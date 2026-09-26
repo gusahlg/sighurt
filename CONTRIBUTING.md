@@ -9,7 +9,7 @@ See [Build and run](./README.md#build-and-run) for prerequisites (`nix-shell` on
 ```bash
 cargo build                                                      # sig and sig-wasm
 cargo build --target wasm32-unknown-unknown --release -p hello-sighurt
-cargo run -p sighurt-browser -- target/wasm32-unknown-unknown/release/hello_sighurt.wasm
+cargo run -p sighurt-ui -- target/wasm32-unknown-unknown/release/hello_sighurt.wasm
 ```
 
 ## Checks
@@ -20,9 +20,8 @@ CI runs these; run them before pushing:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo check --target wasm32-unknown-unknown --workspace --exclude sighurt-browser \
-  --exclude sighurt-core --exclude sighurt-ui --exclude sighurt-engine-wasm \
-  --exclude fullstack-notes-backend
+cargo check --target wasm32-unknown-unknown --workspace --exclude sighurt-core \
+  --exclude sighurt-ui --exclude sighurt-engine-wasm --exclude fullstack-notes-backend
 
 # Only if you touched sighurt-engine-servo or sighurt-ipc (a separate workspace):
 cargo fmt --manifest-path sighurt-engine-servo/Cargo.toml -- --check
@@ -31,7 +30,8 @@ cargo clippy --manifest-path sighurt-engine-servo/Cargo.toml -- -D warnings
 
 ## Guidelines
 
-- **Engines stay out of the browser.** No browser crate (`sighurt-browser`, `sighurt-core`, `sighurt-ui`) links an engine or imports its internals. The only interface is `sighurt-ipc`.
+- **Engines stay out of the browser.** No browser crate (`sighurt-core`, `sighurt-ui`) links an engine or imports its internals. The only interface is `sighurt-ipc`.
+- **The core has no UI.** Tabs, commands, keys, the URL bar and `sig:` pages belong in `sighurt-ui`; `sighurt-core` offers navigables and pages for any UI to arrange.
 - **Keys live in the user's config.** No default bindings and no key handlers in code.
 - **Treat engine output and guest input as untrusted.** Keep the bounds in `sighurt-ipc` and `sighurt-core/src/page.rs`; validate every guest `(ptr, len)`; never link WASI.
 - Small, focused commits and PRs. Test pure logic (routing, config, protocol encoding). Every public SDK function has a doc comment.
@@ -57,9 +57,9 @@ Messages are length-prefixed and little-endian, so an engine can be written in a
 
 ## Adding a command
 
-1. Add the name to `COMMANDS` in `sighurt-core/src/commands.rs`.
-2. Handle it in `Browser::run_command` in `sighurt-core/src/browser.rs`.
-3. List it in the comment in `sighurt-core/src/default-config.toml` and in the README's command table.
+1. Add the name to `COMMANDS` in `sighurt-ui/src/commands.rs`.
+2. Handle it in `Browser::run_command` in `sighurt-ui/src/browser.rs`.
+3. List it in the comment in `sighurt-ui/src/default-ui.toml` and in the README's command table.
 
 ## Adding a host function
 

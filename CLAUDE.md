@@ -3,7 +3,7 @@
 Sighurt (binary `sig`) is a minimal, engine-agnostic browser. It renders what engines tell it to plus what the UI code says, nothing else. There are exactly two draw sources:
 
 - **Sandboxed engines**: separate processes, one per page, speaking `sighurt-ipc` on stdin/stdout. They send finished RGBA frames or `DrawOp` lists plus images, which `sighurt-core` paints.
-- **Trusted UI code**: the GPUI chrome in `sighurt-ui`.
+- **Trusted UI code**: the GPUI chrome in `sighurt-ui`, which is also the `sig` binary. `sighurt-core` has no UI: no tabs, URL bar, commands, keys or pages of its own.
 
 The browser never links an engine. The WASM engine (`sig-wasm`) runs `.wasm` apps that speak Oxide's guest ABI (the `"oxide"` import module); guests are built with `sighurt-sdk` for `wasm32-unknown-unknown`, and host and guest share no Rust types: the boundary is FFI through linear memory.
 
@@ -17,8 +17,8 @@ Run everything inside `nix-shell` on NixOS (`shell.nix`); elsewhere install the 
 
 ```bash
 cargo build                                  # sig and sig-wasm into target/debug
-cargo run -p sighurt-browser -- --help
-cargo run -p sighurt-browser -- target/wasm32-unknown-unknown/release/hello_sighurt.wasm
+cargo run -p sighurt-ui -- --help
+cargo run -p sighurt-ui -- target/wasm32-unknown-unknown/release/hello_sighurt.wasm
 
 # Guest apps (always release for WASM)
 cargo build --target wasm32-unknown-unknown --release -p hello-sighurt
@@ -41,16 +41,18 @@ cp sighurt-engine-servo/target/release/sig-servo target/debug/   # sig looks nex
 
 ```
 ./
-├── sighurt-browser/src/main.rs   # bin `sig`: CLI (--help, --version, --default-config) and wiring
-├── sighurt-core/src/             # Everything but the chrome; no UI of its own
-│   ├── config.rs                 # config.toml merged over default-config.toml
-│   ├── default-config.toml       # Built-in defaults and the format's documentation. Binds no keys
-│   ├── commands.rs               # COMMANDS, CONTEXTS, the RunCommand action, install_keys
-│   ├── router.rs                 # Which engine opens a URL; URL bar input fixup
-│   ├── browser.rs                # Session: tabs, history, routing, Browser::run_command
+├── sighurt-core/src/             # Sighurt without any UI
+│   ├── config.rs                 # config.toml merged over default-config.toml; keeps [ui] for the UI
+│   ├── default-config.toml       # Built-in engines and routing, and their documentation
+│   ├── router.rs                 # Which engine opens a URL; `sig:` is reserved for the UI
+│   ├── navigable.rs              # One place pages are shown: history across engines, routing, downloads
 │   ├── page.rs                   # Engine host: spawns engine processes, paints frames and DrawOp lists
 │   └── download.rs               # Saves what no engine shows to the download folder
-├── sighurt-ui/src/               # Default chrome: tab strip, toolbar/URL bar, status bar
+├── sighurt-ui/src/               # bin `sig` and the default UI; copy this crate for your own UI
+│   ├── main.rs                   # CLI (--help, --version, --default-config) and wiring
+│   ├── settings.rs, default-ui.toml  # The [ui] section: home, search, keys, colors, and its docs
+│   ├── browser.rs                # Tabs (one Navigable each), Browser::run_command, URL bar input fixup
+│   ├── commands.rs               # COMMANDS, CONTEXTS, the RunCommand action, install_keys
 │   ├── lib.rs                    # Root view; moves focus for location.focus, else Browser::run_command
 │   ├── toolbar.rs, pages.rs      # Tabs and URL bar; sig://home and the error display
 │   └── colors.rs                 # Colors, overridable from [ui.colors]
@@ -76,12 +78,13 @@ cp sighurt-engine-servo/target/release/sig-servo target/debug/   # sig looks nex
 
 ## Commands, keys and config
 
-- Everything the browser does is a **named command**: `<area>.<action>`, lower-case, kebab-case actions (`tab.new`, `page.zoom-in`). Arguments follow a space (`tab.select 3`).
-- Commands run in one place: `Browser::run_command` in `sighurt-core/src/browser.rs`, except `location.focus`, which the UI handles. Buttons and keys both go through the `RunCommand` action. Don't add a second path.
-- To add a command: add it to `COMMANDS` in `commands.rs`, handle it in `run_command`, and list it in the comment in `default-config.toml` and in the README's command table.
-- **Keys live only in the user's config**, never in code, and there are **no default bindings**. `[keys]` is global, `[keys.page]` and `[keys.location]` apply while the page or the URL bar has focus (`CONTEXTS`). GPUI keystroke syntax: `secondary` is cmd on macOS and ctrl elsewhere; sequences are space-separated.
-- All settings live in TOML: `{config_dir}/sighurt/config.toml` over `default-config.toml` (`sig --default-config` prints it). There is no settings screen. Engines merge by name, field by field; `[keys]` and `[ui]` are the user's alone. Unknown keys are errors and a broken file is ignored with a warning. `[ui]` belongs to the UI crate (`sighurt-ui` reads `[ui.colors]`). Keep the default file's comments in sync with the code.
-- Routing (`router.rs`): `sig://` is the UI's (only `sig://home` exists), then engine `schemes`, then `extensions`; unmatched `file:` URLs go to `default_engine`, unmatched http(s) URLs to the engine whose `mime` matches the `Content-Type` of a HEAD request, and a type no engine claims is downloaded. Engines are tried in name order.
+- **The core has no UI.** Tabs, commands, keys, the URL bar, search and `sig:` pages live in `sighurt-ui`. The core offers `Navigable` (open, traverse, reload, stop, zoom; events for new navigables and downloads) and `Page`; a UI arranges them however it likes.
+- Everything the default UI does is a **named command**: `<area>.<action>`, lower-case, kebab-case actions (`tab.new`, `page.zoom-in`). Arguments follow a space (`tab.select 3`).
+- Commands run in one place: `Browser::run_command` in `sighurt-ui/src/browser.rs`, except `location.focus`, which the root view handles. Buttons and keys both go through the `RunCommand` action. Don't add a second path.
+- To add a command: add it to `COMMANDS` in `commands.rs`, handle it in `run_command`, and list it in the comment in `default-ui.toml` and in the README's command table.
+- **Keys live only in the user's config**, never in code, and there are **no default bindings**. `[ui.keys]` is global, `[ui.keys.page]` and `[ui.keys.location]` apply while the page or the URL bar has focus (`CONTEXTS`). GPUI keystroke syntax: `secondary` is cmd on macOS and ctrl elsewhere; sequences are space-separated.
+- All settings live in TOML: `{config_dir}/sighurt/config.toml` over `default-config.toml` (the core's: engines) and `default-ui.toml` (the UI's `[ui]`); `sig --default-config` prints both. There is no settings screen. Engines merge by name, field by field; `ui.home` and `ui.search` replace the UI's defaults, and `[ui.keys]` and `[ui.colors]` are the user's alone. Unknown keys are errors: a broken file is ignored with a warning, and so is a broken `[ui]` section. Keep the default files' comments in sync with the code.
+- Routing (`router.rs`): `sig:` URLs are the UI's (the default UI has only `sig://home`) and pages can't open them, then engine `schemes`, then `extensions`; unmatched `file:` URLs go to `default_engine`, unmatched http(s) URLs to the engine whose `mime` matches the `Content-Type` of a HEAD request, and a type no engine claims is downloaded. Engines are tried in name order.
 
 ---
 
@@ -162,7 +165,7 @@ The guest ABI's import module is named `"oxide"` (Oxide's app ABI, comparable to
 ## Security rules — never break these
 
 - **Engines stay out of the browser process.** Page content never runs in `sig`, and no browser crate links an engine.
-- **Treat engine output as untrusted.** Keep every bound in `sighurt-ipc` and `page.rs`. Pages may not open `sig://` URLs, and new tabs and downloads from pages stay throttled.
+- **Treat engine output as untrusted.** Keep every bound in `sighurt-ipc` and `page.rs`. Pages may not open `sig:` URLs, a page opens a new navigable only right after a click or key press in it (`Page::take_activation`), and downloads stay throttled.
 - **Never link WASI** in the WASM engine: no filesystem, no env vars, no raw sockets.
 - **Host access is additive and opt-in.** If it isn't registered in the linker, the guest can't call it. No wildcards.
 - **Validate all lengths** before touching guest memory (use the helpers above). A malicious guest can pass any ptr/len.
@@ -204,7 +207,7 @@ The engine has no widget kit: guests draw their own UI with the canvas API and p
 - Every changed line should trace directly to the request.
 
 **Verify your work.**
-- Browser, core or UI change: `cargo build -p sighurt-browser`.
+- Core or UI change: `cargo build -p sighurt-ui`.
 - WASM engine change: `cargo build -p sighurt-engine-wasm`.
 - SDK change: `cargo build -p sighurt-sdk --target wasm32-unknown-unknown`.
 - Example change: `cargo build --target wasm32-unknown-unknown --release -p <example>`.

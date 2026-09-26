@@ -16,7 +16,7 @@
 //! stdin. The reader thread decodes stdout, turns frames and images into GPUI images and checks
 //! draw lists (the expensive parts) and hands everything to a task on the UI thread, which
 //! updates the page. Nothing is polled: the page redraws when what it shows changes, and tells
-//! the browser with [`PageEvent::Changed`] when its [`PageInfo`] does.
+//! its navigable with [`PageEvent::Changed`] when its [`PageInfo`] does.
 //!
 //! Engines are untrusted, so everything they send is bounded: text and URLs by length, frames
 //! by the viewport, images by count, size and total bytes, draw lists by length, and
@@ -70,6 +70,9 @@ const MAX_IMAGE_SIDE: u32 = 8192;
 const MAX_COORD: f32 = 1e6;
 /// Largest font size in a draw list. Glyphs are rasterized at this size.
 const MAX_FONT_SIZE: f32 = 512.0;
+/// How long a click or key press lets the page open one new navigable, like the transient user
+/// activation of other browsers.
+const ACTIVATION: Duration = Duration::from_secs(5);
 
 /// What the UI shows about a page: URL bar, tab title, toolbar state.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -78,7 +81,7 @@ pub struct PageInfo {
     pub title: Option<String>,
     pub load: LoadState,
     /// True when the engine has its own history to go back through, e.g. links followed
-    /// inside the page. The browser keeps the history of navigations it made itself.
+    /// inside the page. The navigable keeps the history of navigations it made itself.
     pub can_go_back: bool,
     pub can_go_forward: bool,
     /// Transient status text such as the target of a hovered link.
@@ -93,10 +96,10 @@ pub enum LoadState {
     Error(String),
 }
 
-/// Requests and news from a page to the browser.
+/// Requests and news from a page to its navigable.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PageEvent {
-    /// Open `url`. The browser picks the engine, which may not be this one.
+    /// Open `url`. The navigable picks the engine, which may not be this one.
     Open { url: String, new_tab: bool },
     /// [`Page::info`] changed.
     Changed,
@@ -137,6 +140,8 @@ pub struct Page {
     dragging: bool,
     /// Focus state last sent to the engine.
     focused: bool,
+    /// When the user last clicked the page or pressed a key in it, unless that was used up.
+    activated: Option<Instant>,
     /// Kept to bring a restarted engine up to date.
     zoom: f32,
 }
@@ -179,6 +184,7 @@ impl Page {
             retired: Vec::new(),
             dragging: false,
             focused: false,
+            activated: None,
             zoom: 1.0,
         };
         page.start(cx);
@@ -238,6 +244,15 @@ impl Page {
         self.send(ToEngine::Zoom { factor: zoom });
     }
 
+    /// Whether the user clicked the page or pressed a key in it in the last few seconds, which
+    /// lets it do what pages may not do by themselves, such as opening a new navigable. Using
+    /// it up means asking again needs another click or key press.
+    pub fn take_activation(&mut self) -> bool {
+        self.activated
+            .take()
+            .is_some_and(|at| at.elapsed() < ACTIVATION)
+    }
+
     /// Starts a fresh engine process and loads `info.url` in it.
     fn start(&mut self, cx: &mut Context<Self>) {
         // What an earlier process showed means nothing to the new one.
@@ -284,7 +299,7 @@ impl Page {
     }
 
     /// Applies what the engine said. Only what changes the page's look redraws it; what changes
-    /// its [`PageInfo`] goes to the browser, which redraws the chrome.
+    /// its [`PageInfo`] goes to its navigable, which the UI's chrome is drawn from.
     fn handle(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Frame(image) => {
@@ -417,6 +432,9 @@ impl Page {
         if button == MouseButton::Left {
             self.dragging = down;
         }
+        if down {
+            self.activated = Some(Instant::now());
+        }
         let (x, y) = self.page_point(at, window);
         self.send(ToEngine::MouseButton {
             button: dom_button(button),
@@ -430,6 +448,9 @@ impl Page {
         let Some((key, code)) = dom_key(keystroke) else {
             return;
         };
+        if down {
+            self.activated = Some(Instant::now());
+        }
         self.send(ToEngine::Key {
             down,
             key,
@@ -750,7 +771,7 @@ fn byte_len(image: &RenderImage) -> usize {
 /// How engine messages change a page's info; apart from the view, so it can be tested without a
 /// window.
 impl PageInfo {
-    /// Applies one engine message and returns the event it raises for the browser, if any:
+    /// Applies one engine message and returns the event it raises for its navigable, if any:
     /// [`PageEvent::Changed`] only when it changed something.
     fn apply(&mut self, msg: FromEngine) -> Option<PageEvent> {
         let changed = match msg {
@@ -1296,7 +1317,7 @@ pub(crate) mod tests {
             url: "https://a.test/".into(),
         };
         assert_eq!(info.apply(url()), changed);
-        // Saying the same again changes nothing, so the browser hears nothing.
+        // Saying the same again changes nothing, so the navigable hears nothing.
         assert_eq!(info.apply(url()), None);
         info.apply(FromEngine::Title { title: "A".into() });
         assert_eq!(

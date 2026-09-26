@@ -7,13 +7,15 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     canvas, div, font, point, px, Action, App, Bounds, ClickEvent, ClipboardItem, Context, Div,
-    Entity, FocusHandle, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Rgba, ShapedLine, SharedString, Stateful, TextRun, Window,
+    Entity, EntityId, FocusHandle, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Rgba, ShapedLine, SharedString, Stateful, TextRun,
+    Window,
 };
-use sighurt_core::browser::Browser;
-use sighurt_core::commands::RunCommand;
+use sighurt_core::navigable::{Content, Navigable};
 
-use crate::{rendered, Colors};
+use crate::browser::Browser;
+use crate::commands::RunCommand;
+use crate::{pages, rendered, Colors};
 
 /// Text of the URL bar with its caret and selection.
 #[derive(Default)]
@@ -166,8 +168,50 @@ fn icon_button(
         .child(icon)
 }
 
+/// What the tab strip calls a tab.
+pub(crate) fn title(tab: &Navigable) -> String {
+    match tab.content() {
+        Content::Ui(url) if pages::is_home(url) => "Home".into(),
+        Content::Ui(_) | Content::Error { .. } => "Can't open page".into(),
+        Content::Page(_) => {
+            let info = tab.info().expect("a page reports its info");
+            match info.title.as_deref().map(str::trim) {
+                Some(title) if !title.is_empty() => title.to_string(),
+                _ => url_to_title(&info.url),
+            }
+        }
+        Content::Blank if tab.url().is_empty() => "New Tab".into(),
+        Content::Blank => url_to_title(tab.url()),
+    }
+}
+
+/// A short title for a page that doesn't name itself.
+fn url_to_title(url: &str) -> String {
+    if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        return rest
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or(rest)
+            .to_string();
+    }
+    if let Some(path) = url.strip_prefix("file://") {
+        return path
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or("Local file")
+            .to_string();
+    }
+    match url.char_indices().nth(20) {
+        Some((end, _)) => format!("{}\u{2026}", &url[..end]),
+        None => url.to_string(),
+    }
+}
+
 /// One button per tab, each with a close button while there are several, and one for a new tab.
-pub(crate) fn tab_strip(browser: &Browser, colors: &Colors) -> Div {
+pub(crate) fn tab_strip(browser: &Browser, colors: &Colors, cx: &App) -> Div {
     rendered("tabs");
     let count = browser.tabs().len();
     div()
@@ -201,7 +245,13 @@ pub(crate) fn tab_strip(browser: &Browser, colors: &Colors) -> Div {
                 } else {
                     colors.text_muted
                 })
-                .child(div().flex_1().min_w_0().truncate().child(tab.title()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(title(tab.read(cx))),
+                )
                 .on_click(run_on_click(format!("tab.select {}", i + 1)))
                 .when(count > 1, |d| {
                     d.child(
@@ -244,7 +294,7 @@ pub(crate) struct Toolbar {
     content_focus: FocusHandle,
     url: UrlInput,
     /// The tab the URL bar shows. Switching tabs drops what was typed.
-    url_tab: u64,
+    url_tab: EntityId,
 }
 
 impl Toolbar {
@@ -256,7 +306,7 @@ impl Toolbar {
     ) -> Self {
         cx.observe(&browser, |_, _, cx| cx.notify()).detach();
         Self {
-            url_tab: browser.read(cx).active_tab().id(),
+            url_tab: browser.read(cx).active_tab().entity_id(),
             browser,
             colors,
             focus: cx.focus_handle(),
@@ -282,12 +332,13 @@ impl Toolbar {
     /// Shows the active tab's URL in the URL bar unless the user has typed something else.
     fn sync_url(&mut self, cx: &App) {
         let tab = self.browser.read(cx).active_tab();
-        if tab.id() != self.url_tab {
-            self.url_tab = tab.id();
+        if tab.entity_id() != self.url_tab {
+            self.url_tab = tab.entity_id();
             self.url.edited = false;
         }
-        if !self.url.edited && self.url.text != tab.url() {
-            self.url.set_text(tab.url().to_string());
+        let url = tab.read(cx).url();
+        if !self.url.edited && self.url.text != url {
+            self.url.set_text(url.to_string());
         }
     }
 
@@ -446,7 +497,7 @@ impl Render for Toolbar {
         rendered("toolbar");
         self.sync_url(cx);
         let colors = &self.colors;
-        let tab = self.browser.read(cx).active_tab();
+        let tab = self.browser.read(cx).active_tab().read(cx);
         let reload = if tab.loading() {
             icon_button("sig-stop", "✕", true, colors).on_click(run_on_click("page.stop"))
         } else {
@@ -535,6 +586,17 @@ mod tests {
         assert_eq!(url.cursor, 4);
         url.step(false, true);
         assert_eq!(url.selected_text().as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn titles_from_urls() {
+        assert_eq!(url_to_title("https://example.com/a/b?c"), "example.com");
+        assert_eq!(url_to_title("file:///tmp/app.wasm"), "app.wasm");
+        assert_eq!(
+            url_to_title("data:text/html,hello world!!"),
+            "data:text/html,hello\u{2026}"
+        );
+        assert_eq!(url_to_title("about:blank"), "about:blank");
     }
 
     #[test]

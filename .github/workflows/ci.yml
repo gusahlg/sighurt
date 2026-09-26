@@ -69,7 +69,6 @@ jobs:
       - name: Check examples (wasm32)
         run: >
           cargo check --target wasm32-unknown-unknown --workspace
-          --exclude sighurt-browser
           --exclude sighurt-core
           --exclude sighurt-ui
           --exclude sighurt-engine-wasm

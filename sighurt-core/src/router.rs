@@ -1,5 +1,5 @@
-//! Decides what handles a URL: a shell page, one of the configured engines, or the download
-//! manager. The rules are documented in the default config.
+//! Decides what handles a URL: the UI, one of the configured engines, or the download manager.
+//! The rules are documented in the default config.
 
 use std::time::Duration;
 
@@ -7,8 +7,9 @@ use crate::config::Config;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Route {
-    /// A `sig://` page drawn by the shell.
-    Shell,
+    /// A `sig:` URL. The scheme is reserved for the UI's own pages: engines never get these,
+    /// and pages can't open them.
+    Ui,
     Engine(String),
     Download,
     /// Only the server can tell: look up the Content-Type with [`content_type`], then call
@@ -25,7 +26,7 @@ pub fn route(url: &str, config: &Config) -> Route {
     };
     let scheme = parsed.scheme();
     if scheme == "sig" {
-        return Route::Shell;
+        return Route::Ui;
     }
     if !matches!(scheme, "http" | "https" | "file") {
         return match config
@@ -110,46 +111,6 @@ pub fn content_type(url: &str) -> Option<String> {
     }
 }
 
-/// Turns what the user typed (or passed on the command line) into a URL.
-pub fn fixup(input: &str, search: &str) -> String {
-    let input = input.trim();
-    let has_scheme = |scheme: &str| {
-        input
-            .get(..scheme.len())
-            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
-    };
-    if input.is_empty()
-        || input.contains("://")
-        || ["sig:", "data:", "about:"].into_iter().any(has_scheme)
-    {
-        return input.to_string();
-    }
-    if let Some(path) = input.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return file_url(&home.join(path));
-        }
-    }
-    if input.starts_with('/') {
-        return file_url(std::path::Path::new(input));
-    }
-    let host = input.split(['/', '?', '#']).next().unwrap_or_default();
-    let host_name = host.rsplit_once(':').map_or(host, |(name, _)| name);
-    if !input.contains(char::is_whitespace) {
-        if matches!(host_name, "localhost" | "127.0.0.1" | "[::1]") {
-            return format!("http://{input}");
-        }
-        if host_name.contains('.') {
-            return format!("https://{input}");
-        }
-    }
-    if search.contains("{}") {
-        let query =
-            percent_encoding::utf8_percent_encode(input, percent_encoding::NON_ALPHANUMERIC);
-        return search.replace("{}", &query.to_string());
-    }
-    format!("https://{input}")
-}
-
 /// A `file://` URL for `path`, which is made absolute first.
 pub fn file_url(path: &std::path::Path) -> String {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
@@ -181,9 +142,9 @@ mod tests {
     #[test]
     fn routes_without_io() {
         let c = config();
-        assert_eq!(route("sig://home", &c), Route::Shell);
-        assert_eq!(route("SIG://Settings/", &c), Route::Shell);
-        assert_eq!(route("sig:nope", &c), Route::Shell);
+        assert_eq!(route("sig://home", &c), Route::Ui);
+        assert_eq!(route("SIG://Settings/", &c), Route::Ui);
+        assert_eq!(route("sig:nope", &c), Route::Ui);
         assert_eq!(route("gemini://example.org/", &c), engine("gemini"));
         assert_eq!(route("data:text/html,hi", &c), engine("servo"));
         assert_eq!(route("https://a.b/app.wasm", &c), engine("wasm"));
@@ -216,27 +177,5 @@ mod tests {
         let mut c = config();
         c.default_engine = "nope".into();
         assert!(matches!(route("file:///tmp/x", &c), Route::Invalid(_)));
-    }
-
-    #[test]
-    fn fixes_up_input() {
-        let search = "https://s.test/?q={}";
-        assert_eq!(
-            fixup("  https://example.com ", search),
-            "https://example.com"
-        );
-        assert_eq!(fixup("sig://settings", search), "sig://settings");
-        assert_eq!(fixup("Sig:settings", search), "Sig:settings");
-        assert_eq!(fixup("data:text/plain,hi", search), "data:text/plain,hi");
-        assert_eq!(fixup("example.com/a?b", search), "https://example.com/a?b");
-        assert_eq!(fixup("localhost:8000", search), "http://localhost:8000");
-        assert_eq!(fixup("127.0.0.1/x", search), "http://127.0.0.1/x");
-        assert_eq!(fixup("/tmp/app.wasm", search), "file:///tmp/app.wasm");
-        assert_eq!(
-            fixup("rust servo", search),
-            "https://s.test/?q=rust%20servo"
-        );
-        assert_eq!(fixup("sighurt", search), "https://s.test/?q=sighurt");
-        assert_eq!(fixup("", search), "");
     }
 }

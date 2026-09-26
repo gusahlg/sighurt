@@ -48,7 +48,7 @@ target/wasm32-unknown-unknown/release/fullstack_notes_frontend.wasm
 ### 3. Load it in Sighurt
 
 ```sh
-cargo run -p sighurt-browser -- "$PWD/target/wasm32-unknown-unknown/release/fullstack_notes_frontend.wasm"
+cargo run -p sighurt-ui -- "$PWD/target/wasm32-unknown-unknown/release/fullstack_notes_frontend.wasm"
 ```
 
 Or start `sig` and open the `.wasm` file with the open-file command.

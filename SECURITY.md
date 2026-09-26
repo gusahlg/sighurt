@@ -27,7 +27,7 @@ Sighurt's security model is per engine. These areas are in scope:
 
 - Engine output that crashes `sig`, exhausts its memory or gets around the bounds on messages, images, draw lists and coordinates
 - URL routing that sends content to an engine or scheme it should not reach
-- Pages opening `sig://` URLs, or opening tabs or downloads without the throttle
+- Pages opening `sig:` URLs, opening tabs without a click or key press, or starting downloads without the throttle
 - Download handling, such as files written outside the download folder
 
 **WASM engine (`sighurt-engine-wasm`)**
@@ -57,7 +57,7 @@ Sighurt's security model is per engine. These areas are in scope:
 
 ## Security Design
 
-`sig` runs no page code. Every engine is a separate process, and everything it sends over `sighurt-ipc` is untrusted: message sizes, text, URLs, images, draw lists and coordinates are bounded, an engine that doesn't say `Hello` within 10 seconds is stopped, pages can't open `sig://` URLs, and only the front tab may open a tab, at most once a second.
+`sig` runs no page code. Every engine is a separate process, and everything it sends over `sighurt-ipc` is untrusted: message sizes, text, URLs, images, draw lists and coordinates are bounded, an engine that doesn't say `Hello` within 10 seconds is stopped, pages can't open `sig:` URLs, a page opens a new tab only right after the user clicked it or pressed a key in it (once per click or key press), and a page starts at most one download a second.
 
 ### WASM engine
 

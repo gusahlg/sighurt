@@ -1,13 +1,13 @@
 //! Named commands and the keymap that triggers them.
 //!
 //! Everything the user can do is a command string such as `tab.new` or `tab.select 3`. Keys
-//! from the config and the UI's buttons all dispatch the same [`RunCommand`] action. The UI
-//! focuses the URL bar for `location.focus` and hands every other command to
+//! from `[ui.keys]` and the chrome's buttons all dispatch the same [`RunCommand`] action. The
+//! root view focuses the URL bar for `location.focus` and hands every other command to
 //! [`Browser::run_command`](crate::browser::Browser::run_command).
 
 use gpui::{App, KeyBinding, Keystroke, SharedString};
 
-use crate::config;
+use crate::settings;
 
 /// "Run this command." The only GPUI action Sighurt defines.
 #[derive(Clone, Debug, PartialEq, gpui::Action)]
@@ -36,7 +36,7 @@ pub const COMMANDS: &[&str] = &[
     "browser.quit",
 ];
 
-/// Key contexts the UI sets: "page" on the content area, "location" on the URL bar.
+/// Key contexts the chrome sets: "page" on the content area, "location" on the URL bar.
 pub const CONTEXTS: &[&str] = &["page", "location"];
 
 /// Splits `"tab.select 3"` into `("tab.select", "3")`.
@@ -54,7 +54,7 @@ fn is_known(command: &str) -> bool {
 
 /// Registers `bindings` with GPUI. Invalid keystrokes, unknown commands and unknown contexts are
 /// reported and skipped rather than failing startup.
-pub fn install_keys(bindings: &[config::KeyBinding], cx: &mut App) {
+pub fn install_keys(bindings: &[settings::KeyBinding], cx: &mut App) {
     let mut accepted = Vec::new();
     for binding in bindings {
         if let Err(problem) = validate(binding) {
@@ -70,7 +70,7 @@ pub fn install_keys(bindings: &[config::KeyBinding], cx: &mut App) {
     cx.bind_keys(accepted);
 }
 
-fn validate(binding: &config::KeyBinding) -> Result<(), String> {
+fn validate(binding: &settings::KeyBinding) -> Result<(), String> {
     if !is_known(&binding.command) {
         return Err(format!("unknown command {:?}", binding.command));
     }
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn sample_bindings_are_valid() {
-        let config = config::Config::parse(Some(
+        let ui = toml::from_str(
             r#"
             [keys]
             "secondary-t" = "tab.new"
@@ -127,17 +127,18 @@ mod tests {
             [keys.location]
             "alt-enter" = "page.open https://example.com"
             "#,
-        ))
+        )
         .unwrap();
-        assert_eq!(config.keys.len(), 7);
-        for binding in &config.keys {
+        let settings = settings::Settings::new(&ui);
+        assert_eq!(settings.keys.len(), 7);
+        for binding in &settings.keys {
             assert_eq!(validate(binding), Ok(()), "{binding:?}");
         }
     }
 
     #[test]
     fn rejects_bad_bindings() {
-        let binding = |keys: &str, command: &str, context: Option<&str>| config::KeyBinding {
+        let binding = |keys: &str, command: &str, context: Option<&str>| settings::KeyBinding {
             keystrokes: keys.into(),
             command: command.into(),
             context: context.map(Into::into),

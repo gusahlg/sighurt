@@ -3,7 +3,7 @@
 Sighurt (`sig`) is a minimal, engine-agnostic browser. It draws two things and nothing else:
 
 - **What engines send.** Every engine is a separate, sandboxed process that speaks [`sighurt-ipc`](./sighurt-ipc/src/lib.rs) on stdin/stdout, one process per page. It sends either finished RGBA frames or a list of draw operations (rectangles, paths, text, images, clips) that `sig` paints itself.
-- **What the UI code says.** The chrome (tab strip, toolbar with URL bar, status bar, `sig://home`) is trusted GPUI code in `sighurt-ui`.
+- **What the UI code says.** The chrome (tab strip, toolbar with URL bar, status bar, key bindings, `sig://home`) is trusted GPUI code in `sighurt-ui`, which also builds `sig`. The core underneath has no UI at all, so a UI of your own is a copy of that one crate.
 
 Two engines come with it:
 
@@ -13,10 +13,9 @@ Two engines come with it:
 Any other program that speaks `sighurt-ipc` becomes an engine with a few lines of config.
 
 ```text
- sig  (sighurt-browser: main.rs only)
-  ├── sighurt-ui    chrome: tabs, toolbar, URL bar, status bar, sig://home
-  └── sighurt-core  config, commands and keys, routing, tabs and history,
-                    downloads, engine processes and the draw-list/frame renderer
+ sig  (sighurt-ui: tabs, toolbar, URL bar, status bar, commands and keys, sig://home)
+  └── sighurt-core  no UI: engine processes and the draw-list/frame renderer,
+                    routing, per-navigable history across engines, downloads
                          │ sighurt-ipc on stdin/stdout, one process per page
                          │ ↓ navigation, input, resize, zoom
                          │ ↑ frames or draw lists, URL, title, load state
@@ -32,8 +31,8 @@ You need Rust (stable) with the guest target (`rustup target add wasm32-unknown-
 ```bash
 nix-shell                                  # NixOS only
 cargo build                                # builds sig and sig-wasm into target/debug
-cargo run -p sighurt-browser               # opens sig://home
-cargo run -p sighurt-browser -- --help
+cargo run -p sighurt-ui               # opens sig://home
+cargo run -p sighurt-ui -- --help
 ```
 
 ```text
@@ -48,7 +47,7 @@ An argument that names an existing file or directory becomes a `file://` URL. An
 
 ```bash
 cargo build --target wasm32-unknown-unknown --release -p hello-sighurt
-cargo run -p sighurt-browser -- target/wasm32-unknown-unknown/release/hello_sighurt.wasm
+cargo run -p sighurt-ui -- target/wasm32-unknown-unknown/release/hello_sighurt.wasm
 ```
 
 Every crate in [`examples/`](./examples/) except `fullstack-notes/backend` is a WASM app. [`index`](./examples/index/) links to the others by relative URL, so build them all and open it:
@@ -57,7 +56,7 @@ Every crate in [`examples/`](./examples/) except `fullstack-notes/backend` is a 
 cargo build --target wasm32-unknown-unknown --release -p index -p hello-sighurt \
   -p typography-demo -p gradient-demo -p raf-demo -p timer-demo -p events-demo -p sse-demo \
   -p audio-player -p fullstack-notes-frontend
-cargo run -p sighurt-browser -- target/wasm32-unknown-unknown/release/index.wasm
+cargo run -p sighurt-ui -- target/wasm32-unknown-unknown/release/index.wasm
 ```
 
 ### Web pages (Servo)
@@ -67,7 +66,7 @@ cargo run -p sighurt-browser -- target/wasm32-unknown-unknown/release/index.wasm
 ```bash
 cargo build --release --manifest-path sighurt-engine-servo/Cargo.toml
 cp sighurt-engine-servo/target/release/sig-servo target/debug/
-cargo run -p sighurt-browser -- https://example.com
+cargo run -p sighurt-ui -- https://example.com
 ```
 
 `sig` looks for each engine's program next to its own binary, then on `PATH`. `sig://home` lists the configured engines and whether each was found.
@@ -76,9 +75,8 @@ cargo run -p sighurt-browser -- https://example.com
 
 | Crate | What it is |
 |-------|------------|
-| [`sighurt-browser`](./sighurt-browser/) | Binary `sig`: command-line options and wiring (`main.rs` only). |
-| [`sighurt-core`](./sighurt-core/) | Everything but the chrome: config, commands and keymap, routing, the session (tabs, history), downloads, and the engine host that runs engine processes and paints their frames and draw lists. |
-| [`sighurt-ui`](./sighurt-ui/) | The default chrome. Swapping the UI means changing `sighurt-browser/src/main.rs`. |
+| [`sighurt-ui`](./sighurt-ui/) | Binary `sig` and the default UI: tabs, toolbar, URL bar, status bar, commands and key bindings, `sig://home`, and the `[ui]` config. Copy it to make your own UI. |
+| [`sighurt-core`](./sighurt-core/) | Sighurt without any UI: the engine host that runs engine processes and paints their frames and draw lists, routing, navigables (one history each, across engines) and downloads. |
 | [`sighurt-ipc`](./sighurt-ipc/) | The engine protocol. Zero dependencies. |
 | [`sighurt-engine-wasm`](./sighurt-engine-wasm/) | Binary `sig-wasm`: the WASM engine. |
 | [`sighurt-engine-servo`](./sighurt-engine-servo/) | Binary `sig-servo`: the Servo engine. Separate workspace. |
@@ -87,23 +85,24 @@ cargo run -p sighurt-browser -- https://example.com
 
 ## Configuration
 
-All settings live in TOML; there is no settings screen. The built-in configuration is [`sighurt-core/src/default-config.toml`](./sighurt-core/src/default-config.toml), which documents the format; `sig --default-config` prints it. Your file is `sighurt/config.toml` in the platform config directory (`~/.config/sighurt/config.toml` on Linux, `~/Library/Application Support/sighurt/config.toml` on macOS). It is merged over the defaults when `sig` starts:
+All settings live in TOML; there is no settings screen. The built-in configuration is [`sighurt-core/src/default-config.toml`](./sighurt-core/src/default-config.toml) (engines) followed by the UI's [`sighurt-ui/src/default-ui.toml`](./sighurt-ui/src/default-ui.toml) (`[ui]`), which document the format; `sig --default-config` prints both. Your file is `sighurt/config.toml` in the platform config directory (`~/.config/sighurt/config.toml` on Linux, `~/Library/Application Support/sighurt/config.toml` on macOS). It is merged over the defaults when `sig` starts:
 
-- `home`, `search` and `default_engine` replace the defaults.
+- `default_engine` replaces the default.
 - `[engines.<name>]` tables merge by name, field by field. A new name adds an engine.
-- `[keys]` and `[ui]` are yours alone: there are no default bindings or UI settings.
+- `[ui]` belongs to the UI. The default UI's `home` and `search` replace its defaults; `[ui.keys]` and `[ui.colors]` are yours alone: there are no default bindings.
 
-A file that isn't valid TOML or has an unknown key is ignored with a warning. A bad key binding is skipped with a warning.
+A file that isn't valid TOML or has an unknown key is ignored with a warning (an unknown key in `[ui]` only costs the `[ui]` section). A bad key binding is skipped with a warning.
 
 ```toml
-home = "https://example.com"
-
 [engines.servo]
 command = ["/opt/sig-servo/sig-servo"]   # only the command changes
 
 [engines.gemini]                         # a new engine
 command = ["sig-gemini"]
 schemes = ["gemini"]
+
+[ui]
+home = "https://example.com"
 
 [ui.colors]
 bg = "#000000"
@@ -120,7 +119,7 @@ bg = "#000000"
 
 Engines are tried in alphabetical order and the first match wins:
 
-1. `sig://home` is drawn by the UI. Any other `sig://` URL shows an error.
+1. `sig:` URLs belong to the UI, and pages can't open them. The default UI draws `sig://home` and shows an error for any other.
 2. A scheme other than http, https and file goes to the engine that lists it (by default `data:` and `about:` go to Servo), or can't be opened.
 3. The file extension of the URL's path is matched against `extensions`.
 4. Other `file:` URLs go to `default_engine`.
@@ -128,20 +127,20 @@ Engines are tried in alphabetical order and the first match wins:
 
 ### Keys and commands
 
-Everything `sig` does is a named command. The toolbar and tab strip run commands, and so do key bindings. There are no default bindings: bind keys in your own config.
+Everything the default UI does is a named command. The toolbar and tab strip run commands, and so do key bindings. There are no default bindings: bind keys in your own config.
 
 ```toml
-[keys]                          # everywhere
+[ui.keys]                       # everywhere
 "secondary-t" = "tab.new"
 "secondary-w" = "tab.close"
 "secondary-1" = "tab.select 1"
 "secondary-l" = "location.focus"
 "secondary-=" = "page.zoom-in"
 
-[keys.page]                     # only while the page has focus
+[ui.keys.page]                  # only while the page has focus
 "g g" = "location.focus"
 
-[keys.location]                 # only while the URL bar has focus
+[ui.keys.location]              # only while the URL bar has focus
 "alt-enter" = "page.open https://example.com"
 ```
 
@@ -152,7 +151,7 @@ Everything `sig` does is a named command. The toolbar and tab strip run commands
 | `location` | `location.focus` |
 | `browser` | `browser.home`, `browser.quit` |
 
-Keys use GPUI keystroke syntax: modifiers `ctrl`, `alt`, `shift`, `cmd` and `secondary` (cmd on macOS, ctrl elsewhere), with space-separated sequences such as `"ctrl-x ctrl-c"`. The browser sees keys before the page, so a `[keys.page]` binding takes that key away from the page.
+Keys use GPUI keystroke syntax: modifiers `ctrl`, `alt`, `shift`, `cmd` and `secondary` (cmd on macOS, ctrl elsewhere), with space-separated sequences such as `"ctrl-x ctrl-c"`. The browser sees keys before the page, so a `[ui.keys.page]` binding takes that key away from the page.
 
 ## Writing WASM apps
 

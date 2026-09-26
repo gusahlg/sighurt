@@ -1,19 +1,27 @@
-//! # sighurt-ui — Sighurt's default chrome
+//! # sighurt-ui — Sighurt's default UI, and the `sig` binary
+//!
+//! Everything the user sees and does that isn't a page is here, not in `sighurt-core`: the
+//! tabs ([`Browser`], one core `Navigable` each), the commands and their key bindings
+//! ([`commands`]), the URL bar and what it makes of what is typed, the `sig:` pages, and the
+//! `[ui]` section of the config ([`settings`]). Copy this crate to make a UI of your own.
 //!
 //! [`Root`] is the window's view. Top to bottom: the tab strip, the toolbar (back, forward,
 //! reload or stop, and the URL bar), the content area and a one-line status bar. The content
 //! area shows the active tab's engine page, or draws `sig://home` and error messages itself.
 //!
 //! Everything the chrome does is a command: buttons, the URL bar and key bindings all end in
-//! [`RunCommand`]. The chrome moves focus for `location.focus` and hands every other command to
-//! the [`Browser`]. Colors come from `[ui.colors]` in the config (see [`Colors`]).
+//! [`RunCommand`]. The root view moves focus for `location.focus` and hands every other command
+//! to the [`Browser`]. Colors come from `[ui.colors]` in the config (see [`Colors`]).
 //!
 //! The tab strip, the toolbar and the status bar are views of their own, drawn from the
 //! browser's state alone, and GPUI caches them, like the page: an engine's frame repaints its
 //! page and none of the chrome, and the chrome changing repaints none of the page.
 
+pub mod browser;
 mod colors;
+pub mod commands;
 mod pages;
+pub mod settings;
 mod toolbar;
 
 use gpui::prelude::*;
@@ -21,11 +29,12 @@ use gpui::{
     div, px, AnyView, App, Context, Div, Entity, FocusHandle, Focusable, MouseButton,
     MouseDownEvent, NavigationDirection, Pixels, SharedString, StyleRefinement, Window,
 };
-use sighurt_core::browser::{Browser, Shell};
-use sighurt_core::commands::{self, RunCommand};
+use sighurt_core::navigable::Content;
 use sighurt_core::page::LoadState;
 
+use browser::Browser;
 pub use colors::Colors;
+use commands::RunCommand;
 use pages::EngineRow;
 use toolbar::Toolbar;
 
@@ -44,8 +53,9 @@ pub struct Root {
 
 impl Root {
     pub fn new(browser: Entity<Browser>, cx: &mut Context<Self>) -> Self {
-        let config = browser.read(cx).config();
-        let (colors, engines) = (Colors::new(&config.ui), pages::engine_rows(config));
+        let browser_ref = browser.read(cx);
+        let colors = browser_ref.settings().colors;
+        let engines = pages::engine_rows(browser_ref.config());
         let content_focus = cx.focus_handle();
         Self {
             tab_strip: Bar::new(&browser, colors, toolbar::tab_strip, cx),
@@ -86,7 +96,7 @@ impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         rendered("root");
         let colors = self.colors;
-        let tab = self.browser.read(cx).active_tab();
+        let tab = self.browser.read(cx).active_tab().read(cx);
 
         let content = div()
             .id("sig-content")
@@ -97,22 +107,25 @@ impl Render for Root {
             .flex()
             .flex_col();
         let mut page_focus = None;
-        let content = match (tab.shell(), tab.page(), tab.info().map(|info| &info.load)) {
-            (Some(Shell::Home), ..) => content.child(pages::home(&self.engines, &colors)),
-            (Some(Shell::Error { url, message }), ..) => {
-                content.child(pages::error(url, message, &colors))
+        let content = match tab.content() {
+            Content::Ui(url) if pages::is_home(url) => {
+                content.child(pages::home(&self.engines, &colors))
             }
-            (None, _, Some(LoadState::Error(message))) => {
-                content.child(pages::error(tab.url(), message, &colors))
-            }
-            (None, Some(page), _) => {
-                page_focus = Some(page.focus_handle(cx));
-                // Clipped, so a page can't paint over the chrome around it.
-                let view =
-                    AnyView::from(page.clone()).cached(StyleRefinement::default().size_full());
-                content.child(div().flex_1().min_h_0().overflow_hidden().child(view))
-            }
-            (None, None, _) => content,
+            Content::Ui(url) => content.child(pages::error(url, pages::NO_SUCH_PAGE, &colors)),
+            Content::Error { url, message } => content.child(pages::error(url, message, &colors)),
+            Content::Page(page) => match tab.info().map(|info| &info.load) {
+                Some(LoadState::Error(message)) => {
+                    content.child(pages::error(tab.url(), message, &colors))
+                }
+                _ => {
+                    page_focus = Some(page.focus_handle(cx));
+                    // Clipped, so a page can't paint over the chrome around it.
+                    let view =
+                        AnyView::from(page.clone()).cached(StyleRefinement::default().size_full());
+                    content.child(div().flex_1().min_h_0().overflow_hidden().child(view))
+                }
+            },
+            Content::Blank => content,
         };
         // Focus in the content area follows what it shows, and so does focus that went nowhere
         // (at startup, or with a page that was closed).
@@ -163,14 +176,14 @@ fn strip<V: Render>(view: &Entity<V>, height: Pixels) -> AnyView {
 struct Bar {
     browser: Entity<Browser>,
     colors: Colors,
-    draw: fn(&Browser, &Colors) -> Div,
+    draw: fn(&Browser, &Colors, &App) -> Div,
 }
 
 impl Bar {
     fn new(
         browser: &Entity<Browser>,
         colors: Colors,
-        draw: fn(&Browser, &Colors) -> Div,
+        draw: fn(&Browser, &Colors, &App) -> Div,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
@@ -186,15 +199,17 @@ impl Bar {
 
 impl Render for Bar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        (self.draw)(self.browser.read(cx), &self.colors)
+        let cx: &App = cx;
+        (self.draw)(self.browser.read(cx), &self.colors, cx)
     }
 }
 
 /// What the page says about the link under the pointer, or else the latest word from a download.
-fn status_bar(browser: &Browser, colors: &Colors) -> Div {
+fn status_bar(browser: &Browser, colors: &Colors, cx: &App) -> Div {
     rendered("status");
     let status = browser
         .active_tab()
+        .read(cx)
         .info()
         .and_then(|info| info.status.as_deref())
         .or(browser.status())
@@ -224,6 +239,7 @@ mod tests {
     use sighurt_core::config::Config;
 
     use super::*;
+    use crate::settings::Settings;
 
     thread_local! {
         /// Views rendered on this thread, in order.
@@ -244,7 +260,8 @@ mod tests {
         config: Config,
         cx: &mut TestAppContext,
     ) -> (Entity<Root>, Entity<Browser>, &mut VisualTestContext) {
-        let browser = cx.new(|cx| Browser::new(config, urls, cx));
+        let settings = Settings::new(&config.ui);
+        let browser = cx.new(|cx| Browser::new(config, settings, urls, cx));
         let (root, cx) = cx.add_window_view(|_, cx| Root::new(browser.clone(), cx));
         assert_eq!(renders(), ["root", "status", "tabs", "toolbar"]);
         (root, browser, cx)
@@ -264,7 +281,12 @@ mod tests {
         let mut cx = TestAppContext::single();
         let (_, browser, cx) = open(urls, config, &mut cx);
         let page = |i: usize, cx: &mut VisualTestContext| {
-            browser.read_with(cx, |browser, _| browser.tabs()[i].page().unwrap().clone())
+            browser.read_with(cx, |browser, cx| {
+                let Content::Page(page) = browser.tabs()[i].read(cx).content() else {
+                    panic!("tab {i} shows no page");
+                };
+                page.clone()
+            })
         };
         let (front, back) = (page(0, cx), page(1, cx));
 
@@ -299,13 +321,15 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(renders(), ["root"]);
         cx.simulate_click(new_tab.center(), Modifiers::none());
-        browser.read_with(cx, |browser, _| {
+        browser.read_with(cx, |browser, cx| {
             assert_eq!((browser.tabs().len(), browser.active()), (2, 1));
-            assert_eq!(browser.active_tab().url(), "sig://home");
+            assert_eq!(browser.active_tab().read(cx).url(), "sig://home");
         });
         // The new tab's URL bar has focus and its text selected: typing replaces it.
         cx.simulate_keystrokes("s i g : n o p e enter");
-        let tab = browser.read_with(cx, |browser, _| browser.active_tab().title());
+        let tab = browser.read_with(cx, |browser, cx| {
+            toolbar::title(browser.active_tab().read(cx))
+        });
         assert_eq!(tab, "Can't open page");
     }
 }

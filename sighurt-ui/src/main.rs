@@ -1,15 +1,16 @@
-//! `sig`, the Sighurt browser: reads the config, starts the session ([`Browser`]) and opens it in
-//! a window drawn by `sighurt-ui`. Swapping the UI means changing this file.
+//! `sig`, the Sighurt browser: reads the config, starts the tabs ([`Browser`]) and opens them in
+//! a window. A UI of your own is a copy of this crate.
 //!
 //! Sighurt is based on Oxide by Nikhil Ranjan (<https://github.com/niklabh/oxide>).
 
 use std::path::Path;
 
 use gpui::{px, size, App, AppContext, Application, TitlebarOptions, WindowBounds, WindowOptions};
-use sighurt_core::browser::Browser;
 use sighurt_core::config::{self, Config};
-use sighurt_core::{commands, router};
-use sighurt_ui::Root;
+use sighurt_core::router;
+use sighurt_ui::browser::{self, Browser};
+use sighurt_ui::settings::{Settings, DEFAULT_UI};
+use sighurt_ui::{commands, Root};
 
 const USAGE: &str = "\
 Usage: sig [OPTIONS] [URL|PATH ...]
@@ -35,7 +36,7 @@ fn main() {
                     env!("CARGO_PKG_VERSION")
                 )
             }
-            "--default-config" => return print!("{}", config::DEFAULT_CONFIG),
+            "--default-config" => return print!("{}{DEFAULT_UI}", config::DEFAULT_CONFIG),
             option if option.starts_with('-') && option.len() > 1 => {
                 eprint!("sig: unknown option {option}\n\n{USAGE}");
                 std::process::exit(2);
@@ -45,6 +46,7 @@ fn main() {
     }
 
     let config = Config::load();
+    let settings = Settings::new(&config.ui);
     let urls: Vec<String> = inputs
         .iter()
         .map(|input| {
@@ -52,7 +54,7 @@ fn main() {
             if path.exists() {
                 router::file_url(path)
             } else {
-                router::fixup(input, &config.search)
+                browser::fixup(input, &settings.search)
             }
         })
         .collect();
@@ -65,8 +67,8 @@ fn main() {
         })
         .detach();
 
-        commands::install_keys(&config.keys, cx);
-        let browser = cx.new(|cx| Browser::new(config, urls, cx));
+        commands::install_keys(&settings.keys, cx);
+        let browser = cx.new(|cx| Browser::new(config, settings, urls, cx));
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1024.0), px(720.0)), cx)),
             titlebar: Some(TitlebarOptions {

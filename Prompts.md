@@ -3,7 +3,7 @@
 Run cargo fmt --all
 Run cargo clippy --workspace --all-targets -- -D warnings
 Run cargo test --workspace
-Run cargo check --target wasm32-unknown-unknown --workspace --exclude sighurt-browser --exclude sighurt-core --exclude sighurt-ui --exclude sighurt-engine-wasm --exclude fullstack-notes-backend
+Run cargo check --target wasm32-unknown-unknown --workspace --exclude sighurt-core --exclude sighurt-ui --exclude sighurt-engine-wasm --exclude fullstack-notes-backend
 
 The Servo engine (sighurt-engine-servo) is its own workspace and is not covered by the commands above. If you changed it or sighurt-ipc, check it separately:
 

@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CRATES: >-
-        sighurt-browser/Cargo.toml sighurt-core/Cargo.toml sighurt-ui/Cargo.toml
+        sighurt-core/Cargo.toml sighurt-ui/Cargo.toml
         sighurt-engine-wasm/Cargo.toml sighurt-sdk/Cargo.toml
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
@@ -35,7 +35,7 @@ jobs:
       - name: Compute new version
         id: bump
         run: |
-          current=$(grep '^version' sighurt-browser/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          current=$(grep '^version' sighurt-ui/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           IFS='.' read -r major minor patch <<< "$current"
 
           case "${{ inputs.bump }}" in
@@ -119,7 +119,7 @@ jobs:
 
       # sig-servo is not built here: it is a separate, much heavier workspace.
       - name: Build release binaries (sig and sig-wasm)
-        run: cargo build --release -p sighurt-browser -p sighurt-engine-wasm --target ${{ matrix.target }}
+        run: cargo build --release -p sighurt-ui -p sighurt-engine-wasm --target ${{ matrix.target }}
 
       # sig finds sig-wasm next to itself, so they ship together.
       - name: Package

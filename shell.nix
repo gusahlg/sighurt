@@ -1,5 +1,5 @@
 # Development shell for NixOS: `nix-shell`, then build as usual
-# (`cargo run -p sighurt-browser`, and the Servo engine with
+# (`cargo run -p sighurt-ui`, and the Servo engine with
 # `cargo build --release --manifest-path sighurt-engine-servo/Cargo.toml`).
 { pkgs ? import <nixpkgs> { } }:
 let

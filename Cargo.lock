@@ -7028,16 +7028,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "sighurt-browser"
-version = "0.7.0"
-dependencies = [
- "gpui",
- "sighurt-core",
- "sighurt-ui",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "sighurt-core"
 version = "0.7.0"
 dependencies = [
@@ -7111,10 +7101,14 @@ version = "0.7.0"
 name = "sighurt-ui"
 version = "0.7.0"
 dependencies = [
+ "dirs 5.0.1",
  "gpui",
+ "percent-encoding",
+ "serde",
  "sighurt-core",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -7888,9 +7882,9 @@ dependencies = [
 
 [[package]]
 name = "thread_local"
-version = "1.1.9"
+version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if 1.0.4",
 ]

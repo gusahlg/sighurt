@@ -46,23 +46,17 @@ impl Default for Colors {
 }
 
 impl Colors {
-    /// The defaults with `ui`'s (the config's `[ui]` section) `colors` table applied. Unknown
-    /// settings and malformed colors are reported and skipped.
-    pub fn new(ui: &toml::Table) -> Self {
+    /// The defaults with `table` (the config's `[ui.colors]`) applied. Unknown and malformed
+    /// colors are reported and skipped.
+    pub fn new(table: &toml::Table) -> Self {
         let mut colors = Self::default();
-        for (key, value) in ui {
-            let Some(table) = value.as_table().filter(|_| key == "colors") else {
-                tracing::warn!("[ui]: unknown setting {key:?}");
-                continue;
-            };
-            for (name, value) in table {
-                match (colors.field(name), value.as_str().and_then(hex)) {
-                    (Some(field), Some(color)) => *field = color,
-                    (None, _) => tracing::warn!("[ui.colors]: unknown color {name:?}"),
-                    (_, None) => tracing::warn!(
-                        "[ui.colors]: {name} should be \"#rrggbb\" or \"#rrggbbaa\", not {value}"
-                    ),
-                }
+        for (name, value) in table {
+            match (colors.field(name), value.as_str().and_then(hex)) {
+                (Some(field), Some(color)) => *field = color,
+                (None, _) => tracing::warn!("[ui.colors]: unknown color {name:?}"),
+                (_, None) => tracing::warn!(
+                    "[ui.colors]: {name} should be \"#rrggbb\" or \"#rrggbbaa\", not {value}"
+                ),
             }
         }
         colors
@@ -106,17 +100,16 @@ mod tests {
 
     #[test]
     fn config_overrides_defaults() {
-        let ui: toml::Table = toml::from_str(
+        let table: toml::Table = toml::from_str(
             r##"
-            colors.bg = "#000000"
-            colors.selection = "#ff000080"
-            colors.text = "white"
-            colors.nope = "#123456"
-            theme = "light"
+            bg = "#000000"
+            selection = "#ff000080"
+            text = "white"
+            nope = "#123456"
             "##,
         )
         .unwrap();
-        let colors = Colors::new(&ui);
+        let colors = Colors::new(&table);
         assert_eq!(colors.bg, rgb(0x000000));
         assert_eq!(colors.selection, rgba(0xff000080));
         // Malformed or unknown: skipped.

@@ -4,8 +4,8 @@ Sighurt should stay a minimal browser that shows what engines draw. Items ship a
 
 ## Done
 
-- [x] **Every engine out of process.** Engines are separate processes speaking `sighurt-ipc` v2: finished frames or draw lists plus images, painted by `sig`. Everything they send is bounded, the handshake times out, pages can't open `sig://` URLs and new tabs from pages are throttled.
-- [x] **Split browser.** `sighurt-core` (config, commands, routing, session, downloads, engine host), `sighurt-ui` (default chrome, colors from `[ui.colors]`) and `sighurt-browser` (`sig`, wiring only).
+- [x] **Every engine out of process.** Engines are separate processes speaking `sighurt-ipc` v2: finished frames or draw lists plus images, painted by `sig`. Everything they send is bounded, the handshake times out, pages can't open `sig:` URLs, and new tabs from pages need a click or key press.
+- [x] **Core without UI.** `sighurt-core` (engine host, routing, navigables with their history, downloads) has no tabs, URL bar, commands or keys; `sighurt-ui` (tabs, chrome, commands, keys, `[ui]` config) is the `sig` binary and the one crate to copy for a UI of your own.
 - [x] **WASM engine** (`sig-wasm`): Wasmtime sandbox with no WASI, speaking Oxide's `"oxide"` app ABI.
 - [x] **Servo engine** (`sig-servo`): headless Servo rendering HTML/CSS/JS, in its own workspace.
 - [x] **Commands, keys and config in TOML.** Named commands, no default key bindings (global, `page` and `location` contexts), config-driven routing by scheme, extension or `Content-Type`.

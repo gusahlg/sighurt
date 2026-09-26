@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "sighurt-browser",
     "sighurt-core",
     "sighurt-ui",
     "sighurt-engine-wasm",

@@ -2,7 +2,7 @@
 name = "sighurt-core"
 version = "0.7.0"
 edition = "2021"
-description = "Sighurt without its chrome: config, routing, tabs and history, and the host for engine processes"
+description = "Sighurt without any UI: the host for engine processes, routing, history and downloads"
 license = "Apache-2.0"
 
 [dependencies]
