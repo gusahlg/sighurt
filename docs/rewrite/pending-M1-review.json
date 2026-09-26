@@ -1,0 +1,90 @@
+{
+ "summary": "I reviewed the M1 track, and the experiment holds up. I read plan \u00a78\u2013\u00a714, \u00a719, \u00a720, \u00a722, \u00a723 and \u00a725\u2013\u00a728, all of `experiments/m1-mixed` (main, host, page, pacing, shm, chrome, egl, stats, bin/m1-pointer, both scripts and the test pages), `M1.md`, the M1 section of STATUS.md and decisions 31\u201333. I also read the Servo 0.5, servo-paint, surfman 0.13, gleam and SCTK source the code depends on.\n\n**What I ran:**\n- `tools/heavy`: `cargo test -p m1-mixed` passes 6 of 6; `cargo clippy -p m1-mixed --all-targets -D warnings` and `cargo fmt --check` are clean.\n- I re-read every run log the track left in the shared scratchpad and looked at its screenshots.\n- New probes, all in headless sway, never on the live desktop:\n  - **Odd-size scale changes** (rv-odd-nv, rv-odd-mesa): integer fallback, 1001\u00d7661 page, output scale 1\u21942 three times, on the RTX 3070 (GLES2) and on llvmpipe.\n  - **Layout while hidden** (rv-hid-nv-int, rv-hid-nv-frac, rv-hid-mesa-int): scale changes while the page is hidden, then show, integer and fractional.\n  - **GL audit cost** (rv-audit): with and without the audit.\n- All probes exited 0 with no protocol error and 0 readbacks.\n\n**Every number I checked matches the logs.** That covers frame counts, chrome paints, idle wakeups, remap and layout timings, readbacks, the renderer strings, teardown order and pointer coordinates at 100, 150 and 200 %. The code honours \u00a79: the host never attaches or commits on the page leaf; it only sets pending viewport, buffer-scale and frame state. The waker cannot lose a wake. Frame callbacks, buffer releases and Servo's \"frame ready\" stay separate signals. Stale frame callbacks are rejected by frame id, and stale buffer releases by generation. There are no page-sized copies and no timers other than the test timers. `unsafe` is confined to `egl.rs` and one documented `borrow_raw`. There are no sighurt-api changes, and the root Cargo.toml changes are only the member line.\n\n**Problems found:**\n1. **Must fix:** CI will now build Servo. The track flagged this but could not fix `ci.yml`.\n2. Every log behind the ticked boxes lives only in tmpfs. That includes the only River evidence.\n3. Scale changes can lay out an intermediate state with the new buffer size and the old DPR. M1.md doesn't mention it.\n4. Smaller documentation and robustness nits, listed in the findings.\n\nThe claim that the driver commits the new-size buffer on the next swap is true: my odd-size probe confirms it on both drivers. But the runs M1.md cites could not have shown otherwise. The audit adds about 0.1 ms, roughly 7 %, to the paint median.",
+ "criteria": "- **A real HTML page and an animated/WebGL test present through the GPU path: verified.**\n  - L1/L2 logs: GL \"NVIDIA GeForce RTX 3070/PCIe/SSE2\" on River; 2 063 frames in 20 s, 8 ms callback median.\n  - G3/N3 on NVIDIA in headless sway: screenshots lg3/a-3s.png and b-12s.png show the CSS box moving and the WebGL canvas (\"WebGL frames: 150\", then 540).\n- **No ordinary page `read_pixels`/CPU image transport path: verified.**\n  - Every final run logs \"read_to_image 0, GL reads 0\", my probes included.\n  - `ProfilingGl` wraps the GL that WebRender uses (servo-paint painter.rs:154), and every `RenderingContext` method is forwarded.\n  - Caveat: Servo's WebGL thread is not audited; M1.md says so.\n- **Repeated resize, scale changes, hide/show and teardown behave correctly: verified, with caveats.**\n  - G1/G2/H1/H2/N1/N2 logs: 7 scale changes, a 40-size storm, 6 hide/show cycles, \"reported no error\", exit 0.\n  - My probes add what those runs could not show: odd-size integer scale 1\u21942, and layout changes while hidden followed by show, on NVIDIA and llvmpipe, all clean.\n  - Caveats: a resize shows stale layout for a frame or two (documented); a scale change can produce an intermediate wrong-DPR layout (not documented); there is no slow-resize fallback (documented).\n  - None of this was exercised on River.\n- **Keyboard focus routes through the window to page/chrome correctly: verified in headless sway only** (G1/G2/N1/N2 logs).\n  - \"keyboard: enter on the root surface\" appears once.\n  - Keys reach the page or the chrome depending on logical focus.\n  - Clicks, Ctrl+L and Escape switch it, and Servo reports focus true/false.\n  - Not on River, where input injection was not allowed.\n- **Page animation does not cause repeated chrome painting: verified.** 2 chrome paints against 2 063 (L1), 987 (G3), 985 (A1) and 1 002 (N3) page frames.\n- **A static chrome-only experiment sleeps: verified.** C1 (chrome1/m1.log): 0 wakeups in the last 10 s, 4 in the whole 13 s run. A static Servo page also shows 0 (L2, G1, G2, H1, H2).\n- **Diagnostics identify the GL renderer and fallback mode: verified.** Every log prints the GL renderer, vendor and version, the EGL vendor and version, and the presentation path. llvmpipe runs print \"SOFTWARE FALLBACK \u2026 not the GPU path\".\n- **Runs on the actual River/gharial system and GPU driver: verified from logs only.**\n  - live1 and live2 logs: River, RTX 3070, driver 595.99.02; frame callbacks at the 120 Hz output's rate, which implies the surface was on screen.\n  - There is no screenshot, the runs were at a fixed size and scale 1, and no input was injected.\n  - These logs exist only in tmpfs.",
+ "findings": [
+  {
+   "severity": "must-fix",
+   "file": ".github/workflows/ci.yml",
+   "problem": "`experiments/m1-mixed` is now a workspace member that links Servo, but ci.yml's workspace steps exclude only `sighurt-engine-servo` and `sighurt-browser`. So `cargo clippy --workspace \u2026` and `cargo test --workspace \u2026` would compile Servo in the main CI job, which breaks decision 17 (\"CI on this branch never builds Servo in the main job\"). `experiments/m0-coexist` has the same problem. The M1 track flagged this but didn't own the file.",
+   "evidence": "ci.yml lines 44\u201345 and 54 run `--exclude sighurt-engine-servo --exclude sighurt-browser` only. Root Cargo.toml adds `experiments/m1-mixed`, and `experiments/m1-mixed/Cargo.toml` depends on `servo.workspace = true`.",
+   "fix": "Add `--exclude m1-mixed --exclude m0-coexist` to both the \"Clippy (workspace without Servo)\" and \"Test (workspace without Servo)\" steps. Alternatively, set `default-members` or exclude the experiments and check them in servo.yml."
+  },
+  {
+   "severity": "should-fix",
+   "file": "docs/rewrite/M1.md",
+   "problem": "The ticked criteria cite runs by name (L1/L2, G1\u2013G3, H1/H2, A1, C1, N1\u2013N4), but the logs and screenshots behind them exist only in the session scratchpad under /tmp, which is tmpfs on this machine. The live River runs L1/L2 can't be repeated without the user's permission, and they are the only evidence for criterion 8. After a reboot the ticks point at nothing.",
+   "evidence": "`df -T /tmp` reports tmpfs. The logs are `\u2026/scratchpad/{live1,live2,lg1,lg2,lg3,checks3,int1,anim1,chrome1,louise/*}`. `grep -n 'log' docs/rewrite/M1.md` shows no path to retained logs.",
+   "fix": "Copy the logs into `docs/rewrite/m1-runs/<run>.log` and link them from M1.md's run table. They are text and about 4\u201314 KB each; optionally add one or two key screenshots (G1 03-hidden, G3 b-12s). Otherwise, say explicitly that they were not retained."
+  },
+  {
+   "severity": "should-fix",
+   "file": "experiments/m1-mixed/src/page.rs",
+   "problem": "A scale change makes Servo lay out, and fire a DOM `resize` for, an intermediate state that combines the new buffer size with the old DPR. `Page::resize` calls `WebView::resize` and then `WebView::set_hidpi_scale_factor`. Each sends its own root display list (servo-paint painter.rs 1276\u20131297 and 1249\u20131262), so script can process them separately. M1.md only says a resize \"shows old layout at the right size for a frame or two\", which misses this bogus layout. This is the sequence M4 is told to build on.",
+   "evidence": "lg1/m1.log (G1, NVIDIA): after \"scale: 120/120\", the page logs \"resize: dpr 1.5 viewport 853x506\", then \"dpr 1 viewport 1280x760\". lg2/m1.log (G2): \"dpr 2 viewport 640x380\", then \"dpr 1 viewport 1280x760\". It is racy: 2 of 11 runs with scale changes, always on a scale-down step.",
+   "fix": "Record it in M1.md's limitations and the \"For integration\" list. No call order avoids it in Servo 0.5, since either order yields a mixed state. M4 should decide whether to accept one bogus layout per scale change, keep the page unmapped until the settled frame, or patch Servo to update size and DPR in one message."
+  },
+  {
+   "severity": "nit",
+   "file": "docs/rewrite/M1.md",
+   "problem": "The claim that \"the buffer after wl_egl_window_resize had the new size at the next swap: no invalid_size error with integer scales 1 and 2 (G2 and H2)\" is backed by runs that could not have failed. In G2 and H2 every scale change happened with a 1280\u00d7760 page buffer, which is divisible by 2 whether the driver commits the old or the new buffer. The odd-size resizes all ran at scale 1. The claim itself is true.",
+   "evidence": "My probe rv-odd-nv and rv-odd-mesa: `--integer-scale --size 1001x701`, so a 1001\u00d7661 page, with output scale 1\u21942 three times, on the RTX 3070 (GLES2) and on llvmpipe. Both logged \"the compositor reported no error\" and exited 0. wlroots rejects buffers not divisible by the scale on subsurfaces, so this test does discriminate.",
+   "fix": "Cite a run with an odd-size scale change as the evidence. Add an odd-size-then-scale-2 step to headless-checks.sh, for example `resize set 1001 701` followed by `output scale 2`."
+  },
+  {
+   "severity": "nit",
+   "file": "docs/rewrite/M1.md",
+   "problem": "The show-to-committed-frame figures (0.3\u20134.6 ms on NVIDIA, 1.2\u20136.2 ms on llvmpipe) come only from remaps at an unchanged size. The track never measured a layout change while hidden followed by show, and that remap is 3\u201315\u00d7 slower.",
+   "evidence": "My probes rv-hid-nv-int, rv-hid-nv-frac and rv-hid-mesa-int changed the scale while the page was hidden, then showed it. Remap took 13.7\u201318.5 ms on NVIDIA and 9\u201364 ms on llvmpipe. All clean, no protocol error, exit 0.",
+   "fix": "Add the hidden-resize-then-show case and its timings to \"Hide and show\" in M1.md, and add the case to headless-checks.sh."
+  },
+  {
+   "severity": "nit",
+   "file": "docs/rewrite/M1.md",
+   "problem": "\"Counting readbacks\" says the audit times every WebRender GL call, \"so `--no-gl-audit` turns it off for timing runs\". Yet every run in the measurements table ran with the audit on, so the published paint timings include its overhead, and the page doesn't say so.",
+   "evidence": "All logs say \"GL reads 0\"; none says \"not audited\". My rv-audit pair (NVIDIA, headless, animated page, 12 s, twice each): paint median 1.32/1.35 ms with the audit and 1.22/1.26 ms without, about 0.1 ms (~7 %). Present times were unchanged.",
+   "fix": "State in \"Measurements\" that the times include the GL audit (about +0.1 ms per paint on the RTX 3070), or re-measure with `--no-gl-audit`."
+  },
+  {
+   "severity": "nit",
+   "file": "experiments/m1-mixed/src/shm.rs",
+   "problem": "Retiring buffer generations are not bounded in code. `reallocate` allocates a new pool on every size change however many old buffers the compositor still holds, and nothing caps retiring count or bytes. \u00a710 and \u00a726 require bounding the number and bytes of retiring generations. The doc comment's \"at most `count` buffers retiring per generation\" is only a per-generation limit, and the observed max of 1 depends on compositor behaviour.",
+   "evidence": "shm.rs `reallocate` (lines 110\u2013123 of the file) always creates `RawPool::new(len * self.count)`; `retiring` is only counted, never checked. Logs show \"at most 1 chrome \u2026 awaited release\" (checks3, int1).",
+   "fix": "In `acquire`, refuse a new size while `retiring` exceeds a small limit, keeping the invalidation until a release, as sighurt-wayland does (decision 39). Or state in M1.md that the prototype relies on the compositor's releases."
+  },
+  {
+   "severity": "nit",
+   "file": "experiments/m1-mixed/src/main.rs",
+   "problem": "The ordered teardown runs only on the normal path. A dispatch error (`event_loop.dispatch(...)?`), a panic, or `app.error` returns or unwinds without `app.teardown()`. `App` is then dropped in field order, which drops `window` (the root xdg_toplevel and wl_surface) before `page` (Servo and the GL context), and never calls `eglTerminate`. \u00a720 forbids relying on incidental field-drop order for an FFI lifetime invariant. It's harmless today (the page wl_surface proxy isn't destroyed on drop), but the order is accidental.",
+   "evidence": "main.rs lines 226\u2013252: `?` on dispatch, then an early `return Err(error)` before `app.teardown()`. host.rs `App` declares `window` before `page`. checks2/m1.log shows a panic (exit 101, the since-fixed tiny-skia assert) that took this path.",
+   "fix": "Move the teardown sequence into `impl Drop for App`, or make `run()` call teardown on every exit. Either way Servo, the context and `eglTerminate` must come before the Wayland objects, even after a connection error."
+  },
+  {
+   "severity": "nit",
+   "file": "experiments/m1-mixed/src/page.rs",
+   "problem": "The key-ups synthesized on blur use `Key::Named(NamedKey::Unidentified)` and empty modifiers. A page that tracks pressed keys by `KeyboardEvent.key`, as many games do, sees \"keyup Unidentified\" and keeps the real key stuck. That undercuts the \u00a712/\u00a725 goal of no stuck keys after focus moves.",
+   "evidence": "page.rs lines 186\u2013197 (`set_focus(false)`) build `KeyboardEvent::new_without_event(KeyState::Up, Key::Named(NamedKey::Unidentified), code_of(code), \u2026)`.",
+   "fix": "Store the `Key` sent with each press in `pressed` (a HashMap<u32, Key>) and replay it in the synthetic key-up."
+  },
+  {
+   "severity": "nit",
+   "file": "experiments/m1-mixed/src/host.rs",
+   "problem": "With a viewport, the root's opaque region is set only once. `paint_root` returns early once the 1\u00d71 buffer exists, before `set_opaque_region`, so the region stays at the first configured size (1024\u00d7700) through every later resize.",
+   "evidence": "host.rs `paint_root` (around lines 506\u2013521): `if self.root_buffer_size == Some(buffer) { return; }` comes before the region is created and set. With the viewport path `buffer` is always 1\u00d71.",
+   "fix": "Set the opaque region, in logical size, before the early return, or whenever the size changes."
+  },
+  {
+   "severity": "nit",
+   "file": "experiments/m1-mixed/src/stats.rs",
+   "problem": "The diagnostics grow without bound. `Stats::wakeups` gets one entry per loop turn and each `Samples` vector one per paint, present or spin. That is about 400 wakeups a second on River while animating (8 255 in 20 s in L1), so a run without `--exit-after` keeps growing. \u00a726 asks for no unbounded accumulation.",
+   "evidence": "stats.rs `wakeups: Vec<(Instant, Wake)>` is pushed in every `woke()`; `Samples(Vec<Duration>)` is pushed per operation.",
+   "fix": "Keep counters plus a fixed-size histogram or ring buffer, or count wakeups per time bucket, which is enough for the idle-window report."
+  },
+  {
+   "severity": "nit",
+   "file": "experiments/m1-mixed/headless-checks.sh",
+   "problem": "The checks script asserts nothing. Pass or fail comes from reading m1.log by hand, so a re-run (as M3 and M4 will do) gives no verdict. The unit tests cover only the pacer, the refresh driver, key text and stats formatting, not the \u00a725 host behaviours M1 claims.",
+   "evidence": "headless-checks.sh only drives input and screenshots; the final `true` always exits 0. The pass/fail claims in M1.md were derived from grepping logs.",
+   "fix": "End the script with greps that fail it when an expected line is missing: \"mousedown client 100,100\" three times, \"reported no error\", \"read_to_image 0, GL reads 0\", \"in the 10 s before \u2026 : 0\", exit 0. Report PASS/FAIL per criterion."
+  }
+ ]
+}
