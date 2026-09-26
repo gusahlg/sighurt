@@ -1,0 +1,31 @@
+[package]
+name = "m1-mixed"
+description = "M1 experiment: CPU chrome and a Servo page in one Wayland window (sighurt-rewrite-plan.md §23)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+sighurt-api = { path = "../../sighurt-api" }
+servo.workspace = true
+surfman.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+smithay-client-toolkit.workspace = true
+calloop.workspace = true
+cosmic-text.workspace = true
+tiny-skia.workspace = true
+raw-window-handle.workspace = true
+url.workspace = true
+# Types in Servo 0.5's `RenderingContext` trait, at the versions Servo itself uses.
+dpi = "0.1"
+euclid = "0.22"
+gleam = "0.15"
+glow = "0.17"
+# dlopen/dlsym for the few EGL calls the experiment makes itself (src/egl.rs).
+libc = "0.2"
+# Servo's network stack needs a TLS provider; the old sig-servo installed this one too.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }

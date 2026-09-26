@@ -1,0 +1,90 @@
+# The benchmark's workloads (plan §26). Every run of a workload goes through the same phases:
+#
+#   launch  `sig` starts with `open`
+#   first frame, seen on screen (and reported by the engine, where it can)
+#   settle  `settle` seconds for loading to finish
+#   steady  `steady` seconds without input: idle for a static page
+#   active  `active` seconds of the interaction `script` (see SCRIPTS in bench/measure)
+#   quit    browser.quit through its key binding; SIGTERM after 10 s
+#
+# Keys per workload:
+#   open         paths relative to bench/workloads, each opened in its own tab; empty for the
+#                home page. The first tab is the visible one.
+#   description  what it exercises, for the report
+#   settle, steady, active   seconds (defaults 3, 10, 10)
+#   script       the interaction in the active window; "none" to leave it alone
+#
+# Workloads must not change once a baseline is recorded against them: M7 compares the new
+# browser with the baseline on these exact files. Add a new workload instead of editing one.
+
+[home]
+description = "Chrome only: sig's home page, no engine. Types into the URL bar."
+open = []
+script = "type-url"
+
+[article]
+description = "Static Servo page: a text-heavy article with four images. Scrolls down, then up."
+open = ["article.html"]
+script = "scroll-article"
+
+[long]
+description = "Scrolling a long text page (80 sections, ~26 000 words) with the mouse wheel."
+open = ["long.html"]
+script = "scroll-down"
+
+[css-animation]
+description = "Servo: endless CSS transform, opacity, color and width animations. Pointer moves in the active window."
+open = ["css-animation.html"]
+script = "pointer-circle"
+
+[canvas]
+description = "Servo: a 2D canvas redrawn every animation frame (300 balls). Pointer moves in the active window."
+open = ["canvas.html"]
+script = "pointer-circle"
+
+[webgl]
+description = "Servo: a WebGL quad rotating in 3D, redrawn every animation frame. Pointer moves in the active window."
+open = ["webgl.html"]
+script = "pointer-circle"
+
+[wasm-hello]
+description = "Wasm guest hello-sighurt: a static screen of canvas drawing and a text field, redrawn by on_frame at 60 Hz (the old sig-wasm sends a draw list only when it changed). Pointer moves in the active window."
+open = ["wasm/hello_sighurt.wasm"]
+script = "pointer-circle"
+
+[wasm-gradient]
+description = "Wasm guest gradient-demo: a static grid of gradients drawn with the canvas API. Pointer moves in the active window."
+open = ["wasm/gradient_demo.wasm"]
+script = "pointer-circle"
+
+[wasm-raf]
+description = "Wasm guest raf-demo: a ball animated with request_animation_frame (animation). Pointer moves in the active window."
+open = ["wasm/raf_demo.wasm"]
+script = "pointer-circle"
+
+[wasm-timer]
+description = "Wasm guest timer-demo: idle in the steady window; in the active window its four buttons are clicked, starting set_interval timers of 1 s, 0.5 s and 0.1 s and a 3 s set_timeout."
+open = ["wasm/timer_demo.wasm"]
+script = "timer-clicks"
+
+[wasm-busy]
+description = "Plan §26's hostile Wasm workload: a guest (workloads/generate.py) that spends about 36M of its 50M fuel on every frame and draws one unchanging rectangle. Chrome input in the active window: a new tab and closing it again, twice a second."
+open = ["wasm/busy.wasm"]
+script = "tab-toggle"
+
+[many-tabs]
+description = "Eight tabs of the article, one visible: what hidden tabs cost. Switches tab once a second in the active window."
+open = ["article.html", "article.html", "article.html", "article.html", "article.html", "article.html", "article.html", "article.html"]
+settle = 5
+script = "cycle-tabs"
+
+[tab-churn]
+description = "Lifecycle: the article, then ten cycles of opening a new tab, loading the article in it and closing it (one every 2 s); measured again 3 s after the last close."
+open = ["article.html"]
+active = 20
+script = "tab-churn"
+
+[resize-storm]
+description = "The article while the output changes size and scale four times a second (plan §25 resize storm); restored and measured 3 s later."
+open = ["article.html"]
+script = "resize-storm"

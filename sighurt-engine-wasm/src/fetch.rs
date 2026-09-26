@@ -16,6 +16,10 @@
 //!
 //! A background tokio task per request drives `reqwest`'s `bytes_stream()`,
 //! pushing chunks into a `VecDeque<Vec<u8>>` drained by the guest.
+//!
+//! What a guest can make the host keep is bounded: at most [`MAX_REQUESTS`] handles, and per
+//! request at most [`MAX_QUEUED_BYTES`] of body the guest hasn't read (and one chunk more);
+//! past that the task stops reading from the network until the guest catches up.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -24,13 +28,17 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use tokio::runtime::Runtime;
 use wasmtime::{Caller, Linker};
 
 use crate::capabilities::{
     guest_bytes, guest_str, next_handle, with, with_started, write_guest, write_prefix,
-    ConsoleLevel, HostState,
+    ConsoleLevel, HostState, Runtime,
 };
+
+/// Most requests a guest may have (until it removes them).
+pub const MAX_REQUESTS: usize = 256;
+/// Most bytes of unread body the host holds for one request before it stops reading.
+pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 
 // ── Ready-state constants (mirrored in sighurt-sdk) ────────────────────────
 
@@ -62,7 +70,9 @@ struct FetchInner {
     aborted: AtomicBool,
     /// Queued body chunks. Each `Vec<u8>` is one network chunk; the guest may
     /// drain them in smaller pieces — see [`FetchState::recv`] for splitting.
-    chunks: Mutex<VecDeque<Vec<u8>>>,
+    body: Mutex<Body>,
+    /// Signalled when the guest reads, or stops the request, for a driver waiting for room.
+    drained: tokio::sync::Notify,
     /// Last error message (set once before transitioning to [`FETCH_ERROR`]).
     error: Mutex<Option<String>>,
 }
@@ -73,15 +83,28 @@ impl FetchInner {
             state: AtomicU32::new(FETCH_PENDING),
             status: AtomicU32::new(0),
             aborted: AtomicBool::new(false),
-            chunks: Mutex::new(VecDeque::new()),
+            body: Mutex::default(),
+            drained: tokio::sync::Notify::new(),
             error: Mutex::new(None),
         }
+    }
+
+    fn stop(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        self.drained.notify_one();
     }
 
     fn set_error(&self, msg: impl Into<String>) {
         *self.error.lock().unwrap() = Some(msg.into());
         self.state.store(FETCH_ERROR, Ordering::SeqCst);
     }
+}
+
+/// Body chunks the guest hasn't read.
+#[derive(Default)]
+struct Body {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
 }
 
 /// All streaming-fetch state for a host. Lazily initialised on the first
@@ -94,7 +117,7 @@ pub struct FetchState {
 
 impl FetchState {
     pub fn new() -> Option<Self> {
-        let runtime = Runtime::new().ok()?;
+        let runtime = Runtime::new()?;
         Some(Self {
             runtime,
             handles: HashMap::new(),
@@ -102,8 +125,12 @@ impl FetchState {
         })
     }
 
-    /// Dispatch a new request. Returns a handle (`> 0`) or `0` on init failure.
+    /// Dispatch a new request. Returns a handle (`> 0`), or `0` when the guest already has
+    /// [`MAX_REQUESTS`].
     fn begin(&mut self, method: String, url: String, content_type: String, body: Vec<u8>) -> u32 {
+        if self.handles.len() >= MAX_REQUESTS {
+            return 0;
+        }
         let id = next_handle(&mut self.last_id);
         let inner = Arc::new(FetchInner::new());
         let driver_inner = inner.clone();
@@ -147,15 +174,17 @@ impl FetchState {
             return RecvResult::Sentinel(RECV_UNKNOWN);
         };
 
-        let mut q = inner.chunks.lock().unwrap();
-        if let Some(mut chunk) = q.pop_front() {
+        let mut body = inner.body.lock().unwrap();
+        if let Some(mut chunk) = body.chunks.pop_front() {
             if chunk.len() > cap {
                 let remainder = chunk.split_off(cap);
-                q.push_front(remainder);
+                body.chunks.push_front(remainder);
             }
+            body.bytes -= chunk.len();
+            inner.drained.notify_one();
             return RecvResult::Data(chunk);
         }
-        drop(q);
+        drop(body);
 
         match inner.state.load(Ordering::SeqCst) {
             FETCH_DONE => RecvResult::Sentinel(RECV_EOF),
@@ -166,7 +195,7 @@ impl FetchState {
 
     fn abort(&self, id: u32) -> bool {
         if let Some(inner) = self.handles.get(&id) {
-            inner.aborted.store(true, Ordering::SeqCst);
+            inner.stop();
             // Flip state immediately so `state()` reports the intent even
             // before the driver task observes the flag.
             let _ = inner.state.compare_exchange(
@@ -189,7 +218,7 @@ impl FetchState {
 
     fn remove(&mut self, id: u32) {
         if let Some(inner) = self.handles.remove(&id) {
-            inner.aborted.store(true, Ordering::SeqCst);
+            inner.stop();
         }
     }
 }
@@ -259,7 +288,15 @@ async fn drive_request(
         match next {
             Ok(chunk) => {
                 if !chunk.is_empty() {
-                    inner.chunks.lock().unwrap().push_back(chunk.to_vec());
+                    let mut body = inner.body.lock().unwrap();
+                    body.bytes += chunk.len();
+                    body.chunks.push_back(chunk.to_vec());
+                }
+                // Read no further until the guest has caught up.
+                while inner.body.lock().unwrap().bytes > MAX_QUEUED_BYTES
+                    && !inner.aborted.load(Ordering::SeqCst)
+                {
+                    inner.drained.notified().await;
                 }
             }
             Err(e) => {
@@ -305,6 +342,11 @@ pub fn register_fetch_functions(linker: &mut Linker<HostState>) -> Result<()> {
             match with_started(&state.fetch, FetchState::new, |f| {
                 f.begin(method, url, content_type, body)
             }) {
+                Some(0) => {
+                    let message = format!("[FETCH] Refused: {MAX_REQUESTS} requests open");
+                    state.log(ConsoleLevel::Error, message);
+                    0
+                }
                 Some(id) => {
                     state.log(ConsoleLevel::Log, format!("{line} (id={id})"));
                     id
@@ -395,4 +437,85 @@ pub fn register_fetch_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::time::Instant;
+
+    use super::*;
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Serves one response of `total` bytes, a MiB at a time, on a local port.
+    fn serve(total: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request);
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
+            let _ = socket.write_all(head.as_bytes());
+            for _ in 0..total / MIB {
+                if socket.write_all(&[b'a'; MIB]).is_err() {
+                    return;
+                }
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    #[test]
+    fn a_body_nobody_reads_is_held_back_not_kept() {
+        let total = 64 * MIB;
+        let mut fetch = FetchState::new().unwrap();
+        let id = fetch.begin("GET".into(), serve(total), String::new(), Vec::new());
+        let queued = || fetch.handles[&id].body.lock().unwrap().bytes;
+        let started = Instant::now();
+        while queued() < MAX_QUEUED_BYTES && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let held = queued();
+        // Reqwest hands over at most a few hundred KiB at a time.
+        let bound = MAX_QUEUED_BYTES..=MAX_QUEUED_BYTES + MIB;
+        assert!(bound.contains(&held), "{held}");
+        // Reading lets the rest through.
+        let mut read = 0;
+        let started = Instant::now();
+        loop {
+            match fetch.recv(id, MIB) {
+                RecvResult::Data(data) => read += data.len(),
+                RecvResult::Sentinel(RECV_EOF) => break,
+                RecvResult::Sentinel(RECV_PENDING) => std::thread::sleep(Duration::from_millis(1)),
+                RecvResult::Sentinel(code) => panic!("{code}"),
+            }
+            assert!(started.elapsed() < Duration::from_secs(20));
+        }
+        assert_eq!(read, total);
+    }
+
+    #[test]
+    fn a_guest_has_a_bounded_number_of_requests() {
+        let mut fetch = FetchState::new().unwrap();
+        // Nothing listens there: each request fails at once.
+        let url = || "http://127.0.0.1:1/".to_string();
+        for _ in 0..MAX_REQUESTS {
+            assert_ne!(
+                fetch.begin("GET".into(), url(), String::new(), Vec::new()),
+                0
+            );
+        }
+        assert_eq!(
+            fetch.begin("GET".into(), url(), String::new(), Vec::new()),
+            0
+        );
+        fetch.remove(1);
+        assert_ne!(
+            fetch.begin("GET".into(), url(), String::new(), Vec::new()),
+            0
+        );
+    }
 }

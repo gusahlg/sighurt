@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Canvas Animation</title>
+<!-- Benchmark workload: a 2D canvas redrawn on every requestAnimationFrame. 300 bouncing
+     balls with fixed starting positions and speeds, and a line graph of the frame times. -->
+<style>
+  body { margin: 0; background: #101216; color: #e8e8ec; font: 16px/1.4 "DejaVu Sans", sans-serif; }
+  h1 { margin: 0; padding: 20px 28px; font-size: 28px; background: #2b553a; }
+  canvas { display: block; margin: 16px 28px; background: #0b0c10; }
+</style>
+</head>
+<body>
+<h1>Canvas Animation</h1>
+<canvas id="c" width="1200" height="560"></canvas>
+<script>
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  // Numerical Recipes' LCG, so every run animates the same balls.
+  let seed = 12345;
+  const rand = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const balls = [];
+  for (let i = 0; i < 300; i++) {
+    balls.push({
+      x: rand() * 1160 + 20, y: rand() * 520 + 20,
+      vx: (rand() - 0.5) * 6, vy: (rand() - 0.5) * 6,
+      r: 4 + rand() * 12, hue: Math.floor(rand() * 360),
+    });
+  }
+  const times = [];
+  let last = 0;
+  function frame(now) {
+    if (last) times.push(now - last);
+    if (times.length > 240) times.shift();
+    last = now;
+    ctx.fillStyle = "rgba(11, 12, 16, 0.35)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    for (const b of balls) {
+      b.x += b.vx; b.y += b.vy;
+      if (b.x < b.r || b.x > canvas.width - b.r) b.vx = -b.vx;
+      if (b.y < b.r || b.y > canvas.height - b.r) b.vy = -b.vy;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+      ctx.fillStyle = `hsl(${b.hue}, 75%, 60%)`;
+      ctx.fill();
+    }
+    ctx.strokeStyle = "#f5a623";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    times.forEach((t, i) => {
+      const y = canvas.height - 10 - Math.min(t, 50) * 3;
+      if (i) ctx.lineTo(i * 5, y); else ctx.moveTo(0, y);
+    });
+    ctx.stroke();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

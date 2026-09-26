@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Runs the benchmark: every workload, in a new random order each round, for a warmup round
+and `--rounds` measured rounds. Each run is one bench/measure in its own tools/headless-sway
+compositor. `--lock-rounds` rounds at a time run inside one tools/heavy call, which holds the
+machine's heavy-job lock throughout: builds and other jobs interleave between those groups,
+never during a run.
+
+  bench/run --build bench/builds/baseline.toml --label baseline
+  bench/run --build bench/builds/baseline.toml --label try --workloads article,webgl --rounds 3
+
+Results: <out>/<host>/<label>/<timestamp>/set.json (environment, build, order, failures) and
+runs/<round>-<workload>.json (metrics); raw logs in <out>/raw/<host>/<label>/<timestamp>/.
+Round 0 is the warmup: recorded, never compared.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import random
+import signal
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+
+HERE = pathlib.Path(__file__).resolve().parent
+REPO = HERE.parent
+# Longer than any run can take: the quiet gate (2 min), startup (1 min), the windows and quitting.
+RUN_TIMEOUT_S = 420
+
+
+def read(path, default=None):
+    try:
+        return pathlib.Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def tree_hash(paths):
+    """One hash over files, so a result names exactly the harness and workloads it used."""
+    h = hashlib.sha256()
+    for path in sorted(paths):
+        h.update(str(path.relative_to(REPO)).encode() + b"\0" + path.read_bytes())
+    return h.hexdigest()
+
+
+def command(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=60).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def static_environment():
+    cpus = sorted(pathlib.Path("/sys/devices/system/cpu").glob("cpu[0-9]*"))
+    governors = {read(c / "cpufreq/scaling_governor") for c in cpus} - {None}
+    epp = {read(c / "cpufreq/energy_performance_preference") for c in cpus} - {None}
+    model = next((line.split(":", 1)[1].strip() for line in read("/proc/cpuinfo", "").splitlines() if line.startswith("model name")), None)
+    sway = command(["nix-build", "<nixpkgs>", "-A", "sway", "--no-out-link"])
+    return {
+        "host": socket.gethostname(),
+        "kernel": platform.release(),
+        "os": dict(line.split("=", 1) for line in read("/etc/os-release", "").splitlines() if "=" in line).get("PRETTY_NAME", "").strip('"'),
+        "cpu": model,
+        "cpus": os.cpu_count(),
+        "mem_total_mib": int(read("/proc/meminfo").split()[1]) // 1024,
+        "cpu_governor": sorted(governors),
+        "cpu_epp": sorted(epp),
+        "cpufreq_driver": read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver"),
+        "cpu_boost": read("/sys/devices/system/cpu/cpufreq/boost"),
+        "gpu": command(["nvidia-smi", "--query-gpu=name,driver_version,vbios_version,pcie.link.gen.max", "--format=csv,noheader"]),
+        "compositor": f"sway {sway.rsplit('-', 1)[-1] if sway else '?'} (headless backend)",
+        "gpu_processes": command(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"]),
+        "python": platform.python_version(),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--build", required=True, help="bench/builds/<name>.toml")
+    ap.add_argument("--label", help="name of this result set (default: the build's name)")
+    ap.add_argument("--rounds", type=int, default=5, help="measured rounds (default 5)")
+    ap.add_argument("--warmup", type=int, default=1, help="warmup rounds, not compared (default 1)")
+    ap.add_argument("--workloads", help="comma-separated subset (default: all)")
+    ap.add_argument("--seed", type=int, help="seed for the workload order (default: random, recorded)")
+    ap.add_argument("--out", default=str(HERE / "results"), help="results root (default bench/results)")
+    ap.add_argument("--renderer", default="auto", help="tools/headless-sway renderer (default auto: gles2, else pixman)")
+    ap.add_argument("--size", default="1280x800")
+    ap.add_argument("--lock-rounds", type=int, default=2,
+                    help="rounds per hold of the heavy-job lock (default 2, about 20 minutes)")
+    args = ap.parse_args()
+
+    build_path = pathlib.Path(args.build).resolve()
+    build = tomllib.loads(build_path.read_text())
+    build_dir = pathlib.Path(os.path.expanduser(build["dir"]))
+    all_workloads = tomllib.loads((HERE / "workloads.toml").read_text())
+    names = args.workloads.split(",") if args.workloads else list(all_workloads)
+    unknown = [n for n in names if n not in all_workloads]
+    if unknown:
+        sys.exit(f"unknown workloads: {unknown}")
+    seed = args.seed if args.seed is not None else random.SystemRandom().randrange(1 << 31)
+    label = args.label or build_path.stem
+    host = socket.gethostname()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = pathlib.Path(args.out) / host / label / stamp
+    raw = pathlib.Path(args.out) / "raw" / host / label / stamp
+    (out / "runs").mkdir(parents=True)
+
+    workload_files = [p for p in (HERE / "workloads").rglob("*") if p.is_file()] + [HERE / "workloads.toml"]
+    # What decides the numbers: the reporting tools and statistics can change without making
+    # old sets incomparable.
+    harness_files = [HERE / "run", HERE / "measure", *(HERE / "benchlib" / f"{m}.py" for m in ("probes", "pointer", "parsers", "metrics")),
+                     *(HERE / "builds").glob("*.toml"), REPO / "tools/heavy", REPO / "tools/headless-sway"]
+    info_path = build_dir / build.get("info", "")
+    record = {
+        "label": label,
+        "host": host,
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "build": {
+            "name": build_path.stem,
+            "path": str(build_path),
+            "description": build.get("description"),
+            "dir": str(build_dir),
+            "definition": build,
+            "info": json.loads(info_path.read_text()) if build.get("info") and info_path.is_file() else None,
+            "sha256": {b: sha256(build_dir / b) if (build_dir / b).is_file() else "missing"
+                       for b in build.get("binaries", [build["sig"]])},
+            "bytes": {b: (build_dir / b).stat().st_size for b in build.get("binaries", [build["sig"]])
+                      if (build_dir / b).is_file()},
+        },
+        "harness": {"revision": os.environ.get("SIG_BENCH_REV", "unknown"), "sha256": tree_hash(harness_files)},
+        "workloads": {"names": names, "sha256": tree_hash(workload_files), "definitions": {n: all_workloads[n] for n in names}},
+        "environment": static_environment(),
+        # "auto" until the first run resolves it (inside the lock), then fixed for the whole set.
+        "renderer": args.renderer,
+        "size": args.size,
+        "lock_rounds": args.lock_rounds,
+        "raw": str(raw),
+        "rounds": args.rounds,
+        "warmup_rounds": args.warmup,
+        "seed": seed,
+        "order": [],
+        "failures": [],
+    }
+    set_file = out / "set.json"
+    set_file.write_text(json.dumps(record, indent=1))
+    print(f"results: {out}", flush=True)
+
+    rng = random.Random(seed)
+    total = args.warmup + args.rounds
+    for _ in range(total):
+        order = names[:]
+        rng.shuffle(order)
+        record["order"].append(order)
+    set_file.write_text(json.dumps(record, indent=1))
+    for first in range(0, total, args.lock_rounds):
+        rounds = list(range(first, min(first + args.lock_rounds, total)))
+        what = f"benchmark {label}: rounds {rounds[0]}-{rounds[-1]} of {total}"
+        subprocess.run([str(REPO / "tools/heavy"), str(HERE / "run"), "--inner", str(out), *map(str, rounds)],
+                       env=dict(os.environ, SIG_WHAT=what))
+        # The inner run may have resolved the renderer.
+        record = json.loads(set_file.read_text())
+        for round_ in rounds:
+            for workload in record["order"][round_]:
+                failed = out / "runs" / f"{round_}-{workload}.failed.json"
+                if failed.exists() or not (out / "runs" / f"{round_}-{workload}.json").exists():
+                    info = json.loads(failed.read_text()) if failed.exists() else {"status": None, "stderr": "no result"}
+                    record["failures"].append({"run": f"{round_}-{workload}", **info})
+        set_file.write_text(json.dumps(record, indent=1))
+    record["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    set_file.write_text(json.dumps(record, indent=1))
+
+
+def inner(out, rounds):
+    """Runs `rounds` of the set in `out`, inside the lock that the outer bench/run took through
+    tools/heavy."""
+    out = pathlib.Path(out)
+    record = json.loads((out / "set.json").read_text())
+    raw = pathlib.Path(record["raw"])
+    if record["renderer"] == "auto":
+        # Decided once, by the first run, so every run of the set uses the same renderer: a run
+        # that can't get it fails rather than silently measuring another compositor path.
+        probe = subprocess.run([str(REPO / "tools/headless-sway"), "--renderer", "auto", "--", "sh", "-c", 'echo "$SIG_SWAY_RENDERER"'],
+                               capture_output=True, text=True)
+        lines = probe.stdout.split()
+        if probe.returncode != 0 or not lines:
+            sys.exit(f"tools/headless-sway did not start: {probe.stderr[-2000:]}")
+        record["renderer"] = lines[-1]
+        record["renderer_fallback"] = probe.stderr.strip() or None
+        (out / "set.json").write_text(json.dumps(record, indent=1))
+        print(f"compositor renderer: {record['renderer']}", flush=True)
+    for round_, workload in [(r, w) for r in rounds for w in record["order"][r]]:
+        order = record["order"][round_]
+        run_id = f"{round_}-{workload}"
+        run_file = out / "runs" / f"{run_id}.json"
+        cmd = [
+            str(REPO / "tools/headless-sway"), "--renderer", record["renderer"], "--size", record["size"], "--",
+            str(HERE / "measure"), "--build", record["build"]["path"], "--workload", workload,
+            "--out", str(run_file), "--raw", str(raw / run_id),
+        ]
+        started = time.monotonic()
+        # Its own session, so a run that hangs can be stopped with its compositor and browser
+        # rather than holding the lock forever.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            _, stderr = proc.communicate(timeout=RUN_TIMEOUT_S)
+            status = proc.returncode
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            _, stderr = proc.communicate()
+            status = f"timed out after {RUN_TIMEOUT_S} s"
+        took = time.monotonic() - started
+        if status != 0 or not run_file.exists():
+            (out / "runs" / f"{run_id}.failed.json").write_text(json.dumps({"status": status, "stderr": stderr[-4000:]}))
+            print(f"{run_id}: FAILED ({status}) {stderr[-400:]}", flush=True)
+            continue
+        data = json.loads(run_file.read_text())
+        data.update({"round": round_, "warmup": round_ < record["warmup_rounds"], "order_index": order.index(workload)})
+        run_file.write_text(json.dumps(data, indent=1, sort_keys=True))
+        print(f"{run_id}: {took:.0f} s, first frame {data['metrics'].get('startup.first_frame_s')}, anomalies {data['anomalies']}", flush=True)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--inner"]:
+        inner(sys.argv[2], [int(r) for r in sys.argv[3:]])
+    else:
+        main()

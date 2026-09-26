@@ -17,10 +17,18 @@
 //!
 //! All of this is driven by polling from the guest's frame loop, matching the
 //! WebSocket / fetch / RTC subsystems.
+//!
+//! Workers run in the browser process, so they are bounded: a guest has at most
+//! [`MAX_WORKERS`] worker threads alive, terminated ones still finishing included, and the
+//! runtime at most [`MAX_WORKER_THREADS`]; each direction between a guest and a worker holds at
+//! most [`MAX_QUEUED_MESSAGES`] undelivered messages of [`MAX_QUEUED_BYTES`] together, and
+//! posting to a full queue fails. Each call into a worker has the same fuel and time limits as a
+//! page's, and stops at the next epoch tick once the worker is terminated or its page's document
+//! is closed or replaced.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -29,7 +37,16 @@ use wasmtime::{Caller, Linker};
 use crate::capabilities::{
     guest_bytes, guest_str, next_handle, with, write_prefix, ConsoleLevel, HostState,
 };
-use crate::engine::{compile_cached, WasmEngine};
+use crate::engine::{Budget, ThreadCount, WasmEngine};
+
+/// Most worker threads one guest may have alive at once.
+pub const MAX_WORKERS: usize = 16;
+/// Most worker threads alive in a runtime, over all its guests.
+pub const MAX_WORKER_THREADS: usize = 32;
+/// Most messages, and most bytes of them, waiting in either direction between a guest and one
+/// of its workers.
+pub const MAX_QUEUED_MESSAGES: usize = 1024;
+pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Message handed to a worker thread over its inbox channel.
 enum Inbox {
@@ -39,14 +56,42 @@ enum Inbox {
     Terminate,
 }
 
+/// Messages one side of a worker posted and the other hasn't read yet.
+#[derive(Debug, Default)]
+pub struct Mailbox {
+    messages: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl Mailbox {
+    /// Queues `message`, unless the mailbox is full; returns whether it did.
+    pub fn post(&mut self, message: Vec<u8>) -> bool {
+        let bytes = self.bytes + message.len();
+        if self.messages.len() >= MAX_QUEUED_MESSAGES || bytes > MAX_QUEUED_BYTES {
+            return false;
+        }
+        self.bytes = bytes;
+        self.messages.push_back(message);
+        true
+    }
+
+    pub fn take(&mut self) -> Option<Vec<u8>> {
+        let message = self.messages.pop_front()?;
+        self.bytes -= message.len();
+        Some(message)
+    }
+}
+
 /// Parent-side handle to a single running worker.
 struct Worker {
     /// Sender for the worker's inbox (parent → worker).
-    inbox_tx: Sender<Inbox>,
+    inbox_tx: SyncSender<Inbox>,
+    /// Bytes of messages in the inbox.
+    inbox_bytes: Arc<AtomicUsize>,
     /// Messages the worker posted back (worker → parent), drained by `api_worker_recv`.
-    outbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    /// Cleared on terminate so the worker loop exits after its current callback.
-    alive: Arc<AtomicBool>,
+    outbox: Arc<Mutex<Mailbox>>,
+    /// The worker's budget, cancelled on terminate.
+    budget: Budget,
 }
 
 /// Registry of workers spawned by one guest. Created on first spawn.
@@ -54,23 +99,34 @@ struct Worker {
 pub struct WorkerState {
     workers: HashMap<u32, Worker>,
     last_id: u32,
+    /// This guest's worker threads alive, terminated ones included.
+    threads: Arc<AtomicUsize>,
 }
 
 impl WorkerState {
     /// Spawn a worker for `url`, deriving its sandbox state from `parent`.
     ///
-    /// Returns a handle (`> 0`) or `0` if there is no engine to run it on. The worker shares
-    /// only the console and the persistent KV store of the parent's origin; canvas, input,
-    /// timers, and memory are its own.
+    /// Returns a handle (`> 0`) or `0` if there is no engine to run it on, the guest already
+    /// has [`MAX_WORKERS`] worker threads alive or the runtime [`MAX_WORKER_THREADS`], or no
+    /// thread can be started. The worker shares only the console and the persistent KV store of
+    /// the parent's origin; canvas, input, timers, and memory are its own.
     fn spawn(&mut self, url: String, parent: &HostState) -> u32 {
         let Some(engine) = parent.engine.clone() else {
             return 0;
         };
-        let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<Inbox>();
-        let outbox: Arc<Mutex<VecDeque<Vec<u8>>>> = Default::default();
-        let alive = Arc::new(AtomicBool::new(true));
+        let Some(mine) = ThreadCount::add(&self.threads, MAX_WORKERS) else {
+            return 0;
+        };
+        let Some(all) = engine.worker_thread(MAX_WORKER_THREADS) else {
+            return 0;
+        };
+        let (inbox_tx, inbox_rx) = std::sync::mpsc::sync_channel::<Inbox>(MAX_QUEUED_MESSAGES);
+        let inbox_bytes = Arc::new(AtomicUsize::new(0));
+        let outbox: Arc<Mutex<Mailbox>> = Default::default();
+        let budget = parent.budget.child();
         let child = HostState {
             engine: Some(engine.clone()),
+            budget: budget.clone(),
             console: parent.console.clone(),
             current_url: Arc::new(Mutex::new(url.clone())),
             module_origin: Arc::new(Mutex::new(parent.module_origin.lock().unwrap().clone())),
@@ -78,47 +134,59 @@ impl WorkerState {
             ..Default::default()
         };
         let page_url = parent.current_url.lock().unwrap().clone();
-        let alive_thread = alive.clone();
-        std::thread::spawn(move || {
-            let result = worker_main(
-                &url,
-                &page_url,
-                &engine,
-                child.clone(),
-                inbox_rx,
-                &alive_thread,
-            );
-            if let Err(message) = result {
-                child.log(ConsoleLevel::Error, format!("[WORKER] {message}"));
-            }
-        });
+        let bytes = inbox_bytes.clone();
+        let started = std::thread::Builder::new()
+            .name("sighurt-wasm-worker".into())
+            .spawn(move || {
+                let _counted = (mine, all);
+                let inbox = (inbox_rx, bytes);
+                let result = worker_main(&url, &page_url, &engine, child.clone(), inbox);
+                if let Err(message) = result {
+                    child.log(ConsoleLevel::Error, format!("[WORKER] {message}"));
+                }
+            });
+        if started.is_err() {
+            return 0;
+        }
 
         let id = next_handle(&mut self.last_id);
         let worker = Worker {
             inbox_tx,
+            inbox_bytes,
             outbox,
-            alive,
+            budget,
         };
         self.workers.insert(id, worker);
         id
     }
 
     fn post(&self, id: u32, data: Vec<u8>) -> bool {
-        self.workers
-            .get(&id)
-            .is_some_and(|w| w.inbox_tx.send(Inbox::Message(data)).is_ok())
+        let Some(worker) = self.workers.get(&id) else {
+            return false;
+        };
+        let len = data.len();
+        let queued = worker.inbox_bytes.fetch_add(len, Ordering::AcqRel);
+        if queued + len > MAX_QUEUED_BYTES
+            || worker.inbox_tx.try_send(Inbox::Message(data)).is_err()
+        {
+            worker.inbox_bytes.fetch_sub(len, Ordering::AcqRel);
+            return false;
+        }
+        true
     }
 
     fn recv(&self, id: u32) -> Option<Vec<u8>> {
-        self.workers.get(&id)?.outbox.lock().unwrap().pop_front()
+        self.workers.get(&id)?.outbox.lock().unwrap().take()
     }
 
     fn terminate(&mut self, id: u32) -> bool {
         let Some(worker) = self.workers.remove(&id) else {
             return false;
         };
-        worker.alive.store(false, Ordering::Relaxed);
-        let _ = worker.inbox_tx.send(Inbox::Terminate);
+        // Its callback in progress stops at the next epoch tick; dropping the sender ends its
+        // wait for a message.
+        worker.budget.cancel();
+        let _ = worker.inbox_tx.try_send(Inbox::Terminate);
         true
     }
 }
@@ -130,38 +198,37 @@ fn worker_main(
     page_url: &str,
     engine: &WasmEngine,
     host_state: HostState,
-    inbox_rx: Receiver<Inbox>,
-    alive: &AtomicBool,
+    (inbox_rx, inbox_bytes): (Receiver<Inbox>, Arc<AtomicUsize>),
 ) -> Result<(), String> {
+    let budget = host_state.budget.clone();
     let wasm_bytes = crate::runtime::fetch_module(url, page_url)
         .map_err(|e| format!("fetch failed for {url}: {e:#}"))?;
-    let module =
-        compile_cached(engine.engine(), &wasm_bytes).map_err(|e| format!("compile failed: {e}"))?;
+    let module = engine
+        .compile_module(&wasm_bytes)
+        .map_err(|e| format!("compile failed: {e}"))?;
     let (mut store, instance) = crate::runtime::instantiate(engine, host_state, &module)
         .map_err(|e| format!("instantiate failed: {e:#}"))?;
     if let Ok(start_app) = instance.get_typed_func::<(), ()>(&mut store, "start_app") {
-        start_app
-            .call(&mut store, ())
+        engine
+            .start(&mut store, |store| start_app.call(store, ()))
             .map_err(|e| crate::runtime::guest_error("start_app", &e))?;
     }
     let on_message = instance
         .get_typed_func::<u32, ()>(&mut store, "on_message")
         .ok();
-    while alive.load(Ordering::Relaxed) {
+    while !budget.is_cancelled() {
         let bytes = match inbox_rx.recv() {
             Ok(Inbox::Message(bytes)) => bytes,
             Ok(Inbox::Terminate) | Err(_) => break,
         };
+        inbox_bytes.fetch_sub(bytes.len(), Ordering::AcqRel);
         let Some(on_message) = &on_message else {
             continue;
         };
         let len = bytes.len() as u32;
         *store.data().worker_current_msg.lock().unwrap() = Some(bytes);
-        store
-            .set_fuel(engine.fuel_limit())
-            .map_err(|e| e.to_string())?;
-        on_message
-            .call(&mut store, len)
+        engine
+            .call(&mut store, |store| on_message.call(store, len))
             .map_err(|e| crate::runtime::guest_error("on_message", &e))?;
         *store.data().worker_current_msg.lock().unwrap() = None;
     }
@@ -189,7 +256,7 @@ pub fn register_worker_functions(linker: &mut Linker<HostState>) -> Result<()> {
             if id == 0 {
                 state.log(
                     ConsoleLevel::Error,
-                    "[WORKER] spawn failed (no module loader)",
+                    "[WORKER] spawn refused: too many workers, or no module loader",
                 );
                 return -1;
             }
@@ -202,11 +269,14 @@ pub fn register_worker_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     // api_worker_post_message(handle: u32, ptr: u32, len: u32) -> i32
-    //   Parent → worker. Returns 0 on success, -1 if the handle is unknown.
+    //   Parent → worker. Returns 0 on success, -1 if the handle is unknown or its inbox is full.
     linker.func_wrap(
         "oxide",
         "api_worker_post_message",
         |caller: Caller<'_, HostState>, handle: u32, ptr: u32, len: u32| -> i32 {
+            if len as usize > MAX_QUEUED_BYTES {
+                return -1;
+            }
             let Some(data) = guest_bytes(&caller, ptr, len) else {
                 return -1;
             };
@@ -242,17 +312,22 @@ pub fn register_worker_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     // api_worker_post(ptr: u32, len: u32) -> i32
-    //   Worker → its spawning parent. -1 if not running inside a worker.
+    //   Worker → its spawning parent. -1 if not running inside a worker, or its outbox is full.
     linker.func_wrap(
         "oxide",
         "api_worker_post",
         |caller: Caller<'_, HostState>, ptr: u32, len: u32| -> i32 {
+            if len as usize > MAX_QUEUED_BYTES {
+                return -1;
+            }
             let (Some(data), Some(outbox)) =
                 (guest_bytes(&caller, ptr, len), &caller.data().worker_outbox)
             else {
                 return -1;
             };
-            outbox.lock().unwrap().push_back(data);
+            if !outbox.lock().unwrap().post(data) {
+                return -1;
+            }
             0
         },
     )?;
@@ -271,4 +346,23 @@ pub fn register_worker_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mailbox_holds_a_bounded_number_of_bytes_and_messages() {
+        let mut mailbox = Mailbox::default();
+        assert!(mailbox.post(vec![0; MAX_QUEUED_BYTES]));
+        assert!(!mailbox.post(vec![0]));
+        assert_eq!(mailbox.take().map(|m| m.len()), Some(MAX_QUEUED_BYTES));
+        for _ in 0..MAX_QUEUED_MESSAGES {
+            assert!(mailbox.post(Vec::new()));
+        }
+        assert!(!mailbox.post(Vec::new()));
+        assert_eq!(mailbox.take(), Some(Vec::new()));
+        assert!(mailbox.post(Vec::new()));
+    }
 }

@@ -9,6 +9,10 @@
 //!
 //! Guest code imports these symbols from `oxide`; implementations run on the host and
 //! read or mutate the [`HostState`] held in the Wasmtime store attached to the linker.
+//!
+//! Guests run inside the browser process, so everything a guest can make the host keep is
+//! bounded, not only its linear memory: console lines, draw commands and their text, decoded
+//! images, timers, hyperlinks, session storage and history entries.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use wasmtime::*;
 
-use crate::engine::{compile_cached, WasmEngine};
+use crate::engine::{Budget, Wait, WasmEngine};
 use crate::kv::KvStore;
 use crate::navigation::{HistoryEntry, NavigationStack};
 use crate::permissions::{PermissionKind, PermissionStatus, PERMISSION_PENDING};
@@ -59,11 +63,15 @@ pub struct HostState {
     pub memory: Option<Memory>,
     /// Engine and limits used by `api_load_module` and workers to run more modules.
     pub engine: Option<WasmEngine>,
-    /// Same-document history for `api_push_state`, `api_replace_state` and back/forward. Each
-    /// load starts a fresh stack holding just the document URL.
+    /// What the store's calls may spend, and whether the document is still wanted (see
+    /// [`Budget`]).
+    pub budget: Budget,
+    /// Same-document history for `api_push_state`, `api_replace_state` and back/forward: the
+    /// document's own entries, which start as its URL, or as the entries it had when the view
+    /// traverses back to it. Other documents' entries are the view's.
     pub navigation: Arc<Mutex<NavigationStack>>,
     /// Hit-test regions registered by the guest for link clicks in the canvas area.
-    pub hyperlinks: Arc<Mutex<Vec<Hyperlink>>>,
+    pub hyperlinks: Arc<Mutex<Hyperlinks>>,
     /// Links resolved against the document URL (the first field), by guest URL. Guests
     /// register their links again every frame.
     pub resolved_urls: Arc<Mutex<(String, HashMap<String, String>)>>,
@@ -112,7 +120,7 @@ pub struct HostState {
     pub workers: Arc<Mutex<Option<crate::worker::WorkerState>>>,
     /// Outbound message queue, present **only** inside a worker's own state.
     /// `api_worker_post` pushes here; the parent drains it via `api_worker_recv`.
-    pub worker_outbox: Option<Arc<Mutex<std::collections::VecDeque<Vec<u8>>>>>,
+    pub worker_outbox: Option<Arc<Mutex<crate::worker::Mailbox>>>,
     /// Message currently being delivered to a worker's `on_message` export,
     /// read by `api_worker_message_read` during the callback.
     pub worker_current_msg: Arc<Mutex<Option<Vec<u8>>>>,
@@ -142,12 +150,42 @@ pub enum ConsoleLevel {
     Error,
 }
 
+/// Most console lines kept between two frames; later ones are dropped.
+pub const MAX_CONSOLE_LINES: usize = 1000;
+/// Longest console line, draw-command text or other guest string the host keeps, in bytes.
+pub const MAX_TEXT: usize = 16 * 1024;
+/// Longest URL the host keeps from a guest, in bytes (Chrome's limit). Longer ones are refused,
+/// since a shortened URL points somewhere else.
+pub const MAX_URL: usize = 2 * 1024 * 1024;
+
 /// Appends a line to a console, for code that holds the console but not the whole state.
 pub fn console_log(console: &Mutex<Vec<ConsoleEntry>>, level: ConsoleLevel, message: String) {
-    console
-        .lock()
-        .unwrap()
-        .push(ConsoleEntry { level, message });
+    let mut console = console.lock().unwrap();
+    if console.len() < MAX_CONSOLE_LINES {
+        let message = clamp(message);
+        console.push(ConsoleEntry { level, message });
+    }
+}
+
+/// Longest font family name the host keeps; a longer one names no font and means the default.
+pub const MAX_FAMILY: usize = 256;
+
+/// `family`, or the default font's `""` if it is longer than [`MAX_FAMILY`].
+pub fn clamp_family(family: String) -> String {
+    if family.len() > MAX_FAMILY {
+        String::new()
+    } else {
+        family
+    }
+}
+
+/// Cuts `text` to at most [`MAX_TEXT`] bytes at a character boundary.
+pub fn clamp(mut text: String) -> String {
+    if text.len() > MAX_TEXT {
+        text.truncate(text.floor_char_boundary(MAX_TEXT));
+        text.shrink_to_fit();
+    }
+    text
 }
 
 /// The guest's content size and scroll offset, in canvas pixels.
@@ -177,8 +215,21 @@ fn rgba(r: u32, g: u32, b: u32, a: u32) -> Rgba {
     [r as u8, g as u8, b as u8, a as u8]
 }
 
-/// Most images [`CanvasState`] keeps decoded per generation; the oldest goes first.
+/// Most images [`CanvasState`] keeps decoded per generation, and most bytes they may take with
+/// the encoded images they came from; the oldest goes first.
 const MAX_DECODED_IMAGES: usize = 32;
+const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+/// Most draw commands one frame may queue; later ones are dropped.
+pub const MAX_COMMANDS: usize = 200_000;
+/// Most bytes the queued draw commands of one frame may take, text and gradient stops included.
+pub const MAX_CANVAS_BYTES: usize = 64 * 1024 * 1024;
+/// Most images one frame may draw, and most bytes of pixels they may hold together.
+pub const MAX_IMAGES: usize = 4096;
+pub const MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+/// Longest side of an image, in pixels.
+pub const MAX_IMAGE_SIDE: u32 = 8192;
+/// Most stops a gradient keeps.
+pub const MAX_GRADIENT_STOPS: usize = 256;
 
 /// What the guest has drawn: the commands since the last clear and the images they use.
 #[derive(Clone, Debug)]
@@ -195,10 +246,18 @@ pub struct CanvasState {
     pub generation: u64,
     /// A transform, clip or opacity command is in the list.
     transformed: bool,
+    /// Bytes `commands` take, as counted against [`MAX_CANVAS_BYTES`].
+    bytes: usize,
+    /// Bytes of pixels `images` hold.
+    image_bytes: usize,
+    /// Commands dropped since the last clear because the canvas was full.
+    dropped: usize,
     /// Images decoded from guest bytes (`api_canvas_image`) since the previous clear, with the
     /// bytes they came from. Guests pass the same encoded image every frame; this saves
     /// decoding it again.
     decoded: Vec<(Vec<u8>, Arc<DecodedImage>)>,
+    /// Bytes of encoded and decoded images in `decoded`.
+    decoded_bytes: usize,
     /// [`CanvasState::decoded`] of the generation before.
     decoded_before: Vec<(Vec<u8>, Arc<DecodedImage>)>,
 }
@@ -212,25 +271,45 @@ impl Default for CanvasState {
             images: Vec::new(),
             generation: 0,
             transformed: false,
+            bytes: 0,
+            image_bytes: 0,
+            dropped: 0,
             decoded: Vec::new(),
+            decoded_bytes: 0,
             decoded_before: Vec::new(),
         }
     }
 }
 
 impl CanvasState {
-    /// Appends `command`. An opaque fill of the whole canvas hides everything drawn before it,
-    /// which is then dropped: a guest that repaints its background every frame without
-    /// clearing would otherwise grow the list, and the work of every frame, without bound.
-    pub fn push(&mut self, command: DrawCommand) {
+    /// Appends `command`, unless the frame already has [`MAX_COMMANDS`] or [`MAX_CANVAS_BYTES`]
+    /// of them; returns whether it was kept. Text is cut to [`MAX_TEXT`] bytes.
+    ///
+    /// An opaque fill of the whole canvas hides everything drawn before it, which is then
+    /// dropped: a guest that repaints its background every frame without clearing would
+    /// otherwise grow the list, and the work of every frame, without bound.
+    pub fn push(&mut self, mut command: DrawCommand) -> bool {
         if !self.transformed && command.covers(self.width, self.height) {
             self.clear();
         }
+        if let DrawCommand::Text { text, .. } | DrawCommand::TextEx { text, .. } = &mut command {
+            *text = clamp(std::mem::take(text));
+        }
+        if let DrawCommand::TextEx { family, .. } = &mut command {
+            *family = clamp_family(std::mem::take(family));
+        }
+        let bytes = command.bytes();
+        if self.commands.len() >= MAX_COMMANDS || self.bytes + bytes > MAX_CANVAS_BYTES {
+            self.dropped += 1;
+            return false;
+        }
+        self.bytes += bytes;
         self.transformed |= matches!(
             command,
             DrawCommand::Transform { .. } | DrawCommand::Clip { .. } | DrawCommand::Opacity { .. }
         );
         self.commands.push(command);
+        true
     }
 
     /// Drops everything drawn so far.
@@ -239,14 +318,30 @@ impl CanvasState {
         self.images.clear();
         self.generation += 1;
         self.transformed = false;
+        self.bytes = 0;
+        self.image_bytes = 0;
+        self.dropped = 0;
         self.decoded_before = std::mem::take(&mut self.decoded);
+        self.decoded_bytes = 0;
     }
 
-    /// Draws `image` into a rectangle.
-    pub fn push_image(&mut self, image: Arc<DecodedImage>, x: f32, y: f32, w: f32, h: f32) {
+    /// Commands dropped since the last clear because the frame was full.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Draws `image` into a rectangle, unless the frame already holds [`MAX_IMAGES`] images or
+    /// [`MAX_IMAGE_BYTES`] of them; returns whether it was kept.
+    pub fn push_image(&mut self, image: Arc<DecodedImage>, x: f32, y: f32, w: f32, h: f32) -> bool {
         let image_id = match self.images.iter().position(|i| Arc::ptr_eq(i, &image)) {
             Some(index) => index,
             None => {
+                let bytes = image.pixels.len();
+                if self.images.len() >= MAX_IMAGES || self.image_bytes + bytes > MAX_IMAGE_BYTES {
+                    self.dropped += 1;
+                    return false;
+                }
+                self.image_bytes += bytes;
                 self.images.push(image);
                 self.images.len() - 1
             }
@@ -257,31 +352,38 @@ impl CanvasState {
             w,
             h,
             image_id,
-        });
+        })
     }
 
-    /// The image encoded in `bytes` (PNG, JPEG, GIF or WebP), decoded once per run of frames
-    /// that draw it.
-    fn decode(&mut self, bytes: &[u8]) -> Result<Arc<DecodedImage>, String> {
-        let known = |cache: &[(Vec<u8>, Arc<DecodedImage>)]| {
-            cache
-                .iter()
-                .find(|(encoded, _)| encoded == bytes)
-                .map(|(_, image)| image.clone())
-        };
-        if let Some(image) = known(&self.decoded) {
-            return Ok(image);
+    /// The image decoded from `bytes` in this run of frames, if any.
+    fn cached(&self, bytes: &[u8]) -> Option<Arc<DecodedImage>> {
+        self.decoded
+            .iter()
+            .chain(&self.decoded_before)
+            .find(|(encoded, _)| encoded == bytes)
+            .map(|(_, image)| image.clone())
+    }
+
+    /// Remembers that `bytes` decode to `image`, so the next frames that draw it don't decode
+    /// it again.
+    fn remember(&mut self, bytes: Vec<u8>, image: &Arc<DecodedImage>) {
+        let size = bytes.len() + image.pixels.len();
+        let known = self
+            .decoded
+            .iter()
+            .any(|(_, known)| Arc::ptr_eq(known, image));
+        if known || size > MAX_DECODED_BYTES {
+            return;
         }
-        let image = match known(&self.decoded_before) {
-            Some(image) => image,
-            None => Arc::new(DecodedImage::decode(bytes)?),
-        };
         // A guest that draws ever new images without clearing would otherwise keep them all.
-        if self.decoded.len() >= MAX_DECODED_IMAGES {
-            self.decoded.remove(0);
+        while self.decoded.len() >= MAX_DECODED_IMAGES
+            || self.decoded_bytes + size > MAX_DECODED_BYTES
+        {
+            let (old, image) = self.decoded.remove(0);
+            self.decoded_bytes -= old.len() + image.pixels.len();
         }
-        self.decoded.push((bytes.to_vec(), image.clone()));
-        Ok(image)
+        self.decoded_bytes += size;
+        self.decoded.push((bytes, image.clone()));
     }
 }
 
@@ -295,8 +397,8 @@ pub struct DecodedImage {
 }
 
 impl DecodedImage {
-    /// Decodes an image file, refusing images of more than 4096 × 4096 pixels before
-    /// decoding them.
+    /// Decodes an image file, refusing images of more than 4096 × 4096 pixels, or with a side
+    /// over [`MAX_IMAGE_SIDE`], before decoding them.
     fn decode(bytes: &[u8]) -> Result<Self, String> {
         use image::ImageDecoder;
         const MAX_IMAGE_PIXELS: u32 = 4096 * 4096;
@@ -306,7 +408,10 @@ impl DecodedImage {
             .into_decoder()
             .map_err(|e| format!("Failed to decode: {e}"))?;
         let (width, height) = decoder.dimensions();
-        if width.saturating_mul(height) > MAX_IMAGE_PIXELS {
+        if width.saturating_mul(height) > MAX_IMAGE_PIXELS
+            || width > MAX_IMAGE_SIDE
+            || height > MAX_IMAGE_SIDE
+        {
             return Err(format!(
                 "Rejected: {width}x{height} exceeds maximum of {MAX_IMAGE_PIXELS} pixels"
             ));
@@ -479,6 +584,17 @@ impl DrawCommand {
             _ => false,
         }
     }
+
+    /// The bytes the command takes, its text and stops included.
+    fn bytes(&self) -> usize {
+        let heap = match self {
+            Self::Text { text, .. } => text.len(),
+            Self::TextEx { family, text, .. } => family.len() + text.len(),
+            Self::Gradient { stops, .. } => stops.len() * size_of::<GradientStop>(),
+            _ => 0,
+        };
+        size_of::<Self>() + heap
+    }
 }
 
 /// A scheduled timer: either a one-shot `setTimeout` or repeating `setInterval`.
@@ -494,20 +610,32 @@ pub struct TimerEntry {
     pub callback_id: u32,
 }
 
-/// Removes due timers from `timers` and returns their callback ids. Interval timers stay and
-/// are rescheduled one interval from now.
-pub fn drain_expired_timers(timers: &Mutex<Vec<TimerEntry>>) -> Vec<u32> {
-    let now = Instant::now();
-    let mut fired = Vec::new();
-    timers.lock().unwrap().retain_mut(|timer| {
-        if timer.fire_at > now {
-            return true;
+/// Most timers and most animation frame requests a guest may have pending at once.
+pub const MAX_TIMERS: usize = 4096;
+/// Most bytes of keys and values session storage keeps.
+pub const MAX_STORAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Most hyperlinks a guest may register before it clears them, and most bytes of URLs they may
+/// hold together.
+pub const MAX_HYPERLINKS: usize = 4096;
+pub const MAX_HYPERLINK_BYTES: usize = 4 * 1024 * 1024;
+/// Largest state a guest may attach to a history entry, in bytes.
+pub const MAX_HISTORY_STATE: usize = 1024 * 1024;
+
+/// Takes the first timer that was due at `now` and returns its callback id. An interval timer
+/// stays and is rescheduled one interval from the present, so it fires at most once per step.
+pub fn next_due_timer(timers: &Mutex<Vec<TimerEntry>>, now: Instant) -> Option<u32> {
+    let mut timers = timers.lock().unwrap();
+    let index = timers.iter().position(|timer| timer.fire_at <= now)?;
+    let callback_id = timers[index].callback_id;
+    match timers[index].interval {
+        Some(interval) => {
+            timers[index].fire_at = Instant::now().max(now + Duration::from_nanos(1)) + interval
         }
-        fired.push(timer.callback_id);
-        timer.fire_at = now + timer.interval.unwrap_or_default();
-        timer.interval.is_some()
-    });
-    fired
+        None => {
+            timers.remove(index);
+        }
+    }
+    Some(callback_id)
 }
 
 /// One-shot animation frame request. Queued by `api_request_animation_frame` and fired through
@@ -520,10 +648,10 @@ pub struct AnimationRequest {
     pub callback_id: u32,
 }
 
-/// Takes all pending animation frame requests and returns their callback ids.
-pub fn drain_animation_frame_requests(requests: &Mutex<Vec<AnimationRequest>>) -> Vec<u32> {
+/// Takes the oldest pending animation frame request and returns its callback id.
+pub fn next_animation_frame(requests: &Mutex<Vec<AnimationRequest>>) -> Option<u32> {
     let mut requests = requests.lock().unwrap();
-    requests.drain(..).map(|r| r.callback_id).collect()
+    (!requests.is_empty()).then(|| requests.remove(0).callback_id)
 }
 
 /// A clickable axis-aligned rectangle on the canvas that navigates to a URL.
@@ -538,6 +666,39 @@ pub struct Hyperlink {
     pub h: f32,
     /// Target URL, resolved against the page URL when registered.
     pub url: String,
+}
+
+/// The links a guest registered, within [`MAX_HYPERLINKS`] and [`MAX_HYPERLINK_BYTES`].
+#[derive(Debug, Default)]
+pub struct Hyperlinks {
+    links: Vec<Hyperlink>,
+    bytes: usize,
+}
+
+impl Hyperlinks {
+    /// Adds `link`, unless there is no room for it; returns whether it was added.
+    pub fn add(&mut self, link: Hyperlink) -> bool {
+        let bytes = self.bytes + link.url.len();
+        if self.links.len() >= MAX_HYPERLINKS || bytes > MAX_HYPERLINK_BYTES {
+            return false;
+        }
+        self.bytes = bytes;
+        self.links.push(link);
+        true
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The URL of the topmost link at (`x`, `y`) in canvas pixels.
+    pub fn at(&self, x: f32, y: f32) -> Option<&str> {
+        self.links
+            .iter()
+            .rev()
+            .find(|link| x >= link.x && y >= link.y && x <= link.x + link.w && y <= link.y + link.h)
+            .map(|link| link.url.as_str())
+    }
 }
 
 /// Per-frame input snapshot for guest polling via `api_mouse_*`, `api_key_*`, etc.
@@ -596,6 +757,33 @@ pub(crate) fn guest_bytes(caller: &Caller<'_, HostState>, ptr: u32, len: u32) ->
 /// A UTF-8 string in guest memory, or `None` when it is outside the memory or not UTF-8.
 pub(crate) fn guest_str(caller: &Caller<'_, HostState>, ptr: u32, len: u32) -> Option<String> {
     String::from_utf8(guest_bytes(caller, ptr, len)?).ok()
+}
+
+/// Like [`guest_str`], but reads at most `max` bytes of it, cut at a character boundary, so a
+/// guest can't make the host copy more than it keeps.
+pub(crate) fn guest_str_prefix(
+    caller: &Caller<'_, HostState>,
+    ptr: u32,
+    len: u32,
+    max: usize,
+) -> Option<String> {
+    let memory = caller.data().memory.expect("memory not set");
+    let end = (ptr as usize).checked_add(len as usize)?;
+    if end > memory.data_size(caller) {
+        return None;
+    }
+    let bytes = guest_bytes(caller, ptr, len.min(max as u32))?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        // Cut inside a character: keep what comes before it.
+        Err(e) if len as usize > max && e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()
+        }
+        Err(_) => None,
+    }
 }
 
 /// Copies `bytes` into guest memory at `ptr`. False when that is outside the memory.
@@ -728,6 +916,35 @@ fn resolve_url(state: &HostState, raw: &str) -> String {
     url
 }
 
+/// A Tokio runtime for a subsystem's network tasks (fetch, WebSocket, SSE, RTC) that doesn't
+/// wait for them when it is dropped: Tokio's own waits for blocking tasks such as a DNS lookup,
+/// which would hold up the thread that drops the page.
+pub(crate) struct Runtime(Option<tokio::runtime::Runtime>);
+
+impl Runtime {
+    pub(crate) fn new() -> Option<Self> {
+        tokio::runtime::Runtime::new()
+            .ok()
+            .map(|runtime| Self(Some(runtime)))
+    }
+}
+
+impl std::ops::Deref for Runtime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("present until dropped")
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 /// The guest handle after `last`: handles count up from 1 and skip 0, which guests read as
 /// failure.
 pub(crate) fn next_handle(last: &mut u32) -> u32 {
@@ -740,8 +957,30 @@ fn next_timer_id(state: &HostState) -> u32 {
     next_handle(&mut state.timer_last_id.lock().unwrap())
 }
 
+/// Queues `command` on the canvas. The first command a full frame drops is reported on the
+/// console.
 fn draw(caller: &Caller<'_, HostState>, command: DrawCommand) {
-    caller.data().canvas.lock().unwrap().push(command);
+    let mut canvas = caller.data().canvas.lock().unwrap();
+    let kept = canvas.push(command);
+    warn_if_full(caller, canvas, kept);
+}
+
+/// Reports on the console when `kept` says the first command of a full frame was dropped.
+fn warn_if_full(
+    caller: &Caller<'_, HostState>,
+    canvas: std::sync::MutexGuard<'_, CanvasState>,
+    kept: bool,
+) {
+    if !kept && canvas.dropped() == 1 {
+        drop(canvas);
+        caller.data().log(
+            ConsoleLevel::Warn,
+            format!(
+                "[CANVAS] Frame full ({MAX_COMMANDS} commands, {MAX_CANVAS_BYTES} bytes or \
+                 {MAX_IMAGES} images): later draw commands are dropped"
+            ),
+        );
+    }
 }
 
 /// Clamp a guest-supplied font weight to the CSS `100..=900` range. A value of
@@ -810,10 +1049,12 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          data_ptr: u32,
          data_cap: u32|
          -> u64 {
-            let Some(path) = rfd::FileDialog::new()
-                .set_title("Sighurt: Select a file to upload")
-                .pick_file()
-            else {
+            let picked = caller.data().budget.wait(Wait::User, || {
+                rfd::FileDialog::new()
+                    .set_title("Sighurt: Select a file to upload")
+                    .pick_file()
+            });
+            let Some(path) = picked.flatten() else {
                 return 0;
             };
             let name = path
@@ -962,8 +1203,12 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          txt_len: u32,
          out_ptr: u32|
          -> u32 {
-            let family = guest_str(&caller, fam_ptr, fam_len).unwrap_or_default();
-            let text = guest_str(&caller, txt_ptr, txt_len).unwrap_or_default();
+            // Measured as it would be drawn: text cut to `MAX_TEXT`, and an overlong family
+            // name (no font has one) meaning the default font.
+            let family = guest_str_prefix(&caller, fam_ptr, fam_len, MAX_FAMILY + 1);
+            let family = family.map(clamp_family).unwrap_or_default();
+            let text = guest_str_prefix(&caller, txt_ptr, txt_len, MAX_TEXT);
+            let text = text.unwrap_or_default();
             let metrics =
                 crate::text::measure(&text, size, &family, clamp_weight(weight), style != 0);
             let mut buf = [0u8; 12];
@@ -1157,6 +1402,7 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
                 .as_chunks::<8>()
                 .0
                 .iter()
+                .take(MAX_GRADIENT_STOPS)
                 .map(|s| GradientStop {
                     offset: f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
                     color: [s[4], s[5], s[6], s[7]],
@@ -1223,15 +1469,24 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          data_ptr: u32,
          data_len: u32| {
             let raw = guest_bytes(&caller, data_ptr, data_len).unwrap_or_default();
-            let mut canvas = caller.data().canvas.lock().unwrap();
-            match canvas.decode(&raw) {
-                Ok(image) => canvas.push_image(image, x, y, w, h),
-                Err(e) => {
-                    drop(canvas);
-                    caller
-                        .data()
-                        .log(ConsoleLevel::Error, format!("[IMAGE] {e}"));
+            let cached = caller.data().canvas.lock().unwrap().cached(&raw);
+            // Decoding takes a while; the canvas stays unlocked meanwhile.
+            let image = match cached {
+                Some(image) => Ok(image),
+                None => DecodedImage::decode(&raw).map(Arc::new),
+            };
+            match image {
+                Ok(image) => {
+                    let mut canvas = caller.data().canvas.lock().unwrap();
+                    let kept = canvas.push_image(image.clone(), x, y, w, h);
+                    if kept {
+                        canvas.remember(raw, &image);
+                    }
+                    warn_if_full(&caller, canvas, kept);
                 }
+                Err(e) => caller
+                    .data()
+                    .log(ConsoleLevel::Error, format!("[IMAGE] {e}")),
             }
         },
     )?;
@@ -1243,7 +1498,21 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         |caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32| {
             let key = guest_str(&caller, key_ptr, key_len).unwrap_or_default();
             let val = guest_str(&caller, val_ptr, val_len).unwrap_or_default();
-            caller.data().storage.lock().unwrap().insert(key, val);
+            let mut storage = caller.data().storage.lock().unwrap();
+            let others: usize = storage
+                .iter()
+                .filter(|(k, _)| **k != key)
+                .map(|(k, v)| k.len() + v.len())
+                .sum();
+            if others + key.len() + val.len() > MAX_STORAGE_BYTES {
+                drop(storage);
+                caller.data().log(
+                    ConsoleLevel::Error,
+                    format!("[STORAGE] Session storage is full ({MAX_STORAGE_BYTES} bytes)"),
+                );
+                return;
+            }
+            storage.insert(key, val);
         },
     )?;
 
@@ -1311,10 +1580,15 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         linker.func_wrap(
             "oxide",
             name,
+            // Returns the timer's id, or 0 when the guest already has `MAX_TIMERS` timers.
             move |caller: Caller<'_, HostState>, callback_id: u32, delay_ms: u32| -> u32 {
+                let mut timers = caller.data().timers.lock().unwrap();
+                if timers.len() >= MAX_TIMERS {
+                    return 0;
+                }
                 let id = next_timer_id(caller.data());
                 let delay = Duration::from_millis(u64::from(delay_ms));
-                caller.data().timers.lock().unwrap().push(TimerEntry {
+                timers.push(TimerEntry {
                     id,
                     fire_at: Instant::now() + delay,
                     interval: repeat.then_some(delay),
@@ -1334,13 +1608,17 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
 
-    // One-shot per request (call again from inside `on_timer` to continue).
+    // One-shot per request (call again from inside `on_timer` to continue). Returns 0 when the
+    // guest already has `MAX_TIMERS` requests pending.
     linker.func_wrap(
         "oxide",
         "api_request_animation_frame",
         |caller: Caller<'_, HostState>, callback_id: u32| -> u32 {
-            let id = next_timer_id(caller.data());
             let mut requests = caller.data().animation_requests.lock().unwrap();
+            if requests.len() >= MAX_TIMERS {
+                return 0;
+            }
+            let id = next_timer_id(caller.data());
             requests.push(AnimationRequest { id, callback_id });
             id
         },
@@ -1379,7 +1657,8 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     // ── HTTP Fetch ───────────────────────────────────────────────────
-    // Blocks the guest until the whole response is in; `api_fetch_begin` streams instead.
+    // Blocks the guest until the response is in, for at most 30 s; `api_fetch_begin` streams
+    // instead. Only as much of the body as fits the guest's buffer is read.
     linker.func_wrap(
         "oxide",
         "api_fetch",
@@ -1402,7 +1681,8 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
             caller
                 .data()
                 .log(ConsoleLevel::Log, format!("[FETCH] {method} {url}"));
-            let result = (|| {
+            let result = caller.data().budget.wait(Wait::Host, || {
+                use std::io::Read;
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()?;
@@ -1415,8 +1695,14 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
                     request = request.body(body);
                 }
                 let response = request.send()?;
-                Ok::<_, reqwest::Error>((response.status().as_u16(), response.bytes()?))
-            })();
+                let status = response.status().as_u16();
+                let mut body = Vec::new();
+                response.take(u64::from(out_cap)).read_to_end(&mut body)?;
+                Ok::<_, anyhow::Error>((status, body))
+            });
+            let Some(result) = result else {
+                return -1;
+            };
             match result {
                 Ok((status, response)) => {
                     let len = write_prefix(&mut caller, out_ptr, out_cap, &response);
@@ -1444,7 +1730,12 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
                 return -1;
             };
             state.log(ConsoleLevel::Log, format!("[LOAD] Fetching module: {url}"));
-            let (code, message) = load_module(&engine, state, &url);
+            let loaded = state
+                .budget
+                .wait(Wait::Host, || load_module(&engine, state, &url));
+            let Some((code, message)) = loaded else {
+                return -1;
+            };
             let level = if code == 0 {
                 ConsoleLevel::Log
             } else {
@@ -1592,7 +1883,7 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          -> i32 {
             let key = guest_str(&caller, key_ptr, key_len).unwrap_or_default();
             let val = guest_bytes(&caller, val_ptr, val_len).unwrap_or_default();
-            match kv_store(caller.data()).set(&key, &val) {
+            match kv_store(caller.data()).and_then(|kv| kv.set(&key, &val)) {
                 Ok(()) => 0,
                 Err(e) => {
                     let message = format!("[KV] set failed: {e}");
@@ -1613,7 +1904,7 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          out_cap: u32|
          -> i32 {
             let key = guest_str(&caller, key_ptr, key_len).unwrap_or_default();
-            match kv_store(caller.data()).get(&key) {
+            match kv_store(caller.data()).and_then(|kv| kv.get(&key)) {
                 Ok(Some(val)) => {
                     write_prefix(&mut caller, out_ptr, out_cap, &val).unwrap_or(0) as i32
                 }
@@ -1632,7 +1923,7 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "api_kv_store_delete",
         |caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> i32 {
             let key = guest_str(&caller, key_ptr, key_len).unwrap_or_default();
-            match kv_store(caller.data()).delete(&key) {
+            match kv_store(caller.data()).and_then(|kv| kv.delete(&key)) {
                 Ok(()) => 0,
                 Err(e) => {
                     let message = format!("[KV] delete failed: {e}");
@@ -1651,7 +1942,7 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
             let raw_url = guest_str(&caller, url_ptr, url_len).unwrap_or_default();
             let state = caller.data();
             let resolved = resolve_url(state, &raw_url);
-            if AppUrl::parse(&resolved).is_err() {
+            if resolved.len() > MAX_URL || AppUrl::parse(&resolved).is_err() {
                 state.log(
                     ConsoleLevel::Error,
                     format!("[NAV] invalid URL: {resolved}"),
@@ -1664,7 +1955,8 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
 
-    // `push_state` and `replace_state` take (state, title, url); the title is not used.
+    // `push_state` and `replace_state` take (state, title, url); the title is not used. State
+    // over `MAX_HISTORY_STATE` bytes, or a URL over `MAX_URL`, is refused.
     for (name, replace) in [("api_push_state", false), ("api_replace_state", true)] {
         linker.func_wrap(
             "oxide",
@@ -1684,6 +1976,21 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
                 } else {
                     resolve_url(state, &url)
                 };
+                if data.len() > MAX_HISTORY_STATE || url.len() > MAX_URL {
+                    state.log(
+                        ConsoleLevel::Error,
+                        format!("[NAV] {name}: state or URL too long"),
+                    );
+                    return;
+                }
+                // The address bar shows these URLs: another origin's would be a lie.
+                if app_url::app_origin_of(&url) != *state.module_origin.lock().unwrap() {
+                    state.log(
+                        ConsoleLevel::Error,
+                        format!("[NAV] {name}: {url} is not of this app's origin"),
+                    );
+                    return;
+                }
                 let entry = HistoryEntry::new(&url).with_state(data);
                 let mut navigation = state.navigation.lock().unwrap();
                 if replace {
@@ -1732,8 +2039,8 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
 
-    // Every entry in `navigation` belongs to the current document (each load starts a fresh
-    // stack), so moving through it is a same-document traversal: no module reload.
+    // Every entry in `navigation` belongs to the current document (other documents' entries
+    // are the view's), so moving through it is a same-document traversal: no module reload.
     for (name, forward) in [("api_history_back", false), ("api_history_forward", true)] {
         linker.func_wrap("oxide", name, move |caller: Caller<'_, HostState>| -> i32 {
             i32::from(traverse(caller.data(), forward))
@@ -1754,8 +2061,10 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          -> i32 {
             let raw_url = guest_str(&caller, url_ptr, url_len).unwrap_or_default();
             let url = resolve_url(caller.data(), &raw_url);
-            let link = Hyperlink { x, y, w, h, url };
-            caller.data().hyperlinks.lock().unwrap().push(link);
+            let mut links = caller.data().hyperlinks.lock().unwrap();
+            if url.len() > MAX_URL || !links.add(Hyperlink { x, y, w, h, url }) {
+                return -1;
+            }
             0
         },
     )?;
@@ -1900,7 +2209,7 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     // ── GPU ──────────────────────────────────────────────────────────
-    // `sig-wasm` has no GPU: nothing a guest renders or computes there could be shown or read
+    // The Wasm engine has no GPU: nothing a guest renders or computes there could be shown or read
     // back. Every call answers the way it does on a machine without a GPU adapter, which
     // guests already handle.
     linker.func_wrap(
@@ -1959,11 +2268,15 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
-fn kv_store(state: &HostState) -> KvStore {
-    KvStore::new(
-        &crate::kv::default_root(),
+/// The persistent store of the guest's origin, under the runtime's key-value root.
+fn kv_store(state: &HostState) -> std::io::Result<KvStore> {
+    let engine = state.engine.as_ref().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "no key-value store")
+    })?;
+    Ok(KvStore::new(
+        engine.kv_root(),
         &state.module_origin.lock().unwrap(),
-    )
+    ))
 }
 
 /// Moves one same-document history entry back or forward. Returns false at either end.
@@ -1990,12 +2303,13 @@ fn load_module(engine: &WasmEngine, parent: &HostState, url: &str) -> (i32, Stri
         Ok(bytes) => bytes,
         Err(e) => return (-1, format!("[LOAD ERROR] {e:#}")),
     };
-    let module = match compile_cached(engine.engine(), &bytes) {
+    let module = match engine.compile_module(&bytes) {
         Ok(module) => module,
         Err(e) => return (-2, format!("[LOAD ERROR] Compile: {e}")),
     };
     let child = HostState {
         memory: None,
+        budget: parent.budget.child(),
         ..parent.clone()
     };
     let (mut store, instance) = match crate::runtime::instantiate(engine, child, &module) {
@@ -2005,7 +2319,7 @@ fn load_module(engine: &WasmEngine, parent: &HostState, url: &str) -> (i32, Stri
     let Ok(start_app) = instance.get_typed_func::<(), ()>(&mut store, "start_app") else {
         return (-7, "[LOAD ERROR] Module missing start_app".into());
     };
-    match start_app.call(&mut store, ()) {
+    match engine.start(&mut store, |store| start_app.call(store, ())) {
         Ok(()) => (0, format!("[LOAD] Module {url} executed successfully")),
         Err(e) => (
             -8,
@@ -2123,10 +2437,66 @@ mod tests {
                 ..timer(3, None)
             },
         ]);
-        assert_eq!(drain_expired_timers(&timers), [10, 20]);
-        assert_eq!(drain_expired_timers(&timers), Vec::<u32>::new());
+        let due = |step| std::iter::from_fn(|| next_due_timer(&timers, step)).collect::<Vec<_>>();
+        assert_eq!(due(now), [10, 20]);
+        assert_eq!(due(now), Vec::<u32>::new());
         let ids: Vec<_> = timers.lock().unwrap().iter().map(|t| t.id).collect();
         assert_eq!(ids, [2, 3]);
+    }
+
+    #[test]
+    fn a_zero_interval_fires_once_per_step() {
+        let timers = Mutex::new(vec![TimerEntry {
+            id: 1,
+            fire_at: Instant::now(),
+            interval: Some(Duration::ZERO),
+            callback_id: 7,
+        }]);
+        let step = Instant::now();
+        assert_eq!(next_due_timer(&timers, step), Some(7));
+        assert_eq!(next_due_timer(&timers, step), None);
+        assert_eq!(next_due_timer(&timers, Instant::now()), Some(7));
+    }
+
+    #[test]
+    fn the_console_keeps_a_bounded_number_of_short_lines() {
+        let console = Mutex::new(Vec::new());
+        for _ in 0..MAX_CONSOLE_LINES + 10 {
+            console_log(&console, ConsoleLevel::Log, "x".repeat(MAX_TEXT + 1));
+        }
+        let console = console.into_inner().unwrap();
+        assert_eq!(console.len(), MAX_CONSOLE_LINES);
+        assert!(console.iter().all(|line| line.message.len() == MAX_TEXT));
+    }
+
+    #[test]
+    fn a_full_frame_drops_later_commands() {
+        let mut canvas = CanvasState::default();
+        for i in 0..MAX_COMMANDS {
+            assert!(canvas.push(rect(i as f32, 1.0, 255)));
+        }
+        assert!(!canvas.push(rect(0.0, 1.0, 255)));
+        assert_eq!(canvas.commands.len(), MAX_COMMANDS);
+        assert_eq!(canvas.dropped(), 1);
+        canvas.clear();
+        assert_eq!(canvas.dropped(), 0);
+
+        // Text counts against the byte budget too, after being cut to MAX_TEXT.
+        let text = |n| DrawCommand::Text {
+            x: 0.0,
+            y: 0.0,
+            size: 12.0,
+            color: [0; 4],
+            text: "é".repeat(n),
+        };
+        assert!(canvas.push(text(MAX_TEXT)));
+        let DrawCommand::Text { text: kept, .. } = &canvas.commands[0] else {
+            panic!("expected text");
+        };
+        assert_eq!(kept.len(), MAX_TEXT);
+        while canvas.push(text(MAX_TEXT)) {}
+        assert!(canvas.bytes <= MAX_CANVAS_BYTES);
+        assert!(canvas.commands.len() < MAX_COMMANDS);
     }
 
     fn rect(x: f32, w: f32, alpha: u8) -> DrawCommand {
@@ -2167,6 +2537,16 @@ mod tests {
         assert_eq!(canvas.commands.len(), 1);
     }
 
+    /// What `api_canvas_image` does with `bytes`, minus the drawing.
+    fn decode(canvas: &mut CanvasState, bytes: &[u8]) -> Result<Arc<DecodedImage>, String> {
+        let image = match canvas.cached(bytes) {
+            Some(image) => image,
+            None => Arc::new(DecodedImage::decode(bytes)?),
+        };
+        canvas.remember(bytes.to_vec(), &image);
+        Ok(image)
+    }
+
     #[test]
     fn images_are_decoded_once_while_they_are_drawn() {
         let mut png = Vec::new();
@@ -2174,21 +2554,21 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         let mut canvas = CanvasState::default();
-        let first = canvas.decode(&png).unwrap();
+        let first = decode(&mut canvas, &png).unwrap();
         assert_eq!((first.width, first.height), (2, 1));
         assert_eq!(first.pixels, [9, 8, 7, 255, 9, 8, 7, 255]);
         // Drawn twice in a frame: one image.
         canvas.push_image(first.clone(), 0.0, 0.0, 1.0, 1.0);
-        let again = canvas.decode(&png).unwrap();
+        let again = decode(&mut canvas, &png).unwrap();
         canvas.push_image(again, 5.0, 0.0, 1.0, 1.0);
         assert_eq!(canvas.images.len(), 1);
         // The next frames reuse it; a frame without it forgets it.
         canvas.clear();
-        assert!(Arc::ptr_eq(&canvas.decode(&png).unwrap(), &first));
+        assert!(Arc::ptr_eq(&decode(&mut canvas, &png).unwrap(), &first));
         canvas.clear();
         canvas.clear();
-        assert!(!Arc::ptr_eq(&canvas.decode(&png).unwrap(), &first));
-        assert!(canvas.decode(b"not an image").is_err());
+        assert!(!Arc::ptr_eq(&decode(&mut canvas, &png).unwrap(), &first));
+        assert!(decode(&mut canvas, b"not an image").is_err());
     }
 
     #[test]
@@ -2201,12 +2581,71 @@ mod tests {
             png
         };
         let mut canvas = CanvasState::default();
-        let first = canvas.decode(&png(0)).unwrap();
+        let first = decode(&mut canvas, &png(0)).unwrap();
         for shade in 1..=MAX_DECODED_IMAGES as u8 {
-            canvas.decode(&png(shade)).unwrap();
+            decode(&mut canvas, &png(shade)).unwrap();
         }
         assert_eq!(canvas.decoded.len(), MAX_DECODED_IMAGES);
         // The oldest went first.
-        assert!(!Arc::ptr_eq(&canvas.decode(&png(0)).unwrap(), &first));
+        assert!(!Arc::ptr_eq(&decode(&mut canvas, &png(0)).unwrap(), &first));
+    }
+
+    #[test]
+    fn the_decode_cache_is_bounded_in_bytes() {
+        let big = |shade: u8| {
+            let pixels = vec![shade; 16 * 1024 * 1024];
+            Arc::new(DecodedImage {
+                width: 2048,
+                height: 2048,
+                pixels,
+            })
+        };
+        let mut canvas = CanvasState::default();
+        for shade in 0..8 {
+            canvas.remember(vec![shade; 1024], &big(shade));
+            assert!(canvas.decoded_bytes <= MAX_DECODED_BYTES);
+        }
+        assert_eq!(canvas.decoded.len(), 3);
+        // One that alone is over the limit isn't kept at all.
+        let huge = Arc::new(DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: vec![0; MAX_DECODED_BYTES + 1],
+        });
+        canvas.remember(vec![9], &huge);
+        assert!(canvas.cached(&[9]).is_none());
+    }
+
+    #[test]
+    fn hyperlinks_are_bounded_in_bytes() {
+        let link = |url: String| Hyperlink {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            url,
+        };
+        let mut links = Hyperlinks::default();
+        let long = "a".repeat(MAX_HYPERLINK_BYTES / 4);
+        for _ in 0..4 {
+            assert!(links.add(link(long.clone())));
+        }
+        assert!(!links.add(link("b".into())));
+        assert_eq!(links.at(0.5, 0.5), Some(long.as_str()));
+        links.clear();
+        for _ in 0..MAX_HYPERLINKS {
+            assert!(links.add(link("b".into())));
+        }
+        assert!(!links.add(link("b".into())));
+    }
+
+    #[test]
+    fn a_subsystem_runtime_does_not_wait_for_its_tasks() {
+        let runtime = Runtime::new().unwrap();
+        // Like a DNS lookup that takes its time.
+        runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(5)));
+        let started = Instant::now();
+        drop(runtime);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

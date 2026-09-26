@@ -11,3 +11,7 @@ authors.workspace = true
 # without a compositor.
 [dependencies]
 sighurt-api = { path = "../sighurt-api" }
+cosmic-text.workspace = true
+tiny-skia.workspace = true
+# Grapheme and word boundaries for editing. cosmic-text uses it too.
+unicode-segmentation = "1.12"

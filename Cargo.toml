@@ -10,8 +10,6 @@ members = [
     "sighurt-engine-servo",
     "sighurt-engine-wasm",
     "sighurt-engine-demo",
-    # The pre-rewrite engine protocol, until the Wasm engine no longer uses it.
-    "sighurt-ipc",
     # Guest SDK and example guests.
     "sighurt-sdk",
     "examples/hello-sighurt",
@@ -25,6 +23,10 @@ members = [
     "examples/gradient-demo",
     "examples/typography-demo",
     "examples/sse-demo",
+    # M0: Servo and Wasmtime initialized and used in one process (docs/rewrite/M0.md).
+    "experiments/m0-coexist",
+    # M1: CPU chrome and a Servo page in one Wayland window (docs/rewrite/M1.md).
+    "experiments/m1-mixed",
 ]
 # Resolver 3 picks dependency versions that support `rust-version` below, so the lockfile keeps
 # building with louise-pc's Rust 1.95 as well as with the newer toolchain on this machine.
@@ -48,6 +50,10 @@ wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 smithay-client-toolkit = "0.20"
 calloop = "0.14"
+# The version smithay-client-toolkit 0.20 uses, so there is one binding of libxkbcommon.
+xkbcommon = "0.8"
+# Pipes and clocks for the Wayland host; already in the graph through smithay-client-toolkit.
+rustix = { version = "1", features = ["pipe", "time"] }
 # `swash` rasterizes glyphs (SwashCache, Buffer::draw), which the chrome painter needs.
 cosmic-text = { version = "0.14", default-features = false, features = ["std", "swash", "fontconfig"] }
 tiny-skia = "0.11"

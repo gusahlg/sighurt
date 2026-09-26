@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CSS Animation</title>
+<!-- Benchmark workload: CSS keyframe animations that never stop. Transform and opacity
+     animations (which a compositor can run without a new layout), background-color and
+     width animations (which need a repaint), and a scrolling text line. -->
+<style>
+  body { margin: 0; background: #14161b; color: #e8e8ec; font: 16px/1.4 "DejaVu Sans", sans-serif; }
+  h1 { margin: 0; padding: 20px 28px; font-size: 28px; background: #2b3a55; }
+  .grid { display: grid; grid-template-columns: repeat(8, 110px); gap: 18px; padding: 28px; }
+  .tile { width: 110px; height: 110px; border-radius: 14px; background: #4c8bf5; }
+  .spin { animation: spin 2.4s linear infinite; }
+  .pulse { animation: pulse 1.6s ease-in-out infinite alternate; }
+  .fade { animation: fade 1.2s ease-in-out infinite alternate; }
+  .tint { animation: tint 3s linear infinite; }
+  .bar { height: 14px; margin: 10px 28px; background: #f5a623; border-radius: 7px;
+         animation: grow 2s ease-in-out infinite alternate; }
+  .ticker { overflow: hidden; white-space: nowrap; margin: 18px 28px; font-size: 22px; }
+  .ticker span { display: inline-block; animation: slide 8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { from { transform: scale(0.6); } to { transform: scale(1); } }
+  @keyframes fade { from { opacity: 0.15; } to { opacity: 1; } }
+  @keyframes tint { 0% { background: #4c8bf5; } 33% { background: #e8505b; }
+                    66% { background: #3fb68b; } 100% { background: #4c8bf5; } }
+  @keyframes grow { from { width: 5%; } to { width: 90%; } }
+  @keyframes slide { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+</style>
+</head>
+<body>
+<h1>CSS Animation</h1>
+<div class="grid" id="grid"></div>
+<div class="bar"></div>
+<div class="bar" style="animation-delay: -0.7s; background: #7ed321"></div>
+<div class="bar" style="animation-delay: -1.3s; background: #bd10e0"></div>
+<div class="ticker"><span>Sighurt benchmark ticker — the quick brown fox jumps over the lazy dog — räksmörgås — Sighurt benchmark ticker — the quick brown fox jumps over the lazy dog — räksmörgås — </span></div>
+<script>
+  // 32 tiles, four kinds of animation, with fixed phase offsets.
+  const kinds = ["spin", "pulse", "fade", "tint"];
+  const grid = document.getElementById("grid");
+  for (let i = 0; i < 32; i++) {
+    const tile = document.createElement("div");
+    tile.className = "tile " + kinds[i % 4];
+    tile.style.animationDelay = (-(i * 0.173) % 2.4).toFixed(3) + "s";
+    grid.appendChild(tile);
+  }
+</script>
+</body>
+</html>

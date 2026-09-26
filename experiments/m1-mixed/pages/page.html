@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>M1 static page</title>
+<style>
+  body { font: 16px/1.5 sans-serif; margin: 24px; background: #fdfdf8; color: #222; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  #log { font-family: monospace; background: #eef; padding: 6px 10px; }
+  .grid { position: fixed; left: 0; top: 0; width: 100px; height: 100px;
+          border-right: 1px solid #c00; border-bottom: 1px solid #c00; }
+</style>
+</head>
+<body>
+<div class="grid"></div>
+<h1>A static page</h1>
+<p>Servo renders this page with WebRender into an EGL window surface on the page subsurface.
+The chrome strip above it is a separate subsurface, painted on the CPU.</p>
+<p><img src="image.png" width="128" height="96" alt="a gradient with a white disc"></p>
+<p>The red lines mark CSS pixel 100 from the page's top-left corner: a click on them should
+report clientX or clientY 100.</p>
+<p id="log">waiting for input</p>
+<script src="report.js"></script>
+</body>
+</html>

@@ -40,6 +40,10 @@ use crate::capabilities::{guest_bytes, guest_str, next_handle, write_prefix, Hos
 /// Maximum events kept in a guest's pending queue. Older events are dropped
 /// on overflow to prevent unbounded growth from a slow / non-listening guest.
 const MAX_QUEUED_EVENTS: usize = 4096;
+/// Most listeners a guest may register; `api_on_event` fails past it.
+const MAX_LISTENERS: usize = 1024;
+/// Largest custom event, type and payload together, in bytes; larger ones are dropped.
+const MAX_EVENT_BYTES: usize = 64 * 1024;
 
 /// `online_state` sentinel values.
 const ONLINE_UNKNOWN: u8 = 0;
@@ -117,6 +121,9 @@ impl Default for EventState {
 
 impl EventState {
     fn add_listener(&mut self, event_type: String, callback_id: u32) -> u32 {
+        if self.listener_owner.len() >= MAX_LISTENERS {
+            return 0;
+        }
         // Lazily kick off background producers when something is actually listening.
         if (event_type == "online" || event_type == "offline") && !self.online_thread_started {
             self.start_online_checker();
@@ -201,7 +208,8 @@ impl EventState {
 }
 
 /// Drain built-in event sources + the pending custom-event queue and return
-/// `(callback_id, type, data)` tuples to dispatch via `on_event`.
+/// `(callback_id, type, data)` tuples to dispatch via `on_event`: whole events, oldest first,
+/// until there are at least `limit` tuples. Later events stay queued.
 ///
 /// `state` is mutably accessed once. The runtime then calls `on_event` for
 /// each returned tuple, after writing the type/data into [`EventState::current`]
@@ -212,6 +220,7 @@ pub fn drain_pending_events(
     focused: bool,
     mouse_down: bool,
     mouse_pos: (f32, f32),
+    limit: usize,
 ) -> Vec<(u32, String, Vec<u8>)> {
     let mut g = events.lock().unwrap();
 
@@ -305,7 +314,10 @@ pub fn drain_pending_events(
 
     // ── Drain queue → dispatch tuples ─────────────────────────────────
     let mut out = Vec::new();
-    while let Some(ev) = g.queue.pop_front() {
+    while out.len() < limit {
+        let Some(ev) = g.queue.pop_front() else {
+            break;
+        };
         if let Some(vec) = g.listeners.get(&ev.event_type) {
             for &(_, cb) in vec {
                 out.push((cb, ev.event_type.clone(), ev.data.clone()));
@@ -423,7 +435,7 @@ pub fn register_event_functions(linker: &mut Linker<HostState>) -> Result<()> {
             let Some(event_type) = guest_str(&caller, type_ptr, type_len) else {
                 return;
             };
-            if event_type.is_empty() {
+            if event_type.is_empty() || event_type.len() + data_len as usize > MAX_EVENT_BYTES {
                 return;
             }
             let data = guest_bytes(&caller, data_ptr, data_len).unwrap_or_default();

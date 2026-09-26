@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Runs a command in the benchmark harness's own copy of bench/, tools/ and shell.nix on the
+# benchmark machine (louise-pc), in ~/sighurt-bench/harness. It is separate from the tree that
+# tools/remote syncs, so other people's syncs can't change the harness under a long run, and it
+# doesn't hold tools/remote's lock, so a benchmark doesn't block their builds.
+#
+#   bench/remote bench/run --build baseline --label baseline
+#   bench/remote --detach bench/run ...     # keeps running after ssh ends, in a snapshot of the
+#                                           # harness; log in ~/sighurt-bench/logs
+#   bench/remote --no-sync cat ~/sighurt-bench/logs/latest.log
+#
+# The git revision of this working tree goes along as SIG_BENCH_REV, since the copy has no .git.
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+host=${SIG_BENCH_HOST:-louise-pc}
+dest=sighurt-bench/harness
+sync=1 detach=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --no-sync) sync=0; shift ;;
+    --detach) detach=1; shift ;;
+    *) break ;;
+  esac
+done
+[[ $# -gt 0 ]] || { sed -n '2,12p' "$0"; exit 2; }
+if [[ $sync == 1 ]]; then
+  ssh -o BatchMode=yes "$host" "mkdir -p $dest"
+  rsync -a --delete --exclude /bench/results -e 'ssh -o BatchMode=yes' \
+    "$repo/bench" "$repo/tools" "$repo/shell.nix" "$host:$dest/"
+fi
+rev=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)
+git -C "$repo" diff --quiet HEAD -- bench tools 2>/dev/null || rev="$rev+dirty"
+# The remote login shell is fish, so the command goes to bash on stdin.
+{
+  echo "set -e; cd ~/$dest; export SIG_BENCH_REV=$(printf '%q' "$rev")"
+  if [[ $detach == 1 ]]; then
+    # A detached job runs in a snapshot of the harness, so later syncs can't change it midway.
+    echo 'stamp=$(date +%Y%m%d-%H%M%S); mkdir -p ~/sighurt-bench/logs ~/sighurt-bench/snapshots'
+    echo 'cp -a ~/sighurt-bench/harness ~/sighurt-bench/snapshots/$stamp; cd ~/sighurt-bench/snapshots/$stamp'
+    echo 'log=~/sighurt-bench/logs/$stamp.log; ln -sfn "$log" ~/sighurt-bench/logs/latest.log'
+    printf 'setsid nohup'; printf ' %q' "$@"; echo ' > "$log" 2>&1 < /dev/null & echo "detached: $log (pid $!)"'
+  else
+    printf 'exec'; printf ' %q' "$@"; echo
+  fi
+} | ssh -o BatchMode=yes "$host" bash -s

@@ -194,6 +194,7 @@ fn camera_frame(state: &HostState) -> Option<Vec<u8>> {
 }
 
 /// A screenshot of the first display as RGBA, or the guest's error code (logged).
+#[cfg(feature = "screen-capture")]
 fn screen_capture(state: &HostState) -> Result<Vec<u8>, i32> {
     let screens = screenshots::Screen::all()
         .map_err(|e| log_err(&state.console, -2, format!("[SCREEN] Enumerate: {e}")))?;
@@ -207,6 +208,14 @@ fn screen_capture(state: &HostState) -> Result<Vec<u8>, i32> {
     capture.screen_w = image.width();
     capture.screen_h = image.height();
     Ok(image.into_raw())
+}
+
+/// Without the `screen-capture` feature there is no capture to offer: the call fails as a
+/// failed capture (-3), before any permission prompt.
+#[cfg(not(feature = "screen-capture"))]
+fn screen_capture(state: &HostState) -> Result<Vec<u8>, i32> {
+    let message = "[SCREEN] Screen capture is not supported by this build".to_string();
+    Err(log_err(&state.console, -3, message))
 }
 
 /// Register `api_camera_*`, `api_microphone_*`, `api_screen_capture`, and `api_media_pipeline_stats`.
@@ -328,8 +337,10 @@ pub fn register_media_capture_functions(linker: &mut Linker<HostState>) -> Resul
         "api_screen_capture",
         |mut caller: Caller<'_, HostState>, out_ptr: u32, out_cap: u32| -> i32 {
             // The OS may additionally ask for screen-recording permission once granted here.
-            if let Some(code) = permission_gate(caller.data(), PermissionKind::ScreenCapture) {
-                return code;
+            if cfg!(feature = "screen-capture") {
+                if let Some(code) = permission_gate(caller.data(), PermissionKind::ScreenCapture) {
+                    return code;
+                }
             }
             match screen_capture(caller.data()) {
                 Ok(rgba) => {

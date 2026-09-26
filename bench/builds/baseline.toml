@@ -1,0 +1,23 @@
+# The pre-rewrite browser, git tag gpui-baseline (359cb36), built by bench/baseline/build.sh:
+# GPUI chrome in `sig`; every page in its own sig-servo or sig-wasm process over sighurt-ipc.
+description = "gpui-baseline: GPUI chrome, engines as processes over sighurt-ipc, Servo frames read back"
+# Relative paths below are inside `dir`. `~` is the home directory of the benchmark machine.
+dir = "~/sighurt-baseline"
+sig = "target/release/sig"
+# Hashed into every result set.
+binaries = ["target/release/sig", "target/release/sig-servo", "target/release/sig-wasm"]
+# Written by the build; copied into the result set.
+info = "build-info.json"
+# benchlib/parsers.py: what the build's diagnostics on stderr mean. sig-servo's frame timings
+# (SIG_SERVO_TIMING) and GPUI's frame draws (ZED_MEASUREMENTS); sig-wasm has none.
+parsers = ["servo-timing", "gpui-frames"]
+# Installed as $XDG_CONFIG_HOME/sighurt/config.toml. It binds the keys the scripts press.
+config = "baseline.config.toml"
+# The chrome around the page, in logical pixels: tab strip 40 + toolbar 44 above, status bar 20
+# below (gpui-baseline:sighurt-ui/src/lib.rs). The screen probe looks inside what is left.
+chrome_top = 84
+chrome_bottom = 20
+
+[env]
+SIG_SERVO_TIMING = "1"
+ZED_MEASUREMENTS = "1"

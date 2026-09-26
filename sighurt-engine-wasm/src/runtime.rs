@@ -1,117 +1,213 @@
-//! Guest WebAssembly lifecycle for the WASM engine.
+//! A guest's lifecycle: loading it, and running its callbacks one step at a time.
 //!
-//! [`load`] fetches a `.wasm` binary (HTTP/HTTPS or `file://`), compiles it with Wasmtime under
-//! the sandbox policy, links the `oxide` import module (memory, host capabilities) and runs
-//! `start_app()`. After that, interactive guests export `on_frame(dt_ms: u32)` for a per-frame
-//! render loop driven through [`LiveModule::tick`]; optional `on_timer(callback_id: u32)`
-//! callbacks run when timers expire, immediately before each frame.
+//! [`load`] fetches a `.wasm` binary (HTTP/HTTPS or `file://`), compiles it under the sandbox
+//! policy, links the `oxide` import module (memory, host capabilities) and runs `start_app()`.
+//! A guest that exports `on_frame(dt_ms: u32)` becomes a [`Guest`], which runs one
+//! [`step`](Guest::step) per frame: queued events to `on_event`, animation frames and expired
+//! timers to `on_timer`, then `on_frame`.
+//!
+//! Both run on the runtime's worker threads, never on the owner thread, and one step at a time
+//! per guest, so a guest's calls stay in order. A step does a bounded amount of work: each
+//! callback has its fuel and time limit (see [`crate::engine`]), and past [`STEP_BUDGET`] or
+//! [`MAX_CALLBACKS_PER_STEP`] the remaining events and timers wait for the next step, so a
+//! flood of individually small callbacks cannot hold a worker indefinitely. A load or step of a
+//! document that was closed or replaced stops at the next epoch tick, its store's budget
+//! cancelled.
+//!
+//! Owns: calling into guests. Must not own: when steps run (the adapter schedules them) or what
+//! the browser is told about them.
+
+use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use wasmtime::*;
 
 use crate::capabilities::{
-    drain_animation_frame_requests, drain_expired_timers, http_get, register_host_functions,
-    ConsoleLevel, HostState,
+    http_get, next_animation_frame, next_due_timer, register_host_functions, ConsoleLevel,
+    HostState,
 };
-use crate::engine::WasmEngine;
+use crate::draw::{self, DisplayList};
+use crate::engine::{Halt, WasmEngine};
 use crate::events::{drain_pending_events, set_current_event};
 use crate::url::AppUrl;
 
-const FRAME_FUEL_LIMIT: u64 = 50_000_000;
+/// How long a step keeps delivering events and timers before it leaves the rest for the next
+/// step. `on_frame` still runs.
+pub const STEP_BUDGET: Duration = Duration::from_millis(50);
+/// Most event and timer callbacks in one step.
+pub const MAX_CALLBACKS_PER_STEP: usize = 1000;
 
-/// A Wasmtime [`Store`] and typed guest exports kept alive across frames for interactive apps.
+/// A guest that exports `on_frame`: its [`Store`], its callbacks, and what it last drew.
 ///
-/// Constructed when the module exports `on_frame`. The store holds [`HostState`] (canvas, console,
-/// timers, animation requests, etc.) for the lifetime of the document.
-pub struct LiveModule {
+/// The store holds [`HostState`] (canvas, console, timers, animation requests, etc.) for the
+/// lifetime of the document.
+pub struct Guest {
+    engine: WasmEngine,
     store: Store<HostState>,
     on_frame_fn: TypedFunc<u32, ()>,
     on_timer_fn: Option<TypedFunc<u32, ()>>,
     on_event_fn: Option<TypedFunc<u32, ()>>,
+    /// Events taken from the event queue that a step had no budget left to deliver.
+    events: VecDeque<(u32, String, Vec<u8>)>,
+    /// The display list last handed out, to tell whether the next frame differs.
+    drawn: Option<Arc<DisplayList>>,
 }
 
-impl LiveModule {
-    /// Advances one frame: delivers queued events to `on_event`, animation frame requests and
-    /// expired timers to `on_timer`, then calls `on_frame(dt_ms)`.
+/// Input the owner collected since the last step, for the next one.
+#[derive(Debug, Default)]
+pub struct FrameInput {
+    pub keys_pressed: Vec<u32>,
+    pub text: String,
+    pub clicked: [bool; 3],
+    /// Positive up and left, as the guest reads it.
+    pub scroll: (f32, f32),
+}
+
+/// A loaded document: its guest if it runs frames, and what `start_app` drew.
+pub struct Loaded {
+    pub guest: Option<Box<Guest>>,
+    pub list: Option<Arc<DisplayList>>,
+}
+
+impl Guest {
+    /// Runs one step with `input`: queued events to `on_event`, animation frames and expired
+    /// timers to `on_timer`, then `on_frame(dt_ms)`. Returns the new display list if the frame
+    /// drew something different from the last one.
     ///
-    /// Every call gets a fresh frame's worth of fuel. A failing event or timer callback is
-    /// logged to the console; a failing `on_frame` is returned.
-    pub fn tick(&mut self, dt_ms: u32) -> Result<()> {
-        let store = &mut self.store;
+    /// A failing event or timer callback is logged to the console; a failing `on_frame` is
+    /// returned, and ends the document.
+    pub fn step(&mut self, dt_ms: u32, input: FrameInput) -> Result<Option<Arc<DisplayList>>> {
+        {
+            let mut state = self.store.data().input_state.lock().unwrap();
+            state.keys_pressed = input.keys_pressed;
+            state.text = input.text;
+            state.mouse_buttons_clicked = input.clicked;
+            (state.scroll_x, state.scroll_y) = input.scroll;
+        }
+        let started = Instant::now();
+        let mut callbacks = 0;
+        let mut budget_left = || {
+            callbacks += 1;
+            callbacks <= MAX_CALLBACKS_PER_STEP && started.elapsed() < STEP_BUDGET
+        };
+
         // Events first: the guest reacts to resize, input and custom events before it draws.
-        if let Some(on_event) = &self.on_event_fn {
-            let data = store.data();
-            let canvas_size = {
-                let c = data.canvas.lock().unwrap();
-                (c.width, c.height)
-            };
-            let focused = data.focused.load(std::sync::atomic::Ordering::Relaxed);
-            let (mouse_down, mouse_pos) = {
-                let i = data.input_state.lock().unwrap();
-                (i.mouse_buttons_down[0], (i.mouse_x, i.mouse_y))
-            };
-            let events = data.events.clone();
-            let pending =
-                drain_pending_events(&events, canvas_size, focused, mouse_down, mouse_pos);
-            for (callback_id, evt_type, evt_data) in pending {
-                set_current_event(&events, evt_type.clone(), evt_data);
-                call_logged(store, on_event, callback_id, || {
+        if let Some(on_event) = self.on_event_fn.clone() {
+            if self.events.is_empty() {
+                let data = self.store.data();
+                let canvas_size = {
+                    let c = data.canvas.lock().unwrap();
+                    (c.width, c.height)
+                };
+                let focused = data.focused.load(Ordering::Relaxed);
+                let (mouse_down, mouse_pos) = {
+                    let i = data.input_state.lock().unwrap();
+                    (i.mouse_buttons_down[0], (i.mouse_x, i.mouse_y))
+                };
+                self.events = drain_pending_events(
+                    &data.events,
+                    canvas_size,
+                    focused,
+                    mouse_down,
+                    mouse_pos,
+                    MAX_CALLBACKS_PER_STEP,
+                )
+                .into();
+            }
+            while let Some((callback_id, evt_type, evt_data)) = self.events.pop_front() {
+                if !budget_left() {
+                    self.events.push_front((callback_id, evt_type, evt_data));
+                    break;
+                }
+                set_current_event(&self.store.data().events, evt_type.clone(), evt_data);
+                self.call_logged(&on_event, callback_id, || {
                     format!("on_event({evt_type}:{callback_id})")
-                })?;
+                });
             }
         }
 
-        if let Some(on_timer) = &self.on_timer_fn {
-            // Animation frames first (vsync-aligned, one-shot), then regular timers.
-            let animation_frames = drain_animation_frame_requests(&store.data().animation_requests);
-            for callback_id in animation_frames {
-                call_logged(store, on_timer, callback_id, || {
+        if let Some(on_timer) = self.on_timer_fn.clone() {
+            // Animation frames first (one-shot, requested before this step), then timers that
+            // were due when the step began.
+            let data = self.store.data();
+            let mut frames = data.animation_requests.lock().unwrap().len();
+            let (requests, timers) = (data.animation_requests.clone(), data.timers.clone());
+            while frames > 0 && budget_left() {
+                frames -= 1;
+                let Some(callback_id) = next_animation_frame(&requests) else {
+                    break;
+                };
+                self.call_logged(&on_timer, callback_id, || {
                     format!("on_timer(raf:{callback_id})")
-                })?;
+                });
             }
-            let timers = drain_expired_timers(&store.data().timers);
-            for callback_id in timers {
-                call_logged(store, on_timer, callback_id, || {
+            while budget_left() {
+                let Some(callback_id) = next_due_timer(&timers, started) else {
+                    break;
+                };
+                self.call_logged(&on_timer, callback_id, || {
                     format!("on_timer({callback_id})")
-                })?;
+                });
             }
         }
 
-        store.set_fuel(FRAME_FUEL_LIMIT)?;
-        self.on_frame_fn.call(store, dt_ms)
+        let on_frame = self.on_frame_fn.clone();
+        self.engine
+            .call(&mut self.store, |store| on_frame.call(store, dt_ms))
+            .map_err(|e| anyhow::anyhow!(guest_error("on_frame", &e)))?;
+        Ok(self.redrawn())
+    }
+
+    /// Calls a callback export, logging a trap to the console as a failure of `what`.
+    fn call_logged(&mut self, f: &TypedFunc<u32, ()>, arg: u32, what: impl FnOnce() -> String) {
+        if let Err(e) = self
+            .engine
+            .call(&mut self.store, |store| f.call(store, arg))
+        {
+            self.store
+                .data()
+                .log(ConsoleLevel::Error, guest_error(&what(), &e));
+        }
+    }
+
+    /// The canvas as a new display list, if it changed since the last one.
+    fn redrawn(&mut self) -> Option<Arc<DisplayList>> {
+        let list = {
+            let canvas = self.store.data().canvas.lock().unwrap();
+            draw::display_list(&canvas, self.drawn.as_deref())?
+        };
+        let list = Arc::new(list);
+        self.drawn = Some(list.clone());
+        Some(list)
+    }
+
+    /// The state the guest's host functions use.
+    pub fn host_state(&self) -> &HostState {
+        self.store.data()
     }
 }
 
-/// Calls a callback export with a frame's worth of fuel, logging a trap to the console as a
-/// failure of `what`.
-fn call_logged(
-    store: &mut Store<HostState>,
-    f: &TypedFunc<u32, ()>,
-    arg: u32,
-    what: impl FnOnce() -> String,
-) -> Result<()> {
-    store.set_fuel(FRAME_FUEL_LIMIT)?;
-    if let Err(e) = f.call(&mut *store, arg) {
-        store
-            .data()
-            .log(ConsoleLevel::Error, guest_error(&what(), &e));
-    }
-    Ok(())
-}
-
-/// Describes a failed guest call to `what`: that it ran out of fuel, or how it trapped.
+/// Describes a failed guest call to `what`: that it ran out of fuel or time, was cancelled, or
+/// how it trapped.
 pub fn guest_error(what: &str, e: &anyhow::Error) -> String {
-    if e.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
-        format!("{what} halted: fuel limit exceeded")
-    } else {
+    if let Some(halt) = e.downcast_ref::<Halt>() {
+        return format!("{what} halted: {halt}");
+    }
+    match e.downcast_ref::<Trap>() {
+        Some(Trap::OutOfFuel) => format!("{what} halted: fuel limit exceeded"),
+        Some(Trap::Interrupt) => format!("{what} halted: time limit exceeded"),
         // `{:#}` includes the trap itself, not just the outermost context.
-        format!("{what} trapped: {e:#}")
+        _ => format!("{what} trapped: {e:#}"),
     }
 }
 
-/// Instantiates `module` with the host API, bounded memory and a full tank of fuel, in a new
-/// store holding `host_state`. The state's `memory` is the module's own exported memory if it
-/// has one, or else the `oxide.memory` the host provides.
+/// Instantiates `module` with the host API and bounded memory, in a new store holding
+/// `host_state`. The state's `memory` is the module's own exported memory if it has one, or
+/// else the `oxide.memory` the host provides. The module's `start` function, if it has one,
+/// runs with the budget of `start_app`.
 pub fn instantiate(
     engine: &WasmEngine,
     host_state: HostState,
@@ -123,9 +219,15 @@ pub fn instantiate(
     let memory = engine.create_bounded_memory(&mut store)?;
     linker.define(&store, "oxide", "memory", memory)?;
     store.data_mut().memory = Some(memory);
-    let instance = linker
-        .instantiate(&mut store, module)
-        .context("failed to instantiate wasm module")?;
+    let instance = engine
+        .start(&mut store, |store| linker.instantiate(store, module))
+        .map_err(|e| {
+            if e.downcast_ref::<Halt>().is_some() || e.downcast_ref::<Trap>().is_some() {
+                anyhow::anyhow!(guest_error("the module's start function", &e))
+            } else {
+                e.context("failed to instantiate wasm module")
+            }
+        })?;
     if let Some(own) = instance.get_memory(&mut store, "memory") {
         store.data_mut().memory = Some(own);
     }
@@ -135,11 +237,18 @@ pub fn instantiate(
 /// Loads the app at `url` into `host_state`, the state of a new document.
 ///
 /// Fetches the module and its optional sibling manifest (`app.wasm` → `app.toml`), then
-/// compiles and instantiates it and runs `start_app()`, all on the calling thread (the page's
-/// loader). Supports `http`/`https` and `file://` URLs; `url` is fetched as given. Returns a
-/// [`LiveModule`] if the guest exports `on_frame`.
-pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Option<LiveModule>> {
+/// compiles and instantiates it and runs `start_app()`, all on the calling thread (a worker).
+/// Supports `http`/`https` and `file://` URLs; `url` is fetched as given. The document's origin
+/// is `url`'s, whatever URL its history shows. Once `host_state`'s budget is cancelled (the
+/// navigation was superseded, stopped or closed) it gives up between these steps, and guest
+/// code stops at the next epoch tick.
+pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Loaded> {
+    let check = || {
+        anyhow::ensure!(!host_state.budget.is_cancelled(), "cancelled");
+        Ok(())
+    };
     let parsed = AppUrl::parse(url).map_err(|e| anyhow::anyhow!("{e}"))?;
+    check()?;
     let wasm_bytes = fetch_module(url, url)?;
 
     // Optional sibling manifest: metadata + declared permissions.
@@ -151,21 +260,27 @@ pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Op
         ),
     }
 
-    // Capture the app origin for storage/permission scoping. Done once per load so guest
-    // `push_state` calls (which mutate `current_url`) can't shift the origin afterwards.
-    let url = host_state.current_url.lock().unwrap().clone();
-    crate::capabilities::set_module_origin(host_state, &url);
+    // Capture the app origin for storage/permission scoping, from the module's own URL: not
+    // from the entry its history restores, and once per load so guest `push_state` calls
+    // (which mutate `current_url`) can't shift the origin afterwards.
+    crate::capabilities::set_module_origin(host_state, url);
 
+    check()?;
     let module = engine.compile_module(&wasm_bytes)?;
     let (mut store, instance) = instantiate(engine, host_state.clone(), &module)?;
     let start_app = instance
         .get_typed_func::<(), ()>(&mut store, "start_app")
         .context("module must export `start_app` as extern \"C\" fn()")?;
-    if let Err(e) = start_app.call(&mut store, ()) {
+    check()?;
+    if let Err(e) = engine.start(&mut store, |store| start_app.call(store, ())) {
         anyhow::bail!(guest_error("start_app", &e));
     }
+    let list = {
+        let canvas = host_state.canvas.lock().unwrap();
+        draw::display_list(&canvas, None).map(Arc::new)
+    };
     let Ok(on_frame_fn) = instance.get_typed_func::<u32, ()>(&mut store, "on_frame") else {
-        return Ok(None);
+        return Ok(Loaded { guest: None, list });
     };
     let on_timer_fn = instance
         .get_typed_func::<u32, ()>(&mut store, "on_timer")
@@ -173,12 +288,19 @@ pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Op
     let on_event_fn = instance
         .get_typed_func::<u32, ()>(&mut store, "on_event")
         .ok();
-    Ok(Some(LiveModule {
+    let guest = Guest {
+        engine: engine.clone(),
         store,
         on_frame_fn,
         on_timer_fn,
         on_event_fn,
-    }))
+        events: VecDeque::new(),
+        drawn: list.clone(),
+    };
+    Ok(Loaded {
+        guest: Some(Box::new(guest)),
+        list,
+    })
 }
 
 /// Largest `.wasm` module that is fetched or read.
@@ -221,7 +343,7 @@ pub fn fetch_module(url: &str, page_url: &str) -> Result<Vec<u8>> {
     } else if parsed.is_local_file() {
         anyhow::bail!("only local pages can load local modules: {url}");
     } else if parsed.is_internal() {
-        anyhow::bail!("sig:// pages are served by the shell, not the WASM engine");
+        anyhow::bail!("sig:// pages are served by the browser, not the Wasm engine");
     } else {
         anyhow::bail!("unsupported URL scheme: {}", parsed.scheme());
     };

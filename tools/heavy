@@ -12,6 +12,7 @@
 #   SIG_WHAT="servo build" tools/heavy cargo build -p sighurt-engine-servo
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
+host=$(hostname)
 lock=/tmp/gusahlg-heavy.lock
 owner=/tmp/gusahlg-heavy.owner
 if [[ -z ${SIG_HEAVY_HELD:-} ]]; then
@@ -22,7 +23,24 @@ if [[ -z ${SIG_HEAVY_HELD:-} ]]; then
 fi
 echo "sighurt: ${SIG_WHAT:-$*} (since $(date +%H:%M), pid $$)" > "$owner"
 trap 'rm -f "$owner"' EXIT
-export CARGO_BUILD_JOBS=${SIG_JOBS:-8}
+jobs=${SIG_JOBS:-8} mem=${SIG_MEM:-9G}
+props=()
+# While /tmp/gusahlg-desktop-embargo exists, the user is using this desktop (gaming, say):
+# jobs run at idle CPU and IO priority with 2 cores and 6G, Servo is built on louise-pc
+# instead, and nothing started here may reach the user's live Wayland session.
+if [[ $host != louise && -e /tmp/gusahlg-desktop-embargo ]]; then
+  echo "tools/heavy: the user is using this desktop right now: running at idle priority with 2 jobs." \
+    "The live desktop (wayland-1) is off-limits; use tools/headless-sway, or louise-pc via tools/remote." >&2
+  if [[ " ${SIG_WHAT:-} $* " == *servo* ]]; then
+    echo "tools/heavy: refusing a Servo job on this desktop while the user is using it;" \
+      "run it on louise-pc: tools/remote $*" >&2
+    exit 75
+  fi
+  jobs=2 mem=6G
+  props=(-p CPUWeight=idle -p IOWeight=1 --nice=19)
+  [[ ${XDG_RUNTIME_DIR:-} == /tmp/sighl.* ]] || unset WAYLAND_DISPLAY DISPLAY
+fi
+export CARGO_BUILD_JOBS=$jobs
 quoted=$(printf '%q ' "$@")
-systemd-run --user --scope --quiet --collect -p MemoryMax="${SIG_MEM:-9G}" -p MemorySwapMax=0 \
+systemd-run --user --scope --quiet --collect -p MemoryMax="$mem" -p MemorySwapMax=0 "${props[@]}" \
   nix-shell "$repo/shell.nix" --run "cd $(printf '%q' "$PWD") && $quoted"

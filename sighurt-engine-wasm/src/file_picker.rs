@@ -17,6 +17,7 @@ use anyhow::Result;
 use wasmtime::{Caller, Linker};
 
 use crate::capabilities::{guest_str, next_handle, write_guest, HostState};
+use crate::engine::Wait;
 
 /// One picked file or folder, keyed by an opaque handle the guest holds.
 pub struct PickedEntry {
@@ -165,11 +166,14 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
             if !exts.is_empty() {
                 dialog = dialog.add_filter("Files", &exts);
             }
-            let paths = if multiple != 0 {
-                dialog.pick_files().unwrap_or_default()
-            } else {
-                dialog.pick_file().into_iter().collect()
-            };
+            let paths = caller.data().budget.wait(Wait::User, || {
+                if multiple != 0 {
+                    dialog.pick_files().unwrap_or_default()
+                } else {
+                    dialog.pick_file().into_iter().collect()
+                }
+            });
+            let paths = paths.unwrap_or_default();
             if paths.is_empty() {
                 return -1;
             }
@@ -197,7 +201,10 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
         |caller: Caller<'_, HostState>, title_ptr: u32, title_len: u32| -> u32 {
             let title = guest_str(&caller, title_ptr, title_len)
                 .unwrap_or_else(|| "Sighurt: Select a folder".to_string());
-            match rfd::FileDialog::new().set_title(&title).pick_folder() {
+            let picked = caller.data().budget.wait(Wait::User, || {
+                rfd::FileDialog::new().set_title(&title).pick_folder()
+            });
+            match picked.flatten() {
                 Some(path) => caller.data().file_picker.lock().unwrap().alloc(path, true),
                 None => 0,
             }

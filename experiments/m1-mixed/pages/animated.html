@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>M1 animation and WebGL</title>
+<style>
+  body { font: 16px/1.5 sans-serif; margin: 24px; background: #f4f6fb; color: #222; }
+  .track { position: relative; height: 60px; background: #dde; margin: 12px 0; }
+  .box { position: absolute; width: 60px; height: 60px; background: #d33;
+         animation: slide 2s ease-in-out infinite alternate; }
+  @keyframes slide { from { transform: translateX(0) rotate(0); }
+                     to { transform: translateX(400px) rotate(180deg); } }
+  canvas { border: 1px solid #999; display: block; }
+  #log { font-family: monospace; background: #eef; padding: 6px 10px; }
+</style>
+</head>
+<body>
+<h1>CSS animation and WebGL</h1>
+<div class="track"><div class="box"></div></div>
+<canvas id="gl" width="320" height="180"></canvas>
+<p id="frames">WebGL frames: 0</p>
+<p id="log">waiting for input</p>
+<script src="report.js"></script>
+<script>
+  // A WebGL 1 context cleared to a cycling colour, with a scissored square moving across it.
+  const canvas = document.getElementById("gl");
+  const gl = canvas.getContext("webgl");
+  const frames = document.getElementById("frames");
+  if (!gl) {
+    log("webgl: no context");
+  } else {
+    log(`webgl: ${gl.getParameter(gl.VERSION)}`);
+    let n = 0;
+    const draw = (t) => {
+      const s = t / 1000;
+      gl.disable(gl.SCISSOR_TEST);
+      gl.clearColor(0.5 + 0.5 * Math.sin(s), 0.5 + 0.5 * Math.sin(s + 2), 0.5 + 0.5 * Math.sin(s + 4), 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(Math.round(130 + 110 * Math.cos(s * 2)), 60, 60, 60);
+      gl.clearColor(1, 1, 1, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      n += 1;
+      if (n % 30 === 0) frames.textContent = `WebGL frames: ${n}`;
+      requestAnimationFrame(draw);
+    };
+    requestAnimationFrame(draw);
+  }
+</script>
+</body>
+</html>

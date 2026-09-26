@@ -1,0 +1,110 @@
+# Sighurt configuration.
+#
+# This is the built-in default, and `sig --default-config` prints it. Your own file is
+# ~/.config/sighurt/config.toml. It starts with `version = 1`, the version of this format;
+# every other key is optional and keeps the value below when you leave it out. [routing]
+# tables merge by engine, field by field; [keys] and [ui] are yours alone.
+#
+# The problems in the file are reported together. A file with any problem is not used: at
+# startup sig runs with these defaults, and when the file is loaded again the configuration in
+# use stays.
+# Key bindings, colors, the home page, search and routing apply as soon as they are loaded;
+# pages already open stay in the engine they are open in.
+
+version = 1
+
+# Page shown at startup and in new tabs.
+home = "sig://home"
+
+# What the address bar does with text that isn't a URL; `{}` becomes the query.
+search = "https://duckduckgo.com/html/?q={}"
+
+# ── Engines ──────────────────────────────────────────────────────────────────────────────
+#
+# Engines are compiled into sig: servo (the web), wasm (Sighurt apps) and demo (a test
+# engine), as many of them as the build has.
+
+[engines]
+# Opens http and https URLs, and the files and URLs that no routing rule below claims.
+default = "servo"
+# The engines that may open new pages. Leave it out to allow every engine in the build.
+# Pages already open in an engine that you take out stay open until closed.
+# enabled = ["servo", "wasm"]
+
+# ── Routing ──────────────────────────────────────────────────────────────────────────────
+#
+# Which engine opens a URL, in this order:
+#   1. sig: URLs are Sighurt's own pages (sig://home). Pages can't open them.
+#   2. An engine that lists the URL's scheme in `schemes`. http, https, file and sig can't be
+#      listed.
+#   3. A file: URL whose extension an engine lists in `extensions`.
+#   4. An http(s) URL on one of an engine's `origins`, whose extension it lists. This is the
+#      only way a Wasm app opens from a web server; nothing else sends http(s) to wasm.
+#   5. The default engine: every other http(s) and file: URL.
+# A scheme or an extension belongs to one engine only. An extension only picks the engine:
+# the engine checks what it loads, and content it can't show is downloaded or reported.
+
+[routing.servo]
+schemes = ["data", "about"]
+
+[routing.wasm]
+extensions = ["wasm"]
+# Web servers whose .wasm files are apps, as scheme://host[:port]:
+# origins = ["http://localhost:8080"]
+
+# ── Keys ─────────────────────────────────────────────────────────────────────────────────
+#
+# sig has no default key bindings: nothing is bound until you bind it here. The tab strip,
+# the toolbar and the address bar work without any.
+#
+#   [keys]                                # everywhere
+#   "ctrl-t" = "tab.new"
+#   "ctrl-w" = "tab.close"
+#   "ctrl-tab" = "tab.next"
+#   "ctrl-shift-tab" = "tab.previous"
+#   "ctrl-l" = "location.focus"
+#   "ctrl-+" = "page.zoom-in"
+#   "alt-left" = "page.back"
+#   "ctrl-code:KeyQ" = "browser.quit"     # the key where Q is on a US keyboard
+#
+#   [keys.page]                           # only while the page has focus
+#   "f5" = "page.reload"
+#
+#   [keys.location]                       # only while the address bar has focus
+#   "alt-enter" = "page.open https://example.com"
+#
+# A keystroke is modifiers and a key, joined by "-". Modifiers: ctrl, alt, shift, super and
+# altgr. The key is a character ("t", "+", "å"), a key name (enter, escape, tab, space,
+# backspace, delete, insert, home, end, pageup, pagedown, left, right, up, down, menu, f1 to
+# f24, or a W3C key name such as BrowserBack), or code: and a W3C key code for a physical key
+# ("code:KeyQ", "code:Digit1", "code:BracketLeft").
+#
+# A character is what the key types in your layout: "ctrl-+" is Ctrl and the key that types
+# "+", wherever it is. Shift is part of the character, so Ctrl+Shift+1 is "ctrl-!" on most
+# layouts, while a letter keeps its shift: "ctrl-shift-t" and "ctrl-T" are both Ctrl+Shift+T.
+# AltGr is never Ctrl+Alt. While you type, in the address bar or a text field of a page, a
+# keystroke that types a character (no modifier but shift) types it instead of running its
+# command. Key sequences such as "g g" are not supported.
+#
+# Commands: tab.new, tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last,
+# page.open <url>, page.reload, page.stop, page.back, page.forward, page.zoom-in,
+# page.zoom-out, page.zoom-reset, location.focus, browser.home, browser.quit. Tabs count
+# from 1.
+
+# ── UI ───────────────────────────────────────────────────────────────────────────────────
+#
+# [ui] belongs to the chrome and holds only its colors, each "#rrggbb" or "#rrggbbaa"; leave
+# one out to keep its default:
+#
+#   [ui.colors]
+#   bg = "#0a0a0b"          # window and page background
+#   surface = "#18181b"     # address bar and the home page's card
+#   hover = "#27272a"       # buttons under the pointer
+#   tab = "#27272a"         # the selected tab
+#   border = "#27272a"      # lines between areas
+#   focus = "#d4d4d8"       # border of the focused address bar
+#   text = "#fafafa"
+#   text_muted = "#a1a1aa"  # secondary text and icons
+#   text_dim = "#71717a"    # hints and disabled buttons
+#   selection = "#60a5fa55" # selected text in the address bar
+#   error = "#dc2626"       # error messages

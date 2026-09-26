@@ -15,6 +15,7 @@ use crate::audio_format::{self, AUDIO_FORMAT_UNKNOWN};
 use crate::capabilities::{
     guest_bytes, guest_str, http_get, with, with_started, write_prefix, ConsoleLevel, HostState,
 };
+use crate::engine::Wait;
 
 /// Per-channel audio state: a rodio Player plus metadata.
 struct AudioChannel {
@@ -104,10 +105,14 @@ fn play(state: &HostState, channel: u32, data: Vec<u8>, hint: u32) -> i32 {
     }
 }
 
+/// Largest sound `api_audio_play_url` fetches, in bytes.
+const MAX_AUDIO_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Fetches the sound at `url` and plays it on channel 0. Returns the guest's result code.
 fn play_url(state: &HostState, url: &str) -> i32 {
     state.log(ConsoleLevel::Log, format!("[AUDIO] Fetching {url}"));
-    let (data, content_type) = match http_get(url, audio_format::AUDIO_HTTP_ACCEPT, u64::MAX) {
+    let fetched = http_get(url, audio_format::AUDIO_HTTP_ACCEPT, MAX_AUDIO_BYTES);
+    let (data, content_type) = match fetched {
         Ok(response) => response,
         Err(e) => {
             state.log(ConsoleLevel::Error, format!("[AUDIO] Fetch error: {e}"));
@@ -204,7 +209,11 @@ pub fn register_audio_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "api_audio_play_url",
         |caller: Caller<'_, HostState>, url_ptr: u32, url_len: u32| -> i32 {
             let url = guest_str(&caller, url_ptr, url_len).unwrap_or_default();
-            play_url(caller.data(), &url)
+            let state = caller.data();
+            state
+                .budget
+                .wait(Wait::Host, || play_url(state, &url))
+                .unwrap_or(-1)
         },
     )?;
 

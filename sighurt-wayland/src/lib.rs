@@ -15,6 +15,13 @@
 //! Must not own: tabs, navigation, commands, DOM layout, guest execution or any engine's
 //! rendering. Native presenters cooperate with these rules; a raw Wayland pointer in the same
 //! process is not a security boundary.
+//!
+//! The executable's side is small: [`Host`] (with [`Host::new`], windows, targets, placements,
+//! permits and [`Host::next_event`]), [`TargetLease`] and [`FramePermit`] for presenters,
+//! [`ShmFrame`] for CPU painters, and [`Placement`] for the chrome's layout. The module
+//! documentation of each part states its rules.
+
+#![warn(missing_docs)]
 
 pub mod clipboard;
 pub mod connection;
@@ -26,3 +33,10 @@ pub mod shm;
 pub mod targets;
 pub mod text_input;
 pub mod window;
+
+pub use connection::{Capabilities, Diagnostics, Host, HostError, HostEvent, TargetDiagnostics};
+pub use placement::{InputRegion, Placement, PlacementError, TargetPlacement, RESIZE_GRACE};
+pub use scheduler::PresentStats;
+pub use shm::{rgba_to_argb8888, BufferStats, ShmFrame, BYTES_PER_PIXEL};
+pub use targets::{FramePermit, GlHandles, PresentError, PresentMode, TargetLease};
+pub use window::WindowOptions;

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Summarizes one result set as Markdown: the median and interquartile range of every key
+metric per workload (warmup runs left out), the environment and the anomalies.
+
+  bench/report bench/results/louise/baseline/20260926-180000
+  bench/report --all SET        # every metric, not just the key ones
+"""
+
+import argparse
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from benchlib import results, stats  # noqa: E402
+from benchlib.results import fmt  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("set")
+    ap.add_argument("--all", action="store_true", help="every metric")
+    args = ap.parse_args()
+    data = results.load(args.set)
+    s = data["set"]
+    vals = results.values(data)
+    env = s["environment"]
+
+    print(f"## {s['label']} on {s['host']} ({s['started']})\n")
+    print(f"- Build: {s['build']['description']}")
+    for binary, digest in s["build"]["sha256"].items():
+        size = s["build"].get("bytes", {}).get(binary)
+        print(f"  - `{binary}` sha256 `{digest[:16]}…`" + (f", {size / 2**20:.1f} MiB" if size else ""))
+    if s["build"].get("info"):
+        print(f"  - Revision {s['build']['info'].get('revision')}, {s['build']['info'].get('rustc')}")
+    print(f"- Machine: {env['cpu']} ({env['cpus']} CPUs, governor {', '.join(env['cpu_governor'])}, "
+          f"EPP {', '.join(env['cpu_epp'])}, boost {env['cpu_boost']}), {env['mem_total_mib'] // 1024} GiB, {env['gpu']}")
+    print(f"- Kernel {env['kernel']}, {env['os']}; compositor {env['compositor']}, renderer {s['renderer']}, "
+          f"output {s['size']} at scale 1")
+    print(f"- Harness {s['harness']['revision']} (sha256 `{s['harness']['sha256'][:16]}…`), "
+          f"workloads sha256 `{s['workloads']['sha256'][:16]}…`")
+    runs = [r for r in data["runs"] if not r.get("warmup")]
+    print(f"- {s['rounds']} measured rounds after {s['warmup_rounds']} warmup; {len(runs)} measured runs, "
+          f"{len(s['failures'])} failed; workload order randomized per round (seed {s['seed']})\n")
+
+    renderers = sorted({f"{r['engine']}: {r['mode']} ({r['gl_renderer']})" for run in data["runs"] for r in run.get("renderers", [])})
+    if renderers:
+        print("Engine renderers seen: " + "; ".join(renderers) + "\n")
+
+    workloads = [w for w in s["workloads"]["names"] if w in vals]
+    print("### Overview\n")
+    print("Median (IQR) over the measured runs; – where a build's diagnostics don't give the metric.\n")
+    print("| workload | " + " | ".join(f"`{m}`" for m in results.OVERVIEW) + " |")
+    print("|---" * (len(results.OVERVIEW) + 1) + "|")
+    for workload in workloads:
+        cells = []
+        for metric in results.OVERVIEW:
+            xs = vals[workload].get(metric)
+            cells.append(f"{fmt(stats.median(xs))} ({fmt(stats.iqr(xs))})" if xs else "–")
+        print(f"| {workload} | " + " | ".join(cells) + " |")
+    print()
+
+    metrics = sorted({m for w in workloads for m in vals[w]}) if args.all else results.KEY_METRICS
+    print("Cells below are median [Q1–Q3] over the measured runs.\n")
+    for workload in workloads:
+        print(f"### {workload}\n")
+        print(f"{s['workloads']['definitions'][workload].get('description', '')}\n")
+        print("| metric | median [Q1–Q3] | n |")
+        print("|---|---|---|")
+        for metric in metrics:
+            xs = vals[workload].get(metric)
+            if not xs:
+                continue
+            q1, q3 = stats.quartiles(xs)
+            print(f"| {metric} | {fmt(stats.median(xs))} [{fmt(q1)}–{fmt(q3)}] | {len(xs)} |")
+        print()
+
+    anomalies = [(f"{r['round']}-{r['workload']}", a) for r in data["runs"] for a in r.get("anomalies", [])]
+    if anomalies or s["failures"]:
+        print("### Anomalies\n")
+        for run, a in anomalies:
+            print(f"- {run}: {a}")
+        for f in s["failures"]:
+            print(f"- {f['run']}: failed with status {f['status']}")
+
+
+if __name__ == "__main__":
+    main()

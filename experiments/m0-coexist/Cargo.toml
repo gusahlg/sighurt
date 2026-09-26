@@ -1,0 +1,28 @@
+[package]
+name = "m0-coexist"
+description = "Milestone M0: Servo and Wasmtime initialized and used in one process (docs/rewrite/M0.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+servo.workspace = true
+wasmtime.workspace = true
+url.workspace = true
+# Versions Servo 0.5 itself uses, for its rendering context and GL diagnostics.
+dpi = "0.1"
+gleam = "0.15"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+wat = "1"
+libc = "0.2"
+log = "0.4"
+# The Wasm engine's native dependencies that could clash with Servo's, declared exactly as
+# sighurt-engine-wasm declares them.
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "stream"], default-features = false }
+ffmpeg-next = "8.1.0"
+rodio = "0.22.2"
+cpal = "0.17.3"

@@ -4,13 +4,18 @@
 //! peer-to-peer connections with SDP offer/answer exchange, ICE candidate trickle,
 //! data channel messaging, and media track attachment. A lightweight HTTP-based
 //! signaling client is included for bootstrapping connections.
+//!
+//! What a guest, or a remote peer, can make the host keep is bounded: at most [`MAX_PEERS`]
+//! peers, and per peer [`MAX_CHANNELS`] data channels, [`MAX_PENDING`] tracks and ICE
+//! candidates waiting for the guest, and [`MAX_QUEUED_MESSAGES`] received messages of
+//! [`MAX_QUEUED_BYTES`] together. Past these, a remote peer's channels are closed and its
+//! messages and tracks dropped.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use tokio::runtime::Runtime;
 use wasmtime::{Caller, Linker};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -31,7 +36,18 @@ use webrtc::track::track_local::TrackLocal;
 
 use crate::capabilities::{
     guest_bytes, guest_str, next_handle, with, with_started, write_prefix, ConsoleLevel, HostState,
+    Runtime,
 };
+
+/// Most peers a guest may have.
+pub const MAX_PEERS: usize = 64;
+/// Most data channels one peer may have.
+pub const MAX_CHANNELS: usize = 256;
+/// Most tracks and ICE candidates of one peer waiting for the guest.
+pub const MAX_PENDING: usize = 256;
+/// Most received messages of one peer waiting for the guest, and most bytes of them.
+pub const MAX_QUEUED_MESSAGES: usize = 4096;
+pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Incoming message queued by a data channel's on_message callback.
 struct IncomingMessage {
@@ -57,13 +73,28 @@ struct PendingTrack {
 struct PeerState {
     conn: Arc<RTCPeerConnection>,
     data_channels: Arc<Mutex<HashMap<u32, Arc<RTCDataChannel>>>>,
-    incoming_messages: Arc<Mutex<VecDeque<IncomingMessage>>>,
+    incoming_messages: Arc<Mutex<Incoming>>,
     pending_channels: Arc<Mutex<VecDeque<PendingChannel>>>,
     pending_tracks: Arc<Mutex<VecDeque<PendingTrack>>>,
     ice_candidates: Arc<Mutex<VecDeque<String>>>,
     connection_state: Arc<Mutex<u32>>,
     /// Next id for a data channel (ours or the remote peer's) or track.
     next_channel_id: Arc<AtomicU32>,
+}
+
+/// Received messages the guest hasn't read.
+#[derive(Default)]
+struct Incoming {
+    messages: VecDeque<IncomingMessage>,
+    bytes: usize,
+}
+
+/// Queues `item` unless `queue` holds [`MAX_PENDING`] already.
+fn push_pending<T>(queue: &Mutex<VecDeque<T>>, item: T) {
+    let mut queue = queue.lock().unwrap();
+    if queue.len() < MAX_PENDING {
+        queue.push_back(item);
+    }
 }
 
 /// HTTP-based signaling session for bootstrapping peer connections.
@@ -101,25 +132,27 @@ fn map_connection_state(s: RTCPeerConnectionState) -> u32 {
     }
 }
 
-/// Queues the messages arriving on `dc` for the guest as coming from `channel_id`.
-fn deliver_messages(
-    dc: &RTCDataChannel,
-    channel_id: u32,
-    queue: Arc<Mutex<VecDeque<IncomingMessage>>>,
-) {
+/// Queues the messages arriving on `dc` for the guest as coming from `channel_id`, while
+/// there is room.
+fn deliver_messages(dc: &RTCDataChannel, channel_id: u32, queue: Arc<Mutex<Incoming>>) {
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
-        queue.lock().unwrap().push_back(IncomingMessage {
-            channel_id,
-            is_binary: !msg.is_string,
-            data: msg.data.to_vec(),
-        });
+        let mut queue = queue.lock().unwrap();
+        let bytes = queue.bytes + msg.data.len();
+        if queue.messages.len() < MAX_QUEUED_MESSAGES && bytes <= MAX_QUEUED_BYTES {
+            queue.bytes = bytes;
+            queue.messages.push_back(IncomingMessage {
+                channel_id,
+                is_binary: !msg.is_string,
+                data: msg.data.to_vec(),
+            });
+        }
         Box::pin(async {})
     }));
 }
 
 impl RtcState {
     pub fn new() -> Option<Self> {
-        let runtime = Runtime::new().ok()?;
+        let runtime = Runtime::new()?;
         Some(Self {
             runtime,
             peers: HashMap::new(),
@@ -135,6 +168,7 @@ impl RtcState {
     }
 
     fn create_peer(&mut self, stun_urls: Vec<String>) -> Result<u32> {
+        anyhow::ensure!(self.peers.len() < MAX_PEERS, "{MAX_PEERS} peers open");
         let urls = if stun_urls.is_empty() {
             vec!["stun:stun.l.google.com:19302".to_string()]
         } else {
@@ -179,7 +213,7 @@ impl RtcState {
         conn.on_ice_candidate(Box::new(move |c| {
             if let Some(candidate) = c {
                 if let Ok(json) = serde_json::to_string(&candidate.to_json().unwrap_or_default()) {
-                    ice.lock().unwrap().push_back(json);
+                    push_pending(&ice, json);
                 }
             }
             Box::pin(async {})
@@ -191,13 +225,20 @@ impl RtcState {
         let channels = peer.data_channels.clone();
         let next_id = peer.next_channel_id.clone();
         conn.on_data_channel(Box::new(move |dc| {
+            let mut open = channels.lock().unwrap();
+            if open.len() >= MAX_CHANNELS {
+                drop(open);
+                return Box::pin(async move {
+                    let _ = dc.close().await;
+                });
+            }
             let channel_id = next_id.fetch_add(1, Ordering::Relaxed);
             pending.lock().unwrap().push_back(PendingChannel {
                 channel_id,
                 label: dc.label().to_string(),
             });
             deliver_messages(&dc, channel_id, messages.clone());
-            channels.lock().unwrap().insert(channel_id, dc);
+            open.insert(channel_id, dc);
             Box::pin(async {})
         }));
 
@@ -208,11 +249,12 @@ impl RtcState {
                 webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video => 1,
                 _ => 2,
             };
-            tracks.lock().unwrap().push_back(PendingTrack {
+            let track = PendingTrack {
                 kind,
                 id: track.id().to_string(),
                 stream_id: track.stream_id().to_string(),
-            });
+            };
+            push_pending(&tracks, track);
             Box::pin(async {})
         }));
 
@@ -280,6 +322,8 @@ impl RtcState {
 
     fn create_data_channel(&self, peer_id: u32, label: &str, ordered: bool) -> Result<u32> {
         let peer = self.peer(peer_id)?;
+        let open = peer.data_channels.lock().unwrap().len();
+        anyhow::ensure!(open < MAX_CHANNELS, "{MAX_CHANNELS} data channels open");
         let options = (!ordered).then(|| RTCDataChannelInit {
             ordered: Some(false),
             ..Default::default()
@@ -317,9 +361,12 @@ impl RtcState {
         let peer = self.peers.get(&peer_id)?;
         let mut queue = peer.incoming_messages.lock().unwrap();
         let pos = queue
+            .messages
             .iter()
             .position(|m| channel_id == 0 || m.channel_id == channel_id)?;
-        queue.remove(pos)
+        let message = queue.messages.remove(pos)?;
+        queue.bytes -= message.data.len();
+        Some(message)
     }
 
     fn poll_new_channel(&self, peer_id: u32) -> Option<PendingChannel> {
@@ -736,4 +783,31 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_guest_has_a_bounded_number_of_peers() {
+        let mut rtc = RtcState::new().unwrap();
+        // Peers that are never connected: creating one touches no network.
+        let stun = || vec!["stun:127.0.0.1:1".to_string()];
+        for _ in 0..MAX_PEERS {
+            rtc.create_peer(stun()).unwrap();
+        }
+        assert!(rtc.create_peer(stun()).is_err());
+        assert!(rtc.close_peer(1));
+        rtc.create_peer(stun()).unwrap();
+    }
+
+    #[test]
+    fn pending_queues_are_bounded() {
+        let queue = Mutex::new(VecDeque::new());
+        for i in 0..MAX_PENDING + 10 {
+            push_pending(&queue, i);
+        }
+        assert_eq!(queue.lock().unwrap().len(), MAX_PENDING);
+    }
 }

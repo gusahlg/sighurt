@@ -1,151 +1,136 @@
-//! Turns a guest's canvas into [`sighurt_ipc`] draw lists.
+//! The display list: what a guest's canvas looks like, as the rasterizer paints it.
 //!
-//! [`convert`] maps canvas commands to [`DrawOp`]s: the translation, opacity and page zoom are
-//! baked into coordinates and colors, clips become [`DrawOp::PushClip`] / [`DrawOp::PopClip`]
-//! pairs, and the shapes the protocol has no op for are built from the ones it has. [`Presenter`]
-//! sends a page's draw lists and images to the browser, and only what changed.
+//! [`display_list`] turns a frame's canvas commands into [`DrawOp`]s with [`convert`], bounds
+//! them with [`bound`] and keeps the result only when it differs from the previous frame's, so a
+//! guest that redraws the same picture every frame asks for no new presentation. Coordinates
+//! stay in canvas pixels: zoom and the display scale are the rasterizer's business.
+//!
+//! [`convert`] bakes the translation and opacity into coordinates and colors, turns clips into
+//! [`DrawOp::PushClip`] / [`DrawOp::PopClip`] pairs, and builds the shapes the list has no op
+//! for from the ones it has. [`bound`] applies the limits the pre-rewrite browser applied to
+//! every draw list an engine sent it (`gpui-baseline:sighurt-core/src/page.rs`).
+//!
+//! Owns: the draw-op vocabulary, which is this engine's private type. Must not own: pixels.
 
 use std::sync::Arc;
 
-use sighurt_engine_wasm::capabilities::{
-    CanvasState, DecodedImage, DrawCommand, GradientStop, Rgba,
+use tiny_skia::Pixmap;
+
+use crate::capabilities::{
+    clamp, CanvasState, DecodedImage, DrawCommand, GradientStop, Rgba, MAX_IMAGE_SIDE,
 };
-use sighurt_ipc::{DrawOp, FromEngine};
+use crate::raster;
 
 /// How far, in pixels, a flattened curve may stray from the true one.
 const TOLERANCE: f32 = 0.25;
+/// Most operations in one list, and most path points; the rest is cut.
+pub const MAX_OPS: usize = 200_000;
+pub const MAX_POINTS: usize = 1_000_000;
+/// Largest coordinate or size in a list, in canvas pixels.
+pub const MAX_COORD: f32 = 1e6;
+/// Largest font size in a list. Glyphs are rasterized at this size times the zoom and scale.
+pub const MAX_FONT_SIZE: f32 = 512.0;
+/// Deepest nesting of clips; deeper clips are dropped, with what they clip still drawn under
+/// the clip around them.
+pub const MAX_CLIP_DEPTH: usize = 16;
 
-/// Sends a page's draw lists, uploading each image once.
-#[derive(Default)]
-pub struct Presenter {
-    /// The draw list last sent.
-    ops: Vec<DrawOp>,
-    /// Where the next list is built, to reuse its allocation.
-    scratch: Vec<DrawOp>,
-    /// What `ops` was built from: the canvas commands, zoom and overlay. Most frames of a page
-    /// that isn't animating draw exactly what the one before drew; comparing these finds that
-    /// without building the list. The commands are only kept once a frame repeated the list
-    /// before it, so that an animating page doesn't pay for copying them every frame.
-    commands: Option<Vec<DrawCommand>>,
-    zoom: f32,
-    overlay: Vec<DrawOp>,
-    /// The images of the canvas generation last presented, by canvas index. Kept so that
-    /// images a cleared canvas draws again keep their ids instead of being sent again.
-    images: Vec<Image>,
-    generation: Option<u64>,
-    next_id: u32,
+/// One step of a display list. Coordinates are canvas pixels from the page's top-left corner;
+/// colors are `0xRRGGBBAA`, not premultiplied.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DrawOp {
+    /// Fills the whole page (within the current clip).
+    Clear {
+        color: u32,
+    },
+    /// A filled rectangle. `radius` rounds its corners; a square with `radius = w / 2` is a
+    /// circle.
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        color: u32,
+    },
+    /// A polyline stroked `width` wide, or a filled polygon when `width` is 0.
+    Path {
+        points: Vec<(f32, f32)>,
+        width: f32,
+        color: u32,
+    },
+    /// One line of text. The line box is `size * 1.2` tall with its top at `y`; `x` is its left
+    /// edge, centre or right edge for `align` 0, 1 or 2. An empty `family` means the default
+    /// font; `weight` is CSS-style (400 normal, 700 bold).
+    Text {
+        x: f32,
+        y: f32,
+        size: f32,
+        color: u32,
+        family: String,
+        weight: u16,
+        italic: bool,
+        align: u8,
+        text: String,
+    },
+    /// Image `id` of the list's images, scaled into the rectangle.
+    Image {
+        id: u32,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    /// Clips the following operations to the rectangle, intersected with the current clip,
+    /// until the matching [`DrawOp::PopClip`].
+    PushClip {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    PopClip,
 }
 
-/// An image the browser has.
-struct Image {
-    id: u32,
-    image: Arc<DecodedImage>,
+/// A frame of a guest: its ops, the images they draw, and the canvas size it was drawn for.
+#[derive(Debug, PartialEq)]
+pub struct DisplayList {
+    /// The canvas size, in canvas pixels, the guest saw when it drew this.
+    pub size: (u32, u32),
+    pub ops: Vec<DrawOp>,
+    /// [`DrawOp::Image`] ids index this.
+    pub images: Vec<Arc<DecodedImage>>,
+    /// `images` converted for painting ([`raster::convert_images`]); `None` for one that can't
+    /// be painted.
+    pub pixmaps: Vec<Option<Arc<Pixmap>>>,
 }
 
-impl Presenter {
-    /// Forgets which canvas was presented, for a new document. Its images are reused or dropped
-    /// at the next [`present`](Self::present).
-    pub fn reset(&mut self) {
-        self.generation = None;
-    }
-
-    /// Sends `canvas`, zoomed by `zoom`, followed by `overlay` (unzoomed): first the images the
-    /// browser doesn't have yet, then the draw list if it changed, then drops for the images it
-    /// no longer uses.
-    pub fn present(
-        &mut self,
-        canvas: &CanvasState,
-        zoom: f32,
-        overlay: &[DrawOp],
-        send: &mut impl FnMut(&FromEngine),
-    ) {
-        let (retired, remapped) = self.sync_images(canvas, send);
-        let unchanged = !remapped
-            && zoom == self.zoom
-            && overlay == self.overlay
-            && self.commands.as_ref() == Some(&canvas.commands);
-        if !unchanged {
-            let mut ops = std::mem::take(&mut self.scratch);
-            ops.clear();
-            let image_id = |index: usize| self.images.get(index).map(|image| image.id);
-            convert(&canvas.commands, image_id, zoom, &mut ops);
-            ops.extend_from_slice(overlay);
-            if ops == self.ops {
-                self.scratch = ops;
-                self.commands = Some(canvas.commands.clone());
-            } else {
-                let msg = FromEngine::Draw { ops };
-                send(&msg);
-                if let FromEngine::Draw { ops } = msg {
-                    self.scratch = std::mem::replace(&mut self.ops, ops);
-                }
-                self.commands = None;
-            }
-            self.zoom = zoom;
-            self.overlay.clear();
-            self.overlay.extend_from_slice(overlay);
-        }
-        for id in retired {
-            send(&FromEngine::DropImage { id });
-        }
-    }
-
-    /// Uploads the images of `canvas` the browser doesn't have. Returns the ids of those it no
-    /// longer needs, to drop once a draw list without them is out, and whether a canvas image
-    /// index now stands for a different id.
-    fn sync_images(
-        &mut self,
-        canvas: &CanvasState,
-        send: &mut impl FnMut(&FromEngine),
-    ) -> (Vec<u32>, bool) {
-        if self.generation == Some(canvas.generation) {
-            // Images are only appended within a generation.
-            for image in canvas.images.iter().skip(self.images.len()) {
-                let uploaded = self.upload(image, send);
-                self.images.push(uploaded);
-            }
-            return (Vec::new(), false);
-        }
-        // The canvas was cleared: images it draws again keep their ids, the rest are retired.
-        self.generation = Some(canvas.generation);
-        let mut old: Vec<Option<Image>> = self.images.drain(..).map(Some).collect();
-        let mut remapped = false;
-        for (index, image) in canvas.images.iter().enumerate() {
-            let kept = old.iter_mut().enumerate().find(|(_, old)| {
-                old.as_ref()
-                    .is_some_and(|old| Arc::ptr_eq(&old.image, image) || *old.image == **image)
-            });
-            let image = match kept {
-                Some((old_index, kept)) => {
-                    remapped |= old_index != index;
-                    kept.take().unwrap()
-                }
-                None => {
-                    remapped = true;
-                    self.upload(image, send)
-                }
-            };
-            self.images.push(image);
-        }
-        (
-            old.into_iter().flatten().map(|image| image.id).collect(),
-            remapped,
-        )
-    }
-
-    fn upload(&mut self, image: &Arc<DecodedImage>, send: &mut impl FnMut(&FromEngine)) -> Image {
-        self.next_id = self.next_id.wrapping_add(1);
-        send(&FromEngine::Image {
-            id: self.next_id,
-            width: image.width,
-            height: image.height,
-            rgba: image.pixels.clone(),
-        });
-        Image {
-            id: self.next_id,
-            image: image.clone(),
-        }
-    }
+/// The display list of `canvas`, ready to paint, or `None` when it is the same as `previous`.
+pub fn display_list(canvas: &CanvasState, previous: Option<&DisplayList>) -> Option<DisplayList> {
+    let mut ops = Vec::new();
+    let images = canvas.images.len();
+    convert(
+        &canvas.commands,
+        |index| (index < images).then_some(index as u32),
+        &mut ops,
+    );
+    bound(&mut ops, &canvas.images);
+    let size = (canvas.width, canvas.height);
+    let unchanged = previous.is_some_and(|previous| {
+        previous.size == size
+            && previous.ops == ops
+            && previous.images.len() == images
+            && previous
+                .images
+                .iter()
+                .zip(&canvas.images)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+    });
+    (!unchanged).then(|| DisplayList {
+        size,
+        ops,
+        images: canvas.images.clone(),
+        pixmaps: raster::convert_images(&canvas.images, previous),
+    })
 }
 
 /// The transform, opacity and clip depth that apply to a command.
@@ -155,17 +140,16 @@ struct State {
     dy: f32,
     opacity: f32,
     clips: usize,
-    zoom: f32,
 }
 
 impl State {
     fn point(&self, x: f32, y: f32) -> (f32, f32) {
-        ((x + self.dx) * self.zoom, (y + self.dy) * self.zoom)
+        (x + self.dx, y + self.dy)
     }
 
     fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> [f32; 4] {
         let (x, y) = self.point(x, y);
-        [x, y, w * self.zoom, h * self.zoom]
+        [x, y, w, h]
     }
 
     fn color(&self, [r, g, b, a]: Rgba) -> u32 {
@@ -174,14 +158,13 @@ impl State {
     }
 }
 
-/// Appends the draw ops for `commands`, scaled by `zoom`, to `ops`. `image_id` maps canvas
-/// image indices to protocol image ids.
+/// Appends the draw ops for `commands` to `ops`. `image_id` maps canvas image indices to the
+/// list's image ids.
 ///
 /// Transforms apply only their translation, and clips stay axis-aligned rectangles.
 pub fn convert(
     commands: &[DrawCommand],
     image_id: impl Fn(usize) -> Option<u32>,
-    zoom: f32,
     ops: &mut Vec<DrawOp>,
 ) {
     let mut state = State {
@@ -189,7 +172,6 @@ pub fn convert(
         dy: 0.0,
         opacity: 1.0,
         clips: 0,
-        zoom,
     };
     let mut saved = Vec::new();
     for command in commands {
@@ -242,7 +224,7 @@ pub fn convert(
                     y,
                     w,
                     h,
-                    radius: (radius * zoom).min(w.min(h) / 2.0).max(0.0),
+                    radius: radius.min(w.min(h) / 2.0).max(0.0),
                     color: state.color(color),
                 });
             }
@@ -253,7 +235,7 @@ pub fn convert(
                 color,
             } => {
                 let (cx, cy) = state.point(cx, cy);
-                let radius = (radius * zoom).abs();
+                let radius = radius.abs();
                 ops.push(DrawOp::Rect {
                     x: cx - radius,
                     y: cy - radius,
@@ -272,7 +254,7 @@ pub fn convert(
                 thickness,
             } => ops.push(DrawOp::Path {
                 points: vec![state.point(x1, y1), state.point(x2, y2)],
-                width: thickness * zoom,
+                width: thickness,
                 color: state.color(color),
             }),
             DrawCommand::Arc {
@@ -285,7 +267,6 @@ pub fn convert(
                 thickness,
             } => {
                 let (cx, cy) = state.point(cx, cy);
-                let radius = radius * zoom;
                 let sweep = end_angle - start_angle;
                 // A chord spanning angle θ strays r·θ²/8 from its arc.
                 let n = segments(sweep.abs() * (radius.abs() / (8.0 * TOLERANCE)).sqrt());
@@ -297,7 +278,7 @@ pub fn convert(
                     .collect();
                 ops.push(DrawOp::Path {
                     points,
-                    width: thickness * zoom,
+                    width: thickness,
                     color: state.color(color),
                 });
             }
@@ -337,7 +318,7 @@ pub fn convert(
                     .collect();
                 ops.push(DrawOp::Path {
                     points,
-                    width: thickness * zoom,
+                    width: thickness,
                     color: state.color(color),
                 });
             }
@@ -364,7 +345,7 @@ pub fn convert(
                 ops.push(DrawOp::Text {
                     x,
                     y,
-                    size: size * zoom,
+                    size,
                     color: state.color(color),
                     family: String::new(),
                     weight: 400,
@@ -388,7 +369,7 @@ pub fn convert(
                 ops.push(DrawOp::Text {
                     x,
                     y,
-                    size: size * zoom,
+                    size,
                     color: state.color(color),
                     family: family.clone(),
                     weight,
@@ -417,7 +398,7 @@ pub fn convert(
                 let color = |t: f32| state.color(sample(stops, t));
                 let from = state.point(ax, ay);
                 if kind == 1 {
-                    radial_gradient(ops, rect, from, (by * zoom).abs(), color);
+                    radial_gradient(ops, rect, from, by.abs(), color);
                 } else {
                     linear_gradient(ops, rect, from, state.point(bx, by), color);
                 }
@@ -475,8 +456,9 @@ fn linear_gradient(
         let hi = if i + 1 == n {
             f32::INFINITY
         } else if band_color(i + 1) & 0xff == 0xff {
-            // Reach half a pixel under the next strip, which covers it, so no seam shows.
-            (i + 1) as f32 / n as f32 + 0.5 / len2.sqrt()
+            // Reach a pixel under the next strip, which covers it, so no seam shows where
+            // the anti-aliased edges of the two meet.
+            (i + 1) as f32 / n as f32 + 1.0 / len2.sqrt()
         } else {
             (i + 1) as f32 / n as f32
         };
@@ -580,13 +562,79 @@ fn sample(stops: &[GradientStop], t: f32) -> Rgba {
     })
 }
 
+/// Cuts a list to [`MAX_OPS`] operations and [`MAX_POINTS`] path points, so that one list
+/// cannot keep the rasterizer busy for arbitrarily long, and cuts text to
+/// [`MAX_TEXT`](crate::capabilities::MAX_TEXT) bytes. Drops the operations with a coordinate
+/// beyond [`MAX_COORD`] (NaN and infinities included), text that can't be painted, images that
+/// aren't in `images` or have a side of 0 or over [`MAX_IMAGE_SIDE`], and clips nested deeper
+/// than [`MAX_CLIP_DEPTH`], together with their [`DrawOp::PopClip`]. Runs once per list, on the
+/// worker that built it, so painting it needs no checks.
+pub fn bound(ops: &mut Vec<DrawOp>, images: &[Arc<DecodedImage>]) {
+    let mut points = 0;
+    let too_many = ops.iter().take(MAX_OPS).position(|op| {
+        if let DrawOp::Path { points: p, .. } = op {
+            points += p.len();
+        }
+        points > MAX_POINTS
+    });
+    ops.truncate(too_many.unwrap_or(MAX_OPS));
+    // Whether each open clip was kept, innermost last, and how many were.
+    let mut clips: Vec<bool> = Vec::new();
+    let mut depth = 0;
+    ops.retain_mut(|op| {
+        if let DrawOp::Text { text, .. } = op {
+            *text = clamp(std::mem::take(text));
+        }
+        match op {
+            DrawOp::PushClip { .. } => {
+                let keep = in_range(op) && depth < MAX_CLIP_DEPTH;
+                depth += usize::from(keep);
+                clips.push(keep);
+                keep
+            }
+            DrawOp::PopClip => {
+                let kept = clips.pop().unwrap_or(false);
+                depth -= usize::from(kept);
+                kept
+            }
+            DrawOp::Image { id, .. } => {
+                let side = 1..=MAX_IMAGE_SIDE;
+                let exists = images.get(*id as usize).is_some_and(|image| {
+                    side.contains(&image.width) && side.contains(&image.height)
+                });
+                exists && in_range(op)
+            }
+            _ => in_range(op),
+        }
+    });
+}
+
+/// Whether every coordinate and size in `op` is a number within [`MAX_COORD`], and text has
+/// something to show at a font size within [`MAX_FONT_SIZE`].
+fn in_range(op: &DrawOp) -> bool {
+    let ok = |values: &[f32]| values.iter().all(|v| v.abs() <= MAX_COORD);
+    match op {
+        DrawOp::Clear { .. } | DrawOp::PopClip => true,
+        DrawOp::Rect {
+            x, y, w, h, radius, ..
+        } => ok(&[*x, *y, *w, *h, *radius]),
+        DrawOp::Path { points, width, .. } => {
+            ok(&[*width]) && points.iter().all(|&(x, y)| ok(&[x, y]))
+        }
+        DrawOp::Text {
+            x, y, size, text, ..
+        } => ok(&[*x, *y]) && *size > 0.0 && *size <= MAX_FONT_SIZE && !text.is_empty(),
+        DrawOp::Image { x, y, w, h, .. } | DrawOp::PushClip { x, y, w, h } => ok(&[*x, *y, *w, *h]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ops(commands: &[DrawCommand], zoom: f32) -> Vec<DrawOp> {
+    fn ops(commands: &[DrawCommand]) -> Vec<DrawOp> {
         let mut ops = Vec::new();
-        convert(commands, |i| Some(i as u32 + 100), zoom, &mut ops);
+        convert(commands, |i| Some(i as u32 + 100), &mut ops);
         ops
     }
 
@@ -608,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn translation_opacity_and_zoom_are_baked_in() {
+    fn translation_and_opacity_are_baked_in() {
         let commands = [
             DrawCommand::Clear {
                 color: [0x11, 0x22, 0x33, 0xff],
@@ -629,22 +677,22 @@ mod tests {
         ];
         let red = |a: u32| 0xff00_0000 | a;
         assert_eq!(
-            ops(&commands, 2.0),
+            ops(&commands),
             [
                 DrawOp::Clear { color: 0x112233ff },
                 DrawOp::Rect {
-                    x: 20.0,
-                    y: 10.0,
-                    w: 20.0,
-                    h: 20.0,
+                    x: 10.0,
+                    y: 5.0,
+                    w: 10.0,
+                    h: 10.0,
                     radius: 0.0,
                     color: red(128),
                 },
                 DrawOp::Rect {
-                    x: 2.0,
-                    y: 2.0,
-                    w: 4.0,
-                    h: 4.0,
+                    x: 1.0,
+                    y: 1.0,
+                    w: 2.0,
+                    h: 2.0,
                     radius: 0.0,
                     color: red(255),
                 },
@@ -668,7 +716,7 @@ mod tests {
             DrawCommand::Restore,
             clip(3.0),
         ];
-        let kinds: Vec<_> = ops(&commands, 1.0)
+        let kinds: Vec<_> = ops(&commands)
             .into_iter()
             .map(|op| match op {
                 DrawOp::PushClip { x, .. } => format!("push {x}"),
@@ -701,23 +749,23 @@ mod tests {
             },
         ];
         assert_eq!(
-            ops(&commands, 2.0),
+            ops(&commands),
             [
                 DrawOp::Rect {
-                    x: 10.0,
-                    y: 30.0,
-                    w: 20.0,
-                    h: 20.0,
-                    radius: 10.0,
+                    x: 5.0,
+                    y: 15.0,
+                    w: 10.0,
+                    h: 10.0,
+                    radius: 5.0,
                     color: 0xff,
                 },
                 // The radius is clamped to half the shorter side.
                 DrawOp::Rect {
                     x: 0.0,
                     y: 0.0,
-                    w: 20.0,
-                    h: 8.0,
-                    radius: 4.0,
+                    w: 10.0,
+                    h: 4.0,
+                    radius: 2.0,
                     color: 0xff,
                 },
             ]
@@ -735,7 +783,7 @@ mod tests {
             color: [0, 0, 0, 255],
             thickness: 2.0,
         }];
-        let ops = ops(&commands, 1.0);
+        let ops = ops(&commands);
         let [DrawOp::Path { points, width, .. }] = &ops[..] else {
             panic!("expected one path");
         };
@@ -768,7 +816,7 @@ mod tests {
         };
 
         // Vertical: rectangles covering the whole rectangle, from black to white.
-        let bands = ops(&[gradient(10.0, 220.0)], 1.0);
+        let bands = ops(&[gradient(10.0, 220.0)]);
         assert_eq!(bands.len(), 48);
         let mut last_bottom = 20.0;
         let mut last_shade = 0;
@@ -790,7 +838,7 @@ mod tests {
         assert!(last_shade > 250);
 
         // Diagonal: polygons inside the rectangle.
-        for band in ops(&[gradient(110.0, 220.0)], 1.0) {
+        for band in ops(&[gradient(110.0, 220.0)]) {
             let DrawOp::Path { points, width, .. } = band else {
                 panic!("expected a polygon, got {band:?}");
             };
@@ -817,7 +865,7 @@ mod tests {
             by: 20.0,
             stops: vec![stop(0.0, 255), stop(1.0, 0)],
         }];
-        let ops = ops(&commands, 1.0);
+        let ops = ops(&commands);
         assert!(matches!(
             ops[0],
             DrawOp::PushClip {
@@ -859,11 +907,11 @@ mod tests {
             text: "Hi".into(),
         }];
         assert_eq!(
-            ops(&commands, 1.5),
+            ops(&commands),
             [DrawOp::Text {
-                x: 150.0,
-                y: 15.0,
-                size: 18.0,
+                x: 100.0,
+                y: 10.0,
+                size: 12.0,
                 color: 0x010203ff,
                 family: "Georgia".into(),
                 weight: 700,
@@ -874,94 +922,145 @@ mod tests {
         );
     }
 
-    fn canvas(generation: u64, images: Vec<Arc<DecodedImage>>) -> CanvasState {
-        let mut canvas = CanvasState::default();
-        canvas.generation = generation;
-        for image in images {
-            canvas.push_image(image, 0.0, 0.0, 1.0, 1.0);
-        }
-        canvas
-    }
-
-    fn image(v: u8) -> Arc<DecodedImage> {
+    fn image(v: u8, side: u32) -> Arc<DecodedImage> {
         Arc::new(DecodedImage {
-            width: 1,
+            width: side,
             height: 1,
-            pixels: vec![v; 4],
+            pixels: vec![v; 4 * side as usize],
         })
     }
 
-    /// The messages one present sends, as short descriptions.
-    fn present(presenter: &mut Presenter, canvas: &CanvasState) -> Vec<String> {
-        let mut sent = Vec::new();
-        presenter.present(canvas, 1.0, &[], &mut |msg| {
-            sent.push(match msg {
-                FromEngine::Image { id, .. } => format!("image {id}"),
-                FromEngine::DropImage { id } => format!("drop {id}"),
-                FromEngine::Draw { ops } => {
-                    let ids: Vec<_> = ops
-                        .iter()
-                        .map(|op| match op {
-                            DrawOp::Image { id, .. } => id.to_string(),
-                            _ => "?".into(),
-                        })
-                        .collect();
-                    format!("draw {}", ids.join(" "))
-                }
-                other => format!("{other:?}"),
-            })
-        });
-        sent
-    }
-
     #[test]
-    fn images_are_uploaded_once_and_dropped_when_unused() {
-        let mut presenter = Presenter::default();
-        assert_eq!(
-            present(&mut presenter, &canvas(1, vec![image(1)])),
-            ["image 1", "draw 1"]
-        );
-        // Nothing changed.
-        assert!(present(&mut presenter, &canvas(1, vec![image(1)])).is_empty());
-        // An image appended within the generation.
-        assert_eq!(
-            present(&mut presenter, &canvas(1, vec![image(1), image(2)])),
-            ["image 2", "draw 1 2"]
-        );
-        // Cleared and redrawn with the same pixels (in another order): nothing to send.
-        assert_eq!(
-            present(&mut presenter, &canvas(2, vec![image(2), image(1)])),
-            ["draw 2 1"]
-        );
-        // Cleared and redrawn with a new image: the unused one is dropped after the draw list.
-        assert_eq!(
-            present(&mut presenter, &canvas(3, vec![image(1), image(3)])),
-            ["image 3", "draw 1 3", "drop 2"]
-        );
-        // A new document whose canvas starts at the same generation number.
-        presenter.reset();
-        assert_eq!(
-            present(&mut presenter, &canvas(3, vec![image(4)])),
-            ["image 4", "draw 4", "drop 1", "drop 3"]
-        );
-    }
-
-    #[test]
-    fn the_list_is_sent_when_its_commands_zoom_or_overlay_change() {
-        let mut presenter = Presenter::default();
+    fn a_list_is_made_only_when_the_frame_changed() {
         let mut canvas = CanvasState::default();
         canvas.push(rect(0.0, 0.0, 1.0, 1.0, 255));
-        let mut sent = 0;
-        let mut present = |presenter: &mut Presenter, canvas: &CanvasState, zoom, overlay| {
-            presenter.present(canvas, zoom, overlay, &mut |_| sent += 1);
+        let first = display_list(&canvas, None).unwrap();
+        assert_eq!(first.size, (800, 600));
+        // Cleared and drawn again the same way: nothing new.
+        canvas.clear();
+        canvas.push(rect(0.0, 0.0, 1.0, 1.0, 255));
+        assert_eq!(display_list(&canvas, Some(&first)), None);
+        // Another size, another image or another op is new.
+        canvas.width = 400;
+        let resized = display_list(&canvas, Some(&first)).unwrap();
+        assert_eq!(resized.ops, first.ops);
+        canvas.push_image(image(1, 1), 0.0, 0.0, 1.0, 1.0);
+        let with_image = display_list(&canvas, Some(&resized)).unwrap();
+        canvas.clear();
+        canvas.push(rect(0.0, 0.0, 1.0, 1.0, 255));
+        canvas.push_image(image(1, 1), 0.0, 0.0, 1.0, 1.0);
+        assert!(
+            display_list(&canvas, Some(&with_image)).is_some(),
+            "a new image"
+        );
+    }
+
+    fn text(size: f32, text: &str) -> DrawOp {
+        DrawOp::Text {
+            x: 0.0,
+            y: 0.0,
+            size,
+            color: 0xff,
+            family: String::new(),
+            weight: 400,
+            italic: false,
+            align: 0,
+            text: text.into(),
+        }
+    }
+
+    fn plain_rect(x: f32) -> DrawOp {
+        DrawOp::Rect {
+            x,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            radius: 0.0,
+            color: 0xff,
+        }
+    }
+
+    #[test]
+    fn bound_drops_what_cannot_be_painted() {
+        let clip = |x| DrawOp::PushClip {
+            x,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
         };
-        present(&mut presenter, &canvas, 1.0, &[]);
-        present(&mut presenter, &canvas, 1.0, &[]);
-        present(&mut presenter, &canvas, 2.0, &[]);
-        present(&mut presenter, &canvas, 2.0, &[DrawOp::PopClip]);
-        canvas.push(rect(1.0, 0.0, 1.0, 1.0, 255));
-        present(&mut presenter, &canvas, 2.0, &[DrawOp::PopClip]);
-        present(&mut presenter, &canvas, 2.0, &[DrawOp::PopClip]);
-        assert_eq!(sent, 4);
+        let draw_image = |id| DrawOp::Image {
+            id,
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        };
+        let mut ops = vec![
+            plain_rect(f32::NAN),
+            plain_rect(f32::INFINITY),
+            plain_rect(2e6),
+            plain_rect(1.0),
+            text(0.0, "a"),
+            text(MAX_FONT_SIZE + 1.0, "a"),
+            text(12.0, ""),
+            text(12.0, &"x".repeat(crate::capabilities::MAX_TEXT + 10)),
+            // A clip out of range goes with its pop; what it clipped stays.
+            clip(f32::NAN),
+            plain_rect(2.0),
+            DrawOp::PopClip,
+            DrawOp::PopClip,
+            draw_image(0),
+            draw_image(1),
+            draw_image(2),
+            DrawOp::Path {
+                points: vec![(0.0, 0.0), (f32::NAN, 1.0)],
+                width: 1.0,
+                color: 0xff,
+            },
+        ];
+        bound(&mut ops, &[image(1, 1), image(1, MAX_IMAGE_SIDE + 1)]);
+        let DrawOp::Text { text: cut, .. } = &ops[1] else {
+            panic!("expected the long text, got {:?}", ops[1]);
+        };
+        assert_eq!(cut.len(), crate::capabilities::MAX_TEXT);
+        assert_eq!(ops[0], plain_rect(1.0));
+        assert_eq!(ops[2], plain_rect(2.0));
+        assert_eq!(ops[3], draw_image(0));
+        assert_eq!(ops.len(), 4);
+    }
+
+    #[test]
+    fn bound_cuts_long_lists_and_deep_clips() {
+        let mut ops = vec![plain_rect(0.0); MAX_OPS + 5];
+        bound(&mut ops, &[]);
+        assert_eq!(ops.len(), MAX_OPS);
+
+        let path = DrawOp::Path {
+            points: vec![(0.0, 0.0); MAX_POINTS / 2],
+            width: 1.0,
+            color: 0xff,
+        };
+        let mut ops = vec![path.clone(), path.clone(), path];
+        bound(&mut ops, &[]);
+        assert_eq!(ops.len(), 2);
+
+        let clip = DrawOp::PushClip {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        };
+        let deep = MAX_CLIP_DEPTH + 3;
+        let mut ops = vec![clip; deep];
+        ops.push(plain_rect(0.0));
+        ops.extend(std::iter::repeat_n(DrawOp::PopClip, deep));
+        bound(&mut ops, &[]);
+        let pushes = ops
+            .iter()
+            .filter(|op| matches!(op, DrawOp::PushClip { .. }))
+            .count();
+        let pops = ops.iter().filter(|op| **op == DrawOp::PopClip).count();
+        assert_eq!((pushes, pops), (MAX_CLIP_DEPTH, MAX_CLIP_DEPTH));
+        assert!(ops.contains(&plain_rect(0.0)));
     }
 }

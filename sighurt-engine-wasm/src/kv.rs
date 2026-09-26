@@ -1,7 +1,7 @@
 //! The persistent key-value store behind `api_kv_store_*`.
 //!
-//! Every page runs in its own `sig-wasm` process, so the store must work with any number of
-//! processes using it at once, without locks. Each origin gets a directory and each key a file
+//! Any number of views, on the runtime's worker threads, and any number of `sig` processes use
+//! the store at once, so it works without locks. Each origin gets a directory and each key a file
 //! holding the raw value, both named by a SHA-256 hash (so any key is a valid file name and
 //! origins cannot reach each other's files). Writes go to a temporary file that is then renamed
 //! over the old value, which is atomic: readers see the old value or the new one, never a torn
@@ -93,7 +93,8 @@ impl KvStore {
     }
 }
 
-/// `{data_dir}/sighurt/wasm/kv`.
+/// `{data_dir}/sighurt/wasm/kv`: where `sig` keeps the store (see
+/// [`WasmConfig::kv_root`](crate::engine::WasmConfig::kv_root)).
 pub fn default_root() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))

@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Compares two result sets, A (before) and B (after), metric by metric and workload by
+workload: medians, interquartile ranges, the relative change of the median and a two-sided
+Mann–Whitney U p-value, with Benjamini–Hochberg q-values over everything compared.
+
+A change is reported only if p < --alpha AND the medians differ by more than the larger of the
+two IQRs; everything else is "noise". Metrics where lower is better are labelled better/worse;
+the rest (frame counts and rates) higher/lower.
+
+  bench/compare bench/results/louise/baseline/<ts> bench/results/louise/rewrite/<ts>
+  bench/compare --all --workloads article,webgl A B
+"""
+
+import argparse
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from benchlib import results, stats  # noqa: E402
+from benchlib.results import fmt  # noqa: E402
+
+
+def environment_differences(a, b):
+    ea, eb = a["set"]["environment"], b["set"]["environment"]
+    diffs = [f"{k}: {ea.get(k)!r} → {eb.get(k)!r}" for k in sorted(set(ea) | set(eb))
+             if k not in ("gpu_processes",) and ea.get(k) != eb.get(k)]
+    for key in ("renderer", "size"):
+        if a["set"].get(key) != b["set"].get(key):
+            diffs.append(f"{key}: {a['set'].get(key)!r} → {b['set'].get(key)!r}")
+    if a["set"]["workloads"]["sha256"] != b["set"]["workloads"]["sha256"]:
+        diffs.append("WORKLOAD FILES DIFFER: the sets did not run the same workloads")
+    if a["set"]["harness"]["sha256"] != b["set"]["harness"]["sha256"]:
+        diffs.append(f"harness: {a['set']['harness']['revision']} → {b['set']['harness']['revision']} (check that the metrics mean the same)")
+    return diffs
+
+
+def compare(va, vb, metrics_filter, workloads, alpha):
+    rows = []
+    for workload in workloads:
+        ma, mb = va.get(workload, {}), vb.get(workload, {})
+        for metric in metrics_filter(sorted(set(ma) & set(mb))):
+            xa, xb = ma[metric], mb[metric]
+            if len(xa) < 2 or len(xb) < 2:
+                continue
+            med_a, med_b = stats.median(xa), stats.median(xb)
+            iqr_a, iqr_b = stats.iqr(xa), stats.iqr(xb)
+            _, p = stats.mann_whitney(xa, xb)
+            rows.append({
+                "workload": workload, "metric": metric, "a": med_a, "b": med_b, "iqr_a": iqr_a, "iqr_b": iqr_b,
+                "change": (med_b - med_a) / abs(med_a) if med_a else None, "p": p, "n": (len(xa), len(xb)),
+                "beyond_noise": abs(med_b - med_a) > max(iqr_a, iqr_b),
+            })
+    for row, q in zip(rows, stats.benjamini_hochberg([r["p"] for r in rows])):
+        row["q"] = q
+        if row["p"] < alpha and row["beyond_noise"]:
+            up = row["b"] > row["a"]
+            if results.lower_is_better(row["metric"]):
+                row["verdict"] = "worse" if up else "better"
+            else:
+                row["verdict"] = "higher" if up else "lower"
+        else:
+            row["verdict"] = "noise"
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("a", help="result set before")
+    ap.add_argument("b", help="result set after")
+    ap.add_argument("--all", action="store_true", help="every metric, not just the key ones")
+    ap.add_argument("--workloads", help="comma-separated subset")
+    ap.add_argument("--alpha", type=float, default=0.05)
+    ap.add_argument("--changed", action="store_true", help="only rows that are not noise")
+    args = ap.parse_args()
+
+    a, b = results.load(args.a), results.load(args.b)
+    va, vb = results.values(a), results.values(b)
+    workloads = args.workloads.split(",") if args.workloads else [w for w in a["set"]["workloads"]["names"] if w in vb]
+    if args.all:
+        pick = lambda names: names  # noqa: E731
+    else:
+        pick = lambda names: [m for m in results.KEY_METRICS if m in names]  # noqa: E731
+    rows = compare(va, vb, pick, workloads, args.alpha)
+
+    print(f"A: {a['set']['label']} ({a['path']})\nB: {b['set']['label']} ({b['path']})\n")
+    for d in environment_differences(a, b):
+        print(f"- environment differs: {d}")
+    print()
+    print("| workload | metric | A median [IQR] | B median [IQR] | change | p | q | verdict |")
+    print("|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        if args.changed and r["verdict"] == "noise":
+            continue
+        change = "–" if r["change"] is None else f"{100 * r['change']:+.1f}%"
+        print(f"| {r['workload']} | {r['metric']} | {fmt(r['a'])} [{fmt(r['iqr_a'])}] | {fmt(r['b'])} [{fmt(r['iqr_b'])}] "
+              f"| {change} | {r['p']:.3g} | {r['q']:.3g} | {r['verdict']} |")
+    # A metric one build measures and the other doesn't is not a change: say so, rather than
+    # leaving it out silently (a build without readback should report 0, not nothing).
+    for workload in workloads:
+        ma, mb = va.get(workload, {}), vb.get(workload, {})
+        only_a, only_b = pick(sorted(set(ma) - set(mb))), pick(sorted(set(mb) - set(ma)))
+        if only_a:
+            print(f"\n- {workload}: only A measured {', '.join(only_a)}")
+        if only_b:
+            print(f"\n- {workload}: only B measured {', '.join(only_b)}")
+    n = {v: sum(r["verdict"] == v for r in rows) for v in ("better", "worse", "higher", "lower", "noise")}
+    print(f"\n{len(rows)} comparisons: " + ", ".join(f"{k} {v}" for k, v in n.items()))
+    smallest = min((min(r["n"]) for r in rows), default=0)
+    if 0 < smallest < 4:
+        print(f"Note: some metrics have only {smallest} runs; with n = 3 per side the smallest possible p is 0.1.")
+
+
+if __name__ == "__main__":
+    main()

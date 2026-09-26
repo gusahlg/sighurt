@@ -1,10 +1,438 @@
 //! The root surface of a window: its `xdg_toplevel` role and configure handshake.
 //!
-//! Collects the latest configure, acknowledges it as xdg-shell requires, sets the window
-//! geometry deliberately, and starts a layout transaction for the new size. The root is a stable
-//! anchor that stays mapped while any child is visible, and shows an opaque fallback: a solid
-//! buffer redrawn only on resize, or a tiny buffer scaled with `wp_viewporter` when available.
-//! Close requests go to the browser as events. Decoration negotiation is optional; without it
-//! the window is deliberately borderless.
+//! smithay-client-toolkit acknowledges each configure as it arrives; the host records the size
+//! (the default size when the compositor leaves it to the client), sets the window geometry to
+//! the whole root surface, and reports [`HostEvent::WindowConfigured`] when the size or scale
+//! changed. The application answers with a placement, whose layout transaction commits the root
+//! with the new state. A configure that changes neither (activation, say) is committed at once,
+//! or by the transaction already under way.
+//!
+//! The root is a stable anchor that stays mapped while the window exists, and shows an opaque
+//! background wherever no target covers it: a single-pixel buffer scaled with `wp_viewporter`
+//! when both exist, a one-pixel SHM buffer scaled with the viewporter, or, without a viewporter,
+//! a window-sized SHM buffer redrawn only when the window's size changes. A page animating never
+//! touches it.
+//!
+//! Decorations are negotiated with xdg-decoration when the compositor offers it (server-side
+//! requested). Without it the window is deliberately borderless: Sighurt draws no client-side
+//! frame. A close request (the compositor's close button, a key binding) is reported as
+//! [`HostEvent::CloseRequested`]; the browser decides whether to close.
 //!
 //! Must not own: chrome content, or a repaint when a page animates.
+
+use sighurt_api::geometry::{BufferSize, LogicalSize, Scale};
+use sighurt_api::ids::{TargetId, WindowId};
+use sighurt_api::input::TextInputState;
+use smithay_client_toolkit::compositor::CompositorHandler;
+use smithay_client_toolkit::shell::xdg::window::{
+    DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations, WindowHandler,
+};
+use smithay_client_toolkit::shell::{xdg::XdgSurface, WaylandSurface};
+use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_output::{Transform, WlOutput};
+use wayland_client::protocol::wl_surface::WlSurface;
+use wayland_client::{Connection, Proxy, QueueHandle};
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1;
+use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
+
+use crate::connection::{Host, HostEvent, SurfaceOwner};
+use crate::placement::Transaction;
+use crate::scale::WindowScale;
+use crate::shm::{BufferData, BufferKey, BufferOwner, ShmBuffer, Swapchain};
+use crate::targets::Env;
+
+/// How a window starts.
+#[derive(Clone, Debug)]
+pub struct WindowOptions {
+    /// The title the compositor shows.
+    pub title: String,
+    /// The application id, for the compositor's rules and the desktop entry.
+    pub app_id: String,
+    /// The opaque background behind all targets, as red, green, blue.
+    pub background: [u8; 3],
+    /// The size to take when the compositor leaves it to the client.
+    pub size: LogicalSize,
+}
+
+impl Default for WindowOptions {
+    fn default() -> Self {
+        Self {
+            title: "Sighurt".into(),
+            app_id: "sighurt".into(),
+            background: [0x20, 0x20, 0x24],
+            size: LogicalSize {
+                width: 1024,
+                height: 768,
+            },
+        }
+    }
+}
+
+/// The root's background buffer.
+enum Background {
+    /// A single-pixel buffer, scaled by the root's viewport.
+    Pixel { buffer: WlBuffer, attached: bool },
+    /// A one-pixel SHM buffer, scaled by the root's viewport.
+    Tiny { buffer: ShmBuffer, attached: bool },
+    /// Window-sized SHM buffers, without a viewporter.
+    Full {
+        buffers: Swapchain<ShmBuffer>,
+        size: LogicalSize,
+    },
+}
+
+/// One window: its root surface, and the host's state for it.
+pub(crate) struct Window {
+    pub id: WindowId,
+    pub size: LogicalSize,
+    default_size: LogicalSize,
+    pub configured: bool,
+    pub scale: WindowScale,
+    /// The size and scale last reported as `WindowConfigured`.
+    reported: Option<(LogicalSize, Scale)>,
+    pub decorations: DecorationMode,
+    /// Live targets, bottom to top once placed.
+    pub targets: Vec<TargetId>,
+    /// The target that gets keyboard input.
+    pub focus: Option<TargetId>,
+    /// The editor that wants an input method, and its state.
+    pub text_input: Option<(TargetId, TextInputState)>,
+    pub transaction: Option<Transaction>,
+    /// Whether the children must be restacked at the next root commit.
+    pub restack: bool,
+    color: [u8; 3],
+    fractional: Option<WpFractionalScaleV1>,
+    viewport: Option<WpViewport>,
+    background: Background,
+    xdg: XdgWindow,
+}
+
+impl Window {
+    /// The root surface.
+    pub fn root(&self) -> &WlSurface {
+        self.xdg.wl_surface()
+    }
+
+    /// Updates the background for the window's size, as pending root state for the next root
+    /// commit.
+    pub fn update_background(&mut self, env: &Env, viewporter: bool) {
+        let (width, height) = (self.size.width as i32, self.size.height as i32);
+        let root = self.xdg.wl_surface().clone();
+        match &mut self.background {
+            Background::Pixel { buffer, attached } => attach_once(&root, buffer, attached),
+            Background::Tiny { buffer, attached } => {
+                let wl_buffer = buffer.wl_buffer().clone();
+                attach_once(&root, &wl_buffer, attached);
+            }
+            Background::Full { buffers, size } => {
+                if *size == self.size {
+                    return;
+                }
+                let buffer_size = BufferSize {
+                    width: self.size.width,
+                    height: self.size.height,
+                };
+                let Ok((.., bytes)) = crate::shm::layout(buffer_size) else {
+                    return;
+                };
+                let owner = BufferOwner::Root(self.id);
+                let acquired = buffers.acquire(buffer_size, bytes, |key| {
+                    ShmBuffer::new(&env.shm, &env.qh, buffer_size, BufferData { owner, key })
+                });
+                // Without a free buffer the old one stays until the next resize.
+                let Ok((key, mut buffer)) = acquired else {
+                    return;
+                };
+                fill(buffer.pixels(), self.color);
+                root.set_buffer_scale(1);
+                root.attach(Some(buffer.wl_buffer()), 0, 0);
+                root.damage_buffer(0, 0, width, height);
+                buffers.submit(key, buffer);
+                *size = self.size;
+            }
+        }
+        debug_assert_eq!(self.viewport.is_some(), viewporter);
+        if let Some(viewport) = &self.viewport {
+            viewport.set_destination(width, height);
+        }
+    }
+
+    /// The compositor released background buffer `key`.
+    pub fn background_released(&mut self, key: BufferKey) {
+        if let Background::Full { buffers, .. } = &mut self.background {
+            buffers.release(key);
+        }
+    }
+}
+
+fn attach_once(root: &WlSurface, buffer: &WlBuffer, attached: &mut bool) {
+    if !*attached {
+        root.attach(Some(buffer), 0, 0);
+        root.damage_buffer(0, 0, 1, 1);
+        *attached = true;
+    }
+}
+
+/// Fills ARGB8888 `pixels` with an opaque `[r, g, b]`.
+fn fill(pixels: &mut [u8], [r, g, b]: [u8; 3]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        *pixel = [b, g, r, 0xff];
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // Objects on the root go before it; the xdg window destroys its role objects and the
+        // root surface when it drops, after this.
+        if let Some(fractional) = self.fractional.take() {
+            fractional.destroy();
+        }
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        if let Background::Pixel { buffer, .. } = &self.background {
+            buffer.destroy();
+        }
+    }
+}
+
+impl Host {
+    /// Opens a window. It shows nothing until the compositor configures it and the application
+    /// answers [`HostEvent::WindowConfigured`] with a placement.
+    pub fn create_window(&mut self, id: WindowId, options: WindowOptions) {
+        let surface = self.compositor.create_surface(&self.qh);
+        let xdg =
+            self.xdg
+                .create_window(surface.clone(), WindowDecorations::RequestServer, &self.qh);
+        xdg.set_title(options.title);
+        xdg.set_app_id(options.app_id);
+        let globals = &self.globals;
+        let fractional = globals
+            .fractional
+            .as_ref()
+            .map(|m| m.get_fractional_scale(&surface, &self.qh, id));
+        let viewport = globals
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(&surface, &self.qh, ()));
+        let [r, g, b] = options.background;
+        let background = match (&viewport, &globals.single_pixel) {
+            (Some(_), Some(manager)) => {
+                let channel = |c: u8| u32::from(c) * 0x0101_0101;
+                let buffer = manager.create_u32_rgba_buffer(
+                    channel(r),
+                    channel(g),
+                    channel(b),
+                    u32::MAX,
+                    &self.qh,
+                    (),
+                );
+                Background::Pixel {
+                    buffer,
+                    attached: false,
+                }
+            }
+            (Some(_), None) => {
+                let one = BufferSize {
+                    width: 1,
+                    height: 1,
+                };
+                let data = BufferData {
+                    owner: BufferOwner::Root(id),
+                    key: BufferKey {
+                        generation: u64::MAX,
+                        index: 0,
+                    },
+                };
+                match ShmBuffer::new(self.shm.wl_shm(), &self.qh, one, data) {
+                    Ok(mut buffer) => {
+                        fill(buffer.pixels(), options.background);
+                        Background::Tiny {
+                            buffer,
+                            attached: false,
+                        }
+                    }
+                    Err(_) => Background::Full {
+                        buffers: Swapchain::new(),
+                        size: LogicalSize::default(),
+                    },
+                }
+            }
+            (None, _) => Background::Full {
+                buffers: Swapchain::new(),
+                size: LogicalSize::default(),
+            },
+        };
+        // The initial commit, without a buffer, asks for the first configure.
+        xdg.commit();
+        self.surfaces.insert(surface.id(), SurfaceOwner::Root(id));
+        self.windows.insert(
+            id,
+            Window {
+                id,
+                size: LogicalSize::default(),
+                default_size: options.size,
+                configured: false,
+                scale: WindowScale::default(),
+                reported: None,
+                decorations: DecorationMode::Client,
+                targets: Vec::new(),
+                focus: None,
+                text_input: None,
+                transaction: None,
+                restack: false,
+                color: options.background,
+                fractional,
+                viewport,
+                background,
+                xdg,
+            },
+        );
+    }
+
+    /// Closes a window. Its targets are unmapped at once; their surfaces live on until their
+    /// leases are dropped, and nothing more is shown on them.
+    pub fn close_window(&mut self, id: WindowId) {
+        let Some(mut window) = self.windows.remove(&id) else {
+            return;
+        };
+        if let Some(timer) = window.transaction.take().and_then(|tx| tx.timer) {
+            self.loop_ops.remove(timer);
+        }
+        for target in window.targets.iter().filter_map(|t| self.targets.get(t)) {
+            let mut target = target.borrow_mut();
+            target.unmap();
+            target.want_shown = false;
+        }
+        self.surfaces.remove(&window.root().id());
+        self.forget_surface(SurfaceOwner::Root(id));
+        self.window_closed(id);
+        drop(window);
+    }
+
+    /// Reports `window`'s size and scale if they changed; otherwise makes sure the latest
+    /// acknowledged configure is committed.
+    fn report_configuration(&mut self, id: WindowId) {
+        let viewporter = self.globals.viewporter.is_some();
+        let Some(window) = self.windows.get_mut(&id) else {
+            return;
+        };
+        if !window.configured {
+            return;
+        }
+        let now = (window.size, window.scale.effective(viewporter));
+        if window.reported != Some(now) {
+            window.reported = Some(now);
+            // Replaceable: a scale event often comes just before the configure with the new
+            // size, and a placement for the older one would be refused as stale.
+            self.events.retain(
+                |e| !matches!(e, HostEvent::WindowConfigured { window, .. } if *window == id),
+            );
+            self.events.push_back(HostEvent::WindowConfigured {
+                window: id,
+                size: now.0,
+                scale: now.1,
+            });
+        } else if window.transaction.is_none() {
+            window.root().commit();
+        }
+    }
+
+    /// Applies a change of `window`'s scale.
+    pub(crate) fn update_scale(&mut self, window: WindowId, change: impl FnOnce(&mut WindowScale)) {
+        if let Some(w) = self.windows.get_mut(&window) {
+            change(&mut w.scale);
+            self.report_configuration(window);
+        }
+    }
+
+    fn window_of(&self, xdg: &XdgWindow) -> Option<WindowId> {
+        self.windows.values().find(|w| &w.xdg == xdg).map(|w| w.id)
+    }
+}
+
+impl WindowHandler for Host {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, xdg: &XdgWindow) {
+        if let Some(window) = self.window_of(xdg) {
+            self.events.push_back(HostEvent::CloseRequested { window });
+        }
+    }
+
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        xdg: &XdgWindow,
+        configure: WindowConfigure,
+        _: u32,
+    ) {
+        let Some(id) = self.window_of(xdg) else {
+            return;
+        };
+        let window = self.windows.get_mut(&id).expect("found above");
+        let fallback = if window.configured {
+            window.size
+        } else {
+            window.default_size
+        };
+        let (width, height) = configure.new_size;
+        window.size = LogicalSize {
+            width: width.map_or(fallback.width, |w| w.get()),
+            height: height.map_or(fallback.height, |h| h.get()),
+        };
+        window.decorations = configure.decoration_mode;
+        window.configured = true;
+        // The window is all of the root surface: no client-side shadow or frame.
+        let (w, h) = (window.size.width, window.size.height);
+        window
+            .xdg
+            .xdg_surface()
+            .set_window_geometry(0, 0, w as i32, h as i32);
+        self.report_configuration(id);
+    }
+}
+
+impl CompositorHandler for Host {
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &WlSurface,
+        factor: i32,
+    ) {
+        if let Some(SurfaceOwner::Root(window)) = self.surfaces.get(&surface.id()).copied() {
+            self.update_scale(window, |s| s.set_integer(factor));
+        }
+    }
+
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlSurface,
+        _: Transform,
+    ) {
+    }
+
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {
+        // The host's frame callbacks carry their own data (`scheduler::FrameData`).
+    }
+
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlSurface,
+        _: &WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlSurface,
+        _: &WlOutput,
+    ) {
+    }
+}

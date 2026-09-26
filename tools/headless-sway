@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs a command inside its own headless sway compositor, never on the user's desktop.
 #
-#   tools/headless-sway [--size 1280x800] [--scale 1.5] [--renderer pixman|gles2] -- cmd args...
+#   tools/headless-sway [--size 1280x800] [--scale 1.5] [--renderer pixman|gles2|auto] -- cmd args...
 #
 # Inside `cmd`, WAYLAND_DISPLAY/XDG_RUNTIME_DIR point at the private compositor and these drive it
 # through Wayland protocols, so they can only ever reach it:
@@ -12,6 +12,8 @@
 #   wayland-info                            list protocols
 # Never use ydotool or anything else that writes to /dev/uinput: that types into the real desktop.
 # The compositor and its runtime directory are removed when `cmd` exits; its exit code is returned.
+# `--renderer auto` tries gles2 (the GPU) and falls back to pixman. `cmd` also gets
+# SIG_SWAY_RENDERER (the renderer sway runs with), SIG_SWAY_PID and SIG_SWAY_LOG (its log file).
 set -euo pipefail
 size=1280x800 scale=1 renderer=pixman
 while [[ $# -gt 0 ]]; do
@@ -23,7 +25,7 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-[[ $# -gt 0 ]] || { sed -n '2,17p' "$0"; exit 2; }
+[[ $# -gt 0 ]] || { sed -n '2,16p' "$0"; exit 2; }
 bins=$(nix-build '<nixpkgs>' -A sway -A wtype -A wlrctl -A grim -A wayland-utils --no-out-link 2>/dev/null |
   sed 's|$|/bin|' | paste -sd:)
 export PATH="$bins:$PATH"
@@ -37,19 +39,41 @@ focus_follows_mouse no
 CONF
 cleanup() { [[ -n ${sway_pid:-} ]] && kill "$sway_pid" 2>/dev/null; wait 2>/dev/null; rm -rf "$run"; }
 trap cleanup EXIT
-(
-  unset WAYLAND_DISPLAY DISPLAY SWAYSOCK
-  export XDG_RUNTIME_DIR=$run WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=$renderer
-  exec sway -c "$run/config" > "$run/sway.log" 2>&1
-) &
-sway_pid=$!
-for _ in $(seq 100); do
-  [[ -S $run/wayland-1 ]] && break
-  sleep 0.05
-done
+# Starts sway with renderer $1 and waits for its socket; fails if sway exits or times out.
+start_sway() {
+  (
+    unset WAYLAND_DISPLAY DISPLAY SWAYSOCK
+    export XDG_RUNTIME_DIR=$run WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=$1
+    exec sway -c "$run/config" > "$run/sway.log" 2>&1
+  ) &
+  sway_pid=$!
+  for _ in $(seq 100); do
+    [[ -S $run/wayland-1 ]] && return 0
+    kill -0 "$sway_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  [[ -S $run/wayland-1 ]]
+}
+case $renderer in
+  auto)
+    renderer=gles2
+    if ! start_sway gles2; then
+      echo "tools/headless-sway: gles2 failed, falling back to pixman:" >&2
+      tail -5 "$run/sway.log" >&2
+      kill "$sway_pid" 2>/dev/null || true
+      wait "$sway_pid" 2>/dev/null || true
+      rm -f "$run"/wayland-1* "$run"/sway-ipc.*.sock
+      mv "$run/sway.log" "$run/sway-gles2.log"
+      renderer=pixman
+      start_sway pixman || true
+    fi
+    ;;
+  *) start_sway "$renderer" || true ;;
+esac
 [[ -S $run/wayland-1 ]] || { echo "tools/headless-sway: sway did not start:" >&2; cat "$run/sway.log" >&2; exit 1; }
 export XDG_RUNTIME_DIR=$run WAYLAND_DISPLAY=wayland-1
 export SWAYSOCK=$(ls "$run"/sway-ipc.*.sock 2>/dev/null | head -1)
+export SIG_SWAY_RENDERER=$renderer SIG_SWAY_PID=$sway_pid SIG_SWAY_LOG=$run/sway.log
 unset DISPLAY
 set +e
 "$@"

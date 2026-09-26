@@ -4,6 +4,10 @@
 //! drives the HTTP connection on a background tokio task, parses the SSE
 //! wire format, and queues events for `api_sse_recv`. The stream reconnects
 //! automatically with `Last-Event-ID`, matching the web `EventSource` contract.
+//!
+//! What a guest can make the host keep is bounded: at most [`MAX_STREAMS`] streams (until it
+//! removes them), [`MAX_QUEUE`] events per stream (the oldest go first), and events and lines of
+//! at most [`MAX_EVENT_BYTES`]; longer ones are dropped as they arrive.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -12,11 +16,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use tokio::runtime::Runtime;
 use wasmtime::{Caller, Linker};
 
 use crate::capabilities::{
-    guest_str, next_handle, with, with_started, write_guest, ConsoleLevel, HostState,
+    guest_str, next_handle, with, with_started, write_guest, ConsoleLevel, HostState, Runtime,
 };
 
 /// Connection is being established (or reconnecting).
@@ -33,8 +36,12 @@ const RECV_CLOSED: i64 = -2;
 const RECV_ERROR: i64 = -3;
 const RECV_UNKNOWN: i64 = -4;
 
-const MAX_QUEUE: usize = 128;
-const MAX_EVENT_BYTES: usize = 256 * 1024;
+/// Most streams a guest may have.
+pub const MAX_STREAMS: usize = 256;
+/// Most events waiting in one stream.
+pub const MAX_QUEUE: usize = 128;
+/// Largest event, and longest line, kept.
+pub const MAX_EVENT_BYTES: usize = 256 * 1024;
 const DEFAULT_RETRY_MS: u64 = 3_000;
 const MIN_RETRY_MS: u64 = 500;
 const MAX_RETRY_MS: u64 = 60_000;
@@ -50,9 +57,15 @@ pub struct SseEvent {
 /// Incremental SSE parser (WHATWG HTML Living Standard, event stream).
 pub struct SseParser {
     buf: Vec<u8>,
+    /// The rest of the line in progress is dropped: it is too long.
+    skip_line: bool,
     name: String,
     id: String,
     data_lines: Vec<String>,
+    /// Bytes in `data_lines`.
+    data_bytes: usize,
+    /// The event in progress is dropped: it is too large.
+    oversized: bool,
     /// Last `retry:` value seen, if any.
     pub retry_ms: Option<u64>,
 }
@@ -67,9 +80,12 @@ impl SseParser {
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
+            skip_line: false,
             name: String::new(),
             id: String::new(),
             data_lines: Vec::new(),
+            data_bytes: 0,
+            oversized: false,
             retry_ms: None,
         }
     }
@@ -79,6 +95,9 @@ impl SseParser {
         self.buf.extend_from_slice(bytes);
         let mut events = Vec::new();
         while let Some(line) = self.take_line() {
+            if std::mem::take(&mut self.skip_line) {
+                continue;
+            }
             if line.is_empty() {
                 if let Some(ev) = self.dispatch() {
                     events.push(ev);
@@ -91,7 +110,15 @@ impl SseParser {
             let (field, value) = split_field(&line);
             match field {
                 "event" => self.name = value.to_string(),
-                "data" => self.data_lines.push(value.to_string()),
+                "data" if !self.oversized => {
+                    self.data_bytes += value.len() + 1;
+                    if self.data_bytes > MAX_EVENT_BYTES + 1 {
+                        self.oversized = true;
+                        self.data_lines.clear();
+                    } else {
+                        self.data_lines.push(value.to_string());
+                    }
+                }
                 "id" if !value.contains('\0') => self.id = value.to_string(),
                 "retry" if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
                     if let Ok(ms) = value.parse::<u64>() {
@@ -100,6 +127,11 @@ impl SseParser {
                 }
                 _ => {}
             }
+        }
+        // A line that doesn't end within the limit is dropped, up to its end.
+        if self.buf.len() > MAX_EVENT_BYTES {
+            self.buf.clear();
+            self.skip_line = true;
         }
         events
     }
@@ -119,6 +151,12 @@ impl SseParser {
     }
 
     fn dispatch(&mut self) -> Option<SseEvent> {
+        self.data_bytes = 0;
+        if std::mem::take(&mut self.oversized) {
+            self.data_lines.clear();
+            self.name.clear();
+            return None;
+        }
         if self.data_lines.is_empty() {
             self.name.clear();
             return None;
@@ -218,7 +256,7 @@ pub struct SseState {
 
 impl SseState {
     pub fn new() -> Option<Self> {
-        let runtime = Runtime::new().ok()?;
+        let runtime = Runtime::new()?;
         Some(Self {
             runtime,
             streams: HashMap::new(),
@@ -226,7 +264,11 @@ impl SseState {
         })
     }
 
+    /// Opens a stream; returns its handle, or `0` when the guest has [`MAX_STREAMS`].
     fn open(&mut self, url: String) -> u32 {
+        if self.streams.len() >= MAX_STREAMS {
+            return 0;
+        }
         let id = next_handle(&mut self.last_id);
         let inner = Arc::new(SseInner::new());
         let driver = inner.clone();
@@ -399,6 +441,11 @@ pub fn register_sse_functions(linker: &mut Linker<HostState>) -> Result<()> {
             }
             let state = caller.data();
             match with_started(&state.sse, SseState::new, |sse| sse.open(url.clone())) {
+                Some(0) => {
+                    let message = format!("[SSE] Refused: {MAX_STREAMS} streams open");
+                    state.log(ConsoleLevel::Error, message);
+                    0
+                }
                 Some(id) => {
                     state.log(ConsoleLevel::Log, format!("[SSE] Opening {url} (id={id})"));
                     id
@@ -537,6 +584,29 @@ mod tests {
         assert!(p.push(b"lo\n").is_empty());
         let ev = p.push(b"\n");
         assert_eq!(ev[0].data, "hello");
+    }
+
+    #[test]
+    fn overlong_lines_and_events_are_dropped_as_they_arrive() {
+        let mut p = SseParser::new();
+        // A line that never ends keeps at most a line's worth.
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..64 {
+            assert!(p.push(&chunk).is_empty());
+            assert!(p.buf.len() <= MAX_EVENT_BYTES + chunk.len());
+        }
+        // Its end is dropped with it, and the stream goes on.
+        let ev = p.push(b"yyy\ndata: after\n\n");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].data, "after");
+        // An event of many short lines is dropped once it grows too large.
+        let line = format!("data: {}\n", "z".repeat(1000));
+        for _ in 0..1000 {
+            assert!(p.push(line.as_bytes()).is_empty());
+            assert!(p.data_bytes <= MAX_EVENT_BYTES + 1 + line.len());
+        }
+        assert!(p.push(b"\n").is_empty());
+        assert_eq!(p.push(b"data: next\n\n")[0].data, "next");
     }
 
     #[test]
