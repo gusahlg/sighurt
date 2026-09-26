@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# `cargo`, run through tools/heavy: one heavy job per machine, memory-capped, inside nix-shell.
+# Use it for every cargo command in this repo.
+#   tools/cargo check -p sighurt-core
+exec "$(dirname "$0")/heavy" cargo "$@"

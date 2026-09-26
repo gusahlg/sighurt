@@ -1,0 +1,11 @@
+[package]
+name = "sighurt-api"
+description = "Sighurt's internal contract between browser core, Wayland host, chrome and engines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# No dependencies, on purpose: see the crate documentation.
+[dependencies]

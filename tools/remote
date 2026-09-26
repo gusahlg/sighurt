@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Runs a command in a copy of this working tree on louise-pc (12 cores, 15 GB RAM, RTX 4060, lots of
+# disk), under that machine's heavy-job locks. The tree is synced first (without target/ and .git);
+# louise keeps its own target/ in ~/repos/sighurt-rewrite, so Servo stays built there.
+#
+#   tools/remote tools/cargo build -p sighurt-browser
+#   tools/remote tools/heavy bench/run.sh servo-static
+#   tools/remote --no-sync ls target/debug
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+dest=repos/sighurt-rewrite
+sync=1
+[[ ${1:-} == --no-sync ]] && { sync=0; shift; }
+# One remote run at a time from this machine, so a sync never changes the tree under a build.
+exec 9>/tmp/sighurt-remote.lock
+if ! flock -n 9; then
+  echo "tools/remote: waiting for another remote run from this machine" >&2
+  flock 9
+fi
+if [[ $sync == 1 ]]; then
+  rsync -a --delete --exclude /target --exclude /.git --exclude '/bench/results/raw' \
+    -e 'ssh -o BatchMode=yes' "$repo/" "louise-pc:$dest/"
+fi
+# The remote login shell is fish, so the command goes to bash on stdin rather than through
+# ssh's command line.
+{
+  echo "set -e; cd ~/$dest"
+  for var in SIG_MEM SIG_JOBS SIG_WHAT RUST_LOG RUST_BACKTRACE; do
+    [[ -n ${!var:-} ]] && echo "export $var=$(printf '%q' "${!var}")"
+  done
+  printf 'exec'; printf ' %q' "$@"; echo
+} | ssh -o BatchMode=yes louise-pc bash -s

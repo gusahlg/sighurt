@@ -1,9 +1,18 @@
 [workspace]
 members = [
+    # The browser (see sighurt-rewrite-plan.md §5 for what each crate owns).
+    "sighurt-api",
     "sighurt-core",
+    "sighurt-wayland",
     "sighurt-ui",
+    "sighurt-browser",
+    # Engines, compiled into `sig` through sighurt-browser's features.
+    "sighurt-engine-servo",
     "sighurt-engine-wasm",
+    "sighurt-engine-demo",
+    # The pre-rewrite engine protocol, until the Wasm engine no longer uses it.
     "sighurt-ipc",
+    # Guest SDK and example guests.
     "sighurt-sdk",
     "examples/hello-sighurt",
     "examples/audio-player",
@@ -17,5 +26,41 @@ members = [
     "examples/typography-demo",
     "examples/sse-demo",
 ]
-exclude = ["sighurt-engine-servo"]
-resolver = "2"
+# Resolver 3 picks dependency versions that support `rust-version` below, so the lockfile keeps
+# building with louise-pc's Rust 1.95 as well as with the newer toolchain on this machine.
+resolver = "3"
+
+[workspace.package]
+version = "0.7.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0"
+# Sighurt is a fork of Oxide by Nikhil Ranjan (https://github.com/niklabh/oxide); see NOTICE.
+authors = ["Nikhil Ranjan <niklabh>", "The Sighurt contributors"]
+
+# Shared third-party versions. These resolve together in one dependency graph; Cargo.lock was
+# seeded from the Servo build so Servo's dependencies stay at the versions already compiled.
+[workspace.dependencies]
+servo = "0.5"
+surfman = "0.13"
+wasmtime = "36"
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+smithay-client-toolkit = "0.20"
+calloop = "0.14"
+# `swash` rasterizes glyphs (SwashCache, Buffer::draw), which the chrome painter needs.
+cosmic-text = { version = "0.14", default-features = false, features = ["std", "swash", "fontconfig"] }
+tiny-skia = "0.11"
+raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1.2"
+tracing = "0.1"
+url = "2"
+
+# Dependencies are optimized in debug builds too: unoptimized, Servo is slow enough that heavy
+# sites look broken. Without debug info, linking Servo stays tolerable. These are also the
+# settings the Servo artifacts already in target/ were built with, so they are reused. Sighurt's
+# own crates stay unoptimized, with debug info, and rebuild quickly.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false

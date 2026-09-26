@@ -1,22 +1,28 @@
-# Checks the Servo engine (sig-servo), which is its own Cargo workspace.
+# Checks the Servo engine (sighurt-engine-servo), which ci.yml leaves out.
 #
 # HEAVY: this compiles a large part of Servo (the first run takes a long time and a lot of
-# disk space; later runs rely on the cache). It therefore only runs when the engine or the
-# protocol it depends on changes.
+# disk space; later runs rely on the cache). It therefore only runs when the engine, the crates
+# it depends on, or the dependency versions change.
 name: Servo engine
 
 on:
   push:
     branches: ["**"]
     paths:
-      - "sighurt-ipc/**"
+      - "sighurt-api/**"
+      - "sighurt-wayland/**"
       - "sighurt-engine-servo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/servo.yml"
   pull_request:
     branches: [main]
     paths:
-      - "sighurt-ipc/**"
+      - "sighurt-api/**"
+      - "sighurt-wayland/**"
       - "sighurt-engine-servo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/servo.yml"
   workflow_dispatch:
 
@@ -25,7 +31,7 @@ env:
 
 jobs:
   check:
-    name: Check sig-servo
+    name: Clippy sighurt-engine-servo
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -46,14 +52,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sighurt-engine-servo
 
-      - name: Format check
-        run: cargo fmt --manifest-path sighurt-engine-servo/Cargo.toml -- --check
-
-      - name: Check
-        run: cargo check --locked --manifest-path sighurt-engine-servo/Cargo.toml
+      # Formatting is checked by ci.yml, since the crate is in the root workspace.
+      - name: Clippy
+        run: cargo clippy --locked -p sighurt-engine-servo --all-targets -- -D warnings

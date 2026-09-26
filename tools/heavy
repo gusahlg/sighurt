@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Runs a heavy command (a build, a benchmark, a GPU job) on this machine, the safe way:
+#
+# - one heavy job per machine at a time: /tmp/gusahlg-heavy.lock is shared with the other Claude
+#   session working on this user's machines (tensor-ash), which takes it for all of its builds,
+#   benchmarks and GPU jobs too. Always take it before any other lock. While we hold it,
+#   /tmp/gusahlg-heavy.owner says what is running, for the other session to read;
+# - memory-capped (SIG_MEM, default 9G), so a Servo link can't take the machine down;
+# - inside the repo's nix-shell, which NixOS needs for the native libraries.
+#
+#   tools/heavy cargo build -p sighurt-core
+#   SIG_WHAT="servo build" tools/heavy cargo build -p sighurt-engine-servo
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+lock=/tmp/gusahlg-heavy.lock
+owner=/tmp/gusahlg-heavy.owner
+if [[ -z ${SIG_HEAVY_HELD:-} ]]; then
+  if ! flock -n "$lock" true 2>/dev/null; then
+    echo "tools/heavy: waiting for $lock ($(cat "$owner" 2>/dev/null || echo 'held by another session'))" >&2
+  fi
+  SIG_HEAVY_HELD=1 exec flock -E 75 "$lock" "$0" "$@"
+fi
+echo "sighurt: ${SIG_WHAT:-$*} (since $(date +%H:%M), pid $$)" > "$owner"
+trap 'rm -f "$owner"' EXIT
+export CARGO_BUILD_JOBS=${SIG_JOBS:-8}
+quoted=$(printf '%q ' "$@")
+systemd-run --user --scope --quiet --collect -p MemoryMax="${SIG_MEM:-9G}" -p MemorySwapMax=0 \
+  nix-shell "$repo/shell.nix" --run "cd $(printf '%q' "$PWD") && $quoted"

@@ -1,25 +1,13 @@
 [package]
 name = "sighurt-ui"
-version = "0.7.0"
-edition = "2021"
-description = "Sighurt's default UI and the `sig` binary: tabs, toolbar, URL bar, key bindings and status bar"
-license = "Apache-2.0"
+description = "Sighurt's chrome: tab strip and address line, layout, hit testing, text editing, CPU painting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
 
-[[bin]]
-name = "sig"
-path = "src/main.rs"
-
+# No sighurt-wayland: the chrome paints into memory the host lends it, so it builds and tests
+# without a compositor.
 [dependencies]
-sighurt-core = { path = "../sighurt-core" }
-gpui = "0.2.2"
-serde = { version = "1", features = ["derive"] }
-toml = "1.1.2"
-dirs = "5"
-percent-encoding = "2"
-tracing = "0.1"
-# Honours RUST_LOG, e.g. RUST_LOG=sighurt_core=debug shows what engines log to their console.
-tracing-subscriber = "0.3"
-
-[dev-dependencies]
-# Headless windows for tests.
-gpui = { version = "0.2.2", features = ["test-support"] }
+sighurt-api = { path = "../sighurt-api" }

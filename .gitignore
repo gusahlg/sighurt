@@ -58,5 +58,3 @@ yarn-error.log*
 .cursor/
 
 oxide-demo.mp4
-# Servo engine is its own workspace
-/sighurt-engine-servo/target/

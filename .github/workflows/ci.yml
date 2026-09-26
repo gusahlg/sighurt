@@ -34,17 +34,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Everything except Servo, which servo.yml checks: `--workspace` alone, or sighurt-browser
+      # with its default features, would compile Servo (see CLAUDE.md, "Build commands").
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (workspace)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (workspace without Servo)
+        run: >
+          cargo clippy --workspace
+          --exclude sighurt-engine-servo --exclude sighurt-browser
+          --all-targets -- -D warnings
 
-      - name: Build (sig and sig-wasm)
-        run: cargo build
+      - name: Clippy (sig without Servo)
+        run: >
+          cargo clippy -p sighurt-browser --no-default-features --features engine-demo,engine-wasm
+          --all-targets -- -D warnings
 
-      - name: Test (workspace)
-        run: cargo test --workspace
+      - name: Test (workspace without Servo)
+        run: cargo test --workspace --exclude sighurt-engine-servo --exclude sighurt-browser
 
   check-wasm:
     name: Check SDK and examples (wasm32)
@@ -64,15 +71,13 @@ jobs:
       - name: Check SDK
         run: cargo check -p sighurt-sdk --target wasm32-unknown-unknown
 
-      # Everything that builds for wasm32: the SDK, the guest examples and the zero-dependency
-      # protocol crate. The browser crates, the WASM engine and the notes backend are native.
+      # The guest examples (the SDK is checked above; the rest of the workspace is native).
       - name: Check examples (wasm32)
         run: >
-          cargo check --target wasm32-unknown-unknown --workspace
-          --exclude sighurt-core
-          --exclude sighurt-ui
-          --exclude sighurt-engine-wasm
-          --exclude fullstack-notes-backend
+          cargo check --target wasm32-unknown-unknown
+          -p hello-sighurt -p audio-player -p raf-demo -p timer-demo
+          -p fullstack-notes-frontend -p index -p events-demo -p gradient-demo
+          -p typography-demo -p sse-demo
 
       - name: Check fullstack-notes backend
         run: cargo check -p fullstack-notes-backend
