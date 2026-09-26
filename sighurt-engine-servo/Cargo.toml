@@ -1,0 +1,43 @@
+[package]
+name = "sighurt-engine-servo"
+version = "0.1.0"
+edition = "2021"
+description = "Servo (HTML/CSS/JavaScript) content engine for the Sighurt browser"
+# src/rendering.rs is adapted from Servo and stays under Servo's MPL-2.0.
+license = "Apache-2.0 AND MPL-2.0"
+
+# Servo is large and pins many of its own dependencies, so this engine is its own workspace
+# with its own lockfile. The browser never links it; it talks to `sig-servo` over sighurt-ipc.
+[workspace]
+
+[[bin]]
+name = "sig-servo"
+path = "src/main.rs"
+
+[dependencies]
+sighurt-ipc = { path = "../sighurt-ipc" }
+servo = "0.5"
+url = "2"
+euclid = "0.22"
+dpi = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+libc = "0.2"
+log = "0.4"
+dirs = "5"
+# The GL stack Servo is built on, for the GPU rendering context in src/rendering.rs.
+surfman = "0.13"
+gleam = "0.15"
+glow = "0.17"
+
+[profile.dev]
+# Debug info for all of Servo makes linking slow and the binary enormous.
+debug = false
+
+# Servo built without optimizations is slow enough to make heavy sites look broken: YouTube
+# never gets past its placeholder page. This optimizes the dependencies in debug builds too.
+# sig-servo itself stays unoptimized, so rebuilding it after a change is still quick.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = false

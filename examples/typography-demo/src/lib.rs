@@ -4,7 +4,7 @@
 //! `canvas_measure_text` to draw a tight underline under one line and to
 //! right-align another.
 
-use oxide_sdk::*;
+use sighurt_sdk::*;
 
 const SAMPLE: &str = "The quick brown fox jumps over the lazy dog";
 
@@ -32,7 +32,7 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
         700,
         FONT_STYLE_NORMAL,
         TEXT_ALIGN_CENTER,
-        "Oxide Typography",
+        "Sighurt Typography",
     );
 
     let left_col_x = 24.0;

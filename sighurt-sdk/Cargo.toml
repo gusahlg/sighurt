@@ -1,0 +1,14 @@
+[package]
+name = "sighurt-sdk"
+version = "0.7.0"
+edition = "2021"
+description = "Guest SDK for building .wasm apps for Sighurt's WASM engine"
+license = "Apache-2.0"
+# Forked from oxide-sdk (https://github.com/niklabh/oxide).
+authors = ["Nikhil Ranjan <niklabh>"]
+readme = "README.md"
+keywords = ["wasm", "webassembly", "browser", "sdk", "sandbox"]
+categories = ["wasm", "api-bindings"]
+
+[lib]
+crate-type = ["rlib"]

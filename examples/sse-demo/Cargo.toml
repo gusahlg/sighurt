@@ -2,10 +2,10 @@
 name = "sse-demo"
 version = "0.1.0"
 edition = "2021"
-description = "Server-Sent Events demo for the Oxide browser"
+description = "Server-Sent Events demo for Sighurt"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-oxide-sdk = { path = "../../oxide-sdk" }
+sighurt-sdk = { path = "../../sighurt-sdk" }

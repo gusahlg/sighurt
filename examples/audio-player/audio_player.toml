@@ -1,4 +1,4 @@
 name = "Audio Player"
-description = "Decode and play audio"
+description = "Synthesised tones and sound effects on two channels"
 version = "0.1.0"
 permissions = []

@@ -1,0 +1,4 @@
+name = "Hello Sighurt"
+description = "Canvas drawing, mouse, keyboard, and a hand-drawn text field"
+version = "0.1.0"
+permissions = []

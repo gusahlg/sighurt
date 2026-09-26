@@ -2,10 +2,10 @@
 name = "timer-demo"
 version = "0.1.0"
 edition = "2021"
-description = "Timer API demo for the Oxide browser"
+description = "Timer API demo for Sighurt"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-oxide-sdk = { path = "../../oxide-sdk" }
+sighurt-sdk = { path = "../../sighurt-sdk" }

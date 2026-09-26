@@ -1,6 +1,6 @@
 # Fullstack Notes
 
-A full-stack example for the Oxide browser: a **Rust HTTP backend** exchanges data
+A full-stack example for Sighurt's WASM engine: a **Rust HTTP backend** exchanges data
 with a **WebAssembly frontend** using Protocol Buffers over HTTP.
 
 ## Architecture
@@ -8,7 +8,7 @@ with a **WebAssembly frontend** using Protocol Buffers over HTTP.
 ```
 ┌─────────────────────────┐         HTTP + Protobuf         ┌──────────────────────┐
 │   WASM Frontend         │ ◄──────────────────────────────► │   Rust Backend       │
-│   (oxide-sdk guest)     │   GET/POST/DELETE /api/notes     │   (axum server)      │
+│   (sighurt-sdk guest)   │   GET/POST/DELETE /api/notes     │   (axum server)      │
 │   renders on canvas     │                                  │   in-memory store    │
 └─────────────────────────┘                                  └──────────────────────┘
 ```
@@ -22,7 +22,7 @@ The frontend performs a full **CRUD cycle** on startup:
 5. **GET** `/api/notes` — fetch final state
 
 All request and response bodies use the Protocol Buffers binary wire format
-(the same `ProtoEncoder`/`ProtoDecoder` from `oxide-sdk`).
+(the same `ProtoEncoder`/`ProtoDecoder` from `sighurt-sdk`).
 
 ## Quick Start
 
@@ -45,13 +45,13 @@ The compiled module is at:
 target/wasm32-unknown-unknown/release/fullstack_notes_frontend.wasm
 ```
 
-### 3. Load in the Oxide browser
+### 3. Load it in Sighurt
 
 ```sh
-cargo run -p oxide
+cargo run -p sighurt-browser -- "$PWD/target/wasm32-unknown-unknown/release/fullstack_notes_frontend.wasm"
 ```
 
-Open the `.wasm` file via **File → Open** (or drag-and-drop).
+Or start `sig` and open the `.wasm` file with the open-file command.
 
 ## Proto Schema
 

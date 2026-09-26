@@ -1,0 +1,59 @@
+# Checks the Servo engine (sig-servo), which is its own Cargo workspace.
+#
+# HEAVY: this compiles a large part of Servo (the first run takes a long time and a lot of
+# disk space; later runs rely on the cache). It therefore only runs when the engine or the
+# protocol it depends on changes.
+name: Servo engine
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "sighurt-ipc/**"
+      - "sighurt-engine-servo/**"
+      - ".github/workflows/servo.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "sighurt-ipc/**"
+      - "sighurt-engine-servo/**"
+      - ".github/workflows/servo.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check sig-servo
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Servo's native build dependencies: clang/libclang for bindgen, cmake and python3 for
+      # its build scripts, and the graphics/font/windowing development libraries it links.
+      # mozjs is fetched as a prebuilt archive, so no SpiderMonkey toolchain is needed.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang libclang-dev llvm-dev cmake python3 pkg-config m4 \
+            libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libfontconfig1-dev libfreetype6-dev libharfbuzz-dev \
+            libxkbcommon-dev libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libwayland-dev libudev-dev libdbus-1-dev libssl-dev libunwind-dev liblzma-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sighurt-engine-servo
+
+      - name: Format check
+        run: cargo fmt --manifest-path sighurt-engine-servo/Cargo.toml -- --check
+
+      - name: Check
+        run: cargo check --locked --manifest-path sighurt-engine-servo/Cargo.toml

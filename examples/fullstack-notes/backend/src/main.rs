@@ -1,3 +1,7 @@
+// The SDK's zero-dependency protobuf codec, compiled in directly so the backend
+// speaks exactly the same wire format as the WASM frontend.
+#[allow(dead_code)]
+#[path = "../../../../sighurt-sdk/src/proto.rs"]
 mod proto;
 
 use axum::{
@@ -138,7 +142,7 @@ async fn main() {
         notes: Mutex::new(vec![
             Note {
                 id: 1,
-                title: "Learn the Oxide browser".into(),
+                title: "Learn the Sighurt browser".into(),
                 done: true,
                 created_at: 1710000000000,
             },

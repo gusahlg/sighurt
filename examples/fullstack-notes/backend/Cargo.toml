@@ -2,7 +2,7 @@
 name = "fullstack-notes-backend"
 version = "0.1.0"
 edition = "2021"
-description = "Backend server for the fullstack-notes Oxide example"
+description = "Backend server for the fullstack-notes Sighurt example"
 
 [[bin]]
 name = "notes-server"

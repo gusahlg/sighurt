@@ -37,17 +37,17 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (browser)
-        run: cargo clippy -p oxide-browser -- -D warnings
+      - name: Clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Build
-        run: cargo build -p oxide-browser
+      - name: Build (sig and sig-wasm)
+        run: cargo build
 
-      - name: Test (browser)
-        run: cargo test -p oxide-browser
+      - name: Test (workspace)
+        run: cargo test --workspace
 
-  check-sdk:
-    name: Check SDK (wasm32)
+  check-wasm:
+    name: Check SDK and examples (wasm32)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,16 +59,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Test SDK
-        run: cargo test -p oxide-sdk
+        run: cargo test -p sighurt-sdk
 
       - name: Check SDK
-        run: cargo check -p oxide-sdk --target wasm32-unknown-unknown
+        run: cargo check -p sighurt-sdk --target wasm32-unknown-unknown
 
+      # Everything that builds for wasm32: the SDK, the guest examples and the zero-dependency
+      # protocol crate. The browser crates, the WASM engine and the notes backend are native.
       - name: Check examples (wasm32)
         run: >
           cargo check --target wasm32-unknown-unknown --workspace
-          --exclude oxide-browser
-          --exclude oxide-docs
+          --exclude sighurt-browser
+          --exclude sighurt-core
+          --exclude sighurt-ui
+          --exclude sighurt-engine-wasm
           --exclude fullstack-notes-backend
 
       - name: Check fullstack-notes backend

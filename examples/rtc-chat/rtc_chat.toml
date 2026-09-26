@@ -1,4 +1,0 @@
-name = "RTC Chat"
-description = "WebRTC peer-to-peer chat"
-version = "0.1.0"
-permissions = []

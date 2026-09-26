@@ -1,0 +1,17 @@
+[package]
+name = "sighurt-browser"
+version = "0.7.0"
+edition = "2021"
+description = "Sighurt (sig): a minimal, engine-agnostic browser"
+license = "Apache-2.0"
+
+[[bin]]
+name = "sig"
+path = "src/main.rs"
+
+[dependencies]
+sighurt-core = { path = "../sighurt-core" }
+sighurt-ui = { path = "../sighurt-ui" }
+gpui = "0.2.2"
+# Honours RUST_LOG, e.g. RUST_LOG=sighurt_core=debug shows what engines log to their console.
+tracing-subscriber = "0.3"

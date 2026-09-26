@@ -1,0 +1,11 @@
+[package]
+name = "hello-sighurt"
+version = "0.1.0"
+edition = "2021"
+description = "Example guest application for Sighurt"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sighurt-sdk = { path = "../../sighurt-sdk" }

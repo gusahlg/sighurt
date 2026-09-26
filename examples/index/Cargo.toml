@@ -2,10 +2,10 @@
 name = "index"
 version = "0.1.0"
 edition = "2021"
-description = "Landing page for the Oxide platform — links to all demo apps"
+description = "Demo hub for Sighurt's WASM engine — links to the other examples by relative URL"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-oxide-sdk = { path = "../../oxide-sdk" }
+sighurt-sdk = { path = "../../sighurt-sdk" }

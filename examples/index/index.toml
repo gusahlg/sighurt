@@ -1,4 +1,4 @@
-name = "Oxide Examples"
-description = "Demo hub — links to hosted .wasm samples"
+name = "Sighurt Examples"
+description = "Demo hub — links to the example .wasm files next to it"
 version = "0.1.0"
 permissions = []

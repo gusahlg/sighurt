@@ -1,413 +1,187 @@
-# Oxide — A Binary-First Browser
+# Sighurt
 
-[![Release](https://img.shields.io/github/v/release/niklabh/oxide?style=flat-square)](https://github.com/niklabh/oxide/releases)
-[![Crates.io](https://img.shields.io/crates/v/oxide-sdk?style=flat-square)](https://crates.io/crates/oxide-sdk)
-[![License](https://img.shields.io/crates/l/oxide-sdk?style=flat-square)](https://github.com/niklabh/oxide/blob/main/LICENSE)
-[![docs.rs](https://img.shields.io/docsrs/oxide-sdk?style=flat-square)](https://docs.rs/oxide-sdk)
-[![CI](https://img.shields.io/github/actions/workflow/status/niklabh/oxide/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/niklabh/oxide/actions/workflows/ci.yml)
+Sighurt (`sig`) is a minimal, engine-agnostic browser. It draws two things and nothing else:
 
-Oxide is a **binary-first browser**: it fetches and runs `.wasm` (WebAssembly) modules instead of HTML, CSS, and JavaScript. Guest apps are Rust libraries compiled to `wasm32-unknown-unknown`, linked against [`oxide-sdk`](https://crates.io/crates/oxide-sdk), and executed in a **capability-based sandbox** — no filesystem, no environment variables, no raw sockets. Every interaction with the host (canvas, HTTP, audio, WebRTC, GPU, …) goes through explicit, opt-in host APIs registered in a wasmtime linker. Sensitive capabilities — camera, microphone, location, screen capture — additionally sit behind **per-origin permission prompts**, and apps can declare what they need up front in an optional **app manifest**.
+- **What engines send.** Every engine is a separate, sandboxed process that speaks [`sighurt-ipc`](./sighurt-ipc/src/lib.rs) on stdin/stdout, one process per page. It sends either finished RGBA frames or a list of draw operations (rectangles, paths, text, images, clips) that `sig` paints itself.
+- **What the UI code says.** The chrome (tab strip, toolbar with URL bar, status bar, `sig://home`) is trusted GPUI code in `sighurt-ui`.
 
-The desktop shell is built on [GPUI](https://www.gpui.rs/) (Zed's GPU-accelerated UI framework). Guest draw commands map directly onto GPUI primitives, so canvas output gets full hardware acceleration without a DOM or layout engine.
+Two engines come with it:
 
-**[Oxide Forge](./oxide-forge.md)** is an AI-native layer inside the browser where Claude writes, compiles, and hot-loads guest `.wasm` apps. Open `oxide://forge`, describe what you want, watch it run. See the [Oxide Forge](./oxide-forge.md) and the [Forge Kit](./forge/README.md).
+- **`sig-wasm`** runs `.wasm` apps (Rust compiled to `wasm32-unknown-unknown`) in a Wasmtime sandbox with no WASI. Apps reach the host only through explicit APIs. It speaks Oxide's app ABI, so Oxide apps run unchanged.
+- **`sig-servo`** renders HTML/CSS/JavaScript with [Servo](https://servo.org). It is built separately.
 
-![oxide](screens/oxide.png)
+Any other program that speaks `sighurt-ipc` becomes an engine with a few lines of config.
 
-### Demo
-
-<video src="https://oxide.foundation/assets/oxide-demo.mp4" poster="screens/oxide.png" controls width="100%"></video>
-
-## Table of contents
-
-- [Why Oxide?](#why-oxide)
-- [Quick start](#quick-start)
-- [Build a guest app](#build-a-guest-app)
-- [Loading modules](#loading-modules)
-- [Example apps](#example-apps)
-- [Architecture](#architecture)
-- [Host–guest boundary](#hostguest-boundary)
-- [Rendering model](#rendering-model)
-- [Security model](#security-model)
-- [Core stack](#core-stack)
-- [Oxide Forge](#oxide-forge--ai-native-app-generation)
-- [Documentation](#documentation)
-- [Contributing](#contributing)
-- [License](#license)
-
-## Why Oxide?
-
-| Traditional browser | Oxide |
-|---------------------|-------|
-| HTML + CSS + JS parsed at runtime | Single `.wasm` binary compiled ahead of time |
-| Implicit access to DOM, storage, network | Zero capabilities by default; host APIs are explicit |
-| Layout engine + style cascade | Immediate-mode canvas — you place every pixel |
-| Large attack surface (extensions, plugins) | No WASI; sandbox is airtight by construction |
-
-Oxide is aimed at developers who want **Rust end-to-end** (guest UI + optional native backend), **predictable performance** (no JIT for app logic), and **strong isolation** for untrusted or user-generated modules — while still offering rich capabilities (video, WebRTC, GPU, MIDI, file picker) when the host grants them.
-
-## Quick start
-
-### Prerequisites
-
-- **Rust** (stable, 1.75+): [rustup.rs](https://rustup.rs)
-- **`wasm32-unknown-unknown`** target (for guest apps)
-- **FFmpeg** dev libraries (for video decode in the host): `brew install ffmpeg` on macOS; on Debian/Ubuntu see [CONTRIBUTING.md](./CONTRIBUTING.md#prerequisites)
-
-```bash
-rustup target add wasm32-unknown-unknown
+```text
+ sig  (sighurt-browser: main.rs only)
+  ├── sighurt-ui    chrome: tabs, toolbar, URL bar, status bar, sig://home
+  └── sighurt-core  config, commands and keys, routing, tabs and history,
+                    downloads, engine processes and the draw-list/frame renderer
+                         │ sighurt-ipc on stdin/stdout, one process per page
+                         │ ↓ navigation, input, resize, zoom
+                         │ ↑ frames or draw lists, URL, title, load state
+          ┌──────────────┴──────────────┐
+      sig-wasm                      sig-servo, or any program
+      (.wasm apps, "oxide" ABI)     speaking sighurt-ipc
 ```
 
-### Run the browser
+## Build and run
+
+You need Rust (stable) with the guest target (`rustup target add wasm32-unknown-unknown`) and the native libraries GPUI and the WASM engine link: X11/Wayland, xkbcommon, fontconfig, GTK/GLib, FFmpeg, ALSA, udev and v4l. On NixOS, `nix-shell` (see [`shell.nix`](./shell.nix)) provides everything, including what Servo needs. On Debian/Ubuntu, see the `apt-get install` line in [`ci.yml`](./.github/workflows/ci.yml). On macOS, `brew install ffmpeg pkg-config`.
 
 ```bash
-git clone https://github.com/niklabh/oxide.git
-cd oxide
-
-cargo run -p oxide-browser
-# or: cargo build --release -p oxide-browser && ./target/release/oxide-browser
+nix-shell                                  # NixOS only
+cargo build                                # builds sig and sig-wasm into target/debug
+cargo run -p sighurt-browser               # opens sig://home
+cargo run -p sighurt-browser -- --help
 ```
 
-### Run the hello-world guest
+```text
+sig [URL|PATH ...]     open each argument in its own tab (none: the home page)
+sig --default-config   print the built-in configuration
+sig --help | --version
+```
+
+An argument that names an existing file or directory becomes a `file://` URL. Anything else is treated like URL bar input: `example.com` becomes `https://example.com`, and text that doesn't look like an address becomes a search.
+
+### WASM apps
 
 ```bash
-cargo build --target wasm32-unknown-unknown --release -p hello-oxide
+cargo build --target wasm32-unknown-unknown --release -p hello-sighurt
+cargo run -p sighurt-browser -- target/wasm32-unknown-unknown/release/hello_sighurt.wasm
 ```
 
-In the browser: click **Open** and select  
-`target/wasm32-unknown-unknown/release/hello_oxide.wasm`,  
-or enter a hosted URL (e.g. from [oxide.foundation](https://oxide.foundation)) in the address bar.
-
-Internal pages use the `oxide://` scheme: `oxide://home`, `oxide://history`, `oxide://bookmarks`, `oxide://about`, `oxide://forge`, `oxide://settings`.
-
-Common shortcuts: `Cmd/Ctrl+L` focuses the address bar, `Cmd/Ctrl+T` / `W` / `R` manage tabs and reload, `Cmd/Ctrl+K` opens the command palette, `Cmd/Ctrl+F` finds in the page, `Cmd/Ctrl+,` opens settings, and `Cmd/Ctrl++` / `-` / `0` control page zoom. See [DOCS.md](./DOCS.md#keyboard-shortcuts) for the full list.
-
-## Build a guest app
-
-Guest apps are Rust `cdylib` crates. They **must** export `start_app()`; optionally export `on_frame(dt_ms: u32)` for interactive loops and `on_timer(callback_id: u32)` for timers.
+Every crate in [`examples/`](./examples/) except `fullstack-notes/backend` is a WASM app. [`index`](./examples/index/) links to the others by relative URL, so build them all and open it:
 
 ```bash
-cargo new --lib my-app && cd my-app
+cargo build --target wasm32-unknown-unknown --release -p index -p hello-sighurt \
+  -p typography-demo -p gradient-demo -p raf-demo -p timer-demo -p events-demo -p sse-demo \
+  -p audio-player -p fullstack-notes-frontend
+cargo run -p sighurt-browser -- target/wasm32-unknown-unknown/release/index.wasm
 ```
 
-**`Cargo.toml`:**
+### Web pages (Servo)
+
+`sig-servo` has its own Cargo workspace. It needs Servo's build dependencies and the first build is long; see [`sighurt-engine-servo/README.md`](./sighurt-engine-servo/README.md).
+
+```bash
+cargo build --release --manifest-path sighurt-engine-servo/Cargo.toml
+cp sighurt-engine-servo/target/release/sig-servo target/debug/
+cargo run -p sighurt-browser -- https://example.com
+```
+
+`sig` looks for each engine's program next to its own binary, then on `PATH`. `sig://home` lists the configured engines and whether each was found.
+
+## Crates
+
+| Crate | What it is |
+|-------|------------|
+| [`sighurt-browser`](./sighurt-browser/) | Binary `sig`: command-line options and wiring (`main.rs` only). |
+| [`sighurt-core`](./sighurt-core/) | Everything but the chrome: config, commands and keymap, routing, the session (tabs, history), downloads, and the engine host that runs engine processes and paints their frames and draw lists. |
+| [`sighurt-ui`](./sighurt-ui/) | The default chrome. Swapping the UI means changing `sighurt-browser/src/main.rs`. |
+| [`sighurt-ipc`](./sighurt-ipc/) | The engine protocol. Zero dependencies. |
+| [`sighurt-engine-wasm`](./sighurt-engine-wasm/) | Binary `sig-wasm`: the WASM engine. |
+| [`sighurt-engine-servo`](./sighurt-engine-servo/) | Binary `sig-servo`: the Servo engine. Separate workspace. |
+| [`sighurt-sdk`](./sighurt-sdk/) | Guest SDK for WASM apps. |
+| [`examples/`](./examples/) | WASM apps, plus the native backend of `fullstack-notes`. |
+
+## Configuration
+
+All settings live in TOML; there is no settings screen. The built-in configuration is [`sighurt-core/src/default-config.toml`](./sighurt-core/src/default-config.toml), which documents the format; `sig --default-config` prints it. Your file is `sighurt/config.toml` in the platform config directory (`~/.config/sighurt/config.toml` on Linux, `~/Library/Application Support/sighurt/config.toml` on macOS). It is merged over the defaults when `sig` starts:
+
+- `home`, `search` and `default_engine` replace the defaults.
+- `[engines.<name>]` tables merge by name, field by field. A new name adds an engine.
+- `[keys]` and `[ui]` are yours alone: there are no default bindings or UI settings.
+
+A file that isn't valid TOML or has an unknown key is ignored with a warning. A bad key binding is skipped with a warning.
 
 ```toml
-[lib]
-crate-type = ["cdylib"]
+home = "https://example.com"
 
-[dependencies]
-oxide-sdk = "0.7"   # or path = "../oxide/oxide-sdk"
+[engines.servo]
+command = ["/opt/sig-servo/sig-servo"]   # only the command changes
+
+[engines.gemini]                         # a new engine
+command = ["sig-gemini"]
+schemes = ["gemini"]
+
+[ui.colors]
+bg = "#000000"
 ```
 
-**`src/lib.rs` (minimal interactive app):**
+### Engines and routing
+
+| Key | Meaning |
+|-----|---------|
+| `command` | Program and arguments. A bare name is looked up next to `sig`, then on `PATH`. |
+| `schemes` | URL schemes the engine handles, other than http, https and file. |
+| `extensions` | File extensions it renders (`wasm`, not `.wasm`). |
+| `mime` | MIME types it renders. `image/*` matches every image type. |
+
+Engines are tried in alphabetical order and the first match wins:
+
+1. `sig://home` is drawn by the UI. Any other `sig://` URL shows an error.
+2. A scheme other than http, https and file goes to the engine that lists it (by default `data:` and `about:` go to Servo), or can't be opened.
+3. The file extension of the URL's path is matched against `extensions`.
+4. Other `file:` URLs go to `default_engine`.
+5. Other http(s) URLs are probed with a HEAD request (GET if HEAD fails). The `Content-Type` is matched against `mime`; a type no engine lists is downloaded to your download folder. If the probe fails, `default_engine` gets the URL.
+
+### Keys and commands
+
+Everything `sig` does is a named command. The toolbar and tab strip run commands, and so do key bindings. There are no default bindings: bind keys in your own config.
+
+```toml
+[keys]                          # everywhere
+"secondary-t" = "tab.new"
+"secondary-w" = "tab.close"
+"secondary-1" = "tab.select 1"
+"secondary-l" = "location.focus"
+"secondary-=" = "page.zoom-in"
+
+[keys.page]                     # only while the page has focus
+"g g" = "location.focus"
+
+[keys.location]                 # only while the URL bar has focus
+"alt-enter" = "page.open https://example.com"
+```
+
+| Area | Commands |
+|------|----------|
+| `tab` | `tab.new`, `tab.close [n]`, `tab.next`, `tab.previous`, `tab.select <n>`, `tab.last` |
+| `page` | `page.open <url>`, `page.reload`, `page.stop`, `page.back`, `page.forward`, `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` |
+| `location` | `location.focus` |
+| `browser` | `browser.home`, `browser.quit` |
+
+Keys use GPUI keystroke syntax: modifiers `ctrl`, `alt`, `shift`, `cmd` and `secondary` (cmd on macOS, ctrl elsewhere), with space-separated sequences such as `"ctrl-x ctrl-c"`. The browser sees keys before the page, so a `[keys.page]` binding takes that key away from the page.
+
+## Writing WASM apps
+
+A WASM app is a Rust `cdylib` for `wasm32-unknown-unknown` that depends on [`sighurt-sdk`](./sighurt-sdk/) by path (it is not on crates.io). It draws its whole UI on a canvas and polls input; there are no widgets.
 
 ```rust
-use oxide_sdk::*;
+use sighurt_sdk::*;
 
 #[no_mangle]
 pub extern "C" fn start_app() {
-    log("Hello from Oxide!");
+    log("Hello from Sighurt!");
 }
 
 #[no_mangle]
 pub extern "C" fn on_frame(_dt_ms: u32) {
     canvas_clear(30, 30, 46, 255);
-    canvas_text(20.0, 30.0, 24.0, 255, 255, 255, 255, "My Oxide App");
-    ui_button(1, 20.0, 70.0, 120.0, 30.0, "Click", || {
-        log("clicked!");
-    });
+    canvas_text(20.0, 30.0, 24.0, 255, 255, 255, 255, "My app");
 }
 ```
 
-```bash
-cargo build --target wasm32-unknown-unknown --release
-# → target/wasm32-unknown-unknown/release/my_app.wasm
-```
+Host functions live in the WASM import module `"oxide"`, Oxide's app ABI, so apps built for Oxide (including with the [`oxide-sdk`](https://crates.io/crates/oxide-sdk) crate) run unchanged unless they use Oxide's widget kit. The guide and API overview are in [DOCS.md](./DOCS.md).
 
-For a higher-level drawing API, use `oxide_sdk::draw` (`Canvas`, `Color`, `Rect`, `Point2D`). Full API tables, WebSocket/WebRTC patterns, and protobuf fetch are in **[DOCS.md](./DOCS.md)**.
+## Security
 
-### Optional app manifest
+Engines are separate processes and `sig` treats what they send as untrusted: message sizes, text, images, draw lists and coordinates are all bounded, pages can't open `sig://` URLs, and only the front tab may open new tabs, at most one a second. WASM apps get no capabilities by default, and camera, microphone, location and screen capture need a per-origin grant. Servo pages get Servo's security model. An engine you add to the config runs with your privileges. See [SECURITY.md](./SECURITY.md) to report a vulnerability.
 
-Ship a TOML manifest next to your `.wasm` (same URL with `.wasm` → `.toml`, e.g. `my_app.wasm` + `my_app.toml`) to give your app a name and declare the sensitive capabilities it may request:
+## Development
 
-```toml
-name = "My App"
-description = "What it does"
-version = "0.1.0"
-permissions = ["camera", "microphone"]   # also: geolocation, screen-capture
-```
-
-The `name` becomes the tab title. With a manifest present, sensitive APIs **not** listed in `permissions` are denied without prompting; declared ones show a Chrome-style permission prompt on first use per origin. Apps without a manifest may prompt for any sensitive API. See [DOCS.md → App Manifests](./DOCS.md#app-manifests).
-
-### Guest contract (checklist)
-
-| Requirement | Detail |
-|-------------|--------|
-| Crate type | `[lib] crate-type = ["cdylib"]` |
-| Target | `wasm32-unknown-unknown` |
-| Entry | Export `start_app()` — called once on load |
-| Frame loop | Optional `on_frame(dt_ms: u32)` — called every frame; fuel replenished each call |
-| Timers | Optional `on_timer(callback_id: u32)` — for `set_timeout` / `set_interval` |
-| Imports | Only from the `"oxide"` WASM import module (via `oxide-sdk`) — **never WASI** |
-| Memory | All strings/bytes cross the FFI as `(ptr, len)` into linear memory |
-
-## Loading modules
-
-| Method | How |
-|--------|-----|
-| **Local file** | Toolbar **Open** → pick `.wasm` (max 50 MB) |
-| **HTTP(S)** | Enter URL in the address bar; host fetches bytes and compiles |
-| **`file://`** | Open a local path to a `.wasm` file |
-| **`oxide://`** | Built-in pages (home, history, forge, …) — no guest module |
-| **Child module** | Guest calls `load_module(url)` for an isolated sub-sandbox |
-
-Pipeline: **fetch bytes (+ optional sibling manifest) → compile (wasmtime) → link host functions → instantiate → `start_app()` → `on_frame` loop**. Load runs on a background thread; the GPUI shell talks to the runtime over channels.
-
-## Example apps
-
-Build any example with `cargo build --target wasm32-unknown-unknown --release -p <name>`.
-
-| Crate | What it demonstrates |
-|-------|----------------------|
-| [`hello-oxide`](./examples/hello-oxide/) | Widgets, input, frame loop |
-| [`index`](./examples/index/) | Demo hub — links to hosted `.wasm` samples |
-| [`audio-player`](./examples/audio-player/) | Decode and play audio |
-| [`video-player`](./examples/video-player/) | FFmpeg video, subtitles, PiP, HLS |
-| [`media-capture`](./examples/media-capture/) | Camera, microphone, screen capture |
-| [`gpu-graphics-demo`](./examples/gpu-graphics-demo/) | WebGPU-style buffers, shaders, compute |
-| [`rtc-chat`](./examples/rtc-chat/) | WebRTC P2P chat |
-| [`ws-chat`](./examples/ws-chat/) | WebSocket chat |
-| [`sse-demo`](./examples/sse-demo/) | Server-Sent Events (EventSource) |
-| [`stream-fetch-demo`](./examples/stream-fetch-demo/) | Streaming HTTP fetch |
-| [`timer-demo`](./examples/timer-demo/) | `set_timeout` / `set_interval` |
-| [`raf-demo`](./examples/raf-demo/) | `request_animation_frame` |
-| [`midi-demo`](./examples/midi-demo/) | MIDI input visualizer |
-| [`events-demo`](./examples/events-demo/) | Custom event listeners |
-| [`file-picker-demo`](./examples/file-picker-demo/) | Native file/folder picker and I/O |
-| [`platform-demo`](./examples/platform-demo/) | Crypto, compression, and system info |
-| [`gradient-demo`](./examples/gradient-demo/) | Canvas gradients |
-| [`typography-demo`](./examples/typography-demo/) | `canvas_text_ex`, fonts, alignment |
-| [`fullstack-notes`](./examples/fullstack-notes/) | Rust WASM frontend + native backend |
-
-Open **`index`** in the browser for a visual catalog, or run `cargo run -p oxide-browser` and navigate to hosted demos on [oxide.foundation](https://oxide.foundation).
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Oxide Browser                             │
-│                                                                  │
-│  ┌──────────┐  ┌────────────────────────┐  ┌─────────────────┐   │
-│  │  URL Bar │  │        Canvas          │  │     Console     │   │
-│  └────┬─────┘  └───────────┬────────────┘  └────────┬────────┘   │
-│       │                    │                        │            │
-│  ┌────▼────────────────────▼────────────────────────▼─────────┐  │
-│  │                    Host Runtime                            │  │
-│  │  wasmtime engine  ·  fuel metering  ·  bounded memory      │  │
-│  └────────────────────────────┬───────────────────────────────┘  │
-│                               │                                  │
-│  ┌────────────────────────────▼───────────────────────────────┐  │
-│  │                  Capability Layer                          │  │
-│  │  "oxide" import module — ~150 host functions               │  │
-│  │  canvas · gpu · audio · video · capture · fetch · streaming│  │
-│  │  websocket · sse · webrtc · midi · timers · animation frames│  │
-│  │  console · storage · clipboard · widgets · crypto · ...    │  │
-│  └────────────────────────────┬───────────────────────────────┘  │
-│                               │                                  │
-│  ┌────────────────────────────▼───────────────────────────────┐  │
-│  │                  Guest .wasm Module                        │  │
-│  │  exports: start_app(), on_frame(dt)                        │  │
-│  │  imports: oxide::*  (via oxide-sdk)                        │  │
-│  └────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Project structure
-
-```
-oxide/
-├── oxide-browser/           # Host browser (wasmtime + GPUI)
-│   └── src/
-│       ├── engine.rs        # WasmEngine, SandboxPolicy, compile & memory bounds
-│       ├── runtime.rs       # BrowserHost — fetch, load, instantiate, frame loop
-│       ├── capabilities.rs  # Host functions registered into the wasmtime Linker
-│       ├── forge.rs         # oxide://forge — Claude streaming + cargo driver
-│       ├── forge_config.rs  # Forge paths, model, env configuration
-│       ├── navigation.rs    # History stack, back/forward
-│       ├── url.rs           # URL parser (http, https, file, oxide)
-│       ├── rtc.rs, websocket.rs, gpu.rs, video.rs, …
-│       └── ui.rs            # GPUI shell — toolbar, canvas, console, widgets
-├── oxide-sdk/               # Guest SDK (no_std-friendly FFI wrappers)
-│   └── src/
-│       ├── lib.rs           # Safe wrappers over host imports
-│       ├── draw.rs          # High-level Canvas / Color / Rect API
-│       └── proto.rs         # Zero-dependency protobuf codec
-├── forge/                   # Forge kit — prompts, catalog, recipes, templates
-├── examples/                # Guest demo apps (see table above)
-├── DOCS.md                  # Full developer guide & API reference
-└── ROADMAP.md               # Planned features
-```
-
-### Module loading pipeline
-
-```
- ┌───────────────┐     ┌──────────────┐     ┌──────────────────┐
- │  Fetch bytes  │────▶│   Compile    │────▶│  Link host fns   │
- │  (HTTP/file)  │     │  (wasmtime)  │     │  + bounded mem   │
- └───────────────┘     └──────────────┘     └────────┬─────────┘
-                                                     │
- ┌───────────────┐     ┌──────────────┐     ┌────────▼─────────┐
- │  Frame loop   │◀────│  start_app() │◀────│   Instantiate    │
- │  (on_frame)   │     │  entry call  │     │   wasm module    │
- └───────────────┘     └──────────────┘     └──────────────────┘
-```
-
-1. **Fetch** — download `.wasm` via HTTP or read a local file (max 50 MB); an optional sibling `.toml` manifest is loaded alongside.
-2. **Compile** — `WasmEngine` + `SandboxPolicy` (fuel and memory bounds). Serialized artifacts are reused from an on-disk AOT cache keyed by the module hash.
-3. **Link** — register all `oxide::*` imports; bounded linear memory (4096 pages / 256 MB max).
-4. **Instantiate** — `HostState` holds canvas commands, console, input, storage, widgets.
-5. **`start_app()`** — guest entry runs once.
-6. **`on_frame(dt_ms)`** — optional per-frame callback; fuel replenished each frame (50M instructions).
-
-## Host–guest boundary
-
-Guest modules start with **zero capabilities**. All host access is under the `"oxide"` WASM import namespace:
-
-| Category | Host functions (representative) |
-|----------|--------------------------------|
-| **Canvas** | `clear`, `rect`, `circle`, `text`, `text_ex`, `measure_text`, `line`, `image`, scroll/virtual size; plus `oxide_sdk::draw` |
-| **GPU** | buffers, textures, WGSL shaders, render/compute pipelines, `gpu_draw`, `gpu_dispatch_compute` |
-| **UI widgets** | `button`, `checkbox`, `slider`, `text_input` (immediate-mode) |
-| **Console** | `log`, `warn`, `error` |
-| **Input** | mouse position/buttons, keys, scroll delta, modifiers |
-| **Storage** | session `storage_*`, persistent `kv_store_*` (sled-backed) — both scoped to the app origin |
-| **File I/O** | `file_pick`, `folder_pick`, `folder_entries`, `file_read`, `file_read_range` |
-| **Events** | `on_event`, `off_event`, `emit_event` |
-| **Download / PDF** | `download_data`, `download_url`, `canvas_print_pdf` |
-| **HTTP** | `fetch`, `fetch_get/post/…`, `fetch_post_proto`, streaming `fetch_begin/recv/…` |
-| **WebSocket** | connect, send/recv text/binary, ready state, close |
-| **SSE** | EventSource streams with automatic reconnect and `Last-Event-ID` |
-| **WebRTC** | peer connection, SDP, ICE, data channels, media tracks |
-| **Audio / video** | playback, seek, HLS, subtitles; FFmpeg-backed decode |
-| **Media capture** | camera, microphone, screen — gated by per-origin permission prompts |
-| **MIDI** | device enumeration, open, send, recv |
-| **Timers** | `set_timeout`, `set_interval`, `request_animation_frame` |
-| **Navigation** | `navigate`, history, `get_url`, hyperlinks on canvas |
-| **Crypto** | SHA-256, Base64 |
-| **Clipboard** | read, write |
-| **Dynamic loading** | `load_module` — child `.wasm` with isolated memory and fuel |
-
-Data crosses the boundary through linear memory: `(ptr, len)` pairs; helpers `read_guest_string` / `write_guest_bytes` on the host side. See [`CAPABILITIES.md`](./forge/skills/oxide-wasm-app/references/CAPABILITIES.md) for the full generated catalog used by Forge.
-
-## Rendering model
-
-Oxide uses **immediate-mode rendering** — no DOM, no retained scene graph:
-
-1. Each frame, the guest issues draw commands (`canvas_clear`, `canvas_rect`, …) into a command queue on the host.
-2. Widget calls (`ui_button`, …) enqueue overlay widgets.
-3. `ui.rs` drains both queues and paints with GPUI (`paint_quad`, `paint_path`, `paint_image`, GPU text shaping).
-4. Images decode once and cache as `RenderImage` textures (same path for video frames).
-5. Interaction state flows back on the next `on_frame` via `widget_clicked`, mouse/key polling, etc.
-
-The guest decides layout, styling, and hit targets explicitly.
-
-## Security model
-
-| Constraint | Value | Purpose |
-|------------|-------|---------|
-| Filesystem access | **None** | Guest cannot touch host files directly |
-| Environment variables | **None** | Guest cannot read host env |
-| Network sockets | **None** | All HTTP/WebSocket/WebRTC mediated by host |
-| Memory ceiling | 256 MB (4096 pages) | Prevents memory exhaustion |
-| Fuel budget | 500M instructions/call | Prevents infinite loops and DoS |
-| Sensitive APIs | **User permission required** | Camera, mic, location, screen capture prompt per origin |
-| Storage | **Origin-scoped** | Session + persistent KV isolated per app origin |
-
-Security is **additive**: nothing is granted by default. File access uses a native picker; HTTP uses host `reqwest`; child modules get separate memory and fuel. **No WASI** is linked.
-
-On top of the sandbox, sensitive capabilities use a Chrome-style **permission prompt** (top-left, Allow/Block, remembered per origin and capability), and an app's [manifest](#optional-app-manifest) acts as a capability declaration — undeclared sensitive APIs are denied without prompting.
-
-## Core stack
-
-| Component | Crate / library | Role |
-|-----------|-----------------|------|
-| Runtime | `wasmtime` | WASM execution, fuel, memory limits |
-| Networking | `reqwest`, `tokio-tungstenite` | HTTP, streaming fetch, WebSocket |
-| Async | `tokio` | Background load, network, RTC |
-| UI | [GPUI](https://www.gpui.rs/) | Native shell, GPU canvas |
-| Storage | `sled` | Persistent KV per origin |
-| File picker | `rfd` | Native dialogs |
-| Clipboard | `arboard` | System clipboard |
-| Imaging | `image` | PNG/JPEG/GIF/WebP for canvas |
-| Video | `ffmpeg-next` | Decode, HLS, subtitles, PiP |
-| Audio | `rodio` | Multi-channel playback |
-| Capture | `nokhwa`, `cpal`, `screenshots` | Camera, mic, screen |
-| GPU | `wgpu` | Guest WebGPU-style API |
-| WebRTC | `webrtc` | P2P, data channels, tracks |
-| MIDI | `coremidi` (macOS) | MIDI I/O |
-| Crypto | `sha2` | SHA-256 for guests |
-
-## Oxide Forge — AI-native app generation
-
-`oxide://forge` turns natural-language prompts into compiled guest `.wasm` modules running in the same browser.
-
-### Flow
-
-```
- ┌───────────────────┐    ┌────────────────┐   ┌────────────────────┐
- │  prompt / revise  │───▶│  Claude stream │──▶│  write lib.rs      │
- │  (oxide://forge)  │    │  (Messages API)│   │  to chosen dir     │
- └───────────────────┘    └────────────────┘   └──────────┬─────────┘
-                                                          │
- ┌───────────────────┐    ┌──────────────────┐   ┌────────▼─────────┐
- │  "Run" → new tab  │◀───│  load .wasm      │◀──│  cargo build     │
- │  sandboxed        │    │  into BrowserHost│   |  wasm32-unknown  │
- └───────────────────┘    └──────────────────┘   └──────────────────┘
-```
-
-Forge lists every creation; select one and prompt again to **revise** — it sends the current `src/lib.rs` to Claude, rebuilds, and copies `<slug>.wasm` into the project folder. On compile failure, Forge feeds compiler output back to Claude up to **3 times** before surfacing the error.
-
-### Under the hood
-
-| Piece | Location |
-|-------|----------|
-| Prompt kit (system prompt, SDK catalog, recipes, patterns) | [`forge/`](./forge/) |
-| Session state, Claude streaming, cargo driver, self-debug | [`oxide-browser/src/forge.rs`](./oxide-browser/src/forge.rs) |
-| `oxide://forge` UI | [`oxide-browser/src/ui.rs`](./oxide-browser/src/ui.rs) |
-| Base Cargo template per session | [`forge/templates/base/`](./forge/templates/base/) |
-
-Generation follows the [`oxide-wasm-app`](./forge/skills/oxide-wasm-app/SKILL.md) Agent Skill, constrained to the same sandbox as hand-written guests. The Forge **build step runs host `cargo`** — that is intentional developer tooling, not guest code.
-
-### Try Forge
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-…
-cargo run -p oxide-browser
-# URL bar → oxide://forge → type a prompt → Enter
-```
-
-| Variable | Purpose |
-|----------|---------|
-| `ANTHROPIC_API_KEY` | Required for Claude API |
-| `OXIDE_FORGE_DIR` | Output directory for generated projects (default: `target/forge/`) |
-| `OXIDE_FORGE_MODEL` | Override default model (`claude-opus-4-7`) |
-
-Use **Choose folder** in the Forge UI to pick a persistent projects directory. Curated demo prompts: [`forge/DEMO_PROMPTS.md`](./forge/DEMO_PROMPTS.md).
-
-## Documentation
-
-| Resource | Description |
-|----------|-------------|
-| **[DOCS.md](./DOCS.md)** | Full developer guide, API reference, hosting WASM on the web |
-| **[docs.rs/oxide-sdk](https://docs.rs/oxide-sdk)** | Rust API docs for the guest SDK |
-| **[CONTRIBUTING.md](./CONTRIBUTING.md)** | Dev setup, adding host functions, PR process |
-| **[ROADMAP.md](./ROADMAP.md)** | Planned features and milestones |
-| **[forge/README.md](./forge/README.md)** | Forge kit for AI agents |
-| **[SECURITY.md](./SECURITY.md)** | Security reporting |
-| **[oxide-forge.md](./oxide-forge.md)** | Forge hackathon / design notes |
-
-**Workspace checks** (before committing):
+[CONTRIBUTING.md](./CONTRIBUTING.md) covers the checks and how to add an engine, a command or a host function. [ROADMAP.md](./ROADMAP.md) lists what's next. Before committing:
 
 ```bash
 cargo fmt --all
@@ -415,10 +189,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## Contributing
+## Credits and license
 
-Contributions welcome — host capabilities, SDK wrappers, examples, docs, and Forge prompts. See **[CONTRIBUTING.md](./CONTRIBUTING.md)** for the host-function checklist, coding guidelines, and issue labels. Join discussions on [GitHub Issues](https://github.com/niklabh/oxide/issues).
+Sighurt started as a fork of [Oxide](https://github.com/niklabh/oxide) by Nikhil Ranjan.
 
-## License
-
-Apache-2.0 — see [LICENSE](./LICENSE).
+Licensed under Apache-2.0, like Oxide. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE). The exception is `sighurt-engine-servo`, which is `Apache-2.0 AND MPL-2.0`: its `src/rendering.rs` is adapted from [Servo](https://github.com/servo/servo) and stays under the Mozilla Public License 2.0, and `sig-servo` links Servo, which is MPL-2.0.

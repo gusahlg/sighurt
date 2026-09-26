@@ -1,4 +1,4 @@
-use oxide_sdk::*;
+use sighurt_sdk::*;
 
 const BG: (u8, u8, u8) = (25, 25, 40);
 const ACCENT: (u8, u8, u8) = (80, 160, 220);
@@ -14,14 +14,6 @@ const CB_COUNTDOWN: u32 = 1;
 const CB_DELAYED_MSG: u32 = 2;
 const CB_BLINK: u32 = 3;
 const CB_STOPWATCH: u32 = 4;
-
-// Widget / button IDs
-const BTN_START_COUNTDOWN: u32 = 100;
-const BTN_FIRE_DELAY: u32 = 101;
-const BTN_TOGGLE_BLINK: u32 = 102;
-const BTN_STOPWATCH_START: u32 = 103;
-const BTN_STOPWATCH_STOP: u32 = 104;
-const BTN_STOPWATCH_RESET: u32 = 105;
 
 static mut COUNTDOWN: i32 = 0;
 static mut COUNTDOWN_TIMER: u32 = 0;
@@ -69,49 +61,27 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
 
     // ── Header ──────────────────────────────────────────────────────
     canvas_rect(0.0, 0.0, w, 52.0, ACCENT.0, ACCENT.1, ACCENT.2, 255);
-    canvas_text(20.0, 14.0, 22.0, 255, 255, 255, 255, "Oxide Timer Demo");
-    canvas_text(
+    text(20.0, 14.0, 22.0, (255, 255, 255), "Sighurt Timer Demo");
+    text(
         20.0,
         36.0,
         11.0,
-        200,
-        220,
-        255,
-        255,
+        (200, 220, 255),
         "set_timeout / set_interval / clear_timer",
     );
 
     // ── Countdown (set_interval) ────────────────────────────────────
-    canvas_text(
-        20.0,
-        72.0,
-        14.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
-        "COUNTDOWN (set_interval)",
-    );
+    text(20.0, 72.0, 14.0, DIM, "COUNTDOWN (set_interval)");
 
     let countdown = unsafe { COUNTDOWN };
     let running = unsafe { COUNTDOWN_TIMER } != 0;
 
-    ui_button(
-        BTN_START_COUNTDOWN,
-        20.0,
-        95.0,
-        140.0,
-        30.0,
-        "Start from 10",
-        || {
-            if !running {
-                unsafe {
-                    COUNTDOWN = 10;
-                    COUNTDOWN_TIMER = set_interval(CB_COUNTDOWN, 1000);
-                }
-            }
-        },
-    );
+    if button(20.0, 95.0, 140.0, 30.0, "Start from 10") && !running {
+        unsafe {
+            COUNTDOWN = 10;
+            COUNTDOWN_TIMER = set_interval(CB_COUNTDOWN, 1000);
+        }
+    }
 
     let (count_text, count_color) = if countdown > 3 {
         (format!("{countdown}"), GREEN)
@@ -123,46 +93,20 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
         ("--".into(), DIM)
     };
 
-    canvas_text(
-        200.0,
-        100.0,
-        28.0,
-        count_color.0,
-        count_color.1,
-        count_color.2,
-        255,
-        &count_text,
-    );
+    text(200.0, 100.0, 28.0, count_color, &count_text);
 
     if countdown == 0 && !running {
-        canvas_text(260.0, 105.0, 14.0, DIM.0, DIM.1, DIM.2, 255, "Done!");
+        text(260.0, 105.0, 14.0, DIM, "Done!");
     }
 
     // ── Delayed Message (set_timeout) ───────────────────────────────
     canvas_line(20.0, 145.0, w - 20.0, 145.0, 40, 35, 60, 255, 1.0);
-    canvas_text(
-        20.0,
-        160.0,
-        14.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
-        "DELAYED MESSAGE (set_timeout)",
-    );
+    text(20.0, 160.0, 14.0, DIM, "DELAYED MESSAGE (set_timeout)");
 
-    ui_button(
-        BTN_FIRE_DELAY,
-        20.0,
-        183.0,
-        180.0,
-        30.0,
-        "Fire after 3 sec",
-        || {
-            unsafe { DELAYED_MSG = "Waiting..." };
-            set_timeout(CB_DELAYED_MSG, 3000);
-        },
-    );
+    if button(20.0, 183.0, 180.0, 30.0, "Fire after 3 sec") {
+        unsafe { DELAYED_MSG = "Waiting..." };
+        set_timeout(CB_DELAYED_MSG, 3000);
+    }
 
     let msg = unsafe { DELAYED_MSG };
     if !msg.is_empty() {
@@ -171,21 +115,12 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
         } else {
             GREEN
         };
-        canvas_text(220.0, 190.0, 14.0, color.0, color.1, color.2, 255, msg);
+        text(220.0, 190.0, 14.0, color, msg);
     }
 
     // ── Blink (set_interval + clear_timer) ──────────────────────────
     canvas_line(20.0, 230.0, w - 20.0, 230.0, 40, 35, 60, 255, 1.0);
-    canvas_text(
-        20.0,
-        245.0,
-        14.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
-        "BLINK (interval + clear)",
-    );
+    text(20.0, 245.0, 14.0, DIM, "BLINK (interval + clear)");
 
     let blinking = unsafe { BLINK_TIMER } != 0;
     let label = if blinking {
@@ -193,14 +128,8 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
     } else {
         "Start Blink"
     };
-    ui_button(
-        BTN_TOGGLE_BLINK,
-        20.0,
-        268.0,
-        120.0,
-        30.0,
-        label,
-        || unsafe {
+    if button(20.0, 268.0, 120.0, 30.0, label) {
+        unsafe {
             if blinking {
                 clear_timer(BLINK_TIMER);
                 BLINK_TIMER = 0;
@@ -209,8 +138,8 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
                 BLINK_ON = true;
                 BLINK_TIMER = set_interval(CB_BLINK, 500);
             }
-        },
-    );
+        }
+    }
 
     let blink_on = unsafe { BLINK_ON };
     if blink_on {
@@ -219,14 +148,11 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
         canvas_circle(200.0, 283.0, 14.0, 50, 50, 60, 255);
     }
 
-    canvas_text(
+    text(
         230.0,
         276.0,
         13.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
+        DIM,
         if blinking {
             "Toggling every 500ms"
         } else {
@@ -236,90 +162,70 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
 
     // ── Stopwatch (set_interval + clear_timer) ──────────────────────
     canvas_line(20.0, 315.0, w - 20.0, 315.0, 40, 35, 60, 255, 1.0);
-    canvas_text(
-        20.0,
-        330.0,
-        14.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
-        "STOPWATCH (100ms interval)",
-    );
+    text(20.0, 330.0, 14.0, DIM, "STOPWATCH (100ms interval)");
 
     let sw_running = unsafe { STOPWATCH_TIMER } != 0;
     let sw_ms = unsafe { STOPWATCH_MS };
 
-    ui_button(
-        BTN_STOPWATCH_START,
-        20.0,
-        353.0,
-        80.0,
-        30.0,
-        "Start",
-        || {
-            if !sw_running {
-                unsafe {
-                    STOPWATCH_TIMER = set_interval(CB_STOPWATCH, 100);
-                }
-            }
-        },
-    );
-    ui_button(BTN_STOPWATCH_STOP, 110.0, 353.0, 80.0, 30.0, "Stop", || {
-        if sw_running {
-            unsafe {
-                clear_timer(STOPWATCH_TIMER);
-                STOPWATCH_TIMER = 0;
-            }
+    if button(20.0, 353.0, 80.0, 30.0, "Start") && !sw_running {
+        unsafe { STOPWATCH_TIMER = set_interval(CB_STOPWATCH, 100) };
+    }
+    if button(110.0, 353.0, 80.0, 30.0, "Stop") && sw_running {
+        unsafe {
+            clear_timer(STOPWATCH_TIMER);
+            STOPWATCH_TIMER = 0;
         }
-    });
-    ui_button(
-        BTN_STOPWATCH_RESET,
-        200.0,
-        353.0,
-        80.0,
-        30.0,
-        "Reset",
-        || {
-            if !sw_running {
-                unsafe { STOPWATCH_MS = 0 };
-            }
-        },
-    );
+    }
+    if button(200.0, 353.0, 80.0, 30.0, "Reset") && !sw_running {
+        unsafe { STOPWATCH_MS = 0 };
+    }
 
     let secs = sw_ms / 1000;
     let tenths = (sw_ms % 1000) / 100;
-    canvas_text(
-        310.0,
-        355.0,
-        28.0,
-        BRIGHT.0,
-        BRIGHT.1,
-        BRIGHT.2,
-        255,
-        &format!("{secs}.{tenths}s"),
-    );
+    text(310.0, 355.0, 28.0, BRIGHT, &format!("{secs}.{tenths}s"));
 
     // ── Info ─────────────────────────────────────────────────────────
     canvas_line(20.0, 405.0, w - 20.0, 405.0, 40, 35, 60, 255, 1.0);
-    canvas_text(
+    text(
         20.0,
         420.0,
         12.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
+        DIM,
         "Timers fire via exported on_timer(callback_id). Intervals repeat until cleared.",
     );
-    canvas_text(
+    text(
         20.0,
         440.0,
         12.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
+        DIM,
         "Resolution is tied to the frame rate (~16ms at 60fps).",
     );
+}
+
+/// A hand-drawn button: returns `true` when it was clicked this frame.
+fn button(x: f32, y: f32, w: f32, h: f32, label: &str) -> bool {
+    let (mx, my) = mouse_position();
+    let hover = mx >= x && mx < x + w && my >= y && my < y + h;
+    let shade = if hover { 80 } else { 60 };
+    canvas_rounded_rect(x, y, w, h, 6.0, shade, shade, shade + 30, 255);
+    // The 14 px label's line box is 1.2 × its size tall, starting at `y`.
+    canvas_text_ex(
+        x + w / 2.0,
+        y + (h - 14.0 * 1.2) / 2.0,
+        14.0,
+        235,
+        235,
+        245,
+        255,
+        "",
+        0,
+        FONT_STYLE_NORMAL,
+        TEXT_ALIGN_CENTER,
+        label,
+    );
+    hover && mouse_button_clicked(0)
+}
+
+fn text(x: f32, y: f32, size: f32, (r, g, b): (u8, u8, u8), s: &str) {
+    canvas_text(x, y, size, r, g, b, 255, s);
 }

@@ -1,0 +1,84 @@
+# Sighurt configuration.
+#
+# This is the built-in default. Your own file lives at ~/.config/sighurt/config.toml
+# (`sig --default-config` prints this file as a starting point). Every key is optional:
+# whatever you leave out keeps the value below. Engines merge by name. Changes apply when sig
+# next starts.
+
+# Page shown at startup and in new tabs.
+home = "sig://home"
+
+# What the URL bar does with text that isn't a URL; `{}` becomes the query.
+search = "https://duckduckgo.com/html/?q={}"
+
+# Engine for URLs that no rule below claims.
+default_engine = "servo"
+
+# ── Engines ────────────────────────────────────────────────────────────────────────────
+#
+# Every engine is a program that speaks sighurt-ipc on stdin/stdout, one process per page.
+# `command` is the program and its arguments. A bare program name is looked up next to the
+# `sig` binary first, then in PATH. sig-wasm is built with sig; sig-servo is built from
+# sighurt-engine-servo.
+#
+# Which engine opens a URL:
+#   1. sig:// pages belong to the browser.
+#   2. An engine that lists the URL's scheme (for schemes other than http, https and file).
+#   3. An engine that lists the path's file extension.
+#   4. For http(s): an engine that lists the Content-Type of a HEAD request ("type/*" works).
+#      A type no engine lists is downloaded.
+#   5. Otherwise `default_engine`.
+
+[engines.wasm]
+command = ["sig-wasm"]
+extensions = ["wasm"]
+mime = ["application/wasm"]
+
+[engines.servo]
+command = ["sig-servo"]
+schemes = ["data", "about"]
+extensions = ["html", "htm", "xhtml", "svg", "txt", "png", "jpg", "jpeg", "gif", "webp"]
+mime = ["text/html", "application/xhtml+xml", "text/plain", "image/svg+xml", "image/*"]
+
+# ── Keys ───────────────────────────────────────────────────────────────────────────────
+#
+# sig has no default key bindings: nothing is bound until you bind it here. Without bindings,
+# the toolbar and tab strip cover tab.new, tab.close, tab.select, page.back, page.forward,
+# page.reload, page.stop and page.open (the URL bar); every other command needs a binding.
+#
+# keystroke = "command [argument]". Keystrokes use GPUI syntax: modifiers ctrl, alt, shift,
+# cmd, and `secondary` (cmd on macOS, ctrl elsewhere); space-separated sequences such as
+# "g g" are allowed. For example:
+#
+#   [keys]
+#   "secondary-t" = "tab.new"
+#   "secondary-l" = "location.focus"
+#
+#   [keys.page]
+#   "g g" = "location.focus"
+#
+# [keys] applies everywhere. [keys.page] applies only while the page has focus and
+# [keys.location] only while the URL bar has focus, so single-letter bindings can live there
+# without getting in the way of typing elsewhere.
+#
+# Commands: tab.new, tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last,
+# page.open <url>, page.reload, page.stop, page.back, page.forward, page.zoom-in,
+# page.zoom-out, page.zoom-reset, location.focus, browser.home, browser.quit.
+
+# ── UI ─────────────────────────────────────────────────────────────────────────────────
+#
+# [ui] belongs to the UI sig was built with. The default UI reads colors from [ui.colors],
+# each "#rrggbb" or "#rrggbbaa". Leave one out to keep its default:
+#
+#   [ui.colors]
+#   bg = "#0a0a0b"          # window and page background
+#   surface = "#18181b"     # URL bar and the home page's card
+#   hover = "#27272a"       # buttons under the pointer
+#   tab = "#27272a"         # the selected tab
+#   border = "#27272a"      # lines between areas
+#   focus = "#d4d4d8"       # border of the focused URL bar
+#   text = "#fafafa"
+#   text_muted = "#a1a1aa"  # secondary text and icons
+#   text_dim = "#71717a"    # hints and disabled buttons
+#   selection = "#60a5fa55" # selected text in the URL bar
+#   error = "#dc2626"       # error messages

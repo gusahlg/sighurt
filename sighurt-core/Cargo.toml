@@ -1,0 +1,27 @@
+[package]
+name = "sighurt-core"
+version = "0.7.0"
+edition = "2021"
+description = "Sighurt without its chrome: config, routing, tabs and history, and the host for engine processes"
+license = "Apache-2.0"
+
+[dependencies]
+sighurt-ipc = { path = "../sighurt-ipc" }
+gpui = "0.2.2"
+# Hands engine frames and images to GPUI; the version GPUI itself depends on.
+image = { version = "0.25", default-features = false }
+async-channel = "2"
+# `yield_now`, so a busy engine can't hold the UI thread.
+futures-lite = "2"
+reqwest = { version = "0.12", features = ["rustls-tls", "blocking"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = "1.1.2"
+dirs = "5"
+url = "2"
+percent-encoding = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# Headless windows and a deterministic executor for tests.
+gpui = { version = "0.2.2", features = ["test-support"] }
+tempfile = "3"

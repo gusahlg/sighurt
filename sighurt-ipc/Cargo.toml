@@ -1,0 +1,8 @@
+[package]
+name = "sighurt-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "Wire protocol between the Sighurt browser shell and out-of-process content engines"
+license = "Apache-2.0"
+
+[dependencies]

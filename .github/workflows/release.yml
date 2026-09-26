@@ -17,12 +17,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: oxide
 
 jobs:
   version:
     name: Bump Version
     runs-on: ubuntu-latest
+    env:
+      CRATES: >-
+        sighurt-browser/Cargo.toml sighurt-core/Cargo.toml sighurt-ui/Cargo.toml
+        sighurt-engine-wasm/Cargo.toml sighurt-sdk/Cargo.toml
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
       tag: ${{ steps.bump.outputs.tag }}
@@ -32,7 +35,7 @@ jobs:
       - name: Compute new version
         id: bump
         run: |
-          current=$(grep '^version' oxide-browser/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          current=$(grep '^version' sighurt-browser/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           IFS='.' read -r major minor patch <<< "$current"
 
           case "${{ inputs.bump }}" in
@@ -46,10 +49,11 @@ jobs:
           echo "tag=v${new_version}" >> "$GITHUB_OUTPUT"
           echo "Bumping $current -> $new_version (${{ inputs.bump }})"
 
+      # The browser, the WASM engine and the guest SDK are versioned together.
       - name: Update Cargo.toml versions
         run: |
           version="${{ steps.bump.outputs.new_version }}"
-          for f in oxide-browser/Cargo.toml oxide-sdk/Cargo.toml; do
+          for f in $CRATES; do
             sed -i "s/^version = \".*\"/version = \"${version}\"/" "$f"
           done
 
@@ -57,7 +61,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add oxide-browser/Cargo.toml oxide-sdk/Cargo.toml
+          git add $CRATES
           git commit -m "release: v${{ steps.bump.outputs.new_version }}"
           git tag "${{ steps.bump.outputs.tag }}"
           git push origin HEAD --tags
@@ -72,15 +76,11 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: oxide-linux-x86_64
+            artifact: sig-linux-x86_64.tar.gz
 
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: oxide-macos-aarch64
-
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   artifact: oxide-windows-x86_64.exe
+            artifact: sig-macos-aarch64.tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -109,18 +109,6 @@ jobs:
           brew install ffmpeg pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg)/lib/pkgconfig" >> "$GITHUB_ENV"
 
-      # MSVC: ffmpeg-sys-next uses vcpkg::find_package("ffmpeg") before pkg-config.
-      - name: Install FFmpeg (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $root = Join-Path $env:RUNNER_TEMP "vcpkg"
-          git clone --depth 1 https://github.com/microsoft/vcpkg $root
-          & "$root/bootstrap-vcpkg.bat"
-          & "$root/vcpkg.exe" install ffmpeg:x64-windows
-          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$root"
-          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_DEFAULT_TRIPLET=x64-windows"
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -129,18 +117,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release -p oxide-browser --target ${{ matrix.target }}
+      # sig-servo is not built here: it is a separate, much heavier workspace.
+      - name: Build release binaries (sig and sig-wasm)
+        run: cargo build --release -p sighurt-browser -p sighurt-engine-wasm --target ${{ matrix.target }}
 
-      - name: Rename binary (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} ${{ matrix.artifact }}
-
-      - name: Rename binary (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          copy target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe ${{ matrix.artifact }}
+      # sig finds sig-wasm next to itself, so they ship together.
+      - name: Package
+        run: tar -czf ${{ matrix.artifact }} -C target/${{ matrix.target }}/release sig sig-wasm
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -171,7 +154,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
-          name: Oxide ${{ needs.version.outputs.tag }}
+          name: Sighurt ${{ needs.version.outputs.tag }}
           prerelease: false
           generate_release_notes: true
           files: artifacts/*

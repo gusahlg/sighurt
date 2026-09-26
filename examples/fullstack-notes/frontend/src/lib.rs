@@ -1,5 +1,5 @@
-use oxide_sdk::proto::{ProtoDecoder, ProtoEncoder};
-use oxide_sdk::*;
+use sighurt_sdk::proto::{ProtoDecoder, ProtoEncoder};
+use sighurt_sdk::*;
 
 const API_BASE: &str = "http://localhost:3333";
 
@@ -38,21 +38,7 @@ fn decode_note_list(data: &[u8]) -> NoteList {
     let mut dec = ProtoDecoder::new(data);
     while let Some(field) = dec.next() {
         match field.number {
-            1 => {
-                let mut id = 0u32;
-                let mut title = String::new();
-                let mut done = false;
-                let mut sub = field.as_message();
-                while let Some(f) = sub.next() {
-                    match f.number {
-                        1 => id = f.as_u32(),
-                        2 => title = f.as_str().to_string(),
-                        3 => done = f.as_bool(),
-                        _ => {}
-                    }
-                }
-                notes.push(Note { id, title, done });
-            }
+            1 => notes.push(decode_single_note(field.as_bytes())),
             2 => total = field.as_u32(),
             3 => done_count = field.as_u32(),
             _ => {}
@@ -120,6 +106,21 @@ fn draw_note_row(x: f32, y: f32, note: &Note, tag: &str) {
     draw_text(x, y, color, &label);
 }
 
+fn draw_title_bar(w: f32, subtitle: &str) {
+    canvas_rect(0.0, 0.0, w, 50.0, TITLE_BG.0, TITLE_BG.1, TITLE_BG.2, 255);
+    canvas_text(20.0, 14.0, 22.0, 220, 200, 255, 255, "Sighurt Notes");
+    canvas_text(20.0, 38.0, 12.0, DIM.0, DIM.1, DIM.2, 255, subtitle);
+}
+
+fn draw_summary(y: f32, list: &NoteList) {
+    let pending = list.total - list.done_count;
+    let summary = format!(
+        "{} total  \u{2022}  {} done  \u{2022}  {pending} pending",
+        list.total, list.done_count
+    );
+    draw_text(30.0, y, DIM, &summary);
+}
+
 fn status_color(status: u32) -> (u8, u8, u8) {
     match status {
         200..=299 => GREEN,
@@ -138,39 +139,29 @@ pub extern "C" fn start_app() {
     let w = width as f32;
 
     canvas_clear(BG.0, BG.1, BG.2, 255);
-
-    // ── Title bar ────────────────────────────────────────────────────
-    canvas_rect(0.0, 0.0, w, 50.0, TITLE_BG.0, TITLE_BG.1, TITLE_BG.2, 255);
-    canvas_text(20.0, 14.0, 22.0, 220, 200, 255, 255, "Oxide Notes");
-    canvas_text(
-        20.0,
-        38.0,
-        12.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
+    draw_title_bar(
+        w,
         "Full-stack demo  \u{2022}  WASM frontend  \u{2022}  Rust backend  \u{2022}  Protobuf wire format",
     );
 
     let mut ops: Vec<Op> = Vec::new();
     let mut total_up: usize = 0;
     let mut total_down: usize = 0;
-    let mut final_list: Option<NoteList> = None;
-    let mut created_note: Option<Note> = None;
+    let mut record = |method, path: &str, resp: &FetchResponse, detail| {
+        total_down += resp.body.len();
+        ops.push(Op {
+            method,
+            path: path.into(),
+            status: resp.status,
+            detail,
+        });
+    };
 
     // ── Step 1: GET initial notes ────────────────────────────────────
-    let url = format!("{API_BASE}/api/notes");
-    let initial_list = match fetch_get(&url) {
+    let initial_list = match fetch_get(&format!("{API_BASE}/api/notes")) {
         Ok(resp) => {
             let list = decode_note_list(&resp.body);
-            ops.push(Op {
-                method: "GET",
-                path: "/api/notes".into(),
-                status: resp.status,
-                detail: format!("{} notes", list.total),
-            });
-            total_down += resp.body.len();
+            record("GET", "/api/notes", &resp, format!("{} notes", list.total));
             list
         }
         Err(code) => {
@@ -181,60 +172,43 @@ pub extern "C" fn start_app() {
 
     // ── Step 2: POST create a note ───────────────────────────────────
     let body = ProtoEncoder::new()
-        .string(1, "Explore the Oxide fetch API")
+        .string(1, "Explore the Sighurt fetch API")
         .finish();
-    let sent = body.len();
+    let mut created_id = 0;
     if let Ok(resp) = fetch_post(
         &format!("{API_BASE}/api/notes"),
         "application/protobuf",
         &body,
     ) {
         let note = decode_single_note(&resp.body);
-        ops.push(Op {
-            method: "POST",
-            path: "/api/notes".into(),
-            status: resp.status,
-            detail: format!("created #{}", note.id),
-        });
-        total_up += sent;
-        total_down += resp.body.len();
-        created_note = Some(note);
+        record("POST", "/api/notes", &resp, format!("created #{}", note.id));
+        total_up += body.len();
+        created_id = note.id;
     }
 
     // ── Step 3: POST toggle note #2 ─────────────────────────────────
     if let Ok(resp) = fetch_post(&format!("{API_BASE}/api/notes/2/toggle"), "", &[]) {
         let note = decode_single_note(&resp.body);
-        ops.push(Op {
-            method: "POST",
-            path: "/api/notes/2/toggle".into(),
-            status: resp.status,
-            detail: format!("#{} done={}", note.id, note.done),
-        });
-        total_down += resp.body.len();
+        let detail = format!("#{} done={}", note.id, note.done);
+        record("POST", "/api/notes/2/toggle", &resp, detail);
     }
 
     // ── Step 4: DELETE note #3 ───────────────────────────────────────
     if let Ok(resp) = fetch_delete(&format!("{API_BASE}/api/notes/3")) {
         let note = decode_single_note(&resp.body);
-        ops.push(Op {
-            method: "DELETE",
-            path: "/api/notes/3".into(),
-            status: resp.status,
-            detail: format!("removed #{}", note.id),
-        });
-        total_down += resp.body.len();
+        record(
+            "DELETE",
+            "/api/notes/3",
+            &resp,
+            format!("removed #{}", note.id),
+        );
     }
 
     // ── Step 5: GET final state ──────────────────────────────────────
+    let mut final_list = None;
     if let Ok(resp) = fetch_get(&format!("{API_BASE}/api/notes")) {
         let list = decode_note_list(&resp.body);
-        ops.push(Op {
-            method: "GET",
-            path: "/api/notes".into(),
-            status: resp.status,
-            detail: format!("{} notes", list.total),
-        });
-        total_down += resp.body.len();
+        record("GET", "/api/notes", &resp, format!("{} notes", list.total));
         final_list = Some(list);
     }
 
@@ -255,17 +229,7 @@ pub extern "C" fn start_app() {
     draw_heading(20.0, y, "Initial State");
     y += 24.0;
 
-    draw_text(
-        30.0,
-        y,
-        DIM,
-        &format!(
-            "{} total  \u{2022}  {} done  \u{2022}  {} pending",
-            initial_list.total,
-            initial_list.done_count,
-            initial_list.total - initial_list.done_count
-        ),
-    );
+    draw_summary(y, &initial_list);
     y += 20.0;
     for note in &initial_list.notes {
         draw_note_row(30.0, y, note, "");
@@ -299,19 +263,8 @@ pub extern "C" fn start_app() {
     y += 24.0;
 
     if let Some(ref list) = final_list {
-        draw_text(
-            30.0,
-            y,
-            DIM,
-            &format!(
-                "{} total  \u{2022}  {} done  \u{2022}  {} pending",
-                list.total,
-                list.done_count,
-                list.total - list.done_count
-            ),
-        );
+        draw_summary(y, list);
         y += 20.0;
-        let created_id = created_note.as_ref().map(|n| n.id).unwrap_or(0);
         for note in &list.notes {
             let tag = if note.id == created_id {
                 "(new)"
@@ -383,25 +336,14 @@ pub extern "C" fn start_app() {
         "fullstack-notes  \u{2022}  backend: cargo run -p fullstack-notes-backend  \u{2022}  frontend: this WASM module",
     );
 
-    notify("Oxide Notes", "Full-stack demo completed successfully!");
+    notify("Sighurt Notes", "Full-stack demo completed successfully!");
     log("fullstack-notes: done");
 }
 
 /// Renders an error screen when the backend is unreachable.
 fn render_offline(w: f32, err_code: i64) {
     canvas_clear(BG.0, BG.1, BG.2, 255);
-    canvas_rect(0.0, 0.0, w, 50.0, TITLE_BG.0, TITLE_BG.1, TITLE_BG.2, 255);
-    canvas_text(20.0, 14.0, 22.0, 220, 200, 255, 255, "Oxide Notes");
-    canvas_text(
-        20.0,
-        38.0,
-        12.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
-        "Full-stack demo",
-    );
+    draw_title_bar(w, "Full-stack demo");
 
     draw_text(
         20.0,
@@ -418,7 +360,7 @@ fn render_offline(w: f32, err_code: i64) {
         20.0,
         170.0,
         TEXT,
-        "Then reload this WASM module in the Oxide browser.",
+        "Then reload this WASM module in Sighurt.",
     );
 
     error(&format!(

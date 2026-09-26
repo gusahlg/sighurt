@@ -1,0 +1,16 @@
+[package]
+name = "sighurt-ui"
+version = "0.7.0"
+edition = "2021"
+description = "The default chrome of the Sighurt browser: tab strip, toolbar, URL bar and status bar"
+license = "Apache-2.0"
+
+[dependencies]
+sighurt-core = { path = "../sighurt-core" }
+gpui = "0.2.2"
+toml = "1.1.2"
+tracing = "0.1"
+
+[dev-dependencies]
+# Headless windows for tests.
+gpui = { version = "0.2.2", features = ["test-support"] }

@@ -1,0 +1,56 @@
+[package]
+name = "sighurt-engine-wasm"
+version = "0.7.0"
+edition = "2021"
+description = "WASM content engine for Sighurt: runs Oxide-format .wasm apps in a Wasmtime sandbox"
+license = "Apache-2.0"
+
+# The engine process. The browser never links this crate; it talks to `sig-wasm` over
+# sighurt-ipc.
+[[bin]]
+name = "sig-wasm"
+path = "src/main.rs"
+
+[dependencies]
+sighurt-ipc = { path = "../sighurt-ipc" }
+wasmtime = "36"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "stream"], default-features = false }
+rfd = "0.15"
+anyhow = "1"
+chrono = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+sha2 = "0.10"
+base64 = "0.22"
+dirs = "5"
+url = "2"
+percent-encoding = "2"
+getrandom = "0.2"
+rodio = "0.22.2"
+ffmpeg-next = "8.1.0"
+tempfile = "3"
+nokhwa = { version = "0.10.10", features = ["input-native", "camera-sync-impl"] }
+cpal = "0.17.3"
+screenshots = "0.8.10"
+webrtc = "0.17.1"
+bytes = "1.11.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.149"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+gilrs = "0.11"
+toml = "1.1.2"
+hmac = "0.12"
+flate2 = "1.1.9"
+sys-locale = "0.3.2"
+iana-time-zone = "0.1.65"
+starship-battery = "0.11.0"
+# Text measurement, with the shaper GPUI uses on Linux.
+cosmic-text = { version = "0.14", default-features = false, features = ["std", "fontconfig"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coremidi = "0.7"
+
+[dev-dependencies]
+wat = "1"

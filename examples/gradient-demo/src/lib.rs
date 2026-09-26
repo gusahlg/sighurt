@@ -2,8 +2,8 @@
 //! gradient palettes. Every rectangle fits strictly inside the canvas
 //! bounds regardless of width or height.
 
-use oxide_sdk::draw::*;
-use oxide_sdk::*;
+use sighurt_sdk::draw::*;
+use sighurt_sdk::*;
 
 const MARGIN: f32 = 20.0;
 const GAP: f32 = 12.0;
@@ -29,6 +29,9 @@ pub extern "C" fn start_app() {
 #[no_mangle]
 pub extern "C" fn on_frame(_dt_ms: u32) {
     let c = Canvas::new();
+    // Start each frame from an empty draw list; without this every frame's
+    // commands pile up on top of the previous ones.
+    c.clear(Color::hex(0x1b1033));
     let (cw, ch) = c.dimensions();
     let w = cw as f32;
     let h = ch as f32;
@@ -53,32 +56,30 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
 
 // ── Full-canvas vertical linear gradient backdrop.
 fn draw_background(w: f32, h: f32) {
-    vertical_gradient(
+    linear(
         Rect::new(0.0, 0.0, w, h),
-        &[
-            GradientStop::new(0.0, Color::hex(0x1b1033)),
-            GradientStop::new(0.5, Color::hex(0x3b2670)),
-            GradientStop::new(1.0, Color::hex(0x0a1a3d)),
-        ],
+        0.0,
+        1.0,
+        &even_stops([0x1b1033, 0x3b2670, 0x0a1a3d]),
     );
 }
 
 // ── Hero bar: horizontal gradient + accent underline + title text.
 fn draw_hero(c: &Canvas, w: f32) {
-    horizontal_gradient(
+    linear(
         Rect::new(0.0, 0.0, w, HERO_H),
+        1.0,
+        0.0,
         &[
             GradientStop::new(0.0, Color::rgba(20, 10, 40, 230)),
             GradientStop::new(1.0, Color::rgba(60, 20, 80, 150)),
         ],
     );
-    horizontal_gradient(
+    linear(
         Rect::new(0.0, HERO_H - 3.0, w, 3.0),
-        &[
-            GradientStop::new(0.0, Color::hex(0xff6a88)),
-            GradientStop::new(0.5, Color::hex(0xffb86c)),
-            GradientStop::new(1.0, Color::hex(0x5e60ce)),
-        ],
+        1.0,
+        0.0,
+        &even_stops([0xff6a88, 0xffb86c, 0x5e60ce]),
     );
 
     c.text(
@@ -88,7 +89,7 @@ fn draw_hero(c: &Canvas, w: f32) {
         Color::WHITE,
     );
     c.text(
-        "Linear & radial fills rendered by the Oxide canvas",
+        "Linear & radial fills rendered by the Sighurt canvas",
         Point2D::new(MARGIN, 46.0),
         12.0,
         Color::rgba(220, 210, 255, 220),
@@ -137,14 +138,8 @@ fn draw_palette_grid(c: &Canvas, w: f32, top: f32, body_h: f32) {
         let y = grid_top + row * (card_h + GAP);
         let rect = Rect::new(x, y, card_w, card_h);
 
-        diagonal_gradient(
-            rect,
-            &[
-                GradientStop::new(0.0, Color::hex(hexes[0])),
-                GradientStop::new(0.5, Color::hex(hexes[1])),
-                GradientStop::new(1.0, Color::hex(hexes[2])),
-            ],
-        );
+        // Top-left to bottom-right.
+        c.linear_gradient(rect, &even_stops(*hexes));
 
         // Top sheen.
         let sheen_w = (card_w - 12.0).max(0.0);
@@ -166,15 +161,17 @@ fn draw_palette_grid(c: &Canvas, w: f32, top: f32, body_h: f32) {
 }
 
 fn draw_footer(c: &Canvas, w: f32, h: f32) {
-    horizontal_gradient(
+    linear(
         Rect::new(0.0, h - FOOTER_H, w, FOOTER_H),
+        1.0,
+        0.0,
         &[
             GradientStop::new(0.0, Color::rgba(10, 5, 25, 200)),
             GradientStop::new(1.0, Color::rgba(40, 15, 60, 140)),
         ],
     );
     c.text(
-        "oxide_sdk::draw — canvas_gradient with linear color stops",
+        "sighurt_sdk::draw — canvas_gradient with linear color stops",
         Point2D::new(MARGIN, h - FOOTER_H + 11.0),
         11.0,
         Color::rgba(220, 210, 240, 220),
@@ -183,57 +180,33 @@ fn draw_footer(c: &Canvas, w: f32, h: f32) {
 
 // ───────── Helpers ─────────────────────────────────────────────────────────
 
-fn vertical_gradient(rect: Rect, stops: &[GradientStop]) {
-    let raw = stops_to_raw(stops);
-    canvas_gradient(
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h,
-        GRADIENT_LINEAR,
-        rect.x,
-        rect.y,
-        rect.x,
-        rect.y + rect.h,
-        &raw,
-    );
-}
-
-fn horizontal_gradient(rect: Rect, stops: &[GradientStop]) {
-    let raw = stops_to_raw(stops);
-    canvas_gradient(
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h,
-        GRADIENT_LINEAR,
-        rect.x,
-        rect.y,
-        rect.x + rect.w,
-        rect.y,
-        &raw,
-    );
-}
-
-fn diagonal_gradient(rect: Rect, stops: &[GradientStop]) {
-    let raw = stops_to_raw(stops);
-    canvas_gradient(
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h,
-        GRADIENT_LINEAR,
-        rect.x,
-        rect.y,
-        rect.x + rect.w,
-        rect.y + rect.h,
-        &raw,
-    );
-}
-
-fn stops_to_raw(stops: &[GradientStop]) -> Vec<(f32, u8, u8, u8, u8)> {
-    stops
+/// Linear gradient over `rect` from its top-left corner towards
+/// `(x + dx * w, y + dy * h)`: `(0, 1)` runs top to bottom, `(1, 0)` left to right.
+fn linear(rect: Rect, dx: f32, dy: f32, stops: &[GradientStop]) {
+    let raw: Vec<_> = stops
         .iter()
         .map(|s| (s.offset, s.color.r, s.color.g, s.color.b, s.color.a))
-        .collect()
+        .collect();
+    let Rect { x, y, w, h } = rect;
+    canvas_gradient(
+        x,
+        y,
+        w,
+        h,
+        GRADIENT_LINEAR,
+        x,
+        y,
+        x + dx * w,
+        y + dy * h,
+        &raw,
+    );
+}
+
+/// Three opaque colours at the start, middle and end of a gradient.
+fn even_stops([a, b, c]: [u32; 3]) -> [GradientStop; 3] {
+    [
+        GradientStop::new(0.0, Color::hex(a)),
+        GradientStop::new(0.5, Color::hex(b)),
+        GradientStop::new(1.0, Color::hex(c)),
+    ]
 }

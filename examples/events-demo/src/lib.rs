@@ -1,10 +1,10 @@
-//! Demonstrates the Oxide event system: built-in events (`resize`, `focus`,
+//! Demonstrates the Sighurt event system: built-in events (`resize`, `focus`,
 //! `blur`, `visibility_change`, `online`/`offline`, `touch_*`, `gamepad_*`,
 //! `drop_files`) plus custom events emitted from a button click.
 
 #![allow(static_mut_refs)]
 
-use oxide_sdk::*;
+use sighurt_sdk::*;
 
 const BG: (u8, u8, u8) = (24, 24, 36);
 const ACCENT: (u8, u8, u8) = (110, 180, 220);
@@ -29,9 +29,6 @@ const CB_GAMEPAD_CONNECTED: u32 = 12;
 const CB_DROP_FILES: u32 = 13;
 const CB_PING: u32 = 100;
 
-const BTN_PING: u32 = 200;
-const BTN_CLEAR: u32 = 201;
-
 static mut LAST_EVENT: String = String::new();
 static mut LAST_RESIZE: (u32, u32) = (0, 0);
 static mut TOUCH_POS: (f32, f32) = (0.0, 0.0);
@@ -43,35 +40,31 @@ static mut PING_COUNT: u32 = 0;
 static mut GAMEPAD_LINE: String = String::new();
 
 fn read_u32_le(b: &[u8], offset: usize) -> u32 {
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(&b[offset..offset + 4]);
-    u32::from_le_bytes(buf)
+    u32::from_le_bytes(b[offset..offset + 4].try_into().unwrap())
 }
 
 fn read_f32_le(b: &[u8], offset: usize) -> f32 {
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(&b[offset..offset + 4]);
-    f32::from_le_bytes(buf)
+    f32::from_bits(read_u32_le(b, offset))
 }
 
 #[no_mangle]
 pub extern "C" fn start_app() {
     log("events-demo: registering listeners");
     // Fully qualify so we don't shadow the `on_event` export below.
-    oxide_sdk::on_event("resize", CB_RESIZE);
-    oxide_sdk::on_event("focus", CB_FOCUS);
-    oxide_sdk::on_event("blur", CB_BLUR);
-    oxide_sdk::on_event("visibility_change", CB_VISIBILITY);
-    oxide_sdk::on_event("online", CB_ONLINE);
-    oxide_sdk::on_event("offline", CB_OFFLINE);
-    oxide_sdk::on_event("touch_start", CB_TOUCH_START);
-    oxide_sdk::on_event("touch_move", CB_TOUCH_MOVE);
-    oxide_sdk::on_event("touch_end", CB_TOUCH_END);
-    oxide_sdk::on_event("gamepad_connected", CB_GAMEPAD_CONNECTED);
-    oxide_sdk::on_event("gamepad_button", CB_GAMEPAD_BTN);
-    oxide_sdk::on_event("gamepad_axis", CB_GAMEPAD_AXIS);
-    oxide_sdk::on_event("drop_files", CB_DROP_FILES);
-    oxide_sdk::on_event("ping", CB_PING);
+    sighurt_sdk::on_event("resize", CB_RESIZE);
+    sighurt_sdk::on_event("focus", CB_FOCUS);
+    sighurt_sdk::on_event("blur", CB_BLUR);
+    sighurt_sdk::on_event("visibility_change", CB_VISIBILITY);
+    sighurt_sdk::on_event("online", CB_ONLINE);
+    sighurt_sdk::on_event("offline", CB_OFFLINE);
+    sighurt_sdk::on_event("touch_start", CB_TOUCH_START);
+    sighurt_sdk::on_event("touch_move", CB_TOUCH_MOVE);
+    sighurt_sdk::on_event("touch_end", CB_TOUCH_END);
+    sighurt_sdk::on_event("gamepad_connected", CB_GAMEPAD_CONNECTED);
+    sighurt_sdk::on_event("gamepad_button", CB_GAMEPAD_BTN);
+    sighurt_sdk::on_event("gamepad_axis", CB_GAMEPAD_AXIS);
+    sighurt_sdk::on_event("drop_files", CB_DROP_FILES);
+    sighurt_sdk::on_event("ping", CB_PING);
 }
 
 #[no_mangle]
@@ -105,21 +98,12 @@ pub extern "C" fn on_event(callback_id: u32) {
         CB_OFFLINE => unsafe {
             ONLINE_STATE = "offline";
         },
-        CB_TOUCH_START if data.len() == 8 => {
-            let x = read_f32_le(&data, 0);
-            let y = read_f32_le(&data, 4);
-            unsafe {
+        CB_TOUCH_START | CB_TOUCH_MOVE if data.len() == 8 => unsafe {
+            TOUCH_POS = (read_f32_le(&data, 0), read_f32_le(&data, 4));
+            if callback_id == CB_TOUCH_START {
                 TOUCHING = true;
-                TOUCH_POS = (x, y);
             }
-        }
-        CB_TOUCH_MOVE if data.len() == 8 => {
-            let x = read_f32_le(&data, 0);
-            let y = read_f32_le(&data, 4);
-            unsafe {
-                TOUCH_POS = (x, y);
-            }
-        }
+        },
         CB_TOUCH_END => unsafe {
             TOUCHING = false;
         },
@@ -170,159 +154,122 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
     canvas_clear(BG.0, BG.1, BG.2, 255);
 
     canvas_rect(0.0, 0.0, w, 52.0, ACCENT.0, ACCENT.1, ACCENT.2, 255);
-    canvas_text(20.0, 14.0, 22.0, 255, 255, 255, 255, "Oxide Event System");
-    canvas_text(
+    text(20.0, 14.0, 22.0, (255, 255, 255), "Sighurt Event System");
+    text(
         20.0,
         36.0,
         11.0,
-        20,
-        20,
-        40,
-        255,
+        (20, 20, 40),
         "on_event / emit_event / built-in events",
     );
 
     let mut y = 72.0;
+    let mut row = |label: &str, value: &str, color: (u8, u8, u8)| {
+        text(20.0, y, 14.0, DIM, label);
+        text(220.0, y, 14.0, color, value);
+        y += 28.0;
+    };
 
-    let last = unsafe { LAST_EVENT.clone() };
-    canvas_text(
-        20.0,
-        y,
-        14.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
-        "Last event delivered:",
-    );
-    canvas_text(
-        220.0,
-        y,
-        14.0,
-        BRIGHT.0,
-        BRIGHT.1,
-        BRIGHT.2,
-        255,
-        if last.is_empty() { "(none yet)" } else { &last },
-    );
-    y += 28.0;
+    let (last, gamepad, drop) = unsafe { (&LAST_EVENT, &GAMEPAD_LINE, &LAST_DROP) };
+    row("Last event delivered:", or(last, "(none yet)"), BRIGHT);
 
     let (rw, rh) = unsafe { LAST_RESIZE };
-    canvas_text(20.0, y, 14.0, DIM.0, DIM.1, DIM.2, 255, "Canvas resize:");
-    canvas_text(
-        220.0,
-        y,
-        14.0,
-        BRIGHT.0,
-        BRIGHT.1,
-        BRIGHT.2,
-        255,
-        &if rw == 0 {
-            "(no resize yet — try resizing the window)".to_string()
-        } else {
-            format!("{rw} x {rh}")
-        },
+    let resize = if rw == 0 {
+        "(no resize yet — try resizing the window)".to_string()
+    } else {
+        format!("{rw} x {rh}")
+    };
+    row("Canvas resize:", &resize, BRIGHT);
+
+    let focus = unsafe { FOCUS_STATE };
+    row(
+        "Focus state:",
+        focus,
+        if focus == "focused" { GREEN } else { ORANGE },
     );
-    y += 28.0;
 
-    let f = unsafe { FOCUS_STATE };
-    canvas_text(20.0, y, 14.0, DIM.0, DIM.1, DIM.2, 255, "Focus state:");
-    let fc = if f == "focused" { GREEN } else { ORANGE };
-    canvas_text(220.0, y, 14.0, fc.0, fc.1, fc.2, 255, f);
-    y += 28.0;
+    let online = unsafe { ONLINE_STATE };
+    row(
+        "Network:",
+        online,
+        if online == "online" { GREEN } else { ORANGE },
+    );
 
-    let o = unsafe { ONLINE_STATE };
-    canvas_text(20.0, y, 14.0, DIM.0, DIM.1, DIM.2, 255, "Network:");
-    let oc = if o == "online" { GREEN } else { ORANGE };
-    canvas_text(220.0, y, 14.0, oc.0, oc.1, oc.2, 255, o);
-    y += 28.0;
-
-    let touching = unsafe { TOUCHING };
     let (tx, ty) = unsafe { TOUCH_POS };
-    canvas_text(20.0, y, 14.0, DIM.0, DIM.1, DIM.2, 255, "Touch (mouse):");
-    if touching {
-        canvas_text(
-            220.0,
-            y,
-            14.0,
-            PINK.0,
-            PINK.1,
-            PINK.2,
-            255,
+    if unsafe { TOUCHING } {
+        row(
+            "Touch (mouse):",
             &format!("DOWN at ({tx:.0}, {ty:.0})"),
+            PINK,
         );
         canvas_circle(tx, ty, 18.0, PINK.0, PINK.1, PINK.2, 200);
     } else {
-        canvas_text(220.0, y, 14.0, DIM.0, DIM.1, DIM.2, 255, "(release)");
+        row("Touch (mouse):", "(release)", DIM);
     }
-    y += 28.0;
 
-    let gp = unsafe { GAMEPAD_LINE.clone() };
-    canvas_text(20.0, y, 14.0, DIM.0, DIM.1, DIM.2, 255, "Gamepad:");
-    canvas_text(
-        220.0,
-        y,
-        14.0,
-        BRIGHT.0,
-        BRIGHT.1,
-        BRIGHT.2,
-        255,
-        if gp.is_empty() {
-            "(no gamepad input yet)"
-        } else {
-            &gp
-        },
+    row("Gamepad:", or(gamepad, "(no gamepad input yet)"), BRIGHT);
+    row(
+        "Last drop:",
+        or(drop, "(drag a file onto this window)"),
+        BRIGHT,
     );
-    y += 28.0;
-
-    let drop = unsafe { LAST_DROP.clone() };
-    canvas_text(20.0, y, 14.0, DIM.0, DIM.1, DIM.2, 255, "Last drop:");
-    canvas_text(
-        220.0,
-        y,
-        14.0,
-        BRIGHT.0,
-        BRIGHT.1,
-        BRIGHT.2,
-        255,
-        if drop.is_empty() {
-            "(drag a file onto this window)"
-        } else {
-            &drop
-        },
-    );
-    y += 32.0;
+    y += 4.0;
 
     canvas_line(20.0, y, w - 20.0, y, 50, 45, 70, 255, 1.0);
     y += 16.0;
 
-    canvas_text(
-        20.0,
-        y,
-        14.0,
-        DIM.0,
-        DIM.1,
-        DIM.2,
-        255,
-        "Custom event (emit_event / on_event):",
-    );
+    text(20.0, y, 14.0, DIM, "Custom event (emit_event / on_event):");
     y += 22.0;
 
-    ui_button(BTN_PING, 20.0, y, 140.0, 30.0, "Emit \"ping\"", || {
+    if button(20.0, y, 140.0, 30.0, "Emit \"ping\"") {
         emit_event("ping", b"hello");
-    });
-    ui_button(BTN_CLEAR, 170.0, y, 140.0, 30.0, "Reset count", || unsafe {
-        PING_COUNT = 0;
-    });
+    }
+    if button(170.0, y, 140.0, 30.0, "Reset count") {
+        unsafe { PING_COUNT = 0 };
+    }
     let count = unsafe { PING_COUNT };
-    canvas_text(
+    text(
         330.0,
         y + 8.0,
         16.0,
-        BRIGHT.0,
-        BRIGHT.1,
-        BRIGHT.2,
-        255,
+        BRIGHT,
         &format!("ping count: {count}"),
     );
+}
+
+/// A hand-drawn button: returns `true` when it was clicked this frame.
+fn button(x: f32, y: f32, w: f32, h: f32, label: &str) -> bool {
+    let (mx, my) = mouse_position();
+    let hover = mx >= x && mx < x + w && my >= y && my < y + h;
+    let shade = if hover { 80 } else { 60 };
+    canvas_rounded_rect(x, y, w, h, 6.0, shade, shade, shade + 30, 255);
+    // The 14 px label's line box is 1.2 × its size tall, starting at `y`.
+    canvas_text_ex(
+        x + w / 2.0,
+        y + (h - 14.0 * 1.2) / 2.0,
+        14.0,
+        235,
+        235,
+        245,
+        255,
+        "",
+        0,
+        FONT_STYLE_NORMAL,
+        TEXT_ALIGN_CENTER,
+        label,
+    );
+    hover && mouse_button_clicked(0)
+}
+
+fn text(x: f32, y: f32, size: f32, (r, g, b): (u8, u8, u8), s: &str) {
+    canvas_text(x, y, size, r, g, b, 255, s);
+}
+
+/// `s`, or `placeholder` while `s` is empty.
+fn or<'a>(s: &'a str, placeholder: &'a str) -> &'a str {
+    if s.is_empty() {
+        placeholder
+    } else {
+        s
+    }
 }

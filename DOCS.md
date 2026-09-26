@@ -1,1112 +1,89 @@
-# Oxide Browser — Developer Documentation
+# WASM engine and SDK guide
 
-## What is Oxide?
+`sig-wasm` is Sighurt's engine for WebAssembly apps. `sig` starts one `sig-wasm` process per page and talks to it over `sighurt-ipc`. The engine fetches the `.wasm`, runs it in a Wasmtime sandbox and sends what the app draws back to `sig` as a draw list. Apps are Rust crates built for `wasm32-unknown-unknown` against [`sighurt-sdk`](./sighurt-sdk/).
 
-Oxide is a **binary-first browser** that fetches and executes `.wasm` (WebAssembly) modules instead of HTML/JavaScript. Guest applications run in a secure, sandboxed environment with zero access to the host filesystem, environment variables, or arbitrary network sockets.
+The guest ABI is Oxide's: every host function is imported from the WASM module `"oxide"`. Apps built for [Oxide](https://github.com/niklabh/oxide) run unchanged, except ones that use Oxide's widget kit (`ui_*`), which this engine doesn't provide.
 
-The browser provides a set of **capability APIs** that guest modules can import to interact with the host — drawing on a GPU-accelerated canvas, reading/writing storage, making HTTP requests, playing audio/video, capturing media, WebRTC peer-to-peer communication, GPU compute, and more.
+For building `sig` itself, see the [README](./README.md).
 
-The desktop shell is built on [GPUI](https://www.gpui.rs/) (Zed's GPU-accelerated UI framework). Guest draw commands map directly onto GPUI primitives — filled quads, GPU-shaped text, vector paths, and image textures — so your canvas output gets full hardware acceleration.
-
----
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                   Oxide Browser                      │
-│  ┌──────────┐  ┌────────────┐  ┌──────────────┐      │
-│  │  URL Bar │  │   Canvas   │  │   Console    │      │
-│  └────┬─────┘  └──────┬─────┘  └──────┬───────┘      │
-│       │               │               │              │
-│  ┌────▼───────────────▼───────────────▼───────┐      │
-│  │              Host Runtime                  │      │
-│  │  wasmtime engine + sandbox policy          │      │
-│  │  fuel limit: 500M  │  memory: 256MB max    │      │
-│  └────────────────────┬───────────────────────┘      │
-│                       │                              │
-│  ┌────────────────────▼───────────────────────┐      │
-│  │          Capability Provider               │      │
-│  │  "oxide" import module                     │      │
-│  │  canvas, gpu, audio, video, capture,       │      │
-│  │  fetch, streaming fetch, websocket,        │      │
-│  │  webrtc, midi, timers, animation frames,   │      │
-│  │  console, storage, clipboard, navigation,  │      │
-│  │  widgets, input, hyperlinks, crypto        │      │
-│  └────────────────────┬───────────────────────┘      │
-│                       │                              │
-│  ┌────────────────────▼───────────────────────┐      │
-│  │           Guest .wasm Module               │      │
-│  │  exports: start_app(), on_frame(dt_ms)     │      │
-│  │  imports: oxide::*                         │      │
-│  └────────────────────────────────────────────┘      │
-└──────────────────────────────────────────────────────┘
-```
-
-### Rendering Model (GPUI)
-
-Oxide uses an **immediate-mode rendering** approach backed by GPUI:
-
-1. Each frame, the guest issues draw commands (`canvas_clear`, `canvas_rect`, `canvas_text`, …) which push `DrawCommand` variants into the host state.
-2. Widget calls (`ui_button`, `ui_slider`, …) push `WidgetCommand` entries.
-3. The GPUI shell paints both queues each frame using GPU-accelerated primitives: `paint_quad` for rectangles, `paint_path` for circles and lines, `paint_image` for images, and GPU text shaping for text.
-4. Images are decoded once and cached as GPUI `RenderImage` textures (same path for video frames).
-5. Widget interactions (clicks, drags, text edits) flow back through shared state, which the guest reads on the next frame call.
-
-No layout engine. No style cascade. No DOM. The guest decides exactly where every pixel goes.
-
----
-
-## Building & Running the Browser
-
-### Prerequisites
-
-- Rust toolchain (1.75+): https://rustup.rs
-- The `wasm32-unknown-unknown` target (for building guest apps):
+## A first app
 
 ```bash
-rustup target add wasm32-unknown-unknown
+cargo new --lib my-app
 ```
 
-### Build the browser
-
-```bash
-cd oxide
-cargo build --release -p oxide-browser
-```
-
-### Run the browser
-
-```bash
-cargo run -p oxide-browser
-```
-
-This opens the Oxide browser window with a URL bar, canvas area, and console panel.
-
-### Keyboard shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl/Cmd + L` | Focus the address bar |
-| `Ctrl/Cmd + T` / `W` / `R` | New tab / close tab / reload |
-| `Ctrl/Cmd + 1`–`8` / `9` | Switch to tab N / last tab |
-| `Alt + Left` / `Right` (or `Cmd + [` / `]`) | Back / forward |
-| `Ctrl/Cmd + D` / `B` | Bookmark page / toggle bookmarks panel |
-| `Ctrl/Cmd + Shift + J` | Toggle console |
-| `Ctrl/Cmd + K` | Command palette |
-| `Ctrl/Cmd + F` | Find in page (canvas text, widgets, console, history, bookmarks) |
-| `Ctrl/Cmd + G` / `Enter` | Find next (`Shift` for previous) |
-| `Ctrl/Cmd + ,` | Open Settings (`oxide://settings`) |
-| `Ctrl/Cmd + +` / `-` / `0` | Zoom in / out / reset |
-| `Escape` | Blur the address bar, or close the palette |
-
----
-
-## Creating a Guest Application
-
-Guest applications are Rust libraries compiled to `wasm32-unknown-unknown`.
-
-### Step 1: Create a new project
-
-```bash
-cargo new --lib my-oxide-app
-cd my-oxide-app
-```
-
-### Step 2: Configure Cargo.toml
+`Cargo.toml` (`sighurt-sdk` is not on crates.io, so depend on it by path):
 
 ```toml
-[package]
-name = "my-oxide-app"
-version = "0.1.0"
-edition = "2021"
-
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-oxide-sdk = { path = "../oxide/oxide-sdk" }
+sighurt-sdk = { path = "../sighurt/sighurt-sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
 ```
 
-The `crate-type = ["cdylib"]` is essential — it tells Cargo to produce a `.wasm` file suitable for dynamic loading.
-
-### Step 3: Write your app
-
-#### Static app (one-shot render)
+`src/lib.rs`: a text field and a button, drawn by the app itself.
 
 ```rust
-use oxide_sdk::*;
+use std::cell::RefCell;
+use sighurt_sdk::*;
 
-#[no_mangle]
-pub extern "C" fn start_app() {
-    log("App started!");
-    canvas_clear(30, 30, 46, 255);
-    canvas_text(20.0, 30.0, 28.0, 255, 255, 255, 255, "My Oxide App");
-    canvas_rect(20.0, 80.0, 200.0, 100.0, 80, 120, 200, 255);
-    canvas_circle(400.0, 300.0, 60.0, 200, 100, 150, 255);
-    canvas_line(20.0, 200.0, 600.0, 200.0, 100, 100, 100, 255, 2.0);
+thread_local! {
+    static NAME: RefCell<String> = const { RefCell::new(String::new()) };
 }
-```
-
-#### Interactive app (frame loop with widgets)
-
-```rust
-use oxide_sdk::*;
-
-static mut COUNTER: i32 = 0;
 
 #[no_mangle]
 pub extern "C" fn start_app() {
-    log("Interactive app started");
+    log("started");
 }
 
 #[no_mangle]
 pub extern "C" fn on_frame(_dt_ms: u32) {
-    canvas_clear(30, 30, 46, 255);
-    canvas_text(20.0, 30.0, 24.0, 255, 255, 255, 255, "Counter App");
+    NAME.with_borrow_mut(|name| {
+        name.push_str(&text_input());
+        if key_pressed(KEY_BACKSPACE) {
+            name.pop();
+        }
 
-    ui_button(1, 20.0, 70.0, 120.0, 30.0, "Increment", || {
-        unsafe { COUNTER += 1; }
+        canvas_clear(30, 30, 46, 255);
+        canvas_rounded_rect(20.0, 20.0, 240.0, 32.0, 6.0, 50, 50, 70, 255);
+        canvas_text(30.0, 28.0, 16.0, 255, 255, 255, 255, name);
+
+        let (mx, my) = mouse_position();
+        let over = (20.0..120.0).contains(&mx) && (70.0..100.0).contains(&my);
+        canvas_rounded_rect(20.0, 70.0, 100.0, 30.0, 6.0, 70, 70, if over { 140 } else { 100 }, 255);
+        canvas_text(34.0, 77.0, 14.0, 255, 255, 255, 255, "Greet");
+        if (over && mouse_button_clicked(0)) || key_pressed(KEY_ENTER) {
+            log(&format!("Hello, {name}!"));
+        }
     });
-    ui_button(2, 150.0, 70.0, 80.0, 30.0, "Reset", || {
-        unsafe { COUNTER = 0; }
-    });
-
-    let count = unsafe { COUNTER };
-    canvas_text(20.0, 120.0, 18.0, 160, 220, 160, 255, &format!("Count: {count}"));
-
-    let (mx, my) = mouse_position();
-    canvas_circle(mx, my, 10.0, 255, 100, 100, 180);
 }
 ```
 
-#### Using the high-level drawing API
-
-```rust
-use oxide_sdk::draw::*;
-
-#[no_mangle]
-pub extern "C" fn start_app() {
-    let c = Canvas::new();
-    c.clear(Color::hex(0x1e1e2e));
-    c.fill_rect(Rect::new(10.0, 10.0, 200.0, 100.0), Color::rgb(80, 120, 200));
-    c.fill_circle(Point2D::new(300.0, 200.0), 50.0, Color::RED);
-    c.text("Hello!", Point2D::new(20.0, 30.0), 24.0, Color::WHITE);
-    c.line(Point2D::ZERO, Point2D::new(400.0, 300.0), 2.0, Color::YELLOW);
-}
-```
-
-### Step 4: Build
+Build and open it:
 
 ```bash
 cargo build --target wasm32-unknown-unknown --release
+sig target/wasm32-unknown-unknown/release/my_app.wasm
 ```
 
-The output `.wasm` file will be at:
-```
-target/wasm32-unknown-unknown/release/my_oxide_app.wasm
-```
+`sig` routes URLs ending in `.wasm`, and http(s) responses with `Content-Type: application/wasm`, to this engine. To serve apps over HTTP, any static server works: `python3 -m http.server 8080` in the output directory, then open `http://localhost:8080/my_app.wasm`.
 
-### Step 5: Run in Oxide
+## Guest contract
 
-- Open the Oxide browser
-- Click **"Open"** and select your `.wasm` file, OR
-- Serve it over HTTP and enter the URL in the address bar
+1. Export `start_app()`, called once after the module loads.
+2. Optionally export `on_frame(dt_ms: u32)`, called about 60 times a second.
+3. Optionally export `on_timer(callback_id: u32)` for `set_timeout`, `set_interval` and `request_animation_frame`.
+4. Optionally export `on_event(callback_id: u32)` for built-in and custom events, called before timers and `on_frame`.
 
----
+   `on_timer` and `on_event` are delivered from the frame loop, so they only run if the module also exports `on_frame`.
+5. Build as a `cdylib` for `wasm32-unknown-unknown`, and import only from `"oxide"` (never WASI).
 
-## API Reference
-
-All APIs are available through the `oxide-sdk` crate. Import them with `use oxide_sdk::*;`.
-
-### High-Level Drawing API (`oxide_sdk::draw`)
-
-The `draw` module provides GPUI-inspired ergonomic types that wrap the low-level canvas functions.
-
-#### Types
-
-| Type | Description |
-|------|-------------|
-| `Color` | sRGB + alpha color with named constants and constructors |
-| `Point2D` | 2D point in canvas coordinates |
-| `Rect` | Axis-aligned rectangle (x, y, w, h) with hit-testing |
-| `Canvas` | Zero-cost facade for drawing operations |
-
-#### Color
-
-```rust
-use oxide_sdk::draw::Color;
-
-let c = Color::rgb(255, 128, 0);        // opaque orange
-let c = Color::rgba(255, 128, 0, 128);  // semi-transparent
-let c = Color::hex(0xFF8000);           // from hex
-let c = Color::RED.with_alpha(128);     // modify alpha
-
-// Named constants: WHITE, BLACK, RED, GREEN, BLUE, YELLOW, CYAN, MAGENTA, TRANSPARENT
-```
-
-#### Canvas
-
-```rust
-use oxide_sdk::draw::*;
-
-let c = Canvas::new();
-c.clear(Color::hex(0x1e1e2e));
-c.fill_rect(Rect::new(10.0, 10.0, 200.0, 100.0), Color::BLUE);
-c.fill_circle(Point2D::new(300.0, 200.0), 50.0, Color::RED);
-c.text("Hello!", Point2D::new(20.0, 30.0), 24.0, Color::WHITE);
-c.line(Point2D::ZERO, Point2D::new(100.0, 100.0), 2.0, Color::YELLOW);
-c.image(Rect::new(0.0, 0.0, 400.0, 300.0), &image_bytes);
-
-// Typography extension (v0.6.0+)
-c.text_ex(
-    "Shaped & Aligned Text",
-    Point2D::new(20.0, 120.0),
-    16.0,
-    Color::WHITE,
-    "Helvetica",
-    700,                 // CSS weight Bold (700)
-    FONT_STYLE_NORMAL,   // FONT_STYLE_NORMAL / ITALIC / OBLIQUE
-    TEXT_ALIGN_CENTER,   // TEXT_ALIGN_LEFT / CENTER / RIGHT
-);
-let metrics = c.measure_text(16.0, "Helvetica", 700, FONT_STYLE_NORMAL, "Measure me");
-
-// Scrollbar/virtual page sizing (v0.7.0+)
-c.set_content_size(1200, 2000);  // Enable vertical scrolling up to 2000px
-let (sx, sy) = c.scroll_position(); // Sniff scroll coordinates to offset drawing
-```
-
-### Low-Level Canvas API
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `canvas_clear` | `fn(r, g, b, a: u8)` | Clear canvas with solid RGBA color |
-| `canvas_rect` | `fn(x, y, w, h: f32, r, g, b, a: u8)` | Draw filled rectangle |
-| `canvas_circle` | `fn(cx, cy, radius: f32, r, g, b, a: u8)` | Draw filled circle |
-| `canvas_text` | `fn(x, y, size: f32, r, g, b, a: u8, text: &str)` | Draw basic UI text |
-| `canvas_text_ex` | `fn(x, y, size: f32, r, g, b, a: u8, family: &str, weight: u32, style: u32, align: u32, text: &str)` | Draw styled, shaped text |
-| `canvas_measure_text` | `fn(size: f32, family: &str, weight: u32, style: u32, text: &str) -> TextMetrics` |Sniff dimensions of a shaped text line |
-| `canvas_line` | `fn(x1, y1, x2, y2: f32, r, g, b, a: u8, thickness: f32)` | Draw a line |
-| `canvas_image` | `fn(x, y, w, h: f32, data: &[u8])` | Draw encoded image (PNG/JPEG/GIF/WebP) |
-| `canvas_dimensions` | `fn() -> (u32, u32)` | Get physical canvas `(width, height)` in pixels |
-| `set_content_size` | `fn(w, h: u32)` | Set virtual scroll region dimensions |
-| `scroll_position` | `fn() -> (f32, f32)` | Get current absolute `(x, y)` scroll position |
-| `set_scroll_position` | `fn(x, y: f32)` | Programmatically set scroll position |
-
-```rust
-canvas_clear(30, 30, 46, 255);
-canvas_rect(10.0, 10.0, 100.0, 50.0, 255, 0, 0, 255);
-canvas_circle(200.0, 200.0, 30.0, 0, 255, 0, 255);
-canvas_text(10.0, 80.0, 16.0, 255, 255, 255, 255, "Hello!");
-canvas_line(0.0, 0.0, 100.0, 100.0, 255, 255, 0, 255, 2.0);
-
-// Use scroll position in render loop to draw offset items:
-let (sx, sy) = scroll_position();
-canvas_rect(100.0, 500.0 - sy, 200.0, 100.0, 120, 140, 200, 255);
-
-let (w, h) = canvas_dimensions();
-```
-
-### Console
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `log` | `fn(msg: &str)` | Informational message |
-| `warn` | `fn(msg: &str)` | Warning (yellow) |
-| `error` | `fn(msg: &str)` | Error (red) |
-
-### Input Polling
-
-All input functions return per-frame data. Call them from `on_frame()`.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `mouse_position` | `fn() -> (f32, f32)` | Mouse `(x, y)` in canvas coordinates |
-| `mouse_button_down` | `fn(button: u32) -> bool` | Button currently held (0=left, 1=right, 2=middle) |
-| `mouse_button_clicked` | `fn(button: u32) -> bool` | Button clicked this frame |
-| `key_down` | `fn(key: u32) -> bool` | Key currently held (see `KEY_*` constants) |
-| `key_pressed` | `fn(key: u32) -> bool` | Key pressed this frame |
-| `scroll_delta` | `fn() -> (f32, f32)` | Scroll wheel `(dx, dy)` this frame |
-| `modifiers` | `fn() -> u32` | Bitmask: bit 0=Shift, 1=Ctrl, 2=Alt |
-| `shift_held` | `fn() -> bool` | Shift modifier |
-| `ctrl_held` | `fn() -> bool` | Ctrl/Cmd modifier |
-| `alt_held` | `fn() -> bool` | Alt modifier |
-
-#### Key Constants
-
-```rust
-// Letters: KEY_A (0) through KEY_Z (25)
-// Digits: KEY_0 (26) through KEY_9 (35)
-// Special: KEY_ENTER (36), KEY_ESCAPE (37), KEY_TAB (38), KEY_BACKSPACE (39),
-//          KEY_DELETE (40), KEY_SPACE (41)
-// Arrows: KEY_UP (42), KEY_DOWN (43), KEY_LEFT (44), KEY_RIGHT (45)
-// Navigation: KEY_HOME (46), KEY_END (47), KEY_PAGE_UP (48), KEY_PAGE_DOWN (49)
-```
-
-### Interactive Widgets
-
-Widgets are **immediate-mode**: call them every frame from `on_frame()`. Value widgets return the current value; buttons run a callback when clicked. The host renders them as native GPUI elements overlaid on the canvas.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `ui_button` | `fn(id, x, y, w, h: f32, label: &str, on_click: impl FnOnce())` | Button; runs the callback when clicked |
-| `ui_checkbox` | `fn(id, x, y: f32, label: &str, initial: bool) -> bool` | Checkbox; returns checked state |
-| `ui_slider` | `fn(id, x, y, w, min, max, initial: f32) -> f32` | Slider; returns current value |
-| `ui_text_input` | `fn(id, x, y, w: f32, initial: &str) -> String` | Text field; returns current text |
-
-```rust
-ui_button(1, 20.0, 100.0, 120.0, 28.0, "Click Me!", || {
-    log("Button was clicked!");
-});
-
-let dark_mode = ui_checkbox(10, 20.0, 140.0, "Dark mode", false);
-let volume = ui_slider(20, 20.0, 180.0, 300.0, 0.0, 100.0, 50.0);
-let name = ui_text_input(30, 20.0, 220.0, 300.0, "");
-```
-
-### HTTP Fetch
-
-All network access is mediated by the host — the guest never opens raw sockets.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `fetch` | `fn(method, url, content_type, body) -> Result<FetchResponse, i64>` | Full HTTP request |
-| `fetch_get` | `fn(url: &str) -> Result<FetchResponse, i64>` | GET shorthand |
-| `fetch_post` | `fn(url, content_type, body) -> Result<FetchResponse, i64>` | POST |
-| `fetch_post_proto` | `fn(url, msg: &ProtoEncoder) -> Result<FetchResponse, i64>` | POST with protobuf |
-| `fetch_put` | `fn(url, content_type, body) -> Result<FetchResponse, i64>` | PUT |
-| `fetch_delete` | `fn(url: &str) -> Result<FetchResponse, i64>` | DELETE |
-
-```rust
-let resp = fetch_get("https://api.example.com/data").unwrap();
-log(&format!("Status: {}, Body: {}", resp.status, resp.text()));
-```
-
-### Download & PDF Printing
-
-The Download and PDF Print APIs allow saving raw byte buffers, downloading remote URLs asynchronously, and exporting vector PDF prints of the canvas direct to the host's standard Downloads folder.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `download_data` | `fn(data: &[u8], filename: &str) -> i32` | Save raw bytes as a file (returns 0 on success) |
-| `download_url` | `fn(url: &str) -> i32` | Download a remote URL in the background |
-| `canvas_print_pdf` | `fn(filename: &str) -> i32` | Export the current frame's vector paint instructions as a PDF file |
-
-```rust
-// Save a local game state or config
-let json = "{\"score\": 42}";
-download_data(json.as_bytes(), "savegame.json");
-
-// Trigger an async remote file download
-download_url("https://example.com/assets/highres_map.png");
-
-// Print current canvas frame as a vector PDF
-canvas_print_pdf("oxide-screenshot.pdf");
-```
-
-### Protobuf (Native Data Format)
-
-The `oxide_sdk::proto` module provides a zero-dependency encoder/decoder compatible with the Protocol Buffers wire format.
-
-```rust
-use oxide_sdk::proto::{ProtoEncoder, ProtoDecoder};
-
-let msg = ProtoEncoder::new()
-    .string(1, "alice")
-    .uint64(2, 42)
-    .bool(3, true);
-let data = msg.finish();
-
-let mut decoder = ProtoDecoder::new(&data);
-while let Some(field) = decoder.next() {
-    match field.number {
-        1 => log(&format!("name = {}", field.as_str())),
-        2 => log(&format!("age  = {}", field.as_u64())),
-        _ => {}
-    }
-}
-```
-
-### Storage
-
-Both stores are scoped to the **app origin** (scheme + host + port for `http(s)`, the containing directory for `file://`). The origin is captured once per module load, so `push_state` / `replace_state` never shift an app's storage.
-
-#### Session storage (in-memory)
-
-Survives same-origin reloads within a tab; cleared when the tab navigates to a different origin or the browser restarts (like `sessionStorage`).
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `storage_set` | `fn(key: &str, value: &str)` | Store a value |
-| `storage_get` | `fn(key: &str) -> String` | Retrieve (empty if missing) |
-| `storage_remove` | `fn(key: &str)` | Delete a key |
-
-#### Persistent KV store (on-disk, survives restarts, per origin)
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `kv_store_set` | `fn(key: &str, value: &[u8]) -> bool` | Store bytes |
-| `kv_store_set_str` | `fn(key: &str, value: &str) -> bool` | Store string |
-| `kv_store_get` | `fn(key: &str) -> Option<Vec<u8>>` | Read bytes |
-| `kv_store_get_str` | `fn(key: &str) -> Option<String>` | Read string |
-| `kv_store_delete` | `fn(key: &str) -> bool` | Delete key |
-
-### Native File Picker & I/O
-
-Oxide provides a secure, handle-based file and folder picker. Paths never cross the WASM sandbox boundary. Instead, the host manages an internal mapping of handles to file paths and returns opaque `u32` handles to the guest. The guest then performs I/O using these handles.
-
-#### Types
-
-```rust
-pub struct FileMetadata {
-    pub name: String,
-    pub size: u64,
-    pub mime: String,
-    pub modified_ms: u64,
-    pub is_dir: bool,
-}
-
-pub struct FolderEntry {
-    pub name: String,
-    pub size: u64,
-    pub is_dir: bool,
-    pub handle: u32,
-}
-```
-
-#### Functions
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `file_pick` | `fn(title: &str, filters: &str, multiple: bool) -> Vec<u32>` | Open the native file picker. `filters` is a comma-separated list of extensions (e.g. `"png,jpg"`). Returns a list of opaque file handles. |
-| `folder_pick` | `fn(title: &str) -> Option<u32>` | Open the native folder picker. Returns a folder handle. |
-| `folder_entries` | `fn(handle: u32) -> Vec<FolderEntry>` | List children of a folder handle. Opaque handles are returned for children to allow traversal. |
-| `file_metadata` | `fn(handle: u32) -> Option<FileMetadata>` | Query file metadata (name, size, mime, modified_ms, is_dir). |
-| `file_read` | `fn(handle: u32) -> Option<Vec<u8>>` | Read the full file contents (capped at 64 MiB). |
-| `file_read_range` | `fn(handle: u32, offset: u64, len: u32) -> Option<Vec<u8>>` | Read a specific slice of a file, enabling efficient streaming/seeking. |
-
-#### Example
-
-```rust
-use oxide_sdk::{file_pick, file_metadata, file_read, folder_pick, folder_entries};
-
-fn test_file_picker() {
-    // Pick an image
-    let files = file_pick("Select an Image", "png,jpg,jpeg", false);
-    if let Some(&handle) = files.first() {
-        if let Some(meta) = file_metadata(handle) {
-            log(&format!("Picked file: {}, size: {} bytes", meta.name, meta.size));
-        }
-        if let Some(data) = file_read(handle) {
-            log(&format!("Read {} bytes successfully", data.len()));
-        }
-    }
-
-    // Pick a directory and list its contents
-    if let Some(folder_handle) = folder_pick("Select a Workspace Folder") {
-        let entries = folder_entries(folder_handle);
-        for entry in entries {
-            let kind = if entry.is_dir { "Directory" } else { "File" };
-            log(&format!("Entry: {} ({}), Size: {}", entry.name, kind, entry.size));
-        }
-    }
-}
-```
-
-### Audio Playback
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `audio_play` | `fn(data: &[u8]) -> i32` | Play from encoded bytes (WAV/MP3/OGG/FLAC) |
-| `audio_play_url` | `fn(url: &str) -> i32` | Fetch and play from URL |
-| `audio_play_with_format` | `fn(data: &[u8], format: AudioFormat) -> i32` | Play with format hint |
-| `audio_detect_format` | `fn(data: &[u8]) -> AudioFormat` | Sniff container from magic bytes |
-| `audio_pause` / `audio_resume` / `audio_stop` | `fn()` | Playback control |
-| `audio_set_volume` / `audio_get_volume` | `fn(f32)` / `fn() -> f32` | Volume (0.0–2.0) |
-| `audio_is_playing` | `fn() -> bool` | Check playback state |
-| `audio_position` / `audio_seek` / `audio_duration` | | Seek and position (ms) |
-| `audio_set_loop` | `fn(enabled: bool)` | Enable/disable looping |
-| `audio_channel_play` | `fn(channel: u32, data: &[u8]) -> i32` | Multi-channel playback |
-| `audio_channel_stop` | `fn(channel: u32)` | Stop a channel |
-| `audio_channel_set_volume` | `fn(channel: u32, level: f32)` | Per-channel volume |
-
-```rust
-// Play from URL
-audio_play_url("https://example.com/song.mp3");
-
-// Multi-channel (music + effects)
-audio_channel_play(0, &music_bytes);   // background music
-audio_channel_play(1, &sfx_bytes);     // sound effect
-audio_channel_set_volume(0, 0.5);      // lower music volume
-```
-
-### Video Playback
-
-Requires FFmpeg on the host for decoding.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `video_load` | `fn(data: &[u8]) -> i32` | Load from encoded bytes |
-| `video_load_url` | `fn(url: &str) -> i32` | Load from URL (progressive or HLS) |
-| `video_play` / `video_pause` / `video_stop` | `fn()` | Playback control |
-| `video_render` | `fn(x, y, w, h: f32) -> i32` | Draw current frame to canvas |
-| `video_seek` | `fn(position_ms: u64) -> i32` | Seek to position |
-| `video_position` / `video_duration` | `fn() -> u64` | Position and duration (ms) |
-| `video_set_volume` / `video_get_volume` | `fn(f32)` / `fn() -> f32` | Volume control |
-| `video_set_loop` | `fn(enabled: bool)` | Enable looping |
-| `video_set_pip` | `fn(enabled: bool)` | Picture-in-picture overlay |
-| `video_hls_variant_count` / `video_hls_open_variant` | | HLS adaptive streaming |
-| `subtitle_load_srt` / `subtitle_load_vtt` | `fn(text: &str) -> i32` | Load subtitles |
-| `subtitle_clear` | `fn()` | Remove subtitles |
-
-```rust
-video_load_url("https://example.com/video.mp4");
-video_play();
-
-#[no_mangle]
-pub extern "C" fn on_frame(_dt_ms: u32) {
-    let (w, h) = canvas_dimensions();
-    video_render(0.0, 0.0, w as f32, h as f32);
-}
-```
-
-### Media Capture
-
-Gated by the in-browser permission prompt (see [Permissions](#permissions)). The first call per origin returns `PERMISSION_PENDING` (`-5`) while the prompt is showing — retry on a later frame. If the app ships a [manifest](#app-manifests), the capability must be declared in `permissions` or the call returns `-1` without prompting.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `camera_open` | `fn() -> i32` | Open default camera (0=success) |
-| `camera_close` | `fn()` | Stop camera |
-| `camera_capture_frame` | `fn(out: &mut [u8]) -> u32` | Capture RGBA8 frame |
-| `camera_frame_dimensions` | `fn() -> (u32, u32)` | Frame size in pixels |
-| `microphone_open` | `fn() -> i32` | Start mic capture (0=success) |
-| `microphone_close` | `fn()` | Stop mic |
-| `microphone_sample_rate` | `fn() -> u32` | Sample rate in Hz |
-| `microphone_read_samples` | `fn(out: &mut [f32]) -> u32` | Read mono f32 samples |
-| `screen_capture` | `fn(out: &mut [u8]) -> Result<usize, i32>` | Screenshot as RGBA8 |
-| `screen_capture_dimensions` | `fn() -> (u32, u32)` | Screenshot dimensions |
-| `media_pipeline_stats` | `fn() -> (u64, u32)` | Camera frames / mic depth |
-
-```rust
-// In on_frame: retry while the permission prompt is up.
-match camera_open() {
-    0 => {
-        let mut buf = vec![0u8; 1920 * 1080 * 4];
-        let bytes = camera_capture_frame(&mut buf);
-        let (w, h) = camera_frame_dimensions();
-        log(&format!("Captured {}x{} frame ({} bytes)", w, h, bytes));
-    }
-    PERMISSION_PENDING => { /* prompt showing — try again next frame */ }
-    code => log(&format!("camera_open failed: {code}")),
-}
-```
-
-### WebRTC / Real-Time Communication
-
-The RTC API enables peer-to-peer communication for video calls, multiplayer games, collaborative tools, and decentralized messaging. Connections use the [webrtc-rs](https://github.com/webrtc-rs/webrtc) stack on the host; guests interact through handle-based APIs. Events (incoming messages, ICE candidates, state changes) are polled each frame rather than using callbacks.
-
-#### Peer Connection
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `rtc_create_peer` | `fn(stun_servers: &str) -> u32` | Create a peer connection (comma-separated STUN/TURN URLs, `""` for default) |
-| `rtc_close_peer` | `fn(peer_id: u32) -> bool` | Close and release a peer |
-| `rtc_connection_state` | `fn(peer_id: u32) -> u32` | Poll connection state (`RTC_STATE_*` constants) |
-
-Connection state constants: `RTC_STATE_NEW` (0), `RTC_STATE_CONNECTING` (1), `RTC_STATE_CONNECTED` (2), `RTC_STATE_DISCONNECTED` (3), `RTC_STATE_FAILED` (4), `RTC_STATE_CLOSED` (5).
-
-#### SDP Offer/Answer Exchange
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `rtc_create_offer` | `fn(peer_id: u32) -> Result<String, i32>` | Generate SDP offer and set as local description |
-| `rtc_create_answer` | `fn(peer_id: u32) -> Result<String, i32>` | Generate SDP answer (after setting remote offer) |
-| `rtc_set_local_description` | `fn(peer_id: u32, sdp: &str, is_offer: bool) -> i32` | Set local SDP explicitly |
-| `rtc_set_remote_description` | `fn(peer_id: u32, sdp: &str, is_offer: bool) -> i32` | Set remote SDP from the other peer |
-
-#### ICE Candidates
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `rtc_add_ice_candidate` | `fn(peer_id: u32, candidate_json: &str) -> i32` | Add a trickled ICE candidate (JSON) |
-| `rtc_poll_ice_candidate` | `fn(peer_id: u32) -> Option<String>` | Poll for locally gathered ICE candidates |
-
-#### Data Channels
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `rtc_create_data_channel` | `fn(peer_id: u32, label: &str, ordered: bool) -> u32` | Create a data channel (ordered=TCP-like, unordered=UDP-like) |
-| `rtc_send_text` | `fn(peer_id: u32, channel_id: u32, text: &str) -> i32` | Send UTF-8 text |
-| `rtc_send_binary` | `fn(peer_id: u32, channel_id: u32, data: &[u8]) -> i32` | Send binary data |
-| `rtc_send` | `fn(peer_id: u32, channel_id: u32, data: &[u8], is_binary: bool) -> i32` | Send with explicit mode |
-| `rtc_recv` | `fn(peer_id: u32, channel_id: u32) -> Option<RtcMessage>` | Poll for incoming messages (channel_id=0 for any) |
-| `rtc_poll_data_channel` | `fn(peer_id: u32) -> Option<RtcDataChannelInfo>` | Poll for remotely-created data channels |
-
-`RtcMessage` has fields: `channel_id: u32`, `is_binary: bool`, `data: Vec<u8>`, and a `.text()` helper.
-
-#### Media Tracks
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `rtc_add_track` | `fn(peer_id: u32, kind: u32) -> u32` | Attach a media track (`RTC_TRACK_AUDIO`=0, `RTC_TRACK_VIDEO`=1) |
-| `rtc_poll_track` | `fn(peer_id: u32) -> Option<RtcTrackInfo>` | Poll for remote media tracks added by the peer |
-
-`RtcTrackInfo` has fields: `kind: u32`, `id: String`, `stream_id: String`.
-
-#### Signaling
-
-The built-in signaling client bootstraps connections via HTTP. Guests can also use the `fetch` API with any custom signaling server.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `rtc_signal_connect` | `fn(url: &str) -> bool` | Connect to a signaling server |
-| `rtc_signal_join_room` | `fn(room: &str) -> i32` | Join a signaling room |
-| `rtc_signal_send` | `fn(data: &[u8]) -> i32` | Send a signaling message |
-| `rtc_signal_recv` | `fn() -> Option<Vec<u8>>` | Poll for incoming signaling messages |
-
-#### Example: P2P Chat
-
-```rust
-use oxide_sdk::*;
-
-static mut PEER: u32 = 0;
-static mut CHANNEL: u32 = 0;
-static mut GREETED: bool = false;
-
-#[no_mangle]
-pub extern "C" fn start_app() {
-    let peer = rtc_create_peer("");
-    unsafe { PEER = peer; }
-
-    let ch = rtc_create_data_channel(peer, "chat", true);
-    unsafe { CHANNEL = ch; }
-
-    match rtc_create_offer(peer) {
-        Ok(sdp) => log(&format!("Share this offer:\n{sdp}")),
-        Err(e) => error(&format!("Offer failed: {e}")),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn on_frame(_dt_ms: u32) {
-    let (peer, ch) = unsafe { (PEER, CHANNEL) };
-
-    if rtc_connection_state(peer) == RTC_STATE_CONNECTED {
-        // Send a greeting once on connect
-        if !unsafe { GREETED } {
-            rtc_send_text(peer, ch, "Hello from Oxide!");
-            unsafe { GREETED = true; }
-        }
-
-        while let Some(msg) = rtc_recv(peer, 0) {
-            log(&format!("Received: {}", msg.text()));
-        }
-    }
-
-    while let Some(candidate) = rtc_poll_ice_candidate(peer) {
-        log(&format!("ICE: {candidate}"));
-    }
-}
-```
-
-### Timers
-
-Timer callbacks fire via the guest-exported `on_timer(callback_id)` function.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `set_timeout` | `fn(callback_id: u32, delay_ms: u32) -> u32` | One-shot timer |
-| `set_interval` | `fn(callback_id: u32, interval_ms: u32) -> u32` | Repeating timer |
-| `clear_timer` | `fn(timer_id: u32)` | Cancel a timer |
-| `time_now_ms` | `fn() -> u64` | Current UNIX timestamp in ms |
-
-```rust
-let timer = set_timeout(42, 1000); // fires on_timer(42) after 1 second
-
-#[no_mangle]
-pub extern "C" fn on_timer(callback_id: u32) {
-    if callback_id == 42 {
-        log("Timer fired!");
-    }
-}
-```
-
-### Animation Frames
-
-Vsync-aligned one-shot callbacks for smooth rendering. Callbacks fire via the same guest-exported `on_timer(callback_id)` function used by `set_timeout`. See the `raf-demo` example.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `request_animation_frame` | `fn(callback_id: u32) -> u32` | Schedule a one-shot frame callback; returns a request id |
-| `cancel_animation_frame` | `fn(request_id: u32)` | Cancel a pending request |
-
-```rust
-#[no_mangle]
-pub extern "C" fn start_app() {
-    request_animation_frame(7);
-}
-
-#[no_mangle]
-pub extern "C" fn on_timer(id: u32) {
-    if id == 7 {
-        // draw a frame, then schedule the next one
-        request_animation_frame(7);
-    }
-}
-```
-
-### Event System
-
-Oxide features a unified event system for registering listeners for both built-in host events and custom guest events. Events fire via a guest-exported `on_event(callback_id: u32)` function, which the host calls once per pending event each frame (before timers and `on_frame`). Inside that callback, use `event_type()`, `event_data()`, or `event_data_into()` to query the event type and payload bytes.
-
-#### Built-In Events
-
-| Event Type | Payload Description |
-|------------|---------------------|
-| `"resize"` | 8 bytes: `width: u32, height: u32` (little-endian) |
-| `"focus"` / `"blur"` | Empty |
-| `"visibility_change"` | UTF-8 string `"visible"` or `"hidden"` |
-| `"online"` / `"offline"` | Empty |
-| `"touch_start"` | 8 bytes: `x: f32, y: f32` (little-endian) |
-| `"touch_move"` | 8 bytes: `x: f32, y: f32` (little-endian) |
-| `"touch_end"` | 8 bytes: `x: f32, y: f32` (little-endian) |
-| `"gamepad_connected"` | UTF-8 string containing the device name |
-| `"gamepad_button"` | 12 bytes: `id: u32, code: u32, pressed: u32` (little-endian) |
-| `"gamepad_axis"` | 12 bytes: `id: u32, code: u32, value: f32` (little-endian) |
-| `"drop_files"` | UTF-8 JSON array of dropped file paths, e.g. `["/tmp/a.png"]` |
-
-#### Functions
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `on_event` | `fn(event_type: &str, callback_id: u32) -> u32` | Register a listener for an event type. Returns a listener ID. |
-| `off_event` | `fn(listener_id: u32) -> bool` | Cancel a previously-registered listener by ID. |
-| `emit_event` | `fn(event_type: &str, data: &[u8])` | Emit a custom event with a payload, dispatched to listeners next frame. |
-| `event_type` | `fn() -> String` | Retrieve the name of the event currently being delivered (valid only in `on_event`). |
-| `event_data` | `fn(out: &mut [u8]) -> usize` | Copy the current event payload bytes into a buffer (returns bytes written). |
-| `event_data_into` | `fn() -> Vec<u8>` | Allocate a `Vec<u8>` with the full payload bytes of the current event. |
-
-#### Example
-
-```rust
-use oxide_sdk::{on_event, emit_event, event_type, event_data_into};
-
-#[no_mangle]
-pub extern "C" fn start_app() {
-    // Register for built-in resize events
-    on_event("resize", 100);
-
-    // Register for custom chat events
-    on_event("chat_message", 200);
-
-    // Trigger a custom event immediately
-    emit_event("chat_message", b"Hello, Oxide!");
-}
-
-#[no_mangle]
-pub extern "C" fn on_event(callback_id: u32) {
-    let name = event_type();
-    let payload = event_data_into();
-
-    match callback_id {
-        100 => {
-            if name == "resize" && payload.len() == 8 {
-                let w = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-                let h = u32::from_le_bytes(payload[4..8].try_into().unwrap());
-                log(&format!("Window resized to {}x{}", w, h));
-            }
-        }
-        200 => {
-            if let Ok(msg) = String::from_utf8(payload) {
-                log(&format!("Chat received: {}", msg));
-            }
-        }
-        _ => {}
-    }
-}
-```
-
-### Streaming HTTP
-
-Non-blocking variant of `fetch` that streams the response body back to the guest in chunks. Useful for large downloads, HLS playlists, server-sent events, and any response you want to start consuming before it fully arrives. See the `stream-fetch-demo` example.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `fetch_begin` | `fn(method, url, content_type, body) -> u32` | Dispatch a streaming request; returns a handle (`>0`) or `0` on init failure |
-| `fetch_begin_get` | `fn(url: &str) -> u32` | GET shorthand |
-| `fetch_state` | `fn(handle: u32) -> u32` | Poll lifecycle state (see `FETCH_*` constants) |
-| `fetch_status` | `fn(handle: u32) -> u32` | HTTP status code, or `0` until headers arrive |
-| `fetch_recv` | `fn(handle: u32) -> FetchChunk` | Poll the next body chunk (`Pending` / `Data` / `End` / `Error`) |
-| `fetch_recv_into` | `fn(handle: u32, buf: &mut [u8]) -> i64` | Poll into a caller buffer (no allocation) |
-| `fetch_error` | `fn(handle: u32) -> Option<String>` | Retrieve the error message for a failed request |
-| `fetch_abort` | `fn(handle: u32) -> bool` | Cancel an in-flight request |
-
-```rust
-let handle = fetch_begin_get("https://example.com/large.bin");
-
-#[no_mangle]
-pub extern "C" fn on_frame(_dt_ms: u32) {
-    loop {
-        match fetch_recv(HANDLE) {
-            FetchChunk::Pending => break,
-            FetchChunk::Data(bytes) => process(&bytes),
-            FetchChunk::End => { log("done"); break; }
-            FetchChunk::Error => { error(&fetch_error(HANDLE).unwrap_or_default()); break; }
-        }
-    }
-}
-```
-
-### WebSocket
-
-Long-lived bidirectional connections. Messages are queued on the host and drained by the guest each frame via `ws_recv`. See the `ws-chat` example.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `ws_connect` | `fn(url: &str) -> u32` | Open a WebSocket; returns a handle |
-| `ws_ready_state` | `fn(id: u32) -> u32` | Poll state (`WS_CONNECTING`, `WS_OPEN`, `WS_CLOSING`, `WS_CLOSED`) |
-| `ws_send_text` | `fn(id: u32, text: &str) -> i32` | Send a UTF-8 text frame |
-| `ws_send_binary` | `fn(id: u32, data: &[u8]) -> i32` | Send a binary frame |
-| `ws_recv` | `fn(id: u32) -> Option<WsMessage>` | Pop the next message (text or binary) from the queue |
-| `ws_close` | `fn(id: u32) -> i32` | Initiate the close handshake |
-| `ws_remove` | `fn(id: u32)` | Free host resources after `ws_ready_state` returns `WS_CLOSED` |
-
-```rust
-let ws = ws_connect("wss://echo.websocket.events");
-
-#[no_mangle]
-pub extern "C" fn on_frame(_dt_ms: u32) {
-    if ws_ready_state(WS) == WS_OPEN && !SENT {
-        ws_send_text(WS, "hello");
-        SENT = true;
-    }
-    while let Some(msg) = ws_recv(WS) {
-        log(&format!("got: {}", msg.text()));
-    }
-}
-```
-
-### Server-Sent Events
-
-Long-lived HTTP push streams (web `EventSource`). The host reconnects automatically and sends `Last-Event-ID`. Drain events each frame via `sse_recv`. See the `sse-demo` example.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `sse_open` | `fn(url: &str) -> u32` | Open a stream; returns a handle |
-| `sse_state` | `fn(id: u32) -> u32` | `SSE_CONNECTING`, `SSE_OPEN`, `SSE_CLOSED`, `SSE_ERROR` |
-| `sse_recv` | `fn(id: u32) -> Option<SseEvent>` | Pop the next `{ name, id, data }` event |
-| `sse_error` | `fn(id: u32) -> String` | Last error message |
-| `sse_close` | `fn(id: u32) -> i32` | Stop the stream |
-| `sse_remove` | `fn(id: u32)` | Free host resources after close |
-
-```rust
-let sse = sse_open("https://stream.wikimedia.org/v2/stream/recentchange");
-
-#[no_mangle]
-pub extern "C" fn on_frame(_dt_ms: u32) {
-    while let Some(ev) = sse_recv(sse) {
-        log(&format!("{}: {}", ev.name, ev.data));
-    }
-}
-```
-
-### MIDI Devices
-
-Read and write MIDI messages on hardware controllers and synthesisers. Each input port maintains a bounded receive queue; long SysEx packets are split. See the `midi-demo` (piano visualizer) example.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `midi_input_count` / `midi_output_count` | `fn() -> u32` | Enumerate ports |
-| `midi_input_name` / `midi_output_name` | `fn(index: u32) -> String` | Look up port names |
-| `midi_open_input` / `midi_open_output` | `fn(index: u32) -> u32` | Open a port; returns a handle (`0` on failure) |
-| `midi_send` | `fn(handle: u32, data: &[u8]) -> i32` | Send raw MIDI bytes to an output |
-| `midi_recv` | `fn(handle: u32) -> Option<Vec<u8>>` | Pop the next packet from an input queue |
-| `midi_close` | `fn(handle: u32)` | Close a port |
-
-```rust
-let input = midi_open_input(0);
-while let Some(packet) = midi_recv(input) {
-    // packet[0] is the status byte; lower nibble = channel
-    log(&format!("midi: {:02x?}", packet));
-}
-```
-
-### GPU
-
-WebGPU-style API for GPU-backed buffers, textures, shaders, and pipelines. Shader source is WGSL. See the `gpu-graphics-demo` example.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `gpu_create_buffer` | `fn(size: u64, usage: u32) -> u32` | Allocate a GPU buffer |
-| `gpu_create_texture` | `fn(width: u32, height: u32) -> u32` | Allocate a 2D texture |
-| `gpu_create_shader` | `fn(source: &str) -> u32` | Compile a WGSL shader module |
-| `gpu_create_pipeline` | `fn(shader, vertex_entry, fragment_entry) -> u32` | Build a render pipeline |
-| `gpu_create_compute_pipeline` | `fn(shader, entry_point) -> u32` | Build a compute pipeline |
-| `gpu_write_buffer` | `fn(handle, offset, data) -> bool` | Upload bytes into a buffer |
-| `gpu_draw` | `fn(pipeline, target_texture, vertex_count, ...) -> bool` | Issue a draw call into a target texture |
-| `gpu_dispatch_compute` | `fn(pipeline, x, y, z) -> bool` | Dispatch a compute workgroup grid |
-| `gpu_destroy_buffer` / `gpu_destroy_texture` | `fn(handle: u32) -> bool` | Release GPU resources |
-
-### Navigation & History
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `navigate` | `fn(url: &str) -> i32` | Navigate to a URL |
-| `push_state` | `fn(state: &[u8], title: &str, url: &str)` | Push history entry |
-| `replace_state` | `fn(state: &[u8], title: &str, url: &str)` | Replace current entry |
-| `get_url` | `fn() -> String` | Current page URL |
-| `get_state` | `fn() -> Option<Vec<u8>>` | Current history state bytes |
-| `history_length` | `fn() -> u32` | Number of history entries |
-| `history_back` / `history_forward` | `fn() -> bool` | Navigate history |
-
-### Hyperlinks
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `register_hyperlink` | `fn(x, y, w, h: f32, url: &str) -> i32` | Register clickable region |
-| `clear_hyperlinks` | `fn()` | Remove all hyperlinks |
-
-```rust
-canvas_text(20.0, 100.0, 16.0, 100, 150, 255, 255, "Visit Example");
-register_hyperlink(20.0, 100.0, 200.0, 20.0, "https://example.com/app.wasm");
-```
-
-### Crypto & Encoding
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `hash_sha256` | `fn(data: &[u8]) -> [u8; 32]` | SHA-256 hash (raw) |
-| `hash_sha256_hex` | `fn(data: &[u8]) -> String` | SHA-256 hash (hex) |
-| `hash_sha512` | `fn(data: &[u8]) -> [u8; 64]` | SHA-512 hash (raw) |
-| `hash_sha512_hex` | `fn(data: &[u8]) -> String` | SHA-512 hash (hex) |
-| `hmac_sha256` | `fn(key: &[u8], data: &[u8]) -> [u8; 32]` | HMAC-SHA256 tag (raw) |
-| `hmac_sha256_hex` | `fn(key: &[u8], data: &[u8]) -> String` | HMAC-SHA256 tag (hex) |
-| `random_bytes` | `fn(len: usize) -> Vec<u8>` | OS-grade random bytes (64 KiB per host call) |
-| `uuid_v4` | `fn() -> String` | Random RFC 4122 version-4 UUID |
-| `base64_encode` | `fn(data: &[u8]) -> String` | Encode to base64 |
-| `base64_decode` | `fn(encoded: &str) -> Vec<u8>` | Decode from base64 |
-
-### Compression
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `compress` | `fn(format: CompressionFormat, data: &[u8]) -> Vec<u8>` | Gzip, raw deflate, or zlib |
-| `decompress` | `fn(format: CompressionFormat, data: &[u8]) -> Option<Vec<u8>>` | Inverse of `compress`; `None` on corrupt or oversized output |
-
-Formats match the web `CompressionStream` names: `Gzip`, `Deflate` (raw), `Zlib`. Decompressed output is capped at 128 MB on the host.
-
-### System info
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `system_theme` | `fn() -> u32` | `THEME_LIGHT` (0), `THEME_DARK` (1), or `THEME_UNKNOWN` (2). Follows the browser appearance setting (`oxide://settings`) when it is Dark or Light; System uses the OS colour scheme. |
-| `system_locale` | `fn() -> String` | BCP 47 locale tag (e.g. `"en-IN"`) |
-| `system_timezone` | `fn() -> String` | IANA timezone name (e.g. `"Asia/Kolkata"`) |
-| `system_timezone_offset_minutes` | `fn() -> i32` | Minutes east of UTC (e.g. `330` for IST) |
-| `battery_level` | `fn() -> i32` | Charge percent `0..=100`, or `-1` when no battery |
-| `battery_charging` | `fn() -> i32` | `1` charging/full, `0` discharging, `-1` unknown |
-
-### Clipboard
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `clipboard_write` | `fn(text: &str)` | Copy to clipboard |
-| `clipboard_read` | `fn() -> String` | Read from clipboard |
-
-### Random
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `random_u64` | `fn() -> u64` | Cryptographic random u64 |
-| `random_f64` | `fn() -> f64` | Random float in [0.0, 1.0) |
-
-### Other
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `notify` | `fn(title: &str, body: &str)` | Show a notification |
-| `upload_file` | `fn() -> Option<UploadedFile>` | Open native file picker |
-| `get_location` | `fn() -> Result<String, i32>` | Geolocation as `"lat,lon"` (mock); permission-gated — `Err(PERMISSION_PENDING)` while the prompt is showing, `Err(-1)` once blocked |
-| `load_module` | `fn(url: &str) -> i32` | Dynamically load another `.wasm` |
-| `url_resolve` | `fn(base: &str, rel: &str) -> Option<String>` | Resolve relative URL |
-| `url_encode` / `url_decode` | `fn(input: &str) -> String` | Percent-encoding |
-
----
-
-## Security Model
-
-### Sandbox Guarantees
-
-| Constraint | Value | Purpose |
-|------------|-------|---------|
-| **Filesystem access** | None | Guest cannot read/write host files |
-| **Environment variables** | None | Guest cannot read host env vars |
-| **Network sockets** | None | Guest cannot open arbitrary connections |
-| **Memory limit** | 256 MB (4096 pages) | Prevents memory exhaustion |
-| **Fuel limit** | 500M instructions | Prevents infinite loops / DoS |
-
-### How it works
-
-1. **No WASI**: The runtime does *not* link WASI modules. The guest has zero implicit access to system resources.
-2. **Bounded memory**: Linear memory is created with a hard upper bound. Any allocation beyond this causes a trap.
-3. **Fuel metering**: Each WebAssembly instruction consumes fuel. When fuel runs out, execution halts with a clear error message.
-4. **Capability-based access**: The only way a guest can interact with the outside world is through the explicitly provided `oxide::*` host functions.
-
-### Mediated I/O
-
-- **File upload**: `upload_file()` opens a native OS file picker. The guest never gets filesystem access; the host passes the selected file's name and content bytes.
-- **HTTP fetch**: `fetch()` proxies through the host. The guest cannot open raw sockets.
-- **Dynamic loading**: `load_module()` fetches and runs a child `.wasm` with isolated memory and fuel, preventing sandbox escape.
-
-### Permissions
-
-Sensitive APIs — **camera**, **microphone**, **geolocation**, and **screen capture** — are gated behind an in-browser permission prompt (top-left, under the toolbar), similar to Chrome. The flow is non-blocking:
-
-1. The first call per origin (e.g. `camera_open()`) returns `PERMISSION_PENDING` (`-5`) and the prompt appears.
-2. The guest retries on a later frame.
-3. After the user clicks **Allow**, the call succeeds; after **Block**, it returns `-1`. Decisions are remembered per `(origin, capability)` for the lifetime of the tab.
-
-`get_location()` returns `Err(PERMISSION_PENDING)` while the prompt is pending and `Err(-1)` once blocked.
-
----
-
-## App Manifests
-
-An app may ship an optional TOML manifest next to its `.wasm` file, at the same URL with the `.wasm` extension replaced by `.toml` (`https://host/app.wasm` → `https://host/app.toml`). Example:
-
-```toml
-name = "Media Capture"
-description = "Camera preview, microphone level meter, and screenshots"
-version = "0.1.0"
-permissions = ["camera", "microphone", "screen-capture"]
-```
-
-| Field | Required | Meaning |
-|-------|----------|---------|
-| `name` | yes | Shown as the tab title instead of the URL |
-| `description` | no | Short description of the app |
-| `version` | no | Informational version string |
-| `permissions` | no | Sensitive capabilities the app may request: `camera`, `microphone`, `geolocation`, `screen-capture` |
-
-When a manifest is present it acts as a **capability declaration**: sensitive APIs *not* listed in `permissions` are denied without a prompt. Apps without a manifest keep the legacy behavior (any sensitive API may prompt on first use).
-
-Each example crate ships a manifest named after its build artifact (e.g. `examples/media-capture/media_capture.toml`). When loading an example from `target/wasm32-unknown-unknown/release/`, copy the manifest next to the `.wasm` for it to be picked up; hosted deployments should upload both files side by side.
-
----
-
-## Guest Module Contract
-
-Every `.wasm` module loaded by Oxide must:
-
-1. **Export `start_app`** — `extern "C" fn()` entry point, called once on load.
-2. **Optionally export `on_frame`** — `extern "C" fn(dt_ms: u32)` for interactive apps with a render loop.
-3. **Optionally export `on_timer`** — `extern "C" fn(callback_id: u32)` to receive timer callbacks.
-4. **Import from `"oxide"` module** — All host capabilities are under this namespace.
-5. **Compile as `cdylib`** — `crate-type = ["cdylib"]` in `Cargo.toml`.
-6. **Target `wasm32-unknown-unknown`** — no WASI, pure capability-based I/O.
-
-### Minimal valid guest (without the SDK)
+Without the SDK, a valid guest is:
 
 ```rust
 #[link(wasm_import_module = "oxide")]
@@ -1125,123 +102,101 @@ pub extern "C" fn start_app() {
 }
 ```
 
----
+## Drawing and input
 
-## Project Structure
+The app draws each frame onto a canvas in logical pixels, divided by the page zoom; `canvas_dimensions()` gives its size. The engine turns the canvas into `sighurt-ipc` draw operations, and `sig` paints them with its own fonts. There are no widgets: buttons, fields and lists are shapes the app draws and hit-tests against `mouse_position()`. Typed text comes from `text_input()`; keys from `key_pressed` / `key_down` with the `KEY_*` constants. For content taller than the page, call `set_content_size` and offset drawing by `scroll_position()`.
 
-```
-oxide/
-├── Cargo.toml                    # Workspace root
-├── DOCS.md                       # This file
-├── oxide-browser/                # Host browser application
-│   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs               # Entry point (BrowserHost + run_browser)
-│       ├── engine.rs             # WasmEngine, SandboxPolicy, fuel/memory
-│       ├── runtime.rs            # BrowserHost, fetch_and_run, module lifecycle
-│       ├── capabilities.rs       # Host functions ("oxide" import module)
-│       ├── ui.rs                 # GPUI shell (toolbar, canvas, console, tabs)
-│       ├── navigation.rs         # History stack with back/forward
-│       ├── bookmarks.rs          # Persistent bookmarks (sled)
-│       ├── url.rs                # WHATWG URL parsing
-│       ├── audio_format.rs       # Audio magic-byte sniffing
-│       ├── video.rs              # FFmpeg video pipeline
-│       ├── video_format.rs       # Video format sniffing
-│       ├── subtitle.rs           # SRT/VTT subtitle parsing
-│       ├── media_capture.rs      # Camera, mic, screen capture
-│       ├── rtc.rs                # WebRTC peer connections, data channels, signaling
-│       ├── gpu.rs                # WebGPU-style GPU resource management
-│       ├── websocket.rs          # WebSocket connections and frame queues
-│       ├── sse.rs                # Server-Sent Events (EventSource) streams
-│       ├── midi.rs               # MIDI input/output ports with bounded queues
-│       ├── fetch.rs              # Streaming fetch handles and chunk queues
-│       ├── download.rs           # Background downloader for non-WASM URLs
-│       ├── compression.rs        # Gzip / deflate / zlib host functions
-│       └── system.rs             # Theme, locale, timezone, battery
-├── oxide-sdk/                    # Guest SDK (no dependencies)
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs                # Safe wrappers over host FFI imports
-│       ├── draw.rs               # High-level drawing API (Color, Rect, Canvas)
-│       └── proto.rs              # Zero-dependency protobuf codec
-├── oxide-docs/                   # Rustdoc hub crate
-└── examples/
-    ├── hello-oxide/              # Interactive widget demo
-    ├── audio-player/             # Audio playback example
-    ├── video-player/             # Video playback example
-    ├── timer-demo/               # Timer callbacks
-    ├── raf-demo/                 # request_animation_frame demo
-    ├── media-capture/            # Camera/mic/screen capture
-    ├── gpu-graphics-demo/        # GPU/WebGPU rendering demo
-    ├── rtc-chat/                 # WebRTC peer-to-peer chat demo
-    ├── ws-chat/                  # WebSocket chat demo
-    ├── sse-demo/                 # Server-Sent Events demo
-    ├── stream-fetch-demo/        # Streaming HTTP fetch demo
-    ├── midi-demo/                # MIDI piano visualizer
-    ├── index/                    # Demo hub (links to other examples)
-    ├── platform-demo/            # Crypto, compression, and system info
-    └── fullstack-notes/          # Full-stack example (Rust frontend + backend)
-```
+The [`draw`](./sighurt-sdk/src/draw.rs) module wraps the canvas functions in `Canvas`, `Color`, `Rect` and `Point2D`:
 
----
-
-## Extending the Browser
-
-### Adding a new host function
-
-1. **Define it in `capabilities.rs`**: Add a `linker.func_wrap(...)` call in `register_host_functions`.
-2. **Add the FFI declaration in `oxide-sdk/src/lib.rs`**: Add the raw `extern "C"` import and a safe wrapper function.
-3. **Document it**: Update this file and the rustdoc comments.
-
-### Example: Adding `api_set_title`
-
-In `capabilities.rs`:
 ```rust
-linker.func_wrap(
-    "oxide",
-    "api_set_title",
-    |caller: Caller<'_, HostState>, ptr: u32, len: u32| {
-        let mem = caller.data().memory.expect("memory not set");
-        let title = read_guest_string(&mem, &caller, ptr, len).unwrap_or_default();
-        // Store the title somewhere accessible to the UI...
-    },
-)?;
+use sighurt_sdk::draw::*;
+
+let c = Canvas::new();
+c.clear(Color::hex(0x1e1e2e));
+c.fill_rect(Rect::new(10.0, 10.0, 200.0, 100.0), Color::rgb(80, 120, 200));
+c.text("Hello!", Point2D::new(20.0, 30.0), 24.0, Color::WHITE);
 ```
 
-In `oxide-sdk/src/lib.rs`:
-```rust
-#[link(wasm_import_module = "oxide")]
-extern "C" {
-    #[link_name = "api_set_title"]
-    fn _api_set_title(ptr: u32, len: u32);
-}
+## API overview
 
-pub fn set_title(title: &str) {
-    unsafe { _api_set_title(title.as_ptr() as u32, title.len() as u32) }
-}
+Every function has a doc comment in [`sighurt-sdk/src/lib.rs`](./sighurt-sdk/src/lib.rs) (`cargo doc --no-deps -p sighurt-sdk --open`). The examples in [`examples/`](./examples/) use most of them.
+
+| Area | Functions |
+|------|-----------|
+| Canvas | `canvas_clear`, `canvas_rect`, `canvas_rounded_rect`, `canvas_circle`, `canvas_arc`, `canvas_bezier`, `canvas_line`, `canvas_gradient`, `canvas_text`, `canvas_text_ex`, `canvas_measure_text`, `canvas_image`, `canvas_dimensions`, `canvas_save`, `canvas_restore`, `canvas_transform`, `canvas_clip`, `canvas_opacity` |
+| Scrolling | `set_content_size`, `scroll_position`, `set_scroll_position`, `scroll_delta` |
+| Input | `mouse_position`, `mouse_button_down`, `mouse_button_clicked`, `key_down`, `key_pressed`, `text_input`, `modifiers`, `shift_held`, `ctrl_held`, `alt_held` |
+| Console | `log`, `warn`, `error` |
+| Timers | `set_timeout`, `set_interval`, `clear_timer`, `request_animation_frame`, `cancel_animation_frame`, `time_now_ms` |
+| Events | `on_event`, `off_event`, `emit_event`, `event_type`, `event_data`, `event_data_into` |
+| Navigation | `navigate`, `push_state`, `replace_state`, `get_url`, `get_state`, `history_length`, `history_back`, `history_forward`, `register_hyperlink`, `clear_hyperlinks`, `url_resolve`, `url_encode`, `url_decode` |
+| HTTP | `fetch`, `fetch_get`, `fetch_post`, `fetch_post_proto`, `fetch_put`, `fetch_delete`; streaming: `fetch_begin`, `fetch_begin_get`, `fetch_state`, `fetch_status`, `fetch_recv`, `fetch_recv_into`, `fetch_error`, `fetch_abort`, `fetch_remove` |
+| WebSocket | `ws_connect`, `ws_send_text`, `ws_send_binary`, `ws_recv`, `ws_ready_state`, `ws_close`, `ws_remove` |
+| Server-sent events | `sse_open`, `sse_state`, `sse_recv`, `sse_error`, `sse_close`, `sse_remove` |
+| WebRTC | `rtc_create_peer`, `rtc_create_offer`, `rtc_create_answer`, `rtc_set_local_description`, `rtc_set_remote_description`, `rtc_add_ice_candidate`, `rtc_poll_ice_candidate`, `rtc_create_data_channel`, `rtc_send`, `rtc_recv`, `rtc_add_track`, `rtc_poll_track`, `rtc_signal_connect`, … |
+| Storage | `storage_set`, `storage_get`, `storage_remove` (session, per origin); `kv_store_set`, `kv_store_get`, `kv_store_delete` (on disk, per origin) |
+| Files | `upload_file`, `file_pick`, `folder_pick`, `folder_entries`, `file_read`, `file_read_range`, `file_metadata` (native dialogs; the app gets contents or opaque handles, never paths) |
+| Downloads | `download_data`, `download_url`, `canvas_print_pdf` (saved to the download folder) |
+| Audio | `audio_play`, `audio_play_url`, `audio_play_with_format`, `audio_pause`, `audio_resume`, `audio_stop`, `audio_seek`, `audio_set_volume`, `audio_set_loop`, `audio_channel_play`, … |
+| Video | `video_load`, `video_load_url`, `video_play`, `video_pause`, `video_seek`, `video_render`, `video_hls_open_variant`, `subtitle_load_srt`, `subtitle_load_vtt`, … |
+| Media capture | `camera_open`, `camera_capture_frame`, `microphone_open`, `microphone_read_samples`, `screen_capture`, … (permission-gated) |
+| MIDI | `midi_input_count`, `midi_output_count`, `midi_open_input`, `midi_open_output`, `midi_send`, `midi_recv`, `midi_close` |
+| Workers | `spawn_worker`, `worker_post_message`, `worker_recv`, `worker_terminate`; inside a worker: `worker_post`, `worker_message_read` |
+| Modules | `load_module`: runs a child `.wasm` with its own memory and fuel |
+| Crypto and encoding | `hash_sha256`, `hash_sha512`, `hmac_sha256` (+ `_hex`), `random_bytes`, `random_u64`, `random_f64`, `uuid_v4`, `base64_encode`, `base64_decode`, `compress`, `decompress`; [`proto`](./sighurt-sdk/src/proto.rs) is a small protobuf codec |
+| System | `system_locale`, `system_timezone`, `system_timezone_offset_minutes`, `battery_level`, `battery_charging` |
+
+Present for ABI compatibility but not functional:
+
+- `gpu_*`: stubs that return 0 or `false`.
+- `clipboard_write` / `clipboard_read`: always refused (logged; reads return an empty string).
+- `system_theme`: always `THEME_UNKNOWN`.
+- `notify`: writes the notification to the console instead of showing it.
+- `get_location`: returns a fixed placeholder location once permitted.
+
+### Events
+
+`on_event(type, callback_id)` subscribes; the engine calls the guest's `on_event(callback_id)` export, during which `event_type()` and `event_data()` describe the event. Built-in types: `resize` (`width: u32, height: u32`), `focus`, `blur`, `visibility_change` (`"visible"` / `"hidden"`), `online`, `offline`, `touch_start` / `touch_move` / `touch_end` (`x: f32, y: f32`, synthesised from the primary mouse button), `gamepad_connected` (device name), `gamepad_button` (`id, code, pressed: u32`) and `gamepad_axis` (`id, code: u32, value: f32`). Payloads are little-endian. `emit_event` queues custom events.
+
+### Console
+
+Console lines go to `sig`'s log at debug level: run `RUST_LOG=sighurt_core=debug sig …` to see them.
+
+## Permissions and manifests
+
+Camera, microphone, geolocation and screen capture need a grant per origin. The first call returns `PERMISSION_PENDING` (`-5`) and the engine draws a prompt over the page; retry on a later frame. After **Allow** the call works, after **Block** it returns `-1`. Decisions last as long as the page's process. An origin is scheme, host and port for network URLs, and the containing directory for `file://` URLs.
+
+An app may ship a TOML manifest next to its `.wasm`, at the same URL with `.toml` instead of `.wasm`:
+
+```toml
+name = "Audio Player"          # required; used as the page title
+description = "Plays audio"    # optional
+version = "0.1.0"              # optional
+permissions = ["microphone"]   # camera, microphone, geolocation, screen-capture
 ```
 
----
+With a manifest, sensitive APIs it doesn't list are denied without a prompt. Without one, any of them may prompt. Examples ship their manifest next to their source (for example `examples/audio-player/audio_player.toml`); copy it next to the built `.wasm` to use it.
 
-## Serving WASM Files Over HTTP
+## Sandbox
 
-```bash
-cd target/wasm32-unknown-unknown/release/
-python3 -m http.server 8080
-# Navigate to: http://localhost:8080/my_oxide_app.wasm
-```
+| Limit | Value |
+|-------|-------|
+| Filesystem, environment, raw sockets | None: no WASI is linked |
+| Memory | 256 MB (4096 pages) |
+| Fuel | 500M instructions when the module starts, 50M per `on_frame` |
+| Module size | 50 MB |
 
----
+The guest reaches the outside world only through the host functions registered in `sighurt-engine-wasm/src/capabilities.rs`. Network access goes through the host's HTTP, WebSocket, SSE and WebRTC clients; files only through native dialogs the user answers. Session storage is cleared when a page navigates to another origin; the kv store keeps each origin in its own directory.
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| "module must export `start_app`" | Missing entry point | Add `#[no_mangle] pub extern "C" fn start_app()` |
-| "fuel limit exceeded" | Infinite loop or very long computation | Optimize code or reduce work per frame |
-| "failed to compile wasm module" | Invalid `.wasm` binary | Ensure `--target wasm32-unknown-unknown` |
-| "guest string out of bounds" | Buffer too small | Increase buffer sizes in guest code |
-| "network request failed" | URL unreachable | Ensure the server is running and accessible |
-| Blank canvas | No draw commands | Call `canvas_clear()` + draw something |
-| `canvas_dimensions()` returns (0,0) | Called before first frame | Call from `on_frame()` after the canvas is laid out |
-| `shift_held()` always false | Modifier not synced | Ensure you're on oxide-browser ≥ 0.4.0 |
+| Symptom | Fix |
+|---------|-----|
+| "module must export `start_app`" | Add `#[no_mangle] pub extern "C" fn start_app()`. |
+| "fuel limit exceeded" | Do less work per frame, or spread it over frames or a worker. |
+| Blank page | Draw something in `on_frame`, starting with `canvas_clear`. |
+| `on_timer` / `on_event` never called | Export an `on_frame`, even an empty one. |
+| A `.wasm` URL downloads or opens in another engine | Serve it as `application/wasm`, or use a URL ending in `.wasm`. |
+| `sig-wasm` not found | Run `cargo build` (it puts `sig-wasm` next to `sig`), or put it on `PATH`. |
+
+To add a host function, see [CLAUDE.md](./CLAUDE.md#adding-a-host-function-to-the-wasm-engine) or [CONTRIBUTING.md](./CONTRIBUTING.md#adding-a-host-function).
