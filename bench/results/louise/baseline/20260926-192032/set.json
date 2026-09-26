@@ -1,0 +1,315 @@
+{
+ "label": "baseline",
+ "host": "louise",
+ "started": "2026-09-26T19:20:32+0200",
+ "build": {
+  "name": "baseline",
+  "path": "/home/gusahlg/sighurt-bench/snapshots/20260926-192032/bench/builds/baseline.toml",
+  "description": "gpui-baseline: GPUI chrome, engines as processes over sighurt-ipc, Servo frames read back",
+  "dir": "/home/gusahlg/sighurt-baseline",
+  "definition": {
+   "description": "gpui-baseline: GPUI chrome, engines as processes over sighurt-ipc, Servo frames read back",
+   "dir": "~/sighurt-baseline",
+   "sig": "target/release/sig",
+   "binaries": [
+    "target/release/sig",
+    "target/release/sig-servo",
+    "target/release/sig-wasm"
+   ],
+   "info": "build-info.json",
+   "parsers": [
+    "servo-timing",
+    "gpui-frames"
+   ],
+   "config": "baseline.config.toml",
+   "chrome_top": 84,
+   "chrome_bottom": 20,
+   "env": {
+    "SIG_SERVO_TIMING": "1",
+    "ZED_MEASUREMENTS": "1"
+   }
+  },
+  "info": {
+   "revision": "359cb3614ae3a9a5dfc73804b1abe51e0477755d",
+   "built": "2026-09-26T18:21:13+02:00",
+   "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+   "sha256": {
+    "target/release/sig": "f31d11c48705e0351a024dfb267b10a454cd51275e246040b60f66665292f57b",
+    "target/release/sig-wasm": "9099b41fde8cf1aac83f1e75ac32c3e5b0630b7b83974816974eee9eb4469c18",
+    "target/release/sig-servo": "687ef7720dbf85df1424adea255aaac09b4cb8dd146ed73470daa92cef81a71b",
+    "target/wasm32-unknown-unknown/release/gradient_demo.wasm": "63dc0d5ae583ad3fa4a58bb7a347fd0bf5867a29528354956fa2e30973298ef9",
+    "target/wasm32-unknown-unknown/release/hello_sighurt.wasm": "884998b86fdc79b67068c8a73f9c438b31b86de20f4b0f9c014092b2bfc62917",
+    "target/wasm32-unknown-unknown/release/raf_demo.wasm": "5799180a88129b45402f8597e3d1cfe1b1b126a704e3bf016a6da38ece196ba8",
+    "target/wasm32-unknown-unknown/release/timer_demo.wasm": "388bc33c52c71c545de18241e2b9e4d5e00ffa87b7a12c9c0403b4ff66e24a96"
+   }
+  },
+  "sha256": {
+   "target/release/sig": "f31d11c48705e0351a024dfb267b10a454cd51275e246040b60f66665292f57b",
+   "target/release/sig-servo": "687ef7720dbf85df1424adea255aaac09b4cb8dd146ed73470daa92cef81a71b",
+   "target/release/sig-wasm": "9099b41fde8cf1aac83f1e75ac32c3e5b0630b7b83974816974eee9eb4469c18"
+  },
+  "bytes": {
+   "target/release/sig": 27493192,
+   "target/release/sig-servo": 158708296,
+   "target/release/sig-wasm": 48993312
+  }
+ },
+ "harness": {
+  "revision": "0944db3ea20a7439da73d7accf29897258a790f8+dirty",
+  "sha256": "90f0f1b801829dfc5f1e23dbfa2eabaae6adbf1fe11941183818db13ceaef32e"
+ },
+ "workloads": {
+  "names": [
+   "home",
+   "article",
+   "long",
+   "css-animation",
+   "canvas",
+   "webgl",
+   "wasm-hello",
+   "wasm-gradient",
+   "wasm-raf",
+   "wasm-timer",
+   "wasm-busy",
+   "many-tabs",
+   "tab-churn",
+   "resize-storm"
+  ],
+  "sha256": "7fb5ac806b65d4a4cbfa85af6ac5410c3a9786ebb7f0a1843f2464471ffd998f",
+  "definitions": {
+   "home": {
+    "description": "Chrome only: sig's home page, no engine. Types into the URL bar.",
+    "open": [],
+    "script": "type-url"
+   },
+   "article": {
+    "description": "Static Servo page: a text-heavy article with four images. Scrolls down, then up.",
+    "open": [
+     "article.html"
+    ],
+    "script": "scroll-article"
+   },
+   "long": {
+    "description": "Scrolling a long text page (80 sections, ~26 000 words) with the mouse wheel.",
+    "open": [
+     "long.html"
+    ],
+    "script": "scroll-down"
+   },
+   "css-animation": {
+    "description": "Servo: endless CSS transform, opacity, color and width animations. Pointer moves in the active window.",
+    "open": [
+     "css-animation.html"
+    ],
+    "script": "pointer-circle"
+   },
+   "canvas": {
+    "description": "Servo: a 2D canvas redrawn every animation frame (300 balls). Pointer moves in the active window.",
+    "open": [
+     "canvas.html"
+    ],
+    "script": "pointer-circle"
+   },
+   "webgl": {
+    "description": "Servo: a WebGL quad rotating in 3D, redrawn every animation frame. Pointer moves in the active window.",
+    "open": [
+     "webgl.html"
+    ],
+    "script": "pointer-circle"
+   },
+   "wasm-hello": {
+    "description": "Wasm guest hello-sighurt: a static screen of canvas drawing and a text field, redrawn by on_frame at 60 Hz (the old sig-wasm sends a draw list only when it changed). Pointer moves in the active window.",
+    "open": [
+     "wasm/hello_sighurt.wasm"
+    ],
+    "script": "pointer-circle"
+   },
+   "wasm-gradient": {
+    "description": "Wasm guest gradient-demo: a static grid of gradients drawn with the canvas API. Pointer moves in the active window.",
+    "open": [
+     "wasm/gradient_demo.wasm"
+    ],
+    "script": "pointer-circle"
+   },
+   "wasm-raf": {
+    "description": "Wasm guest raf-demo: a ball animated with request_animation_frame (animation). Pointer moves in the active window.",
+    "open": [
+     "wasm/raf_demo.wasm"
+    ],
+    "script": "pointer-circle"
+   },
+   "wasm-timer": {
+    "description": "Wasm guest timer-demo: idle in the steady window; in the active window its four buttons are clicked, starting set_interval timers of 1 s, 0.5 s and 0.1 s and a 3 s set_timeout.",
+    "open": [
+     "wasm/timer_demo.wasm"
+    ],
+    "script": "timer-clicks"
+   },
+   "wasm-busy": {
+    "description": "Plan \u00a726's hostile Wasm workload: a guest (workloads/generate.py) that spends about 36M of its 50M fuel on every frame and draws one unchanging rectangle. Chrome input in the active window: a new tab and closing it again, twice a second.",
+    "open": [
+     "wasm/busy.wasm"
+    ],
+    "script": "tab-toggle"
+   },
+   "many-tabs": {
+    "description": "Eight tabs of the article, one visible: what hidden tabs cost. Switches tab once a second in the active window.",
+    "open": [
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html"
+    ],
+    "settle": 5,
+    "script": "cycle-tabs"
+   },
+   "tab-churn": {
+    "description": "Lifecycle: the article, then ten cycles of opening a new tab, loading the article in it and closing it (one every 2 s); measured again 3 s after the last close.",
+    "open": [
+     "article.html"
+    ],
+    "active": 20,
+    "script": "tab-churn"
+   },
+   "resize-storm": {
+    "description": "The article while the output changes size and scale four times a second (plan \u00a725 resize storm); restored and measured 3 s later.",
+    "open": [
+     "article.html"
+    ],
+    "script": "resize-storm"
+   }
+  }
+ },
+ "environment": {
+  "host": "louise",
+  "kernel": "6.18.35",
+  "os": "NixOS 26.11 (Zokor)",
+  "cpu": "AMD Ryzen 5 5500",
+  "cpus": 12,
+  "mem_total_mib": 15788,
+  "cpu_governor": [
+   "powersave"
+  ],
+  "cpu_epp": [
+   "balance_performance"
+  ],
+  "cpufreq_driver": "amd-pstate-epp",
+  "cpu_boost": "1",
+  "gpu": "NVIDIA GeForce RTX 4060, 595.80, 95.07.31.40.F2, 3",
+  "compositor": "sway 1.12 (headless backend)",
+  "gpu_processes": "293670, /home/gusahlg/llama.cpp/build/bin/ggml-rpc-server, 94 MiB",
+  "python": "3.13.13"
+ },
+ "renderer": "gles2",
+ "size": "1280x800",
+ "lock_rounds": 2,
+ "raw": "/home/gusahlg/sighurt-bench/results/raw/louise/baseline/20260926-192032",
+ "rounds": 5,
+ "warmup_rounds": 1,
+ "seed": 1002161634,
+ "order": [
+  [
+   "long",
+   "wasm-gradient",
+   "wasm-raf",
+   "tab-churn",
+   "article",
+   "resize-storm",
+   "wasm-hello",
+   "many-tabs",
+   "css-animation",
+   "wasm-timer",
+   "canvas",
+   "webgl",
+   "home",
+   "wasm-busy"
+  ],
+  [
+   "wasm-busy",
+   "css-animation",
+   "webgl",
+   "article",
+   "long",
+   "wasm-gradient",
+   "home",
+   "tab-churn",
+   "wasm-raf",
+   "canvas",
+   "resize-storm",
+   "wasm-hello",
+   "many-tabs",
+   "wasm-timer"
+  ],
+  [
+   "long",
+   "wasm-raf",
+   "canvas",
+   "css-animation",
+   "wasm-gradient",
+   "home",
+   "wasm-hello",
+   "tab-churn",
+   "wasm-timer",
+   "many-tabs",
+   "resize-storm",
+   "webgl",
+   "wasm-busy",
+   "article"
+  ],
+  [
+   "resize-storm",
+   "article",
+   "wasm-timer",
+   "wasm-raf",
+   "wasm-gradient",
+   "long",
+   "webgl",
+   "tab-churn",
+   "canvas",
+   "many-tabs",
+   "home",
+   "css-animation",
+   "wasm-busy",
+   "wasm-hello"
+  ],
+  [
+   "css-animation",
+   "wasm-raf",
+   "article",
+   "wasm-busy",
+   "resize-storm",
+   "wasm-timer",
+   "tab-churn",
+   "home",
+   "webgl",
+   "wasm-hello",
+   "canvas",
+   "wasm-gradient",
+   "long",
+   "many-tabs"
+  ],
+  [
+   "many-tabs",
+   "wasm-busy",
+   "wasm-hello",
+   "webgl",
+   "wasm-gradient",
+   "tab-churn",
+   "canvas",
+   "wasm-raf",
+   "long",
+   "wasm-timer",
+   "css-animation",
+   "resize-storm",
+   "article",
+   "home"
+  ]
+ ],
+ "failures": [],
+ "renderer_fallback": null,
+ "finished": "2026-09-26T20:49:39+0200"
+}
