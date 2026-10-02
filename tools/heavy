@@ -25,11 +25,17 @@ echo "sighurt: ${SIG_WHAT:-$*} (since $(date +%H:%M), pid $$)" > "$owner"
 trap 'rm -f "$owner"' EXIT
 jobs=${SIG_JOBS:-8} mem=${SIG_MEM:-9G}
 props=()
-# While /tmp/gusahlg-desktop-embargo exists or a game runs, the user is using this desktop:
-# jobs run at idle CPU and IO priority with 2 cores and 6G, Servo is built on louise-pc
-# instead, and nothing started here may reach the user's live Wayland session.
+# While /tmp/gusahlg-desktop-embargo exists or a game runs, the user is using this machine.
+# On louise-pc nothing heavy runs then: run it on the desktop instead. On the desktop, jobs run
+# at idle CPU and IO priority with 2 cores and 6G, Servo is built on louise-pc instead, and
+# nothing started here may reach the user's live Wayland session.
 # A running Steam game (anything under steamapps/common/) counts as the user being here too.
-if [[ $host != louise ]] && { [[ -e /tmp/gusahlg-desktop-embargo ]] || pgrep -f "steamapps/commo[n]/" >/dev/null; }; then
+if [[ -e /tmp/gusahlg-desktop-embargo ]] || pgrep -f "steamapps/commo[n]/" >/dev/null; then
+  if [[ $host == louise ]]; then
+    echo "tools/heavy: the user is using louise-pc right now (gaming): refusing heavy work here;" \
+      "run it on the desktop instead (the same command without tools/remote)." >&2
+    exit 75
+  fi
   echo "tools/heavy: the user is using this desktop right now: running at idle priority with 2 jobs." \
     "The live desktop (wayland-1) is off-limits; use tools/headless-sway, or louise-pc via tools/remote." >&2
   if [[ " ${SIG_WHAT:-} $* " == *servo* ]]; then

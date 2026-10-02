@@ -1,6 +1,6 @@
 //! Carrying out the core's effects: opening and closing views with their targets, engine
-//! commands, visibility and focus, the page's cursor and text field, services, notices and
-//! session writes.
+//! commands, visibility and focus, the chrome's own commands, the page's cursor and text field,
+//! services, notices and session writes.
 //!
 //! Effects are carried out in the order the core returned them. What they report back (an
 //! engine refusing to open a view or take a command, a service's answer) is queued as a
@@ -22,9 +22,11 @@ use std::time::Instant;
 
 use sighurt_api::engine::{EngineCommand, EngineError, EngineWaker};
 use sighurt_api::input::InputKind;
-use sighurt_core::{BrowserEvent, Effect, Focus};
+use sighurt_core::{BrowserEvent, Effect};
+use sighurt_ui::extension::ChromeEvent;
 
 use crate::app::{App, ViewEntry};
+use crate::{chrome, registry};
 
 impl App {
     /// Carries out one effect of the core.
@@ -68,20 +70,27 @@ impl App {
                 }
             }
             Effect::Focus(focus) => {
-                let actions = self.chrome.set_focus(match focus {
-                    Focus::Page => sighurt_ui::Focus::Page,
-                    Focus::Location => sighurt_ui::Focus::Chrome,
-                });
-                self.ui(actions);
+                let actions = self.chrome.handle(ChromeEvent::Focus(focus));
+                self.chrome_actions(actions);
             }
             Effect::ChromeInput(event) => {
-                let actions = match &event.kind {
-                    InputKind::Key(key) => self.chrome.key(key),
-                    InputKind::TextInput(text) => self.chrome.text_input(text),
+                let event = match event.kind {
+                    InputKind::Key(key) => ChromeEvent::Key(key),
+                    InputKind::TextInput(text) => ChromeEvent::TextInput(text),
                     // Window focus reached the chrome already, whoever has the keyboard.
-                    InputKind::Focus(_) | InputKind::Pointer(_) => Vec::new(),
+                    InputKind::Focus(_) | InputKind::Pointer(_) => return,
                 };
-                self.ui(actions);
+                let actions = self.chrome.handle(event);
+                self.chrome_actions(actions);
+            }
+            Effect::ChromeCommand(action) => {
+                match chrome::command(&registry::chrome(self.chrome_name), action) {
+                    Ok(event) => {
+                        let actions = self.chrome.handle(event);
+                        self.chrome_actions(actions);
+                    }
+                    Err(notice) => self.show_notice(notice),
+                }
             }
             Effect::PageCursor(cursor) => {
                 if let Some((_, entry)) = self.shown_view() {
@@ -102,7 +111,11 @@ impl App {
             Effect::Service {
                 request, service, ..
             } => {
-                if let Some(result) = self.services.perform(&mut self.host, request, service) {
+                let downloads = self.core.config().downloads();
+                let performed = self
+                    .services
+                    .perform(&mut self.host, request, service, downloads);
+                if let Some(result) = performed {
                     self.queue
                         .push_back(BrowserEvent::ServiceDone { request, result });
                 }

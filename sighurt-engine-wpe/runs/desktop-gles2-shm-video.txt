@@ -1,0 +1,23 @@
+[   0.014] window 1024x768 at 120/120
+[   0.017] ViewReady { view: ViewId(1) }
+[   0.017] LoadingChanged { view: ViewId(1), loading: true }
+[   0.166] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 13:48:46.386: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.186] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "http://127.0.0.1:34259/video.html" }
+[   0.189] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "http://127.0.0.1:34259/video.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.189] HistoryChanged { view: ViewId(1), entries: ["http://127.0.0.1:34259/video.html"], current: 0 }
+[   0.191] TitleChanged { view: ViewId(1), title: Some("video") }
+[   0.274] CursorChanged { view: ViewId(1), cursor: Default }
+[   0.274] StatusTextChanged { view: ViewId(1), text: None }
+[   0.363] LoadingChanged { view: ViewId(1), loading: false }
+[   0.442] TitleChanged { view: ViewId(1), title: Some("video playing 4 0") }
+[   1.442] TitleChanged { view: ViewId(1), title: Some("video playing 4 1") }
+[   1.558] action quit
+[   1.558] end: wakeups 138 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 136 stale-frames 1 rounded-frames 0 failed-imports 0
+[   1.558] end: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   1.558] end: submitted 39 dmabuf-frames 0 dmabuf-imports 0 shm-copies 39 shm-bytes 151756800 dropped 1 releases 38 present-mean-ms 0.960 present-max-ms 2.014
+[   1.558] end: ViewId(1) frames 39 pacing n=38 median=33.33ms p95=34.99ms max=95.42ms
+[   1.558] end: pss-kib 230049 (bwrap 966, WPENetworkProce 30027, wpe-window 40931, WPEWebProcess 157155, xdg-dbus-proxy 970)
+shut down: the compositor reported no error
+exit 0

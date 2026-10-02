@@ -24,7 +24,8 @@ Every change that is supposed to make Sighurt faster or lighter goes through the
    falls to 0, `active.cpu_pct` falls, and `startup.first_frame_s` does not rise." The named
    metrics are the *primary* metrics.
 2. **Measurement.** Run the full set (`bench/run`) for the build before and after the change,
-   on the same machine, and compare them (`bench/compare`).
+   on the same machine, best in one session that interleaves the two builds' runs, and compare
+   them (`bench/compare`).
 3. **Decision.** Keep the change only if its primary metrics improved beyond noise **and** no
    other key metric regressed beyond noise. A regression that is accepted anyway gets an entry in
    the decisions log of `docs/rewrite/STATUS.md` saying why.
@@ -36,28 +37,41 @@ hypothesis is a new hypothesis: re-run the affected workloads before believing i
 
 ### How noise is controlled
 
-- **One heavy job at a time.** The rounds of a set run two at a time (`--lock-rounds`) inside
-  one `tools/heavy` call, which holds `/tmp/gusahlg-heavy.lock` from before the first compositor
-  starts until the last run of those rounds has shut down, so no build or other benchmark
-  shares the machine with a run. The lock is released in between so other work can interleave;
-  every run is still clean. Two rounds hold it for about 20 minutes, like a Servo build. Fewer,
-  longer holds because `flock` doesn't queue its waiters: when it is released, any of them may
-  get it, so with fifteen jobs waiting (26 September) one acquisition can take an hour.
+- **One heavy job at a time.** The runs go through `tools/heavy` in groups, each holding
+  `/tmp/gusahlg-heavy.lock` from before its first compositor starts until its last run has shut
+  down, so no build or other benchmark shares the machine with a run. The lock is released in
+  between so other work can interleave; every run is still clean. By default a group is two
+  rounds (`--lock-rounds`, about 20 minutes per build, like a Servo build): fewer, longer holds,
+  because `flock` doesn't queue its waiters (when it is released, any of them may get it, so
+  with fifteen jobs waiting on 26 September one acquisition took an hour). On a machine others
+  need for short jobs, `--lock-runs 1` holds it for one run at a time.
 - **A quiet machine.** After taking the lock, `bench/measure` waits (up to 2 minutes) until the
   whole machine uses less than 0.5 CPU and less than 5 % GPU over two seconds. What it saw is
   recorded in the run (`gate`); a run that started on a busy machine is marked as an anomaly.
 - **A private compositor.** Each run gets its own headless sway (`tools/headless-sway`), with a
   1280×800 output at scale 1, on the GPU (`--renderer auto`: gles2, else pixman). The first run
-  of a set makes the choice, inside the lock, and every later run uses it: a run that can't get
-  that renderer fails instead of silently measuring another compositor path.
+  of a session makes the choice, inside the lock, and every later run uses it: a run that can't
+  get that renderer fails instead of silently measuring another compositor path. Sway, grim and
+  the other tools come from the repository's pinned nixpkgs (`nix/nixpkgs.nix`), not the
+  machine's, so every machine and every build runs the same compositor build; each set records
+  its store path (`compositor_store_path`) and the pin's revision (`nixpkgs`).
 - **Fresh state, warm caches.** `sig` gets a new, empty `XDG_CONFIG_HOME` (holding only the
-  build's benchmark config) and `XDG_DATA_HOME` (so Servo's profile starts empty) every run,
-  and a per-build `XDG_CACHE_HOME` kept between runs (shader, font and Wasm AOT caches), which
-  the warmup round fills.
+  build's benchmark config), `XDG_DATA_HOME` (so Servo's profile starts empty) and
+  `XDG_STATE_HOME` (the rewrite saves its tabs there and restores them beside the ones it is
+  asked to open, so without it a run would reopen the previous run's pages) every run, and a
+  per-build `XDG_CACHE_HOME` kept between runs (shader, font and Wasm AOT caches), which the
+  warmup round fills.
 - **Repetition and order.** A set is one warmup round (recorded, never compared) and five
   measured rounds (`--rounds`). Each round runs every workload once, in a new random order, so
   slow drifts (temperature, the other session's jobs between runs) spread over all workloads.
   The seed is recorded.
+- **Builds compared in one session.** Given several builds (`--build` and `--label` once each),
+  `bench/run` measures them in one session: each round runs every workload of every build
+  once, all in one random order, so drift during the session (temperature, other jobs between
+  lock holds, the machine's state) affects every build alike, and every build runs under the
+  same compositor, driver, harness and tools. Each build gets its own set; the session file
+  (`results/<host>/sessions/<timestamp>.json`) has the shared order, and each run its place in
+  its round (`session_index`).
 - **The same binaries throughout.** `bench/run` resolves the build's directory once (a
   `rewrite-latest` link stays on the build it named when the set started) and hashes its
   binaries then and again before every run; if they change, the set stops.
@@ -116,6 +130,11 @@ as `SIG_BENCH_REV`). It is not `tools/remote`: other people's syncs don't change
 under a running benchmark, and it doesn't hold `tools/remote`'s lock for hours.
 
 ```sh
+# Two builds interleaved in one session (how M7's comparison was measured):
+bench/remote --detach bench/run --build bench/builds/baseline.toml --label baseline \
+  --build bench/builds/rewrite.toml --label rewrite --build-dir ~/sighurt-baseline \
+  --build-dir ~/sighurt-bench/builds/<rev> --rounds 7 --lock-runs 1 --out ~/sighurt-bench/results
+
 # The baseline binaries, once (see bench/baseline/build.sh):
 git archive gpui-baseline | ssh louise-pc 'mkdir -p ~/sighurt-baseline && tar -x -C ~/sighurt-baseline'
 bench/remote --detach bench/baseline/build.sh
@@ -133,8 +152,10 @@ bench/compare bench/results/louise/baseline/<timestamp> bench/results/louise/<la
 ```
 
 The rewrite's `sig` at a revision (see `bench/rewrite/build.sh`): it builds a `git archive` of
-that revision on louise-pc into `~/sighurt-bench/builds/<rev>`, which nothing writes again, and
-points `~/sighurt-bench/builds/rewrite-latest` at it, which `builds/rewrite.toml` measures:
+that revision on louise-pc, with the Rust of the revision's pinned nixpkgs (`shell.nix` brings
+none, and louise-pc's own is older than the workspace's `rust-version`), into
+`~/sighurt-bench/builds/<rev>`, which nothing writes again, and points
+`~/sighurt-bench/builds/rewrite-latest` at it, which `builds/rewrite.toml` measures:
 
 ```sh
 bench/rewrite/build.sh HEAD            # detached; bench/remote --no-sync tail -f ~/sighurt-bench/logs/latest.log
@@ -145,6 +166,15 @@ bench/remote --detach bench/run --build bench/builds/rewrite.toml --label rewrit
 A quick look at a few workloads: `--workloads article,webgl --rounds 2 --warmup 0`. One run by
 hand, inside the lock and a compositor:
 `tools/heavy tools/headless-sway --renderer auto -- bench/measure --build bench/builds/baseline.toml --workload article --out /tmp/run.json --raw /tmp/raw`.
+
+### The pipe alone
+
+`bench/pipe-cost` measures what the baseline's frame transport cost by itself, without Servo,
+GPUI or a readback: a writer process sends 1280×696 RGBA frames at 59.3 a second through a pipe
+in sighurt-ipc's framing and a reader process reads each one whole, as `sig-servo` and `sig`
+did. It prints both processes' CPU and wakeups per second and the frame's crossing time, per
+run and as medians. Run it on the benchmark machine under the lock:
+`bench/remote tools/heavy bench/pipe-cost`.
 
 ### Build cost
 
@@ -185,7 +215,8 @@ ended during the run, ctrl+q did not quit it within 10 s (`shutdown.forced`), it
 anything but a clean exit or the signal the harness sent (an abort while quitting, say; `exit`
 records how it ended), its stderr (every process of the tree) has a crash line (`panicked at`,
 `fatal runtime error`, `Segmentation fault`, `core dumped`, `GPU has crashed`, a lost Vulkan
-device), or a diagnostics line was malformed.
+device), a diagnostics line was malformed, or the build's report at exit is missing or shows
+another number of tabs than the run opened (every script ends with the tabs it started with).
 
 Metric names are `<window>.<metric>`; `total` is launch → active end. The process tree is `sig`
 and all its descendants (the baseline's `sig-servo` and `sig-wasm` processes); `_browser` is
@@ -211,12 +242,15 @@ and all its descendants (the baseline's `sig-servo` and `sig-wasm` processes); `
 | `readback_mib(_per_s)` | page pixels read back from the GPU to the CPU (w × h × 4 per produced frame) |
 | `ipc_pixel_mib(_per_s)`, `ipc_pixel_mib_per_frame` | page pixels sent over IPC (w × h × 4 per delivered frame) |
 | `ipc_out_mib(_per_s)`, `ipc_out_writes` | bytes and write calls of the engine processes (`/proc/<pid>/io` `wchar`, `syscw`): their protocol output (frames, draw lists) plus their stderr. The only frame-volume measure for `sig-wasm`, which has no diagnostics |
-| `paint_p50_ms`, `read_p50_ms`, `send_p50_ms` (and p95) | per-frame paint, readback and IPC times from the diagnostics. Baseline: `send` is from the end of the readback to the end of the write, so it includes comparing the frame with the previous one |
+| `paint_p50_ms`, `read_p50_ms`, `send_p50_ms` (and p95) | per-frame paint, readback and IPC times from the diagnostics. Baseline: `send` is from the end of the readback to the end of the write, so it includes comparing the frame with the previous one. Rewrite: `paint` is Servo's `WebView::paint` (the CPU engines' whole `present`) |
+| `present_p50_ms` (and p95) | rewrite: the whole `present` call of a page frame, painting and swap included |
+| `swap_p50_ms` (and p95) | Servo's `swap` of a frame into its surface, from its timing lines (`RUST_LOG=sighurt_engine_servo::timing=debug`, the audit build) |
 | `gpu_util_pct`, `gpu_mem_used_mib`, `gpu_clock_mhz` | `nvidia-smi` every 200 ms: the whole GPU (desktop and other processes included) |
 | `gpu_fb_tree_mib` | GPU memory of the tree's processes at the window's end (`nvidia-smi pmon`) |
 | `compositor_cpu_pct` | the headless sway's CPU: compositing cost the browser causes |
 | `shutdown.s`, `shutdown.forced` | ctrl+q → every process of the tree gone; 1 if a signal was needed |
-| `ctr.<name>`, `ctr.<name>_per_s` | a build's own counters (`counters` diagnostics): the increase over the window and its rate. `page_frames_painted`, `page_frames_presented`, `readback_bytes` and `chrome_paints` also give `frames_produced`, `frames_delivered`, `readback_mib` and `browser_frames` (and their rates) when the build prints no per-event lines |
+| `ctr.<name>`, `ctr.<name>_per_s` | a build's own counters (`counters` diagnostics): the increase over the window and its rate. `page_frames_painted`, `page_frames_presented`, `readback_bytes` and `chrome_paints` also give `frames_produced`, `frames_delivered`, `readback_mib` and `browser_frames` (and their rates) when the build prints no per-event lines. An engine's own counts are `ctr.engine.<name>.readbacks` and, audited, `ctr.engine.<name>.gl_reads` |
+| `exit.*` | from the report a build writes at exit (`diagnostics_file`): `exit.page_readbacks` and `exit.readback_mib` (the readbacks the engines counted), `exit.gl_reads` (only when audited), `exit.present_errors`, and the peaks: `exit.max_present_ms`, `exit.max_pump_ms`, `exit.max_chrome_paint_ms`, `exit.max_host_queue`, `exit.max_pump_events`, `exit.max_target_buffers`, `exit.max_retiring_generations`, `exit.max_buffer_mib` |
 
 Known limits of the measurements:
 
@@ -278,7 +312,13 @@ the same guest code (`workloads/wasm/SHA256SUMS`).
 - **A build:** a `builds/<name>.toml` (see `builds/baseline.toml` and `builds/rewrite.toml`):
   where `sig` is, which binaries to hash, where the engines run (`engines`), extra environment,
   the config that binds the keys the scripts press, the chrome's height for the screen probe,
-  the diagnostic parsers and, for a build that prints counters on a signal, `counters_signal`.
+  the diagnostic parsers, for a build that prints counters on a signal `counters_signal`, and
+  for one that writes its report as JSON (`sig --diagnostics FILE`) `diagnostics_file = true`:
+  `bench/measure` then keeps the report written at exit in the run (`diagnostics`) and its
+  `exit.*` metrics. `builds/rewrite-audit.toml` is the rewrite with Servo's GL read audit and
+  its timing lines: they cost CPU (the audit times every GL call; `RUST_LOG` raises the `log`
+  level for the whole process), so it checks readbacks and swap times and is not compared for
+  performance.
   The keys: ctrl+l
   `location.focus`, ctrl+tab `tab.next`, ctrl+t `tab.new`, ctrl+w `tab.close`, ctrl+o
   `page.open {workloads}/article.html` (`{workloads}` becomes the workloads directory) and
@@ -286,8 +326,11 @@ the same guest code (`workloads/wasm/SHA256SUMS`).
   Measure release builds only: the workspace's dev profile optimizes dependencies but keeps
   debug assertions on.
 - **Diagnostics of a new binary:** a parser class in `benchlib/parsers.py` that turns a stderr
-  line into a `frame`, `renderer`, `first-frame`, `browser-frame` or `counters` event (the
-  kinds are documented at the top of that file), listed in the build's `parsers`.
+  line into a `frame`, `renderer`, `first-frame`, `browser-frame`, `counters` or
+  `engine-timing` event (the kinds are documented at the top of that file), listed in the
+  build's `parsers`. What its diagnostics can't measure honestly against another build's goes
+  in the class's `INCOMPARABLE` (GPUI's draw log, for one); `bench/compare` leaves those rows
+  out and lists them with the reason.
 - **The rewrite's diagnostics** (`sighurt-browser`'s `diagnostics` module) are read by the
   `sig-diag` parser; its docstring is the format. With `SIG_DIAG=1`, `sig` writes
   `sig-diag t=<CLOCK_MONOTONIC s> <kind> key=value …` lines to stderr. The counters are the
@@ -312,12 +355,16 @@ the same guest code (`workloads/wasm/SHA256SUMS`).
 | `measure` | one run: gate, launch, probes, script, quit, checks, metrics |
 | `report`, `compare` | Markdown summary of one set; comparison of two |
 | `build-cost` | clean release builds under the lock, timed, and lockfile package counts |
-| `remote` | sync the harness to the benchmark machine and run there |
+| `pipe-cost` | the baseline's frame transport alone (frames through a pipe, as `sig-servo` sent them to `sig`): CPU and wakeups of writer and reader |
+| `remote` | sync the harness (`bench/`, `tools/`, `shell.nix`, `nix/`) to the benchmark machine and run there |
 | `benchlib/` | `probes.py` (/proc, nvidia-smi, grim), `seat.py` and `us.xkb` (the virtual pointer and keyboard), `parsers.py`, `metrics.py`, `stats.py`, `results.py` |
-| `builds/` | build definitions and their benchmark configs |
+| `builds/` | build definitions and their benchmark configs (`rewrite-audit.toml`: the rewrite audited, not for performance) |
 | `baseline/build.sh` | builds `gpui-baseline` in release mode |
 | `rewrite/build.sh` | builds a revision of the rewrite's `sig` into its own directory |
 | `results/<host>/<label>/<timestamp>/` | `set.json` and `runs/<round>-<workload>.json` (committed) |
+| `results/<host>/sessions/<timestamp>.json` | a session: its sets and the order its runs had (committed) |
+| `results/<host>/exploratory/<date>/` | one-off runs of `bench/measure` with a workload file of their own (longer windows, more cycles), with that file and the script that ran them: evidence for a report, not sets to compare |
+| `results/IPC-REMOVAL.md` | the baseline against the rewrite at 3c510fe: what removing the IPC, GPUI and the readback did |
 | `results/<host>/build-cost/` | `bench/build-cost` records (committed) |
 | `results/raw/` | per run: stderr with timestamps, samples, the sway log, and screenshots after settling and after the active window (not committed) |
 | `results/BASELINE.md` | the recorded baseline |

@@ -1,5 +1,6 @@
 //! Which chrome element is under a point: maps window-logical positions to the layout's hit
-//! targets (tabs, their close buttons, the toolbar buttons, the address field).
+//! targets (tabs at the top or in the list, their close buttons, the new-tab and toolbar buttons,
+//! the address field).
 //!
 //! The chrome converts the host's surface-local position into window coordinates once, with
 //! the placement of the surface the event arrived on, and the painter draws every control at
@@ -72,7 +73,7 @@ mod tests {
             width: 800,
             height: 600,
         };
-        let layout = Layout::new(size, &ids, LayoutOptions::default());
+        let layout = Layout::new(size, &ids, LayoutOptions::default(), 0);
         let close = layout.tabs[1].close.unwrap();
         let center = |r: sighurt_api::geometry::WindowRect| {
             point(

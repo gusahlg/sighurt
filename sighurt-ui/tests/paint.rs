@@ -12,62 +12,13 @@ use std::path::PathBuf;
 use common::*;
 use sighurt_api::geometry::{SurfacePoint, WindowPoint, WindowRect};
 use sighurt_api::input::{
-    ButtonState, FocusEvent, Key, KeyCode, KeyEvent, Modifiers, PointerEvent, Preedit,
-    TextInputEvent,
+    ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerEvent,
+    Preedit, TextInputEvent,
 };
-use sighurt_ui::{Chrome, CpuPainter, Focus, PaintError, PixelBuffer, TabContent};
+use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
+use sighurt_ui::layout::{Status, Tabs};
+use sighurt_ui::{Colors, CpuPainter, LayoutOptions, Model, PaintError, PixelBuffer, TabContent};
 use tiny_skia::{IntSize, Pixmap};
-
-/// A pixel differs if a channel is off by more than this...
-const CHANNEL_TOLERANCE: u8 = 8;
-/// ...and an image matches if at most this fraction of its pixels differ, which absorbs
-/// rounding differences between CPUs and SIMD paths.
-const PIXEL_TOLERANCE: f64 = 0.002;
-
-fn golden(name: &str, image: &Image) {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/{name}.png"));
-    let size = IntSize::from_wh(image.width, image.height).unwrap();
-    let actual = Pixmap::from_vec(image.rgba.clone(), size).unwrap();
-    if std::env::var_os("SIGHURT_BLESS").is_some() {
-        actual.save_png(&path).unwrap();
-        return;
-    }
-    let expected = Pixmap::load_png(&path).unwrap_or_else(|error| {
-        panic!(
-            "{}: {error}; create it with SIGHURT_BLESS=1",
-            path.display()
-        )
-    });
-    let failed = || {
-        let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.png"));
-        actual.save_png(&out).unwrap();
-        out.display().to_string()
-    };
-    assert_eq!(
-        (expected.width(), expected.height()),
-        (image.width, image.height),
-        "{name}: size changed; this run's image is {}",
-        failed()
-    );
-    let differing = expected
-        .data()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(image.rgba.as_chunks::<4>().0)
-        .filter(|(a, b)| {
-            a.iter()
-                .zip(*b)
-                .any(|(a, b)| a.abs_diff(*b) > CHANNEL_TOLERANCE)
-        })
-        .count();
-    let allowed = (f64::from(image.width * image.height) * PIXEL_TOLERANCE) as usize;
-    assert!(
-        differing <= allowed,
-        "{name}: {differing} pixels differ (at most {allowed} may); this run's image is {}",
-        failed()
-    );
-}
 
 fn key(key: Key, text: Option<&str>) -> KeyEvent {
     KeyEvent {
@@ -81,14 +32,14 @@ fn key(key: Key, text: Option<&str>) -> KeyEvent {
     }
 }
 
-fn type_text(chrome: &mut Chrome, text: &str) {
+fn type_text(chrome: &mut Model, text: &str) {
     for c in text.chars() {
         let c = c.to_string();
         chrome.key(&key(Key::Character(c.clone()), Some(&c)));
     }
 }
 
-fn hover(chrome: &mut Chrome, rect: WindowRect) {
+fn hover(chrome: &mut Model, rect: WindowRect) {
     let surface = chrome.layout().chrome;
     let at = WindowPoint {
         x: f64::from(rect.x) + f64::from(rect.width) / 2.0,
@@ -103,10 +54,10 @@ fn hover(chrome: &mut Chrome, rect: WindowRect) {
     );
 }
 
-fn focused(width: u32) -> Chrome {
+fn focused(width: u32) -> Model {
     let mut chrome = chrome(width, 600, three_tabs());
     chrome.window_focus(FocusEvent::Activated);
-    chrome.set_focus(Focus::Chrome);
+    chrome.set_focus(KeyboardFocus::Chrome);
     chrome
 }
 
@@ -116,17 +67,15 @@ fn golden_tabs() {
     let mut chrome = chrome(900, 600, three_tabs());
     let reload = chrome.layout().reload;
     hover(&mut chrome, reload);
-    let rect = chrome.layout().chrome;
-    golden("tabs-100", &paint(&mut chrome, rect, 120));
-    golden("tabs-200", &paint(&mut chrome, rect, 240));
+    golden("tabs-100", &paint(&mut chrome, CHROME, 120));
+    golden("tabs-200", &paint(&mut chrome, CHROME, 240));
 }
 
 /// The address line focused with everything selected, as after location.focus.
 #[test]
 fn golden_selected_address() {
     let mut chrome = focused(700);
-    let rect = chrome.layout().chrome;
-    golden("selected-125", &paint(&mut chrome, rect, 150));
+    golden("selected-125", &paint(&mut chrome, CHROME, 150));
 }
 
 /// Typing: Swedish letters, the caret after them, then an input method's preedit.
@@ -134,8 +83,7 @@ fn golden_selected_address() {
 fn golden_typing() {
     let mut chrome = focused(700);
     type_text(&mut chrome, "räksmörgås och blåbär");
-    let rect = chrome.layout().chrome;
-    golden("typing-150", &paint(&mut chrome, rect, 180));
+    golden("typing-150", &paint(&mut chrome, CHROME, 180));
     chrome.text_input(&TextInputEvent {
         preedit: Some(Preedit {
             text: "ö".into(),
@@ -143,7 +91,7 @@ fn golden_typing() {
         }),
         ..TextInputEvent::default()
     });
-    golden("preedit-150", &paint(&mut chrome, rect, 180));
+    golden("preedit-150", &paint(&mut chrome, CHROME, 180));
 }
 
 /// A long address scrolled so its caret stays visible, in a narrow window.
@@ -154,37 +102,105 @@ fn golden_scrolled_address() {
         &mut chrome,
         "https://exempel.se/en/mycket/lång/adress?med=många&delar=ö",
     );
-    let rect = chrome.layout().chrome;
-    golden("scrolled-125", &paint(&mut chrome, rect, 150));
+    golden("scrolled-125", &paint(&mut chrome, CHROME, 150));
 }
 
 /// The status strip: a hovered link, and a failed command.
 #[test]
 fn golden_status() {
     let mut chrome = chrome(700, 300, three_tabs());
-    let rect = chrome.layout().status;
-    golden("status-150", &paint(&mut chrome, rect, 180));
+    golden("status-150", &paint(&mut chrome, STATUS, 180));
     let mut chrome = focused(700);
     type_text(&mut chrome, ":tab.explode");
     chrome.key(&key(Key::Named("Enter".into()), None));
-    let rect = chrome.layout().status;
     assert!(chrome.state().command_error.is_some());
-    golden("status-error-100", &paint(&mut chrome, rect, 120));
-    let rect = chrome.layout().chrome;
-    golden("command-error-100", &paint(&mut chrome, rect, 120));
+    golden("status-error-100", &paint(&mut chrome, STATUS, 120));
+    golden("command-error-100", &paint(&mut chrome, CHROME, 120));
 }
 
 /// sig://home and an error page, which the chrome draws in the page area.
 #[test]
 fn golden_pages() {
     let mut chrome = chrome(800, 600, showing("sig://home", TabContent::Internal));
-    let rect = chrome.layout().page;
-    golden("home-100", &paint(&mut chrome, rect, 120));
+    golden("home-100", &paint(&mut chrome, PAGE, 120));
     let message = "The server at unknown.example could not be found.".to_owned();
     let error = showing("https://unknown.example/", TabContent::Error(message));
     let mut chrome = common::chrome(640, 480, error);
-    let rect = chrome.layout().page;
-    golden("error-125", &paint(&mut chrome, rect, 150));
+    golden("error-125", &paint(&mut chrome, PAGE, 150));
+}
+
+/// `[chrome.standard]`: a compact strip and toolbar with a hovered close button and a keymap's
+/// indicator in the address field, no buttons
+/// with the line focused, the status overlay, and the tab list on the left with a loading and
+/// a hovered tab.
+#[test]
+fn golden_options() {
+    let default = LayoutOptions::default();
+    let colors = Colors::default();
+    let compact = LayoutOptions {
+        compact: true,
+        ..default
+    };
+    let mut snapshot = three_tabs();
+    snapshot.keymap = Some("NORMAL g".into());
+    let mut chrome = arranged(900, 600, snapshot, colors, compact);
+    let close = chrome.layout().tabs[1].close.unwrap();
+    hover(&mut chrome, close);
+    golden("compact-100", &paint(&mut chrome, CHROME, 120));
+
+    let bare = LayoutOptions {
+        buttons: false,
+        ..default
+    };
+    let mut chrome = arranged(700, 600, three_tabs(), colors, bare);
+    chrome.window_focus(FocusEvent::Activated);
+    chrome.set_focus(KeyboardFocus::Chrome);
+    type_text(&mut chrome, "blåbär");
+    golden("no-buttons-125", &paint(&mut chrome, CHROME, 150));
+
+    let overlay = LayoutOptions {
+        status: Status::Overlay,
+        ..default
+    };
+    let mut chrome = arranged(700, 400, three_tabs(), colors, overlay);
+    golden("overlay-150", &paint(&mut chrome, STATUS, 180));
+
+    let left = LayoutOptions {
+        tabs: Tabs::Left,
+        ..default
+    };
+    let mut chrome = arranged(700, 400, three_tabs(), colors, left);
+    let tabs = chrome.layout().tab_list;
+    let second = chrome.layout().tabs[1].rect;
+    let at = WindowPoint {
+        x: f64::from(second.x) + 20.0,
+        y: f64::from(second.y) + 10.0,
+    };
+    chrome.pointer(
+        tabs,
+        &PointerEvent::Motion {
+            position: SurfacePoint {
+                x: at.x - f64::from(tabs.x),
+                y: at.y - f64::from(tabs.y),
+            },
+            modifiers: Modifiers::default(),
+        },
+    );
+    golden("tabs-left-125", &paint(&mut chrome, TABS, 150));
+}
+
+/// `[ui] font-size = 18`: the strip, toolbar and text 18/14 as big, and the home page's text.
+#[test]
+fn golden_font_size_18() {
+    let options = LayoutOptions {
+        font_size: 18,
+        ..LayoutOptions::default()
+    };
+    let mut chrome = arranged(900, 600, three_tabs(), Colors::default(), options);
+    golden("font-18-100", &paint(&mut chrome, CHROME, 120));
+    let home = showing("sig://home", TabContent::Internal);
+    let mut chrome = arranged(800, 600, home, Colors::default(), options);
+    golden("font-18-home-100", &paint(&mut chrome, PAGE, 120));
 }
 
 /// Every paint covers the whole buffer: a buffer holding an older frame or garbage comes out
@@ -193,7 +209,7 @@ fn golden_pages() {
 fn paints_cover_the_whole_buffer() {
     let mut chrome = chrome(640, 480, three_tabs());
     let rect = chrome.layout().chrome;
-    let fresh = paint(&mut chrome, rect, 150);
+    let fresh = paint(&mut chrome, CHROME, 150);
     let metrics = metrics(rect, 150);
     let size = metrics.buffer();
     let mut data: Vec<u8> = (0..size.width * size.height * 4)
@@ -206,7 +222,7 @@ fn paints_cover_the_whole_buffer() {
         stride: size.width as usize * 4,
     };
     CpuPainter::new()
-        .paint(&mut chrome, &metrics, buffer)
+        .paint(&mut chrome, CHROME, &metrics, buffer)
         .unwrap();
     assert!(argb_to_rgba(&data) == fresh.rgba, "garbage showed through");
 }
@@ -217,7 +233,7 @@ fn padded_strides() {
     let mut chrome = chrome(333, 200, three_tabs());
     let rect = chrome.layout().chrome;
     for scale in SCALES {
-        let packed = paint(&mut chrome, rect, scale);
+        let packed = paint(&mut chrome, CHROME, scale);
         let metrics = metrics(rect, scale);
         let size = metrics.buffer();
         let row = size.width as usize * 4;
@@ -231,7 +247,9 @@ fn padded_strides() {
             stride,
         };
         let mut painter = CpuPainter::new();
-        painter.paint(&mut chrome, &metrics, buffer).unwrap();
+        painter
+            .paint(&mut chrome, CHROME, &metrics, buffer)
+            .unwrap();
         for (y, line) in data.chunks(stride).enumerate() {
             let expected = &packed.rgba[y * row..(y + 1) * row];
             assert!(
@@ -256,7 +274,7 @@ fn bad_buffers_are_refused() {
         height: size.height,
         stride: size.width as usize * 4,
     };
-    let result = painter.paint(&mut chrome, &metrics, wrong_size);
+    let result = painter.paint(&mut chrome, CHROME, &metrics, wrong_size);
     assert!(
         matches!(result, Err(PaintError::WrongSize { .. })),
         "{result:?}"
@@ -267,7 +285,7 @@ fn bad_buffers_are_refused() {
         height: size.height,
         stride: 4,
     };
-    let result = painter.paint(&mut chrome, &metrics, short_stride);
+    let result = painter.paint(&mut chrome, CHROME, &metrics, short_stride);
     assert_eq!(result, Err(PaintError::WrongLayout));
     let len = data.len();
     let short_memory = PixelBuffer {
@@ -276,7 +294,7 @@ fn bad_buffers_are_refused() {
         height: size.height,
         stride: size.width as usize * 4,
     };
-    let result = painter.paint(&mut chrome, &metrics, short_memory);
+    let result = painter.paint(&mut chrome, CHROME, &metrics, short_memory);
     assert_eq!(result, Err(PaintError::WrongLayout));
     // An empty target paints nothing, successfully.
     let empty = self::metrics(WindowRect::default(), 150);
@@ -286,7 +304,7 @@ fn bad_buffers_are_refused() {
         height: 0,
         stride: 0,
     };
-    assert_eq!(painter.paint(&mut chrome, &empty, nothing), Ok(()));
+    assert_eq!(painter.paint(&mut chrome, CHROME, &empty, nothing), Ok(()));
 }
 
 /// Odd window sizes paint at every scale without trouble, and the chrome is opaque.
@@ -295,12 +313,11 @@ fn odd_sizes_paint() {
     for (width, height) in [(1, 1), (37, 39), (101, 85), (157, 104), (641, 481)] {
         for scale in SCALES {
             let mut chrome = chrome(width, height, three_tabs());
-            let layout = chrome.layout().clone();
-            for rect in [layout.chrome, layout.status, layout.page] {
-                if rect.size().is_empty() {
+            for surface in [CHROME, STATUS, PAGE] {
+                if rect_of(&chrome, surface).size().is_empty() {
                     continue;
                 }
-                let image = paint(&mut chrome, rect, scale);
+                let image = paint(&mut chrome, surface, scale);
                 assert!(image
                     .rgba
                     .as_chunks::<4>()
@@ -323,7 +340,7 @@ fn edges_are_crisp_at_every_scale() {
         for width in [640, 1001] {
             let mut chrome = chrome(width, 480, three_tabs());
             let layout = chrome.layout().clone();
-            let image = paint(&mut chrome, layout.chrome, scale);
+            let image = paint(&mut chrome, CHROME, scale);
             let ratio = f64::from(image.width) / f64::from(width);
             let at = |logical: f64| (logical * ratio) as u32;
             // Left of the first tab and the back button: background and the two border lines.
@@ -371,7 +388,7 @@ fn measure_with_system_fonts() {
     use std::time::Instant;
 
     use sighurt_api::geometry::LogicalSize;
-    use sighurt_ui::{Colors, Fonts, LayoutOptions};
+    use sighurt_ui::Fonts;
 
     let start = Instant::now();
     let fonts = Fonts::system();
@@ -380,7 +397,7 @@ fn measure_with_system_fonts() {
         start.elapsed(),
         fonts.family()
     );
-    let mut chrome = Chrome::new(fonts, Colors::default(), LayoutOptions::default());
+    let mut chrome = Model::new(fonts, Colors::default(), LayoutOptions::default());
     chrome.resize(LogicalSize {
         width: 1920,
         height: 1080,
@@ -395,7 +412,7 @@ fn measure_with_system_fonts() {
         let metrics = metrics(rect, scale);
         let size = metrics.buffer();
         let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
-        let mut time = |chrome: &mut Chrome, data: &mut Vec<u8>| {
+        let mut time = |chrome: &mut Model, data: &mut Vec<u8>| {
             let start = Instant::now();
             let buffer = PixelBuffer {
                 data,
@@ -403,7 +420,7 @@ fn measure_with_system_fonts() {
                 height: size.height,
                 stride: size.width as usize * 4,
             };
-            painter.paint(chrome, &metrics, buffer).unwrap();
+            painter.paint(chrome, CHROME, &metrics, buffer).unwrap();
             start.elapsed()
         };
         let cold = time(&mut chrome, &mut data);
@@ -424,9 +441,8 @@ fn measure_with_system_fonts() {
     home.tabs[0].active = false;
     home.tabs[2].active = true;
     chrome.set_snapshot(home);
-    let rect = chrome.layout().page;
     let start = Instant::now();
-    let image = paint(&mut chrome, rect, 240);
+    let image = paint(&mut chrome, PAGE, 240);
     println!(
         "home page at 200 % ({}×{}): {:?}",
         image.width,

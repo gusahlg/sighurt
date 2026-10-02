@@ -10,13 +10,20 @@
 //! 4. A `file:` URL goes to the engine that claims its extension: local apps, which the engine
 //!    validates when it loads them.
 //! 5. An http(s) URL goes to an engine only through a narrow rule: one of the engine's
-//!    configured origins, and one of its extensions.
-//! 6. Everything else, ordinary web pages included, goes to the default engine.
+//!    configured origins, and one of its extensions,
+//! 6. or one of its host patterns (`[routing.<engine>] hosts`). Of the patterns that match a
+//!    host, an exact one beats any `*.` wildcard, and a longer wildcard a shorter one.
+//! 7. Everything else, ordinary web pages included, goes to the default engine.
 //!
-//! The engine must be enabled. Extensions are hints for choosing a loader, not proof of what
+//! The engine must be enabled; the rules of an engine the build lacks are left out
+//! ([`Config::routes`]). Extensions are hints for choosing a loader, not proof of what
 //! the content is. Content the engine can't show becomes a download (the engine asks for one)
-//! or a clear error.
+//! or a clear error. The same rules decide where a link a user clicks goes (`crate::state`).
+//!
+//! Typed text becomes a URL in [`fixup`]: a URL stays one, then search keywords (`[keywords]`),
+//! paths, host names, and a search for anything else.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use url::Url;
@@ -71,10 +78,12 @@ pub fn route(url: &Url, config: &Config, explicit: Option<&str>) -> Route {
                 routes.iter().find(claims)
             } else {
                 let origin = url.origin().ascii_serialization();
+                let host = url.host_str().unwrap_or_default();
                 routes
                     .iter()
                     .filter(claims)
                     .find(|route| route.origins.contains(&origin))
+                    .or_else(|| claiming_host(routes, host))
             };
             rule.map_or(config.default_engine(), |route| &route.engine)
                 .to_owned()
@@ -92,6 +101,26 @@ fn routes_of<'a>(routes: &'a [EngineRoutes], engine: &str) -> Option<&'a EngineR
     routes.iter().find(|route| route.engine == engine)
 }
 
+/// The route with the host pattern that matches `host` most specifically: an exact pattern
+/// before any wildcard, a longer wildcard before a shorter one. `*.example.com` matches the
+/// hosts under example.com at any depth, not example.com itself. A pattern belongs to one
+/// engine, so there is never a tie.
+fn claiming_host<'a>(routes: &'a [EngineRoutes], host: &str) -> Option<&'a EngineRoutes> {
+    let specificity = |pattern: &String| match pattern.strip_prefix("*.") {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .is_some_and(|under| under.ends_with('.'))
+            .then_some(suffix.len()),
+        None => (*pattern == host).then_some(usize::MAX),
+    };
+    routes
+        .iter()
+        .flat_map(|route| route.hosts.iter().map(move |pattern| (pattern, route)))
+        .filter_map(|(pattern, route)| Some((specificity(pattern)?, route)))
+        .max_by_key(|&(specificity, _)| specificity)
+        .map(|(_, route)| route)
+}
+
 /// The lower-case extension of the URL's last path segment, if it has one.
 fn extension(url: &Url) -> Option<String> {
     let name = url.path_segments()?.next_back()?;
@@ -99,11 +128,18 @@ fn extension(url: &Url) -> Option<String> {
     (!extension.is_empty()).then(|| extension.to_lowercase())
 }
 
-/// Turns what the user typed (or passed on the command line) into a URL: a URL stays as it is,
-/// a host name gets a scheme, an absolute path or `~/path` (with `home`, the user's home
-/// directory) becomes a `file:` URL, and anything else becomes a search with the `search`
+/// Turns what the user typed (or passed on the command line) into a URL: a URL stays as it is;
+/// input whose first word is one of `keywords` uses its template, the rest of the input
+/// percent-encoded where its `{}` is (a template without `{}` is used only for the keyword
+/// alone); a host name gets a scheme; an absolute path or `~/path` (with `home`, the user's
+/// home directory) becomes a `file:` URL; and anything else becomes a search with the `search`
 /// template. Empty input stays empty.
-pub fn fixup(input: &str, search: &str, home: Option<&Path>) -> String {
+pub fn fixup(
+    input: &str,
+    search: &str,
+    keywords: &BTreeMap<String, String>,
+    home: Option<&Path>,
+) -> String {
     let input = input.trim();
     let has_scheme = |scheme: &str| {
         input
@@ -115,6 +151,17 @@ pub fn fixup(input: &str, search: &str, home: Option<&Path>) -> String {
         || ["sig:", "data:", "about:"].into_iter().any(has_scheme)
     {
         return input.to_owned();
+    }
+    let (word, rest) = match input.split_once(char::is_whitespace) {
+        Some((word, rest)) => (word, rest.trim_start()),
+        None => (input, ""),
+    };
+    match keywords.get(word) {
+        Some(template) if template.contains("{}") => {
+            return template.replace("{}", &query_encode(rest))
+        }
+        Some(template) if rest.is_empty() => return template.clone(),
+        _ => {}
     }
     if let (Some(path), Some(home)) = (input.strip_prefix("~/"), home) {
         return file_url(&home.join(path));
@@ -159,17 +206,33 @@ pub fn file_url(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Environment;
+    use sighurt_api::engine::EngineCapabilities;
+
+    /// A build with Servo, the Wasm engine and the demo engine.
+    fn env() -> Environment {
+        let engines = ["servo", "wasm", "demo"];
+        Environment {
+            engines: engines
+                .map(|e| (e.into(), EngineCapabilities::default()))
+                .into(),
+            ..Environment::default()
+        }
+    }
 
     fn config() -> Config {
-        Config::parse(Some(
-            r#"
+        Config::parse(
+            Some(
+                r#"
             version = 1
             [routing.demo]
             schemes = ["demo"]
             [routing.wasm]
             origins = ["http://localhost:8080"]
             "#,
-        ))
+            ),
+            &env(),
+        )
         .unwrap()
     }
 
@@ -228,8 +291,67 @@ mod tests {
     }
 
     #[test]
+    fn host_rules_send_hosts_to_their_engines_the_most_specific_first() {
+        let text = r#"
+            version = 1
+            [routing.wasm]
+            origins = ["https://maps.google.com"]
+            hosts = ["*.google.com", "docs.example.com", "127.0.0.1", "bücher.de"]
+            [routing.demo]
+            hosts = ["maps.google.com", "*.mail.google.com"]
+            [routing.servo]
+            hosts = ["*.a.mail.google.com"]
+            "#;
+        let config = Config::parse(Some(text), &env()).unwrap();
+        let routed = |url: &str, explicit| route(&Url::parse(url).unwrap(), &config, explicit);
+        let cases = [
+            ("https://docs.example.com/a?b#c", engine("wasm")),
+            // An exact pattern is that host alone.
+            ("https://a.docs.example.com/", engine("servo")),
+            ("https://example.com/", engine("servo")),
+            // A wildcard covers the hosts under its domain at any depth, not the domain.
+            ("https://www.google.com/search?q=x", engine("wasm")),
+            ("http://WWW.Google.COM:8080/", engine("wasm")),
+            ("https://a.b.google.com/", engine("wasm")),
+            ("https://google.com/", engine("servo")),
+            ("https://notgoogle.com/", engine("servo")),
+            // An exact pattern beats a wildcard, a longer wildcard a shorter one.
+            ("https://maps.google.com/", engine("demo")),
+            ("https://x.maps.google.com/", engine("wasm")),
+            ("https://mail.google.com/", engine("wasm")),
+            ("https://inbox.mail.google.com/", engine("demo")),
+            ("https://z.a.mail.google.com/", engine("servo")),
+            // IP addresses match exactly; names as the url crate normalizes them.
+            ("http://127.0.0.1:9/", engine("wasm")),
+            ("http://127.0.0.2/", engine("servo")),
+            ("https://Bücher.de/", engine("wasm")),
+            ("https://xn--bcher-kva.de/", engine("wasm")),
+            // Only http(s) URLs: a local file goes by its extension.
+            ("file:///docs.example.com", engine("servo")),
+            // An origin's rule with an extension comes first.
+            ("https://maps.google.com/app.wasm", engine("wasm")),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(routed(url, None), expected, "{url}");
+        }
+        // The user's explicit choice wins.
+        assert_eq!(
+            routed("https://www.google.com/", Some("servo")),
+            engine("servo")
+        );
+        // An engine that isn't enabled opens nothing.
+        let disabled = format!("{text}\n[engines]\nenabled = [\"servo\", \"demo\"]");
+        let disabled = Config::parse(Some(&disabled), &env()).unwrap();
+        let url = Url::parse("https://www.google.com/").unwrap();
+        assert!(
+            matches!(route(&url, &disabled, None), Route::Error(e) if e.contains("not enabled"))
+        );
+    }
+
+    #[test]
     fn disabled_engines_open_nothing() {
-        let config = Config::parse(Some("version = 1\n[engines]\nenabled = [\"servo\"]")).unwrap();
+        let config = "version = 1\n[engines]\nenabled = [\"servo\"]";
+        let config = Config::parse(Some(config), &env()).unwrap();
         let url = Url::parse("file:///tmp/app.wasm").unwrap();
         assert!(matches!(route(&url, &config, None), Route::Error(e) if e.contains("not enabled")));
         assert!(matches!(
@@ -263,10 +385,62 @@ mod tests {
             ),
             ("", ""),
         ];
+        let none = BTreeMap::new();
         for (input, url) in cases {
-            assert_eq!(fixup(input, search, home), url, "{input:?}");
+            assert_eq!(fixup(input, search, &none, home), url, "{input:?}");
         }
         // Without a home directory, ~ is just text.
-        assert_eq!(fixup("~/x", search, None), "https://s.test/?q=%7E%2Fx");
+        assert_eq!(
+            fixup("~/x", search, &none, None),
+            "https://s.test/?q=%7E%2Fx"
+        );
+    }
+
+    #[test]
+    fn keywords_come_before_paths_hosts_and_search() {
+        let search = "https://s.test/?q={}";
+        let keywords = BTreeMap::from(
+            [
+                ("w", "https://w.test/search?q={}&lang=sv"),
+                ("gh", "https://github.com/"),
+                ("two", "http://t.test/{}/{}"),
+                ("tmp", "https://k.test/?q={}"),
+                ("localhost2", "https://l.test/{}"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let home = Some(Path::new("/home/me"));
+        let cases = [
+            // A keyword with a query, percent-encoded as a search's.
+            (
+                "w räksmörgås",
+                "https://w.test/search?q=r%C3%A4ksm%C3%B6rg%C3%A5s&lang=sv",
+            ),
+            (
+                "  w   rust  borrow ",
+                "https://w.test/search?q=rust%20%20borrow&lang=sv",
+            ),
+            ("two a/b", "http://t.test/a%2Fb/a%2Fb"),
+            // A keyword alone: an empty query, or a template without {} as it is.
+            ("w", "https://w.test/search?q=&lang=sv"),
+            ("gh", "https://github.com/"),
+            // A template without {} isn't used for a query: that is a search.
+            ("gh servo", "https://s.test/?q=gh%20servo"),
+            // URLs, internal pages, paths and hosts are never keywords.
+            ("w://x y", "w://x y"),
+            ("gh://servo", "gh://servo"),
+            ("sig://home", "sig://home"),
+            ("/tmp x", "file:///tmp%20x"),
+            ("~/tmp", "file:///home/me/tmp"),
+            ("tmp.example", "https://tmp.example"),
+            ("localhost:8000", "http://localhost:8000"),
+            ("w.test/x", "https://w.test/x"),
+            // Only the first word, exactly.
+            ("W rust", "https://s.test/?q=W%20rust"),
+            ("rust w", "https://s.test/?q=rust%20w"),
+        ];
+        for (input, url) in cases {
+            assert_eq!(fixup(input, search, &keywords, home), url, "{input:?}");
+        }
     }
 }

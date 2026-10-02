@@ -1,9 +1,9 @@
-# Development shell for NixOS: `nix-shell`, then build as usual
-# (`cargo run -p sighurt-ui`, and the Servo engine with
-# `cargo build --release --manifest-path sighurt-engine-servo/Cargo.toml`).
+# Development shell for NixOS (plan §21): the pinned Rust toolchain and every native library the
+# workspace builds and runs with. `tools/cargo` and `tools/heavy` run in it; `nix-shell`, then
+# build as usual (`cargo build -p sighurt-browser`).
 { pkgs ? import ./nix/nixpkgs.nix { } }:
 let
-  # Loaded at runtime by GPUI, the WASM engine and Servo.
+  # Loaded at runtime by the WASM engine and Servo.
   runtimeLibs = with pkgs; [
     libxkbcommon wayland vulkan-loader libGL mesa
     libx11 libxcb libxcursor libxrandr libxi libxext libxfixes libxrender
@@ -15,6 +15,9 @@ let
 in
 pkgs.mkShell ({
   nativeBuildInputs = with pkgs; [
+    # The pin's Rust (1.98.1), the workspace's `rust-version`: the same compiler on every
+    # machine. It is the desktop's own, so Servo's build in target/ stays fresh there.
+    rustc cargo clippy rustfmt
     pkg-config cmake gnumake python3 perl yasm nasm m4
     llvmPackages.clang llvmPackages.libclang.lib llvmPackages.lld
   ];

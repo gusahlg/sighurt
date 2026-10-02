@@ -3,8 +3,8 @@
 WPE WebKit is the engine for short-term web compatibility; Servo stays the long-term engine.
 nixpkgs has libwpe and wpebackend-fdo but no WPE WebKit, so it is built from its release
 tarball. This file says how and why, what it costs, how a program finds it, and how it was
-checked. The engine adapter is separate work; what it needs from this build is under "Using the
-prefix".
+checked; then how WebKit was proven as an in-process engine, and the engine crate,
+`sighurt-engine-wpe`, built on that proof.
 
 ```sh
 # Build on louise-pc (1 h 22 min), as a user service that outlives the ssh session:
@@ -202,9 +202,9 @@ none is in an `# env-dep:` line of rustc's dependency files. Checked with cargo 
 desktop: `cargo build -v -p sighurt-wayland -p sighurt-engine-wasm` (which builds six of the ten:
 `wayland-sys`, `smithay-client-toolkit`, `alsa-sys`, `ffmpeg-sys-next`, `libudev-sys` and
 `openssl-sys`; the other four declare the same variables) reported 549 units `Fresh` both with
-the four variables exported by hand and then in the real shell once the prefix was there. The WPE engine's build script should run
-pkg-config with `PKG_CONFIG_PATH=$SIGHURT_WPE_PKG_CONFIG_PATH` and declare
-`cargo:rerun-if-env-changed=SIGHURT_WPE_PKG_CONFIG_PATH`; nothing else sees it.
+the four variables exported by hand and then in the real shell once the prefix was there. The WPE engine's build script
+(`sighurt-engine-wpe/build.rs`) runs pkg-config with `PKG_CONFIG_PATH=$SIGHURT_WPE_PKG_CONFIG_PATH`
+and declares `cargo:rerun-if-env-changed=SIGHURT_WPE_PKG_CONFIG_PATH`; nothing else sees it.
 
 Once the prefix exists, the shell's derivation changes, and with it `out`, `NIX_LDFLAGS`'s
 self-RPATH and `-frandom-seed` in `NIX_CFLAGS_COMPILE`; no build script tracks those either (the
@@ -264,9 +264,8 @@ installed fonts, which differ.
 1. The test helpers listed under "Pinned nixpkgs" take sway, grim and the rest from the
    machine's `<nixpkgs>` (on louise-pc a different revision than the pin). They aren't part of
    this work; importing `nix/nixpkgs.nix` would pin them too.
-2. No machine compiles with Rust 1.95 any more: louise-pc did through its own nixpkgs, and
-   CLAUDE.md says it does. The workspace's `rust-version` (1.95) goes untested until a 1.95
-   toolchain is pinned for that check or `rust-version` is raised.
+2. Settled: the workspace's `rust-version` is 1.98, and `shell.nix` brings the pin's Rust
+   1.98.1 to every machine (STATUS decision 86).
 3. Untested: the DRM platform (it needs a free DRM master: a VT without a compositor), the
    MiniBrowser, WebDriver, audio output, and a run on the user's River session.
 4. The prefix depends on the home directory being the same path on both machines. A machine with
@@ -282,25 +281,25 @@ host (`sighurt-wayland`) and the real engine contract (`EngineRuntime`):
 - **`experiments/wpe-engine`**, the prototype of `sighurt-engine-wpe`: `WpeRuntime` implements
   `EngineRuntime` with the host's target leases and frame permits; `wpe-window` is a window with
   a CPU chrome strip and WPE views, like M1's experiment; `window-checks.sh` drives it in a
-  private compositor (41 checks with DMA-BUF, 40 with shared memory).
+  private compositor (41 checks with DMA-BUF, 40 with shared memory). It became
+  `sighurt-engine-wpe` (the second part of this file) and was deleted; it and its run outputs are
+  at commit 3c510fe (`git show 3c510fe:experiments/wpe-engine/runs/desktop-gles2.txt`), except the
+  two River logs (`river-dmabuf.log`, `river-shm.log`): `*.log` is ignored, so they were never
+  committed, and they went with the directory. Their figures survive as transcribed below.
 - **`experiments/wpe-coexist`**: Servo 0.5 (through `sighurt-engine-servo`), the Wasm engine
   (`sighurt-engine-wasm`, Wasmtime 36 and every native library it links) and the WPE prototype in
   one executable, mounted on one host and one owner loop as `sig` mounts its engines, side by side
   in one window; `coexist-checks.sh` adds what the executable exports and what binds to it.
 
 ```sh
-tools/cargo build -p wpe-engine
-tools/cargo build -p sighurt-browser --no-default-features --example virtual-pointer
-tools/heavy tools/headless-sway --renderer gles2  -- experiments/wpe-engine/window-checks.sh OUT
-tools/heavy tools/headless-sway --renderer pixman -- experiments/wpe-engine/window-checks.sh OUT
-tools/heavy tools/headless-sway --renderer gles2  -- experiments/wpe-engine/window-checks.sh OUT --shm
 tools/cargo build -p wpe-coexist     # links Servo: build it where Servo is built
 tools/heavy tools/headless-sway --renderer gles2  -- experiments/wpe-coexist/coexist-checks.sh OUT
 ```
 
 **Result: go**, on every question, with two fixes that `sig` needs anyway (below: the executable
 must not export the C libraries linked into it, and JavaScriptCore in `sig`'s process must stay
-off signals). Run outputs are in `experiments/wpe-engine/runs/` and `experiments/wpe-coexist/runs/`.
+off signals). Run outputs are in `experiments/wpe-coexist/runs/` and, for the prototype, at commit
+3c510fe. The prototype's checks now run as `sighurt-engine-wpe/tests/window-checks.sh`.
 
 | Question | Answer | Evidence |
 |---|---|---|
@@ -605,12 +604,11 @@ table.
 1. **`requestAnimationFrame` runs at 60 Hz on faster outputs**: the display has no `WPEScreen`, so
    WebKit's vblank timer uses 60 Hz. A screen with the output's refresh rate (and a
    `WPEScreenSyncObserver` fed by the host's frame callbacks) fixes it.
-2. **Not implemented in the prototype**: input methods (`WPEInputMethodContext` ↔ the host's
-   text-input), the clipboard (`WPEClipboard` ↔ the host's clipboard services), popups and context
-   menus, `window.open` and navigation policy (`OpenRequested`), downloads and permission requests
-   (`ServiceRequested`), the back-forward list (`HistoryChanged`, history effects), cursor images
-   (only cursor names), pointer lock, touch, accessibility. Capabilities report only history
-   traversal and page zoom.
+2. **Not implemented in the prototype**: input methods, the clipboard, popups and context menus,
+   `window.open` and navigation policy, downloads and permission requests, the back-forward list,
+   cursor images, pointer lock, touch, accessibility. `sighurt-engine-wpe` does the first six
+   (below, "What the engine adds"); popups, cursor images, pointer lock, touch and accessibility
+   remain open.
 3. **Implicit synchronization only**: WebKit waits for each rendering fence in the UI process.
    Explicit synchronization (`linux-drm-syncobj-v1` in the host, `use_explicit_sync`) would save a
    wakeup per frame. The loop's 5–6 iterations per frame are measured, not optimized.
@@ -627,33 +625,343 @@ table.
    the adapter has to be checked against each new WebKit's headers.
 8. **Not run**: `wpe-coexist` on louise-pc (Servo must be rebuilt there first), a crash of the
    network process, fractional scales live on River, more than one window.
-9. **`ci.yml` and CLAUDE.md's pre-commit commands** must exclude `wpe-engine` and `wpe-coexist`
-   (they need the WPE prefix; `wpe-coexist` builds Servo), as they exclude `m0-coexist` and
-   `m1-mixed`.
+9. **`ci.yml` and CLAUDE.md's pre-commit commands** must exclude `sighurt-engine-wpe` and
+   `wpe-coexist` (they need the WPE prefix; `wpe-coexist` builds Servo), as they exclude
+   `m0-coexist` and `m1-mixed`.
 
-## A plan for `sighurt-engine-wpe`
+# `sighurt-engine-wpe`: the engine
 
-The prototype's modules carry over almost as they are; what changes is what `sig` adds around
-them.
+The prototype became the engine crate `sighurt-engine-wpe`, with what a usable engine needs
+around it; `sig` compiles it in with the feature `engine-wpe`, one of its default features
+("In `sig`" below). Its design follows plan §14 (by analogy with Servo's adapter), §12, §16, §17,
+§20 and §25. Decisions 69–73 and 78 in STATUS.md record what was chosen.
 
-1. **Crate** `sighurt-engine-wpe` (api, wayland; `glib` 0.22; build script as `wpe-engine`'s):
-   `ffi`, `platform` (the subclasses), `glib_loop`, `present`, `input`, `runtime`, plus
-   `navigation` (WebKit's load events and back-forward list → navigation events, history effects
-   and `HistoryChanged`) and `view` (per-view state). Feature `engine-wpe` on `sighurt-browser`, an
-   entry in `registry.rs` (`start: fn(EngineWaker)`, mode `Gl` until the host has a `Native` mode,
-   renderer "WebKit, DMA-BUF" or "SHM fallback").
-2. **`sig`'s link**: `-Wl,--exclude-libs,ALL` for the `sig` binary (`cargo:rustc-link-arg-bins`
-   in `sighurt-browser`'s build script), with or without WPE (decision 65).
-3. **Process setup** stays in the runtime: JavaScriptCore's options before WebKit is first used
-   (decision 66); one WPE runtime per process (WebKit's UI-process state is global, and the
-   display is the primary one).
-4. **Services**: WebKit's `decide-policy` (new windows → `OpenRequested`, downloads →
-   `ServiceRequested`), `permission-request` → the permission service, a `WPEClipboard` subclass on
-   the host's clipboard, a `WPEInputMethodContext` subclass on the host's text input, cursor
-   bytes, a `WPEScreen` per output with scale and refresh rate.
-5. **Profile**: a persistent `WebKitNetworkSession` under `{data_dir}/sighurt/wpe` (the prototype
-   uses an ephemeral one), WebKit's sandbox on.
-6. **Tests**: `window-checks.sh`'s scenarios move into `sighurt-browser/tests/engines.sh` as a
-   `wpe` scenario; the GLib and keysym unit tests move with their modules.
-7. **Later**: explicit synchronization, the 60 Hz `requestAnimationFrame` (limitation 1), fewer
-   wakeups per frame.
+```sh
+tools/cargo test -p sighurt-engine-wpe --lib                     # 14 unit tests, no compositor
+sighurt-engine-wpe/tests/headless.sh [pixman]                     # tests/engine.rs in headless sway
+tools/cargo build -p sighurt-engine-wpe --example wpe-window
+tools/cargo build -p sighurt-browser --no-default-features --example virtual-pointer
+tools/heavy tools/headless-sway --renderer gles2  -- sighurt-engine-wpe/tests/window-checks.sh OUT
+tools/heavy tools/headless-sway --renderer pixman -- sighurt-engine-wpe/tests/window-checks.sh OUT
+tools/heavy tools/headless-sway --renderer gles2  -- sighurt-engine-wpe/tests/window-checks.sh OUT --shm
+```
+
+## The crate
+
+| Module | Owns |
+|---|---|
+| `runtime` | `WpeRuntime` (`EngineRuntime`), `WpeConfig`, `Diagnostics`, `CAPABILITIES`; one per process |
+| `view` | a view's state (`Page`), WebKit's signals turned into notes, the requests a view made |
+| `navigation` | ids, documents, history and history effects from WebKit's back-forward list (pure, unit-tested) |
+| `platform` | Sighurt's `WPEDisplay` and `WPEView` (GObject subclasses) |
+| `clipboard` | Sighurt's `WPEClipboard`: page data never stays in WebKit, reads go through the browser |
+| `ime` | Sighurt's `WPEInputMethodContext`, between WebKit's editor and the host's text input |
+| `present` | the presenter on the host's connection: DMA-BUF imports, the SHM fallback |
+| `glib_loop` | WebKit's GLib main context in the owner loop (decision 64) |
+| `input` | the host's input as `WPEEvent`s |
+| `ffi` | the C API it calls (WPE Platform API and WebKit), written from the 2.52 headers, and the library's loading |
+
+`build.rs` finds WebKit only through `SIGHURT_WPE_PKG_CONFIG_PATH` (with `rerun-if-env-changed`)
+and fails with a message naming `nix/build-wpewebkit.sh` when it is missing. It links nothing:
+it hands the library's path to the crate (`SIGHURT_WPE_LIBRARY`), and `WpeRuntime::new` opens it
+(`ffi::load`, `dlopen` with `RTLD_NOW | RTLD_LOCAL`), so a program with the engine compiled in
+maps WebKit and the libraries only it needs when its first WPE page opens (decision 84; the
+library finds its own dependencies through its RPATH). The lockfile gained only `sighurt-engine-wpe`
+(and lost `wpe-engine`); `log` and, for the tests, `smithay-client-toolkit` were already in it.
+
+## What the engine adds to the prototype
+
+**Navigation.** WebKit's GLib API gives navigations no ids. What it does give, in WebKit 2.52
+(observed in probe runs of every case; the engine's notes record WebKit's address and a snapshot
+of its back-forward list inside each signal):
+
+| What happened | Signals, in order |
+|---|---|
+| The browser's load of another document | `is-loading` true and `uri` (the pending request), `decide-policy`, `load-changed` STARTED, a new list entry, COMMITTED, FINISHED |
+| The page's own load (a link, `location = `) | `decide-policy`, STARTED, a new entry, `uri` and COMMITTED; `uri` keeps the old address until the commit |
+| The browser's back or forward to another document | `is-loading`, `uri`, the list's current entry moves, `decide-policy`, STARTED, COMMITTED |
+| The browser's back to an entry of the same document | `is-loading` true, `uri`, the list moves, `is-loading` false: no load, no further `uri` |
+| The browser's fragment of the page shown | `is-loading` true, `uri`, `decide-policy`, a new entry, `is-loading` false |
+| The page's `pushState`, `location.hash`, `history.back()` within the document | the list changes, then `uri` |
+| The page's `replaceState` | `uri` only (the current entry's address changes in place) |
+| Reload, `location.replace`, a load of the address shown | STARTED, COMMITTED; the list keeps the same current entry |
+| Two browser requests in a row, the second a fragment | WebKit abandons the first and drops its marker of a pending request (`is-loading` false, `uri` back to the page's) before the second's new entry |
+
+From that, `navigation::Navigator`: the browser's latest request that WebKit hasn't started takes
+the next STARTED, or ends as a same-document commit on a new entry, or (after the list moved for
+it) when loading stops; anything else gets an id of the adapter's own, and the page's own
+same-document navigation is a `uri` change while nothing loads. Every commit gets its history
+effect by comparing the list's entries by identity (WebKit's item objects, held by the snapshot so
+they can't be reused): the same current entry is `Replace`, an entry that was there `Traverse`, a
+new one after the old current `Push`. `HistoryChanged` carries the list. A new document is every
+COMMITTED (a document shown again too); same-document commits keep it. Traversal by any delta
+goes to the list's entry at that offset; beyond the list it is `Cancelled` without WebKit. Failed
+loads show no WebKit error page: `NavigationFailed` (`Load` with WebKit's message, `Cancelled` for
+Stop, a 204, a superseded load or a response that became a download), and the document stays.
+After a web process ends, WebKit's address empties; that is no navigation.
+
+Limits, documented in `navigation.rs`: a load the page starts in the instant between the
+browser's request and WebKit starting it takes the browser's id; the browser's same-document
+traversal while the page still loads resources commits when that loading ends; a navigation to
+the very address shown with its fragment changes nothing in WebKit and stays pending until the
+next. The page's own loads report no `NavigationStarted` (WebKit's address doesn't have their URL
+yet; the api makes the event optional for them).
+
+**Status, title, cursor, loading.** The hovered link (`mouse-target-changed`) is
+`StatusTextChanged`; `title`, `is-loading` and WebKit's cursor names are the other replaceable
+events, coalesced per view (title, status and cursor as the latest value per view between
+WebKit's returns, so a page changing its title in a loop costs one event).
+
+**Requests.** Each is a `ServiceRequested` for the view's committed document with its origin,
+bounded to 16 per view, refused when unanswered (WebKit's own request objects deny or cancel
+when dropped, which also happens when a new document commits):
+
+- Permissions: geolocation, and camera, microphone (both asked; allowed once both are granted) or
+  screen capture for `getUserMedia`. Anything else WebKit asks (notifications, device info,
+  website data, media keys) is refused at once. WebKit's own position provider (GeoClue over
+  D-Bus) is refused too: Sighurt has no position service, so a granted page hears that no
+  position is available.
+- File pickers (`<input type=file>`, multiple or not, with the accepted MIME types) as
+  `PickFiles`; WebKit opens one only for a user's click.
+- Downloads: a response WebKit can't show (WebKit's default ignores it) or an attachment becomes
+  WebKit's download, which the engine cancels before anything is written and hands to the
+  browser as `Download { Url, suggested_name }`; the navigation ends `Cancelled`.
+- The clipboard: WebKit's clipboard is one per process and synchronous. A page's copy becomes
+  `ClipboardWrite` (text, and HTML when WebKit has it) and WebKit keeps nothing. The clipboard
+  always offers text; a paste that finds nothing granted asks with `ClipboardRead`, and the
+  answer is granted for one second and pasted again with WebKit's Paste command, so the page sees
+  an empty paste first, then the real one. WebKit refuses the async clipboard API's reads in WPE
+  itself, so reads only follow the user's paste; both go to the view with the user's latest click
+  or key.
+- `window.open` and `target=_blank` make no WebKit view: `OpenRequested(NewView)` (WebKit's
+  popup blocker already requires a user gesture; the core requires activation). A navigation to a
+  scheme WebKit doesn't load (`mailto:`, `sig:`, a custom one) is `OpenRequested(CurrentView)`
+  when the page asks and a failed navigation when the browser does. `window.close()` is
+  `CloseRequested` (WebKit allows it only in a tab with one entry).
+- Refused outright: HTTP authentication, context menus, fullscreen (off until §17's coordination
+  exists). `alert`, `confirm` and `prompt` are closed by WebKit's WPE default (`confirm` and
+  `prompt` cancelled); a page asking to stay when it is left (`beforeunload`) is left, as in
+  Servo, since WebKit's default answer (stay) cancelled the browser's navigation with no event
+  once the user had touched the page (decision 84); `<select>` popups don't open.
+- The views get a `WebKitWebContext` of their own with the document-browser cache model: WebKit's
+  default keeps a closed page's web process for up to 30 minutes for its site (WebKit's process
+  cache, sized when a context is made), so closing the last WPE tab freed nothing (decision 84).
+
+**Input methods.** The WPE Platform API has them (`WPEInputMethodContext`), so the engine
+implements them rather than reporting a limitation: the display makes each view a context that
+reports focus, caret (the target's surface-local coordinates), surrounding text (UTF-8 offsets)
+and purpose as `TextInputChanged`, never a password's text, and turns the host's updates into
+WebKit's own signals (delete around the cursor in characters, commit, preedit). Key events are
+never filtered, so text never arrives twice. A field is reported once WebKit has said where its
+caret is: wlroots latches a text-input session's features (surrounding text among them) when it
+is enabled, so a first report without the text would keep it from the input method for that
+field.
+
+**Failures and lifetime.** A web process that dies is `ViewFailed` (its navigations in flight
+fail as cancelled, its requests and input-method state end); a reload or navigation starts a new
+one. A broken connection on the presenter's queue (the host's connection) is `RuntimeFailed`
+once, after which every call fails. `WpeRuntime::new` refuses a second runtime in the process
+(WebKit's UI-process state and the primary display are global). The profile is a persistent
+`WebKitNetworkSession` in `WpeConfig::profile` (caches in `cache/`) under `{profile}/lock`;
+locked by another process, or unset, the session is ephemeral. `shutdown` closes every view
+(WebKit's view, buffers and our `wl_buffer`s, our surface proxy and SHM buffers, then the
+lease), lets GLib finish WebKit's teardown, disconnects its handlers from WebKit objects that
+outlive it (the default context's geolocation manager lives until the process exits), then drops
+the session, display, presenter and GLib context.
+
+**Diagnostics.** `transport`, `device`, `driver` (the DRM device's kernel driver from sysfs),
+`formats`, frames, DMA-BUF imports, SHM copies and bytes, stale and rounded frames, failed
+imports, GLib dispatches, views, the profile, and the longest and total `present` time;
+`Diagnostics::renderer()` gives "WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)" or "WebKit,
+SHARED-MEMORY FALLBACK: one CPU copy per frame", which is also logged as a warning when the
+fallback is chosen.
+
+## Tests and results
+
+Desktop (`sighurt`, RTX 3070, driver 595.99.02), headless sway 1.12 from the pinned nixpkgs at
+1280 × 800, 2 October 2026, debug builds:
+
+| | GLES2 (DMA-BUF) | pixman (SHM) | GLES2, `--shm` |
+|---|---|---|---|
+| `tests/engine.rs` (`headless.sh`) | pass | pass | — |
+| `window-checks.sh` | 60 of 60 | 60 of 60 | 60 of 60 |
+| Animation: frames in 6 s, interval median / p95 / max | 350, 17.13 / 17.59 / 19.33 ms | 345, 17.36 / 17.81 / 18.73 ms | 342, 17.46 / 18.15 / 18.48 ms |
+| CPU copies of page frames | 0 (4 DMA-BUF imports for the whole animation) | 346 (1.35 GB) | 343 (1.33 GB) |
+| `present` mean / max | 0.052 / 0.111 ms | 0.99 / 2.17 ms (the first frame) | 1.12 / 1.61 ms |
+| Loop wakeups per animated frame (GLib dispatches) | 4.0 (2.1); 5.8 before decision 73 | 3.1 (1.1); 4.1 before | 3.2 (1.1); 3.6 before |
+| Idle, static page: loop wakeups (GLib dispatches) in 5 s | 1 (0), the probe's own | 1 (0) | 1 (0) |
+| Chrome repaints during the animation | 0 | 0 | 0 |
+
+`tests/engine.rs` (one process, one scenario after another; §25's engine tests): a second runtime
+is refused; the first page commits with the browser's id and presents; same-document entries
+(fragment, `pushState`) keep the document with the page's ids; navigation, back across documents
+(a new generation), back within the document, forward by two, beyond the end (`Cancelled`),
+reload (`Replace`, no new entry), two navigations in a row; a host that doesn't resolve
+(`Load`), a 204, Stop on a slow response (`Cancelled`), `mailto:` asked by the browser (failed)
+and by the page (`OpenRequested`), each keeping the document; an attachment and unshowable content
+become download requests with the right URL and name; `window.close()`; geolocation refused (the
+page gets error 1) and granted (error 2: no position); a click on a `target=_blank` link asks for
+a tab without navigating; a click on a file field asks for files and the page receives the
+answer, while the page's own `click()` opens nothing; a hidden view loads but presents nothing
+and presents when shown; a crashed web process fails its view only, the other view navigates
+and presents, and a reload brings a new document; a real input method (zwp_input_method_v2
+through the host) sees the field, its preedit shows and its commit is typed, it sees the field's
+text, and a password field reaches it as a password with `sensitive_data` and `hidden_text`
+and without its text; a lease WebKit can't present to is `Unsupported`; closing a view; no CPU
+copy on DMA-BUF and counted copies on SHM; the profile locked until shutdown; no protocol error.
+
+`window-checks.sh` adds: the compositor shows the page under the chrome strip; WebGL runs in the
+page; two views animate side by side; a VP9 video plays (over a local http server, with
+GStreamer's fake audio sink); history through `back`, `forward`, `reload`; `SIGKILL` of the web
+process; pointer, `å ä ö` and a dead key typed with `wtype`, a named key, focus moves; copy goes to
+the Wayland clipboard and paste comes from it (`wl-paste`, `wl-copy`); the wheel; the hovered
+link as status text; scales 1.5, 2, 1.25 and 1 with the page's `devicePixelRatio`, size and
+click positions right; a resize; page zoom (the page sees `devicePixelRatio` 2 and half the size);
+`https://example.com/` loads and is shown. Outputs: `sighurt-engine-wpe/runs/` (`desktop-*`).
+
+`experiments/wpe-coexist` now links the crate (only its dependency changed): `coexist-checks.sh`
+14 of 14 on the desktop (GLES2), Servo, the Wasm engine and WebKit in one process as before.
+
+Memory (proportional set size, the animation and a static page in two views): 251 MiB on DMA-BUF
+(web process 193, network process 24, `wpe-window` 30), as the prototype measured.
+
+## In `sig`
+
+`sig` (`sighurt-browser`) compiles the engine in with the feature `engine-wpe`, which its
+`default = [...]` line lists beside `engine-servo` and `engine-wasm`; inside `nix-shell`,
+`cargo run -p sighurt-browser` has all three. Servo stays the default engine for the web: WPE
+WebKit opens what `[routing.wpe] hosts` gives it and what `page.open-in wpe` asks for (decision
+78). What the integration is:
+
+- **The registry entry `wpe`** (`sighurt-browser/src/registry.rs`): `CAPABILITIES`, native
+  (`PresentMode::Gl`) targets, the settings it honors (`user-agent`, `storage`), and
+  `WpeRuntime::new` on first use with `WpeConfig { profile, user_agent }`: the profile is
+  `{data_dir}/sighurt/wpe` with `storage = "profile"` and none (an ephemeral session) with
+  `"ephemeral"`. The diagnostics' renderer line is `mode=hardware gl="WebKit, DMA-BUF on
+  /dev/dri/renderD128 (nvidia)"`, or `mode=fallback` with the shared-memory line; the copies of
+  that fallback are the engine's page readbacks. Starting it warns when `GIO_EXTRA_MODULES` or
+  `GST_PLUGIN_SYSTEM_PATH_1_0` is missing (no `https:`, no media).
+- **The build**: without the prefix, the engine's build script stops the build with what to do
+  (`nix/build-wpewebkit.sh`, or `--pull louise-pc`, and the feature set without WPE:
+  `--no-default-features --features engine-servo,engine-wasm`) as `cargo::error` lines.
+  `sig`'s own build script links it with `-Wl,--exclude-libs,ALL` (decision 65). WebKit isn't
+  linked: the engine opens it when the runtime first starts (decision 84), so a session that
+  opens no WPE page maps none of it.
+- **Symbols**: `sig` exports 1 symbol (`main`; 1 075 before the flag), and with `LD_BIND_NOW=1`
+  no shared library binds into it but libpulse's look-up of `main` (837 bindings before, from
+  HarfBuzz, libpng, FreeType, libjpeg, libass and others; 0 from WebKit's library in both).
+  `engines.sh` `wpe` checks both.
+- **SIGUSR1** (found in the first `engines.sh` run): JavaScriptCore's thread-suspension handler
+  takes SIGUSR1 unless `JSC_SIGNAL_FOR_GC` names another signal. It replaced `sig`'s diagnostics
+  handler (WTF logs "Overriding existing handler for signal 10"), and the next SIGUSR1 sent to
+  `sig` suspended the thread that took it with nobody to resume it: `sig` stopped. `sig` now sets
+  `JSC_SIGNAL_FOR_GC=12` (SIGUSR2, which nothing in its process uses) at the start of `main`,
+  before any thread, unless the environment sets it; WebKit's processes inherit it. JavaScriptCore
+  also reads every `JSC_` variable as an option of its own, so each WebKit process logs "ERROR:
+  invalid option: JSC_SIGNAL_FOR_GC=12" once; WTF takes the signal from it all the same.
+- **Run time**: `shell.nix` sets `GIO_EXTRA_MODULES` and `GST_PLUGIN_SYSTEM_PATH_1_0`; `sig`
+  doesn't set them (it already needs the shell's `LD_LIBRARY_PATH` for what it loads at run time).
+  `engines.sh` runs `sig` on a D-Bus session of its own, as the engine's tests do.
+
+**The page's navigations** (the WPE half of extension-api.md §1.4, decision 77's contract). WebKit
+asks `decide-policy` about every navigation of every frame, and its navigation action doesn't say
+which frame navigates. Probed in `wpe-window` with WebKit 2.52.6 (each line: navigation type,
+user gesture, redirect):
+
+| Navigation | Type | Gesture |
+|---|---|---|
+| The browser's load (`load_uri`), a frame's first load, a script's `location =` after a timer or on load, a frame's `src` set by a script | other | no |
+| The browser's back and forward | back-forward | no |
+| The browser's reload | reload | no |
+| A link clicked in the page, or in a frame of it | link-clicked | yes |
+| A form sent with a click | form-submitted | yes |
+| `location =` in a click handler, or in a timeout a click started; a frame a click handler made | other | yes |
+
+So the adapter asks (`view::asks`) about a link or a GET form the user clicked, not redirected,
+and holds WebKit's policy decision (`PageNavigation`, which ignores the decision when dropped,
+since WebKit's own uses it when dropped) until the core's answer, at most 16 per view. Everything
+else goes ahead in WebKit without asking: the browser's own loads, reloads and traversals, frames
+loading, scripts' navigations, even one a click ran (a click-made frame would look the same and
+move the whole tab), and POST forms (another engine would get only the address). Limits: a link
+clicked inside a frame is asked about, and moves the whole tab if routing gives it to another
+engine (Servo 0.5's limit too); a script's navigation that a click ran stays in WebKit where
+Servo would hand it over. In `sig` the core answered within 0.07–0.23 ms of WebKit's question
+(`wpe-timing navigation-answered`, eight answers over four runs).
+
+**End to end** (`sighurt-browser/tests/engines.sh`, scenario `wpe`, 59 checks, and two of the
+`settings` scenario; headless sway 1.12 with GLES2 on the desktop's RTX 3070, 2 October 2026; the
+whole of `engines.sh`, 217 checks, passes with them):
+
+- `input.html` on `localhost`, which `[routing.wpe] hosts` claims, opens in WebKit; a click
+  lands at its page position; å, ä, ö and a dead-key ä are typed; Ctrl+C reaches the Wayland
+  clipboard (`wl-paste`) and Ctrl+V pastes from it (`wl-copy`).
+- Idle: after load, WebKit's overlay scrollbar of the 3 000 px page animates for about 3 s (about
+  37 frames a second; with the scrollbar hidden by CSS, nothing), then `sig` wakes once in 3 s
+  (the report's own) with no page frame and no chrome paint.
+- A WebGL page animates at 129 or 130 frames in 2 s (the output's 60 Hz) with no chrome paint;
+  every WPE frame came as a DMA-BUF: 0 copies, `readback_bytes=0` on all 606 and 608 frame lines
+  of two runs.
+- `page.open-in wpe https://example.com/` opens it in WebKit (title "Example Domain"); an app
+  typed into that tab is content WebKit can't show, so `sig` downloads it into `[downloads]
+  directory`, whole.
+- One tab across Servo, WPE and Wasm: back three times and forward three times, each segment
+  shown in its own view and none loaded again.
+- Links: from the WPE page to a page routing gives Servo, the tab opens it in Servo and back
+  returns to the kept WPE page; a link to a page on its own host stays in WebKit; a click whose
+  script navigates to the Servo page stays in WebKit; from Servo to a `localhost` page, WebKit.
+- `SIGKILL` of WebKit's web processes: the tab says the page crashed, `sig` and Servo go on, F5
+  loads the page in a new web process.
+- WebKit keeps its profile (`storage/`, its `localStorage`, `cache/`) in the run's data
+  directory; with `[engines.wpe] storage = "ephemeral"` (`settings`) nothing of WebKit's is left
+  in the data or cache directory, and `user-agent` is both the header and `navigator.userAgent`.
+
+## Limitations and open problems (the engine)
+
+1. **`requestAnimationFrame` at 60 Hz on faster outputs** (the proof's limitation 1): no
+   `WPEScreen` with the output's refresh rate; the host doesn't report it to engines yet.
+2. **Navigation ids** in the races listed above; the page's own loads have no
+   `NavigationStarted`.
+3. **Paste** shows the page an empty paste before the real one; the clipboard acts for the view
+   with the latest input; text only (HTML too when a page copies).
+4. **Downloads are fetched again by the browser**, without WebKit's cookies or the POST body
+   that produced them; `blob:` and `data:` downloads can't be fetched that way. A download from a
+   view that has no document yet can't be asked for (as for every engine).
+5. **Media**: `file:` videos don't play (WebKit's sandboxed web process reads them itself and
+   sees no files outside its sandbox; pages and images load through the network process and
+   work); no media without an audio server. Camera and microphone requests are mapped but
+   untested: the sandboxed web process saw no capture device on either machine, and WebKit asks
+   only when one exists.
+6. **Not supported**: `<select>` popups, context menus, script dialogs (closed; `beforeunload`
+   leaves the page), HTTP
+   authentication (refused), fullscreen, pointer lock, cursor images (names only), touch,
+   accessibility, find in page, screenshots. `TextInputState::multiline` is always `false`
+   (WebKit's input-method state doesn't say).
+7. **Wakeups per frame**: 4.0 loop wakeups and 2.1 GLib dispatches per animated frame on DMA-BUF,
+   from 5.8 before GLib got several turns per pump (decision 73). Counted with temporary counters
+   on one animated view: of 3.5 wakeups per frame, 1.9 are the compositor's (the frame callback
+   and the buffer release, which the host's socket brings) and 1.6 the watch thread's (WebKit's
+   frame message and its rendering fence); before, 3.25 were the watch thread's, half of them
+   WebKit waking its own context while it dispatched. Explicit synchronization (the proof's
+   limitation 3) would save the fence's.
+8. **The host**: `PresentMode::Gl` names a native target that isn't GL (the proof's limitation
+   4); its text input could re-enable a session when surrounding text first appears (the
+   engine works around it).
+9. **Not run**: on louise-pc (its benchmark runs held it, then it didn't answer; `shell.nix`
+   now brings the pin's Rust, decision 86), a `RuntimeFailed` (it needs the compositor
+   connection broken mid-run), on River, and `sig` with WPE on River.
+10. **Navigations a page asks about** are links and GET forms the user clicked; a script's
+   navigation, even one a click ran, stays in WebKit, and a link clicked inside a frame moves the
+   whole tab when it goes to another engine ("In `sig`"). The core moves the tab only for the
+   link the user pressed (the status text at the press), so a GET form stays in WebKit too
+   (decision 82).
+12. **A hidden page that animated keeps waking**: one thread of its web process wakes about
+   120 times a second while the page is hidden, until it is shown or closed: in `sig` a thread
+   named `SkiaGPUWorker`, in `wpe-window` the compositor's (`org.webkit.ThreadedCompositor`),
+   sleeping in `poll` with a timeout and using almost no CPU (`perf` sampled about 13 µs in 3 s
+   there). WebKit's own behavior: the page is hidden (unmapped, so WebKit suspends its painting
+   and scripted animations), and finishing the adapter's pending frame at hide changed nothing.
+   `engines.sh` `wpe` bounds the whole tree in that state (decision 84).
+13. **The network process** stays as long as the runtime (31 MiB): it holds the session's
+   cookies, an ephemeral session's only copy.
+11. **"ERROR: invalid option: JSC_SIGNAL_FOR_GC=12"** in `sig`'s log, once per WebKit process:
+   JavaScriptCore's option parser's view of the variable that keeps it off SIGUSR1.

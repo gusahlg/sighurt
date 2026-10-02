@@ -51,6 +51,20 @@ def engine_placement(result_set):
     return result_set["set"]["build"]["definition"].get("engines", "processes")
 
 
+def incomparable(result_set):
+    """[(workloads, metric pattern, reason)]: what the set's build declares its diagnostics can't
+    measure honestly against another build's (benchlib/parsers.py, `INCOMPARABLE`)."""
+    from benchlib import parsers
+
+    s = result_set["set"]
+    definitions = s["workloads"]["definitions"]
+    out = []
+    for scripts, pattern, reason in parsers.incomparable(s["build"]["definition"].get("parsers", [])):
+        workloads = {w for w, d in definitions.items() if scripts is None or d.get("script", "none") in scripts}
+        out.append((workloads, re.compile(pattern), f"{s['label']}: {reason}"))
+    return out
+
+
 # Metrics that describe the split between the browser process and engine processes. Across
 # builds that place engines differently they compare process layouts, not work: in-process,
 # `_engines` and `ipc_out_` are 0 by construction and `_browser` holds everything.
@@ -62,7 +76,8 @@ PROCESS_SPLIT = re.compile(r"_(browser|engines)$|\.ipc_out_")
 # a static page, so the tools report their changes without calling them better or worse.
 LOWER_IS_BETTER = re.compile(
     r"\.(cpu_|runq_wait|ctxsw_|wakeups|rss_|pss_|readback|ipc_|gpu_util|gpu_fb|gpu_mem|compositor_cpu"
-    r"|paint_|read_|send_|browser_draw_|input_to_|mapped_s|first_frame|processes_exited)|^shutdown\."
+    r"|paint_|read_|send_|present_|swap_|browser_draw_|input_to_|mapped_s|first_frame|processes_exited"
+    r"|page_readbacks|gl_reads|max_)|^shutdown\."
 )
 
 
@@ -114,11 +129,18 @@ KEY_METRICS = [
     "active.paint_p50_ms",
     "active.read_p50_ms",
     "active.send_p50_ms",
+    "active.present_p50_ms",
+    "active.swap_p50_ms",
     "active.gpu_util_pct",
     "active.compositor_cpu_pct",
     "after.rss_growth_mib",
     "after.pss_growth_mib",
     "shutdown.s",
+    "exit.page_readbacks",
+    "exit.gl_reads",
+    "exit.max_present_ms",
+    "exit.max_pump_ms",
+    "exit.max_target_buffers",
 ]
 
 

@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# End-to-end tests of `sig` with its default engines, Servo and Wasm, in a private headless sway
-# with the GLES2 renderer (the GPU): never on the desktop, since they type and click. Builds
-# `sig` (default features), the virtual-pointer helper and the example guests with tools/cargo,
+# End-to-end tests of `sig` with its default engines, Servo, Wasm and WPE WebKit, in a private
+# headless sway with the GLES2 renderer (the GPU), on a D-Bus session of their own
+# (sighurt-engine-wpe/tests/private-bus): never on the desktop, since they type and click. Builds
+# `sig` (default features, with the modal keymap and the line chrome compiled in too, which only
+# `showcase` selects), the virtual-pointer helper and the example guests with tools/cargo,
 # then runs the scenarios below inside `tools/headless-sway --renderer gles2`, printing PASS or
 # FAIL for each check. A local web server (`serve.py`) serves `tests/pages` and the guests;
 # the test guests in `tests/guests` are WAT, which Wasmtime compiles as it does binaries. Only
 # https://example.com/ needs the network. Servo builds here only when the desktop is free
-# (`tools/heavy` refuses it otherwise); then run it on louise-pc through tools/remote.
+# (`tools/heavy` refuses it otherwise); then run it on louise-pc through tools/remote. WPE
+# WebKit must be installed (docs/rewrite/WPE.md).
 #
 # The checks read what `sig` itself says: its diagnostics (which tab and view are shown, each
 # tab's loading and history state, frame and readback counters, with Servo's GL reads audited:
@@ -22,15 +25,40 @@
 #   servo   M4 at browser level: local pages, https://example.com/ and a WebGL page; open, close
 #           and switch tabs; text input (å, ä, ö, a dead key) and the clipboard both ways;
 #           pointer positions and page size at scales 1, 1.25, 1.5 and 2; a wheel notch; back
-#           and forward through same-document entries; reload; stop; idle and animation
-#           without chrome repaints; zero readbacks; a clean quit with Servo shut down
+#           and forward through same-document entries; reload; stop; keys sent with
+#           page.send-key; [input] scroll-speed applied live; idle and animation without chrome
+#           repaints; zero readbacks; a clean quit with Servo shut down
 #   wasm    M5 at browser level: hello-sighurt, gradient-demo, raf-demo, timer-demo and
 #           events-demo run and take input; a guest looping in on_frame and one calling the host
 #           in a loop are stopped while the chrome keeps working; invalid drawing fails safely;
-#           busy guests don't hold up typing in the address bar
+#           a guest's download goes into the download folder whatever its name says; busy
+#           guests don't hold up typing in the address bar
 #   cross   one tab across the engine boundary: a Servo page, a Wasm app, back and forward
 #           through both engines' entries, a third segment, and the segments restored after a
 #           restart
+#   settings  [engines.servo] and [engines.wpe] user-agent (the header the engine sends and
+#           navigator.userAgent) and storage = "ephemeral" for Servo, WPE and Wasm (no profile,
+#           no store or cache left after quitting); a [keywords] template; page.open-in wasm for
+#           an app routing sends to Servo, and back to the Servo page; a changed engine setting's
+#           restart notice
+#   links   links in a Servo page follow the routing: a click on a link to an app on a Wasm
+#           origin, or on a host [routing.wasm] hosts claims, opens it in the Wasm engine; a page
+#           that sends itself there without a click, and the links of a view page.open-in chose,
+#           stay in Servo
+#   wpe     WPE WebKit in sig: what the executable exports and what binds to it; a page on a
+#           host [routing.wpe] hosts claims, and https://example.com/ with page.open-in wpe;
+#           text input (å, ä, ö, a dead key) and the clipboard both ways; idle, and a WebGL page
+#           animating without chrome repaints and with no CPU copy (DMA-BUF), and idle across
+#           the whole process tree (WebKit's processes too) with it shown or hidden; one tab
+#           across Servo, WPE and Wasm, back and forward; links between Servo and WPE following
+#           the routing, and a script's navigation staying in WPE; WebKit's web processes killed
+#           and a reload; closing every WPE tab ends WebKit's web processes; the profile WebKit
+#           keeps
+#   showcase  a configuration that changes much: the modal keymap (a sequence, typing in insert
+#           mode, keys swallowed in normal mode, a command line), the standard chrome's tab list
+#           on the left and chrome.toggle-tabs, [ui] font-size, a [routing.wpe] hosts rule, a
+#           [keywords] template; a binding and a color added while sig runs apply at once, and a
+#           new [ui] chrome gets a notice; started again, the line chrome with the same keymap
 #
 # Exits with the number of failed checks.
 set -u
@@ -44,20 +72,25 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: engines.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase)
   mkdir -p "$out"
+  # Other builds replace target/debug/sig (the demo engine's tests build it with other
+  # features); this link keeps the binary these runs use. It is made under the same hold of the
+  # machine's lock as the build, so no other build can come between them.
+  link='ln -f target/debug/sig target/debug/sig-engines-e2e'
   if [[ $build == 1 ]]; then
-    SIG_WHAT="servo build: sig (default features) for engines.sh" tools/cargo build \
-      -p sighurt-browser --bins --example virtual-pointer || exit 1
+    SIG_WHAT="servo build: sig (default features) for engines.sh" tools/heavy bash -c \
+      "cargo build -p sighurt-browser --features keymap-modal,chrome-line --bins \
+       --example virtual-pointer && $link" || exit 1
     SIG_WHAT="build the example guests for engines.sh" tools/cargo build \
       --target wasm32-unknown-unknown --release "${guests[@]/#/-p}" || exit 1
+  else
+    $link || exit 1
   fi
-  # Other builds replace target/debug/sig (the demo engine's tests build it with other
-  # features); this link keeps the binary these runs use.
-  ln -f target/debug/sig target/debug/sig-engines-e2e || exit 1
   failed=0
   for scenario in "${scenarios[@]}"; do
-    tools/heavy tools/headless-sway --renderer gles2 -- "$0" --inside "$out/$scenario" "$scenario"
+    tools/heavy tools/headless-sway --renderer gles2 -- sighurt-engine-wpe/tests/private-bus \
+      "$0" --inside "$out/$scenario" "$scenario"
     failed=$((failed + $?))
   done
   echo "engines.sh: $failed failed check(s); screenshots and logs in $out"
@@ -75,7 +108,7 @@ mkdir -p "$out/config/sighurt" "$out/state" "$out/data" "$out/cache" "$out/downl
 export XDG_CONFIG_HOME=$out/config XDG_STATE_HOME=$out/state XDG_DATA_HOME=$out/data
 export XDG_CACHE_HOME=$out/cache XDG_DOWNLOAD_DIR=$out/downloads
 export SIG_DIAG=1 SIG_AUDIT_GL=1 RUST_LOG=${RUST_LOG:-warn}
-export PATH="$(nix-build '<nixpkgs>' -A wl-clipboard --no-out-link 2>/dev/null)/bin:$PATH"
+export PATH="$(nix-build nix/nixpkgs.nix -A wl-clipboard --no-out-link 2>/dev/null)/bin:$PATH"
 sig=target/debug/sig-engines-e2e
 probe=sighurt-browser/tests/probe.py
 session=$out/state/sighurt/session.toml
@@ -86,8 +119,11 @@ server_pid=$!
 for _ in $(seq 50); do [[ -s $out/port ]] && break; sleep 0.1; done
 base=http://127.0.0.1:$(cat "$out/port")
 served() { grep -c " GET $1\$" "$out/server.log"; }
+# Downloads go to the run's folder: the desktop's comes from user-dirs.dirs, not the environment.
 cat > "$out/config/sighurt/config.toml" <<CONF
 version = 1
+[downloads]
+directory = "$out/downloads"
 [routing.wasm]
 origins = ["$base"]
 [keys]
@@ -108,6 +144,8 @@ origins = ["$base"]
 "f7" = "page.stop"
 "alt-left" = "page.back"
 "alt-right" = "page.forward"
+"alt-j" = "page.send-key end"
+"alt-k" = "page.send-key home"
 "ctrl-q" = "browser.quit"
 CONF
 # The example guests, and the test guests in WAT, which Wasmtime compiles as it does binaries.
@@ -139,11 +177,15 @@ mkfifo "$XDG_RUNTIME_DIR/pointer"
 target/debug/examples/virtual-pointer < "$XDG_RUNTIME_DIR/pointer" &
 pointer_pid=$!
 exec 3> "$XDG_RUNTIME_DIR/pointer"
+# The helpers hold tools/heavy's lock with this script: they end with it, however it ends.
+trap 'kill "$keyboard" "$pointer_pid" "$server_pid" ${sig_pid:-} 2>/dev/null' EXIT
 layout_w=1280 layout_h=800
 # The chrome above the page is 84 logical pixels tall at every scale.
 chrome_h=84
 point() { echo "move $1 $2 $layout_w $layout_h" >&3; }
-click() { point "$1" "$2"; sleep 0.1; echo click >&3; sleep 0.2; }
+# The pointer rests a moment before the click, so a link under it is the page's status text
+# when the button goes down: a link the routing gives another engine follows it only then.
+click() { point "$1" "$2"; sleep 0.3; echo click >&3; sleep 0.2; }
 key() { wtype "$@"; sleep 0.25; }
 # open URL: types URL into the address bar of the active tab and opens it.
 open() { key -M ctrl l -m ctrl; key "$1"; key -k Return; }
@@ -366,6 +408,35 @@ servo)
   sleep 4
   info "a stopped navigation still waiting for its response: $(python3 "$probe" session "$session" "True, url(1)")"
 
+  step "keys.html: page.send-key end and home (alt-j, alt-k), then a wheel notch at scroll-speed 1 and 3"
+  open "$base/keys.html"
+  check "keys.html commits" "$(sess 10 "url(1).startswith('$base/keys.html#'), url(1)")"
+  # The page's address says "#<key>/<code> <scrollY>".
+  key -M alt j -m alt
+  check "page.send-key end reaches Servo as End, with its code" \
+    "$(sess 8 "url(1).split('#')[1].startswith('End/End '), url(1).split('#')[1]")"
+  info "after End the page is at: $(python3 "$probe" session "$session" "True, url(1).split('#')[1]")"
+  key -M alt k -m alt
+  check "page.send-key home reaches Servo as Home" \
+    "$(sess 8 "url(1).split('#')[1].startswith('Home/Home '), url(1).split('#')[1]")"
+  scrolled() { python3 "$probe" session "$session" "True, int(url(1).split(' ')[-1])" | cut -d' ' -f2; }
+  point 640 500
+  sleep 0.5
+  top=$(scrolled)
+  wlrctl pointer scroll 15 0
+  sleep 1.5
+  one=$(( $(scrolled) - top ))
+  key -M alt k -m alt
+  sleep 1
+  printf '[input]\nscroll-speed = 3\n' >> "$out/config/sighurt/config.toml"
+  sleep 0.5
+  top=$(scrolled)
+  wlrctl pointer scroll 15 0
+  sleep 1.5
+  three=$(( $(scrolled) - top ))
+  check "scroll-speed 3, loaded live, scrolls a notch three times as far" \
+    "$(answer "$([[ $one -gt 0 ]] && python3 -c "import sys; sys.exit(abs($three - 3 * $one) > 0.1 * 3 * $one + 2)"; echo $?)" "a notch scrolled $one px at 1, $three px at 3")"
+
   step "ctrl-q"
   key -M ctrl q -m ctrl
   wait "$sig_pid"; code=$?
@@ -486,6 +557,16 @@ wasm)
   check "its frame: the clear outside every clip, green fills inside" \
     "$(answer "$([[ $outside == '0 0 64' && $inside == '0 128 0' ]]; echo $?)" "page (0, 0): $outside, page (400, 300): $inside")"
 
+  step "download.wasm saves data under an absolute path: sig saves it in the download folder"
+  rm -f /tmp/sighurt-e2e-escape.txt
+  key -M ctrl t -m ctrl
+  key "file://$g/download.wasm"
+  key -k Return
+  for _ in $(seq 40); do [[ -s $out/downloads/sighurt-e2e-escape.txt ]] && break; sleep 0.25; done
+  check "a guest's download lands in the download folder, never where its name points" \
+    "$(answer "$([[ $(cat "$out/downloads/sighurt-e2e-escape.txt" 2>/dev/null) == hello && ! -e /tmp/sighurt-e2e-escape.txt ]]; echo $?)" \
+      "in the folder: $(ls "$out/downloads" | tr '\n' ' ')/tmp/sighurt-e2e-escape.txt $([[ -e /tmp/sighurt-e2e-escape.txt ]] && echo exists || echo absent)")"
+
   step "typing into the address bar while guests work"
   key -M alt 1 -m alt
   read -r median max lost <<< "$(typing)"
@@ -593,6 +674,493 @@ cross)
   kill -TERM "$sig_pid"
   wait "$sig_pid"; code=$?
   check "SIGTERM exits cleanly" "$(answer "$code" "exit code $code")"
+  ;;
+settings)
+  agent="SighurtTest/1.0 (engines.sh)"
+  cat >> "$out/config/sighurt/config.toml" <<CONF
+[keywords]
+t = "$base/count.html?q={}"
+[engines.servo]
+user-agent = "$agent"
+storage = "ephemeral"
+[engines.wasm]
+storage = "ephemeral"
+[engines.wpe]
+user-agent = "$agent"
+storage = "ephemeral"
+CONF
+  step "user-agent and storage for Servo, WPE and Wasm; ua.html reports the header and navigator.userAgent"
+  start_sig "$base/ua.html"
+  check "Servo sends the configured user agent, and its pages see it" \
+    "$(sess 20 "url(1).split('#', 1)[-1]=='[\"$agent\",\"$agent\"]', url(1).split('#', 1)[-1]")"
+  check "and the configuration was valid: no notice" "$(dg 3 "d['status'] is None, d['status']")"
+
+  step "a keyword: t åäö"
+  open "t åäö"
+  check "a keyword opens its template with the rest as the query" \
+    "$(sess 15 "url(1)=='$base/count.html?q=åäö', url(1)")"
+
+  step "page.open-in wasm: an app on localhost, an origin routing sends to Servo; then back"
+  app=http://localhost:$(cat "$out/port")/guests/gradient-demo.wasm
+  open ":page.open-in wasm $app"
+  check "page.open-in opens it in the engine named" "$(shows_tab 1 wasm)"
+  check "as a segment of its own after the Servo page" \
+    "$(sess 15 "[e for e, _, _ in segs(1)]==['servo', 'wasm'] and url(1)=='$app', (segs(1), url(1))")"
+  shot 01-open-in-wasm 1
+  key -M alt -k Left -m alt
+  check "back returns to the page in Servo" "$(shows_tab 1 servo)"
+
+  step "a Wasm app that keeps a key, in a new tab"
+  key -M ctrl t -m ctrl
+  key "$base/guests/kv.wasm"
+  key -k Return
+  check "the app kept its key" "$(sess 20 "url(2).endswith('/kv.wasm#stored'), url(2)")"
+  scratch=$(ls -d "$XDG_RUNTIME_DIR"/sighurt-wasm-* 2>/dev/null | head -1)
+  check "with storage = ephemeral the store is in a directory of this run's" \
+    "$(answer "$([[ -n $scratch && -n $(ls -A "$scratch/kv" 2>/dev/null) ]]; echo $?)" "${scratch:-none}: $(ls -A "$scratch/kv" 2>&1 | head -3 | tr '\n' ' ')")"
+  check "only the user may read it" \
+    "$(answer "$([[ $(stat -c %a "$scratch" 2>/dev/null) == 700 ]]; echo $?)" "mode $(stat -c %a "$scratch" 2>&1)")"
+
+  step "page.open-in wpe ua.html, in a third tab"
+  key -M ctrl t -m ctrl
+  open ":page.open-in wpe $base/ua.html"
+  check "WebKit sends the configured user agent, and its pages see it" \
+    "$(sess 20 "seg(3)['engine']=='wpe' and url(3).split('#', 1)[-1]=='[\"$agent\",\"$agent\"]', (seg(3)['engine'], url(3).split('#', 1)[-1])")"
+
+  step "user-agent changed while sig runs: it applies at the next start, and a notice says so"
+  sed -i 's|^user-agent = .*|user-agent = "Other/2.0"|' "$out/config/sighurt/config.toml"
+  check "a changed engine setting gets a notice" "$(dg 5 "d['status']=='notice', d['status']")"
+
+  step "ctrl-q"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+  check "Servo kept no profile" "$(answer "$([[ ! -e $out/data/sighurt/servo ]]; echo $?)" "$(ls -A "$out/data/sighurt" 2>&1 | tr '\n' ' ')")"
+  webkit=$(find "$out/data" "$out/cache" \( -iname '*wpe*' -o -iname '*webkit*' \) 2>/dev/null | tr '\n' ' ')
+  check "WebKit kept nothing: no profile, no data or cache of its own" "$(answer "$([[ -z $webkit ]]; echo $?)" "${webkit:-none}")"
+  check "the Wasm engine kept no store and no compiled modules" \
+    "$(answer "$([[ ! -e $out/data/sighurt/wasm && ! -e $out/cache/sighurt/wasm-aot ]]; echo $?)" "$(ls -A "$out/data/sighurt" "$out/cache/sighurt" 2>&1 | tr '\n' ' ')")"
+  check "and its directory for this run is gone" \
+    "$(answer "$([[ -n $scratch && ! -e $scratch ]] && ! ls -d "$XDG_RUNTIME_DIR"/sighurt-wasm-* >/dev/null 2>&1; echo $?)" "${scratch:-none}")"
+  ;;
+links)
+  # Besides the origin every scenario's [routing.wasm] has, the host localhost, which links.html
+  # (on 127.0.0.1) links to. Its links are bands 150 page pixels tall.
+  sed -i 's|^origins = .*|&\nhosts = ["localhost"]|' "$out/config/sighurt/config.toml"
+  wasm_host=http://localhost:$(cat "$out/port")
+  band() { echo $((chrome_h + 150 * $1 - 75)); }
+  step "links.html in Servo, then a click on its link to an app on the Wasm origin"
+  RUST_LOG=warn,sighurt_engine_servo::timing=debug start_sig "$base/links.html"
+  check "links.html opens in Servo" "$(sess 20 "url(1)=='$base/links.html' and seg(1)['engine']=='servo', (segs(1), url(1))")"
+  shot 01-links 1
+  click 200 "$(band 1)"
+  check "a click on a link to an app on the Wasm origin opens it in the Wasm engine" "$(shows_tab 1 wasm)"
+  check "as a segment after the Servo page" \
+    "$(sess 15 "segs(1)==[('servo', 1, 0), ('wasm', 1, 0)] and url(1)=='$base/guests/gradient-demo.wasm', (segs(1), url(1))")"
+  shot 02-app-from-a-link 1
+  key -M alt -k Left -m alt
+  check "back returns to the Servo page" "$(shows_tab 1 servo)"
+  check "which was kept, not loaded again" "$(answer "$([[ $(served /links.html) == 1 ]]; echo $?)" "$(served /links.html) request(s)")"
+
+  step "a click on its link to an app on the host [routing.wasm] hosts claims"
+  click 200 "$(band 2)"
+  check "a click on a link to a host the routing gives Wasm opens it there" "$(shows_tab 1 wasm)"
+  check "the app on that host" "$(sess 15 "url(1)=='$wasm_host/guests/hello-sighurt.wasm' and seg(1)['engine']=='wasm', (segs(1), url(1))")"
+  key -M alt -k Left -m alt
+  check "back returns to the Servo page" "$(shows_tab 1 servo)"
+
+  step "a click on its link to itself, which then sends itself to that host without a click"
+  click 200 "$(band 3)"
+  check "what a page does without a click stays in Servo" \
+    "$(sess 15 "url(1)=='$wasm_host/second.html?redirected' and seg(1)['engine']=='servo', (segs(1), url(1))")"
+  check "the tab shows its Servo view" "$(shows_tab 1 servo)"
+
+  step "page.open-in servo links.html, then a click on its link to a page on that host"
+  open ":page.open-in servo $base/links.html"
+  check "page.open-in servo opens links.html" "$(sess 15 "url(1)=='$base/links.html', url(1)")"
+  sleep 0.5
+  click 200 "$(band 4)"
+  check "the links of a view page.open-in chose stay in its engine" \
+    "$(sess 15 "url(1)=='$wasm_host/second.html?chosen' and seg(1)['engine']=='servo', (segs(1), url(1))")"
+  check "the tab shows its Servo view" "$(shows_tab 1 servo)"
+  shot 03-chosen-stays
+
+  held=$(grep -o 'navigation-answered view=[0-9]* held_ms=[0-9.]*' "$out/sig.log" | grep -o '[0-9.]*$' | tr '\n' ' ')
+  info "how long Servo held each navigation for the core's answer, in ms: $held"
+  check "Servo asked about each of the five navigations" "$(answer "$([[ $(wc -w <<< "$held") == 5 ]]; echo $?)" "$(wc -w <<< "$held") answered")"
+  step "ctrl-q"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+  ;;
+wpe)
+  lh=http://localhost:$(cat "$out/port")
+  cat >> "$out/config/sighurt/config.toml" <<CONF
+[routing.wpe]
+hosts = ["localhost"]
+CONF
+  step "what sig exports, and which of its symbols the shared libraries bind to (decision 65)"
+  exports=$(readelf --dyn-syms -W "$sig" | awk '$7 != "UND" && NR > 3 && $8 != "" {print $8}' | sort -u | tr '\n' ' ')
+  check "sig exports none of the C libraries linked into it" \
+    "$(answer "$([[ $(wc -w <<< "$exports") -le 1 ]]; echo $?)" "$(wc -w <<< "$exports") exported: $exports")"
+  LD_DEBUG=bindings LD_BIND_NOW=1 LD_DEBUG_OUTPUT="$out/bindings" "$sig" --version > /dev/null 2>&1
+  exe=$(basename "$sig")
+  into=$(grep -h "binding file [^ ]* \[0\] to [^ ]*/$exe \[0\]" "$out"/bindings.* | grep -v "binding file [^ ]*/$exe \[0\]")
+  rm -f "$out"/bindings.*
+  webkit=$(grep -c libWPEWebKit <<< "$into")
+  others=$(grep -v "symbol \`main'" <<< "$into" | grep -c .)
+  check "no shared library, WebKit's included, binds to sig's copies of its libraries" \
+    "$(answer "$([[ $webkit == 0 && $others == 0 ]]; echo $?)" "from WebKit's library $webkit, in all $others besides libpulse's look-up of main")"
+
+  step "input.html on localhost, a host [routing.wpe] hosts claims"
+  RUST_LOG=warn,sighurt_engine_wpe::timing=debug start_sig "$lh/input.html"
+  check "a page on a host the routing gives WPE opens in WebKit" \
+    "$(sess 30 "url(1).startswith('$lh/input.html#') and seg(1)['engine']=='wpe', (seg(1)['engine'], url(1))")"
+  check "its WPE view is shown" "$(shows_tab 1 wpe)"
+  shot 01-input 1
+  check "WebKit's JavaScriptCore left sig's SIGUSR1 (diagnostics) alone" \
+    "$(answer "$(! grep -q 'Overriding existing handler for signal' "$out/sig.log"; echo $?)" "$(grep -o 'Overriding existing handler for signal [0-9]*' "$out/sig.log" || echo 'no handler replaced')")"
+  check "WebKit renders on the GPU and its frames come as DMA-BUFs" \
+    "$(answer "$(grep -q 'renderer engine=wpe mode=hardware gl="WebKit, DMA-BUF on ' "$out/sig.log"; echo $?)" "$(grep -o 'renderer engine=wpe.*' "$out/sig.log")")"
+  step "idle on the static page, once WebKit's overlay scrollbar (the page is 3000 px tall) has faded"
+  point 1200 790
+  for waited in $(seq 10); do read -r frames _ _ <<< "$(counted 1)"; [[ $frames == 0 ]] && break; done
+  info "WebKit's scrollbar animated until about $waited s after the pointer left the page"
+  read -r frames paints wakeups <<< "$(counted 3)"
+  check "a static WPE page leaves sig's owner loop asleep" "$(answer "$([[ $wakeups -le 1 && $frames == 0 && $paints == 0 ]]; echo $?)" \
+    "$wakeups wakeups (the report's own included), $frames page frames, $paints chrome paints in 3 s")"
+  # The owner's counter misses WebKit's threads and processes: count every thread of the tree.
+  tree=$(python3 "$probe" switches "$sig_pid" 3)
+  check "and the whole process tree, WebKit's processes included, nearly so" \
+    "$(answer "$(python3 -c "print(0 if ${tree%% *} <= 10 else 1)")" "${tree%% *} context switches a second; busiest: ${tree#* }")"
+
+  step "text and the clipboard in the page's field"
+  click 100 $((chrome_h + 100))
+  check "a click at page (100, 100) reaches the page there" "$(sess 8 "'mousedown 100,100' in url(1), url(1).split('#')[1]")"
+  click 100 $((chrome_h + 215))
+  key 'åäö' -k dead_diaeresis -k a
+  check "åäö and a dead key typed into a field" "$(sess 8 "url(1).endswith('#field åäöä'), url(1).split('#')[1]")"
+  rm -f "$out/copied.txt"
+  key -M ctrl a -m ctrl
+  key -M ctrl c -m ctrl
+  sleep 0.5
+  wl-paste -n > "$out/copied.txt" 2>&1
+  check "ctrl-c in the page puts its selection on the Wayland clipboard" \
+    "$(answer "$([[ $(cat "$out/copied.txt") == åäöä ]]; echo $?)" "wl-paste: $(cat "$out/copied.txt")")"
+  wl-copy -n -o 'xyz'
+  sleep 0.3
+  click 300 $((chrome_h + 215))
+  key -k End
+  key -M ctrl v -m ctrl
+  check "ctrl-v pastes the Wayland clipboard into the page" "$(sess 8 "url(1).endswith('#field åäöäxyz'), url(1).split('#')[1]")"
+  shot 02-typed-and-pasted
+
+  step "ctrl-t, animated.html on localhost: a WebGL page"
+  key -M ctrl t -m ctrl
+  key "$lh/animated.html"
+  key -k Return
+  check "the WebGL page opens in WPE and has a WebGL context" \
+    "$(sess 20 "url(2)=='$lh/animated.html' and seg(2)['engine']=='wpe' and seg(2).get('title')=='webgl', (seg(2)['engine'], url(2), seg(2).get('title'))")"
+  check "the second tab shows its WPE view" "$(shows_tab 2 wpe)"
+  sleep 1
+  read -r frames paints _ <<< "$(counted 2)"
+  check "the WebGL page animates at the compositor's pace" "$(answer "$([[ $frames -ge 60 ]]; echo $?)" "$frames page frames in 2 s")"
+  check "page animation repaints no chrome" "$(answer "$([[ $paints == 0 ]]; echo $?)" "$paints chrome paints in 2 s")"
+  shot 03-webgl 0
+  check "no CPU copy of a WPE frame so far" \
+    "$(dg 3 "engines['wpe']['readbacks']==0 and c['page_readbacks']==0, ('wpe copies', engines['wpe']['readbacks'], 'page readbacks', c['page_readbacks'], 'of', c['page_frames_presented'], 'frames')")"
+
+  step "ctrl-t, page.open-in wpe https://example.com/"
+  key -M ctrl t -m ctrl
+  open ":page.open-in wpe https://example.com/"
+  check "page.open-in wpe opens example.com in WebKit" \
+    "$(sess 25 "url(3)=='https://example.com/' and seg(3)['engine']=='wpe' and seg(3).get('title')=='Example Domain', (seg(3)['engine'], url(3), seg(3).get('title'))")"
+  check "the third tab shows its WPE view" "$(shows_tab 3 wpe)"
+  shot 04-example-com 1
+  step "an app on localhost typed into that tab: content WebKit can't show, so sig downloads it"
+  open "$lh/guests/hello-sighurt.wasm"
+  check "it lands in the download folder, whole" \
+    "$(answer "$(for _ in $(seq 40); do cmp -s "$out/downloads/hello-sighurt.wasm" "$out/guests/hello-sighurt.wasm" && break; sleep 0.25; done; cmp -s "$out/downloads/hello-sighurt.wasm" "$out/guests/hello-sighurt.wasm"; echo $?)" "$(ls "$out/downloads" | tr '\n' ' ')")"
+  check "and the tab keeps its page" "$(sess 5 "url(3)=='https://example.com/' and seg(3)['engine']=='wpe', (seg(3)['engine'], url(3))")"
+  step "idle, with the WebGL page that animated hidden in the second tab"
+  sleep 2
+  tree=$(python3 "$probe" switches "$sig_pid" 5)
+  info "a hidden WPE tab that animated: one thread of its web process wakes about 120 times a second (WebKit's own, almost no CPU)"
+  check "a hidden WPE tab that animated renders nothing: the tree stays under 300 context switches a second" \
+    "$(answer "$(python3 -c "print(0 if ${tree%% *} <= 300 else 1)")" "${tree%% *} a second; busiest: ${tree#* }")"
+
+  step "one tab across the engines: history.html in Servo, an app in Wasm, wpe.html in WPE"
+  # The new tab's first segment is its home page, sig://home: (None, 1, 0).
+  key -M ctrl t -m ctrl
+  key "$base/history.html"
+  key -k Return
+  check "a page on 127.0.0.1 opens in Servo, the default engine" "$(sess 20 "segs(4)[1:]==[('servo', 3, 2)], segs(4)")"
+  open "$base/guests/gradient-demo.wasm"
+  check "an app opens in the Wasm engine, a segment of its own" \
+    "$(sess 15 "segs(4)[1:]==[('servo', 3, 2), ('wasm', 1, 0)], segs(4)")"
+  check "the tab shows the Wasm view" "$(shows_tab 4 wasm)"
+  open "$lh/wpe.html"
+  check "a page on localhost opens in WPE, a third segment" \
+    "$(sess 15 "segs(4)[1:]==[('servo', 3, 2), ('wasm', 1, 0), ('wpe', 1, 0)] and url(4)=='$lh/wpe.html', (segs(4), url(4))")"
+  check "the tab shows the WPE view" "$(shows_tab 4 wpe)"
+  shot 05-three-engines 1
+  step "back three times, forward three times"
+  key -M alt -k Left -m alt
+  check "back: the app" "$(sess 10 "tab(4)['current']==2 and url(4)=='$base/guests/gradient-demo.wasm', (tab(4)['current'], url(4))")"
+  check "shown in its Wasm view" "$(shows_tab 4 wasm)"
+  key -M alt -k Left -m alt
+  check "back: the Servo page at #two" "$(sess 10 "tab(4)['current']==1 and url(4)=='$base/history.html#two', (tab(4)['current'], url(4))")"
+  check "shown in its Servo view" "$(shows_tab 4 servo)"
+  key -M alt -k Left -m alt
+  check "back within Servo: #one" "$(sess 10 "tab(4)['current']==1 and url(4)=='$base/history.html#one', (tab(4)['current'], url(4))")"
+  key -M alt -k Right -m alt
+  check "forward within Servo: #two" "$(sess 10 "tab(4)['current']==1 and url(4)=='$base/history.html#two', (tab(4)['current'], url(4))")"
+  key -M alt -k Right -m alt
+  check "forward: the app" "$(sess 10 "tab(4)['current']==2 and url(4)=='$base/guests/gradient-demo.wasm', (tab(4)['current'], url(4))")"
+  check "shown in its Wasm view" "$(shows_tab 4 wasm)"
+  key -M alt -k Right -m alt
+  check "forward: the WPE page" "$(sess 10 "tab(4)['current']==3 and url(4)=='$lh/wpe.html', (tab(4)['current'], url(4))")"
+  check "shown in its WPE view" "$(shows_tab 4 wpe)"
+  check "no segment was loaded again" "$(answer "$([[ $(served /history.html) == 1 && $(served /wpe.html) == 1 && $(served /guests/gradient-demo.wasm) == 1 ]]; echo $?)" \
+    "requests: history.html $(served /history.html), wpe.html $(served /wpe.html), the app $(served /guests/gradient-demo.wasm)")"
+
+  step "the WPE page's links: to a page the routing gives Servo, to one on its own host, and a script's"
+  sleep 0.5
+  click 300 $((chrome_h + 75))
+  check "a click on a link to a page the routing gives Servo opens it in Servo" "$(shows_tab 4 servo)"
+  check "as a segment after the WPE page" \
+    "$(sess 15 "segs(4)[1:]==[('servo', 3, 2), ('wasm', 1, 0), ('wpe', 1, 0), ('servo', 1, 0)] and url(4)=='$base/second.html?from-wpe', (segs(4), url(4))")"
+  check "a hidden WPE view is kept alone: the Servo page and the app before it became records" \
+    "$(dg 5 "sorted(v['engine'] for v in views if v['tab']==4)==['servo', 'wpe'], [(v['engine'], v['shown']) for v in views if v['tab']==4]")"
+  key -M alt -k Left -m alt
+  check "back returns to the WPE page" "$(shows_tab 4 wpe)"
+  check "which was kept, not loaded again" "$(answer "$([[ $(served /wpe.html) == 1 ]]; echo $?)" "$(served /wpe.html) request(s)")"
+  sleep 0.5
+  click 300 $((chrome_h + 225))
+  check "a link to a page on its own host stays in WPE" \
+    "$(sess 15 "url(4)=='$lh/second.html?in-wpe' and seg(4)['engine']=='wpe' and len(entries(4))==2, (segs(4), url(4))")"
+  key -M alt -k Left -m alt
+  check "back within WPE: the WPE page" "$(sess 10 "url(4)=='$lh/wpe.html', url(4)")"
+  sleep 0.5
+  click 300 $((chrome_h + 375))
+  check "a script's navigation stays in WPE, even after a click" \
+    "$(sess 15 "url(4)=='$base/second.html?from-wpe-script' and seg(4)['engine']=='wpe', (segs(4), url(4))")"
+  step "links.html in Servo: a click on its link to a page on localhost"
+  open "$base/links.html"
+  check "links.html opens in Servo" "$(sess 15 "url(4)=='$base/links.html' and seg(4)['engine']=='servo', (segs(4), url(4))")"
+  sleep 0.5
+  click 200 $((chrome_h + 525))
+  check "a click in Servo on a link to a host the routing gives WPE opens it in WebKit" \
+    "$(sess 15 "url(4)=='$lh/second.html?chosen' and seg(4)['engine']=='wpe', (segs(4), url(4))")"
+  check "the tab shows its WPE view" "$(shows_tab 4 wpe)"
+  shot 06-from-servo-to-wpe 0.5
+  held=$(grep -o 'wpe-timing navigation-answered view=[0-9]* held_ms=[0-9.]*' "$out/sig.log" | grep -o '[0-9.]*$' | tr '\n' ' ')
+  info "how long WebKit held each navigation for the core's answer, in ms: $held"
+  check "WebKit asked about the two links clicked in it, not the script's navigation" \
+    "$(answer "$([[ $(wc -w <<< "$held") == 2 ]]; echo $?)" "$(wc -w <<< "$held") answered")"
+
+  step "WebKit's web processes killed, then F5 in the first tab"
+  key -M alt 1 -m alt
+  check "alt-1 shows the first tab" "$(shows_tab 1 wpe)"
+  descendants() { local child; for child in $(pgrep -P "$1"); do echo "$child"; descendants "$child"; done; }
+  web=$(for p in $(descendants "$sig_pid"); do [[ $(cat "/proc/$p/comm" 2>/dev/null) == WPEWebProcess ]] && echo "$p"; done)
+  info "WebKit's web processes: $(wc -w <<< "$web")"
+  # SIGKILL: JavaScriptCore's handler in the web process returns from a SIGSEGV sent by kill(2).
+  kill -KILL $web
+  check "the tab says its page failed" "$(dg 5 "tabs[0]['error'] and d['status']=='error', (tabs[0], d['status'])")"
+  check "sig lives on" "$(answer "$(kill -0 "$sig_pid"; echo $?)" "pid $sig_pid")"
+  shot 07-crashed 0.3
+  before=$(value "shown['submissions']")
+  key -k F5
+  check "F5 starts a new web process and loads the page again" \
+    "$(dg 15 "not tabs[0]['error'] and shown and shown['tab']==1 and shown['engine']=='wpe' and shown['submissions'] > $before, (tabs[0], shown and shown['submissions'], $before)")"
+  again=$(for p in $(descendants "$sig_pid"); do [[ $(cat "/proc/$p/comm" 2>/dev/null) == WPEWebProcess ]] && echo "$p"; done)
+  check "in a web process of its own" "$(answer "$([[ -n $again ]] && ! grep -qxF -f <(tr ' ' '\n' <<< "$web") <<< "$again"; echo $?)" "killed: $(echo $web), now: $(echo $again)")"
+  shot 08-reloaded 0.5
+  key -M ctrl t -m ctrl
+  key "$base/second.html"
+  key -k Return
+  check "Servo goes on: a new tab opens a page in it" "$(shows_tab 5 servo)"
+
+  step "every tab with a WPE page closed: WebKit's web processes end with them"
+  for _ in 1 2 3 4; do key -M alt 1 -m alt; key -M ctrl w -m ctrl; done
+  check "only the Servo tab is left" "$(dg 5 "len(tabs)==1 and shown and shown['engine']=='servo', (len(tabs), shown and shown['engine'])")"
+  web_left() { for p in $(descendants "$sig_pid"); do [[ $(cat "/proc/$p/comm" 2>/dev/null) == WPEWebProcess ]] && echo "$p"; done; }
+  for waited in $(seq 0 10); do [[ -z $(web_left) ]] && break; sleep 0.5; done
+  check "no WebKit web process outlives the last WPE tab by more than 5 s" \
+    "$(answer "$([[ -z $(web_left) ]]; echo $?)" "$(wc -w <<< "$(web_left)") left after $((waited / 2)).$((waited % 2 * 5)) s")"
+  info "WebKit's network process stays while the runtime does: $(for p in $(descendants "$sig_pid"); do cat "/proc/$p/comm" 2>/dev/null; done | grep -c WPENetwork)"
+
+  step "ctrl-q"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+  check "zero CPU copies of WPE frames, all DMA-BUF" \
+    "$(python3 -c "import json; d=json.load(open('$out/diag.json')); w=[e for e in d['engines'] if e['name']=='wpe'][0]; print(0 if w['readbacks']==0 else 1, 'wpe copies', w['readbacks'], 'gl', w['gl'])")"
+  frames=$(grep -c 'sig-diag .* frame engine=wpe' "$out/sig.log")
+  clean=$(grep -c 'sig-diag .* frame engine=wpe .*readback_bytes=0 ' "$out/sig.log")
+  check "every WPE frame line says readback_bytes=0" "$(answer "$([[ $frames -gt 0 && $frames == "$clean" ]]; echo $?)" "$clean of $frames")"
+  kept=$(find "$out/data/sighurt/wpe" -type f ! -name lock 2>/dev/null | sed "s|$out/data/sighurt/wpe/||" | tr '\n' ' ')
+  check "WebKit kept its profile in the data directory" "$(answer "$([[ -n $kept ]]; echo $?)" "${kept:-nothing}")"
+  ;;
+showcase)
+  lh=http://localhost:$(cat "$out/port")
+  config=$out/config/sighurt/config.toml
+  # The modal keymap instead of [keys], the standard chrome with its tabs on the left at 16 px, a
+  # site for WPE and a search keyword.
+  cat > "$config" <<CONF
+version = 1
+[downloads]
+directory = "$out/downloads"
+[routing.wpe]
+hosts = ["localhost"]
+[keywords]
+t = "$base/count.html?q={}"
+[input]
+keymap = "modal"
+[keymap.modal]
+start = "normal"
+typing = "insert"
+pass = ["insert"]
+[keymap.modal.always]
+"ctrl-q" = "browser.quit"
+[keymap.modal.normal]
+"g t" = "tab.next"
+"g T" = "tab.previous"
+"o" = "location.focus"
+":" = { run = "location.focus", pass = true }
+"i" = "mode insert"
+"b" = "chrome.toggle-tabs"
+[keymap.modal.insert]
+"escape" = "mode normal"
+[ui]
+chrome = "standard"
+font-size = 16
+[chrome.standard]
+tabs = "left"
+CONF
+  # At 16 px every height of the standard chrome is its 14 px height times 16 / 14, rounded:
+  # the toolbar 44 → 50, the status strip 20 → 23, and the tab list's width 220 → 251.
+  toolbar=50 strip=23 list=251
+  surfaces="[(x['role'], x['mapped'], x['width'], x['height']) for x in t if x['role'] not in ('view', 'retiring')]"
+  step "input.html on localhost and second.html on 127.0.0.1"
+  start_sig "$lh/input.html" "$base/second.html"
+  check "the configuration is valid: no notice" "$(dg 3 "d['status'] is None, d['status']")"
+  check "a page on localhost, which [routing.wpe] hosts claims, opens in WebKit" \
+    "$(sess 30 "seg(1)['engine']=='wpe' and url(1).startswith('$lh/input.html#'), (segs(1), url(1))")"
+  check "a page on 127.0.0.1 opens in Servo" "$(sess 20 "seg(2)['engine']=='servo' and url(2)=='$base/second.html', (segs(2), url(2))")"
+  check "the tab list is on the left, and font-size 16 sizes the chrome" \
+    "$(dg 5 "surface('tabs')['mapped'] and (surface('tabs')['width'], surface('tabs')['height'])==($list, 800 - $toolbar - $strip) and surface('chrome')['height']==$toolbar and surface('status')['height']==$strip, $surfaces")"
+  check "the page beside it" "$(dg 5 "shown and (shown['width'], shown['height'])==(1280 - $list, 800 - $toolbar - $strip), shown and (shown['width'], shown['height'])")"
+  point 1000 700
+  shot 01-left-tabs-16px-normal 1
+
+  step "the modal keymap: g t, then g T"
+  key g
+  key t
+  check "g t shows the next tab" "$(shows_tab 2 servo)"
+  key g
+  key -M shift t -m shift
+  check "g T shows the one before" "$(shows_tab 1 wpe)"
+  step "a click on the WPE page's field enters insert mode: åäö; Escape, then z in normal mode"
+  click $((list + 100)) $((toolbar + 215))
+  key 'åäö'
+  check "insert mode: what is typed reaches WebKit's field" "$(sess 8 "url(1).endswith('#field åäö'), url(1).split('#')[1]")"
+  shot 02-insert-mode 0.3
+  key -k Escape
+  key z
+  sleep 0.5
+  check "normal mode: an unbound letter is swallowed" "$(sess 2 "url(1).endswith('#field åäö'), url(1).split('#')[1]")"
+  shot 03-normal-mode 0.3
+
+  step "o (location.focus), a keyword search: t åäö"
+  key o
+  key 't åäö'
+  key -k Return
+  check "a [keywords] template opens with the rest as its query, in Servo" \
+    "$(sess 15 "url(1)=='$base/count.html?q=åäö' and seg(1)['engine']=='servo', (segs(1), url(1))")"
+  check "the tab shows its Servo view" "$(shows_tab 1 servo)"
+  step "o, an address on localhost typed: WPE again"
+  key o
+  key "$lh/second.html"
+  key -k Return
+  check "a typed address on a host the routing gives WPE opens there" \
+    "$(sess 15 "url(1)=='$lh/second.html' and seg(1)['engine']=='wpe', (segs(1), url(1))")"
+  check "the tab shows its WPE view" "$(shows_tab 1 wpe)"
+  step ": then tab.select 2, typed after the colon the key put there"
+  key :
+  key 'tab.select 2'
+  key -k Return
+  check "a command line opened with :" "$(shows_tab 2 servo)"
+
+  step "b: chrome.toggle-tabs, twice"
+  key b
+  check "chrome.toggle-tabs hides the tab list, and the page takes its room" \
+    "$(dg 5 "not surface('tabs')['mapped'] and shown and shown['width']==1280, ($surfaces, shown and shown['width'])")"
+  key b
+  check "and shows it again" "$(dg 5 "surface('tabs')['mapped'] and shown and shown['width']==1280 - $list, ($surfaces, shown and shown['width'])")"
+
+  step "a binding and a color added while sig runs"
+  point 1000 700
+  key n
+  check "n is bound to nothing yet" "$(dg 3 "len(tabs)==2, len(tabs)")"
+  purple() {
+    grim -t ppm "$out/$1.ppm"
+    python3 "$probe" png "$out/$1.ppm" "$out/$1.png"
+    python3 "$probe" count "$out/$1.ppm" 0 "$toolbar" "$list" $((800 - strip)) 124 58 237
+  }
+  before=$(purple 04-before-reload)
+  sed -i 's|^"b" = "chrome.toggle-tabs"$|&\n"n" = "tab.new"|; s|^\[ui\]$|[ui.colors]\ntab = "#7c3aed"\n&|' "$config"
+  sleep 0.7
+  check "the new file is valid: no notice" "$(dg 3 "d['status'] is None, d['status']")"
+  after=$(purple 05-after-reload)
+  check "the new tab color applies at once: the active row of the list" \
+    "$(answer "$([[ $before == 0 && $after -gt 2000 ]]; echo $?)" "pixels of #7c3aed in the tab list: $before before, $after after")"
+  key n
+  check "the new binding applies at once: n opens a tab" "$(dg 5 "len(tabs)==3 and d['active_tab']==3, (len(tabs), d['active_tab'])")"
+  shot 06-new-tab-by-new-binding
+  key -k Escape
+
+  step "[ui] chrome = \"line\" while sig runs: a notice, since a chrome changes at the next start"
+  sed -i 's|^chrome = "standard"$|chrome = "line"|; /^"b" = "chrome.toggle-tabs"$/d' "$config"
+  check "a new chrome gets a notice that it applies at restart" "$(dg 5 "d['status']=='notice', d['status']")"
+  check "the standard chrome stays meanwhile" "$(dg 3 "surface('tabs')['mapped'] and surface('line') is None, $surfaces")"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q, bound in always, exits cleanly" "$(answer "$code" "exit code $code")"
+  check "the session holds the three tabs" \
+    "$(python3 "$probe" session "$session" "len(s['tabs'])==3 and [seg(i).get('engine') for i in (1, 2)]==['wpe', 'servo'], [(seg(i).get('engine'), url(i)) for i in range(1, len(s['tabs']) + 1)]")"
+
+  step "started again: the line chrome, the same keymap; the three tabs restored"
+  # The line is 28 px at 14 px, so 32 at 16.
+  line=32
+  start_sig
+  check "the configuration is valid: no notice" "$(dg 3 "d['status'] is None, d['status']")"
+  check "the line chrome: one line at the top, 32 px at font-size 16" \
+    "$(dg 5 "[x['role'] for x in t if x['role'] not in ('view', 'retiring', 'page')]==['line'] and (surface('line')['width'], surface('line')['height'])==(1280, $line), $surfaces")"
+  step "g T: from the home page in the third tab to the second"
+  key g
+  key -M shift t -m shift
+  check "the modal keymap drives it: g T" "$(shows_tab 2 servo)"
+  check "and the page has the window but the line" "$(dg 5 "(shown['width'], shown['height'])==(1280, 800 - $line), (shown['width'], shown['height'])")"
+  point 1000 700
+  shot 07-line-chrome 1
+  step "o, an address on localhost typed into the line"
+  key o
+  key "$lh/input.html"
+  key -k Return
+  check "the line opens a typed address on localhost in WPE" \
+    "$(sess 15 "url(2).startswith('$lh/input.html') and seg(2)['engine']=='wpe', (segs(2), url(2))")"
+  check "the tab shows its WPE view" "$(shows_tab 2 wpe)"
+  shot 08-line-chrome-wpe 1
+  step ": then tab.select 1"
+  key :
+  key 'tab.select 1'
+  key -k Return
+  check "a command line in the line chrome" "$(shows_tab 1 wpe)"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   ;;
 esac
 finish

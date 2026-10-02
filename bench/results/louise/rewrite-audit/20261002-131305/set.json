@@ -1,0 +1,203 @@
+{
+ "label": "rewrite-audit",
+ "host": "louise",
+ "started": "2026-10-02T13:13:07+0200",
+ "build": {
+  "name": "rewrite-audit",
+  "path": "/home/gusahlg/sighurt-bench/snapshots/20261002-131305/bench/builds/rewrite-audit.toml",
+  "description": "rewrite, audited: SIG_AUDIT_GL=1 and Servo's timing lines (not for performance comparisons)",
+  "dir": "/home/gusahlg/sighurt-bench/builds/3c510fe0b051",
+  "definition": {
+   "description": "rewrite, audited: SIG_AUDIT_GL=1 and Servo's timing lines (not for performance comparisons)",
+   "dir": "~/sighurt-bench/builds/rewrite-latest",
+   "sig": "sig",
+   "engines": "in-process",
+   "binaries": [
+    "sig"
+   ],
+   "info": "build-info.json",
+   "parsers": [
+    "sig-diag",
+    "servo-log-timing"
+   ],
+   "counters_signal": "SIGUSR1",
+   "diagnostics_file": true,
+   "config": "rewrite.config.toml",
+   "chrome_top": 84,
+   "chrome_bottom": 20,
+   "env": {
+    "SIG_DIAG": "1",
+    "SIG_AUDIT_GL": "1",
+    "RUST_LOG": "error,sighurt_engine_servo::timing=debug"
+   }
+  },
+  "config": "# sig's configuration for benchmark runs of the rewrite, in the format of decision 28\n# (version 1: bindings in [keys], not the baseline's [ui.keys]). The same keys do the same\n# things as in baseline.config.toml, because the interaction scripts press them. bench/measure\n# replaces \"{workloads}\" with the absolute path of bench/workloads.\nversion = 1\n\n[keys]\n\"ctrl-l\" = \"location.focus\"\n\"ctrl-tab\" = \"tab.next\"\n\"ctrl-q\" = \"browser.quit\"\n\"ctrl-t\" = \"tab.new\"\n\"ctrl-w\" = \"tab.close\"\n\"ctrl-o\" = \"page.open {workloads}/article.html\"\n",
+  "info": {
+   "revision": "3c510fe0b051a759e061281c9e0117b27b5a6fa3",
+   "features": "default",
+   "cargo": "cargo build --release -p sighurt-browser",
+   "finished": "Finished `release` profile [optimized] target(s) in 13m 04s",
+   "built": "2026-10-02T12:44:47+02:00",
+   "rustc": "rustc 1.98.1 (48a229cea 2026-09-01) (built from a source tarball)",
+   "sha256": {
+    "sig": "83bde87413c02d052220011db3baa2b3edba2c925fb20c3172df8e0bc95ad7de"
+   }
+  },
+  "sha256": {
+   "sig": "83bde87413c02d052220011db3baa2b3edba2c925fb20c3172df8e0bc95ad7de"
+  },
+  "bytes": {
+   "sig": 214424872
+  }
+ },
+ "harness": {
+  "revision": "3c510fe0b051a759e061281c9e0117b27b5a6fa3+dirty",
+  "sha256": "3d0d865f14a2491130b15071e977f7056d5e2c3a3cfe31c73a9e323c1d729ed6"
+ },
+ "workloads": {
+  "names": [
+   "article",
+   "long",
+   "css-animation",
+   "canvas",
+   "webgl",
+   "many-tabs",
+   "tab-churn",
+   "resize-storm"
+  ],
+  "sha256": "b420411cfea997a9f4ea12a25f5fc96cc09fc01419cd02888d1270fde4b8e8fe",
+  "definitions": {
+   "article": {
+    "description": "Static Servo page: a text-heavy article with four images. Scrolls down, then up.",
+    "open": [
+     "article.html"
+    ],
+    "script": "scroll-article"
+   },
+   "long": {
+    "description": "Scrolling a long text page (80 sections, ~26 000 words) with the mouse wheel.",
+    "open": [
+     "long.html"
+    ],
+    "script": "scroll-down"
+   },
+   "css-animation": {
+    "description": "Servo: endless CSS transform, opacity, color and width animations. Pointer moves in the active window.",
+    "open": [
+     "css-animation.html"
+    ],
+    "script": "pointer-circle"
+   },
+   "canvas": {
+    "description": "Servo: a 2D canvas redrawn every animation frame (300 balls). Pointer moves in the active window.",
+    "open": [
+     "canvas.html"
+    ],
+    "script": "pointer-circle"
+   },
+   "webgl": {
+    "description": "Servo: a WebGL quad rotating in 3D, redrawn every animation frame. Pointer moves in the active window.",
+    "open": [
+     "webgl.html"
+    ],
+    "script": "pointer-circle"
+   },
+   "many-tabs": {
+    "description": "Eight tabs of the article, one visible: what hidden tabs cost. Switches tab once a second in the active window.",
+    "open": [
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html",
+     "article.html"
+    ],
+    "settle": 5,
+    "script": "cycle-tabs"
+   },
+   "tab-churn": {
+    "description": "Lifecycle: the article, then ten cycles of opening a new tab, loading the article in it and closing it (one every 2 s); measured again 3 s after the last close.",
+    "open": [
+     "article.html"
+    ],
+    "active": 20,
+    "script": "tab-churn"
+   },
+   "resize-storm": {
+    "description": "The article while the output changes size and scale four times a second (plan \u00a725 resize storm); restored and measured 3 s later.",
+    "open": [
+     "article.html"
+    ],
+    "script": "resize-storm"
+   }
+  }
+ },
+ "environment": {
+  "host": "louise",
+  "kernel": "6.18.35",
+  "os": "NixOS 26.11 (Zokor)",
+  "cpu": "AMD Ryzen 5 5500",
+  "cpus": 12,
+  "mem_total_mib": 15788,
+  "cpu_governor": [
+   "powersave"
+  ],
+  "cpu_epp": [
+   "balance_performance"
+  ],
+  "cpufreq_driver": "amd-pstate-epp",
+  "cpu_boost": "1",
+  "gpu": "NVIDIA GeForce RTX 4060, 595.80, 95.07.31.40.F2, 3",
+  "compositor": "sway 1.12 (headless backend)",
+  "compositor_store_path": "/nix/store/6816vyd7b49db9525xs7rcyk8ygdipwa-sway-1.12",
+  "nixpkgs": "4975466d324710c576dc11ad614684e6bd8cad8e",
+  "gpu_processes": "203959, /home/gusahlg/llama.cpp/build/bin/ggml-rpc-server, 94 MiB\n204614, /home/gusahlg/sighurt-baseline/target/release/sig, 169 MiB",
+  "python": "3.13.13"
+ },
+ "renderer": "gles2",
+ "size": "1280x800",
+ "lock_runs": 1,
+ "raw": "/home/gusahlg/sighurt-bench/results/raw/louise/rewrite-audit/20261002-131305",
+ "rounds": 2,
+ "warmup_rounds": 1,
+ "seed": 2058478950,
+ "order": [
+  [
+   "webgl",
+   "canvas",
+   "resize-storm",
+   "article",
+   "tab-churn",
+   "long",
+   "css-animation",
+   "many-tabs"
+  ],
+  [
+   "tab-churn",
+   "resize-storm",
+   "many-tabs",
+   "long",
+   "article",
+   "css-animation",
+   "webgl",
+   "canvas"
+  ],
+  [
+   "article",
+   "webgl",
+   "long",
+   "many-tabs",
+   "tab-churn",
+   "css-animation",
+   "canvas",
+   "resize-storm"
+  ]
+ ],
+ "session": "/home/gusahlg/sighurt-bench/results/louise/sessions/20261002-131305.json",
+ "interleaved_with": [],
+ "failures": [],
+ "renderer_fallback": null,
+ "finished": "2026-10-02T13:40:40+0200"
+}

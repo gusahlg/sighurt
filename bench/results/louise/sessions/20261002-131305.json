@@ -1,0 +1,115 @@
+{
+ "started": "2026-10-02T13:13:07+0200",
+ "sets": {
+  "rewrite-audit": "/home/gusahlg/sighurt-bench/results/louise/rewrite-audit/20261002-131305"
+ },
+ "seed": 2058478950,
+ "rounds": 2,
+ "warmup_rounds": 1,
+ "renderer": "gles2",
+ "lock_runs": 1,
+ "order": [
+  [
+   [
+    "rewrite-audit",
+    "webgl"
+   ],
+   [
+    "rewrite-audit",
+    "canvas"
+   ],
+   [
+    "rewrite-audit",
+    "resize-storm"
+   ],
+   [
+    "rewrite-audit",
+    "article"
+   ],
+   [
+    "rewrite-audit",
+    "tab-churn"
+   ],
+   [
+    "rewrite-audit",
+    "long"
+   ],
+   [
+    "rewrite-audit",
+    "css-animation"
+   ],
+   [
+    "rewrite-audit",
+    "many-tabs"
+   ]
+  ],
+  [
+   [
+    "rewrite-audit",
+    "tab-churn"
+   ],
+   [
+    "rewrite-audit",
+    "resize-storm"
+   ],
+   [
+    "rewrite-audit",
+    "many-tabs"
+   ],
+   [
+    "rewrite-audit",
+    "long"
+   ],
+   [
+    "rewrite-audit",
+    "article"
+   ],
+   [
+    "rewrite-audit",
+    "css-animation"
+   ],
+   [
+    "rewrite-audit",
+    "webgl"
+   ],
+   [
+    "rewrite-audit",
+    "canvas"
+   ]
+  ],
+  [
+   [
+    "rewrite-audit",
+    "article"
+   ],
+   [
+    "rewrite-audit",
+    "webgl"
+   ],
+   [
+    "rewrite-audit",
+    "long"
+   ],
+   [
+    "rewrite-audit",
+    "many-tabs"
+   ],
+   [
+    "rewrite-audit",
+    "tab-churn"
+   ],
+   [
+    "rewrite-audit",
+    "css-animation"
+   ],
+   [
+    "rewrite-audit",
+    "canvas"
+   ],
+   [
+    "rewrite-audit",
+    "resize-storm"
+   ]
+  ]
+ ]
+}

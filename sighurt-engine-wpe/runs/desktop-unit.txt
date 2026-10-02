@@ -1,0 +1,18 @@
+test ime::tests::purposes ... ok
+test ime::tests::deletions_in_bytes_become_characters ... ok
+test navigation::tests::a_crash_ends_what_was_in_flight ... ok
+test input::tests::swedish_letters_and_a_dead_key_have_their_keysyms ... ok
+test navigation::tests::effects_follow_entry_identity_not_addresses ... ok
+test navigation::tests::same_document_navigations_of_the_page_keep_the_document ... ok
+test navigation::tests::the_browsers_request_takes_the_next_load_and_the_page_gets_its_own_ids ... ok
+test ime::tests::host_updates_become_webkits_signals_in_order ... ok
+test navigation::tests::the_later_of_two_requests_keeps_its_id_through_webkits_dropped_marker ... ok
+test navigation::tests::the_browsers_same_document_requests_commit_without_a_load ... ok
+test runtime::tests::css_cursor_names_map_onto_the_apis ... ok
+test runtime::tests::replaceable_events_keep_only_the_latest_per_view ... ok
+test view::tests::webkit_loads_web_schemes_and_hands_over_the_rest ... ok
+test glib_loop::tests::sources_wake_the_owner_and_an_idle_context_sleeps ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test wpe_views_navigate_present_ask_and_fail_distinctly ... ignored, needs a compositor: run tests/headless.sh
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

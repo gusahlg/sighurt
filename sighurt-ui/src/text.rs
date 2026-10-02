@@ -1,11 +1,13 @@
 //! Fonts and shaped text: font discovery, shaping and fallback with cosmic-text, a bounded
-//! cache of shaped lines, and where each offset of a shaped line sits.
+//! cache of shaped lines, and where each offset of a shaped line sits. Part of the chrome API:
+//! another chrome shapes its text with [`Fonts`] too.
 //!
 //! Text is shaped once in logical pixels. The painter rasterizes the same glyphs at the
-//! target's scale (see [`crate::paint_cpu`]), so caret positions, hit testing and the drawn
-//! glyphs agree at every scale.
+//! target's scale (see [`crate::canvas`]), so caret positions, hit testing and the drawn
+//! glyphs agree at every scale. The sizes are given at the default font size, 14 px
+//! ([`DEFAULT_FONT_SIZE`]); [`TextStyle::at`] scales them to `[ui] font-size`.
 //!
-//! Must not own: glyph images (the painter's cache) or what the text says.
+//! Must not own: glyph images (the canvas's cache) or what the text says.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -30,9 +32,18 @@ const PREFERRED_FAMILIES: [&str; 7] = [
     "FreeSans",
 ];
 
+/// The font size the chrome's sizes are given at: `[ui] font-size` when it is left out.
+pub const DEFAULT_FONT_SIZE: u16 = 14;
+
+/// `px` logical pixels at the default font size, at `font_size`, rounded to whole pixels.
+pub(crate) fn at_size(px: u32, font_size: u16) -> u32 {
+    let default = u32::from(DEFAULT_FONT_SIZE);
+    (px * u32::from(font_size) + default / 2) / default
+}
+
 /// How a piece of chrome text is set: its size and line height in logical pixels, and weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct TextStyle {
+pub struct TextStyle {
     /// Font size.
     pub size: u16,
     /// Line height; the text is centred in it.
@@ -61,6 +72,17 @@ impl TextStyle {
     pub const fn weight(self, weight: u16) -> Self {
         Self { weight, ..self }
     }
+
+    /// The style at `[ui] font-size` `font_size`: its size and line height (given at
+    /// [`DEFAULT_FONT_SIZE`]) times `font_size / 14`, rounded to whole pixels.
+    pub fn at(self, font_size: u16) -> Self {
+        let scale = |px: u16| at_size(px.into(), font_size).try_into().unwrap_or(u16::MAX);
+        Self {
+            size: scale(self.size),
+            line_height: scale(self.line_height),
+            ..self
+        }
+    }
 }
 
 /// The chrome's fonts and its cache of shaped text.
@@ -68,6 +90,8 @@ pub struct Fonts {
     system: FontSystem,
     /// The chrome's font family; `None` leaves the choice to the font database's sans-serif.
     family: Option<String>,
+    /// The family it was made with, which [`Fonts::set_family`] falls back to.
+    default: Option<String>,
     shaped: HashMap<ShapeKey, Rc<ShapedText>>,
     shaped_bytes: usize,
 }
@@ -119,15 +143,35 @@ impl Fonts {
         }
         Self {
             system,
+            default: family.clone(),
             family,
             shaped: HashMap::new(),
             shaped_bytes: 0,
         }
     }
 
-    /// The chrome's font family, if one of the preferred ones (or the given fonts) had it.
+    /// The chrome's font family, if one of the preferred ones (or the given fonts, or
+    /// [`Fonts::set_family`]) had it.
     pub fn family(&self) -> Option<&str> {
         self.family.as_deref()
+    }
+
+    /// Sets the chrome's text in `family` (`[ui] font`, matched without regard to case), or in
+    /// the family it was made with for `None`. A family that isn't installed is not an error,
+    /// since one configuration serves several machines: the text stays in the family it was
+    /// made with, and the log says so. A new family drops the shaped text.
+    pub fn set_family(&mut self, family: Option<&str>) {
+        let installed = family.and_then(|name| installed_family(self.system.db(), name));
+        if let (Some(wanted), None) = (family, &installed) {
+            let used = self.default.as_deref().unwrap_or("the default sans-serif");
+            log::warn!("the font {wanted:?} is not installed; the chrome's text is in {used}");
+        }
+        let family = installed.or_else(|| self.default.clone());
+        if family != self.family {
+            self.family = family;
+            self.shaped.clear();
+            self.shaped_bytes = 0;
+        }
     }
 
     /// The font system, for rasterizing glyphs of text this shaped.
@@ -136,17 +180,17 @@ impl Fonts {
     }
 
     /// `text` shaped on one line.
-    pub(crate) fn line(&mut self, text: &str, style: TextStyle) -> Rc<ShapedText> {
+    pub fn line(&mut self, text: &str, style: TextStyle) -> Rc<ShapedText> {
         self.shape(text, style, None)
     }
 
     /// `text` shaped and wrapped at word boundaries (or anywhere, for a long word) to `width`.
-    pub(crate) fn wrapped(&mut self, text: &str, style: TextStyle, width: f32) -> Rc<ShapedText> {
+    pub fn wrapped(&mut self, text: &str, style: TextStyle, width: f32) -> Rc<ShapedText> {
         self.shape(text, style, Some(width.max(1.0)))
     }
 
     /// `text` on one line, cut with an ellipsis if it is wider than `width`.
-    pub(crate) fn fitted(&mut self, text: &str, style: TextStyle, width: f32) -> Rc<ShapedText> {
+    pub fn fitted(&mut self, text: &str, style: TextStyle, width: f32) -> Rc<ShapedText> {
         let line = self.line(text, style);
         if line.width <= width {
             return line;
@@ -210,8 +254,17 @@ fn has_family(db: &fontdb::Database, family: &str) -> bool {
         .any(|face| face.families.iter().any(|(name, _)| name == family))
 }
 
+/// The installed family called `family`, ignoring case, by its own name.
+fn installed_family(db: &fontdb::Database, family: &str) -> Option<String> {
+    let names = db.faces().flat_map(|face| &face.families);
+    let found = names
+        .map(|(name, _)| name)
+        .find(|name| name.eq_ignore_ascii_case(family));
+    found.cloned()
+}
+
 /// Text laid out in logical pixels, with its top-left corner at the origin.
-pub(crate) struct ShapedText {
+pub struct ShapedText {
     buffer: Buffer,
     /// The widest line's width.
     pub width: f32,
@@ -234,7 +287,7 @@ impl ShapedText {
     }
 
     /// The laid-out lines.
-    pub fn runs(&self) -> cosmic_text::LayoutRunIter<'_> {
+    pub(crate) fn runs(&self) -> cosmic_text::LayoutRunIter<'_> {
         self.buffer.layout_runs()
     }
 
@@ -323,6 +376,60 @@ pub(crate) mod tests {
     #[test]
     fn test_font_is_the_chrome_font() {
         assert_eq!(fonts().family(), Some("Cantarell"));
+    }
+
+    /// The log's warnings, for the test that checks one.
+    struct Warnings(std::sync::Mutex<Vec<String>>);
+
+    impl log::Log for Warnings {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.0.lock().unwrap().push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static WARNINGS: Warnings = Warnings(std::sync::Mutex::new(Vec::new()));
+
+    /// `[ui] font`: an installed family by any case; one that isn't installed falls back to the
+    /// family the fonts were made with, and the log says which.
+    #[test]
+    fn a_family_that_isnt_installed_falls_back_and_says_so() {
+        log::set_logger(&WARNINGS).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+        let mut fonts = fonts();
+        fonts.set_family(Some("cantarell"));
+        assert_eq!(fonts.family(), Some("Cantarell"));
+        assert!(WARNINGS.0.lock().unwrap().is_empty());
+        fonts.set_family(Some("Nope Sans"));
+        assert_eq!(fonts.family(), Some("Cantarell"));
+        let warnings = WARNINGS.0.lock().unwrap().clone();
+        assert_eq!(
+            warnings,
+            ["the font \"Nope Sans\" is not installed; the chrome's text is in Cantarell"]
+        );
+        fonts.set_family(None);
+        assert_eq!(fonts.family(), Some("Cantarell"));
+        assert!(fonts.line("Blåbär", TextStyle::SM).width > 30.0);
+    }
+
+    #[test]
+    fn styles_scale_with_the_font_size() {
+        let at = |style: TextStyle, size| {
+            let style = style.at(size);
+            (style.size, style.line_height)
+        };
+        assert_eq!(at(TextStyle::SM, 14), (14, 20));
+        assert_eq!(at(TextStyle::SM, 18), (18, 26));
+        assert_eq!(at(TextStyle::XS, 18), (15, 21));
+        assert_eq!(at(TextStyle::HEADING, 9), (13, 18));
+        assert_eq!(TextStyle::HEADING.at(32).weight, 700);
     }
 
     #[test]

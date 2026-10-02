@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>wpe links</title>
+<!-- For engines.sh's `wpe` scenario, opened on localhost, which its [routing.wpe] hosts claims.
+     Bands 150 page pixels tall: a link to a page on 127.0.0.1, which no rule claims (Servo's), a
+     link to a page on localhost (WPE's), and a button whose script goes to the 127.0.0.1 page.
+     It keeps a value in localStorage, which a WebKit profile keeps. -->
+<style>
+  body { margin: 0; font: 32px sans-serif; background: #eef0fa; }
+  a, button { display: block; width: 100%; height: 150px; margin: 0; font: inherit; }
+</style>
+<a id="servo">A page the routing gives Servo</a>
+<a id="wpe">A page on this host</a>
+<button id="script">A script going to the Servo page</button>
+<script>
+  const servo = `http://127.0.0.1:${location.port}/second.html?from-wpe`;
+  document.getElementById("servo").href = servo;
+  document.getElementById("wpe").href = `http://localhost:${location.port}/second.html?in-wpe`;
+  document.getElementById("script").onclick = () => { location = `${servo}-script`; };
+  localStorage.setItem("sighurt", "kept");
+</script>

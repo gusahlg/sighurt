@@ -1,0 +1,48 @@
+[   0.024] window 1024x768 at 120/120
+[   0.029] ViewReady { view: ViewId(1) }
+[   0.029] LoadingChanged { view: ViewId(1), loading: true }
+[   0.029] ViewReady { view: ViewId(2) }
+[   0.029] LoadingChanged { view: ViewId(2), loading: true }
+[   0.181] window 1280x800 at 120/120
+[   0.358] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html" }
+
+** (WPEWebProcess:2): WARNING **: 13:48:39.062: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.360] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.360] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html"], current: 0 }
+
+** (WPEWebProcess:2): WARNING **: 13:48:39.069: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.366] NavigationStarted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html" }
+[   0.367] NavigationCommitted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html", document: DocumentGeneration(2), history: Some(Push) }
+[   0.367] HistoryChanged { view: ViewId(2), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html"], current: 0 }
+[   0.493] LoadingChanged { view: ViewId(1), loading: false }
+[   0.495] TitleChanged { view: ViewId(1), title: Some("webgl WebGL 1.0") }
+[   0.501] LoadingChanged { view: ViewId(2), loading: false }
+[   0.503] TitleChanged { view: ViewId(2), title: Some("webgl WebGL 1.0") }
+[   1.440] TitleChanged { view: ViewId(1), title: Some("webgl 60") }
+[   1.455] TitleChanged { view: ViewId(2), title: Some("webgl 60") }
+[   2.425] TitleChanged { view: ViewId(1), title: Some("webgl 120") }
+[   2.439] TitleChanged { view: ViewId(2), title: Some("webgl 120") }
+[   3.407] TitleChanged { view: ViewId(1), title: Some("webgl 180") }
+[   3.422] TitleChanged { view: ViewId(2), title: Some("webgl 180") }
+[   4.394] TitleChanged { view: ViewId(1), title: Some("webgl 240") }
+[   4.409] TitleChanged { view: ViewId(2), title: Some("webgl 240") }
+[   5.400] TitleChanged { view: ViewId(1), title: Some("webgl 300") }
+[   5.416] TitleChanged { view: ViewId(2), title: Some("webgl 300") }
+[   5.960] action mark
+[   5.960] mark: wakeups 1712 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 811 stale-frames 2 rounded-frames 0 failed-imports 0
+[   5.960] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   5.960] mark: submitted 663 dmabuf-frames 0 dmabuf-imports 0 shm-copies 663 shm-bytes 1289932800 dropped 2 releases 661 present-mean-ms 0.570 present-max-ms 1.133
+[   5.960] mark: ViewId(1) frames 332 pacing n=331 median=16.46ms p95=17.06ms max=19.15ms
+[   5.960] mark: ViewId(2) frames 331 pacing n=330 median=16.46ms p95=17.01ms max=19.14ms
+[   5.960] mark: pss-kib 274724 (wpe-window 36832, WPEWebProcess 209543, xdg-dbus-proxy 1748, WPENetworkProce 24776, bwrap 1825)
+[   6.419] TitleChanged { view: ViewId(1), title: Some("webgl 360") }
+[   6.436] TitleChanged { view: ViewId(2), title: Some("webgl 360") }
+[   6.537] action quit
+[   6.537] end: wakeups 1873 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 882 stale-frames 2 rounded-frames 0 failed-imports 0
+[   6.537] end: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   6.537] end: submitted 731 dmabuf-frames 0 dmabuf-imports 0 shm-copies 731 shm-bytes 1422233600 dropped 2 releases 729 present-mean-ms 0.575 present-max-ms 1.133
+[   6.537] end: ViewId(1) frames 366 pacing n=365 median=16.47ms p95=17.30ms max=23.17ms
+[   6.537] end: ViewId(2) frames 365 pacing n=364 median=16.47ms p95=17.30ms max=23.41ms
+[   6.537] end: pss-kib 274816 (xdg-dbus-proxy 1749, bwrap 1825, WPENetworkProce 24776, wpe-window 36827, WPEWebProcess 209639)
+shut down: the compositor reported no error
+exit 0

@@ -4,11 +4,13 @@
 //! Work that takes time runs off the owner thread (downloads on threads of their own, clipboard
 //! reads as the host's asynchronous pipes) and reports back with its `RequestId` through a
 //! channel that wakes the loop. Downloads report progress as short status lines for the status
-//! strip, as the old browser did: saved as `name`, `name (1)`, ... in the download folder (the
-//! home folder if there is none), a name that never leads out of the folder, and no file left
-//! behind by a failed or cancelled download: at quit, the file of a download still waiting on
-//! its server is deleted by the owner. File pickers and permissions have no implementation yet
-//! and fail closed with `ServiceError::Unsupported`, as does anything else.
+//! strip, as the old browser did: saved as `name`, `name (1)`, ... in the download folder
+//! (`[downloads] directory`, else the desktop's, else `~/Downloads`; made by the download that
+//! first needs it), a name that never leads out of the folder and is never a dot file or hides
+//! characters, and no file left behind by
+//! a failed or cancelled download: at quit, the file of a download still waiting on its server
+//! is deleted by the owner. File pickers and permissions have no implementation yet and fail
+//! closed with `ServiceError::Unsupported`, as does anything else.
 //!
 //! Must not own: the decision whether a service is allowed (the core).
 
@@ -90,13 +92,15 @@ impl Services {
         }
     }
 
-    /// Performs `service` for `request`. `Some` is the answer now; `None` means it comes later,
-    /// through [`Services::clipboard_read`].
+    /// Performs `service` for `request`, a download into `downloads` if the configuration names
+    /// a folder. `Some` is the answer now; `None` means it comes later, through
+    /// [`Services::clipboard_read`].
     pub fn perform(
         &mut self,
         host: &mut Host,
         request: RequestId,
         service: Service,
+        downloads: Option<&Path>,
     ) -> Option<ServiceResult> {
         match service {
             Service::ClipboardRead {
@@ -115,7 +119,11 @@ impl Services {
             Service::Download {
                 source,
                 suggested_name,
-            } => Some(self.download(source, suggested_name)),
+            } => Some(
+                folder(downloads)
+                    .map_err(ServiceError::Failed)
+                    .and_then(|dir| self.download(source, suggested_name, dir)),
+            ),
             Service::OpenExternal { url } => Some(open_external(&url)),
             Service::PickFiles { .. } | Service::Permission(_) => {
                 Some(Err(ServiceError::Unsupported))
@@ -156,8 +164,14 @@ impl Services {
         done
     }
 
-    /// Starts saving `source`: the browser has taken the download over when this returns `Ok`.
-    fn download(&mut self, source: DownloadSource, suggested: Option<String>) -> ServiceResult {
+    /// Starts saving `source` in `dir`: the browser has taken the download over when this
+    /// returns `Ok`.
+    fn download(
+        &mut self,
+        source: DownloadSource,
+        suggested: Option<String>,
+        dir: PathBuf,
+    ) -> ServiceResult {
         let name = match (&source, suggested) {
             (_, Some(name)) => sanitize(&name),
             (DownloadSource::Url(url), None) => filename_from_url(url),
@@ -171,7 +185,7 @@ impl Services {
                 )));
             }
         }
-        self.spawn_download(source, name, folder())
+        self.spawn_download(source, name, dir)
     }
 
     /// Saves `source` as `name` in `dir` on a thread of its own.
@@ -273,16 +287,19 @@ fn open_external(url: &str) -> ServiceResult {
     Ok(ServiceReply::Done)
 }
 
-/// The user's download folder, or their home folder if there is none.
-fn folder() -> PathBuf {
-    dirs::download_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
+/// The download folder: `configured`, else the desktop's, else `~/Downloads`; never the home
+/// folder itself, where a file's name could make it a dot file something else reads.
+fn folder(configured: Option<&Path>) -> Result<PathBuf, String> {
+    configured
+        .map(Path::to_owned)
+        .or_else(dirs::download_dir)
+        .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+        .ok_or_else(|| "there is no download folder: sig doesn't know the home folder".into())
 }
 
-/// Saves `source` into a new file named after `name` in `dir` and returns its path. A failed or
-/// cancelled download leaves no file behind. `partial` holds the file's path while it is
-/// incomplete.
+/// Saves `source` into a new file named after `name` in `dir`, which is made if it doesn't
+/// exist, and returns its path. A failed or cancelled download leaves no file behind. `partial`
+/// holds the file's path while it is incomplete.
 fn save(
     source: DownloadSource,
     dir: &Path,
@@ -310,6 +327,7 @@ fn save(
             (Box::new(response), total)
         }
     };
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
     let (path, file) = create_unique(dir, name).map_err(|e| e.to_string())?;
     *partial.lock().unwrap_or_else(PoisonError::into_inner) = Some(path.clone());
     let total = total.map(format_bytes);
@@ -348,13 +366,30 @@ fn save(
     }
 }
 
-/// A file name from untrusted text: its last path component, or `"download"`.
+/// A file name from untrusted text: its last path component, without control or invisible
+/// formatting characters (Unicode's format characters: bidi controls, zero-width ones) and
+/// without dots or whitespace at either end, so it is never hidden or a dot file; or
+/// `"download"`. As Firefox and Chromium clean the names they save.
 fn sanitize(name: &str) -> String {
-    let name: String = name.chars().filter(|c| !c.is_control()).collect();
-    match name.rsplit(['/', '\\']).next().map(str::trim) {
-        Some(name) if !matches!(name, "" | "." | "..") => name.chars().take(200).collect(),
-        _ => "download".to_string(),
+    let name: String = name
+        .chars()
+        .filter(|&c| !c.is_control() && !is_format(c))
+        .collect();
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    match last.trim_matches(|c: char| c == '.' || c.is_whitespace()) {
+        "" => "download".to_string(),
+        name => name.chars().take(200).collect(),
     }
+}
+
+/// Whether `c` is a Unicode format character (general category Cf, Unicode 16).
+fn is_format(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}' | '\u{890}'
+        | '\u{891}' | '\u{8e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}'
+        | '\u{110bd}' | '\u{110cd}' | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}' | '\u{e0001}' | '\u{e0020}'..='\u{e007f}')
 }
 
 /// A reasonable filename from a URL, falling back to `"download"`. The name never leads out of
@@ -447,6 +482,32 @@ mod tests {
         assert_eq!(filename_from_url("https://example.com/x%2F.."), "download");
         assert_eq!(sanitize("../../etc/passwd"), "passwd");
         assert_eq!(sanitize("a\nb.txt"), "ab.txt");
+    }
+
+    #[test]
+    fn names_are_never_dot_files_or_hide_characters() {
+        let cases = [
+            (".zshenv", "zshenv"),
+            ("a/../.profile", "profile"),
+            ("/home/me/.ssh/authorized_keys", "authorized_keys"),
+            ("..", "download"),
+            (" . ", "download"),
+            ("name.", "name"),
+            ("  report.pdf  ", "report.pdf"),
+            // A right-to-left override would show "invoice_exe.pdf" for this name.
+            ("invoice_\u{202e}fdp.exe", "invoice_fdp.exe"),
+            ("a\u{200b}b\u{feff}c\u{2066}d.txt", "abcd.txt"),
+            ("\u{e0041}tag.txt", "tag.txt"),
+            ("räksmörgås.txt", "räksmörgås.txt"),
+        ];
+        for (name, saved) in cases {
+            assert_eq!(sanitize(name), saved, "{name:?}");
+        }
+        assert_eq!(filename_from_url("https://a.test/..%2F.zshenv"), "zshenv");
+        assert_eq!(
+            filename_from_url("https://a.test/%E2%80%AEfdp.exe"),
+            "fdp.exe"
+        );
     }
 
     #[test]
@@ -558,6 +619,47 @@ mod tests {
         );
         assert!(last.starts_with("Download of b.zip failed"), "{last}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn downloads_go_to_the_configured_folder_made_when_first_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("Hämtade filer").join("sig");
+        assert_eq!(folder(Some(&configured)), Ok(configured.clone()));
+        // Never the home folder itself.
+        let desktops = dirs::download_dir().or_else(|| Some(dirs::home_dir()?.join("Downloads")));
+        assert_eq!(folder(None).ok(), desktops);
+        assert_ne!(folder(None).ok(), dirs::home_dir());
+        assert!(!configured.exists());
+        let last = finish(
+            DownloadSource::Data(b"hej".to_vec()),
+            &folder(Some(&configured)).unwrap(),
+            "a.txt",
+        );
+        let saved = configured.join("a.txt");
+        assert_eq!(last, format!("Saved {}", saved.display()));
+        assert_eq!(std::fs::read_to_string(saved).unwrap(), "hej");
+    }
+
+    #[test]
+    fn a_folder_that_cant_be_made_fails_the_download_and_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a file");
+        std::fs::write(&file, "").unwrap();
+        let last = finish(
+            DownloadSource::Data(b"hej".to_vec()),
+            &file.join("sub"),
+            "a.txt",
+        );
+        assert!(
+            last.starts_with(&format!(
+                "Download of a.txt failed: cannot make {}",
+                file.join("sub").display()
+            )),
+            "{last}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&file).unwrap(), b"");
     }
 
     #[test]

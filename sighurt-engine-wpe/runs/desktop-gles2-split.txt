@@ -1,0 +1,48 @@
+[   0.025] window 1024x768 at 120/120
+[   0.029] ViewReady { view: ViewId(1) }
+[   0.029] LoadingChanged { view: ViewId(1), loading: true }
+[   0.029] ViewReady { view: ViewId(2) }
+[   0.029] LoadingChanged { view: ViewId(2), loading: true }
+[   0.178] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 14:05:11.176: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.365] NavigationStarted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html" }
+[   0.366] NavigationCommitted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.366] HistoryChanged { view: ViewId(2), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html"], current: 0 }
+
+** (WPEWebProcess:2): WARNING **: 14:05:11.181: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.370] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html" }
+[   0.371] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html", document: DocumentGeneration(2), history: Some(Push) }
+[   0.371] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html"], current: 0 }
+[   0.504] LoadingChanged { view: ViewId(1), loading: false }
+[   0.505] TitleChanged { view: ViewId(1), title: Some("webgl WebGL 1.0") }
+[   0.512] LoadingChanged { view: ViewId(2), loading: false }
+[   0.513] TitleChanged { view: ViewId(2), title: Some("webgl WebGL 1.0") }
+[   1.454] TitleChanged { view: ViewId(1), title: Some("webgl 60") }
+[   1.454] TitleChanged { view: ViewId(2), title: Some("webgl 60") }
+[   2.432] TitleChanged { view: ViewId(1), title: Some("webgl 120") }
+[   2.432] TitleChanged { view: ViewId(2), title: Some("webgl 120") }
+[   3.417] TitleChanged { view: ViewId(2), title: Some("webgl 180") }
+[   3.417] TitleChanged { view: ViewId(1), title: Some("webgl 180") }
+[   4.410] TitleChanged { view: ViewId(1), title: Some("webgl 240") }
+[   4.410] TitleChanged { view: ViewId(2), title: Some("webgl 240") }
+[   5.414] TitleChanged { view: ViewId(1), title: Some("webgl 300") }
+[   5.414] TitleChanged { view: ViewId(2), title: Some("webgl 300") }
+[   5.932] action mark
+[   5.932] mark: wakeups 1437 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 985 stale-frames 2 rounded-frames 0 failed-imports 0
+[   5.932] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[   5.932] mark: submitted 658 dmabuf-frames 658 dmabuf-imports 6 shm-copies 0 shm-bytes 0 dropped 2 releases 656 present-mean-ms 0.031 present-max-ms 0.179
+[   5.932] mark: ViewId(1) frames 329 pacing n=328 median=16.46ms p95=16.91ms max=19.23ms
+[   5.932] mark: ViewId(2) frames 329 pacing n=328 median=16.46ms p95=16.91ms max=19.23ms
+[   5.932] mark: pss-kib 260514 (wpe-window 30673, WPEWebProcess 201639, xdg-dbus-proxy 1750, bwrap 1837, WPENetworkProce 24615)
+[   6.433] TitleChanged { view: ViewId(2), title: Some("webgl 360") }
+[   6.433] TitleChanged { view: ViewId(1), title: Some("webgl 360") }
+[   6.501] action quit
+[   6.501] end: wakeups 1617 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 1104 stale-frames 2 rounded-frames 0 failed-imports 0
+[   6.501] end: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[   6.501] end: submitted 726 dmabuf-frames 726 dmabuf-imports 6 shm-copies 0 shm-bytes 0 dropped 2 releases 724 present-mean-ms 0.033 present-max-ms 0.183
+[   6.501] end: ViewId(1) frames 363 pacing n=362 median=16.49ms p95=17.09ms max=26.10ms
+[   6.501] end: ViewId(2) frames 363 pacing n=362 median=16.49ms p95=17.10ms max=26.15ms
+[   6.501] end: pss-kib 260652 (WPEWebProcess 201764, bwrap 1837, WPENetworkProce 24615, wpe-window 30685, xdg-dbus-proxy 1751)
+shut down: the compositor reported no error
+exit 0

@@ -9,6 +9,9 @@
 //! order. [`Coalescing`] is that queue, and the runtime's queue of events too: a page that
 //! floods Servo with them costs constant time per item.
 //!
+//! A navigation the page asks for is held as a [`PageNavigation`], which denies it when dropped
+//! unanswered (Servo's own `NavigationRequest` allows it), so it goes ahead only if allowed.
+//!
 //! Requests the API has no answer for are dropped on arrival, which resolves them closed, as
 //! decision 16 deferred them: `<select>` menus keep their selection, colour pickers their
 //! colour, `alert` is acknowledged, `confirm` and `prompt` are cancelled, context menus are
@@ -23,6 +26,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::mem::Discriminant;
+use std::time::Instant;
 
 use servo::{
     ClipboardDelegate, CreateNewWebViewRequest, Cursor, EmbedderControl, EmbedderControlId,
@@ -47,7 +51,7 @@ pub(crate) enum Note {
     /// The page called `window.close()`.
     Closed,
     /// The page asks to navigate (a link, a form, a script) in its frame or a subframe.
-    Navigation(NavigationRequest),
+    Navigation(PageNavigation),
     /// The page opens a new browsing context (`target=_blank`, `window.open`).
     CreateNew(CreateNewWebViewRequest),
     Permission(PermissionRequest),
@@ -158,7 +162,11 @@ impl WebViewDelegate for Delegate {
     }
 
     fn request_navigation(&self, webview: WebView, request: NavigationRequest) {
-        self.note(&webview, Note::Navigation(request));
+        let navigation = PageNavigation {
+            request: Some(request),
+            since: Instant::now(),
+        };
+        self.note(&webview, Note::Navigation(navigation));
     }
 
     fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
@@ -198,6 +206,37 @@ impl ClipboardDelegate for Delegate {
 
     fn set_text(&self, webview: WebView, text: String) {
         self.note(&webview, Note::ClipboardWrite(Some(text)));
+    }
+}
+
+/// A navigation a page asks for, until it is answered. Dropped unanswered (with its note, its
+/// view, its document or the runtime), it is denied: Servo would allow it.
+pub(crate) struct PageNavigation {
+    /// `None` once answered.
+    request: Option<NavigationRequest>,
+    /// When Servo asked.
+    pub since: Instant,
+}
+
+impl PageNavigation {
+    /// Where it goes.
+    pub fn url(&self) -> &Url {
+        &self.request.as_ref().expect("unanswered").url
+    }
+
+    /// Lets it go ahead.
+    pub fn allow(mut self) {
+        if let Some(request) = self.request.take() {
+            request.allow();
+        }
+    }
+}
+
+impl Drop for PageNavigation {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            request.deny();
+        }
     }
 }
 

@@ -1,227 +1,46 @@
-//! Key bindings: the keystrokes of the user's `[keys]` configuration, matched against the key
-//! events the host normalized (`sighurt_api::input::KeyEvent`).
+//! Keys: the `bindings` keymap, which reads the user's `[keys]` configuration, and the core's
+//! record of the presses taken, which holds whatever keymap is in use.
 //!
 //! Bindings come only from the configuration: there are none by default and no key handlers in
 //! code. `[keys]` applies everywhere, `[keys.page]` while the page has focus and
-//! `[keys.location]` while the address bar has; a binding of the focused part wins over a
-//! global one.
+//! `[keys.location]` while the chrome (the address bar) has; a binding of the focused part wins
+//! over a global one. Keystrokes are `sighurt_api::keymap::Chord`s, matched as that type says:
+//! by the layout's meaning unless they name a physical key, and AltGr never Ctrl+Alt. While the
+//! user types, in the address bar or a page's text field, a binding that would type a character
+//! (no modifier but Shift) lets the key type.
 //!
-//! A binding matches the key's meaning in the current layout (`KeyEvent::key`) unless it names a
-//! physical key (`code:KeyQ`). Modifiers the layout used to produce a character don't count, so
-//! AltGr + 2 is "@" on a Swedish layout and never a Ctrl+Alt shortcut, and `ctrl-+` is Ctrl and
-//! whatever key types "+". For letters, shift counts: `ctrl-shift-t` (or `ctrl-T`) is Ctrl+Shift+T
-//! whether or not Caps Lock is on. While the user types, in the address bar or a page's text
-//! field, a binding that would type a character (no modifier but Shift) lets the key type.
+//! [`KeyState`] keeps the guarantees of `sighurt_api::keymap` for any keymap: a press taken
+//! also takes its release and its auto-repeats, so the page or the address bar never sees half a
+//! keystroke; only a fresh press asks the keymap, so a key held down before a modifier joined it
+//! keeps repeating where its press went.
 //!
-//! A press the browser consumes also consumes its release and its auto-repeats, so the page or
-//! the address bar never sees half a keystroke. Only a fresh press starts a binding: a key held
-//! down before a modifier joined it keeps repeating where its press went.
+//! Must not own: what a command does ([`crate::commands`]) or where the keyboard is
+//! ([`crate::state`]).
 
 use std::collections::HashSet;
 use std::fmt;
-use std::str::FromStr;
 
-use sighurt_api::commands::Command;
+use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::SeatId;
-use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, Modifiers};
+use sighurt_api::input::{ButtonState, KeyCode, KeyEvent, KeyboardFocus};
+use sighurt_api::keymap::{Chord, KeyAction, KeyContext, Keymap, KeymapKind};
+use sighurt_api::settings::{Table, Value};
 
-use crate::state::Focus;
+/// The `bindings` keymap: the default, which every build has.
+pub const KIND: KeymapKind = KeymapKind {
+    name: "bindings",
+    check,
+    new,
+};
 
-/// One keystroke: modifiers and a key, such as `ctrl-shift-t`, `alt-left` or `ctrl-code:KeyQ`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Chord {
-    mods: Mods,
-    key: ChordKey,
+fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
+    let mut problems = Vec::new();
+    Bindings::from_table(table, commands, &mut problems);
+    problems
 }
 
-/// The modifiers a binding cares about. Caps Lock and Num Lock never matter.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-struct Mods {
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    logo: bool,
-    alt_graph: bool,
-}
-
-impl Mods {
-    fn held(held: Modifiers, consumed: Modifiers) -> Self {
-        Self {
-            ctrl: held.control && !consumed.control,
-            alt: held.alt && !consumed.alt,
-            shift: held.shift && !consumed.shift,
-            logo: held.logo && !consumed.logo,
-            alt_graph: held.alt_graph && !consumed.alt_graph,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum ChordKey {
-    /// What the key types. A letter is kept in lower case; whether it was upper case is Shift.
-    Character(String),
-    /// A key that types nothing, by its W3C key name ("Enter", "ArrowLeft", "F5").
-    Named(String),
-    /// A physical key, wherever the layout puts its meaning.
-    Code(KeyCode),
-}
-
-/// Key names accepted in lower case, and the W3C key names they stand for.
-const KEY_NAMES: [(&str, &str); 16] = [
-    ("enter", "Enter"),
-    ("escape", "Escape"),
-    ("esc", "Escape"),
-    ("tab", "Tab"),
-    ("backspace", "Backspace"),
-    ("delete", "Delete"),
-    ("insert", "Insert"),
-    ("home", "Home"),
-    ("end", "End"),
-    ("pageup", "PageUp"),
-    ("pagedown", "PageDown"),
-    ("left", "ArrowLeft"),
-    ("right", "ArrowRight"),
-    ("up", "ArrowUp"),
-    ("down", "ArrowDown"),
-    ("menu", "ContextMenu"),
-];
-
-/// The lower-case form of `text` if it is one letter that has upper and lower case.
-fn letter(text: &str) -> Option<String> {
-    let mut chars = text.chars();
-    let c = chars.next()?;
-    let cased = chars.next().is_none() && c.to_lowercase().ne(c.to_uppercase());
-    cased.then(|| c.to_lowercase().collect())
-}
-
-impl Chord {
-    /// Whether `event` is this keystroke.
-    pub fn matches(&self, event: &KeyEvent) -> bool {
-        let all = Mods::held(event.modifiers, Modifiers::default());
-        match &self.key {
-            ChordKey::Code(code) => event.code == *code && self.mods == all,
-            ChordKey::Named(name) => {
-                matches!(&event.key, Key::Named(key) if key == name) && self.mods == all
-            }
-            ChordKey::Character(character) => {
-                let Key::Character(typed) = &event.key else {
-                    return false;
-                };
-                let mut mods = Mods::held(event.modifiers, event.consumed);
-                match letter(typed) {
-                    Some(lower) => {
-                        mods.shift = event.modifiers.shift;
-                        lower == *character && self.mods == mods
-                    }
-                    None => typed == character && self.mods == mods,
-                }
-            }
-        }
-    }
-
-    /// Whether the keystroke would type a character, so it must not fire while the user types.
-    fn types(&self) -> bool {
-        let Mods {
-            ctrl,
-            alt,
-            logo,
-            alt_graph,
-            ..
-        } = self.mods;
-        matches!(self.key, ChordKey::Character(_)) && !(ctrl || alt || logo || alt_graph)
-    }
-}
-
-impl FromStr for Chord {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, String> {
-        if text.trim().contains(char::is_whitespace) {
-            return Err("key sequences such as \"g g\" are not supported".into());
-        }
-        // The key comes after the last "-", and "-" is a key too: "ctrl--", "-".
-        let (modifiers, key) = match text.strip_suffix("--") {
-            Some(modifiers) => (modifiers, "-"),
-            None if text == "-" => ("", "-"),
-            None => text.rsplit_once('-').unwrap_or(("", text)),
-        };
-        let mut mods = Mods::default();
-        for modifier in modifiers.split('-').filter(|_| !modifiers.is_empty()) {
-            let held = match modifier {
-                // `secondary` is how configurations for the GPUI-based sig said ctrl.
-                "ctrl" | "secondary" => &mut mods.ctrl,
-                "alt" => &mut mods.alt,
-                "shift" => &mut mods.shift,
-                "super" => &mut mods.logo,
-                "altgr" => &mut mods.alt_graph,
-                other => {
-                    return Err(format!(
-                        "unknown modifier {other:?} (use ctrl, alt, shift, super or altgr)"
-                    ))
-                }
-            };
-            *held = true;
-        }
-        let key = if let Some(code) = key.strip_prefix("code:") {
-            let code = (0..=255)
-                .map(KeyCode)
-                .find(|candidate| candidate.w3c_code() == Some(code))
-                .ok_or_else(|| format!("unknown key code {code:?}"))?;
-            ChordKey::Code(code)
-        } else if let Some(lower) = letter(key) {
-            mods.shift |= key != lower;
-            ChordKey::Character(lower)
-        } else if key.chars().count() == 1 && !key.starts_with(char::is_control) {
-            ChordKey::Character(key.to_owned())
-        } else if key == "space" {
-            ChordKey::Character(" ".into())
-        } else if let Some((_, name)) = KEY_NAMES.iter().find(|(alias, _)| *alias == key) {
-            ChordKey::Named((*name).into())
-        } else if let Some(n) = key.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
-            match n {
-                1..=24 => ChordKey::Named(format!("F{n}")),
-                _ => return Err(format!("there is no key {key:?}")),
-            }
-        } else if key.starts_with(|c: char| c.is_ascii_uppercase())
-            && key.len() > 1
-            && key.chars().all(|c| c.is_ascii_alphanumeric())
-        {
-            // A W3C key name as it is, such as "BrowserBack" or "AudioVolumeUp".
-            ChordKey::Named(key.into())
-        } else if key.is_empty() {
-            return Err("the keystroke names no key".into());
-        } else {
-            return Err(format!("unknown key {key:?}"));
-        };
-        Ok(Self { mods, key })
-    }
-}
-
-impl fmt::Display for Chord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Mods {
-            ctrl,
-            alt,
-            shift,
-            logo,
-            alt_graph,
-        } = self.mods;
-        let names = [
-            (ctrl, "ctrl-"),
-            (alt, "alt-"),
-            (shift, "shift-"),
-            (logo, "super-"),
-            (alt_graph, "altgr-"),
-        ];
-        for (_, name) in names.iter().filter(|(held, _)| *held) {
-            f.write_str(name)?;
-        }
-        match &self.key {
-            ChordKey::Character(c) if c == " " => f.write_str("space"),
-            ChordKey::Character(c) | ChordKey::Named(c) => f.write_str(c),
-            ChordKey::Code(code) => write!(f, "code:{}", code.w3c_code().unwrap_or_default()),
-        }
-    }
+fn new() -> Box<dyn Keymap> {
+    Box::new(Bindings::default())
 }
 
 /// The configured bindings, per input context.
@@ -241,15 +60,25 @@ struct Binding {
 }
 
 impl Bindings {
-    /// Reads the `[keys]` table, adding what is wrong with it to `problems`.
-    pub(crate) fn from_table(keys: &toml::Table, problems: &mut Vec<String>) -> Self {
+    /// Reads the `[keys]` table, with its commands parsed by `commands`, adding what is wrong
+    /// with it to `problems`.
+    pub(crate) fn from_table(
+        keys: &Table,
+        commands: &CommandSet<'_>,
+        problems: &mut Vec<String>,
+    ) -> Self {
         let mut bindings = Self::default();
         for (key, value) in keys {
             match value {
-                toml::Value::String(command) => {
-                    add(&mut bindings.global, "[keys]", key, command, problems)
-                }
-                toml::Value::Table(table) => {
+                Value::String(command) => add(
+                    &mut bindings.global,
+                    "[keys]",
+                    key,
+                    command,
+                    commands,
+                    problems,
+                ),
+                Value::Table(table) => {
                     let (list, section) = match key.as_str() {
                         "page" => (&mut bindings.page, "[keys.page]"),
                         "location" => (&mut bindings.location, "[keys.location]"),
@@ -262,7 +91,7 @@ impl Bindings {
                     };
                     for (key, value) in table {
                         match value.as_str() {
-                            Some(command) => add(list, section, key, command, problems),
+                            Some(command) => add(list, section, key, command, commands, problems),
                             None => problems
                                 .push(format!("{section} {key:?}: expected a command in quotes")),
                         }
@@ -279,10 +108,10 @@ impl Bindings {
 
     /// The command bound to `event` while `focus` has the keyboard. `typing` says the focused
     /// part is a text field, where keystrokes that type characters are left to it.
-    pub fn find(&self, focus: Focus, typing: bool, event: &KeyEvent) -> Option<&Command> {
+    pub fn find(&self, focus: KeyboardFocus, typing: bool, event: &KeyEvent) -> Option<&Command> {
         let context = match focus {
-            Focus::Page => &self.page,
-            Focus::Location => &self.location,
+            KeyboardFocus::Page => &self.page,
+            KeyboardFocus::Chrome => &self.location,
         };
         context
             .iter()
@@ -292,19 +121,34 @@ impl Bindings {
     }
 }
 
+impl Keymap for Bindings {
+    fn configure(&mut self, settings: &Table) {
+        // `check` accepted the table, so reading it finds nothing wrong.
+        *self = Bindings::from_table(settings, &CommandSet::ANY, &mut Vec::new());
+    }
+
+    fn press(&mut self, key: &KeyEvent, context: KeyContext) -> KeyAction {
+        match self.find(context.focus, context.typing, key) {
+            Some(command) => KeyAction::Run(command.clone()),
+            None => KeyAction::Pass,
+        }
+    }
+}
+
 /// Parses one binding into `list`, or says what is wrong with it.
 fn add(
     list: &mut Vec<Binding>,
     section: &str,
     text: &str,
     command: &str,
+    commands: &CommandSet<'_>,
     problems: &mut Vec<String>,
 ) {
     let chord = match text.parse::<Chord>() {
         Ok(chord) => chord,
         Err(error) => return problems.push(format!("{section} {text:?}: {error}")),
     };
-    let command = match command.parse::<Command>() {
+    let command = match commands.parse(command) {
         Ok(command) => command,
         Err(error) => return problems.push(format!("{section} {text:?} = {command:?}: {error}")),
     };
@@ -324,67 +168,129 @@ fn add(
 /// What to do with one key event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum KeyOutcome {
-    /// It is bound: run the command. The key goes nowhere else.
+    /// Run the command. The key goes nowhere else.
     Run(Command),
-    /// The release or auto-repeat of a press the browser consumed: drop it.
+    /// Run the command, then deliver the key to whatever has focus after it.
+    RunThenDeliver(Command),
+    /// A press the keymap took, or the release or auto-repeat of one: drop it.
     Consumed,
     /// Not the browser's: deliver it to whatever has focus.
     Deliver,
 }
 
-/// The presses the browser consumed and whose releases it still owes nobody, per seat.
-#[derive(Debug, Default)]
+/// The keymap in use, and the presses taken whose releases the core owes nobody, per seat.
 pub(crate) struct KeyState {
-    consumed: HashSet<(SeatId, KeyCode)>,
+    kind: KeymapKind,
+    keymap: Box<dyn Keymap>,
+    /// The context the keymap was last told of.
+    context: Option<KeyContext>,
+    taken: HashSet<(SeatId, KeyCode)>,
+}
+
+impl fmt::Debug for KeyState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyState")
+            .field("keymap", &self.kind)
+            .field("context", &self.context)
+            .field("taken", &self.taken)
+            .finish()
+    }
 }
 
 impl KeyState {
-    /// Decides what happens to `event`, a key event from `seat`.
+    /// A new keymap of `kind`, configured with `settings`.
+    pub(crate) fn new(kind: KeymapKind, settings: &Table) -> Self {
+        let mut keymap = (kind.new)();
+        keymap.configure(settings);
+        Self {
+            kind,
+            keymap,
+            context: None,
+            taken: HashSet::new(),
+        }
+    }
+
+    /// Applies a reloaded configuration: a keymap of the same kind is configured again and
+    /// keeps its state; another kind replaces it. Taken presses stay taken either way.
+    pub(crate) fn configure(&mut self, kind: KeymapKind, settings: &Table) {
+        if kind != self.kind {
+            self.kind = kind;
+            self.keymap = (kind.new)();
+            self.context = None;
+        }
+        self.keymap.configure(settings);
+    }
+
+    /// Decides what happens to `event`, a key event from `seat` in `context`.
     pub(crate) fn handle(
         &mut self,
-        bindings: &Bindings,
-        focus: Focus,
-        typing: bool,
+        context: KeyContext,
         seat: SeatId,
         event: &KeyEvent,
     ) -> KeyOutcome {
         let key = (seat, event.code);
         match event.state {
-            ButtonState::Released if self.consumed.remove(&key) => KeyOutcome::Consumed,
+            ButtonState::Released if self.taken.remove(&key) => KeyOutcome::Consumed,
             ButtonState::Released => KeyOutcome::Deliver,
-            // Held since before it matched a binding (R held, then Ctrl): only a fresh press
-            // starts one, so its repeats and release go where its press went.
-            ButtonState::Pressed if event.repeat && !self.consumed.contains(&key) => {
+            // Passed, or held since before (R held, then Ctrl): only a fresh press asks the
+            // keymap, so its repeats and release go where its press went.
+            ButtonState::Pressed if event.repeat && !self.taken.contains(&key) => {
                 KeyOutcome::Deliver
             }
-            ButtonState::Pressed => match bindings.find(focus, typing, event) {
-                Some(command) => {
-                    self.consumed.insert(key);
-                    KeyOutcome::Run(command.clone())
+            // A repeat of a press the keymap took may run again, but never passes.
+            ButtonState::Pressed if event.repeat => match self.keymap.press(event, context) {
+                KeyAction::Run(command) | KeyAction::RunThenPass(command) => {
+                    KeyOutcome::Run(command)
                 }
-                // Held down after its binding stopped matching (a modifier was let go).
-                None if event.repeat && self.consumed.contains(&key) => KeyOutcome::Consumed,
-                None => {
-                    self.consumed.remove(&key);
+                KeyAction::Pass | KeyAction::Take => KeyOutcome::Consumed,
+            },
+            ButtonState::Pressed => match self.keymap.press(event, context) {
+                KeyAction::Pass => {
+                    self.taken.remove(&key);
                     KeyOutcome::Deliver
+                }
+                KeyAction::Take => {
+                    self.taken.insert(key);
+                    KeyOutcome::Consumed
+                }
+                KeyAction::Run(command) => {
+                    self.taken.insert(key);
+                    KeyOutcome::Run(command)
+                }
+                KeyAction::RunThenPass(command) => {
+                    self.taken.remove(&key);
+                    KeyOutcome::RunThenDeliver(command)
                 }
             },
         }
     }
 
-    /// The window lost the keyboard: no releases will come for what is held.
+    /// Tells the keymap the context, if it changed since it was last told.
+    pub(crate) fn set_context(&mut self, context: KeyContext) {
+        if self.context != Some(context) {
+            self.context = Some(context);
+            self.keymap.context(context);
+        }
+    }
+
+    /// The window lost the keyboard: no releases will come for what is held, and the keymap
+    /// drops what it waits for.
     pub(crate) fn forget(&mut self, seat: SeatId) {
-        self.consumed.retain(|(held, _)| *held != seat);
+        self.taken.retain(|(held, _)| *held != seat);
+        self.keymap.reset();
+    }
+
+    /// What the keymap says about itself, for the chrome.
+    pub(crate) fn indicator(&self) -> Option<&str> {
+        self.keymap.indicator()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use sighurt_api::input::{Key, Modifiers};
 
-    fn chord(text: &str) -> Chord {
-        text.parse().unwrap_or_else(|e| panic!("{text:?}: {e}"))
-    }
+    use super::*;
 
     const NONE: Modifiers = Modifiers {
         shift: false,
@@ -397,19 +303,6 @@ mod tests {
     };
     const CTRL: Modifiers = Modifiers {
         control: true,
-        ..NONE
-    };
-    const SHIFT: Modifiers = Modifiers {
-        shift: true,
-        ..NONE
-    };
-    const CTRL_SHIFT: Modifiers = Modifiers {
-        control: true,
-        shift: true,
-        ..NONE
-    };
-    const ALT_GR: Modifiers = Modifiers {
-        alt_graph: true,
         ..NONE
     };
 
@@ -430,127 +323,32 @@ mod tests {
         Key::Character(text.into())
     }
 
-    fn named(name: &str) -> Key {
-        Key::Named(name.into())
-    }
-
-    const KEY_T: u32 = 20;
-    const KEY_2: u32 = 3;
-    const KEY_TAB: u32 = 15;
-    const KEY_EQUAL: u32 = 13;
-    const KEY_MINUS: u32 = 12;
     const KEY_Q: u32 = 16;
     const KEY_R: u32 = 19;
     const KEY_A: u32 = 30;
-    const KEY_LEFT: u32 = 105;
 
-    #[test]
-    fn parses_keystrokes() {
-        assert_eq!(chord("ctrl-t").to_string(), "ctrl-t");
-        assert_eq!(chord("ctrl-T"), chord("ctrl-shift-t"));
-        assert_eq!(chord("secondary-t"), chord("ctrl-t"));
-        assert_eq!(chord("ctrl--").to_string(), "ctrl--");
-        assert_eq!(chord("-").to_string(), "-");
-        assert_eq!(chord("alt-left").to_string(), "alt-ArrowLeft");
-        assert_eq!(chord("f5"), chord("F5"));
-        assert_eq!(chord("space").to_string(), "space");
-        assert_eq!(chord("ctrl-code:KeyQ").to_string(), "ctrl-code:KeyQ");
-        assert_eq!(chord("BrowserBack").to_string(), "BrowserBack");
-        assert_eq!(chord("altgr-Å").to_string(), "shift-altgr-å");
-    }
-
-    #[test]
-    fn rejects_bad_keystrokes() {
-        for (text, error) in [
-            ("g g", "sequences"),
-            ("ctrl-", "no key"),
-            ("hyper-t", "unknown modifier"),
-            ("ctrl--t", "unknown modifier"),
-            ("ctrl-code:KeyZZ", "unknown key code"),
-            ("f25", "no key"),
-            ("ctrl-pgup", "unknown key"),
-        ] {
-            let result = text.parse::<Chord>();
-            assert!(
-                result.as_ref().is_err_and(|e| e.contains(error)),
-                "{text:?}: {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn letters_match_with_their_shift_state() {
-        let ctrl_t = press(KEY_T, character("t"), CTRL, NONE);
-        let ctrl_shift_t = press(KEY_T, character("T"), CTRL_SHIFT, SHIFT);
-        // Caps Lock makes the key "T" without Shift.
-        let caps = Modifiers {
-            caps_lock: true,
-            ..CTRL
-        };
-        let ctrl_t_caps = press(KEY_T, character("T"), caps, NONE);
-        assert!(chord("ctrl-t").matches(&ctrl_t));
-        assert!(chord("ctrl-t").matches(&ctrl_t_caps));
-        assert!(!chord("ctrl-t").matches(&ctrl_shift_t));
-        assert!(chord("ctrl-shift-t").matches(&ctrl_shift_t));
-        assert!(chord("ctrl-T").matches(&ctrl_shift_t));
-        assert!(!chord("ctrl-shift-t").matches(&ctrl_t));
-    }
-
-    #[test]
-    fn characters_match_what_the_layout_types() {
-        // US: Shift + = types "+", with Shift consumed.
-        let us_plus = press(KEY_EQUAL, character("+"), CTRL_SHIFT, SHIFT);
-        // Swedish: + has a key of its own, left of the backspace key.
-        let se_plus = press(KEY_MINUS, character("+"), CTRL, NONE);
-        for event in [&us_plus, &se_plus] {
-            assert!(chord("ctrl-+").matches(event));
-            assert!(!chord("ctrl-=").matches(event));
-        }
-        // The physical key is the = key on US layouts whatever it types.
-        assert!(chord("ctrl-shift-code:Equal").matches(&us_plus));
-        assert!(!chord("ctrl-code:Equal").matches(&us_plus));
-        assert!(!chord("ctrl-shift-code:Equal").matches(&se_plus));
-    }
-
-    #[test]
-    fn altgr_is_never_ctrl_alt() {
-        // Swedish AltGr + 2 types "@".
-        let at = press(KEY_2, character("@"), ALT_GR, ALT_GR);
-        assert!(!chord("ctrl-alt-2").matches(&at));
-        assert!(!chord("ctrl-alt-@").matches(&at));
-        assert!(!chord("altgr-2").matches(&at));
-        assert!(chord("@").matches(&at));
-        // Ctrl + Alt + 2, where the layout types nothing else, is Ctrl + Alt.
-        let ctrl_alt = Modifiers { alt: true, ..CTRL };
-        assert!(chord("ctrl-alt-2").matches(&press(KEY_2, character("2"), ctrl_alt, NONE)));
-        // AltGr on a key that types nothing must be asked for.
-        let left = press(KEY_LEFT, named("ArrowLeft"), ALT_GR, NONE);
-        assert!(!chord("left").matches(&left));
-        assert!(chord("altgr-left").matches(&left));
-    }
-
-    #[test]
-    fn named_keys_keep_their_modifiers() {
-        // xkb consumes Shift on Tab (it becomes ISO_Left_Tab), but Shift+Tab is still shifted.
-        let shift_tab = press(KEY_TAB, named("Tab"), CTRL_SHIFT, SHIFT);
-        assert!(chord("ctrl-shift-tab").matches(&shift_tab));
-        assert!(!chord("ctrl-tab").matches(&shift_tab));
-        assert!(chord("ctrl-tab").matches(&press(KEY_TAB, named("Tab"), CTRL, NONE)));
-    }
-
-    #[test]
-    fn physical_keys_ignore_the_layout() {
-        // On a Dvorak layout the key where Q is on QWERTY types "'".
-        let event = press(KEY_Q, character("'"), CTRL, NONE);
-        assert!(chord("ctrl-code:KeyQ").matches(&event));
-        assert!(!chord("ctrl-q").matches(&event));
+    /// `[keys]` written as `text`, as settings.
+    fn table(text: &str) -> Table {
+        let mut problems = Vec::new();
+        let table = crate::config::settings(text.parse().unwrap(), "[keys]", &mut problems);
+        assert_eq!(problems, Vec::<String>::new());
+        table
     }
 
     fn bindings(text: &str) -> Result<Bindings, Vec<String>> {
         let mut problems = Vec::new();
-        let bindings = Bindings::from_table(&text.parse().unwrap(), &mut problems);
+        let commands = CommandSet::new("standard", &[]);
+        let bindings = Bindings::from_table(&table(text), &commands, &mut problems);
         problems.is_empty().then_some(bindings).ok_or(problems)
     }
+
+    /// The `bindings` keymap with `[keys]` written as `text`.
+    fn keys(text: &str) -> KeyState {
+        assert!(bindings(text).is_ok());
+        KeyState::new(KIND, &table(text))
+    }
+
+    const PAGE: KeyContext = KeyContext::new(KeyboardFocus::Page, false);
 
     #[test]
     fn context_bindings_win_and_typing_keeps_characters() {
@@ -567,20 +365,20 @@ mod tests {
         .unwrap();
         let ctrl_l = press(38, character("l"), CTRL, NONE);
         assert_eq!(
-            bindings.find(Focus::Page, false, &ctrl_l),
+            bindings.find(KeyboardFocus::Page, false, &ctrl_l),
             Some(&Command::PageReload)
         );
         assert_eq!(
-            bindings.find(Focus::Location, true, &ctrl_l),
+            bindings.find(KeyboardFocus::Chrome, true, &ctrl_l),
             Some(&Command::LocationFocus)
         );
         let j = press(36, character("j"), NONE, NONE);
         assert_eq!(
-            bindings.find(Focus::Page, false, &j),
+            bindings.find(KeyboardFocus::Page, false, &j),
             Some(&Command::TabNext)
         );
-        assert_eq!(bindings.find(Focus::Page, true, &j), None);
-        assert_eq!(bindings.find(Focus::Location, true, &j), None);
+        assert_eq!(bindings.find(KeyboardFocus::Page, true, &j), None);
+        assert_eq!(bindings.find(KeyboardFocus::Chrome, true, &j), None);
     }
 
     #[test]
@@ -591,6 +389,7 @@ mod tests {
             "ctrl-T" = "tab.new"
             "ctrl-shift-t" = "tab.close"
             "g g" = "location.focus"
+            "ctrl-q" = "chrome.toggle-tabs"
             "x" = 1
             [sidebar]
             "a" = "tab.new"
@@ -601,6 +400,7 @@ mod tests {
             "unknown command \"tab.nwe\"",
             "are the same keystroke",
             "not supported",
+            "the standard chrome has no command chrome.toggle-tabs",
             "expected a command",
             "unknown context",
         ];
@@ -614,11 +414,27 @@ mod tests {
     }
 
     #[test]
+    fn the_keymap_reads_its_table_as_the_check_did() {
+        let text = "\"ctrl-q\" = \"browser.quit\"\n[page]\n\"f5\" = \"page.reload\"";
+        let mut keymap = Bindings::default();
+        keymap.configure(&table(text));
+        assert_eq!(keymap, bindings(text).unwrap());
+        let ctrl_q = press(KEY_Q, character("q"), CTRL, NONE);
+        assert_eq!(
+            keymap.press(&ctrl_q, PAGE),
+            KeyAction::Run(Command::BrowserQuit)
+        );
+        assert_eq!(
+            keymap.press(&press(KEY_A, character("a"), NONE, NONE), PAGE),
+            KeyAction::Pass
+        );
+    }
+
+    #[test]
     fn consumed_presses_consume_their_releases() {
-        let bindings = bindings(r#""ctrl-a" = "tab.new""#).unwrap();
+        let mut keys = keys(r#""ctrl-a" = "tab.new""#);
         let seat = SeatId::next();
-        let mut keys = KeyState::default();
-        let mut handle = |event: &KeyEvent| keys.handle(&bindings, Focus::Page, false, seat, event);
+        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event);
         let down = press(KEY_A, character("a"), CTRL, NONE);
         let repeat = KeyEvent {
             repeat: true,
@@ -648,10 +464,9 @@ mod tests {
 
     #[test]
     fn a_held_key_never_turns_into_a_shortcut() {
-        let bindings = bindings(r#""ctrl-r" = "page.reload""#).unwrap();
+        let mut keys = keys(r#""ctrl-r" = "page.reload""#);
         let seat = SeatId::next();
-        let mut keys = KeyState::default();
-        let mut handle = |event: &KeyEvent| keys.handle(&bindings, Focus::Page, false, seat, event);
+        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event);
         // R goes down and repeats, and Ctrl goes down while it does.
         let r = press(KEY_R, character("r"), NONE, NONE);
         assert_eq!(handle(&r), KeyOutcome::Deliver);
@@ -676,20 +491,16 @@ mod tests {
 
     #[test]
     fn losing_the_keyboard_forgets_held_keys() {
-        let bindings = bindings(r#""ctrl-a" = "tab.new""#).unwrap();
+        let mut keys = keys(r#""ctrl-a" = "tab.new""#);
         let seat = SeatId::next();
-        let mut keys = KeyState::default();
         let down = press(KEY_A, character("a"), CTRL, NONE);
         let up = KeyEvent {
             state: ButtonState::Released,
             modifiers: NONE,
             ..down.clone()
         };
-        keys.handle(&bindings, Focus::Page, false, seat, &down);
+        keys.handle(PAGE, seat, &down);
         keys.forget(seat);
-        assert_eq!(
-            keys.handle(&bindings, Focus::Page, false, seat, &up),
-            KeyOutcome::Deliver
-        );
+        assert_eq!(keys.handle(PAGE, seat, &up), KeyOutcome::Deliver);
     }
 }

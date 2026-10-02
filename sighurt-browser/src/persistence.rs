@@ -1,10 +1,10 @@
 //! Files: reading and watching the configuration (`{config_dir}/sighurt/config.toml`), and
 //! loading and saving the session (`{state_dir}/sighurt/session.toml`).
 //!
-//! The core parses and validates the configuration; `sig` adds the one check the core can't
-//! make, the `[ui.colors]` names, with `sighurt_ui::Colors::set`, before it tells the core a
-//! reload succeeded. A file with any problem is not used: at startup `sig` runs with the
-//! built-in configuration and says why, and a reload that fails keeps the configuration in use.
+//! The core parses and validates the configuration, against what the build has (its engines,
+//! keymaps and chromes, and the chrome's color names: `sighurt_core::Environment`). A file with
+//! any problem is not used: at startup `sig` runs with the built-in configuration and says why,
+//! and a reload that fails keeps the configuration in use.
 //! The configuration's directory is watched with inotify, so a saved file (written in place or
 //! renamed over the old one) or a deleted one is read again; nothing polls.
 //!
@@ -27,7 +27,7 @@ use std::thread::JoinHandle;
 use rustix::fs::inotify;
 use sighurt_core::config::{Config, ConfigError};
 use sighurt_core::session::Session;
-use sighurt_ui::Colors;
+use sighurt_core::Environment;
 
 /// Where `sig`'s files are.
 #[derive(Clone, Debug)]
@@ -50,17 +50,11 @@ impl Paths {
     }
 }
 
-/// A configuration that passed every check, with the chrome's colors from it.
-pub struct Loaded {
-    pub config: Config,
-    pub colors: Colors,
-}
-
 /// Why a configuration file can't be used.
 pub enum LoadError {
     /// The core's parser found problems.
     Config(ConfigError),
-    /// Reading the file, or `[ui.colors]`, failed; for the user.
+    /// Reading the file failed; for the user.
     Other(String),
 }
 
@@ -73,8 +67,9 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-/// Reads and checks the configuration at `path` (none: the built-in one).
-pub fn load_config(path: Option<&Path>) -> Result<Loaded, LoadError> {
+/// Reads and checks the configuration at `path` (none: the built-in one) for a build with
+/// what `env` lists.
+pub fn load_config(path: Option<&Path>, env: &Environment) -> Result<Config, LoadError> {
     let text = match path.map(fs::read_to_string) {
         None => None,
         Some(Ok(text)) => Some(text),
@@ -84,36 +79,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Loaded, LoadError> {
             return Err(LoadError::Other(format!("cannot read {path}: {error}")));
         }
     };
-    let config = Config::parse(text.as_deref()).map_err(LoadError::Config)?;
-    let colors = colors(&config).map_err(LoadError::Other)?;
-    Ok(Loaded { config, colors })
-}
-
-/// The chrome's colors from `config`'s `[ui.colors]`, or every problem with them. The core has
-/// checked that each value is a color; only the chrome knows the names.
-pub fn colors(config: &Config) -> Result<Colors, String> {
-    let mut colors = Colors::default();
-    let Some(table) = config.ui().get("colors").and_then(|v| v.as_table()) else {
-        return Ok(colors);
-    };
-    let problems: Vec<String> = table
-        .iter()
-        .filter_map(|(name, value)| {
-            let value = value.as_str().unwrap_or_default();
-            colors
-                .set(name, value)
-                .err()
-                .map(|e| format!("- [ui.colors] {e}"))
-        })
-        .collect();
-    match problems.is_empty() {
-        true => Ok(colors),
-        false => Err(format!(
-            "invalid configuration\n{}\nknown colors: {}",
-            problems.join("\n"),
-            Colors::NAMES.join(", ")
-        )),
-    }
+    Config::parse(text.as_deref(), env).map_err(LoadError::Config)
 }
 
 /// Watches the configuration file's directory for the file being written, replaced or deleted.
@@ -249,30 +215,9 @@ mod tests {
     #[test]
     fn a_missing_file_is_the_built_in_configuration() {
         let dir = tempfile::tempdir().unwrap();
-        let loaded = load_config(Some(&dir.path().join("config.toml")))
-            .ok()
-            .unwrap();
-        assert_eq!(loaded.config, Config::default());
-        assert_eq!(loaded.colors, Colors::default());
-    }
-
-    #[test]
-    fn unknown_color_names_are_errors() {
-        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "version = 1\n[ui.colors]\ntext = \"#ff0000\"\nbackground = \"#000000\"\n",
-        )
-        .unwrap();
-        let error = load_config(Some(&path)).err().unwrap().to_string();
-        assert!(error.contains("unknown color \"background\""), "{error}");
-        fs::write(&path, "version = 1\n[ui.colors]\ntext = \"#ff0000\"\n").unwrap();
-        let loaded = load_config(Some(&path)).ok().unwrap();
-        assert_eq!(
-            loaded.colors.text,
-            sighurt_ui::Rgba::parse("#ff0000").unwrap()
-        );
+        let config = load_config(Some(&path), &Environment::default()).ok();
+        assert_eq!(config, Some(Config::default()));
     }
 
     #[test]

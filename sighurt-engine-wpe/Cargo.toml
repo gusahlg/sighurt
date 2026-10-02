@@ -1,0 +1,38 @@
+[package]
+name = "sighurt-engine-wpe"
+description = "The WPE WebKit engine for Sighurt: WebKit's UI process in sig, frames presented on host targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+# WPE WebKit comes from the prefix nix/build-wpewebkit.sh installs (build.rs), opened when the
+# runtime first starts (src/ffi.rs), not linked.
+
+[dependencies]
+sighurt-api = { path = "../sighurt-api" }
+sighurt-wayland = { path = "../sighurt-wayland" }
+# The host's own wl_display, through a second event queue for the page's buffers.
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+# The target's raw display and surface, from the lease.
+raw-window-handle.workspace = true
+# Keysyms for the keys the host already translated (WebKit takes keysyms, not W3C names).
+xkbcommon.workspace = true
+# Origins of committed pages, for service requests.
+url.workspace = true
+# GObject subclasses of WebKit's platform classes (the WPE Platform API).
+glib = "0.22"
+libc = "0.2"
+# Warnings about the fallback path and the profile, through the executable's logger.
+log = "0.4"
+
+[dev-dependencies]
+# The owner loop of the tests and the example.
+calloop.workspace = true
+# An input method for the tests (zwp_input_method_v2).
+smithay-client-toolkit.workspace = true
+
+[build-dependencies]
+pkg-config = "0.3"

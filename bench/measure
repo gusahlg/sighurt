@@ -350,9 +350,15 @@ def main():
     cache.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update(build.get("env", {}))
-    env.update({"XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"), "XDG_CACHE_HOME": str(cache)})
+    # Fresh configuration, data (Servo's profile) and state (the rewrite's saved tabs, which it
+    # restores beside the ones it is asked to open) every run; caches kept per build.
+    env.update({"XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"),
+                "XDG_STATE_HOME": str(home / "state"), "XDG_CACHE_HOME": str(cache)})
     targets = [str(HERE / "workloads" / p) for p in workload["open"]]
-    cmd = [str(build_dir / build["sig"])] + targets
+    # A build that writes its report as JSON (`diagnostics_file`): at exit, and at every mark
+    # through counters_signal.
+    report_file = home / "diagnostics.json" if build.get("diagnostics_file") else None
+    cmd = [str(build_dir / build["sig"])] + (["--diagnostics", str(report_file)] if report_file else []) + targets
 
     parse = parsers.make(build.get("parsers", []))
     events = []
@@ -485,6 +491,20 @@ def main():
     gpu.stop()
     if stderr_log:
         stderr_log.close()
+    report = None
+    if report_file:
+        try:
+            report = json.loads(report_file.read_text())
+        except (OSError, ValueError) as e:
+            anomalies.append(f"no diagnostics report: {e}")
+        else:
+            if not report.get("exit"):
+                anomalies.append("the diagnostics report is not the one written at exit")
+            # Every script ends with the tabs it started with: the workload's, or the home page.
+            if "tabs" in report and len(report["tabs"]) != max(1, len(workload["open"])):
+                anomalies.append(f"{len(report['tabs'])} tabs at exit, not {max(1, len(workload['open']))}")
+            if raw:
+                shutil.copy(report_file, raw / "diagnostics.json")
     shutil.rmtree(home, ignore_errors=True)
     if forced:
         anomalies.append(f"did not quit within 10 s of ctrl-q; sent {forced.name}")
@@ -503,7 +523,8 @@ def main():
         "build": build_name,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "command": cmd,
-        "compositor": {"renderer": os.environ.get("SIG_SWAY_RENDERER"), "output": [width, height]},
+        "compositor": {"renderer": os.environ.get("SIG_SWAY_RENDERER"), "store_path": os.environ.get("SIG_SWAY_STORE"),
+                       "output": [width, height]},
         "gate": gate,
         "environment": {"before": env_before, "after": dynamic_environment()},
         "renderers": [e for _, e in events if e["kind"] == "renderer"],
@@ -514,7 +535,11 @@ def main():
                  "signal_sent": forced.name if forced else None},
         "anomalies": anomalies,
         "metrics": metrics.run_metrics(sampler, gpu, events, sway_pid, launch, screen, windows, ctx["inputs"], ctx["pixels"]),
+        # The build's own report at exit, without its per-target detail (in the raw logs).
+        "diagnostics": {k: v for k, v in report.items() if k != "targets"} if report else None,
     }
+    if report:
+        result["metrics"].update(metrics.exit_metrics(report))
     result["metrics"]["shutdown.s"] = shutdown_s
     result["metrics"]["shutdown.forced"] = 0 if forced is None else 1
     pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)

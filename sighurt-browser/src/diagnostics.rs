@@ -3,8 +3,8 @@
 //! Counts loop wakeups and iterations, input events, core events and effects, engine pumps and
 //! their events, frame-ready notifications, page frames presented (and not ready), chrome
 //! paints per surface, placements, and the deepest queues seen; times the longest pump,
-//! present and chrome paint; keeps the most SHM buffers any target held, sampled after every
-//! presentation (where buffers are allocated). The host adds, per target, its metrics and its
+//! present and chrome paint; keeps the most SHM buffers any target, and any of the chrome's
+//! targets, held, sampled after every presentation (where buffers are allocated). The host adds, per target, its metrics and its
 //! permits, submissions, frame callbacks, buffer releases and presentation feedback, kept
 //! distinct (submission is not display), and its buffers and bytes. Each engine is listed with
 //! how it renders (for Servo, the actual GL renderer and whether it is a software fallback),
@@ -86,11 +86,11 @@ pub struct Counters {
     pub readback_bytes: u64,
     /// Chrome-drawn surfaces painted, all of them.
     pub chrome_paints: u64,
-    /// The chrome surface at the top painted.
+    /// The standard chrome's surface at the top ("chrome") painted.
     pub paints_chrome: u64,
-    /// The status strip painted.
+    /// Its status strip ("status") painted.
     pub paints_status: u64,
-    /// A page the chrome draws (`sig://home`, errors) painted.
+    /// A page the chrome draws (`sig://home`, errors: "page") painted.
     pub paints_page: u64,
     /// Placements applied.
     pub placements: u64,
@@ -117,6 +117,8 @@ pub struct Peaks {
     pub max_chrome_paint_us: u64,
     /// The most SHM buffers one target held, of every generation.
     pub max_target_buffers: u64,
+    /// The most SHM buffers one of the chrome's targets held, of every generation.
+    pub max_chrome_buffers: u64,
     /// The most superseded generations one target still held.
     pub max_retiring_generations: u64,
     /// The most bytes of SHM buffers all targets held together.
@@ -126,7 +128,8 @@ pub struct Peaks {
 /// One target, as the host and `sig` see it.
 #[derive(Clone, Debug, Serialize)]
 pub struct TargetReport {
-    /// What it is: "chrome", "status", "page" (drawn by the chrome) or "view".
+    /// What it is: the name of the chrome's surface ("chrome", "status" and "page" for the
+    /// standard chrome), "view", or "retiring".
     pub role: &'static str,
     /// For a view, its engine and its tab's position in the tab strip, from 1.
     pub engine: Option<String>,
@@ -307,13 +310,20 @@ impl Diagnostics {
         }
     }
 
-    /// The SHM buffers the targets hold now, per target (buffers, retiring generations) and in
-    /// bytes altogether: keeps the largest.
-    pub fn buffers(&mut self, per_target: impl Iterator<Item = (usize, usize)>, bytes: usize) {
+    /// The SHM buffers the targets hold now, per target (buffers, retiring generations,
+    /// whether it is the chrome's) and in bytes altogether: keeps the largest.
+    pub fn buffers(
+        &mut self,
+        per_target: impl Iterator<Item = (usize, usize, bool)>,
+        bytes: usize,
+    ) {
         let p = &mut self.peaks;
-        for (buffers, retiring) in per_target {
+        for (buffers, retiring, chrome) in per_target {
             p.max_target_buffers = p.max_target_buffers.max(buffers as u64);
             p.max_retiring_generations = p.max_retiring_generations.max(retiring as u64);
+            if chrome {
+                p.max_chrome_buffers = p.max_chrome_buffers.max(buffers as u64);
+            }
         }
         p.max_buffer_bytes = p.max_buffer_bytes.max(bytes as u64);
     }
@@ -338,7 +348,8 @@ impl Diagnostics {
         match surface {
             "chrome" => c.paints_chrome += 1,
             "status" => c.paints_status += 1,
-            _ => c.paints_page += 1,
+            "page" => c.paints_page += 1,
+            _ => {}
         }
         let p = &mut self.peaks;
         p.max_chrome_paint_us = p.max_chrome_paint_us.max(micros(draw));
@@ -450,16 +461,17 @@ mod tests {
     #[test]
     fn buffer_peaks_keep_the_largest() {
         let mut diag = Diagnostics::new(None);
-        diag.buffers([(2, 0), (3, 1)].into_iter(), 1000);
-        diag.buffers([(1, 2)].into_iter(), 500);
+        diag.buffers([(2, 0, true), (3, 1, false)].into_iter(), 1000);
+        diag.buffers([(1, 2, true)].into_iter(), 500);
         let p = &diag.peaks;
         assert_eq!(
             (
                 p.max_target_buffers,
+                p.max_chrome_buffers,
                 p.max_retiring_generations,
                 p.max_buffer_bytes
             ),
-            (3, 2, 1000)
+            (3, 2, 2, 1000)
         );
     }
 

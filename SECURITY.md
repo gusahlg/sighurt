@@ -21,33 +21,35 @@ We will acknowledge the report and keep you informed while we investigate.
 
 ## Scope
 
-Sighurt's security model is per engine. These areas are in scope:
+These areas are in scope:
 
-**Browser (`sighurt-core`, `sighurt-ui`, `sighurt-ipc`)**
+**Browser (`sighurt-core`, `sighurt-ui`, `sighurt-wayland`, `sighurt-browser`)**
 
-- Engine output that crashes `sig`, exhausts its memory or gets around the bounds on messages, images, draw lists and coordinates
-- URL routing that sends content to an engine or scheme it should not reach
-- Pages opening `sig:` URLs, opening tabs without a click or key press, or starting downloads without the throttle
-- Download handling, such as files written outside the download folder
+- What pages send (titles, status text, addresses, requests) crashing `sig`, exhausting its memory or getting around the bounds below
+- A page that writes the address line, makes its title look like the address, opens `sig:` pages or runs a browser command
+- A page opening tabs without a click or key press of the user's, or moving its tab to another engine without the user's click on that link, or while the user's own address loads; downloads that get around the throttle; files written outside the download folder, or named to hide what they are
+- Privileged services (clipboard, downloads, file pickers, external URLs, permissions) granted to the wrong document or without the user
+- Routing that sends content to an engine or a scheme it should not reach
 
 **WASM engine (`sighurt-engine-wasm`)**
 
 - **Sandbox escapes**: guest modules reaching anything beyond the registered host functions
 - **Host API abuse**: exploiting a host function beyond its intended scope, including guest pointers and lengths that read or write outside guest memory
+- **Resource exhaustion**: making the host allocate without bound (draw lists, images, text, timers, workers, network buffers), or a guest that keeps the browser from responding despite the fuel, time and memory limits
 - **Permission bypasses**: using the camera, microphone, geolocation or screen capture without a grant, or getting around a manifest's declarations
 - **Cross-origin data leaks**: one app reading another origin's session or persistent storage, or inheriting its grants
-- **Resource limits**: bugs in fuel metering, memory limits or the `wasmtime` integration
 - **File-picker misuse**: an app reaching files the user did not pick
 
-**Servo engine (`sighurt-engine-servo`)**
+**Servo and WPE WebKit engines (`sighurt-engine-servo`, `sighurt-engine-wpe`)**
 
-- Bugs in how `sig-servo` embeds Servo or talks to `sig`. Report vulnerabilities in Servo itself to the [Servo project](https://github.com/servo/servo).
+- Bugs in how Sighurt embeds them: requests that bypass the browser's policy, navigations the browser was not asked about, page data in the logs. Report vulnerabilities in Servo itself to the [Servo project](https://github.com/servo/servo) and in WebKit to [WebKit](https://webkit.org/security-policy/).
 
 ## Out of Scope
 
 - Denial of service through excessive fuel use in the WASM engine (mitigated by design)
-- Bugs in upstream dependencies, including Servo and Wasmtime (report those to the respective projects)
-- Anything an external engine you configured yourself can do. Engines in `[engines.*]` are programs that run with your privileges.
+- Bugs in upstream dependencies, including Servo, WebKit and Wasmtime (report those to the respective projects)
+- That a compromised Servo or WebKit can take over `sig`: the engines run in its process, as described below
+- Keymaps and chromes compiled into `sig`: like the engines, they are trusted code
 - Issues requiring physical access to the user's machine
 
 ## Disclosure Policy
@@ -57,22 +59,34 @@ Sighurt's security model is per engine. These areas are in scope:
 
 ## Security Design
 
-`sig` runs no page code. Every engine is a separate process, and everything it sends over `sighurt-ipc` is untrusted: message sizes, text, URLs, images, draw lists and coordinates are bounded, an engine that doesn't say `Hello` within 10 seconds is stopped, pages can't open `sig:` URLs, a page opens a new tab only right after the user clicked it or pressed a key in it (once per click or key press), and a page starts at most one download a second.
+### The engines run in `sig`'s process
+
+Servo, WPE WebKit's UI-process half and the Wasm engine are libraries compiled into `sig`, and there is no IPC between them and the browser. The contracts between the browser and its engines keep correct code correct; they are not a sandbox. Code execution in an engine is code execution in `sig`, with the user's privileges, and a native crash in an engine ends the whole browser. Isolating an engine would take a restricted worker process, which Sighurt doesn't have.
+
+What each engine adds of its own:
+
+- **Servo** runs its script, layout and network threads in `sig`'s process.
+- **WPE WebKit** runs pages in its own web processes, each in a bubblewrap sandbox (its own network, PID and UTS namespaces, a seccomp filter, read-only binds), and networking in a network process that WebKit doesn't sandbox. A crashed web process fails its tab, which a reload brings back. WebKit's UI-process code runs in `sig`.
+- **The WASM engine** runs apps under Wasmtime, which isolates their memory, with the limits below.
+
+### What pages get
+
+Engines report what pages do as events, and the browser core decides. Everything a page says is untrusted:
+
+- Titles and status text are cut to 16 KiB and shown on one line with control and bidi characters removed; URLs over 2 MiB are dropped, never shortened. Addresses are shown decoded only where that can't hide or fake part of them.
+- A page can't write the address line, run a browser command through a URL, open `sig:` pages, or open `file:` URLs unless it is a `file:` page itself.
+- A page opens a new tab only within 5 seconds of a click or key press in it, one tab per click or key press. It moves its tab to another engine (a link the routing gives another engine) only within 5 seconds of the user's click on that very link (the link the page's status text named at the press), using up the same click, and never while the tab loads an address the user asked for.
+- Page-initiated downloads, a Wasm app's included, are limited to one a second per tab. Files go into the download folder (never the home folder itself), named after the last part of the suggested name without dots or whitespace at its ends and without control or invisible formatting characters.
+- The clipboard, file pickers and handing a URL to the desktop need a click or key press in the page; camera, microphone, location and screen capture need the user's answer. A request acts for one document and is dropped when that document goes. `sig` has no permission prompt or file picker yet, so those requests are refused, and anything it doesn't know is refused too.
+- Password fields go to the input method marked sensitive and hidden, without their text.
+- The diagnostics and the logs hold no clipboard contents, credentials or page data.
 
 ### WASM engine
 
 1. **No WASI**: guests run in Wasmtime with no filesystem, environment or socket access.
-2. **Capability-based APIs**: guests can only call host functions registered in the linker.
-3. **Permission prompts**: camera, microphone, geolocation and screen capture each need an explicit Allow per origin, remembered per `(origin, capability)` for the life of the page's process.
+2. **Capability-based APIs**: guests can only call host functions registered in the linker, and every guest pointer and length is checked.
+3. **Permission prompts**: camera, microphone, geolocation and screen capture each need an explicit Allow per origin, which the engine's own prompt asks for and remembers per `(origin, capability)` for the life of the tab's view. A page can't hide the prompt and still have it answered.
 4. **Manifest declarations**: an app that ships a manifest must declare the sensitive capabilities it may request. Undeclared ones are denied without a prompt.
 5. **Origin-scoped storage**: session and persistent storage are per origin. Session storage is cleared on cross-origin navigation.
-6. **Fuel metering and memory limits**: execution and guest memory (256 MB) are bounded.
+6. **Limits**: fuel (500M instructions to start, 50M per callback), wall-clock time (10 s to start, 1 s per callback, so a guest that keeps calling the host is stopped too), 256 MB of guest memory, and bounds on everything a guest can make the host allocate.
 7. **No clipboard**: clipboard access is always refused.
-
-### Servo engine
-
-Web content gets Servo's security model. Each page runs in its own `sig-servo` process.
-
-### Engines you configure
-
-An engine under `[engines.*]` is a program you chose to run, with your privileges. `sig` bounds what it reads from it, but otherwise trusts it as much as any program you run.

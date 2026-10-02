@@ -65,6 +65,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     page_zoom: false,
     pointer_lock: false,
     native_popups: false,
+    process_per_view: false,
 };
 
 /// How long `demo:slow` takes to have a frame for a new layout: longer than the host's resize
@@ -455,8 +456,10 @@ impl EngineRuntime for DemoRuntime {
                 view.focused = focused;
             }
             EngineCommand::Input(event) => self.input(id, event.kind),
-            // The demo engine asks for no services, so there is nothing to resolve.
-            EngineCommand::ResolveServiceRequest { .. } => {}
+            // The demo engine asks for no services and has no links, so there is nothing to
+            // resolve or answer.
+            EngineCommand::ResolveServiceRequest { .. }
+            | EngineCommand::AnswerNavigation { .. } => {}
         }
         Ok(())
     }

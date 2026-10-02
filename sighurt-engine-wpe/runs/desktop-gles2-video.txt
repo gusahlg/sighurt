@@ -1,0 +1,23 @@
+[   0.014] window 1024x768 at 120/120
+[   0.018] ViewReady { view: ViewId(1) }
+[   0.018] LoadingChanged { view: ViewId(1), loading: true }
+[   0.167] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 14:05:18.457: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.190] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "http://127.0.0.1:38307/video.html" }
+[   0.193] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "http://127.0.0.1:38307/video.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.193] HistoryChanged { view: ViewId(1), entries: ["http://127.0.0.1:38307/video.html"], current: 0 }
+[   0.195] TitleChanged { view: ViewId(1), title: Some("video") }
+[   0.278] CursorChanged { view: ViewId(1), cursor: Default }
+[   0.278] StatusTextChanged { view: ViewId(1), text: None }
+[   0.379] LoadingChanged { view: ViewId(1), loading: false }
+[   0.446] TitleChanged { view: ViewId(1), title: Some("video playing 4 0") }
+[   1.446] TitleChanged { view: ViewId(1), title: Some("video playing 4 1") }
+[   1.541] action quit
+[   1.541] end: wakeups 138 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 147 stale-frames 1 rounded-frames 0 failed-imports 0
+[   1.541] end: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[   1.541] end: submitted 38 dmabuf-frames 38 dmabuf-imports 3 shm-copies 0 shm-bytes 0 dropped 1 releases 36 present-mean-ms 0.036 present-max-ms 0.085
+[   1.541] end: ViewId(1) frames 38 pacing n=37 median=33.33ms p95=35.22ms max=110.64ms
+[   1.541] end: pss-kib 220085 (WPEWebProcess 153203, WPENetworkProce 30099, wpe-window 34853, xdg-dbus-proxy 969, bwrap 961)
+shut down: the compositor reported no error
+exit 0

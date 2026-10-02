@@ -8,11 +8,14 @@ and the path), so the tests can count loads. Besides the files in PAGES:
 
     /guests/NAME       the file NAME in GUESTS (Wasm apps)
     /count.html        a page whose title is "load N", N counting the requests for it
+    /ua.html           a page that puts the User-Agent header of its request and what its script
+                       sees as navigator.userAgent in its address: #["header","script"]
     /slow.html?s=N     a page that answers after N seconds
     /hold.png          an image held for a minute, or until the client gives up
 """
 
 import http.server
+import json
 import sys
 import threading
 import time
@@ -50,6 +53,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if url.path == "/count.html":
             self.page(f"<!DOCTYPE html><meta charset=utf-8><title>load {count}</title>"
                       f"<h1>Load {count}</h1><p>This page counts its loads.</p>")
+        elif url.path == "/ua.html":
+            header = json.dumps(self.headers.get("User-Agent", ""))
+            self.page("<!DOCTYPE html><meta charset=utf-8><title>user agent</title><script>"
+                      f"history.replaceState(null, '', '#' + JSON.stringify([{header}, "
+                      "navigator.userAgent]));</script>")
         elif url.path == "/slow.html":
             time.sleep(float(query.get("s", ["3"])[0]))
             self.page("<!DOCTYPE html><meta charset=utf-8><title>slow</title>"

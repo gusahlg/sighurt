@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>links</title>
+<!-- Links for engines.sh's `links` scenario, each a band 150 page pixels tall: an app on the Wasm
+     origin of the configuration, an app on the host its [routing.wasm] hosts claim (localhost),
+     this page again sending itself to that host half a second after it loads (with no click of
+     the user's), and a page on that host. -->
+<style>
+  body { margin: 0; font: 32px sans-serif; }
+  a { display: block; height: 150px; }
+</style>
+<a href="/guests/gradient-demo.wasm">An app on the Wasm origin</a>
+<a id="app">An app on a Wasm host</a>
+<a href="/links.html?redirect">This page, sending itself to that host</a>
+<a id="page">A page on that host</a>
+<script>
+  const host = `http://localhost:${location.port}`;
+  document.getElementById("app").href = `${host}/guests/hello-sighurt.wasm`;
+  document.getElementById("page").href = `${host}/second.html?chosen`;
+  if (location.search === "?redirect") {
+    setTimeout(() => { location = `${host}/second.html?redirected`; }, 500);
+  }
+</script>

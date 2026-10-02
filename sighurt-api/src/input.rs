@@ -472,7 +472,7 @@ pub struct SurroundingText {
 }
 
 /// A change of the window's keyboard focus for one seat, as the compositor reports it. This is
-/// separate from which part of the window (page, address bar, ...) has logical focus.
+/// separate from which part of the window has logical focus ([`KeyboardFocus`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FocusEvent {
     /// The window gained keyboard focus.
@@ -480,6 +480,18 @@ pub enum FocusEvent {
     /// The window lost keyboard focus. Held keys, auto-repeat and pointer captures end:
     /// receivers must not keep treating keys as pressed.
     Deactivated,
+}
+
+/// Which part of the window has the keyboard: the logical focus the core keeps, which the
+/// chrome follows and keymaps see (`keymap::KeyContext`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum KeyboardFocus {
+    /// The active tab's page, or the page the chrome draws in its place.
+    #[default]
+    Page,
+    /// The chrome: its address and command line, or another of its widgets. The
+    /// configuration's `[keys.location]` applies here.
+    Chrome,
 }
 
 #[cfg(test)]

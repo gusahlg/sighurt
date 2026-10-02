@@ -1,0 +1,994 @@
+{
+ "anomalies": [],
+ "build": "baseline",
+ "command": [
+  "/home/gusahlg/sighurt-baseline/target/release/sig",
+  "/home/gusahlg/sighurt-bench/harness/bench/workloads/article.html"
+ ],
+ "compositor": {
+  "output": [
+   1280,
+   800
+  ],
+  "renderer": "gles2",
+  "store_path": "/nix/store/6816vyd7b49db9525xs7rcyk8ygdipwa-sway-1.12"
+ },
+ "diagnostics": null,
+ "environment": {
+  "after": {
+   "cpu_mhz_mean": 2736,
+   "gpu": {
+    "clock_mhz": 225.0,
+    "pstate": "P8",
+    "temp_c": 58.0,
+    "util_pct": 2.0
+   },
+   "loadavg": "0.15 0.40 0.53 1/393 355542",
+   "mem_available_mib": 14252,
+   "swap_used_mib": 1
+  },
+  "before": {
+   "cpu_mhz_mean": 2905,
+   "gpu": {
+    "clock_mhz": 2490.0,
+    "pstate": "P2",
+    "temp_c": 55.0,
+    "util_pct": 0.0
+   },
+   "loadavg": "1.47 0.63 0.62 2/406 351820",
+   "mem_available_mib": 13990,
+   "swap_used_mib": 1
+  }
+ },
+ "exit": {
+  "description": "exit status 0",
+  "returncode": 0,
+  "signal_sent": null
+ },
+ "gate": {
+  "busy_cores": 0.015,
+  "gpu": {
+   "clock_mhz": 2490.0,
+   "pstate": "P2",
+   "temp_c": 55.0,
+   "util_pct": 0.0
+  },
+  "quiet": true,
+  "waited_s": 2.0
+ },
+ "harness_cpu": {
+  "self_s": 4.231,
+  "tools_s": 0.245
+ },
+ "metrics": {
+  "active.browser_draw_p50_ms": 0.766109,
+  "active.browser_draw_p95_ms": 1.192999,
+  "active.browser_fps": 1.0998648088338383,
+  "active.browser_frames": 132,
+  "active.compositor_cpu_pct": 3.566228319552142,
+  "active.cpu_pct": 13.731645492107312,
+  "active.cpu_pct_browser": 2.458031201560472,
+  "active.cpu_pct_engines": 11.273614290546854,
+  "active.cpu_s": 16.479999999999997,
+  "active.cpu_sched_ms": 15096.0853,
+  "active.cpu_sys_s": 7.619999999999995,
+  "active.cpu_user_s": 8.860000000000003,
+  "active.ctxsw_invol": 1088,
+  "active.ctxsw_vol": 95806,
+  "active.fps_delivered": 0.9998770989398529,
+  "active.fps_produced": 1.9914218887218738,
+  "active.frames_delivered": 120,
+  "active.frames_produced": 239,
+  "active.gpu_clock_mhz": 2478.5809682804675,
+  "active.gpu_fb_tree_mib": 225.0,
+  "active.gpu_mem_used_mib": 468.7429048414023,
+  "active.gpu_util_pct": 2.7762938230383973,
+  "active.ipc_out_mib": 401.05075550079346,
+  "active.ipc_out_mib_per_s": 3.341678882814747,
+  "active.ipc_out_writes": 4679,
+  "active.ipc_pixel_mib": 407.8125,
+  "active.ipc_pixel_mib_per_frame": 3.3984375,
+  "active.ipc_pixel_mib_per_s": 3.3980198284284064,
+  "active.paint_p50_ms": 1.7,
+  "active.paint_p95_ms": 4.6,
+  "active.processes": 62,
+  "active.processes_exited": 60,
+  "active.pss_end_mib": 397.720703125,
+  "active.pss_growth_mib": 22.1845703125,
+  "active.pss_mean_mib": 444.408352092161,
+  "active.pss_peak_mib": 491.162109375,
+  "active.read_p50_ms": 2.1,
+  "active.read_p95_ms": 3.0,
+  "active.readback_mib": 812.2265625,
+  "active.readback_mib_per_s": 6.767722824953243,
+  "active.rss_growth_mib": 19.40625,
+  "active.rss_mean_mib": 625.8169772409716,
+  "active.rss_peak_mib": 723.04296875,
+  "active.runq_wait_ms": 41.334969,
+  "active.send_p50_ms": 1.5,
+  "active.send_p95_ms": 2.8,
+  "active.wakeups_per_s": 798.2852111752629,
+  "active.wakeups_per_s_browser": 448.5698635118915,
+  "active.wakeups_per_s_engines": 349.7153476633714,
+  "active.wall_s": 120.01474994000091,
+  "after.browser_draw_p50_ms": 0.766109,
+  "after.browser_draw_p95_ms": 1.192999,
+  "after.browser_fps": 1.0729089896539434,
+  "after.browser_frames": 132,
+  "after.compositor_cpu_pct": 3.5763632988464784,
+  "after.cpu_pct": 13.41949046908076,
+  "after.cpu_pct_browser": 2.422173325127842,
+  "after.cpu_pct_engines": 10.997317143952934,
+  "after.cpu_s": 16.509999999999998,
+  "after.cpu_sched_ms": 15127.013377,
+  "after.cpu_sys_s": 7.6299999999999955,
+  "after.cpu_user_s": 8.880000000000003,
+  "after.ctxsw_invol": 1088,
+  "after.ctxsw_vol": 96553,
+  "after.fps_delivered": 0.9753718087763122,
+  "after.fps_produced": 1.9426155191461552,
+  "after.frames_delivered": 120,
+  "after.frames_produced": 239,
+  "after.gpu_clock_mhz": 2438.452768729642,
+  "after.gpu_fb_tree_mib": 225.0,
+  "after.gpu_mem_used_mib": 465.6221498371336,
+  "after.gpu_util_pct": 2.750814332247557,
+  "after.ipc_out_mib": 401.05075550079346,
+  "after.ipc_out_mib_per_s": 3.2597800066992955,
+  "after.ipc_out_writes": 4679,
+  "after.ipc_pixel_mib": 407.8125,
+  "after.ipc_pixel_mib_per_frame": 3.3984375,
+  "after.ipc_pixel_mib_per_s": 3.3147401313882483,
+  "after.paint_p50_ms": 1.7,
+  "after.paint_p95_ms": 4.6,
+  "after.processes": 62,
+  "after.processes_exited": 60,
+  "after.pss_end_mib": 397.720703125,
+  "after.pss_growth_mib": 22.1845703125,
+  "after.pss_mean_mib": 442.87760950307376,
+  "after.pss_peak_mib": 491.162109375,
+  "after.read_p50_ms": 2.1,
+  "after.read_p95_ms": 3.0,
+  "after.readback_mib": 812.2265625,
+  "after.readback_mib_per_s": 6.601857428348262,
+  "after.rss_growth_mib": 19.40625,
+  "after.rss_mean_mib": 622.5469240734925,
+  "after.rss_peak_mib": 723.04296875,
+  "after.runq_wait_ms": 41.413979,
+  "after.send_p50_ms": 1.5,
+  "after.send_p95_ms": 2.8,
+  "after.wakeups_per_s": 784.7922854398273,
+  "after.wakeups_per_s_browser": 443.6478672219056,
+  "after.wakeups_per_s_engines": 341.14441821792167,
+  "after.wall_s": 123.03000652699848,
+  "shutdown.forced": 0,
+  "shutdown.s": 0.1507503920001909,
+  "startup.browser_draw_p50_ms": 0.32356900000000005,
+  "startup.browser_draw_p95_ms": 1.315088,
+  "startup.browser_fps": 1.9949285462259831,
+  "startup.browser_frames": 7,
+  "startup.compositor_cpu_pct": 3.1348877154979733,
+  "startup.cpu_pct": 16.81439774676186,
+  "startup.cpu_pct_browser": 10.259632523447914,
+  "startup.cpu_pct_engines": 6.554765223313945,
+  "startup.cpu_s": 0.59,
+  "startup.cpu_sched_ms": 580.665786,
+  "startup.cpu_sys_s": 0.35,
+  "startup.cpu_user_s": 0.24,
+  "startup.ctxsw_invol": 131,
+  "startup.ctxsw_vol": 1932,
+  "startup.first_frame_after_navigate_ms": 8.0,
+  "startup.first_frame_engine_s": 0.3938851520033495,
+  "startup.first_frame_s": 0.40411674000279163,
+  "startup.fps_delivered": 0.5699795846359952,
+  "startup.fps_produced": 1.9949285462259831,
+  "startup.frames_delivered": 2,
+  "startup.frames_produced": 7,
+  "startup.gpu_clock_mhz": 2490.0,
+  "startup.gpu_fb_tree_mib": 225.0,
+  "startup.gpu_mem_used_mib": 423.88235294117646,
+  "startup.gpu_util_pct": 0.7058823529411765,
+  "startup.ipc_out_mib": 6.947793960571289,
+  "startup.ipc_out_mib_per_s": 1.9800503578914497,
+  "startup.ipc_out_writes": 200,
+  "startup.ipc_pixel_mib": 6.796875,
+  "startup.ipc_pixel_mib_per_frame": 3.3984375,
+  "startup.ipc_pixel_mib_per_s": 1.9370399946613899,
+  "startup.mapped_s": 0.3537003260025813,
+  "startup.paint_p50_ms": 0.2,
+  "startup.paint_p95_ms": 4.4,
+  "startup.processes": 2,
+  "startup.processes_exited": 0,
+  "startup.pss_end_mib": 375.5361328125,
+  "startup.pss_growth_mib": 375.126953125,
+  "startup.pss_mean_mib": 269.02260044642856,
+  "startup.pss_peak_mib": 375.5361328125,
+  "startup.read_p50_ms": 1.0,
+  "startup.read_p95_ms": 3.2,
+  "startup.readback_mib": 23.7890625,
+  "startup.readback_mib_per_s": 6.779639981314865,
+  "startup.rss_growth_mib": 479.8359375,
+  "startup.rss_mean_mib": 431.38065378289474,
+  "startup.rss_peak_mib": 480.4609375,
+  "startup.runq_wait_ms": 6.318933,
+  "startup.send_p50_ms": 3.1,
+  "startup.send_p95_ms": 3.4,
+  "startup.wakeups_per_s": 550.6002787583714,
+  "startup.wakeups_per_s_browser": 334.2930263890112,
+  "startup.wakeups_per_s_engines": 216.30725236936019,
+  "startup.wall_s": 3.508897606003302,
+  "steady.browser_fps": 0.0,
+  "steady.browser_frames": 0,
+  "steady.compositor_cpu_pct": 4.193833725751963,
+  "steady.cpu_pct": 0.7988254715718026,
+  "steady.cpu_pct_browser": 0.7988254715718026,
+  "steady.cpu_pct_engines": 0.0,
+  "steady.cpu_s": 0.08000000000000004,
+  "steady.cpu_sched_ms": 72.995344,
+  "steady.cpu_sys_s": 0.040000000000000036,
+  "steady.cpu_user_s": 0.04000000000000001,
+  "steady.ctxsw_invol": 19,
+  "steady.ctxsw_vol": 1917,
+  "steady.fps_delivered": 0.0,
+  "steady.fps_produced": 0.0,
+  "steady.frames_delivered": 0,
+  "steady.frames_produced": 0,
+  "steady.gpu_clock_mhz": 392.1,
+  "steady.gpu_fb_tree_mib": 225.0,
+  "steady.gpu_mem_used_mib": 440.0,
+  "steady.gpu_util_pct": 1.76,
+  "steady.ipc_out_mib": 0.0,
+  "steady.ipc_out_mib_per_s": 0.0,
+  "steady.ipc_out_writes": 0,
+  "steady.ipc_pixel_mib": 0.0,
+  "steady.ipc_pixel_mib_per_s": 0.0,
+  "steady.processes": 2,
+  "steady.processes_exited": 0,
+  "steady.pss_end_mib": 375.5361328125,
+  "steady.pss_growth_mib": 0.0,
+  "steady.pss_mean_mib": 375.5361328125,
+  "steady.pss_peak_mib": 375.5361328125,
+  "steady.readback_mib": 0.0,
+  "steady.readback_mib_per_s": 0.0,
+  "steady.rss_growth_mib": 0.0,
+  "steady.rss_mean_mib": 480.4609375,
+  "steady.rss_peak_mib": 480.4609375,
+  "steady.runq_wait_ms": 0.24293,
+  "steady.wakeups_per_s": 191.41855362539312,
+  "steady.wakeups_per_s_browser": 191.41855362539312,
+  "steady.wakeups_per_s_engines": 0.0,
+  "steady.wall_s": 10.014703191998706,
+  "total.browser_draw_p50_ms": 0.760779,
+  "total.browser_draw_p95_ms": 1.213648,
+  "total.browser_fps": 1.0408994811738586,
+  "total.browser_frames": 139,
+  "total.compositor_cpu_pct": 3.6019615139901147,
+  "total.cpu_pct": 12.842752591461636,
+  "total.cpu_pct_browser": 2.5385965763880436,
+  "total.cpu_pct_engines": 10.304156015073607,
+  "total.cpu_s": 17.15,
+  "total.cpu_sched_ms": 15749.74643,
+  "total.cpu_sys_s": 8.009999999999994,
+  "total.cpu_user_s": 9.140000000000002,
+  "total.ctxsw_invol": 1238,
+  "total.ctxsw_vol": 99655,
+  "total.fps_delivered": 0.9135952280806529,
+  "total.fps_produced": 1.8421674271134476,
+  "total.frames_delivered": 122,
+  "total.frames_produced": 246,
+  "total.gpu_clock_mhz": 2322.2297297297296,
+  "total.gpu_fb_tree_mib": 225.0,
+  "total.gpu_mem_used_mib": 465.43993993993996,
+  "total.gpu_util_pct": 2.6471471471471473,
+  "total.ipc_out_mib": 407.99854946136475,
+  "total.ipc_out_mib_per_s": 3.055291211899435,
+  "total.ipc_out_writes": 4879,
+  "total.ipc_pixel_mib": 414.609375,
+  "total.ipc_pixel_mib_per_frame": 3.3984375,
+  "total.ipc_pixel_mib_per_s": 3.104796282930344,
+  "total.paint_p50_ms": 0.2,
+  "total.paint_p95_ms": 4.5,
+  "total.processes": 62,
+  "total.processes_exited": 60,
+  "total.pss_end_mib": 397.720703125,
+  "total.pss_growth_mib": 397.3115234375,
+  "total.pss_mean_mib": 430.21263020833334,
+  "total.pss_peak_mib": 491.162109375,
+  "total.read_p50_ms": 1.6,
+  "total.read_p95_ms": 3.0,
+  "total.readback_mib": 836.015625,
+  "total.readback_mib_per_s": 6.2604908655808575,
+  "total.rss_growth_mib": 499.2421875,
+  "total.rss_mean_mib": 609.262188222265,
+  "total.rss_peak_mib": 723.04296875,
+  "total.runq_wait_ms": 47.896832,
+  "total.send_p50_ms": 1.5,
+  "total.send_p95_ms": 2.8,
+  "total.wakeups_per_s": 746.265020117848,
+  "total.wakeups_per_s_browser": 426.28203572533744,
+  "total.wakeups_per_s_engines": 319.9829843925106,
+  "total.wall_s": 133.53835073800292
+ },
+ "processes": {
+  "351824": {
+   "comm": "sig",
+   "ppid": 351815
+  },
+  "351859": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "351967": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352022": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352077": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352132": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352187": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352242": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352312": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352382": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352437": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352492": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352547": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352602": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352657": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352712": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352767": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352822": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352877": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352932": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "352987": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353042": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353097": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353167": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353237": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353292": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353350": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353421": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353476": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353561": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353616": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353685": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353740": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353795": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353850": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353920": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "353975": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354030": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354100": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354170": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354225": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354280": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354335": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354390": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354445": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354500": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354555": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354610": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354665": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354720": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354790": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354845": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354900": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "354970": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "355040": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "355095": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "355150": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "355205": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "355276": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "355361": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "355416": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  },
+  "355471": {
+   "comm": "sig-servo",
+   "ppid": 351824
+  }
+ },
+ "renderers": [
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 81.9
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 100.7
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 89.4
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 89.5
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 88.6
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 92.4
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 91.9
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 92.0
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 92.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 92.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 94.8
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 94.0
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 93.8
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 94.2
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 94.5
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 94.9
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 94.9
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 96.8
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 95.5
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 95.4
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 96.0
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 96.9
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 97.5
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 97.4
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 83.2
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 81.8
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.6
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 80.6
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.8
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.9
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 80.6
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.2
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 78.8
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.8
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 78.7
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.6
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 78.0
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 80.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 80.3
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.6
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.3
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 78.6
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 78.8
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.9
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 78.9
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.4
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 83.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 84.0
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 84.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 83.7
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 83.2
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 81.7
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 81.2
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.2
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.1
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 78.7
+  },
+  {
+   "engine": "servo",
+   "gl_renderer": "NVIDIA GeForce RTX 4060/PCIe/SSE2",
+   "kind": "renderer",
+   "mode": "hardware",
+   "setup_ms": 79.4
+  }
+ ],
+ "screen_polls": 10,
+ "started": "2026-10-02T15:48:25+0200",
+ "workload": "tab-churn-long"
+}

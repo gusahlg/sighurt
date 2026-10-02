@@ -6,10 +6,16 @@ members = [
     "sighurt-wayland",
     "sighurt-ui",
     "sighurt-browser",
+    # Chromes besides the standard one, compiled into `sig` through sighurt-browser's features.
+    "sighurt-chrome-line",
     # Engines, compiled into `sig` through sighurt-browser's features.
     "sighurt-engine-servo",
     "sighurt-engine-wasm",
     "sighurt-engine-demo",
+    # Needs the WPE WebKit prefix of nix/build-wpewebkit.sh (docs/rewrite/WPE.md).
+    "sighurt-engine-wpe",
+    # Keymaps, compiled into `sig` through sighurt-browser's features.
+    "sighurt-keymap-modal",
     # Guest SDK and example guests.
     "sighurt-sdk",
     "examples/hello-sighurt",
@@ -27,8 +33,7 @@ members = [
     "experiments/m0-coexist",
     # M1: CPU chrome and a Servo page in one Wayland window (docs/rewrite/M1.md).
     "experiments/m1-mixed",
-    # WPE WebKit as an in-process engine, and beside Servo and Wasmtime (docs/rewrite/WPE.md).
-    "experiments/wpe-engine",
+    # WPE WebKit beside Servo and Wasmtime in one process (docs/rewrite/WPE.md).
     "experiments/wpe-coexist",
 ]
 # Resolver 3 picks dependency versions that support `rust-version` below: the Rust of the nixpkgs

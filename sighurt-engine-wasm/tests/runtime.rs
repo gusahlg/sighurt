@@ -1456,3 +1456,82 @@ fn a_static_page_leaves_the_owner_asleep() {
     assert_eq!(wakes, 0);
     assert!(events.is_empty(), "{events:#?}");
 }
+
+/// Saves five times in `start_app`: data as an absolute path and as `../escape.txt`, a URL whose
+/// last segment decodes to `../.zshenv`, the canvas as a PDF, and data once more.
+const DOWNLOADS: &str = r##"
+(module
+  (import "oxide" "api_download_data" (func $data (param i32 i32 i32 i32) (result i32)))
+  (import "oxide" "api_download_url" (func $url (param i32 i32) (result i32)))
+  (import "oxide" "api_canvas_print_pdf" (func $pdf (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "hello")
+  (data (i32.const 16) "/tmp/sighurt-wasm-download-test")
+  (data (i32.const 64) "../escape.txt")
+  (data (i32.const 96) "https://a.test/..%2F.zshenv")
+  (data (i32.const 128) "report")
+  (func (export "start_app")
+    (drop (call $data (i32.const 0) (i32.const 5) (i32.const 16) (i32.const 31)))
+    (drop (call $data (i32.const 0) (i32.const 5) (i32.const 64) (i32.const 13)))
+    (drop (call $url (i32.const 96) (i32.const 27)))
+    (drop (call $pdf (i32.const 128) (i32.const 6)))
+    (drop (call $data (i32.const 0) (i32.const 5) (i32.const 64) (i32.const 13)))))
+"##;
+
+#[test]
+fn downloads_are_the_browsers_to_make() {
+    use sighurt_api::services::{DownloadSource, Service};
+    let escape = std::path::Path::new("/tmp/sighurt-wasm-download-test");
+    let _ = std::fs::remove_file(escape);
+    let mut host = Host::new();
+    let url = guest(host.dir(), "downloads", DOWNLOADS);
+    let (view, _) = host.open(800, 600, 120);
+    host.navigate(view, &url);
+    let mut events = host.until(5 * SECS, |e| matches!(e, EngineEvent::ServiceRequested(_)));
+    events.extend(host.run_for(SECS / 2));
+    let document = events
+        .iter()
+        .find_map(|e| match e {
+            EngineEvent::NavigationCommitted { document, .. } => Some(*document),
+            _ => None,
+        })
+        .unwrap();
+    let requests: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ServiceRequested(request) => Some(request),
+            _ => None,
+        })
+        .collect();
+    // Four wait for the browser at most: the fifth fails in the guest.
+    assert_eq!(requests.len(), 4, "{requests:#?}");
+    let asked: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            assert_eq!((request.view, request.document), (view, document));
+            match &request.service {
+                Service::Download {
+                    source: DownloadSource::Data(data),
+                    suggested_name,
+                } => (data.starts_with(b"hello"), suggested_name.as_deref()),
+                Service::Download {
+                    source: DownloadSource::Url(url),
+                    suggested_name: None,
+                } => (url == "https://a.test/..%2F.zshenv", None),
+                other => panic!("not a download: {other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            (true, Some("/tmp/sighurt-wasm-download-test")),
+            (true, Some("../escape.txt")),
+            (true, None),
+            (false, Some("report.pdf")),
+        ]
+    );
+    // The engine wrote nothing: the names are for the browser to clean.
+    assert!(!escape.exists());
+    assert!(!host.dir().join("..").join("escape.txt").exists());
+}

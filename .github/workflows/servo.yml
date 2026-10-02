@@ -1,5 +1,6 @@
-# Checks the Servo engine (sighurt-engine-servo) and `sig` with its default features (Servo and
-# Wasm), which ci.yml leaves out.
+# Checks the Servo engine (sighurt-engine-servo) and `sig` with Servo, which ci.yml leaves out.
+# `sig`'s default features also have WPE WebKit, which needs a prefix the runners don't have
+# (docs/rewrite/WPE.md), so `sig` is checked here with every feature but `engine-wpe`.
 #
 # HEAVY: this compiles a large part of Servo (the first run takes a long time and a lot of
 # disk space; later runs rely on the cache). It therefore only runs when the engine, the crates
@@ -43,7 +44,7 @@ jobs:
       # Servo's native build dependencies: clang/libclang for bindgen, cmake and python3 for
       # its build scripts, and the graphics/font/windowing development libraries it links.
       # mozjs is fetched as a prebuilt archive, so no SpiderMonkey toolchain is needed. The last
-      # three lines are the Wasm engine's, which `sig`'s default features link too (as in ci.yml).
+      # three lines are the Wasm engine's, which `sig` links too (as in ci.yml).
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -67,6 +68,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked -p sighurt-engine-servo --all-targets -- -D warnings
 
-      # The Servo arm of sig's engine registry is compiled only with its default features.
-      - name: Clippy (sig with its default features)
-        run: cargo clippy --locked -p sighurt-browser --all-targets -- -D warnings
+      # The Servo arm of sig's engine registry is compiled only with `engine-servo`.
+      - name: Clippy (sig with Servo, without WPE WebKit)
+        run: >
+          cargo clippy --locked -p sighurt-browser --no-default-features
+          --features engine-servo,engine-wasm,engine-demo,keymap-modal,chrome-line
+          --all-targets -- -D warnings

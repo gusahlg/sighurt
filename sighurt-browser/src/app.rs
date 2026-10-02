@@ -17,8 +17,8 @@
 //!    whose deadline passed.
 //! 4. Hand their events to the core after the pumps return.
 //! 5. Rebuild the chrome's snapshot only when the core said the chrome changed; invalidate only
-//!    the chrome surfaces it damaged; apply a placement only when it differs from the last (or
-//!    answers a configure).
+//!    the chrome surfaces it asks to repaint; apply a placement only when it differs from the
+//!    last (or answers a configure).
 //! 6. Present whatever the host has permits for: the chrome paints its surfaces, engines present
 //!    their views. Presenting is a call, so the runtimes are pumped again; steps 1–6 repeat until
 //!    a pass does nothing, at most [`MAX_PASSES`] times.
@@ -28,16 +28,22 @@
 //! Nothing ticks at a fixed rate: an idle browser sleeps until the compositor, an engine, a
 //! service or a signal wakes it. Downloads and session writes run on threads of their own.
 //!
+//! The chrome is the one `[ui] chrome` names when `sig` starts ([`registry::CHROMES`]), driven
+//! through `sighurt_ui::extension::Chrome`: its surfaces are SHM targets by name
+//! ([`ChromeTargets`]), created when it first lists them.
+//!
 //! Shutdown (plan §20): stop taking input, cancel downloads, write the session (at once, whole),
 //! close every view and shut every runtime down (each releases its target leases), wait a moment
-//! for the downloads (deleting the files of those still waiting on a server), retire the
-//! chrome's leases, close the window, and only then drop the host. If a runtime could not shut
-//! down (Servo after a crash, decision 54), the process ends with `_exit` after the downloads,
-//! releasing nothing that runtime may still use.
+//! for the downloads (deleting the files of those still waiting on a server), delete what
+//! engines kept only for this run (`storage = "ephemeral"`), retire the chrome's leases, close
+//! the window, and only then drop the host. If a runtime could not shut down (Servo after a
+//! crash, decision 54), the process ends with `_exit` after that, releasing nothing that runtime
+//! may still use. With `[session] restore` off, the session is neither read nor written.
 //!
 //! Must not own: browser policy (the core) or drawing (the chrome and engines).
 //!
 //! [`effects`]: crate::effects
+//! [`registry::CHROMES`]: crate::registry::CHROMES
 
 use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::OwnedFd;
@@ -48,25 +54,26 @@ use calloop::generic::Generic;
 use calloop::ping::{make_ping, Ping};
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use sighurt_api::engine::{EngineCommand, EngineError, EngineWaker};
-use sighurt_api::events::EngineEvent;
-use sighurt_api::geometry::{LogicalSize, WindowRect};
+use sighurt_api::events::{Cursor, EngineEvent};
+use sighurt_api::geometry::LogicalSize;
 use sighurt_api::ids::{RequestId, SeatId, TargetId, ViewId, WindowId};
-use sighurt_api::input::{InputEvent, InputKind, PointerEvent};
+use sighurt_api::input::{InputEvent, InputKind, KeyboardFocus, PointerButton, PointerEvent};
 use sighurt_api::services::{ClipboardData, Selection};
 use sighurt_core::tabs::{Content, TabSummary};
-use sighurt_core::{BrowserEvent, BrowserState, Environment, Focus};
-use sighurt_ui::{
-    Chrome, CpuPainter, EngineRow, Fonts, HomeInfo, LayoutOptions, PixelBuffer, Snapshot,
-    TabContent, TabSnapshot, UiAction,
+use sighurt_core::{BrowserEvent, BrowserState, Environment};
+use sighurt_ui::extension::{
+    Chrome, ChromeAction, ChromeEvent, SurfaceName, TextField, MAX_SURFACES,
 };
+use sighurt_ui::{EngineRow, HomeInfo, PixelBuffer, Snapshot};
 use sighurt_wayland::{
     FramePermit, Host, HostEvent, InputRegion, Placement, PresentMode, TargetLease,
     TargetPlacement, WindowOptions,
 };
 
+use crate::chrome::{self, ChromeTargets};
 use crate::diagnostics::{Diagnostics, EngineReport, Report, TabReport, TargetReport};
 use crate::persistence::{self, ConfigWatch, Paths, SessionWriter};
-use crate::registry::{Registry, State};
+use crate::registry::{self, Registry, State};
 use crate::services::{Completion, Services};
 use crate::Args;
 
@@ -84,32 +91,6 @@ const NOTICE_FIRST: Duration = Duration::from_secs(5);
 const MAX_PASTE: usize = 1024 * 1024;
 /// Clipboard types for text, most preferred first.
 const TEXT_TYPES: [&str; 3] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
-
-/// The chrome's own surfaces: the strip at the top, the status strip at the bottom, and the
-/// page area while the chrome draws a page there (`sig://home`, errors).
-pub(crate) struct Surfaces {
-    pub top: TargetLease,
-    pub status: TargetLease,
-    pub page: TargetLease,
-}
-
-/// Which chrome surface a target is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Surface {
-    Top,
-    Status,
-    Page,
-}
-
-impl Surface {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Top => "chrome",
-            Self::Status => "status",
-            Self::Page => "page",
-        }
-    }
-}
 
 /// A live engine view, as `sig` knows it.
 pub(crate) struct ViewEntry {
@@ -129,10 +110,19 @@ pub struct App {
     pub(crate) core: BrowserState,
     /// Events for the core, in order.
     pub(crate) queue: VecDeque<BrowserEvent>,
-    pub(crate) chrome: Chrome,
-    painter: CpuPainter,
-    /// `None` once shut down.
-    pub(crate) surfaces: Option<Surfaces>,
+    /// What the build has, which configurations are checked against.
+    env: Environment,
+    pub(crate) chrome: Box<dyn Chrome>,
+    /// The chrome's name: the configuration's `[ui] chrome` when `sig` started.
+    pub(crate) chrome_name: &'static str,
+    /// The chrome's surfaces as targets, and their leases by name.
+    chrome_targets: ChromeTargets,
+    leases: BTreeMap<SurfaceName, TargetLease>,
+    /// The chrome's latest text field for the input method, and the target it was set on.
+    chrome_text: Option<TextField>,
+    chrome_text_target: Option<TargetId>,
+    /// The pointer's shape over the chrome, for targets made later.
+    chrome_cursor: Cursor,
     pub(crate) registry: Registry,
     pub(crate) views: BTreeMap<ViewId, ViewEntry>,
     pub(crate) services: Services,
@@ -237,30 +227,27 @@ fn watch(handle: &LoopHandle<'static, App>, signals: OwnedFd, paths: &Paths) -> 
 impl App {
     fn new(mut host: Host, wake: Ping, args: Args) -> Result<Self, String> {
         let paths = Paths::from_env();
+        let mut registry = Registry::compiled();
+        let env = registry.environment();
         let mut notice = None;
-        let loaded = match persistence::load_config(paths.config.as_deref()) {
-            Ok(loaded) => loaded,
+        let config = match persistence::load_config(paths.config.as_deref(), &env) {
+            Ok(config) => config,
             Err(error) => {
                 log::warn!("the configuration can't be used: {error}");
                 notice = Some(format!(
                     "{error}\nsig runs with the built-in configuration until the file is fixed."
                 ));
-                persistence::load_config(None).map_err(|e| e.to_string())?
+                persistence::load_config(None, &env).map_err(|e| e.to_string())?
             }
         };
-        let mut registry = Registry::compiled();
         let servo_wake = wake.clone();
-        registry.start_at_launch(&loaded.config, || {
-            EngineWaker::new(move || servo_wake.ping())
-        });
+        registry.start_at_launch(&config, || EngineWaker::new(move || servo_wake.ping()));
         // Servo's logger, if it started; otherwise env_logger.
         crate::registry::install_logger();
-        let env = Environment {
-            engines: registry.capabilities(),
-            home_dir: dirs::home_dir(),
-        };
+        let kind = registry::chrome(config.chrome());
+        let mut chrome = (kind.new)();
         let window = WindowId::next();
-        let bg = loaded.colors.bg;
+        let bg = chrome::theme(&config).colors.bg;
         host.create_window(
             window,
             WindowOptions {
@@ -270,15 +257,7 @@ impl App {
                 ..WindowOptions::default()
             },
         );
-        let target = |host: &mut Host| {
-            host.create_target(window, PresentMode::Shm, None)
-                .map_err(|e| e.to_string())
-        };
-        let surfaces = Surfaces {
-            top: target(&mut host)?,
-            status: target(&mut host)?,
-            page: target(&mut host)?,
-        };
+        let configured = chrome.handle(chrome::configure(&config, kind.name));
         let session = match &paths.session {
             Some(path) => match SessionWriter::new(path.clone()) {
                 Ok(writer) => Some(writer),
@@ -293,11 +272,16 @@ impl App {
         let mut app = Self {
             host,
             window,
-            core: BrowserState::new(loaded.config, env),
+            core: BrowserState::new(config, env.clone()),
             queue: VecDeque::new(),
-            chrome: Chrome::new(Fonts::system(), loaded.colors, LayoutOptions::default()),
-            painter: CpuPainter::new(),
-            surfaces: Some(surfaces),
+            env,
+            chrome,
+            chrome_name: kind.name,
+            chrome_targets: ChromeTargets::default(),
+            leases: BTreeMap::new(),
+            chrome_text: None,
+            chrome_text_target: None,
+            chrome_cursor: Cursor::Default,
             registry,
             views: BTreeMap::new(),
             services: Services::new(move || services_wake.ping()),
@@ -319,6 +303,7 @@ impl App {
             signals: Vec::new(),
             quit: None,
         };
+        app.chrome_actions(configured);
         app.queue.push_back(BrowserEvent::Start {
             session: None,
             open: args.open,
@@ -329,9 +314,12 @@ impl App {
         Ok(app)
     }
 
-    /// Restores the session and opens the command line's pages.
+    /// Restores the session, unless `[session] restore` is off, and opens the command line's
+    /// pages.
     fn start(&mut self) {
-        let session = match self.paths.session.as_deref().map(persistence::load_session) {
+        let path = self.paths.session.as_deref();
+        let path = path.filter(|_| self.core.config().restore_session());
+        let session = match path.map(persistence::load_session) {
             Some(Ok(session)) => session,
             Some(Err(error)) => {
                 self.show_notice(format!("The saved tabs can't be restored: {error}"));
@@ -447,8 +435,8 @@ impl App {
         match event {
             HostEvent::WindowConfigured { size, .. } => {
                 self.size = Some(size);
-                let actions = self.chrome.resize(size);
-                self.ui(actions);
+                let actions = self.chrome.handle(ChromeEvent::Resize(size));
+                self.chrome_actions(actions);
                 self.place_now = true;
             }
             HostEvent::CloseRequested { .. } => self.queue.push_back(BrowserEvent::Command(
@@ -468,8 +456,8 @@ impl App {
                     self.paste = None;
                     if let Ok(data) = result {
                         let text = String::from_utf8_lossy(&data.data).into_owned();
-                        let actions = self.chrome.paste(request, &text);
-                        self.ui(actions);
+                        let actions = self.chrome.handle(ChromeEvent::Pasted { request, text });
+                        self.chrome_actions(actions);
                     }
                 } else if let Some(result) = self.services.clipboard_read(request, result) {
                     self.queue
@@ -482,24 +470,36 @@ impl App {
         }
     }
 
-    /// Routes input: pointer input to the chrome surface or page it is over; keys, input-method
-    /// text and window focus to the core, which binds keys and hands the rest to the page or
-    /// the chrome.
+    /// Routes input: pointer input to the chrome surface or page it is over, except the mouse's
+    /// side buttons, which go to the core wherever the pointer is (`[input.buttons]`); keys,
+    /// input-method text and window focus to the core, which binds keys and hands the rest to
+    /// the page or the chrome.
     fn input(&mut self, target: Option<TargetId>, event: InputEvent, at: Instant) {
         match &event.kind {
             InputKind::Pointer(pointer) => {
-                if let Some(surface) = target.and_then(|t| self.surface_of(t)) {
-                    let rect = self.surface_rect(surface);
-                    let actions = self.chrome.pointer(rect, pointer);
-                    self.ui(actions);
+                let side = matches!(
+                    pointer,
+                    PointerEvent::Button {
+                        button: PointerButton::Back | PointerButton::Forward,
+                        ..
+                    }
+                );
+                if side {
+                    let view = target.and_then(|t| self.view_of(t));
+                    self.queue
+                        .push_back(BrowserEvent::Button { view, event, at });
+                } else if let Some(surface) = target.and_then(|t| self.surface_of(t)) {
+                    let event = pointer.clone();
+                    let actions = self.chrome.handle(ChromeEvent::Pointer { surface, event });
+                    self.chrome_actions(actions);
                 } else if let Some(view) = target.and_then(|t| self.view_of(t)) {
                     self.queue
                         .push_back(BrowserEvent::Pointer { view, event, at });
                 }
             }
             InputKind::Focus(focus) => {
-                let actions = self.chrome.window_focus(*focus);
-                self.ui(actions);
+                let actions = self.chrome.handle(ChromeEvent::WindowFocus(*focus));
+                self.chrome_actions(actions);
                 self.queue.push_back(BrowserEvent::Keyboard { event, at });
             }
             InputKind::Key(_) | InputKind::TextInput(_) => {
@@ -509,15 +509,16 @@ impl App {
     }
 
     /// Carries out what the chrome asks for.
-    pub(crate) fn ui(&mut self, actions: Vec<UiAction>) {
+    pub(crate) fn chrome_actions(&mut self, actions: Vec<ChromeAction>) {
         for action in actions {
             match action {
-                UiAction::Command(command) => self.queue.push_back(BrowserEvent::Command(command)),
-                UiAction::Focus(focus) => self.queue.push_back(BrowserEvent::Focus(match focus {
-                    sighurt_ui::Focus::Page => Focus::Page,
-                    sighurt_ui::Focus::Chrome => Focus::Location,
-                })),
-                UiAction::Copy(text) => {
+                ChromeAction::Command(command) => {
+                    self.queue.push_back(BrowserEvent::Command(command))
+                }
+                ChromeAction::SelectTab(tab) => self.queue.push_back(BrowserEvent::SelectTab(tab)),
+                ChromeAction::CloseTab(tab) => self.queue.push_back(BrowserEvent::CloseTab(tab)),
+                ChromeAction::Focus(focus) => self.queue.push_back(BrowserEvent::Focus(focus)),
+                ChromeAction::Copy(text) => {
                     let item = ClipboardData {
                         mime_type: TEXT_TYPES[0].into(),
                         data: text.into_bytes(),
@@ -527,7 +528,7 @@ impl App {
                         self.show_notice(format!("Copying failed: {error}"));
                     }
                 }
-                UiAction::Paste(request) => {
+                ChromeAction::Paste(request) => {
                     if let Some(old) = self.paste.replace(request) {
                         self.host.clipboard_cancel(old);
                     }
@@ -535,20 +536,40 @@ impl App {
                     self.host
                         .clipboard_read(request, Selection::Clipboard, &types, MAX_PASTE);
                 }
-                UiAction::TextInput(state) => {
-                    if let Some(s) = &self.surfaces {
-                        self.host.set_text_input(self.window, s.top.id(), state);
+                ChromeAction::TextInput(field) => {
+                    self.chrome_text = field;
+                    self.sync_chrome_text();
+                }
+                ChromeAction::Cursor(cursor) => {
+                    self.chrome_cursor = cursor;
+                    for lease in self.leases.values() {
+                        self.host.set_cursor(lease.id(), cursor);
                     }
                 }
-                UiAction::Cursor(cursor) => {
-                    if let Some(s) = &self.surfaces {
-                        for target in [s.top.id(), s.status.id(), s.page.id()] {
-                            self.host.set_cursor(target, cursor);
-                        }
+                ChromeAction::Repaint(surface) => {
+                    if let Some(target) = self.target_of(surface) {
+                        self.host.invalidate(target);
                     }
                 }
             }
         }
+    }
+
+    /// Gives the host the chrome's text field, on its surface's target once that has one, and
+    /// takes it from the target it was on before.
+    fn sync_chrome_text(&mut self) {
+        let wanted = self
+            .chrome_text
+            .as_ref()
+            .and_then(|field| self.target_of(field.surface));
+        if let Some(old) = self.chrome_text_target.filter(|&old| Some(old) != wanted) {
+            self.host.set_text_input(self.window, old, None);
+        }
+        if let Some(target) = wanted {
+            let state = self.chrome_text.as_ref().map(|field| field.state.clone());
+            self.host.set_text_input(self.window, target, state);
+        }
+        self.chrome_text_target = wanted;
     }
 
     /// Hands queued events to the core and carries out its effects, until nothing is queued.
@@ -684,8 +705,8 @@ impl App {
                 break;
             }
             let snapshot = self.snapshot();
-            let actions = self.chrome.set_snapshot(snapshot);
-            self.ui(actions);
+            let actions = self.chrome.handle(ChromeEvent::Snapshot(snapshot));
+            self.chrome_actions(actions);
             self.run_core();
             worked = true;
             // A navigation whose tab the user left is no longer waited for.
@@ -696,53 +717,15 @@ impl App {
                 }
             }
         }
-        let damage = self.chrome.take_damage();
-        if let Some(s) = &self.surfaces {
-            let damaged = [
-                (damage.chrome, s.top.id()),
-                (damage.status, s.status.id()),
-                (damage.page, s.page.id()),
-            ];
-            for (damaged, target) in damaged {
-                if damaged {
-                    self.host.invalidate(target);
-                }
-            }
-        }
         worked |= self.place();
         self.sync_keyboard_focus();
         worked
     }
 
-    /// What the chrome shows: the core's tabs, and the status line.
+    /// What the chrome shows: the core's tabs, the status line and the home page, contained.
     fn snapshot(&self) -> Snapshot {
-        let active = self.core.active();
-        let mut snapshot = Snapshot {
-            home: self.home_info(),
-            ..Snapshot::default()
-        };
-        for (index, tab) in self.core.tabs().enumerate() {
-            let content = match (tab.content, tab.error) {
-                (Content::View(_), _) => TabContent::Engine,
-                (Content::Internal(_), _) => TabContent::Internal,
-                (Content::Blank, Some(error)) => TabContent::Error(error.message.clone()),
-                (Content::Blank, None) => TabContent::Blank,
-            };
-            if index == active {
-                snapshot.can_go_back = tab.can_go_back;
-                snapshot.can_go_forward = tab.can_go_forward;
-                snapshot.status = self.status(&tab).map(|(_, text)| text.to_owned());
-            }
-            snapshot.tabs.push(TabSnapshot {
-                id: tab.id,
-                title: tab.title.into_owned(),
-                url: tab.url.unwrap_or_default().to_owned(),
-                loading: tab.loading,
-                active: index == active,
-                content,
-            });
-        }
-        snapshot
+        let status = |tab: &TabSummary<'_>| self.status(tab).map(|(_, text)| text.to_owned());
+        chrome::snapshot(&self.core, self.home_info(), status)
     }
 
     /// What `sig://home` says: the configuration file and the engines of this build.
@@ -784,11 +767,12 @@ impl App {
         }
     }
 
-    /// What the status strip shows for `tab`, and where it comes from.
+    /// What the status strip shows for `tab`, and where it comes from. A tab's error is shown
+    /// there unless the page area shows it (a tab with nothing else to show).
     fn status<'a>(&'a self, tab: &TabSummary<'a>) -> Option<(&'static str, &'a str)> {
         let error = tab
             .error
-            .filter(|_| matches!(tab.content, Content::View(_)))
+            .filter(|_| !matches!(tab.content, Content::Blank))
             .map(|e| e.message.as_str());
         status_line(
             self.notice.as_deref(),
@@ -819,28 +803,58 @@ impl App {
     }
 
     /// The window's layout for the host: every view (only the shown one visible) at the page
-    /// rectangle, the chrome's page above them, the chrome and the status strip on top.
-    fn placement(&self) -> Option<Placement> {
-        let (size, surfaces) = (self.size?, self.surfaces.as_ref()?);
-        let layout = self.chrome.layout();
-        let place = |target: TargetId, rect: WindowRect, visible: bool| TargetPlacement {
-            target,
-            rect,
-            visible,
-            input: InputRegion::Whole,
-        };
+    /// rectangle, the chrome's surfaces above them in its order. A surface name the chrome
+    /// hasn't used before gets a target here.
+    fn placement(&mut self) -> Option<Placement> {
+        let size = self.size?;
+        let placing = self.chrome_targets.place(self.chrome.layout(), size);
+        for name in placing.refused {
+            self.diag.error(format!(
+                "the chrome uses more than {MAX_SURFACES} surfaces: {name} is not shown"
+            ));
+        }
         let mut targets: Vec<TargetPlacement> = self
             .views
             .values()
-            .map(|entry| place(entry.target, layout.page, entry.visible))
+            .map(|entry| TargetPlacement {
+                target: entry.target,
+                rect: placing.page,
+                visible: entry.visible,
+                input: InputRegion::Whole,
+            })
             .collect();
-        targets.push(place(
-            surfaces.page.id(),
-            layout.page,
-            self.chrome.draws_page(),
-        ));
-        targets.push(place(surfaces.top.id(), layout.chrome, true));
-        targets.push(place(surfaces.status.id(), layout.status, true));
+        let mut created = false;
+        for placed in placing.surfaces {
+            let target = match self.leases.get(placed.name) {
+                Some(lease) => lease.id(),
+                None => match self.host.create_target(self.window, PresentMode::Shm, None) {
+                    Ok(lease) => {
+                        let target = lease.id();
+                        self.host.set_cursor(target, self.chrome_cursor);
+                        // Its first frame, whatever the chrome asked to repaint before.
+                        self.host.invalidate(target);
+                        self.leases.insert(placed.name, lease);
+                        created = true;
+                        target
+                    }
+                    Err(error) => {
+                        let name = placed.name;
+                        self.diag
+                            .error(format!("no target for the chrome's {name}: {error}"));
+                        continue;
+                    }
+                },
+            };
+            targets.push(TargetPlacement {
+                target,
+                rect: placed.rect,
+                visible: placed.visible,
+                input: placed.input,
+            });
+        }
+        if created {
+            self.sync_chrome_text();
+        }
         Some(Placement {
             window: self.window,
             size,
@@ -872,17 +886,22 @@ impl App {
         }
     }
 
-    /// Gives the host's logical keyboard focus to whatever the core says has the keyboard.
+    /// Gives the host's logical keyboard focus to whatever the core says has the keyboard: the
+    /// chrome's surface with its text field (or its first surface), the shown view, or the
+    /// chrome's surface at the page's rectangle while it draws the page.
     fn sync_keyboard_focus(&mut self) {
-        let Some(surfaces) = &self.surfaces else {
-            return;
+        let layout = self.chrome.layout();
+        let listed = |rect: Option<_>| {
+            let surfaces = layout.surfaces.iter();
+            let mut surfaces = surfaces.filter(|s| rect.is_none_or(|rect| s.rect == rect));
+            surfaces.find_map(|surface| self.target_of(surface.name))
         };
         let wanted = match self.core.focus() {
-            Focus::Location => Some(surfaces.top.id()),
-            Focus::Page => self
+            KeyboardFocus::Chrome => self.chrome_text_target.or_else(|| listed(None)),
+            KeyboardFocus::Page => self
                 .shown_view()
                 .map(|(_, entry)| entry.target)
-                .or(Some(surfaces.page.id())),
+                .or_else(|| listed(Some(layout.page).filter(|page| !page.size().is_empty()))),
         };
         if wanted != self.keyboard_target {
             self.keyboard_target = wanted;
@@ -905,25 +924,17 @@ impl App {
             .map(|(&view, _)| view)
     }
 
-    fn surface_of(&self, target: TargetId) -> Option<Surface> {
-        let s = self.surfaces.as_ref()?;
-        [
-            (s.top.id(), Surface::Top),
-            (s.status.id(), Surface::Status),
-            (s.page.id(), Surface::Page),
-        ]
-        .into_iter()
-        .find(|(id, _)| *id == target)
-        .map(|(_, surface)| surface)
+    /// The chrome's surface that `target` is.
+    fn surface_of(&self, target: TargetId) -> Option<SurfaceName> {
+        let mut leases = self.leases.iter();
+        leases
+            .find(|(_, lease)| lease.id() == target)
+            .map(|(&name, _)| name)
     }
 
-    fn surface_rect(&self, surface: Surface) -> WindowRect {
-        let layout = self.chrome.layout();
-        match surface {
-            Surface::Top => layout.chrome,
-            Surface::Status => layout.status,
-            Surface::Page => layout.page,
-        }
+    /// The target of the chrome's surface `surface`, once it has one.
+    fn target_of(&self, surface: SurfaceName) -> Option<TargetId> {
+        self.leases.get(surface).map(TargetLease::id)
     }
 
     // ── Step 6: presenting ────────────────────────────────────────────────────────────────
@@ -944,23 +955,27 @@ impl App {
         if worked {
             // Buffers are allocated while presenting, so this sees every peak.
             let host = self.host.diagnostics();
-            let per_target = host
+            let per_target: Vec<_> = host
                 .targets
                 .iter()
-                .map(|t| (t.buffers.buffers, t.buffers.retiring_generations));
+                .map(|t| {
+                    let chrome = self.surface_of(t.target).is_some();
+                    (t.buffers.buffers, t.buffers.retiring_generations, chrome)
+                })
+                .collect();
             let bytes = host.targets.iter().map(|t| t.buffers.bytes).sum();
-            self.diag.buffers(per_target, bytes);
+            self.diag.buffers(per_target.into_iter(), bytes);
         }
         worked
     }
 
-    fn paint_chrome(&mut self, surface: Surface, permit: FramePermit) {
+    fn paint_chrome(&mut self, surface: SurfaceName, permit: FramePermit) {
         let metrics = permit.metrics();
         let mut frame = match permit.shm_frame() {
             Ok(frame) => frame,
             Err(error) => {
                 self.diag
-                    .error(format!("no buffer for the {}: {error}", surface.name()));
+                    .error(format!("no buffer for the chrome's {surface}: {error}"));
                 return;
             }
         };
@@ -972,15 +987,15 @@ impl App {
             height: size.height,
             stride,
         };
-        match self.painter.paint(&mut self.chrome, &metrics, buffer) {
+        match self.chrome.paint(surface, &metrics, buffer) {
             Ok(()) => {
                 frame.submit();
-                self.diag.chrome(surface.name(), started.elapsed());
+                self.diag.chrome(surface, started.elapsed());
             }
             // The buffer goes back unsubmitted.
             Err(error) => self
                 .diag
-                .error(format!("painting the {} failed: {error}", surface.name())),
+                .error(format!("painting the chrome's {surface} failed: {error}")),
         }
     }
 
@@ -1037,11 +1052,18 @@ impl App {
 
     fn reload_config(&mut self) {
         self.diag.counters.config_reloads += 1;
-        match persistence::load_config(self.paths.config.as_deref()) {
-            Ok(loaded) => {
-                self.chrome.set_colors(loaded.colors);
+        match persistence::load_config(self.paths.config.as_deref(), &self.env) {
+            Ok(config) => {
+                // Saving the session again: the tabs as they are now go to the file soon.
+                if config.restore_session() && !self.core.config().restore_session() {
+                    self.session_changed();
+                }
+                let actions = self
+                    .chrome
+                    .handle(chrome::configure(&config, self.chrome_name));
+                self.chrome_actions(actions);
                 self.queue
-                    .push_back(BrowserEvent::ConfigReloaded(Ok(loaded.config)));
+                    .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
                 self.notice_first = None;
                 if self.notice.take().is_some() {
                     self.snapshot_dirty = true;
@@ -1061,10 +1083,12 @@ impl App {
         self.run_core();
     }
 
-    /// Hands the session to the writer now.
+    /// Hands the session to the writer now, unless `[session] restore` is off: then the file
+    /// stays as it is.
     pub(crate) fn save_session(&mut self) {
         self.session_due = None;
-        if let Some(writer) = &self.session {
+        let writer = self.session.as_ref();
+        if let Some(writer) = writer.filter(|_| self.core.config().restore_session()) {
             writer.save(self.core.session().to_text());
             self.diag.counters.session_saves += 1;
         }
@@ -1080,7 +1104,12 @@ impl App {
 
     fn report(&mut self, at_exit: bool) {
         // Readbacks made since the engines' last frames, each as big as the page area.
-        let page = self.surfaces.as_ref().map(|s| s.page.metrics().buffer());
+        let scale = self
+            .leases
+            .values()
+            .next()
+            .map(|lease| lease.metrics().scale());
+        let page = scale.map(|scale| scale.buffer_size(self.chrome.layout().page.size()));
         let page_bytes = page.map_or(0, |b| u64::from(b.width) * u64::from(b.height) * 4);
         for engine in self.registry.engines() {
             if let State::Running(runtime) = engine.state() {
@@ -1095,7 +1124,7 @@ impl App {
             .map(|t| {
                 let (role, engine, tab) = match (self.surface_of(t.target), self.view_of(t.target))
                 {
-                    (Some(surface), _) => (surface.name(), None, None),
+                    (Some(surface), _) => (surface, None, None),
                     (None, Some(view)) => (
                         "view",
                         Some(self.views[&view].engine.clone()),
@@ -1192,7 +1221,9 @@ impl App {
         let code = self.quit.take().unwrap_or(ExitCode::SUCCESS);
         self.services.cancel_downloads();
         if let Some(writer) = self.session.take() {
-            writer.save(self.core.session().to_text());
+            if self.core.config().restore_session() {
+                writer.save(self.core.session().to_text());
+            }
             writer.finish();
         }
         let views: Vec<(ViewId, String)> = self
@@ -1212,16 +1243,18 @@ impl App {
         let Self {
             mut host,
             window,
-            surfaces,
+            leases,
             services,
-            registry,
+            mut registry,
             ..
         } = self;
         services.shutdown();
+        // Late, so that no guest still finishing its last call writes there again.
+        registry.remove_scratch();
         if registry.leaked() {
             exit_now(code);
         }
-        drop(surfaces);
+        drop(leases);
         host.close_window(window);
         host.flush();
         drop(host);

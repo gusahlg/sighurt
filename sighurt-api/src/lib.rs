@@ -16,6 +16,9 @@
 //! - [`services`]: privileged requests (clipboard, downloads, file pickers, external URLs,
 //!   permissions) and their answers.
 //! - [`commands`]: the browser commands users bind keys to, such as `tab.new`.
+//! - [`settings`]: the values of a keymap's or chrome's own table of the configuration.
+//! - [`keymap`]: the [`Keymap`](keymap::Keymap) trait keymaps implement, which turns key
+//!   presses into commands, and the keystroke syntax of the configuration.
 //!
 //! This is an internal contract rebuilt with the workspace, not a stable plugin ABI. The guest
 //! SDK for Wasm apps is a separate compatibility promise. See `sighurt-rewrite-plan.md` §5–§7,
@@ -30,4 +33,6 @@ pub mod events;
 pub mod geometry;
 pub mod ids;
 pub mod input;
+pub mod keymap;
 pub mod services;
+pub mod settings;

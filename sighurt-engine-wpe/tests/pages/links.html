@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>links</title>
+<!-- Things only a user's click may do: the top-left link opens a tab, the field below it a file
+     picker; a new fragment makes the page click the field itself. The title says what happened. -->
+<style>
+  body { font: 20px sans-serif; margin: 0; background: #f8f4ee; }
+  a, input { position: fixed; left: 0; width: 200px; height: 40px; display: block; }
+  #tab { top: 0; background: #cde; }
+  #file { top: 60px; }
+</style>
+<a id="tab" href="second.html" target="_blank">a new tab</a>
+<input id="file" type="file" multiple>
+<script>
+  file.addEventListener("change", () => {
+    document.title = "files " + [...file.files].map((f) => f.name).join(",");
+  });
+  file.addEventListener("cancel", () => { document.title = "files cancelled"; });
+  // Without a user's click: WebKit opens no picker.
+  addEventListener("hashchange", () => { file.click(); document.title = "clicked by script"; });
+</script>

@@ -40,11 +40,11 @@ use sighurt_api::geometry::{LogicalSize, WindowRect};
 use sighurt_api::ids::{NavigationId, TargetId, ViewId, WindowId};
 use sighurt_engine_servo::{ServoConfig, ServoRuntime};
 use sighurt_engine_wasm::{SandboxPolicy, WasmConfig, WasmRuntime};
+use sighurt_engine_wpe::{WpeConfig, WpeRuntime};
 use sighurt_wayland::{
     FramePermit, Host, HostEvent, InputRegion, Placement, PresentMode, TargetLease,
     TargetPlacement, WindowOptions,
 };
-use wpe_engine::{WpeConfig, WpeRuntime};
 
 type Runtime = dyn EngineRuntime<Target = TargetLease, FramePermit = FramePermit>;
 

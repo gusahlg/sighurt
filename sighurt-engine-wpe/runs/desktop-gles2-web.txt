@@ -1,0 +1,27 @@
+[   0.041] window 1024x768 at 120/120
+[   0.045] ViewReady { view: ViewId(1) }
+[   0.045] LoadingChanged { view: ViewId(1), loading: true }
+[   0.193] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 14:05:46.837: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.221] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "https://example.com/" }
+[   0.259] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "https://example.com/", document: DocumentGeneration(1), history: Some(Push) }
+[   0.259] HistoryChanged { view: ViewId(1), entries: ["https://example.com/"], current: 0 }
+[   0.259] TitleChanged { view: ViewId(1), title: Some("Example Domain") }
+[   0.299] LoadingChanged { view: ViewId(1), loading: false }
+[   0.317] StatusTextChanged { view: ViewId(1), text: None }
+[   0.317] CursorChanged { view: ViewId(1), cursor: Default }
+[   1.781] action mark
+[   1.781] mark: wakeups 47 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 76 stale-frames 1 rounded-frames 0 failed-imports 0
+[   1.781] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[   1.781] mark: submitted 1 dmabuf-frames 1 dmabuf-imports 1 shm-copies 0 shm-bytes 0 dropped 1 releases 0 present-mean-ms 0.037 present-max-ms 0.037
+[   1.781] mark: ViewId(1) frames 1 pacing -
+[   1.781] mark: pss-kib 250418 (wpe-window 35803, WPENetworkProce 67746, WPEWebProcess 144937, bwrap 974, xdg-dbus-proxy 958)
+[   2.114] action quit
+[   2.114] end: wakeups 49 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 76 stale-frames 1 rounded-frames 0 failed-imports 0
+[   2.114] end: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[   2.114] end: submitted 1 dmabuf-frames 1 dmabuf-imports 1 shm-copies 0 shm-bytes 0 dropped 1 releases 0 present-mean-ms 0.037 present-max-ms 0.037
+[   2.114] end: ViewId(1) frames 1 pacing -
+[   2.114] end: pss-kib 250426 (WPEWebProcess 144937, xdg-dbus-proxy 958, WPENetworkProce 67746, bwrap 974, wpe-window 35811)
+shut down: the compositor reported no error
+exit 0

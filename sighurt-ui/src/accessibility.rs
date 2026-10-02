@@ -1,5 +1,6 @@
 //! The chrome's accessibility tree as plain data: roles, names, values, states and bounds of
-//! its widgets, with stable ids, and a document node for the page area.
+//! its widgets, with stable ids, and a document node for the page area. Only what is shown is
+//! in it: no tab list while the tabs are hidden, no buttons that `[chrome.standard]` leaves out.
 //!
 //! When an engine view shows the page, the document node is the container its accessibility
 //! subtree will hang under once engines provide one; none does yet, and the node says only
@@ -12,8 +13,9 @@
 use sighurt_api::geometry::WindowRect;
 use sighurt_api::ids::TabId;
 
-use crate::chrome::{Chrome, Tone};
+use crate::chrome::{Model, Tone};
 use crate::hit_test::Target;
+use crate::layout::Tabs;
 
 /// A node's identity. It stays the same while the thing it names exists, so an assistive
 /// technology can follow a tab across tree updates.
@@ -21,7 +23,7 @@ use crate::hit_test::Target;
 pub enum NodeId {
     /// The window.
     Window,
-    /// The tab strip.
+    /// The tab strip, or the tab list on the left.
     TabList,
     /// A tab.
     Tab(TabId),
@@ -138,7 +140,7 @@ fn node(id: NodeId, role: Role, name: impl Into<String>, bounds: WindowRect) -> 
     }
 }
 
-impl Chrome {
+impl Model {
     /// The chrome's accessibility tree as it is now.
     pub fn accessibility(&mut self) -> Tree {
         let layout = self.layout().clone();
@@ -146,7 +148,11 @@ impl Chrome {
         let state = self.state().clone();
         let mut nodes = Vec::new();
 
-        let mut tab_list = node(NodeId::TabList, Role::TabList, "Tabs", layout.tab_strip);
+        let tab_bounds = match layout.options.tabs {
+            Tabs::Left => layout.tab_list,
+            Tabs::Top | Tabs::Hidden => layout.tab_strip,
+        };
+        let mut tab_list = node(NodeId::TabList, Role::TabList, "Tabs", tab_bounds);
         for (tab, place) in snapshot.tabs.iter().zip(&layout.tabs) {
             let mut entry = node(
                 NodeId::Tab(tab.id),
@@ -168,13 +174,16 @@ impl Chrome {
             tab_list.children.push(entry.id);
             nodes.push(entry);
         }
-        tab_list.children.push(NodeId::NewTab);
-        nodes.push(node(
-            NodeId::NewTab,
-            Role::Button,
-            "New tab",
-            layout.new_tab,
-        ));
+        let tabs_shown = layout.options.tabs != Tabs::Hidden;
+        if tabs_shown {
+            tab_list.children.push(NodeId::NewTab);
+            nodes.push(node(
+                NodeId::NewTab,
+                Role::Button,
+                "New tab",
+                layout.new_tab,
+            ));
+        }
 
         let loading = snapshot.active().is_some_and(|tab| tab.loading);
         let buttons = [
@@ -193,6 +202,9 @@ impl Chrome {
             ),
         ];
         let mut toolbar = node(NodeId::Toolbar, Role::Toolbar, "Navigation", layout.toolbar);
+        let buttons = buttons
+            .into_iter()
+            .filter(|button| !button.2.size().is_empty());
         for (id, name, bounds, enabled) in buttons {
             let mut button = node(id, Role::Button, name, bounds);
             button.states.disabled = !enabled;
@@ -246,8 +258,12 @@ impl Chrome {
                 height: size.height,
             }
         });
-        window.children = vec![NodeId::TabList, NodeId::Toolbar, NodeId::Page];
-        let mut roots = vec![window, tab_list, toolbar, page];
+        window.children = vec![NodeId::Toolbar, NodeId::Page];
+        let mut roots = vec![window, toolbar, page];
+        if tabs_shown {
+            roots[0].children.insert(0, NodeId::TabList);
+            roots.insert(1, tab_list);
+        }
         if !layout.status.size().is_empty() {
             let mut status = node(NodeId::Status, Role::Status, "Status", layout.status);
             status.value = self.status_line().map(|(line, _)| line);

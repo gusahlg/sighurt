@@ -121,11 +121,15 @@ def window(sampler, gpu, events, sway_pid, start, end, inputs=(), pixels=()):
         m["ipc_pixel_mib_per_s"] = m["ipc_pixel_mib"] / wall
         if delivered:
             m["ipc_pixel_mib_per_frame"] = m["ipc_pixel_mib"] / len(delivered)
-        for key in ("paint_ms", "read_ms", "send_ms"):
+        for key in ("paint_ms", "read_ms", "send_ms", "present_ms"):
             values = sorted(e[key] for e in frames if e.get(key) is not None)
             if values:
                 m[f"{key.removesuffix('_ms')}_p50_ms"] = percentile(values, 0.5)
                 m[f"{key.removesuffix('_ms')}_p95_ms"] = percentile(values, 0.95)
+    swaps = sorted(e["swap_ms"] for t, e in events if e["kind"] == "engine-timing" and ta <= t <= tb)
+    if swaps:
+        m["swap_p50_ms"] = percentile(swaps, 0.5)
+        m["swap_p95_ms"] = percentile(swaps, 0.95)
 
     # The browser's own window frames (baseline: every GPUI draw, chrome and page area together).
     if any(e["kind"] == "browser-frame" for _, e in events):
@@ -163,24 +167,51 @@ COUNTER_DELAY_S = 1.0
 
 
 def counters(events, ta, tb, from_launch=False):
-    """Each counter's increase over the window from `ta` to `tb` ("ctr.<name>") and its rate
-    ("ctr.<name>_per_s"), between the first snapshot within COUNTER_DELAY_S after each end. The
-    rate divides by the time between the two snapshots, not the marks. A window that starts at
-    launch starts from zero, since the process has just started. Without both snapshots, none."""
-    snapshots = [(t, e["values"]) for t, e in events if e["kind"] == "counters"]
-
-    def after(mark):
-        return next(((t, v) for t, v in snapshots if mark <= t <= mark + COUNTER_DELAY_S), None)
-
-    a = (ta, {}) if from_launch else after(ta)
-    b = after(tb)
-    if a is None or b is None or b[0] <= a[0]:
-        return {}
+    """Each counter's increase over the window from `ta` to `tb` ("ctr.<name>", or
+    "ctr.<group>.<name>" for a snapshot's group) and its rate ("..._per_s"), between the first
+    snapshot of its group within COUNTER_DELAY_S after each end. The rate divides by the time
+    between the two snapshots, not the marks. A window that starts at launch starts from zero,
+    since the process has just started. Without both snapshots, none."""
     out = {}
-    for name, value in b[1].items():
-        increase = value - a[1].get(name, 0)
-        out[f"ctr.{name}"] = increase
-        out[f"ctr.{name}_per_s"] = increase / (b[0] - a[0])
+    for group in dict.fromkeys(e.get("group") for _, e in events if e["kind"] == "counters"):
+        snapshots = [(t, e["values"]) for t, e in events if e["kind"] == "counters" and e.get("group") == group]
+
+        def after(mark):
+            return next(((t, v) for t, v in snapshots if mark <= t <= mark + COUNTER_DELAY_S), None)
+
+        a = (ta, {}) if from_launch else after(ta)
+        b = after(tb)
+        if a is None or b is None or b[0] <= a[0]:
+            continue
+        prefix = f"ctr.{group}." if group else "ctr."
+        for name, value in b[1].items():
+            increase = value - a[1].get(name, 0)
+            out[f"{prefix}{name}"] = increase
+            out[f"{prefix}{name}_per_s"] = increase / (b[0] - a[0])
+    return out
+
+
+def exit_metrics(report):
+    """The whole run, from the report a build writes at exit (`--diagnostics FILE`, the rewrite's
+    JSON): the page readbacks its engines counted, their GL reads when audited, and the peaks
+    (longest calls, deepest queues, most buffers) as "exit.<name>"."""
+    counters, peaks = report.get("counters", {}), report.get("peaks", {})
+    out = {}
+    for name in ("page_readbacks", "present_errors"):
+        if name in counters:
+            out[f"exit.{name}"] = counters[name]
+    if "readback_bytes" in counters:
+        out["exit.readback_mib"] = counters["readback_bytes"] / MIB
+    gl_reads = [e["gl_reads"] for e in report.get("engines", []) if e.get("gl_reads") is not None]
+    if gl_reads:
+        out["exit.gl_reads"] = sum(gl_reads)
+    for name, value in peaks.items():
+        if name.endswith("_us"):
+            out[f"exit.{name.removesuffix('_us')}_ms"] = value / 1000
+        elif name.endswith("_bytes"):
+            out[f"exit.{name.removesuffix('_bytes')}_mib"] = value / MIB
+        else:
+            out[f"exit.{name}"] = value
     return out
 
 

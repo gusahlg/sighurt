@@ -36,23 +36,26 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Everything except Servo, which servo.yml checks. These build Servo and are left out:
-      # sighurt-engine-servo, sig's default features (sighurt-browser is checked below with the
-      # other engines), and the M0 and M1 experiments. `--workspace` alone would compile Servo
-      # (see CLAUDE.md, "Build commands").
+      # Everything except Servo, which servo.yml checks, and WPE WebKit, which needs the prefix
+      # nix/build-wpewebkit.sh installs and is checked on a developer machine (docs/rewrite/WPE.md).
+      # Left out: sighurt-engine-servo, sighurt-engine-wpe, sig's default features (sighurt-browser
+      # is checked below with the demo and Wasm engines, the modal keymap and the line chrome),
+      # and the experiments that link Servo (m0-coexist, m1-mixed, wpe-coexist). `--workspace`
+      # alone would compile both (see CLAUDE.md, "Build commands").
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (workspace without Servo)
+      - name: Clippy (workspace without Servo and WPE WebKit)
         run: >
           cargo clippy --workspace
-          --exclude sighurt-engine-servo --exclude sighurt-browser
-          --exclude m0-coexist --exclude m1-mixed
+          --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-browser
+          --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
           --all-targets -- -D warnings
 
-      - name: Clippy (sig without Servo)
+      - name: Clippy (sig without Servo and WPE WebKit)
         run: >
-          cargo clippy -p sighurt-browser --no-default-features --features engine-demo,engine-wasm
+          cargo clippy -p sighurt-browser --no-default-features
+          --features engine-demo,engine-wasm,keymap-modal,chrome-line
           --all-targets -- -D warnings
 
       # The Wasm engine's tests run these example guests (sighurt-engine-wasm/tests/).
@@ -61,16 +64,18 @@ jobs:
           cargo build --target wasm32-unknown-unknown --release
           -p hello-sighurt -p raf-demo -p gradient-demo -p typography-demo
 
-      - name: Test (workspace without Servo)
+      - name: Test (workspace without Servo and WPE WebKit)
         run: >
           cargo test --workspace
-          --exclude sighurt-engine-servo --exclude sighurt-browser
-          --exclude m0-coexist --exclude m1-mixed
+          --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-browser
+          --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
 
-      # Unit tests only: the end-to-end tests (sighurt-browser/tests/headless.sh) need a
-      # compositor and run on a developer machine.
-      - name: Test (sig without Servo)
-        run: cargo test -p sighurt-browser --no-default-features --features engine-demo,engine-wasm
+      # Unit tests only: the end-to-end tests (sighurt-browser/tests/headless.sh and engines.sh)
+      # need a compositor and run on a developer machine.
+      - name: Test (sig without Servo and WPE WebKit)
+        run: >
+          cargo test -p sighurt-browser --no-default-features
+          --features engine-demo,engine-wasm,keymap-modal,chrome-line
 
   check-wasm:
     name: Check SDK and examples (wasm32)

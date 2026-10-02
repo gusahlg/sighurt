@@ -1,6 +1,6 @@
 # WASM engine and SDK guide
 
-`sig-wasm` is Sighurt's engine for WebAssembly apps. `sig` starts one `sig-wasm` process per page and talks to it over `sighurt-ipc`. The engine fetches the `.wasm`, runs it in a Wasmtime sandbox and sends what the app draws back to `sig` as a draw list. Apps are Rust crates built for `wasm32-unknown-unknown` against [`sighurt-sdk`](./sighurt-sdk/).
+The Wasm engine ([`sighurt-engine-wasm`](./sighurt-engine-wasm/)) is Sighurt's engine for WebAssembly apps. It is compiled into `sig` (feature `engine-wasm`, one of its defaults) and runs in `sig`'s process. It fetches the `.wasm`, runs it under Wasmtime with no WASI, one store per page, with the app's callbacks on worker threads, and paints what the app draws on the CPU into a shared-memory buffer that `sig`'s Wayland host lends it. Apps are Rust crates built for `wasm32-unknown-unknown` against [`sighurt-sdk`](./sighurt-sdk/).
 
 The guest ABI is Oxide's: every host function is imported from the WASM module `"oxide"`. Apps built for [Oxide](https://github.com/niklabh/oxide) run unchanged, except ones that use Oxide's widget kit (`ui_*`), which this engine doesn't provide.
 
@@ -71,7 +71,14 @@ cargo build --target wasm32-unknown-unknown --release
 sig target/wasm32-unknown-unknown/release/my_app.wasm
 ```
 
-`sig` routes URLs ending in `.wasm`, and http(s) responses with `Content-Type: application/wasm`, to this engine. To serve apps over HTTP, any static server works: `python3 -m http.server 8080` in the output directory, then open `http://localhost:8080/my_app.wasm`.
+`sig` opens `file:` URLs ending in `.wasm` in this engine. Over HTTP it opens `.wasm` URLs on the web servers you name in your configuration, since a web page may link to a `.wasm` file it means to download; any static server works:
+
+```toml
+[routing.wasm]
+origins = ["http://localhost:8080"]
+```
+
+Then `python3 -m http.server 8080` in the output directory, and open `http://localhost:8080/my_app.wasm`. `[routing.wasm] hosts = ["apps.example.com"]` gives the engine a whole host instead, and `page.open-in wasm <url>` opens one URL in it, whatever the routing says.
 
 ## Guest contract
 
@@ -104,7 +111,7 @@ pub extern "C" fn start_app() {
 
 ## Drawing and input
 
-The app draws each frame onto a canvas in logical pixels, divided by the page zoom; `canvas_dimensions()` gives its size. The engine turns the canvas into `sighurt-ipc` draw operations, and `sig` paints them with its own fonts. There are no widgets: buttons, fields and lists are shapes the app draws and hit-tests against `mouse_position()`. Typed text comes from `text_input()`; keys from `key_pressed` / `key_down` with the `KEY_*` constants. For content taller than the page, call `set_content_size` and offset drawing by `scroll_position()`.
+The app draws each frame onto a canvas in logical pixels, divided by the page zoom; `canvas_dimensions()` gives its size. The engine paints the canvas itself, at the window's scale, with tiny-skia and cosmic-text, and only when the app drew something new. There are no widgets: buttons, fields and lists are shapes the app draws and hit-tests against `mouse_position()`. Typed text comes from `text_input()`; keys from `key_pressed` / `key_down` with the `KEY_*` constants. For content taller than the page, call `set_content_size` and offset drawing by `scroll_position()`.
 
 The [`draw`](./sighurt-sdk/src/draw.rs) module wraps the canvas functions in `Canvas`, `Color`, `Rect` and `Point2D`:
 
@@ -136,7 +143,7 @@ Every function has a doc comment in [`sighurt-sdk/src/lib.rs`](./sighurt-sdk/src
 | WebRTC | `rtc_create_peer`, `rtc_create_offer`, `rtc_create_answer`, `rtc_set_local_description`, `rtc_set_remote_description`, `rtc_add_ice_candidate`, `rtc_poll_ice_candidate`, `rtc_create_data_channel`, `rtc_send`, `rtc_recv`, `rtc_add_track`, `rtc_poll_track`, `rtc_signal_connect`, … |
 | Storage | `storage_set`, `storage_get`, `storage_remove` (session, per origin); `kv_store_set`, `kv_store_get`, `kv_store_delete` (on disk, per origin) |
 | Files | `upload_file`, `file_pick`, `folder_pick`, `folder_entries`, `file_read`, `file_read_range`, `file_metadata` (native dialogs; the app gets contents or opaque handles, never paths) |
-| Downloads | `download_data`, `download_url`, `canvas_print_pdf` (saved to the download folder) |
+| Downloads | `download_data`, `download_url`, `canvas_print_pdf`: requests the browser decides on (one a second per tab) and saves in its download folder (`[downloads] directory`), under a name it cleans; the engine writes no file itself |
 | Audio | `audio_play`, `audio_play_url`, `audio_play_with_format`, `audio_pause`, `audio_resume`, `audio_stop`, `audio_seek`, `audio_set_volume`, `audio_set_loop`, `audio_channel_play`, … |
 | Video | `video_load`, `video_load_url`, `video_play`, `video_pause`, `video_seek`, `video_render`, `video_hls_open_variant`, `subtitle_load_srt`, `subtitle_load_vtt`, … |
 | Media capture | `camera_open`, `camera_capture_frame`, `microphone_open`, `microphone_read_samples`, `screen_capture`, … (permission-gated) |
@@ -160,11 +167,11 @@ Present for ABI compatibility but not functional:
 
 ### Console
 
-Console lines go to `sig`'s log at debug level: run `RUST_LOG=sighurt_core=debug sig …` to see them.
+Console lines go to `sig`'s log at debug level, under the target `sighurt::wasm::console`: run `RUST_LOG=sighurt::wasm::console=debug sig …` to see them. They are page data, so nothing logs them at a higher level.
 
 ## Permissions and manifests
 
-Camera, microphone, geolocation and screen capture need a grant per origin. The first call returns `PERMISSION_PENDING` (`-5`) and the engine draws a prompt over the page; retry on a later frame. After **Allow** the call works, after **Block** it returns `-1`. Decisions last as long as the page's process. An origin is scheme, host and port for network URLs, and the containing directory for `file://` URLs.
+Camera, microphone, geolocation and screen capture need a grant per origin. The first call returns `PERMISSION_PENDING` (`-5`) and the engine draws a prompt over the page; retry on a later frame. After **Allow** the call works, after **Block** it returns `-1`. Decisions last as long as the tab's view. The prompt answers Enter, Escape and clicks only once a frame showing it was painted, so a page can't hide it and still have it answered. An origin is scheme, host and port for network URLs, and the containing directory for `file://` URLs.
 
 An app may ship a TOML manifest next to its `.wasm`, at the same URL with `.toml` instead of `.wasm`:
 
@@ -184,9 +191,10 @@ With a manifest, sensitive APIs it doesn't list are denied without a prompt. Wit
 | Filesystem, environment, raw sockets | None: no WASI is linked |
 | Memory | 256 MB (4096 pages) |
 | Fuel | 500M instructions when the module starts, 50M per `on_frame` |
+| Time | 10 s for `start_app`, 1 s for each later callback, not counting host functions that wait for the network (at most 30 s of that per call) |
 | Module size | 50 MB |
 
-The guest reaches the outside world only through the host functions registered in `sighurt-engine-wasm/src/capabilities.rs`. Network access goes through the host's HTTP, WebSocket, SSE and WebRTC clients; files only through native dialogs the user answers. Session storage is cleared when a page navigates to another origin; the kv store keeps each origin in its own directory.
+The guest reaches the outside world only through the host functions registered in `sighurt-engine-wasm/src/capabilities.rs`. Network access goes through the host's HTTP, WebSocket, SSE and WebRTC clients; files only through native dialogs the user answers. Session storage is cleared when a page navigates to another origin; the kv store keeps each origin in its own directory, under `~/.local/share/sighurt/wasm`; with `[engines.wasm] storage = "ephemeral"`, in a directory of the run's own under `$XDG_RUNTIME_DIR`, which `sig` deletes when it quits. Draw lists, images, text, timers, history, workers and network buffers are bounded too, so an app can't make the host allocate without limit. The engine runs in `sig`'s process: Wasmtime's isolation and the registered host functions are what stand between an app and the browser.
 
 ## Troubleshooting
 
@@ -196,7 +204,7 @@ The guest reaches the outside world only through the host functions registered i
 | "fuel limit exceeded" | Do less work per frame, or spread it over frames or a worker. |
 | Blank page | Draw something in `on_frame`, starting with `canvas_clear`. |
 | `on_timer` / `on_event` never called | Export an `on_frame`, even an empty one. |
-| A `.wasm` URL downloads or opens in another engine | Serve it as `application/wasm`, or use a URL ending in `.wasm`. |
-| `sig-wasm` not found | Run `cargo build` (it puts `sig-wasm` next to `sig`), or put it on `PATH`. |
+| A `.wasm` URL opens in another engine | Name its server in `[routing.wasm] origins` (or its host in `hosts`), or open it with `page.open-in wasm`. |
+| "The wasm engine is not part of this build of sig." | Build `sig` with the `engine-wasm` feature (a default one). |
 
 To add a host function, see [CLAUDE.md](./CLAUDE.md#adding-a-host-function-to-the-wasm-engine) or [CONTRIBUTING.md](./CONTRIBUTING.md#adding-a-host-function).

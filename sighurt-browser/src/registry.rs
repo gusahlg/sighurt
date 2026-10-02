@@ -1,11 +1,13 @@
 //! The engines compiled into this build, and their runtimes.
 //!
-//! Cargo features decide which engines exist (`engine-servo`, `engine-wasm`, `engine-demo`);
+//! Cargo features decide which engines exist (`engine-servo`, `engine-wasm`, `engine-wpe`,
+//! `engine-demo`);
 //! runtime configuration decides which of them may open new views (the core checks it). A
 //! runtime is created on first use, one per engine kind, with the [`EngineWaker`] it needs, and
 //! its `Target` and `FramePermit` bound to `sighurt_wayland`'s types. The registry also knows
 //! what each engine supports before its runtime exists, since the core needs that from the
-//! start, and how its views present (shared memory or GL), since the host creates their targets.
+//! start, and how its views present (shared memory, or native targets for Servo's GL and
+//! WebKit's DMA-BUFs), since the host creates their targets.
 //!
 //! Each runtime remembers why it must be pumped: it was called this iteration, its waker fired,
 //! or its pump deadline passed. The registry also remembers a runtime that its `shutdown` had
@@ -18,16 +20,34 @@
 //! process. Without it, `sig` installs `env_logger`; a Servo started later, by a configuration
 //! that enables it, then logs through that one ([`install_logger`]).
 //!
+//! The chromes and keymaps of the build are listed here too ([`CHROMES`], [`KEYMAPS`]), as
+//! engines are: compiled in, chosen by the configuration (`[ui] chrome` at startup, `[input]
+//! keymap` live).
+//!
+//! Each engine declares the settings of `[engines.<name>]` it honors (`user-agent`, `storage`),
+//! which the core checks the configuration against, and every runtime starts with the settings
+//! of the configuration `sig` started with, whenever it starts ([`Launch`]): its own
+//! configuration (`ServoConfig`, `WasmConfig`, `WpeConfig`) is made from them here. An engine
+//! started with
+//! `storage = "ephemeral"` that has to write while it runs gets a directory of its own under
+//! `$XDG_RUNTIME_DIR` ([`Launch::scratch`]), which [`Registry::remove_scratch`] deletes at the
+//! end of shutdown, after everything that could still write there has stopped.
+//!
 //! Must not own: routing policy (the core decides which engine opens a URL).
 
-use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{EngineCapabilities, EngineRuntime, EngineWaker, PumpStatus};
-use sighurt_core::config::Config;
+use sighurt_api::keymap::KeymapKind;
+use sighurt_core::config::{Config, EngineSettings};
+use sighurt_core::{ChromeChecks, Environment};
+use sighurt_ui::extension::ChromeKind;
+use sighurt_ui::Colors;
 use sighurt_wayland::{FramePermit, PresentMode, TargetLease};
+use tempfile::TempDir;
 
 /// The contract every engine's runtime implements, bound to the host's types.
 pub type Contract = dyn EngineRuntime<Target = TargetLease, FramePermit = FramePermit>;
@@ -39,6 +59,8 @@ pub enum Runtime {
     Servo(Box<sighurt_engine_servo::ServoRuntime>),
     #[cfg(feature = "engine-wasm")]
     Wasm(Box<sighurt_engine_wasm::WasmRuntime<TargetLease>>),
+    #[cfg(feature = "engine-wpe")]
+    Wpe(Box<sighurt_engine_wpe::WpeRuntime>),
     #[cfg(feature = "engine-demo")]
     Demo(Box<sighurt_engine_demo::DemoRuntime>),
 }
@@ -52,6 +74,8 @@ impl Deref for Runtime {
             Self::Servo(ref runtime) => &**runtime,
             #[cfg(feature = "engine-wasm")]
             Self::Wasm(ref runtime) => &**runtime,
+            #[cfg(feature = "engine-wpe")]
+            Self::Wpe(ref runtime) => &**runtime,
             #[cfg(feature = "engine-demo")]
             Self::Demo(ref runtime) => &**runtime,
         }
@@ -65,6 +89,8 @@ impl DerefMut for Runtime {
             Self::Servo(ref mut runtime) => &mut **runtime,
             #[cfg(feature = "engine-wasm")]
             Self::Wasm(ref mut runtime) => &mut **runtime,
+            #[cfg(feature = "engine-wpe")]
+            Self::Wpe(ref mut runtime) => &mut **runtime,
             #[cfg(feature = "engine-demo")]
             Self::Demo(ref mut runtime) => &mut **runtime,
         }
@@ -74,7 +100,8 @@ impl DerefMut for Runtime {
 impl Runtime {
     /// How it renders, once it knows: "cpu" for the CPU engines; for Servo, after its first
     /// view has a context, "hardware" or "software" (a software rasterizer: the diagnosed
-    /// fallback) and the GL renderer.
+    /// fallback) and the GL renderer; for WPE, after its first view, "hardware" (WebKit's
+    /// DMA-BUFs on the GPU) or "fallback" (shared memory, a CPU copy per frame) and how.
     pub fn renderer(&self) -> Option<(&'static str, Option<String>)> {
         match *self {
             #[cfg(feature = "engine-servo")]
@@ -82,13 +109,24 @@ impl Runtime {
                 let mode = if gl.software { "software" } else { "hardware" };
                 (mode, Some(gl.renderer))
             }),
+            #[cfg(feature = "engine-wpe")]
+            Self::Wpe(ref runtime) => {
+                use sighurt_engine_wpe::Transport;
+                let diagnostics = runtime.diagnostics();
+                let mode = match diagnostics.transport? {
+                    Transport::Dmabuf => "hardware",
+                    Transport::Shm => "fallback",
+                };
+                Some((mode, diagnostics.renderer()))
+            }
             #[allow(unreachable_patterns)]
             _ => Some(("cpu", None)),
         }
     }
 
     /// Page readbacks to the CPU the engine made: Servo counts `read_to_image` and, when
-    /// auditing, GL reads. 0 for the CPU engines, which paint into the host's buffers.
+    /// auditing, GL reads; WPE the frames of its shared-memory fallback, which WebKit reads back
+    /// and the presenter copies. 0 for the CPU engines, which paint into the host's buffers.
     pub fn readbacks(&self) -> u64 {
         match *self {
             #[cfg(feature = "engine-servo")]
@@ -96,6 +134,8 @@ impl Runtime {
                 let d = runtime.diagnostics();
                 d.read_to_image + d.gl_reads.unwrap_or(0)
             }
+            #[cfg(feature = "engine-wpe")]
+            Self::Wpe(ref runtime) => runtime.diagnostics().present.shm_copies,
             #[allow(unreachable_patterns)]
             _ => 0,
         }
@@ -147,6 +187,65 @@ pub fn install_logger() {
     }
 }
 
+/// The chromes compiled into this build: the standard one always, then those of features.
+pub const CHROMES: &[ChromeKind] = &[
+    sighurt_ui::standard::KIND,
+    #[cfg(feature = "chrome-line")]
+    sighurt_chrome_line::KIND,
+];
+
+/// The keymaps compiled into this build besides the core's own `bindings`.
+pub const KEYMAPS: &[KeymapKind] = &[
+    #[cfg(feature = "keymap-modal")]
+    sighurt_keymap_modal::KIND,
+];
+
+/// The chrome of this build called `name`. A configuration checked against [`CHROMES`] names
+/// one of them; the standard chrome stands in otherwise.
+pub fn chrome(name: &str) -> ChromeKind {
+    let found = CHROMES.iter().find(|chrome| chrome.name == name);
+    found.copied().unwrap_or(sighurt_ui::standard::KIND)
+}
+
+/// What the core checks of `chrome`.
+pub fn checks(chrome: &ChromeKind) -> ChromeChecks {
+    ChromeChecks {
+        name: chrome.name,
+        check: chrome.check,
+        commands: chrome.commands,
+    }
+}
+
+/// What a runtime is started with.
+// Only the Wasm engine needs a scratch directory, and the demo engine reads nothing.
+#[cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
+pub struct Launch<'a> {
+    /// `[engines.<name>]` of the configuration `sig` started with.
+    pub settings: &'a EngineSettings,
+    scratch: &'a mut Option<TempDir>,
+    name: &'static str,
+}
+
+#[cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
+impl Launch<'_> {
+    /// A directory of the engine's own for what it keeps only while `sig` runs, made now:
+    /// under `$XDG_RUNTIME_DIR` (or the temporary directory), readable by the user alone, and
+    /// deleted at the end of `sig`'s shutdown.
+    pub fn scratch(&mut self) -> Result<PathBuf, String> {
+        if self.scratch.is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let base = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("sighurt-{}-", self.name))
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(&base)
+                .map_err(|e| format!("cannot make a directory in {}: {e}", base.display()))?;
+            *self.scratch = Some(dir);
+        }
+        Ok(self.scratch.as_ref().expect("made above").path().to_owned())
+    }
+}
+
 /// One compiled-in engine.
 pub struct Engine {
     /// Its name in the configuration.
@@ -157,7 +256,13 @@ pub struct Engine {
     pub mode: PresentMode,
     /// How it renders, for diagnostics and the home page.
     pub renderer: &'static str,
-    start: fn(EngineWaker) -> Result<Runtime, String>,
+    /// The settings of `[engines.<name>]` it honors.
+    pub honors: &'static [&'static str],
+    start: fn(EngineWaker, Launch<'_>) -> Result<Runtime, String>,
+    /// What it starts with: the configuration's when `sig` started.
+    settings: EngineSettings,
+    /// Its directory for what it keeps only while `sig` runs, once it has one.
+    scratch: Option<TempDir>,
     state: State,
     waker: Option<EngineWaker>,
     /// Called since its last pump.
@@ -179,6 +284,7 @@ pub enum State {
         not(any(
             feature = "engine-servo",
             feature = "engine-wasm",
+            feature = "engine-wpe",
             feature = "engine-demo"
         )),
         allow(dead_code)
@@ -197,6 +303,7 @@ impl Engine {
         not(any(
             feature = "engine-servo",
             feature = "engine-wasm",
+            feature = "engine-wpe",
             feature = "engine-demo"
         )),
         allow(dead_code)
@@ -206,14 +313,18 @@ impl Engine {
         capabilities: EngineCapabilities,
         mode: PresentMode,
         renderer: &'static str,
-        start: fn(EngineWaker) -> Result<Runtime, String>,
+        honors: &'static [&'static str],
+        start: fn(EngineWaker, Launch<'_>) -> Result<Runtime, String>,
     ) -> Self {
         Self {
             name,
             capabilities,
             mode,
             renderer,
+            honors,
             start,
+            settings: EngineSettings::default(),
+            scratch: None,
             state: State::NotStarted,
             waker: None,
             called: false,
@@ -242,6 +353,8 @@ impl Registry {
             servo(),
             #[cfg(feature = "engine-wasm")]
             wasm(),
+            #[cfg(feature = "engine-wpe")]
+            wpe(),
             #[cfg(feature = "engine-demo")]
             demo(),
         ];
@@ -251,12 +364,21 @@ impl Registry {
         }
     }
 
-    /// What each engine supports, by name, for the core's `Environment`.
-    pub fn capabilities(&self) -> BTreeMap<String, EngineCapabilities> {
-        self.engines
-            .iter()
-            .map(|e| (e.name.to_owned(), e.capabilities))
-            .collect()
+    /// What the core checks configurations against: the build's engines, with what each
+    /// supports and which settings it honors, its keymaps, its chromes and their colors.
+    pub fn environment(&self) -> Environment {
+        let engines = self.engines.iter();
+        Environment {
+            engines: engines
+                .clone()
+                .map(|e| (e.name.into(), e.capabilities))
+                .collect(),
+            engine_settings: engines.map(|e| (e.name.into(), e.honors)).collect(),
+            home_dir: dirs::home_dir(),
+            keymaps: KEYMAPS.to_vec(),
+            chromes: CHROMES.iter().map(checks).collect(),
+            color_names: &Colors::NAMES,
+        }
     }
 
     /// Every engine, in build order.
@@ -269,10 +391,14 @@ impl Registry {
         self.engines.iter().find(|e| e.name == name)
     }
 
-    /// Starts the engines that start with `sig` rather than on first use: Servo, when it is
-    /// compiled in and `config` enables it (decision 26).
+    /// Takes the settings every runtime starts with from `config`, the configuration `sig`
+    /// starts with, then starts the engines that start with `sig` rather than on first use:
+    /// Servo, when it is compiled in and `config` enables it (decision 26).
     #[cfg_attr(not(feature = "engine-servo"), allow(unused_variables))]
     pub fn start_at_launch(&mut self, config: &Config, waker: impl FnOnce() -> EngineWaker) {
+        for engine in &mut self.engines {
+            engine.settings = config.engine_settings(engine.name);
+        }
         #[cfg(feature = "engine-servo")]
         if config.is_enabled("servo") {
             if let Err(error) = self.start("servo", waker) {
@@ -299,7 +425,12 @@ impl Registry {
             .ok_or_else(|| format!("the {name} engine is not part of this build"))?;
         if matches!(engine.state, State::NotStarted) {
             let waker = waker();
-            engine.state = match (engine.start)(waker.clone()) {
+            let launch = Launch {
+                settings: &engine.settings,
+                scratch: &mut engine.scratch,
+                name: engine.name,
+            };
+            engine.state = match (engine.start)(waker.clone(), launch) {
                 Ok(runtime) => {
                     if runtime.capabilities() != engine.capabilities {
                         log::warn!(
@@ -418,6 +549,21 @@ impl Registry {
     pub fn leaked(&self) -> bool {
         self.leaked
     }
+
+    /// Deletes the engines' directories for what they keep only while `sig` runs. Called at
+    /// the end of shutdown: a guest still finishing its last call when its runtime shut down
+    /// could otherwise write there again.
+    pub fn remove_scratch(&mut self) {
+        for engine in &mut self.engines {
+            let Some(dir) = engine.scratch.take() else {
+                continue;
+            };
+            let path = dir.path().to_owned();
+            if let Err(error) = dir.close() {
+                log::warn!("cannot delete {}: {error}", path.display());
+            }
+        }
+    }
 }
 
 #[cfg(feature = "engine-demo")]
@@ -428,13 +574,14 @@ fn demo() -> Engine {
         CAPABILITIES,
         PresentMode::Shm,
         "cpu, wl_shm",
-        |_waker| Ok(Runtime::Demo(Box::new(DemoRuntime::new()))),
+        &[],
+        |_waker, _launch| Ok(Runtime::Demo(Box::new(DemoRuntime::new()))),
     )
 }
 
 #[cfg(feature = "engine-wasm")]
 fn wasm() -> Engine {
-    use sighurt_engine_wasm::{default_aot_cache, kv, SandboxPolicy, WasmConfig, WasmRuntime};
+    use sighurt_engine_wasm::WasmRuntime;
     // What `WasmRuntime::capabilities` reports; `Registry::start` warns if they ever differ.
     let capabilities = EngineCapabilities {
         history_traversal: true,
@@ -446,34 +593,85 @@ fn wasm() -> Engine {
         capabilities,
         PresentMode::Shm,
         "cpu (tiny-skia), wl_shm",
-        |waker| {
-            let config = WasmConfig {
-                policy: SandboxPolicy::default(),
-                kv_root: kv::default_root(),
-                aot_cache: default_aot_cache(),
-            };
-            WasmRuntime::<TargetLease>::new(config, waker)
+        // Not `user-agent`: guests make their own requests.
+        &["storage"],
+        |waker, launch| {
+            WasmRuntime::<TargetLease>::new(wasm_config(launch)?, waker)
                 .map(|runtime| Runtime::Wasm(Box::new(runtime)))
                 .map_err(|e| e.to_string())
         },
     )
 }
 
+/// The Wasm runtime's directories: the key-value store in the user's data directory and
+/// compiled modules in the cache, or with `storage = "ephemeral"` the store in the engine's
+/// scratch directory and no cache, so nothing outlives `sig`.
+#[cfg(feature = "engine-wasm")]
+fn wasm_config(mut launch: Launch<'_>) -> Result<sighurt_engine_wasm::WasmConfig, String> {
+    use sighurt_core::config::Storage;
+    use sighurt_engine_wasm::{default_aot_cache, kv, SandboxPolicy, WasmConfig};
+    let (kv_root, aot_cache) = match launch.settings.storage {
+        Storage::Profile => (kv::default_root(), default_aot_cache()),
+        Storage::Ephemeral => (launch.scratch()?.join("kv"), None),
+    };
+    Ok(WasmConfig {
+        policy: SandboxPolicy::default(),
+        kv_root,
+        aot_cache,
+    })
+}
+
+#[cfg(feature = "engine-wpe")]
+fn wpe() -> Engine {
+    use sighurt_engine_wpe::{WpeRuntime, CAPABILITIES};
+    Engine::new(
+        "wpe",
+        CAPABILITIES,
+        // A native target: WebKit's frames are attached by the engine, not painted by the host.
+        PresentMode::Gl,
+        "WebKit: its DMA-BUFs straight into the page's subsurface",
+        &["user-agent", "storage"],
+        |waker, launch| {
+            // shell.nix sets them; without them https: and media fail inside WebKit.
+            for variable in ["GIO_EXTRA_MODULES", "GST_PLUGIN_SYSTEM_PATH_1_0"] {
+                if std::env::var_os(variable).is_none() {
+                    log::warn!("wpe: {variable} is not set: run sig in the repository's nix-shell");
+                }
+            }
+            WpeRuntime::new(wpe_config(launch.settings), waker)
+                .map(|runtime| Runtime::Wpe(Box::new(runtime)))
+                .map_err(|e| e.to_string())
+        },
+    )
+}
+
+/// WebKit's configuration: its profile in the user's data directory, or with
+/// `storage = "ephemeral"` none, which keeps everything in memory; the user agent, if one is set.
+#[cfg(feature = "engine-wpe")]
+fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
+    use sighurt_core::config::Storage;
+    let profile = match settings.storage {
+        Storage::Profile => dirs::data_dir().map(|d| d.join("sighurt").join("wpe")),
+        Storage::Ephemeral => None,
+    };
+    sighurt_engine_wpe::WpeConfig {
+        profile,
+        user_agent: settings.user_agent.clone(),
+        ..Default::default()
+    }
+}
+
 #[cfg(feature = "engine-servo")]
 fn servo() -> Engine {
-    use sighurt_engine_servo::{ServoConfig, ServoRuntime, CAPABILITIES};
+    use sighurt_engine_servo::{ServoRuntime, CAPABILITIES};
     Engine::new(
         "servo",
         CAPABILITIES,
         PresentMode::Gl,
         "gl, straight into the page's subsurface",
-        |waker| {
-            let config = ServoConfig {
-                profile: dirs::data_dir().map(|d| d.join("sighurt").join("servo")),
-                // Times every GL call: for tests and measurements only.
-                audit_gl: std::env::var_os("SIG_AUDIT_GL").is_some_and(|v| v == "1"),
-            };
-            let runtime = ServoRuntime::new(config, waker);
+        &["user-agent", "storage"],
+        |waker, launch| {
+            let runtime = ServoRuntime::new(servo_config(launch.settings), waker);
             if !LOGGER.swap(true, Ordering::SeqCst) {
                 runtime.setup_logging();
             } else {
@@ -484,4 +682,159 @@ fn servo() -> Engine {
             Ok(Runtime::Servo(Box::new(runtime)))
         },
     )
+}
+
+/// Servo's configuration: its profile in the user's data directory, or with
+/// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set.
+#[cfg(feature = "engine-servo")]
+fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoConfig {
+    use sighurt_core::config::Storage;
+    let profile = match settings.storage {
+        Storage::Profile => dirs::data_dir().map(|d| d.join("sighurt").join("servo")),
+        Storage::Ephemeral => None,
+    };
+    sighurt_engine_servo::ServoConfig {
+        profile,
+        user_agent: settings.user_agent.clone(),
+        // Times every GL call: for tests and measurements only.
+        audit_gl: std::env::var_os("SIG_AUDIT_GL").is_some_and(|v| v == "1"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_core_learns_what_each_engine_honors() {
+        let registry = Registry::compiled();
+        let env = registry.environment();
+        assert_eq!(
+            env.engine_settings.keys().collect::<Vec<_>>(),
+            env.engines.keys().collect::<Vec<_>>()
+        );
+        // A valid value of each setting the core knows; an engine honoring another fails here.
+        let valid = |name: &str| match name {
+            "user-agent" => "\"Sighurt\"",
+            "storage" => "\"ephemeral\"",
+            other => panic!("no valid value of {other} here"),
+        };
+        for engine in registry.engines() {
+            let settings: String = engine
+                .honors
+                .iter()
+                .map(|name| format!("{name} = {}\n", valid(name)))
+                .collect();
+            let text = format!("version = 1\n[engines.{}]\n{settings}", engine.name);
+            let config = Config::parse(Some(&text), &env);
+            assert!(config.is_ok(), "{}: {config:?}", engine.name);
+        }
+        #[cfg(feature = "engine-servo")]
+        assert_eq!(env.engine_settings["servo"], ["user-agent", "storage"]);
+        #[cfg(feature = "engine-wasm")]
+        assert_eq!(env.engine_settings["wasm"], ["storage"]);
+        #[cfg(feature = "engine-wpe")]
+        assert_eq!(env.engine_settings["wpe"], ["user-agent", "storage"]);
+        #[cfg(feature = "engine-demo")]
+        assert!(env.engine_settings["demo"].is_empty());
+    }
+
+    #[cfg(feature = "engine-servo")]
+    #[test]
+    fn servos_configuration_follows_its_settings() {
+        use sighurt_core::config::Storage;
+        let ephemeral = EngineSettings {
+            user_agent: Some("Sighurt/1".into()),
+            storage: Storage::Ephemeral,
+        };
+        let config = servo_config(&ephemeral);
+        assert_eq!(
+            (config.profile, config.user_agent.as_deref()),
+            (None, Some("Sighurt/1"))
+        );
+        let config = servo_config(&EngineSettings::default());
+        let profile = dirs::data_dir().map(|d| d.join("sighurt").join("servo"));
+        assert_eq!((config.profile, config.user_agent), (profile, None));
+    }
+
+    #[cfg(feature = "engine-wpe")]
+    #[test]
+    fn webkits_configuration_follows_its_settings() {
+        use sighurt_core::config::Storage;
+        let ephemeral = EngineSettings {
+            user_agent: Some("Sighurt/1".into()),
+            storage: Storage::Ephemeral,
+        };
+        let config = wpe_config(&ephemeral);
+        assert_eq!(
+            (config.profile, config.user_agent.as_deref()),
+            (None, Some("Sighurt/1"))
+        );
+        let config = wpe_config(&EngineSettings::default());
+        let profile = dirs::data_dir().map(|d| d.join("sighurt").join("wpe"));
+        assert_eq!((config.profile, config.user_agent), (profile, None));
+        assert!(!config.force_shm && !config.jsc_signal_handlers);
+    }
+
+    #[cfg(feature = "engine-wasm")]
+    #[test]
+    fn the_wasm_engines_directories_follow_its_storage() {
+        use sighurt_core::config::Storage;
+        use sighurt_engine_wasm::{default_aot_cache, kv};
+        let mut scratch = None;
+        let ephemeral = EngineSettings {
+            storage: Storage::Ephemeral,
+            ..EngineSettings::default()
+        };
+        let config = wasm_config(Launch {
+            settings: &ephemeral,
+            scratch: &mut scratch,
+            name: "wasm",
+        });
+        let config = config.unwrap();
+        let dir = scratch.as_ref().expect("made").path();
+        assert_eq!((config.kv_root, config.aot_cache), (dir.join("kv"), None));
+        let mut none = None;
+        let config = wasm_config(Launch {
+            settings: &EngineSettings::default(),
+            scratch: &mut none,
+            name: "wasm",
+        });
+        let config = config.unwrap();
+        assert_eq!(
+            (config.kv_root, config.aot_cache),
+            (kv::default_root(), default_aot_cache())
+        );
+        assert!(none.is_none(), "no directory for nothing");
+    }
+
+    #[cfg(feature = "engine-wasm")]
+    #[test]
+    fn an_ephemeral_engines_directory_lasts_until_the_end_of_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut registry = Registry::compiled();
+        let text = "version = 1\n[engines]\ndefault = \"wasm\"\nenabled = [\"wasm\"]\n\
+                    [engines.wasm]\nstorage = \"ephemeral\"";
+        let config = Config::parse(Some(text), &registry.environment()).unwrap();
+        registry.start_at_launch(&config, || -> EngineWaker { unreachable!("no Servo") });
+        assert!(registry.start("wasm", || EngineWaker::new(|| {})).is_ok());
+        let wasm = registry.engine("wasm").unwrap();
+        let scratch = wasm
+            .scratch
+            .as_ref()
+            .expect("made at start")
+            .path()
+            .to_owned();
+        let base = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
+        assert!(
+            scratch.starts_with(&base) && scratch.is_dir(),
+            "{scratch:?}"
+        );
+        let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the user's alone");
+        registry.shutdown();
+        assert!(scratch.is_dir(), "kept while guests may still finish");
+        registry.remove_scratch();
+        assert!(!scratch.exists());
+    }
 }

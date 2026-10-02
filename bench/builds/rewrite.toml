@@ -13,6 +13,9 @@ info = "build-info.json"
 # it gets SIGUSR1 (bench/measure sends it at every mark).
 parsers = ["sig-diag"]
 counters_signal = "SIGUSR1"
+# sig writes its report as JSON too (`--diagnostics FILE`): bench/measure keeps the one written
+# at exit (page readbacks, GL reads, peaks) in the run.
+diagnostics_file = true
 config = "rewrite.config.toml"
 # sighurt-ui's layout: tab strip 40 + toolbar 44 above, the status strip 20 below. The screen
 # probe looks inside what is left.

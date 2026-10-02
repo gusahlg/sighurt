@@ -13,8 +13,10 @@
 # Never use ydotool or anything else that writes to /dev/uinput: that types into the real desktop.
 # The compositor and its runtime directory are removed when `cmd` exits; its exit code is returned.
 # `--renderer auto` tries gles2 (the GPU, with SWAY_UNSUPPORTED_GPU=true for the proprietary NVIDIA
-# driver) and falls back to pixman. `cmd` also gets
-# SIG_SWAY_RENDERER (the renderer sway runs with), SIG_SWAY_PID and SIG_SWAY_LOG (its log file).
+# driver) and falls back to pixman. Sway and these tools come from the repository's pinned nixpkgs
+# (nix/nixpkgs.nix), so every machine runs the same compositor build. `cmd` also gets
+# SIG_SWAY_RENDERER (the renderer sway runs with), SIG_SWAY_PID, SIG_SWAY_LOG (its log file) and
+# SIG_SWAY_STORE (sway's Nix store path, which names the exact build).
 set -euo pipefail
 size=1280x800 scale=1 renderer=pixman
 while [[ $# -gt 0 ]]; do
@@ -26,10 +28,11 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-[[ $# -gt 0 ]] || { sed -n '2,17p' "$0"; exit 2; }
-bins=$(nix-build '<nixpkgs>' -A sway -A wtype -A wlrctl -A grim -A wayland-utils --no-out-link 2>/dev/null |
-  sed 's|$|/bin|' | paste -sd:)
-export PATH="$bins:$PATH"
+[[ $# -gt 0 ]] || { sed -n '2,19p' "$0"; exit 2; }
+pkgs=$(cd "$(dirname "$0")/.." && pwd)/nix/nixpkgs.nix
+stores=$(nix-build "$pkgs" -A sway -A wtype -A wlrctl -A grim -A wayland-utils --no-out-link 2>/dev/null) ||
+  { echo "tools/headless-sway: cannot build sway and its tools from $pkgs" >&2; exit 1; }
+export PATH="$(sed 's|$|/bin|' <<<"$stores" | paste -sd:):$PATH"
 # Short path: Unix socket names are limited to 108 bytes.
 run=$(mktemp -d /tmp/sighl.XXXXXX)
 chmod 700 "$run"
@@ -76,7 +79,7 @@ esac
 [[ -S $run/wayland-1 ]] || { echo "tools/headless-sway: sway did not start:" >&2; cat "$run/sway.log" >&2; exit 1; }
 export XDG_RUNTIME_DIR=$run WAYLAND_DISPLAY=wayland-1
 export SWAYSOCK=$(ls "$run"/sway-ipc.*.sock 2>/dev/null | head -1)
-export SIG_SWAY_RENDERER=$renderer SIG_SWAY_PID=$sway_pid SIG_SWAY_LOG=$run/sway.log
+export SIG_SWAY_RENDERER=$renderer SIG_SWAY_PID=$sway_pid SIG_SWAY_LOG=$run/sway.log SIG_SWAY_STORE=${stores%%$'\n'*}
 unset DISPLAY
 set +e
 "$@"

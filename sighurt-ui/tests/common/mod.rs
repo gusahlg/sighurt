@@ -3,12 +3,17 @@
 
 #![allow(dead_code)]
 
+use std::path::PathBuf;
+
 use sighurt_api::geometry::{LogicalSize, Metrics, Scale, WindowRect};
 use sighurt_api::ids::{LayoutEpoch, TabId};
+use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
+use sighurt_ui::extension::SurfaceName;
 use sighurt_ui::{
-    Chrome, Colors, CpuPainter, EngineRow, Fonts, HomeInfo, LayoutOptions, PixelBuffer, Snapshot,
+    Colors, CpuPainter, EngineRow, Fonts, HomeInfo, LayoutOptions, Model, PixelBuffer, Snapshot,
     TabContent, TabSnapshot,
 };
+use tiny_skia::{IntSize, Pixmap};
 
 /// The bundled test font (see tests/fonts/README.md).
 pub const FONT: &[u8] = include_bytes!("../fonts/Cantarell-Regular.ttf");
@@ -21,15 +26,38 @@ pub fn fonts() -> Fonts {
 }
 
 /// A chrome for a window of `width` × `height` showing `snapshot`.
-pub fn chrome(width: u32, height: u32, snapshot: Snapshot) -> Chrome {
+pub fn chrome(width: u32, height: u32, snapshot: Snapshot) -> Model {
     chrome_with(width, height, snapshot, Colors::default())
 }
 
-pub fn chrome_with(width: u32, height: u32, snapshot: Snapshot, colors: Colors) -> Chrome {
-    let mut chrome = Chrome::new(fonts(), colors, LayoutOptions::default());
+pub fn chrome_with(width: u32, height: u32, snapshot: Snapshot, colors: Colors) -> Model {
+    arranged(width, height, snapshot, colors, LayoutOptions::default())
+}
+
+/// A chrome with `colors`, laid out with `options`.
+pub fn arranged(
+    width: u32,
+    height: u32,
+    snapshot: Snapshot,
+    colors: Colors,
+    options: LayoutOptions,
+) -> Model {
+    let mut chrome = Model::new(fonts(), colors, options);
     chrome.resize(LogicalSize { width, height });
     chrome.set_snapshot(snapshot);
     chrome
+}
+
+/// Where the standard chrome's `surface` is placed.
+pub fn rect_of(chrome: &Model, surface: SurfaceName) -> WindowRect {
+    let layout = chrome.layout();
+    match surface {
+        CHROME => layout.chrome,
+        TABS => layout.tab_list,
+        STATUS => layout.status,
+        PAGE => layout.page,
+        other => panic!("the standard chrome has no surface {other}"),
+    }
 }
 
 /// A tab called `title` (the core's title for it) showing `url`.
@@ -67,6 +95,7 @@ pub fn three_tabs() -> Snapshot {
         can_go_back: false,
         can_go_forward: true,
         status: Some("https://sighurt.example/docs/räksmörgås".into()),
+        keymap: None,
         home: home_info(),
     }
 }
@@ -127,9 +156,9 @@ pub fn metrics(rect: WindowRect, scale: u32) -> Metrics {
     )
 }
 
-/// Paints what `chrome` shows in `rect` at `scale` (over 120) and reads the buffer back.
-pub fn paint(chrome: &mut Chrome, rect: WindowRect, scale: u32) -> Image {
-    let metrics = metrics(rect, scale);
+/// Paints `chrome`'s `surface` at `scale` (over 120) and reads the buffer back.
+pub fn paint(chrome: &mut Model, surface: SurfaceName, scale: u32) -> Image {
+    let metrics = metrics(rect_of(chrome, surface), scale);
     let size = metrics.buffer();
     let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
     let buffer = PixelBuffer {
@@ -138,7 +167,9 @@ pub fn paint(chrome: &mut Chrome, rect: WindowRect, scale: u32) -> Image {
         height: size.height,
         stride: size.width as usize * 4,
     };
-    CpuPainter::new().paint(chrome, &metrics, buffer).unwrap();
+    CpuPainter::new()
+        .paint(chrome, surface, &metrics, buffer)
+        .unwrap();
     Image {
         width: size.width,
         height: size.height,
@@ -157,4 +188,57 @@ pub fn argb_to_rgba(data: &[u8]) -> Vec<u8> {
             [r, g, b, a]
         })
         .collect()
+}
+
+/// A pixel differs if a channel is off by more than this...
+const CHANNEL_TOLERANCE: u8 = 8;
+/// ...and an image matches if at most this fraction of its pixels differ, which absorbs
+/// rounding differences between CPUs and SIMD paths.
+const PIXEL_TOLERANCE: f64 = 0.002;
+
+/// Compares `image` with the golden image `name` in tests/golden/, or writes it there with
+/// `SIGHURT_BLESS=1`.
+pub fn golden(name: &str, image: &Image) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/{name}.png"));
+    let size = IntSize::from_wh(image.width, image.height).unwrap();
+    let actual = Pixmap::from_vec(image.rgba.clone(), size).unwrap();
+    if std::env::var_os("SIGHURT_BLESS").is_some() {
+        actual.save_png(&path).unwrap();
+        return;
+    }
+    let expected = Pixmap::load_png(&path).unwrap_or_else(|error| {
+        panic!(
+            "{}: {error}; create it with SIGHURT_BLESS=1",
+            path.display()
+        )
+    });
+    let failed = || {
+        let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.png"));
+        actual.save_png(&out).unwrap();
+        out.display().to_string()
+    };
+    assert_eq!(
+        (expected.width(), expected.height()),
+        (image.width, image.height),
+        "{name}: size changed; this run's image is {}",
+        failed()
+    );
+    let differing = expected
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(image.rgba.as_chunks::<4>().0)
+        .filter(|(a, b)| {
+            a.iter()
+                .zip(*b)
+                .any(|(a, b)| a.abs_diff(*b) > CHANNEL_TOLERANCE)
+        })
+        .count();
+    let allowed = (f64::from(image.width * image.height) * PIXEL_TOLERANCE) as usize;
+    assert!(
+        differing <= allowed,
+        "{name}: {differing} pixels differ (at most {allowed} may); this run's image is {}",
+        failed()
+    );
 }

@@ -10,7 +10,8 @@
 #   bench/remote --no-sync tail -f ~/sighurt-bench/logs/latest.log
 #
 # It uploads `git archive <rev>` to louise-pc and builds it there, detached (bench/remote
-# --detach), under the archive's own tools/heavy and shell.nix. The target directory
+# --detach), under the archive's own tools/heavy and shell.nix, with the Rust of its pinned
+# nixpkgs (nix/nixpkgs.nix), which build-info.json records. The target directory
 # ~/sighurt-bench/target-rewrite is kept between builds, so a new revision rebuilds only what
 # changed, and the binary is copied out of it, so no later build or sync (tools/remote's
 # ~/repos/sighurt-rewrite) can change a build that was measured.
@@ -38,6 +39,11 @@ if [[ ${1:-} == --on-host ]]; then
   fi
   mkdir -p "$dest.tmp"
   cd "$src"
+  # Rust from the revision's pinned nixpkgs, which revisions before shell.nix brought it lack;
+  # the machine's own may be older than the workspace's rust-version.
+  if [[ -f nix/nixpkgs.nix ]] && ! grep -q 'rustc cargo' shell.nix; then
+    PATH=$(nix-build nix/nixpkgs.nix -A rustc -A cargo --no-out-link | sed 's|$|/bin|' | paste -sd:):$PATH
+  fi
   CARGO_TARGET_DIR=~/$root/target-rewrite SIG_MEM=${SIG_MEM:-11G} SIG_WHAT="bench: rewrite sig $name" \
     tools/heavy cargo build "${flags[@]}" 2>&1 | tee "$dest.tmp/build.log"
   cp ~/$root/target-rewrite/release/sig "$dest.tmp/sig"

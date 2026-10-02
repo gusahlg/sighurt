@@ -1,0 +1,25 @@
+[   0.014] window 1024x768 at 120/120
+[   0.017] ViewReady { view: ViewId(1) }
+[   0.017] LoadingChanged { view: ViewId(1), loading: true }
+[   0.165] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 13:49:14.889: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.212] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "https://example.com/" }
+[   0.257] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "https://example.com/", document: DocumentGeneration(1), history: Some(Push) }
+[   0.257] HistoryChanged { view: ViewId(1), entries: ["https://example.com/"], current: 0 }
+[   0.257] TitleChanged { view: ViewId(1), title: Some("Example Domain") }
+[   0.296] LoadingChanged { view: ViewId(1), loading: false }
+[   1.782] action mark
+[   1.782] mark: wakeups 47 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 73 stale-frames 1 rounded-frames 0 failed-imports 0
+[   1.782] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   1.782] mark: submitted 1 dmabuf-frames 0 dmabuf-imports 0 shm-copies 1 shm-bytes 3891200 dropped 1 releases 1 present-mean-ms 2.358 present-max-ms 2.358
+[   1.782] mark: ViewId(1) frames 1 pacing -
+[   1.782] mark: pss-kib 258477 (WPENetworkProce 67677, wpe-window 39724, xdg-dbus-proxy 970, WPEWebProcess 149124, bwrap 982)
+[   2.133] action quit
+[   2.133] end: wakeups 49 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 73 stale-frames 1 rounded-frames 0 failed-imports 0
+[   2.133] end: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   2.133] end: submitted 1 dmabuf-frames 0 dmabuf-imports 0 shm-copies 1 shm-bytes 3891200 dropped 1 releases 1 present-mean-ms 2.358 present-max-ms 2.358
+[   2.133] end: ViewId(1) frames 1 pacing -
+[   2.133] end: pss-kib 258486 (WPENetworkProce 67677, wpe-window 39732, bwrap 982, xdg-dbus-proxy 971, WPEWebProcess 149124)
+shut down: the compositor reported no error
+exit 0

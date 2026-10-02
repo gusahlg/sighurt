@@ -8,16 +8,21 @@ two IQRs; everything else is "noise". Metrics where lower is better are labelled
 the rest (frame counts and rates) higher/lower.
 
 It says how many runs of each workload had anomalies (a crash, a forced quit, a busy machine) or
-failed; --exclude-anomalous leaves the anomalous runs out. When the two builds place their
-engines differently (processes against in-process), the metrics that split the browser process
-from engine processes are left out: they would compare process layouts, not work.
+failed; --exclude-anomalous leaves the anomalous runs out. Only what both builds measure
+honestly is compared. When the two builds place their engines differently (processes against
+in-process), the metrics that split the browser process from engine processes are left out:
+they would compare process layouts, not work. So are the metrics a build's diagnostics declare
+they can't measure honestly (benchlib/parsers.py, INCOMPARABLE), each listed with the reason,
+and the metrics only one build measures, listed per build.
 
   bench/compare bench/results/louise/baseline/<ts> bench/results/louise/rewrite/<ts>
   bench/compare --all --workloads article,webgl A B
+  bench/compare --all --metrics 'cpu_pct$|wakeups_per_s$' A B
 """
 
 import argparse
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -40,11 +45,18 @@ def environment_differences(a, b):
     return diffs
 
 
-def compare(va, vb, metrics_filter, workloads, alpha):
+def excluded(rules, workload, metric):
+    """The reason `metric` of `workload` is not compared, or None."""
+    return next((reason for workloads, pattern, reason in rules if workload in workloads and pattern.search(metric)), None)
+
+
+def compare(va, vb, metrics_filter, workloads, alpha, rules=()):
     rows = []
     for workload in workloads:
         ma, mb = va.get(workload, {}), vb.get(workload, {})
         for metric in metrics_filter(sorted(set(ma) & set(mb))):
+            if excluded(rules, workload, metric):
+                continue
             xa, xb = ma[metric], mb[metric]
             if len(xa) < 2 or len(xb) < 2:
                 continue
@@ -74,6 +86,7 @@ def main():
     ap.add_argument("a", help="result set before")
     ap.add_argument("b", help="result set after")
     ap.add_argument("--all", action="store_true", help="every metric, not just the key ones")
+    ap.add_argument("--metrics", help="only the metrics this regular expression finds")
     ap.add_argument("--workloads", help="comma-separated subset")
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--changed", action="store_true", help="only rows that are not noise")
@@ -85,11 +98,13 @@ def main():
     workloads = args.workloads.split(",") if args.workloads else [w for w in a["set"]["workloads"]["names"] if w in vb]
     placements = results.engine_placement(a), results.engine_placement(b)
     split = (lambda m: True) if placements[0] == placements[1] else (lambda m: not results.PROCESS_SPLIT.search(m))
+    chosen = re.compile(args.metrics).search if args.metrics else (lambda m: True)
     if args.all:
-        pick = lambda names: [m for m in names if split(m)]  # noqa: E731
+        pick = lambda names: [m for m in names if split(m) and chosen(m)]  # noqa: E731
     else:
-        pick = lambda names: [m for m in results.KEY_METRICS if m in names and split(m)]  # noqa: E731
-    rows = compare(va, vb, pick, workloads, args.alpha)
+        pick = lambda names: [m for m in results.KEY_METRICS if m in names and split(m) and chosen(m)]  # noqa: E731
+    rules = results.incomparable(a) + results.incomparable(b)
+    rows = compare(va, vb, pick, workloads, args.alpha, rules)
 
     print(f"A: {a['set']['label']} ({a['path']})\nB: {b['set']['label']} ({b['path']})\n")
     for d in environment_differences(a, b):
@@ -122,6 +137,12 @@ def main():
             print(f"\n- {workload}: only A measured {', '.join(only_a)}")
         if only_b:
             print(f"\n- {workload}: only B measured {', '.join(only_b)}")
+        not_compared = {}
+        for metric in pick(sorted(set(ma) & set(mb))):
+            if reason := excluded(rules, workload, metric):
+                not_compared.setdefault(reason, []).append(metric)
+        for reason, names in not_compared.items():
+            print(f"\n- {workload}: not compared ({reason}): {', '.join(names)}")
     n = {v: sum(r["verdict"] == v for r in rows) for v in ("better", "worse", "higher", "lower", "noise")}
     print(f"\n{len(rows)} comparisons: " + ", ".join(f"{k} {v}" for k, v in n.items()))
     smallest = min((min(r["n"]) for r in rows), default=0)

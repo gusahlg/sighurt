@@ -5,7 +5,8 @@
 //!
 //! ```text
 //! move X Y W H   move to (X, Y) of a W×H logical layout (the output's logical size)
-//! click          press and release the left button
+//! click [BUTTON] press and release BUTTON: left (the default), side or extra (the mouse's
+//!                back and forward buttons)
 //! press          press the left button and hold it
 //! release        release it
 //! ```
@@ -26,6 +27,8 @@ use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 
 const BTN_LEFT: u32 = 0x110;
+const BTN_SIDE: u32 = 0x113;
+const BTN_EXTRA: u32 = 0x114;
 
 struct State;
 
@@ -67,10 +70,19 @@ fn main() -> Result<(), String> {
                     pointer.frame();
                 }
             }
-            ["click"] => {
-                pointer.button(time(), BTN_LEFT, ButtonState::Pressed);
+            ["click", button @ ..] if button.len() <= 1 => {
+                let button = match button {
+                    [] | ["left"] => BTN_LEFT,
+                    ["side"] => BTN_SIDE,
+                    ["extra"] => BTN_EXTRA,
+                    _ => {
+                        eprintln!("virtual-pointer: unknown button in {line:?}");
+                        continue;
+                    }
+                };
+                pointer.button(time(), button, ButtonState::Pressed);
                 pointer.frame();
-                pointer.button(time(), BTN_LEFT, ButtonState::Released);
+                pointer.button(time(), button, ButtonState::Released);
                 pointer.frame();
             }
             ["press"] => {

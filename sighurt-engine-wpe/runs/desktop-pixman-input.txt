@@ -1,0 +1,106 @@
+[   0.013] window 1024x768 at 120/120
+[   0.016] ViewReady { view: ViewId(1) }
+[   0.016] LoadingChanged { view: ViewId(1), loading: true }
+[   0.163] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 13:47:53.111: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.164] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/input.html" }
+[   0.166] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/input.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.166] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/input.html"], current: 0 }
+[   0.169] LoadingChanged { view: ViewId(1), loading: false }
+[   0.169] TitleChanged { view: ViewId(1), title: Some("load dpr 1 1280x760") }
+[   0.229] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 23, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "", cursor: 0, anchor: 0 }), purpose: Normal, multiline: false }) }
+[   0.266] StatusTextChanged { view: ViewId(1), text: None }
+[   0.266] CursorChanged { view: ViewId(1), cursor: Default }
+[   1.173] CursorChanged { view: ViewId(1), cursor: Default }
+[   1.281] TextInputChanged { view: ViewId(1), state: None }
+[   1.284] TitleChanged { view: ViewId(1), title: Some("mousedown 0 50,50 detail 1") }
+[   1.594] CursorChanged { view: ViewId(1), cursor: Text }
+[   1.594] StatusTextChanged { view: ViewId(1), text: None }
+[   2.020] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 35, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "å", cursor: 2, anchor: 2 }), purpose: Normal, multiline: false }) }
+[   2.020] TitleChanged { view: ViewId(1), title: Some("field å") }
+[   2.022] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 47, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "åä", cursor: 4, anchor: 4 }), purpose: Normal, multiline: false }) }
+[   2.022] TitleChanged { view: ViewId(1), title: Some("field åä") }
+[   2.024] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 59, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "åäö", cursor: 6, anchor: 6 }), purpose: Normal, multiline: false }) }
+[   2.025] TitleChanged { view: ViewId(1), title: Some("field åäö") }
+[   2.342] TitleChanged { view: ViewId(1), title: Some("keydown Dead Escape") }
+[   2.344] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 71, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "åäöä", cursor: 8, anchor: 8 }), purpose: Normal, multiline: false }) }
+[   2.344] TitleChanged { view: ViewId(1), title: Some("field åäöä") }
+[   2.869] TitleChanged { view: ViewId(1), title: Some("keydown F2 Escape") }
+[   3.177] action focus=chrome
+[   3.177] TextInputChanged { view: ViewId(1), state: None }
+[   3.178] TitleChanged { view: ViewId(1), title: Some("blur") }
+[   4.024] action focus=page
+[   4.026] TitleChanged { view: ViewId(1), title: Some("focus") }
+[   4.554] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 83, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "åäöäy", cursor: 9, anchor: 9 }), purpose: Normal, multiline: false }) }
+[   4.555] TitleChanged { view: ViewId(1), title: Some("field åäöäy") }
+[   4.897] ServiceRequested(ServiceRequest { id: RequestId(1), view: ViewId(1), document: DocumentGeneration(1), origin: None, service: ClipboardWrite { selection: Clipboard, items: [ClipboardData { mime_type: "text/plain;charset=utf-8", data: [195, 165, 195, 164, 195, 182, 195, 164, 121] }] } })
+[   4.897] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 83, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "åäöäy", cursor: 0, anchor: 9 }), purpose: Normal, multiline: false }) }
+[   5.741] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 83, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "åäöäy", cursor: 9, anchor: 9 }), purpose: Normal, multiline: false }) }
+[   5.755] ServiceRequested(ServiceRequest { id: RequestId(2), view: ViewId(1), document: DocumentGeneration(1), origin: None, service: ClipboardRead { selection: Clipboard, mime_types: ["text/plain;charset=utf-8", "text/plain"], limit: 4194304 } })
+[   5.761] TextInputChanged { view: ViewId(1), state: Some(TextInputState { caret: SurfaceRect { x: 119, y: 206, width: 1, height: 24 }, surrounding: Some(SurroundingText { text: "åäöäyxyz", cursor: 12, anchor: 12 }), purpose: Normal, multiline: false }) }
+[   5.761] TitleChanged { view: ViewId(1), title: Some("field åäöäyxyz") }
+[   6.773] CursorChanged { view: ViewId(1), cursor: Default }
+[   6.773] StatusTextChanged { view: ViewId(1), text: None }
+[   6.775] TitleChanged { view: ViewId(1), title: Some("wheel 1") }
+[   6.787] TitleChanged { view: ViewId(1), title: Some("scrollY 25") }
+[   6.886] StatusTextChanged { view: ViewId(1), text: None }
+[   6.886] CursorChanged { view: ViewId(1), cursor: Default }
+[   7.294] window 853x533 at 180/120
+[   7.295] StatusTextChanged { view: ViewId(1), text: None }
+[   7.295] CursorChanged { view: ViewId(1), cursor: Default }
+[   7.308] TitleChanged { view: ViewId(1), title: Some("resize dpr 1.5 853x493") }
+[   7.322] CursorChanged { view: ViewId(1), cursor: Default }
+[   8.448] CursorChanged { view: ViewId(1), cursor: Default }
+[   8.553] TextInputChanged { view: ViewId(1), state: None }
+[   8.554] TitleChanged { view: ViewId(1), title: Some("mousedown 0 50,50 detail 1") }
+[   8.875] window 640x400 at 240/120
+[   8.877] CursorChanged { view: ViewId(1), cursor: Default }
+[   8.903] TitleChanged { view: ViewId(1), title: Some("resize dpr 2 640x360") }
+[   8.921] CursorChanged { view: ViewId(1), cursor: Default }
+[  10.115] TitleChanged { view: ViewId(1), title: Some("mousedown 0 50,50 detail 1") }
+[  10.435] window 1024x640 at 150/120
+[  10.436] CursorChanged { view: ViewId(1), cursor: Default }
+[  10.456] TitleChanged { view: ViewId(1), title: Some("resize dpr 1.25 1024x600") }
+[  10.467] CursorChanged { view: ViewId(1), cursor: Default }
+[  11.676] TitleChanged { view: ViewId(1), title: Some("mousedown 0 50,50 detail 1") }
+[  11.994] window 1280x800 at 120/120
+[  11.995] CursorChanged { view: ViewId(1), cursor: Default }
+[  12.014] TitleChanged { view: ViewId(1), title: Some("resize dpr 1 1280x760") }
+[  12.026] CursorChanged { view: ViewId(1), cursor: Default }
+[  13.237] TitleChanged { view: ViewId(1), title: Some("mousedown 0 50,50 detail 1") }
+[  13.554] window 1000x700 at 120/120
+[  13.555] CursorChanged { view: ViewId(1), cursor: Default }
+[  13.558] TitleChanged { view: ViewId(1), title: Some("resize dpr 1 1000x660") }
+[  13.573] CursorChanged { view: ViewId(1), cursor: Default }
+[  14.697] action zoom=2
+[  14.722] TitleChanged { view: ViewId(1), title: Some("scrollY 25") }
+[  14.801] StatusTextChanged { view: ViewId(1), text: None }
+[  14.801] CursorChanged { view: ViewId(1), cursor: Default }
+[  15.201] action eval=innerWidth + 'x' + innerHeight + ' dpr ' + devicePixelRatio
+[  15.207] script ViewId(1): Ok("500x330 dpr 2")
+[  15.715] action zoom=1
+[  15.818] CursorChanged { view: ViewId(1), cursor: Default }
+[  16.231] window 1280x800 at 120/120
+[  16.231] StatusTextChanged { view: ViewId(1), text: None }
+[  16.232] CursorChanged { view: ViewId(1), cursor: Default }
+[  16.232] action open=/home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/links.html
+[  16.232] LoadingChanged { view: ViewId(1), loading: true }
+[  16.240] NavigationStarted { view: ViewId(1), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/links.html" }
+[  16.240] TitleChanged { view: ViewId(1), title: Some("resize dpr 1 1280x760") }
+[  16.244] NavigationCommitted { view: ViewId(1), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/links.html", document: DocumentGeneration(2), history: Some(Push) }
+[  16.244] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/input.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/links.html"], current: 1 }
+[  16.244] TitleChanged { view: ViewId(1), title: Some("") }
+[  16.248] LoadingChanged { view: ViewId(1), loading: false }
+[  16.259] TitleChanged { view: ViewId(1), title: Some("links") }
+[  16.260] CursorChanged { view: ViewId(1), cursor: Default }
+[  17.739] CursorChanged { view: ViewId(1), cursor: Pointer }
+[  17.740] StatusTextChanged { view: ViewId(1), text: Some("file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html") }
+[  17.746] action quit
+[  17.746] end: wakeups 1214 chrome-paints 8 transport Some(Shm) device None driver None formats 0 glib-dispatches 724 stale-frames 5 rounded-frames 52 failed-imports 0
+[  17.746] end: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[  17.746] end: submitted 299 dmabuf-frames 0 dmabuf-imports 0 shm-copies 299 shm-bytes 1146383248 dropped 6 releases 298 present-mean-ms 1.066 present-max-ms 6.548
+[  17.746] end: ViewId(1) frames 299 pacing n=293 median=17.49ms p95=23.20ms max=602.23ms
+[  17.746] end: pss-kib 229179 (WPENetworkProce 28125, bwrap 966, wpe-window 47069, WPEWebProcess 152018, xdg-dbus-proxy 1001)
+shut down: the compositor reported no error
+exit 0

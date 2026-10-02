@@ -1,16 +1,17 @@
 //! `sig`, the Sighurt browser executable.
 //!
 //! Wires the pieces together: the core's state and policy, the Wayland host, the chrome, and the
-//! engines selected at build time by Cargo features. It owns process-wide setup (logging, the
-//! TLS provider, the panic hook, signals), the owner event loop ([`app`]), and every effect with
-//! I/O.
+//! engines selected at build time by Cargo features (with the chromes and keymaps, listed in
+//! [`registry`]). It owns process-wide setup (logging, the TLS provider, the panic hook,
+//! signals), the owner event loop ([`app`]), and every effect with I/O.
 //!
 //! Process-wide setup follows decision 26, before any engine starts: the panic hook logs and
 //! never exits; rustls gets the aws-lc-rs provider; the one `log` logger is Servo's when Servo
 //! is compiled in and enabled, `env_logger` otherwise (see [`registry`]). SIGUSR1 prints the
 //! diagnostics, SIGTERM and SIGINT quit cleanly (the session is saved); their handlers only
-//! write to a pipe the loop reads. The one forced exit is [`app`]'s, after a Servo that could
-//! not shut down (decision 54).
+//! write to a pipe the loop reads. With WPE WebKit compiled in, its JavaScriptCore suspends
+//! threads with SIGUSR2 instead of SIGUSR1 (`keep_webkit_off_sigusr1`). The one forced exit is
+//! [`app`]'s, after a Servo that could not shut down (decision 54).
 //!
 //! Must not own: browser policy (the core), drawing (the chrome and the engines), or any
 //! engine's internals.
@@ -18,6 +19,7 @@
 //! Sighurt is based on Oxide by Nikhil Ranjan (<https://github.com/niklabh/oxide>).
 
 mod app;
+mod chrome;
 mod diagnostics;
 mod effects;
 mod persistence;
@@ -131,6 +133,17 @@ fn install_panic_hook() {
     }));
 }
 
+/// Gives WebKit's JavaScriptCore SIGUSR2 for suspending threads (`JSC_SIGNAL_FOR_GC`), unless
+/// the environment names a signal already. Its default is SIGUSR1, `sig`'s diagnostics signal:
+/// WebKit's handler would replace `sig`'s, and a SIGUSR1 sent to `sig` would suspend the thread
+/// that took it, for good (decision 78). Changes the environment, so it runs before any thread.
+#[cfg(feature = "engine-wpe")]
+fn keep_webkit_off_sigusr1() {
+    if std::env::var_os("JSC_SIGNAL_FOR_GC").is_none() {
+        std::env::set_var("JSC_SIGNAL_FOR_GC", libc::SIGUSR2.to_string());
+    }
+}
+
 /// The signals `sig` handles, and the pipe their handlers write the signal number to.
 fn install_signal_handlers() -> std::io::Result<OwnedFd> {
     use rustix::pipe::{pipe_with, PipeFlags};
@@ -151,6 +164,8 @@ fn install_signal_handlers() -> std::io::Result<OwnedFd> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(feature = "engine-wpe")]
+    keep_webkit_off_sigusr1();
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(code) => return code,

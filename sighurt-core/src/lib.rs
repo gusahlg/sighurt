@@ -18,7 +18,7 @@
 //! - [`navigation`]: navigations and cross-engine history segments.
 //! - [`router`]: which engine opens a URL; turning typed text into a URL.
 //! - [`commands`]: carrying out browser commands.
-//! - [`keys`]: key bindings.
+//! - [`keys`]: the `bindings` keymap, and the keys any keymap took.
 //! - [`permissions`]: what pages may ask for.
 //! - [`config`]: the configuration format.
 //! - [`session`]: the saved session.
@@ -36,4 +36,6 @@ pub mod session;
 pub mod state;
 pub mod tabs;
 
-pub use state::{update, BrowserEvent, BrowserState, Effect, Environment, Focus, OpenRequest};
+pub use state::{
+    update, BrowserEvent, BrowserState, ChromeChecks, Effect, Environment, OpenRequest,
+};

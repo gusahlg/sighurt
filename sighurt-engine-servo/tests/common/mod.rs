@@ -1,8 +1,9 @@
 //! A small owner loop for the Servo adapter's tests and example, playing the executable: one
 //! window, one GL page target per view, the host's input and metrics routed to the views,
-//! frames presented on the host's permits, and the engine's service requests answered
-//! (clipboard through the host, everything else refused). Every engine event is kept, with
-//! the time since the start, and printed.
+//! frames presented on the host's permits, the engine's service requests answered (clipboard
+//! through the host, everything else refused) and the page's navigations allowed, unless a test
+//! answers them itself ([`State::navigations`]). Every engine event is kept, with the time since
+//! the start, and printed.
 //!
 //! It does what `sig` will do for Servo (decision 26): installs rustls's aws-lc-rs provider and
 //! a panic hook that hands panics to Servo's logger, builds the runtime and installs its logger.
@@ -12,6 +13,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use calloop::EventLoop;
@@ -62,6 +64,9 @@ pub struct State {
     pub actions: Vec<String>,
     /// Loop iterations so far: wakeups, to show an idle loop sleeps.
     pub iterations: u64,
+    /// How the loop answers the page's navigation requests: `Some(allow)` at once, as a browser
+    /// whose routing keeps them in Servo would; `None` not at all, for the test to answer.
+    pub navigations: Option<bool>,
     /// Clipboard reads in flight, for the view that asked.
     reads: HashMap<RequestId, ViewId>,
     /// The runtime was called since the last pump.
@@ -78,12 +83,23 @@ pub struct Driver {
 /// How long `/slow/...` pages of [`serve`] take to answer.
 pub const SLOW: Duration = Duration::from_secs(3);
 
+/// The path of every request [`serve`] got, in order.
+static SERVED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether [`serve`] got a request for `path`.
+pub fn served(path: &str) -> bool {
+    SERVED.lock().unwrap().iter().any(|p| p == path)
+}
+
 /// Starts an HTTP server on 127.0.0.1 that runs until the process ends, and returns its
 /// address (`http://127.0.0.1:PORT`). `/204` answers "204 No Content"; anything else is a page
 /// titled with its path, which `/slow/...` sends after [`SLOW`]. A query makes the page act
 /// 300 ms after it loads: `?go=PATH` navigates it there, `?back` calls `history.back()`,
-/// `?open=PATH` opens PATH in a new browsing context; `?img=PATH` gives it an image from PATH.
-/// `/held` never answers, so a page with `?img=/held` keeps loading.
+/// `?open=PATH` opens PATH in a new browsing context; `?img=PATH` gives it an image from PATH,
+/// `?link=PATH` a link to PATH that covers the page, and `?frames=N` N frames that each go to
+/// `/landedI.html` when they have loaded, the page's title counting those that have (`landed
+/// 3`). `/held` never answers, so a page with `?img=/held` keeps loading. [`served`] says what
+/// was asked for.
 pub fn serve() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
     let base = format!("http://{}", listener.local_addr().expect("its address"));
@@ -106,6 +122,8 @@ fn answer(mut stream: TcpStream) {
         header.clear();
     }
     let target = request.split_whitespace().nth(1).unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    SERVED.lock().unwrap().push(path.to_owned());
     if target == "/204" {
         let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
         return;
@@ -117,16 +135,31 @@ fn answer(mut stream: TcpStream) {
     if target.starts_with("/slow/") {
         std::thread::sleep(SLOW);
     }
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let (act, img) = match query.split_once('=').unwrap_or((query, "")) {
+    let (act, extra) = match query.split_once('=').unwrap_or((query, "")) {
         ("go", to) => (format!("location = {to:?}"), String::new()),
         ("back", _) => ("history.back()".into(), String::new()),
         ("open", to) => (format!("window.open({to:?})"), String::new()),
         ("img", src) => (String::new(), format!("<img src={src:?}>")),
+        ("link", to) => {
+            let cover = "position:fixed;left:0;top:0;width:100%;height:100%";
+            (
+                String::new(),
+                format!("<a href={to:?} style={cover:?}>{to}</a>"),
+            )
+        }
+        ("frames", n) => {
+            let frames: String = (1..=n.parse().unwrap_or(0))
+                .map(|i| format!("<iframe src='/frame{i}.html?go=/landed{i}.html'></iframe>"))
+                .collect();
+            let count = "const landed = () => [...document.querySelectorAll('iframe')].filter(\
+                         f => f.contentWindow.location.pathname.startsWith('/landed')).length;\
+                         setInterval(() => document.title = 'landed ' + landed(), 100)";
+            (String::new(), format!("{frames}<script>{count}</script>"))
+        }
         _ => (String::new(), String::new()),
     };
     let body = format!(
-        "<!DOCTYPE html><title>{path}</title><h1>{path}</h1>{img}\
+        "<!DOCTYPE html><title>{path}</title><h1>{path}</h1>{extra}\
          <script>addEventListener('load', () => setTimeout(() => {{ {act} }}, 300))</script>"
     );
     let _ = write!(
@@ -191,6 +224,7 @@ impl Driver {
             running: true,
             actions: Vec::new(),
             iterations: 0,
+            navigations: Some(true),
             reads: HashMap::new(),
             called: false,
             due: None,
@@ -531,6 +565,12 @@ impl State {
                         view,
                         EngineCommand::ResolveServiceRequest { request, result },
                     );
+                }
+            }
+            (EngineEvent::NavigationRequested { view, request, .. }, _) => {
+                if let Some(allow) = self.navigations {
+                    let (view, request) = (*view, *request);
+                    self.command(view, EngineCommand::AnswerNavigation { request, allow });
                 }
             }
             (EngineEvent::ViewClosed { view }, Some(_)) => {

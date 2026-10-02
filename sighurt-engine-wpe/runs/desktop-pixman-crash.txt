@@ -1,0 +1,32 @@
+[   0.013] window 1024x768 at 120/120
+[   0.016] ViewReady { view: ViewId(1) }
+[   0.016] LoadingChanged { view: ViewId(1), loading: true }
+[   0.163] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 13:47:50.974: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.210] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html" }
+[   0.211] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.211] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html"], current: 0 }
+[   0.212] LoadingChanged { view: ViewId(1), loading: false }
+[   0.212] TitleChanged { view: ViewId(1), title: Some("red") }
+[   0.287] StatusTextChanged { view: ViewId(1), text: None }
+[   0.287] CursorChanged { view: ViewId(1), cursor: Default }
+[   0.379] ViewFailed { view: ViewId(1), message: "The page's web process crashed; reload to start it again" }
+[   0.379] TitleChanged { view: ViewId(1), title: Some("") }
+[   0.489] action reload
+[   0.510] LoadingChanged { view: ViewId(1), loading: true }
+
+** (WPEWebProcess:2): WARNING **: 13:47:51.434: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.670] NavigationStarted { view: ViewId(1), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html" }
+[   0.671] NavigationCommitted { view: ViewId(1), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html", document: DocumentGeneration(2), history: Some(Replace) }
+[   0.671] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html"], current: 0 }
+[   0.671] LoadingChanged { view: ViewId(1), loading: false }
+[   0.672] TitleChanged { view: ViewId(1), title: Some("red") }
+[   2.128] action quit
+[   2.128] end: wakeups 77 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 125 stale-frames 1 rounded-frames 0 failed-imports 0
+[   2.128] end: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   2.128] end: submitted 2 dmabuf-frames 0 dmabuf-imports 0 shm-copies 2 shm-bytes 7782400 dropped 1 releases 1 present-mean-ms 2.538 present-max-ms 3.466
+[   2.128] end: ViewId(1) frames 2 pacing n=1 median=459.81ms p95=459.81ms max=459.81ms
+[   2.128] end: pss-kib 193497 (WPEWebProcess 122532, wpe-window 40905, xdg-dbus-proxy 971, bwrap 978, WPENetworkProce 28111)
+shut down: the compositor reported no error
+exit 0

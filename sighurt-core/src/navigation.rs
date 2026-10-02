@@ -20,7 +20,8 @@
 //! segments of their own; nothing is inserted into an engine's history.
 //!
 //! Crossing into another segment keeps the one left behind alive, up to [`RETAINED_VIEWS`]
-//! per tab. A segment evicted beyond that, or restored from a saved session, becomes a
+//! per tab, where a view of an engine with a process per view (WebKit's) counts as all of them:
+//! it is kept alone. A segment evicted beyond that, or restored from a saved session, becomes a
 //! [`Record`]: its URLs and nothing else. Opening a record loads its URL in a new view, and
 //! the page's document, scripts and form state are gone. That is reported as a reload, never
 //! as exact restoration.
@@ -44,7 +45,9 @@ use sighurt_api::ids::{NavigationId, ViewId};
 
 use crate::tabs::MAX_URL;
 
-/// Engine views a tab keeps alive besides the one it shows. Older ones become [`Record`]s.
+/// Engine views a tab keeps alive besides the one it shows, or one alone of an engine that
+/// runs each view in a process of its own (`EngineCapabilities::process_per_view`). Older ones
+/// become [`Record`]s.
 pub const RETAINED_VIEWS: usize = 2;
 
 /// The most segments a tab's history keeps; the oldest go first.
@@ -355,6 +358,9 @@ pub(crate) struct Switch {
     pub view: ViewId,
     /// Where its segment goes once it has committed and is ready.
     pub into: SwitchInto,
+    /// The page's own navigation opened it, not the user: another of the page's may replace
+    /// it, while one the user started can't be cancelled or replaced by the page.
+    pub by_page: bool,
 }
 
 /// Where a switched-to view's segment goes.

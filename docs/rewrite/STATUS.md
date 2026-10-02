@@ -9,15 +9,28 @@ log with what was decided instead.
 
 ## Where things stand
 
-- **Foundation.** The workspace has the crate layout of §5. `sighurt-api` v0 exists: ids, units
-  and scale, input, the engine contract, events, services and commands, with unit tests for id
-  allocation, scale rounding, the engine waker and command parsing. `sighurt-core`,
-  `sighurt-wayland`, `sighurt-ui`, `sighurt-engine-servo`, `sighurt-engine-demo` and
-  `sighurt-browser` are skeletons: module files whose documentation states their
-  responsibility. `sig` prints its version and help and otherwise says the rewrite is in
-  progress. `sighurt-engine-wasm` and `sighurt-ipc` are unchanged, still the old `sig-wasm`
-  process. The API went through a plan-conformance and implementability review; what changed
-  is in decisions 9 and 11–17.
+`sig` (`sighurt-browser`) is the rewrite's browser, on Wayland, with its engines compiled in and
+no IPC: Servo 0.5 (the default engine for the web, presenting GL straight into its page
+subsurface), WPE WebKit 2.52.6 (for the sites the configuration gives it, presenting its
+DMA-BUFs) and the Wasm engine (Oxide's app ABI, drawn on the CPU), plus a demo engine for tests.
+The chrome is drawn on the CPU; the core is plain Rust with no I/O. Keymaps and chromes are small
+traits (extension-api.md), with the defaults built on them and one proof each: the modal keymap
+and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone (at tag `gpui-baseline`).
+
+- **Milestones.** M0, M1, M2, M3 and M5 pass. M4 passes with Stop's one Servo 0.5 limit accepted
+  (decision 80). M6 is open (its daily workflows are for the user to name). M7 has its comparison
+  (decision 79): the readback criterion holds; memory growth and the remaining regressions await
+  decisions, and River and a second compositor family are still to be measured.
+- **WPE WebKit** is a default engine of `sig` (decision 78); **the configuration and the extension
+  API** are built to the design's 18 steps (decisions 67, 68 and 74–77).
+- **Verified last** (the section "Final verification and documentation", at the end of the
+  milestones): every end-to-end suite, unit tests and clippy on every feature set, a configuration
+  showcase, and a short live run of `sig` with all three engines on River. README, DOCS, SECURITY,
+  CONTRIBUTING, ROADMAP, CLAUDE.md and CI describe this state.
+- **Then the wave's three reviews were applied** (section "Review fixes", decisions 82–86): links
+  move a tab only when the user pressed them, a Wasm app's downloads go through the browser,
+  WebKit is opened on first use and its processes end with the last WPE page, retained views are
+  bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
 
 ## Milestones (§23)
 
@@ -211,7 +224,8 @@ requests act for a committed document.
 - [x] Normal close and compositor disconnect handled deliberately.
 
 Each is ticked on the chrome's and the host's tests below and on `sig` with the demo engine in a
-private headless sway ("Integration" at the end of this section); none has run on River yet.
+private headless sway ("Integration" at the end of this section); `sig` has run on River since,
+without input (M4's L1, and R2 in "Final verification and documentation").
 `sig` with its default features (Servo and Wasm) was built and run on this desktop on 2 October
 2026 (the end of this section).
 
@@ -257,7 +271,10 @@ Chrome half (`sighurt-ui`, tested without a compositor; the criteria above also 
   (`layout::tests::odd_sizes_keep_everything_inside`, `odd_sizes_paint`).
 - [x] Accessibility tree as plain data, matching the hit targets
   (`accessibility_matches_the_hit_targets`).
-- [ ] Shown in a real window on River (needs `sighurt-wayland` and `sig`).
+- [x] Shown in a real window on River. *R2 ("Final verification and documentation"): `sig` on River
+  0.4.8 with gharial, three runs; the compositor presented the standard chrome's surfaces
+  (`wp_presentation` feedback: the toolbar target 7, 6 and 4 frames, the status strip 1, in the
+  three runs) at 1542 × 84 and 1542 × 20. No screenshot: nothing captures the user's desktop.*
 
 Measured on this machine (release build, `measure_with_system_fonts`, DejaVu Sans chosen from the
 installed fonts): `Fonts::system()` 2.8 ms; the 1920-wide chrome repaints in 0.27 ms at 100 %
@@ -336,7 +353,10 @@ test written for it:
   `ConnectionLost` with the protocol error when there is one, and the loop keeps running
   (`losing_the_compositor_is_reported_once`).
 - [x] The M3 criteria at the top: `sig` wires host, chrome and demo engine together (Integration, below).
-- [ ] Run on River/gharial (not done: the desktop is in use). Also untested: the integer-scale
+- [x] Run on River/gharial: `sig` in M4's L1 and in R2 ("Final verification and documentation"):
+  the window and its subsurfaces, every protocol of the host's list found, the three engines
+  presenting, idle asleep, a clean exit on SIGTERM. Without input, a resize or a scale change
+  there, since nothing may type into the user's desktop. Also untested: the integer-scale
   fallback without a viewporter, a second compositor family, cursors (shape protocol and theme)
   by eye, the primary selection. Drag-and-drop is not implemented.
 
@@ -453,7 +473,7 @@ and the session holds the three tabs (scratchpad run `app/servo2`; an earlier ru
 looked at. Not run: the `_exit` after a Servo that could not shut down (no page can crash
 Servo's script thread in a normal build; the adapter's `crash.rs` shows the leak itself).
 
-Not done: `sig` on River; headless sway's gles2 renderer for the end-to-end suite. Open from the
+Not done: headless sway's gles2 renderer for the demo engine's suite (`engines.sh` uses it). Open from the
 review, each needing another track: the Wasm and Servo crates exporting their capabilities as
 the demo engine does (`CAPABILITIES`), so the registry's copies go; the shared third-party
 versions (reqwest, rustls, log, libc, dirs, serde_json, tempfile) in the root
@@ -562,13 +582,14 @@ At browser level (decision 58), `sig` with its default features (Servo and Wasm)
   `second.html`; the tab's history stays one Servo segment of five entries, each saved under its
   own address (Servo 0.5 named the `#one` entry `#two` until decision 58), and the tab can go
   back, not forward. *Adapter:* E1 and W1 above.
-- [ ] Reload and stop. *B1:* F5 loads `count.html` again (the server sees a second request) and
-  adds no entry. Stop (F7) on `loading.html`, whose image the server holds for a minute, ends the
-  tab's loading at once (it was loading 2 s after the commit); before decision 58 it did nothing,
-  because `Window.prototype.stop` doesn't exist in Servo. *Not met:* Stop 1 s into a navigation
-  whose response takes 3 s doesn't stop it: the page commits when the response comes (seen in
-  B1, pinned in E1; Servo 0.5 has no way to cancel it, decision 57). Accepting this as a Servo 0.5
-  limit, or working around it in the adapter, is for a decision.
+- [x] Reload and stop, with one accepted Servo 0.5 limit (decision 80). *B1:* F5 loads
+  `count.html` again (the server sees a second request) and adds no entry. Stop (F7) on
+  `loading.html`, whose image the server holds for a minute, ends the tab's loading at once (it was
+  loading 2 s after the commit); before decision 58 it did nothing, because
+  `Window.prototype.stop` doesn't exist in Servo. *E1:* Stop gives up a load Servo dropped after a
+  204. *Not met, and accepted (decision 80):* Stop 1 s into a navigation whose response takes 3 s
+  doesn't stop it: the page commits when the response comes (seen in B1, where `engines.sh` logs
+  it as INFO, pinned in E1; Servo 0.5 has no way to cancel it, decision 57).
 - [x] Use the clipboard and text input. *B1:* "åäö" and a dead diaeresis + a, typed with `wtype`
   into a field of the page, reach it ("field åäöä"); Ctrl+A, Ctrl+C put "åäöä" on the Wayland
   clipboard (`wl-paste`), and Ctrl+V pastes `wl-copy`'s "xyz" ("field åäöäxyz"): both through the
@@ -605,9 +626,10 @@ the first frame of each view's context and the first at a new scale are slow, 25
 over 20 ms), and the very first 137 ms (159 ms for the whole `present`), all on the owner
 thread, so the chrome waits that long once per view (L1: 83 ms on River).
 
-Open: stopping a navigation that waits for its response (above); a field identity in
-`TextInputState` (decision 44), which Servo can supply; a way to hand over links the core routes
-to another engine (decision 55); `<select>`, dialogs and HTTP authentication (decision 16);
+Open: stopping a navigation that waits for its response (accepted as a Servo 0.5 limit, decision
+80); a field identity in
+`TextInputState` (decision 44), which Servo can supply; `<select>`, dialogs and HTTP
+authentication (decision 16);
 Servo 0.5's other limits in decisions 55 and 57 (the old layout for a frame after a resize,
 overlapping navigations beyond 5 s); the `gl_handles` safety note in `sighurt-wayland`
 (decision 51: one EGL display per connection); the slow first frames above.
@@ -809,10 +831,52 @@ Pass:
 
 ### M7 — Measure, compare, and retire the old display path
 
-- [ ] Evidence shows the normal page readback path is eliminated.
+The measurement: [`bench/results/IPC-REMOVAL.md`](../../bench/results/IPC-REMOVAL.md) (decision 79).
+The baseline binaries (`gpui-baseline`, the September set's) and the rewrite at 3c510fe (default
+features, release, Rust 1.98.1) ran interleaved in one session on `louise-pc` (RTX 4060, driver
+595.80, headless sway 1.12 from the pinned nixpkgs, GLES2, 1280 × 800) on 2 October 2026: the 16
+workloads of `bench/workloads.toml`, one warm-up and 7 measured rounds a build, 256 runs, none
+failed, no rewrite run with an anomaly. Sets `bench/results/louise/{baseline,rewrite}/20261002-131052/`;
+the predictions, written before the first run, are in `bench/HYPOTHESES.md` (20 of 25 held).
+Every change below has p = 0.0006 (exact Mann–Whitney, 7 against 7):
+
+- Animated Servo pages: CPU −74 % (`css-animation` 52.3 → 13.7 % of a core), −76 % (`webgl`),
+  −43 % (`canvas`); wakeups 7,728 → 851/s; no chrome repaints (59 → 0 a second). The pipe alone
+  (`bench/pipe-cost`, the baseline's frame size and rate) costs 6,500 wakeups/s and 10.6 % of a
+  core; the readback with its comparison is the largest share of the rest.
+- Idle: 191 → 0.1 wakeups/s, CPU 0.7 → 0 %. Memory: one article 375 → 184 MiB PSS, eight tabs
+  after visiting all 978 → 409 MiB, a Wasm guest 242–246 → 78–82 MiB. Launch to page on screen
+  0.40 → 0.15 s. Scrolling to a submitted frame 17.4 → 2.2 ms. Chrome input beside a busy guest
+  33 → 17 ms; the output flood now loses no chrome input (20 of 20 lost) and quits on ctrl+q.
+- Build cost: 13 min 04 s of cargo time for `sig` from an empty target against the baseline's
+  16 min 04 s over two workspaces (different compilers: indicative only).
+- *A threat to these figures (review, decision 84): the rewrite measured, 3c510fe, had no WPE
+  WebKit. The default build after it linked libWPEWebKit and its 72 libraries into every `sig`
+  (29.8 MiB PSS, 82 000 relocations at start, measured by the review). Since decision 84 the
+  engine opens WebKit only when its first WPE page opens, so a session without WPE pages maps 6
+  more libraries than a build without the engine (GLib's) and nothing of WebKit; measured
+  against such a build in "Review fixes" (dev builds on this desktop: launch time and the
+  article's memory the same within noise, the home page +0.9 MiB).*
+
+- [x] Evidence shows the normal page readback path is eliminated. *Servo's `read_to_image`
+  count (`page_readbacks`) 0 in all 64 Servo runs of the session (35,848 frames), where the
+  baseline read back 6.8–202 MiB/s; with Servo's GL audit (`SIG_AUDIT_GL=1`,
+  `bench/results/louise/rewrite-audit/20261002-131305/`), 0 `glReadPixels`/`glGetTexImage` in 24
+  runs of the eight Servo workloads (CSS animation, WebGL, a 2D canvas, scrolling, eight tabs,
+  tab churn, a resize storm across four scales). On louise-pc's NVIDIA GLES2 path; not run on
+  River or another driver.*
 - [ ] No major functional regression in the agreed workflows remains.
-- [ ] Lifecycle tests show no unbounded resource growth.
-- [ ] Remaining regressions have an explicit decision.
+- [ ] Lifecycle tests show no unbounded resource growth. *So far: `resize-storm` keeps 15 MiB
+  (baseline 111); `tab-churn` keeps 58 MiB after 10 cycles (baseline 13) and, in a 60-cycle
+  exploratory run (3 times), about 69 MiB, level after 20 cycles (baseline 22–26 MiB); during two
+  minutes of `css-animation` RSS rose about 1.1 MiB a minute (one run; H18 says how to settle it).*
+- [ ] Remaining regressions have an explicit decision. *Open, measured and not decided:
+  `tab-churn`'s retained memory (H12); Wasm animations double the compositor's CPU, which now
+  uploads a whole shared-memory page per frame (H14); Servo animations at 58.2 instead of 59.2
+  frames a second (H16); the flood's raster holds the owner thread 63 ms a frame, so chrome
+  input waits 53 ms (H15); static guests wake the process about 250 times a second (H13).*
+
+Not done for M7: another compositor family, River.
 
 ### WPE — Make WPE WebKit available on both machines
 
@@ -848,7 +912,9 @@ part of this.
 
 Open (WPE.md, "Open problems"): the DRM platform, the MiniBrowser, WebDriver and audio are
 untested; test helpers still take their tools from `<nixpkgs>`; no machine compiles with Rust
-1.95 any more.
+1.95 any more. *Since ("Final verification and documentation"): `sighurt-browser/tests/engines.sh` takes wl-clipboard from the
+pin; `sighurt-wayland/tests/headless.sh`, `sighurt-engine-servo/tests/window-checks.sh` and
+`experiments/m1-mixed/live-check.sh` still use `<nixpkgs>`.*
 
 ### WPE — Prove WPE WebKit as an in-process engine (its M0 and M1)
 
@@ -859,7 +925,8 @@ driver and `window-checks.sh`) and `experiments/wpe-coexist` (Servo, the Wasm en
 one process and one window, `coexist-checks.sh`). Run outputs: `experiments/wpe-*/runs/`. Tests:
 `cargo test -p wpe-engine` (2 unit tests: the GLib loop's wakes and sleep, the keysym table);
 clippy `-D warnings` and rustfmt clean on both crates. Decisions 62–66. **Go** for
-`sighurt-engine-wpe` (WPE.md has the plan).
+`sighurt-engine-wpe`, which superseded the prototype (next section); `experiments/wpe-engine` and
+its runs are at commit 3c510fe.
 
 M0's criteria, for WPE:
 
@@ -910,8 +977,11 @@ passing on the desktop and on louise-pc, in headless sway with GLES2, pixman, an
   nothing typed into the page meanwhile, clicks and the wheel.*
 - [x] Page animation does not cause chrome repaints. *2 chrome paints (first configure and resize)
   during every animation, on all machines and live.*
-- [x] An idle page sleeps. *1 loop wakeup (the probe's own) and 0 GLib dispatches in 5 s, every
-  machine and transport, and on River.*
+- [x] An idle page leaves the owner loop asleep. *1 loop wakeup (the probe's own) and 0 GLib
+  dispatches in 5 s, every machine and transport, and on River. That counts the owner loop
+  only, not WebKit's threads and processes; across `sig`'s whole process tree an idle shown WPE
+  page makes 4.7 context switches a second, and a hidden one that animated about 150 (WebKit's
+  own; "Review fixes").*
 - [x] WebKit's GLib main loop runs inside the owner loop with no busy polling (decision 64).
   *Unit test `sources_wake_the_owner_and_an_idle_context_sleeps`; the idle figures above.*
 - [x] Diagnostics identify the transport, the DRM device and the fallback. *`transport`,
@@ -921,10 +991,901 @@ passing on the desktop and on louise-pc, in headless sway with GLES2, pixman, an
 
 Open (WPE.md, "Limitations and open problems"): `requestAnimationFrame` at 60 Hz on faster
 outputs (no `WPEScreen`); input methods, clipboard, popups, new windows, downloads, permissions,
-the back-forward list and accessibility are not in the prototype; implicit synchronization only;
-the host's `PresentMode::Gl` name for a non-GL presenter; one unexplained click offset right after
-a page loaded; `wpe-coexist` not run on louise-pc (Servo must be rebuilt there); `ci.yml` and
-CLAUDE.md's pre-commit commands must exclude `wpe-engine` and `wpe-coexist`.
+the back-forward list and accessibility are not in the prototype (the engine crate does all but
+popups and accessibility); implicit synchronization only; the host's `PresentMode::Gl` name for a
+non-GL presenter; one unexplained click offset right after a page loaded; `wpe-coexist` not run
+on louise-pc (Servo must be rebuilt there); `ci.yml` and CLAUDE.md's pre-commit commands must
+exclude `sighurt-engine-wpe` and `wpe-coexist` (*done*, "Final verification and documentation").
+
+### WPE — The engine crate `sighurt-engine-wpe`
+
+The prototype as a usable engine (plan §14 by analogy, §12, §16, §17, §20, §25): [`WPE.md`](WPE.md),
+"`sighurt-engine-wpe`: the engine". `WpeRuntime` implements `EngineRuntime<Target = TargetLease,
+FramePermit = FramePermit>` through the WPE Platform API; `sig` wires it in separately (feature
+`engine-wpe`). Decisions 69–73. Tests: `cargo test -p sighurt-engine-wpe --lib` (14 unit tests:
+navigation rules and history effects, input-method signals on WebKit's own class, keysyms, the
+GLib loop, cursors, coalescing, schemes); `tests/headless.sh` runs `tests/engine.rs` in headless
+sway; `tests/window-checks.sh` drives `examples/wpe-window`. Clippy `-D warnings` and rustfmt
+clean. All runs on this desktop (RTX 3070), headless sway 1.12, 2 October 2026.
+
+- [x] Navigation events with ids: `NavigationStarted` for the browser's, `Committed` with a
+  document and a history effect from WebKit's back-forward list by entry identity, `Failed`
+  (`Load` or `Cancelled`); title, the hovered link as status text, cursor, `LoadingChanged`.
+  *`navigation::tests` (6, including WebKit's dropped pending-request marker); `engine.rs`:
+  fragment and `pushState` keep the document with the page's ids, back across and within
+  documents, forward by two, beyond the end, reload, two navigations in a row, an unresolvable
+  host, a 204, Stop; window-checks: back, back, forward, reload commit as traversals and a
+  replace, the status text follows the pointer over a link.*
+- [x] `HistoryChanged` from the back-forward list, traversal by any delta. *`engine.rs`: entries
+  and current index after each step; beyond the list `Cancelled` without WebKit.*
+- [x] Reload, stop, zoom, visibility. *`engine.rs` (reload, Stop, hidden views present nothing and
+  present when shown); window-checks (hide/show, tabs, page zoom: the page sees
+  `devicePixelRatio` 2 and half its size).*
+- [x] Clipboard and permission prompts as `ServiceRequested`, failing closed. *`engine.rs`:
+  geolocation refused (the page gets error 1) and granted (error 2: WebKit's own GeoClue provider is
+  refused); window-checks: copy reaches the Wayland clipboard through `ClipboardWrite` (`wl-paste`)
+  and paste comes from it through `ClipboardRead` (`wl-copy`, "field åäöäyxyz"). Camera and
+  microphone are mapped but WebKit asks only when a capture device exists, and none was visible in
+  the sandbox.*
+- [x] New windows as `OpenRequested(NewView)` after a user's click; downloads as
+  `ServiceRequested(Download)`. *`engine.rs`: a click on a `target=_blank` link asks for a tab
+  without navigating; an attachment and unshowable content become download requests with URL and
+  name, the navigation `Cancelled`; other schemes `OpenRequested(CurrentView)`; `window.close()`
+  `CloseRequested`; file pickers as `PickFiles` for a click only.*
+- [x] Text input (IME) through `WPEInputMethodContext`. *`ime::tests` (WebKit's signals in order);
+  `engine.rs` with a real input method (zwp_input_method_v2 through the host): preedit shown,
+  commit typed, surrounding text seen, a password field as a password with `sensitive_data` and
+  `hidden_text` and without its text.*
+- [x] `ViewFailed` on a web-process crash, with reload; `RuntimeFailed`; shutdown order. *`engine.rs`:
+  a terminated web process fails its view only, the other view navigates and presents, a reload
+  makes a new document; window-checks: `SIGKILL` of the web process, then the page shown again;
+  every run exits with no protocol error. `RuntimeFailed` (a broken compositor connection on the
+  presenter's queue) is implemented, not run.*
+- [x] JavaScriptCore's two options before WebKit is first used; the GLib watch thread with
+  `EngineWaker`. *Unchanged from the proof; `glib_loop::tests`; `wpe-coexist` now links the crate:
+  `coexist-checks.sh` 14 of 14 (Servo, Wasm and WebKit traps, crash, exports).*
+- [x] DMA-BUF presentation with a diagnosed, counted SHM fallback; diagnostics. *window-checks 60
+  of 60 with GLES2 (DMA-BUF: 0 copies, 4 imports for 350 frames), pixman (SHM: 346 copies,
+  1.35 GB, logged as the fallback) and GLES2 with `--shm` (343 copies); `renderer()` names
+  transport, device and driver. Outputs in `sighurt-engine-wpe/runs/`.*
+- [x] Real pages, https, WebGL, video, two views, å/ä/ö, scales 1, 1.5, 2 (and 1.25), idle wakeups,
+  zero copies on DMA-BUF. *window-checks: `https://example.com/` loads and is shown, WebGL
+  animates (350 frames in 6 s, 17.1 ms median), a VP9 video plays, two views animate side by side,
+  `å ä ö` and a dead key typed, the page sees each scale's `devicePixelRatio` and size and clicks
+  land at the same CSS position, 1 loop wakeup and 0 GLib dispatches in 5 s idle.*
+- [ ] Run on louise-pc and in `sig`. *In `sig`: done, next section. On louise-pc: not yet; its
+  benchmark runs held its lock, and its profile's Rust is 1.95 while the workspace needs 1.98 (the
+  pinned nixpkgs' 1.98.1 works when put first on `PATH`). Since ("Review fixes"): `shell.nix`
+  brings the pin's Rust (decision 86); louise-pc didn't answer over SSH in that pass.*
+
+Open (WPE.md, "Limitations and open problems (the engine)"): `requestAnimationFrame` at 60 Hz;
+navigation-id races in the instant between a browser request and WebKit starting it; an empty
+paste before the real one; downloads fetched again without WebKit's cookies; `file:` media and
+media without an audio server; `<select>`, context menus, dialogs, HTTP authentication,
+fullscreen, pointer lock, accessibility; 4.0 loop wakeups per animated frame on DMA-BUF (from 5.8:
+decision 73).
+
+### WPE — In `sig`: the default build, per-site routing, links and settings
+
+`sig` compiles WPE WebKit in by default and opens with it what the configuration and the user give
+it; Servo stays the default engine for the web ([`WPE.md`](WPE.md), "In `sig`"). Decision 78.
+Everything below ran on this desktop (RTX 3070, headless sway 1.12 with GLES2) on 2 October 2026;
+scratchpad runs `wpe-int/…`.
+
+- [x] Feature `engine-wpe` in `sig`'s `default = [...]` beside `engine-servo` and `engine-wasm`;
+  `[engines] default` stays `servo`, and WPE opens what `[routing.wpe] hosts` gives it and what
+  `page.open-in wpe` asks for. The built-in configuration and the README say so. *`engines.sh`
+  `wpe`: a page on `localhost`, which `[routing.wpe] hosts = ["localhost"]` claims, opens in
+  WebKit; `:page.open-in wpe https://example.com/` too; a page on 127.0.0.1 typed into the same tab
+  opens in Servo.*
+- [x] A machine without the WPE prefix gets a clear build error. *The engine's build script stops
+  with `cargo::error` lines naming `nix/build-wpewebkit.sh`, `--pull louise-pc`, shell.nix and
+  `--no-default-features --features engine-servo,engine-wasm`, then why (no
+  `SIGHURT_WPE_PKG_CONFIG_PATH`, or pkg-config's answer): both cases built in a scratch target
+  directory.*
+- [x] `sig` linked with `-Wl,--exclude-libs,ALL` and an RPATH to the prefix (`build.rs`, decision
+  65). *`sig` exports 1 symbol (`main`), where the build before exported 1 075; with
+  `LD_DEBUG=bindings LD_BIND_NOW=1 sig --version`, no shared library binds into it but libpulse's
+  look-up of `main` (837 bindings before, 0 of them from WebKit's library, which wasn't linked);
+  `engines.sh` `wpe` checks both.*
+- [x] `[engines.wpe] user-agent` and `storage`. *`registry::tests`:
+  `the_core_learns_what_each_engine_honors` (WPE honors both, and a file setting both is valid),
+  `webkits_configuration_follows_its_settings` (profile `{data_dir}/sighurt/wpe`, none when
+  ephemeral; the user agent); `tests/engine.rs`: the configured agent is the header WebKit sends
+  and `navigator.userAgent`; `engines.sh` `settings`: with `user-agent` and `storage =
+  "ephemeral"`, `page.open-in wpe` of `ua.html` reports the agent both ways, and after quitting
+  nothing of WebKit's is in the data or cache directory; `wpe`: WebKit keeps its profile
+  (`localStorage`, caches) in the data directory.*
+- [x] `NavigationRequested` and `AnswerNavigation` in the WPE adapter, for a link or a GET form the
+  user clicked (WebKit's user-gesture flag and navigation type; WebKit's policy decision doesn't
+  tell frames apart, WPE.md has the probe). *`tests/engine.rs`
+  `the_page_asks_before_it_navigates`: a click on a link asks, for the link's document, and nothing
+  is fetched before the answer; allowed, it commits with the page's own id (`Push`); the browser's
+  back and reload don't ask; denied, nothing is fetched; a new document refuses what the old one
+  held and a late answer does nothing; a GET form asks; a click's script and a POST form go ahead
+  without asking; 17 links clicked in 17 frames: frames loading ask nothing, 16 are held and the
+  17th goes ahead, then the 16 go ahead when allowed; closing the view refuses what it holds and
+  nothing of the view follows `ViewClosed`. `engines.sh` `wpe`: from the WPE page a link to a page
+  routing gives Servo opens there and back returns to the kept WPE page, a link on its own host
+  stays, a click's script stays in WebKit, and a link in a Servo page to `localhost` opens in
+  WebKit; the core answered WebKit within 0.07–0.23 ms (eight answers, four runs).*
+- [x] `page.open-in wpe` and the capabilities, exported like Servo's. *`sig`'s registry takes
+  `sighurt_engine_wpe::CAPABILITIES`; the runtime reports the same (no "as the registry says"
+  warning in any run's log).*
+- [x] End to end in `sig`: `engines.sh` scenario `wpe`, 59 checks: what `sig` exports and binds;
+  the routing rule and `page.open-in wpe` (https://example.com/); a click at its position, å, ä, ö
+  and a dead key, the clipboard both ways; idle after WebKit's scrollbar fades (the owner loop: 1
+  wakeup in 3 s, no frame, no paint; the whole process tree only since "Review fixes"); a local WebGL page at the output's 60 Hz with no chrome paint and no CPU copy
+  (every WPE frame `readback_bytes=0`, the renderer line `mode=hardware` on DMA-BUF); a download of
+  content WebKit can't show into `[downloads] directory`; one tab across Servo, WPE and Wasm back
+  and forward with nothing loaded again; links between Servo and WebKit; `SIGKILL` of WebKit's web
+  processes, the tab's error, Servo going on and F5 in a new web process; a clean quit and the
+  profile. *Runs `wpe-int/e4` and `wpe-int/verify/engines`: 59 of 59 each; screenshots
+  `02-typed-and-pasted`, `03-webgl`, `04-example-com`, `06-from-servo-to-wpe`, `07-crashed` and
+  `08-reloaded` looked at.*
+- [x] Found and fixed: JavaScriptCore took `sig`'s SIGUSR1 (decision 78). *The first `engines.sh`
+  run: WTF logged "Overriding existing handler for signal 10", and `sig` stopped at the first
+  diagnostics request. With `JSC_SIGNAL_FOR_GC=12` set at the start of `main`, the check "WebKit's
+  JavaScriptCore left sig's SIGUSR1 (diagnostics) alone" passes and every diagnostics request is
+  answered.*
+
+Tests: `cargo test -p sighurt-api` 32, `-p sighurt-core` 126, `-p sighurt-engine-wpe --lib` 14,
+`-p sighurt-browser` 33 with `engine-demo,engine-wasm,keymap-modal`, 32 with `engine-wpe` alone
+and 35 with its default features and `keymap-modal`; the WPE compositor test
+(`sighurt-engine-wpe/tests/headless.sh`, GLES2) and `window-checks.sh` (GLES2, 60 of 60) after the
+change. Clippy `-D warnings` on all targets of api, core and the WPE adapter, of `wpe-coexist`, and
+of `sig` with no engine, `engine-demo`, `engine-wpe`, `engine-demo,engine-wasm,keymap-modal,
+chrome-line`, `engine-servo,engine-wasm` and its default features with `keymap-modal`; rustfmt;
+rustdoc `-D warnings` on the WPE adapter (its broken and private links fixed) and the api. With the
+final code, both suites whole: `engines.sh` 217 of 217 (servo 63, wasm 29, cross 33, settings 17,
+links 16, wpe 59; run `wpe-int/verify/engines`) and `headless.sh` 74 of 74. Eight guarantees broken
+on purpose in place, one at a time under one hold of the machine's lock, each file checked byte for
+byte afterwards, each failed the test meant for it (`wpe-int/breaks`): a held navigation used when
+dropped, a click's script asked about, a POST form asked about, no limit of 16, a new document
+keeping what the old one held, the user agent not applied, and in the registry `ephemeral` keeping
+a profile and the user agent not passed on.
+
+Open: the WPE scenario hasn't run on louise-pc or River; JavaScriptCore logs "ERROR: invalid
+option: JSC_SIGNAL_FOR_GC=12" once per WebKit process; a script's navigation that a click ran stays
+in WebKit and a link clicked in a frame moves the whole tab (WPE.md, "In `sig`"); `[engines.wpe]
+javascript` could be honored (WebKit's `enable-javascript` setting) but nothing uses it yet
+(extension-api.md §1.10); CLAUDE.md's pre-commit commands and `ci.yml` must exclude
+`sighurt-engine-wpe` and `wpe-coexist` (no WPE prefix in CI), and CLAUDE.md's "Anything that builds
+Servo" commands now also need the prefix (not this track's files). *Since ("Final verification and documentation"): the CI and
+CLAUDE.md items are done; `sig` with WPE WebKit ran on River (R2: a page the routing gave WPE,
+DMA-BUF on the RTX 3070, no copy); the `wpe` scenario still hasn't run on louise-pc.*
+
+### Extension API — configuration and the keymap and chrome APIs (steps 1–4)
+
+The design is [`extension-api.md`](extension-api.md); this is its part 3, "A. The APIs, with no
+change in behavior", steps 1–4. Decisions 67 and 68. Everything below ran on this desktop
+(RTX 3070) on 2 October 2026 with the working tree of that moment.
+
+- [x] Step 1: `sighurt_api::{settings, keymap}`, `input::KeyboardFocus` (replacing the core's and
+  the chrome's `Focus`) and `commands::CommandSet`; the `bindings` keymap through them. *`Chord`
+  moved unchanged into the api, its seven tests with it; `KeyState` holds a `Box<dyn Keymap>`
+  and keeps the taken-press rule for any keymap. `sighurt-api/tests/keymap.rs` implements a
+  keymap with a two-key sequence from outside the crate. Core tests with a fake keymap
+  (`tests/browser.rs`): `a_taken_press_takes_its_release_whatever_the_keymap_says`,
+  `run_then_pass_delivers_to_the_new_focus`, `the_keymap_hears_context_changes`,
+  `a_changed_indicator_redraws_the_chrome`. The existing key tests pass after the rename
+  (`consumed_presses_consume_their_releases`, `a_held_key_never_turns_into_a_shortcut`,
+  `losing_the_keyboard_forgets_held_keys`, `bound_keys_never_reach_the_page_by_halves`,
+  `focus_follows_the_core`).*
+- [x] Step 2: `[input] keymap`, `[keymap.<name>]`, the build's kinds in `Environment`,
+  `Config::parse(.., &Environment)`, notices. *`config::tests`:
+  `an_unknown_keymap_is_an_error_that_lists_the_builds`,
+  `tables_for_what_the_build_lacks_get_a_notice` (keymaps, chromes, routing, `enabled`; the
+  built-in file stays silent), `a_key_table_nobody_reads_gets_a_notice` (both ways),
+  `keymap_bindings_points_to_keys`, `a_keymaps_problems_are_prefixed_and_in_the_one_list`,
+  `the_selected_keymap_reads_its_own_table`, `dates_are_not_settings`; `tests/browser.rs`:
+  `a_reload_that_keeps_the_keymap_configures_it_and_keeps_its_state`,
+  `a_switch_replaces_the_keymap_and_a_held_keys_release_is_still_taken`,
+  `configuration_notices_are_shown_at_start_and_on_reload`. Changed: every caller of
+  `Config::parse`.*
+- [x] Step 3: `sighurt_ui::extension`; the `standard` chrome through it; tabs by id; `sig`
+  contains the snapshot's strings. *sighurt-ui's `Chrome` is `Model`, returning `ChromeAction`s
+  (`UiAction` is gone); `Snapshot::keymap` and `Snapshot::contain` (every field's bound) are new;
+  the core has `BrowserEvent::SelectTab` and `CloseTab`. All sighurt-ui tests pass and the eleven
+  golden images are unchanged (`git status sighurt-ui/tests/golden` is clean; nothing was
+  blessed). Changed: `tabs_select_close_and_open` (`SelectTab(id)`, `CloseTab(id)`). New:
+  `sighurt-ui/tests/extension.rs` drives the standard chrome through `Box<dyn Chrome>` only (a
+  tab click selects by id, an identical snapshot repaints nothing, a resize repaints every listed
+  surface, painting the page through the trait matches golden `home-100` and is byte for byte
+  the model's painting) and implements a chrome of its own (input areas, a theme, a text field);
+  `state::tests::every_string_of_a_snapshot_is_contained_to_its_bound`; in the core
+  `closing_a_tab_by_id_after_the_list_shifted` and `selecting_a_closed_tab_by_id_does_nothing`;
+  in `sig` `chrome::tests::the_snapshot_contains_what_pages_say` (a title with U+202E and a
+  newline, through a real core).*
+- [x] Step 4: `sig` drives `Box<dyn Chrome>` with named surfaces and input areas; `[ui] chrome`;
+  the core checks `[ui]`. *`sig`'s `chrome::ChromeTargets` is the bookkeeping, unit-tested
+  without a compositor (`names_get_targets_in_the_chromes_order`,
+  `a_ninth_name_is_refused_and_reported_once`, `rectangles_are_clipped_to_the_window`,
+  `input_rectangles_are_clipped_to_their_surface`,
+  `a_name_no_longer_listed_is_hidden_with_its_last_rectangle`); core tests
+  `ui_is_checked_against_the_build`, `unknown_color_names_are_errors` (moved from
+  `persistence`), `a_reload_that_changes_the_chrome_says_it_applies_at_restart`; changed
+  `keys_and_ui_are_the_users_alone` (`[ui] font` valid, `fnt` an error).
+  `sighurt-browser/tests/headless.sh`: 45 of 45, the roles still `chrome`, `status`, `page`, and
+  the new check "no chrome target held more than 3 buffers" (2 at most over the main
+  scenario's storm and scale changes; scratchpad runs `e2e1` and `e2e2`, the second with the
+  final code; screenshots `main/06`, `config/02` and `config/03` looked at: the unknown color
+  is now the core's error). `engines.sh` with Servo
+  and Wasm: 121 of 121 (servo 59, wasm 29, cross 33; run `eng1`, screenshots `servo/04` and
+  `servo/06-scale-1.5` looked at).*
+
+Tests: `cargo test -p sighurt-api` 28 + 1, `-p sighurt-core` 45 + 52, `-p sighurt-ui` 28 + 6 + 23
++ 11 (1 ignored) + 1, `-p sighurt-browser` 27 with `engine-demo` and 27 with its default features; clippy
+`-D warnings` on all targets of api, core and ui, and of `sig` with no engine, `engine-demo`,
+`engine-demo,engine-wasm` and its default features; rustfmt. Fourteen guarantees broken on
+purpose in a copy of the file, one at a time, each failed the test meant for it: a passed repeat
+of a taken press, a `RunThenPass` press taken, the context never told, a reload always replacing
+the keymap, a switch forgetting taken presses, an indicator change not redrawn, tabs by number,
+the restart notice, the unused-`[keys]` notice, the missing-keymap notice, an uncontained
+snapshot, hidden surfaces left out of the placement, unclipped input areas, a tab click as a
+numbered command.
+
+Open: `[ui] font` and `font-size` are checked and reach the chrome in its `Theme`, but the
+standard chrome draws with its own font and sizes until step 17, and the default file doesn't
+document them yet; `extension-api.md`'s status line and changelog don't record the
+implementation; CLAUDE.md's and the README's command lists gain `page.open-in`, `page.send-key`
+and `chrome.<action>` with steps 5, 6 and 12, which add them. `sig` with these changes has not
+run on River. *Since ("Final verification and documentation"): the font is drawn (step 17) and documented, the command lists
+are complete, and `sig` with the `bindings` keymap and the standard chrome ran on River (R2);
+`extension-api.md` is still open.*
+
+### Extension API — commands, the modal keymap, side buttons and scrolling (steps 5–7 and 10)
+
+[`extension-api.md`](extension-api.md), part 3, steps 5, 6, 7 and 10, their API, core and `sig`
+side; the chrome's half of steps 5 and 10 (the standard chrome's `chrome.toggle-tabs`, removing
+its side-button code) is the chrome track's. Decision 74. Everything below ran on this desktop
+(RTX 3070) on 2 October 2026, with the working tree of that moment (the chrome and WPE tracks'
+work in progress included).
+
+- [x] Step 5: `chrome.<action>`. `Command::Chrome(action)`: kebab-case, 1 to 32 characters, no
+  argument. It is checked at load against the selected chrome's actions through `CommandSet`, in
+  `[keys]`, `[input.buttons]` and any keymap's table alike; the core returns
+  `Effect::ChromeCommand(action)`, and `sig` hands it to the running chrome as
+  `ChromeEvent::Command` or shows a notice naming the commands it has (`sig`'s `chrome::command`).
+  *api `commands::tests::chrome_commands_are_kebab_case_and_take_no_argument` (an argument, an
+  empty action, upper case and `_` refused) and `a_command_set_names_what_its_chrome_lacks`; core
+  `config::tests::chrome_commands_are_checked_against_the_selected_chrome` (the three tables in
+  one list, and the same commands for a chrome with none) and `chrome_commands_go_to_the_chrome`
+  (bound and typed; the keyboard stays where it is); `sig`
+  `chrome::tests::a_chrome_gets_its_own_commands_and_a_notice_says_what_it_lacks`; `headless.sh`
+  `modal`: `:chrome.nope` puts `sig`'s notice in the status strip (screenshot `modal/04`: "The
+  standard chrome has no command chrome.nope; it has chrome.toggle-tabs.").*
+- [x] Step 6: `page.send-key <key>`. `Command::PageSendKey(SentKey)`, with the modifiers, the W3C
+  key and the evdev code: a named key (`down`, `pageup`, `enter`, `f5`, …, or a W3C key name that
+  is also the code of a key that types nothing on common layouts and isn't one of a pair or on the
+  keypad) or `space`, with modifiers; characters and `code:` are refused. The core presses and
+  releases it in the shown view, back to back, only while the page has the keyboard; run by a key
+  press, that press is the page's activation. *api `send_key_presses_named_keys` (codes, the round
+  trip through `Display`, space's text, every refusal); core
+  `a_sent_key_is_pressed_and_released_in_the_page_back_to_back` (two effects, nothing between),
+  `a_sent_key_needs_the_page_to_have_the_keyboard` (the chrome has it; a `sig:` page shows),
+  `a_key_sent_by_a_key_press_is_the_users_activation` (as a command a pop-up is blocked; from
+  `alt-j` it opens a tab); `engines.sh` `servo`, on a page 20 000 pixels tall: `alt-j`, bound to
+  `page.send-key end`, reaches Servo as a keydown with key and code `End` and scrolls the page to
+  its bottom (19 304), and `page.send-key home` brings it back to 0.*
+- [x] Step 7: `sighurt-keymap-modal` (§2.5), feature `keymap-modal`, `[input] keymap = "modal"`:
+  modes, sequences of up to 4 keys, `always`, `pass` modes, a `typing` mode, `{ run, pass = true
+  }`, the indicator. It depends on `sighurt-api` only (`toml` is a dev-dependency of its tests).
+  *`sighurt-keymap-modal/tests/modal.rs`, 13 tests through `KIND` and `Box<dyn Keymap>` only: the
+  design's table is valid (its chrome command checked against the chrome), modes and the indicator
+  ("NORMAL g"), sequences, a failed sequence starting afresh, modifier and dead keys inside a
+  sequence, unbound keys swallowed or passed, the typing mode, the chrome (only `always`, and only
+  its keys that don't type), `RunThenPass`, repeats, `reset` and `context` ending a sequence, a
+  reload keeping the mode, and every configuration problem (19, including a prefix in the same
+  mode and with `always`, and sequences starting with a typing key where keys pass). `headless.sh`
+  `modal`, 13 checks: `g` alone waits and `g t` shows the next tab; in normal mode `z` and `j`
+  type nothing, `i` then "hej" reaches the page and Escape leaves insert mode (the session's title
+  is exactly "Demo: resize · hej"); `x` closes a tab; `:` opens the command line with the colon in
+  it, and `tab.select 1` typed there (with `t` bound in normal mode) runs; ctrl-q in `always`
+  quits (screenshots `modal/02`–`04` looked at).*
+- [x] Step 10: `[input] scroll-speed` and `[input.buttons]`, core and `sig`. `sig` sends every
+  side-button event to the core as `BrowserEvent::Button`, over a view or the chrome; the built-in
+  file binds `back` and `forward` to `page.back` and `page.forward`. *core
+  `config::tests::input_settings_merge_key_by_key_and_are_checked`,
+  `a_bound_buttons_release_stays_taken_after_a_reload_unbinds_it` (and an unbound press and its
+  release reach the page), `side_buttons_over_the_chrome_run_their_commands_or_go_nowhere`,
+  `scrolling_goes_scroll_speed_times_as_far` (pixels and 120ths, rounding never to 0);
+  `the_mouse_back_button_goes_back` passes unchanged; `headless.sh` `modal`: the back button over
+  the tab strip goes back and the forward button over the page goes forward (the tab's history
+  state in the diagnostics); `engines.sh` `servo`: a wheel notch scrolled a Servo page 15 px, and
+  45 px after `[input] scroll-speed = 3` was added to the file while `sig` ran.*
+
+Tests: `cargo test -p sighurt-api` 30 + 1, `-p sighurt-core` 47 + 59, `-p sighurt-keymap-modal`
+13, `-p sighurt-browser` 28 with `engine-demo,keymap-modal` and 28 with its default features and
+`keymap-modal`. Clippy `-D warnings` on all targets of api, core and the modal keymap, and of
+`sig` with no engine, `engine-demo`, `engine-demo,keymap-modal`,
+`engine-demo,engine-wasm,keymap-modal` and its default features with `keymap-modal`; rustfmt.
+`headless.sh` (built with `engine-demo,keymap-modal`): 58 of 58, three times (scratchpad runs
+`e2e1`, `e2e2` with the final code, and `e2e3` with the scripts' fix below). `engines.sh` `servo`,
+with Servo built here: 63 of 63, the 59 of before and the 4 above (run `eng2`); its first try ran
+another track's demo build of `sig`, which a build had put in `target/debug` between this script's
+build and its link, so `engines.sh` and `headless.sh` now build and link their binary under one
+hold of the machine's lock. Twenty-five guarantees broken on purpose in a scratch copy of api,
+core and the keymap, one at a time, each failed the test meant for it: a sent key reaching the
+page while the chrome has the keyboard, a sent key not counting as activation, a taken button's
+release decided by the binding of the moment, an unbound button over the chrome reaching the page,
+a wheel step rounded to nothing, no scaling, a side button arriving as `Pointer` skipping the
+bindings, no `ChromeCommand`, button commands parsed without the chrome's actions, no range check
+on `scroll-speed`, a button's default lost when the file has `[input]`, characters, paired keys
+and keypad keys accepted as sent keys, upper case in a chrome action, `CommandSet` not checking
+the action; and in the keymap: no prefix check, no typing-start check, a failed sequence not
+starting afresh, modifiers breaking a sequence, the last key of a sequence repeating its command,
+typing keys of `always` applying in the chrome, a mode's bindings applying in the chrome, unbound
+typing keys passing in normal mode, no typing mode, and a context change keeping an unfinished
+sequence.
+
+Open: CLAUDE.md's command list and the README's command table need `page.send-key <key>` and
+`chrome.<action>`, and CLAUDE.md's pre-commit clippy of `sig` and `ci.yml` the `keymap-modal`
+feature; `extension-api.md` doesn't record the implementation; the built-in file documents the
+standard chrome's command but not yet its `[chrome.standard]` options (steps 15 and 16, the chrome
+track's); the standard chrome doesn't show the keymap's indicator (the chrome track's); the modal
+keymap's limits of §2.5 stand (no way out of a page's text field but a click, no link hints, no
+find, no counts); `sig` with these changes has not run on River. *Since ("Final verification and documentation"): CLAUDE.md,
+the README, `ci.yml` and the built-in file are done, and the standard chrome shows the indicator
+(decision 75); the modal keymap ran end to end with all three engines (`engines.sh` `showcase`),
+not on River.*
+
+### Extension API — the chromes: options, the line chrome, fonts (steps 5, 8, 10 and 15–17)
+
+The chrome's side of [`extension-api.md`](extension-api.md) part 3: step 5's
+`chrome.toggle-tabs`, step 8 (`sighurt-chrome-line`, with sighurt-ui's `Canvas` split out of
+`paint_cpu`), step 10's removal of the chrome's side-button code, and steps 15–17
+(`[chrome.standard]`, `tabs = "left"`, `[ui] font` and `font-size`); and a bug the verification
+found: the address line showed percent-encoded addresses as they were. Decision 75. Everything
+below ran on this desktop (RTX 3070) on 2 October 2026 with the working tree of that moment, the
+keys lane's core and `sig` changes in it. End to end: `sighurt-ui/tests/headless.sh` (new: `sig`
+with `engine-demo,chrome-line` in `tools/headless-sway`, pixman, with the binaries copied out of
+`target/` right after the build), 35 of 35 checks in the run `chrome-lane/run2` (scratchpad):
+`line` 11, `overlay` 12, `left` 8, `font` 4; every screenshot looked at. Again 35 of 35 with the
+final code (run `run3`).
+
+- [x] Step 5, the chrome's side: `ChromeEvent::Command(action)`; the standard chrome's
+  `commands` is `["toggle-tabs"]`, which hides the tabs or shows them where `tabs` puts them (at
+  the top when that is `hidden`). *`sighurt-ui/tests/extension.rs::toggle_tabs_hides_and_shows_them`
+  (top, left and hidden, through the trait). End to end (`left`): `ctrl-b` bound to
+  `chrome.toggle-tabs` unmaps the `tabs` target and the page grows to 1280 px, and a second press
+  maps it again. A first run bound it with the line chrome selected, and the file was refused:
+  "the line chrome has no command chrome.toggle-tabs; it has none".*
+- [x] Step 8: `sighurt-chrome-line`, `[ui] chrome = "line"`, feature `chrome-line` (two lines in
+  `sig`'s manifest, two in its registry). *`cargo tree -p sighurt-chrome-line -e normal`:
+  sighurt-api and sighurt-ui only. `tests/line.rs`, 7 tests through `Box<dyn Chrome>`: typing an
+  address and Enter; `:tab.next`, the page getting the keyboard before the command; a bad
+  command; Escape; a paste (only the latest answer, once, not after Escape; Ctrl+A Ctrl+C copies
+  the decoded address); a click placing the caret where it is drawn at 100, 125, 150 and 200 %;
+  its surfaces (`line`, and `page` on `sig://home`; `position = "bottom"`; 36 px at 18 px);
+  repaints only for what changed; the kind's check. Golden images `line-100`, `typing-150`,
+  `error-200` and `home-100` looked at. End to end (`line`): the roles are `line` (1280 × 28) and,
+  on `sig://home`, `page`; `ctrl-l` and a typed `demo://resize` open it; a click on the line and
+  a typed `demo://animation` open that (120 frames in 2 s, 0 chrome paints); 3 s idle: 0 chrome
+  paints, 1 wakeup (the report's).* `Canvas` (with `Pen`) now holds what `CpuPainter` did to a
+  buffer, and `Fonts`, `TextStyle` and `ShapedText` are public, for other chromes.
+- [x] Step 10, the chrome's side: the standard chrome does nothing with the side buttons.
+  *`side_buttons_are_not_the_chromes`; `toolbar_buttons` lost its side-button checks (the keys
+  lane's core tests have them).*
+- [x] Step 15: `[chrome.standard]` `status = "strip" | "overlay"`, `buttons`, `compact`, `tabs =
+  "top" | "hidden"`, checked by the standard kind. *`layout::tests`:
+  `each_option_moves_only_its_part`, and `odd_sizes_keep_everything_inside` over every
+  combination of the options at 14 and 18 px; `hit_targets_stay_on_drawn_controls_at_every_scale`
+  now with six option sets (compact; no buttons with the overlay; left; left and compact at
+  18 px; hidden at 18 px) at four scales; `the_status_overlay_lies_over_the_page_and_takes_no_input`
+  (listed only with status text, `InputArea::Rects([])`, one rectangle for every hovered link,
+  the page unchanged); `the_standard_kind`; golden `compact-100`, `no-buttons-125`, `overlay-150`
+  looked at. End to end (`overlay`): no status text, no status target; the pointer on the resize
+  page maps the 640 × 20 overlay and the page stays 1280 × 716; under the overlay the page still
+  gets the pointer (its crosshair line drawn at x 300, then 500) with 0 placements meanwhile;
+  `status = "strip"` saved to the file maps the 1280 × 20 strip and the page shrinks to 696 at
+  once, and back.*
+- [x] Step 16: `tabs = "left"`: rows in a `tabs` surface of their own below the toolbar, the
+  new-tab button the last row, scrolled a whole row at a time (3 a wheel notch; a row per row's
+  height of touchpad). *`the_tab_list_scrolls_by_whole_rows` (40 tabs),
+  `the_tab_list_scrolls_and_follows_the_active_tab` (only the list repaints; a switch to a tab out
+  of view scrolls it into view), `the_tab_list_on_the_left` through the trait; the hit targets
+  above; golden `tabs-left-125` looked at. End to end (`left`): a 220 × 736 `tabs` target beside
+  the 1060 px page; a click on the third row shows tab 3.*
+- [x] Step 17: `[ui] font` and `font-size`. *`heights_follow_the_font_size` (14 px: 40/44/20,
+  18 px: 51/57/26, compact and 9 px too), `styles_scale_with_the_font_size`,
+  `a_family_that_isnt_installed_falls_back_and_says_so` (by any case; the log's warning),
+  `the_font_size_scales_the_standard_chrome` (a reload back to 14 px lays out again), the caret
+  test at 14 and 18 px; golden `font-18-100` and `font-18-home-100` looked at. End to end
+  (`font`): 18 px gives a 108 px chrome and a 26 px strip, the log says "the font "Nope Sans" is
+  not installed; the chrome's text is in DejaVu Sans", and a saved 14 gives 84 and 20 at once.*
+- [x] Addresses read decoded where that is safe (`extension::readable_url`), in the address line
+  and in the status line's hovered links, in both chromes. *`extension::tests`:
+  `addresses_read_decoded`, `what_could_hide_or_fake_the_address_stays_encoded`,
+  `the_shown_form_opens_the_same_address` (the url crate parses each shown form back to its
+  address); `the_address_line_reads_decoded` (Enter on it opens the decoded form; the page's
+  accessible value stays the committed address). End to end (`font`, screenshot):
+  `demo://pattern?%C3%A5%C3%A4%C3%B6%E2%80%AE#K%C3%A4llor` reads
+  `demo://pattern?åäö%E2%80%AE#Källor`; in the keys lane's suite, `main/11` shows
+  `demo://slow?åäö`.*
+- [x] The standard chrome shows the keymap's indicator at the address field's right end (the
+  keys lane's section left this open). *`an_identical_snapshot_repaints_nothing` changed: an
+  indicator repaints the chrome alone; golden `compact-100` shows "NORMAL g"; in `sig` with the
+  modal keymap, the keys lane's `modal/02` shows "INSERT".*
+
+Tests: `cargo test -p sighurt-ui` 36 + 10 + 26 + 13 (1 ignored) + 1, `-p sighurt-chrome-line` 7,
+`-p sighurt-browser --no-default-features --features engine-demo,chrome-line` 28; clippy `-D
+warnings` on all targets of sighurt-ui, sighurt-chrome-line and that `sig`; rustfmt. The eleven
+golden images from before re-render byte for byte (blessed into a copy, compared with `cmp`).
+The keys lane's `sighurt-browser/tests/headless.sh` (standard chrome, `engine-demo,keymap-modal`):
+58 of 58 (run `chrome-lane/sigsuite`; screenshots `main/06` and `main/11` looked at), and its
+`modal` and `main` again with the final code, 42 of 42 (run `sigsuite2`, `modal/02` looked at).
+Twenty
+guarantees broken on purpose, one at a time while holding the machine's lock (so no other build
+saw them), each failed the test meant for it: bidi controls or ASCII decoded, the raw address
+shown, the overlay taking input or listed without text, repaints for unlisted surfaces,
+`toggle-tabs` doing nothing or keeping hidden tabs hidden, the list's scroll repainting the
+toolbar, no reveal of the active tab, one row a notch, no font-size scaling, `compact` ignored,
+the side buttons back in the chrome, no log for a missing font, the address text half a pixel
+off its caret rectangle; and in the line chrome a command before the keyboard moves, a stale
+paste, a repaint for every snapshot, a click not placing the caret.
+
+Open: `extension-api.md`'s changelog, CLAUDE.md's crate and module tables (the new crate;
+sighurt-ui's `canvas`) and the README's commands are other tracks' files; `default-config.toml`
+doesn't document `[chrome.standard]`'s options, `[ui] font` or `font-size` yet; the wheel over
+the tab list is unit-tested only (the virtual pointer has no axis); the line chrome and the new
+options have not run on River. *Since ("Final verification and documentation"): CLAUDE.md, the README and the built-in file are
+done; the line chrome and `tabs = "left"` ran with all three engines (`engines.sh` `showcase`),
+not on River.*
+
+### Extension API — zoom, keywords, page.open-in, engine settings, files (steps 9, 11, 12, 14, 18)
+
+[`extension-api.md`](extension-api.md), part 3, steps 9, 11, 12, 14 (Servo's and the Wasm engine's
+half; WPE's is the WPE integration's: a line in the registry naming the settings it honors) and 18.
+Decision 76. Everything below ran on this desktop (RTX 3070) on 2 October 2026 with the working
+tree of that moment (the chrome and WPE lanes' work in progress included). End to end: a new
+`settings` scenario in `sighurt-browser/tests/headless.sh` (demo engine, 16 checks) and in
+`tests/engines.sh` (Servo and Wasm in headless sway with GLES2, 15 checks), all passing
+(scratchpad runs `settings-lane/h1` and `settings-lane/e1`; screenshots `settings/01` of both
+looked at).
+
+- [x] Step 9: `zoom`, 0.5 to 3 (the ladder's ends), live. New tabs start at it and `page.zoom-reset` returns to it; open and restored tabs keep their own. *core
+  `config::tests::zoom_is_within_the_ladders_ends`;
+  `tests/browser.rs::new_tabs_start_at_the_configured_zoom_and_reset_returns_to_it` (the view opens
+  at it, `SetZoom(1.25)` on reset, a reload leaves open tabs as they are, restored tabs keep 1.0,
+  1.25 and 0.9 where a new one takes the new 2.0); `headless.sh` `settings`: the session's zooms are
+  [1.25, 1.25], 1.5 after `:page.zoom-in`, 1.25 after `:page.zoom-reset`, and [1.25, 1.25, 0.9]
+  after `zoom = 0.9` was saved while `sig` ran and a tab was opened.*
+- [x] Step 11: `[keywords]`. When the first word typed is a keyword, the rest goes where its
+  template has `{}`, encoded as a search is; a template without `{}` is used for the keyword
+  alone. *router `keywords_come_before_paths_hosts_and_search` (17 cases: queries, a keyword
+  alone, a template without `{}` with and without a query, URLs, `sig:`, paths, `~/`, host names,
+  `localhost:8000`, upper case, a keyword that isn't the first word); config
+  `keywords_are_names_for_web_templates` (every refusal); core `keywords_open_their_templates`
+  (from `page.open`, and live after a reload); `engines.sh` `settings`: "t åäö" typed into the
+  address bar opens `count.html?q=åäö` in Servo.*
+- [x] Step 12: `page.open-in <engine> [address]`, and chosen views (`View::chosen`). The engine's
+  name is checked for its form when the command is parsed, the build and `enabled` when it runs,
+  with the tab's error as for a typed address; without an address it opens the tab's committed
+  address, else the one loading, else the one that failed. *api
+  `open_in_names_an_engine_and_may_take_an_address` and the round trip of
+  `display_gives_the_canonical_string_back`; core
+  `open_in_reopens_the_page_in_the_engine_named_and_back_returns` (a Wasm view for the Servo
+  page's address that replaces it once committed, back to the kept Servo view and forward, the
+  new view chosen; the page's own navigation leaves it chosen, `page.open` into the same engine
+  unchooses it in the same view and `page.open-in` the same engine chooses it again without a new
+  view; an address routing gives to Wasm opened in Servo; typed text through the router),
+  `open_in_takes_the_address_still_loading`, `open_in_says_why_it_cant` (a `sig:` page, an engine
+  not in the build with the page kept, one not enabled, a scheme the engine doesn't open);
+  `headless.sh` `settings`: `:page.open-in demo demo://resize`, and `:page.open-in servo
+  https://example.com/` in a demo build puts "The servo engine is not part of this build of sig."
+  in the status strip with the page kept; `engines.sh` `settings`: `:page.open-in wasm` of an app
+  on `http://localhost:<port>`, an origin routing gives to Servo, shows it in the Wasm engine as a
+  segment after the Servo page, and back shows the Servo page.* Nothing reads `chosen` until step
+  13's hand-off of page navigations.
+- [x] Step 14, Servo and Wasm: `[engines.<engine>] user-agent` and `storage`, a vocabulary the core
+  checks from one table (`config::ENGINE_SETTINGS`) against what the registry says each engine
+  honors (`Environment::engine_settings`: Servo both, Wasm `storage`, the demo engine none).
+  *config `engine_settings_are_checked_against_what_each_engine_honors` (values, an unknown key,
+  a setting the engine can't honor naming what it honors, a misnamed engine, user agents with a
+  line break, a tab, a letter beyond ASCII or DEL, a table for an engine the build lacks checked
+  for its form with a notice); changed: `an_old_file_with_a_version_says_what_moved` (the hints
+  for `[engines.wasm] command` and `extensions` instead of "[engines]: unknown field `wasm`");
+  core `a_reload_that_changes_engine_settings_says_they_apply_at_restart`; `sig`
+  `registry::tests`: `the_core_learns_what_each_engine_honors` (and each name is a setting the
+  core reads), `servos_configuration_follows_its_settings`,
+  `the_wasm_engines_directories_follow_its_storage`,
+  `an_ephemeral_engines_directory_lasts_until_the_end_of_shutdown` (mode 700 under
+  `$XDG_RUNTIME_DIR`, kept through `shutdown`, gone after `remove_scratch`); Servo
+  `runtime::tests::user_agent_is_firefox` (the executable's agent as it is) and
+  `tests/engine.rs`, whose Servo is configured with a user agent that a test page's
+  `navigator.userAgent` puts in its title (`tests/headless.sh`: the three test binaries pass
+  in headless sway with GLES2);
+  `engines.sh` `settings`, with `[engines.servo] user-agent = "SighurtTest/1.0 (engines.sh)"`,
+  `storage = "ephemeral"` and `[engines.wasm] storage = "ephemeral"`: `ua.html` reports both the
+  header the server got and `navigator.userAgent` as that string; a Wasm app's key lands in
+  `$XDG_RUNTIME_DIR/sighurt-wasm-*/kv` (mode 700); a user agent changed while `sig` runs gets a
+  notice; after ctrl-q there is no Servo profile, no Wasm store or module cache in the run's data
+  and cache directories, and the run's directory is gone; `headless.sh` `settings`:
+  `[engines.demo] storage` saved while `sig` runs is refused, "[engines.demo] storage: the demo
+  engine can't honor it (it honors: none)" in the log and a notice in the strip.*
+- [x] Step 18: `[downloads] directory` (absolute or `~/`, live, made by the first download that
+  needs it) and `[session] restore` (read at start; writing stops and resumes live). *config
+  `the_download_folder_is_absolute_or_in_the_home_directory`,
+  `the_session_is_restored_unless_the_file_says_not`; `sig`
+  `services::tests::downloads_go_to_the_configured_folder_made_when_first_needed`,
+  `a_folder_that_cant_be_made_fails_the_download_and_leaves_nothing`; `headless.sh` `settings`:
+  with `restore = false` a `sig` started over a saved session of three tabs shows one tab and no
+  view, and a new tab and a quit leave the file byte for byte as it was; `restore = true` saved
+  while `sig` runs writes its two tabs at once.* No engine of this build downloads through the
+  service yet (WPE's will), so the configured folder is unit-tested, not run end to end.
+
+Tests: `cargo test -p sighurt-api` 31 + 1, `-p sighurt-core` 53 + 65, `-p sighurt-browser` 33 with
+`engine-demo,engine-wasm,keymap-modal` and 34 with its default features and `keymap-modal`, `-p
+sighurt-engine-servo --lib` 28. Clippy `-D warnings` on all targets of api and core, of `sig` with
+no engine, `engine-demo`, `engine-wasm`, `engine-demo,engine-wasm,keymap-modal` and its default
+features with `keymap-modal`, and of the Servo adapter; rustfmt on every file changed. With the
+final code, both suites whole: `headless.sh` 74 of 74 (main 29, config 9, close 4, disconnect 3,
+modal 13, settings 16; run `settings-lane/h2`) and `engines.sh` 140 of 140 (servo 63, wasm 29, cross
+33, settings 15; run `settings-lane/e2`). Twenty-nine guarantees broken on purpose, one at a time,
+each failed the test meant for it: 22 of the api and core in a scratch copy of the workspace with a
+target directory of its own (new tabs, a reset or a restored tab ignoring `zoom`, no range check or
+merge of `zoom`, keywords ignored or a template without `{}` taking a query, `localhost` or any
+template accepted as a keyword, the core passing no keywords, `page.open-in` ignoring its engine or
+the address loading, typing leaving a view chosen, the page's own navigation unchoosing it, engine
+settings unchecked against the engine, any user agent, no notice for an engine table the build
+lacks, no hint for the old `command`, no restart notice, `~/` not expanded, `[session] restore`
+ignored, upper case in `page.open-in`'s engine), and 7 of `sig`'s in place under one hold of the
+machine's lock, the files checked byte for byte afterwards (runtimes started without the launch
+settings, the scratch directory readable by others or never deleted, an ephemeral Wasm engine
+caching modules or keeping its store in the data directory, the download folder not made or
+ignored).
+
+Open: CLAUDE.md's command list and the README's command table need `page.open-in <engine> [url]`,
+and `extension-api.md` doesn't record the implementation (not this lane's files); a Wasm app's own
+downloads (`api_download_data`, `api_download_url`, `api_canvas_print_pdf`) still write to the
+desktop's download folder themselves, not through the download service, so `[downloads]
+directory` doesn't apply to them (M6 moves them to the service); `chosen` isn't kept by a record,
+so a view restored from history is unchosen, and F5 on a failed `page.open-in` tries the address
+again with routing; with `storage = "ephemeral"` a Wasm app's store is on disk under
+`$XDG_RUNTIME_DIR` while `sig` runs, and stays there if `sig` is killed (a tmpfs, emptied at
+logout); WPE's settings (`user-agent`, `storage`) are the WPE integration's; nothing has run on
+River. *Since ("Final verification and documentation"): the command lists are done, and WPE's settings are (decision 78).*
+
+### Extension API — host rules, and links that follow the routing (step 13)
+
+[`extension-api.md`](extension-api.md), part 3, step 13: `[routing.<engine>] hosts` and the
+hand-off of the navigations a page starts (`NavigationRequested`, `AnswerNavigation`), in
+sighurt-api, the core and the Servo adapter, as one change. The WPE adapter's half is the WPE
+integration's (below). Decision 77. Everything below ran on this desktop (RTX 3070, headless sway
+1.12 with GLES2) on 2 October 2026 with the working tree of that moment; scratchpad runs
+`step13/…`.
+
+- [x] Host rules: `[routing.<engine>] hosts`, a host name or IP address, or `*.` and a host name
+  (every host under it, at any depth, not the name itself), lower-cased and IDNA-normalized by the
+  `url` crate as it normalizes a URL's host; a scheme, port, path, user or a `*` anywhere else is
+  a problem, and a pattern belongs to one engine. Rule 6 of the router, after an origin's rule:
+  an exact host beats any wildcard, a longer wildcard a shorter one. Merged field by field like
+  the other routing fields. *config `host_rules_are_host_names_or_wildcards_of_one_engine`
+  (normalized forms, `Bücher.de` as `xn--bcher-kva.de`, `[0:0::1]` as `[::1]`; 13 refused forms;
+  `*.Example.com` and `*.example.COM` of two engines are one pattern claimed twice; the merge);
+  router `host_rules_send_hosts_to_their_engines_the_most_specific_first` (19 URLs: exact versus
+  wildcard versus a longer wildcard, any depth, not the bare domain, ports, IP addresses, IDNA, no
+  `file:`, an origin's rule first; an explicit choice wins; a disabled engine is an error);
+  `the_documented_examples_are_valid` reads the default file's `[routing.wpe]` example.*
+- [x] The contract: `EngineEvent::NavigationRequested { view, document, request, url }` and
+  `EngineCommand::AnswerNavigation { request, allow }` (an additive api change; their
+  documentation is the contract an engine implements). The demo and Wasm engines never ask: one
+  match arm each. `sig` carries the answer like any engine command.
+- [x] The core's rule (`state::navigation_requested`): denied for a document its tab doesn't show,
+  and for what no page may open (`sig:`, `file:` from a web page, with the notice `OpenRequested`
+  gives); allowed for a chosen view; denied and opened in a new view as routing says when routing
+  gives the URL to another engine that can open views now (in the build, enabled, working) and
+  the user clicked or pressed a key in the page within 5 s, which that uses up; allowed
+  otherwise. *`tests/browser.rs`: `a_clicked_link_to_a_host_another_engine_claims_opens_there`
+  (4.9 s after a click; the new view replaces the page once it commits; back returns to the kept
+  page; the click is used up; Enter in the page counts),
+  `what_a_page_does_without_a_click_or_key_stays_in_its_engine` (none, one 5 s old; a link the
+  page's own engine opens leaves the click for the next),
+  `a_chosen_views_links_stay_in_its_engine_until_an_address_is_typed`,
+  `a_link_to_a_host_no_rule_claims_returns_to_the_default_engine`,
+  `only_the_page_a_tab_shows_may_navigate` (a replaced document, a page kept in the history; a
+  background tab's page may), `links_routing_cant_place_stay_and_what_pages_may_not_open_is_denied`
+  (a disabled engine, one the build lacks, `javascript:`, `blob:`, `data:`, a URL over 2 MiB
+  stay; `sig:` and `file:` are denied with a notice; none uses the click up). The helper every one
+  of these 25 requests goes through asserts exactly one `AnswerNavigation` for it; `every_event`
+  gains `NavigationRequested`, so a closed or replaced view's late request gets nothing at all
+  (`a_closed_tab_ignores_late_events`, `a_replaced_view_is_forgotten`).*
+- [x] Servo's half: every navigation it would load itself is held (`delegate::PageNavigation`,
+  which denies when dropped unanswered, where Servo's `NavigationRequest` allows) and reported
+  for the current document; at most 16 per view, beyond them, or without a committed document, it
+  goes ahead at once. A new document, a crash, closing the view (before its WebView goes) and
+  shutdown (with notes not yet taken in) deny what is held. Servo 0.5 carries out the browser's
+  reload as the page's navigation to its own address (`Location::reload`, through the
+  constellation's `schedule_navigation`); the adapter lets that one go ahead without asking.
+  `ServoDiagnostics::asked` counts what is held. *`tests/engine.rs`
+  `the_page_asks_before_it_navigates` (the test loop answers itself): a click through the
+  adapter's input on a page's link asks, for the link's document, and nothing is fetched before
+  the answer; allowed, it commits with the page's own id (`Push`); a reload commits without
+  asking; denied, the target is never fetched and the page stays; a new document denies what the
+  old one held (`asked` 0) and a late answer does nothing; of 17 frames navigating themselves 16
+  are held and the 17th goes ahead (title "landed 1"), then allowing the 16 gives "landed 17";
+  closing the view while it holds one: the target is never fetched and nothing follows
+  `ViewClosed`. `tests/headless.sh`: the three binaries pass (run `servo-4`).*
+- [x] End to end: `engines.sh` `links` (16 checks, run `e1`): in a Servo page on
+  `http://127.0.0.1:<port>`, a click on a link to `/guests/gradient-demo.wasm`, on the origin
+  `[routing.wasm] origins` names, shows the app in the Wasm engine as a segment after the page
+  (diagnostics: tab 1's view on `wasm`), and back shows the Servo page, not loaded again; a click
+  on a link to `http://localhost:<port>/guests/hello-sighurt.wasm` with `[routing.wasm] hosts =
+  ["localhost"]` opens it in Wasm too; a page that sends itself to that host 0.5 s after it loads
+  stays in Servo; after `:page.open-in servo`, a click on a link to that host stays in Servo.
+  Servo held each of the five navigations 0.08–0.20 ms before the core's answer
+  (`servo-timing navigation-answered`): `sig` hands a pump's events to the core and carries out
+  its answer in the same `pump_engines` call.
+  Screenshots `links/01`–`03` looked at.*
+
+Tests: `cargo test -p sighurt-api` 31 + 1, `-p sighurt-core` 55 + 71, `-p sighurt-browser` 33
+with `engine-demo,engine-wasm,keymap-modal` and 34 with its default features and `keymap-modal`;
+the Servo adapter's three compositor tests (run `servo-4`); clippy `-D warnings` on all targets
+of api, core, the demo and Wasm engines, the Servo adapter and `sig` with no engine, with
+`engine-demo,engine-wasm,keymap-modal` and with its default features and `keymap-modal`;
+rustfmt. `headless.sh` 74 of 74 (run `h1`) and
+`engines.sh` 156 of 156 (servo 63, wasm 29, cross 33, settings 15, links 16; run `e1`). Sixteen
+guarantees of the core broken on purpose in a scratch copy of api and core with a target directory
+of its own, one at a time, each failed the test meant for it (`core-breaks2.log`): a hand-off
+without a click, a click not used up, a chosen view handed off, any document of the view asking,
+no refusal of `sig:` and `file:`, an engine that can't open views taking the link, an answer
+given twice, a denial without the new view, a wildcard matching its own domain, an exact host not
+beating a wildcard, hosts before origins, `*` anywhere, a host claimed twice, hosts not merged, a
+wildcard of an IP address, patterns not normalized. Six of the Servo adapter's, broken in place
+under one hold of the machine's lock and each file checked byte for byte afterwards, each failed
+`tests/engine.rs` (`servo-breaks.log`): the page navigating without asking, a denied navigation
+going ahead, a held navigation allowed when dropped (Servo's own default), a new document keeping
+what the old one held, no limit of 16, the browser's reload asking.
+
+Open: **the WPE adapter's half** (the WPE integration's): its `command` needs an
+`AnswerNavigation` arm to compile (until it reports any, `EngineCommand::AnswerNavigation { .. }
+=> {}`); then, in `decide-policy`, a `NAVIGATION_ACTION` for the main frame that WebKit would load
+itself and that the browser didn't start is held (`g_object_ref` on the decision) and reported
+for the committed document, answered with `webkit_policy_decision_use` or `_ignore`, ignored when
+dropped (a new document, close, shutdown), at most 16 per view. Servo 0.5 doesn't say which frame
+a navigation is from, so a click on a link inside a frame that goes elsewhere moves the whole tab
+(bounded by the click). A hand-off carries only the URL: a form's POST data and the referrer stay
+behind. CLAUDE.md's engine contract (`OpenRequested` paragraph) and the README don't mention the
+hand-off, and `extension-api.md` doesn't record the implementation (not this lane's files).
+Nothing has run on River. *Since: the WPE adapter's half is done (decision 78); CLAUDE.md and the
+README describe the hand-off ("Final verification and documentation").*
+
+### Final verification and documentation
+
+The wave's last pass: everything built and run together, a configuration showcase, a live run on
+River, and the documents brought to the actual state. Decisions 80 and 81. Everything ran on this
+desktop (RTX 3070, driver 595.99.02) on 2 October 2026, with the working tree after every track of
+the wave; scratchpad runs `final/…`. `sig` is a dev build (dependencies optimized, Sighurt's own
+crates not), built with its default features (Servo, Wasm, WPE WebKit) and `keymap-modal,
+chrome-line`.
+
+- [x] End to end, every suite whole. *`sighurt-browser/tests/headless.sh` (demo engine, pixman): 74
+  of 74 (main 29, config 9, close 4, disconnect 3, modal 13, settings 16). `engines.sh` (GLES2): 250
+  of 250 (servo 63, wasm 29, cross 33, settings 17, links 16, wpe 59, showcase 33).
+  `sighurt-ui/tests/headless.sh`: 35 of 35 (line 11, overlay 12, left 8, font 4).
+  `sighurt-wayland/tests/headless.sh`: 17 protocol tests. `sighurt-engine-wasm/tests/headless.sh`:
+  the lease test, raf-demo (358 frames) and gradient-demo (4) through a resize and a rescale, 2
+  buffers, no retiring generation. `sighurt-engine-servo/tests/headless.sh` (E1): `engine.rs`,
+  `crash.rs` and `unavailable_context.rs` pass. `sighurt-engine-wpe/tests/headless.sh` (GLES2):
+  passes. `window-checks.sh`: Servo's 21 of 21, WPE's 60 of 60. `wpe-coexist`'s
+  `coexist-checks.sh`: 14 of 14. `experiments/m1-mixed/headless-checks.sh`: 15 of 17 (below).*
+- [x] Unit tests. *`cargo test --workspace` without Servo, WPE and `sig` (api 31 + 1, core 55 + 71,
+  wayland 48 (+ 17 ignored, run above), ui 36 + 10 + 26 + 13 + 1, the line chrome 7, the modal
+  keymap 13, demo 3, Wasm 141 + 30 + 5, SDK 16, `fullstack-notes`' server 8): 515 passed, 26
+  ignored (the compositor tests above, two measurements and the SDK's doc examples). `-p sighurt-engine-servo
+  --lib` 28, `-p sighurt-engine-wpe --lib` 14. `-p sighurt-browser`: 31 with `engine-demo`, 32 with
+  `engine-wpe`, 33 with `engine-demo,engine-wasm,keymap-modal,chrome-line`, 35 with its default
+  features, 35 with all features.*
+- [x] Clippy `-D warnings` on all targets. *The workspace without Servo, `sig` and the experiments
+  that link Servo (WPE's adapter included); `sighurt-engine-servo`, `m0-coexist`, `m1-mixed` and
+  `wpe-coexist`; `sig` with no feature, with each engine alone, with `engine-servo,engine-wasm`,
+  with `engine-demo,engine-wasm,keymap-modal,chrome-line` (CI's set), with
+  `engine-servo,engine-wasm,engine-demo,keymap-modal,chrome-line` (`servo.yml`'s), with its default
+  features and with all features. The SDK and the example guests build for `wasm32`.*
+- [ ] rustfmt. *`cargo fmt --all --check` fails on one file, `experiments/wpe-coexist/src/main.rs`
+  (`use sighurt_engine_wpe::…` out of order; the WPE track's file, not changed here); every other
+  file is formatted. Since ("Review fixes"): formatted, and `cargo fmt --all --check` passes.*
+- [x] A configuration showcase, `engines.sh` `showcase` (33 checks, screenshots
+  `showcase/01`–`08` looked at). With `[input] keymap = "modal"`, `[chrome.standard] tabs =
+  "left"`, `[ui] font-size = 16`, `[routing.wpe] hosts = ["localhost"]` and a `[keywords]`
+  template, and no `[keys]`: the file is valid (no notice); a page on localhost opens in WebKit and
+  one on 127.0.0.1 in Servo; the tab list is a 251 × 727 surface beside a 1029 × 727 page under a
+  50 px toolbar and above a 23 px strip (16 px: 220, 44 and 20 times 16 / 14); `g t` and `g T`
+  switch tabs; a click on WebKit's field puts the keymap in insert mode ("INSERT" in the address
+  field) and "åäö" reaches the field, Escape returns to normal mode and a `z` is swallowed; `o` and
+  "t åäö" open the keyword's template in Servo; a typed localhost address opens in WPE; `:` with
+  "tab.select 2" runs; `b` (`chrome.toggle-tabs`) hides and shows the list, the page taking its
+  room. Saved while `sig` runs, a new binding (`n`, `tab.new`) works at once where it did nothing
+  before, and a new `tab` color fills the active row (0 pixels of #7c3aed before, 8 478 after); a
+  new `[ui] chrome = "line"` gets a notice and the standard chrome stays. Started again with the
+  restored tabs: the line chrome alone (1280 × 32 at 16 px), the page 1280 × 768, the mode in the
+  line, `g T`, a typed localhost address in WPE and `:tab.select 1` through it.
+- [x] **R2**, live on the user's River 0.4.8 (gharial) desktop, RTX 3070: three runs of `sig` of
+  about 7 s each, Servo's, WPE's and the Wasm engine's page in the shown tab and the other two in
+  background tabs, its own configuration, profile and D-Bus session, no input, no screenshot;
+  SIGTERM, exit 0 each. *Renderers: `engine=servo mode=hardware gl="NVIDIA GeForce RTX
+  3070/PCIe/SSE2"`, `engine=wpe mode=hardware gl="WebKit, DMA-BUF on /dev/dri/renderD128
+  (nvidia)"`, `engine=wasm mode=cpu`. Copies and readbacks: `page_readbacks` 0, `readback_bytes` 0,
+  Servo's GL reads 0 (audited), WebKit's copies 0, every frame line `readback_bytes=0` (3, 2 and 1
+  frames at 1542 × 1304, scale 1). Idle, 3.3 s after each page settled: 1 wakeup and 1 iteration
+  (the report's own), 0 pumps, 0 frames, 0 chrome paints, in all three runs. First frame after
+  navigating: Servo 394 ms, WPE 362 ms, Wasm 195 ms. The chrome presented (wp_presentation: 7, 6
+  and 4 frames of the toolbar). The host found every protocol of its list (viewporter, fractional
+  scale, single-pixel buffer, text input, clipboard, primary selection, cursor shape, presentation
+  time, decorations).*
+- [x] Documents. *README (what `sig` is, building with and without WPE, the features, the
+  configuration reference, routing and links, the command table with `page.open-in`,
+  `page.send-key` and `chrome.<action>`, keys and the modal keymap, the chromes, writing a keymap or
+  a chrome), DOCS (the in-process Wasm engine, routing for apps, limits), SECURITY (in-process
+  engines are no sandbox; what pages get; WebKit's own process sandbox), CONTRIBUTING (checks with
+  and without Servo and WPE, the end-to-end scripts, adding an engine), ROADMAP, CLAUDE.md (WPE,
+  keymaps and chromes, commands, the hand-off, louise-pc's Rust, the pre-commit commands), the
+  built-in file's comments (the modal keymap, the line chrome, file locations), `ci.yml`,
+  `servo.yml`, and `release.yml` removed (decision 81). Checked: the README's four configuration
+  examples and DOCS's `[routing.wasm]` example, each started in `sig` in headless sway, are valid
+  (no notice, no problem in the log); the README's keymap example, built in a crate of its own
+  against `sighurt-api`, passes clippy and a test (Ctrl+N runs `tab.next`, a bad command and a
+  missing key are its kind's problems); `RUST_LOG=sighurt::wasm::console=debug` shows
+  hello-sighurt's console line as DOCS says.*
+
+Found, not fixed (other tracks' files): `experiments/m1-mixed/headless-checks.sh` fails 2 of 17
+(scratchpad `final/comp/m1/m1.log`): the key held across the blur goes up as "Unidentified", where
+the R1–R4 runs (on louise-pc's own sway, before decision 79 pinned it) saw its own value. Not
+investigated: the experiment, M1's frozen proof and not `sig`, translates a release from its own
+keysym (`page.rs`). With `[engines.servo] storage = "ephemeral"`, Servo logs "Failed to initialize
+ClientStorage engine … unable to open database file" in a temporary directory (`engines.sh`
+`settings` and the README's example), so its client storage (IndexedDB and the like) is likely
+unavailable in that mode: for the Servo track. Wasm console lines appear twice in the log.
+
+Open: `cargo fmt` on `wpe-coexist`; `sighurt-wayland/tests/headless.sh`,
+`sighurt-engine-servo/tests/window-checks.sh` and `experiments/m1-mixed/live-check.sh` still take
+wl-clipboard (and lswt, grim) from `<nixpkgs>`; `extension-api.md` still calls itself a proposal
+with nothing implemented; `shell.nix`'s header still describes GPUI and `sighurt-ui`'s `sig`, and
+NOTICE doesn't mention WPE WebKit; `sighurt-engine-servo/README.md`'s remote build command needs
+louise-pc's Rust (CLAUDE.md has the working one); nothing has run on louise-pc this pass; the
+River run had no input, resize or scale change. *Since ("Review fixes"): `wpe-coexist` is
+formatted, `extension-api.md` records the implementation, `shell.nix`'s header describes it and
+it brings the pinned Rust, so the Servo README's remote command works as written.*
+
+### Review fixes: the wave's three reviews applied
+
+The correctness, security and performance reviews of this wave gave 15 findings; each was
+checked against the code and the plan before it was acted on, and each fix below has its test or
+measurement. Decisions 82–86. Everything ran on this desktop (RTX 3070, headless sway 1.12 from
+the pin, GLES2 unless named) on 2 October 2026 with the working tree after the fixes; scratchpad
+runs `runs/…`, `cache/…`, `idle/…` and `bench/…`. louise-pc didn't answer over SSH during this
+pass, so nothing ran there.
+
+- [x] **rustfmt**: `experiments/wpe-coexist/src/main.rs` formatted. *`cargo fmt --all --check`
+  exits 0.*
+- [x] **A tab's error on a `sig:` page is shown** (`App::status` hid it unless an engine view
+  showed). *`headless.sh` `settings`: `:page.open-in demo` on `sig://home` puts "sig: pages are
+  Sighurt's own and open in no engine" in the status strip (diagnostics `status == "error"`;
+  screenshot `settings/02-open-in-on-home` looked at); with the old filter put back the check
+  fails (`[3, null, true]`).*
+- [x] **Routing rules of an engine the build lacks are inert; `[engines] default` must be in the
+  build** (decision 82 (3)). *config `an_engine_the_build_lacks_opens_nothing` (the rules are
+  checked, conflicts too, and left out; `default = "wpe"` is one problem naming the build's
+  engines); `tests/browser.rs` `an_engine_the_build_lacks_takes_neither_typed_addresses_nor_links`
+  (a command-line URL, a typed address and a clicked link on a host `[routing.wpe]` claims open
+  in Servo with no error; `page.open-in wpe` says the engine isn't in the build).*
+- [x] **The toolchain is pinned** (decision 86): `shell.nix` brings the pin's `rustc`, `cargo`,
+  `clippy` and `rustfmt` 1.98.1, the desktop's own store paths, and the `PATH` workarounds are
+  gone (CLAUDE.md; `bench/rewrite/build.sh` keeps one for revisions whose `shell.nix` predates
+  it). *The shell's environment before and after differs only in `PATH`, `nativeBuildInputs`,
+  `NIXPKGS_CMAKE_PREFIX_PATH` and what follows from the shell's own store path (`out`, the
+  random seed in `NIX_CFLAGS_COMPILE`, the rpath in `NIX_LDFLAGS`); `cargo build -v -p
+  sighurt-browser` (default features, Servo) in the new shell: 937 units `Fresh`, only the 9
+  Sighurt crates whose sources changed compiled. Not run on louise-pc (unreachable).*
+- [x] **extension-api.md describes what was built**: status "implemented", §1.4, §2.2, §2.5 and
+  §2.6 brought in line with the code, and a changelog entry for every departure (decisions 67,
+  68, 74–77 and 82). M4's stale open item (a way to hand over links, done by step 13) removed.
+- [x] **A Wasm guest's downloads go through the browser** (decision 83): `api_download_data`,
+  `api_download_url` and `api_canvas_print_pdf` queue `Service::Download` requests (at most 4 or
+  64 MiB waiting, none from a worker) that the view hands to the core, which throttles them, and
+  `sig` saves them in `[downloads] directory` under a cleaned name. The engine writes no file
+  and starts no thread. *`runtime::downloads_are_the_browsers_to_make` (a guest saving to
+  `/tmp/…`, `../escape.txt`, a URL ending in `..%2F.zshenv` and a PDF: four requests for the
+  document with the names as given, a fifth refused, no file written); `engines.sh` `wasm`: a
+  guest saving "hello" as `/tmp/sighurt-e2e-escape.txt` gets `sighurt-e2e-escape.txt` in the
+  run's download folder and nothing in `/tmp`. Broken on purpose: no request handed over, no
+  queue bound; each failed the test.*
+- [x] **The download folder is never the home folder, and names are cleaned** (decision 83):
+  `~/Downloads` when the desktop names no folder; `sanitize` drops Unicode format characters
+  (bidi, zero-width, tags) and trims dots and whitespace from both ends. *`services::tests::
+  names_are_never_dot_files_or_hide_characters` (`.zshenv`, `a/../.profile`, an absolute path,
+  `..`, a right-to-left override, zero-width characters, a tag character, `..%2F.zshenv` from a
+  URL), `downloads_go_to_the_configured_folder_made_when_first_needed` (not the home folder);
+  each broken on purpose failed its test. Not done: activation for page downloads, which would
+  refuse a download the user typed the address of (that load has no page activation); each
+  download already shows its own status line ("Saved …").*
+- [x] **WPE leaves a page that asks to stay** (decision 84). *`tests/engine.rs`: on a page whose
+  `beforeunload` asks to stay, after a click in it, the browser's `Navigate` commits; with the
+  handler made to fall through to WebKit's default, the test fails at that assertion.*
+- [x] **A page can't cancel or replace the user's switch to another engine** (decision 82 (2)).
+  *`tests/browser.rs` `a_page_cannot_cancel_or_replace_the_users_switch`: while the user's typed
+  address loads in another engine, the old page's `OpenRequested(CurrentView)` (the review's case
+  A) and its request for a link the user had clicked (case B, denied) close and open nothing,
+  and the user's page is shown when it commits; without the guard the test fails. Left as it
+  was: a page's `OpenRequested(CurrentView)` that routing can't place, with no switch pending,
+  sets the tab's error, which the status strip shows over the page the tab keeps.*
+- [x] **Only the link the user pressed moves the tab** (decision 82 (1)). *`tests/browser.rs`
+  `only_the_link_the_user_clicked_leaves_the_engine` (a click on another link or on no link, and
+  a key press, let no frame or script take the tab elsewhere); the hand-off tests now click a
+  link (`click_link`), and the same address written differently (`HTTPS://X.Apps.Test:443/`)
+  hands off. Broken on purpose (no URL match; a key press keeping the link; a fixed link recorded
+  at every press): each failed a test. `engines.sh` `links` and `wpe` pass with real clicks over
+  real links in Servo and WebKit (the pointer rests 0.3 s before the press, so the status text is
+  the link's).*
+- [x] **No WebKit web process outlives the last WPE page** (decision 84). *`wpe-window` over
+  HTTP: before, a 99 MiB web process stayed 20 s after both views closed (WebKit's process cache;
+  setting the cache model on the default context changed nothing, since the cache is sized when
+  a context is made); with a context of the views' own and the document-browser model, each web
+  process ended within about a second of its view; after a cross-site navigation WebKit also
+  kept a 65 MiB prewarmed process, which ends with the context, now made with the first view and
+  ended with the last (`cache/nav2`: none left). `engines.sh` `wpe`: after every WPE tab is
+  closed, 0 web processes are left; the network process (31 MiB) stays with the runtime.*
+- [x] **Retained views by cost** (decision 85): a hidden view of an engine with a process per
+  view (`EngineCapabilities::process_per_view`, WPE) counts as both of the tab's retained views.
+  *`tests/browser.rs` `a_view_with_a_process_of_its_own_is_kept_alone` (Servo, WPE, Servo: the
+  first Servo view becomes a record, back shows WebKit's page at once and back again loads the
+  record); broken on purpose, it fails. `engines.sh` `wpe`: in a tab of Servo, Wasm and WPE
+  pages, a link from WebKit to a Servo page leaves 2 live views (the WPE page's and the new one),
+  back shows the kept WPE page without loading it again. The review's `cross-retain` scenario
+  keeps 2 live views instead of 3; by its own figures the view saved is about 28 MiB (453.7 −
+  248.2 − 177.1), while the hidden web process (177 MiB) stays for an instant back.*
+- [x] **WebKit isn't linked** (decision 84): the engine opens `libWPEWebKit-2.0.so.1` by path
+  when its runtime first starts. *`sig` (default features) needs 21 libraries and maps 110 at
+  start, where the review counted 185; a build without the engine: 18 and 104. `LD_DEBUG=
+  statistics sig --version`: 27 461 relocations and 4.1–4.7 M cycles in the loader, 25 135 and
+  3.7–3.8 M without the engine (the review: 81 999 and 15–16 M). `bench/run` on this desktop,
+  dev builds of today's `sig` with and without the engine (both with the modal keymap and the line
+  chrome), interleaved, 5 rounds after a warm-up, workloads `article`, `home` and `many-tabs`
+  (`bench/results/sighurt/*/20261002-190653`): launch to page on screen 0.152 against 0.153 s
+  (article) and memory 197 against 198 MiB PSS (article), 408 against 409 (eight tabs), all noise;
+  `home` 74.9 against 75.8 MiB (+0.9 MiB, p = 0.008, q = 0.34: GLib's libraries). The review
+  measured WebKit's linked libraries at 29.8 MiB PSS of such a session. So M7's figures for
+  3c510fe, which had no WPE, stand for today's default build to about a MiB; release builds on
+  louise-pc were not re-measured (it didn't answer).*
+- [x] **Idle measured across the process tree** (`probe.py switches`). *`engines.sh` `wpe`: an
+  idle shown WPE page, 4.7 context switches a second over `sig` and all its descendants (≤ 10
+  checked; two runs); a hidden tab that animated, 145.6 and 149.4 a second, 131.2 and 121.8 of
+  them one `SkiaGPUWorker` thread of its web process (≤ 300 checked, so a hidden page that
+  rendered would fail). The source,
+  looked for in `wpe-window`: one thread of the hidden page's web process (there WebKit's
+  compositor thread) waking about 120 times a second from `poll` with a timeout, with almost no
+  CPU (`perf`: about 13 µs sampled in 3 s); WebKit's own (finishing the adapter's pending frame
+  at hide changed nothing), so not fixed. The WPE M1 and "In `sig`" idle claims now say they
+  count the owner loop only.*
+- [x] **The GLib watch thread** (decision 84): a new set wakes a thread parked on the condition
+  variable by the notification alone, and the interrupt is drained only when it fired. *Animated
+  WebGL page in `wpe-window`, 3 × 4 s each: the watch thread's reads 235 → 5–37 a second and the
+  owner's writes 413 → 292–302 (the interrupt writes gone); context switches unchanged (watch
+  thread 197–241 before, 196–236 after): an interrupted `poll` that returns at once doesn't
+  block, so the review's premise (extra context switches) didn't hold; the syscalls did.
+  `glib_loop::tests` passes.*
+
+Tests: `cargo test --workspace` without Servo, WPE and `sig`: 521 passed, 26 ignored (core 56 +
+75, the Wasm runtime 31); `-p sighurt-engine-servo -p sighurt-engine-wpe --lib` 28 + 14; `-p
+sighurt-browser` 34 with `engine-demo,engine-wasm,keymap-modal,chrome-line`, 36 with all
+features. Clippy `-D warnings` on all targets: the workspace without Servo and WPE; `sig` with
+CI's set; `sighurt-engine-servo`, `sighurt-engine-wpe`, `sighurt-browser`, `m0-coexist`,
+`m1-mixed` and `wpe-coexist`; `sig` with all features, none, each engine alone, `engine-servo,
+engine-wasm` and `servo.yml`'s set. rustfmt. End to end: `sighurt-browser/tests/headless.sh` 75 of 75 (main 29, config 9, close 4,
+disconnect 3, modal 13, settings 17; run `runs/headless`); `engines.sh` 255 of 255 (servo 63, wasm
+30, cross 33, settings 17, links 16, wpe 63, showcase 33; run `runs/engines-final`, screenshots
+`settings/02-open-in-on-home` of the first and `wpe/06-from-servo-to-wpe` looked at); the WPE
+adapter's `tests/headless.sh` (GLES2) passes, and its `window-checks.sh` passes all 60 checks with
+GLES2, with GLES2 and `--shm`, and with pixman; `wpe-coexist`'s `coexist-checks.sh` 14 of 14 (no
+WebKit symbol binds into the executable, every engine presents, the traps). Fourteen guarantees
+broken on purpose, one at a time, each failed the test meant for it (`breaks/`): the clicked-link
+match, links recorded at key presses, the link of the press replaced by a fixed one, the switch
+guard, the retention cost, inert rules, the default-engine check, the status strip's error, the
+beforeunload answer, sanitize's trimming and format characters, the home-folder fallback, the
+Wasm view handing over downloads and its queue bound; the redundant clearing of the link after a
+hand-off was the one that failed nothing, and was removed.
+
 
 ## Decisions log
 
@@ -1705,3 +2666,456 @@ Newest last. Each entry says what was decided and why.
     process: pages keep signal-based traps and fast Wasm memory in the web processes. Crash
     containment comes from WebKit's own process model (WPE.md, "Process model"), not from
     Sighurt.
+67. **The configuration stays at version 1 and is checked against the build** (extension-api.md,
+    decision 1, as far as its steps 1–4 go; amends 21, 28 and 41). New and optional: `[input]
+    keymap` (default `bindings`, applies live), `[keymap.<name>]`, `[ui] chrome` (default
+    `standard`, read when `sig` starts; a reload that changes it gets a notice saying so), `[ui]
+    font` and `font-size` (checked, handed to the chrome in its theme), and `[chrome.<name>]`.
+    `Config::parse(user, &Environment)` checks the whole file in one pass: each keymap's and
+    chrome's table with its own check (problems prefixed `[keymap.x]` or `[chrome.x]`, in the one
+    list; an unused table is still checked), and the `[ui.colors]` names of the build's chrome
+    (`sig` no longer checks them itself). A table for a keymap, chrome or engine (`[routing.x]`,
+    an `[engines] enabled` entry) that the build doesn't have is accepted with a notice naming
+    what it has, and so is a key table no keymap reads; only the user's file gets notices, and
+    the core shows them (`Effect::Notice`) at start and on each valid reload.
+    `[keymap.bindings]` is an error pointing to `[keys]`. Implementations get their tables as
+    `sighurt_api::settings` values, taken from the parsed TOML directly, since serde turns dates
+    into strings; dates are refused. *Why:* the user's request to make more configurable, §21,
+    and extension-api.md §1.1 and §1.11: every version 1 file keeps its meaning, and one file
+    serves builds with and without an implementation.
+68. **The keymap and chrome APIs** (extension-api.md, decision 5; amends 18 and 40). The keymap
+    API is `sighurt_api::{settings, keymap}`, `input::KeyboardFocus` (replacing
+    `sighurt_core::Focus` and `sighurt_ui::Focus`) and `commands::CommandSet`. The core holds a
+    `Box<dyn Keymap>`, `bindings` included, and keeps the rule that a taken press takes its
+    release and repeats whatever the keymap says: keymaps decide fresh presses and repeats of
+    what they took, and `RunThenPass` routes the press by the focus after the command. The core
+    tells the keymap the context when it changes and resets it when the window loses the
+    keyboard; a changed indicator redraws the chrome; a reload configures the same keymap
+    (keeping its state) or replaces it (taken presses stay taken). The chrome API is
+    `sighurt_ui::extension` (`Chrome`, `ChromeEvent`, `ChromeAction`, a `ChromeLayout` of up to
+    8 named surfaces with input areas, `ChromeKind`, `Theme`, `contained`); sighurt-ui's chrome
+    is `Model` behind the `standard` chrome, and `UiAction` became `ChromeAction`. A tab click
+    is `SelectTab(TabId)` or `CloseTab(TabId)`, which the core runs as `tab.select` or
+    `tab.close` with the tab's number at that moment; a tab that is gone does nothing. `sig`
+    picks the chrome from `[ui] chrome` at startup (`registry::CHROMES`; `KEYMAPS` stays empty
+    until a keymap crate exists), drives it through the trait, keeps one SHM target per surface
+    name (a listed one at its rectangle clipped to the window, its input area clipped to it; one
+    no longer listed hidden at its last rectangle, clipped), contains every snapshot string to
+    the bounds of extension-api.md §2.6 (`Snapshot::contain`), gives the host's keyboard focus to
+    the chrome's text-field surface or the chrome surface at the page's rectangle, and counts
+    paints and peak buffers by surface name. There is no stability promise. Left out until
+    something uses them: `Value::as_f64` (nothing reads a float) and `TabSnapshot::engine`
+    (neither the standard chrome nor the line chrome shows it); chrome commands
+    (`ChromeEvent::Command`, `Command::Chrome`) come with step 5, and `CommandSet` already names
+    a chrome's actions in its errors. *Why:* the user's request for "a tiny api that makes it
+    possible for other people to program their own implementations"; §4, §8 (input regions),
+    §13 and §28's first two questions: the keymap's state is the keymap's, taken presses the
+    core's, surfaces the chrome's to lay out and the host's to validate, and a late tab click
+    still names its tab.
+69. **WPE navigations and history come from WebKit's back-forward list** (`sighurt-engine-wpe`,
+    amends 12's attribution rule for WebKit). WebKit's GLib API gives navigations no ids, so the
+    browser's latest request WebKit hasn't started takes the next `load-changed` STARTED, or ends
+    as a same-document commit on a new list entry or, after the list moved for it, when
+    `is-loading` turns false; every other load and the page's own same-document navigations
+    (`uri` changing while nothing loads) get the adapter's ids. A commit's `HistoryEffect` comes
+    from comparing list snapshots, taken inside WebKit's signals, by entry identity: the same
+    current entry is `Replace`, an existing one `Traverse`, a new one after the old current
+    `Push`. A request stays pending when WebKit merely drops its marker of a pending request (two
+    requests in a row). Failed loads show no WebKit error page. *Why:* §16 ("the engine owns the
+    truth of its history"; nothing guessed from URLs); the sequences WebKit 2.52 actually emits,
+    recorded in probe runs (WPE.md, "What the engine adds to the prototype");
+    `navigation::tests`, `engine.rs`.
+70. **WPE's requests go through the service API and fail closed.** Permissions (geolocation,
+    camera and microphone, screen capture), file pickers, downloads and the clipboard are
+    `ServiceRequested` for the committed document, at most 16 per view; WebKit's request objects
+    are refused when dropped (unanswered, or at a new document). WebKit's clipboard keeps no page
+    data: a copy is `ClipboardWrite`, a paste that finds nothing asks `ClipboardRead` and, once
+    answered, is run again with the text granted for one second (the page sees an empty paste
+    first; WebKit's clipboard is synchronous and one per process). A download is WebKit's
+    download cancelled before writing and handed to the browser by URL. New windows and other
+    schemes are `OpenRequested`; HTTP authentication, context menus and fullscreen are refused;
+    WebKit's own GeoClue position provider is refused (no position service exists). *Why:* §12,
+    §17 and CLAUDE.md's security rules: the core decides, the executable performs, nothing
+    succeeds silently; the evidence is `engine.rs` and window-checks (copy and paste through the
+    Wayland clipboard).
+71. **WPE input methods go through `WPEInputMethodContext`**, which the Platform API offers:
+    WebKit's focus, caret, surrounding text and purpose become `TextInputChanged` (never a
+    password's text), the host's updates WebKit's own signals, and key events are never
+    filtered. A field is reported once WebKit has given its caret, because wlroots latches a
+    text-input session's features at enable: a first report without surrounding text kept the
+    text from the input method for the whole field (seen in `engine.rs` before the change). The
+    host could re-enable when surrounding text first appears; that is the host's to decide.
+    *Why:* §12 ("implement preedit, committed text, surrounding text ... where available");
+    `ime::tests`, `engine.rs` with a real input method.
+72. **One WPE runtime per process, with a locked profile and an explicit shutdown.** A second
+    `WpeRuntime::new` is refused (WebKit's UI-process state and the primary display are global).
+    The profile is a persistent `WebKitNetworkSession` in `WpeConfig::profile` under
+    `{profile}/lock`, ephemeral when locked by another process or unset. `shutdown` closes the
+    views in the proof's order, lets GLib finish, and disconnects the engine's handlers from
+    WebKit objects that outlive it (the default context's geolocation manager is finalized at
+    process exit, where a glib-rs closure made on another thread aborted the test process).
+    `experiments/wpe-engine` is deleted; `wpe-coexist` links the crate. *Why:* §20 (explicit
+    ownership, nothing left to `Drop` order); decision 26's profile rule, as for Servo.
+73. **WebKit's GLib context takes up to four turns per pump while something is ready at once**
+    (amends 64). WebKit often wakes its own context, or leaves a source ready, while it
+    dispatches (its run loop's zero-delay work); a turn on the owner costs less than the watch
+    thread waking the owner for another loop iteration. `GlibLoop::iterate` checks and
+    dispatches again, at most four turns, while `prepare` says a source is ready or a queried
+    descriptor is ready at once (a zero-timeout `poll`), then returns `Pending { deadline: None }`
+    as before if work remains. *Why:* §19 ("if processing generates immediately runnable work,
+    arrange another iteration") at the lowest cost, with the pump still bounded; measured with
+    temporary counters on one animated view (DMA-BUF, desktop): loop wakeups per frame 5.1 to
+    3.5, the watch thread's wakes 3.25 to 1.6, GLib dispatches (1.65) and pacing (16.7 ms
+    median) unchanged; in `window-checks.sh` 5.8 to 4.0 per frame, idle still 1 wakeup in 5 s.
+74. **Chrome commands, `page.send-key`, the modal keymap, the mouse's side buttons and scroll
+    speed** (extension-api.md, decisions 4, 5 (its proof keymap) and 6, as far as its steps 5, 6,
+    7 and 10 go; amends 27 and 28). (1) `chrome.<action>` is `Command::Chrome(action)`, the action
+    kebab-case ASCII of 1 to 32 characters with no argument (`CommandError::InvalidChromeAction`
+    otherwise). `Command::NAMES` gains only `page.send-key`, since a chrome's actions are its own,
+    and `Command::name` is `chrome` for all of them. A configuration's are checked against the
+    selected chrome through `CommandSet`; the core hands every one on as `Effect::ChromeCommand`
+    without checking it, and `sig` checks it against the chrome it runs, since a command typed
+    after `:` is parsed with no chrome to check against. (2) `page.send-key` holds a `SentKey`:
+    the modifiers, the W3C key and the evdev code. It names a key as a keystroke of the
+    configuration does, but only a named key whose W3C name is also the code of a key that types
+    nothing on common layouts and is neither one of a pair nor on the keypad (`down`, `pageup`,
+    `enter`, `f5`, `BrowserBack`), or `space`: what a character means depends on the layout. Its
+    press types " " for space unless Control or Super is held, and nothing otherwise. The core
+    sends the press and the release back to back on the seat whose keyboard it heard last, only
+    while the page has the keyboard, and only a key press that runs it is the page's activation.
+    (3) The side buttons are `BrowserEvent::Button { view: Option<ViewId> }`, which `sig` sends
+    for every Back and Forward event wherever the pointer is; one that comes as
+    `BrowserEvent::Pointer` takes the same path, so the old behavior holds by configuration and
+    `the_mouse_back_button_goes_back` is unchanged. The core keeps the presses it took per seat
+    and takes their releases even after the binding changes; an unbound press over the shown view
+    is the page's like any button (activation, the keyboard), anywhere else it goes nowhere. The
+    built-in file binds `back` and `forward` to `page.back` and `page.forward`, and sets `[input]
+    keymap = "bindings"` and `scroll-speed = 1.0`, so `[input]` and `[input.buttons]` merge key by
+    key and `""` unbinds a button. (4) `scroll-speed` multiplies the scrolling the core hands a
+    page: pixels as they are, a wheel's 120ths rounded but never to 0; the chrome's own scrolling
+    is untouched. (5) The modal keymap follows §2.5, and decides what it left open: `start` is
+    required; a mode's name is 1 to 32 lower-case letters, digits and dashes; two bindings that
+    apply in one mode (its own and `always`'s) may be neither the same keys nor one the start of
+    the other; `always` follows the rule of `pass` modes (no sequence starting with a key that
+    types), and while the chrome has the keyboard only its keys that don't type apply, so the
+    address line gets every character; any change of context ends an unfinished sequence; a reload
+    keeps the mode while the table still has it; text fields switch modes only when `typing` is
+    set, and the chrome taking the keyboard in between changes no mode; `{ run, pass = false }` is
+    a plain command. *Why:* the user's request for configurable keys and UI through a tiny API;
+    §12 (a taken press or button takes its release, whatever the configuration does meanwhile),
+    §21 (validated once, applied live), §26 (sequences need no timer, nothing ticks) and §28's
+    first question: the mode and the unfinished sequence are the keymap's, taken keys and buttons
+    and where the keyboard is the core's, a chrome's actions the chrome's, and which chrome runs
+    `sig`'s.
+75. **The standard chrome's options and fonts, the line chrome, and addresses shown decoded**
+    (extension-api.md steps 5, 8, 10 and 15–17 on the chrome's side; amends 18 and 20). (1)
+    `[chrome.standard]` takes `tabs` (`top`, `left`, `hidden`), `status` (`strip`, `overlay`),
+    `buttons` and `compact`, all live; `chrome.toggle-tabs` switches between the configured tabs
+    and none (none and the top for `hidden`) and stays switched across reloads. (2) Every size is
+    today's times `font-size` / 14, rounded half up; compact is a 32 px strip with 28 px tabs and
+    a 36 px toolbar with a 28 px address field; the text styles scale the same way, and the
+    address field's text sits on whole logical pixels, as its caret rectangle does. Nothing is
+    measured for the standard chrome's layout (decision 21 stands); the line chrome measures
+    text within its one line. (3) The tab list on the left is 220 px wide, at most half the
+    window; it shows whole rows, scrolls a row at a time (3 a wheel notch), ends with the new-tab
+    button, and a switch to a tab out of view scrolls it into view. (4) The status overlay is half
+    the page wide, at least 200 px and at most the page, as tall as the strip, listed only while
+    there is status text, with no input region, and the page keeps its size. (5) Amends 18: the
+    painter paints a surface by name (`CpuPainter::paint(model, surface, ..)`), not whatever lies
+    in a rectangle, since the overlay lies over the page area, whose buffer would otherwise hold
+    the status text and show it stale once the overlay goes. A chrome reports repaints only for
+    the surfaces it lists. (6) Amends 20: `[ui] font` names a family, matched without regard to
+    case; one that isn't installed leaves the text in the first installed family of decision
+    20's list, with a warning in the log, and a new family drops the shaped text. `Canvas` and
+    `Pen` (a buffer checked against its metrics, the glyph cache, ARGB8888) are split out of the
+    painter, and `Fonts`, `TextStyle` and `ShapedText` are public: with `TextEditor` they are
+    the helpers of the chrome API, which `sighurt-chrome-line` uses and nothing of the core, the
+    host or an engine. (7) A committed address is shown decoded where that is safe
+    (`readable_url`): percent-encoded UTF-8 in the path, query and fragment, but never ASCII
+    (`%2F`, `%25` and `%20` stay), whitespace, control, bidi or invisible formatting characters
+    (the lists Firefox and Chromium keep encoded) or padlocks, and never the scheme or host
+    (`xn--` stays). The shown form, typed back, parses to the same address, upper-case hex
+    aside. Both chromes show addresses and hovered links this way; the snapshot keeps the
+    committed URL. (8) The side buttons are not the chrome's (decision 74). (9) The standard
+    chrome shows the keymap's indicator at the address field's right end. *Why:* the user's
+    request ("improve the possibilities to configure things", a tiny API others can implement),
+    plan §8 (an overlay's input region covers only what it should receive), §13, §17 (page
+    text and addresses shown contained, the address line not spoofable), §26 (no repaint
+    without a change, nothing ticks) and §28's first question: what is shown and where is the
+    chrome's, which surfaces exist the host's to validate.
+76. **Zoom, search keywords, `page.open-in` and chosen views, engine settings, the download folder
+    and session restore** (extension-api.md decisions 1, 3 and 6, as far as its steps 9, 11, 12,
+    14 and 18 go; amends 28 and 67). (1) `zoom` (0.5 to 3, live) is the zoom of every new tab,
+    a page's pop-up tabs included, and what `page.zoom-reset` returns to; open and restored tabs
+    keep theirs. (2) `[keywords]` maps names of 1 to 32 lower-case letters, digits and dashes (not
+    `localhost`, so never a host or a URL) to http(s) templates. When the first word typed (or
+    given to `page.open`) is one, the rest goes where `{}` is, encoded as a search is; a template
+    without `{}` is used only for the keyword alone, and "gh servo" is a search (the design left
+    it open; this way nothing typed is dropped). Input with `://` or starting with `sig:`, `data:`
+    or `about:` is never a keyword use; keywords come before paths and host names. (3)
+    `page.open-in <engine> [address]` is `Command::PageOpenIn { engine, address }`; the name's form
+    is checked when it is parsed (`CommandError::InvalidEngine`), the build and `enabled` when it
+    runs, with the tab's error as for a typed address (a `sig:` page, an engine the build lacks,
+    one not enabled, a scheme it doesn't open). Without an address it opens the tab's committed
+    address, else the one loading, else the one that failed. It is a navigation of the tab with
+    the user's explicit choice (decision 29: a new segment, back returns). (4) A view is chosen
+    (`View::chosen`) when the user opened or last navigated it with an explicit engine; a user's
+    navigation without one unchooses it, the page's own (`OpenRequested`) leaves it as it is.
+    Nothing reads it before step 13; records don't keep it. (5) `[engines.<engine>]` holds a
+    neutral vocabulary read from one table in the core (`ENGINE_SETTINGS`: `user-agent`, 1 to 512
+    printable ASCII characters, since Servo unwraps its parse as a header; `storage`, `profile` or
+    `ephemeral`), checked against what the registry declares each engine honors
+    (`Environment::engine_settings`: Servo both, Wasm `storage`, the demo engine none; WPE adds
+    its line). Setting what an engine can't honor is an error naming the engine and what it
+    honors; a table for an engine the build lacks is checked for its form and gets the notice;
+    the old format's `command`, `schemes`, `extensions` and `mime` get the hints of
+    extension-api.md §1.11. Every runtime starts with the settings of the configuration `sig`
+    started with (`Registry::start_at_launch`), whenever it starts, so a reload that changes them
+    gets a notice that they apply at restart. (6) Servo: `user_agent` replaces the adapter's
+    Firefox-like string, process-wide (the header and `navigator.userAgent`); `ephemeral` is no
+    profile. Wasm: `ephemeral` puts the key-value store in a directory of the runtime's own,
+    `$XDG_RUNTIME_DIR/sighurt-wasm-*` (mode 700, made when the runtime starts), and caches no
+    compiled modules; `sig` deletes the directory at the end of its shutdown, after the
+    downloads' grace, since a guest still finishing its last call when the runtime shut down
+    could write there again. No temporary module cache, unlike the design: a compile that outlives
+    shutdown would write it again, and it would record which apps ran. (7) `BrowserEvent::
+    ConfigReloaded` carries `Result<Box<Config>, ConfigError>`: the configuration grew past
+    clippy's bound for an enum variant. (8) `[downloads] directory` is an absolute path or `~/…`,
+    expanded by the core with `Environment::home_dir`, read at each download; the download's
+    thread makes the folder, and failing to fails the download with its status line and no file.
+    (9) `[session] restore = false`: `sig` reads no session at start and writes none, leaving the
+    file as it is; turned on while `sig` runs, it saves the tabs after the usual delay. *Why:* the
+    user's request ("improve the possibilities to configure things"), plan §16 (an explicit user
+    engine choice wins), §17, §20 (shutdown order, what outlives the process), §21 (validated
+    once, live where possible, restart for engines) and §28's first question: each setting has one
+    owner (`zoom` and keywords the core's, engine settings the engines' made by `sig`, the folder
+    and the session file `sig`'s), and what an engine honors is the registry's to say.
+77. **Host rules, and links that follow the routing** (extension-api.md decision 2, as far as its
+    step 13 goes; amends 28, 53 and 57; settles 55's open item about links). (1)
+    `[routing.<engine>] hosts` takes host names and IP addresses, and `*.name` for every host under
+    a name but not the name itself, normalized as the `url` crate normalizes a URL's host (so a
+    pattern means what the hosts it is matched against mean); a pattern belongs to one engine. The
+    router tries them after an origin's rule and before the default engine, the most specific
+    first: an exact host, then the longest wildcard. (2) An engine asks before it performs a
+    navigation its page started that it would load itself (`EngineEvent::NavigationRequested`,
+    with the asking document and a `RequestId`), holds it until `EngineCommand::AnswerNavigation`,
+    at most 16 per view (beyond them, it goes ahead without asking), and denies what it still holds
+    when the view closes, its document is replaced or gone, or the runtime shuts down; a late
+    answer does nothing. (3) The core answers every one at once: denied for a document its tab
+    doesn't show and for what no page may open (`sig:`, `file:` from a web page, decision 41's
+    rule, checked here too so that a hand-off never opens what a page may not); allowed for a
+    chosen view (decision 76); otherwise denied and opened in the tab as routing says only when
+    routing gives the URL to another engine that can open views now and the user clicked or
+    pressed a key in the page within 5 s, which that uses up (decision 30's activation, shared with
+    pop-ups: one click, one tab or one hand-off); allowed in all other cases. Where the design said
+    "another enabled engine", the core also requires the engine to be in the build and working:
+    a link to a host claimed by an engine this build lacks (one file, several builds) or that
+    stopped stays in its engine instead of becoming an error page. A URL longer than 2 MiB, which
+    the core keeps nowhere, is allowed in place. (4) Servo: Servo's `NavigationRequest` is held in a
+    wrapper that denies it when dropped, since Servo allows one dropped unanswered; nothing
+    dropped by mistake goes ahead. Servo 0.5 carries out the browser's own reload as the page's
+    navigation to its address (`Location::reload` → `schedule_navigation`), so the request that
+    follows the adapter's `reload()` for the current address goes ahead without asking (a reload
+    is never handed off). Navigations to other schemes, and to `file:` from web pages, are still
+    denied and handed over as `OpenRequested` (decision 53). The time from Servo's request to the
+    answer is logged (`servo-timing navigation-answered`): 0.08–0.20 ms in `sig`. (5) Accepted Servo
+    0.5 limits, recorded with 55 and 57: a navigation doesn't say which frame it is from, so a
+    frame's navigations are asked about too; they stay in Servo unless the user clicked or typed
+    in the page within 5 s, so a click on a link inside a frame that goes elsewhere moves the
+    whole tab. While a request is held, Servo's constellation drops another navigation of the same
+    frame. Only the URL is handed over: a form's POST data and the referrer stay behind. *Why:*
+    the user's request (more configurable: which sites open in which engine), plan §16 (routing
+    without a probe; an explicit user choice wins; engines own their navigations but not the
+    browser's routing), §17 (pages get nothing by themselves: an activation, used up), §28's first
+    question (routing policy stays in the core; which schemes an engine loads stays in the engine)
+    and second (a late answer names its request and document); extension-api.md §1.4.
+78. **WPE WebKit is one of `sig`'s default engines, for the sites the configuration gives it**
+    (amends 1, 26 and 65; completes 72 and 77 for WebKit). (1) `sighurt-browser`'s `default`
+    features are `engine-servo`, `engine-wasm` and `engine-wpe`; `[engines] default` stays
+    `servo`, so WebKit opens only what `[routing.wpe] hosts` claims and what `page.open-in wpe`
+    asks for, and links between them follow decision 77. Without the WPE prefix the engine's build
+    script stops the build with `cargo::error` lines saying how to install it and how to build
+    `sig` without it (`--no-default-features --features engine-servo,engine-wasm`). (2) `sig`'s
+    build script links every target with `-Wl,--exclude-libs,ALL` (65, now built: 1 symbol
+    exported, no library binding into `sig`) and an RPATH from `DEP_WPEWEBKIT_RPATH`. (3) The
+    registry's `wpe` entry honors `user-agent` (every view's `WebKitSettings`) and `storage` (a
+    persistent network session in `{data_dir}/sighurt/wpe` under its lock, decision 72, or an
+    ephemeral one); its renderer line is `hardware` on DMA-BUF and `fallback` on shared memory,
+    whose copies are its page readbacks. (4) Amends 26: `sig` sets `JSC_SIGNAL_FOR_GC=12`
+    (SIGUSR2) at the start of `main`, before any thread exists, unless the environment names a
+    signal; JavaScriptCore's thread-suspension handler otherwise takes SIGUSR1, `sig`'s
+    diagnostics signal, and a SIGUSR1 then suspends the thread that receives it with nobody to
+    resume it (found by `engines.sh`: `sig` stopped at its first diagnostics request).
+    JavaScriptCore logs that it doesn't know the variable as an option of its own, once per
+    process; WTF reads it all the same. `GIO_EXTRA_MODULES` and `GST_PLUGIN_SYSTEM_PATH_1_0` stay
+    `shell.nix`'s (`sig` warns when they are missing), as `LD_LIBRARY_PATH` does. (5) The WPE
+    adapter asks (`NavigationRequested`) about a link or a GET form the user clicked, by WebKit's
+    navigation type and user-gesture flag, not a redirect, and holds WebKit's policy decision in
+    a wrapper that ignores it when dropped (WebKit uses a decision dropped unanswered), at most
+    16 per view, refused at a new document, a crash, close and shutdown. Everything else goes
+    ahead in WebKit without asking: WebKit's policy decision doesn't say which frame navigates,
+    and a frame a click handler makes looks like a script's navigation after a click (type
+    "other", a gesture; probed), so scripts' navigations stay in WebKit even after a click; a POST
+    form stays, since a hand-off carries only the address. A link clicked inside a frame is asked
+    about and moves the whole tab when routing gives it elsewhere, as in Servo (77). *Why:* the
+    user's request ("add in another engine backend for WPE webkit ... to increase short term
+    compatibility, servo is still the long term goal. Make it work"); plan §16 (routing without a
+    probe; the engine owns its navigations), §17 (a page moves the tab only with the user's
+    click), §18 and §21 (one build with every engine; process-wide setup is the executable's),
+    §26 (no copy on the display path; measured in `engines.sh`) and §28's first question (which
+    navigations are the user's is the engine's knowledge, routing the core's, the process's
+    signals `sig`'s).
+79. **M7's comparison is one interleaved session under the pinned compositor, and the
+    benchmark builds the rewrite with the pinned Rust** (amends 49). `bench/run` takes several
+    builds and runs all their workloads in one random order per round, each run holding the
+    heavy-job lock alone (`--lock-runs 1`), so drift falls on every build alike and other agents'
+    short jobs fit in between; each build keeps its own set. `tools/headless-sway` and the harness
+    take sway, grim and the input tools from `nix/nixpkgs.nix` instead of the machine's
+    `<nixpkgs>` (on louise-pc that was a different sway 1.12 build), and every set records the
+    compositor's store path and the pin. Every run gets its own `XDG_STATE_HOME`: the rewrite
+    saves its tabs there and restores them beside the ones it is asked to open, which in a trial
+    made the `home` run measure the previous run's CSS animation; a run that ends with other tabs
+    than it opened is an anomaly. `sig`'s `--diagnostics` report at exit is kept in each run
+    (`exit.*` metrics). The compared runs carry no `RUST_LOG` (a debug target raises the `log`
+    level for all of Servo) and no GL audit (it times every GL call); the set `rewrite-audit` has
+    both. A build's parser declares what it can't measure honestly against another build
+    (`INCOMPARABLE`: GPUI's key-driven draws, `sig-servo`'s navigation time), and `bench/compare`
+    leaves those rows out with the reason. `bench/pipe-cost` measures the baseline's frame
+    transport alone. `bench/rewrite/build.sh` puts the pinned nixpkgs' `rustc` and `cargo` first
+    on `PATH`: `shell.nix` brings no Rust, and louise-pc's own is 1.95, older than the
+    workspace's `rust-version` (1.98), so `tools/heavy cargo build` of the workspace fails there.
+    *Why:* the same compositor, driver and toolchain for both builds, measured in the same session
+    (the task's fairness requirements), and what the trial runs found; the September baseline
+    measured again this way differs from its first set in nothing after the false-discovery
+    correction.
+80. **Stop can't stop a Servo navigation still waiting for its response: an accepted Servo 0.5
+    limit** (settles what decisions 57 and 58 left open; M4's "Reload and stop"). Servo 0.5 has no
+    embedder call that cancels a top-level navigation whose response hasn't come (its `WebView`
+    has `load`, `reload` and traversals, no stop), and the page's `window.stop()` aborts only the
+    current document's own fetches (servo-script 0.5 `Window::stop_loading`). No adapter
+    workaround is correct: a load asked for while the navigation is pending is dropped by Servo
+    (57 (2)), and going back or reloading after the commit would change history the user didn't
+    touch and still fetch the page. So `page.stop` in Servo does what Servo can: it cancels a
+    navigation the adapter still queues, gives up a load that has shown no sign of life for 5 s
+    (the way out of a 204), and stops the document's loading (58 (1)); a navigation already waiting
+    for its response commits when the response comes, with its id. `engines.sh` `servo` logs that
+    case as INFO and E1's `engine.rs` pins it, so a Servo that can cancel shows up as a test
+    change. WPE WebKit's Stop does cancel such a navigation (`sighurt-engine-wpe/tests/engine.rs`:
+    "Stop ends the navigation", `Cancelled`, the document stays), so a site where it matters can
+    be given to WPE. Revisit with a Servo version that can cancel a pending navigation. *Why:* §23
+    ("a clearly unsupported feature is better than a claimed feature that only works by
+    accident") and STATUS's rule that a criterion that doesn't hold is decided in this log.
+81. **The documents and CI describe the rewrite now, and the release workflow is gone** (amends
+    plan §23 M7's last step, which waits for M7 to update them; the user asked for documentation
+    of the actual state this wave). README, DOCS, SECURITY, CONTRIBUTING, ROADMAP and CLAUDE.md
+    describe `sig` as it is: in-process engines with no IPC (and so no sandbox claim), WPE WebKit
+    beside Servo and Wasm, the configuration, the command table, and how to write a keymap or a
+    chrome (the README's keymap example was compiled and tested against `sighurt-api` in a crate
+    of its own). CI checks what builds without Servo and WPE WebKit: `ci.yml` leaves out
+    `sighurt-engine-wpe` and `wpe-coexist` (the runners have no WPE prefix) and checks `sig` with
+    the demo and Wasm engines, the modal keymap and the line chrome; `servo.yml` checks `sig` with
+    every feature but `engine-wpe`. `release.yml` is deleted rather than fixed: everything it
+    built is gone (`sighurt-ui`'s `sig`, `sig-wasm`), it targeted macOS (Sighurt is Wayland-only),
+    its version bump reads the version from `sighurt-ui/Cargo.toml`, which now says
+    `version.workspace = true`, and edits per-crate `version` lines that only the SDK still has;
+    and a release of today's `sig` needs a packaging decision nobody has made: its default build needs
+    the WPE prefix (not on GitHub's runners) and runs only with `shell.nix`'s libraries and an
+    RPATH into `~/.local/share/sighurt/deps`. `sighurt-browser/tests/engines.sh` builds `sig` with
+    its default features plus `keymap-modal` and `chrome-line`, which only its `showcase` scenario
+    selects, and takes wl-clipboard from the nixpkgs pin. *Why:* the user's request ("Continue to
+    optimize and test to make sure it is as good as it can be"), §23 (documents and CI that
+    describe the actual architecture) and §28's fifth question: a release workflow that can't
+    work is a claim without evidence.
+
+82. **A page moves its tab only for the link the user pressed, never over the user's own
+    navigation, and an engine the build lacks takes nothing** (the wave's reviews; amends 30, 67,
+    76 and 77; extension-api.md's changelog records it). (1) At each press of a pointer button in
+    a page the core keeps the page's status text, the hovered link (`View::link`; a key press
+    clears it), and decision 77's hand-off happens only when the `NavigationRequested` URL is
+    that link (as the `url` crate parses both), within decision 30's 5 s, using the activation
+    up. So a frame's or script's navigation right after a click elsewhere, a link opened with the
+    keyboard, and a form stay in their engine; a link clicked inside a frame still moves the
+    whole tab (77 (5)). The 5 s window is kept rather than the review's 1 s: the URL match closes
+    the hole (an ad or sandboxed iframe can send the tab only where the user pressed), and a slow
+    press mustn't miss. (2) A switch the user started (a typed address, `page.open-in`, back or
+    forward into a record) can't be cancelled or replaced by the page it leaves: while it is
+    pending, the page's `OpenRequested(CurrentView)` does nothing and its hand-off is denied with
+    nothing opened (`Switch::by_page`). A switch a page started may be replaced by the page or the
+    user. (3) The routing rules of an engine the build lacks are checked (form and conflicts) and
+    left out of `Config::routes`, so what they claim goes to the default engine, typed, restored
+    or clicked alike, and the notice says the rules are unused; this replaces 77's "a link to a
+    host claimed by an engine this build lacks stays in its engine". `[engines] default` in the
+    user's file must name an engine of the build (a problem that lists them); the built-in
+    `servo` isn't checked, so a build without Servo still starts. `page.open-in` such an engine
+    still says it isn't in the build. (4) A tab's error is shown in the status strip on a `sig:`
+    page too; only a tab with nothing to show draws it in the page area. *Why:* the reviews
+    showed a page cancelling the user's switch to another engine's site, or replacing its
+    address, any frame's script moving the tab after any click (Servo 0.5 asks about every
+    frame), decision 67's "one file serves several builds" broken for routing, and errors on the
+    home page invisible; plan §17 (pages get nothing by themselves; trustworthy UI), §16 (the
+    user's explicit choice wins). Evidence: "Review fixes".
+83. **A Wasm app's downloads are the browser's, and the download folder and names are safe**
+    (amends 25 and 76; settles 76's open item and the gpui-baseline bug the security review
+    found: a guest's file name went into `Path::join` uncleaned, so a guest could create any new
+    file the user could, `~/.config/autostart` included, with no click). `api_download_data`,
+    `api_download_url` and `api_canvas_print_pdf` queue `Service::Download` (`Data` or `Url`, the
+    guest's name as the suggestion) in the document's `HostState::downloads`, at most 4 or 64 MiB
+    waiting and none from a worker (each refusal is -1 to the guest and a console line); the view
+    hands them to the core as `ServiceRequested` once the call has returned, with the document's
+    generation and the app's origin. The core throttles them per tab (decision 15) and `sig`
+    saves them as any download: `[downloads] directory`, a unique name made with `create_new`.
+    The engine writes no file and starts no thread; the guest's 0 means the browser has the
+    request. `sig`'s download folder is the configured one, else the desktop's, else
+    `~/Downloads`, never the home folder; `sanitize` keeps the last path component, drops control
+    and Unicode format characters (Cf: bidi controls, zero-width and tag characters) and trims
+    dots and whitespace from both ends, as Firefox and Chromium do. Page downloads still need no
+    activation: a download the user typed the address of has none, and each download shows its
+    own status line. *Why:* SECURITY.md's scope (files written outside the download folder), plan
+    §17 (the core decides, the executable performs) and CLAUDE.md's rule to bound what a guest
+    can make the host allocate. Evidence: "Review fixes".
+84. **WPE WebKit is opened when first used, its web processes end with the last WPE page, and it
+    leaves a page that asks to stay** (amends 62, 64, 72 and 78). (1) The crate links nothing of
+    WebKit: its build script hands the library's path to the crate, and `WpeRuntime::new` opens
+    it (`ffi::load`: `dlopen`, `RTLD_NOW | RTLD_LOCAL`) and finds the 114 functions the adapter
+    calls through a table; every `ffi` function keeps its name and signature and panics before
+    `load`. A `sig` session that opens no WPE page maps none of WebKit or the 72 libraries only it
+    needs (GStreamer, libsoup, ICU, flite, …); the RPATH to the prefix and `DEP_WPEWEBKIT_RPATH`
+    are gone (the library finds its dependencies through its own RPATH). This answers the
+    review's threat to M7's figures (3c510fe had no WPE); building WebKit without speech
+    synthesis was the alternative, and would have removed only flite. (2) The views get a
+    `WebKitWebContext` of their own, made with the first view and ended with the last, with the
+    document-browser cache model set before it is made: WebKit's default context keeps a closed
+    page's web process up to 30 minutes for its site (its process cache, sized when a context is
+    made from the model then), and after a cross-site navigation a prewarmed spare that only the
+    context's end shuts down. The network process stays with the runtime: it holds the session's
+    cookies, an ephemeral session's only copy. (3) WebKit's `script-dialog` for
+    `BEFORE_UNLOAD_CONFIRM` is answered "leave", as Servo 0.5's default is: WPE's own answer
+    (stay) cancelled the browser's `Navigate`, `Reload` and `Traverse` inside WebKit with no
+    event once the user had touched the page, so the navigation stayed pending for ever.
+    `alert`, `confirm` and `prompt` keep WPE's default (closed, cancelled). (4) The GLib watch
+    thread is woken by the condition variable alone while it is parked there, and drains its
+    interrupt only when it fired: two syscalls less per new set; context switches unchanged.
+    (5) A hidden WPE page that animated keeps one thread of its web process waking about 120 times
+    a second (WebKit's own; measured, not fixed); `engines.sh` bounds the tree in that state.
+    *Why:* the reviews' findings; plan §21 ("a linked optional engine need not initialize until
+    first use"), §26 (memory and wakeups measured across the tree), §20 (every accepted command
+    ends in events: the engine contract) and §28's third question. Evidence: "Review fixes".
+85. **A tab keeps hidden views by their cost: one of an engine with a process per view is kept
+    alone** (amends 29). `EngineCapabilities::process_per_view` (additive; WPE true, the others
+    false) says each view is an OS process of its own. Such a hidden view counts as all of
+    `RETAINED_VIEWS` (2), so it is kept only as the tab's one hidden view; beyond the bound the
+    farthest segments become records, as before (the nearest page stays instant to go back to,
+    the older ones reload). Servo and Wasm tabs are unchanged. Not done: evicting a hidden view
+    after some time, which would free the remaining web process too but needs a clock event the
+    core doesn't have (it reads no clock). *Why:* plan §27 ("hidden WebViews retain excessive
+    memory: add a tested eviction policy; acknowledge reload semantics") and §16 (bounded
+    retention, records reload); the review's three-views-for-one-tab case. Evidence: "Review
+    fixes".
+86. **`shell.nix` brings the pinned Rust** (amends 59 and 79; plan §21: pin the toolchain). The
+    pin's `rustc`, `cargo`, `clippy` and `rustfmt` 1.98.1 are the shell's first, so every machine
+    builds with the workspace's `rust-version` through `tools/cargo` and `tools/heavy` alone, and
+    the `PATH` workarounds of CLAUDE.md's louise-pc command and `bench/rewrite/build.sh` go
+    (the latter keeps one for revisions whose `shell.nix` predates this). The pin's toolchain is
+    the desktop's own (the same store paths), so Servo's artifacts in `target/` stay fresh: no
+    build script tracks what the shell's environment changed. *Why:* plan §21, and decision 79's
+    finding that louise-pc's own Rust (1.95) can't build the workspace. Evidence: "Review fixes".

@@ -1,0 +1,15 @@
+# Exploratory, not a benchmark workload: the animations left alone for two minutes, to see
+# whether the memory they gain in the steady window levels off.
+[wasm-raf-long]
+description = "Wasm guest raf-demo, 120 s without input."
+open = ["wasm/raf_demo.wasm"]
+steady = 120
+active = 1
+script = "none"
+
+[css-animation-long]
+description = "Servo: endless CSS animations, 120 s without input."
+open = ["css-animation.html"]
+steady = 120
+active = 1
+script = "none"

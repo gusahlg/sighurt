@@ -1,0 +1,34 @@
+# The rewrite's `sig` audited: rewrite.toml with Servo's GL read audit (SIG_AUDIT_GL=1, which times
+# every GL call) and its per-frame timing lines (RUST_LOG, which raises the `log` level for the
+# whole process). For checking that no page pixels are read back at the GL level and for the
+# swap times, not for comparing CPU or latency with other sets.
+#
+# The rewrite's `sig` (branch `rewrite`): CPU chrome and engines compiled in, in one process.
+# bench/rewrite/build.sh builds a revision into its own directory, ~/sighurt-bench/builds/<rev>,
+# never written again, and points `rewrite-latest` at it. bench/run resolves the link when a set
+# starts; `--build-dir ~/sighurt-bench/builds/<rev>` measures an earlier build.
+description = "rewrite, audited: SIG_AUDIT_GL=1 and Servo's timing lines (not for performance comparisons)"
+dir = "~/sighurt-bench/builds/rewrite-latest"
+sig = "sig"
+engines = "in-process"
+binaries = ["sig"]
+# Written by the build: revision, features, rustc, sha256.
+info = "build-info.json"
+# benchlib/parsers.py SigDiag: sig's SIG_DIAG=1 lines, including counters, which it prints when
+# it gets SIGUSR1 (bench/measure sends it at every mark).
+parsers = ["sig-diag", "servo-log-timing"]
+counters_signal = "SIGUSR1"
+# sig writes its report as JSON too (`--diagnostics FILE`): bench/measure keeps the one written
+# at exit (page readbacks, GL reads, peaks) in the run.
+diagnostics_file = true
+config = "rewrite.config.toml"
+# sighurt-ui's layout: tab strip 40 + toolbar 44 above, the status strip 20 below. The screen
+# probe looks inside what is left.
+chrome_top = 84
+chrome_bottom = 20
+
+[env]
+SIG_DIAG = "1"
+SIG_AUDIT_GL = "1"
+# Errors as without RUST_LOG (env_logger's default), and Servo's timing lines.
+RUST_LOG = "error,sighurt_engine_servo::timing=debug"

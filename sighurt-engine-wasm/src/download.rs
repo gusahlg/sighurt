@@ -1,17 +1,35 @@
-//! Saving files to the user's Downloads directory: guest data (`api_download_data`), a URL
-//! (`api_download_url`) and the canvas as a PDF (`api_canvas_print_pdf`).
+//! Downloads a guest asks for: its own data (`api_download_data`), a URL (`api_download_url`)
+//! and the canvas as a PDF (`api_canvas_print_pdf`). The engine writes no file itself: each is
+//! queued in the document's [`HostState::downloads`] and, once the guest's call has returned,
+//! handed to the browser as a download request (`Service::Download`, by the view), which the
+//! core allows or refuses (one a second per tab) and the browser performs: its download folder,
+//! a file name it cleans from the guest's, never one that leads elsewhere. A worker's guest has
+//! no view to ask through, so its downloads fail.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use sighurt_api::services::DownloadSource;
 use wasmtime::{Caller, Linker};
 
 use crate::capabilities::{
-    console_log, guest_bytes, guest_str, CanvasState, ConsoleEntry, ConsoleLevel, DrawCommand,
-    HostState, Rgba,
+    guest_bytes, guest_str, CanvasState, ConsoleLevel, DrawCommand, HostState, Rgba, MAX_URL,
 };
+
+/// The most downloads a document may have waiting for the browser; more fail.
+pub const MAX_QUEUED_DOWNLOADS: usize = 4;
+
+/// The most bytes of the guest's own data its waiting downloads may hold; more fail.
+pub const MAX_QUEUED_DOWNLOAD_BYTES: usize = 64 << 20;
+
+/// A download a guest asked for, until its view hands it to the browser.
+#[derive(Debug)]
+pub struct Download {
+    /// What to save.
+    pub source: DownloadSource,
+    /// The file name the guest proposed, which the browser cleans or replaces.
+    pub name: Option<String>,
+}
 
 /// Register the download host functions.
 pub fn register_download_functions(linker: &mut Linker<HostState>) -> Result<()> {
@@ -24,25 +42,16 @@ pub fn register_download_functions(linker: &mut Linker<HostState>) -> Result<()>
          filename_ptr: u32,
          filename_len: u32|
          -> i32 {
-            let data = guest_bytes(&caller, data_ptr, data_len).unwrap_or_default();
             let filename = guest_str(&caller, filename_ptr, filename_len).unwrap_or_default();
-            if data.is_empty() || filename.is_empty() {
+            if data_len == 0 || data_len as usize > MAX_QUEUED_DOWNLOAD_BYTES || filename.is_empty()
+            {
                 return -1;
             }
-            let (level, message, code) = match save_download(&data, &filename) {
-                Ok(_) => (
-                    ConsoleLevel::Log,
-                    format!("[DOWNLOAD] Saved {} bytes to {filename}", data.len()),
-                    0,
-                ),
-                Err(e) => (
-                    ConsoleLevel::Error,
-                    format!("[DOWNLOAD] Failed to save {filename}: {e}"),
-                    -1,
-                ),
+            let Some(data) = guest_bytes(&caller, data_ptr, data_len) else {
+                return -1;
             };
-            caller.data().log(level, message);
-            code
+            let source = DownloadSource::Data(data);
+            queue(caller.data(), source, Some(filename), "[DOWNLOAD]")
         },
     )?;
 
@@ -51,13 +60,10 @@ pub fn register_download_functions(linker: &mut Linker<HostState>) -> Result<()>
         "api_download_url",
         |caller: Caller<'_, HostState>, url_ptr: u32, url_len: u32| -> i32 {
             let url = guest_str(&caller, url_ptr, url_len).unwrap_or_default();
-            if url.is_empty() {
+            if url.is_empty() || url.len() > MAX_URL {
                 return -1;
             }
-            let message = format!("[DOWNLOAD] Started download for {url}");
-            caller.data().log(ConsoleLevel::Log, message);
-            download_url(url, caller.data().console.clone());
-            0
+            queue(caller.data(), DownloadSource::Url(url), None, "[DOWNLOAD]")
         },
     )?;
 
@@ -76,91 +82,62 @@ pub fn register_download_functions(linker: &mut Linker<HostState>) -> Result<()>
                     chrono::Local::now().format("sighurt-canvas-%Y%m%d-%H%M%S.pdf")
                 )
             } else if filename.to_lowercase().ends_with(".pdf") {
-                filename.clone()
+                filename
             } else {
                 format!("{filename}.pdf")
             };
-            let (level, message, code) = match save_download(&pdf, &name) {
-                Ok(_) => (
-                    ConsoleLevel::Log,
-                    format!("[PRINT] Canvas exported to PDF: {filename}"),
-                    0,
-                ),
-                Err(e) => (
-                    ConsoleLevel::Error,
-                    format!("[PRINT] PDF export failed: {e}"),
-                    -1,
-                ),
-            };
-            caller.data().log(level, message);
-            code
+            queue(
+                caller.data(),
+                DownloadSource::Data(pdf),
+                Some(name),
+                "[PRINT]",
+            )
         },
     )?;
 
     Ok(())
 }
 
-/// Writes `data` to the user's Downloads directory under a name that does not clash.
-fn save_download(data: &[u8], filename: &str) -> std::io::Result<PathBuf> {
-    let dest = download_path(filename);
-    std::fs::write(&dest, data)?;
-    Ok(dest)
-}
-
-/// Downloads `url` into the user's Downloads directory on a background thread, streaming the
-/// body to disk, and logs the outcome to `console`.
-fn download_url(url: String, console: Arc<Mutex<Vec<ConsoleEntry>>>) {
-    std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<PathBuf> {
-            let mut response = reqwest::blocking::get(&url)?.error_for_status()?;
-            let name = response
-                .url()
-                .path_segments()
-                .and_then(|mut segments| segments.next_back())
-                .map(crate::url::percent_decode)
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "download".into());
-            let dest = download_path(&name);
-            response.copy_to(&mut std::fs::File::create(&dest)?)?;
-            Ok(dest)
-        })();
-        let (level, message) = match result {
-            Ok(dest) => (
-                ConsoleLevel::Log,
-                format!("[DOWNLOAD] Saved {url} to {}", dest.display()),
-            ),
-            Err(e) => (
-                ConsoleLevel::Error,
-                format!("[DOWNLOAD] Failed to download {url}: {e}"),
-            ),
+/// Queues a download of `source` for the browser, as `name`, and logs it with `tag`: 0 if it
+/// was queued, -1 if not (in a worker, or beyond the queue's bounds).
+fn queue(state: &HostState, source: DownloadSource, name: Option<String>, tag: &str) -> i32 {
+    let what = match &source {
+        DownloadSource::Url(url) => url.clone(),
+        DownloadSource::Data(data) => format!("{} bytes", data.len()),
+    };
+    let refused = if state.worker_outbox.is_some() {
+        Some("a worker can't download")
+    } else {
+        let mut queued = state.downloads.lock().unwrap();
+        let bytes = |download: &Download| match &download.source {
+            DownloadSource::Data(data) => data.len(),
+            DownloadSource::Url(_) => 0,
         };
-        console_log(&console, level, message);
-    });
-}
-
-/// A path in the user's Downloads directory for `filename` that does not clash.
-fn download_path(filename: &str) -> PathBuf {
-    let dir = dirs::download_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
-    unique_path(&dir, filename)
-}
-
-/// If `dir/name` exists, try `name (1)`, `name (2)`, etc.
-fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let candidate = dir.join(name);
-    if !candidate.exists() {
-        return candidate;
+        let new = Download { source, name };
+        let total = queued.iter().map(bytes).sum::<usize>() + bytes(&new);
+        if queued.len() >= MAX_QUEUED_DOWNLOADS || total > MAX_QUEUED_DOWNLOAD_BYTES {
+            Some("too many downloads at once")
+        } else {
+            queued.push(new);
+            None
+        }
+    };
+    match refused {
+        None => {
+            state.log(
+                ConsoleLevel::Log,
+                format!("{tag} {what}: asked the browser to save it"),
+            );
+            0
+        }
+        Some(why) => {
+            state.log(
+                ConsoleLevel::Error,
+                format!("{tag} {what}: not saved: {why}"),
+            );
+            -1
+        }
     }
-    let path = Path::new(name);
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    (1u32..)
-        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
-        .find(|p| !p.exists())
-        .unwrap_or(candidate)
 }
 
 /// Points per canvas pixel (96 dpi).

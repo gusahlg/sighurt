@@ -77,6 +77,8 @@ pub struct HostState {
     pub resolved_urls: Arc<Mutex<(String, HashMap<String, String>)>>,
     /// Set by guest `api_navigate`; the engine asks the browser to open it.
     pub pending_navigation: Arc<Mutex<Option<String>>>,
+    /// Downloads the guest asked for (`crate::download`); the engine asks the browser for them.
+    pub downloads: Arc<Mutex<Vec<crate::download::Download>>>,
     /// The URL of the currently loaded module (set by the host before execution).
     pub current_url: Arc<Mutex<String>>,
     /// Stable origin of the currently loaded module (see [`crate::url::app_origin_of`]).

@@ -120,10 +120,17 @@ class GpuiFrames(unittest.TestCase):
 class SigDiag(unittest.TestCase):
     def test_lines(self):
         parse = parsers.make(["sig-diag"])
-        frame = parse("sig-diag t=12.5 frame engine=servo view=3 w=1280 h=696 presented=1 readback_bytes=0 paint_ms=1.9")
+        frame = parse("sig-diag t=12.5 frame engine=servo view=3 w=1280 h=696 presented=1 readback_bytes=0 paint_ms=1.9 present_ms=2.25")
         self.assertEqual(frame, {"kind": "frame", "engine": "servo", "view": "3", "delivered": True, "presented": True,
-                                 "readback_bytes": 0, "ipc_pixel_bytes": 0, "paint_ms": 1.9, "read_ms": None,
-                                 "send_ms": None, "t": 12.5})
+                                 "readback_bytes": 0, "ipc_pixel_bytes": 0, "paint_ms": 1.9, "present_ms": 2.25,
+                                 "read_ms": None, "send_ms": None, "t": 12.5})
+        # An engine's own counts, as sig prints them after the counters (pairs() in diagnostics.rs).
+        engine = parse('sig-diag t=2.5 engine name=servo renderer="gl, straight into the page\'s subsurface" '
+                       'gl="hardware: NVIDIA GeForce RTX 4060/PCIe/SSE2" readbacks=2 gl_reads=0 state=running')
+        self.assertEqual(engine, {"kind": "counters", "group": "engine.servo", "values": {"readbacks": 2, "gl_reads": 0}, "t": 2.5})
+        unaudited = parse("sig-diag t=2.5 engine name=wasm renderer=cpu readbacks=0 state=running")
+        self.assertEqual(unaudited["values"], {"readbacks": 0})
+        self.assertIsNone(parse("sig-diag t=2.5 peaks max_pump_us=300"))
         chrome = parse("sig-diag t=13 chrome surface=status draw_ms=0.25")
         self.assertEqual((chrome["kind"], chrome["draw_ms"], chrome["t"]), ("browser-frame", 0.25, 13.0))
         renderer = parse('sig-diag t=1 renderer engine=servo mode=hardware gl="NVIDIA GeForce RTX 4060/PCIe/SSE2"')
@@ -144,6 +151,20 @@ class SigDiag(unittest.TestCase):
         ]:
             with self.subTest(line=line), self.assertRaises(ValueError):
                 parse(line)
+
+
+class ServoLogTiming(unittest.TestCase):
+    def test_lines(self):
+        parse = parsers.make(["servo-log-timing"])
+        frame = parse("[2026-10-02T10:00:00Z DEBUG sighurt_engine_servo::timing] "
+                      "servo-timing frame view=3 w=1280 h=696 paint_ms=1.234 swap_ms=0.210")
+        self.assertEqual(frame, {"kind": "engine-timing", "engine": "servo", "view": "3", "w": 1280, "h": 696,
+                                 "paint_ms": 1.234, "swap_ms": 0.21})
+        # sig-diag's first-frame line already says it; other lines are nothing.
+        self.assertIsNone(parse("[x DEBUG sighurt_engine_servo::timing] servo-timing first-frame view=3 after_navigate_ms=345.6"))
+        self.assertIsNone(parse("sig-diag t=1 frame engine=servo presented=1 readback_bytes=0"))
+        with self.assertRaises(ValueError):
+            parse("[x DEBUG sighurt_engine_servo::timing] servo-timing frame view=3 w=1280")
 
 
 class FakeSampler:
@@ -281,6 +302,42 @@ class Window(unittest.TestCase):
         self.assertNotIn("ctr.pumps", metrics.window(sampler, NoGpu, late, None, "a", "b"))
         self.assertNotIn("ctr.pumps", metrics.window(sampler, NoGpu, [], None, "a", "b"))
 
+    def test_counter_groups_and_engine_timings(self):
+        full = [(10.0, {1: proc(0, 0, 0, 0, {})}, {}), (20.0, {1: proc(0, 0, 0, 0, {})}, {})]
+        sampler = FakeSampler(1, full, {"a": 0, "b": 1})
+        events = [
+            (10.1, {"kind": "counters", "values": {"pumps": 5}}),
+            (10.2, {"kind": "counters", "group": "engine.servo", "values": {"readbacks": 1, "gl_reads": 4}}),
+            (20.1, {"kind": "counters", "values": {"pumps": 9}}),
+            (20.2, {"kind": "counters", "group": "engine.servo", "values": {"readbacks": 1, "gl_reads": 10}}),
+            (12.0, {"kind": "frame", "delivered": True, "presented": True, "readback_bytes": 0, "ipc_pixel_bytes": 0,
+                    "paint_ms": 1.0, "present_ms": 3.0}),
+            (13.0, {"kind": "frame", "delivered": True, "presented": True, "readback_bytes": 0, "ipc_pixel_bytes": 0,
+                    "paint_ms": 2.0, "present_ms": 5.0}),
+            (12.1, {"kind": "engine-timing", "swap_ms": 0.5}),
+            (13.1, {"kind": "engine-timing", "swap_ms": 0.25}),
+            (25.0, {"kind": "engine-timing", "swap_ms": 9.0}),  # after the window
+        ]
+        m = metrics.window(sampler, NoGpu, events, None, "a", "b")
+        self.assertEqual((m["ctr.pumps"], m["ctr.engine.servo.readbacks"], m["ctr.engine.servo.gl_reads"]), (4, 0, 6))
+        self.assertAlmostEqual(m["ctr.engine.servo.gl_reads_per_s"], 6 / 10.0)
+        self.assertEqual((m["present_p50_ms"], m["present_p95_ms"], m["paint_p50_ms"]), (3.0, 5.0, 1.0))
+        self.assertEqual((m["swap_p50_ms"], m["swap_p95_ms"]), (0.25, 0.5))
+        # Frames without a present time (the baseline's) give no present metric.
+        self.assertNotIn("present_p50_ms", metrics.window(sampler, NoGpu, [e for e in events if "present_ms" not in e[1]], None, "a", "b"))
+
+    def test_exit_report(self):
+        report = {"exit": True,
+                  "counters": {"page_readbacks": 0, "readback_bytes": 3 * metrics.MIB, "present_errors": 1, "pumps": 7},
+                  "peaks": {"max_pump_us": 1500, "max_target_buffers": 3, "max_buffer_bytes": 2 * metrics.MIB},
+                  "engines": [{"name": "servo", "readbacks": 0, "gl_reads": 2}, {"name": "wasm", "readbacks": 0, "gl_reads": None}]}
+        self.assertEqual(metrics.exit_metrics(report), {
+            "exit.page_readbacks": 0, "exit.present_errors": 1, "exit.readback_mib": 3.0, "exit.gl_reads": 2,
+            "exit.max_pump_ms": 1.5, "exit.max_target_buffers": 3, "exit.max_buffer_mib": 2.0})
+        # Without an audit there are no GL reads to report, not zero of them.
+        report["engines"][0]["gl_reads"] = None
+        self.assertNotIn("exit.gl_reads", metrics.exit_metrics(report))
+
     def test_pixel_latency(self):
         self.assertEqual(metrics.pixel_latency([]), {})
         m = metrics.pixel_latency([0.030, None, 0.010, 0.020])
@@ -301,17 +358,18 @@ class Window(unittest.TestCase):
         self.assertTrue(math.isclose(metrics.percentile([1, 2], 0.5), 1))
 
 
-def write_set(root, label, values, extra=None, engines="processes", anomalous=()):
-    """A result set with one workload, "w", whose runs have the given metric values; the runs of
-    the rounds in `anomalous` have an anomaly."""
+def write_set(root, label, values, extra=None, engines="processes", anomalous=(), parsers=(), script="none"):
+    """A result set with one workload, "w" (running `script`), whose runs have the given metric
+    values; the runs of the rounds in `anomalous` have an anomaly."""
     path = root / label
     (path / "runs").mkdir(parents=True)
     env = {"host": "h", "kernel": "k", "os": "o", "cpu": "c", "cpus": 1, "mem_total_mib": 1024,
            "cpu_governor": ["g"], "cpu_epp": ["e"], "cpu_boost": "1", "gpu": "gpu", "compositor": "sway"}
     record = {"label": label, "host": "h", "started": "now", "renderer": "gles2", "size": "1280x800",
-              "build": {"description": label, "sha256": {"sig": "0" * 64}, "info": None, "definition": {"engines": engines}},
+              "build": {"description": label, "sha256": {"sig": "0" * 64}, "info": None,
+                        "definition": {"engines": engines, "parsers": list(parsers)}},
               "harness": {"revision": "r", "sha256": "1" * 64},
-              "workloads": {"names": ["w"], "sha256": "2" * 64, "definitions": {"w": {"description": "d"}}},
+              "workloads": {"names": ["w"], "sha256": "2" * 64, "definitions": {"w": {"description": "d", "script": script}}},
               "environment": env, "rounds": len(values), "warmup_rounds": 1, "seed": 1,
               "failures": [{"run": "3-w", "status": 1, "stderr": "boom"}]}
     (path / "set.json").write_text(json.dumps(record))
@@ -373,6 +431,56 @@ class Tools(unittest.TestCase):
             self.assertIn("| w | steady.cpu_pct |", out)
             same = write_set(root, "c", [10, 11, 12, 13, 14], split)
             self.assertIn("| w | steady.cpu_pct_engines |", self.run_tool("compare", "--all", a, same))
+
+
+    def test_compare_leaves_out_what_a_build_cannot_measure_honestly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            keys = {"active.browser_fps": 2.0, "active.input_to_screen_p50_ms": 30.0, "active.input_to_pixels_p50_ms": 33.0}
+            a = write_set(root, "a", [10, 11, 12, 13, 14], keys, parsers=["gpui-frames"], script="tab-toggle")
+            b = write_set(root, "b", [5, 5.5, 6, 6.5, 7], keys, parsers=["sig-diag"], script="tab-toggle")
+            out = self.run_tool("compare", "--all", a, b)
+            self.assertNotIn("| w | active.browser_fps |", out)
+            self.assertNotIn("| w | active.input_to_screen_p50_ms |", out)
+            self.assertIn("| w | active.input_to_pixels_p50_ms |", out)
+            self.assertIn("not compared (a: GPUI's log misses the draws it makes while dispatching a key): "
+                          "active.browser_fps, active.input_to_screen_p50_ms", out)
+            # Where the script presses no keys, GPUI's frames count.
+            c = write_set(root, "c", [10, 11, 12, 13, 14], keys, parsers=["gpui-frames"], script="pointer-circle")
+            d = write_set(root, "d", [5, 5.5, 6, 6.5, 7], keys, parsers=["sig-diag"], script="pointer-circle")
+            self.assertIn("| w | active.browser_fps |", self.run_tool("compare", "--all", c, d))
+            # A rule for every script: sig-servo's navigation time against sig's.
+            nav = {"startup.first_frame_after_navigate_ms": 9.0}
+            e = write_set(root, "e", [10, 11, 12, 13, 14], nav, parsers=["servo-timing"], script="scroll-down")
+            f = write_set(root, "f", [10, 11, 12, 13, 14], {"startup.first_frame_after_navigate_ms": 100.0}, parsers=["sig-diag"])
+            self.assertNotIn("| w | startup.first_frame_after_navigate_ms |", self.run_tool("compare", "--all", e, f))
+            # --metrics picks rows by name.
+            out = self.run_tool("compare", "--all", "--metrics", "cpu_pct$", c, d)
+            self.assertIn("| w | steady.cpu_pct |", out)
+            self.assertNotIn("| w | active.browser_fps |", out)
+
+
+    def test_pipe_cost_moves_every_frame(self):
+        out = self.run_tool("pipe-cost", "--size", "32x16", "--fps", "200", "--seconds", "0.1", "--runs", "2").splitlines()
+        runs, summary = [json.loads(line) for line in out[:-1]], json.loads(out[-1])
+        self.assertEqual(len(runs), 2)
+        for run in runs:
+            self.assertEqual((run["frames"], run["received"]), (20, 20))
+            self.assertGreater(run["wakeups_per_s_reader"], 0)
+            self.assertAlmostEqual(run["mib_per_s"], 20 * 32 * 16 * 4 / 2**20 / run["wall_s"])
+        self.assertEqual(summary["median"]["frames"], 20)
+
+
+class Run(unittest.TestCase):
+    def test_interleave_runs_every_build_and_workload_once_a_round(self):
+        run = script("run")
+        order = run.interleave(["baseline", "rewrite"], ["a", "b", "c"], 4, seed=7)
+        self.assertEqual(len(order), 4)
+        for runs in order:
+            self.assertEqual(sorted(map(tuple, runs)), [(l, w) for l in ("baseline", "rewrite") for w in "abc"])
+        # Reproducible from the seed, different between rounds.
+        self.assertEqual(order, run.interleave(["baseline", "rewrite"], ["a", "b", "c"], 4, seed=7))
+        self.assertGreater(len({tuple(map(tuple, runs)) for runs in order}), 1)
 
 
 class Seat(unittest.TestCase):

@@ -1,0 +1,770 @@
+//! The line chrome, `[ui] chrome = "line"`: the whole chrome is one line, at the top of the
+//! window or, with `[chrome.line] position = "bottom"`, at the bottom. It proves that the chrome
+//! API (`sighurt_ui::extension`) is enough for a chrome whose surfaces, layout, editing and
+//! painting are its own: it uses sighurt-ui's helpers ([`Fonts`], [`TextEditor`], [`Canvas`])
+//! and nothing of the core, the host or an engine.
+//!
+//! Unfocused, the line shows the active tab's place (`[2/5]`), the keymap's indicator, the
+//! committed address (decoded where that is safe), a mark while the page loads, and on the right
+//! the status text, cut to fit: the status always has up to half the line, so `sig`'s notices
+//! stay visible however long the address. A click on the line, or `location.focus`, makes it an
+//! editor: Enter opens what was typed, a line starting with `:` runs a command, and Escape gives
+//! the page the keyboard. There are no buttons, no tab strip and no commands of its own: tabs are
+//! reached by keys and `:tab.select 3`. While the active tab shows no engine's page
+//! (`sig://home`, an error), a few lines of text say what there is.
+//!
+//! Its surfaces, bottom to top: [`PAGE`] while it draws the page area, and [`LINE`]. It repaints
+//! only what changed, and nothing ticks: the caret is steady.
+//!
+//! Must not own: browser state (the core's, which arrives as snapshots), targets and placement
+//! (`sig` and the host), or what a key does (the keymap's: only keys it passes reach the line).
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+use std::rc::Rc;
+
+use sighurt_api::commands::Command;
+use sighurt_api::events::Cursor;
+use sighurt_api::geometry::{LogicalSize, Metrics, SurfaceRect, WindowRect};
+use sighurt_api::ids::RequestId;
+use sighurt_api::input::{
+    ButtonState, FocusEvent, Key, KeyEvent, KeyboardFocus, PointerButton, PointerEvent,
+    TextInputState, TextPurpose,
+};
+use sighurt_api::settings::{Table, Value};
+use sighurt_ui::extension::{
+    contained, readable_url, Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout,
+    ChromeSurface, SurfaceName, TextField, Theme,
+};
+use sighurt_ui::state::{is_home, NO_SUCH_PAGE};
+use sighurt_ui::text_edit::TextEditor;
+use sighurt_ui::{
+    Canvas, Fonts, PaintError, Pen, PixelBuffer, Rgba, ShapedText, Snapshot, TabContent, TextStyle,
+};
+
+/// The line.
+pub const LINE: SurfaceName = "line";
+/// The page area, while the line chrome draws a page there.
+pub const PAGE: SurfaceName = "page";
+
+/// The line's height at the default font size, 14 px.
+const HEIGHT: f32 = 28.0;
+/// Space at the line's ends and between its parts.
+const GAP: f32 = 8.0;
+/// Room for the loading mark, and its size.
+const MARK_ROOM: f32 = 12.0;
+const MARK: f32 = 6.0;
+/// The caret's width.
+const CARET: f32 = 2.0;
+/// Characters kept of a failed command's message.
+const MAX_ERROR: usize = 2000;
+
+/// The line chrome, for the registry.
+pub const KIND: ChromeKind = ChromeKind {
+    name: "line",
+    check,
+    commands: &[],
+    new: || Box::new(Line::new(Fonts::system())),
+};
+
+/// Everything wrong with `[chrome.line]`.
+fn check(settings: &Table) -> Vec<String> {
+    let problem = |(key, value): (&String, &Value)| match (key.as_str(), value.as_str()) {
+        ("position", Some("top" | "bottom")) => None,
+        ("position", Some(other)) => Some(format!(
+            "position: expected \"top\" or \"bottom\", not {other:?}"
+        )),
+        ("position", None) => Some(format!(
+            "position: expected \"top\" or \"bottom\", not {}",
+            value.kind()
+        )),
+        _ => Some(format!("{key}: unknown key (the line chrome has position)")),
+    };
+    settings.iter().filter_map(problem).collect()
+}
+
+/// The line chrome.
+pub struct Line {
+    fonts: Fonts,
+    canvas: Canvas,
+    theme: Theme,
+    /// `[chrome.line] position = "bottom"`.
+    bottom: bool,
+    window: LogicalSize,
+    snapshot: Snapshot,
+    layout: ChromeLayout,
+    /// What is being typed, while the line has the keyboard.
+    editor: TextEditor,
+    focused: bool,
+    /// Whether the window has the keyboard: the caret and the selection show only then.
+    window_active: bool,
+    /// Why the last `:command` failed, until the line changes.
+    error: Option<String>,
+    /// The clipboard read the line waits for: the latest Ctrl+V's, while it has the keyboard
+    /// and its tab.
+    paste: Option<RequestId>,
+    /// The field the executable was last told about, so only changes are reported.
+    text_input: Option<TextInputState>,
+    cursor: Cursor,
+    /// The line, and the page it draws, show something new.
+    line_changed: bool,
+    page_changed: bool,
+}
+
+/// The line as drawn: its parts shaped, and where they are, in window coordinates.
+struct View {
+    /// The top of the text's line.
+    top: f32,
+    prefix: Rc<ShapedText>,
+    /// The address's room: its left and right ends.
+    field: (f32, f32),
+    /// The address, or what is being typed, and where its origin is.
+    text: Rc<ShapedText>,
+    text_x: f32,
+    caret: Option<f32>,
+    selection: Option<(f32, f32)>,
+    preedit: Option<(f32, f32)>,
+    /// The loading mark's left edge, while the page loads.
+    mark: Option<f32>,
+    /// The status text, where it starts, and whether it says what went wrong.
+    status: Option<(Rc<ShapedText>, f32, bool)>,
+}
+
+impl Line {
+    /// The line chrome with `fonts`, for a window of no size yet.
+    pub fn new(fonts: Fonts) -> Self {
+        let mut line = Self {
+            fonts,
+            canvas: Canvas::new(),
+            theme: Theme::default(),
+            bottom: false,
+            window: LogicalSize::default(),
+            snapshot: Snapshot::default(),
+            layout: ChromeLayout::default(),
+            editor: TextEditor::default(),
+            focused: false,
+            window_active: false,
+            error: None,
+            paste: None,
+            text_input: None,
+            cursor: Cursor::Default,
+            line_changed: true,
+            page_changed: true,
+        };
+        line.relayout();
+        line
+    }
+
+    /// `px` logical pixels at the default font size, at the configured one.
+    fn scaled(&self, px: f32) -> f32 {
+        px * f32::from(self.theme.font_size) / 14.0
+    }
+
+    fn style(&self) -> TextStyle {
+        TextStyle::SM.at(self.theme.font_size)
+    }
+
+    fn line_rect(&self) -> WindowRect {
+        let LogicalSize { width, height } = self.window;
+        let line = (self.scaled(HEIGHT).round() as u32).min(height);
+        let y = if self.bottom { height - line } else { 0 };
+        WindowRect {
+            x: 0,
+            y: y as i32,
+            width,
+            height: line,
+        }
+    }
+
+    fn page_rect(&self) -> WindowRect {
+        let line = self.line_rect();
+        let y = if self.bottom { 0 } else { line.height };
+        WindowRect {
+            x: 0,
+            y: y as i32,
+            width: self.window.width,
+            height: self.window.height - line.height,
+        }
+    }
+
+    /// Whether the active tab shows a page the line chrome draws: `sig:` pages and errors.
+    fn draws_page(&self) -> bool {
+        let content = self.snapshot.active().map(|tab| &tab.content);
+        matches!(content, Some(TabContent::Internal | TabContent::Error(_)))
+    }
+
+    fn relayout(&mut self) {
+        let page = self.page_rect();
+        let page_surface = self.draws_page().then(|| ChromeSurface::new(PAGE, page));
+        let line = ChromeSurface::new(LINE, self.line_rect());
+        self.layout = ChromeLayout::new(page, page_surface.into_iter().chain([line]).collect());
+    }
+
+    fn set_snapshot(&mut self, snapshot: Snapshot) {
+        if snapshot == self.snapshot {
+            return;
+        }
+        let old = std::mem::replace(&mut self.snapshot, snapshot);
+        self.line_changed |= in_line(&old) != in_line(&self.snapshot);
+        self.page_changed |= in_page(&old) != in_page(&self.snapshot);
+        let active = |snapshot: &Snapshot| snapshot.active().map(|tab| tab.id);
+        if active(&old) != active(&self.snapshot) {
+            // Another tab: what was typed for the last one goes, with its paste.
+            self.paste = None;
+            if self.focused {
+                self.editor.set_text(&self.address());
+                self.editor.select_all();
+            }
+        }
+    }
+
+    /// The active tab's committed address, as the line shows it.
+    fn address(&self) -> String {
+        let url = self.snapshot.active().map_or("", |tab| tab.url.as_str());
+        readable_url(url).into_owned()
+    }
+
+    /// The line takes the keyboard, with the address selected, ready to type over.
+    fn focus(&mut self) {
+        if !self.focused {
+            self.focused = true;
+            self.editor.set_text(&self.address());
+            self.error = None;
+        }
+        self.editor.select_all();
+    }
+
+    /// The page takes the keyboard: what was typed goes.
+    fn unfocus(&mut self) {
+        self.focused = false;
+        self.paste = None;
+        self.error = None;
+        self.editor.clear_preedit();
+    }
+
+    fn pointer(&mut self, surface: SurfaceName, event: &PointerEvent) -> Vec<ChromeAction> {
+        let mut actions = Vec::new();
+        match (surface, event) {
+            (
+                LINE,
+                PointerEvent::Button {
+                    button: PointerButton::Left,
+                    state: ButtonState::Pressed,
+                    position,
+                    modifiers,
+                },
+            ) => {
+                if self.focused {
+                    let x = self.line_rect().x as f32 + position.x as f32;
+                    let view = self.view();
+                    if view.preedit.is_none() {
+                        let offset = view.text.offset_at(x - view.text_x);
+                        self.editor.move_to(offset, modifiers.shift);
+                    }
+                } else {
+                    self.focus();
+                    actions.push(ChromeAction::Focus(KeyboardFocus::Chrome));
+                }
+            }
+            (
+                PAGE,
+                PointerEvent::Button {
+                    button: PointerButton::Left,
+                    state: ButtonState::Pressed,
+                    ..
+                },
+            ) if self.focused => {
+                self.unfocus();
+                actions.push(ChromeAction::Focus(KeyboardFocus::Page));
+            }
+            (_, PointerEvent::Enter { .. } | PointerEvent::Motion { .. }) => {
+                let cursor = if surface == LINE {
+                    Cursor::Text
+                } else {
+                    Cursor::Default
+                };
+                self.set_cursor(cursor, &mut actions);
+            }
+            (_, PointerEvent::Leave) => self.set_cursor(Cursor::Default, &mut actions),
+            _ => {}
+        }
+        actions
+    }
+
+    fn set_cursor(&mut self, cursor: Cursor, actions: &mut Vec<ChromeAction>) {
+        if cursor != self.cursor {
+            self.cursor = cursor;
+            actions.push(ChromeAction::Cursor(cursor));
+        }
+    }
+
+    /// A key press the keymap passed, while the line has the keyboard.
+    fn key(&mut self, event: &KeyEvent) -> Vec<ChromeAction> {
+        let mut actions = Vec::new();
+        let select = event.modifiers.shift;
+        // Control and Alt as modifiers, not as keys the layout used to make a character.
+        let control = event.modifiers.control && !event.consumed.control;
+        let alt = event.modifiers.alt && !event.consumed.alt;
+        let editor = &mut self.editor;
+        match &event.key {
+            Key::Named(name) => match name.as_str() {
+                "Escape" => {
+                    self.unfocus();
+                    actions.push(ChromeAction::Focus(KeyboardFocus::Page));
+                }
+                "Enter" => self.submit(&mut actions),
+                "ArrowLeft" | "ArrowRight" => editor.move_grapheme(name == "ArrowRight", select),
+                "Home" => editor.move_to(0, select),
+                "End" => editor.move_to(editor.text().len(), select),
+                "Backspace" | "Delete" => editor.delete_grapheme(name == "Delete"),
+                _ => {}
+            },
+            _ if control => match shortcut_letter(event) {
+                Some('a') => editor.select_all(),
+                Some(letter @ ('c' | 'x')) => {
+                    if let Some(text) = editor.selected_text() {
+                        actions.push(ChromeAction::Copy(text.to_owned()));
+                        if letter == 'x' {
+                            editor.insert("");
+                        }
+                    }
+                }
+                Some('v') => {
+                    let request = RequestId::next();
+                    self.paste = Some(request);
+                    actions.push(ChromeAction::Paste(request));
+                }
+                _ => {}
+            },
+            _ => {
+                if let Some(text) = event.text.as_deref().filter(|_| !alt) {
+                    editor.insert(text);
+                }
+            }
+        }
+        actions
+    }
+
+    /// Enter: open what was typed, or run it as a command after a `:`. The keyboard goes to the
+    /// page before a command runs, so a command for the page finds it there.
+    fn submit(&mut self, actions: &mut Vec<ChromeAction>) {
+        let line = self.editor.text().trim().to_owned();
+        if let Some(command) = line.strip_prefix(':') {
+            match command.parse::<Command>() {
+                Ok(command) => {
+                    self.unfocus();
+                    actions.push(ChromeAction::Focus(KeyboardFocus::Page));
+                    actions.push(ChromeAction::Command(command));
+                }
+                Err(error) => {
+                    let message = format!(":{}: {error}", command.trim());
+                    self.error = Some(contained(&message, MAX_ERROR));
+                }
+            }
+        } else if line.is_empty() {
+            self.unfocus();
+            actions.push(ChromeAction::Focus(KeyboardFocus::Page));
+        } else {
+            // The core gives the page the keyboard once it opens it.
+            actions.push(ChromeAction::Command(Command::PageOpen(line)));
+        }
+    }
+
+    /// The line as drawn now.
+    fn view(&mut self) -> View {
+        let style = self.style();
+        let line = self.line_rect();
+        let gap = self.scaled(GAP);
+        let (left, right) = (
+            line.x as f32 + gap,
+            (line.x + line.width as i32) as f32 - gap,
+        );
+        let height = f32::from(style.line_height);
+        let top = line.y as f32 + ((line.height as f32 - height) / 2.0).floor();
+
+        let tabs = &self.snapshot.tabs;
+        let active = tabs.iter().position(|tab| tab.active);
+        let mut prefix = active.map_or(String::new(), |i| format!("[{}/{}]", i + 1, tabs.len()));
+        if let Some(indicator) = &self.snapshot.keymap {
+            prefix.push_str("  ");
+            prefix.push_str(indicator);
+        }
+        let prefix = self.fonts.line(&prefix, style);
+
+        let status = match (&self.error, &self.snapshot.status) {
+            (Some(error), _) => Some((error.clone(), true)),
+            // A hovered link's address reads decoded, as the line's own does.
+            (None, Some(status)) => Some((readable_url(status).into_owned(), false)),
+            (None, None) => None,
+        };
+        let half = (line.width as f32 / 2.0 - gap).max(0.0);
+        let status = status.map(|(text, error)| {
+            let shaped = self.fonts.fitted(&text, style, half);
+            let x = right - shaped.width;
+            (shaped, x, error)
+        });
+
+        let loading = self.snapshot.active().is_some_and(|tab| tab.loading);
+        let mark_room = if loading { self.scaled(MARK_ROOM) } else { 0.0 };
+        let start = match prefix.width > 0.0 {
+            true => left + prefix.width + gap,
+            false => left,
+        };
+        let end = status.as_ref().map_or(right, |(_, x, _)| x - gap) - mark_room;
+        let field = (start, end.max(start));
+        let mark = loading.then_some(field.1);
+
+        let (text, text_x, caret, selection, preedit) = if self.focused {
+            let display = self.editor.display();
+            let text = self.fonts.line(&display.text, style);
+            let x = field.0 - self.editor.scroll();
+            let span = |range: &std::ops::Range<usize>| {
+                let (a, b) = (text.x_at(range.start), text.x_at(range.end));
+                (x + a.min(b), x + a.max(b))
+            };
+            let caret = display.caret.map(|offset| x + text.x_at(offset));
+            let selection = (!display.selection.is_empty()).then(|| span(&display.selection));
+            let preedit = display.preedit.as_ref().map(span);
+            (text, x, caret, selection, preedit)
+        } else {
+            let address = self.address();
+            let text = self.fonts.fitted(&address, style, field.1 - field.0);
+            (text, field.0, None, None, None)
+        };
+        View {
+            top,
+            prefix,
+            field,
+            text,
+            text_x,
+            caret,
+            selection,
+            preedit,
+            mark,
+            status,
+        }
+    }
+
+    /// Keeps the caret in view and reports what the executable needs to know.
+    fn finish(&mut self, mut actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
+        let before = self.editor.scroll();
+        if self.focused {
+            let view = self.view();
+            let caret = view.caret.map_or(0.0, |x| x - view.text_x);
+            let room = view.field.1 - view.field.0;
+            let width = view.text.width;
+            self.editor.scroll_to_caret(caret, CARET, width, room);
+        } else {
+            self.editor.reset_scroll();
+        }
+        self.line_changed |= self.editor.scroll() != before;
+
+        let text_input = self.focused.then(|| self.text_input_state());
+        if text_input != self.text_input {
+            self.text_input = text_input.clone();
+            let field = text_input.map(|state| TextField::new(LINE, state));
+            actions.push(ChromeAction::TextInput(field));
+        }
+        self.relayout();
+        if std::mem::take(&mut self.line_changed) {
+            actions.push(ChromeAction::Repaint(LINE));
+        }
+        if std::mem::take(&mut self.page_changed) && self.draws_page() {
+            actions.push(ChromeAction::Repaint(PAGE));
+        }
+        actions
+    }
+
+    fn text_input_state(&mut self) -> TextInputState {
+        let view = self.view();
+        let line = self.line_rect();
+        let x = view.caret.unwrap_or(view.text_x) - line.x as f32;
+        TextInputState {
+            caret: SurfaceRect {
+                x: x.round() as i32,
+                y: view.top as i32 - line.y,
+                width: CARET as u32,
+                height: self.style().line_height.into(),
+            },
+            surrounding: Some(self.editor.surrounding()),
+            purpose: TextPurpose::Url,
+            multiline: false,
+        }
+    }
+
+    fn paint_line(&mut self, pen: &mut Pen) {
+        let colors = self.theme.colors;
+        pen.clear(Rgba {
+            a: 255,
+            ..colors.bg
+        });
+        let line = self.line_rect();
+        let [x, y, width, height] = [
+            line.x as f32,
+            line.y as f32,
+            line.width as f32,
+            line.height as f32,
+        ];
+        // A line between it and the page.
+        let edge = if self.bottom { y } else { y + height - 1.0 };
+        pen.fill([x, edge, width, 1.0], colors.border);
+
+        let view = self.view();
+        let gap = self.scaled(GAP);
+        let text_height = f32::from(self.style().line_height);
+        let all = [x, y, width, height];
+        pen.text(
+            &mut self.fonts,
+            &view.prefix,
+            (x + gap, view.top),
+            colors.text_muted,
+            all,
+        );
+        let (from, to) = view.field;
+        let field = [from, y, to - from, height];
+        if self.focused {
+            // The field being edited stands out from the rest of the line.
+            let margin = self.scaled(MARK_ROOM - MARK);
+            let back = [
+                from - margin / 2.0,
+                y + 2.0,
+                to - from + margin,
+                height - 4.0,
+            ];
+            pen.fill(back, colors.surface);
+        }
+        let clipped = |(a, b): (f32, f32)| {
+            let (a, b) = (a.max(from), b.min(to));
+            (a < b).then_some([a, view.top, b - a, text_height])
+        };
+        let active = self.focused && self.window_active;
+        if let Some(selection) = view.selection.filter(|_| active).and_then(clipped) {
+            pen.fill(selection, colors.selection);
+        }
+        let at = (view.text_x, view.top);
+        pen.text(&mut self.fonts, &view.text, at, colors.text, field);
+        if let Some(preedit) = view.preedit.and_then(clipped) {
+            let underline = view.top + text_height - self.scaled(2.0);
+            pen.fill([preedit[0], underline, preedit[2], 1.0], colors.text);
+        }
+        let caret = view.caret.filter(|_| active && view.selection.is_none());
+        if let Some(caret) = caret.filter(|&caret| caret >= from - 1.0 && caret <= to + 1.0) {
+            pen.fill([caret, view.top, CARET, text_height], colors.text);
+        }
+        if let Some(mark) = view.mark {
+            let size = self.scaled(MARK);
+            let left = mark + (self.scaled(MARK_ROOM) - size) / 2.0;
+            let top = y + (height - size) / 2.0;
+            pen.fill([left, top, size, size], colors.text_muted);
+        }
+        if let Some((status, at, error)) = &view.status {
+            let color = if *error {
+                colors.error
+            } else {
+                colors.text_muted
+            };
+            pen.text(&mut self.fonts, status, (*at, view.top), color, all);
+        }
+    }
+
+    /// A few lines of text about the page the active tab can't show in an engine.
+    fn page_lines(&self) -> Vec<(String, Rgba)> {
+        let colors = &self.theme.colors;
+        let Some(tab) = self.snapshot.active() else {
+            return Vec::new();
+        };
+        match &tab.content {
+            TabContent::Internal if is_home(&tab.url) => {
+                let home = &self.snapshot.home;
+                let mut lines = vec![
+                    ("Sighurt".to_owned(), colors.text),
+                    (
+                        "Click the line, or use location.focus, to type an address, a search or \
+                         a command after a colon, such as :tab.new."
+                            .to_owned(),
+                        colors.text_muted,
+                    ),
+                    (
+                        format!("The configuration is in {}.", home.config_path),
+                        colors.text_muted,
+                    ),
+                ];
+                for engine in &home.engines {
+                    let color = match engine.available {
+                        true => colors.text_muted,
+                        false => colors.error,
+                    };
+                    lines.push((format!("{}: {}", engine.name, engine.detail), color));
+                }
+                lines
+            }
+            TabContent::Internal => vec![(NO_SUCH_PAGE.to_owned(), colors.text_muted)],
+            TabContent::Error(message) => vec![
+                (
+                    format!("Can't show {}", readable_url(&tab.url)),
+                    colors.text,
+                ),
+                (message.clone(), colors.text_muted),
+            ],
+            TabContent::Engine | TabContent::Blank => Vec::new(),
+        }
+    }
+
+    fn paint_page(&mut self, pen: &mut Pen) {
+        let colors = self.theme.colors;
+        pen.clear(Rgba {
+            a: 255,
+            ..colors.bg
+        });
+        let page = self.page_rect();
+        let [x, y, width, height] = [
+            page.x as f32,
+            page.y as f32,
+            page.width as f32,
+            page.height as f32,
+        ];
+        let gap = 2.0 * self.scaled(GAP);
+        let style = self.style();
+        let mut top = y + gap;
+        for (text, color) in self.page_lines() {
+            let shaped = self
+                .fonts
+                .wrapped(&text, style, (width - 2.0 * gap).max(1.0));
+            pen.text(
+                &mut self.fonts,
+                &shaped,
+                (x + gap, top),
+                color,
+                [x, y, width, height],
+            );
+            top += shaped.height + self.scaled(GAP) / 2.0;
+        }
+    }
+}
+
+/// What the line shows of `snapshot`.
+fn in_line(snapshot: &Snapshot) -> impl PartialEq {
+    let active = snapshot.tabs.iter().position(|tab| tab.active);
+    let tab = snapshot.active().map(|tab| (tab.url.clone(), tab.loading));
+    let count = snapshot.tabs.len();
+    (
+        active,
+        count,
+        tab,
+        snapshot.keymap.clone(),
+        snapshot.status.clone(),
+    )
+}
+
+/// What the page the line chrome draws shows of `snapshot`, if it draws one.
+fn in_page(snapshot: &Snapshot) -> impl PartialEq {
+    let tab = snapshot.active();
+    let drawn =
+        tab.filter(|tab| matches!(tab.content, TabContent::Internal | TabContent::Error(_)));
+    drawn.map(|tab| (tab.content.clone(), tab.url.clone(), snapshot.home.clone()))
+}
+
+/// The letter of a Ctrl shortcut: the key's character, or for layouts without Latin letters
+/// (Cyrillic, Greek, ...) the physical key's, so Ctrl+V pastes on every layout.
+fn shortcut_letter(event: &KeyEvent) -> Option<char> {
+    if let Key::Character(text) = &event.key {
+        let mut chars = text.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c.is_ascii_alphabetic() {
+                return Some(c.to_ascii_lowercase());
+            }
+        }
+    }
+    let code = event.code.w3c_code()?.strip_prefix("Key")?;
+    code.chars().next().map(|c| c.to_ascii_lowercase())
+}
+
+impl Chrome for Line {
+    fn handle(&mut self, event: ChromeEvent) -> Vec<ChromeAction> {
+        let before = (self.editor.clone(), self.error.clone(), self.focused);
+        let actions = match event {
+            ChromeEvent::Configure { theme, settings } => {
+                let position = settings.get("position").and_then(Value::as_str);
+                self.bottom = position == Some("bottom");
+                self.fonts.set_family(theme.font.as_deref());
+                self.theme = theme;
+                (self.line_changed, self.page_changed) = (true, true);
+                Vec::new()
+            }
+            ChromeEvent::Resize(size) => {
+                if size != self.window {
+                    self.window = size;
+                    (self.line_changed, self.page_changed) = (true, true);
+                }
+                Vec::new()
+            }
+            ChromeEvent::Snapshot(snapshot) => {
+                self.set_snapshot(snapshot);
+                Vec::new()
+            }
+            ChromeEvent::Focus(KeyboardFocus::Chrome) => {
+                self.focus();
+                Vec::new()
+            }
+            ChromeEvent::Focus(KeyboardFocus::Page) => {
+                self.unfocus();
+                Vec::new()
+            }
+            ChromeEvent::WindowFocus(event) => {
+                self.window_active = event == FocusEvent::Activated;
+                self.line_changed |= self.focused;
+                Vec::new()
+            }
+            ChromeEvent::Pointer { surface, event } => self.pointer(surface, &event),
+            ChromeEvent::Key(key) if self.focused && key.state == ButtonState::Pressed => {
+                self.key(&key)
+            }
+            ChromeEvent::TextInput(event) if self.focused => {
+                self.editor.input_method(&event);
+                Vec::new()
+            }
+            ChromeEvent::Pasted { request, text } if self.paste == Some(request) => {
+                self.paste = None;
+                self.editor.paste(&text);
+                Vec::new()
+            }
+            // Keys and text for a line without the keyboard, a late paste, and commands,
+            // which the line chrome has none of.
+            _ => Vec::new(),
+        };
+        let (editor, error, focused) = before;
+        if self.editor != editor {
+            self.line_changed = true;
+            if self.editor.text() != editor.text() {
+                // The line changed: the error about it goes.
+                self.error = None;
+            }
+        }
+        self.line_changed |= self.error != error || self.focused != focused;
+        self.finish(actions)
+    }
+
+    fn layout(&self) -> &ChromeLayout {
+        &self.layout
+    }
+
+    fn paint(
+        &mut self,
+        surface: SurfaceName,
+        metrics: &Metrics,
+        buffer: PixelBuffer<'_>,
+    ) -> Result<(), PaintError> {
+        let mut canvas = std::mem::take(&mut self.canvas);
+        let painted = canvas.paint(metrics, buffer, |pen| match surface {
+            LINE => self.paint_line(pen),
+            PAGE => self.paint_page(pen),
+            _ => pen.clear(Rgba {
+                a: 255,
+                ..self.theme.colors.bg
+            }),
+        });
+        self.canvas = canvas;
+        painted
+    }
+}

@@ -11,6 +11,13 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 dest=repos/sighurt-rewrite
 sync=1
 [[ ${1:-} == --no-sync ]] && { sync=0; shift; }
+# While the user is using louise-pc (gaming), nothing heavy runs there: say so before syncing.
+if ssh -o BatchMode=yes -o ConnectTimeout=8 louise-pc \
+    '[ -e /tmp/gusahlg-desktop-embargo ] || pgrep -f "steamapps/commo[n]/" >/dev/null' 2>/dev/null; then
+  echo "tools/remote: the user is using louise-pc right now (gaming): run this on the desktop" \
+    "instead (the same command without tools/remote)." >&2
+  exit 75
+fi
 # One remote run at a time from this machine, so a sync never changes the tree under a build.
 exec 9>/tmp/sighurt-remote.lock
 if ! flock -n 9; then

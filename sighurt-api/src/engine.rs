@@ -137,6 +137,10 @@ pub struct EngineCapabilities {
     /// Requests for native popups (select menus, context menus, dialogs) for the host to show.
     /// The API has no requests for these yet (deferred to M4), so engines report `false`.
     pub native_popups: bool,
+    /// Each view runs in an operating-system process of its own (WebKit's web process), so a
+    /// view kept alive while hidden, such as a page in a tab's history, costs that process. Not
+    /// an operation: the core keeps fewer such views alive.
+    pub process_per_view: bool,
 }
 
 /// How a view starts.
@@ -208,6 +212,17 @@ pub enum EngineCommand {
         request: RequestId,
         /// The answer.
         result: ServiceResult,
+    },
+    /// The answer to the view's
+    /// [`NavigationRequested`](crate::events::EngineEvent::NavigationRequested) `request`:
+    /// `allow` lets the engine perform the navigation; `false` drops it, and the browser may
+    /// open the URL elsewhere. An answer for a request the engine no longer holds does nothing,
+    /// and an engine that never asks never gets one.
+    AnswerNavigation {
+        /// The request being answered.
+        request: RequestId,
+        /// Whether the engine may perform the navigation.
+        allow: bool,
     },
 }
 

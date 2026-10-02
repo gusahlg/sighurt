@@ -20,6 +20,14 @@
 //! adapter allocates, and its [`NavigationStarted`](EngineEvent::NavigationStarted) is
 //! optional, since some engines learn of it only when it commits.
 //!
+//! Before an engine performs a navigation its page started (a link, a form, a script), it asks
+//! the browser with [`NavigationRequested`](EngineEvent::NavigationRequested), since the
+//! browser's routing may give the URL to another engine; one it can't perform itself it hands
+//! over with [`OpenRequested`](EngineEvent::OpenRequested). An engine that knows which of them
+//! the user started may ask about those alone (WebKit's user-gesture flag: a link or a GET form
+//! the user clicked); the others stay in it. HTTP redirects are part of the
+//! navigation that got them, not navigations of their own.
+//!
 //! A [`NavigationCommitted`](EngineEvent::NavigationCommitted), or a `NavigationStarted` with a
 //! newer id, supersedes every navigation of that view that was pending before it: the core
 //! drops those without waiting for a [`Cancelled`](NavigationError::Cancelled), which engines
@@ -145,11 +153,33 @@ pub enum EngineEvent {
         /// The withdrawn request.
         request: RequestId,
     },
+    /// The page asks to navigate to `url`, which the engine would load itself: a link, a form
+    /// or a script of the top-level document, or of a frame from an engine that can't tell
+    /// them apart (Servo 0.5, WebKit 2.52). The engine holds the navigation until the browser
+    /// answers `request` with
+    /// [`AnswerNavigation`](crate::engine::EngineCommand::AnswerNavigation): allowed, it goes
+    /// ahead as a navigation the page started (see the module documentation); denied, it never
+    /// happens, and the browser may open `url` elsewhere.
+    /// When the view closes, `document` is replaced or gone, or the runtime shuts down, the
+    /// engine denies whatever it still holds, and a later answer for it does nothing. An engine
+    /// holds at most 16 per view, and lets the page's navigations beyond them go ahead without
+    /// asking. Not replaceable: the browser answers every one.
+    NavigationRequested {
+        /// The view.
+        view: ViewId,
+        /// The document that asked.
+        document: DocumentGeneration,
+        /// Identifies this request in the answer.
+        request: RequestId,
+        /// Where it goes.
+        url: String,
+    },
     /// The page asks the browser to open `url`: a policy request. The core routes `url` like
     /// any other, so it may go to another engine, and decides whether to allow it; a page can
-    /// never open a `sig://` page this way. Navigations the engine performs itself are reported
-    /// as `NavigationStarted` and `NavigationCommitted` instead; this is for the ones it hands
-    /// over, such as a link in a Wasm guest or a URL Servo shouldn't load.
+    /// never open a `sig://` page this way. Navigations the engine performs itself are asked
+    /// about with `NavigationRequested` and reported as `NavigationStarted` and
+    /// `NavigationCommitted` instead; this is for the ones it hands over, such as a link in a
+    /// Wasm guest or a URL Servo shouldn't load.
     OpenRequested {
         /// The view that asked.
         view: ViewId,
@@ -207,6 +237,7 @@ impl EngineEvent {
             | Self::TextInputChanged { view, .. }
             | Self::FrameReady { view }
             | Self::ServiceCancelled { view, .. }
+            | Self::NavigationRequested { view, .. }
             | Self::OpenRequested { view, .. }
             | Self::CloseRequested { view, .. }
             | Self::ViewClosed { view }

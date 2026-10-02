@@ -1,6 +1,6 @@
 //! One Servo view: its WebView, target lease and rendering context, with its visibility, focus,
-//! zoom, current metrics, navigations, held keys, input-method state, pending service requests
-//! and the pop-ups it opened.
+//! zoom, current metrics, navigations, held keys, input-method state, pending service requests,
+//! the navigations its pages asked the browser about and the pop-ups it opened.
 //!
 //! The WebView is made once the view has room (non-empty metrics, so a GL context can exist)
 //! and its first navigation: Servo loads a WebView's first URL as it builds it, and building
@@ -36,7 +36,7 @@ use sighurt_api::input::InputEvent;
 use sighurt_wayland::TargetLease;
 use url::Url;
 
-use crate::delegate::Delegate;
+use crate::delegate::{Delegate, PageNavigation};
 use crate::input::{Composition, Keys};
 use crate::navigation::{Navigator, Request};
 use crate::presentation::{physical, FrameDriver, PageContext, Readbacks};
@@ -110,6 +110,13 @@ pub(crate) struct View {
     /// Servo's input-method request for the focused field, while there is one.
     pub ime: Option<EmbedderControlId>,
     pub requests: Vec<(RequestId, Pending)>,
+    /// Navigations the current document asked for, waiting for the browser's answer. Dropped
+    /// (with the document, the view or the runtime), they are denied.
+    pub asked: Vec<(RequestId, PageNavigation)>,
+    /// The browser asked for a reload, which Servo 0.5 carries out as the page's own navigation
+    /// to its address (`Location::reload`): that navigation is the browser's, and goes ahead
+    /// without asking.
+    pub reloading: bool,
     /// Hidden WebViews for pages the view's current document opened, until their first
     /// navigation says where they go.
     pub popups: Vec<WebView>,
@@ -154,6 +161,8 @@ impl View {
             composition: Composition::default(),
             ime: None,
             requests: Vec::new(),
+            asked: Vec::new(),
+            reloading: false,
             popups: Vec::new(),
             ready: false,
             crashed: false,
@@ -234,6 +243,20 @@ impl View {
             webview.load(url);
         }
         self.load = Some(Load::new(Some(navigation)));
+        given_up
+    }
+
+    /// Lets a navigation the page asked for go ahead. If it is the top level's (Servo 0.5 doesn't
+    /// say whether it is an iframe's), Servo would drop a browser navigation until it has its
+    /// document: a load already in flight goes on, and one that showed no sign of life for
+    /// [`LOAD_WAIT`] is given up for it. Returns the browser navigation given up.
+    pub fn allow(&mut self, navigation: PageNavigation) -> Option<NavigationId> {
+        navigation.allow();
+        if self.load.is_some_and(|load| load.alive(Instant::now())) {
+            return None;
+        }
+        let given_up = self.give_up_load();
+        self.load = Some(Load::new(None));
         given_up
     }
 

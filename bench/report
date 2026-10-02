@@ -45,7 +45,8 @@ def main():
     if s.get("stopped"):
         print(f"**The set stopped early**: {s['stopped']}\n")
 
-    renderers = sorted({f"{r['engine']}: {r['mode']} ({r['gl_renderer']})" for run in data["runs"] for r in run.get("renderers", [])})
+    renderers = sorted({f"{r['engine']}: {r['mode']}" + (f" ({r['gl_renderer']})" if r.get("gl_renderer") else "")
+                        for run in data["runs"] for r in run.get("renderers", [])})
     if renderers:
         print("Engine renderers seen: " + "; ".join(renderers) + "\n")
 

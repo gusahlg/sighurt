@@ -1,0 +1,77 @@
+PASS pixman: the red page loads
+PASS pixman: the compositor shows it under the chrome
+PASS pixman: the chrome strip is shown
+INFO [   6.458] mark: wakeups 67 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 117 stale-frames 1 rounded-frames 0 failed-imports 0
+INFO idle: 1 loop wakeups and 0 GLib dispatches in 5 s
+PASS pixman: idle: at most 3 wakeups in 5 s with a static page (1 is the mark)
+INFO transport Some(Shm), device None, driver None, 0 DMA-BUF formats
+INFO [   6.458] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+PASS pixman: the animation presents in its tab (frames in 6 s)
+PASS pixman: WebGL runs in the page
+PASS pixman: no chrome repaint because the page animated
+INFO [  13.028] mark: ViewId(2) frames 345 pacing n=344 median=17.36ms p95=17.81ms max=18.73ms
+INFO [  13.028] mark: submitted 346 dmabuf-frames 0 dmabuf-imports 0 shm-copies 346 shm-bytes 1346355200 dropped 2 releases 344 present-mean-ms 0.993 present-max-ms 2.171
+INFO [  13.028] mark: pss-kib 284357 (bwrap 1822, WPENetworkProce 24781, wpe-window 42462, xdg-dbus-proxy 1737, WPEWebProcess 213555)
+PASS pixman: SHM fallback: one counted copy per frame
+PASS pixman: SHM fallback: diagnosed
+PASS pixman: a hidden view presents nothing
+PASS pixman: the red page shows again
+PASS pixman: hiding unmaps the page (the window's background)
+PASS pixman: showing maps it again
+PASS pixman: present: exits cleanly, no protocol error
+PASS pixman: two views present at once (left)
+PASS pixman: two views present at once (right)
+PASS pixman: split: exits cleanly, no protocol error
+PASS pixman: the video plays
+INFO video playing 4 1
+PASS pixman: video: exits cleanly, no protocol error
+PASS pixman: history: the page adds its entries
+INFO history: history.html#two history.html#one history.html#two history.html#two; effects Push Push Push Push Traverse Traverse Traverse Replace Push Push
+PASS pixman: history: back, back, forward, reload commit as traversals and a replace
+PASS pixman: history: exits cleanly, no protocol error
+PASS pixman: crash: the page loads
+INFO crash: web processes of this window: 530686
+PASS pixman: a crashed web process is ViewFailed
+INFO [   0.379] ViewFailed { view: ViewId(1), message: "The page's web process crashed; reload to start it again" }
+PASS pixman: the browser lives on
+PASS pixman: a reload starts a new web process
+PASS pixman: the reloaded page is shown
+INFO crash: web processes now: 530762
+PASS pixman: crash: exits cleanly, no protocol error
+PASS pixman: the input page loads at the window's size
+PASS pixman: a click arrives at its surface-local position
+PASS pixman: å ä ö and a dead key are typed
+PASS pixman: a named key reaches the page
+PASS pixman: the page blurs when the chrome takes the keyboard
+PASS pixman: keys for the chrome don't reach the page
+PASS pixman: the page has focus again
+PASS pixman: and gets keys
+PASS pixman: copy asks the browser, which puts it on the Wayland clipboard
+PASS pixman: paste asks the browser, which reads the Wayland clipboard
+INFO clipboard requests: 2
+PASS pixman: the wheel scrolls the page
+PASS pixman: scale 1.5: the page sees dpr 1.5 and 853x493
+PASS pixman: scale 1.5: the page is shown, its corner at 100 CSS px
+PASS pixman: scale 1.5: clicks land at the same CSS position
+PASS pixman: scale 2: the page sees dpr 2 and 640x360
+PASS pixman: scale 2: the page is shown, its corner at 100 CSS px
+PASS pixman: scale 2: clicks land at the same CSS position
+PASS pixman: scale 1.25: the page sees dpr 1.25 and 1024x600
+PASS pixman: scale 1.25: the page is shown, its corner at 100 CSS px
+PASS pixman: scale 1.25: clicks land at the same CSS position
+PASS pixman: scale 1: the page sees dpr 1 and 1280x760
+PASS pixman: scale 1: the page is shown, its corner at 100 CSS px
+PASS pixman: scale 1: clicks land at the same CSS position
+PASS pixman: a new size reaches the page
+PASS pixman: and is shown
+PASS pixman: page zoom: the page sees dpr 2 and half the size
+PASS pixman: the hovered link is the status text
+PASS pixman: and leaves it
+PASS pixman: input: exits cleanly, no protocol error
+PASS pixman: an https page loads
+PASS pixman: and is shown
+PASS pixman: web: exits cleanly, no protocol error
+0 failed; logs and screenshots in /tmp/claude-1000/-home-gusahlg-repos-sighurt/4074f6cc-047d-4246-ae06-9980bd83ce65/scratchpad/final/wc-pixman
+wl_display_dispatch: Broken pipe
+Io error: Broken pipe (os error 32)
+Error: "Backend error: Io error: Broken pipe (os error 32)"

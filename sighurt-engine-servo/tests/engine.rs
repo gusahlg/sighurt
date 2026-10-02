@@ -1,7 +1,8 @@
 //! The Servo adapter against a real compositor and a real Servo: navigation and history (with
 //! same-document entries), failed navigations and hidden views each have their own outcome
-//! (plan §25, with `crash.rs` and `unavailable_context.rs`), the display path reads nothing back,
-//! and Servo shuts down under its profile lock.
+//! (plan §25, with `crash.rs` and `unavailable_context.rs`), a page's own navigations wait for
+//! the browser's answer, the display path reads nothing back, pages see the configured user
+//! agent, and Servo shuts down under its profile lock.
 //!
 //! Servo initializes once per process, so this is one test, one scenario after another. It
 //! needs a Wayland compositor and is `#[ignore]`d: `tests/headless.sh` runs it in a private
@@ -15,10 +16,16 @@ use std::time::{Duration, Instant};
 use common::{Driver, Layout, State};
 use sighurt_api::engine::EngineCommand;
 use sighurt_api::events::{EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
-use sighurt_api::ids::{DocumentGeneration, NavigationId, ViewId};
+use sighurt_api::geometry::SurfacePoint;
+use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, ViewId};
+use sighurt_api::input::{
+    ButtonState, InputEvent, InputKind, Modifiers, PointerButton, PointerEvent,
+};
 use sighurt_engine_servo::ServoConfig;
 
 const WAIT: Duration = Duration::from_secs(20);
+/// The user agent the test's Servo is configured with.
+const AGENT: &str = "SighurtTest/1.0 (engine.rs)";
 /// How long a view waits for a load Servo may have dropped (`view::LOAD_WAIT`).
 const LOAD_WAIT: Duration = Duration::from_secs(5);
 
@@ -271,12 +278,191 @@ fn navigations_servo_would_drop_or_misattribute(d: &mut Driver, a: ViewId) {
     );
 }
 
+/// The navigations `view`'s pages asked about: the document that asked, the request and where.
+fn asked(state: &State, view: ViewId) -> Vec<(DocumentGeneration, RequestId, String)> {
+    state
+        .events_of(view)
+        .filter_map(|event| match event {
+            EngineEvent::NavigationRequested {
+                document,
+                request,
+                url,
+                ..
+            } => Some((*document, *request, url.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A click in the middle of `view`, through the adapter's input path.
+fn click(state: &mut State, view: ViewId) {
+    let seat = SeatId::next();
+    let position = SurfacePoint { x: 200.0, y: 200.0 };
+    let modifiers = Modifiers::default();
+    let button = |state| PointerEvent::Button {
+        button: PointerButton::Left,
+        state,
+        position,
+        modifiers,
+    };
+    let events = [
+        PointerEvent::Motion {
+            position,
+            modifiers,
+        },
+        button(ButtonState::Pressed),
+        button(ButtonState::Released),
+    ];
+    for event in events {
+        let kind = InputKind::Pointer(event);
+        state.command(view, EngineCommand::Input(InputEvent { seat, kind }));
+    }
+}
+
+/// The latest title of `view`.
+fn title(state: &State, view: ViewId) -> Option<String> {
+    state.events_of(view).rev().find_map(|event| match event {
+        EngineEvent::TitleChanged { title, .. } => title.clone(),
+        _ => None,
+    })
+}
+
+/// A page's own navigations wait for the browser's answer (extension-api.md §1.4): a click on a
+/// link asks first; allowed, it commits as the page's own; denied, nothing loads. A new
+/// document, and closing the view, deny what is held, and a late answer does nothing. At most 16
+/// wait per view. `a`, the view shown, is hidden meanwhile.
+fn the_page_asks_before_it_navigates(d: &mut Driver, a: ViewId) {
+    let server = common::serve();
+    let url = |path: &str| format!("{server}{path}");
+    d.state.navigations = None;
+    d.state.set_visible(a, false);
+    let asked_now = |d: &Driver| d.state.runtime.diagnostics().asked;
+
+    // A click on a link asks, for the document the link is in, and nothing loads meanwhile.
+    let v = d.state.open(&url("/links.html?link=/allowed.html"), true);
+    d.state.set_focus(Some(v));
+    assert!(d.run_until(WAIT, |s| commit(s, v).is_some() && s.submitted(v) > 0));
+    // The page is painted, so a click finds the link.
+    d.run_for(Duration::from_millis(500));
+    let (first, _, document) = commit(&d.state, v).unwrap();
+    click(&mut d.state, v);
+    assert!(
+        d.run_until(WAIT, |s| asked(s, v).len() == 1),
+        "a click on a link asks"
+    );
+    let (by, request, to) = asked(&d.state, v)[0].clone();
+    assert_eq!((by, to), (document, url("/allowed.html")));
+    d.run_for(Duration::from_millis(500));
+    assert!(
+        !common::served("/allowed.html"),
+        "nothing loads before the answer"
+    );
+    assert_eq!(asked_now(d), 1);
+    // Allowed, it commits with the page's own id.
+    let allow = |request| EngineCommand::AnswerNavigation {
+        request,
+        allow: true,
+    };
+    d.state.command(v, allow(request));
+    let allowed = url("/allowed.html");
+    assert!(d.run_until(WAIT, |s| commit_to(s, v, &allowed).is_some()));
+    let (own, _, effect) = commit_to(&d.state, v, &allowed).unwrap();
+    assert_ne!(own, first, "the page's own navigation");
+    assert_eq!((effect, asked_now(d)), (Some(HistoryEffect::Push), 0));
+
+    // The browser's reload, which Servo 0.5 carries out as the page's own navigation, doesn't
+    // ask.
+    let reload = NavigationId::next();
+    d.state
+        .command(v, EngineCommand::Reload { navigation: reload });
+    assert!(
+        d.run_until(WAIT, |s| committed(s, v, reload)),
+        "a reload goes ahead"
+    );
+    assert_eq!((asked(&d.state, v).len(), asked_now(d)), (1, 0));
+
+    // Denied, nothing loads and the page stays.
+    let stay = d.state.navigate(v, &url("/stay.html?link=/denied.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, v, stay)));
+    d.run_for(Duration::from_millis(500));
+    click(&mut d.state, v);
+    assert!(d.run_until(WAIT, |s| asked(s, v).len() == 2));
+    let (_, request, _) = asked(&d.state, v)[1].clone();
+    let deny = EngineCommand::AnswerNavigation {
+        request,
+        allow: false,
+    };
+    d.state.command(v, deny);
+    d.run_for(Duration::from_millis(1500));
+    assert!(
+        !common::served("/denied.html"),
+        "a denied navigation loads nothing"
+    );
+    assert_eq!((commit(&d.state, v).unwrap().0, asked_now(d)), (stay, 0));
+
+    // A new document denies what the old one asked for, and a late answer does nothing.
+    click(&mut d.state, v);
+    assert!(d.run_until(WAIT, |s| asked(s, v).len() == 3));
+    let (_, late, _) = asked(&d.state, v)[2].clone();
+    let away = d.state.navigate(v, &url("/away.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, v, away)));
+    assert_eq!(asked_now(d), 0, "denied with its document");
+    d.state.command(v, allow(late));
+    d.run_for(Duration::from_millis(1000));
+    assert!(!common::served("/denied.html"));
+    assert_eq!(commit(&d.state, v).unwrap().0, away);
+
+    // At most 16 wait: of 17 frames navigating themselves, the 17th goes ahead without asking.
+    let frames = d.state.navigate(v, &url("/frames.html?frames=17"));
+    assert!(d.run_until(WAIT, |s| committed(s, v, frames)));
+    let before = asked(&d.state, v).len();
+    let landed = |s: &State, n: usize| title(s, v) == Some(format!("landed {n}"));
+    assert!(
+        d.run_until(WAIT, |s| landed(s, 1)),
+        "the 17th goes ahead: {:?}",
+        title(&d.state, v)
+    );
+    d.run_for(Duration::from_millis(1000));
+    let held = asked(&d.state, v)[before..].to_vec();
+    assert_eq!((held.len(), asked_now(d)), (16, 16));
+    assert!(landed(&d.state, 1), "{:?}", title(&d.state, v));
+    for (_, request, _) in held {
+        d.state.command(v, allow(request));
+    }
+    assert!(
+        d.run_until(WAIT, |s| landed(s, 17)),
+        "allowed, the 16 go ahead: {:?}",
+        title(&d.state, v)
+    );
+
+    // Closing the view denies what it holds, and nothing of the view comes after.
+    let last = d.state.navigate(v, &url("/close.html?link=/closed.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, v, last)));
+    d.run_for(Duration::from_millis(500));
+    click(&mut d.state, v);
+    assert!(d.run_until(WAIT, |s| asked(s, v)
+        .last()
+        .is_some_and(|(_, _, to)| to.ends_with("/closed.html"))));
+    d.state.close(v);
+    let closed = |e: &EngineEvent| matches!(e, EngineEvent::ViewClosed { .. });
+    assert!(d.run_until(WAIT, |s| s.events_of(v).any(closed)));
+    d.run_for(Duration::from_millis(1000));
+    assert!(!common::served("/closed.html"), "closing denied it");
+    assert_eq!(d.state.events_of(v).skip_while(|e| !closed(e)).count(), 1);
+    assert_eq!(asked_now(d), 0);
+
+    d.state.navigations = Some(true);
+    d.state.set_visible(a, true);
+    d.state.set_focus(Some(a));
+}
+
 #[test]
 #[ignore = "needs a compositor: run tests/headless.sh"]
 fn servo_views_navigate_present_and_fail_distinctly() {
     let profile = std::env::temp_dir().join(format!("sighurt-m4-profile-{}", std::process::id()));
     let config = ServoConfig {
         profile: Some(profile.clone()),
+        user_agent: Some(AGENT.into()),
         audit_gl: true,
     };
     let mut d = Driver::new(config, Layout::Stack);
@@ -385,6 +571,7 @@ fn servo_views_navigate_present_and_fail_distinctly() {
     assert!(commit(&d.state, a).unwrap().1.ends_with("second.html"));
 
     navigations_servo_would_drop_or_misattribute(&mut d, a);
+    the_page_asks_before_it_navigates(&mut d, a);
 
     // Failed navigations. An address that isn't one fails the navigation, nothing else.
     let invalid = d.state.navigate(a, "http://[");
@@ -446,6 +633,16 @@ fn servo_views_navigate_present_and_fail_distinctly() {
     d.state.close(b);
     assert!(d.run_until(WAIT, |s| s.events_of(b).any(closed)));
     assert!(d.state.runtime.diagnostics().views == 1);
+
+    // The user agent the executable chose is the one pages see.
+    let agent = |e: &EngineEvent| matches!(e, EngineEvent::TitleChanged { title: Some(title), .. } if title == AGENT);
+    let ua = d.state.open(&page("agent.html"), true);
+    assert!(
+        d.run_until(WAIT, |s| s.events_of(ua).any(agent)),
+        "navigator.userAgent is the configured one"
+    );
+    d.state.close(ua);
+    assert!(d.run_until(WAIT, |s| s.events_of(ua).any(closed)));
 
     let diagnostics = d.state.runtime.diagnostics();
     println!("{diagnostics:?}");

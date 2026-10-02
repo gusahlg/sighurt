@@ -8,6 +8,12 @@ the reference for M7 and for every hypothesis in [`../HYPOTHESES.md`](../HYPOTHE
 2026: 16 workloads, 1 warm-up and 5 measured rounds, 96 runs, none failed). Its summary, below
 the notes, is `bench/report` output for that set.
 
+**Measured again on 2 October 2026**, the same binaries, interleaved with the rewrite at 3c510fe
+in one session under the pinned nixpkgs' sway (`bench/results/louise/baseline/20261002-131052/`,
+7 measured rounds): of 519 comparisons with the set above, none differs after the
+false-discovery correction (smallest q = 0.33). Comparisons with the rewrite use that set, whose
+runs share the rewrite's conditions: [`IPC-REMOVAL.md`](IPC-REMOVAL.md).
+
 ## Notes
 
 - **Build.** `gpui-baseline` (revision 359cb36) from a `git archive` of the tag (not a

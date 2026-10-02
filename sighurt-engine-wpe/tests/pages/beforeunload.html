@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>stay</title>
+<style>html, body { margin: 0; height: 100%; }</style>
+<script>
+  // Asks to stay whenever it is left; WebKit asks the embedder only once the user has interacted
+  // with the page, so a click here arms it.
+  addEventListener('beforeunload', (event) => { event.preventDefault(); event.returnValue = ''; });
+  addEventListener('click', () => { document.title = 'clicked'; });
+</script>
+<body>A page that asks to stay.</body>

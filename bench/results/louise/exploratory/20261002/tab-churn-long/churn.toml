@@ -1,0 +1,7 @@
+# Exploratory, not a benchmark workload: tab-churn for 120 s (60 cycles) instead of 20 s, to see
+# whether the memory each cycle leaves behind levels off.
+[tab-churn-long]
+description = "The article, then sixty cycles of opening a new tab, loading the article in it and closing it (one every 2 s); measured again 3 s after the last close."
+open = ["article.html"]
+active = 120
+script = "tab-churn"

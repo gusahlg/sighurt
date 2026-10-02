@@ -1,0 +1,76 @@
+tools/heavy: waiting for /tmp/gusahlg-heavy.lock (sighurt: tools/headless-sway -- sighurt-ui/tests/headless.sh --inside /tmp/claude-1000/-home-gusahlg-repos-sighurt/4074f6cc-047d-4246-ae06-9980bd83ce65/scratchpad/e2e/run1/line line /tmp/claude-1000/-home-gusahlg-repos-sighurt/4074f6cc-047d-4246-ae06-9980bd83ce65/scratchpad/e2e/run1/bin (since 13:55, pid 549784))
+PASS gles2: the red page loads
+PASS gles2: the compositor shows it under the chrome
+PASS gles2: the chrome strip is shown
+INFO [   6.358] mark: wakeups 68 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 107 stale-frames 1 rounded-frames 0 failed-imports 0
+INFO idle: 1 loop wakeups and 0 GLib dispatches in 5 s
+PASS gles2: idle: at most 3 wakeups in 5 s with a static page (1 is the mark)
+INFO transport Some(Dmabuf), device Some("/dev/dri/renderD128"), driver Some("nvidia"), 756 DMA-BUF formats
+INFO [   6.358] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+PASS gles2: the animation presents in its tab (frames in 6 s)
+PASS gles2: WebGL runs in the page
+PASS gles2: no chrome repaint because the page animated
+INFO [  12.937] mark: ViewId(2) frames 350 pacing n=349 median=17.13ms p95=17.59ms max=19.33ms
+INFO [  12.937] mark: submitted 351 dmabuf-frames 351 dmabuf-imports 4 shm-copies 0 shm-bytes 0 dropped 2 releases 349 present-mean-ms 0.052 present-max-ms 0.111
+INFO [  12.937] mark: pss-kib 256338 (WPENetworkProce 24707, bwrap 1827, wpe-window 30949, WPEWebProcess 197092, xdg-dbus-proxy 1763)
+PASS gles2: DMA-BUF: no CPU copies
+PASS gles2: DMA-BUF: buffers come back (releases)
+PASS gles2: a hidden view presents nothing
+PASS gles2: the red page shows again
+PASS gles2: hiding unmaps the page (the window's background)
+PASS gles2: showing maps it again
+PASS gles2: present: exits cleanly, no protocol error
+PASS gles2: two views present at once (left)
+PASS gles2: two views present at once (right)
+PASS gles2: split: exits cleanly, no protocol error
+PASS gles2: the video plays
+INFO video playing 4 1
+PASS gles2: video: exits cleanly, no protocol error
+PASS gles2: history: the page adds its entries
+INFO history: history.html#two history.html#one history.html#two history.html#two; effects Push Push Push Push Traverse Traverse Traverse Replace Push Push
+PASS gles2: history: back, back, forward, reload commit as traversals and a replace
+PASS gles2: history: exits cleanly, no protocol error
+PASS gles2: crash: the page loads
+INFO crash: web processes of this window: 554273
+PASS gles2: a crashed web process is ViewFailed
+INFO [   0.382] ViewFailed { view: ViewId(1), message: "The page's web process crashed; reload to start it again" }
+PASS gles2: the browser lives on
+PASS gles2: a reload starts a new web process
+PASS gles2: the reloaded page is shown
+INFO crash: web processes now: 554340
+PASS gles2: crash: exits cleanly, no protocol error
+PASS gles2: the input page loads at the window's size
+PASS gles2: a click arrives at its surface-local position
+PASS gles2: å ä ö and a dead key are typed
+PASS gles2: a named key reaches the page
+PASS gles2: the page blurs when the chrome takes the keyboard
+PASS gles2: keys for the chrome don't reach the page
+PASS gles2: the page has focus again
+PASS gles2: and gets keys
+PASS gles2: copy asks the browser, which puts it on the Wayland clipboard
+PASS gles2: paste asks the browser, which reads the Wayland clipboard
+INFO clipboard requests: 2
+PASS gles2: the wheel scrolls the page
+PASS gles2: scale 1.5: the page sees dpr 1.5 and 853x493
+PASS gles2: scale 1.5: the page is shown, its corner at 100 CSS px
+PASS gles2: scale 1.5: clicks land at the same CSS position
+PASS gles2: scale 2: the page sees dpr 2 and 640x360
+PASS gles2: scale 2: the page is shown, its corner at 100 CSS px
+PASS gles2: scale 2: clicks land at the same CSS position
+PASS gles2: scale 1.25: the page sees dpr 1.25 and 1024x600
+PASS gles2: scale 1.25: the page is shown, its corner at 100 CSS px
+PASS gles2: scale 1.25: clicks land at the same CSS position
+PASS gles2: scale 1: the page sees dpr 1 and 1280x760
+PASS gles2: scale 1: the page is shown, its corner at 100 CSS px
+PASS gles2: scale 1: clicks land at the same CSS position
+PASS gles2: a new size reaches the page
+PASS gles2: and is shown
+PASS gles2: page zoom: the page sees dpr 2 and half the size
+PASS gles2: the hovered link is the status text
+PASS gles2: and leaves it
+PASS gles2: input: exits cleanly, no protocol error
+PASS gles2: an https page loads
+PASS gles2: and is shown
+PASS gles2: web: exits cleanly, no protocol error
+0 failed; logs and screenshots in /tmp/claude-1000/-home-gusahlg-repos-sighurt/4074f6cc-047d-4246-ae06-9980bd83ce65/scratchpad/final/wc-trap
+wl_display_dispatch: Broken pipe

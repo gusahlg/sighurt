@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# private-bus CMD...: runs CMD on a D-Bus session bus of its own with no service activation, as
+# nix/wpe-smoke.sh does: WebKit's D-Bus calls (accessibility, portals) reach neither the user's
+# session nor services started for them.
+set -eu
+conf=$(mktemp)
+trap 'rm -f "$conf"' EXIT
+cat > "$conf" << 'CONF'
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+CONF
+dbus-run-session --config-file="$conf" -- "$@"

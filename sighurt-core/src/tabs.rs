@@ -70,13 +70,14 @@ pub(crate) struct Tab {
 }
 
 impl Tab {
-    pub(crate) fn new(opened_by_page: bool) -> Self {
+    /// An empty tab at page zoom `zoom`.
+    pub(crate) fn new(opened_by_page: bool, zoom: f64) -> Self {
         Self {
             id: TabId::next(),
             segments: Vec::new(),
             current: 0,
             switch: None,
-            zoom: 1.0,
+            zoom,
             error: None,
             last_download: None,
             opened_by_page,
@@ -162,6 +163,11 @@ pub struct View {
     pub(crate) navigations: Navigations,
     /// When the user last clicked or pressed a key in it, unless used up.
     pub(crate) activation: Option<Instant>,
+    /// The link the pointer was over (the page's status text) when that was a click; `None`
+    /// after a key press.
+    pub(crate) link: Option<String>,
+    /// Opened, or last navigated by the user, in an engine the user chose.
+    pub(crate) chosen: bool,
     /// The user's answers to `document`'s permission prompts. Dropped with the document.
     pub(crate) answers: Vec<(Permission, bool)>,
 }
@@ -188,8 +194,17 @@ impl View {
             history: EngineHistory::default(),
             navigations: Navigations::default(),
             activation: None,
+            link: None,
+            chosen: false,
             answers: Vec::new(),
         }
+    }
+
+    /// The user clicked (over `link`, if the pointer was over one) or pressed a key in it at
+    /// `at`.
+    pub(crate) fn activated(&mut self, at: Instant, link: Option<String>) {
+        self.activation = Some(at);
+        self.link = link;
     }
 
     /// Its id.
@@ -223,6 +238,14 @@ impl View {
     /// Its pending navigations.
     pub fn navigations(&self) -> &Navigations {
         &self.navigations
+    }
+
+    /// Whether it is chosen: opened, or last navigated by the user, in an engine the user chose
+    /// (`page.open-in`, or an `OpenRequest` naming an engine). Typing an address, `page.open`
+    /// and `browser.home` make it unchosen; the page's own navigations leave it as it is. The
+    /// links of a chosen view's pages stay in its engine, wherever routing would send them.
+    pub fn chosen(&self) -> bool {
+        self.chosen
     }
 
     /// What is left of it once it is closed.

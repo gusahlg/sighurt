@@ -1,0 +1,46 @@
+[   0.023] window 1024x768 at 120/120
+[   0.027] ViewReady { view: ViewId(1) }
+[   0.027] LoadingChanged { view: ViewId(1), loading: true }
+[   0.027] ViewReady { view: ViewId(2) }
+[   0.027] LoadingChanged { view: ViewId(2), loading: true }
+[   0.174] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 13:47:35.317: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.361] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html" }
+[   0.363] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.363] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html"], current: 0 }
+
+** (WPEWebProcess:2): WARNING **: 13:47:35.325: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.369] NavigationStarted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html" }
+[   0.371] NavigationCommitted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html", document: DocumentGeneration(2), history: Some(Push) }
+[   0.371] HistoryChanged { view: ViewId(2), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html"], current: 0 }
+[   0.495] LoadingChanged { view: ViewId(1), loading: false }
+[   0.496] TitleChanged { view: ViewId(1), title: Some("webgl WebGL 1.0") }
+[   0.499] LoadingChanged { view: ViewId(2), loading: false }
+[   0.499] TitleChanged { view: ViewId(2), title: Some("webgl WebGL 1.0") }
+[   1.497] TitleChanged { view: ViewId(1), title: Some("webgl 60") }
+[   1.515] TitleChanged { view: ViewId(2), title: Some("webgl 60") }
+[   2.536] TitleChanged { view: ViewId(1), title: Some("webgl 120") }
+[   2.553] TitleChanged { view: ViewId(2), title: Some("webgl 120") }
+[   3.577] TitleChanged { view: ViewId(1), title: Some("webgl 180") }
+[   3.593] TitleChanged { view: ViewId(2), title: Some("webgl 180") }
+[   4.615] TitleChanged { view: ViewId(1), title: Some("webgl 240") }
+[   4.632] TitleChanged { view: ViewId(2), title: Some("webgl 240") }
+[   5.666] TitleChanged { view: ViewId(1), title: Some("webgl 300") }
+[   5.682] TitleChanged { view: ViewId(2), title: Some("webgl 300") }
+[   5.963] action mark
+[   5.963] mark: wakeups 1308 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 771 stale-frames 2 rounded-frames 0 failed-imports 0
+[   5.963] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   5.963] mark: submitted 632 dmabuf-frames 0 dmabuf-imports 0 shm-copies 632 shm-bytes 1229619200 dropped 2 releases 628 present-mean-ms 0.541 present-max-ms 0.879
+[   5.963] mark: ViewId(1) frames 316 pacing n=315 median=17.35ms p95=17.80ms max=18.21ms
+[   5.963] mark: ViewId(2) frames 316 pacing n=315 median=17.35ms p95=17.77ms max=18.12ms
+[   5.963] mark: pss-kib 282668 (wpe-window 38360, WPENetworkProce 24746, bwrap 1842, xdg-dbus-proxy 1759, WPEWebProcess 215961)
+[   6.524] action quit
+[   6.524] end: wakeups 1437 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 834 stale-frames 2 rounded-frames 0 failed-imports 0
+[   6.524] end: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   6.524] end: submitted 696 dmabuf-frames 0 dmabuf-imports 0 shm-copies 696 shm-bytes 1354137600 dropped 2 releases 692 present-mean-ms 0.542 present-max-ms 0.879
+[   6.524] end: ViewId(1) frames 348 pacing n=347 median=17.36ms p95=17.84ms max=22.08ms
+[   6.524] end: ViewId(2) frames 348 pacing n=347 median=17.36ms p95=17.82ms max=21.92ms
+[   6.524] end: pss-kib 282743 (xdg-dbus-proxy 1759, wpe-window 38392, WPEWebProcess 216001, bwrap 1844, WPENetworkProce 24747)
+shut down: the compositor reported no error
+exit 0

@@ -1,0 +1,81 @@
+[   0.024] window 1024x768 at 120/120
+[   0.027] ViewReady { view: ViewId(1) }
+[   0.027] LoadingChanged { view: ViewId(1), loading: true }
+[   0.027] ViewReady { view: ViewId(2) }
+[   0.027] LoadingChanged { view: ViewId(2), loading: true }
+[   0.175] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 13:48:18.849: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.237] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html" }
+[   0.239] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.239] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html"], current: 0 }
+[   0.240] LoadingChanged { view: ViewId(1), loading: false }
+[   0.240] TitleChanged { view: ViewId(1), title: Some("red") }
+
+** (WPEWebProcess:2): WARNING **: 13:48:18.857: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.245] NavigationStarted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html" }
+[   0.246] NavigationCommitted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html", document: DocumentGeneration(2), history: Some(Push) }
+[   0.246] HistoryChanged { view: ViewId(2), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html"], current: 0 }
+[   0.376] LoadingChanged { view: ViewId(2), loading: false }
+[   0.376] TitleChanged { view: ViewId(2), title: Some("webgl WebGL 1.0") }
+[   1.350] action mark
+[   1.350] mark: wakeups 66 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 113 stale-frames 1 rounded-frames 0 failed-imports 0
+[   1.350] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   1.350] mark: submitted 1 dmabuf-frames 0 dmabuf-imports 0 shm-copies 1 shm-bytes 3891200 dropped 1 releases 1 present-mean-ms 1.600 present-max-ms 1.600
+[   1.350] mark: ViewId(1) frames 1 pacing -
+[   1.350] mark: ViewId(2) frames 0 pacing -
+[   1.350] mark: pss-kib 258725 (WPEWebProcess 195937, wpe-window 34597, xdg-dbus-proxy 1749, WPENetworkProce 24623, bwrap 1819)
+[   6.352] action mark
+[   6.352] mark: wakeups 67 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 113 stale-frames 1 rounded-frames 0 failed-imports 0
+[   6.352] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   6.352] mark: submitted 1 dmabuf-frames 0 dmabuf-imports 0 shm-copies 1 shm-bytes 3891200 dropped 1 releases 1 present-mean-ms 1.600 present-max-ms 1.600
+[   6.352] mark: ViewId(1) frames 1 pacing -
+[   6.352] mark: ViewId(2) frames 0 pacing -
+[   6.352] mark: pss-kib 259020 (bwrap 1819, WPEWebProcess 196125, wpe-window 34704, WPENetworkProce 24623, xdg-dbus-proxy 1749)
+[   6.907] action select=2
+[   7.937] TitleChanged { view: ViewId(2), title: Some("webgl 60") }
+[   8.991] TitleChanged { view: ViewId(2), title: Some("webgl 120") }
+[  10.042] TitleChanged { view: ViewId(2), title: Some("webgl 180") }
+[  11.097] TitleChanged { view: ViewId(2), title: Some("webgl 240") }
+[  12.149] TitleChanged { view: ViewId(2), title: Some("webgl 300") }
+[  12.910] action mark
+[  12.910] mark: wakeups 1160 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 494 stale-frames 2 rounded-frames 0 failed-imports 0
+[  12.910] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[  12.910] mark: submitted 343 dmabuf-frames 0 dmabuf-imports 0 shm-copies 343 shm-bytes 1334681600 dropped 2 releases 342 present-mean-ms 1.115 present-max-ms 1.614
+[  12.910] mark: ViewId(1) frames 1 pacing -
+[  12.910] mark: ViewId(2) frames 342 pacing n=341 median=17.46ms p95=18.15ms max=18.48ms
+[  12.910] mark: pss-kib 276019 (WPENetworkProce 24627, xdg-dbus-proxy 1753, wpe-window 40696, bwrap 1819, WPEWebProcess 207124)
+[  13.201] TitleChanged { view: ViewId(2), title: Some("webgl 360") }
+[  13.513] action select=1
+[  14.516] action mark
+[  14.516] mark: wakeups 1293 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 538 stale-frames 2 rounded-frames 0 failed-imports 0
+[  14.516] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[  14.516] mark: submitted 378 dmabuf-frames 0 dmabuf-imports 0 shm-copies 378 shm-bytes 1470873600 dropped 2 releases 378 present-mean-ms 1.110 present-max-ms 1.614
+[  14.516] mark: ViewId(1) frames 1 pacing -
+[  14.516] mark: ViewId(2) frames 377 pacing n=376 median=17.46ms p95=18.15ms max=24.06ms
+[  14.516] mark: pss-kib 276043 (wpe-window 40716, WPEWebProcess 207128, WPENetworkProce 24627, bwrap 1819, xdg-dbus-proxy 1753)
+[  14.730] action mark
+[  14.730] mark: wakeups 1294 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 538 stale-frames 2 rounded-frames 0 failed-imports 0
+[  14.730] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[  14.730] mark: submitted 378 dmabuf-frames 0 dmabuf-imports 0 shm-copies 378 shm-bytes 1470873600 dropped 2 releases 378 present-mean-ms 1.110 present-max-ms 1.614
+[  14.730] mark: ViewId(1) frames 1 pacing -
+[  14.730] mark: ViewId(2) frames 377 pacing n=376 median=17.46ms p95=18.15ms max=24.06ms
+[  14.730] mark: pss-kib 276043 (bwrap 1819, wpe-window 40716, WPEWebProcess 207128, xdg-dbus-proxy 1753, WPENetworkProce 24627)
+[  17.736] action mark
+[  17.736] mark: wakeups 1295 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 538 stale-frames 2 rounded-frames 0 failed-imports 0
+[  17.736] mark: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[  17.736] mark: submitted 378 dmabuf-frames 0 dmabuf-imports 0 shm-copies 378 shm-bytes 1470873600 dropped 2 releases 378 present-mean-ms 1.110 present-max-ms 1.614
+[  17.736] mark: ViewId(1) frames 1 pacing -
+[  17.736] mark: ViewId(2) frames 377 pacing n=376 median=17.46ms p95=18.15ms max=24.06ms
+[  17.736] mark: pss-kib 276078 (wpe-window 40715, xdg-dbus-proxy 1757, WPENetworkProce 24619, bwrap 1819, WPEWebProcess 207168)
+[  17.979] action hide
+[  19.005] action show
+[  20.033] action quit
+[  20.033] end: wakeups 1303 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 544 stale-frames 2 rounded-frames 0 failed-imports 0
+[  20.033] end: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[  20.033] end: submitted 378 dmabuf-frames 0 dmabuf-imports 0 shm-copies 378 shm-bytes 1470873600 dropped 2 releases 378 present-mean-ms 1.110 present-max-ms 1.614
+[  20.033] end: ViewId(1) frames 1 pacing -
+[  20.033] end: ViewId(2) frames 377 pacing n=376 median=17.46ms p95=18.15ms max=24.06ms
+[  20.033] end: pss-kib 276066 (wpe-window 40715, bwrap 1819, xdg-dbus-proxy 1757, WPENetworkProce 24619, WPEWebProcess 207156)
+shut down: the compositor reported no error
+exit 0

@@ -1,0 +1,81 @@
+[   0.024] window 1024x768 at 120/120
+[   0.028] ViewReady { view: ViewId(1) }
+[   0.028] LoadingChanged { view: ViewId(1), loading: true }
+[   0.028] ViewReady { view: ViewId(2) }
+[   0.028] LoadingChanged { view: ViewId(2), loading: true }
+[   0.175] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 14:04:50.898: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.237] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html" }
+[   0.240] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.240] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/red.html"], current: 0 }
+[   0.242] LoadingChanged { view: ViewId(1), loading: false }
+[   0.242] TitleChanged { view: ViewId(1), title: Some("red") }
+
+** (WPEWebProcess:2): WARNING **: 14:04:50.907: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.245] NavigationStarted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html" }
+[   0.247] NavigationCommitted { view: ViewId(2), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html", document: DocumentGeneration(2), history: Some(Push) }
+[   0.247] HistoryChanged { view: ViewId(2), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/animated.html"], current: 0 }
+[   0.379] LoadingChanged { view: ViewId(2), loading: false }
+[   0.379] TitleChanged { view: ViewId(2), title: Some("webgl WebGL 1.0") }
+[   1.355] action mark
+[   1.355] mark: wakeups 67 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 107 stale-frames 1 rounded-frames 0 failed-imports 0
+[   1.355] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[   1.355] mark: submitted 1 dmabuf-frames 1 dmabuf-imports 1 shm-copies 0 shm-bytes 0 dropped 1 releases 0 present-mean-ms 0.033 present-max-ms 0.033
+[   1.355] mark: ViewId(1) frames 1 pacing -
+[   1.355] mark: ViewId(2) frames 0 pacing -
+[   1.355] mark: pss-kib 250905 (xdg-dbus-proxy 1761, bwrap 1827, WPENetworkProce 24704, wpe-window 30784, WPEWebProcess 191829)
+[   6.358] action mark
+[   6.358] mark: wakeups 68 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 107 stale-frames 1 rounded-frames 0 failed-imports 0
+[   6.358] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[   6.358] mark: submitted 1 dmabuf-frames 1 dmabuf-imports 1 shm-copies 0 shm-bytes 0 dropped 1 releases 0 present-mean-ms 0.033 present-max-ms 0.033
+[   6.358] mark: ViewId(1) frames 1 pacing -
+[   6.358] mark: ViewId(2) frames 0 pacing -
+[   6.358] mark: pss-kib 251196 (WPEWebProcess 192017, wpe-window 30890, WPENetworkProce 24703, bwrap 1827, xdg-dbus-proxy 1759)
+[   6.931] action select=2
+[   7.934] TitleChanged { view: ViewId(2), title: Some("webgl 60") }
+[   8.959] TitleChanged { view: ViewId(2), title: Some("webgl 120") }
+[   9.994] TitleChanged { view: ViewId(2), title: Some("webgl 180") }
+[  11.026] TitleChanged { view: ViewId(2), title: Some("webgl 240") }
+[  12.054] TitleChanged { view: ViewId(2), title: Some("webgl 300") }
+[  12.937] action mark
+[  12.937] mark: wakeups 1465 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 846 stale-frames 2 rounded-frames 0 failed-imports 0
+[  12.937] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[  12.937] mark: submitted 351 dmabuf-frames 351 dmabuf-imports 4 shm-copies 0 shm-bytes 0 dropped 2 releases 349 present-mean-ms 0.052 present-max-ms 0.111
+[  12.937] mark: ViewId(1) frames 1 pacing -
+[  12.937] mark: ViewId(2) frames 350 pacing n=349 median=17.13ms p95=17.59ms max=19.33ms
+[  12.937] mark: pss-kib 256338 (WPENetworkProce 24707, bwrap 1827, wpe-window 30949, WPEWebProcess 197092, xdg-dbus-proxy 1763)
+[  13.091] TitleChanged { view: ViewId(2), title: Some("webgl 360") }
+[  13.540] action select=1
+[  14.544] action mark
+[  14.544] mark: wakeups 1612 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 927 stale-frames 2 rounded-frames 0 failed-imports 0
+[  14.544] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[  14.544] mark: submitted 386 dmabuf-frames 386 dmabuf-imports 4 shm-copies 0 shm-bytes 0 dropped 2 releases 384 present-mean-ms 0.052 present-max-ms 0.117
+[  14.544] mark: ViewId(1) frames 1 pacing -
+[  14.544] mark: ViewId(2) frames 385 pacing n=384 median=17.13ms p95=17.62ms max=23.29ms
+[  14.544] mark: pss-kib 256390 (WPEWebProcess 197128, wpe-window 30965, WPENetworkProce 24707, bwrap 1827, xdg-dbus-proxy 1763)
+[  14.758] action mark
+[  14.758] mark: wakeups 1613 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 927 stale-frames 2 rounded-frames 0 failed-imports 0
+[  14.758] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[  14.758] mark: submitted 386 dmabuf-frames 386 dmabuf-imports 4 shm-copies 0 shm-bytes 0 dropped 2 releases 384 present-mean-ms 0.052 present-max-ms 0.117
+[  14.758] mark: ViewId(1) frames 1 pacing -
+[  14.758] mark: ViewId(2) frames 385 pacing n=384 median=17.13ms p95=17.62ms max=23.29ms
+[  14.758] mark: pss-kib 256390 (WPENetworkProce 24707, WPEWebProcess 197128, xdg-dbus-proxy 1763, bwrap 1827, wpe-window 30965)
+[  17.766] action mark
+[  17.766] mark: wakeups 1614 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 927 stale-frames 2 rounded-frames 0 failed-imports 0
+[  17.766] mark: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[  17.766] mark: submitted 386 dmabuf-frames 386 dmabuf-imports 4 shm-copies 0 shm-bytes 0 dropped 2 releases 384 present-mean-ms 0.052 present-max-ms 0.117
+[  17.766] mark: ViewId(1) frames 1 pacing -
+[  17.766] mark: ViewId(2) frames 385 pacing n=384 median=17.13ms p95=17.62ms max=23.29ms
+[  17.766] mark: pss-kib 256426 (WPENetworkProce 24699, bwrap 1827, xdg-dbus-proxy 1767, wpe-window 30965, WPEWebProcess 197168)
+[  18.010] action hide
+[  19.036] action show
+[  20.062] action quit
+[  20.062] end: wakeups 1623 chrome-paints 2 transport Some(Dmabuf) device Some("/dev/dri/renderD128") driver Some("nvidia") formats 756 glib-dispatches 934 stale-frames 2 rounded-frames 0 failed-imports 0
+[  20.062] end: renderer Some("WebKit, DMA-BUF on /dev/dri/renderD128 (nvidia)")
+[  20.062] end: submitted 386 dmabuf-frames 386 dmabuf-imports 4 shm-copies 0 shm-bytes 0 dropped 2 releases 384 present-mean-ms 0.052 present-max-ms 0.117
+[  20.062] end: ViewId(1) frames 1 pacing -
+[  20.062] end: ViewId(2) frames 385 pacing n=384 median=17.13ms p95=17.62ms max=23.29ms
+[  20.062] end: pss-kib 256415 (wpe-window 30965, WPEWebProcess 197156, WPENetworkProce 24699, xdg-dbus-proxy 1768, bwrap 1827)
+shut down: the compositor reported no error
+exit 0

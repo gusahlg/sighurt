@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs a command in the benchmark harness's own copy of bench/, tools/ and shell.nix on the
+# Runs a command in the benchmark harness's own copy of bench/, tools/, shell.nix and nix/ on the
 # benchmark machine (louise-pc), in ~/sighurt-bench/harness. It is separate from the tree that
 # tools/remote syncs, so other people's syncs can't change the harness under a long run, and it
 # doesn't hold tools/remote's lock, so a benchmark doesn't block their builds.
@@ -26,7 +26,7 @@ done
 if [[ $sync == 1 ]]; then
   ssh -o BatchMode=yes "$host" "mkdir -p $dest"
   rsync -a --delete --exclude /bench/results -e 'ssh -o BatchMode=yes' \
-    "$repo/bench" "$repo/tools" "$repo/shell.nix" "$host:$dest/"
+    "$repo/bench" "$repo/tools" "$repo/shell.nix" "$repo/nix" "$host:$dest/"
 fi
 rev=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)
 git -C "$repo" diff --quiet HEAD -- bench tools 2>/dev/null || rev="$rev+dirty"

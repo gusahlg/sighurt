@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>keys</title>
+<!-- The last key this page received (key/code) and how far it is scrolled, in its address
+     (history.replaceState), which sig saves in its session, so engines.sh reads it there. -->
+<style>
+  body { margin: 0; height: 20000px; background: linear-gradient(#fdfdf8, #88aacc); }
+</style>
+<script>
+  let key = "none";
+  const say = () => history.replaceState(null, "", `#${key} ${Math.round(scrollY)}`);
+  addEventListener("keydown", (e) => { key = `${e.key}/${e.code}`; say(); });
+  addEventListener("scroll", say);
+  addEventListener("load", say);
+</script>

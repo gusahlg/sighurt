@@ -14,6 +14,16 @@
 //! are waiting, so a page that floods Servo with commits fills Servo's own channels, not this
 //! queue.
 //!
+//! Before Servo carries out a navigation a page started that it would load itself (a link, a
+//! form, a script, of the top-level document or of a frame: Servo 0.5 doesn't say which), the
+//! view asks the browser (`NavigationRequested`) and holds Servo's request until the answer
+//! (`AnswerNavigation`), at most [`MAX_ASKED`] per view; beyond them, or without a committed
+//! document to ask for, the navigation goes ahead without asking, and so does the browser's own
+//! reload, which Servo 0.5 carries out as the page's navigation to its address. A new document,
+//! a crash, closing the view and shutting down deny what is still held. A navigation Servo
+//! doesn't load itself (another scheme; a local file from a web page) is denied and handed to
+//! the browser (`OpenRequested`).
+//!
 //! `Stop` cancels a navigation still queued (see [`crate::view`]), gives up on a top-level load
 //! that has shown no sign of life for [`LOAD_WAIT`](crate::view::LOAD_WAIT) (its
 //! `NavigationFailed` is `Cancelled`), and stops the document's own loading (`window.stop()`).
@@ -36,7 +46,11 @@
 //! ```text
 //! servo-timing frame view=3 w=1280 h=696 paint_ms=1.234 swap_ms=0.210
 //! servo-timing first-frame view=3 after_navigate_ms=345.6
+//! servo-timing navigation-answered view=3 held_ms=0.412
 //! ```
+//!
+//! The last is how long a navigation the page asked for waited for the browser's answer, from
+//! Servo's request to the answer.
 //!
 //! [`EngineRuntime::shutdown`] closes in the order M1 established: the WebViews, then Servo
 //! (which spins until its constellation, WebGL and paint threads are done), then each view's
@@ -84,6 +98,9 @@ const MAX_EVENTS_PER_PUMP: usize = 256;
 const MAX_REQUESTS: usize = 16;
 /// Pop-ups a view may have waiting for their first navigation.
 const MAX_POPUPS: usize = 4;
+/// Navigations a view may hold for the browser's answer; the page's navigations beyond them go
+/// ahead without asking.
+const MAX_ASKED: usize = 16;
 /// The most clipboard text a page reads.
 const CLIPBOARD_LIMIT: usize = 4 << 20;
 const TEXT_PLAIN: &str = "text/plain;charset=utf-8";
@@ -100,6 +117,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
+    process_per_view: false,
 };
 
 /// What the executable decides for the Servo runtime.
@@ -107,6 +125,10 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
 pub struct ServoConfig {
     /// Servo's profile directory: `{data_dir}/sighurt/servo` in `sig`. `None` keeps nothing.
     pub profile: Option<PathBuf>,
+    /// The user agent pages see and requests send, process-wide; `None` for the adapter's own,
+    /// Servo's with Firefox's `Gecko/20100101` token. It must be a valid HTTP header value:
+    /// Servo's network code unwraps its parse.
+    pub user_agent: Option<String>,
     /// Counts every `glReadPixels`/`glGetTexImage` WebRender makes, for tests and diagnostics.
     /// It times every GL call, so it is off for normal use; `read_to_image` is always counted.
     pub audit_gl: bool,
@@ -128,6 +150,8 @@ pub struct ServoDiagnostics {
     pub frames: u64,
     /// Open views.
     pub views: usize,
+    /// Navigations the views' pages asked for that wait for the browser's answer.
+    pub asked: usize,
     /// How long painting and navigating took.
     pub timing: ServoTiming,
     /// Servo was left running when the runtime shut down (after a page crash or a lost
@@ -259,7 +283,7 @@ impl ServoRuntime {
                 config_dir: profile.clone(),
                 ..Opts::default()
             })
-            .preferences(preferences())
+            .preferences(preferences(config.user_agent.as_deref()))
             .event_loop_waker(Box::new(Waker(waker.clone())))
             .build();
         let delegate = Rc::new(Delegate::default());
@@ -304,6 +328,7 @@ impl ServoRuntime {
             gl_reads: self.readbacks.gl_reads.as_ref().map(|reads| reads.get()),
             frames: self.frames,
             views: self.views.len(),
+            asked: self.views.values().map(|view| view.asked.len()).sum(),
             timing: self.timing,
             leaked: self.leaked,
         }
@@ -614,8 +639,10 @@ impl ServoRuntime {
                     );
                     if view.document() != before {
                         // Nothing asked for by the old document carries over; the browser
-                        // cancels its requests itself.
+                        // cancels its requests itself, and its navigations are denied.
                         view.requests.clear();
+                        view.asked.clear();
+                        view.reloading = false;
                         for popup in view.popups.drain(..) {
                             self.owners.remove(&popup.id());
                         }
@@ -660,6 +687,7 @@ impl ServoRuntime {
             }
             Note::Crashed(reason) => {
                 view.crashed = true;
+                view.asked.clear();
                 self.page_crashed = true;
                 push(
                     events,
@@ -674,23 +702,38 @@ impl ServoRuntime {
                     push(events, EngineEvent::CloseRequested { view: id, document });
                 }
             }
-            Note::Navigation(request) => {
-                if view.loads_itself(&request.url) {
-                    request.allow();
-                    // If it is the top level's (Servo 0.5 doesn't say whether it is an
-                    // iframe's), Servo would drop a browser navigation until it has its
-                    // document. One already in flight goes on; one that showed no sign of life
-                    // for `LOAD_WAIT` is given up for it.
-                    if !view.load.is_some_and(|load| load.alive(Instant::now())) {
-                        if let Some(given_up) = view.give_up_load() {
-                            push(events, cancelled(id, given_up));
+            Note::Navigation(navigation) => {
+                let url = navigation.url().to_string();
+                if view.loads_itself(navigation.url()) {
+                    let reload = view.reloading && view.navigator.url() == Some(url.as_str());
+                    match view.document() {
+                        Some(document) if !reload && view.asked.len() < MAX_ASKED => {
+                            let request = RequestId::next();
+                            view.asked.push((request, navigation));
+                            push(
+                                events,
+                                EngineEvent::NavigationRequested {
+                                    view: id,
+                                    document,
+                                    request,
+                                    url,
+                                },
+                            );
                         }
-                        view.load = Some(Load::new(None));
+                        // The browser's reload, or nothing to ask for, or too much asked.
+                        _ => {
+                            if reload {
+                                view.reloading = false;
+                            }
+                            if let Some(given_up) = view.allow(navigation) {
+                                push(events, cancelled(id, given_up));
+                            }
+                        }
                     }
                     return;
                 }
-                let url = request.url.to_string();
-                request.deny();
+                // Denied, and handed to the browser.
+                drop(navigation);
                 if let Some(document) = view.document() {
                     push(
                         events,
@@ -843,11 +886,8 @@ impl ServoRuntime {
         note: Note,
     ) {
         let url = match note {
-            Note::Navigation(request) => {
-                let url = request.url.clone();
-                request.deny();
-                url
-            }
+            // Denied when dropped.
+            Note::Navigation(navigation) => navigation.url().clone(),
             Note::History(entries, current) => match entries.into_iter().nth(current) {
                 Some(url) => url,
                 None => return,
@@ -877,6 +917,8 @@ impl ServoRuntime {
     /// Drops what Servo made for a view, then the context, then the lease. Returns the view
     /// back if something still holds the context, so its lease isn't dropped under it.
     fn release(&mut self, mut view: View) -> Option<View> {
+        // Denied while their WebView still exists.
+        view.asked.clear();
         for popup in view.popups.drain(..) {
             self.owners.remove(&popup.id());
         }
@@ -1052,6 +1094,7 @@ impl EngineRuntime for ServoRuntime {
                 Some(webview) if view.navigator.url().is_some() => {
                     view.navigator.request(navigation, Request::Reload);
                     webview.reload();
+                    view.reloading = true;
                     view.load = Some(Load::new(Some(navigation)));
                     if !view.loading {
                         view.loading = true;
@@ -1145,6 +1188,26 @@ impl EngineRuntime for ServoRuntime {
                 if let Some(index) = index {
                     let (_, pending) = view.requests.remove(index);
                     resolve(pending, result);
+                }
+            }
+            EngineCommand::AnswerNavigation { request, allow } => {
+                let index = view.asked.iter().position(|(r, _)| *r == request);
+                if let Some(index) = index {
+                    let (_, navigation) = view.asked.remove(index);
+                    log::debug!(
+                        target: TIMING,
+                        "servo-timing navigation-answered view={} held_ms={:.3}",
+                        id.serial(),
+                        navigation.since.elapsed().as_secs_f64() * 1e3
+                    );
+                    match allow {
+                        true => {
+                            if let Some(given_up) = view.allow(navigation) {
+                                push(&mut self.events, cancelled(id, given_up));
+                            }
+                        }
+                        false => drop(navigation),
+                    }
                 }
             }
         }
@@ -1252,12 +1315,15 @@ impl EngineRuntime for ServoRuntime {
         let mut views: Vec<View> = self.views.drain().map(|(_, view)| view).collect();
         views.append(&mut self.closing);
         for view in &mut views {
+            view.asked.clear();
             view.popups.clear();
             view.webview = None;
             view.requests.clear();
         }
         self.owners.clear();
+        // Navigations in notes not taken in yet are denied with them.
         self.held.clear();
+        drop(self.delegate.take());
         if self.failed.is_some() || self.page_crashed {
             // Servo's `Drop` spins until its constellation says it has exited, which neither a
             // lost backend nor, after a page crash, a constellation waiting for the dead
@@ -1324,10 +1390,14 @@ fn resolve(pending: Pending, result: ServiceResult) {
 }
 
 /// Servo's preferences: its defaults with the changes the old `sig-servo` made, for the
-/// reasons its README records (`gpui-baseline:sighurt-engine-servo/README.md`).
-fn preferences() -> Preferences {
+/// reasons its README records (`gpui-baseline:sighurt-engine-servo/README.md`), and
+/// `user_agent` if the executable sets one.
+fn preferences(user_agent: Option<&str>) -> Preferences {
     let mut prefs = Preferences::default();
-    prefs.user_agent = firefox_user_agent(&prefs.user_agent);
+    prefs.user_agent = match user_agent {
+        Some(agent) => agent.to_owned(),
+        None => firefox_user_agent(&prefs.user_agent),
+    };
     // Web platform features that Servo 0.5 implements but leaves off, and that common sites use.
     // Without grid, sites like mozilla.org and theguardian.com lose their layout.
     prefs.dom_exec_command_enabled = true;
@@ -1431,6 +1501,10 @@ mod tests {
         );
         let default = firefox_user_agent(&Preferences::default().user_agent);
         assert!(default.contains(" Gecko/20100101 Firefox/"), "{default}");
+        assert_eq!(preferences(None).user_agent, default);
+        // The executable's, as it is.
+        let agent = "Mozilla/5.0 (X11; Linux x86_64) Sighurt/0.1";
+        assert_eq!(preferences(Some(agent)).user_agent, agent);
     }
 
     /// Servo's constellation can't be killed from outside, so this reports its loss the way

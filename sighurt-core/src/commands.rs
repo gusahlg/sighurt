@@ -7,18 +7,28 @@
 //!   one before if it was the last.
 //! - `tab.next` and `tab.previous` wrap around.
 //! - Page zoom walks [`ZOOM_STEPS`] and stops at its ends; each tab keeps its own, across
-//!   engines.
+//!   engines. New tabs start at the configured `zoom`, and `page.zoom-reset` returns to it.
+//! - `page.open-in <engine> [address]` opens the address, or the active tab's own address
+//!   again, in the engine named, as a new navigation of the tab (the old page is a segment back
+//!   in its history); the view it opens is chosen (`View::chosen`). An engine the build lacks,
+//!   or one not enabled, and `sig:` pages are the tab's error, as when typed.
 //! - `browser.home` opens the home page in the active tab.
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
 //!   `Effect::Focus`. Commands that change what the page area shows give the page the keyboard.
+//! - `page.send-key` presses and releases its key in the page only while the page has the
+//!   keyboard; run by a key press, that counts as the user's key press in the page.
+//! - `chrome.<action>` is the chrome's own: the core hands it on (`Effect::ChromeCommand`).
+//! - A tab the chrome selects or closes by its identity gets the command for its number now.
 //!
-//! Key bindings are matched in [`crate::keys`].
+//! Key presses become commands in [`crate::keys`].
 
 use std::num::NonZeroUsize;
 
 use sighurt_api::commands::Command;
+use sighurt_api::ids::TabId;
+use sighurt_api::input::KeyboardFocus;
 
-use crate::state::{BrowserState, Focus, Fx};
+use crate::state::{BrowserState, By, Effect, Fx};
 
 /// Page zoom levels in percent, as in common browsers.
 pub const ZOOM_STEPS: [u32; 13] = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300];
@@ -57,13 +67,13 @@ impl BrowserState {
                 let tab = self.new_tab(false);
                 self.active = tab;
                 self.open_home(tab, fx);
-                Some(Focus::Location)
+                Some(KeyboardFocus::Chrome)
             }
             Command::TabClose(n) => {
                 if let Some(index) = n.map_or(Some(active), tab_number) {
                     self.close_tab(index, fx);
                 }
-                Some(Focus::Page)
+                Some(KeyboardFocus::Page)
             }
             Command::TabNext => self.select((active + 1) % count, fx),
             Command::TabPrevious => self.select((active + count - 1) % count, fx),
@@ -72,9 +82,19 @@ impl BrowserState {
             Command::PageOpen(input) => {
                 let url = self.fixup(&input);
                 if !url.is_empty() {
-                    self.navigate(active, url, None, fx);
+                    self.navigate(active, url, By::User(None), fx);
                 }
-                Some(Focus::Page)
+                Some(KeyboardFocus::Page)
+            }
+            Command::PageOpenIn { engine, address } => {
+                let url = match address {
+                    Some(address) => Some(self.fixup(&address)),
+                    None => self.address(active),
+                };
+                if let Some(url) = url.filter(|url| !url.is_empty()) {
+                    self.navigate(active, url, By::User(Some(&engine)), fx);
+                }
+                Some(KeyboardFocus::Page)
             }
             Command::PageReload => {
                 self.reload(active, fx);
@@ -86,26 +106,34 @@ impl BrowserState {
             }
             Command::PageBack | Command::PageForward => {
                 self.traverse(active, command == Command::PageBack, fx);
-                Some(Focus::Page)
+                Some(KeyboardFocus::Page)
             }
             Command::PageZoomIn | Command::PageZoomOut | Command::PageZoomReset => {
                 let tab = &mut self.tabs[active];
                 tab.zoom = match command {
                     Command::PageZoomIn => zoom_step(tab.zoom, true),
                     Command::PageZoomOut => zoom_step(tab.zoom, false),
-                    _ => 1.0,
+                    _ => self.config.zoom(),
                 };
                 fx.chrome = true;
                 fx.session = true;
                 None
             }
-            Command::LocationFocus => Some(Focus::Location),
+            Command::PageSendKey(key) => {
+                self.send_key(&key, fx);
+                None
+            }
+            Command::LocationFocus => Some(KeyboardFocus::Chrome),
             Command::BrowserHome => {
                 self.open_home(active, fx);
-                Some(Focus::Page)
+                Some(KeyboardFocus::Page)
             }
             Command::BrowserQuit => {
                 fx.quit = true;
+                None
+            }
+            Command::Chrome(action) => {
+                fx.push(Effect::ChromeCommand(action));
                 None
             }
         };
@@ -114,11 +142,25 @@ impl BrowserState {
         }
     }
 
-    fn select(&mut self, index: usize, fx: &mut Fx) -> Option<Focus> {
+    /// Runs the command `command` makes of tab `tab`'s number, as a tab clicked in the chrome
+    /// asks: by its identity, so a tab list that changed since the chrome drew it can't make the
+    /// command act on another tab. A tab that is gone does nothing.
+    pub(crate) fn tab_command(
+        &mut self,
+        tab: TabId,
+        command: impl FnOnce(NonZeroUsize) -> Command,
+        fx: &mut Fx,
+    ) {
+        if let Some(n) = self.tab_index(tab).and_then(|i| NonZeroUsize::new(i + 1)) {
+            self.run_command(command(n), fx);
+        }
+    }
+
+    fn select(&mut self, index: usize, fx: &mut Fx) -> Option<KeyboardFocus> {
         self.active = index;
         fx.chrome = true;
         fx.session = true;
-        Some(Focus::Page)
+        Some(KeyboardFocus::Page)
     }
 }
 

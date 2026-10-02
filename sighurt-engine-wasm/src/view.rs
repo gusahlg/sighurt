@@ -31,6 +31,12 @@
 //! delivered late but in order, and its audio and network connections carry on. It presents
 //! nothing until it is shown again.
 //!
+//! ## Downloads
+//!
+//! What a guest asks to save ([`crate::download`]) becomes a `ServiceRequested(Download)` of
+//! its document once its call has returned; the browser decides on it and saves it. The answer
+//! needs nothing more from the engine: the guest's call returned long ago.
+//!
 //! ## The permission prompt
 //!
 //! The engine draws the prompt over the page, with a paint budget of its own, and it answers
@@ -48,11 +54,12 @@ use std::time::Instant;
 use sighurt_api::engine::{EngineCommand, EngineError, ViewOptions};
 use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{LogicalSize, Metrics, SurfacePoint};
-use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, RequestId, ViewId};
 use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyEvent, PointerButton, PointerEvent,
     ScrollDelta,
 };
+use sighurt_api::services::{Service, ServiceRequest};
 
 use crate::capabilities::{HostState, MAX_URL};
 use crate::draw::{DisplayList, DrawOp};
@@ -328,8 +335,11 @@ impl View {
                 self.invalidate(out);
             }
             EngineCommand::Input(event) => self.input(event, out),
-            // The engine makes no service requests yet, so there is nothing to resolve.
-            EngineCommand::ResolveServiceRequest { .. } => {}
+            // Its only requests are downloads, which need nothing back (see "Downloads"), and
+            // it hands every guest navigation to the browser (`OpenRequested`), so it asks
+            // about none.
+            EngineCommand::ResolveServiceRequest { .. }
+            | EngineCommand::AnswerNavigation { .. } => {}
         }
         Ok(())
     }
@@ -526,18 +536,32 @@ impl View {
         self.after_run(out);
     }
 
-    /// Reports what the guest did in a load or step: a navigation it asked for, history it
-    /// changed, a permission prompt it raised, links it moved under the pointer.
+    /// Reports what the guest did in a load or step: a navigation and downloads it asked for,
+    /// history it changed, a permission prompt it raised, links it moved under the pointer.
     fn after_run(&mut self, out: &mut Outbox) {
         let requested = lock(&self.page.pending_navigation).take();
-        if let (Some(url), Some(document)) = (requested, &self.document) {
-            if url.len() <= MAX_URL {
+        let downloads = mem::take(&mut *lock(&self.page.downloads));
+        if let Some(document) = &self.document {
+            if let Some(url) = requested.filter(|url| url.len() <= MAX_URL) {
                 out.push(EngineEvent::OpenRequested {
                     view: self.id,
                     document: document.generation,
                     url,
                     disposition: OpenDisposition::CurrentView,
                 });
+            }
+            let origin = lock(&self.page.module_origin).clone();
+            for download in downloads {
+                out.push(EngineEvent::ServiceRequested(ServiceRequest {
+                    id: RequestId::next(),
+                    view: self.id,
+                    document: document.generation,
+                    origin: Some(origin.clone()).filter(|origin| !origin.is_empty()),
+                    service: Service::Download {
+                        source: download.source,
+                        suggested_name: download.name,
+                    },
+                }));
             }
         }
         if self.loading.is_none() {

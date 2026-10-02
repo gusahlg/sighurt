@@ -1,9 +1,10 @@
 //! `ChromeState`: the chrome's own interaction state, and the browser [`Snapshot`] it reads.
 //!
 //! The snapshot is read-only input: the executable fills it from the core's state after every
-//! change. `ChromeState` holds what only the chrome needs: the address editor's text,
-//! selection, composition and scroll, whether it has focus, and what the pointer hovers over
-//! and presses.
+//! change, and contains every string in it first ([`Snapshot::contain`]), within the bound its
+//! field states. `ChromeState` holds what only the chrome needs: the address editor's text,
+//! selection, composition and scroll, whether it has focus, what the pointer hovers over and
+//! presses, and how the tabs are shown and scrolled.
 //!
 //! Must not own: the committed URL, the tab list, tab titles, which commands move the keyboard
 //! focus, or anything else the core owns. Editing the address never changes the committed
@@ -11,6 +12,7 @@
 
 use sighurt_api::ids::{RequestId, TabId};
 
+use crate::extension::contained;
 use crate::hit_test::Target;
 use crate::text_edit::TextEditor;
 
@@ -23,9 +25,11 @@ pub struct Snapshot {
     pub can_go_back: bool,
     /// Whether the active tab can go forward.
     pub can_go_forward: bool,
-    /// The status line: the active page's hovered link, or the latest word from a download.
-    /// Untrusted text; drawn contained.
+    /// The status line: the active page's hovered link, or `sig`'s own notice. Untrusted;
+    /// at most 2 000 characters.
     pub status: Option<String>,
+    /// What the keymap says about itself ("NORMAL"), if anything; at most 64 characters.
+    pub keymap: Option<String>,
     /// What `sig://home` shows.
     pub home: HomeInfo,
 }
@@ -35,7 +39,47 @@ impl Snapshot {
     pub fn active(&self) -> Option<&TabSnapshot> {
         self.tabs.iter().find(|tab| tab.active)
     }
+
+    /// Makes every string safe to show on one line ([`contained`]) and cuts it to the bound its
+    /// field states. The executable does this before a chrome sees a snapshot.
+    pub fn contain(&mut self) {
+        let contain = |text: &mut String, max: usize| *text = contained(text, max);
+        for tab in &mut self.tabs {
+            contain(&mut tab.title, MAX_TITLE);
+            contain(&mut tab.url, MAX_URL);
+            if let TabContent::Error(message) = &mut tab.content {
+                contain(message, MAX_MESSAGE);
+            }
+        }
+        if let Some(status) = &mut self.status {
+            contain(status, MAX_STATUS);
+        }
+        if let Some(keymap) = &mut self.keymap {
+            contain(keymap, MAX_INDICATOR);
+        }
+        contain(&mut self.home.config_path, MAX_PATH);
+        for engine in &mut self.home.engines {
+            contain(&mut engine.name, MAX_ENGINE_NAME);
+            contain(&mut engine.detail, MAX_ENGINE_DETAIL);
+        }
+    }
 }
+
+/// Characters kept of a title: more than a tab can show.
+const MAX_TITLE: usize = 200;
+/// Characters kept of a URL: the address editor's limit.
+const MAX_URL: usize = 32 * 1024;
+/// Characters kept of the status line: more than the strip can show.
+pub(crate) const MAX_STATUS: usize = 2000;
+/// Characters kept of an error message.
+pub(crate) const MAX_MESSAGE: usize = 4000;
+/// Characters kept of the keymap's indicator.
+const MAX_INDICATOR: usize = 64;
+/// Characters kept of the configuration's path.
+const MAX_PATH: usize = 1000;
+/// Characters kept of an engine's name and of its line on the home page.
+pub(crate) const MAX_ENGINE_NAME: usize = 100;
+pub(crate) const MAX_ENGINE_DETAIL: usize = 500;
 
 /// One tab.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,10 +87,11 @@ pub struct TabSnapshot {
     /// The tab's identity.
     pub id: TabId,
     /// The core's title for it (`TabSummary::title`): the page's own, or one made from its
-    /// address. Untrusted; drawn contained. Pages the chrome draws have titles of its own.
+    /// address. Untrusted; at most 200 characters. Pages the chrome draws have titles of its
+    /// own.
     pub title: String,
     /// The committed URL: what the tab shows now, not what is being typed or requested. Empty
-    /// while nothing has committed.
+    /// while nothing has committed. At most 32 768 characters.
     pub url: String,
     /// Whether the page is loading.
     pub loading: bool,
@@ -66,14 +111,15 @@ pub enum TabContent {
     Internal,
     /// An engine's view.
     Engine,
-    /// The address couldn't be shown; the chrome draws the error. The message is for the user.
+    /// The address couldn't be shown; the chrome draws the error. The message is for the user,
+    /// at most 4 000 characters.
     Error(String),
 }
 
 /// What the home page says.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HomeInfo {
-    /// Where the configuration file is.
+    /// Where the configuration file is; at most 1 000 characters.
     pub config_path: String,
     /// The engines this build has, in the configuration's order.
     pub engines: Vec<EngineRow>,
@@ -82,9 +128,10 @@ pub struct HomeInfo {
 /// One engine on the home page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineRow {
-    /// Its name in the configuration.
+    /// Its name in the configuration; at most 100 characters.
     pub name: String,
-    /// One line about it, such as "compiled in · default" or "disabled in the configuration".
+    /// One line about it, such as "compiled in · default" or "disabled in the configuration";
+    /// at most 500 characters.
     pub detail: String,
     /// Whether it can open pages; the detail is shown as an error otherwise.
     pub available: bool,
@@ -107,23 +154,9 @@ impl TabSnapshot {
         match &self.content {
             TabContent::Internal if is_home(&self.url) => "Home".into(),
             TabContent::Internal | TabContent::Error(_) => "Can't open page".into(),
-            TabContent::Engine | TabContent::Blank => untrusted_line(self.title.trim(), MAX_TITLE),
+            TabContent::Engine | TabContent::Blank => contained(self.title.trim(), MAX_TITLE),
         }
     }
-}
-
-/// Characters of a title kept for drawing: more than a tab can show.
-const MAX_TITLE: usize = 200;
-
-/// Untrusted text made safe to draw on one line: control characters become spaces, bidi
-/// embedding, override and isolate controls are dropped (so a title or hovered link can't
-/// reorder what follows it), and at most `max_chars` characters are kept.
-pub(crate) fn untrusted_line(text: &str, max_chars: usize) -> String {
-    text.chars()
-        .filter(|c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(max_chars)
-        .collect()
 }
 
 /// The chrome's temporary interaction and editing state.
@@ -152,6 +185,12 @@ pub struct ChromeState {
     /// The clipboard read the line waits for: the latest Ctrl+V's, until it is answered or
     /// the line loses focus or its tab.
     pub paste: Option<RequestId>,
+    /// `chrome.toggle-tabs` hid the tabs, or showed those `[chrome.standard]` hides.
+    pub tabs_toggled: bool,
+    /// The tab list's first row shown.
+    pub first_row: usize,
+    /// Scrolling of the tab list not yet a whole row, in logical pixels.
+    pub scrolled: f64,
 }
 
 #[cfg(test)]
@@ -206,6 +245,51 @@ mod tests {
             title(Engine, "app.wasm", "file:///tmp/app.wasm"),
             "app.wasm"
         );
+    }
+
+    #[test]
+    fn every_string_of_a_snapshot_is_contained_to_its_bound() {
+        let long = |c: char, n: usize| format!("\u{202e}a\nb{}", c.to_string().repeat(n));
+        let mut tab = tab(
+            TabContent::Error(long('m', 5000)),
+            &long('t', 300),
+            &long('u', 40000),
+        );
+        tab.active = true;
+        let mut snapshot = Snapshot {
+            tabs: vec![tab],
+            status: Some(long('s', 3000)),
+            keymap: Some(long('k', 100)),
+            home: HomeInfo {
+                config_path: long('p', 2000),
+                engines: vec![EngineRow {
+                    name: long('n', 200),
+                    detail: long('d', 600),
+                    available: true,
+                }],
+            },
+            ..Snapshot::default()
+        };
+        snapshot.contain();
+        let tab = &snapshot.tabs[0];
+        let TabContent::Error(message) = &tab.content else {
+            panic!("{:?}", tab.content)
+        };
+        let engine = &snapshot.home.engines[0];
+        let strings = [
+            (&tab.title, 200),
+            (&tab.url, 32 * 1024),
+            (message, 4000),
+            (snapshot.status.as_ref().unwrap(), 2000),
+            (snapshot.keymap.as_ref().unwrap(), 64),
+            (&snapshot.home.config_path, 1000),
+            (&engine.name, 100),
+            (&engine.detail, 500),
+        ];
+        for (text, bound) in strings {
+            assert!(text.starts_with("a b"), "{text:.10}");
+            assert_eq!(text.chars().count(), bound);
+        }
     }
 
     #[test]

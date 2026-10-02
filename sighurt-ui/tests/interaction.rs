@@ -13,12 +13,15 @@ use sighurt_api::events::Cursor;
 use sighurt_api::geometry::{SurfacePoint, WindowPoint, WindowRect};
 use sighurt_api::ids::RequestId;
 use sighurt_api::input::{
-    ButtonState, FocusEvent, Key, KeyCode, KeyEvent, Modifiers, PointerButton, PointerEvent,
-    Preedit, TextInputEvent,
+    ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerButton,
+    PointerEvent, Preedit, TextInputEvent,
 };
 use sighurt_ui::accessibility::NodeId;
+use sighurt_ui::chrome::{CHROME, TABS};
+use sighurt_ui::extension::ChromeAction;
 use sighurt_ui::hit_test::{hit_test, Target};
-use sighurt_ui::{Chrome, Colors, Damage, Focus, Rgba, Snapshot, TabContent, UiAction};
+use sighurt_ui::layout::{Status, Tabs};
+use sighurt_ui::{Colors, Damage, LayoutOptions, Model, Rgba, Snapshot, TabContent};
 
 fn n(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).unwrap()
@@ -68,7 +71,7 @@ const SHIFT: Modifiers = Modifiers {
     num_lock: false,
 };
 
-fn type_text(chrome: &mut Chrome, text: &str) {
+fn type_text(chrome: &mut Model, text: &str) {
     for c in text.chars() {
         chrome.key(&typed(&c.to_string()));
     }
@@ -94,7 +97,7 @@ fn center(rect: WindowRect) -> WindowPoint {
 }
 
 /// Presses and releases the primary button at window position `at` on the chrome surface.
-fn click(chrome: &mut Chrome, at: WindowPoint) -> Vec<UiAction> {
+fn click(chrome: &mut Model, at: WindowPoint) -> Vec<ChromeAction> {
     let surface = chrome.layout().chrome;
     let local = WindowPoint {
         x: at.x - f64::from(surface.x),
@@ -111,11 +114,11 @@ fn click(chrome: &mut Chrome, at: WindowPoint) -> Vec<UiAction> {
     actions
 }
 
-fn commands(actions: &[UiAction]) -> Vec<Command> {
+fn commands(actions: &[ChromeAction]) -> Vec<Command> {
     actions
         .iter()
         .filter_map(|action| match action {
-            UiAction::Command(command) => Some(command.clone()),
+            ChromeAction::Command(command) => Some(command.clone()),
             _ => None,
         })
         .collect()
@@ -123,19 +126,19 @@ fn commands(actions: &[UiAction]) -> Vec<Command> {
 
 /// A chrome with the address line focused (as the core does for `location.focus`) and `text`
 /// typed.
-fn editing(text: &str) -> Chrome {
+fn editing(text: &str) -> Model {
     let mut chrome = chrome(800, 600, three_tabs());
     chrome.window_focus(FocusEvent::Activated);
-    chrome.set_focus(Focus::Chrome);
+    chrome.set_focus(KeyboardFocus::Chrome);
     assert!(chrome.state().focused);
     type_text(&mut chrome, text);
     chrome
 }
 
 /// The clipboard request among `actions`.
-fn paste_request(actions: &[UiAction]) -> RequestId {
+fn paste_request(actions: &[ChromeAction]) -> RequestId {
     let request = actions.iter().find_map(|action| match action {
-        UiAction::Paste(request) => Some(*request),
+        ChromeAction::Paste(request) => Some(*request),
         _ => None,
     });
     request.unwrap_or_else(|| panic!("no clipboard read in {actions:?}"))
@@ -150,7 +153,7 @@ fn switched(snapshot: &Snapshot, n: usize) -> Snapshot {
     snapshot
 }
 
-fn address(chrome: &Chrome) -> &str {
+fn address(chrome: &Model) -> &str {
     chrome.state().address.text()
 }
 
@@ -228,7 +231,7 @@ fn selection_copy_cut_and_paste() {
     assert_eq!(chrome.state().address.selected_text(), Some("blåbär"));
     let actions = chrome.key(&ctrl("c", 46));
     assert!(
-        actions.contains(&UiAction::Copy("blåbär".into())),
+        actions.contains(&ChromeAction::Copy("blåbär".into())),
         "{actions:?}"
     );
     // Ctrl+V asks for the clipboard; its text replaces the selection without line breaks.
@@ -238,7 +241,7 @@ fn selection_copy_cut_and_paste() {
     // Shift+Home selects to the start; Ctrl+X cuts.
     chrome.key(&named("Home", SHIFT));
     let actions = chrome.key(&ctrl("x", 45));
-    assert!(actions.contains(&UiAction::Copy("https://exempel.se/lingonsylt".into())));
+    assert!(actions.contains(&ChromeAction::Copy("https://exempel.se/lingonsylt".into())));
     assert_eq!(address(&chrome), "");
     // Ctrl+A on a layout without Latin letters still selects all: the physical key counts.
     type_text(&mut chrome, "ö");
@@ -259,10 +262,13 @@ fn escape_discards_and_enter_opens() {
     let mut chrome = editing("sylt");
     let actions = chrome.key(&named("Escape", Modifiers::default()));
     assert!(
-        actions.contains(&UiAction::Focus(Focus::Page)),
+        actions.contains(&ChromeAction::Focus(KeyboardFocus::Page)),
         "{actions:?}"
     );
-    assert!(actions.contains(&UiAction::TextInput(None)), "{actions:?}");
+    assert!(
+        actions.contains(&ChromeAction::TextInput(None)),
+        "{actions:?}"
+    );
     assert_eq!(address(&chrome), "https://sighurt.example/");
     assert!(!chrome.state().focused);
 
@@ -272,7 +278,7 @@ fn escape_discards_and_enter_opens() {
     chrome.key(&named("Delete", Modifiers::default()));
     let actions = chrome.key(&named("Enter", Modifiers::default()));
     assert_eq!(commands(&actions), []);
-    assert!(actions.contains(&UiAction::Focus(Focus::Page)));
+    assert!(actions.contains(&ChromeAction::Focus(KeyboardFocus::Page)));
 }
 
 /// Enter opens what was typed. The line keeps showing it until its tab commits another address,
@@ -286,7 +292,7 @@ fn an_opened_line_stays_until_its_load_ends() {
     let open = Command::PageOpen("rust borrow checker".into());
     assert_eq!(commands(&actions), [open]);
     // The core runs it: the page gets focus and the tab loads.
-    chrome.set_focus(Focus::Page);
+    chrome.set_focus(KeyboardFocus::Page);
     assert!(!chrome.state().focused);
     let mut snapshot = chrome.snapshot().clone();
     snapshot.tabs[0].loading = true;
@@ -308,7 +314,7 @@ fn an_opened_line_stays_until_its_load_ends() {
     let mut snapshot = chrome.snapshot().clone();
     snapshot.tabs[0].loading = true;
     chrome.set_snapshot(snapshot.clone());
-    chrome.set_focus(Focus::Page);
+    chrome.set_focus(KeyboardFocus::Page);
     assert_eq!(address(&chrome), "sylt");
     snapshot.tabs[0].loading = false;
     chrome.set_snapshot(snapshot);
@@ -317,7 +323,7 @@ fn an_opened_line_stays_until_its_load_ends() {
     // So does a load that never started, at the next snapshot, even an unchanged one.
     let mut chrome = editing("sylt");
     chrome.key(&enter);
-    chrome.set_focus(Focus::Page);
+    chrome.set_focus(KeyboardFocus::Page);
     assert_eq!(address(&chrome), "sylt");
     chrome.set_snapshot(chrome.snapshot().clone());
     assert_eq!(address(&chrome), "https://sighurt.example/");
@@ -325,7 +331,7 @@ fn an_opened_line_stays_until_its_load_ends() {
     // Switching tabs drops it.
     let mut chrome = editing("sylt");
     chrome.key(&enter);
-    chrome.set_focus(Focus::Page);
+    chrome.set_focus(KeyboardFocus::Page);
     let mut snapshot = chrome.snapshot().clone();
     snapshot.tabs[0].loading = true;
     chrome.set_snapshot(snapshot.clone());
@@ -336,18 +342,18 @@ fn an_opened_line_stays_until_its_load_ends() {
     // taking focus drops it.
     let mut chrome = editing("sylt");
     chrome.key(&enter);
-    chrome.set_focus(Focus::Page);
+    chrome.set_focus(KeyboardFocus::Page);
     let mut snapshot = chrome.snapshot().clone();
     snapshot.tabs[0].loading = true;
     chrome.set_snapshot(snapshot.clone());
-    chrome.set_focus(Focus::Chrome);
+    chrome.set_focus(KeyboardFocus::Chrome);
     assert_eq!(chrome.state().address.selected_text(), Some("sylt"));
     type_text(&mut chrome, "lingon");
     snapshot.tabs[0].url = "https://sighurt.example/sylt".into();
     snapshot.tabs[0].loading = false;
     chrome.set_snapshot(snapshot);
     assert_eq!(address(&chrome), "lingon");
-    chrome.set_focus(Focus::Page);
+    chrome.set_focus(KeyboardFocus::Page);
     assert_eq!(address(&chrome), "https://sighurt.example/sylt");
 }
 
@@ -357,10 +363,10 @@ fn an_opened_line_stays_until_its_load_ends() {
 fn focus_follows_the_core() {
     let mut chrome = chrome(800, 600, three_tabs());
     chrome.window_focus(FocusEvent::Activated);
-    let actions = chrome.set_focus(Focus::Chrome);
+    let actions = chrome.set_focus(KeyboardFocus::Chrome);
     assert!(chrome.state().focused);
     assert!(
-        matches!(actions[..], [UiAction::TextInput(Some(_))]),
+        matches!(actions[..], [ChromeAction::TextInput(Some(_))]),
         "{actions:?}"
     );
     assert_eq!(
@@ -370,11 +376,14 @@ fn focus_follows_the_core() {
     // The page takes focus (a tab switch, back, a click in the page): what was typed is
     // dropped.
     type_text(&mut chrome, "halv");
-    assert_eq!(chrome.set_focus(Focus::Page), [UiAction::TextInput(None)]);
+    assert_eq!(
+        chrome.set_focus(KeyboardFocus::Page),
+        [ChromeAction::TextInput(None)]
+    );
     assert!(!chrome.state().focused);
     assert_eq!(address(&chrome), "https://sighurt.example/");
     chrome.take_damage();
-    assert_eq!(chrome.set_focus(Focus::Page), []);
+    assert_eq!(chrome.set_focus(KeyboardFocus::Page), []);
     assert!(!chrome.take_damage().any());
 }
 
@@ -390,7 +399,7 @@ fn a_late_clipboard_answer_is_ignored() {
     chrome.key(&named("Escape", Modifiers::default()));
     let other = switched(chrome.snapshot(), 1);
     chrome.set_snapshot(other);
-    chrome.set_focus(Focus::Chrome);
+    chrome.set_focus(KeyboardFocus::Chrome);
     chrome.paste(stale, "stale clipboard");
     assert_eq!(address(&chrome), "https://recept.example/sylt");
 
@@ -416,7 +425,7 @@ fn typed_commands_run_after_a_colon() {
     type_text(&mut chrome, ":tab.close 2");
     let actions = chrome.key(&named("Enter", Modifiers::default()));
     assert_eq!(commands(&actions), [Command::TabClose(Some(n(2)))]);
-    assert!(actions.contains(&UiAction::Focus(Focus::Page)));
+    assert!(actions.contains(&ChromeAction::Focus(KeyboardFocus::Page)));
     assert_eq!(address(&chrome), "https://sighurt.example/");
 
     // A bad command keeps the line and focus, and says why until the line changes.
@@ -485,7 +494,7 @@ fn a_new_tab_focuses_its_address_selected() {
     snapshot.tabs.push(new);
     chrome.set_snapshot(snapshot);
     // For tab.new, the core focuses the address line.
-    chrome.set_focus(Focus::Chrome);
+    chrome.set_focus(KeyboardFocus::Chrome);
     assert_eq!(chrome.state().address.selected_text(), Some("sig://home"));
     // Typing replaces it.
     type_text(&mut chrome, "å");
@@ -499,11 +508,11 @@ fn clicking_the_address_selects_then_places_the_cursor() {
     let field = chrome.layout().address;
     let actions = click(&mut chrome, center(field));
     assert!(
-        actions.contains(&UiAction::Focus(Focus::Chrome)),
+        actions.contains(&ChromeAction::Focus(KeyboardFocus::Chrome)),
         "{actions:?}"
     );
     let caret = actions.iter().find_map(|action| match action {
-        UiAction::TextInput(Some(state)) => Some(state.clone()),
+        ChromeAction::TextInput(Some(field)) => Some(field.state.clone()),
         _ => None,
     });
     assert!(caret.is_some(), "the input method is told: {actions:?}");
@@ -590,10 +599,12 @@ fn dragging_out_of_the_chrome_selects_and_never_sticks() {
 fn tabs_select_close_and_open() {
     let mut chrome = chrome(800, 600, three_tabs());
     let layout = chrome.layout().clone();
+    let ids: Vec<_> = chrome.snapshot().tabs.iter().map(|tab| tab.id).collect();
+    // By identity, never by position.
     let actions = click(&mut chrome, center(layout.tabs[1].rect));
-    assert_eq!(commands(&actions), [Command::TabSelect(n(2))]);
+    assert_eq!(actions, [ChromeAction::SelectTab(ids[1])]);
     let actions = click(&mut chrome, center(layout.tabs[2].close.unwrap()));
-    assert_eq!(commands(&actions), [Command::TabClose(Some(n(3)))]);
+    assert_eq!(actions, [ChromeAction::CloseTab(ids[2])]);
     // Pressing one tab and releasing on another is no click.
     let surface = layout.chrome;
     chrome.pointer(
@@ -612,7 +623,7 @@ fn tabs_select_close_and_open() {
             ButtonState::Released,
         ),
     );
-    assert_eq!(commands(&actions), []);
+    assert_eq!(actions, []);
     // A release without a press does nothing either.
     let actions = chrome.pointer(
         surface,
@@ -622,7 +633,7 @@ fn tabs_select_close_and_open() {
             ButtonState::Released,
         ),
     );
-    assert_eq!(commands(&actions), []);
+    assert_eq!(actions, []);
 }
 
 #[test]
@@ -647,19 +658,6 @@ fn toolbar_buttons() {
         commands(&click(&mut chrome, center(layout.reload))),
         [Command::PageStop]
     );
-    // The mouse's back and forward buttons work anywhere on the chrome.
-    let surface = layout.chrome;
-    let at = center(layout.tab_strip);
-    let actions = chrome.pointer(
-        surface,
-        &button(at, PointerButton::Forward, ButtonState::Pressed),
-    );
-    assert_eq!(commands(&actions), [Command::PageForward]);
-    let actions = chrome.pointer(
-        surface,
-        &button(at, PointerButton::Back, ButtonState::Pressed),
-    );
-    assert_eq!(commands(&actions), []);
 }
 
 #[test]
@@ -673,7 +671,7 @@ fn hover_sets_the_cursor_and_repaints_only_the_chrome() {
     };
     let actions = chrome.pointer(surface, &over(center(chrome.layout().address)));
     assert!(
-        actions.contains(&UiAction::Cursor(Cursor::Text)),
+        actions.contains(&ChromeAction::Cursor(Cursor::Text)),
         "{actions:?}"
     );
     let damage = chrome.take_damage();
@@ -681,6 +679,7 @@ fn hover_sets_the_cursor_and_repaints_only_the_chrome() {
         damage,
         Damage {
             chrome: true,
+            tabs: false,
             status: false,
             page: false
         }
@@ -692,11 +691,11 @@ fn hover_sets_the_cursor_and_repaints_only_the_chrome() {
     assert!(!chrome.take_damage().any());
     let actions = chrome.pointer(surface, &over(center(chrome.layout().reload)));
     assert!(
-        actions.contains(&UiAction::Cursor(Cursor::Pointer)),
+        actions.contains(&ChromeAction::Cursor(Cursor::Pointer)),
         "{actions:?}"
     );
     let actions = chrome.pointer(surface, &PointerEvent::Leave);
-    assert_eq!(actions, [UiAction::Cursor(Cursor::Default)]);
+    assert_eq!(actions, [ChromeAction::Cursor(Cursor::Default)]);
     // The disabled back button doesn't react.
     chrome.pointer(surface, &over(center(chrome.layout().back)));
     assert_eq!(chrome.state().hover, None);
@@ -719,6 +718,7 @@ fn idle_snapshots_repaint_nothing() {
         chrome.take_damage(),
         Damage {
             chrome: false,
+            tabs: false,
             status: true,
             page: false
         }
@@ -733,6 +733,7 @@ fn idle_snapshots_repaint_nothing() {
         chrome.take_damage(),
         Damage {
             chrome: true,
+            tabs: false,
             status: false,
             page: false
         }
@@ -747,6 +748,7 @@ fn idle_snapshots_repaint_nothing() {
         chrome.take_damage(),
         Damage {
             chrome: true,
+            tabs: false,
             status: false,
             page: true
         }
@@ -768,7 +770,7 @@ fn input_method_preedit_and_commit() {
     let state = actions
         .iter()
         .find_map(|action| match action {
-            UiAction::TextInput(Some(state)) => Some(state.clone()),
+            ChromeAction::TextInput(Some(field)) => Some(field.state.clone()),
             _ => None,
         })
         .expect("the caret moved");
@@ -782,25 +784,35 @@ fn input_method_preedit_and_commit() {
     assert_eq!(chrome.state().address.preedit(), None);
 }
 
-/// The input method's caret rectangle is where the caret is drawn, at every scale.
+/// The input method's caret rectangle is where the caret is drawn, at every scale and at two
+/// font sizes.
 #[test]
 fn the_input_method_caret_is_where_the_caret_is_drawn() {
-    for scale in SCALES {
-        let mut chrome = editing("");
-        chrome.key(&ctrl("a", 30));
+    for (scale, font_size) in SCALES
+        .into_iter()
+        .flat_map(|scale| [(scale, 14), (scale, 18)])
+    {
+        let options = LayoutOptions {
+            font_size,
+            ..LayoutOptions::default()
+        };
+        let mut chrome = arranged(800, 600, three_tabs(), Colors::default(), options);
+        chrome.window_focus(FocusEvent::Activated);
+        chrome.set_focus(KeyboardFocus::Chrome);
         type_text(&mut chrome, "blåbär");
         // A trailing space keeps the caret clear of the last glyph.
         let state = chrome
             .key(&typed(" "))
             .into_iter()
             .find_map(|action| match action {
-                UiAction::TextInput(Some(state)) => Some(state),
+                ChromeAction::TextInput(Some(field)) => Some(field.state),
                 _ => None,
             })
             .expect("typing moves the caret");
         let rect = chrome.layout().chrome;
-        let image = paint(&mut chrome, rect, scale);
+        let image = paint(&mut chrome, CHROME, scale);
         let ratio = f64::from(image.width) / f64::from(rect.width);
+        let what = format!("{font_size} px at {scale}/120");
         // The caret is the rightmost run of text-colored pixels in the middle of the line.
         let text = Colors::default().text;
         let text = [text.r, text.g, text.b, 255];
@@ -819,18 +831,19 @@ fn the_input_method_caret_is_where_the_caret_is_drawn() {
         let reported = f64::from(state.caret.x) * ratio;
         assert!(
             (reported - f64::from(left)).abs() <= ratio + 0.5,
-            "at {scale}/120: caret reported at {reported} px, drawn from {left} px"
+            "{what}: caret reported at {reported} px, drawn from {left} px"
         );
         // It is as tall as reported.
         for y in top..bottom {
-            assert_eq!(image.pixel(right, y), text, "at {scale}/120, row {y}");
+            assert_eq!(image.pixel(right, y), text, "{what}, row {y}");
         }
     }
 }
 
-/// Hit targets stay on the drawn controls at 100 %, 125 %, 150 % and 200 %: every pixel painted
-/// in a control's own color hits that control, and every pixel that hits a control lies within
-/// what is drawn for it. Distinct colors make each control's drawing identifiable.
+/// Hit targets stay on the drawn controls at 100 %, 125 %, 150 % and 200 %, with every
+/// `[chrome.standard]` option and two font sizes: every pixel painted in a control's own color
+/// hits that control, and every pixel that hits a control lies within what is drawn for it.
+/// Distinct colors make each control's drawing identifiable.
 #[test]
 fn hit_targets_stay_on_drawn_controls_at_every_scale() {
     let colors = Colors {
@@ -839,53 +852,103 @@ fn hit_targets_stay_on_drawn_controls_at_every_scale() {
         surface: Rgba::rgb(0x0000ff),
         ..Colors::default()
     };
-    for scale in SCALES {
-        for (width, height) in [(800, 600), (1001, 777), (333, 250)] {
-            let snapshot = three_tabs();
-            let mut chrome = chrome_with(width, height, snapshot, colors);
-            let layout = chrome.layout().clone();
-            let what = format!("{width}×{height} at {scale}/120");
-            // The hovered button, the active tab and the address field, each in its own color.
-            let hovered = [Target::Forward, Target::ReloadOrStop];
-            for target in hovered {
-                let rect = match target {
-                    Target::Forward => layout.forward,
-                    _ => layout.reload,
+    let default = LayoutOptions::default();
+    let variants = [
+        default,
+        LayoutOptions {
+            compact: true,
+            ..default
+        },
+        LayoutOptions {
+            buttons: false,
+            status: Status::Overlay,
+            ..default
+        },
+        LayoutOptions {
+            tabs: Tabs::Left,
+            ..default
+        },
+        LayoutOptions {
+            tabs: Tabs::Left,
+            compact: true,
+            font_size: 18,
+            ..default
+        },
+        LayoutOptions {
+            tabs: Tabs::Hidden,
+            font_size: 18,
+            ..default
+        },
+    ];
+    for options in variants {
+        let sizes: &[(u32, u32)] = match options == default {
+            true => &[(800, 600), (1001, 777), (333, 250)],
+            false => &[(1001, 777), (333, 250)],
+        };
+        for &(width, height) in sizes {
+            for scale in SCALES {
+                let mut chrome = arranged(width, height, three_tabs(), colors, options);
+                let layout = chrome.layout().clone();
+                let what = format!("{width}×{height} at {scale}/120, {options:?}");
+                let active = Target::Tab(chrome.snapshot().tabs[0].id);
+                // The hovered button, the active tab and the address field, each in its own
+                // color, on the surface each is drawn on.
+                let hovered = match options.buttons {
+                    true => vec![Some(Target::Forward), Some(Target::ReloadOrStop)],
+                    false => vec![None],
                 };
-                let at = center(rect);
-                chrome.pointer(
-                    layout.chrome,
-                    &PointerEvent::Motion {
-                        position: SurfacePoint { x: at.x, y: at.y },
-                        modifiers: Modifiers::default(),
-                    },
-                );
-                let expected = [
-                    (Target::Tab(chrome.snapshot().tabs[0].id), colors.tab),
-                    (target, colors.hover),
-                    (Target::Address, colors.surface),
-                ];
-                let image = paint(&mut chrome, layout.chrome, scale);
-                let ratio = (
-                    f64::from(image.width) / f64::from(layout.chrome.width),
-                    f64::from(image.height) / f64::from(layout.chrome.height),
-                );
-                for (target, color) in expected {
-                    check_target(&image, ratio, &layout, target, color, &what);
+                for target in hovered {
+                    let mut expected = vec![(CHROME, Target::Address, colors.surface)];
+                    if let Some(target) = target {
+                        let rect = match target {
+                            Target::Forward => layout.forward,
+                            _ => layout.reload,
+                        };
+                        let at = center(rect);
+                        chrome.pointer(
+                            layout.chrome,
+                            &PointerEvent::Motion {
+                                position: SurfacePoint { x: at.x, y: at.y },
+                                modifiers: Modifiers::default(),
+                            },
+                        );
+                        expected.push((CHROME, target, colors.hover));
+                    }
+                    match options.tabs {
+                        Tabs::Top => expected.push((CHROME, active, colors.tab)),
+                        Tabs::Left => expected.push((TABS, active, colors.tab)),
+                        Tabs::Hidden => {}
+                    }
+                    for surface in [CHROME, TABS] {
+                        let mut on = expected.iter().filter(|(s, ..)| *s == surface).peekable();
+                        if on.peek().is_none() {
+                            continue;
+                        }
+                        let image = paint(&mut chrome, surface, scale);
+                        let rect = rect_of(&chrome, surface);
+                        for &(_, target, color) in on {
+                            check_target(&image, rect, &layout, target, color, &what);
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+/// Checks `target`, drawn in `color` on `image`, a surface placed at `surface`.
 fn check_target(
     image: &Image,
-    ratio: (f64, f64),
+    surface: WindowRect,
     layout: &sighurt_ui::Layout,
     target: Target,
     color: Rgba,
     what: &str,
 ) {
+    let ratio = (
+        f64::from(image.width) / f64::from(surface.width),
+        f64::from(image.height) / f64::from(surface.height),
+    );
     let color = [color.r, color.g, color.b, 255];
     // A tab's close button sits on the tab, drawn over its background.
     let part_of = |hit: Target| match (hit, target) {
@@ -894,8 +957,8 @@ fn check_target(
     };
     let hits = |x: u32, y: u32| {
         let point = WindowPoint {
-            x: (f64::from(x) + 0.5) / ratio.0,
-            y: (f64::from(y) + 0.5) / ratio.1,
+            x: f64::from(surface.x) + (f64::from(x) + 0.5) / ratio.0,
+            y: f64::from(surface.y) + (f64::from(y) + 0.5) / ratio.1,
         };
         hit_test(layout, point).is_some_and(part_of)
     };
@@ -938,7 +1001,7 @@ fn check_target(
 #[test]
 fn surface_positions_are_converted_once() {
     let mut chrome = chrome(800, 600, showing("sig://home", TabContent::Internal));
-    chrome.set_focus(Focus::Chrome);
+    chrome.set_focus(KeyboardFocus::Chrome);
     let page = chrome.layout().page;
     let local = WindowPoint { x: 10.0, y: 10.0 };
     let actions = chrome.pointer(
@@ -946,7 +1009,7 @@ fn surface_positions_are_converted_once() {
         &button(local, PointerButton::Left, ButtonState::Pressed),
     );
     assert!(
-        actions.contains(&UiAction::Focus(Focus::Page)),
+        actions.contains(&ChromeAction::Focus(KeyboardFocus::Page)),
         "{actions:?}"
     );
     assert_eq!(chrome.state().pressed, None);
@@ -966,7 +1029,7 @@ fn surface_positions_are_converted_once() {
 #[test]
 fn accessibility_matches_the_hit_targets() {
     let mut chrome = chrome(800, 600, three_tabs());
-    chrome.set_focus(Focus::Chrome);
+    chrome.set_focus(KeyboardFocus::Chrome);
     let layout = chrome.layout().clone();
     let tree = chrome.accessibility();
     assert_eq!(tree.focus, Some(sighurt_ui::accessibility::NodeId::Address));
@@ -1012,9 +1075,170 @@ fn accessibility_matches_the_hit_targets() {
 fn an_empty_snapshot_and_window_are_harmless() {
     let mut chrome = chrome(0, 0, Snapshot::default());
     assert_eq!(click(&mut chrome, WindowPoint { x: 1.0, y: 1.0 }), []);
-    chrome.set_focus(Focus::Chrome);
+    chrome.set_focus(KeyboardFocus::Chrome);
     type_text(&mut chrome, "a");
     assert_eq!(address(&chrome), "a");
     let actions = chrome.key(&named("Enter", Modifiers::default()));
     assert_eq!(commands(&actions), [Command::PageOpen("a".into())]);
+}
+
+/// The mouse's side buttons are the core's (`[input.buttons]`), wherever the pointer is: the
+/// chrome does nothing with them.
+#[test]
+fn side_buttons_are_not_the_chromes() {
+    let mut chrome = chrome(800, 600, three_tabs());
+    let surface = chrome.layout().chrome;
+    let at = center(chrome.layout().tab_strip);
+    for side in [PointerButton::Back, PointerButton::Forward] {
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            assert_eq!(chrome.pointer(surface, &button(at, side, state)), []);
+        }
+    }
+}
+
+/// The address line shows a committed address decoded where that is safe, keeps the committed
+/// one apart, and opens what it shows as the same address.
+#[test]
+fn the_address_line_reads_decoded() {
+    let committed = "https://sv.wikipedia.org/wiki/R%C3%A4ksm%C3%B6rg%C3%A5s#K%C3%A4llor%E2%80%AE";
+    let mut chrome = chrome(800, 600, showing(committed, TabContent::Engine));
+    let shown = "https://sv.wikipedia.org/wiki/Räksmörgås#Källor%E2%80%AE";
+    assert_eq!(address(&chrome), shown);
+    assert!(!chrome.state().address.is_modified());
+    // The page's accessible value is the committed address, as it was.
+    let tree = chrome.accessibility();
+    assert_eq!(
+        tree.node(NodeId::Page).unwrap().value.as_deref(),
+        Some(committed)
+    );
+    // An unchanged snapshot changes nothing; Escape after focusing shows the same again.
+    chrome.take_damage();
+    chrome.set_snapshot(chrome.snapshot().clone());
+    assert!(!chrome.take_damage().any());
+    chrome.window_focus(FocusEvent::Activated);
+    chrome.set_focus(KeyboardFocus::Chrome);
+    assert_eq!(chrome.state().address.selected_text(), Some(shown));
+    chrome.key(&named("Escape", Modifiers::default()));
+    assert_eq!(address(&chrome), shown);
+    // Enter opens what it shows, which the core parses back to the committed address.
+    chrome.set_focus(KeyboardFocus::Chrome);
+    let actions = chrome.key(&named("Enter", Modifiers::default()));
+    assert_eq!(commands(&actions), [Command::PageOpen(shown.into())]);
+}
+
+/// The tab list on the left scrolls by whole rows with the wheel or a touchpad, only over the
+/// list, repainting the list alone; a switch to a tab out of view scrolls it into view.
+#[test]
+fn the_tab_list_scrolls_and_follows_the_active_tab() {
+    let left = LayoutOptions {
+        tabs: Tabs::Left,
+        ..LayoutOptions::default()
+    };
+    let mut snapshot = three_tabs();
+    snapshot.tabs = (0..40)
+        .map(|i| {
+            tab(
+                &format!("Tab {i}"),
+                "https://a.example/",
+                TabContent::Engine,
+            )
+        })
+        .collect();
+    snapshot.tabs[0].active = true;
+    // 15 rows of 36 px fit below the toolbar (44 px) and above the status strip (20 px).
+    let mut chrome = arranged(800, 44 + 556 + 20, snapshot, Colors::default(), left);
+    let ids: Vec<_> = chrome.snapshot().tabs.iter().map(|tab| tab.id).collect();
+    let list = chrome.layout().tab_list;
+    assert_eq!(chrome.layout().rows, 15);
+    let wheel = |y| PointerEvent::Scroll {
+        delta: sighurt_api::input::ScrollDelta::Wheel { x: 0, y },
+        position: SurfacePoint { x: 50.0, y: 50.0 },
+        modifiers: Modifiers::default(),
+    };
+    let first_row = |chrome: &Model| {
+        let layout = chrome.layout();
+        let shown = layout
+            .tabs
+            .iter()
+            .position(|tab| !tab.rect.size().is_empty());
+        shown.map(|i| layout.tabs[i].id)
+    };
+    // A notch scrolls three rows, and repaints the list alone.
+    chrome.take_damage();
+    chrome.pointer(list, &wheel(120));
+    assert_eq!(first_row(&chrome), Some(ids[3]));
+    assert_eq!(
+        chrome.take_damage(),
+        Damage {
+            tabs: true,
+            ..Damage::default()
+        }
+    );
+    // A click on its first row shown selects that tab, by identity.
+    let top_row = WindowPoint {
+        x: 50.0,
+        y: 4.0 + 16.0,
+    };
+    let local = |at: WindowPoint| WindowPoint { x: at.x, y: at.y };
+    let press = chrome.pointer(
+        list,
+        &button(local(top_row), PointerButton::Left, ButtonState::Pressed),
+    );
+    let release = chrome.pointer(
+        list,
+        &button(local(top_row), PointerButton::Left, ButtonState::Released),
+    );
+    assert_eq!([press, release].concat(), [ChromeAction::SelectTab(ids[3])]);
+    // A touchpad's pixels move a row for each row's height; half a row waits for more.
+    chrome.pointer(
+        list,
+        &PointerEvent::Scroll {
+            delta: sighurt_api::input::ScrollDelta::Pixels { x: 0.0, y: 54.0 },
+            position: SurfacePoint { x: 50.0, y: 50.0 },
+            modifiers: Modifiers::default(),
+        },
+    );
+    assert_eq!(first_row(&chrome), Some(ids[4]));
+    chrome.pointer(
+        list,
+        &PointerEvent::Scroll {
+            delta: sighurt_api::input::ScrollDelta::Pixels { x: 0.0, y: 18.0 },
+            position: SurfacePoint { x: 50.0, y: 50.0 },
+            modifiers: Modifiers::default(),
+        },
+    );
+    assert_eq!(first_row(&chrome), Some(ids[5]));
+    // Past either end it stops: the last rows, then the first.
+    for _ in 0..20 {
+        chrome.pointer(list, &wheel(120));
+    }
+    assert_eq!(chrome.layout().first_row, 41 - 15);
+    for _ in 0..20 {
+        chrome.pointer(list, &wheel(-120));
+    }
+    assert_eq!(first_row(&chrome), Some(ids[0]));
+    // The wheel over the toolbar scrolls nothing.
+    let toolbar = chrome.layout().chrome;
+    let over_toolbar = PointerEvent::Scroll {
+        delta: sighurt_api::input::ScrollDelta::Wheel { x: 0, y: 120 },
+        position: SurfacePoint { x: 50.0, y: 20.0 },
+        modifiers: Modifiers::default(),
+    };
+    chrome.pointer(toolbar, &over_toolbar);
+    assert_eq!(first_row(&chrome), Some(ids[0]));
+    // Switching to tab 30 (tab.select 30) brings it into view as the last row; back to the
+    // first brings that back as the first row.
+    let mut switched = chrome.snapshot().clone();
+    for (i, tab) in switched.tabs.iter_mut().enumerate() {
+        tab.active = i == 29;
+    }
+    chrome.set_snapshot(switched.clone());
+    let layout = chrome.layout();
+    assert_eq!(layout.first_row, 15);
+    assert!(!layout.tabs[29].rect.size().is_empty());
+    for (i, tab) in switched.tabs.iter_mut().enumerate() {
+        tab.active = i == 0;
+    }
+    chrome.set_snapshot(switched);
+    assert_eq!(chrome.layout().first_row, 0);
 }

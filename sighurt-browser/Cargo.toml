@@ -14,11 +14,18 @@ path = "src/main.rs"
 [features]
 # The engines compiled into `sig`: this line is the list. Edit it to choose the engines of a
 # default build; `--no-default-features --features engine-demo` picks them for one build.
-# Which compiled engines may open pages is runtime configuration.
-default = ["engine-servo", "engine-wasm"]
+# Which compiled engines may open pages is runtime configuration. WPE WebKit needs the prefix
+# nix/build-wpewebkit.sh installs (docs/rewrite/WPE.md); without it, build with
+# `--no-default-features --features engine-servo,engine-wasm`.
+default = ["engine-servo", "engine-wasm", "engine-wpe"]
 engine-servo = ["dep:sighurt-engine-servo"]
 engine-wasm = ["dep:sighurt-engine-wasm"]
+engine-wpe = ["dep:sighurt-engine-wpe"]
 engine-demo = ["dep:sighurt-engine-demo"]
+# Keymaps besides the core's own `bindings`, chosen by `[input] keymap`.
+keymap-modal = ["dep:sighurt-keymap-modal"]
+# Chromes besides sighurt-ui's `standard`, chosen by `[ui] chrome`.
+chrome-line = ["dep:sighurt-chrome-line"]
 
 [dependencies]
 sighurt-api = { path = "../sighurt-api" }
@@ -27,7 +34,10 @@ sighurt-wayland = { path = "../sighurt-wayland" }
 sighurt-ui = { path = "../sighurt-ui" }
 sighurt-engine-servo = { path = "../sighurt-engine-servo", optional = true }
 sighurt-engine-wasm = { path = "../sighurt-engine-wasm", optional = true }
+sighurt-engine-wpe = { path = "../sighurt-engine-wpe", optional = true }
 sighurt-engine-demo = { path = "../sighurt-engine-demo", optional = true }
+sighurt-keymap-modal = { path = "../sighurt-keymap-modal", optional = true }
+sighurt-chrome-line = { path = "../sighurt-chrome-line", optional = true }
 # The owner loop.
 calloop.workspace = true
 # The self-pipe for signals, the configuration watch (inotify) and CLOCK_MONOTONIC for the
@@ -48,9 +58,10 @@ env_logger = "0.11"
 reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "stream"], default-features = false }
 # `sig` installs the TLS provider before anything builds a TLS configuration (decision 26).
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+# The directory of what `storage = "ephemeral"` keeps while `sig` runs.
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 # The `virtual-pointer` example, a test helper that keeps one pointer plugged into a private
 # compositor.
 wayland-client.workspace = true

@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>video</title>
+<!-- Plays clip.webm (made by window-checks.sh) muted and in a loop; the title says how far. -->
+<style>body { margin: 0; background: #000; } video { width: 640px; height: 360px; }</style>
+<video id="v" src="clip.webm" muted loop autoplay></video>
+<script>
+  const say = (message) => { document.title = message; };
+  v.addEventListener("error", () => say(`video error ${v.error && v.error.code}`));
+  setInterval(() => say(`video ${v.currentTime > 0 ? "playing" : "waiting"} ${v.readyState} ${Math.floor(v.currentTime)}`), 250);
+</script>

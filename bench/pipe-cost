@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""The baseline's frame transport alone, without Servo, GPUI or a readback: one process writes
+frames of WxH RGBA pixels into a pipe at a fixed rate, as `sig-servo` wrote each
+`FromEngine::Frame` to its stdout (a small header, then the pixels in one write), and another
+reads each frame into its buffer, as `sig` did (sighurt-ipc `read_pixels`: reads until the frame
+is complete; a pipe hands over at most its buffer, 64 KiB by default, per read). It reports each
+process's CPU time and voluntary context switches (wakeups) per second, and how long a frame
+took to cross. Run it under tools/heavy, like any measurement:
+
+  tools/heavy bench/pipe-cost                         # 1280x696 at 59.3/s for 10 s, 5 runs
+  tools/heavy bench/pipe-cost --pipe-size 1048576     # the same through a 1 MiB pipe
+
+It is a lower bound on what the transport cost the baseline: the reader reuses one buffer (sig
+allocated one per frame) and nothing compares, swizzles or uploads the frame. One JSON line per
+run, then the medians.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import resource
+import statistics
+import struct
+import time
+
+HEADER = struct.Struct("<IBIIId")  # len, tag, width, height, size (sighurt-ipc), send time
+
+
+def usage():
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return {"cpu_s": r.ru_utime + r.ru_stime, "wakeups": r.ru_nvcsw}
+
+
+def read_exact(fd, view):
+    while view:
+        n = os.readv(fd, [view])
+        if n == 0:
+            raise EOFError
+        view = view[n:]
+
+
+def reader(fd, report, size):
+    """Reads frames until the writer closes the pipe, then reports its usage and the crossing
+    times."""
+    start = usage()
+    header, frame = bytearray(HEADER.size), bytearray(size)
+    crossed = []
+    try:
+        while True:
+            read_exact(fd, memoryview(header))
+            sent = HEADER.unpack(header)[5]
+            read_exact(fd, memoryview(frame))
+            crossed.append(time.monotonic() - sent)
+    except EOFError:
+        pass
+    end = usage()
+    os.write(report, json.dumps({k: end[k] - start[k] for k in end} | {"crossed": crossed}).encode())
+
+
+def run(width, height, fps, seconds, pipe_size):
+    size = width * height * 4
+    data_r, data_w = os.pipe()
+    report_r, report_w = os.pipe()
+    if pipe_size:
+        fcntl.fcntl(data_w, fcntl.F_SETPIPE_SZ, pipe_size)
+    child = os.fork()
+    if child == 0:
+        os.close(data_w)
+        os.close(report_r)
+        reader(data_r, report_w, size)
+        os._exit(0)
+    os.close(data_r)
+    os.close(report_w)
+    frame = bytes(range(256)) * (size // 256) + bytes(size % 256)
+    start, began = usage(), time.monotonic()
+    frames = int(seconds * fps)
+    for k in range(frames):
+        time.sleep(max(0.0, began + k / fps - time.monotonic()))
+        header = HEADER.pack(1 + 12 + size, 2, width, height, size, time.monotonic())
+        os.writev(data_w, [header, frame])
+    os.close(data_w)
+    wall = time.monotonic() - began
+    end = usage()
+    with os.fdopen(report_r, "rb") as f:
+        got = json.loads(f.read())
+    os.waitpid(child, 0)
+    writer = {k: end[k] - start[k] for k in end}
+    crossed = sorted(1000 * c for c in got.pop("crossed"))
+    return {
+        "frames": frames,
+        "received": len(crossed),
+        "wall_s": wall,
+        "mib_per_s": frames * size / 2**20 / wall,
+        "cpu_pct": 100 * (writer["cpu_s"] + got["cpu_s"]) / wall,
+        "cpu_pct_writer": 100 * writer["cpu_s"] / wall,
+        "cpu_pct_reader": 100 * got["cpu_s"] / wall,
+        "wakeups_per_s": (writer["wakeups"] + got["wakeups"]) / wall,
+        "wakeups_per_s_writer": writer["wakeups"] / wall,
+        "wakeups_per_s_reader": got["wakeups"] / wall,
+        "cross_p50_ms": crossed[len(crossed) // 2] if crossed else None,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--size", default="1280x696", help="frame size, WxH (default: the benchmark's page area)")
+    ap.add_argument("--fps", type=float, default=59.3, help="frames a second (default: the baseline's animations)")
+    ap.add_argument("--seconds", type=float, default=10.0)
+    ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--pipe-size", type=int, help="the pipe's buffer in bytes (default: the system's, 64 KiB)")
+    args = ap.parse_args()
+    width, height = (int(x) for x in args.size.split("x"))
+    runs = []
+    for _ in range(args.runs):
+        runs.append(run(width, height, args.fps, args.seconds, args.pipe_size))
+        print(json.dumps(runs[-1]), flush=True)
+    median = {k: statistics.median(r[k] for r in runs) for k in runs[0] if runs[0][k] is not None}
+    print(json.dumps({"median": median, "size": args.size, "fps": args.fps, "pipe_size": args.pipe_size or "default"}))
+
+
+if __name__ == "__main__":
+    main()

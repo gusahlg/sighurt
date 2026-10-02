@@ -1,9 +1,10 @@
 # Configuration and the extension API: design
 
-**Status:** proposal, second draft. Nothing is implemented, and nothing in it goes into STATUS
-until the user accepts it. First written 2 October 2026 against `rewrite` at 3c7f5fd (with the
-uncommitted work then in the tree), and revised the same day after two independent reviews.
-§R lists every finding, what was checked, and what became of it.
+**Status:** implemented: STATUS decisions 67, 68 and 74–77, with the review fixes of decision
+82. Where the code departs from this design, the changelog at the end says so, and the sections
+below describe the code. First written 2 October 2026 against `rewrite` at 3c7f5fd (with the
+uncommitted work then in the tree), and revised the same day after two independent reviews of
+the draft; §R lists every finding, what was checked, and what became of it.
 **Asked for:** "improve the possibilities to configure things. UI and keybindings should still
 just have a tiny api that makes it possible for other people to program their own
 implementations."
@@ -241,8 +242,10 @@ The routing order of `sighurt_core::router` becomes:
 6. **New:** an http(s) URL whose host matches one of an engine's `hosts` goes to that engine.
 7. Everything else goes to the default engine.
 
-Rule 6 needs no network request (plan §16). The engine must be enabled and in the build, as
-today; otherwise the tab shows the error.
+Rule 6 needs no network request (plan §16). The engine must be enabled; otherwise the tab shows
+the error. The rules of an engine the build lacks are checked and left out, so what they claim
+goes to the default engine, typed or clicked alike, and one file serves several builds; only
+`page.open-in` such an engine says it isn't in the build.
 
 **`page.open-in <engine> [address]`.** It opens `address`, or, without one, the active tab's
 committed address, in `<engine>`. While nothing has committed yet, it uses the requested
@@ -293,10 +296,12 @@ The core decides in one place, in this order:
    names one). Typing an address, `page.open` and `browser.home` make the view unchosen. A
    page's own navigations leave the flag as it is. So the tab stays in the engine the user chose
    until they type an address.
-3. If routing names another enabled engine, and the view has a user activation (a click or key
-   press in it within the last 5 s, decision 30), the core denies the navigation, uses up the
-   activation, and navigates the tab to the URL with routing. The new view replaces this one
-   once it commits, and back returns here (decision 29).
+3. If routing names another engine of the build that is enabled and working, and the user
+   clicked a link to this very URL in the page within the last 5 s (the page's status text
+   named it when the button went down; decision 30's activation), the core denies the
+   navigation, uses up the activation, and navigates the tab to the URL with routing, unless the
+   tab is loading an address the user asked for, which the page can't replace. The new view
+   replaces this one once it commits, and back returns here (decision 29).
 4. Otherwise the core allows it.
 
 What this means for the user:
@@ -305,15 +310,16 @@ What this means for the user:
   go: from Servo to a WPE host, and from a WPE host back to Servo (the default) for a site no
   rule claims.
 - After `page.open-in`, links stay in the chosen engine.
-- A navigation with no recent click or key press stays in its engine. That covers a script's
-  redirect, a meta refresh, and an iframe loading.
+- Everything else stays in its engine: a script's redirect, a meta refresh, an iframe loading,
+  a script's navigation right after a click, a link opened with the keyboard, a form.
 
-**Why the activation rule (a Servo 0.5 limit).** Servo's `request_navigation` also covers the
+**Why the clicked-link rule (a Servo 0.5 limit).** Servo's `request_navigation` also covers the
 navigations of nested iframes, and its `NavigationRequest` doesn't say which frame asks: its
 `pipeline_id` is `pub(crate)` (servo-0.5.0/webview_delegate.rs:32–37). Without the rule, an ad
-iframe navigating itself to a claimed host would move the whole tab to another engine. With it,
-only a navigation within 5 s of the user's own click or key press in the page can move the tab,
-and only one per activation.
+iframe navigating itself to a claimed host would move the whole tab to another engine; with the
+draft's rule (any click or key press within 5 s), it still could, right after any click anywhere
+in the page, and a sandboxed iframe could navigate the top level that way. Now only the address
+of the link the user pressed can move the tab, once per click.
 
 One case is left, to be recorded as a Servo 0.5 limit next to decision 55: a link *inside an
 iframe* that the user clicks, to a host another engine claims, moves the whole tab, and the
@@ -605,7 +611,6 @@ pub type Table = std::collections::BTreeMap<String, Value>;
 impl Value {
     pub fn as_str(&self) -> Option<&str>;
     pub fn as_bool(&self) -> Option<bool>;
-    pub fn as_f64(&self) -> Option<f64>;      // integers too
     pub fn as_table(&self) -> Option<&Table>;
     pub fn kind(&self) -> &'static str;       // "a string", "a table": for messages
 }
@@ -846,8 +851,10 @@ How it behaves:
   bound in a `pass` mode; it then never reaches the page in that mode, as the user asked.
 - **Repeats:** a held key repeats a single-key `Run` binding, so a held `j` keeps scrolling.
   Anything else it took is held quietly.
-- **While the chrome has the keyboard**, only `always` applies. Enter, Escape and editing belong
-  to the chrome. When the chrome gives the keyboard back, the mode is what it was.
+- **While the chrome has the keyboard**, only `always`'s bindings whose first key types nothing
+  apply, so the line gets every character. Enter, Escape and the editing keys belong to the
+  chrome unless `always` binds them. When the chrome gives the keyboard back, the mode is what
+  it was.
 - **Indicator:** the mode in capitals, followed by the keys of an unfinished sequence.
 
 **What it can't do, and why.** This is not Vimium:
@@ -988,11 +995,18 @@ pub struct ChromeKind {
 /// embedding, override and isolate controls are dropped; at most `max_chars` are kept.
 /// (Today's `sighurt_ui::state::untrusted_line`, made public.)
 pub fn contained(text: &str, max_chars: usize) -> String;
+
+/// A committed address as an address line shows it: percent-encoded UTF-8 in its path, query
+/// and fragment decoded, except what could hide or fake part of it (decision 75).
+pub fn readable_url(url: &str) -> Cow<'_, str>;
 ```
 
-The existing snapshot types gain two fields: `Snapshot::keymap: Option<String>`, the keymap's
-indicator, and `TabSnapshot::engine: Option<String>`, the engine a tab's page is open in. The
-other snapshot, color and painting types stay as they are, where they are.
+The existing snapshot types gain one field, `Snapshot::keymap: Option<String>`, the keymap's
+indicator, and one method, `Snapshot::contain`, which the executable runs before a chrome sees a
+snapshot. The other snapshot, color and painting types stay as they are, where they are. Besides
+`Canvas` (with `Pen`), `Fonts`, `TextStyle`, `ShapedText` and `TextEditor`, a chrome may use
+`state::{is_home, NO_SUCH_PAGE}`, which say what the page area shows for `sig:` addresses; the
+line chrome uses all of them.
 
 **The contract between the executable and a chrome:**
 
@@ -1741,3 +1755,24 @@ finding was checked against the plan and the code before it was acted on.
   - `KeymapKind::check` takes a `CommandSet`;
   - no version constant and no promise;
   - links hand over through `NavigationRequested` (engine contract), not `HandOff`.
+- **Implementation** (2 October 2026, STATUS decisions 67, 68 and 74–77, and the review fixes of
+  decision 82). Where the code departs from the second draft, and what an implementation needs
+  to know:
+  - `Value::as_f64` was left out (nothing reads a float), and so was `TabSnapshot::engine`
+    (neither chrome shows it).
+  - Added to the chrome API's surface: `readable_url`, `Snapshot::contain`, `Pen`, `TextStyle`,
+    `ShapedText` and `state::{is_home, NO_SUCH_PAGE}`.
+  - `NavigationRequested` is narrower: an engine holds at most 16 per view and lets the page's
+    navigations beyond them go ahead, and an engine that knows which navigations the user
+    started may ask about those alone (WPE: a link or a GET form the user clicked).
+  - The core hands a page's navigation to another engine only for the link the user pressed
+    (the page's status text at the press), never while the tab loads an address the user asked
+    for; a key press or a form no longer moves the tab (decision 82, amending 77).
+  - The rules of an engine the build lacks are left out, so a typed address goes where a link
+    does; `[engines] default` must name an engine of the build (decision 82).
+  - An ephemeral Wasm engine keeps no module cache at all, not a temporary one (decision 76).
+  - The modal keymap's `always` table applies its keys that type nothing while the chrome has
+    the keyboard, Enter and Escape included if it binds them (decision 74 (5)).
+  - Guard tests: `sighurt-api/tests/keymap.rs` (a keymap with a two-key sequence, from outside
+    the crate) and `sighurt-ui/tests/extension.rs` (the standard chrome through the trait, and a
+    chrome of its own) pass with these changes.

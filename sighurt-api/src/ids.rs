@@ -15,7 +15,7 @@
 //! - [`NavigationId`], for a navigation its page starts itself (a link, a script, the history
 //!   API); the core allocates the ones for navigations it requests.
 //! - [`DocumentGeneration`], whenever a view commits a new document.
-//! - [`RequestId`], for each service request its view makes.
+//! - [`RequestId`], for each service request and each navigation request its view makes.
 
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};

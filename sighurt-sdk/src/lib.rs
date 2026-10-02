@@ -3334,9 +3334,12 @@ pub const KEY_PAGE_DOWN: u32 = 49;
 
 // ─── Download & Print-to-PDF API ─────────────────────────────────────────────
 
-/// Save arbitrary bytes as a file in the host Downloads directory.
+/// Ask the browser to save arbitrary bytes as a file in the user's download folder.
 ///
-/// Returns 0 on success, -1 on failure (empty data or filename).
+/// The browser decides (at most one download a second per tab) and picks the file's name from
+/// `filename`'s last part, cleaned: a name never leads out of the folder. Returns 0 when the
+/// browser has the request, -1 when it is refused at once (empty data or filename, more than
+/// 64 MiB, too many at once, or called from a worker).
 pub fn download_data(data: &[u8], filename: &str) -> i32 {
     unsafe {
         _api_download_data(
@@ -3348,10 +3351,10 @@ pub fn download_data(data: &[u8], filename: &str) -> i32 {
     }
 }
 
-/// Download a remote URL as a file in the host Downloads directory.
+/// Ask the browser to download an absolute http(s) URL into the user's download folder.
 ///
-/// The download runs in the background with progress tracking.
-/// Returns 0 on success, -1 on failure.
+/// The browser decides and downloads it in the background, showing its progress. Returns 0
+/// when the browser has the request, -1 when it is refused at once.
 pub fn download_url(url: &str) -> i32 {
     unsafe { _api_download_url(url.as_ptr() as u32, url.len() as u32) }
 }
@@ -3359,13 +3362,15 @@ pub fn download_url(url: &str) -> i32 {
 /// Export the current canvas content as a PDF file.
 ///
 /// Renders canvas draw commands (rectangles, text, lines, circles, arcs,
-/// beziers, rounded rects) to a vector PDF saved in the Downloads directory.
-/// Images, gradients, transforms, clipping, and opacity are not yet
-/// supported — use `download_data` with a self-rendered image for those.
+/// beziers, rounded rects) to a vector PDF that the browser saves in the
+/// user's download folder, as [`download_data`] does. Images, gradients,
+/// transforms, clipping, and opacity are not yet supported — use
+/// `download_data` with a self-rendered image for those.
 ///
-/// The output filename is auto-generated with a timestamp.
+/// `filename` gets `.pdf` added if it lacks it; a blank one is replaced by a
+/// name with a timestamp.
 ///
-/// Returns 0 on success, -1 on failure.
+/// Returns 0 when the browser has the request, -1 when it is refused at once.
 pub fn canvas_print_pdf(filename: &str) -> i32 {
     unsafe { _api_canvas_print_pdf(filename.as_ptr() as u32, filename.len() as u32) }
 }

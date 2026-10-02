@@ -9809,10 +9809,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sighurt-api",
+ "sighurt-chrome-line",
  "sighurt-core",
  "sighurt-engine-demo",
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
+ "sighurt-engine-wpe",
+ "sighurt-keymap-modal",
  "sighurt-ui",
  "sighurt-wayland",
  "signal-hook-registry",
@@ -9820,6 +9823,15 @@ dependencies = [
  "tempfile",
  "url",
  "wayland-client 0.31.15",
+]
+
+[[package]]
+name = "sighurt-chrome-line"
+version = "0.7.0"
+dependencies = [
+ "sighurt-api",
+ "sighurt-ui",
+ "tiny-skia 0.11.4",
 ]
 
 [[package]]
@@ -9907,6 +9919,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "sighurt-engine-wpe"
+version = "0.7.0"
+dependencies = [
+ "calloop",
+ "glib",
+ "libc",
+ "log",
+ "pkg-config",
+ "raw-window-handle",
+ "sighurt-api",
+ "sighurt-wayland",
+ "smithay-client-toolkit",
+ "url",
+ "wayland-client 0.31.15",
+ "wayland-protocols 0.32.13",
+ "xkbcommon",
+]
+
+[[package]]
+name = "sighurt-keymap-modal"
+version = "0.7.0"
+dependencies = [
+ "sighurt-api",
+ "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
 name = "sighurt-sdk"
 version = "0.7.0"
 
@@ -9915,9 +9954,11 @@ name = "sighurt-ui"
 version = "0.7.0"
 dependencies = [
  "cosmic-text",
+ "log",
  "sighurt-api",
  "tiny-skia 0.11.4",
  "unicode-segmentation",
+ "url",
 ]
 
 [[package]]
@@ -13429,26 +13470,10 @@ dependencies = [
  "sighurt-api",
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
+ "sighurt-engine-wpe",
  "sighurt-wayland",
  "wasmtime",
  "wat",
- "wpe-engine",
-]
-
-[[package]]
-name = "wpe-engine"
-version = "0.7.0"
-dependencies = [
- "calloop",
- "glib",
- "libc",
- "pkg-config",
- "raw-window-handle",
- "sighurt-api",
- "sighurt-wayland",
- "wayland-client 0.31.15",
- "wayland-protocols 0.32.13",
- "xkbcommon",
 ]
 
 [[package]]

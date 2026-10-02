@@ -1,0 +1,67 @@
+[   0.016] window 1024x768 at 120/120
+[   0.020] ViewReady { view: ViewId(1) }
+[   0.020] LoadingChanged { view: ViewId(1), loading: true }
+[   0.167] window 1280x800 at 120/120
+
+** (WPEWebProcess:2): WARNING **: 13:48:47.977: Can't connect to a11y bus: Could not connect: No such file or directory
+[   0.167] NavigationStarted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html" }
+[   0.168] NavigationCommitted { view: ViewId(1), navigation: NavigationId(1), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", document: DocumentGeneration(1), history: Some(Push) }
+[   0.168] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html"], current: 0 }
+[   0.174] LoadingChanged { view: ViewId(1), loading: false }
+[   0.174] TitleChanged { view: ViewId(1), title: Some("history 0") }
+[   0.248] CursorChanged { view: ViewId(1), cursor: Text }
+[   0.248] StatusTextChanged { view: ViewId(1), text: None }
+[   0.376] NavigationCommitted { view: ViewId(1), navigation: NavigationId(2), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", document: DocumentGeneration(1), history: Some(Push) }
+[   0.376] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one"], current: 1 }
+[   0.376] TitleChanged { view: ViewId(1), title: Some("history 1") }
+[   0.575] NavigationCommitted { view: ViewId(1), navigation: NavigationId(3), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", document: DocumentGeneration(1), history: Some(Push) }
+[   0.575] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two"], current: 2 }
+[   0.575] TitleChanged { view: ViewId(1), title: Some("history 2") }
+[   0.617] action open=/home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html
+[   0.617] LoadingChanged { view: ViewId(1), loading: true }
+[   0.618] NavigationStarted { view: ViewId(1), navigation: NavigationId(4), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html" }
+[   0.622] NavigationCommitted { view: ViewId(1), navigation: NavigationId(4), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html", document: DocumentGeneration(2), history: Some(Push) }
+[   0.622] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html"], current: 3 }
+[   0.622] TitleChanged { view: ViewId(1), title: Some("") }
+[   0.624] LoadingChanged { view: ViewId(1), loading: false }
+[   0.624] TitleChanged { view: ViewId(1), title: Some("second") }
+[   2.124] action back
+[   2.125] LoadingChanged { view: ViewId(1), loading: true }
+[   2.128] NavigationStarted { view: ViewId(1), navigation: NavigationId(5), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two" }
+[   2.129] NavigationCommitted { view: ViewId(1), navigation: NavigationId(5), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", document: DocumentGeneration(3), history: Some(Traverse) }
+[   2.129] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html"], current: 2 }
+[   2.129] TitleChanged { view: ViewId(1), title: Some("") }
+[   2.130] LoadingChanged { view: ViewId(1), loading: false }
+[   2.130] TitleChanged { view: ViewId(1), title: Some("history 2") }
+[   3.131] action back
+[   3.132] LoadingChanged { view: ViewId(1), loading: true }
+[   3.134] NavigationCommitted { view: ViewId(1), navigation: NavigationId(6), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", document: DocumentGeneration(3), history: Some(Traverse) }
+[   3.135] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html"], current: 1 }
+[   3.135] LoadingChanged { view: ViewId(1), loading: false }
+[   4.140] action forward
+[   4.140] LoadingChanged { view: ViewId(1), loading: true }
+[   4.143] NavigationCommitted { view: ViewId(1), navigation: NavigationId(7), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", document: DocumentGeneration(3), history: Some(Traverse) }
+[   4.143] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html"], current: 2 }
+[   4.143] LoadingChanged { view: ViewId(1), loading: false }
+[   5.147] action reload
+[   5.148] LoadingChanged { view: ViewId(1), loading: true }
+[   5.150] NavigationStarted { view: ViewId(1), navigation: NavigationId(8), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two" }
+[   5.154] NavigationCommitted { view: ViewId(1), navigation: NavigationId(8), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", document: DocumentGeneration(4), history: Some(Replace) }
+[   5.154] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/second.html"], current: 2 }
+[   5.154] TitleChanged { view: ViewId(1), title: Some("") }
+[   5.155] LoadingChanged { view: ViewId(1), loading: false }
+[   5.159] TitleChanged { view: ViewId(1), title: Some("history 0") }
+[   5.356] NavigationCommitted { view: ViewId(1), navigation: NavigationId(9), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", document: DocumentGeneration(4), history: Some(Push) }
+[   5.356] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one"], current: 3 }
+[   5.356] TitleChanged { view: ViewId(1), title: Some("history 1") }
+[   5.556] NavigationCommitted { view: ViewId(1), navigation: NavigationId(10), url: "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", document: DocumentGeneration(4), history: Some(Push) }
+[   5.556] HistoryChanged { view: ViewId(1), entries: ["file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#one", "file:///home/gusahlg/repos/sighurt/sighurt-engine-wpe/tests/pages/history.html#two"], current: 4 }
+[   5.556] TitleChanged { view: ViewId(1), title: Some("history 2") }
+[   6.669] action quit
+[   6.669] end: wakeups 133 chrome-paints 2 transport Some(Shm) device None driver None formats 0 glib-dispatches 216 stale-frames 1 rounded-frames 0 failed-imports 0
+[   6.669] end: renderer Some("WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame")
+[   6.669] end: submitted 4 dmabuf-frames 0 dmabuf-imports 0 shm-copies 4 shm-bytes 15564800 dropped 1 releases 4 present-mean-ms 1.310 present-max-ms 1.756
+[   6.669] end: ViewId(1) frames 4 pacing n=1 median=397.61ms p95=397.61ms max=397.61ms
+[   6.669] end: pss-kib 215634 (wpe-window 41056, WPEWebProcess 144376, xdg-dbus-proxy 961, bwrap 974, WPENetworkProce 28267)
+shut down: the compositor reported no error
+exit 0
