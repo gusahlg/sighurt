@@ -5,17 +5,20 @@ This product is derived from Oxide (https://github.com/niklabh/oxide),
 Copyright 2026 Nikhil Ranjan, licensed under the Apache License, Version 2.0.
 
 The Sighurt contributors have modified the files that came from Oxide. The
-codebase has been restructured into a browser (sighurt-browser, sighurt-core,
-sighurt-ui), an engine protocol (sighurt-ipc) and separate engine processes.
-The WASM engine (sighurt-engine-wasm), the guest SDK (sighurt-sdk, formerly
-oxide-sdk), the GPUI chrome, the documentation and the example apps are
-derived from Oxide's source. The git history records the individual changes.
+codebase has been restructured into a browser core (sighurt-core), a Wayland
+host (sighurt-wayland), a chrome drawn on the CPU (sighurt-ui) and the sig
+executable (sighurt-browser), with the content engines compiled into sig. The
+WASM engine (sighurt-engine-wasm), the guest SDK (sighurt-sdk, formerly
+oxide-sdk), sig's downloads, the documentation and the example apps are
+derived from Oxide's source. The git history records the individual changes;
+the code before the restructuring is at the git tag gpui-baseline.
 
 The WASM guest ABI keeps Oxide's "oxide" import module name, so applications
 built for Oxide run unchanged in Sighurt's WASM engine.
 
-sighurt-engine-servo (the sig-servo binary) is licensed under Apache-2.0 AND
-MPL-2.0. Its file src/rendering.rs is adapted from rendering_context.rs in
-the Servo project (https://github.com/servo/servo) and remains under the
-Mozilla Public License, Version 2.0 (https://mozilla.org/MPL/2.0/).
-sig-servo also links Servo, which is licensed under MPL-2.0.
+sighurt-engine-servo, the Servo engine compiled into sig, is licensed under
+Apache-2.0 AND MPL-2.0. It contains no files adapted from the Servo project
+(https://github.com/servo/servo) at present; any that it adapts keep their
+notices and remain under the Mozilla Public License, Version 2.0
+(https://mozilla.org/MPL/2.0/). sig built with the engine-servo feature (one
+of its default features) also links Servo, which is licensed under MPL-2.0.

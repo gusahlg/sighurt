@@ -89,9 +89,15 @@ fn main() {
 
     while driver.state.running {
         driver.iterate(None);
-        for action in std::mem::take(&mut driver.state.actions) {
+        let actions = std::mem::take(&mut driver.state.actions);
+        for action in &actions {
             println!("[{:8.3}] action {action}", driver.state.secs());
-            act(&mut driver.state, &action);
+            act(&mut driver.state, action);
+        }
+        if actions.iter().any(|action| action != "mark") {
+            // What the actions asked for is carried out now, not at the next wakeup. (A mark
+            // asks for nothing, so the idle check counts only the wakeups that print them.)
+            driver.iterate(Some(Duration::ZERO));
         }
     }
 
@@ -179,6 +185,16 @@ fn report(state: State) {
     println!(
         "report: frames {}, read_to_image {}, GL reads {:?}, wakeups {}",
         diagnostics.frames, diagnostics.read_to_image, diagnostics.gl_reads, state.iterations
+    );
+    let timing = diagnostics.timing;
+    let mean = |total: Duration| total / diagnostics.frames.max(1) as u32;
+    println!(
+        "report: paint mean {:?} max {:?}, swap mean {:?} max {:?}, first frame after navigating {:?}",
+        mean(timing.total_paint),
+        timing.max_paint,
+        mean(timing.total_swap),
+        timing.max_swap,
+        timing.first_frame
     );
     for page in &state.pages {
         println!(

@@ -262,6 +262,7 @@ impl DemoRuntime {
                     navigation,
                     url,
                     document: DocumentGeneration::next(),
+                    history: None,
                 });
                 queue.push(EngineEvent::TitleChanged {
                     view: id,

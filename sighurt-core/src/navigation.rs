@@ -29,16 +29,17 @@
 //! it in that segment's engine history, which a view can't forget, are cut off by a limit.
 //! Only a new navigation does this. The core knows its own navigations, traversals and reloads
 //! by their ids, including those a newer request superseded, since an engine carries out every
-//! traversal it is sent. Of the commits a page started itself, the API says only whether they
-//! kept the document: a new document counts as a new navigation (a link, a form, a script
-//! navigation, a redirect), a same-document commit doesn't (a fragment, `pushState`,
-//! `replaceState`, the page's own traversal). So `replaceState` never discards later segments,
-//! a `pushState` leaves them reachable, and a page's own traversal to another document
-//! (`history.back()` across documents) or reload discards them: telling those apart needs the
-//! engine to say what the commit did to its history.
+//! traversal it is sent. A commit the page started itself is a new navigation when the engine
+//! says it added an entry ([`HistoryEffect::Push`]: a link, a form, a script navigation, a
+//! fragment, `pushState`), and not when it replaced the entry or moved to another (a reload,
+//! `replaceState`, the page's own `history.back()`). An engine that doesn't say leaves only
+//! whether the document changed: a new document counts as a new navigation, a same-document
+//! commit doesn't, so then `pushState` leaves later segments reachable and a page's own
+//! traversal to another document, or its own reload, discards them.
 //!
 //! Must not own: the engines' session history.
 
+use sighurt_api::events::HistoryEffect;
 use sighurt_api::ids::{NavigationId, ViewId};
 
 use crate::tabs::MAX_URL;
@@ -72,14 +73,15 @@ pub enum NavigationKind {
 }
 
 impl NavigationKind {
-    /// Whether committing it creates a new history entry, discarding what came after.
-    /// `new_document` says whether the commit replaced the document, which is all that is known
-    /// of a page's own navigation (see the module documentation).
-    pub fn is_new(self, new_document: bool) -> bool {
+    /// Whether committing it creates a new history entry, discarding what came after. For a
+    /// page's own navigation, `history` is what the engine says the commit did, and
+    /// `new_document` whether it replaced the document, all that is known without it (see the
+    /// module documentation).
+    pub fn is_new(self, new_document: bool, history: Option<HistoryEffect>) -> bool {
         match self {
             Self::Navigate => true,
             Self::Reload | Self::Traverse => false,
-            Self::Page => new_document,
+            Self::Page => history.map_or(new_document, |h| h == HistoryEffect::Push),
         }
     }
 }
@@ -418,11 +420,15 @@ mod tests {
 
     #[test]
     fn only_new_entries_discard_what_came_after() {
-        assert!(NavigationKind::Navigate.is_new(false));
-        assert!(!NavigationKind::Traverse.is_new(true));
-        assert!(!NavigationKind::Reload.is_new(true));
-        assert!(NavigationKind::Page.is_new(true));
-        assert!(!NavigationKind::Page.is_new(false));
+        assert!(NavigationKind::Navigate.is_new(false, None));
+        assert!(!NavigationKind::Traverse.is_new(true, None));
+        assert!(!NavigationKind::Reload.is_new(true, None));
+        assert!(NavigationKind::Page.is_new(true, None));
+        assert!(!NavigationKind::Page.is_new(false, None));
+        // What the engine says decides for the page's own commits.
+        assert!(NavigationKind::Page.is_new(false, Some(HistoryEffect::Push)));
+        assert!(!NavigationKind::Page.is_new(true, Some(HistoryEffect::Traverse)));
+        assert!(!NavigationKind::Page.is_new(true, Some(HistoryEffect::Replace)));
     }
 
     #[test]

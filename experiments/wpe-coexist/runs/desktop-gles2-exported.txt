@@ -1,0 +1,68 @@
+INFO exports hb_*: 507
+INFO exports FT_*: 153
+INFO exports png_*: 240
+INFO exports jpeg_*: 72
+INFO exports deflate*: 0
+INFO exports inflate*: 0
+INFO exports setenv*: 1
+INFO exports in all: 1307
+INFO bindings from shared libraries into the executable: 1524
+INFO   libsqlite3.so: 445
+INFO   libharfbuzz.so.0: 236
+INFO   libWPEWebKit-2.0.so.1: 220
+INFO   libpng16.so.16: 106
+INFO   libfreetype.so.6: 105
+INFO   libjpeg.so.62: 70
+INFO   libass.so.9: 66
+INFO   libfontconfig.so.1: 23
+INFO   libavfilter.so.11: 22
+INFO   libv4lconvert.so.0: 16
+INFO   libharfbuzz-icu.so.0: 11
+INFO   libopenmpt.so.0: 10
+FAIL no symbol of WebKit's library binds into the executable
+INFO signals at start: SEGV=0x5b37a8dfa020(wpe-coexist-export) BUS=0x5b37a8dfa020(wpe-coexist-export) ILL=default FPE=default USR1=default USR2=default PIPE=ignored CHLD=default
+INFO signals after Servo: SEGV=0x5b37a8dfa020(wpe-coexist-export) BUS=0x5b37a8dfa020(wpe-coexist-export) ILL=default FPE=default USR1=default USR2=default PIPE=ignored CHLD=default
+INFO signals after the Wasm engine: SEGV=0x5b37a2c0df20(wpe-coexist-export) BUS=0x5b37a8dfa020(wpe-coexist-export) ILL=0x5b37a2c0df20(wpe-coexist-export) FPE=0x5b37a2c0df20(wpe-coexist-export) USR1=default USR2=default PIPE=ignored CHLD=default
+PASS Wasmtime guests trap before WebKit starts (oob 100/100, unreachable 100/100)
+INFO signals after Wasmtime: SEGV=0x5b37a2c0df20(wpe-coexist-export) BUS=0x5b37a8dfa020(wpe-coexist-export) ILL=0x5b37a2c0df20(wpe-coexist-export) FPE=0x5b37a2c0df20(wpe-coexist-export) USR1=default USR2=default PIPE=ignored CHLD=default
+PASS the window is configured
+INFO signals after WebKit's first view: SEGV=0x5b37a2c0df20(wpe-coexist-export) BUS=0x5b37a8dfa020(wpe-coexist-export) ILL=0x5b37a2c0df20(wpe-coexist-export) FPE=0x5b37a2c0df20(wpe-coexist-export) USR1=0x731dad5662a0(libWPEWebKit-2.0.so.1) USR2=default PIPE=ignored CHLD=default
+INFO [ 0.103] Servo title Some("")
+INFO [ 0.103] Servo title Some("servo")
+INFO [ 0.108] Servo title Some("servo js=42 oob=100/100 unreachable=100/100 ms=4")
+INFO [ 0.261] Wpe title Some("wpe")
+INFO [ 0.261] Wpe title Some("wpe js=42 oob=100/100 unreachable=100/100 ms=4")
+PASS Servo and WebKit run JavaScript and trap in their Wasm (servo: "servo js=42 oob=100/100 unreachable=100/100 ms=4", wpe: "wpe js=42 oob=100/100 unreachable=100/100 ms=4")
+PASS every engine presents (Servo 2, Wpe 1, Wasm 1)
+INFO holding for 3 s
+INFO Servo GL: Some("NVIDIA GeForce RTX 3070/PCIe/SSE2"), read_to_image 0; WPE transport Some(Dmabuf) on Some("/dev/dri/renderD128"), shm copies 0
+PASS WebKit returns a script's value into this process (Some(Ok("42 true")))
+INFO signals after JavaScriptCore in this process: SEGV=0x5b37a723eb80(wpe-coexist-export) BUS=0x5b37a8dfa020(wpe-coexist-export) ILL=0x5b37a723eb80(wpe-coexist-export) FPE=0x5b37a2c0df20(wpe-coexist-export) USR1=0x731dad5662a0(libWPEWebKit-2.0.so.1) USR2=default PIPE=ignored CHLD=default
+PASS a Wasmtime trap leaves this thread's signal mask as it was (blocked after the trap: [])
+INFO [ 3.397] Wpe title Some("")
+INFO [ 3.398] Wpe title Some("wpe2")
+INFO [ 3.405] Servo title None
+INFO [ 3.405] Servo title Some("")
+INFO [ 3.405] Servo title Some("servo2")
+INFO [ 3.407] Wpe title Some("wpe2 js=42 oob=2000/2000 unreachable=2000/2000 ms=9")
+INFO [ 3.436] Servo title Some("servo2 js=42 oob=2000/2000 unreachable=2000/2000 ms=30")
+PASS the pages trap 2000 times each way while Wasmtime traps on two threads (servo: "servo2 js=42 oob=2000/2000 unreachable=2000/2000 ms=30", wpe: "wpe2 js=42 oob=2000/2000 unreachable=2000/2000 ms=9"; thread rounds 9890, wrong traps 0 + 0)
+INFO [ 3.439] Wasm failed: on_frame trapped: error while executing at wasm backtrace:
+PASS a trapping Wasm guest fails its view only
+INFO WebKit web processes: [308617]
+INFO [ 3.444] Wpe failed: WebKit's web process crashed; reload to start a new one
+INFO [ 3.444] Wpe title Some("")
+PASS a killed web process fails the WPE view
+INFO [ 3.454] Servo title None
+INFO [ 3.454] Servo title Some("")
+INFO [ 3.454] Servo title Some("servo3")
+INFO [ 3.456] Servo title Some("servo3 js=42 oob=10/10 unreachable=10/10 ms=2")
+PASS Servo goes on after WebKit's crash (servo3 js=42 oob=10/10 unreachable=10/10 ms=2)
+INFO [ 3.624] Wpe title Some("wpe2")
+INFO [ 3.632] Wpe title Some("wpe2 js=42 oob=2000/2000 unreachable=2000/2000 ms=12")
+PASS a reload brings the WPE view back (wpe2 js=42 oob=2000/2000 unreachable=2000/2000 ms=12)
+INFO shared libraries mapped: 210
+PASS no shared library is mapped twice under one name ([])
+INFO shut down in 12.071832ms; Servo left running: false
+PASS the process exits with 0
+1 failed; output in /tmp/claude-1000/-home-gusahlg-repos-sighurt/4074f6cc-047d-4246-ae06-9980bd83ce65/scratchpad/coexist-export

@@ -1,0 +1,52 @@
+PASS gles2: the red page loads
+PASS gles2: the compositor shows it under the chrome
+PASS gles2: the chrome strip is shown
+INFO [   6.463] mark: wakeups 109 chrome-paints 2 transport Some(Shm) device None formats 0 glib-dispatches 101 stale-frames 1 rounded-frames 0 failed-imports 0
+INFO idle: 1 loop wakeups and 0 GLib dispatches in 5 s
+PASS gles2: idle: at most 3 wakeups in 5 s with a static page (1 is the mark)
+INFO transport Some(Shm), device None, 0 DMA-BUF formats
+PASS gles2: the animation presents in its tab (frames in 6 s)
+PASS gles2: no chrome repaint because the page animated
+INFO [  12.994] mark: ViewId(2) frames 351 pacing n=350 median=17.07ms p95=17.23ms max=18.39ms
+INFO [  12.994] mark: dmabuf-frames 0 dmabuf-imports 0 shm-copies 352 shm-bytes 1369702400 dropped 2 releases 352
+INFO [  13.007] mark: pss-kib 286036 (bwrap 2467, WPENetworkProce 24799, wpe-window 39812, WPEWebProcess 216545, xdg-dbus-proxy 2413)
+PASS gles2: SHM: one copy per frame
+PASS gles2: a hidden view presents nothing
+PASS gles2: the red page shows again
+INFO red page frames: 1 before, 1 after showing it again
+PASS gles2: hiding unmaps the page (the window's background)
+PASS gles2: showing maps it again
+PASS gles2: shutdown: the window closes cleanly
+PASS gles2: crash: the page loads
+INFO crash: web processes of this window: 93520
+PASS gles2: a crashed web process is ViewFailed
+INFO [   0.424] ViewFailed { view: ViewId(1), message: "WebKit's web process crashed; reload to start a new one" }
+PASS gles2: the browser lives on
+PASS gles2: a reload starts a new web process
+PASS gles2: the reloaded page is shown
+INFO crash: web processes now: 93591
+PASS gles2: the input page loads at the window's size
+PASS gles2: a click arrives at its surface-local position
+PASS gles2: å ä ö and a dead key are typed
+PASS gles2: a named key reaches the page
+PASS gles2: the page blurs when the chrome takes the keyboard
+PASS gles2: keys for the chrome don't reach the page
+PASS gles2: the page has focus again
+PASS gles2: and gets keys
+PASS gles2: the wheel scrolls the page
+PASS gles2: scale 1.5: the page sees dpr 1.5 and 853x493
+PASS gles2: scale 1.5: the page is shown, its corner at 100 CSS px
+PASS gles2: scale 1.5: clicks land at the same CSS position
+PASS gles2: scale 2: the page sees dpr 2 and 640x360
+PASS gles2: scale 2: the page is shown, its corner at 100 CSS px
+PASS gles2: scale 2: clicks land at the same CSS position
+PASS gles2: scale 1.25: the page sees dpr 1.25 and 1024x600
+PASS gles2: scale 1.25: the page is shown, its corner at 100 CSS px
+PASS gles2: scale 1.25: clicks land at the same CSS position
+PASS gles2: scale 1: the page sees dpr 1 and 1280x760
+PASS gles2: scale 1: the page is shown, its corner at 100 CSS px
+PASS gles2: scale 1: clicks land at the same CSS position
+PASS gles2: a new size reaches the page
+PASS gles2: and is shown
+INFO [  12.875] mark: wakeups 1226 chrome-paints 7 transport Some(Shm) device None formats 0 glib-dispatches 515 stale-frames 5 rounded-frames 64 failed-imports 0
+0 failed; logs and screenshots in /tmp/wpe-louise-gles2-shm

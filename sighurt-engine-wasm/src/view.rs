@@ -583,6 +583,7 @@ impl View {
             navigation: navigation.unwrap_or_else(NavigationId::next),
             url,
             document: document.generation,
+            history: None,
         });
         out.push(EngineEvent::HistoryChanged {
             view: self.id,

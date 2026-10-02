@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>input</title>
+<!-- Says what it receives in its title: pointer positions, keys (key and code), typed text,
+     wheel, focus, the viewport. The field has focus from the start. -->
+<style>
+  body { font: 20px sans-serif; margin: 0; background: #fdfdf8; height: 3000px; }
+  #field { position: fixed; left: 20px; top: 200px; width: 300px; height: 30px; font-size: 20px; }
+  .corner { position: fixed; left: 0; top: 0; width: 100px; height: 100px; background: #0a0; }
+</style>
+<div class="corner"></div>
+<input id="field" autocomplete="off">
+<script>
+  const say = (message) => { document.title = message; };
+  const viewport = () => `dpr ${devicePixelRatio} ${innerWidth}x${innerHeight}`;
+  addEventListener("mousedown", (e) => {
+    if (e.target !== field) say(`mousedown ${e.button} ${e.clientX},${e.clientY} detail ${e.detail}`);
+  });
+  addEventListener("keydown", (e) => {
+    if (e.key === "Dead" || e.key === "F2") say(`keydown ${e.key} ${e.code}`);
+  });
+  addEventListener("wheel", (e) => say(`wheel ${Math.sign(e.deltaY)}`));
+  addEventListener("scroll", () => say(`scrollY ${Math.round(scrollY)}`));
+  addEventListener("resize", () => say(`resize ${viewport()}`));
+  addEventListener("focus", () => say("focus"));
+  addEventListener("blur", () => say("blur"));
+  addEventListener("load", () => { field.focus(); say(`load ${viewport()}`); });
+  field.addEventListener("input", () => say(`field ${field.value}`));
+</script>

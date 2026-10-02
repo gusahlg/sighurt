@@ -28,9 +28,12 @@
 //! Nothing ticks at a fixed rate: an idle browser sleeps until the compositor, an engine, a
 //! service or a signal wakes it. Downloads and session writes run on threads of their own.
 //!
-//! Shutdown (plan §20): stop taking input, write the session (at once, whole), close every view
-//! and shut every runtime down (each releases its target leases), cancel downloads, retire the
-//! chrome's leases, close the window, and only then drop the host.
+//! Shutdown (plan §20): stop taking input, cancel downloads, write the session (at once, whole),
+//! close every view and shut every runtime down (each releases its target leases), wait a moment
+//! for the downloads (deleting the files of those still waiting on a server), retire the
+//! chrome's leases, close the window, and only then drop the host. If a runtime could not shut
+//! down (Servo after a crash, decision 54), the process ends with `_exit` after the downloads,
+//! releasing nothing that runtime may still use.
 //!
 //! Must not own: browser policy (the core) or drawing (the chrome and engines).
 //!
@@ -61,7 +64,7 @@ use sighurt_wayland::{
     TargetPlacement, WindowOptions,
 };
 
-use crate::diagnostics::{Diagnostics, EngineReport, Report, TargetReport};
+use crate::diagnostics::{Diagnostics, EngineReport, Report, TabReport, TargetReport};
 use crate::persistence::{self, ConfigWatch, Paths, SessionWriter};
 use crate::registry::{Registry, State};
 use crate::services::{Completion, Services};
@@ -171,8 +174,11 @@ pub fn run(args: Args, signals: OwnedFd) -> Result<ExitCode, String> {
         .insert_source(wake_source, |(), &mut (), _| {})
         .map_err(|e| e.error.to_string())?;
     let mut app = App::new(host, wake, args)?;
-    watch(&handle, signals, &app.paths)?;
-    app.start();
+    // From here on every way out goes through `App::shutdown`, which releases in §20's order.
+    match watch(&handle, signals, &app.paths) {
+        Ok(()) => app.start(),
+        Err(error) => app.fail(error),
+    }
     let mut busy = true;
     while app.quit.is_none() {
         let timeout = if busy {
@@ -180,9 +186,10 @@ pub fn run(args: Args, signals: OwnedFd) -> Result<ExitCode, String> {
         } else {
             app.timeout()
         };
-        event_loop
-            .dispatch(timeout, &mut app)
-            .map_err(|e| format!("the event loop failed: {e}"))?;
+        if let Err(error) = event_loop.dispatch(timeout, &mut app) {
+            app.fail(format!("the event loop failed: {error}"));
+            break;
+        }
         if timeout != Some(Duration::ZERO) {
             app.diag.counters.wakeups += 1;
         }
@@ -234,6 +241,7 @@ impl App {
         let loaded = match persistence::load_config(paths.config.as_deref()) {
             Ok(loaded) => loaded,
             Err(error) => {
+                log::warn!("the configuration can't be used: {error}");
                 notice = Some(format!(
                     "{error}\nsig runs with the built-in configuration until the file is fixed."
                 ));
@@ -390,6 +398,12 @@ impl App {
         next.map(|at| at.saturating_duration_since(now))
     }
 
+    /// `sig` can't go on: reports `error` and quits with a failure.
+    fn fail(&mut self, error: String) {
+        self.diag.error(error);
+        self.quit = Some(ExitCode::FAILURE);
+    }
+
     fn handle_signals(&mut self) {
         for signal in std::mem::take(&mut self.signals) {
             match i32::from(signal) {
@@ -463,9 +477,7 @@ impl App {
                 }
             }
             HostEvent::ConnectionLost { error } => {
-                self.diag
-                    .error(format!("the Wayland connection is gone: {error}"));
-                self.quit = Some(ExitCode::FAILURE);
+                self.fail(format!("the Wayland connection is gone: {error}"))
             }
         }
     }
@@ -798,9 +810,9 @@ impl App {
     }
 
     /// Shows `message` in the status strip until another replaces it, for [`NOTICE_FIRST`]
-    /// before anything the page says there.
+    /// before anything the page says there. Not logged: notices can hold page data (an origin,
+    /// a URL, a downloaded file's name).
     pub(crate) fn show_notice(&mut self, message: String) {
-        log::info!("notice: {message}");
         self.notice = Some(message);
         self.notice_first = Some(Instant::now() + NOTICE_FIRST);
         self.snapshot_dirty = true;
@@ -994,11 +1006,15 @@ impl App {
                 let readback_bytes =
                     self.diag
                         .readbacks(&entry.engine, runtime.readbacks(), buffer);
-                let name = format!("{view:?}");
-                let serial = name.trim_start_matches("ViewId(").trim_end_matches(')');
                 let size = (size.width, size.height);
-                self.diag
-                    .frame(&entry.engine, serial, size, took, readback_bytes);
+                let paint = runtime.paint_time().unwrap_or(took);
+                self.diag.frame(
+                    &entry.engine,
+                    view.serial(),
+                    size,
+                    (paint, took),
+                    readback_bytes,
+                );
                 if let Some(asked) = entry.navigated.take() {
                     self.diag.first_frame(&entry.engine, asked.elapsed());
                 }
@@ -1031,10 +1047,13 @@ impl App {
                     self.snapshot_dirty = true;
                 }
             }
-            Err(persistence::LoadError::Config(error)) => self
-                .queue
-                .push_back(BrowserEvent::ConfigReloaded(Err(error))),
+            Err(persistence::LoadError::Config(error)) => {
+                log::warn!("the configuration in use stays: {error}");
+                self.queue
+                    .push_back(BrowserEvent::ConfigReloaded(Err(error)));
+            }
             Err(persistence::LoadError::Other(message)) => {
+                log::warn!("the configuration in use stays: {message}");
                 self.show_notice(format!("{message}\nThe configuration in use stays."))
             }
         }
@@ -1128,6 +1147,7 @@ impl App {
                         .and_then(|r| r.renderer())
                         .and_then(|(mode, gl)| gl.map(|gl| format!("{mode}: {gl}"))),
                     readbacks: running.map_or(0, |r| r.readbacks()),
+                    gl_reads: running.and_then(|r| r.gl_reads()),
                     state: match engine.state() {
                         State::NotStarted => "not started".into(),
                         State::Running(_) => "running".into(),
@@ -1137,11 +1157,23 @@ impl App {
                 }
             })
             .collect();
+        let tabs = self
+            .core
+            .tabs()
+            .map(|tab| TabReport {
+                loading: tab.loading,
+                can_go_back: tab.can_go_back,
+                can_go_forward: tab.can_go_forward,
+                reloads: tab.reloads,
+                error: tab.error.is_some(),
+            })
+            .collect();
         let report = Report {
             counters: self.diag.counters.clone(),
             peaks: self.diag.peaks.clone(),
             targets,
             engines,
+            tabs,
             active_tab: self.core.active() + 1,
             status: self
                 .active_tab()
@@ -1153,9 +1185,12 @@ impl App {
         self.diag.report(&report, at_exit);
     }
 
-    /// Shuts down in the order of plan §20 and returns the exit code.
+    /// Shuts down in the order of plan §20 and returns the exit code. If an engine could not
+    /// shut down (decision 54), the process ends here with `_exit` once the session is written
+    /// and the downloads have ended or been deleted.
     fn shutdown(mut self) -> ExitCode {
         let code = self.quit.take().unwrap_or(ExitCode::SUCCESS);
+        self.services.cancel_downloads();
         if let Some(writer) = self.session.take() {
             writer.save(self.core.session().to_text());
             writer.finish();
@@ -1179,15 +1214,33 @@ impl App {
             window,
             surfaces,
             services,
+            registry,
             ..
         } = self;
         services.shutdown();
+        if registry.leaked() {
+            exit_now(code);
+        }
         drop(surfaces);
         host.close_window(window);
         host.flush();
         drop(host);
         code
     }
+}
+
+/// Ends the process now, with `code`, without exit handlers or destructors: what decision 54
+/// prescribes after Servo was left running. Its threads still use GL contexts, the EGL display
+/// and the Wayland connection, which exit handlers (the driver's) and the host's destructors
+/// would tear down under them; the compositor cleans up after the closed connection.
+fn exit_now(code: ExitCode) -> ! {
+    log::error!("an engine could not shut down; sig ends without running exit handlers");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let status = if code == ExitCode::SUCCESS { 0 } else { 1 };
+    // SAFETY: `_exit` ends the process at once. Nothing here relies on a destructor or exit
+    // handler running: the session file and the diagnostics are written and closed, and the
+    // downloads have ended or their files are deleted.
+    unsafe { libc::_exit(status) }
 }
 
 /// What the status strip shows, and where it comes from: a notice of `sig`'s own while it is

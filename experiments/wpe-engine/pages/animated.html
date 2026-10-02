@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>animated</title>
+<!-- A CSS animation and a WebGL canvas redrawn on every requestAnimationFrame; the title counts
+     the WebGL frames, so the driver's log shows the page's own pace. -->
+<style>
+  body { font: 16px sans-serif; margin: 24px; background: #f4f6fb; }
+  .box { width: 60px; height: 60px; background: #d33; margin: 12px 0;
+         animation: slide 2s ease-in-out infinite alternate; }
+  @keyframes slide { to { transform: translateX(400px) rotate(180deg); } }
+</style>
+<div class="box"></div>
+<canvas id="gl" width="320" height="180"></canvas>
+<script>
+  const gl = document.getElementById("gl").getContext("webgl");
+  let n = 0;
+  const draw = (t) => {
+    const s = t / 1000;
+    gl.clearColor(0.5 + 0.5 * Math.sin(s), 0.5 + 0.5 * Math.sin(s + 2), 0.5 + 0.5 * Math.sin(s + 4), 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (++n % 60 === 0) document.title = `webgl ${n}`;
+    requestAnimationFrame(draw);
+  };
+  document.title = gl ? `webgl ${gl.getParameter(gl.VERSION)}` : "no webgl";
+  requestAnimationFrame(draw);
+</script>

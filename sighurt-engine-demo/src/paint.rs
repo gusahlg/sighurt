@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use sighurt_api::geometry::SurfacePoint;
+use sighurt_api::geometry::{BufferPoint, SurfacePoint};
 use sighurt_wayland::ShmFrame;
 
 use crate::Page;
@@ -100,7 +100,8 @@ pub(crate) fn paint(frame: &mut ShmFrame, scene: &Scene) {
         (Page::Slow, false) => bands(&mut canvas, &SLOW),
         (Page::Crash, false) => stripes(&mut canvas, rgb(0x1c1917), rgb(0x292524)),
         (Page::Animation, false) => animation(&mut canvas, scene.elapsed),
-        (Page::Resize, false) => resize(&mut canvas, scene.pointer),
+        // Where the contract's conversion puts the pointer, as the status text says.
+        (Page::Resize, false) => resize(&mut canvas, scene.pointer.map(|p| metrics.to_buffer(p))),
     }
     let (edge, square) = (canvas.x(8.0), canvas.x(16.0));
     let (top, bottom) = (canvas.y(8.0), canvas.y(8.0) + canvas.y(16.0));
@@ -173,7 +174,7 @@ fn animation(canvas: &mut Canvas<'_>, elapsed: Duration) {
 
 /// A checkerboard of 16-logical-pixel squares, a one-buffer-pixel red border, and crosshairs
 /// through the buffer pixel under the pointer.
-fn resize(canvas: &mut Canvas<'_>, pointer: Option<SurfacePoint>) {
+fn resize(canvas: &mut Canvas<'_>, pointer: Option<BufferPoint>) {
     let (light, dark) = (rgb(0xd8d8d0), rgb(0x989890));
     let (square_x, square_y) = (16.0 * canvas.ratio.0, 16.0 * canvas.ratio.1);
     let row = |first: [u8; 4], second: [u8; 4]| -> Vec<u8> {
@@ -198,8 +199,7 @@ fn resize(canvas: &mut Canvas<'_>, pointer: Option<SurfacePoint>) {
     canvas.rect((0, w), (h.saturating_sub(1), h), BORDER);
     canvas.rect((0, 1), (0, h), BORDER);
     canvas.rect((w.saturating_sub(1), w), (0, h), BORDER);
-    if let Some(point) = pointer {
-        let (x, y) = (point.x * canvas.ratio.0, point.y * canvas.ratio.1);
+    if let Some(BufferPoint { x, y }) = pointer {
         if x >= 0.0 && y >= 0.0 {
             let (x, y) = (x as usize, y as usize);
             canvas.rect((x, x + 1), (0, h), CROSSHAIR);

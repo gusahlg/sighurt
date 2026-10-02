@@ -1,7 +1,7 @@
 # Development shell for NixOS: `nix-shell`, then build as usual
 # (`cargo run -p sighurt-ui`, and the Servo engine with
 # `cargo build --release --manifest-path sighurt-engine-servo/Cargo.toml`).
-{ pkgs ? import <nixpkgs> { } }:
+{ pkgs ? import ./nix/nixpkgs.nix { } }:
 let
   # Loaded at runtime by GPUI, the WASM engine and Servo.
   runtimeLibs = with pkgs; [
@@ -9,8 +9,11 @@ let
     libx11 libxcb libxcursor libxrandr libxi libxext libxfixes libxrender
     fontconfig freetype alsa-lib udev dbus openssl libv4l
   ];
+  # WPE WebKit, once nix/build-wpewebkit.sh has installed it on this machine (docs/rewrite/WPE.md).
+  wpe = import ./nix/wpewebkit.nix { inherit pkgs; };
+  hasWpe = builtins.pathExists "${wpe.prefix}/lib/pkgconfig/wpe-webkit-2.0.pc";
 in
-pkgs.mkShell {
+pkgs.mkShell ({
   nativeBuildInputs = with pkgs; [
     pkg-config cmake gnumake python3 perl yasm nasm m4
     llvmPackages.clang llvmPackages.libclang.lib llvmPackages.lld
@@ -24,5 +27,6 @@ pkgs.mkShell {
   # nixpkgs' rustc has no bundled rust-lld; link wasm guests with lld's wasm-ld.
   CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER = "wasm-ld";
   LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-  LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
-}
+  LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs
+    + pkgs.lib.optionalString hasWpe ":${wpe.prefix}/lib";
+} // pkgs.lib.optionalAttrs hasWpe wpe.env)

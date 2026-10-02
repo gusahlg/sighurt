@@ -1,10 +1,13 @@
 //! A virtual pointer that stays plugged in while it reads commands from stdin, for the headless
-//! end-to-end tests (`sighurt-browser/tests/headless.sh`). Only ever run it inside a private
-//! compositor (`tools/headless-sway`); it moves the pointer of whatever compositor it reaches.
+//! end-to-end tests (`sighurt-browser/tests/headless.sh` and `engines.sh`). Only ever run it
+//! inside a private compositor (`tools/headless-sway`); it moves the pointer of whatever
+//! compositor it reaches.
 //!
 //! ```text
 //! move X Y W H   move to (X, Y) of a W×H logical layout (the output's logical size)
 //! click          press and release the left button
+//! press          press the left button and hold it
+//! release        release it
 //! ```
 //!
 //! wlrctl creates a new virtual pointer for each command and removes it right after, so the
@@ -67,6 +70,14 @@ fn main() -> Result<(), String> {
             ["click"] => {
                 pointer.button(time(), BTN_LEFT, ButtonState::Pressed);
                 pointer.frame();
+                pointer.button(time(), BTN_LEFT, ButtonState::Released);
+                pointer.frame();
+            }
+            ["press"] => {
+                pointer.button(time(), BTN_LEFT, ButtonState::Pressed);
+                pointer.frame();
+            }
+            ["release"] => {
                 pointer.button(time(), BTN_LEFT, ButtonState::Released);
                 pointer.frame();
             }

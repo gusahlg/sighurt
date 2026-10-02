@@ -6,8 +6,9 @@
 //! channel that wakes the loop. Downloads report progress as short status lines for the status
 //! strip, as the old browser did: saved as `name`, `name (1)`, ... in the download folder (the
 //! home folder if there is none), a name that never leads out of the folder, and no file left
-//! behind by a failed or cancelled download. File pickers and permissions have no
-//! implementation yet and fail closed with `ServiceError::Unsupported`, as does anything else.
+//! behind by a failed or cancelled download: at quit, the file of a download still waiting on
+//! its server is deleted by the owner. File pickers and permissions have no implementation yet
+//! and fail closed with `ServiceError::Unsupported`, as does anything else.
 //!
 //! Must not own: the decision whether a service is allowed (the core).
 
@@ -17,7 +18,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -47,7 +48,20 @@ pub enum Completion {
 /// A running download.
 struct Download {
     cancel: Arc<AtomicBool>,
+    /// The file it writes, from when it is created until it is complete.
+    partial: Partial,
     thread: JoinHandle<()>,
+}
+
+/// The file a download is writing, until it is complete.
+type Partial = Arc<Mutex<Option<PathBuf>>>;
+
+/// Takes the path out of `partial`.
+fn take(partial: &Mutex<Option<PathBuf>>) -> Option<PathBuf> {
+    partial
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
 }
 
 /// The services in progress.
@@ -157,6 +171,16 @@ impl Services {
                 )));
             }
         }
+        self.spawn_download(source, name, folder())
+    }
+
+    /// Saves `source` as `name` in `dir` on a thread of its own.
+    fn spawn_download(
+        &mut self,
+        source: DownloadSource,
+        name: String,
+        dir: PathBuf,
+    ) -> ServiceResult {
         let id = self.next;
         self.next += 1;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -165,11 +189,12 @@ impl Services {
             wake: Arc::clone(&self.wake),
         };
         let stop = Arc::clone(&cancel);
-        let dir = folder();
+        let partial = Partial::default();
+        let file = Arc::clone(&partial);
         let thread = std::thread::Builder::new()
             .name("sighurt-download".into())
             .spawn(move || {
-                let last = match save(source, &dir, &name, &stop, &report) {
+                let last = match save(source, &dir, &name, &stop, &file, &report) {
                     Ok(path) => format!("Saved {}", path.display()),
                     Err(e) => format!("Download of {name} failed: {e}"),
                 };
@@ -177,15 +202,29 @@ impl Services {
                 report.send(Completion::Finished(id));
             })
             .map_err(|e| ServiceError::Failed(format!("cannot start the download: {e}")))?;
-        self.downloads.insert(id, Download { cancel, thread });
+        self.downloads.insert(
+            id,
+            Download {
+                cancel,
+                partial,
+                thread,
+            },
+        );
         Ok(ServiceReply::Done)
     }
 
-    /// Cancels every download and waits a moment for them to delete their files.
-    pub fn shutdown(self) {
+    /// Cancels every download: each stops at its next read and deletes its file. The first
+    /// step of quitting (plan §20: stop creating work).
+    pub fn cancel_downloads(&self) {
         for download in self.downloads.values() {
             download.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Cancels every download and waits a moment for them to end. The file of one still
+    /// waiting on its server after that is deleted here, so none is left behind.
+    pub fn shutdown(self) {
+        self.cancel_downloads();
         let until = Instant::now() + CANCEL_GRACE;
         for (_, download) in self.downloads {
             while !download.thread.is_finished() && Instant::now() < until {
@@ -193,6 +232,8 @@ impl Services {
             }
             if download.thread.is_finished() {
                 let _ = download.thread.join();
+            } else if let Some(path) = take(&download.partial) {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -240,12 +281,14 @@ fn folder() -> PathBuf {
 }
 
 /// Saves `source` into a new file named after `name` in `dir` and returns its path. A failed or
-/// cancelled download leaves no file behind.
+/// cancelled download leaves no file behind. `partial` holds the file's path while it is
+/// incomplete.
 fn save(
     source: DownloadSource,
     dir: &Path,
     name: &str,
     cancel: &AtomicBool,
+    partial: &Mutex<Option<PathBuf>>,
     report: &Reporter,
 ) -> Result<PathBuf, String> {
     let (mut body, total): (Box<dyn Read>, Option<u64>) = match source {
@@ -268,6 +311,7 @@ fn save(
         }
     };
     let (path, file) = create_unique(dir, name).map_err(|e| e.to_string())?;
+    *partial.lock().unwrap_or_else(PoisonError::into_inner) = Some(path.clone());
     let total = total.map(format_bytes);
     let copy = || -> io::Result<()> {
         let mut writer = BufWriter::new(file);
@@ -293,7 +337,9 @@ fn save(
             }
         }
     };
-    match copy() {
+    let copied = copy();
+    take(partial);
+    match copied {
         Ok(()) => Ok(path),
         Err(e) => {
             let _ = std::fs::remove_file(&path);
@@ -450,7 +496,15 @@ mod tests {
             sender,
             wake: Arc::new(|| {}),
         };
-        let last = match save(source, dir, name, &AtomicBool::new(false), &report) {
+        let partial = Mutex::default();
+        let last = match save(
+            source,
+            dir,
+            name,
+            &AtomicBool::new(false),
+            &partial,
+            &report,
+        ) {
             Ok(path) => format!("Saved {}", path.display()),
             Err(e) => format!("Download of {name} failed: {e}"),
         };
@@ -519,9 +573,49 @@ mod tests {
             dir.path(),
             "x.bin",
             &AtomicBool::new(true),
+            &Mutex::default(),
             &report,
         );
         assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn quitting_deletes_a_download_its_server_keeps_waiting() {
+        // Sends half of the body, then nothing, with the connection open.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/stalled.bin", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = io::BufReader::new(&stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhalf";
+            stream.write_all(head.as_bytes()).unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut services = Services::new(|| {});
+        let started = services.spawn_download(
+            DownloadSource::Url(url),
+            "stalled.bin".into(),
+            dir.path().into(),
+        );
+        assert!(started.is_ok());
+        let file = dir.path().join("stalled.bin");
+        let until = Instant::now() + Duration::from_secs(5);
+        while !file.exists() {
+            assert!(
+                Instant::now() < until,
+                "the download never created its file"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let quitting = Instant::now();
+        services.shutdown();
+        assert!(quitting.elapsed() < CANCEL_GRACE + Duration::from_millis(200));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

@@ -8,7 +8,9 @@
 //! start, and how its views present (shared memory or GL), since the host creates their targets.
 //!
 //! Each runtime remembers why it must be pumped: it was called this iteration, its waker fired,
-//! or its pump deadline passed.
+//! or its pump deadline passed. The registry also remembers a runtime that its `shutdown` had
+//! to leave running (Servo after a page crash or a lost backend, decision 54), so that `sig`
+//! knows to end with `_exit`.
 //!
 //! Servo is the exception to starting on first use (decision 26): when it is compiled in and
 //! enabled, it starts with `sig`, because its logger must be the process's one `log` logger
@@ -21,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{EngineCapabilities, EngineRuntime, EngineWaker, PumpStatus};
 use sighurt_core::config::Config;
@@ -96,6 +98,41 @@ impl Runtime {
             }
             #[allow(unreachable_patterns)]
             _ => 0,
+        }
+    }
+
+    /// How long the engine itself took to paint the frame it last submitted, when it times
+    /// that apart from presenting: Servo's `WebView::paint` (WebRender drawing the frame),
+    /// without its spin and swap. `None` for the CPU engines, whose `present` is the painting.
+    pub fn paint_time(&self) -> Option<Duration> {
+        match *self {
+            #[cfg(feature = "engine-servo")]
+            Self::Servo(ref runtime) => Some(runtime.diagnostics().timing.paint),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// The GL reads among [`Runtime::readbacks`], when the engine audits its GL calls (Servo
+    /// with `SIG_AUDIT_GL=1`).
+    pub fn gl_reads(&self) -> Option<u64> {
+        match *self {
+            #[cfg(feature = "engine-servo")]
+            Self::Servo(ref runtime) => runtime.diagnostics().gl_reads,
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// Whether `shutdown` had to leave the engine running: Servo after a page crash or a lost
+    /// backend (decision 54). Its threads still use GL state on the host's connection, so the
+    /// process must end without exit handlers.
+    fn leaked(&self) -> bool {
+        match *self {
+            #[cfg(feature = "engine-servo")]
+            Self::Servo(ref runtime) => runtime.diagnostics().leaked,
+            #[allow(unreachable_patterns)]
+            _ => false,
         }
     }
 }
@@ -193,6 +230,8 @@ impl Engine {
 /// Every compiled-in engine.
 pub struct Registry {
     engines: Vec<Engine>,
+    /// A runtime that was shut down is still running ([`Runtime::leaked`]).
+    leaked: bool,
 }
 
 impl Registry {
@@ -206,7 +245,10 @@ impl Registry {
             #[cfg(feature = "engine-demo")]
             demo(),
         ];
-        Self { engines }
+        Self {
+            engines,
+            leaked: false,
+        }
     }
 
     /// What each engine supports, by name, for the core's `Environment`.
@@ -298,6 +340,7 @@ impl Registry {
         if let Some(engine) = self.engines.iter_mut().find(|e| e.name == name) {
             if let State::Running(runtime) = &mut engine.state {
                 runtime.shutdown();
+                self.leaked |= runtime.leaked();
             }
             engine.state = State::Failed(why.to_owned());
         }
@@ -358,14 +401,22 @@ impl Registry {
         earliest.map(Some)
     }
 
-    /// Shuts every running runtime down, in build order. Afterwards nothing runs.
+    /// Shuts every running runtime down, in build order. Afterwards nothing runs, unless
+    /// [`Registry::leaked`].
     pub fn shutdown(&mut self) {
         for engine in &mut self.engines {
             if let State::Running(runtime) = &mut engine.state {
                 runtime.shutdown();
+                self.leaked |= runtime.leaked();
                 engine.state = State::ShutDown;
             }
         }
+    }
+
+    /// Whether a runtime that was shut down, or failed, had to be left running (decision 54):
+    /// then `sig` must end with `_exit` once its own state is saved.
+    pub fn leaked(&self) -> bool {
+        self.leaked
     }
 }
 
@@ -410,23 +461,17 @@ fn wasm() -> Engine {
 
 #[cfg(feature = "engine-servo")]
 fn servo() -> Engine {
-    use sighurt_engine_servo::{ServoConfig, ServoRuntime};
-    // What `ServoRuntime::capabilities` reports; `Registry::start` warns if they ever differ.
-    let capabilities = EngineCapabilities {
-        history_traversal: true,
-        text_input: true,
-        page_zoom: true,
-        ..EngineCapabilities::default()
-    };
+    use sighurt_engine_servo::{ServoConfig, ServoRuntime, CAPABILITIES};
     Engine::new(
         "servo",
-        capabilities,
+        CAPABILITIES,
         PresentMode::Gl,
         "gl, straight into the page's subsurface",
         |waker| {
             let config = ServoConfig {
                 profile: dirs::data_dir().map(|d| d.join("sighurt").join("servo")),
-                audit_gl: false,
+                // Times every GL call: for tests and measurements only.
+                audit_gl: std::env::var_os("SIG_AUDIT_GL").is_some_and(|v| v == "1"),
             };
             let runtime = ServoRuntime::new(config, waker);
             if !LOGGER.swap(true, Ordering::SeqCst) {

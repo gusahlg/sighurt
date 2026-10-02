@@ -10,6 +10,8 @@
 #![allow(dead_code)] // Each test binary uses part of it.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use calloop::EventLoop;
@@ -64,11 +66,75 @@ pub struct State {
     reads: HashMap<RequestId, ViewId>,
     /// The runtime was called since the last pump.
     called: bool,
+    /// When the runtime asked to be pumped again.
+    due: Option<Instant>,
 }
 
 pub struct Driver {
     pub event_loop: EventLoop<'static, State>,
     pub state: State,
+}
+
+/// How long `/slow/...` pages of [`serve`] take to answer.
+pub const SLOW: Duration = Duration::from_secs(3);
+
+/// Starts an HTTP server on 127.0.0.1 that runs until the process ends, and returns its
+/// address (`http://127.0.0.1:PORT`). `/204` answers "204 No Content"; anything else is a page
+/// titled with its path, which `/slow/...` sends after [`SLOW`]. A query makes the page act
+/// 300 ms after it loads: `?go=PATH` navigates it there, `?back` calls `history.back()`,
+/// `?open=PATH` opens PATH in a new browsing context; `?img=PATH` gives it an image from PATH.
+/// `/held` never answers, so a page with `?img=/held` keeps loading.
+pub fn serve() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+    let base = format!("http://{}", listener.local_addr().expect("its address"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || answer(stream));
+        }
+    });
+    base
+}
+
+fn answer(mut stream: TcpStream) {
+    let mut reader = BufReader::new(&stream);
+    let mut request = String::new();
+    if reader.read_line(&mut request).is_err() {
+        return;
+    }
+    let mut header = String::new();
+    while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+        header.clear();
+    }
+    let target = request.split_whitespace().nth(1).unwrap_or("/");
+    if target == "/204" {
+        let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        return;
+    }
+    if target == "/held" {
+        std::thread::sleep(Duration::from_secs(600));
+        return;
+    }
+    if target.starts_with("/slow/") {
+        std::thread::sleep(SLOW);
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let (act, img) = match query.split_once('=').unwrap_or((query, "")) {
+        ("go", to) => (format!("location = {to:?}"), String::new()),
+        ("back", _) => ("history.back()".into(), String::new()),
+        ("open", to) => (format!("window.open({to:?})"), String::new()),
+        ("img", src) => (String::new(), format!("<img src={src:?}>")),
+        _ => (String::new(), String::new()),
+    };
+    let body = format!(
+        "<!DOCTYPE html><title>{path}</title><h1>{path}</h1>{img}\
+         <script>addEventListener('load', () => setTimeout(() => {{ {act} }}, 300))</script>"
+    );
+    let _ = write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
 }
 
 /// What `sig` does before any engine (decision 26): the TLS provider and the panic hook that
@@ -127,13 +193,22 @@ impl Driver {
             iterations: 0,
             reads: HashMap::new(),
             called: false,
+            due: None,
         };
         Self { event_loop, state }
     }
 
-    /// One loop iteration: waits up to `timeout` (or until something happens, with `None`),
-    /// then handles what happened.
+    /// One loop iteration: waits up to `timeout` (or until something happens, with `None`), and
+    /// no longer than the runtime's pump deadline, then handles what happened.
     pub fn iterate(&mut self, timeout: Option<Duration>) {
+        let due = self
+            .state
+            .due
+            .map(|due| due.saturating_duration_since(Instant::now()));
+        let timeout = match (timeout, due) {
+            (Some(timeout), Some(due)) => Some(timeout.min(due)),
+            (timeout, due) => timeout.or(due),
+        };
         self.event_loop
             .dispatch(timeout, &mut self.state)
             .expect("the event loop");
@@ -342,15 +417,19 @@ impl State {
         while let Some(event) = self.host.next_event() {
             self.host_event(event);
         }
-        if std::mem::take(&mut self.called) | self.waker.take() {
+        let due = self.due.is_some_and(|due| Instant::now() >= due);
+        if std::mem::take(&mut self.called) | self.waker.take() | due {
+            self.due = None;
             loop {
                 let mut events = Vec::new();
                 let status = self.runtime.pump(&mut events);
                 for event in events {
                     self.engine_event(event);
                 }
-                if status == PumpStatus::Idle {
-                    break;
+                match status {
+                    PumpStatus::Pending { deadline: None } => {}
+                    PumpStatus::Pending { deadline } => break self.due = deadline,
+                    PumpStatus::Idle => break,
                 }
             }
         }

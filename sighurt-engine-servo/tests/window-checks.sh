@@ -75,6 +75,11 @@ wtype -k End
 wtype -M ctrl v -m ctrl
 sleep 0.8
 shot 02-typed
+# A wheel notch over the page (wlrctl's pointer comes and goes, m1-pointer's stays plugged in,
+# so the seat keeps its pointer).
+point 640 500
+wlrctl pointer scroll 15 0
+sleep 0.5
 for scale in 1.5 2 1.25 1; do
   swaymsg -q output HEADLESS-1 scale "$scale"
   shot "03-scale-$scale" 1.5
@@ -125,6 +130,7 @@ for i in $(seq 40); do
 done
 swaymsg -q "$app resize set 900 650"
 shot 09-after-storm 1.5
+swaymsg -t get_tree > "$out/tree-after-storm.json"
 act mark
 sleep 6
 act mark
@@ -182,6 +188,37 @@ idle() {
   marks=($(grep -oE 'mark: [0-9]+ wakeups' "$out/run1.log" | grep -oE '[0-9]+'))
   [[ ${#marks[@]} -eq 2 && $((marks[1] - marks[0])) -le 1 ]]
 }
+# The commits after the first `back`: back, back, forward through history.html's entries, each
+# a traversal.
+traversals() {
+  awk '/action back/ { on = 1 } on && /NavigationCommitted/ {
+         match($0, /url: "[^"]*"/); url = substr($0, RSTART + 6, RLENGTH - 7); sub(/.*\//, "", url)
+         print url, ($0 ~ /history: Some\(Traverse\)/ ? "traverse" : "other") }' "$out/run1.log" |
+    head -3 | paste -sd' '
+}
+back_and_forward() {
+  local got
+  got=$(traversals)
+  echo "traversal commits: $got" >> "$out/verdict.txt"
+  [[ $got == "history.html#two traverse history.html#one traverse history.html#two traverse" ]]
+}
+# The window's last configured size before the idle marks is the size sway gave it after the
+# storm (sway sometimes drops the storm's final `resize set`, M1.md).
+size_after_storm() {
+  local sway page
+  sway=$(python3 -c 'import json, sys
+def find(node):
+    if node.get("app_id") == "sighurt-servo":
+        return "%dx%d" % (node["rect"]["width"], node["rect"]["height"])
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        if found := find(child):
+            return found
+print(find(json.load(open(sys.argv[1]))) or "")' "$out/tree-after-storm.json")
+  page=$(awk '/action mark/ { exit } /\] window [0-9]+x[0-9]+/ { match($0, /window [0-9]+x[0-9]+/); size = substr($0, RSTART + 7, RLENGTH - 7) }
+              END { print size }' "$out/run1.log")
+  echo "after the storm: sway ${sway:-?}, window ${page:-?}" >> "$out/verdict.txt"
+  [[ -n $sway && $sway == "$page" ]]
+}
 both_views_presented() {
   [[ $(grep -cE 'report: ViewId\([0-9]+\) presented [0-9]{2,}' "$out/run3.log") -eq 2 ]]
 }
@@ -194,7 +231,9 @@ check "paste comes from the Wayland clipboard" has run1.log 'Some("field åäöx
 check "the page sees scale 1.5" has run1.log 'resize dpr 1.5'
 check "the page sees scale 2" has run1.log 'resize dpr 2 '
 check "same-document entries in the history" has run1.log 'history.html#two'
-check "back and forward commit" count_at_least run1.log 'NavigationCommitted' 8
+check "back, back, forward commit as traversals, in order" back_and_forward
+check "a wheel notch reaches the page" has run1.log 'Some("scrolled")'
+check "the window ends the storm at sway's size" size_after_storm
 check "an idle page doesn't wake the loop" idle
 check "no page readback (input run)" no_readback run1.log
 check "clean exit (input run)" clean_exit run1.log

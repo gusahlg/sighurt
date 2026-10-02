@@ -10,15 +10,17 @@
 mod common;
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Driver, Layout, State};
 use sighurt_api::engine::EngineCommand;
-use sighurt_api::events::{EngineEvent, NavigationError};
+use sighurt_api::events::{EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
 use sighurt_api::ids::{DocumentGeneration, NavigationId, ViewId};
 use sighurt_engine_servo::ServoConfig;
 
 const WAIT: Duration = Duration::from_secs(20);
+/// How long a view waits for a load Servo may have dropped (`view::LOAD_WAIT`).
+const LOAD_WAIT: Duration = Duration::from_secs(5);
 
 fn page(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -56,8 +58,217 @@ fn history(state: &State, view: ViewId) -> Option<(Vec<String>, usize)> {
     })
 }
 
+/// Whether `view` last said it was loading.
+fn loading(state: &State, view: ViewId) -> Option<bool> {
+    state.events_of(view).rev().find_map(|event| match event {
+        EngineEvent::LoadingChanged { loading, .. } => Some(*loading),
+        _ => None,
+    })
+}
+
 fn count(state: &State, view: ViewId, what: fn(&EngineEvent) -> bool) -> usize {
     state.events_of(view).filter(|e| what(e)).count()
+}
+
+fn cancelled(state: &State, view: ViewId, navigation: NavigationId) -> bool {
+    state.events_of(view).any(|e| {
+        matches!(e, EngineEvent::NavigationFailed { navigation: n, error: NavigationError::Cancelled, .. }
+            if *n == navigation)
+    })
+}
+
+/// The first commit of `view` to `to`: navigation, document and history effect.
+fn commit_to(
+    state: &State,
+    view: ViewId,
+    to: &str,
+) -> Option<(NavigationId, DocumentGeneration, Option<HistoryEffect>)> {
+    state.events_of(view).find_map(|event| match event {
+        EngineEvent::NavigationCommitted {
+            navigation,
+            url,
+            document,
+            history,
+            ..
+        } if url == to => Some((*navigation, *document, *history)),
+        _ => None,
+    })
+}
+
+/// What Servo 0.5 drops or doesn't attribute by itself (the M4 review): a navigation after a
+/// 204 response, one asked for while the page's own navigation waits for its response, two
+/// quick traversals, a page's own traversal, Stop.
+fn navigations_servo_would_drop_or_misattribute(d: &mut Driver, a: ViewId) {
+    let server = common::serve();
+    let url = |path: &str| format!("{server}{path}");
+    let started = Instant::now();
+
+    // A 204 response ends its navigation without a word from Servo; the next navigation still
+    // loads, at most `LOAD_WAIT` (5 s) after it, and the 204's is given up.
+    let no_content = d.state.navigate(a, &url("/204"));
+    d.run_for(Duration::from_millis(500));
+    let after = d.state.navigate(a, &url("/after-204.html"));
+    assert!(
+        d.run_until(WAIT, |s| committed(s, a, after)),
+        "a navigation after a 204 response loads"
+    );
+    println!(
+        "[{:8.3}] after the 204: {:?}",
+        d.state.secs(),
+        started.elapsed()
+    );
+    assert!(started.elapsed() < Duration::from_secs(7));
+    assert!(cancelled(&d.state, a, no_content), "the 204's is given up");
+    let (_, _, effect) = commit_to(&d.state, a, &url("/after-204.html")).unwrap();
+    assert_eq!(effect, Some(HistoryEffect::Push));
+
+    // The page navigates itself to a slow page; the browser's navigation asked for while that
+    // one waits for its response is held until the page's commits, then loads with its id.
+    let own = d.state.navigate(a, &url("/self.html?go=/slow/own.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, a, own)));
+    d.run_for(Duration::from_millis(1000));
+    let typed = d.state.navigate(a, &url("/typed.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, a, typed)), "typed loads");
+    let (page, ..) = commit_to(&d.state, a, &url("/slow/own.html")).expect("the page's commits");
+    assert!(page != typed && page != own, "the page's commit is its own");
+    assert!(commit(&d.state, a).unwrap().1.ends_with("/typed.html"));
+
+    // Two quick backs, both asked for before either commits, keep their ids.
+    for name in ["/one.html", "/two.html"] {
+        let navigation = d.state.navigate(a, &url(name));
+        assert!(d.run_until(WAIT, |s| committed(s, a, navigation)));
+    }
+    let (_, two, _) = commit_to(&d.state, a, &url("/two.html")).unwrap();
+    let length = history(&d.state, a).unwrap().0.len();
+    let back_to_one = d.state.traverse(a, -1);
+    let back_to_typed = d.state.traverse(a, -1);
+    assert!(d.run_until(WAIT, |s| committed(s, a, back_to_typed)));
+    assert!(committed(&d.state, a, back_to_one));
+    let traversals: Vec<_> = d
+        .state
+        .events_of(a)
+        .filter_map(|e| match e {
+            EngineEvent::NavigationCommitted {
+                navigation,
+                url,
+                document,
+                history,
+                ..
+            } if [back_to_one, back_to_typed].contains(navigation) => {
+                Some((*navigation, url.clone(), *document, *history))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(traversals.len(), 2, "{traversals:?}");
+    assert_eq!(traversals[0].0, back_to_one);
+    assert!(traversals[0].1.ends_with("/one.html"), "{traversals:?}");
+    assert!(traversals[1].1.ends_with("/typed.html"), "{traversals:?}");
+    assert_ne!(traversals[0].2, two);
+    assert!(traversals
+        .iter()
+        .all(|t| t.3 == Some(HistoryEffect::Traverse)));
+    assert_eq!(history(&d.state, a).unwrap().0.len(), length);
+
+    // The page's own `history.back()`: its own id, a traversal.
+    let goes_back = d.state.navigate(a, &url("/goes-back.html?back"));
+    assert!(d.run_until(WAIT, |s| committed(s, a, goes_back)));
+    let went_back = |s: &State| {
+        s.events_of(a).rev().find_map(|e| match e {
+            EngineEvent::NavigationCommitted {
+                navigation,
+                url,
+                history,
+                ..
+            } if url.ends_with("/typed.html") && ![typed, back_to_typed].contains(navigation) => {
+                Some((*navigation, *history))
+            }
+            _ => None,
+        })
+    };
+    assert!(
+        d.run_until(WAIT, |s| went_back(s).is_some()),
+        "the page goes back"
+    );
+    let (own_back, effect) = went_back(&d.state).unwrap();
+    assert_ne!(own_back, goes_back);
+    assert_eq!(effect, Some(HistoryEffect::Traverse));
+
+    // A back that finds no entry by the time Servo gets it (the first took the last one) is
+    // cancelled.
+    let c = d.state.open(&url("/c1.html"), false);
+    assert!(d.run_until(WAIT, |s| commit(s, c).is_some()));
+    let to_c2 = d.state.navigate(c, &url("/c2.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, c, to_c2)));
+    let (back, too_far) = (d.state.traverse(c, -1), d.state.traverse(c, -1));
+    assert!(d.run_until(WAIT, |s| committed(s, c, back) && cancelled(s, c, too_far)));
+    d.state.close(c);
+    assert!(d.run_until(WAIT, |s| s
+        .events_of(c)
+        .any(|e| matches!(e, EngineEvent::ViewClosed { .. }))));
+
+    // A page's pop-up asks the browser for a new view on behalf of the document that opened it.
+    let opener = d.state.navigate(a, &url("/opener.html?open=/opened.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, a, opener)));
+    let (_, opener_doc, _) =
+        commit_to(&d.state, a, &url("/opener.html?open=/opened.html")).unwrap();
+    let opened = |s: &State| {
+        s.events_of(a).find_map(|e| match e {
+            EngineEvent::OpenRequested {
+                document,
+                url,
+                disposition: OpenDisposition::NewView,
+                ..
+            } if url.ends_with("/opened.html") => Some(*document),
+            _ => None,
+        })
+    };
+    assert!(
+        d.run_until(WAIT, |s| opened(s).is_some()),
+        "the pop-up asks"
+    );
+    assert_eq!(opened(&d.state), Some(opener_doc));
+
+    // Stop stops the document's own loading: an image that never comes keeps it loading until
+    // then (`window.stop()`).
+    let held = d.state.navigate(a, &url("/loading.html?img=/held"));
+    assert!(d.run_until(WAIT, |s| committed(s, a, held)));
+    d.run_for(Duration::from_millis(1000));
+    assert_eq!(
+        loading(&d.state, a),
+        Some(true),
+        "the image keeps it loading"
+    );
+    d.state.command(a, EngineCommand::Stop);
+    assert!(
+        d.run_until(Duration::from_secs(2), |s| loading(s, a) == Some(false)),
+        "Stop stops the document's loading"
+    );
+
+    // Stop can't stop a navigation waiting for its response (Servo 0.5): it commits, with its
+    // id. After a 204, though, the navigation Servo dropped is given up.
+    let slow = d.state.navigate(a, &url("/slow/stopped.html"));
+    d.run_for(Duration::from_millis(1000));
+    d.state.command(a, EngineCommand::Stop);
+    assert!(
+        d.run_until(WAIT, |s| committed(s, a, slow)),
+        "it still commits"
+    );
+    assert!(!cancelled(&d.state, a, slow));
+    let dropped = d.state.navigate(a, &url("/204"));
+    d.run_for(LOAD_WAIT + Duration::from_millis(500));
+    assert!(!cancelled(&d.state, a, dropped));
+    d.state.command(a, EngineCommand::Stop);
+    d.run_for(Duration::from_millis(200));
+    assert!(cancelled(&d.state, a, dropped), "Stop gives it up");
+
+    let timing = d.state.runtime.diagnostics().timing;
+    println!("[{:8.3}] {timing:?}", d.state.secs());
+    assert!(timing.total_paint > Duration::ZERO && timing.max_swap > Duration::ZERO);
+    assert!(
+        timing.first_frame.is_some(),
+        "navigate to first frame is timed"
+    );
 }
 
 #[test]
@@ -172,6 +383,8 @@ fn servo_views_navigate_present_and_fail_distinctly() {
         "the first commits first"
     );
     assert!(commit(&d.state, a).unwrap().1.ends_with("second.html"));
+
+    navigations_servo_would_drop_or_misattribute(&mut d, a);
 
     // Failed navigations. An address that isn't one fails the navigation, nothing else.
     let invalid = d.state.navigate(a, "http://[");

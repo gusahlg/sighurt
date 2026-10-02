@@ -1,0 +1,52 @@
+PASS pixman: the red page loads
+PASS pixman: the compositor shows it under the chrome
+PASS pixman: the chrome strip is shown
+INFO [   6.349] mark: wakeups 112 chrome-paints 2 transport Some(Shm) device None formats 0 glib-dispatches 111 stale-frames 1 rounded-frames 0 failed-imports 0
+INFO idle: 1 loop wakeups and 0 GLib dispatches in 5 s
+PASS pixman: idle: at most 3 wakeups in 5 s with a static page (1 is the mark)
+INFO transport Some(Shm), device None, 0 DMA-BUF formats
+PASS pixman: the animation presents in its tab (frames in 6 s)
+PASS pixman: no chrome repaint because the page animated
+INFO [  12.905] mark: ViewId(2) frames 346 pacing n=345 median=17.35ms p95=17.76ms max=18.45ms
+INFO [  12.905] mark: dmabuf-frames 0 dmabuf-imports 0 shm-copies 347 shm-bytes 1350246400 dropped 2 releases 345
+INFO [  12.917] mark: pss-kib 283654 (WPENetworkProce 24635, bwrap 1839, WPEWebProcess 213664, xdg-dbus-proxy 1744, wpe-window 41772)
+PASS pixman: SHM: one copy per frame
+PASS pixman: a hidden view presents nothing
+PASS pixman: the red page shows again
+INFO red page frames: 1 before, 1 after showing it again
+PASS pixman: hiding unmaps the page (the window's background)
+PASS pixman: showing maps it again
+PASS pixman: shutdown: the window closes cleanly
+PASS pixman: crash: the page loads
+INFO crash: web processes of this window: 304820
+PASS pixman: a crashed web process is ViewFailed
+INFO [   0.449] ViewFailed { view: ViewId(1), message: "WebKit's web process crashed; reload to start a new one" }
+PASS pixman: the browser lives on
+PASS pixman: a reload starts a new web process
+PASS pixman: the reloaded page is shown
+INFO crash: web processes now: 304894
+PASS pixman: the input page loads at the window's size
+PASS pixman: a click arrives at its surface-local position
+PASS pixman: å ä ö and a dead key are typed
+PASS pixman: a named key reaches the page
+PASS pixman: the page blurs when the chrome takes the keyboard
+PASS pixman: keys for the chrome don't reach the page
+PASS pixman: the page has focus again
+PASS pixman: and gets keys
+PASS pixman: the wheel scrolls the page
+PASS pixman: scale 1.5: the page sees dpr 1.5 and 853x493
+PASS pixman: scale 1.5: the page is shown, its corner at 100 CSS px
+PASS pixman: scale 1.5: clicks land at the same CSS position
+PASS pixman: scale 2: the page sees dpr 2 and 640x360
+PASS pixman: scale 2: the page is shown, its corner at 100 CSS px
+PASS pixman: scale 2: clicks land at the same CSS position
+PASS pixman: scale 1.25: the page sees dpr 1.25 and 1024x600
+PASS pixman: scale 1.25: the page is shown, its corner at 100 CSS px
+PASS pixman: scale 1.25: clicks land at the same CSS position
+PASS pixman: scale 1: the page sees dpr 1 and 1280x760
+PASS pixman: scale 1: the page is shown, its corner at 100 CSS px
+PASS pixman: scale 1: clicks land at the same CSS position
+PASS pixman: a new size reaches the page
+PASS pixman: and is shown
+INFO [  12.904] mark: wakeups 1168 chrome-paints 7 transport Some(Shm) device None formats 0 glib-dispatches 519 stale-frames 6 rounded-frames 52 failed-imports 0
+0 failed; logs and screenshots in /tmp/claude-1000/-home-gusahlg-repos-sighurt/4074f6cc-047d-4246-ae06-9980bd83ce65/scratchpad/final-pixman

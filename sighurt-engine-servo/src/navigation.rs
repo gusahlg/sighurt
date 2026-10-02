@@ -1,5 +1,5 @@
-//! Navigation for Servo views: which navigation each of Servo's history changes commits, and
-//! which document it shows.
+//! Navigation for Servo views: which navigation each of Servo's history changes commits, which
+//! document it shows and what it did to the history.
 //!
 //! Servo owns its session history, same-document entries included, and reports it whole with
 //! every change (`notify_history_changed`: the entries and the current index). Each change is a
@@ -8,11 +8,14 @@
 //! also records (with the top-level URL). This module turns those reports into
 //! `NavigationCommitted` and `HistoryChanged`:
 //!
-//! - **Which navigation.** Servo 0.5's `WebView::load` returns no id, so a commit is attributed
-//!   to the latest pending navigation the browser asked for that fits it (the API allows this):
-//!   `Navigate` a new document in a new entry, `Reload` a new document in the same entry,
-//!   `Traverse` a move by exactly its delta. Anything else is the page's own navigation, with an
-//!   id allocated here. An attributed commit supersedes the requests before it.
+//! - **Which navigation.** A traversal the browser asked for is known exactly: Servo's
+//!   constellation reports the history change a `go_back`/`go_forward` made right before that
+//!   traversal's `notify_traversal_complete`, and the runtime passes its id in. Servo 0.5's
+//!   `WebView::load` returns no id, so any other commit is attributed to the latest pending
+//!   navigation the browser asked for that fits it (the API allows this): `Navigate` a new
+//!   document in a new entry, `Reload` a new document in the same entry. Anything else is the
+//!   page's own navigation (its `history.back()` included), with an id allocated here. An
+//!   attributed commit supersedes the requests before it.
 //! - **Which document.** A new document is known from Servo's `LoadStatus::Started`, which the
 //!   new top-level document's script thread reports before it asks to be activated (so before
 //!   the history change), and from the browser's own `Navigate` and `Reload`, which always load
@@ -21,18 +24,31 @@
 //!   Servo's list as its shape changes (an entry pushed without a new document shares its
 //!   predecessor's key). No URL is compared to decide any of this. A document shown again gets
 //!   a new [`DocumentGeneration`], so nothing granted to it before carries over.
+//! - **What it did to the history** ([`HistoryEffect`]): from the shape of the change, a new
+//!   entry after the current one, the current one replaced, or a move to another; unknown for a
+//!   shape this doesn't recognise.
 //! - **What is reported.** A commit that changes neither the document nor the address and that
 //!   the browser didn't ask for (an iframe's navigation) updates the history only.
+//! - **The entries' addresses.** Servo 0.5's report names an entry that `pushState` or
+//!   `replaceState` made after its neighbour nearer the current one (its projection has no
+//!   address for such entries: `Constellation::notify_history_changed`), while the current
+//!   entry's address is always right. So each entry keeps the address it had when it was last
+//!   current, carried along as the list changes shape, like the document keys; the history the
+//!   browser gets (and saves) names every entry rightly.
 //!
 //! Limits of Servo 0.5, all erring towards "new document" except the first: a page navigation
 //! from a document that never got a `<body>` (still `Started`) arrives without its own
 //! `Started`, which Servo suppresses as unchanged, and is taken for a same-document commit; a
 //! same-document commit that lands while a browser `Navigate`/`Reload` is loading and the
 //! current document is still `Started` is taken for that navigation; a history reshaped in a
-//! way this doesn't recognise (Servo trimming it) starts every entry afresh.
+//! way this doesn't recognise (Servo trimming it) starts every entry afresh. A page's own step
+//! forward to the last entry (`history.forward()`) looks like a `pushState` that replaced the
+//! one entry after it; without a new document it is taken for a traversal and its effect is
+//! unknown.
 //!
 //! Must not own: cross-engine history (the core).
 
+use sighurt_api::events::HistoryEffect;
 use sighurt_api::ids::{DocumentGeneration, NavigationId};
 
 /// The most browser requests remembered as pending. Older ones are forgotten: their commits
@@ -53,6 +69,7 @@ pub(crate) struct Commit {
     pub navigation: NavigationId,
     pub url: String,
     pub document: DocumentGeneration,
+    pub history: Option<HistoryEffect>,
 }
 
 /// How Servo's history changed from one report to the next.
@@ -142,15 +159,23 @@ impl Navigator {
         delta != 0 && self.reported && (0..self.entries.len() as i64).contains(&target)
     }
 
+    /// Forgets the browser's request `navigation`: its commit, if Servo makes one after all,
+    /// counts as the page's own.
+    pub fn forget(&mut self, navigation: NavigationId) {
+        self.pending.retain(|&(id, _)| id != navigation);
+    }
+
     /// Servo reported its history: `entries`, the current one at `current`. `started_later` says
     /// whether Servo's `Started` for this view arrived in the same batch of callbacks after this
     /// report (the two come on different channels, so their order within one batch is
-    /// arbitrary). Returns the commit to report, if any.
+    /// arbitrary). `traversal` is the browser's traversal this change carried out, if Servo said
+    /// so (`notify_traversal_complete`). Returns the commit to report, if any.
     pub fn history_changed(
         &mut self,
         entries: Vec<String>,
         current: usize,
         started_later: bool,
+        traversal: Option<NavigationId>,
     ) -> Option<Commit> {
         if current >= entries.len() {
             return None;
@@ -158,9 +183,9 @@ impl Navigator {
         let old = self.reported.then_some((self.entries.len(), self.current));
         let shape = shape(old, (entries.len(), current));
         let started = self.started || started_later;
-        let moved = current as i64 - self.current as i64;
 
-        // The browser request this commit carries out, if any.
+        // The browser request this commit carries out, if any: the traversal Servo named, or
+        // the latest navigation or reload that fits.
         let fits = |request: Request| match request {
             Request::Navigate => {
                 matches!(
@@ -169,15 +194,20 @@ impl Navigator {
                 )
             }
             Request::Reload => shape == Shape::Replace,
-            Request::Traverse(delta) => {
-                matches!(shape, Shape::Traverse | Shape::ForwardOrPush) && i64::from(delta) == moved
-            }
+            Request::Traverse(_) => false,
         };
         let evidence_of_a_new_document = started || self.loading_started;
-        let attributed = self.pending.iter().rposition(|&(_, request)| {
-            fits(request) && (matches!(request, Request::Traverse(_)) || evidence_of_a_new_document)
-        });
-        let request = attributed.map(|index| self.pending[index]);
+        let attributed = match traversal {
+            Some(id) => self.pending.iter().position(|&(other, _)| other == id),
+            None => self
+                .pending
+                .iter()
+                .rposition(|&(_, request)| fits(request) && evidence_of_a_new_document),
+        };
+        let request = match traversal {
+            Some(id) => Some((id, Request::Traverse(current as i32 - self.current as i32))),
+            None => attributed.map(|index| self.pending[index]),
+        };
         if let Some(index) = attributed {
             self.pending.drain(..=index);
         }
@@ -201,18 +231,49 @@ impl Navigator {
         let keys = self.reshape_keys(shape, entries.len(), current, new_document, started);
         let url_changed = self.url() != Some(entries[current].as_str());
         self.keys = keys;
-        self.entries = entries;
+        self.entries = self.reshape_entries(shape, entries, current);
         self.current = current;
         self.reported = true;
         if new_document || self.document.is_none() {
             self.started = false;
             self.document = Some(DocumentGeneration::next());
         }
+        let history = match shape {
+            Shape::First | Shape::Push => Some(HistoryEffect::Push),
+            Shape::Replace => Some(HistoryEffect::Replace),
+            Shape::Traverse => Some(HistoryEffect::Traverse),
+            // A document loaded into the next entry is a new entry; otherwise it may have been
+            // the page's own step forward.
+            Shape::ForwardOrPush => started.then_some(HistoryEffect::Push),
+            Shape::Other => None,
+        };
         (request.is_some() || new_document || url_changed).then(|| Commit {
             navigation: request.map_or_else(NavigationId::next, |(id, _)| id),
             url: self.entries[current].clone(),
             document: self.document.expect("set above"),
+            history,
         })
+    }
+
+    /// The entries as last reported, each named by the address it had when it was last current
+    /// (see the module documentation).
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
+    /// The address of each entry of the new list: the one it had when it was last current, as
+    /// far as this view saw it, else Servo's.
+    fn reshape_entries(&self, shape: Shape, reported: Vec<String>, current: usize) -> Vec<String> {
+        let mut entries = match shape {
+            Shape::First | Shape::Other => return reported,
+            Shape::Push => self.entries[..=self.current].to_vec(),
+            Shape::Replace | Shape::Traverse | Shape::ForwardOrPush => self.entries.clone(),
+        };
+        entries.truncate(reported.len());
+        let known = entries.len();
+        entries.extend_from_slice(&reported[known..]);
+        entries[current].clone_from(&reported[current]);
+        entries
     }
 
     /// The document key of each entry of the new list.
@@ -266,10 +327,66 @@ mod tests {
     fn load(n: &mut Navigator, entries: &[&str], current: usize) -> Commit {
         n.load_status(true, false);
         let commit = n
-            .history_changed(urls(entries), current, false)
+            .history_changed(urls(entries), current, false, None)
             .expect("a commit");
         n.load_status(false, false);
         commit
+    }
+
+    /// The page's own change of the history, or an iframe's.
+    fn page(n: &mut Navigator, entries: &[&str], current: usize) -> Option<Commit> {
+        n.history_changed(urls(entries), current, false, None)
+    }
+
+    /// The browser's traversal `id`, as Servo reports it: the history change, then
+    /// `notify_traversal_complete`.
+    fn traversed(n: &mut Navigator, entries: &[&str], current: usize, id: NavigationId) -> Commit {
+        n.history_changed(urls(entries), current, false, Some(id))
+            .expect("a traversal commits")
+    }
+
+    /// Servo 0.5 names an entry `pushState` made after its neighbour nearer the current one;
+    /// each entry keeps the address it had when it was current.
+    #[test]
+    fn entries_keep_the_address_they_had_when_current() {
+        let mut n = Navigator::default();
+        n.request(NavigationId::next(), Request::Navigate);
+        load(&mut n, &["https://a/"], 0);
+        page(&mut n, &["https://a/", "https://a/#one"], 1);
+        // `pushState("#two")`: Servo names the entry before it after it.
+        page(
+            &mut n,
+            &["https://a/", "https://a/#two", "https://a/#two"],
+            2,
+        );
+        let right = urls(&["https://a/", "https://a/#one", "https://a/#two"]);
+        assert_eq!(n.entries(), right);
+        // Back to #one: now the entry after it is named after it.
+        let back = NavigationId::next();
+        n.request(back, Request::Traverse(-1));
+        let commit = traversed(
+            &mut n,
+            &["https://a/", "https://a/#one", "https://a/#one"],
+            1,
+            back,
+        );
+        assert_eq!(commit.url, "https://a/#one");
+        assert_eq!(n.entries(), right);
+        // A new entry from #one drops #two; `replaceState` renames the current entry.
+        page(
+            &mut n,
+            &["https://a/", "https://a/#one", "https://a/#three"],
+            2,
+        );
+        page(
+            &mut n,
+            &["https://a/", "https://a/#four", "https://a/#four"],
+            2,
+        );
+        assert_eq!(
+            n.entries(),
+            urls(&["https://a/", "https://a/#one", "https://a/#four"])
+        );
     }
 
     #[test]
@@ -280,6 +397,7 @@ mod tests {
         let commit = load(&mut n, &["https://a/"], 0);
         assert_eq!(commit.navigation, first);
         assert_eq!(commit.url, "https://a/");
+        assert_eq!(commit.history, Some(HistoryEffect::Push));
         let a = commit.document;
 
         let second = NavigationId::next();
@@ -287,6 +405,7 @@ mod tests {
         let commit = load(&mut n, &["https://a/", "https://b/"], 1);
         assert_eq!(commit.navigation, second);
         assert_ne!(commit.document, a);
+        assert_eq!(commit.history, Some(HistoryEffect::Push));
     }
 
     #[test]
@@ -296,7 +415,9 @@ mod tests {
         n.request(first, Request::Navigate);
         // Servo's new WebView starts `Started` and suppresses the first document's report.
         n.load_status(true, true);
-        let commit = n.history_changed(urls(&["https://a/"]), 0, false).unwrap();
+        let commit = n
+            .history_changed(urls(&["https://a/"]), 0, false, None)
+            .unwrap();
         assert_eq!(commit.navigation, first);
     }
 
@@ -307,62 +428,35 @@ mod tests {
         let doc = load(&mut n, &["https://a/"], 0).document;
 
         // A fragment and pushState: new entries, same document, the page's own ids.
-        let hash = n
-            .history_changed(urls(&["https://a/", "https://a/#x"]), 1, false)
-            .unwrap();
+        let hash = page(&mut n, &["https://a/", "https://a/#x"], 1).unwrap();
         assert_eq!(hash.document, doc);
-        let push = n
-            .history_changed(
-                urls(&["https://a/", "https://a/#x", "https://a/p"]),
-                2,
-                false,
-            )
-            .unwrap();
+        assert_eq!(hash.history, Some(HistoryEffect::Push));
+        let push = page(&mut n, &["https://a/", "https://a/#x", "https://a/p"], 2).unwrap();
         assert_eq!(push.document, doc);
         assert_ne!(hash.navigation, push.navigation);
 
         // replaceState: same entry, same document.
-        let replaced = n
-            .history_changed(
-                urls(&["https://a/", "https://a/#x", "https://a/q"]),
-                2,
-                false,
-            )
-            .unwrap();
+        let replaced = page(&mut n, &["https://a/", "https://a/#x", "https://a/q"], 2).unwrap();
         assert_eq!(replaced.document, doc);
+        assert_eq!(replaced.history, Some(HistoryEffect::Replace));
 
         // The browser goes back twice: traversals within the document.
+        let entries = ["https://a/", "https://a/#x", "https://a/q"];
         let back = NavigationId::next();
         n.request(back, Request::Traverse(-1));
-        let commit = n
-            .history_changed(
-                urls(&["https://a/", "https://a/#x", "https://a/q"]),
-                1,
-                false,
-            )
-            .unwrap();
+        let commit = traversed(&mut n, &entries, 1, back);
         assert_eq!((commit.navigation, commit.document), (back, doc));
+        assert_eq!(commit.history, Some(HistoryEffect::Traverse));
         let back = NavigationId::next();
         n.request(back, Request::Traverse(-1));
-        let commit = n
-            .history_changed(
-                urls(&["https://a/", "https://a/#x", "https://a/q"]),
-                0,
-                false,
-            )
-            .unwrap();
+        let commit = traversed(&mut n, &entries, 0, back);
         assert_eq!((commit.navigation, commit.document), (back, doc));
         // And forward again, to the last entry: a traversal, not a new entry.
         let forward = NavigationId::next();
         n.request(forward, Request::Traverse(2));
-        let commit = n
-            .history_changed(
-                urls(&["https://a/", "https://a/#x", "https://a/q"]),
-                2,
-                false,
-            )
-            .unwrap();
+        let commit = traversed(&mut n, &entries, 2, forward);
         assert_eq!((commit.navigation, commit.document), (forward, doc));
+        assert_eq!(commit.history, Some(HistoryEffect::Traverse));
     }
 
     #[test]
@@ -370,9 +464,7 @@ mod tests {
         let mut n = Navigator::default();
         n.request(NavigationId::next(), Request::Navigate);
         let a = load(&mut n, &["https://a/"], 0).document;
-        let a_hash = n
-            .history_changed(urls(&["https://a/", "https://a/#x"]), 1, false)
-            .unwrap();
+        let a_hash = page(&mut n, &["https://a/", "https://a/#x"], 1).unwrap();
         assert_eq!(a_hash.document, a);
         n.request(NavigationId::next(), Request::Navigate);
         let b = load(&mut n, &["https://a/", "https://a/#x", "https://b/"], 2).document;
@@ -381,7 +473,7 @@ mod tests {
         let back = NavigationId::next();
         n.request(back, Request::Traverse(-1));
         let entries = ["https://a/", "https://a/#x", "https://b/"];
-        let commit = n.history_changed(urls(&entries), 1, false).unwrap();
+        let commit = traversed(&mut n, &entries, 1, back);
         assert_eq!(commit.navigation, back);
         assert_ne!(
             commit.document, a,
@@ -390,17 +482,62 @@ mod tests {
         assert_ne!(commit.document, b);
         let a_again = commit.document;
         // Within a again: same document.
-        n.request(NavigationId::next(), Request::Traverse(-1));
-        let commit = n.history_changed(urls(&entries), 0, false).unwrap();
-        assert_eq!(commit.document, a_again);
+        let back = NavigationId::next();
+        n.request(back, Request::Traverse(-1));
+        assert_eq!(traversed(&mut n, &entries, 0, back).document, a_again);
         // Forward by two to b, reloaded because Servo had evicted it: `Started` arrives in the
         // same batch, after the history report.
         let forward = NavigationId::next();
         n.request(forward, Request::Traverse(2));
-        let commit = n.history_changed(urls(&entries), 2, true).unwrap();
+        let commit = n
+            .history_changed(urls(&entries), 2, true, Some(forward))
+            .unwrap();
         assert_eq!(commit.navigation, forward);
         assert_ne!(commit.document, a_again);
         assert_ne!(commit.document, b);
+    }
+
+    #[test]
+    fn two_traversals_asked_for_before_either_commits_keep_their_ids() {
+        // The reviewer's case: back, back, with both requests pending before Servo reports.
+        let mut n = Navigator::default();
+        n.request(NavigationId::next(), Request::Navigate);
+        load(&mut n, &["https://a/"], 0);
+        n.request(NavigationId::next(), Request::Navigate);
+        load(&mut n, &["https://a/", "https://b/"], 1);
+        n.request(NavigationId::next(), Request::Navigate);
+        let c = load(&mut n, &["https://a/", "https://b/", "https://c/"], 2).document;
+        let (first, second) = (NavigationId::next(), NavigationId::next());
+        n.request(first, Request::Traverse(-1));
+        n.request(second, Request::Traverse(-1));
+        let entries = ["https://a/", "https://b/", "https://c/"];
+        let to_b = traversed(&mut n, &entries, 1, first);
+        let to_a = traversed(&mut n, &entries, 0, second);
+        assert_eq!((to_b.navigation, to_a.navigation), (first, second));
+        assert_eq!(to_a.history, Some(HistoryEffect::Traverse));
+        let documents = [c, to_b.document, to_a.document];
+        assert!(documents[0] != documents[1] && documents[1] != documents[2]);
+    }
+
+    #[test]
+    fn a_pages_own_traversal_is_its_own_while_the_browser_traverses() {
+        let mut n = Navigator::default();
+        n.request(NavigationId::next(), Request::Navigate);
+        load(&mut n, &["https://a/"], 0);
+        n.request(NavigationId::next(), Request::Navigate);
+        load(&mut n, &["https://a/", "https://b/"], 1);
+        let entries = ["https://a/", "https://b/"];
+        // The browser's back is on its way when the page's `history.back()` lands: Servo says
+        // nothing completed, so it is the page's, though its shape fits the browser's request.
+        let back = NavigationId::next();
+        n.request(back, Request::Traverse(-1));
+        let own = page(&mut n, &entries, 0).expect("another document");
+        assert_ne!(own.navigation, back);
+        assert_eq!(own.history, Some(HistoryEffect::Traverse));
+        // A browser traversal Servo names is the browser's.
+        let forward = NavigationId::next();
+        n.request(forward, Request::Traverse(1));
+        assert_eq!(traversed(&mut n, &entries, 1, forward).navigation, forward);
     }
 
     #[test]
@@ -411,9 +548,10 @@ mod tests {
         let reload = NavigationId::next();
         n.request(reload, Request::Reload);
         // Servo suppresses the new document's `Started`: only the history change comes.
-        let commit = n.history_changed(urls(&["https://a/"]), 0, false).unwrap();
+        let commit = page(&mut n, &["https://a/"], 0).unwrap();
         assert_eq!(commit.navigation, reload);
         assert_ne!(commit.document, doc);
+        assert_eq!(commit.history, Some(HistoryEffect::Replace));
     }
 
     #[test]
@@ -425,20 +563,29 @@ mod tests {
         let to_c = NavigationId::next();
         n.request(to_c, Request::Navigate);
         n.load_status(true, false);
-        let link = n
-            .history_changed(urls(&["https://a/", "https://b/"]), 1, false)
-            .unwrap();
+        let link = page(&mut n, &["https://a/", "https://b/"], 1).unwrap();
         // Servo can't say which: the pending request takes it, as the API allows.
         assert_eq!(link.navigation, to_c);
         assert_ne!(link.document, a);
         n.load_status(false, false);
         // A later link, with nothing pending, is the page's own.
         n.load_status(true, false);
-        let own = n
-            .history_changed(urls(&["https://a/", "https://b/", "https://d/"]), 2, false)
-            .unwrap();
+        let own = page(&mut n, &["https://a/", "https://b/", "https://d/"], 2).unwrap();
         assert_ne!(own.navigation, to_c);
         assert_ne!(own.document, link.document);
+        assert_eq!(own.history, Some(HistoryEffect::Push));
+    }
+
+    #[test]
+    fn a_forgotten_request_is_not_credited_with_a_commit() {
+        let mut n = Navigator::default();
+        n.request(NavigationId::next(), Request::Navigate);
+        load(&mut n, &["https://a/"], 0);
+        let given_up = NavigationId::next();
+        n.request(given_up, Request::Navigate);
+        n.forget(given_up);
+        let late = load(&mut n, &["https://a/", "https://b/"], 1);
+        assert_ne!(late.navigation, given_up);
     }
 
     #[test]
@@ -449,9 +596,7 @@ mod tests {
         let to_b = NavigationId::next();
         n.request(to_b, Request::Navigate);
         // The current page pushes a fragment before b's response arrives.
-        let hash = n
-            .history_changed(urls(&["https://a/", "https://a/#x"]), 1, false)
-            .unwrap();
+        let hash = page(&mut n, &["https://a/", "https://a/#x"], 1).unwrap();
         assert_ne!(hash.navigation, to_b);
         assert_eq!(hash.document, a);
         // Then b arrives and still carries the browser's id.
@@ -465,16 +610,13 @@ mod tests {
         n.request(NavigationId::next(), Request::Navigate);
         load(&mut n, &["https://a/"], 0);
         // Servo's joint history gains an entry with the top-level URL.
-        assert_eq!(
-            n.history_changed(urls(&["https://a/", "https://a/"]), 1, false),
-            None
-        );
+        assert_eq!(page(&mut n, &["https://a/", "https://a/"], 1), None);
         assert!(n.can_traverse(-1));
         // The browser's back, within the iframe, still commits for its request.
         let back = NavigationId::next();
         n.request(back, Request::Traverse(-1));
-        let commit = n.history_changed(urls(&["https://a/", "https://a/"]), 0, false);
-        assert_eq!(commit.map(|c| c.navigation), Some(back));
+        let commit = traversed(&mut n, &["https://a/", "https://a/"], 0, back);
+        assert_eq!(commit.navigation, back);
     }
 
     #[test]
@@ -496,10 +638,9 @@ mod tests {
         let mut n = Navigator::default();
         n.request(NavigationId::next(), Request::Navigate);
         let a = load(&mut n, &["https://a/"], 0).document;
-        let commit = n
-            .history_changed(urls(&["https://x/", "https://y/", "https://z/"]), 0, false)
-            .unwrap();
+        let commit = page(&mut n, &["https://x/", "https://y/", "https://z/"], 0).unwrap();
         assert_ne!(commit.document, a);
+        assert_eq!(commit.history, None, "what it did is unknown");
         assert_eq!(n.url(), Some("https://x/"));
     }
 }

@@ -1,4 +1,5 @@
-# Checks the Servo engine (sighurt-engine-servo), which ci.yml leaves out.
+# Checks the Servo engine (sighurt-engine-servo) and `sig` with its default features (Servo and
+# Wasm), which ci.yml leaves out.
 #
 # HEAVY: this compiles a large part of Servo (the first run takes a long time and a lot of
 # disk space; later runs rely on the cache). It therefore only runs when the engine, the crates
@@ -12,6 +13,7 @@ on:
       - "sighurt-api/**"
       - "sighurt-wayland/**"
       - "sighurt-engine-servo/**"
+      - "sighurt-browser/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/servo.yml"
@@ -21,6 +23,7 @@ on:
       - "sighurt-api/**"
       - "sighurt-wayland/**"
       - "sighurt-engine-servo/**"
+      - "sighurt-browser/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/servo.yml"
@@ -39,7 +42,8 @@ jobs:
 
       # Servo's native build dependencies: clang/libclang for bindgen, cmake and python3 for
       # its build scripts, and the graphics/font/windowing development libraries it links.
-      # mozjs is fetched as a prebuilt archive, so no SpiderMonkey toolchain is needed.
+      # mozjs is fetched as a prebuilt archive, so no SpiderMonkey toolchain is needed. The last
+      # three lines are the Wasm engine's, which `sig`'s default features link too (as in ci.yml).
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -48,7 +52,10 @@ jobs:
             libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
             libfontconfig1-dev libfreetype6-dev libharfbuzz-dev \
             libxkbcommon-dev libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libwayland-dev libudev-dev libdbus-1-dev libssl-dev libunwind-dev liblzma-dev
+            libwayland-dev libudev-dev libdbus-1-dev libssl-dev libunwind-dev liblzma-dev \
+            libgtk-3-dev libasound2-dev libv4l-dev libxkbcommon-x11-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
+            libavdevice-dev libswscale-dev libswresample-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -59,3 +66,7 @@ jobs:
       # Formatting is checked by ci.yml, since the crate is in the root workspace.
       - name: Clippy
         run: cargo clippy --locked -p sighurt-engine-servo --all-targets -- -D warnings
+
+      # The Servo arm of sig's engine registry is compiled only with its default features.
+      - name: Clippy (sig with its default features)
+        run: cargo clippy --locked -p sighurt-browser --all-targets -- -D warnings

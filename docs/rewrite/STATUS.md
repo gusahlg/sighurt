@@ -211,8 +211,9 @@ requests act for a committed document.
 - [x] Normal close and compositor disconnect handled deliberately.
 
 Each is ticked on the chrome's and the host's tests below and on `sig` with the demo engine in a
-private headless sway ("Integration" at the end of this section); none has run on River yet, and
-`sig` with Servo compiled in (its default features) has not been built yet.
+private headless sway ("Integration" at the end of this section); none has run on River yet.
+`sig` with its default features (Servo and Wasm) was built and run on this desktop on 2 October
+2026 (the end of this section).
 
 Chrome half (`sighurt-ui`, tested without a compositor; the criteria above also need the host and
 `sig`). Tests are in `sighurt-ui/src/*` and `sighurt-ui/tests/{interaction,paint}.rs`:
@@ -378,7 +379,8 @@ whose tab it is, what the status strip shows: "notice", "page" or "error", never
 on the session file, on `sig`'s log and on screenshot pixels. After the independent review
 (decision 47), on this machine on 27 September 2026, all 44 checks passed
 (scratchpad run `sigfix/final`), and the screenshots `main/12`, `main/14` and `config/02` were
-looked at:
+looked at. After the second pass over that review (decision 56), all 44 passed again on 2 October
+2026 (scratchpad runs `app/e2e` and `app/e2e2`; `main/12` and `config/02` looked at):
 
 - Address/command editing: `ctrl-l`, "åäö", Escape, then `ctrl-l`, "demo://slow?åäö" and Enter
   opens it in the third tab (asserted: the tab and its shown view; the session holds
@@ -399,7 +401,9 @@ looked at:
 - Coordinates: at 100 % the pointer at window (300, 300) puts the resize page's crosshairs on
   output pixel (300, 300), and at 150 % layout (400, 300) puts them on output pixel (600, 450)
   (asserted on screenshot pixels, ±1; `12` shows page (400, 216), buffer pixel (600.2, 324.3));
-  every mapped buffer is its logical size × 1.5, rounded (853 → 1280). 125 % and 200 % are
+  every mapped buffer is its logical size × 1.5, rounded (853 → 1280). The crosshairs are drawn
+  where `Metrics::to_buffer` puts the pointer, the conversion the status text reports (since
+  decision 56; before, the page had its own copy of the formula). 125 % and 200 % are
   covered only by the chrome's tests. Resizing to 1000×700 unmaps the slow page for its 400 ms
   (`09`: the root's background) and maps its late frame (`10`), screenshot-only.
 - Coalescing: with `sig` stopped (SIGSTOP), 30 pointer moves over the page; after SIGCONT 28
@@ -425,21 +429,43 @@ looked at:
   name keeps the configuration in use (asserted by the bindings still working).
 
 Unit tests: `tools/cargo test -p sighurt-browser -p sighurt-engine-demo --no-default-features
---features engine-demo` (24: arguments, downloads, atomic session writes, the configuration
-watch, colors, diagnostics lines, readback and buffer accounting, motion coalescing, the status
-strip's order, demo URLs, the demo engine's event coalescing). Checked: clippy with
-`engine-demo` alone, with `engine-demo,engine-wasm` and with no engine, all `-D warnings`;
-`cargo fmt --check`. Not done: `sig` on River; `sig` with its default features, so the Servo
-arm of `registry.rs` (`ServoRuntime::new`, `setup_logging`, `diagnostics`) and its renderer and
-readback lines are UNVERIFIED: that build was still queued behind other runs on louise-pc; a
-Servo or Wasm page in a real window (M4, M5); headless sway's gles2 renderer.
+--features engine-demo` (25: arguments, downloads, a download whose server stalls deleted at quit
+(`quitting_deletes_a_download_its_server_keeps_waiting`, which fails with the deletion removed),
+atomic session writes, the configuration watch, colors, diagnostics lines, readback and buffer
+accounting, motion coalescing, the status strip's order, demo URLs, the demo engine's event
+coalescing); the same 22 of `sig` with `engine-demo,engine-wasm` and with its default features.
+Checked on 2 October 2026: clippy `-D warnings` on all targets with no engine, `engine-demo`,
+`engine-wasm`, `engine-demo,engine-wasm`, the default features (Servo and Wasm), `engine-servo`
+alone and all three; `cargo fmt --check`.
+
+Servo and Wasm in `sig` (decision 56), on this desktop (RTX 3070, driver 595.99.02) on 2 October
+2026, with the working tree of that moment (the Servo track's changes to `sighurt-engine-servo`
+and the api in progress): `tools/cargo build -p sighurt-browser` (its default features), clippy
+as above, and `tools/cargo test -p sighurt-browser` (22 passed). In `tools/headless-sway
+--renderer gles2` (sway 1.12), `sig` opened a local HTML file and https://example.com/ in Servo
+and gradient-demo in the Wasm engine, one tab each, then switched through them with configured
+keys: the renderer lines say `engine=servo mode=hardware gl="NVIDIA GeForce RTX 3070/PCIe/SSE2"`
+and `engine=wasm mode=cpu`; 76 page frames, every frame line `readback_bytes=0` and
+`page_readbacks` 0 (Servo's `read_to_image`; the GL audit was off); `first-frame` only for the
+first tab (122 ms); Servo's profile written under the run's `XDG_DATA_HOME`; ctrl-q exits with 0
+and the session holds the three tabs (scratchpad run `app/servo2`; an earlier run of commit
+3c7f5fd with this pass's changes, `app/servo1`, gave the same). Screenshots of the three tabs
+looked at. Not run: the `_exit` after a Servo that could not shut down (no page can crash
+Servo's script thread in a normal build; the adapter's `crash.rs` shows the leak itself).
+
+Not done: `sig` on River; headless sway's gles2 renderer for the end-to-end suite. Open from the
+review, each needing another track: the Wasm and Servo crates exporting their capabilities as
+the demo engine does (`CAPABILITIES`), so the registry's copies go; the shared third-party
+versions (reqwest, rustls, log, libc, dirs, serde_json, tempfile) in the root
+`[workspace.dependencies]`; one virtual-pointer helper for the headless scripts instead of three
+copies; a host setter for the root's background, so a reloaded `[ui.colors] bg` reaches it.
 
 ### M4 — Convert and mount Servo
 
-The adapter is `sighurt-engine-servo` (decisions 51–55): `ServoRuntime` implements
+The adapter is `sighurt-engine-servo` (decisions 51–55 and 57): `ServoRuntime` implements
 `EngineRuntime` with the host's `TargetLease` and `FramePermit`, one Servo per process and one
-WebView per view, each view on its own `WindowRenderingContext` made from its lease. It is not in
-`sig`'s registry yet. `examples/servo-window.rs` puts Servo views in a window with
+WebView per view, each view on its own `WindowRenderingContext` made from its lease. `sig`'s
+registry starts it (decisions 26 and 56). `examples/servo-window.rs` puts Servo views in a window with
 `sighurt-wayland` through the owner loop the tests use (`tests/common/mod.rs`, which also does
 `sig`'s process setup: the TLS provider, the panic hook, Servo's logger). Evidence, all on
 `louise-pc` (RTX 4060, driver 595.80) in headless sway 1.12 with the GLES2 renderer
@@ -459,39 +485,108 @@ WebView per view, each view on its own `WindowRenderingContext` made from its le
   lock, and a lost backend reported to a real Servo the way Servo reports it.
 - Clippy with `-D warnings` on all targets and `cargo fmt --check`: clean.
 
-The pass criteria are the browser's; what is ticked or evidenced here is the adapter's half, and
-each needs `sig` with the Servo engine in its registry for the rest:
+After the independent review's fixes (decision 57), on this desktop (RTX 3070, driver 595.99.02)
+in headless sway 1.12 with the GLES2 renderer, 2 October 2026 (louise-pc was building WebKit):
 
-- [ ] Browse a fixed set of pages. *Adapter:* W1 loads the input and history test pages, M1's
-  `animated.html` (CSS animation and WebGL 1: 703–706 frames in its 12 s run with three
-  hide/show cycles) and https://example.com/ (title "Example Domain"), on "NVIDIA GeForce RTX
-  4060/PCIe/SSE2", never a software fallback.
-- [ ] Open, close and switch tabs. *Adapter:* E1 opens a hidden view (it loads and presents
-  nothing), switches between two views seven times (the hidden one stops presenting, the shown
-  one presents without waiting for a callback) and closes one (`ViewClosed`); W1 switches tabs
-  12 times and runs two animated views side by side (470 frames each).
-- [ ] Navigate back/forward, including same-document entries. *Adapter:* E1: a fragment and
-  `pushState` keep the document and get the page's own ids; a browser navigation commits with
-  its id and a new document; back into the first document (which Servo kept alive) gets a new
-  generation, back within it keeps it, forward by two, and a traversal past the end is
-  `Cancelled`. W1 repeats it through the example (commits for `#two`, `#one`, `#two`).
-- [ ] Reload and stop. *Adapter:* E1: a reload commits a new document in the same entry with its
-  id; two navigations in a row both commit, in order, with their ids (Servo 0.5 would drop the
-  second). Stop runs `window.stop()` (Servo 0.5 has no stop) and reports loading ended; untested.
-- [ ] Use the clipboard and text input. *Adapter:* W1: "åäö" typed into a field; Ctrl+C put it
-  on the Wayland clipboard (`wl-paste` read "åäö"); Ctrl+V pasted `wl-copy`'s "xyz" ("åäöxyz"),
-  both as `ServiceRequested` clipboard requests the host answered. Input-method composition is
-  unit-tested (U1), not run against an input method.
-- [ ] Resize across scales. *Adapter:* W1: the page saw `dpr 1.5 853x533`, `dpr 2 640x400`,
-  `dpr 1.25 1024x640` and `dpr 1 1280x800`; a click at logical (100, 100) reached the page at
-  (100, 100) at 100 % and 150 %; a scale change while hidden; five window sizes and a storm of 40;
-  no protocol error.
+- **E1** again, all three pass. `engine.rs` (20 s) now also runs against a local HTTP server
+  (`tests/common::serve`): a navigation asked for 0.5 s after one that got a 204 commits with its
+  id 5.0 s after the 204 was asked for, and the 204's is `Cancelled`; a page's own navigation to a
+  page that answers after 3 s commits with an id of its own, and the browser's navigation asked
+  for 1 s into that wait commits after it, with its id; two backs asked for together commit
+  `one.html` and `typed.html` with their own ids, `Traverse`; a back that finds no entry by the
+  time Servo gets it is `Cancelled`; the page's own `history.back()` commits with an adapter id,
+  `Traverse`; a pop-up's `OpenRequested` carries its opener's document; Stop 1 s into a 3 s
+  response doesn't stop it (it commits with its id), and Stop 5.5 s after a 204 gives that one up
+  (`Cancelled`). `read_to_image` 0, GL reads 0; `ServoTiming` filled (37 frames, first frame
+  14 ms after its navigation).
+- **U1**: 27 tests, adding exact traversal attribution, a page's own traversal while the
+  browser's is on its way, a forgotten request, the history effects and the coalescing queue
+  (`a_flood_of_replacements_stays_small` caught a bug in it before it ran in Servo).
+- **W1**: `tests/window-checks.sh`, 21 of 21 checks in the second run (in the first, the idle
+  check counted the extra iteration the example now runs after an action, which a `mark` no
+  longer gets). Replacing "back and forward commit": the commits
+  after back, back, forward are `#two`, `#one`, `#two`, each `Traverse`; a wheel notch reaches
+  the page ("scrolled"); after the storm the window's last configure (580×340) is sway's size
+  for it (sway again dropped the final `resize set`, M1.md). An action's events now come at
+  once (`open=` → `NavigationStarted` within 1 ms; they waited for the next wakeup). WebGL: 691
+  frames, paint mean 1.6 ms, swap mean 0.2 ms; two animated views 470 frames each; idle: 1
+  wakeup in 6 s; `read_to_image` 0 and GL reads 0 in every run. With
+  `RUST_LOG=sighurt_engine_servo::timing=debug` every frame logged its `servo-timing` line.
+  Screenshots looked at (after the storm, the split views).
+- Clippy `-D warnings` on all targets and `cargo fmt --check`: clean.
+
+At browser level (decision 58), `sig` with its default features (Servo and Wasm) on this desktop
+(RTX 3070, driver 595.99.02), 2 October 2026:
+
+- **B1**: `sighurt-browser/tests/engines.sh`, scenario `servo`, in `tools/headless-sway
+  --renderer gles2` (sway 1.12). It drives `sig` with configured keys, a virtual pointer and
+  `wtype` against a local web server (`tests/serve.py`, pages in `tests/pages/`), and asserts on
+  `sig`'s own diagnostics (which tab and view are shown, each tab's loading and history state,
+  frame, wakeup and readback counters, Servo's GL reads audited with `SIG_AUDIT_GL=1`), its
+  session file (the test pages report what they received through `history.replaceState`, which
+  `sig` saves), the server's request log and screenshot pixels. 59 of 59 checks passed in the
+  run `final` (scratchpad), with the fixes of decision 58; screenshots looked at (the typed and
+  pasted field, the WebGL page, https://example.com/, the page at scale 2, the loading page).
+  `sig` is a dev build there: dependencies optimized, the workspace's own crates not.
+- **B2**: scenario `cross`, the same tab across the engine boundary (M6's segments, run here
+  because the task asked for it): 33 of 33 (M5).
+- **L1**: one 18 s run of `sig` on the user's River 0.4.8 (gharial) desktop, a static local page,
+  no input and no screenshot, its own configuration and profile: `renderer engine=servo
+  mode=hardware gl="NVIDIA GeForce RTX 3070/PCIe/SSE2"`; 2 page frames at 1542×1304, 0 page
+  readbacks and 0 GL reads (audited); over 10.3 s of idle, 1 wakeup and 1 iteration (the report
+  that asked for the numbers), 0 pumps, 0 frames, 0 chrome paints; SIGTERM, exit 0. The host
+  found the viewporter, fractional scale, single-pixel buffer, text input, clipboard and primary
+  selection, cursor shape, presentation time and decorations. First frame 131 ms after
+  navigating.
+- After decision 58's adapter fixes: E1 (all three test binaries, `engine.rs` now also checks
+  that Stop stops a document whose image never comes), U1 (28 tests) and W1 (21 of 21) pass;
+  clippy `-D warnings` on all targets of the adapter and of `sig` with its default features, and
+  `cargo fmt --check`, clean. `sig`'s demo suite (`tests/headless.sh`) still passes 44 of 44.
+
+- [x] Browse a fixed set of pages. *B1:* local pages over HTTP (`input.html`, `history.html`,
+  `second.html`, `count.html`, `loading.html`, `slow.html`, `animated.html` with a CSS animation
+  and WebGL 1) and https://example.com/ (title "Example Domain" in the session) commit in Servo,
+  rendered by "NVIDIA GeForce RTX 3070/PCIe/SSE2" (`mode=hardware`, never a software fallback);
+  the WebGL page presents 119 frames in 2 s (the headless output's 60 Hz) with 0 chrome paints; a
+  page that was opened in a background tab before the window had its size fills the page area
+  when shown (pixel-checked; decision 58). *Adapter:* W1 also loads them on louise-pc's RTX 4060.
+- [x] Open, close and switch tabs. *B1:* Ctrl+T opens a tab on the home page, a typed address
+  opens in it in Servo; Ctrl+W closes it and its view (3 tabs, 3 views, the session forgets it);
+  a click on the tab strip, Ctrl+Tab and Alt+N each show the tab's own view. A page animating in a
+  background tab leaves `sig` asleep (1 wakeup in 3 s, the report's own; before decision 58 such
+  a tab, opened hidden, woke it 137 times a second), and so does a static page with that tab
+  hidden again. *Adapter:* E1 and W1 above.
+- [x] Navigate back/forward, including same-document entries. *B1:* `history.html` adds `#one`
+  (a fragment) and `#two` (`pushState`) itself, then `second.html`: Alt+Left returns to `#two`
+  (another document), again to `#one` (the same document), Alt+Right to `#two` and to
+  `second.html`; the tab's history stays one Servo segment of five entries, each saved under its
+  own address (Servo 0.5 named the `#one` entry `#two` until decision 58), and the tab can go
+  back, not forward. *Adapter:* E1 and W1 above.
+- [ ] Reload and stop. *B1:* F5 loads `count.html` again (the server sees a second request) and
+  adds no entry. Stop (F7) on `loading.html`, whose image the server holds for a minute, ends the
+  tab's loading at once (it was loading 2 s after the commit); before decision 58 it did nothing,
+  because `Window.prototype.stop` doesn't exist in Servo. *Not met:* Stop 1 s into a navigation
+  whose response takes 3 s doesn't stop it: the page commits when the response comes (seen in
+  B1, pinned in E1; Servo 0.5 has no way to cancel it, decision 57). Accepting this as a Servo 0.5
+  limit, or working around it in the adapter, is for a decision.
+- [x] Use the clipboard and text input. *B1:* "åäö" and a dead diaeresis + a, typed with `wtype`
+  into a field of the page, reach it ("field åäöä"); Ctrl+A, Ctrl+C put "åäöä" on the Wayland
+  clipboard (`wl-paste`), and Ctrl+V pastes `wl-copy`'s "xyz" ("field åäöäxyz"): both through the
+  core's service policy and the host's clipboard. A wheel notch reaches the page. Input-method
+  composition is unit-tested (U1), not run against an input method.
+- [x] Resize across scales. *B1:* at scales 1.25, 1.5, 2 and back to 1 the page reports
+  `dpr 1.25 1024x536`, `dpr 1.5 853x429`, `dpr 2 640x296` and `dpr 1 1280x696` (the page area at
+  that ratio); the view's buffer is its logical size times the scale (1280×670, 1280×644,
+  1280×592, 1280×696) at scale 150, 180, 240 and 120 over 120; and a click at page (100, 100)
+  reaches the page at CSS (100, 100) at every scale. *Adapter:* W1 adds window sizes and a storm.
 - [x] Close without an adapter-triggered whole-process exit. The crate has no `process::exit`,
   `_exit`, panic hook, logger or TLS provider. E1: `shutdown` closes Servo, the contexts, the EGL
   display and the leases in M1's order and returns, and the profile's lock is held until Servo has
   shut down and then released; W1: every run ends "the compositor reported no error", exit 0.
   After a page crash or a lost backend, when Servo 0.5 can't shut down, `shutdown` still returns,
-  leaving Servo running (`ServoDiagnostics::leaked`, decision 54; `crash.rs`).
+  leaving Servo running (`ServoDiagnostics::leaked`, decision 54; `crash.rs`). *B1, B2, L1:* `sig`
+  quits on Ctrl+Q and SIGTERM with exit 0 and no forced exit, after Servo wrote its profile
+  (cookies, HSTS, auth cache: its shutdown ran to the end).
 
 §25's engine test, "page errors, failed navigation, unavailable context, hidden tabs and runtime
 failure produce distinct outcomes": a page crash is `ViewFailed` and the view loads again, with
@@ -502,13 +597,20 @@ nothing (`engine.rs`); no GL context is `ViewFailed` then `ViewClosed`, the runt
 `RuntimeFailed`, after which every call fails (U1: Servo's constellation can't be killed from
 outside, so the loss is reported through `ServoDelegate::notify_error`, as Servo does). No run
 read page pixels back: `read_to_image` 0 and, with the GL audit on, 0 GL reads in every run of
-W1 and E1. An idle static page left the loop asleep: 1 wakeup (the mark itself) in 6 s (W1).
+W1, E1, B1 (346 Servo frames, every `frame` line `readback_bytes=0`) and L1. An idle static page
+left the loop asleep: 1 wakeup (the mark itself) in 6 s (W1), 1 in 3 s (B1), 1 in 10 s (L1).
 
-Open: wiring into `sig` (registry, `setup_logging`, `_exit` after `leaked`); an API field for
-what a commit did to the history (decision 41) and a field identity in `TextInputState`
-(decision 44), both of which Servo can supply; a way to hand over links the core routes to
-another engine (decision 55); `<select>`, dialogs and HTTP authentication (decision 16);
-Servo 0.5's limits in decision 55.
+Measured in B1 (`frame` lines, decision 58): Servo's own paint 2.1 ms on average over 346 frames;
+the first frame of each view's context and the first at a new scale are slow, 25–34 ms (5 frames
+over 20 ms), and the very first 137 ms (159 ms for the whole `present`), all on the owner
+thread, so the chrome waits that long once per view (L1: 83 ms on River).
+
+Open: stopping a navigation that waits for its response (above); a field identity in
+`TextInputState` (decision 44), which Servo can supply; a way to hand over links the core routes
+to another engine (decision 55); `<select>`, dialogs and HTTP authentication (decision 16);
+Servo 0.5's other limits in decisions 55 and 57 (the old layout for a frame after a resize,
+overlapping navigations beyond 5 s); the `gl_handles` safety note in `sighurt-wayland`
+(decision 51: one EGL display per connection); the slow first frames above.
 
 ### M5 — Mount Wasm while preserving the SDK
 
@@ -556,8 +658,25 @@ Build/do:
   three buffers (the host's bound), no retiring generation; raf-demo 352 frames in 6 s,
   gradient-demo 4 (it presents only when its layout changes). Screenshots looked at: both
   crisp and laid out at each size.
-- [ ] The runtime in `sig`'s registry and a run of `sig` (the browser track: its registry
-  already names `WasmRuntime<TargetLease>`).
+- [x] The runtime in `sig`'s registry and a run of `sig`: `sig` starts `WasmRuntime<TargetLease>`
+  on first use (decision 56), and **B3** below runs it.
+
+**B3**: `sighurt-browser/tests/engines.sh`, scenario `wasm`, `sig` with its default features in
+`tools/headless-sway --renderer gles2` (sway 1.12) on this desktop (RTX 3070), 2 October 2026:
+29 of 29 checks passed in the run `final` (scratchpad), screenshots looked at. The guests are
+the example guests' release builds and four test guests in WAT (`tests/guests/`: an endless
+`on_frame`, a host call in an endless loop, a guest busy 40 ms every frame, and the engine
+tests' invalid requests), which Wasmtime compiles as it does binaries. **B2**, scenario `cross`,
+takes one tab across the engine boundary: 33 of 33 in `final`. A Servo page that adds its own
+`#one` and `#two`, then a Wasm app from the web server (`[routing.wasm] origins`) in the same tab,
+a segment of its own: back crosses into the Servo segment at `#two`, its view kept (the server
+sees no second request), back and forward move within Servo, forward crosses into the kept Wasm
+view (no second request); a Servo page opened from the app is a third segment, and back twice
+and forward twice cross both boundaries, each segment shown in its own engine's view; at most
+three live views (the shown one and two retained). After a restart the tab has the same three
+segments as records, shows the third, and back loads the app and then the Servo page at `#two`
+again, each in its own engine, every saved entry kept (the entries before `#two` become a record
+of their own, decision 29).
 
 Compatibility sample (tests in `sighurt-engine-wasm/tests/`, run on this machine on 26
 September 2026 with the example guests built for `wasm32-unknown-unknown`; the SDK and examples
@@ -567,18 +686,23 @@ gradient-demo -p typography-demo`); CI's test job doesn't build them yet.
 
 | Guest | What it exercises | Evidence |
 |---|---|---|
-| hello-sighurt | shapes, text, 100 %/200 % scale, page zoom | `runtime::hello_sighurt_draws` (pixel probes) |
-| raf-demo | `request_animation_frame` via `on_timer`, `on_frame`, hidden-view policy | `runtime::raf_demo_animates`, `runtime::a_hidden_view_steps_once_a_second` |
-| gradient-demo | linear gradients, text | `golden::gradient_demo` (probes, golden image) |
+| hello-sighurt | shapes, text, 100 %/200 % scale, page zoom | `runtime::hello_sighurt_draws` (pixel probes); B3: presents in `sig`, the pointer at window (400, 384) shows as "position (400, 300)" with its dot (screenshot) |
+| raf-demo | `request_animation_frame` via `on_timer`, `on_frame`, hidden-view policy | `runtime::raf_demo_animates`, `runtime::a_hidden_view_steps_once_a_second`; B3: 121 frames in 2 s, 0 chrome paints |
+| gradient-demo | linear gradients, text | `golden::gradient_demo` (probes, golden image); B3: static, `sig` asleep (1 wakeup in 3 s, the report's own); B2: loaded from the web server by `[routing.wasm] origins` |
 | typography-demo | `canvas_text_ex` weights/styles/alignment, `measure_text`, 150 % | `golden::typography_demo`, `golden::typography_demo_at_150_percent` |
-| WAT guests | timers, custom and resize events, typing (dead key, Ctrl), Enter, links (hover, click, middle click), `push_state` + `Traverse`, back and forward across documents, permission prompt, KV store shared by two views, workers | `runtime::*` |
-| timer-demo, events-demo, audio-player, sse-demo, fullstack-notes, index | not exercised yet | — |
+| timer-demo | `set_interval`, `clear_timer`, hand-drawn buttons on mouse clicks | B3: Start Blink makes the light toggle (pixel-checked every 0.25 s: lit and unlit both seen), the stopwatch reads 2.2 s 2.2 s after Start (screenshot) |
+| events-demo | `on_event` for built-in events (touch from the mouse, focus, resize) and `emit_event` | B3: a held button is `touch_start` drawn at the pointer (pixel-checked), released `touch_end`; Emit "ping" counts 1 per click, focus "focused", a resize "1000 x 596" (screenshots) |
+| WAT guests | timers, custom and resize events, typing (dead key, Ctrl), Enter, links (hover, click, middle click), `push_state` + `Traverse`, back and forward across documents, permission prompt, KV store shared by two views, workers | `runtime::*`; B3: the looping, busy and invalid-request guests in `sig` |
+| audio-player, sse-demo, fullstack-notes, index | not exercised yet | — |
 
 Pass:
 
-- [ ] The chosen existing guests run with documented compatibility. Engine side: the table
-  above, through the real `EngineRuntime` with an in-memory target. Not yet in `sig` on a
-  Wayland target (the glue above).
+- [x] The chosen existing guests run with documented compatibility: the table above. Engine side
+  through the real `EngineRuntime` with an in-memory target; in `sig` on the host's SHM targets
+  (B3): hello-sighurt, gradient-demo, raf-demo, timer-demo and events-demo each load in the Wasm
+  engine (`renderer engine=wasm mode=cpu`), present when their tab is shown and take the input
+  above. Not exercised: audio-player, sse-demo, fullstack-notes, index (media and network, whose
+  services M6 reattaches).
 - [x] Looping guests hit execution limits (decision 42), each stopped in bounded time with the
   owner's longest pump under 50 ms: an endless `on_frame` by fuel
   (`runtime::a_looping_guest_hits_the_fuel_limit_without_blocking_the_owner`, 27 ms); a host
@@ -600,6 +724,10 @@ Pass:
   (`runtime::guests_waiting_on_the_network_do_not_hold_up_the_others`, which timed out with the
   hand-over removed; `pool::tests::a_waiting_job_hands_its_place_to_a_spare`,
   `pool::tests::spares_are_bounded`). Past 16 spares per pool, waits hold their threads again.
+  *B3:* in `sig`, a guest looping in `on_frame` and one calling the host in an endless loop are
+  each stopped within moments of loading ("on_frame halted: fuel limit exceeded" in the status
+  strip, the tab marked failed, and it stays stopped), Alt+1 still switches tabs at once, and no
+  engine pump of the whole run held the owner 50 ms (longest 135 µs).
 - [x] Invalid drawing/resource requests fail safely:
   `runtime::invalid_drawing_and_resource_requests_fail_safely` (NaN/infinite geometry,
   pointers outside guest memory, a broken image, 240 000 draw commands and 120 000 links in one
@@ -617,13 +745,24 @@ Pass:
   bodies, streaming fetch, WebSocket and SSE (handles, queued bytes with backpressure, message
   size), RTC (peers, channels, queued messages). Not audited: video (`api_video_load_url` blocks
   for its HTTP timeouts and reads HLS playlists without a size limit) and MIDI message sizes.
+  *B3:* the engine tests' invalid-request guest, opened in `sig`, says it lived through them
+  (its `push_state` to `#alive` is in the session), its tab shows no error, and its frame shows
+  the clear (0, 0, 64) outside every clip and the green fills (0, 128, 0) inside (pixel-checked).
 - [x] Stale completions are discarded: `runtime::a_superseded_load_is_discarded`,
   `runtime::a_step_that_finishes_after_navigation_is_discarded`,
   `runtime::nothing_arrives_for_a_closed_view`; what they leave is dropped off the owner thread
   (`view::tests::replaced_loads_and_closed_views_stop_and_are_dropped_elsewhere`,
   `pool::tests::a_dropped_pool_drops_its_jobs_on_its_threads`).
-- [ ] Guest activity does not starve chrome input. Engine side: with six guests taking 40 ms a
-  frame on the four worker threads, a key reached another guest in 2–21 ms and no `pump` took
+- [x] Guest activity does not starve chrome input. *B3:* eight letters typed one by one into
+  the address bar, each timed from just before `wtype` starts to `sig`'s next paint of the
+  chrome strip (so `wtype`'s own start is included): over the static gradient-demo median
+  11.4 ms, longest 13.4 ms; over a guest busy 40 ms every frame (presenting 20 frames a second)
+  11.0 and 13.4 ms; over raf-demo at scale 2 (2560×1600, painted on the owner thread) 16.4 and
+  22.3 ms; every key repainted the chrome; no engine pump held the owner 50 ms (longest 135 µs;
+  longest `present` 16 ms; longest chrome paint 44 ms, a dev build's first at scale 2). The
+  looping guests above leave tab switching working. Engine side:
+  with six guests taking 40 ms a frame on the four worker threads, a key reached another guest
+  in 2–21 ms and no `pump` took
   more than 24 µs (`runtime::input_reaches_a_guest_while_others_are_busy`); a page that draws
   the same frame every frame wakes the owner 0 times a second
   (`runtime::a_static_page_leaves_the_owner_asleep`); another guest measuring 8 MiB of text a
@@ -674,6 +813,118 @@ Pass:
 - [ ] No major functional regression in the agreed workflows remains.
 - [ ] Lifecycle tests show no unbounded resource growth.
 - [ ] Remaining regressions have an explicit decision.
+
+### WPE — Make WPE WebKit available on both machines
+
+Short-term web compatibility through WPE WebKit, built from source; Servo stays the long-term
+engine. How it is built and why, with timings, disk use and the smoke test:
+[`WPE.md`](WPE.md). Files: `nix/nixpkgs.nix`, `nix/wpewebkit.nix`, `nix/build-wpewebkit.sh`,
+`nix/wpe-smoke.c`, `nix/wpe-smoke.sh`, `shell.nix`. Decisions 59–61. The engine adapter is not
+part of this.
+
+- [x] nixpkgs pinned for the repository (§21): `nix/nixpkgs.nix`, revision 4975466 (the
+  desktop's system revision), imported by `shell.nix`. *`rustc.drvPath` through the pin is
+  `9f6ax144…-rustc-wrapper-1.98.1.drv` on both machines, the same as the desktop's `<nixpkgs>`;
+  `nix-instantiate shell.nix` gave `5g4i70pv…-nix-shell.drv` on the desktop before and after the
+  change, and the same on louise-pc.*
+- [x] WPE WebKit 2.52.6 built from the signed release tarball on louise-pc: WPE Platform API
+  (Wayland, DRM, headless) and the libwpe API, bubblewrap sandbox, GStreamer, introspection,
+  MiniBrowser; no Qt, no docs. *`tools/heavy nix/build-wpewebkit.sh` on louise-pc, 2 October
+  2026: 1 h 22 min, `-j6` under a 13 GiB cap (peak 12.4 GiB); the prefix's 43 store-path
+  references are all in its GC-rooted runtime closure (the script's check).*
+- [x] The same prefix on the desktop. *`nix/build-wpewebkit.sh --pull louise-pc`: rsync, root,
+  check ok; a manifest of the prefix (190 entries: contents, modes, symlinks) hashes the same on
+  both machines.*
+- [x] `shell.nix` exposes the prefix when it exists (`SIGHURT_WPE_PREFIX`,
+  `SIGHURT_WPE_PKG_CONFIG_PATH`, `LD_LIBRARY_PATH`, `GIO_EXTRA_MODULES`,
+  `GST_PLUGIN_SYSTEM_PATH_1_0`) and is unchanged when it doesn't. *The shell derivation above;
+  with the prefix present, `cargo build -v -p sighurt-wayland -p sighurt-engine-wasm` on the
+  desktop reported all 549 units `Fresh`.*
+- [x] A program loads pages with it on both machines. *`tools/heavy tools/headless-sway
+  --renderer auto -- nix/wpe-smoke.sh`: 22 of 22 checks on the desktop (RTX 3070) and on
+  louise-pc (RTX 4060). Headless and on Wayland, pages load and are painted, the compositor shows
+  them, WebGL works and GStreamer plays H.264, VP9 and Opus, the web process runs under `bwrap`,
+  `https://` works, and `webkit://gpu` reports the NVIDIA GPU through GBM with DMA-BUF frames.*
+
+Open (WPE.md, "Open problems"): the DRM platform, the MiniBrowser, WebDriver and audio are
+untested; test helpers still take their tools from `<nixpkgs>`; no machine compiles with Rust
+1.95 any more.
+
+### WPE — Prove WPE WebKit as an in-process engine (its M0 and M1)
+
+The WPE equivalent of M0 and M1 (§23, with §9, §10, §18, §19, §27): [`WPE.md`](WPE.md), "WPE
+WebKit as an in-process engine: the proof". Experiments: `experiments/wpe-engine` (the prototype
+of `sighurt-engine-wpe`: `WpeRuntime` behind `EngineRuntime` on the real host, the `wpe-window`
+driver and `window-checks.sh`) and `experiments/wpe-coexist` (Servo, the Wasm engine and WPE in
+one process and one window, `coexist-checks.sh`). Run outputs: `experiments/wpe-*/runs/`. Tests:
+`cargo test -p wpe-engine` (2 unit tests: the GLib loop's wakes and sleep, the keysym table);
+clippy `-D warnings` and rustfmt clean on both crates. Decisions 62–66. **Go** for
+`sighurt-engine-wpe` (WPE.md has the plan).
+
+M0's criteria, for WPE:
+
+- [x] WPE WebKit, Servo 0.5 and Wasmtime 36 (with the whole Wasm engine) link into one executable
+  and work in one process. *`coexist-checks.sh` on the desktop (headless sway, GLES2): 14 of 14;
+  `wpe-coexist` live on River: 12 of 12. JavaScript and Wasm traps in Servo and WebKit pages,
+  Wasmtime traps before and after WebKit starts, 2 000 traps each way in both pages while two
+  threads trap in Wasmtime, a trapping Wasm guest failing its view only, every engine presenting
+  (Servo `read_to_image` 0, WebKit 0 copies), a clean shutdown in 12 ms with exit status 0.*
+- [x] Symbol clashes checked, and the one found fixed: the executable exported its static
+  HarfBuzz, FreeType, libpng, mozjpeg, SQLite and SpiderMonkey's `getenv`/`abort`, and shared
+  libraries bound into them, WebKit's included. *`LD_DEBUG=bindings LD_BIND_NOW=1`: 1 307 exports
+  and 1 524 bindings into the executable (220 from `libWPEWebKit-2.0.so.1`) as Cargo links it; 1
+  export and 0 bindings with `-Wl,--exclude-libs,ALL` (decision 65). No library mapped twice.*
+- [x] Signal and trap handlers reviewed with WebKit in the process, and the clash found fixed:
+  JavaScriptCore's handler in the UI process plus Wasmtime's `longjmp` leave every signal blocked,
+  and the next Wasmtime trap kills the process with `SIGILL`. *Reproduced
+  (`runs/desktop-gles2-jsc-signal-handlers.txt`, a core dump); with JavaScriptCore's polling
+  traps and no Wasm fault handler in Sighurt's process (decision 66), the signal mask stays intact
+  and the concurrent trap checks pass.*
+- [x] A crashed web process is a view failure, not a browser crash. *`SIGKILL` of WebKit's web
+  process: `ViewFailed` (reason `CRASHED`) in about 0.2 s, the browser and the other engines go
+  on, a reload starts a new web process and shows the page (`window-checks.sh` on both machines;
+  `wpe-coexist` on the desktop and River).*
+- [x] No blanket unsafe workaround: the fixes are a linker flag and two JavaScriptCore options;
+  the experiments' `unsafe` is FFI and reading signal dispositions and masks.
+
+M1's criteria, for WPE (`window-checks.sh`: 41 checks with DMA-BUF, 40 with shared memory, all
+passing on the desktop and on louise-pc, in headless sway with GLES2, pixman, and GLES2 with
+`--shm`; River runs live, without input or screenshots):
+
+- [x] A real page and an animated/WebGL page present through the GPU path onto the host's page
+  subsurface, as WebKit's DMA-BUFs attached as `wl_buffer`s. *0 CPU copies; 4 imports for a whole
+  animation; 350 frames in 6 s at 17.1 ms median (60 Hz output) on both machines, 1 200 frames in
+  10 s at 8.33 ms median on River at 120 Hz with the RTX 3070.*
+- [x] No CPU copy on the normal path, and the fallback diagnosed: shared memory where DMA-BUF is
+  unavailable (pixman) or forced, one copy per frame, counted. *`shm-copies`, `shm-bytes` and the
+  transport in every report: 347 copies (1.35 GB) in 6 s at 1280 × 760; 1.01 GB/s on River.*
+- [x] Frame callbacks and buffer release followed. *Frames paced by the host's callbacks
+  (`wpe_view_buffer_rendered` at commit, so WebKit renders at most one frame ahead); releases
+  hand buffers back (349 of 350 at the probe); at most 3 SHM buffers per view.*
+- [x] Repeated resize, scale changes, hide/show and teardown behave correctly. *Scales 1.5, 2,
+  1.25, 1 and a resize: the page sees the right `devicePixelRatio` and size, shows, and clicks land
+  at the same CSS position; at most one stale frame per change, one-pixel rounding differences
+  shown (WPE.md); hidden views present nothing; shutdown clean.*
+- [x] Keyboard focus routes to page and chrome, with keysyms, keycodes and modifiers. *å ä ö and
+  a dead-key ä typed, F2 delivered, blur and focus when the chrome takes and returns the keyboard,
+  nothing typed into the page meanwhile, clicks and the wheel.*
+- [x] Page animation does not cause chrome repaints. *2 chrome paints (first configure and resize)
+  during every animation, on all machines and live.*
+- [x] An idle page sleeps. *1 loop wakeup (the probe's own) and 0 GLib dispatches in 5 s, every
+  machine and transport, and on River.*
+- [x] WebKit's GLib main loop runs inside the owner loop with no busy polling (decision 64).
+  *Unit test `sources_wake_the_owner_and_an_idle_context_sleeps`; the idle figures above.*
+- [x] Diagnostics identify the transport, the DRM device and the fallback. *`transport`,
+  `device` (`/dev/dri/renderD128`), formats (756), copies and bytes in every report.*
+- [x] Runs on River with gharial and the RTX 3070. *Three live runs (20, 15 and 9 s): a DMA-BUF
+  animation then an idle page, the SHM fallback, and `wpe-coexist` (12 of 12).*
+
+Open (WPE.md, "Limitations and open problems"): `requestAnimationFrame` at 60 Hz on faster
+outputs (no `WPEScreen`); input methods, clipboard, popups, new windows, downloads, permissions,
+the back-forward list and accessibility are not in the prototype; implicit synchronization only;
+the host's `PresentMode::Gl` name for a non-GL presenter; one unexplained click offset right after
+a page loaded; `wpe-coexist` not run on louise-pc (Servo must be rebuilt there); `ci.yml` and
+CLAUDE.md's pre-commit commands must exclude `wpe-engine` and `wpe-coexist`.
 
 ## Decisions log
 
@@ -1240,3 +1491,217 @@ Newest last. Each entry says what was decided and why.
     still `Started` (no `<body>` yet) is taken for a same-document commit. *Why:* evidence in
     the M4 section; kept small per §23's "extend the API only where the second engine shows a
     missing concept".
+56. **`sig` review fixes, second pass (amends 47 and 54).** The review's must-fix and should-fix
+    findings had been applied in decision 47; this pass checked each against the code and the
+    end-to-end suite and fixed what was left. (1) When an engine's `shutdown` had to leave it
+    running (`ServoDiagnostics::leaked`, decision 54), at quit or after `RuntimeFailed`, `sig`
+    ends with `_exit` once the session is written and the downloads have ended or been
+    deleted, without closing the window or dropping the host: Servo's threads still use GL
+    state on that connection, and the compositor cleans up after it. (2) Quitting cancels the
+    downloads first (§20: stop creating work), and after the 500 ms grace deletes the file of
+    one still waiting on its server, which the cancel flag can't reach in the middle of a read.
+    (3) Notices are no longer logged, since they hold origins, URLs and file names (page data);
+    configuration errors are logged as warnings where they are found. (4) The diagnostics'
+    `view=` is `ViewId::serial()`, a new accessor on the api's ids, not a trimmed `Debug`
+    string. (5) The demo engine draws its crosshairs where `Metrics::to_buffer` puts the
+    pointer. (6) `servo.yml` also runs clippy on `sig` with its default features, so CI compiles
+    the registry's Servo arm. (7) A failing event loop or configuration watch ends `sig` through
+    the same ordered shutdown as a quit, rather than by dropping `App` field by field (host
+    first). *Why:* the independent review of M3 and the Servo wiring left open in M4; §20, §26
+    and CLAUDE.md's rule that diagnostics never log page data.
+57. **Servo adapter review fixes (amends 52, 53 and 55; settles the field decision 41 left
+    open).** Each finding of the independent M4 review was checked against Servo 0.5's sources.
+    (1) **Traversals are attributed exactly.** `go_back`/`go_forward` return a `TraversalId`,
+    and the constellation sends a traversal's history change and its
+    `notify_traversal_complete` back to back (servo-constellation 0.5: `TraverseHistory` →
+    `handle_traverse_history_msg`, then `HistoryTraversalComplete`), so the history change right
+    before a traversal's completion is that traversal's. When the completion hasn't arrived with
+    the change, the WebView's notes wait, in order, for Servo's next batch. A completion with no
+    change before it (Servo found no entry) is `Cancelled`. History shapes now attribute only
+    `Navigate` and `Reload`; the page's own `history.back()` gets an id of its own.
+    (2) **A load that Servo may have dropped is waited for at most 5 s.** Servo 0.5 drops a
+    `WebView::load` while the browsing context has a pending change, and a 204 or 205 response
+    aborts a navigation without telling the embedder (`AbortLoadUrl`). Before this fix, every
+    later navigation stayed queued until a reload. A view now waits for a top-level load
+    (`view::Load`) only `LOAD_WAIT` = 5 s after the load was asked for or after its document
+    reported `Started`. The load may be the browser's, or one the page started and was allowed;
+    `NavigationRequest` doesn't say whether that one is an iframe's. After the wait, the queued
+    navigation is sent at the pump's deadline, and the abandoned browser navigation is reported
+    `Cancelled` and forgotten (a late commit of it counts as the page's own). 5 s is long enough
+    for a slow server's response to keep its navigation's identity, and short enough to bound
+    the wait after a 204 or an iframe's navigation. Left: if a response takes longer than 5 s and
+    the browser navigates again, Servo drops the new navigation and the late commit carries its
+    id; a navigation asked for within 5 s of an iframe navigating itself waits up to 5 s.
+    (3) **Stop** cancels a queued navigation. It gives up a load that has shown no sign of life
+    for 5 s, which is the way out of a 204. It stops the document's loading through
+    `Window.prototype.stop.call(window)`, which a page can't replace by redefining
+    `window.stop`. Servo 0.5 can't cancel a top-level navigation that is waiting for its response:
+    no embedder message does it, and `window.stop()` only aborts the document's own fetches
+    (servo-script 0.5 `Window::stop_loading`). That navigation still commits, with its id.
+    (4) **`NavigationCommitted.history: Option<HistoryEffect>`** (`Push`, `Replace`,
+    `Traverse`; an additive api change). Servo fills it from the history's shape. The core uses
+    it for commits the page started: a `Push` discards later segments, `Replace` and `Traverse`
+    don't. So the page's own back into another document, and its own reload, keep the forward
+    segments, and `pushState` now discards them, since it is a new entry. The Wasm and demo
+    engines report `None`, which keeps decision 41's rule for them.
+    (5) A pop-up's `OpenRequested` carries the document that opened it. Pop-ups are dropped when
+    that document is replaced, and none is made before a document commits.
+    (6) Events and delegate notes are kept in `delegate::Coalescing`, which costs constant time per
+    item and keeps the latest replaceable item in its own place. A pump spins Servo only while
+    fewer than 256 events wait.
+    (7) **Timing.** `ServoDiagnostics::timing` (`ServoTiming`) holds the last, longest and total
+    paint (`WebView::paint`) and swap of submitted frames. It also holds the latest time from a
+    `Navigate` to the first frame of its committed document. With
+    `RUST_LOG=sighurt_engine_servo::timing=debug`, each is also logged as a
+    `servo-timing frame view=N w= h= paint_ms= swap_ms=` or
+    `servo-timing first-frame view=N after_navigate_ms=` line.
+    (8) **Rejected: `NotReady` after a resize until Servo has a new frame.** `WebView::resize`
+    sets Servo's `RepaintReason::Resize`, and every spin then calls `notify_new_frame_ready`
+    until a paint clears it (servo-paint 0.5 `Painter::resize_rendering_context`,
+    `webviews_needing_repaint`). A frame-ready after the resize therefore says nothing about the
+    relayout, and Servo 0.5 has no other signal for it (M1 found the same). The first frame at a
+    new size stays WebRender's current scene at that size: the old layout, for a frame or two
+    (M1). It is reported `Submitted`, since the buffer is the permit's size. This is accepted, as
+    the intermediate state of a scale change is in 55.
+    (9) Smaller fixes. The lease is the view's last field, and a second `open_view` for an id
+    that is open is refused. `shutdown` drops the leases after `eglTerminate`, as its
+    documentation said. A permit for another view is an error, not a debug assertion.
+    `servo-window` carries out an action at once rather than at the next wakeup. W1 checks the
+    traversal commits in order, a wheel notch, and the window's size after the storm.
+    `CAPABILITIES` is exported for the registry.
+    Not changed: Servo still loads a page's own navigation to `data:`. An iframe's navigation to
+    another scheme still becomes the tab's `OpenRequested(CurrentView)`, because Servo 0.5
+    doesn't say which frame asks; the core could require a user activation for page requests to
+    other schemes. *Why:* the M4 review; §16, §19, §26 and §28's question 2.
+58. **Browser-level verification of `sig` with Servo and Wasm, and the integration fixes it
+    found (amends 52, 54 and 57).** `sighurt-browser/tests/engines.sh` runs `sig` with its default
+    features in headless sway with the GLES2 renderer (scenarios `servo`, `wasm` and `cross`; B1–B3
+    in M4 and M5). Fixed in the Servo adapter, each found by it:
+    (1) **Stop is `window.stop()`.** `Window` is a `[Global]` interface, so `stop` is the
+    window's own property and `Window.prototype.stop` is undefined in Servo 0.5 (a probe page:
+    `typeof Window.prototype.stop` is "undefined", the own property writable and configurable);
+    decision 57's `Window.prototype.stop.call(window)` threw, and Stop never stopped a document's
+    loading. A page that replaces `window.stop` keeps loading, as it could by starting new
+    fetches. E1 now checks it.
+    (2) **A hidden view is throttled at each history change.** Servo 0.5 throttles the document a
+    WebView shows when asked (`Constellation::set_webview_throttled`), not the WebView: asked when
+    a WebView is built, before its browsing context exists, the request is dropped ("Tried to
+    SetWebViewThrottled after closure"), and every document a hidden view navigates to starts
+    unthrottled. A WebGL page opened in a background tab woke `sig` 137 times a second (822
+    wakeups, 0 frames, in 6 s); now 1 in 6 s.
+    (3) **A hidden view is resized with the page area** (decision 13 says hidden views keep the
+    page area's metrics; the adapter skipped the resize while the view had no EGL window surface).
+    A view opened before the window's first configure (the host's 1024×768 default) kept its
+    first layout when shown at 1280×696 if its page ran a CSS animation: Servo 0.5 didn't lay it
+    out again on the resize that came with the show (a static page did). surfman's resize on
+    Wayland without a bound surface only records the size, so the page is laid out at its size
+    while hidden, as other browsers do with background tabs; a WebView built after its context
+    is resized to the current metrics.
+    (4) **History entries keep their own address.** Servo 0.5's history report names an entry made
+    by `pushState`/`replaceState` after its neighbour nearer the current one (its projection has
+    no address for such entries); the adapter keeps the address each entry had when it was last
+    current, reshaped with the list like the document keys
+    (`navigation::tests::entries_keep_the_address_they_had_when_current`, which fails without
+    it). Before, the session saved `#two` for the `#one` entry, so a restored tab went back to
+    the wrong address. Decision 52's "reported as it comes" no longer holds.
+    In `sig`: the diagnostics JSON lists each tab's browser state (loading, back and forward, a
+    record, an error; never an address or title), `SIG_AUDIT_GL=1` turns on Servo's GL read audit
+    and the engine report gives `gl_reads`, a `frame` line's `paint_ms` is the engine's own
+    painting (Servo's `WebView::paint`, `ServoTiming`) and `present_ms` the `present` call (the
+    Servo track's ask), and the registry takes Servo's exported `CAPABILITIES`. The test helper
+    `virtual-pointer` can hold the button (`press`, `release`).
+    Not changed, measured and left for decisions: Stop can't stop a navigation waiting for its
+    response (M4's criterion stays open); hidden Wasm guests that draw wake `sig` about once a
+    second each (decision 23's hidden pace: 4 wakeups in 3 s with four in background tabs), since
+    the owner hears of each new frame although a hidden view can't present it; a guest sees a
+    button release as a click at the pointer's position when its next step runs, so a release
+    followed within one frame by a move counts at the new position (the SDK polls position and
+    clicks per frame); the first frame of each Servo context costs 25–167 ms of owner time
+    (WebRender's warm-up), during which the chrome waits; the address bar shows a fragment's
+    percent-encoding as it is (`#field%20%C3%A5…`). *Why:* M4's and M5's pass criteria at browser
+    level (§23), §26's acceptance criteria, and §28's questions 3 (wakeups) and 5 (evidence).
+59. **nixpkgs is pinned in `nix/nixpkgs.nix`, at the desktop's revision** (§21).
+    `builtins.fetchTarball` of nixpkgs 4975466, named `source` so that it is the store path the
+    desktop's flake input already was, with no user configuration or overlays; `shell.nix` and
+    `nix/wpewebkit.nix` import it. The desktop's shell derivation stayed the same. louise-pc moved
+    from its own 9ae611a (Rust 1.95) to Rust 1.98.1: its Servo is rebuilt once, and no machine
+    checks the workspace's `rust-version` (1.95) any more. *Why:* both machines must build the
+    same thing, and WPE WebKit's prefix refers to store paths of one revision; the desktop's
+    revision kept every other build there untouched (WPE.md, "Pinned nixpkgs").
+60. **WPE WebKit 2.52.6 is built from its release tarball into a plain prefix with the same
+    path on both machines** (`~/.local/share/sighurt/deps/wpewebkit-2.52.6`), from a
+    `nix-shell --pure` on the pinned nixpkgs (clang, Release, `-j6`), and copied with rsync. A
+    `runtime` derivation listing every input is the prefix's GC root next to it, and the build
+    fails if the prefix names a store path outside that closure. Flags: the WPE Platform API with
+    Wayland, DRM and headless, the libwpe API, the bubblewrap sandbox with nixpkgs' WebKitGTK
+    sandbox patch, GStreamer, introspection (the GIR files name the prefix's library),
+    MiniBrowser; no Qt, no docs. *Why:* nixpkgs has no WPE WebKit; a Nix derivation's output
+    can't move between the machines (only root is a trusted user, and changing that is the
+    user's call), and building it on each costs the build twice; 2.52.6 is the pinned nixpkgs'
+    WebKitGTK, so its inputs and patch apply as they are (WPE.md).
+61. **WPE WebKit reaches the shell through variables of its own, never `PKG_CONFIG_PATH`**:
+    `SIGHURT_WPE_PREFIX` and `SIGHURT_WPE_PKG_CONFIG_PATH`, with `LD_LIBRARY_PATH`,
+    `GIO_EXTRA_MODULES` and `GST_PLUGIN_SYSTEM_PATH_1_0`, and only when the prefix is installed.
+    The WPE engine's build script runs pkg-config with `SIGHURT_WPE_PKG_CONFIG_PATH` and declares
+    `rerun-if-env-changed` for it. *Why:* ten crates' build scripts (`wayland-sys`,
+    `yeslogic-fontconfig-sys`, `x11-dl`, …) declare `PKG_CONFIG_PATH`, so changing it, or the
+    shell's `buildInputs`, rebuilds most of Servo on every machine; none declares the new
+    variables (the build outputs in `target/`, rustc's env-deps, and a `Fresh` cargo run with the
+    prefix present; WPE.md, "Using the prefix").
+62. **WPE WebKit is embedded through the WPE Platform API** (WPE.md, "1. The embedding API"):
+    Sighurt's own `WPEDisplay` and `WPEView`, GObject subclasses written with glib-rs 0.22, with
+    WebKit's stock `WPEToplevel`, one per view. WebKit hands each frame to the view as a DMA-BUF
+    or shared-memory `WPEBuffer`; the engine answers with `wpe_view_buffer_rendered` and
+    `wpe_view_buffer_released`. The display advertises the compositor's DMA-BUF formats and main
+    device and is WebKit's primary display. Not libwpe with WPEBackend-fdo. *Why:* the libwpe API
+    is WebKit's legacy API (a build may leave it out since 2.51.4; the MiniBrowser left it in
+    2.49.2; new embedding features go to WPEPlatform only); the buffer hand-off maps one to one
+    onto the host's permits and `wl_buffer.release`, with no nested compositor and no EGL in
+    Sighurt's process; it is the smaller adapter (66 C functions, two subclasses, no
+    WPEBackend-fdo). Its API still changes between WebKit releases and is off by default in 2.52
+    release builds: Sighurt builds WebKit itself (decision 60) and rechecks the adapter on each
+    WebKit update.
+63. **WPE views present on native page targets: DMA-BUF without copies, shared memory with one
+    counted copy as the fallback** (WPE.md, "4. Presentation"). The presenter joins the host's
+    `wl_display` with its own event queue, imports each WebKit buffer once with
+    `zwp_linux_buffer_params_v1.create_immed`, and attaches, damages and commits it on the host's
+    permit; frame done (`buffer_rendered`) is signalled at commit, so WebKit renders at most one
+    frame ahead and the host's frame callbacks pace it. The first view picks the transport:
+    DMA-BUF when the compositor has `zwp_linux_dmabuf_v1` version 4 with a main device; otherwise
+    WebKit is given no DRM device, renders into shared memory, and the presenter copies each frame
+    into at most 3 `wl_shm` buffers per view. A frame one pixel off the host's rounding is shown
+    (WebKit floors, the host's viewport scales); a frame of an old size is dropped. Implicit
+    synchronization: WebKit waits for its rendering fence before handing a frame over. *Why:*
+    §3's target (no page readback, no re-upload) holds on the hardware path; §10's three signals
+    stay apart (FrameReady, the host's callback, release); the fallback is visible in diagnostics
+    (§26).
+64. **WebKit's GLib main context runs from the owner loop through a watch thread and
+    `EngineWaker`** (WPE.md, "3."). The runtime acquires the default context and splits GLib's
+    iteration across pumps (check and dispatch, then prepare and query; the query's timeout is the
+    pump's deadline); a thread `poll`s the queried descriptors, wakes the owner, and waits for the
+    next set. Not calloop sources for GLib's descriptors. *Why:* WebKit's descriptors change every
+    frame (rendering fences), and epoll registrations of descriptors GLib closes are unsafe where
+    `poll` takes them afresh; the runtime needs only the `EngineWaker` every runtime gets
+    (`registry.rs`); no busy polling (0 GLib dispatches and 1 loop wakeup in 5 s idle).
+65. **`sig`'s executable is linked with `-Wl,--exclude-libs,ALL`**, so the C libraries
+    statically linked into it stay private (proposed for `sighurt-browser`'s build script; proven
+    in `wpe-coexist/build.rs`). *Why:* as Cargo links it, the executable exports its copies of
+    HarfBuzz 11.2.0, FreeType 2.13.2, libpng 1.6.44, SQLite 3.51.1, mozjpeg and SpiderMonkey's
+    `getenv`/`setenv`/`abort` (today's `sig`: 1 075 symbols), and shared libraries bind into them
+    instead of their own versions: 1 524 bindings in `wpe-coexist`, 220 from WebKit's library and
+    445 from libsqlite3's own internal calls (`LD_DEBUG=bindings`). That mixes two versions of a
+    library on the same objects, in `sig` today (libass, fontconfig, HarfBuzz) and in WebKit's UI
+    process. With the flag: 1 export, 0 bindings, every check passing. Servo using system
+    libraries was rejected (HarfBuzz is bundled unconditionally by `servo-fonts`; a Servo
+    rebuild; the other libraries would remain), and `RTLD_DEEPBIND` was not needed.
+66. **JavaScriptCore in Sighurt's process stays off signals** (amends 26): before WebKit is first
+    used, the WPE runtime sets JavaScriptCore's `usePollingTraps = true` and
+    `useWasmFaultSignalHandler = false` (`jsc_options_set_boolean`) and fails to start if they
+    don't hold. A web process that dies is `ViewFailed`, and a reload starts a new one. *Why:*
+    WebKit keeps a JavaScriptCore VM in the UI process (script results are `JSCValue`s); its
+    `SIGSEGV`/`SIGBUS` handler blocks every signal while it chains to the next handler, and
+    Wasmtime 36 leaves its handler with `longjmp`, which keeps that mask, so the next Wasmtime trap
+    is a blocked `SIGILL` that kills the process (reproduced, with a core dump). Options are per
+    process: pages keep signal-based traps and fast Wasm memory in the web processes. Crash
+    containment comes from WebKit's own process model (WPE.md, "Process model"), not from
+    Sighurt.

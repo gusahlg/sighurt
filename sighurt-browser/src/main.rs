@@ -7,8 +7,13 @@
 //!
 //! Process-wide setup follows decision 26, before any engine starts: the panic hook logs and
 //! never exits; rustls gets the aws-lc-rs provider; the one `log` logger is Servo's when Servo
-//! is compiled in and enabled, `env_logger` otherwise (see [`registry`]). SIGUSR1 prints the diagnostics, SIGTERM and SIGINT quit
-//! cleanly (the session is saved); their handlers only write to a pipe the loop reads.
+//! is compiled in and enabled, `env_logger` otherwise (see [`registry`]). SIGUSR1 prints the
+//! diagnostics, SIGTERM and SIGINT quit cleanly (the session is saved); their handlers only
+//! write to a pipe the loop reads. The one forced exit is [`app`]'s, after a Servo that could
+//! not shut down (decision 54).
+//!
+//! Must not own: browser policy (the core), drawing (the chrome and the engines), or any
+//! engine's internals.
 //!
 //! Sighurt is based on Oxide by Nikhil Ranjan (<https://github.com/niklabh/oxide>).
 
@@ -40,8 +45,9 @@ Options:
   -V, --version            Print the version and exit
 
 Environment:
-  SIG_DIAG=1   Print a diagnostics line for every page frame and chrome paint on stderr
-  RUST_LOG     Log filter, such as RUST_LOG=debug
+  SIG_DIAG=1      Print a diagnostics line for every page frame and chrome paint on stderr
+  SIG_AUDIT_GL=1  Count Servo's GL reads of page pixels too (times every GL call; for tests)
+  RUST_LOG        Log filter, such as RUST_LOG=debug
 
 Signals: SIGUSR1 prints the diagnostics on stderr; SIGTERM and SIGINT quit, saving the tabs.
 ";

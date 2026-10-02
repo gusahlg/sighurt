@@ -15,8 +15,10 @@ Sighurt is a fork of Oxide by Nikhil Ranjan (github.com/niklabh/oxide, Apache-2.
 The user's machines are shared with another Claude session. Breaking these rules can crash a machine.
 
 - Run **every** cargo command as `tools/cargo <args>`, never plain `cargo`, and any other heavy command (benchmarks, GPU work, long test runs) as `tools/heavy <cmd>`. Both take the machine-wide lock `/tmp/gusahlg-heavy.lock`, which the other session takes too, cap memory at 9 G and enter `nix-shell`. Waiting for the lock is normal; never work around it. Build only the crates you need (`-p <crate>`).
-- Build Servo on the second machine: `SIG_WHAT="servo build" tools/remote tools/cargo build -p <crate>` syncs this working tree to louise-pc and builds there, in its own target directory. louise-pc has Rust 1.95, the workspace's `rust-version`: code must compile on 1.95.
+- Build Servo on the second machine: `SIG_WHAT="servo build" tools/remote tools/cargo build -p <crate>` syncs this working tree to louise-pc and builds there, in its own target directory. Both machines get the same toolchain and native libraries from the nixpkgs pin in `nix/nixpkgs.nix` (Rust 1.98.1), which `shell.nix` imports. When louise-pc is busy, `tools/cargo` builds Servo here, in this desktop's `target/` (Servo is compiled there), unless the user is using the desktop: while a game runs or `/tmp/gusahlg-desktop-embargo` exists, `tools/heavy` refuses Servo jobs here.
 - Never start a Wayland client on the user's desktop unless your task explicitly allows it, and never inject input there. Test Wayland code in a private compositor: `tools/headless-sway [--scale S] [--size WxH] -- <cmd>`. Inside it `wtype`, `wlrctl`, `swaymsg`, `grim` and `wayland-info` drive and inspect that compositor only. Never use ydotool or anything that writes to `/dev/uinput`.
+- **Never capture the user's desktop.** `grim` (or any screenshot tool) run outside `tools/headless-sway` photographs every monitor of the user's live session, with whatever private windows are open. Screenshots come only from a private compositor; live-desktop checks use logs and diagnostics.
+- **Never build a copy of the workspace into the shared `target/`.** Cargo identifies path crates by their path relative to the workspace root, so a copy's artifacts are taken as up to date for the real tree and break every other agent's builds. Build copies with their own `CARGO_TARGET_DIR`.
 
 ---
 
@@ -35,19 +37,19 @@ The user's machines are shared with another Claude session. Breaking these rules
 - **The chrome is drawn on the CPU** with cosmic-text and tiny-skia into shared-memory buffers. GPUI is gone.
 - **Servo presents GL straight into its subsurface** (`WindowRenderingContext` on surfman). The normal display path never reads page pixels back to the CPU.
 - **The core is ordinary Rust**: roughly `update(state, event) -> Vec<Effect>`, with no I/O. Engines report facts as events and never change browser state; the executable carries out the effects.
-- `sighurt-ipc` and the `sig-wasm` process remain only until the Wasm engine is converted (milestone M5).
+- **The Wasm engine is a library too** (decision 22): `sighurt-ipc` and the `sig-wasm` process are gone. Its guests run on its worker threads and draw on the CPU into the host's SHM buffers.
 
 ## Crates and dependency rules
 
 | Crate | Modules | Project dependencies |
 |---|---|---|
 | `sighurt-api` | `ids`, `geometry`, `input`, `engine`, `events`, `services`, `commands` | None, and no third-party crates |
-| `sighurt-core` | `state`, `tabs`, `navigation`, `router`, `commands`, `permissions`, `config`, `session` | api |
+| `sighurt-core` | `state`, `tabs`, `navigation`, `router`, `commands`, `keys`, `permissions`, `config`, `session` | api |
 | `sighurt-wayland` | `connection`, `window`, `targets`, `placement`, `scale`, `input`, `text_input`, `clipboard`, `scheduler`, `shm` | api |
-| `sighurt-ui` | `state`, `layout`, `hit_test`, `text_edit`, `chrome`, `paint_cpu`, `accessibility` | api (it paints into memory the host lends it) |
+| `sighurt-ui` | `state`, `layout`, `hit_test`, `text_edit`, `text`, `chrome`, `paint_cpu`, `accessibility` | api (it paints into memory the host lends it) |
 | `sighurt-engine-servo` | `runtime`, `view`, `delegate`, `presentation`, `input`, `navigation` | api, wayland; Servo 0.5 |
-| `sighurt-engine-wasm` | Wasmtime runtime, host functions, guest drawing (still the old `sig-wasm` process) | api, wayland, once converted |
-| `sighurt-engine-demo` | A test engine: static pattern, animation, slow frame, resize, recoverable error | api, wayland |
+| `sighurt-engine-wasm` | `adapter` (`WasmRuntime`), `view`, `navigation`, `engine` (Wasmtime, limits), `live` and `pool` (guest threads), `capabilities` (host functions), `draw` and `raster` (CPU drawing), `wayland` (its `CpuTarget` for the host's SHM lease), and a module per guest subsystem | api, wayland |
+| `sighurt-engine-demo` | `lib` (the runtime and its pages: static pattern, animation, slow frame, resize, failed navigation, crash), `paint` | api, wayland |
 | `sighurt-browser` | `main`, `app`, `effects`, `registry`, `services`, `persistence`, `diagnostics` | All of the above; engines optional |
 | `sighurt-sdk` | The guest-side Wasm API | None: independent of every native crate |
 
@@ -74,23 +76,38 @@ tools/cargo fmt -p <crate>
 # (tools/heavy outside: headless-sway replaces XDG_RUNTIME_DIR, which tools/heavy needs)
 tools/cargo build -p sighurt-browser --no-default-features --features engine-demo
 tools/heavy tools/headless-sway -- target/debug/sig
+# sig's unit tests, and its end-to-end tests in a private headless sway (builds sig with the
+# demo engine; prints PASS or FAIL per check, screenshots and logs in OUT)
+tools/cargo test -p sighurt-browser -p sighurt-engine-demo --no-default-features --features engine-demo
+sighurt-browser/tests/headless.sh OUT
 
-# Anything that builds Servo (sig's default features, sighurt-engine-servo): on louise-pc
+# Anything that builds Servo (sig's default features, sighurt-engine-servo, the M0 and M1
+# experiments): on louise-pc, or with the same commands without `tools/remote` here (see
+# "Machine rules")
 SIG_WHAT="servo build" tools/remote tools/cargo build -p sighurt-browser
 SIG_WHAT="servo build" tools/remote tools/cargo clippy -p sighurt-engine-servo -p sighurt-browser --all-targets -- -D warnings
+# sig with Servo and Wasm, on the GPU, in a private compositor (with SIG_DIAG=1 it prints the
+# GL renderer and a line per frame)
+tools/heavy tools/headless-sway --renderer gles2 -- target/debug/sig https://example.com/
 
-# Wasm guests (always release)
-tools/cargo build --target wasm32-unknown-unknown --release -p hello-sighurt
+# Wasm guests (always release); the Wasm engine's tests run the first four
+tools/cargo build --target wasm32-unknown-unknown --release -p hello-sighurt -p raf-demo -p gradient-demo -p typography-demo
 tools/cargo build -p sighurt-sdk --target wasm32-unknown-unknown
+
+# Compositor tests of the host and the engines (each script says how to run it)
+sighurt-wayland/tests/headless.sh
+sighurt-engine-wasm/tests/headless.sh [OUT]
+SIG_WHAT="servo test" tools/remote sighurt-engine-servo/tests/headless.sh
 
 # Before a commit: everything except Servo here, Servo on louise-pc (above)
 tools/cargo fmt --all
-tools/cargo clippy --workspace --exclude sighurt-engine-servo --exclude sighurt-browser --all-targets -- -D warnings
+tools/cargo clippy --workspace --exclude sighurt-engine-servo --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-engine --exclude wpe-coexist --all-targets -- -D warnings
 tools/cargo clippy -p sighurt-browser --no-default-features --features engine-demo,engine-wasm --all-targets -- -D warnings
-tools/cargo test --workspace --exclude sighurt-engine-servo --exclude sighurt-browser
+tools/cargo test --workspace --exclude sighurt-engine-servo --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-engine --exclude wpe-coexist
+tools/cargo test -p sighurt-browser --no-default-features --features engine-demo,engine-wasm
 ```
 
-`--workspace` alone, or `sighurt-browser` with its default features, compiles Servo. Dependencies are built at `opt-level = 3` without debug info even in dev builds (Servo is unusable unoptimized); the Servo artifacts in `target/` were built with the same dependency settings, so keep them.
+`--workspace` alone, `sighurt-browser` with its default features, `m0-coexist` and `m1-mixed` compile Servo. Dependencies are built at `opt-level = 3` without debug info even in dev builds (Servo is unusable unoptimized); the Servo artifacts in `target/` were built with the same dependency settings, so keep them.
 
 ## Commands, keys and configuration
 
@@ -213,7 +230,7 @@ The guest ABI's import module is named `"oxide"` (Oxide's app ABI, comparable to
 ## Guest app contract (WASM engine)
 
 1. Export `start_app()`, called once on load.
-2. Optionally export `on_frame(dt_ms: u32)`, called about 60 times a second (fuel replenished each call).
+2. Optionally export `on_frame(dt_ms: u32)`, called about 60 times a second while the page is shown and once a second while it is hidden (fuel replenished each call).
 3. Optionally export `on_timer(callback_id: u32)`, called when a `set_timeout`/`set_interval`/`request_animation_frame` fires.
 4. Optionally export `on_event(callback_id: u32)`, called once per pending built-in or custom event each frame (before timers and `on_frame`).
 
@@ -261,7 +278,7 @@ The engine has no widget kit: guests draw their own UI with the canvas API and p
 **Verify your work.**
 - `sighurt-api`, `-core`, `-wayland`, `-ui`, `-engine-demo`: `tools/cargo check`, `test` and `clippy -- -D warnings` on the crate.
 - `sighurt-browser`: `tools/cargo check -p sighurt-browser --no-default-features`, plus `--features engine-demo`.
-- `sighurt-engine-servo`, or anything built with Servo: `SIG_WHAT="servo build" tools/remote tools/cargo check -p sighurt-engine-servo`.
+- `sighurt-engine-servo`, or anything built with Servo: `SIG_WHAT="servo build" tools/remote tools/cargo check -p sighurt-engine-servo` (and `-p sighurt-browser` with its default features).
 - WASM engine change: `tools/cargo build -p sighurt-engine-wasm`.
 - SDK change: `tools/cargo build -p sighurt-sdk --target wasm32-unknown-unknown`.
 - Example change: `tools/cargo build --target wasm32-unknown-unknown --release -p <example>`.
@@ -280,5 +297,5 @@ The engine has no widget kit: guests draw their own UI with the canvas API and p
 - **`HostState.memory` is set before instantiation**, so `caller.data().memory` is always there inside a host function. The helpers `expect` it.
 - **`block_on` vs spawn.** RTC uses `runtime.block_on` for synchronous host calls; WebSocket uses `runtime.spawn` for background tasks. Match the subsystem you're in.
 - **`Arc<Mutex<Option<T>>>` lazy init.** Subsystems such as rtc, ws, midi, fetch, sse and workers are `None` until first use; go through `with_started` / `with`.
-- **Frame fuel.** Each `on_frame` gets 50M instructions (`FRAME_FUEL_LIMIT` in `runtime.rs`); a store starts with 500M (`FUEL_LIMIT` in `engine.rs`). Host functions don't count against fuel and can't call back into the guest.
-- **The Wasm engine is still one process per page** until it is converted, so state shared between pages (the kv store) works across processes without locks; see `kv.rs`.
+- **Guest limits.** Each callback (`on_frame`, `on_timer`, `on_event`) gets 50M instructions (`FRAME_FUEL_LIMIT`) and `start_app` 500M (`FUEL_LIMIT`), and each has a wall-clock limit (1 s, `start_app` 10 s) that time spent waiting in host functions doesn't count against (`SandboxPolicy` in `engine.rs`). Host functions don't count against fuel and can't call back into the guest.
+- **Guests run on worker threads, in `sig`'s process.** Every view of the Wasm engine shares its runtime, and several `sig` processes may run at once, so state shared between pages (the kv store) works without locks; see `kv.rs`.

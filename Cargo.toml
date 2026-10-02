@@ -27,15 +27,18 @@ members = [
     "experiments/m0-coexist",
     # M1: CPU chrome and a Servo page in one Wayland window (docs/rewrite/M1.md).
     "experiments/m1-mixed",
+    # WPE WebKit as an in-process engine, and beside Servo and Wasmtime (docs/rewrite/WPE.md).
+    "experiments/wpe-engine",
+    "experiments/wpe-coexist",
 ]
-# Resolver 3 picks dependency versions that support `rust-version` below, so the lockfile keeps
-# building with louise-pc's Rust 1.95 as well as with the newer toolchain on this machine.
+# Resolver 3 picks dependency versions that support `rust-version` below: the Rust of the nixpkgs
+# pin in nix/nixpkgs.nix, which both machines build with.
 resolver = "3"
 
 [workspace.package]
 version = "0.7.0"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.98"
 license = "Apache-2.0"
 # Sighurt is a fork of Oxide by Nikhil Ranjan (https://github.com/niklabh/oxide); see NOTICE.
 authors = ["Nikhil Ranjan <niklabh>", "The Sighurt contributors"]

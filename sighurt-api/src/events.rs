@@ -26,7 +26,9 @@
 //! need not send for them. An engine that cannot tell which navigation committed (Servo 0.5's
 //! `WebView::load` returns no id) attributes the commit to the latest navigation the browser
 //! asked for that is still pending, or allocates a new id, and documents that limit in its
-//! adapter. Nothing guesses by comparing URLs.
+//! adapter. Nothing guesses by comparing URLs. A commit says what it did to the engine's own
+//! history ([`HistoryEffect`]) when the engine knows, since an id the adapter allocated says
+//! only that the page started it, not whether it added an entry or moved to another.
 
 use std::fmt;
 
@@ -65,6 +67,9 @@ pub enum EngineEvent {
         url: String,
         /// The document now shown.
         document: DocumentGeneration,
+        /// What the commit did to the engine's session history, when the engine can tell;
+        /// `None` from an engine that keeps no history of its own or doesn't know.
+        history: Option<HistoryEffect>,
     },
     /// A navigation ended without committing. The previous document stays.
     NavigationFailed {
@@ -210,6 +215,19 @@ impl EngineEvent {
             Self::RuntimeFailed { .. } => None,
         }
     }
+}
+
+/// What a commit did to the engine's own session history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HistoryEffect {
+    /// A new entry after the current one, dropping the entries that were after it: the
+    /// browser's `Navigate`, a link, a form, a script navigation, a fragment, `pushState`.
+    Push,
+    /// The current entry, replaced: a reload, `replaceState`, `location.replace`.
+    Replace,
+    /// Another existing entry became the current one: back or forward, the browser's or the
+    /// page's own (`history.back()`).
+    Traverse,
 }
 
 /// Where a page wants a URL opened.

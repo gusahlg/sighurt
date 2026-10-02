@@ -6,7 +6,8 @@
 //! `EngineEvent`s after the Servo call returns (`runtime::ServoRuntime::absorb`), so nothing
 //! mutates browser state re-entrantly. Replaceable notes (a new frame, title, status text,
 //! cursor) keep only the latest per WebView between two drains; everything else keeps its
-//! order.
+//! order. [`Coalescing`] is that queue, and the runtime's queue of events too: a page that
+//! floods Servo with them costs constant time per item.
 //!
 //! Requests the API has no answer for are dropped on arrival, which resolves them closed, as
 //! decision 16 deferred them: `<select>` menus keep their selection, colour pickers their
@@ -19,11 +20,14 @@
 //! runtime to report, never an exit.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
+use std::mem::Discriminant;
 
 use servo::{
     ClipboardDelegate, CreateNewWebViewRequest, Cursor, EmbedderControl, EmbedderControlId,
     LoadStatus, NavigationRequest, PermissionRequest, ServoDelegate, ServoError, StringRequest,
-    WebView, WebViewDelegate, WebViewId,
+    TraversalId, WebView, WebViewDelegate, WebViewId,
 };
 use url::Url;
 
@@ -35,6 +39,10 @@ pub(crate) enum Note {
     Cursor(Cursor),
     Load(LoadStatus),
     History(Vec<Url>, usize),
+    /// A traversal the browser asked for (`WebView::go_back`/`go_forward`) is done. Servo's
+    /// constellation sends it right after the history change the traversal made, or alone when
+    /// the traversal did nothing.
+    TraversalComplete(TraversalId),
     Crashed(String),
     /// The page called `window.close()`.
     Closed,
@@ -55,21 +63,21 @@ pub(crate) enum Note {
 
 impl Note {
     /// Whether a later note of the same kind replaces this one.
-    fn replaces(&self, other: &Note) -> bool {
+    fn replaceable(&self) -> bool {
         matches!(
-            (self, other),
-            (Note::FrameReady, Note::FrameReady)
-                | (Note::Title(_), Note::Title(_))
-                | (Note::Status(_), Note::Status(_))
-                | (Note::Cursor(_), Note::Cursor(_))
+            self,
+            Note::FrameReady | Note::Title(_) | Note::Status(_) | Note::Cursor(_)
         )
     }
 }
 
+/// The notes of every WebView, keeping the latest replaceable note per WebView and kind.
+type Notes = Coalescing<(WebViewId, Discriminant<Note>), (WebViewId, Note)>;
+
 /// Every WebView's delegate: queues [`Note`]s until the runtime drains them.
 #[derive(Default)]
 pub(crate) struct Delegate {
-    notes: RefCell<Vec<(WebViewId, Note)>>,
+    notes: RefCell<Notes>,
     backend_lost: Cell<bool>,
 }
 
@@ -79,14 +87,16 @@ impl Delegate {
     }
 
     fn note_for(&self, id: WebViewId, note: Note) {
-        let mut notes = self.notes.borrow_mut();
-        notes.retain(|(other, old)| *other != id || !note.replaces(old));
-        notes.push((id, note));
+        let key = note
+            .replaceable()
+            .then(|| (id, std::mem::discriminant(&note)));
+        self.notes.borrow_mut().push(key, (id, note));
     }
 
     /// What Servo said since the last call, oldest first.
     pub fn take(&self) -> Vec<(WebViewId, Note)> {
-        self.notes.take()
+        let mut notes = self.notes.borrow_mut();
+        std::iter::from_fn(|| notes.pop()).collect()
     }
 
     /// Whether Servo lost its backend (the constellation), which it can't recover from.
@@ -133,6 +143,10 @@ impl WebViewDelegate for Delegate {
 
     fn notify_history_changed(&self, webview: WebView, entries: Vec<Url>, current: usize) {
         self.note(&webview, Note::History(entries, current));
+    }
+
+    fn notify_traversal_complete(&self, webview: WebView, traversal: TraversalId) {
+        self.note(&webview, Note::TraversalComplete(traversal));
     }
 
     fn notify_closed(&self, webview: WebView) {
@@ -184,5 +198,138 @@ impl ClipboardDelegate for Delegate {
 
     fn set_text(&self, webview: WebView, text: String) {
         self.note(&webview, Note::ClipboardWrite(Some(text)));
+    }
+}
+
+/// A first-in, first-out queue in which an item pushed with a key replaces the queued item with
+/// the same key: the earlier is dropped, the later keeps its own place. Pushing and popping
+/// cost constant time (amortized): a replaced item leaves a gap, and the gaps are swept out
+/// once they outnumber the items.
+pub(crate) struct Coalescing<K, T> {
+    slots: VecDeque<Option<(Option<K>, T)>>,
+    /// The sequence number of `slots[0]`.
+    first: u64,
+    /// The sequence number of the queued item with each key.
+    keyed: HashMap<K, u64>,
+    len: usize,
+}
+
+impl<K, T> Default for Coalescing<K, T> {
+    fn default() -> Self {
+        Self {
+            slots: VecDeque::new(),
+            first: 0,
+            keyed: HashMap::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<K: Copy + Eq + Hash, T> Coalescing<K, T> {
+    pub fn push(&mut self, key: Option<K>, item: T) {
+        if let Some(old) = key.and_then(|key| self.keyed.remove(&key)) {
+            self.slots[(old - self.first) as usize] = None;
+            self.len -= 1;
+            if self.slots.len() > 2 * self.len + 64 {
+                self.sweep();
+            }
+        }
+        if let Some(key) = key {
+            self.keyed.insert(key, self.first + self.slots.len() as u64);
+        }
+        self.slots.push_back(Some((key, item)));
+        self.len += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        while let Some(slot) = self.slots.pop_front() {
+            self.first += 1;
+            if let Some((key, item)) = slot {
+                if let Some(key) = key {
+                    self.keyed.remove(&key);
+                }
+                self.len -= 1;
+                return Some(item);
+            }
+        }
+        None
+    }
+
+    /// How many items are queued.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self {
+            first: self.first + self.slots.len() as u64,
+            ..Self::default()
+        };
+    }
+
+    /// Drops the gaps, renumbering what is left.
+    fn sweep(&mut self) {
+        let items = std::mem::take(&mut self.slots);
+        self.keyed.clear();
+        for (key, item) in items.into_iter().flatten() {
+            if let Some(key) = key {
+                self.keyed.insert(key, self.first + self.slots.len() as u64);
+            }
+            self.slots.push_back(Some((key, item)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_keyed_item_replaces_the_queued_one_and_keeps_its_own_place() {
+        let mut queue = Coalescing::default();
+        queue.push(Some('t'), "title 1");
+        queue.push(None, "commit");
+        queue.push(Some('t'), "title 2");
+        queue.push(Some('s'), "status");
+        queue.push(None, "commit");
+        assert_eq!(queue.len(), 4);
+        assert_eq!(queue.pop(), Some("commit"));
+        // A key popped is free again.
+        assert_eq!(queue.pop(), Some("title 2"));
+        queue.push(Some('t'), "title 3");
+        let rest: Vec<_> = std::iter::from_fn(|| queue.pop()).collect();
+        assert_eq!(rest, ["status", "commit", "title 3"]);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn a_flood_of_replacements_stays_small() {
+        let mut queue = Coalescing::default();
+        for i in 0..100_000 {
+            queue.push(None, i);
+            queue.push(Some(()), -i);
+        }
+        assert_eq!(queue.len(), 100_001);
+        assert!(
+            queue.slots.len() <= 2 * queue.len() + 65,
+            "{}",
+            queue.slots.len()
+        );
+        let mut queue = Coalescing::default();
+        for i in 0..100_000 {
+            queue.push(Some(()), i);
+        }
+        assert_eq!(queue.len(), 1);
+        assert!(queue.slots.len() <= 65);
+        assert_eq!(queue.pop(), Some(99_999));
+        queue.push(Some(()), 1);
+        queue.clear();
+        assert_eq!((queue.len(), queue.pop()), (0, None));
+        queue.push(Some(()), 2);
+        assert_eq!(queue.pop(), Some(2));
     }
 }

@@ -9,6 +9,17 @@
 //! every call fails: Servo can be built only once per process, so web pages need a browser
 //! restart, and dropping and rebuilding this wrapper would not reset Servo's global state.
 //!
+//! The events wait in one queue, which keeps the latest replaceable event per view and kind; a
+//! pump hands over at most [`MAX_EVENTS_PER_PUMP`] and spins Servo only while fewer than that
+//! are waiting, so a page that floods Servo with commits fills Servo's own channels, not this
+//! queue.
+//!
+//! `Stop` cancels a navigation still queued (see [`crate::view`]), gives up on a top-level load
+//! that has shown no sign of life for [`LOAD_WAIT`](crate::view::LOAD_WAIT) (its
+//! `NavigationFailed` is `Cancelled`), and stops the document's own loading (`window.stop()`).
+//! Servo 0.5 can't cancel a top-level load still waiting for its response: that one goes on and
+//! commits when its response comes.
+//!
 //! Servo keeps its profile (cookies, local storage, HSTS, HTTP authentication) in the directory
 //! the executable passes, written by this runtime only: it holds `{profile}/lock` from before
 //! Servo is built until Servo has shut down (Servo writes the profile while it shuts down), and
@@ -16,6 +27,16 @@
 //!
 //! A crashed page's view loads its next navigation in a new WebView on the same context: Servo
 //! 0.5 keeps sending the crashed site's documents to the dead script thread.
+//!
+//! Timing ([`ServoTiming`]): every submitted frame's paint (`WebView::paint`) and swap, and how
+//! long the browser's navigations took to their document's first frame, in
+//! [`ServoDiagnostics`], and one line each through the `log` target [`TIMING`] at debug level,
+//! which the executable's logger enables (`RUST_LOG=sighurt_engine_servo::timing=debug`):
+//!
+//! ```text
+//! servo-timing frame view=3 w=1280 h=696 paint_ms=1.234 swap_ms=0.210
+//! servo-timing first-frame view=3 after_navigate_ms=345.6
+//! ```
 //!
 //! [`EngineRuntime::shutdown`] closes in the order M1 established: the WebViews, then Servo
 //! (which spins until its constellation, WebGL and paint threads are done), then each view's
@@ -27,10 +48,12 @@
 //! Must not own: process lifetime, logging or TLS setup, the allocator (the executable): no
 //! `process::exit`, `_exit`, panic hook, logger or crypto provider here.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{File, TryLockError};
+use std::mem::Discriminant;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use servo::{
     EmbedderControl, EventLoopWaker, LoadStatus, Opts, PermissionFeature, Preferences,
@@ -40,8 +63,8 @@ use sighurt_api::engine::{
     EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, PresentOutcome,
     PumpStatus, ViewOptions,
 };
-use sighurt_api::events::{EngineEvent, OpenDisposition};
-use sighurt_api::ids::{NavigationId, RequestId, ViewId};
+use sighurt_api::events::{EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
+use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, ViewId};
 use sighurt_api::services::{
     ClipboardData, Permission, PickMode, Selection, Service, ServiceReply, ServiceRequest,
     ServiceResult,
@@ -49,11 +72,11 @@ use sighurt_api::services::{
 use sighurt_wayland::{FramePermit, PresentMode, TargetLease};
 use url::Url;
 
-use crate::delegate::{Delegate, Note};
+use crate::delegate::{Coalescing, Delegate, Note};
 use crate::input::text_input_state;
 use crate::navigation::{Navigator, Request};
 use crate::presentation::{physical, Egl, GlInfo, Readbacks};
-use crate::view::{Pending, View};
+use crate::view::{Load, Pending, View};
 
 /// Events handed over per pump; the rest wait for the next.
 const MAX_EVENTS_PER_PUMP: usize = 256;
@@ -64,6 +87,20 @@ const MAX_POPUPS: usize = 4;
 /// The most clipboard text a page reads.
 const CLIPBOARD_LIMIT: usize = 4 << 20;
 const TEXT_PLAIN: &str = "text/plain;charset=utf-8";
+/// The `log` target of the timing lines (see the module documentation).
+pub const TIMING: &str = "sighurt_engine_servo::timing";
+
+/// What the Servo engine supports, for the executable's registry before the runtime exists.
+pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    history_traversal: true,
+    text_input: true,
+    accessibility: false,
+    screenshots: false,
+    find_in_page: false,
+    page_zoom: true,
+    pointer_lock: false,
+    native_popups: false,
+};
 
 /// What the executable decides for the Servo runtime.
 #[derive(Clone, Debug, Default)]
@@ -91,34 +128,48 @@ pub struct ServoDiagnostics {
     pub frames: u64,
     /// Open views.
     pub views: usize,
+    /// How long painting and navigating took.
+    pub timing: ServoTiming,
     /// Servo was left running when the runtime shut down (after a page crash or a lost
     /// backend, it can't shut down): its threads outlive the runtime, the profile wasn't
     /// written, and the executable should end the process without running exit handlers.
     pub leaked: bool,
 }
 
+/// Paint and swap times of the frames submitted so far, and how long the browser's latest
+/// navigation took to show (the baseline's `SIG_SERVO_TIMING`). A swap never waits (swap
+/// interval 0), so it measures the driver's submission, not the display.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServoTiming {
+    /// `WebView::paint` of the last frame submitted: WebRender drawing the frame.
+    pub paint: Duration,
+    /// The swap of the last frame submitted.
+    pub swap: Duration,
+    /// The longest paint and swap so far.
+    pub max_paint: Duration,
+    pub max_swap: Duration,
+    /// All paints and swaps so far, over [`ServoDiagnostics::frames`] frames.
+    pub total_paint: Duration,
+    pub total_swap: Duration,
+    /// From the browser's latest `Navigate` that has shown to its document's first submitted
+    /// frame.
+    pub first_frame: Option<Duration>,
+}
+
 /// Who a Servo WebView is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Owner {
     View(ViewId),
-    /// A hidden pop-up the view's page opened, until its first navigation.
-    Popup(ViewId),
+    /// A hidden pop-up the view's document opened, until its first navigation.
+    Popup(ViewId, DocumentGeneration),
 }
 
-/// The events a pump hands over, keeping only the latest replaceable event per view.
-#[derive(Debug, Default)]
-struct Events(VecDeque<EngineEvent>);
+/// The events a pump hands over, keeping only the latest replaceable event per view and kind.
+type Events = Coalescing<(Option<ViewId>, Discriminant<EngineEvent>), EngineEvent>;
 
-impl Events {
-    fn push(&mut self, event: EngineEvent) {
-        if replaceable(&event) {
-            let kind = std::mem::discriminant(&event);
-            let view = event.view();
-            self.0
-                .retain(|old| std::mem::discriminant(old) != kind || old.view() != view);
-        }
-        self.0.push_back(event);
-    }
+fn push(events: &mut Events, event: EngineEvent) {
+    let key = replaceable(&event).then(|| (event.view(), std::mem::discriminant(&event)));
+    events.push(key, event);
 }
 
 fn replaceable(event: &EngineEvent) -> bool {
@@ -132,6 +183,26 @@ fn replaceable(event: &EngineEvent) -> bool {
             | EngineEvent::TextInputChanged { .. }
             | EngineEvent::FrameReady { .. }
     )
+}
+
+fn cancelled(view: ViewId, navigation: NavigationId) -> EngineEvent {
+    EngineEvent::NavigationFailed {
+        view,
+        navigation,
+        error: NavigationError::Cancelled,
+    }
+}
+
+/// Whether the note `notes` holds after a history change of `webview` says the change was a
+/// browser traversal: Servo's constellation reports a traversal's history change and then, at
+/// once, its completion, so the next history note or completion of the WebView tells.
+enum Traversal {
+    /// It was this traversal of the browser's.
+    Of(NavigationId),
+    /// It wasn't one.
+    No,
+    /// The completion may not have arrived yet.
+    Unknown,
 }
 
 /// The one Servo runtime of the process. See the module documentation.
@@ -148,10 +219,14 @@ pub struct ServoRuntime {
     /// Servo's keyboard focus is one WebView at a time; `blur` blurs whichever has it.
     servo_focus: Option<ViewId>,
     events: Events,
+    /// Notes of WebViews whose last history change may be a traversal whose completion hasn't
+    /// arrived, held in order for the next absorb, with whether each was counted already.
+    held: Vec<(WebViewId, Note, bool)>,
     readbacks: Readbacks,
     gl: Option<GlInfo>,
     egl: Option<Egl>,
     frames: u64,
+    timing: ServoTiming,
     profile: Option<PathBuf>,
     /// Held from before Servo is built until it has shut down.
     profile_lock: Option<File>,
@@ -198,10 +273,12 @@ impl ServoRuntime {
             closing: Vec::new(),
             servo_focus: None,
             events: Events::default(),
+            held: Vec::new(),
             readbacks,
             gl: None,
             egl: None,
             frames: 0,
+            timing: ServoTiming::default(),
             profile,
             profile_lock,
             failed: None,
@@ -227,6 +304,7 @@ impl ServoRuntime {
             gl_reads: self.readbacks.gl_reads.as_ref().map(|reads| reads.get()),
             frames: self.frames,
             views: self.views.len(),
+            timing: self.timing,
             leaked: self.leaked,
         }
     }
@@ -281,7 +359,7 @@ impl ServoRuntime {
         if let Some(webview) = view.ensure_webview(&servo, &self.delegate) {
             self.owners.insert(webview.id(), Owner::View(id));
             if !std::mem::replace(&mut view.ready, true) {
-                self.events.push(EngineEvent::ViewReady { view: id });
+                push(&mut self.events, EngineEvent::ViewReady { view: id });
             }
             self.apply_focus(id);
         }
@@ -300,9 +378,11 @@ impl ServoRuntime {
         }
         view.crashed = false;
         view.queued = None;
+        view.load = None;
+        view.traversals.clear();
         view.navigator = Navigator::default();
         view.navigator.request(navigation, Request::Navigate);
-        view.first = Some(url);
+        view.first = Some((navigation, url));
         view.requests.clear();
         view.ime = None;
         view.composition.reset();
@@ -322,8 +402,10 @@ impl ServoRuntime {
 
     /// `view` couldn't continue: it is closed, reported as failed and closed.
     fn fail_view(&mut self, id: ViewId, message: String) {
-        self.events
-            .push(EngineEvent::ViewFailed { view: id, message });
+        push(
+            &mut self.events,
+            EngineEvent::ViewFailed { view: id, message },
+        );
         self.close_view(id);
     }
 
@@ -365,14 +447,16 @@ impl ServoRuntime {
         }
         let request = RequestId::next();
         view.requests.push((request, pending));
-        self.events
-            .push(EngineEvent::ServiceRequested(ServiceRequest {
+        push(
+            &mut self.events,
+            EngineEvent::ServiceRequested(ServiceRequest {
                 id: request,
                 view: id,
                 document,
                 origin: view.origin(),
                 service,
-            }));
+            }),
+        );
     }
 
     /// Turns what Servo's delegates queued into events and view state.
@@ -380,28 +464,48 @@ impl ServoRuntime {
         if self.delegate.backend_lost() && self.failed.is_none() {
             let message = "Servo lost its backend; web pages need a browser restart".to_string();
             log::error!("servo: {message}");
-            self.events.push(EngineEvent::RuntimeFailed {
-                message: message.clone(),
-            });
+            push(
+                &mut self.events,
+                EngineEvent::RuntimeFailed {
+                    message: message.clone(),
+                },
+            );
             self.failed = Some(message);
         }
         // Each note, and whether it is a `Started` already counted with the history change it
         // belongs to: the two arrive on different channels, so within one batch the history
-        // change may come first.
-        let mut notes: Vec<_> = self
-            .delegate
-            .take()
+        // change may come first. Notes held back last time come first.
+        let fresh = self.delegate.take().into_iter().map(|(w, n)| (w, n, false));
+        let mut notes: Vec<_> = std::mem::take(&mut self.held)
             .into_iter()
-            .map(|(webview, note)| Some((webview, note, false)))
+            .chain(fresh)
+            .map(Some)
             .collect();
+        let mut holding = Vec::new();
         for index in 0..notes.len() {
             let Some((webview, note, counted)) = notes[index].take() else {
                 continue;
             };
+            if holding.contains(&webview) {
+                self.held.push((webview, note, counted));
+                continue;
+            }
             match self.owners.get(&webview).copied() {
                 Some(Owner::View(view)) => {
+                    let mut traversal = None;
                     let mut started_later = false;
                     if matches!(note, Note::History(..)) {
+                        match self.traversal(view, webview, &notes[index + 1..]) {
+                            Traversal::Of(navigation) => traversal = Some(navigation),
+                            Traversal::No => {}
+                            Traversal::Unknown => {
+                                // Its completion comes with Servo's next batch: this note and
+                                // the WebView's later ones wait for it, in order.
+                                holding.push(webview);
+                                self.held.push((webview, note, counted));
+                                continue;
+                            }
+                        }
                         let later = notes[index + 1..].iter_mut().flatten().find(|(id, n, c)| {
                             *id == webview && !*c && matches!(n, Note::Load(LoadStatus::Started))
                         });
@@ -410,116 +514,198 @@ impl ServoRuntime {
                             started_later = true;
                         }
                     }
-                    self.view_note(view, note, started_later || counted);
+                    self.view_note(view, note, started_later || counted, traversal);
                 }
-                Some(Owner::Popup(parent)) => self.popup_note(parent, webview, note),
+                Some(Owner::Popup(parent, document)) => {
+                    self.popup_note(parent, document, webview, note)
+                }
                 // A WebView being closed; what it says no longer matters.
                 None => {}
             }
         }
     }
 
+    /// Whether the history change of `webview` before `rest` is a browser traversal of `view`,
+    /// and which (see [`Traversal`]).
+    fn traversal(
+        &self,
+        view: ViewId,
+        webview: WebViewId,
+        rest: &[Option<(WebViewId, Note, bool)>],
+    ) -> Traversal {
+        let Some(view) = self.views.get(&view).filter(|v| !v.traversals.is_empty()) else {
+            return Traversal::No;
+        };
+        let next = rest.iter().flatten().find(|(id, note, _)| {
+            *id == webview && matches!(note, Note::History(..) | Note::TraversalComplete(_))
+        });
+        match next {
+            Some((_, Note::TraversalComplete(done), _)) => view
+                .traversals
+                .iter()
+                .find(|(t, _)| t == done)
+                .map_or(Traversal::No, |&(_, navigation)| Traversal::Of(navigation)),
+            Some(_) => Traversal::No,
+            None => Traversal::Unknown,
+        }
+    }
+
     /// `counted`: for a history change, a `Started` that belongs to it comes later in the
-    /// batch; for a `Started`, it was counted with its history change already.
-    fn view_note(&mut self, id: ViewId, note: Note, counted: bool) {
+    /// batch; for a `Started`, it was counted with its history change already. `traversal`: the
+    /// browser's traversal a history change carried out.
+    fn view_note(
+        &mut self,
+        id: ViewId,
+        note: Note,
+        counted: bool,
+        traversal: Option<NavigationId>,
+    ) {
         let Some(view) = self.views.get_mut(&id) else {
             return;
         };
+        let events = &mut self.events;
         match note {
             Note::FrameReady => view.frame_ready = true,
-            Note::Title(title) => self
-                .events
-                .push(EngineEvent::TitleChanged { view: id, title }),
-            Note::Status(text) => self
-                .events
-                .push(EngineEvent::StatusTextChanged { view: id, text }),
-            Note::Cursor(cursor) => self.events.push(EngineEvent::CursorChanged {
-                view: id,
-                cursor: crate::input::cursor(cursor),
-            }),
+            Note::Title(title) => push(events, EngineEvent::TitleChanged { view: id, title }),
+            Note::Status(text) => push(events, EngineEvent::StatusTextChanged { view: id, text }),
+            Note::Cursor(cursor) => push(
+                events,
+                EngineEvent::CursorChanged {
+                    view: id,
+                    cursor: crate::input::cursor(cursor),
+                },
+            ),
             Note::Load(status) => {
-                view.navigator
-                    .load_status(status == LoadStatus::Started, counted);
+                let started = status == LoadStatus::Started;
+                view.navigator.load_status(started, counted);
+                if let (true, Some(load)) = (started, &mut view.load) {
+                    // Its document is on its way: the commit follows.
+                    load.since = Instant::now();
+                }
                 let loading = status != LoadStatus::Complete;
                 if loading != view.loading {
                     view.loading = loading;
-                    self.events
-                        .push(EngineEvent::LoadingChanged { view: id, loading });
+                    push(events, EngineEvent::LoadingChanged { view: id, loading });
                 }
             }
             Note::History(entries, current) => {
                 let entries: Vec<String> = entries.into_iter().map(String::from).collect();
                 let before = view.document();
+                if let Some(navigation) = traversal {
+                    view.traversals.retain(|&(_, n)| n != navigation);
+                }
                 let commit = view
                     .navigator
-                    .history_changed(entries.clone(), current, counted);
+                    .history_changed(entries, current, counted, traversal);
                 if let Some(commit) = commit {
-                    self.events.push(EngineEvent::NavigationCommitted {
-                        view: id,
-                        navigation: commit.navigation,
-                        url: commit.url,
-                        document: commit.document,
-                    });
-                }
-                if view.document() != before {
-                    // Servo has no load in flight any more: the one waiting goes now.
-                    view.in_flight = false;
-                    if let (Some((navigation, url)), Some(webview)) =
-                        (view.queued.take(), &view.webview)
-                    {
-                        view.navigator.request(navigation, Request::Navigate);
-                        webview.load(url);
-                        view.in_flight = true;
+                    if let Some((navigation, _, committed)) = &mut view.navigated {
+                        *committed |= *navigation == commit.navigation;
                     }
-                    // Nothing asked for by the old document carries over; the browser
-                    // cancels its requests itself.
-                    view.requests.clear();
-                    if view.ime.take().is_some() {
-                        view.composition.reset();
-                        self.events.push(EngineEvent::TextInputChanged {
+                    let loaded = commit.history != Some(HistoryEffect::Traverse);
+                    push(
+                        events,
+                        EngineEvent::NavigationCommitted {
                             view: id,
-                            state: None,
-                        });
+                            navigation: commit.navigation,
+                            url: commit.url,
+                            document: commit.document,
+                            history: commit.history,
+                        },
+                    );
+                    if view.document() != before {
+                        // Nothing asked for by the old document carries over; the browser
+                        // cancels its requests itself.
+                        view.requests.clear();
+                        for popup in view.popups.drain(..) {
+                            self.owners.remove(&popup.id());
+                        }
+                        if view.ime.take().is_some() {
+                            view.composition.reset();
+                            push(
+                                events,
+                                EngineEvent::TextInputChanged {
+                                    view: id,
+                                    state: None,
+                                },
+                            );
+                        }
+                        if loaded {
+                            // The load Servo had in flight brought this document (a traversal
+                            // doesn't end one): the navigation waiting for it goes now.
+                            view.load = None;
+                            if let Some(given_up) = view.send_queued(Instant::now()) {
+                                push(events, cancelled(id, given_up));
+                            }
+                        }
                     }
                 }
-                self.events.push(EngineEvent::HistoryChanged {
-                    view: id,
-                    entries,
-                    current,
-                });
+                push(
+                    events,
+                    EngineEvent::HistoryChanged {
+                        view: id,
+                        entries: view.navigator.entries().to_vec(),
+                        current,
+                    },
+                );
+                view.keep_throttled();
+            }
+            Note::TraversalComplete(done) => {
+                // Still waiting: the traversal changed nothing, Servo found no entry there.
+                let index = view.traversals.iter().position(|(t, _)| *t == done);
+                if let Some(index) = index {
+                    let (_, navigation) = view.traversals.remove(index);
+                    view.navigator.forget(navigation);
+                    push(events, cancelled(id, navigation));
+                }
             }
             Note::Crashed(reason) => {
                 view.crashed = true;
                 self.page_crashed = true;
-                self.events.push(EngineEvent::ViewFailed {
-                    view: id,
-                    message: format!("The page crashed: {reason}"),
-                });
+                push(
+                    events,
+                    EngineEvent::ViewFailed {
+                        view: id,
+                        message: format!("The page crashed: {reason}"),
+                    },
+                );
             }
             Note::Closed => {
                 if let Some(document) = view.document() {
-                    self.events
-                        .push(EngineEvent::CloseRequested { view: id, document });
+                    push(events, EngineEvent::CloseRequested { view: id, document });
                 }
             }
             Note::Navigation(request) => {
                 if view.loads_itself(&request.url) {
                     request.allow();
+                    // If it is the top level's (Servo 0.5 doesn't say whether it is an
+                    // iframe's), Servo would drop a browser navigation until it has its
+                    // document. One already in flight goes on; one that showed no sign of life
+                    // for `LOAD_WAIT` is given up for it.
+                    if !view.load.is_some_and(|load| load.alive(Instant::now())) {
+                        if let Some(given_up) = view.give_up_load() {
+                            push(events, cancelled(id, given_up));
+                        }
+                        view.load = Some(Load::new(None));
+                    }
                     return;
                 }
                 let url = request.url.to_string();
                 request.deny();
                 if let Some(document) = view.document() {
-                    self.events.push(EngineEvent::OpenRequested {
-                        view: id,
-                        document,
-                        url,
-                        disposition: OpenDisposition::CurrentView,
-                    });
+                    push(
+                        events,
+                        EngineEvent::OpenRequested {
+                            view: id,
+                            document,
+                            url,
+                            disposition: OpenDisposition::CurrentView,
+                        },
+                    );
                 }
             }
             Note::CreateNew(request) => {
-                let Some(context) = view.context.clone() else {
+                let (Some(context), Some(document)) = (view.context.clone(), view.document())
+                else {
                     return;
                 };
                 if view.popups.len() >= MAX_POPUPS {
@@ -533,7 +719,7 @@ impl ServoRuntime {
                     .build();
                 // It shares the page's rendering context and must never paint over it.
                 popup.hide();
-                self.owners.insert(popup.id(), Owner::Popup(id));
+                self.owners.insert(popup.id(), Owner::Popup(id, document));
                 view.popups.push(popup);
             }
             Note::Permission(request) => {
@@ -560,10 +746,13 @@ impl ServoRuntime {
                     control.multiline(),
                     &view.metrics,
                 );
-                self.events.push(EngineEvent::TextInputChanged {
-                    view: id,
-                    state: Some(state),
-                });
+                push(
+                    events,
+                    EngineEvent::TextInputChanged {
+                        view: id,
+                        state: Some(state),
+                    },
+                );
             }
             Note::Control(EmbedderControl::FilePicker(picker)) => {
                 let mode = match picker.allow_select_multiple() {
@@ -587,18 +776,20 @@ impl ServoRuntime {
                 if view.ime == Some(control) {
                     view.ime = None;
                     view.composition.reset();
-                    self.events.push(EngineEvent::TextInputChanged {
-                        view: id,
-                        state: None,
-                    });
+                    push(
+                        events,
+                        EngineEvent::TextInputChanged {
+                            view: id,
+                            state: None,
+                        },
+                    );
                 }
                 let picker = view.requests.iter().position(
                     |(_, pending)| matches!(pending, Pending::Files(p) if p.id() == control),
                 );
                 if let Some(index) = picker {
                     let (request, _) = view.requests.remove(index);
-                    self.events
-                        .push(EngineEvent::ServiceCancelled { view: id, request });
+                    push(events, EngineEvent::ServiceCancelled { view: id, request });
                 }
             }
             Note::ClipboardRead(request) => self.request(
@@ -630,18 +821,27 @@ impl ServoRuntime {
             Note::Stopped => {
                 if view.loading {
                     view.loading = false;
-                    self.events.push(EngineEvent::LoadingChanged {
-                        view: id,
-                        loading: false,
-                    });
+                    push(
+                        events,
+                        EngineEvent::LoadingChanged {
+                            view: id,
+                            loading: false,
+                        },
+                    );
                 }
             }
         }
     }
 
-    /// A pop-up's first navigation goes to the browser as a new tab, and the pop-up closes.
-    /// Nothing else it asks for is granted.
-    fn popup_note(&mut self, parent: ViewId, popup: WebViewId, note: Note) {
+    /// A pop-up's first navigation goes to the browser as a new tab, on behalf of the
+    /// `document` that opened it, and the pop-up closes. Nothing else it asks for is granted.
+    fn popup_note(
+        &mut self,
+        parent: ViewId,
+        document: DocumentGeneration,
+        popup: WebViewId,
+        note: Note,
+    ) {
         let url = match note {
             Note::Navigation(request) => {
                 let url = request.url.clone();
@@ -663,14 +863,15 @@ impl ServoRuntime {
             return;
         };
         view.popups.retain(|p| p.id() != popup);
-        if let Some(document) = view.document() {
-            self.events.push(EngineEvent::OpenRequested {
+        push(
+            &mut self.events,
+            EngineEvent::OpenRequested {
                 view: parent,
                 document,
                 url: url.into(),
                 disposition: OpenDisposition::NewView,
-            });
-        }
+            },
+        );
     }
 
     /// Drops what Servo made for a view, then the context, then the lease. Returns the view
@@ -701,8 +902,52 @@ impl ServoRuntime {
             let id = view.id;
             match self.release(view) {
                 Some(view) => self.closing.push(view),
-                None => self.events.push(EngineEvent::ViewClosed { view: id }),
+                None => push(&mut self.events, EngineEvent::ViewClosed { view: id }),
             }
+        }
+    }
+
+    /// Paints `id`'s frame at `size` and swaps it in, timing both.
+    fn paint(&mut self, id: ViewId, size: dpi::PhysicalSize<u32>) {
+        let Some(view) = self.views.get_mut(&id) else {
+            return;
+        };
+        let (Some(webview), Some(context)) = (&view.webview, &view.context) else {
+            return;
+        };
+        if context.size() != size {
+            webview.resize(size);
+        }
+        let start = Instant::now();
+        webview.paint();
+        let painted = Instant::now();
+        context.swap();
+        let (paint, swap) = (painted - start, painted.elapsed());
+        self.frames += 1;
+        let t = &mut self.timing;
+        t.paint = paint;
+        t.swap = swap;
+        t.max_paint = t.max_paint.max(paint);
+        t.max_swap = t.max_swap.max(swap);
+        t.total_paint += paint;
+        t.total_swap += swap;
+        let serial = id.serial();
+        log::debug!(
+            target: TIMING,
+            "servo-timing frame view={serial} w={} h={} paint_ms={:.3} swap_ms={:.3}",
+            size.width,
+            size.height,
+            paint.as_secs_f64() * 1e3,
+            swap.as_secs_f64() * 1e3
+        );
+        if let Some((_, asked, true)) = view.navigated.take_if(|&mut (_, _, shown)| shown) {
+            let after = asked.elapsed();
+            t.first_frame = Some(after);
+            log::debug!(
+                target: TIMING,
+                "servo-timing first-frame view={serial} after_navigate_ms={:.1}",
+                after.as_secs_f64() * 1e3
+            );
         }
     }
 }
@@ -712,12 +957,7 @@ impl EngineRuntime for ServoRuntime {
     type FramePermit = FramePermit;
 
     fn capabilities(&self) -> EngineCapabilities {
-        EngineCapabilities {
-            history_traversal: true,
-            text_input: true,
-            page_zoom: true,
-            ..EngineCapabilities::default()
-        }
+        CAPABILITIES
     }
 
     fn open_view(
@@ -731,6 +971,12 @@ impl EngineRuntime for ServoRuntime {
             return Err(EngineError::Unsupported(
                 "presenting into a shared-memory target",
             ));
+        }
+        if self.views.contains_key(&view) {
+            return Err(EngineError::View {
+                view,
+                message: "this view is open already".into(),
+            });
         }
         self.views.insert(view, View::new(view, options, target));
         if let Err(message) = self.start(view) {
@@ -749,82 +995,92 @@ impl EngineRuntime for ServoRuntime {
             .views
             .get_mut(&id)
             .ok_or(EngineError::UnknownView(id))?;
-        let cancelled = |navigation| EngineEvent::NavigationFailed {
-            view: id,
-            navigation,
-            error: sighurt_api::events::NavigationError::Cancelled,
-        };
+        let now = Instant::now();
         match command {
             EngineCommand::Navigate { navigation, url } => {
                 let url = match Url::parse(&url) {
                     Ok(url) => url,
                     Err(error) => {
-                        self.events.push(EngineEvent::NavigationFailed {
-                            view: id,
-                            navigation,
-                            error: sighurt_api::events::NavigationError::Load(format!(
-                                "Not a valid address: {error}"
-                            )),
-                        });
+                        push(
+                            &mut self.events,
+                            EngineEvent::NavigationFailed {
+                                view: id,
+                                navigation,
+                                error: NavigationError::Load(format!(
+                                    "Not a valid address: {error}"
+                                )),
+                            },
+                        );
                         return Ok(());
                     }
                 };
-                self.events.push(EngineEvent::NavigationStarted {
-                    view: id,
-                    navigation,
-                    url: url.to_string(),
-                });
+                push(
+                    &mut self.events,
+                    EngineEvent::NavigationStarted {
+                        view: id,
+                        navigation,
+                        url: url.to_string(),
+                    },
+                );
+                view.navigated = Some((navigation, now, false));
                 if view.crashed {
                     self.restart(id, navigation, url);
                     return Ok(());
                 }
-                match &view.webview {
-                    Some(_) if view.in_flight => {
-                        if let Some((old, _)) = view.queued.replace((navigation, url)) {
-                            self.events.push(cancelled(old));
-                        }
+                if view.webview.is_none() {
+                    view.navigator.request(navigation, Request::Navigate);
+                    view.first = Some((navigation, url));
+                    if let Err(message) = self.start(id) {
+                        self.fail_view(id, message);
                     }
-                    Some(webview) => {
-                        view.navigator.request(navigation, Request::Navigate);
-                        webview.load(url);
-                        view.in_flight = true;
-                    }
-                    None => {
-                        view.navigator.request(navigation, Request::Navigate);
-                        view.first = Some(url);
-                        if let Err(message) = self.start(id) {
-                            self.fail_view(id, message);
-                        }
-                    }
+                    return Ok(());
+                }
+                if let Some((old, _)) = view.queued.replace((navigation, url)) {
+                    push(&mut self.events, cancelled(id, old));
+                }
+                if let Some(given_up) = view.send_queued(now) {
+                    push(&mut self.events, cancelled(id, given_up));
                 }
             }
             EngineCommand::Reload { navigation } => match &view.webview {
                 Some(_) if view.crashed => {
                     match view.navigator.url().and_then(|url| Url::parse(url).ok()) {
                         Some(url) => self.restart(id, navigation, url),
-                        None => self.events.push(cancelled(navigation)),
+                        None => push(&mut self.events, cancelled(id, navigation)),
                     }
                 }
                 Some(webview) if view.navigator.url().is_some() => {
                     view.navigator.request(navigation, Request::Reload);
                     webview.reload();
-                    view.in_flight = true;
+                    view.load = Some(Load::new(Some(navigation)));
                     if !view.loading {
                         view.loading = true;
-                        self.events.push(EngineEvent::LoadingChanged {
-                            view: id,
-                            loading: true,
-                        });
+                        push(
+                            &mut self.events,
+                            EngineEvent::LoadingChanged {
+                                view: id,
+                                loading: true,
+                            },
+                        );
                     }
                 }
-                _ => self.events.push(cancelled(navigation)),
+                _ => push(&mut self.events, cancelled(id, navigation)),
             },
             EngineCommand::Stop => {
                 if let Some((old, _)) = view.queued.take() {
-                    self.events.push(cancelled(old));
+                    push(&mut self.events, cancelled(id, old));
                 }
-                // Servo 0.5 has no stop: `window.stop()` stops the document's loading, but
-                // can't cancel a navigation whose response hasn't arrived.
+                // Servo 0.5 can't cancel a top-level load awaiting its response; one that has
+                // shown no sign of life for `LOAD_WAIT` is given up.
+                if view.load.is_some_and(|load| !load.alive(now)) {
+                    if let Some(given_up) = view.give_up_load() {
+                        push(&mut self.events, cancelled(id, given_up));
+                    }
+                }
+                // The document's own loading. `Window` is a [Global] interface, so `stop` is the
+                // window's own property, not the prototype's (`Window.prototype.stop` is
+                // undefined); a page that replaces it keeps loading, as it could by starting
+                // new fetches.
                 if let Some(webview) = &view.webview {
                     let delegate = Rc::clone(&self.delegate);
                     let webview_id = webview.id();
@@ -840,13 +1096,14 @@ impl EngineRuntime for ServoRuntime {
                     (Some(webview), true) if !view.crashed => {
                         view.navigator.request(navigation, Request::Traverse(delta));
                         let steps = delta.unsigned_abs() as usize;
-                        if delta < 0 {
-                            webview.go_back(steps);
+                        let traversal = if delta < 0 {
+                            webview.go_back(steps)
                         } else {
-                            webview.go_forward(steps);
-                        }
+                            webview.go_forward(steps)
+                        };
+                        view.traversals.push((traversal, navigation));
                     }
-                    _ => self.events.push(cancelled(navigation)),
+                    _ => push(&mut self.events, cancelled(id, navigation)),
                 }
             }
             EngineCommand::SetMetrics(metrics) => {
@@ -895,30 +1152,47 @@ impl EngineRuntime for ServoRuntime {
     }
 
     fn pump(&mut self, events: &mut Vec<EngineEvent>) -> PumpStatus {
+        let mut deadline: Option<Instant> = None;
         if self.servo.is_some() && self.failed.is_none() {
-            self.spin();
+            // With a backlog, what Servo has next waits in its own channels.
+            if self.events.len() < MAX_EVENTS_PER_PUMP {
+                self.spin();
+            }
             self.release_closing();
+            let now = Instant::now();
             for view in self.views.values_mut() {
+                if let Some(given_up) = view.send_queued(now) {
+                    push(&mut self.events, cancelled(view.id, given_up));
+                }
+                if let (Some(_), Some(load)) = (&view.queued, view.load) {
+                    let due = load.deadline();
+                    deadline = Some(deadline.map_or(due, |d| d.min(due)));
+                }
                 let wants = view.frame_ready || view.needs_submit || view.driver.is_waiting();
                 if wants && view.visible && view.webview.is_some() && !view.frame_requested {
                     view.frame_requested = true;
-                    self.events.push(EngineEvent::FrameReady { view: view.id });
+                    push(&mut self.events, EngineEvent::FrameReady { view: view.id });
                 }
             }
         }
-        let count = self.events.0.len().min(MAX_EVENTS_PER_PUMP);
-        events.extend(self.events.0.drain(..count));
-        if self.events.0.is_empty() {
-            PumpStatus::Idle
-        } else {
-            PumpStatus::Pending { deadline: None }
+        let count = self.events.len().min(MAX_EVENTS_PER_PUMP);
+        events.extend(std::iter::from_fn(|| self.events.pop()).take(count));
+        match (self.events.len(), deadline) {
+            (0, None) => PumpStatus::Idle,
+            (0, deadline) => PumpStatus::Pending { deadline },
+            _ => PumpStatus::Pending { deadline: None },
         }
     }
 
     fn present(&mut self, id: ViewId, permit: FramePermit) -> Result<PresentOutcome, EngineError> {
         self.alive()?;
         let view = self.views.get(&id).ok_or(EngineError::UnknownView(id))?;
-        debug_assert_eq!(permit.view(), Some(id), "a permit for another view");
+        if permit.view() != Some(id) {
+            return Err(EngineError::View {
+                view: id,
+                message: "a frame permit for another view's target".into(),
+            });
+        }
         let driver = Rc::clone(&view.driver);
         let spun = driver.is_waiting();
         if spun {
@@ -933,30 +1207,25 @@ impl EngineRuntime for ServoRuntime {
             .ok_or(EngineError::UnknownView(id))?;
         view.frame_requested = false;
         let epoch = permit.metrics().epoch();
-        let outcome = match (&view.webview, &view.context) {
-            (Some(webview), Some(context))
-                if view.visible && context.is_bound() && permit.is_current() =>
-            {
-                if view.frame_ready || view.needs_submit || view.presented != Some(epoch) {
-                    let size = physical(permit.metrics().buffer());
-                    if context.size() != size {
-                        webview.resize(size);
-                    }
-                    webview.paint();
-                    context.swap();
-                    view.frame_ready = false;
-                    view.needs_submit = false;
-                    view.presented = Some(epoch);
-                    self.frames += 1;
-                    PresentOutcome::Submitted
-                } else {
-                    PresentOutcome::Unchanged
-                }
+        let ready = matches!(
+            (&view.webview, &view.context),
+            (Some(_), Some(context)) if view.visible && context.is_bound() && permit.is_current()
+        );
+        let outcome = match ready {
+            true if view.frame_ready || view.needs_submit || view.presented != Some(epoch) => {
+                // At a new size this is WebRender's current scene at that size: Servo lays the
+                // page out again asynchronously and gives no sign when it has (decision 56).
+                view.frame_ready = false;
+                view.needs_submit = false;
+                view.presented = Some(epoch);
+                self.paint(id, physical(permit.metrics().buffer()));
+                PresentOutcome::Submitted
             }
-            _ => PresentOutcome::NotReady,
+            true => PresentOutcome::Unchanged,
+            false => PresentOutcome::NotReady,
         };
         permit.finish(outcome);
-        if spun && !self.events.0.is_empty() {
+        if spun && !self.events.is_empty() {
             // What the spin produced is delivered by the next pump.
             self.waker.wake();
         }
@@ -972,7 +1241,7 @@ impl EngineRuntime for ServoRuntime {
         }
         match self.release(view) {
             Some(view) => self.closing.push(view),
-            None => self.events.push(EngineEvent::ViewClosed { view: id }),
+            None => push(&mut self.events, EngineEvent::ViewClosed { view: id }),
         }
     }
 
@@ -988,6 +1257,7 @@ impl EngineRuntime for ServoRuntime {
             view.requests.clear();
         }
         self.owners.clear();
+        self.held.clear();
         if self.failed.is_some() || self.page_crashed {
             // Servo's `Drop` spins until its constellation says it has exited, which neither a
             // lost backend nor, after a page crash, a constellation waiting for the dead
@@ -1004,6 +1274,7 @@ impl EngineRuntime for ServoRuntime {
         // the rendering contexts. It writes the profile on the way, under the lock.
         drop(servo);
         let mut contexts_leaked = false;
+        let mut leases = Vec::new();
         for mut view in views {
             if let Some(context) = view.context.take() {
                 match Rc::try_unwrap(context) {
@@ -1017,15 +1288,17 @@ impl EngineRuntime for ServoRuntime {
                     }
                 }
             }
-            drop(view);
+            leases.push(view);
         }
         if let (Some(egl), false) = (self.egl.take(), contexts_leaked) {
             if let Err(error) = egl.terminate() {
                 log::warn!("servo: {error}");
             }
         }
+        // The leases last: the display is gone, and nothing made from their surfaces is left.
+        drop(leases);
         self.profile_lock = None;
-        self.events.0.clear();
+        self.events.clear();
     }
 }
 
@@ -1215,21 +1488,30 @@ mod tests {
     fn replaceable_events_keep_only_the_latest_per_view_in_place() {
         let (a, b) = (ViewId::next(), ViewId::next());
         let mut events = Events::default();
-        events.push(EngineEvent::TitleChanged {
-            view: a,
-            title: Some("1".into()),
-        });
-        events.push(EngineEvent::ViewReady { view: a });
-        events.push(EngineEvent::TitleChanged {
-            view: b,
-            title: Some("b".into()),
-        });
-        events.push(EngineEvent::TitleChanged {
-            view: a,
-            title: Some("2".into()),
-        });
-        events.push(EngineEvent::ViewReady { view: a });
-        let got: Vec<_> = events.0.into_iter().collect();
+        push(
+            &mut events,
+            EngineEvent::TitleChanged {
+                view: a,
+                title: Some("1".into()),
+            },
+        );
+        push(&mut events, EngineEvent::ViewReady { view: a });
+        push(
+            &mut events,
+            EngineEvent::TitleChanged {
+                view: b,
+                title: Some("b".into()),
+            },
+        );
+        push(
+            &mut events,
+            EngineEvent::TitleChanged {
+                view: a,
+                title: Some("2".into()),
+            },
+        );
+        push(&mut events, EngineEvent::ViewReady { view: a });
+        let got: Vec<_> = std::iter::from_fn(|| events.pop()).collect();
         assert_eq!(
             got,
             [

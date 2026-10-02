@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>input</title>
+<!-- What this page receives, it says in its address (history.replaceState), which sig saves in
+     its session, so engines.sh reads it from there; the title and the page say it too. -->
+<style>
+  body { font: 20px sans-serif; margin: 0; background: #fdfdf8; height: 3000px; }
+  .grid { position: fixed; left: 0; top: 0; width: 100px; height: 100px;
+          border-right: 1px solid #c00; border-bottom: 1px solid #c00; }
+  #field { position: fixed; left: 20px; top: 200px; width: 300px; height: 30px; font-size: 20px; }
+  #said { position: fixed; left: 20px; top: 260px; }
+</style>
+<div class="grid"></div>
+<input id="field" autocomplete="off">
+<p id="said">nothing yet</p>
+<script>
+  const say = (message) => {
+    document.title = message;
+    said.textContent = message;
+    history.replaceState(null, "", "#" + encodeURIComponent(message));
+  };
+  const viewport = () => `dpr ${devicePixelRatio} ${innerWidth}x${innerHeight}`;
+  addEventListener("mousedown", (e) => {
+    if (e.target !== field) say(`mousedown ${e.clientX},${e.clientY}`);
+  });
+  addEventListener("wheel", () => say("scrolled"));
+  addEventListener("resize", () => say(`resize ${viewport()}`));
+  addEventListener("load", () => say(`load ${viewport()}`));
+  field.addEventListener("input", () => say(`field ${field.value}`));
+</script>

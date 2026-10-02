@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{EngineCapabilities, EngineCommand, EngineError, ViewOptions};
-use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
+use sighurt_api::events::{Cursor, EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{SurfacePoint, SurfaceRect};
 use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, TabId, ViewId};
 use sighurt_api::input::{
@@ -191,6 +191,7 @@ impl Harness {
                 navigation,
                 url: view.entries[view.current].clone(),
                 document: view.document,
+                history: None,
             },
             EngineEvent::HistoryChanged {
                 view: id,
@@ -522,6 +523,7 @@ fn an_engine_switch_keeps_the_tab_and_rejects_the_old_view() {
         navigation,
         url,
         document,
+        history: None,
     });
     assert_eq!(b.active().id, tab);
     assert_eq!(b.shown(), wasm);
@@ -576,6 +578,7 @@ fn same_document_history_is_the_engines_not_url_guesses() {
             navigation: NavigationId::next(),
             url: url.to_string(),
             document,
+            history: None,
         });
         b.engine(EngineEvent::HistoryChanged {
             view,
@@ -784,6 +787,7 @@ fn stale_and_superseded_navigations_are_ignored() {
         navigation: second,
         url: "https://c.test/".into(),
         document,
+        history: None,
     });
     assert_eq!(b.active().url, Some("https://c.test/"));
     b.engine(EngineEvent::NavigationFailed {
@@ -840,6 +844,7 @@ fn only_a_new_document_the_page_opened_discards_later_segments() {
         navigation: NavigationId::next(),
         url: "https://b.test/#x".into(),
         document,
+        history: None,
     });
     assert_eq!(closed(&effects), []);
     assert_eq!(b.active().url, Some("https://b.test/#x"));
@@ -850,6 +855,7 @@ fn only_a_new_document_the_page_opened_discards_later_segments() {
         navigation: NavigationId::next(),
         url: "https://d.test/".into(),
         document: DocumentGeneration::next(),
+        history: None,
     });
     assert_eq!(closed(&effects), [wasm]);
     let urls = ["https://a.test/", "https://b.test/#x", "https://d.test/"];
@@ -859,6 +865,31 @@ fn only_a_new_document_the_page_opened_discards_later_segments() {
         current: 2,
     });
     assert!(!b.active().can_go_forward);
+}
+
+#[test]
+fn what_the_engine_says_a_page_commit_did_decides_what_it_discards() {
+    // The page's own `history.back()` into another document keeps what came after.
+    let (mut b, servo, wasm) = back_from_an_app();
+    let effects = b.engine(EngineEvent::NavigationCommitted {
+        view: servo,
+        navigation: NavigationId::next(),
+        url: "https://a.test/".into(),
+        document: DocumentGeneration::next(),
+        history: Some(HistoryEffect::Traverse),
+    });
+    assert_eq!(closed(&effects), []);
+    assert!(b.state.view(wasm).is_some());
+    // Its `pushState` is a new entry: what came after it is gone.
+    let document = b.document(servo);
+    let effects = b.engine(EngineEvent::NavigationCommitted {
+        view: servo,
+        navigation: NavigationId::next(),
+        url: "https://a.test/p".into(),
+        document,
+        history: Some(HistoryEffect::Push),
+    });
+    assert_eq!(closed(&effects), [wasm]);
 }
 
 #[test]
@@ -1032,6 +1063,7 @@ fn every_event(view: ViewId, document: DocumentGeneration) -> Vec<EngineEvent> {
             navigation: NavigationId::next(),
             url: "https://late.test/".into(),
             document: DocumentGeneration::next(),
+            history: None,
         },
         EngineEvent::NavigationFailed {
             view,

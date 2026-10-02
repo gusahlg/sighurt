@@ -36,6 +36,12 @@ macro_rules! ids {
                 static LAST: AtomicU64 = AtomicU64::new(0);
                 Self(next_serial(&LAST))
             }
+
+            /// The id's number, for diagnostics that print it. Nothing turns a number back
+            /// into an id.
+            pub fn serial(self) -> u64 {
+                self.0.get()
+            }
         }
     )*};
 }
@@ -90,6 +96,7 @@ mod tests {
         let b = ViewId::next();
         let c = ViewId::next();
         assert!(a < b && b < c);
+        assert!(a.serial() < b.serial() && b.serial() < c.serial());
     }
 
     #[test]

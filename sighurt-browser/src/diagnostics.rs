@@ -19,13 +19,17 @@
 //!
 //! - with `SIG_DIAG=1`, one stderr line per page frame and chrome paint, in the format
 //!   `bench/benchlib/parsers.py` (`SigDiag`) reads: `sig-diag t=<CLOCK_MONOTONIC s> <kind>
-//!   key=value ...`; a `renderer` line for each engine at its first frame (`mode=cpu`, or
+//!   key=value ...`, where a `frame` line's `paint_ms` is the engine's own painting (Servo's
+//!   WebRender paint; for the CPU engines the whole `present`) and `present_ms` the `present`
+//!   call; a `renderer` line for each engine at its first frame (`mode=cpu`, or
 //!   `mode=hardware|software gl="<GL_RENDERER>"`); a `first-frame` line for a navigation
 //!   started in the active tab, at the view's first frame after it;
 //! - on SIGUSR1 and at exit (at exit only with `SIG_DIAG=1`), a `counters` line (cumulative
 //!   counts, as bench/ takes them), a `peaks` line (queue depths, longest calls) and one line
 //!   per target and engine;
-//! - with `--diagnostics FILE`, the same as JSON in FILE, rewritten on SIGUSR1 and at exit.
+//! - with `--diagnostics FILE`, the same as JSON in FILE, rewritten on SIGUSR1 and at exit,
+//!   with which tab is active, what the status strip shows and each tab's browser state
+//!   (loading, back and forward, a record, an error), never an address or a title.
 //!
 //! Never logs clipboard contents, credentials, URLs or other page data.
 //!
@@ -157,11 +161,28 @@ pub struct EngineReport {
     pub renderer: &'static str,
     /// For a GL engine once it has a context: "hardware" or "software", and the GL renderer.
     pub gl: Option<String>,
-    /// Page readbacks to the CPU the engine counted (Servo's `read_to_image`); 0 on the
-    /// display path and for the CPU engines, which paint into the host's buffers.
+    /// Page readbacks to the CPU the engine counted (Servo's `read_to_image`, and its GL reads
+    /// when auditing); 0 on the display path and for the CPU engines, which paint into the
+    /// host's buffers.
     pub readbacks: u64,
+    /// The `glReadPixels`/`glGetTexImage` calls among them, when the engine audits its GL calls
+    /// (Servo with `SIG_AUDIT_GL=1`); `None` otherwise.
+    pub gl_reads: Option<u64>,
     /// "not started", "running", "shut down" or "failed: why".
     pub state: String,
+}
+
+/// One tab, as the core sees it: browser state only, never its address or title.
+#[derive(Clone, Debug, Serialize)]
+pub struct TabReport {
+    /// A navigation is under way or the page is loading.
+    pub loading: bool,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
+    /// It shows a record, which loads again when shown.
+    pub reloads: bool,
+    /// Its latest navigation failed, or its view did.
+    pub error: bool,
 }
 
 /// Everything printed at once.
@@ -170,6 +191,8 @@ pub struct Report {
     pub peaks: Peaks,
     pub targets: Vec<TargetReport>,
     pub engines: Vec<EngineReport>,
+    /// The tabs, in the tab strip's order.
+    pub tabs: Vec<TabReport>,
     /// The active tab's position in the tab strip, from 1.
     pub active_tab: usize,
     /// What the status strip shows: "notice", "page" or "error" (never the text itself).
@@ -255,27 +278,30 @@ impl Diagnostics {
         bytes
     }
 
-    /// A page frame an engine submitted, `paint` after `present` was called, with the bytes
-    /// of the readbacks counted since the engine's previous frame.
+    /// A page frame an engine submitted: how long the engine painted it and how long the
+    /// `present` call took (the same for the CPU engines; for Servo the paint is WebRender's,
+    /// without the spin and the swap), with the bytes of the readbacks counted since the
+    /// engine's previous frame.
     pub fn frame(
         &mut self,
         engine: &str,
-        view: &str,
+        view: u64,
         size: (u32, u32),
-        paint: Duration,
+        (paint, present): (Duration, Duration),
         readback_bytes: u64,
     ) {
         self.counters.page_frames_painted += 1;
         self.counters.page_frames_presented += 1;
-        self.peaks.max_present_us = self.peaks.max_present_us.max(micros(paint));
+        self.peaks.max_present_us = self.peaks.max_present_us.max(micros(present));
         if self.lines {
             self.line(
                 "frame",
                 format_args!(
-                    "engine={engine} view={view} w={} h={} presented=1 readback_bytes={readback_bytes} paint_ms={:.3}",
+                    "engine={engine} view={view} w={} h={} presented=1 readback_bytes={readback_bytes} paint_ms={:.3} present_ms={:.3}",
                     size.0,
                     size.1,
-                    paint.as_secs_f64() * 1e3
+                    paint.as_secs_f64() * 1e3,
+                    present.as_secs_f64() * 1e3
                 ),
             );
         }
@@ -357,6 +383,7 @@ impl Diagnostics {
                 "peaks": report.peaks,
                 "targets": report.targets,
                 "engines": report.engines,
+                "tabs": report.tabs,
                 "active_tab": report.active_tab,
                 "status": report.status,
                 "capabilities": report.capabilities,

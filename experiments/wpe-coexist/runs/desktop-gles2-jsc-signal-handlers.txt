@@ -1,0 +1,34 @@
+tools/heavy: waiting for /tmp/gusahlg-heavy.lock (held by another session)
+INFO exports hb_*: 0
+INFO exports FT_*: 0
+INFO exports png_*: 0
+INFO exports jpeg_*: 0
+INFO exports deflate*: 0
+INFO exports inflate*: 0
+INFO exports setenv*: 0
+INFO exports in all: 1
+INFO bindings from shared libraries into the executable: 2
+INFO   libpulse.so.0: 1
+INFO   libpulsecommon-17.0.so: 1
+PASS no symbol of WebKit's library binds into the executable
+experiments/wpe-coexist/coexist-checks.sh: line 68: 309009 Illegal instruction        (core dumped) WPE_COEXIST_HOLD=3 "$binary" > "$out/run.log" 2>&1
+INFO signals at start: SEGV=0x5d7175366720(wpe-coexist) BUS=0x5d7175366720(wpe-coexist) ILL=default FPE=default USR1=default USR2=default PIPE=ignored CHLD=default
+INFO signals after Servo: SEGV=0x5d7175366720(wpe-coexist) BUS=0x5d7175366720(wpe-coexist) ILL=default FPE=default USR1=default USR2=default PIPE=ignored CHLD=default
+INFO signals after the Wasm engine: SEGV=0x5d716f17dea0(wpe-coexist) BUS=0x5d7175366720(wpe-coexist) ILL=0x5d716f17dea0(wpe-coexist) FPE=0x5d716f17dea0(wpe-coexist) USR1=default USR2=default PIPE=ignored CHLD=default
+PASS Wasmtime guests trap before WebKit starts (oob 100/100, unreachable 100/100)
+INFO signals after Wasmtime: SEGV=0x5d716f17dea0(wpe-coexist) BUS=0x5d7175366720(wpe-coexist) ILL=0x5d716f17dea0(wpe-coexist) FPE=0x5d716f17dea0(wpe-coexist) USR1=default USR2=default PIPE=ignored CHLD=default
+PASS the window is configured
+INFO signals after WebKit's first view: SEGV=0x5d716f17dea0(wpe-coexist) BUS=0x5d7175366720(wpe-coexist) ILL=0x5d716f17dea0(wpe-coexist) FPE=0x5d716f17dea0(wpe-coexist) USR1=0x7d4cd5d662a0(libWPEWebKit-2.0.so.1) USR2=default PIPE=ignored CHLD=default
+INFO [ 0.107] Servo title Some("")
+INFO [ 0.107] Servo title Some("servo")
+INFO [ 0.111] Servo title Some("servo js=42 oob=100/100 unreachable=100/100 ms=4")
+INFO [ 0.220] Wpe title Some("wpe")
+INFO [ 0.221] Wpe title Some("wpe js=42 oob=100/100 unreachable=100/100 ms=4")
+PASS Servo and WebKit run JavaScript and trap in their Wasm (servo: "servo js=42 oob=100/100 unreachable=100/100 ms=4", wpe: "wpe js=42 oob=100/100 unreachable=100/100 ms=4")
+PASS every engine presents (Servo 2, Wpe 1, Wasm 1)
+INFO holding for 3 s
+INFO Servo GL: Some("NVIDIA GeForce RTX 3070/PCIe/SSE2"), read_to_image 0; WPE transport Some(Dmabuf) on Some("/dev/dri/renderD128"), shm copies 0
+PASS WebKit returns a script's value into this process (Some(Ok("42 true")))
+INFO signals after JavaScriptCore in this process: SEGV=0x7d4cd5d5b940(libWPEWebKit-2.0.so.1) BUS=0x7d4cd5d5b940(libWPEWebKit-2.0.so.1) ILL=0x5d71737aeb00(wpe-coexist) FPE=0x5d716f17dea0(wpe-coexist) USR1=0x7d4cd5d662a0(libWPEWebKit-2.0.so.1) USR2=default PIPE=ignored CHLD=default
+FAIL the process exits with 0
+1 failed; output in /tmp/claude-1000/-home-gusahlg-repos-sighurt/4074f6cc-047d-4246-ae06-9980bd83ce65/scratchpad/coexist-jsc

@@ -1,0 +1,25 @@
+[package]
+name = "wpe-coexist"
+description = "WPE WebKit, Servo 0.5 and Wasmtime 36 in one process, mounted as sig mounts them (docs/rewrite/WPE.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+sighurt-api = { path = "../../sighurt-api" }
+sighurt-wayland = { path = "../../sighurt-wayland" }
+# The three engines as `sig` links them: Servo (default features, as `sig`'s build), the Wasm
+# engine with every native library it brings, and the WPE prototype.
+sighurt-engine-servo = { path = "../../sighurt-engine-servo" }
+sighurt-engine-wasm = { path = "../../sighurt-engine-wasm" }
+wpe-engine = { path = "../wpe-engine" }
+wasmtime.workspace = true
+calloop.workspace = true
+wat = "1"
+libc = "0.2"
+log = "0.4"
+# `sig` installs this TLS provider before any engine (M0, decision 26).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }

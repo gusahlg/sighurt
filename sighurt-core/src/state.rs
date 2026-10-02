@@ -34,7 +34,7 @@ use std::time::Instant;
 
 use sighurt_api::commands::Command;
 use sighurt_api::engine::{EngineCapabilities, EngineCommand, EngineError, ViewOptions};
-use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
+use sighurt_api::events::{Cursor, EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
 use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, TabId, ViewId};
 use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, PointerButton, PointerEvent, TextInputState,
@@ -1150,8 +1150,9 @@ impl BrowserState {
                 navigation,
                 url,
                 document,
+                history,
                 ..
-            } => self.committed(id, navigation, url, document, fx),
+            } => self.committed(id, navigation, url, document, history, fx),
             EngineEvent::NavigationFailed {
                 navigation, error, ..
             } => self.navigation_failed(id, navigation, error, fx),
@@ -1207,13 +1208,17 @@ impl BrowserState {
         navigation: NavigationId,
         url: String,
         document: DocumentGeneration,
+        history: Option<HistoryEffect>,
         fx: &mut Fx,
     ) {
         fx.chrome = true;
         fx.session = true;
         let view = self.views.get_mut(&id).expect("checked by the caller");
         let new_document = view.document != Some(document);
-        let new_entry = view.navigations.committed(navigation).is_new(new_document);
+        let new_entry = view
+            .navigations
+            .committed(navigation)
+            .is_new(new_document, history);
         view.url = bounded(url);
         view.failure = None;
         if new_entry {
