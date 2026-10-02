@@ -201,8 +201,8 @@ tabs = "left"
 | `[ui] chrome` | the chrome that draws the window (at the next start) | `"standard"` |
 | `[ui] font`, `font-size` | the chrome's font family, and its size in logical pixels (9 to 32) | an installed sans-serif, 14 |
 | `[ui.colors]` | `bg`, `surface`, `hover`, `tab`, `border`, `focus`, `text`, `text_muted`, `text_dim`, `selection`, `error`: `"#rrggbb"` or `"#rrggbbaa"` | a dark theme |
-| `[chrome.standard]` | `tabs` (`"top"`, `"left"`, `"hidden"`), `status` (`"strip"`, `"overlay"`), `buttons`, `compact` | top, strip, true, false |
-| `[chrome.line]` | `position` (`"top"`, `"bottom"`) | top |
+| `[chrome.standard]` | `tabs` (`"top"`, `"left"`, `"hidden"`), `status` (`"strip"`, `"overlay"`), `buttons`, `compact`, `engine-label` (the engine a page runs in, in its tab and the address bar) | top, strip, true, false, true |
+| `[chrome.line]` | `position` (`"top"`, `"bottom"`), `engine-label` (the page's engine at the line's end) | top, true |
 | `[downloads] directory` | where downloads go: an absolute path or `~/…` | the desktop's download folder, else `~/Downloads` |
 | `[session] restore` | open the tabs of the last run, and save them as they change | `true` |
 
@@ -313,8 +313,11 @@ and a status strip; `[chrome.standard]` moves the tabs to a list on the left or 
 the status over the page only while there is something to say, drops the buttons or makes it
 compact. The line chrome (feature `chrome-line`, `[ui] chrome = "line"`) is one line at the top or
 the bottom of the window: the tab's place (`[2/5]`), the keymap's mode, the address and the status;
-tabs are reached by keys and commands. Every chrome shows what pages say (titles, status text,
-addresses) contained to one line, and `sig`'s own notices whenever there are any.
+tabs are reached by keys and commands. Both name the engine a page runs in (`servo`, `wpe`,
+`wasm`), small and muted: the standard chrome in each tab and at the address bar's right end, the
+line chrome at the line's end; `sig:` pages have none, and `engine-label = false` turns it off.
+Every chrome shows what pages say (titles, status text, addresses) contained to one line, and
+`sig`'s own notices whenever there are any.
 
 ## Writing your own keymap or chrome
 

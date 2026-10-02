@@ -1,6 +1,8 @@
 //! The chrome's accessibility tree as plain data: roles, names, values, states and bounds of
 //! its widgets, with stable ids, and a document node for the page area. Only what is shown is
 //! in it: no tab list while the tabs are hidden, no buttons that `[chrome.standard]` leaves out.
+//! An engine page's tab is described by its engine ("Engine: servo") while the chrome labels
+//! tabs with it.
 //!
 //! When an engine view shows the page, the document node is the container its accessibility
 //! subtree will hang under once engines provide one; none does yet, and the node says only
@@ -162,6 +164,8 @@ impl Model {
             );
             entry.states.selected = tab.active;
             entry.states.busy = tab.loading;
+            let engine = tab.engine_label().filter(|_| layout.options.engine_label);
+            entry.description = engine.map(|engine| format!("Engine: {engine}"));
             if let Some(close) = place.close {
                 entry.children.push(NodeId::CloseTab(tab.id));
                 nodes.push(node(

@@ -69,6 +69,7 @@ pub fn tab(title: &str, url: &str, content: TabContent) -> TabSnapshot {
         loading: false,
         active: false,
         content,
+        engine: None,
     }
 }
 
@@ -98,6 +99,15 @@ pub fn three_tabs() -> Snapshot {
         keymap: None,
         home: home_info(),
     }
+}
+
+/// `snapshot` with tab `i` naming `engines[i]` as the engine of its page, as `sig` says it for
+/// engine pages; `""` names none.
+pub fn labelled(mut snapshot: Snapshot, engines: &[&str]) -> Snapshot {
+    for (tab, engine) in snapshot.tabs.iter_mut().zip(engines) {
+        tab.engine = (!engine.is_empty()).then(|| engine.to_string());
+    }
+    snapshot
 }
 
 pub fn home_info() -> HomeInfo {

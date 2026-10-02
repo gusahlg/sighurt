@@ -15,7 +15,9 @@
 //!
 //! The address line doubles as the command line: a line starting with `:` runs the command
 //! after it, such as `:tab.close 2`, so every command can be reached without a key binding. Its
-//! right end shows the keymap's indicator, if the keymap has one ("NORMAL").
+//! right end shows the keymap's indicator, if the keymap has one ("NORMAL"), and before it the
+//! engine of the active tab's page while the line isn't focused, as each engine page's tab does
+//! (`[chrome.standard] engine-label`).
 //!
 //! The chrome marks what needs repainting ([`Damage`]) only after an edit, a hover change, a
 //! snapshot change it shows, a configuration change or a layout change: a static chrome needs
@@ -44,8 +46,8 @@ use crate::extension::{contained, readable_url, ChromeAction, SurfaceName, TextF
 use crate::hit_test::{hit_test, Target};
 use crate::layout::{Layout, LayoutOptions, Tabs};
 use crate::state::{
-    is_home, ChromeState, HomeInfo, Snapshot, TabContent, MAX_ENGINE_DETAIL, MAX_ENGINE_NAME,
-    MAX_MESSAGE, MAX_STATUS, NO_SUCH_PAGE,
+    is_home, ChromeState, HomeInfo, Snapshot, TabContent, TabSnapshot, MAX_ENGINE_DETAIL,
+    MAX_ENGINE_NAME, MAX_MESSAGE, MAX_STATUS, NO_SUCH_PAGE,
 };
 use crate::text::{Fonts, ShapedText, TextStyle};
 
@@ -65,6 +67,8 @@ const ADDRESS_PADDING: f32 = 12.0;
 const ROWS_PER_NOTCH: f64 = 3.0;
 /// The caret's width in logical pixels.
 pub(crate) const CARET_WIDTH: f32 = 2.0;
+/// The engine label's text: smaller than the title or address beside it.
+pub(crate) const LABEL: TextStyle = TextStyle::XS;
 
 /// A color, with straight (not premultiplied) alpha.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -309,6 +313,8 @@ pub(crate) struct AddressView {
     pub preedit: Option<(f32, f32)>,
     /// The keymap's indicator at the field's right end, and where it starts.
     pub indicator: Option<(Rc<ShapedText>, f32)>,
+    /// The active tab's engine before the indicator, and where its text's origin is.
+    pub engine: Option<(Rc<ShapedText>, f32, f32)>,
 }
 
 /// The standard chrome: its state, layout and fonts, and what it does with input.
@@ -424,9 +430,12 @@ impl Model {
             let old = std::mem::replace(&mut self.snapshot, snapshot);
             let new = &self.snapshot;
             let tabs = old.tabs != new.tabs;
-            // The toolbar shows where the active tab can go, whether it loads, and the keymap's
-            // indicator.
-            let active = |snapshot: &Snapshot| snapshot.active().map(|tab| (tab.id, tab.loading));
+            // The toolbar shows where the active tab can go, whether it loads, its engine, and
+            // the keymap's indicator.
+            let active = |snapshot: &Snapshot| {
+                let tab = snapshot.active();
+                tab.map(|tab| (tab.id, tab.loading, tab.engine_label()))
+            };
             let toolbar = old.can_go_back != new.can_go_back
                 || old.can_go_forward != new.can_go_forward
                 || active(&old) != active(new)
@@ -966,12 +975,24 @@ impl Model {
             let x = right - shaped.width;
             (shaped, x)
         });
-        let text_right = indicator.as_ref().map_or(right, |(_, x)| x - padding);
+        let label_right = indicator.as_ref().map_or(right, |(_, x)| x - padding);
+        // The engine of the active tab's page, before the indicator, if it fits in a quarter of
+        // the field, while the line isn't being edited.
+        let active = self.snapshot.active().filter(|_| !self.state.focused);
+        let engine = active
+            .and_then(|tab| engine_label(&mut self.fonts, options, tab, field.width as f32 / 4.0));
+        let text_right = engine
+            .as_ref()
+            .map_or(label_right, |shaped| label_right - shaped.width - padding);
         let clip = (field.x as f32 + padding, text_right.max(field.x as f32));
         let x = clip.0 - editor.scroll();
         // On a whole logical pixel, as the input method's caret rectangle is.
         let y =
             field.y as f32 + ((field.height as f32 - f32::from(style.line_height)) / 2.0).floor();
+        let engine = engine.map(|label| {
+            let top = label_top(&mut self.fonts, options, style, y);
+            (label_right - label.width, top, label)
+        });
         let span = |range: &std::ops::Range<usize>| {
             let (a, b) = (shaped.x_at(range.start), shaped.x_at(range.end));
             (x + a.min(b), x + a.max(b))
@@ -985,6 +1006,7 @@ impl Model {
             y,
             clip,
             indicator,
+            engine: engine.map(|(x, y, shaped)| (shaped, x, y)),
         }
     }
 
@@ -1102,6 +1124,31 @@ impl Model {
             texts,
         })
     }
+}
+
+/// The label naming `tab`'s engine ([`TabSnapshot::engine_label`]), if it fits whole in
+/// `width`: none when `options` leave it out or the tab names no engine. A cut engine name says
+/// little, so a label that doesn't fit gives its room back to the text beside it.
+pub(crate) fn engine_label(
+    fonts: &mut Fonts,
+    options: LayoutOptions,
+    tab: &TabSnapshot,
+    width: f32,
+) -> Option<Rc<ShapedText>> {
+    let text = tab.engine_label().filter(|_| options.engine_label)?;
+    let shaped = fonts.line(&text, options.text(LABEL));
+    (shaped.width <= width).then_some(shaped)
+}
+
+/// Where a line in the label's style starts so that its baseline is that of a line in `style`
+/// starting at `top`.
+pub(crate) fn label_top(
+    fonts: &mut Fonts,
+    options: LayoutOptions,
+    style: TextStyle,
+    top: f32,
+) -> f32 {
+    top + fonts.baseline(style) - fonts.baseline(options.text(LABEL))
 }
 
 /// The page the chrome draws for the active tab, if it draws one.

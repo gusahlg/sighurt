@@ -60,6 +60,16 @@ pub fn command(kind: &ChromeKind, action: String) -> Result<ChromeEvent, String>
     ))
 }
 
+/// The engine `tab`'s page runs in, by its configured name: the engine of the view it shows, and
+/// none for `sig:` pages, blank tabs and errors. Browser state the core keeps, which the chrome
+/// labels the tab with.
+pub fn engine<'a>(core: &'a BrowserState, tab: &TabSummary<'_>) -> Option<&'a str> {
+    match tab.content {
+        Content::View(view) => core.view(view).map(|view| view.engine()),
+        Content::Internal(_) | Content::Blank => None,
+    }
+}
+
 /// What the chrome shows of `core`: its tabs, `status` (the active tab's status line) and
 /// `home`, with every string contained to the bound its field states.
 pub fn snapshot(
@@ -80,6 +90,7 @@ pub fn snapshot(
             (Content::Blank, Some(error)) => TabContent::Error(error.message.clone()),
             (Content::Blank, None) => TabContent::Blank,
         };
+        let engine = engine(core, &tab).map(str::to_owned);
         if index == active {
             snapshot.can_go_back = tab.can_go_back;
             snapshot.can_go_forward = tab.can_go_forward;
@@ -91,6 +102,7 @@ pub fn snapshot(
             url: tab.url.unwrap_or_default().to_owned(),
             loading: tab.loading,
             active: index == active,
+            engine,
             content,
         });
     }
@@ -429,15 +441,15 @@ mod tests {
         let config = "version = 1\n[routing.demo]\nschemes = [\"demo\"]";
         let config = Config::parse(Some(config), &env).unwrap();
         let mut core = BrowserState::new(config, env);
-        let open = vec![OpenRequest {
-            input: "demo://pattern".into(),
+        let open = ["demo://pattern", "sig://home"].map(|input| OpenRequest {
+            input: input.into(),
             engine: None,
-        }];
+        });
         let effects = update(
             &mut core,
             BrowserEvent::Start {
                 session: None,
-                open,
+                open: open.into(),
             },
         );
         let (view, navigation) = effects
@@ -450,6 +462,17 @@ mod tests {
                 _ => None,
             })
             .expect("the page is opened");
+        // Neither a tab whose page hasn't committed yet nor sig://home names an engine.
+        let engines = |core: &BrowserState| {
+            let snapshot = snapshot(core, HomeInfo::default(), |_| None);
+            let tabs = snapshot.tabs.into_iter();
+            tabs.map(|tab| (tab.content, tab.engine))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            engines(&core),
+            [(TabContent::Blank, None), (TabContent::Internal, None)]
+        );
         let document = sighurt_api::ids::DocumentGeneration::next();
         let title = format!("a\u{202e}gpj.exe\nb{}", "x".repeat(300));
         for event in [
@@ -477,5 +500,8 @@ mod tests {
         assert!(tab.title.starts_with("agpj.exe b"), "{:?}", tab.title);
         assert_eq!(tab.title.chars().count(), 200);
         assert_eq!(snapshot.status.as_deref(), Some("hover  "));
+        // The engine page names its engine, by its configured name.
+        assert_eq!(tab.engine.as_deref(), Some("demo"));
+        assert_eq!(snapshot.tabs[1].engine, None);
     }
 }

@@ -3119,3 +3119,45 @@ Newest last. Each entry says what was decided and why.
     the desktop's own (the same store paths), so Servo's artifacts in `target/` stay fresh: no
     build script tracks what the shell's environment changed. *Why:* plan §21, and decision 79's
     finding that louise-pc's own Rust (1.95) can't build the workspace. Evidence: "Review fixes".
+87. **Each tab names the engine its page runs in, and the chromes draw it** (amends 68, which
+    left `TabSnapshot::engine` out until a chrome showed it, and 75's options). (1) It is UI
+    code: `sig`'s snapshot builder (`chrome::engine`) copies the configured name of the engine
+    whose view a tab shows, browser state the core already exposes (`TabSummary::content`,
+    `View::engine`), into sighurt-ui's `TabSnapshot::engine`, contained to 100 characters like
+    an engine row's name.
+    `sig:` pages, blank tabs, records and error pages have none, and `TabSnapshot::engine_label`
+    applies that rule again on the chrome's side. No engine crate, nothing of sighurt-api and no
+    code of the core changed. (2) The standard chrome draws it in `text_muted` at 12 px (scaled
+    with `font-size`), on the title's baseline, inside the tab right before its close button, so
+    the tab's and the close button's hit targets stay as they were; the title is cut before it.
+    It shows only whole, and only if it fits in half the tab's room for text, less a gap,
+    whatever the title, so tabs of one width agree: in narrow tabs a cut "se…" said nothing and
+    left a title of "…", and the first version, which let a short title lend the label its room,
+    labelled a Servo tab titled "A" beside unlabelled long-titled ones that looked like
+    sig://home's (review; `tabs_of_one_width_agree_on_their_labels`). At the address
+    field's right end (before the keymap's indicator) it names the active tab's engine if it
+    fits in a quarter of the field; the field's text area ends before it, and it hides while
+    the line is focused. The line chrome puts it, as small and muted, at the line's end if it
+    fits in a quarter of the line. `Fonts::baseline` puts text of two sizes on one baseline,
+    whatever the text. (3) `[chrome.standard] engine-label` and `[chrome.line] engine-label`, true
+    by default, are checked by each chrome kind and apply live. (4) The accessibility tree
+    describes each labelled tab as "Engine: <name>"; the diagnostics JSON gives each tab's
+    `engine`. It repaints only when a tab's engine changes, never for a frame. *Why:* the user's
+    request ("for this per tab display thing make sure it is part of the UI code and not part of
+    the engine code"); plan §17 (snapshot strings contained), §26 (no repaint caused by page
+    animation) and §28's first and fourth questions: which engine shows a page is the core's
+    state, how it is shown the chrome's, and no renderer detail reaches the core's types.
+    Evidence, on this desktop (RTX 3070, headless sway, GLES2) on 2 October 2026: sighurt-ui's
+    `engine_labels_stay_on_their_tabs_at_every_scale` (at 100, 125, 150 and 200 %, tabs at the
+    top and on the left, compact and at 18 px, every label pixel hits its own tab and no close
+    button, the close buttons' pixels hit them, clicks on a label and a close button select and
+    close), `the_address_fields_engine_label_never_overlaps_its_text`,
+    `the_tree_names_each_tabs_engine`, `the_engine_label_through_the_trait`,
+    `a_new_engine_repaints_its_label`, `engine_labels`; six
+    new golden images (`engine-tabs-100`, `-200`, `engine-compact-150`, `engine-font-18-100`,
+    `engine-left-125`, `engine-narrow-150`) and the line chrome's `the_engine_label` with
+    `engine-100` and `engine-typing-150`, every existing golden image unchanged; `sig`'s
+    `the_snapshot_contains_what_pages_say`; and engines.sh's new `labels` scenario, 16 of 16
+    (Servo, WPE through a `[routing.wpe] hosts` rule and sig://home labelled servo, wpe and
+    nothing in the diagnostics and on screen; `engine-label = false` while `sig` runs; the line
+    chrome's "wpe" after a restart).

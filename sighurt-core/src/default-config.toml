@@ -204,12 +204,14 @@ forward = "page.forward"
 # "left" (a list beside the page) or "hidden"; status = "strip" (below the page) or "overlay"
 # (over the page's bottom-left corner, only while there is something to say); buttons = true
 # or false (back, forward and reload before the address); compact = false or true (a lower tab
-# strip and toolbar). They apply as soon as they are loaded.
+# strip and toolbar); engine-label = true or false (the engine a page runs in, such as servo or
+# wpe, in small muted text in its tab and at the address bar's right end; sig: pages have
+# none). They apply as soon as they are loaded.
 #
 # A sig built with the chrome-line feature has line: the whole chrome is one line, showing the
 # tab's place ([2/5]), the keymap's mode, the address and the status; tabs are reached by keys
-# and commands, and it has no commands of its own. Its one option, in [chrome.line]: position =
-# "top" or "bottom".
+# and commands, and it has no commands of its own. Its options, in [chrome.line]: position =
+# "top" or "bottom"; engine-label = true or false (the page's engine at the line's end).
 #
 # The colors, each "#rrggbb" or "#rrggbbaa"; leave one out to keep its default:
 #

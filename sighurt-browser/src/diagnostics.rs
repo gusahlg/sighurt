@@ -29,7 +29,8 @@
 //!   per target and engine;
 //! - with `--diagnostics FILE`, the same as JSON in FILE, rewritten on SIGUSR1 and at exit,
 //!   with which tab is active, what the status strip shows and each tab's browser state
-//!   (loading, back and forward, a record, an error), never an address or a title.
+//!   (loading, back and forward, a record, an error, the engine its tab is labelled with), never
+//!   an address or a title.
 //!
 //! Never logs clipboard contents, credentials, URLs or other page data.
 //!
@@ -186,6 +187,9 @@ pub struct TabReport {
     pub reloads: bool,
     /// Its latest navigation failed, or its view did.
     pub error: bool,
+    /// The engine the chrome is told its page runs in (`TabSnapshot::engine`); none for `sig:`
+    /// pages, blank tabs and errors.
+    pub engine: Option<String>,
 }
 
 /// Everything printed at once.

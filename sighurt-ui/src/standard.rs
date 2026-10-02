@@ -8,7 +8,7 @@
 //! text, which takes no pointer input so the page under it keeps its hover).
 //!
 //! `[chrome.standard]` takes `tabs` (`"top"`, `"left"` or `"hidden"`), `status` (`"strip"` or
-//! `"overlay"`), `buttons` and `compact` (true or false); its one command is
+//! `"overlay"`), `buttons`, `compact` and `engine-label` (true or false); its one command is
 //! `chrome.toggle-tabs`. `[ui] font` and `font-size` set its text.
 //!
 //! Must not own: anything the model doesn't; this is only the adapter.
@@ -62,10 +62,12 @@ fn option(key: &str, value: &Value, options: &mut LayoutOptions) -> Result<(), S
         ("status", ..) => return Err(wrong(r#""strip" or "overlay""#)),
         ("buttons", _, Some(on)) => options.buttons = on,
         ("compact", _, Some(on)) => options.compact = on,
-        ("buttons" | "compact", ..) => return Err(wrong("true or false")),
+        ("engine-label", _, Some(on)) => options.engine_label = on,
+        ("buttons" | "compact" | "engine-label", ..) => return Err(wrong("true or false")),
         _ => {
             return Err(format!(
-                "{key}: unknown key (the standard chrome has tabs, status, buttons and compact)"
+                "{key}: unknown key (the standard chrome has tabs, status, buttons, compact and \
+                 engine-label)"
             ))
         }
     }

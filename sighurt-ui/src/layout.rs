@@ -83,6 +83,9 @@ pub struct LayoutOptions {
     pub buttons: bool,
     /// A lower tab strip and toolbar: 32 and 36 px instead of 40 and 44, at 14 px.
     pub compact: bool,
+    /// The engine's name in each engine page's tab, and at the address field's right end. It
+    /// takes room from the text beside it, never from the layout.
+    pub engine_label: bool,
     /// `[ui] font-size`, in logical pixels: every size and text style scales with it.
     pub font_size: u16,
 }
@@ -94,6 +97,7 @@ impl Default for LayoutOptions {
             status: Status::Strip,
             buttons: true,
             compact: false,
+            engine_label: true,
             font_size: DEFAULT_FONT_SIZE,
         }
     }
@@ -420,6 +424,7 @@ mod tests {
                             status,
                             buttons,
                             compact,
+                            engine_label: true,
                             font_size,
                         });
                     }

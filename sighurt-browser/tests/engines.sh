@@ -59,6 +59,9 @@
 #           on the left and chrome.toggle-tabs, [ui] font-size, a [routing.wpe] hosts rule, a
 #           [keywords] template; a binding and a color added while sig runs apply at once, and a
 #           new [ui] chrome gets a notice; started again, the line chrome with the same keymap
+#   labels  the engine labels: a Servo page, a page [routing.wpe] hosts gives WPE and sig://home
+#           are labelled servo, wpe and nothing, in their tabs and the address bar; engine-label =
+#           false turns them off while sig runs; the line chrome names the page's engine too
 #
 # Exits with the number of failed checks.
 set -u
@@ -72,7 +75,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: engines.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase labels)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (the demo engine's tests build it with other
   # features); this link keeps the binary these runs use. It is made under the same hold of the
@@ -1158,6 +1161,83 @@ CONF
   key 'tab.select 1'
   key -k Return
   check "a command line in the line chrome" "$(shows_tab 1 wpe)"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+  ;;
+
+labels)
+  lh=http://localhost:$(cat "$out/port")
+  config=$out/config/sighurt/config.toml
+  cat >> "$config" <<CONF
+[routing.wpe]
+hosts = ["localhost"]
+CONF
+  # At scale 1 in the 1280 × 800 window: three tabs of 220 px from x = 4, 4 px apart, in the
+  # 40 px strip; the address field from x = 104 to 1272, y = 46 to 78, its right end the label's.
+  tab_x=(4 228 452)
+  shot_ppm() { grim -t ppm "$out/$1.ppm"; python3 "$probe" png "$out/$1.ppm" "$out/$1.png"; step "screenshot $1"; }
+  # changed A B X0 Y0 X1 Y1: the pixels of the rectangle that differ between screenshots A and B.
+  changed() { python3 "$probe" differ "$out/$1.ppm" "$out/$2.ppm" "$3" "$4" "$5" "$6"; }
+  in_tab() { changed "$1" "$2" "${tab_x[$3]}" 4 $((tab_x[$3] + 220)) 36; }
+  step "a Servo page, a page on localhost, which [routing.wpe] hosts gives WPE, and sig://home"
+  start_sig "$base/second.html" "$lh/second.html" sig://home
+  check "the first page opens in Servo, the second in WPE" \
+    "$(sess 30 "seg(1)['engine']=='servo' and url(1)=='$base/second.html' and seg(2)['engine']=='wpe' and url(2)=='$lh/second.html', (segs(1), segs(2))")"
+  check "sig tells the chrome servo, wpe and no engine for sig://home" \
+    "$(dg 10 "[x['engine'] for x in tabs]==['servo', 'wpe', None], [x['engine'] for x in tabs]")"
+  check "the Servo page is shown" "$(shows_tab 1 servo)"
+  point 1000 700
+  sleep 1
+  shot_ppm 01-servo-labels
+  key -M alt 2 -m alt
+  check "alt-2 shows the WPE page" "$(shows_tab 2 wpe)"
+  sleep 1
+  shot_ppm 02-wpe-labels
+  key -M alt 3 -m alt
+  check "alt-3 shows sig://home" "$(dg 5 "d['active_tab']==3 and shown is None, (d['active_tab'], shown)")"
+  sleep 1
+  shot_ppm 03-home-labels
+
+  step "[chrome.standard] engine-label = false while sig runs"
+  printf '[chrome.standard]\nengine-label = false\n' >> "$config"
+  sleep 0.7
+  check "the new file is valid: no notice" "$(dg 3 "d['status'] is None, d['status']")"
+  sleep 0.5
+  shot_ppm 04-home-no-labels
+  servo=$(in_tab 03-home-labels 04-home-no-labels 0) wpe=$(in_tab 03-home-labels 04-home-no-labels 1)
+  home=$(in_tab 03-home-labels 04-home-no-labels 2)
+  check "the Servo and WPE tabs had labels, which go at once; the home tab had none" \
+    "$(answer "$([[ $servo -gt 20 && $wpe -gt 20 && $home == 0 ]]; echo $?)" "pixels changed: $servo in the Servo tab, $wpe in the WPE tab, $home in the home tab")"
+  address=$(changed 03-home-labels 04-home-no-labels 104 46 1272 78)
+  check "sig://home has no label in the address field" "$(answer "$([[ $address == 0 ]]; echo $?)" "$address pixels changed")"
+  key -M alt 1 -m alt
+  check "alt-1 shows the Servo page again" "$(shows_tab 1 servo)"
+  sleep 1
+  shot_ppm 05-servo-no-labels
+  key -M alt 2 -m alt
+  check "alt-2 shows the WPE page again" "$(shows_tab 2 wpe)"
+  sleep 1
+  shot_ppm 06-wpe-no-labels
+  servo=$(changed 01-servo-labels 05-servo-no-labels 1100 46 1272 78)
+  wpe=$(changed 02-wpe-labels 06-wpe-no-labels 1100 46 1272 78)
+  text=$(changed 01-servo-labels 05-servo-no-labels 104 46 1100 78)
+  check "the address field's right end named the shown page's engine, and its text stayed" \
+    "$(answer "$([[ $servo -gt 20 && $wpe -gt 20 && $text == 0 ]]; echo $?)" "pixels changed at its right end: $servo with Servo, $wpe with WPE; $text in the rest")"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+
+  step "started again with the line chrome and engine-label on: the WPE tab restored"
+  sed -i '/^\[chrome.standard\]$/,$d' "$config"
+  printf '[ui]\nchrome = "line"\n' >> "$config"
+  start_sig
+  check "the configuration is valid: no notice" "$(dg 3 "d['status'] is None, d['status']")"
+  check "the WPE page is shown, and labelled wpe" \
+    "$(dg 30 "shown is not None and shown['engine']=='wpe' and tabs[d['active_tab'] - 1]['engine']=='wpe', (shown and shown['engine'], [x['engine'] for x in tabs])")"
+  point 1000 700
+  sleep 1
+  shot_ppm 07-line-wpe
   key -M ctrl q -m ctrl
   wait "$sig_pid"; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"

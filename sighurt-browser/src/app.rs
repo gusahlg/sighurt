@@ -1195,6 +1195,7 @@ impl App {
                 can_go_forward: tab.can_go_forward,
                 reloads: tab.reloads,
                 error: tab.error.is_some(),
+                engine: chrome::engine(&self.core, &tab).map(str::to_owned),
             })
             .collect();
         let report = Report {

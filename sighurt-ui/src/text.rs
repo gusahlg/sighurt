@@ -189,6 +189,14 @@ impl Fonts {
         self.shape(text, style, Some(width.max(1.0)))
     }
 
+    /// Where a line in `style` has its baseline, from the line's top: the chrome's font's,
+    /// whatever the text, so text in two styles on one line can share a baseline.
+    pub fn baseline(&mut self, style: TextStyle) -> f32 {
+        let line = self.line("x", style);
+        let run = line.runs().next();
+        run.map_or(f32::from(style.line_height) / 2.0, |run| run.line_y)
+    }
+
     /// `text` on one line, cut with an ellipsis if it is wider than `width`.
     pub fn fitted(&mut self, text: &str, style: TextStyle, width: f32) -> Rc<ShapedText> {
         let line = self.line(text, style);

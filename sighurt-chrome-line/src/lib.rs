@@ -7,11 +7,13 @@
 //! Unfocused, the line shows the active tab's place (`[2/5]`), the keymap's indicator, the
 //! committed address (decoded where that is safe), a mark while the page loads, and on the right
 //! the status text, cut to fit: the status always has up to half the line, so `sig`'s notices
-//! stay visible however long the address. A click on the line, or `location.focus`, makes it an
-//! editor: Enter opens what was typed, a line starting with `:` runs a command, and Escape gives
-//! the page the keyboard. There are no buttons, no tab strip and no commands of its own: tabs are
-//! reached by keys and `:tab.select 3`. While the active tab shows no engine's page
-//! (`sig://home`, an error), a few lines of text say what there is.
+//! stay visible however long the address. At its end, small and muted, is the engine the active
+//! tab's page runs in, if it fits whole in a quarter of the line (`[chrome.line] engine-label =
+//! false` leaves it out); `sig:` pages, blank tabs and errors have none. A click on the line, or
+//! `location.focus`, makes it an editor: Enter opens what was typed, a line starting with `:`
+//! runs a command, and Escape gives the page the keyboard. There are no buttons, no tab strip
+//! and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
+//! shows no engine's page (`sig://home`, an error), a few lines of text say what there is.
 //!
 //! Its surfaces, bottom to top: [`PAGE`] while it draws the page area, and [`LINE`]. It repaints
 //! only what changed, and nothing ticks: the caret is steady.
@@ -70,16 +72,23 @@ pub const KIND: ChromeKind = ChromeKind {
 
 /// Everything wrong with `[chrome.line]`.
 fn check(settings: &Table) -> Vec<String> {
-    let problem = |(key, value): (&String, &Value)| match (key.as_str(), value.as_str()) {
-        ("position", Some("top" | "bottom")) => None,
-        ("position", Some(other)) => Some(format!(
-            "position: expected \"top\" or \"bottom\", not {other:?}"
-        )),
-        ("position", None) => Some(format!(
-            "position: expected \"top\" or \"bottom\", not {}",
-            value.kind()
-        )),
-        _ => Some(format!("{key}: unknown key (the line chrome has position)")),
+    let problem = |(key, value): (&String, &Value)| {
+        let given = match value.as_str() {
+            Some(text) => format!("{text:?}"),
+            None => value.kind().to_owned(),
+        };
+        match (key.as_str(), value.as_str(), value.as_bool()) {
+            ("position", Some("top" | "bottom"), _) | ("engine-label", _, Some(_)) => None,
+            ("position", ..) => Some(format!(
+                "position: expected \"top\" or \"bottom\", not {given}"
+            )),
+            ("engine-label", ..) => {
+                Some(format!("engine-label: expected true or false, not {given}"))
+            }
+            _ => Some(format!(
+                "{key}: unknown key (the line chrome has position and engine-label)"
+            )),
+        }
     };
     settings.iter().filter_map(problem).collect()
 }
@@ -91,6 +100,8 @@ pub struct Line {
     theme: Theme,
     /// `[chrome.line] position = "bottom"`.
     bottom: bool,
+    /// `[chrome.line] engine-label`: the engine's name at the line's end.
+    engine_label: bool,
     window: LogicalSize,
     snapshot: Snapshot,
     layout: ChromeLayout,
@@ -129,6 +140,8 @@ struct View {
     mark: Option<f32>,
     /// The status text, where it starts, and whether it says what went wrong.
     status: Option<(Rc<ShapedText>, f32, bool)>,
+    /// The engine of the active tab's page, and where its text's origin is.
+    engine: Option<(Rc<ShapedText>, f32, f32)>,
 }
 
 impl Line {
@@ -139,6 +152,7 @@ impl Line {
             canvas: Canvas::new(),
             theme: Theme::default(),
             bottom: false,
+            engine_label: true,
             window: LogicalSize::default(),
             snapshot: Snapshot::default(),
             layout: ChromeLayout::default(),
@@ -392,6 +406,18 @@ impl Line {
         }
         let prefix = self.fonts.line(&prefix, style);
 
+        // The engine at the end, smaller, on the line's baseline, if it fits whole in a quarter
+        // of the line.
+        let small = TextStyle::XS.at(self.theme.font_size);
+        let active = self.snapshot.active().filter(|_| self.engine_label);
+        let engine = active.and_then(|tab| tab.engine_label());
+        let engine = engine.map(|text| self.fonts.line(&text, small));
+        let engine = engine.filter(|shaped| shaped.width <= line.width as f32 / 4.0);
+        let engine_top = top + self.fonts.baseline(style) - self.fonts.baseline(small);
+        let engine = engine.map(|shaped| (right - shaped.width, shaped));
+        // Twice the gap before it, since the status beside it is muted too.
+        let right = engine.as_ref().map_or(right, |(x, _)| x - 2.0 * gap);
+
         let status = match (&self.error, &self.snapshot.status) {
             (Some(error), _) => Some((error.clone(), true)),
             // A hovered link's address reads decoded, as the line's own does.
@@ -443,6 +469,7 @@ impl Line {
             preedit,
             mark,
             status,
+            engine: engine.map(|(x, shaped)| (shaped, x, engine_top)),
         }
     }
 
@@ -566,6 +593,10 @@ impl Line {
             };
             pen.text(&mut self.fonts, status, (*at, view.top), color, all);
         }
+        if let Some((engine, x, top)) = &view.engine {
+            let color = colors.text_muted;
+            pen.text(&mut self.fonts, engine, (*x, *top), color, all);
+        }
     }
 
     /// A few lines of text about the page the active tab can't show in an engine.
@@ -646,7 +677,9 @@ impl Line {
 /// What the line shows of `snapshot`.
 fn in_line(snapshot: &Snapshot) -> impl PartialEq {
     let active = snapshot.tabs.iter().position(|tab| tab.active);
-    let tab = snapshot.active().map(|tab| (tab.url.clone(), tab.loading));
+    let tab = snapshot
+        .active()
+        .map(|tab| (tab.url.clone(), tab.loading, tab.engine_label()));
     let count = snapshot.tabs.len();
     (
         active,
@@ -687,6 +720,8 @@ impl Chrome for Line {
             ChromeEvent::Configure { theme, settings } => {
                 let position = settings.get("position").and_then(Value::as_str);
                 self.bottom = position == Some("bottom");
+                let label = settings.get("engine-label").and_then(Value::as_bool);
+                self.engine_label = label.unwrap_or(true);
                 self.fonts.set_family(theme.font.as_deref());
                 self.theme = theme;
                 (self.line_changed, self.page_changed) = (true, true);

@@ -1242,3 +1242,314 @@ fn the_tab_list_scrolls_and_follows_the_active_tab() {
     chrome.set_snapshot(switched);
     assert_eq!(chrome.layout().first_row, 0);
 }
+
+/// Where buffer pixel `(x, y)` of a surface placed at `surface`, painted as `image`, is in the
+/// window: its centre.
+fn window_point(image: &Image, surface: WindowRect, x: u32, y: u32) -> WindowPoint {
+    WindowPoint {
+        x: f64::from(surface.x)
+            + (f64::from(x) + 0.5) * f64::from(surface.width) / f64::from(image.width),
+        y: f64::from(surface.y)
+            + (f64::from(y) + 0.5) * f64::from(surface.height) / f64::from(image.height),
+    }
+}
+
+/// The pixels where `a` and `b` differ, as buffer coordinates.
+fn differing(a: &Image, b: &Image) -> Vec<(u32, u32)> {
+    assert_eq!((a.width, a.height), (b.width, b.height));
+    let mut pixels = Vec::new();
+    for y in 0..a.height {
+        for x in 0..a.width {
+            if a.pixel(x, y) != b.pixel(x, y) {
+                pixels.push((x, y));
+            }
+        }
+    }
+    pixels
+}
+
+/// Presses and releases the primary button at window position `at` on the surface placed at
+/// `surface`.
+fn click_on(chrome: &mut Model, surface: WindowRect, at: WindowPoint) -> Vec<ChromeAction> {
+    let local = WindowPoint {
+        x: at.x - f64::from(surface.x),
+        y: at.y - f64::from(surface.y),
+    };
+    let mut actions = Vec::new();
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        actions.extend(chrome.pointer(surface, &button(local, PointerButton::Left, state)));
+    }
+    actions
+}
+
+/// Three tabs with short titles, so a label never cuts one: a Servo page (active), a WPE page
+/// and the home page, which names an engine the chrome must not show.
+fn short_titled() -> Snapshot {
+    let mut snapshot = labelled(three_tabs(), &["servo", "wpe", "servo"]);
+    snapshot.tabs[0].title = "A".into();
+    snapshot.tabs[1].title = "B".into();
+    snapshot
+}
+
+/// The engine label lies inside its tab, where a press selects the tab as anywhere else on it,
+/// and off the close button, at 100 %, 125 %, 150 % and 200 %, with the tabs at the top and on
+/// the left, compact and at 18 px. The close button's drawing still hits the close button, and
+/// a click on the label selects its tab and one on the close button closes it.
+#[test]
+fn engine_labels_stay_on_their_tabs_at_every_scale() {
+    let colors = Colors {
+        text_dim: Rgba::rgb(0xff00ff),
+        ..Colors::default()
+    };
+    let close_color = [0xff, 0x00, 0xff, 0xff];
+    let default = LayoutOptions::default();
+    let left = LayoutOptions {
+        tabs: Tabs::Left,
+        ..default
+    };
+    let variants = [
+        default,
+        LayoutOptions {
+            compact: true,
+            ..default
+        },
+        LayoutOptions {
+            font_size: 18,
+            ..default
+        },
+        left,
+        LayoutOptions {
+            compact: true,
+            font_size: 18,
+            ..left
+        },
+    ];
+    for options in variants {
+        for scale in SCALES {
+            let what = format!("at {scale}/120, {options:?}");
+            let without = LayoutOptions {
+                engine_label: false,
+                ..options
+            };
+            let mut chrome = arranged(800, 600, short_titled(), colors, options);
+            let mut bare = arranged(800, 600, short_titled(), colors, without);
+            let surface = match options.tabs {
+                Tabs::Left => TABS,
+                _ => CHROME,
+            };
+            let rect = rect_of(&chrome, surface);
+            let layout = chrome.layout().clone();
+            let ids: Vec<_> = layout.tabs.iter().map(|tab| tab.id).collect();
+            let image = paint(&mut chrome, surface, scale);
+            let unlabelled = paint(&mut bare, surface, scale);
+            // Each label's pixels, by the tab whose label they are: the bounds in the buffer.
+            let mut labels: Vec<Option<[u32; 4]>> = vec![None; ids.len()];
+            for (x, y) in differing(&image, &unlabelled) {
+                let point = window_point(&image, rect, x, y);
+                if layout.address.contains(point) {
+                    continue;
+                }
+                let Some(Target::Tab(id)) = hit_test(&layout, point) else {
+                    panic!(
+                        "{what}: label pixel ({x}, {y}) hits {:?}",
+                        hit_test(&layout, point)
+                    );
+                };
+                let i = ids.iter().position(|&tab| tab == id).unwrap();
+                let [l, t, r, b] = labels[i].get_or_insert([x, y, x, y]);
+                (*l, *t, *r, *b) = ((*l).min(x), (*t).min(y), (*r).max(x), (*b).max(y));
+            }
+            assert!(
+                labels[0].is_some() && labels[1].is_some(),
+                "{what}: {labels:?}"
+            );
+            assert_eq!(labels[2], None, "{what}: the home page's tab has no label");
+            // The close buttons are drawn where they are hit (a disabled back button in the
+            // toolbar has their color too).
+            let mut crosses = 0;
+            let tab_area = match options.tabs {
+                Tabs::Left => layout.tab_list,
+                _ => layout.tab_strip,
+            };
+            for y in 0..image.height {
+                for x in 0..image.width {
+                    let point = window_point(&image, rect, x, y);
+                    if image.pixel(x, y) == close_color && tab_area.contains(point) {
+                        let hit = hit_test(&layout, point);
+                        assert!(
+                            matches!(hit, Some(Target::CloseTab(_))),
+                            "{what}: close button pixel ({x}, {y}) hits {hit:?}"
+                        );
+                        crosses += 1;
+                    }
+                }
+            }
+            assert!(crosses > 0, "{what}: no close button drawn");
+            // A click on the second tab's label selects it; one on its close button closes it.
+            let [l, t, r, b] = labels[1].unwrap();
+            let label = window_point(&image, rect, (l + r) / 2, (t + b) / 2);
+            let place = rect_of(&chrome, surface);
+            assert_eq!(
+                click_on(&mut chrome, place, label),
+                [ChromeAction::SelectTab(ids[1])],
+                "{what}"
+            );
+            let close = center(layout.tabs[1].close.unwrap());
+            assert_eq!(
+                click_on(&mut chrome, place, close),
+                [ChromeAction::CloseTab(ids[1])],
+                "{what}"
+            );
+        }
+    }
+}
+
+/// Whether a tab shows its engine label depends on the tab's room, not on its title: of six
+/// equally wide Servo tabs with long and one-letter titles, all are labelled, or in a narrow
+/// window none is, at every scale.
+#[test]
+fn tabs_of_one_width_agree_on_their_labels() {
+    let options = LayoutOptions::default();
+    let without = LayoutOptions {
+        engine_label: false,
+        ..options
+    };
+    let mut snapshot = three_tabs();
+    snapshot.tabs = (0..6)
+        .map(|i| {
+            let title = ["Sighurt — a small browser", "A"][i % 2];
+            let mut tab = tab(title, "https://sighurt.example/", TabContent::Engine);
+            tab.engine = Some("servo".into());
+            tab.active = i == 0;
+            tab
+        })
+        .collect();
+    for (width, shown) in [(600, false), (1400, true)] {
+        for scale in SCALES {
+            let colors = Colors::default();
+            let mut chrome = arranged(width, 400, snapshot.clone(), colors, options);
+            let mut bare = arranged(width, 400, snapshot.clone(), colors, without);
+            let rect = rect_of(&chrome, CHROME);
+            let layout = chrome.layout().clone();
+            let image = paint(&mut chrome, CHROME, scale);
+            let unlabelled = paint(&mut bare, CHROME, scale);
+            let mut shows = vec![false; layout.tabs.len()];
+            for (x, y) in differing(&image, &unlabelled) {
+                let point = window_point(&image, rect, x, y);
+                if let Some(Target::Tab(id)) = hit_test(&layout, point) {
+                    shows[layout.tabs.iter().position(|tab| tab.id == id).unwrap()] = true;
+                }
+            }
+            assert_eq!(shows, [shown; 6], "{width} px at {scale}/120");
+        }
+    }
+}
+
+/// The engine label at the address field's right end: the field's text ends before it at
+/// every scale, compact, at 18 px and beside a keymap's indicator, and it hides while the line
+/// is being edited.
+#[test]
+fn the_address_fields_engine_label_never_overlaps_its_text() {
+    let default = LayoutOptions::default();
+    let variants = [
+        (default, None),
+        (
+            LayoutOptions {
+                compact: true,
+                ..default
+            },
+            Some("NORMAL"),
+        ),
+        (
+            LayoutOptions {
+                font_size: 18,
+                ..default
+            },
+            None,
+        ),
+    ];
+    let long = "https://sighurt.example/a/very/long/address/that/runs/under/the/label/if/it/could";
+    for (options, keymap) in variants {
+        for scale in SCALES {
+            let what = format!("at {scale}/120, {options:?}, {keymap:?}");
+            let snapshot = |url: &str| {
+                let mut snapshot = labelled(three_tabs(), &["servo"]);
+                snapshot.tabs[0].url = url.into();
+                snapshot.keymap = keymap.map(Into::into);
+                snapshot
+            };
+            let without = LayoutOptions {
+                engine_label: false,
+                ..options
+            };
+            let colors = Colors::default();
+            let mut full = arranged(500, 300, snapshot(long), colors, options);
+            let mut label_only = arranged(500, 300, snapshot(""), colors, options);
+            let mut neither = arranged(500, 300, snapshot(""), colors, without);
+            let rect = full.layout().chrome;
+            let field = full.layout().address;
+            let toolbar = full.layout().toolbar;
+            let [full_image, label_image, bare_image] = [&mut full, &mut label_only, &mut neither]
+                .map(|chrome| paint(chrome, CHROME, scale));
+            let in_field = |pixels: Vec<(u32, u32)>| -> Vec<(u32, u32)> {
+                let inside = |&(x, y): &(u32, u32)| {
+                    let point = window_point(&full_image, rect, x, y);
+                    // Every changed pixel of the toolbar is inside the field.
+                    if toolbar.contains(point) {
+                        assert!(
+                            field.contains(point),
+                            "{what}: ({x}, {y}) outside the field"
+                        );
+                    }
+                    field.contains(point)
+                };
+                pixels.into_iter().filter(inside).collect()
+            };
+            let text = in_field(differing(&full_image, &label_image));
+            let label = in_field(differing(&label_image, &bare_image));
+            assert!(!text.is_empty() && !label.is_empty(), "{what}");
+            let text_right = text.iter().map(|&(x, _)| x).max().unwrap();
+            let label_left = label.iter().map(|&(x, _)| x).min().unwrap();
+            assert!(
+                text_right < label_left,
+                "{what}: the text reaches {text_right}, the label starts at {label_left}"
+            );
+            // While the line is being edited, the label hides.
+            for chrome in [&mut full, &mut neither] {
+                chrome.window_focus(FocusEvent::Activated);
+                chrome.set_focus(KeyboardFocus::Chrome);
+                type_text(chrome, long);
+            }
+            let typing = paint(&mut full, CHROME, scale);
+            let bare_typing = paint(&mut neither, CHROME, scale);
+            let typed = in_field(differing(&typing, &bare_typing));
+            assert!(typed.is_empty(), "{what}: {} pixels differ", typed.len());
+        }
+    }
+}
+
+/// The tree describes each engine page's tab by its engine, while the chrome labels tabs.
+#[test]
+fn the_tree_names_each_tabs_engine() {
+    let mut chrome = chrome(800, 600, short_titled());
+    let ids: Vec<_> = chrome.snapshot().tabs.iter().map(|tab| tab.id).collect();
+    let descriptions = |chrome: &mut Model| {
+        let tree = chrome.accessibility();
+        let ids = ids.iter();
+        ids.map(|&id| tree.node(NodeId::Tab(id)).unwrap().description.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        descriptions(&mut chrome),
+        [
+            Some("Engine: servo".into()),
+            Some("Engine: wpe".into()),
+            None
+        ]
+    );
+    chrome.set_options(LayoutOptions {
+        engine_label: false,
+        ..LayoutOptions::default()
+    });
+    assert_eq!(descriptions(&mut chrome), [None, None, None]);
+}

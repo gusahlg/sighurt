@@ -47,6 +47,9 @@ impl Snapshot {
         for tab in &mut self.tabs {
             contain(&mut tab.title, MAX_TITLE);
             contain(&mut tab.url, MAX_URL);
+            if let Some(engine) = &mut tab.engine {
+                contain(engine, MAX_ENGINE_NAME);
+            }
             if let TabContent::Error(message) = &mut tab.content {
                 contain(message, MAX_MESSAGE);
             }
@@ -99,6 +102,9 @@ pub struct TabSnapshot {
     pub active: bool,
     /// What the page area shows for this tab.
     pub content: TabContent,
+    /// The engine its page runs in, by its name in the configuration ("servo"): for an engine
+    /// page, and `None` for `sig:` pages, blank tabs and errors. At most 100 characters.
+    pub engine: Option<String>,
 }
 
 /// What a tab's page area shows.
@@ -157,6 +163,16 @@ impl TabSnapshot {
             TabContent::Engine | TabContent::Blank => contained(self.title.trim(), MAX_TITLE),
         }
     }
+
+    /// The engine a label on the tab names: [`TabSnapshot::engine`], contained, for an engine
+    /// page only. The pages the chrome draws, blank tabs and an empty name have none.
+    pub fn engine_label(&self) -> Option<String> {
+        let engine = self.engine.as_deref();
+        let engine = engine.filter(|_| self.content == TabContent::Engine)?;
+        let engine = contained(engine, MAX_ENGINE_NAME);
+        let engine = engine.trim();
+        (!engine.is_empty()).then(|| engine.to_owned())
+    }
 }
 
 /// The chrome's temporary interaction and editing state.
@@ -205,6 +221,7 @@ mod tests {
             loading: false,
             active: false,
             content,
+            engine: None,
         }
     }
 
@@ -256,6 +273,7 @@ mod tests {
             &long('u', 40000),
         );
         tab.active = true;
+        tab.engine = Some(long('e', 200));
         let mut snapshot = Snapshot {
             tabs: vec![tab],
             status: Some(long('s', 3000)),
@@ -279,6 +297,7 @@ mod tests {
         let strings = [
             (&tab.title, 200),
             (&tab.url, 32 * 1024),
+            (tab.engine.as_ref().unwrap(), 100),
             (message, 4000),
             (snapshot.status.as_ref().unwrap(), 2000),
             (snapshot.keymap.as_ref().unwrap(), 64),
@@ -289,6 +308,24 @@ mod tests {
         for (text, bound) in strings {
             assert!(text.starts_with("a b"), "{text:.10}");
             assert_eq!(text.chars().count(), bound);
+        }
+    }
+
+    /// Only an engine page names its engine, contained and trimmed; an empty name is none.
+    #[test]
+    fn engine_labels() {
+        use TabContent::*;
+        let label = |content, engine: Option<&str>| {
+            let mut tab = tab(content, "t", "https://a.test");
+            tab.engine = engine.map(Into::into);
+            tab.engine_label()
+        };
+        assert_eq!(label(Engine, Some("servo")), Some("servo".into()));
+        assert_eq!(label(Engine, Some(" \u{202e}wpe\n")), Some("wpe".into()));
+        assert_eq!(label(Engine, Some(" ")), None);
+        assert_eq!(label(Engine, None), None);
+        for content in [Blank, Internal, Error("x".into())] {
+            assert_eq!(label(content, Some("servo")), None);
         }
     }
 

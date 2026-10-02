@@ -49,6 +49,7 @@ fn tab(title: &str, url: &str, content: TabContent) -> TabSnapshot {
         loading: false,
         active: false,
         content,
+        engine: None,
     }
 }
 
@@ -270,7 +271,22 @@ fn the_kind_checks_its_table() {
     let unknown = table("tabs", Value::Boolean(true));
     assert_eq!(
         (KIND.check)(&unknown),
-        ["tabs: unknown key (the line chrome has position)"]
+        ["tabs: unknown key (the line chrome has position and engine-label)"]
+    );
+    for on in [true, false] {
+        let ok = table("engine-label", Value::Boolean(on));
+        assert_eq!((KIND.check)(&ok), Vec::<String>::new());
+    }
+    let wrong = Table::from([
+        ("engine-label".to_owned(), Value::String("off".into())),
+        ("position".to_owned(), Value::Integer(1)),
+    ]);
+    assert_eq!(
+        (KIND.check)(&wrong),
+        [
+            "engine-label: expected true or false, not \"off\"",
+            "position: expected \"top\" or \"bottom\", not a whole number",
+        ]
     );
 }
 
@@ -509,6 +525,90 @@ fn a_click_places_the_caret_where_it_is_drawn() {
     }
 }
 
+/// `five_tabs` with every tab's page in an engine: the active one in WPE.
+fn five_engine_tabs() -> Snapshot {
+    let mut snapshot = five_tabs();
+    for tab in &mut snapshot.tabs {
+        tab.engine = Some("servo".into());
+    }
+    snapshot.tabs[1].engine = Some("wpe".into());
+    snapshot
+}
+
+/// The engine's name at the line's end: only for an engine page, contained, cut never (it
+/// gives its room back when it doesn't fit), off and on again with `engine-label`, and a page
+/// that moves to another engine repaints the line.
+#[test]
+fn the_engine_label() {
+    let painted = |settings: Table, snapshot: Snapshot, width: u32| {
+        let mut chrome = line(settings, width, 400);
+        chrome.handle(ChromeEvent::Snapshot(snapshot));
+        paint(&mut *chrome, LINE, 150).rgba
+    };
+    let plain = painted(Table::new(), five_tabs(), 700);
+    let labelled = painted(Table::new(), five_engine_tabs(), 700);
+    assert_ne!(labelled, plain);
+    // Only the active tab's engine shows.
+    let mut others = five_engine_tabs();
+    others.tabs[1].engine = None;
+    assert_eq!(painted(Table::new(), others, 700), plain);
+    for content in [
+        TabContent::Internal,
+        TabContent::Blank,
+        TabContent::Error("No such host".into()),
+    ] {
+        let page = showing("https://a.example/", content.clone());
+        let mut named = page.clone();
+        named.tabs[0].engine = Some("servo".into());
+        assert_eq!(
+            painted(Table::new(), named, 700),
+            painted(Table::new(), page, 700),
+            "{content:?}"
+        );
+    }
+    // Contained, by sig and again by the chrome.
+    let mut sent = five_engine_tabs();
+    sent.tabs[1].engine = Some("\u{202e}wpe\n".into());
+    assert_eq!(painted(Table::new(), sent.clone(), 700), labelled);
+    sent.contain();
+    assert_eq!(painted(Table::new(), sent, 700), labelled);
+    // A name that doesn't fit whole in a quarter of the line isn't drawn.
+    let mut long = five_engine_tabs();
+    long.tabs[1].engine = Some("w".repeat(100));
+    let mut none = five_engine_tabs();
+    none.tabs[1].engine = None;
+    assert_eq!(
+        painted(Table::new(), long, 700),
+        painted(Table::new(), none, 700)
+    );
+
+    // Off and on again while it runs.
+    let off = Table::from([("engine-label".to_owned(), Value::Boolean(false))]);
+    assert_eq!(painted(off.clone(), five_engine_tabs(), 700), plain);
+    let mut chrome = line(Table::new(), 700, 400);
+    chrome.handle(ChromeEvent::Snapshot(five_engine_tabs()));
+    let configure = |chrome: &mut dyn Chrome, settings| {
+        chrome.handle(ChromeEvent::Configure {
+            theme: Theme::default(),
+            settings,
+        })
+    };
+    assert_eq!(repaints(&configure(&mut *chrome, off)), [LINE]);
+    assert_eq!(paint(&mut *chrome, LINE, 150).rgba, plain);
+    assert_eq!(repaints(&configure(&mut *chrome, Table::new())), [LINE]);
+    assert_eq!(paint(&mut *chrome, LINE, 150).rgba, labelled);
+
+    // The active tab's page in another engine repaints the line; another tab's doesn't.
+    let mut moved = five_engine_tabs();
+    moved.tabs[1].engine = Some("servo".into());
+    assert_eq!(
+        repaints(&chrome.handle(ChromeEvent::Snapshot(moved.clone()))),
+        [LINE]
+    );
+    moved.tabs[3].engine = Some("wpe".into());
+    assert!(repaints(&chrome.handle(ChromeEvent::Snapshot(moved))).is_empty());
+}
+
 /// The line unfocused (place, indicator, decoded address, loading mark, status) at 100 %,
 /// typing at 150 %, a failed command at 200 % with the line at the bottom, and the home page.
 #[test]
@@ -535,4 +635,12 @@ fn golden_images() {
         TabContent::Internal,
     )));
     golden("home-100", &paint(&mut *chrome, PAGE, 120));
+
+    // The engine at the line's end, unfocused at 100 % and typing at 150 %.
+    let mut chrome = line(Table::new(), 700, 400);
+    chrome.handle(ChromeEvent::Snapshot(five_engine_tabs()));
+    golden("engine-100", &paint(&mut *chrome, LINE, 120));
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    type_text(&mut *chrome, "https://exempel.se/sök?q=blåbär och lingon");
+    golden("engine-typing-150", &paint(&mut *chrome, LINE, 180));
 }

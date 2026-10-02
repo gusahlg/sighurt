@@ -1053,6 +1053,7 @@ line chrome uses all of them.
   | status | 2 000 characters |
   | `TabContent::Error` message | 4 000 characters |
   | an engine row's name / detail | 100 / 500 characters |
+  | `TabSnapshot::engine` (a tab's engine) | 100 characters, an engine row's name's bound |
   | keymap indicator | 64 characters |
   | configuration path | 1 000 characters |
 
@@ -1776,3 +1777,9 @@ finding was checked against the plan and the code before it was acted on.
   - Guard tests: `sighurt-api/tests/keymap.rs` (a keymap with a two-key sequence, from outside
     the crate) and `sighurt-ui/tests/extension.rs` (the standard chrome through the trait, and a
     chrome of its own) pass with these changes.
+- **Engine labels** (2 October 2026, STATUS decision 87): `TabSnapshot::engine` is added after
+  all, now that both chromes show it: the configured name of the engine a tab's page runs in,
+  `None` for `sig:` pages, blank tabs and errors, contained to 100 characters like an engine
+  row's name. Also added: `TabSnapshot::engine_label` (the name, for an engine page only),
+  `Fonts::baseline` (to put text of two sizes on one baseline) and `LayoutOptions::engine_label`.
+  A chrome that builds `TabSnapshot` values itself must name the new field.

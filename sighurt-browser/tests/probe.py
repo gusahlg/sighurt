@@ -8,6 +8,9 @@
     probe.py count PPM X0 Y0 X1 Y1 R G B
                                     how many pixels of the rectangle from (X0, Y0) to (X1, Y1),
                                     end excluded, are exactly that colour
+    probe.py differ PPM PPM X0 Y0 X1 Y1
+                                    how many pixels of that rectangle differ between two
+                                    screenshots of the same size
     probe.py png PPM PNG            the screenshot as a PNG, to look at
     probe.py after LOG T0 REGEX     milliseconds from T0 (CLOCK_MONOTONIC seconds) to the first
                                     `sig-diag` line of LOG after T0 that matches REGEX
@@ -109,6 +112,18 @@ def count(path, x0, y0, x1, y1, r, g, b):
               for y in range(int(y0), int(y1)) for x in range(int(x0), int(x1))))
 
 
+def differ(a, b, x0, y0, x1, y1):
+    images = []
+    for path in (a, b):
+        data = open(path, "rb").read()
+        m = re.match(rb"P6\s+(\d+)\s+(\d+)\s+\d+\s", data)
+        images.append((int(m[1]), data[m.end():]))
+    (width, one), (_, two) = images
+    print(sum(one[3 * (y * width + x):3 * (y * width + x) + 3]
+              != two[3 * (y * width + x):3 * (y * width + x) + 3]
+              for y in range(int(y0), int(y1)) for x in range(int(x0), int(x1))))
+
+
 def png(ppm, out):
     data = open(ppm, "rb").read()
     m = re.match(rb"P6\s+(\d+)\s+(\d+)\s+\d+\s", data)
@@ -174,6 +189,6 @@ def switches(pid, seconds):
     print(f"{sum(rates.values()):.1f}", " ".join(f"{k}={v:.1f}" for k, v in busiest if v))
 
 
-commands = {"diag": diag, "session": session, "pixel": pixel, "count": count, "png": png,
-            "after": after, "switches": switches}
+commands = {"diag": diag, "session": session, "pixel": pixel, "count": count, "differ": differ,
+            "png": png, "after": after, "switches": switches}
 commands[sys.argv[1]](*sys.argv[2:])

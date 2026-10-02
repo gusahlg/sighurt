@@ -203,6 +203,57 @@ fn golden_font_size_18() {
     golden("font-18-home-100", &paint(&mut chrome, PAGE, 120));
 }
 
+/// Engine labels: in each engine page's tab (a Servo page, a loading WPE page, none on the home
+/// page's) and at the address field's right end, at the top at 100 % and 200 %, compact beside
+/// a keymap's indicator at 150 %, at 18 px, in the list on the left at 125 %, and in tabs too
+/// narrow for a whole label at 150 %.
+#[test]
+fn golden_engine_labels() {
+    let default = LayoutOptions::default();
+    let colors = Colors::default();
+    let snapshot = || labelled(three_tabs(), &["servo", "wpe", "servo"]);
+    let mut chrome = common::chrome(900, 600, snapshot());
+    golden("engine-tabs-100", &paint(&mut chrome, CHROME, 120));
+    golden("engine-tabs-200", &paint(&mut chrome, CHROME, 240));
+
+    let compact = LayoutOptions {
+        compact: true,
+        ..default
+    };
+    let mut indicated = snapshot();
+    indicated.keymap = Some("NORMAL".into());
+    let mut chrome = arranged(700, 600, indicated, colors, compact);
+    golden("engine-compact-150", &paint(&mut chrome, CHROME, 180));
+
+    let large = LayoutOptions {
+        font_size: 18,
+        ..default
+    };
+    let mut chrome = arranged(900, 600, snapshot(), colors, large);
+    golden("engine-font-18-100", &paint(&mut chrome, CHROME, 120));
+
+    let left = LayoutOptions {
+        tabs: Tabs::Left,
+        ..default
+    };
+    let mut chrome = arranged(700, 400, snapshot(), colors, left);
+    golden("engine-left-125", &paint(&mut chrome, TABS, 150));
+
+    // Six tabs: the first two again, and a Servo page whose short title doesn't earn it a label.
+    let mut many = snapshot();
+    for i in 0..2 {
+        let mut again = many.tabs[i].clone();
+        again.id = sighurt_api::ids::TabId::next();
+        again.active = false;
+        many.tabs.push(again);
+    }
+    let mut short = tab("A", "https://a.example/", TabContent::Engine);
+    short.engine = Some("servo".into());
+    many.tabs.push(short);
+    let mut chrome = common::chrome(600, 400, many);
+    golden("engine-narrow-150", &paint(&mut chrome, CHROME, 180));
+}
+
 /// Every paint covers the whole buffer: a buffer holding an older frame or garbage comes out
 /// the same as a fresh one, as alternating SHM buffers need.
 #[test]

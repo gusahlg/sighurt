@@ -7,14 +7,20 @@
 //! since it lies over the page), and a page the chrome draws itself on [`PAGE`]. Painting by
 //! surface rather than by rectangle keeps the overlay out of the page area's buffer below it.
 //! Rectangles come from the layout the hit test uses, so controls stay under the pointer; icon
-//! and text sizes scale with the font size as the layout does.
+//! and text sizes scale with the font size as the layout does. An engine page's tab names its
+//! engine in small muted text before the close button, on the title's baseline and inside the
+//! tab, where a click selects the tab as anywhere else on it; the title is cut before the label,
+//! which shows only whole, and only if it fits in half the tab's room for text less a gap, so
+//! tabs of one width agree whatever their titles.
 //!
 //! Must not own: buffers or their lifetime (the host's SHM presenter), or page pixels.
 
 use sighurt_api::geometry::{Metrics, WindowRect};
 
 use crate::canvas::{Canvas, PaintError, Pen, PixelBuffer};
-use crate::chrome::{Colors, Model, Rgba, Tone, CARET_WIDTH, CHROME, PAGE, STATUS, TABS};
+use crate::chrome::{
+    engine_label, label_top, Colors, Model, Rgba, Tone, CARET_WIDTH, CHROME, PAGE, STATUS, TABS,
+};
 use crate::extension::SurfaceName;
 use crate::hit_test::Target;
 use crate::layout::{LayoutOptions, Status, TabLayout};
@@ -154,7 +160,7 @@ fn draw_tab(
         });
         left += k(12.0);
     }
-    let right = match place.close {
+    let mut right = match place.close {
         Some(close) => {
             let [x, y, w, h] = rect_f(close);
             let color = match hover == Some(Target::CloseTab(tab.id)) {
@@ -166,10 +172,19 @@ fn draw_tab(
         }
         None => rect[0] + rect[2] - k(12.0),
     };
+    // The engine's name at the right end, if it fits in half the room, whatever the title: the
+    // title is cut before it.
     let style = options.text(TextStyle::SM);
+    let title = tab.display_title();
+    let room = (right - left).max(0.0);
+    let label = engine_label(chrome.fonts(), options, tab, room / 2.0 - k(8.0));
+    let label = label.map(|label| (right - label.width, label));
+    if let Some((x, _)) = &label {
+        right = x - k(8.0);
+    }
     let text = chrome
         .fonts()
-        .fitted(&tab.display_title(), style, (right - left).max(0.0));
+        .fitted(&title, style, (right - left).max(0.0));
     let top = center_y - f32::from(style.line_height) / 2.0;
     let color = if tab.active {
         colors.text
@@ -178,6 +193,11 @@ fn draw_tab(
     };
     let clip = [left, rect[1], (right - left).max(0.0), rect[3]];
     pen.text(chrome.fonts(), &text, (left, top), color, clip);
+    if let Some((x, label)) = label {
+        let at = (x, label_top(chrome.fonts(), options, style, top));
+        let clip = [x, rect[1], label.width, rect[3]];
+        pen.text(chrome.fonts(), &label, at, colors.text_muted, clip);
+    }
 }
 
 /// The new-tab button's +, centred at `(cx, cy)`.
@@ -321,6 +341,10 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
             colors.text_muted,
             field,
         );
+    }
+    if let Some((engine, x, y)) = &view.engine {
+        let field = rect_f(field);
+        pen.text(chrome.fonts(), engine, (*x, *y), colors.text_muted, field);
     }
     if let Some(preedit) = view.preedit.and_then(clipped) {
         let underline = view.y + line - options.scaled(2.0);

@@ -170,6 +170,7 @@ fn the_standard_kind() {
         ("status", text("overlay")),
         ("buttons", Value::Boolean(false)),
         ("compact", Value::Boolean(true)),
+        ("engine-label", Value::Boolean(false)),
     ]);
     assert_eq!(check(&every), Vec::<String>::new());
     for tabs in ["top", "hidden"] {
@@ -180,14 +181,17 @@ fn the_standard_kind() {
         ("status", Value::Boolean(true)),
         ("buttons", text("yes")),
         ("compact", Value::Integer(1)),
+        ("engine-label", text("off")),
         ("colour", text("red")),
     ]);
     assert_eq!(
         check(&wrong),
         [
             "buttons: expected true or false, not \"yes\"",
-            "colour: unknown key (the standard chrome has tabs, status, buttons and compact)",
+            "colour: unknown key (the standard chrome has tabs, status, buttons, compact and \
+             engine-label)",
             "compact: expected true or false, not a whole number",
+            "engine-label: expected true or false, not \"off\"",
             "status: expected \"strip\" or \"overlay\", not true",
             "tabs: expected \"top\", \"left\" or \"hidden\", not \"lft\"",
         ]
@@ -546,4 +550,116 @@ fn a_chrome_from_outside_the_crate() {
     let actions = click(&mut *chrome, "bar", (10.0, 10.0));
     assert_eq!(actions[0], ChromeAction::Focus(KeyboardFocus::Chrome));
     assert!(matches!(&actions[1], ChromeAction::TextInput(Some(field)) if field.surface == "bar"));
+}
+
+/// `[chrome.standard]` with the given booleans.
+fn switches<const N: usize>(entries: [(&str, bool); N]) -> Table {
+    entries
+        .map(|(key, on)| (key.to_owned(), Value::Boolean(on)))
+        .into()
+}
+
+/// The engine label through the trait: only engine pages have one, in their tab and at the
+/// address field's right end; the chrome shows the engine's name contained; and
+/// `engine-label = false` turns it off at once, and on again.
+#[test]
+fn the_engine_label_through_the_trait() {
+    let painted = |settings: Table, snapshot: Snapshot| {
+        let mut chrome = standard_with(settings, 14, 800, 600);
+        chrome.handle(ChromeEvent::Snapshot(snapshot));
+        let surfaces = names(&*chrome);
+        let images: Vec<_> = surfaces
+            .iter()
+            .map(|&name| paint_surface(&mut *chrome, name, 150).rgba)
+            .collect();
+        (surfaces, images)
+    };
+    let with = |engines: &[&str]| labelled(three_tabs(), engines);
+    let plain = painted(Table::new(), three_tabs());
+    assert_ne!(
+        painted(Table::new(), with(&["servo", "wpe"])),
+        plain,
+        "engine pages have labels"
+    );
+    // A label on the home page's tab, which no engine shows, is not drawn.
+    assert_eq!(
+        painted(Table::new(), with(&["", "", "servo"])),
+        plain,
+        "sig://home has none"
+    );
+    for content in [
+        TabContent::Internal,
+        TabContent::Blank,
+        TabContent::Error("No such host".into()),
+    ] {
+        let page = showing("https://a.example/", content.clone());
+        let named = labelled(page.clone(), &["servo"]);
+        assert_eq!(
+            painted(Table::new(), named),
+            painted(Table::new(), page),
+            "{content:?}"
+        );
+    }
+
+    // What `sig` sends is contained (Snapshot::contain), and the chrome contains it again.
+    let mut sent = with(&["\u{202e}servo\n", "wpe"]);
+    sent.contain();
+    assert_eq!(sent.tabs[0].engine.as_deref(), Some("servo "));
+    let clean = painted(Table::new(), with(&["servo", "wpe"]));
+    assert_eq!(painted(Table::new(), sent), clean);
+    assert_eq!(
+        painted(Table::new(), with(&["\u{202e}servo\n", "wpe"])),
+        clean
+    );
+    let mut long = with(&[&"x".repeat(300)]);
+    long.contain();
+    assert_eq!(
+        long.tabs[0].engine.as_ref().map(|e| e.chars().count()),
+        Some(100)
+    );
+
+    // Off and on again while the chrome runs: it repaints, and shows what it would have shown
+    // configured that way from the start.
+    let mut chrome = standard_with(Table::new(), 14, 800, 600);
+    chrome.handle(ChromeEvent::Snapshot(with(&["servo", "wpe"])));
+    let reconfigure = |chrome: &mut dyn Chrome, on: bool| {
+        chrome.handle(ChromeEvent::Configure {
+            theme: Theme::default(),
+            settings: switches([("engine-label", on)]),
+        })
+    };
+    let actions = reconfigure(&mut *chrome, false);
+    assert!(repaints(&actions).contains(&"chrome"), "{actions:?}");
+    let off = paint_surface(&mut *chrome, "chrome", 150).rgba;
+    assert_eq!(off, plain.1[0], "no label at all");
+    let actions = reconfigure(&mut *chrome, true);
+    assert!(repaints(&actions).contains(&"chrome"), "{actions:?}");
+    assert_eq!(paint_surface(&mut *chrome, "chrome", 150).rgba, clean.1[0]);
+}
+
+/// A tab whose page moves to another engine repaints what shows the label: the tab strip's
+/// surface at the top, or the list on the left, and the toolbar for the active tab.
+#[test]
+fn a_new_engine_repaints_its_label() {
+    let mut chrome = standard(800, 600);
+    let before = labelled(three_tabs(), &["servo", "servo"]);
+    chrome.handle(ChromeEvent::Snapshot(before.clone()));
+    let mut after = before.clone();
+    after.tabs[1].engine = Some("wpe".into());
+    assert_eq!(
+        repaints(&chrome.handle(ChromeEvent::Snapshot(after))),
+        ["chrome"]
+    );
+
+    let left = Table::from([("tabs".to_owned(), text("left"))]);
+    let mut chrome = standard_with(left, 14, 800, 600);
+    chrome.handle(ChromeEvent::Snapshot(before.clone()));
+    let mut inactive = before.clone();
+    inactive.tabs[1].engine = Some("wpe".into());
+    let actions = chrome.handle(ChromeEvent::Snapshot(inactive.clone()));
+    assert_eq!(repaints(&actions), ["tabs"]);
+    let mut active = inactive;
+    active.tabs[0].engine = Some("wpe".into());
+    let actions = chrome.handle(ChromeEvent::Snapshot(active));
+    assert_eq!(repaints(&actions), ["chrome", "tabs"]);
 }
