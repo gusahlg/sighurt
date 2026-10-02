@@ -17,13 +17,20 @@ use sighurt_api::ids::{LayoutEpoch, NavigationId, SeatId, ViewId};
 use sighurt_api::input::{InputEvent, InputKind};
 use sighurt_engine_wasm::{CpuTarget, Frame, SandboxPolicy, WasmConfig, WasmRuntime};
 
-/// The last frame a target was given: its size and ARGB8888 pixels (B, G, R, A in memory).
+/// The last frame a target was given: its size and ARGB8888 pixels (B, G, R, A in memory), and
+/// how long painting it took.
 #[derive(Clone, Default)]
-pub struct Shown(Arc<Mutex<Option<Painted>>>);
+pub struct Shown(Arc<Mutex<Option<Painted>>>, Arc<Mutex<Duration>>);
 
 type Painted = (BufferSize, Vec<u8>);
 
 impl Shown {
+    /// How long the runtime took to paint the last frame into the buffer it was lent: the
+    /// owner thread's time, without what this in-memory target spends allocating buffers.
+    pub fn painting(&self) -> Duration {
+        *self.1.lock().unwrap()
+    }
+
     /// The `[b, g, r, a]` bytes of pixel (`x`, `y`) of the last frame.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let shown = self.0.lock().unwrap();
@@ -92,11 +99,13 @@ impl CpuTarget for TestTarget {
     ) -> Result<(), String> {
         let BufferSize { width, height } = permit.size;
         let mut pixels = vec![0x55; 4 * (width * height) as usize];
+        let started = Instant::now();
         paint(Frame {
             pixels: &mut pixels,
             size: permit.size,
             stride: 4 * width as usize,
         })?;
+        *self.shown.1.lock().unwrap() = started.elapsed();
         *self.shown.0.lock().unwrap() = Some((permit.size, pixels));
         Ok(())
     }

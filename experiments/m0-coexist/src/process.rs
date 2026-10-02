@@ -1,5 +1,5 @@
 //! Process-wide state: the panic hook, the TLS provider, signal handlers, the libraries the
-//! Wasm engine brings along, and resource figures for the record.
+//! Wasm engine brings along, and resource and library figures for the record.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -29,7 +29,8 @@ pub fn install_panic_hook(style_panics: Arc<AtomicUsize>) {
             style_panics.fetch_add(1, Ordering::SeqCst);
         }
         // On a script thread, Servo's logger turns this record into a crash page and
-        // `notify_crashed`; elsewhere its constellation ignores it.
+        // `notify_crashed` for every view with a document on that thread (step 9); elsewhere
+        // its constellation ignores it.
         log::error!("{info}");
     }));
 }
@@ -57,15 +58,27 @@ pub fn install_tls_provider() -> Result<String, String> {
 
 /// The current SIGSEGV and SIGILL handlers, to show which runtime installed its own last.
 pub fn trap_handlers() -> [usize; 2] {
-    [libc::SIGSEGV, libc::SIGILL].map(|signal| {
-        // SAFETY: with a null new action, `sigaction` only reads the current one into
-        // `current`, a valid, writable `sigaction`. No handler changes.
-        unsafe {
-            let mut current: libc::sigaction = std::mem::zeroed();
-            libc::sigaction(signal, std::ptr::null(), &mut current);
-            current.sa_sigaction
-        }
-    })
+    [libc::SIGSEGV, libc::SIGILL].map(handler)
+}
+
+/// The current handler of `signal`: an address, or `SIG_DFL` (0) or `SIG_IGN` (1).
+pub fn handler(signal: libc::c_int) -> usize {
+    // SAFETY: with a null new action, `sigaction` only reads the current one into `current`,
+    // a valid, writable `sigaction`. No handler changes.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut current);
+        current.sa_sigaction
+    }
+}
+
+/// The file of the first mapping in this process whose path contains `name`.
+pub fn mapped_library(name: &str) -> Option<String> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    maps.lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .find(|path| path.contains(name))
+        .map(str::to_string)
 }
 
 /// Initializes the libraries the Wasm engine links that could clash with Servo's: FFmpeg,

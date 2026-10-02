@@ -11,6 +11,10 @@ never during a run.
 Results: <out>/<host>/<label>/<timestamp>/set.json (environment, build, order, failures) and
 runs/<round>-<workload>.json (metrics); raw logs in <out>/raw/<host>/<label>/<timestamp>/.
 Round 0 is the warmup: recorded, never compared.
+
+The build's directory is resolved once, at the start (a `latest` symlink stays pointing at the
+build it named then), and its binaries are hashed then and again before every run: a set whose
+binaries change stops, rather than mixing two builds.
 """
 
 import argparse
@@ -56,6 +60,11 @@ def tree_hash(paths):
     return h.hexdigest()
 
 
+def binary_hashes(build_dir, build):
+    return {b: sha256(build_dir / b) if (build_dir / b).is_file() else "missing"
+            for b in build.get("binaries", [build["sig"]])}
+
+
 def command(args):
     try:
         return subprocess.run(args, capture_output=True, text=True, timeout=60).stdout.strip()
@@ -90,6 +99,7 @@ def static_environment():
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build", required=True, help="bench/builds/<name>.toml")
+    ap.add_argument("--build-dir", help="the build's directory, instead of the toml's `dir`")
     ap.add_argument("--label", help="name of this result set (default: the build's name)")
     ap.add_argument("--rounds", type=int, default=5, help="measured rounds (default 5)")
     ap.add_argument("--warmup", type=int, default=1, help="warmup rounds, not compared (default 1)")
@@ -104,7 +114,9 @@ def main():
 
     build_path = pathlib.Path(args.build).resolve()
     build = tomllib.loads(build_path.read_text())
-    build_dir = pathlib.Path(os.path.expanduser(build["dir"]))
+    build_dir = pathlib.Path(os.path.expanduser(args.build_dir or build["dir"])).resolve()
+    if not (build_dir / build["sig"]).is_file():
+        sys.exit(f"no {build['sig']} in {build_dir}")
     all_workloads = tomllib.loads((HERE / "workloads.toml").read_text())
     names = args.workloads.split(",") if args.workloads else list(all_workloads)
     unknown = [n for n in names if n not in all_workloads]
@@ -121,8 +133,10 @@ def main():
     workload_files = [p for p in (HERE / "workloads").rglob("*") if p.is_file()] + [HERE / "workloads.toml"]
     # What decides the numbers: the reporting tools and statistics can change without making
     # old sets incomparable.
-    harness_files = [HERE / "run", HERE / "measure", *(HERE / "benchlib" / f"{m}.py" for m in ("probes", "pointer", "parsers", "metrics")),
-                     *(HERE / "builds").glob("*.toml"), REPO / "tools/heavy", REPO / "tools/headless-sway"]
+    # The build's own definition and config are in the record, not in this hash, so adding a
+    # build doesn't make every earlier set look measured by another harness.
+    harness_files = [HERE / "run", HERE / "measure", *(HERE / "benchlib" / f"{m}.py" for m in ("probes", "seat", "parsers", "metrics")),
+                     HERE / "benchlib" / "us.xkb", REPO / "tools/heavy", REPO / "tools/headless-sway"]
     info_path = build_dir / build.get("info", "")
     record = {
         "label": label,
@@ -134,9 +148,9 @@ def main():
             "description": build.get("description"),
             "dir": str(build_dir),
             "definition": build,
+            "config": (build_path.parent / build["config"]).read_text(),
             "info": json.loads(info_path.read_text()) if build.get("info") and info_path.is_file() else None,
-            "sha256": {b: sha256(build_dir / b) if (build_dir / b).is_file() else "missing"
-                       for b in build.get("binaries", [build["sig"]])},
+            "sha256": binary_hashes(build_dir, build),
             "bytes": {b: (build_dir / b).stat().st_size for b in build.get("binaries", [build["sig"]])
                       if (build_dir / b).is_file()},
         },
@@ -168,8 +182,8 @@ def main():
     for first in range(0, total, args.lock_rounds):
         rounds = list(range(first, min(first + args.lock_rounds, total)))
         what = f"benchmark {label}: rounds {rounds[0]}-{rounds[-1]} of {total}"
-        subprocess.run([str(REPO / "tools/heavy"), str(HERE / "run"), "--inner", str(out), *map(str, rounds)],
-                       env=dict(os.environ, SIG_WHAT=what))
+        inner_status = subprocess.run([str(REPO / "tools/heavy"), str(HERE / "run"), "--inner", str(out), *map(str, rounds)],
+                                      env=dict(os.environ, SIG_WHAT=what)).returncode
         # The inner run may have resolved the renderer.
         record = json.loads(set_file.read_text())
         for round_ in rounds:
@@ -179,6 +193,10 @@ def main():
                     info = json.loads(failed.read_text()) if failed.exists() else {"status": None, "stderr": "no result"}
                     record["failures"].append({"run": f"{round_}-{workload}", **info})
         set_file.write_text(json.dumps(record, indent=1))
+        if inner_status != 0:
+            # The compositor didn't start or the binaries changed: later rounds would fail too.
+            record["stopped"] = f"rounds {rounds[0]}-{rounds[-1]} exited with status {inner_status}"
+            break
     record["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     set_file.write_text(json.dumps(record, indent=1))
 
@@ -205,10 +223,15 @@ def inner(out, rounds):
         order = record["order"][round_]
         run_id = f"{round_}-{workload}"
         run_file = out / "runs" / f"{run_id}.json"
+        build_dir = pathlib.Path(record["build"]["dir"])
+        if (hashes := binary_hashes(build_dir, record["build"]["definition"])) != record["build"]["sha256"]:
+            (out / "runs" / f"{run_id}.failed.json").write_text(json.dumps(
+                {"status": "binaries changed", "stderr": f"since the set started: {hashes}"}))
+            sys.exit(f"{run_id}: the build's binaries changed since the set started; stopping the set")
         cmd = [
             str(REPO / "tools/headless-sway"), "--renderer", record["renderer"], "--size", record["size"], "--",
-            str(HERE / "measure"), "--build", record["build"]["path"], "--workload", workload,
-            "--out", str(run_file), "--raw", str(raw / run_id),
+            str(HERE / "measure"), "--build", record["build"]["path"], "--build-dir", str(build_dir),
+            "--workload", workload, "--out", str(run_file), "--raw", str(raw / run_id),
         ]
         started = time.monotonic()
         # Its own session, so a run that hangs can be stopped with its compositor and browser

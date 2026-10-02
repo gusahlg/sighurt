@@ -61,15 +61,17 @@ Source: `sighurt-ui/src/default-ui.toml`, `sighurt-ui/src/settings.rs`, `sighurt
 At the baseline, bindings live under **`[ui.keys]`**, with the contexts **`[ui.keys.page]`** and
 **`[ui.keys.location]`**. A top-level `[keys]` table is a configuration error there
 (`sighurt-core/src/config.rs`, test `typos_are_errors`), although the baseline's CLAUDE.md still
-says `[keys]`.
+says `[keys]`. Configuration format version 1 (STATUS.md decision 28, M2) moves them back to the
+top level: `[keys]`, `[keys.page]` and `[keys.location]`.
 
 | Baseline | Decision | Why |
 |---|---|---|
 | No default bindings: nothing is bound until the user binds it; the toolbar and tab strip cover `tab.new`, `tab.close`, `tab.select`, `page.back`, `page.forward`, `page.reload`, `page.stop` and `page.open` | keep | A stated policy (CLAUDE.md). The plan's §21 example binds keys only as an illustration of syntax. |
-| `keystroke = "command [argument]"`: global in `[ui.keys]`, while the page has focus in `[ui.keys.page]`, while the URL bar has focus in `[ui.keys.location]` | keep the three scopes; the table names change with the configuration format (§4) | Single-letter bindings in the page context are a daily workflow (`"g g" = "location.focus"`). |
-| GPUI keystroke syntax: `ctrl`, `alt`, `shift`, `cmd`, `secondary` (cmd on macOS, ctrl elsewhere), space-separated sequences such as `"ctrl-x ctrl-c"` | change | GPUI is gone (decision 2). The new syntax is parsed from xkbcommon keysyms (plan §12): logical keys by default, physical keys on request, AltGr kept apart. Sequences stay. `secondary` becomes plain `ctrl`, since the rewrite is Linux-only. Settled in M3. |
-| A bad binding (unknown command or context, bad keystroke) is skipped with a warning; startup continues | keep | Plan §21: validate before use, keep the rest. |
-| The browser sees keys before the page, so a page-context binding takes that key from the page | keep | Plan §12 ordering; a consumed press must not leave the page a stuck key (§25). |
+| `keystroke = "command [argument]"`: global in `[ui.keys]`, while the page has focus in `[ui.keys.page]`, while the URL bar has focus in `[ui.keys.location]` | keep the three scopes; change the table names to `[keys]`, `[keys.page]`, `[keys.location]` | Decision 28. |
+| GPUI keystroke syntax: `ctrl`, `alt`, `shift`, `cmd`, `secondary` (cmd on macOS, ctrl elsewhere) | change | GPUI is gone (decision 2). Decision 28 (M2): `mod-mod-key` with `ctrl`, `alt`, `shift`, `super`, `altgr` and `secondary` (still ctrl); `cmd` is gone. The key is a character as the layout types it, a key name, or `code:<W3C code>` for a physical key (plan §12); AltGr is never Ctrl+Alt. |
+| Space-separated key sequences such as `"g g"` or `"ctrl-x ctrl-c"` | change: rejected with an error when the configuration loads | Decision 28: replaying the keys held back while a sequence is pending needs timers, which the core doesn't have. Whether a sequence (such as `"g g" = "location.focus"`) is part of a daily workflow is for the user to say with M6's workflow list (M0's open item); if one is, M6 must bring sequences back. |
+| A bad binding (unknown command or context, bad keystroke) is skipped with a warning; startup continues | change: a file with any problem is rejected as a whole | Decision 28: parsing reports every problem, and any problem rejects the file; at startup `sig` runs with the built-in defaults, on a reload the configuration in use stays (plan §21). |
+| The browser sees keys before the page, so a page-context binding takes that key from the page | keep, except while typing | Plan §12 ordering; a consumed press must not leave the page a stuck key (§25). Decision 28: while the address bar or a page's text field has focus, a binding that would type a character (no modifier but shift) lets it type. |
 | URL bar editing, hard-wired: Escape drops the edit and focuses the page; Enter runs `page.open <text>`; `secondary-a` selects all; `secondary-c`/`x`/`v` copy, cut and paste (pasted newlines removed); Left/Right (Shift extends), Home/End, Backspace/Delete; mouse drag selects | keep, with `ctrl` for `secondary`; add IME composition | Editor behavior, not bindings. Plan §13 adds Unicode-cluster movement, horizontal scrolling and IME. |
 
 ## 4. Configuration
@@ -80,17 +82,17 @@ Source: `sighurt-core/src/config.rs`, `sighurt-core/src/default-config.toml`,
 | Baseline | Decision | Why |
 |---|---|---|
 | `{config_dir}/sighurt/config.toml` (`~/.config/sighurt/config.toml`), merged over the built-in defaults | keep | |
-| A file that isn't valid TOML, or has an unknown key, is ignored with a warning; an error in `[ui]` only costs `[ui]` | keep | Plan §21 goes further: an invalid reload keeps the previous valid configuration. |
+| A file that isn't valid TOML, or has an unknown key, is ignored with a warning; an error in `[ui]` only costs `[ui]` | change: any problem anywhere, `[ui]` included, rejects the whole file, reported with every other problem | Decision 28 and plan §21: at startup the built-in defaults apply; an invalid reload keeps the configuration in use. |
 | Changes apply when `sig` next starts | change | Plan §21: keys and colors apply live; a renderer change needs a restart. |
 | No format version | change | Plan §21 adds `version = 1`, so later format changes are deliberate. |
-| `default_engine = "servo"` | keep | |
-| `[engines.<name>]` tables merge by name, field by field; a new name adds an engine | change | Engines are compiled in (decision 1), so a name can only refer to a compiled engine; an unknown name is an error. Settled with the configuration in M2. |
+| `default_engine = "servo"` | change: `[engines] default = "servo"`, and `[engines] enabled` lists the engines that may open pages | Decision 28. |
+| `[engines.<name>]` tables merge by name, field by field; a new name adds an engine | change: routing moves to `[routing.<engine>]`, still merged over the defaults field by field | Engines are compiled in (decision 1), so a name can only refer to a compiled engine; an unknown name is an error (decision 28). |
 | `[engines.<name>] command = [...]`: the engine program, looked up next to `sig`, then on `PATH` | drop | No engine processes (decision 1). An external engine is a later, separate decision (plan §18). |
-| `[engines.<name>] schemes = [...]` (Servo: `data`, `about`) | keep | Routing rule 3 of plan §16. |
-| `[engines.<name>] extensions = [...]` (Wasm: `wasm`; Servo: `html`, `htm`, `xhtml`, `svg`, `txt`, `png`, `jpg`, `jpeg`, `gif`, `webp`) | keep, as loader hints | Plan §16: extensions select a loader; they don't validate content. |
-| `[engines.<name>] mime = [...]`, matched against a HEAD (then GET) probe's `Content-Type` for every http(s) URL | change | Plan §16: ordinary http(s) goes to Servo without a probe; Wasm apps over http(s) by extension or an explicit action, then validated by the loader. `mime` survives only if M6 finds a use in the engines' own response handling; otherwise it is dropped then. |
-| `[ui] home = "sig://home"`: the page at startup and in new tabs | keep | |
-| `[ui] search = "https://duckduckgo.com/html/?q={}"`: where URL-bar text that isn't an address goes | keep | |
+| `[engines.<name>] schemes = [...]` (Servo: `data`, `about`) | keep, as `[routing.<engine>] schemes` | Routing rule 3 of plan §16; a scheme belongs to one engine (decision 28). |
+| `[engines.<name>] extensions = [...]` (Wasm: `wasm`; Servo: `html`, `htm`, `xhtml`, `svg`, `txt`, `png`, `jpg`, `jpeg`, `gif`, `webp`) | keep, as loader hints in `[routing.<engine>] extensions` | Plan §16: extensions select a loader; they don't validate content. The new defaults list only `wasm` for the Wasm engine; other `file:` URLs go to the default engine (decision 28). |
+| `[engines.<name>] mime = [...]`, matched against a HEAD (then GET) probe's `Content-Type` for every http(s) URL | drop | Plan §16: ordinary http(s) goes to Servo without a probe. Decision 28 (M2) has no `mime`: a Wasm app opens over http(s) when the Wasm engine lists both the URL's origin (`[routing.wasm] origins`) and its extension, and the loader validates what it gets. |
+| `[ui] home = "sig://home"`: the page at startup and in new tabs | keep, as top-level `home` | Decision 28: `[ui]` holds only the chrome's colors. |
+| `[ui] search = "https://duckduckgo.com/html/?q={}"`: where URL-bar text that isn't an address goes | keep, as top-level `search` | Decision 28. |
 | `[ui.colors]`: `bg`, `surface`, `hover`, `tab`, `border`, `focus`, `text`, `text_muted`, `text_dim`, `selection`, `error`, each `#rrggbb` or `#rrggbbaa` | keep the names and defaults | The CPU chrome can draw every one of them. |
 | `[ui]` belongs to the UI crate, which documents and checks it | keep | Plan §5: the UI owns chrome state. |
 
@@ -103,7 +105,7 @@ Source: `sighurt-core/src/config.rs`, `sighurt-core/src/default-config.toml`,
 | 3. The path's file extension is matched against `extensions` | keep |
 | 4. Other `file:` URLs go to `default_engine` | keep |
 | 5. Other http(s) URLs are probed (HEAD, then GET); the `Content-Type` picks the engine; a type no engine lists is downloaded; a failed probe goes to `default_engine` | change: http(s) goes to Servo directly; unsupported content becomes a download or an error through the engine's response handling (plan §16) |
-| Engines are tried in name order | keep |
+| Engines are tried in name order | change: each scheme and extension belongs to one engine, so the order no longer matters (decision 28) |
 
 ### URL-bar fixup (`sighurt-ui/src/browser.rs`, `fixup`)
 

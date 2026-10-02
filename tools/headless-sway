@@ -12,7 +12,8 @@
 #   wayland-info                            list protocols
 # Never use ydotool or anything else that writes to /dev/uinput: that types into the real desktop.
 # The compositor and its runtime directory are removed when `cmd` exits; its exit code is returned.
-# `--renderer auto` tries gles2 (the GPU) and falls back to pixman. `cmd` also gets
+# `--renderer auto` tries gles2 (the GPU, with SWAY_UNSUPPORTED_GPU=true for the proprietary NVIDIA
+# driver) and falls back to pixman. `cmd` also gets
 # SIG_SWAY_RENDERER (the renderer sway runs with), SIG_SWAY_PID and SIG_SWAY_LOG (its log file).
 set -euo pipefail
 size=1280x800 scale=1 renderer=pixman
@@ -25,7 +26,7 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-[[ $# -gt 0 ]] || { sed -n '2,16p' "$0"; exit 2; }
+[[ $# -gt 0 ]] || { sed -n '2,17p' "$0"; exit 2; }
 bins=$(nix-build '<nixpkgs>' -A sway -A wtype -A wlrctl -A grim -A wayland-utils --no-out-link 2>/dev/null |
   sed 's|$|/bin|' | paste -sd:)
 export PATH="$bins:$PATH"
@@ -44,6 +45,8 @@ start_sway() {
   (
     unset WAYLAND_DISPLAY DISPLAY SWAYSOCK
     export XDG_RUNTIME_DIR=$run WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=$1
+    # Sway refuses the proprietary NVIDIA driver unless told to go on.
+    [[ $1 == gles2 ]] && export SWAY_UNSUPPORTED_GPU=true
     exec sway -c "$run/config" > "$run/sway.log" 2>&1
   ) &
   sway_pid=$!

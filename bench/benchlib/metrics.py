@@ -16,9 +16,10 @@ import math
 MIB = 1024 * 1024
 
 
-def window(sampler, gpu, events, sway_pid, start, end, inputs=()):
+def window(sampler, gpu, events, sway_pid, start, end, inputs=(), pixels=()):
     """Metrics for the window between marks `start` and `end`. `inputs` are the times of the
-    inputs whose latency the script measures (scrolls, tab switches)."""
+    inputs whose latency the script measures (scrolls, tab switches), `pixels` the (input time,
+    seconds until the chrome changed on screen, or None) of chrome inputs."""
     ia, ib = sampler.marks[start], sampler.marks[end]
     ta, procs_a, extra_a = sampler.full[ia]
     tb, _, extra_b = sampler.full[ib]
@@ -136,7 +137,51 @@ def window(sampler, gpu, events, sway_pid, start, end, inputs=()):
             m["browser_draw_p95_ms"] = percentile(drawn, 0.95)
 
     m.update(latency(events, [(t, kind) for t, kind in inputs if ta <= t <= tb]))
+    m.update(pixel_latency([seconds for t, seconds in pixels if ta <= t <= tb]))
+    m.update(counters(events, ta, tb, from_launch=start == "launch"))
+    for name, (count, rate, scale) in FROM_COUNTERS.items():
+        if count not in m and f"ctr.{name}" in m:
+            m[count] = m[f"ctr.{name}"] * scale
+            m[rate] = m[f"ctr.{name}_per_s"] * scale
     return m
+
+
+# Counters that give the metrics the per-event diagnostics give, under the same names, for a
+# build that prints counters and not a line per frame: counter -> (metric, its rate, scale).
+# Per-event lines win where both exist. The latency metrics need the per-event lines.
+FROM_COUNTERS = {
+    "page_frames_painted": ("frames_produced", "fps_produced", 1),
+    "page_frames_presented": ("frames_delivered", "fps_delivered", 1),
+    "readback_bytes": ("readback_mib", "readback_mib_per_s", 1 / MIB),
+    "chrome_paints": ("browser_frames", "browser_fps", 1),
+}
+
+
+# How long after a mark the counters snapshot it asked for may arrive (bench/measure sends the
+# build's counters_signal at every mark but the first).
+COUNTER_DELAY_S = 1.0
+
+
+def counters(events, ta, tb, from_launch=False):
+    """Each counter's increase over the window from `ta` to `tb` ("ctr.<name>") and its rate
+    ("ctr.<name>_per_s"), between the first snapshot within COUNTER_DELAY_S after each end. The
+    rate divides by the time between the two snapshots, not the marks. A window that starts at
+    launch starts from zero, since the process has just started. Without both snapshots, none."""
+    snapshots = [(t, e["values"]) for t, e in events if e["kind"] == "counters"]
+
+    def after(mark):
+        return next(((t, v) for t, v in snapshots if mark <= t <= mark + COUNTER_DELAY_S), None)
+
+    a = (ta, {}) if from_launch else after(ta)
+    b = after(tb)
+    if a is None or b is None or b[0] <= a[0]:
+        return {}
+    out = {}
+    for name, value in b[1].items():
+        increase = value - a[1].get(name, 0)
+        out[f"ctr.{name}"] = increase
+        out[f"ctr.{name}_per_s"] = increase / (b[0] - a[0])
+    return out
 
 
 def latency(events, inputs, limit=1.0):
@@ -198,19 +243,32 @@ def latency(events, inputs, limit=1.0):
     return out
 
 
+def pixel_latency(seconds):
+    """input_to_pixels: chrome input -> the chrome's pixels changed on screen (bench/measure
+    chrome_keys; None: no change within its limit, counted in _missed)."""
+    if not seconds:
+        return {}
+    ms = sorted(1000 * s for s in seconds if s is not None)
+    out = {"input_to_pixels_missed": sum(s is None for s in seconds)}
+    if ms:
+        out["input_to_pixels_p50_ms"] = percentile(ms, 0.5)
+        out["input_to_pixels_p95_ms"] = percentile(ms, 0.95)
+    return out
+
+
 def percentile(sorted_values, q):
     """Nearest-rank percentile of already sorted values."""
     return sorted_values[max(0, math.ceil(q * len(sorted_values)) - 1)]
 
 
-def run_metrics(sampler, gpu, events, sway_pid, launch, screen, windows, inputs=()):
+def run_metrics(sampler, gpu, events, sway_pid, launch, screen, windows, inputs=(), pixels=()):
     """All of a run's metrics. `screen` is the ScreenWatcher, `launch` the launch time,
-    `windows` the (name, start mark, end mark) triples to compute and `inputs` the times of the
-    script's latency-probing inputs."""
+    `windows` the (name, start mark, end mark) triples to compute, `inputs` the times of the
+    script's latency-probing inputs and `pixels` the chrome inputs' screen latencies."""
     out = {}
     for name, start, end in windows:
         if start in sampler.marks and end in sampler.marks:
-            for key, value in window(sampler, gpu, events, sway_pid, start, end, inputs).items():
+            for key, value in window(sampler, gpu, events, sway_pid, start, end, inputs, pixels).items():
                 out[f"{name}.{key}"] = value
     if screen.mapped is not None:
         out["startup.mapped_s"] = screen.mapped - launch

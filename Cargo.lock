@@ -5212,6 +5212,8 @@ dependencies = [
  "rodio",
  "rustls",
  "servo",
+ "sighurt-api",
+ "sighurt-engine-wasm",
  "tokio",
  "url",
  "wasmtime",
@@ -9718,6 +9720,17 @@ version = "0.7.0"
 name = "sighurt-browser"
 version = "0.7.0"
 dependencies = [
+ "calloop",
+ "dirs",
+ "env_logger",
+ "libc",
+ "log",
+ "percent-encoding",
+ "reqwest",
+ "rustix 1.1.5",
+ "rustls",
+ "serde",
+ "serde_json",
  "sighurt-api",
  "sighurt-core",
  "sighurt-engine-demo",
@@ -9725,6 +9738,11 @@ dependencies = [
  "sighurt-engine-wasm",
  "sighurt-ui",
  "sighurt-wayland",
+ "signal-hook-registry",
+ "smithay-client-toolkit",
+ "tempfile",
+ "url",
+ "wayland-client 0.31.15",
 ]
 
 [[package]]
@@ -9749,9 +9767,20 @@ dependencies = [
 name = "sighurt-engine-servo"
 version = "0.7.0"
 dependencies = [
+ "calloop",
+ "dpi",
+ "euclid",
+ "gleam",
+ "glow",
+ "libc",
+ "log",
+ "raw-window-handle",
+ "rustls",
  "servo",
  "sighurt-api",
  "sighurt-wayland",
+ "surfman",
+ "url",
 ]
 
 [[package]]
@@ -9761,6 +9790,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "calloop",
  "chrono",
  "coremidi",
  "cosmic-text",
@@ -9784,6 +9814,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sighurt-api",
+ "sighurt-wayland",
  "starship-battery",
  "sys-locale",
  "tempfile",

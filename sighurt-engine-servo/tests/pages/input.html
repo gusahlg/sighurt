@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>input</title>
+<!-- Reports what the page receives in its title, which the engine reports as TitleChanged, so
+     input routing, text and the viewport are checked from servo-window's log. -->
+<style>
+  body { font: 20px sans-serif; margin: 0; background: #fdfdf8; }
+  .grid { position: fixed; left: 0; top: 0; width: 100px; height: 100px;
+          border-right: 1px solid #c00; border-bottom: 1px solid #c00; }
+  #field { position: fixed; left: 20px; top: 200px; width: 300px; height: 30px; font-size: 20px; }
+  p { position: fixed; left: 20px; top: 260px; }
+</style>
+<div class="grid"></div>
+<input id="field" autocomplete="off">
+<p>The red lines mark CSS pixel 100: a click on their corner is at 100,100.</p>
+<script>
+  const say = (message) => { document.title = message; };
+  const viewport = () => `dpr ${devicePixelRatio} ${innerWidth}x${innerHeight}`;
+  addEventListener("mousedown", (e) => say(`mousedown ${e.clientX},${e.clientY} button ${e.button}`));
+  addEventListener("keydown", (e) => say(`keydown ${e.key} ${e.code}`));
+  addEventListener("keyup", (e) => say(`keyup ${e.key} ${e.code}`));
+  addEventListener("wheel", () => say(`scrolled`));
+  addEventListener("resize", () => say(`resize ${viewport()}`));
+  addEventListener("load", () => say(`load ${viewport()}`));
+  field.addEventListener("input", () => say(`field ${field.value}`));
+</script>

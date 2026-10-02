@@ -902,6 +902,64 @@ fn input_reaches_a_guest_while_others_are_busy() {
     );
 }
 
+/// A guest whose every frame fetches `URL`, a server that never answers: each `api_fetch`
+/// waits for its 30 s timeout.
+fn hanging_fetch(url: &str) -> String {
+    format!(
+        r##"
+(module
+  (import "oxide" "api_fetch" (func $fetch (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "GET")
+  (data (i32.const 16) "{url}")
+  (func (export "start_app"))
+  (func (export "on_frame") (param i32)
+    (drop (call $fetch (i32.const 0) (i32.const 3) (i32.const 16) (i32.const {len})
+                       (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)
+                       (i32.const 1024) (i32.const 16)))))
+"##,
+        len = url.len()
+    )
+}
+
+/// Six guests waiting on a server that never answers would hold every guest thread for the
+/// fetch's 30 s timeout; while they wait, spare threads run the others, so a key press still
+/// reaches another guest at once.
+#[test]
+fn guests_waiting_on_the_network_do_not_hold_up_the_others() {
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", server.local_addr().unwrap());
+    // Accepts every connection and answers none, until the test ends.
+    std::thread::spawn(move || {
+        let held: Vec<_> = server.incoming().collect();
+        drop(held);
+    });
+    let mut host = Host::new();
+    let hanging = guest(host.dir(), "hanging", &hanging_fetch(&url));
+    for _ in 0..6 {
+        load(&mut host, &hanging);
+    }
+    let typing = guest(host.dir(), "typing", TYPING);
+    let (view, _) = load(&mut host, &typing);
+    host.run_for(SECS / 2);
+    let started = Instant::now();
+    host.input(
+        view,
+        press(
+            Key::Character("x".into()),
+            45,
+            Some("x"),
+            Modifiers::default(),
+        ),
+    );
+    host.until(10 * SECS, |event| {
+        committed_url(event).is_some_and(|url| url.ends_with("#x"))
+    });
+    let latency = started.elapsed();
+    eprintln!("key to guest with 6 guests waiting on the network: {latency:?}");
+    assert!(latency < 2 * SECS, "{latency:?}");
+}
+
 /// Keeps calling `api_fetch` (a refused local port, so each call returns at once) until 2 s
 /// have passed, then records that it got that far.
 const FETCH_LOOP: &str = r##"

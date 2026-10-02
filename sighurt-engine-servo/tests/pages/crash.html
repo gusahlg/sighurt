@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>crash</title>
+<p>This page panics its script thread with Servo's test helper (the tests enable
+<code>dom_servo_helpers_enabled</code>; it exists only in test builds).</p>
+<script>
+  addEventListener("load", () => setTimeout(() => ServoTestUtils.panic(), 100));
+</script>

@@ -16,6 +16,8 @@ screen-capture = ["dep:screenshots"]
 
 [dependencies]
 sighurt-api = { path = "../sighurt-api" }
+# The SHM target lease and frame permit views present into (`wayland.rs`).
+sighurt-wayland = { path = "../sighurt-wayland" }
 wasmtime.workspace = true
 tiny-skia.workspace = true
 # Shaping, font fallback and glyph rasterization for guest text.
@@ -58,3 +60,5 @@ coremidi = "0.7"
 
 [dev-dependencies]
 wat = "1"
+# The `wasm-view` example's event loop.
+calloop.workspace = true

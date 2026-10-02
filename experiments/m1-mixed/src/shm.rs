@@ -29,8 +29,11 @@ pub struct BufferKey {
 /// A buffer is free (ours to draw into) until it is attached, and then the compositor's until
 /// `wl_buffer.release`. With none free, [`acquire`](Self::acquire) returns `None` and the caller
 /// keeps its invalidation for the next release. A new size starts a new generation: the old
-/// generation's free buffers are destroyed at once, held ones on release, so a resize storm
-/// leaves at most `count` buffers retiring per generation still on screen.
+/// generation's free buffers are destroyed at once, held ones on release. A new size waits
+/// (`None` again) while it would leave more than `count` buffers of old sizes awaiting release,
+/// so a resize storm keeps at most `count` old buffers, one generation's worth (§10). The
+/// release it waits for always comes: every old buffer has been superseded by a newer one,
+/// since the caller attaches and commits each buffer it acquires.
 pub struct ShmBuffers {
     owner: Owner,
     count: usize,
@@ -41,6 +44,8 @@ pub struct ShmBuffers {
     retiring: usize,
     /// The most buffers of old generations that were waiting for release at once.
     pub max_retiring: usize,
+    /// How often [`acquire`](Self::acquire) refused a new size until an old buffer's release.
+    pub size_waits: u64,
 }
 
 struct Slot {
@@ -59,11 +64,13 @@ impl ShmBuffers {
             slots: Vec::new(),
             retiring: 0,
             max_retiring: 0,
+            size_waits: 0,
         }
     }
 
     /// A free buffer of `size`, as its slot and its pixels (rows of `width × 4` bytes, B G R X
-    /// in memory). `None` while the compositor holds every buffer.
+    /// in memory). `None` while the compositor holds every buffer, or, for a new size, while it
+    /// holds too many buffers of old sizes.
     pub fn acquire<D>(
         &mut self,
         shm: &Shm,
@@ -74,6 +81,11 @@ impl ShmBuffers {
         D: Dispatch<WlBuffer, BufferKey> + 'static,
     {
         if size != self.size || self.pool.is_none() {
+            let held = self.slots.iter().filter(|slot| slot.held).count();
+            if self.retiring + held > self.count {
+                self.size_waits += 1;
+                return None;
+            }
             self.reallocate(shm, size, qh);
         }
         let slot = self.slots.iter().position(|slot| !slot.held)?;

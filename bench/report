@@ -27,7 +27,7 @@ def main():
     env = s["environment"]
 
     print(f"## {s['label']} on {s['host']} ({s['started']})\n")
-    print(f"- Build: {s['build']['description']}")
+    print(f"- Build: {s['build']['description']} (engines: {results.engine_placement(data)})")
     for binary, digest in s["build"]["sha256"].items():
         size = s["build"].get("bytes", {}).get(binary)
         print(f"  - `{binary}` sha256 `{digest[:16]}…`" + (f", {size / 2**20:.1f} MiB" if size else ""))
@@ -42,6 +42,8 @@ def main():
     runs = [r for r in data["runs"] if not r.get("warmup")]
     print(f"- {s['rounds']} measured rounds after {s['warmup_rounds']} warmup; {len(runs)} measured runs, "
           f"{len(s['failures'])} failed; workload order randomized per round (seed {s['seed']})\n")
+    if s.get("stopped"):
+        print(f"**The set stopped early**: {s['stopped']}\n")
 
     renderers = sorted({f"{r['engine']}: {r['mode']} ({r['gl_renderer']})" for run in data["runs"] for r in run.get("renderers", [])})
     if renderers:

@@ -12,7 +12,7 @@
 //! (§10, "Subsurface commit policy").
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use servo::KeyState;
 use sighurt_api::geometry::{BufferSize, LogicalSize, Metrics, Scale, SurfacePoint, WindowRect};
@@ -80,6 +80,8 @@ pub struct Options {
     /// Ask for exactly this size (minimum and maximum), which tiling window managers usually
     /// honour by floating the window.
     pub fixed_size: Option<LogicalSize>,
+    /// How far back the report counts the loop's wakeups before exit.
+    pub idle_window: Duration,
 }
 
 /// Which part of the window gets the keyboard: the logical focus, separate from whether the
@@ -146,6 +148,8 @@ pub struct App {
     page_metrics: Option<Metrics>,
     root_buffers: ShmBuffers,
     root_buffer_size: Option<BufferSize>,
+    /// The root's new size waits for the release of an old root buffer.
+    root_pending: bool,
     chrome_buffers: ShmBuffers,
     chrome: Chrome,
     chrome_dirty: Option<ChromeCause>,
@@ -164,6 +168,8 @@ pub struct App {
     /// Keys consumed by browser shortcuts, whose releases are swallowed too.
     consumed: HashSet<u32>,
 
+    /// Whether the ordered release ran (see [`App::release`]).
+    released: bool,
     pub quit: bool,
     pub error: Option<String>,
     pub stats: Stats,
@@ -276,6 +282,7 @@ impl App {
             page_metrics: None,
             root_buffers: ShmBuffers::new(Owner::Root, 1),
             root_buffer_size: None,
+            root_pending: false,
             chrome_buffers: ShmBuffers::new(Owner::Chrome, 2),
             chrome: Chrome::new(chrome_text),
             chrome_dirty: None,
@@ -288,9 +295,10 @@ impl App {
             focus: Focus::Page,
             activated: false,
             consumed: HashSet::new(),
+            released: false,
             quit: false,
             error: None,
-            stats: Stats::default(),
+            stats: Stats::new(options.idle_window),
         })
     }
 
@@ -300,6 +308,11 @@ impl App {
         self.stats.woke();
         if self.layout_dirty {
             self.apply_layout();
+        } else if self.root_pending {
+            self.paint_root();
+            if !self.root_pending {
+                self.window.commit();
+            }
         }
         if let Some(page) = &mut self.page {
             if page.take_work() {
@@ -323,16 +336,40 @@ impl App {
         self.page.as_ref().map(Page::readbacks)
     }
 
-    pub fn max_retiring_buffers(&self) -> (usize, usize) {
-        (
-            self.chrome_buffers.max_retiring,
-            self.root_buffers.max_retiring,
+    /// The SHM report line: the most old-size buffers awaiting release at once, and how often
+    /// a new size was refused because too many were, for the chrome and the root.
+    pub fn shm_report(&self) -> String {
+        let (chrome, root) = (&self.chrome_buffers, &self.root_buffers);
+        format!(
+            "at most {} chrome and {} root buffers of old sizes awaited release at once; a new \
+             size was refused until a release {} and {} times",
+            chrome.max_retiring, root.max_retiring, chrome.size_waits, root.size_waits
         )
     }
 
-    /// Tears the window down in the order §9 and §20 need: the page's GL context and EGL
-    /// surface before its `wl_subsurface` and `wl_surface`, children before the root.
+    /// Tears the window down: [`release`](Self::release), then the root, then a round trip
+    /// that surfaces any protocol error the teardown caused.
     pub fn teardown(mut self) -> Result<(), String> {
+        let page = self.release();
+        let connection = self.connection.clone();
+        // What `release` left: the xdg_toplevel, the xdg_surface and the root wl_surface.
+        drop(self);
+        connection
+            .roundtrip()
+            .map_err(|e| format!("teardown: {e}"))?;
+        log!("teardown: chrome and window destroyed; the compositor reported no error");
+        page
+    }
+
+    /// Destroys everything but the root, once, in the order §9 and §20 need: the page's
+    /// Servo, GL context and EGL display before its `wl_subsurface` and `wl_surface`, children
+    /// before the root. [`teardown`](Self::teardown) calls it, and so does `Drop` when the loop
+    /// ended with an error or a panic, so no way out relies on the fields' drop order; the
+    /// window, which `Drop` leaves to the fields, is the last thing destroyed.
+    fn release(&mut self) -> Result<(), String> {
+        if std::mem::replace(&mut self.released, true) {
+            return Ok(());
+        }
         if let Some(keyboard) = self.keyboard.take() {
             keyboard.release();
         }
@@ -372,13 +409,6 @@ impl App {
         if let Some(fractional) = self.fractional.take() {
             fractional.destroy();
         }
-        // Destroys the xdg_toplevel, the xdg_surface and the root wl_surface.
-        drop(self.window);
-        // A round trip surfaces any protocol error the teardown caused.
-        self.connection
-            .roundtrip()
-            .map_err(|e| format!("teardown: {e}"))?;
-        log!("teardown: chrome and window destroyed; the compositor reported no error");
         page
     }
 
@@ -427,7 +457,7 @@ impl App {
             role.set_sync();
         }
         // 2. The root background.
-        self.paint_root(size);
+        self.paint_root();
         // 3. The chrome, at its new size (cached until the root commit).
         self.chrome_dirty = Some(ChromeCause::Layout);
         self.paint_chrome();
@@ -484,7 +514,12 @@ impl App {
         }
     }
 
-    fn paint_root(&mut self, size: LogicalSize) {
+    /// The root background at the configured size: with a viewport, one pixel stretched over
+    /// the window; without, a whole-window buffer at the integer scale. When a new buffer size
+    /// has to wait for a release, the root keeps its old buffer and buffer scale (a new scale
+    /// on the old buffer could be an `invalid_size` error) and the next loop turn retries.
+    fn paint_root(&mut self) {
+        let Some(size) = self.size else { return };
         let rect = WindowRect {
             x: 0,
             y: 0,
@@ -492,8 +527,10 @@ impl App {
             height: size.height,
         };
         let surface = self.window.wl_surface().clone();
-        self.set_surface_size(&surface, self.root_viewport.as_ref(), rect);
-        // With a viewport, one pixel stretched over the window; without, the whole window.
+        let opaque = self.compositor.wl_compositor().create_region(&self.qh, ());
+        opaque.add(0, 0, size.width as i32, size.height as i32);
+        surface.set_opaque_region(Some(&opaque));
+        opaque.destroy();
         let buffer = match self.root_viewport {
             Some(_) => BufferSize {
                 width: 1,
@@ -503,22 +540,21 @@ impl App {
                 .unwrap_or(Scale::ONE)
                 .buffer_size(rect.size()),
         };
-        if self.root_buffer_size == Some(buffer) {
-            return;
+        if self.root_buffer_size != Some(buffer) {
+            let Some((slot, pixels)) = self.root_buffers.acquire(&self.shm, buffer, &self.qh)
+            else {
+                self.root_pending = true;
+                return;
+            };
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                *pixel = ROOT_COLOR;
+            }
+            self.root_buffers.attach(slot, &surface);
+            surface.damage_buffer(0, 0, buffer.width as i32, buffer.height as i32);
+            self.root_buffer_size = Some(buffer);
         }
-        let Some((slot, pixels)) = self.root_buffers.acquire(&self.shm, buffer, &self.qh) else {
-            return;
-        };
-        for pixel in pixels.as_chunks_mut::<4>().0 {
-            *pixel = ROOT_COLOR;
-        }
-        self.root_buffers.attach(slot, &surface);
-        surface.damage_buffer(0, 0, buffer.width as i32, buffer.height as i32);
-        let opaque = self.compositor.wl_compositor().create_region(&self.qh, ());
-        opaque.add(0, 0, size.width as i32, size.height as i32);
-        surface.set_opaque_region(Some(&opaque));
-        opaque.destroy();
-        self.root_buffer_size = Some(buffer);
+        self.root_pending = false;
+        self.set_surface_size(&surface, self.root_viewport.as_ref(), rect);
     }
 
     /// Paints the whole chrome strip into a free buffer and commits it. With both buffers still
@@ -793,6 +829,15 @@ impl App {
                 log!("keyboard: to the chrome, text now {:?}", self.chrome.text);
                 self.chrome_dirty = Some(ChromeCause::Text);
             }
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if !self.released {
+            log!("teardown: the loop ended early; releasing in order");
+            let _ = self.release();
         }
     }
 }

@@ -330,13 +330,15 @@ impl Budget {
     }
 
     /// Runs `f`, a host operation that waits for `what`, without charging the time to the
-    /// call's time limit. `None`, without running `f`, when the store was cancelled.
+    /// call's time limit. `None`, without running `f`, when the store was cancelled. On a
+    /// worker pool's thread, a spare runs the pool's other guests meanwhile
+    /// ([`crate::pool::blocking`]).
     pub fn wait<R>(&self, what: Wait, f: impl FnOnce() -> R) -> Option<R> {
         if self.is_cancelled() {
             return None;
         }
         let started = Instant::now();
-        let result = f();
+        let result = crate::pool::blocking(f);
         let took = started.elapsed();
         if let Some(call) = self.lock().as_mut() {
             call.waited += took;
@@ -783,5 +785,28 @@ pub(crate) mod tests {
         compile_cached_in(engine.engine(), &wasm, Some(dir.path())).expect("fallback compile");
         let cached = std::fs::read(&path).unwrap();
         assert_ne!(cached, b"not a compiled module");
+    }
+
+    /// An artifact compiled under another `Config` (here the pre-rewrite one, without epoch
+    /// interruption), found where this engine's would be, is refused and replaced: a stale
+    /// cache costs a compile, never runs code built for other checks.
+    #[test]
+    fn aot_cache_entries_of_another_config_are_recompiled() {
+        let engine = engine_with(SandboxPolicy::default());
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = empty_wasm();
+        let mut old = Config::new();
+        old.consume_fuel(true);
+        let old = Engine::new(&old).unwrap();
+        let stale = Module::new(&old, &wasm).unwrap().serialize().unwrap();
+        let versioned = dir.path().join(AOT_CACHE_FORMAT);
+        std::fs::create_dir_all(&versioned).unwrap();
+        let path = cache_path(&versioned, &module_hash(&wasm));
+        std::fs::write(&path, &stale).unwrap();
+        assert!(load_cached(engine.engine(), &versioned, &module_hash(&wasm)).is_none());
+        compile_cached_in(engine.engine(), &wasm, Some(dir.path())).unwrap();
+        let cached = std::fs::read(&path).unwrap();
+        assert_ne!(cached, stale);
+        assert!(load_cached(engine.engine(), &versioned, &module_hash(&wasm)).is_some());
     }
 }

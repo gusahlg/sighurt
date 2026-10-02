@@ -11,6 +11,7 @@
 
 mod guests;
 mod process;
+mod wasm_engine;
 mod web;
 
 use std::fmt::Display;
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use guests::{Guest, Wasm, FRAME_FUEL_LIMIT};
 use servo::{JSValue, ServoBuilder};
+use sighurt_api::engine::EngineRuntime;
 use url::Url;
 use web::Web;
 
@@ -131,15 +133,18 @@ fn run(order: Order) -> ExitCode {
     report.info("resources at start", process::resources());
     let handlers_at_start = process::trap_handlers();
 
+    let profile = std::env::temp_dir().join(format!("m0-coexist-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&profile);
+    let wasm_dir = std::env::temp_dir().join(format!("m0-coexist-wasm-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&wasm_dir);
+
     let mut wasm = None;
     let mut handlers_after_wasmtime = [0; 2];
     if order == Order::WasmtimeFirst {
-        wasm = start_wasmtime(&mut report);
+        wasm = start_wasmtime(&mut report, &wasm_dir);
         handlers_after_wasmtime = process::trap_handlers();
     }
 
-    let profile = std::env::temp_dir().join(format!("m0-coexist-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&profile);
     let started = Instant::now();
     let mut web = Web::new(profile.clone());
     // The one `log` logger of the process; M0.md, "Logging", says why it is Servo's.
@@ -174,7 +179,7 @@ fn run(order: Order) -> ExitCode {
     let loaded = web.spin_until(
         TIMEOUT,
         || {
-            if let Some((_, guests)) = &mut wasm {
+            if let Some((_, guests, _)) = &mut wasm {
                 for guest in guests.iter_mut() {
                     if guest.trap_round().is_ok() {
                         owner_rounds += 1;
@@ -212,7 +217,7 @@ fn run(order: Order) -> ExitCode {
     let handlers_after_servo = process::trap_handlers();
 
     if order == Order::ServoFirst {
-        wasm = start_wasmtime(&mut report);
+        wasm = start_wasmtime(&mut report, &wasm_dir);
         handlers_after_wasmtime = process::trap_handlers();
     }
     report.check(
@@ -224,7 +229,7 @@ fn run(order: Order) -> ExitCode {
             handlers_after_servo,
         ),
     );
-    let Some((wasm, mut guests)) = wasm else {
+    let Some((wasm, mut guests, mut runtime)) = wasm else {
         return finish(report);
     };
 
@@ -236,6 +241,7 @@ fn run(order: Order) -> ExitCode {
             report.fail(&format!("view {i}"), format!("crashed: {reason}"));
         }
     }
+    script_thread_panic(&mut report, &web);
     // Closing one view leaves the other working.
     drop(web.views.remove(0));
     report.check(
@@ -249,9 +255,14 @@ fn run(order: Order) -> ExitCode {
     report.info("resources with both engines", process::resources());
 
     shut_down(&mut report, web, &profile);
-    drop((guests, wasm));
-    report.info("wasmtime", "stores and engines dropped");
+    runtime.shutdown();
+    drop((runtime, guests, wasm));
+    report.info(
+        "wasmtime",
+        "the Wasm engine's runtime shut down; stores and engines dropped",
+    );
     let _ = std::fs::remove_dir_all(&profile);
+    let _ = std::fs::remove_dir_all(&wasm_dir);
 
     report.info(
         "second servo initialization",
@@ -270,8 +281,12 @@ fn run(order: Order) -> ExitCode {
     finish(report)
 }
 
-/// Creates the engines and two guests, and makes both trap once.
-fn start_wasmtime(report: &mut Report) -> Option<(Wasm, [Guest; 2])> {
+/// Creates the engines and two guests, and makes both trap once; then starts the Wasm engine's
+/// runtime, which opens a guest that connects over TLS, in `dir`.
+fn start_wasmtime(
+    report: &mut Report,
+    dir: &Path,
+) -> Option<(Wasm, [Guest; 2], wasm_engine::Runtime)> {
     let started = Instant::now();
     let result = Wasm::new().and_then(|wasm| {
         let guests = [
@@ -296,7 +311,55 @@ fn start_wasmtime(report: &mut Report) -> Option<(Wasm, [Guest; 2])> {
                 .map(|()| "MemoryOutOfBounds, UnreachableCodeReached"),
         );
     }
-    Some((wasm, guests))
+    report.info("threads after wasmtime compiled", process::thread_names());
+    let mut runtime = match wasm_engine::start(dir) {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            report.fail("wasm engine runtime", e);
+            return None;
+        }
+    };
+    openssl(report, &mut runtime, dir);
+    Some((wasm, guests, runtime))
+}
+
+/// A guest of the Wasm engine connects to `wss://`, which initializes OpenSSL (through
+/// tokio-tungstenite's `native-tls`): it must change no signal handler and none of the
+/// variables OpenSSL reads.
+fn openssl(report: &mut Report, runtime: &mut wasm_engine::Runtime, dir: &Path) {
+    let signals = [
+        libc::SIGSEGV,
+        libc::SIGILL,
+        libc::SIGFPE,
+        libc::SIGBUS,
+        libc::SIGPIPE,
+    ];
+    let variables = ["SSL_CERT_FILE", "SSL_CERT_DIR", "OPENSSL_CONF"];
+    let state = || {
+        (
+            signals.map(process::handler),
+            variables.map(std::env::var_os),
+        )
+    };
+    let before = state();
+    let result = wasm_engine::open_tls_guest(runtime, dir, TIMEOUT);
+    let after = state();
+    let library = process::mapped_library("libssl").unwrap_or_else(|| "libssl not mapped".into());
+    report.check(
+        "wasm engine: a guest's wss:// connection initializes OpenSSL",
+        result.and_then(|detail| {
+            if before == after {
+                Ok(format!(
+                    "{detail}; {library}; no signal handler and no SSL_CERT_FILE, \
+                     SSL_CERT_DIR or OPENSSL_CONF changed"
+                ))
+            } else {
+                Err(format!(
+                    "signal handlers or environment changed: {before:?} → {after:?}"
+                ))
+            }
+        }),
+    );
 }
 
 /// Pages trap in SpiderMonkey on Servo's script threads while this thread stops guests by fuel
@@ -405,6 +468,36 @@ fn panics_elsewhere(report: &mut Report, web: &Web, style_panics: &AtomicUsize) 
                 Ok("the hook counted the style thread's; Servo still evaluates JavaScript")
             }
             (count, result) => Err(format!("{count} style-thread panics counted; {result:?}")),
+        },
+    );
+}
+
+/// A panic on a page's script thread: Servo fails every view with a document on that thread
+/// (`notify_crashed`, then a crash page), and views on other script threads go on. The pages
+/// are `data:` URLs, which have no site, so each view has a script thread of its own.
+fn script_thread_panic(report: &mut Report, web: &Web) {
+    // Panics on view 0's script thread; its result never arrives.
+    web.start_evaluation(0, "ServoTestUtils.panic()", web::Evaluation::default());
+    web.spin_until(
+        TIMEOUT,
+        || {},
+        |web| web.views[0].state.crashed.borrow().is_some(),
+    );
+    let crashed = |view: usize| web.views[view].state.crashed.borrow().clone();
+    let probe = web
+        .evaluate(1, "probe(10)", TIMEOUT)
+        .and_then(|value| expect_probe(&js_string(value), 1, 10));
+    report.check(
+        "a panic on view 0's script thread",
+        match (crashed(0), crashed(1), probe) {
+            (Some(reason), None, Ok(_)) => Ok(format!(
+                "view 0 crashed ({:?}); view 1, on another script thread, didn't and still runs \
+                 its script",
+                reason.lines().last().unwrap_or_default()
+            )),
+            (view0, view1, probe) => Err(format!(
+                "view 0 crashed: {view0:?}; view 1 crashed: {view1:?}; view 1's probe: {probe:?}"
+            )),
         },
     );
 }

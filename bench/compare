@@ -7,6 +7,11 @@ A change is reported only if p < --alpha AND the medians differ by more than the
 two IQRs; everything else is "noise". Metrics where lower is better are labelled better/worse;
 the rest (frame counts and rates) higher/lower.
 
+It says how many runs of each workload had anomalies (a crash, a forced quit, a busy machine) or
+failed; --exclude-anomalous leaves the anomalous runs out. When the two builds place their
+engines differently (processes against in-process), the metrics that split the browser process
+from engine processes are left out: they would compare process layouts, not work.
+
   bench/compare bench/results/louise/baseline/<ts> bench/results/louise/rewrite/<ts>
   bench/compare --all --workloads article,webgl A B
 """
@@ -72,20 +77,33 @@ def main():
     ap.add_argument("--workloads", help="comma-separated subset")
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--changed", action="store_true", help="only rows that are not noise")
+    ap.add_argument("--exclude-anomalous", action="store_true", help="leave out runs that have anomalies")
     args = ap.parse_args()
 
     a, b = results.load(args.a), results.load(args.b)
-    va, vb = results.values(a), results.values(b)
+    va, vb = (results.values(s, args.exclude_anomalous) for s in (a, b))
     workloads = args.workloads.split(",") if args.workloads else [w for w in a["set"]["workloads"]["names"] if w in vb]
+    placements = results.engine_placement(a), results.engine_placement(b)
+    split = (lambda m: True) if placements[0] == placements[1] else (lambda m: not results.PROCESS_SPLIT.search(m))
     if args.all:
-        pick = lambda names: names  # noqa: E731
+        pick = lambda names: [m for m in names if split(m)]  # noqa: E731
     else:
-        pick = lambda names: [m for m in results.KEY_METRICS if m in names]  # noqa: E731
+        pick = lambda names: [m for m in results.KEY_METRICS if m in names and split(m)]  # noqa: E731
     rows = compare(va, vb, pick, workloads, args.alpha)
 
     print(f"A: {a['set']['label']} ({a['path']})\nB: {b['set']['label']} ({b['path']})\n")
     for d in environment_differences(a, b):
         print(f"- environment differs: {d}")
+    if placements[0] != placements[1]:
+        print(f"- engines: {placements[0]} → {placements[1]}: the browser/engine split metrics "
+              "(*_browser, *_engines, ipc_out_*) are left out")
+    for name, s in (("A", a), ("B", b)):
+        counts = results.problems(s)
+        for workload in workloads:
+            anomalous, failed = counts.get(workload, (0, 0))
+            if anomalous or failed:
+                what = "left out" if args.exclude_anomalous else "included"
+                print(f"- {name} {workload}: {anomalous} run(s) with anomalies ({what}), {failed} failed")
     print()
     print("| workload | metric | A median [IQR] | B median [IQR] | change | p | q | verdict |")
     print("|---|---|---|---|---|---|---|---|")

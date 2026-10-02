@@ -62,7 +62,6 @@ struct Args {
     options: Options,
     exit_after: Option<Duration>,
     hide_cycles: u32,
-    idle_window: Duration,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -112,10 +111,10 @@ fn parse_args() -> Result<Args, String> {
             integer_scale,
             audit_gl,
             fixed_size,
+            idle_window,
         },
         exit_after,
         hide_cycles,
-        idle_window,
     })
 }
 
@@ -231,10 +230,7 @@ fn run(args: Args) -> Result<(), String> {
     }
     let end = Instant::now();
 
-    log!(
-        "report:\n{}",
-        app.stats.report(start, end, args.idle_window)
-    );
+    log!("report:\n{}", app.stats.report(start, end));
     match app.readbacks() {
         Some((images, gl)) => log!(
             "readbacks: read_to_image {images}, GL reads {}",
@@ -242,11 +238,10 @@ fn run(args: Args) -> Result<(), String> {
         ),
         None => log!("readbacks: no page"),
     }
-    let (chrome, root) = app.max_retiring_buffers();
-    log!(
-        "shm: at most {chrome} chrome and {root} root buffers of old sizes awaited release at once"
-    );
+    log!("shm: {}", app.shm_report());
     if let Some(error) = app.error.take() {
+        // `App`'s `Drop` releases everything in the same order as `teardown`, as it does when
+        // `dispatch` fails or something panics.
         return Err(error);
     }
     app.teardown()?;

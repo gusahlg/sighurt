@@ -4,6 +4,9 @@ description = "gpui-baseline: GPUI chrome, engines as processes over sighurt-ipc
 # Relative paths below are inside `dir`. `~` is the home directory of the benchmark machine.
 dir = "~/sighurt-baseline"
 sig = "target/release/sig"
+# Where the engines run: "processes" (one per page) or "in-process". bench/compare leaves out
+# the browser/engine split metrics when two sets differ in this.
+engines = "processes"
 # Hashed into every result set.
 binaries = ["target/release/sig", "target/release/sig-servo", "target/release/sig-wasm"]
 # Written by the build; copied into the result set.

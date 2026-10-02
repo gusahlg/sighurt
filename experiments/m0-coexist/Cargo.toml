@@ -9,9 +9,16 @@ license.workspace = true
 publish = false
 
 [dependencies]
-servo.workspace = true
+# `testbinding` compiles `ServoTestUtils` (exposed only with the `dom_servo_helpers_enabled`
+# preference), whose `panic()` panics on the calling page's script thread (step 9). Only this
+# experiment builds Servo with it.
+servo = { workspace = true, features = ["testbinding"] }
 wasmtime.workspace = true
 url.workspace = true
+# The Wasm engine itself, mounted as `sig` mounts it, so that every native library it links
+# (FFmpeg, ALSA, OpenSSL, libudev, v4l, WebRTC, ...) links into this executable too.
+sighurt-engine-wasm = { path = "../../sighurt-engine-wasm" }
+sighurt-api = { path = "../../sighurt-api" }
 # Versions Servo 0.5 itself uses, for its rendering context and GL diagnostics.
 dpi = "0.1"
 gleam = "0.15"
@@ -19,8 +26,8 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 wat = "1"
 libc = "0.2"
 log = "0.4"
-# The Wasm engine's native dependencies that could clash with Servo's, declared exactly as
-# sighurt-engine-wasm declares them.
+# Libraries of the Wasm engine that step 2 initializes directly, with the engine's version
+# requirements (Cargo resolves each to the engine's own copy).
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "stream"], default-features = false }
 ffmpeg-next = "8.1.0"

@@ -249,10 +249,11 @@ pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Lo
     };
     let parsed = AppUrl::parse(url).map_err(|e| anyhow::anyhow!("{e}"))?;
     check()?;
-    let wasm_bytes = fetch_module(url, url)?;
+    // Fetching waits on the network: other loads go on meanwhile.
+    let wasm_bytes = crate::pool::blocking(|| fetch_module(url, url))?;
 
     // Optional sibling manifest: metadata + declared permissions.
-    match crate::manifest::fetch_manifest(&parsed) {
+    match crate::pool::blocking(|| crate::manifest::fetch_manifest(&parsed)) {
         Ok(manifest) => *host_state.manifest.lock().unwrap() = manifest,
         Err(e) => host_state.log(
             ConsoleLevel::Warn,

@@ -18,11 +18,18 @@
 //! budget of its own, so no list can hide it. Images are converted for painting when the list
 //! is made, on the guest's worker ([`convert_images`]), not here.
 //!
+//! A large frame is painted in horizontal bands at once, straight into the lent buffer ([`paint`]).
+//! Which ops fit the budget is decided first, once for the whole frame ([`select`]); each band
+//! then paints the part of those ops that reaches its rows. So the same ops are painted
+//! whatever the number of bands, and the bands together do the frame's work, not more. Shapes
+//! are placed relative to each band, so an anti-aliased edge pixel may be shaded a little
+//! differently than in one piece (`bands_paint_what_one_piece_does`).
+//!
 //! Owns: turning ops into pixels. Must not own: what the ops are (see [`crate::draw`]) or when a
 //! frame is painted (the host grants a frame permit).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use sighurt_api::geometry::BufferSize;
 use tiny_skia::{
@@ -115,46 +122,178 @@ fn pixmap(image: &DecodedImage) -> Option<Pixmap> {
 
 /// Paints `scene` into `frame`, replacing what it held. Fails, painting nothing, for a buffer
 /// whose rows are padded or that is smaller than its size says.
+///
+/// A large frame is painted in horizontal bands at once, one on the calling thread and the
+/// others on threads of their own, each straight into its rows of the buffer. Which ops the
+/// budget allows is decided first, for the whole frame; then every band paints the part of
+/// those ops that reaches its rows. So the caller waits for the slowest band rather than for
+/// the whole frame, and nothing is copied.
 pub fn paint(frame: Frame<'_>, scene: &Scene<'_>) -> Result<(), String> {
+    let count = bands(frame.size.width, frame.size.height);
+    paint_in_bands(frame, scene, count)
+}
+
+/// [`paint`] in `count` bands.
+fn paint_in_bands(frame: Frame<'_>, scene: &Scene<'_>, count: u32) -> Result<(), String> {
     let BufferSize { width, height } = frame.size;
     let len = frame.stride * height as usize;
-    if frame.stride != 4 * width as usize || frame.pixels.len() < len {
+    if frame.stride != 4 * width as usize || frame.pixels.len() < len || len == 0 {
         return Err(format!(
             "unsupported buffer: {width}x{height}, stride {}, {} bytes",
             frame.stride,
             frame.pixels.len()
         ));
     }
-    let mut page =
-        PixmapMut::from_bytes(&mut frame.pixels[..len], width, height).ok_or("empty buffer")?;
-    page.fill(Color::TRANSPARENT);
+    let page = [0.0, 0.0, width as f32, height as f32];
     let budget = MAX_OVERDRAW * f64::from(width) * f64::from(height);
-    let mut painter = Painter {
-        page,
-        layers: Vec::new(),
-        budget,
+    let work = Work {
+        scene,
+        list: scene
+            .list
+            .map(|list| select(&list.ops, scene.list_scale, page, budget))
+            .unwrap_or_default(),
+        overlay: select(scene.overlay, scene.overlay_scale, page, budget),
+        width,
     };
-    if let Some(list) = scene.list {
-        painter.ops(&list.ops, scene.list_scale, &list.pixmaps);
-    }
-    painter.budget = budget;
-    painter.ops(scene.overlay, scene.overlay_scale, &[]);
+    let band_rows = height.div_ceil(count.clamp(1, height));
+    // Each band waits in a slot of its own, so a band whose thread can't be started is still
+    // there to paint on this one.
+    let bands: Vec<(Mutex<Option<&mut [u8]>>, u32)> = frame.pixels[..len]
+        .chunks_mut(frame.stride * band_rows as usize)
+        .zip((0..).step_by(band_rows as usize))
+        .map(|(rows, top)| (Mutex::new(Some(rows)), top))
+        .collect();
+    let paint = |(rows, top): &(Mutex<Option<&mut [u8]>>, u32)| {
+        let rows = rows.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(rows) = rows {
+            paint_band(rows, *top, &work);
+        }
+    };
+    std::thread::scope(|scope| {
+        for band in &bands[1..] {
+            let spawned = std::thread::Builder::new()
+                .name("sighurt-wasm-band".into())
+                .spawn_scoped(scope, move || paint(band));
+            if spawned.is_err() {
+                paint(band);
+            }
+        }
+        paint(&bands[0]);
+    });
     Ok(())
 }
 
-struct Painter<'a> {
-    page: PixmapMut<'a>,
-    /// Open clips, innermost last.
-    layers: Vec<Layer>,
-    /// Pixels of work left for this frame.
-    budget: f64,
+/// Most threads that paint one frame, the caller's included.
+const MAX_BANDS: u32 = 8;
+/// Pixels a band is worth a thread for.
+const MIN_BAND_PIXELS: u64 = 256 * 1024;
+
+/// How many bands to paint a `width` × `height` frame in.
+fn bands(width: u32, height: u32) -> u32 {
+    static CORES: OnceLock<u32> = OnceLock::new();
+    let cores = *CORES.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_BANDS as usize) as u32)
+    });
+    let worth = (u64::from(width) * u64::from(height) / MIN_BAND_PIXELS) as u32;
+    worth.clamp(1, cores).min(height)
 }
 
-/// An open clip: what is painted inside it, and where that goes on the page.
+/// What every band of a frame paints.
+struct Work<'a> {
+    scene: &'a Scene<'a>,
+    list: Selection,
+    overlay: Selection,
+    /// The buffer's width in pixels.
+    width: u32,
+}
+
+/// The ops of a list that a frame paints, decided once for the whole frame.
+#[derive(Default)]
+struct Selection {
+    /// Ops from here on are not painted: the first of them doesn't fit the budget.
+    end: usize,
+    /// The `PushClip`s before `end` that the budget had no room for, by index, ascending:
+    /// nothing inside them shows.
+    refused: Vec<usize>,
+}
+
+/// Which of `ops`, in units of `scale` buffer pixels, a frame of `page` paints within
+/// `budget`: each op is charged what it costs within its clip over the whole frame, and each
+/// clip its layer, up to the first op the budget has no room for. It paints nothing.
+fn select(ops: &[DrawOp], scale: (f32, f32), page: Bounds, mut budget: f64) -> Selection {
+    let mut clips: Vec<Bounds> = Vec::new();
+    let mut refused = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let clip = clips.last().copied().unwrap_or(page);
+        match *op {
+            DrawOp::PushClip { x, y, w, h } => {
+                let layer = snap(intersect(scaled([x, y, x + w, y + h], scale), clip));
+                let cost = 2.0 * area(layer);
+                if cost <= budget {
+                    budget -= cost;
+                    clips.push(layer);
+                } else {
+                    refused.push(i);
+                    clips.push([0.0; 4]);
+                }
+            }
+            DrawOp::PopClip => {
+                clips.pop();
+            }
+            _ => match cost(op, scale, clip) {
+                Some(cost) if cost > budget => return Selection { end: i, refused },
+                Some(cost) => budget -= cost,
+                None => {}
+            },
+        }
+    }
+    Selection {
+        end: ops.len(),
+        refused,
+    }
+}
+
+/// Paints `work` into `rows`, the buffer's rows from `top` down.
+fn paint_band(rows: &mut [u8], top: u32, work: &Work<'_>) {
+    let width = work.width;
+    let height = (rows.len() / (4 * width as usize)) as u32;
+    let Some(mut page) = PixmapMut::from_bytes(rows, width, height) else {
+        return;
+    };
+    let scene = work.scene;
+    // A list that starts by painting all of it opaque replaces what the buffer held anyway.
+    let covered = scene
+        .list
+        .and_then(|list| list.ops.first())
+        .is_some_and(|op| matches!(op, DrawOp::Clear { color } if color & 0xff == 0xff));
+    if !covered {
+        page.fill(Color::TRANSPARENT);
+    }
+    let mut painter = Painter {
+        page,
+        top: top as i32,
+        layers: Vec::new(),
+    };
+    if let Some(list) = scene.list {
+        painter.ops(&list.ops, &work.list, scene.list_scale, &list.pixmaps);
+    }
+    painter.ops(scene.overlay, &work.overlay, scene.overlay_scale, &[]);
+}
+
+struct Painter<'a> {
+    /// The rows of the buffer this painter paints: a band, or the whole buffer.
+    page: PixmapMut<'a>,
+    /// Where they start in the buffer. Everything else is in buffer pixels.
+    top: i32,
+    /// Open clips, innermost last.
+    layers: Vec<Layer>,
+}
+
+/// An open clip: what is painted inside it, and where that goes in the buffer.
 struct Layer {
     /// `None` when the clip is empty: nothing inside it shows.
     pixmap: Option<Pixmap>,
-    /// The layer's top-left corner on the page, in buffer pixels.
+    /// The layer's top-left corner in the buffer, in buffer pixels.
     x: i32,
     y: i32,
 }
@@ -163,36 +302,37 @@ struct Layer {
 type Bounds = [f32; 4];
 
 impl Painter<'_> {
-    /// Paints `ops`, whose units are `scale` buffer pixels, and closes the clips they leave
-    /// open. Stops at the first op the budget has no room for.
-    fn ops(&mut self, ops: &[DrawOp], scale: (f32, f32), images: &[Option<Arc<Pixmap>>]) {
-        let depth = self.layers.len();
-        for op in ops {
+    /// Paints the `selection` of `ops`, whose units are `scale` buffer pixels, that reaches
+    /// these rows, and closes the clips they leave open.
+    fn ops(
+        &mut self,
+        ops: &[DrawOp],
+        selection: &Selection,
+        scale: (f32, f32),
+        images: &[Option<Arc<Pixmap>>],
+    ) {
+        let mut refused = selection.refused.iter().copied().peekable();
+        for (i, op) in ops[..selection.end].iter().enumerate() {
             match *op {
                 DrawOp::PushClip { x, y, w, h } => {
-                    self.push_clip(scaled([x, y, x + w, y + h], scale))
+                    let refused = refused.next_if_eq(&i).is_some();
+                    self.push_clip(scaled([x, y, x + w, y + h], scale), refused);
                 }
-                DrawOp::PopClip if self.layers.len() > depth => self.pop_clip(),
-                DrawOp::PopClip => {}
+                DrawOp::PopClip => self.pop_clip(),
                 _ => {
-                    let Some(cost) = self.cost(op, scale) else {
-                        continue;
-                    };
-                    if cost > self.budget {
-                        break;
+                    if cost(op, scale, self.clip()).is_some() {
+                        self.draw(op, scale, images);
                     }
-                    self.budget -= cost;
-                    self.draw(op, scale, images);
                 }
             }
         }
-        while self.layers.len() > depth {
+        while !self.layers.is_empty() {
             self.pop_clip();
         }
     }
 
-    /// Where painting goes now: the innermost clip's pixmap or the page, with the transform
-    /// from buffer pixels on the page to that pixmap. `None` inside an empty clip.
+    /// Where painting goes now: the innermost clip's pixmap or the page, with the offset from
+    /// buffer pixels to that pixmap's. `None` inside an empty clip.
     fn target(&mut self) -> Option<(PixmapMut<'_>, (f32, f32))> {
         match self.layers.last_mut() {
             Some(layer) => {
@@ -202,12 +342,12 @@ impl Painter<'_> {
             None => {
                 let (width, height) = (self.page.width(), self.page.height());
                 let page = PixmapMut::from_bytes(self.page.data_mut(), width, height)?;
-                Some((page, (0.0, 0.0)))
+                Some((page, (0.0, -self.top as f32)))
             }
         }
     }
 
-    /// The area painting can reach now, in buffer pixels on the page.
+    /// The area painting can reach now, in buffer pixels.
     fn clip(&self) -> Bounds {
         match self.layers.last() {
             Some(Layer {
@@ -219,27 +359,27 @@ impl Painter<'_> {
                 [x, y, x + pixmap.width() as f32, y + pixmap.height() as f32]
             }
             Some(_) => [0.0; 4],
-            None => [
-                0.0,
-                0.0,
-                self.page.width() as f32,
-                self.page.height() as f32,
-            ],
+            None => {
+                let top = self.top as f32;
+                let (width, height) = (self.page.width() as f32, self.page.height() as f32);
+                [0.0, top, width, top + height]
+            }
         }
     }
 
-    fn push_clip(&mut self, bounds: Bounds) {
-        let [l, t, r, b] = intersect(bounds, self.clip());
-        let (x, y) = (l.floor() as i32, t.floor() as i32);
-        let (w, h) = ((r.ceil() as i32 - x).max(0), (b.ceil() as i32 - y).max(0));
-        let cost = 2.0 * f64::from(w) * f64::from(h);
-        let pixmap = if cost <= self.budget {
-            self.budget -= cost;
-            Pixmap::new(w as u32, h as u32)
-        } else {
+    /// Opens a clip of `bounds`; a `refused` one shows nothing.
+    fn push_clip(&mut self, bounds: Bounds, refused: bool) {
+        let [l, t, r, b] = snap(intersect(bounds, self.clip()));
+        let pixmap = if refused {
             None
+        } else {
+            Pixmap::new((r - l) as u32, (b - t) as u32)
         };
-        self.layers.push(Layer { pixmap, x, y });
+        self.layers.push(Layer {
+            pixmap,
+            x: l as i32,
+            y: t as i32,
+        });
     }
 
     fn pop_clip(&mut self) {
@@ -264,58 +404,17 @@ impl Painter<'_> {
         }
     }
 
-    /// What painting `op` costs: the pixels it can cover within the clip, and for text what
-    /// shaping it costs too. `None` when it can't reach the clip, so painting it would change
-    /// nothing.
-    fn cost(&self, op: &DrawOp, (sx, sy): (f32, f32)) -> Option<f64> {
-        let clip = self.clip();
-        let area = |[l, t, r, b]: Bounds| f64::from((r - l).max(0.0)) * f64::from((b - t).max(0.0));
-        let within = |bounds: Bounds| area(intersect(scaled(bounds, (sx, sy)), clip));
-        let reached = |pixels: f64| (pixels > 0.0).then_some(pixels);
-        match *op {
-            DrawOp::Clear { .. } => reached(area(clip)),
-            DrawOp::Rect { x, y, w, h, .. } | DrawOp::Image { x, y, w, h, .. } => {
-                reached(within([x, y, x + w, y + h]))
-            }
-            DrawOp::Path {
-                ref points, width, ..
-            } => {
-                let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-                for &(x, y) in points {
-                    (l, t, r, b) = (l.min(x), t.min(y), r.max(x), b.max(y));
-                }
-                let half = width / 2.0;
-                reached(within([l - half, t - half, r + half, b + half]))
-            }
-            DrawOp::Text {
-                x,
-                y,
-                size,
-                ref text,
-                ..
-            } => {
-                if size * sy > MAX_TEXT_PX {
-                    return None;
-                }
-                // Glyphs are about a font size wide (and a character takes at least a byte);
-                // the text may sit left or right of `x`. Where they may reach is wider: some
-                // glyphs are wider than that, and marks go above and below the line.
-                let wide = size * text.len() as f32;
-                let reach = [x - 2.0 * wide, y - size, x + 2.0 * wide, y + 2.2 * size];
-                reached(within(reach))?;
-                let covered = within([x - wide, y, x + wide, y + size * 1.2]);
-                Some(covered + TEXT_OP_COST + TEXT_BYTE_COST * text.len() as f64)
-            }
-            DrawOp::PushClip { .. } | DrawOp::PopClip => Some(0.0),
-        }
-    }
-
     fn draw(&mut self, op: &DrawOp, (sx, sy): (f32, f32), images: &[Option<Arc<Pixmap>>]) {
         let Some((mut target, (dx, dy))) = self.target() else {
             return;
         };
         let transform = Transform::from_row(sx, 0.0, 0.0, sy, dx, dy);
         match *op {
+            // Opaque: the same as filling, which is a plain store of the color.
+            DrawOp::Clear { color } if color & 0xff == 0xff => {
+                let [r, g, b, _] = color.to_be_bytes();
+                target.fill(Color::from_rgba8(b, g, r, 0xff));
+            }
             DrawOp::Clear { color } => {
                 let (w, h) = (target.width() as f32, target.height() as f32);
                 if let Some(rect) = Rect::from_xywh(0.0, 0.0, w, h) {
@@ -512,6 +611,61 @@ fn intersect(a: Bounds, b: Bounds) -> Bounds {
     [l, t, a[2].min(b[2]).max(l), a[3].min(b[3]).max(t)]
 }
 
+/// `bounds` grown to whole pixels.
+fn snap([l, t, r, b]: Bounds) -> Bounds {
+    [l.floor(), t.floor(), r.ceil(), b.ceil()]
+}
+
+/// The pixels in `bounds`.
+fn area([l, t, r, b]: Bounds) -> f64 {
+    f64::from((r - l).max(0.0)) * f64::from((b - t).max(0.0))
+}
+
+/// What painting `op`, in units of `(sx, sy)` buffer pixels, costs: the pixels it can cover
+/// within `clip`, and for text what
+/// shaping it costs too. `None` when it can't reach the clip, so painting it would change
+/// nothing.
+fn cost(op: &DrawOp, (sx, sy): (f32, f32), clip: Bounds) -> Option<f64> {
+    let within = |bounds: Bounds| area(intersect(scaled(bounds, (sx, sy)), clip));
+    let reached = |pixels: f64| (pixels > 0.0).then_some(pixels);
+    match *op {
+        DrawOp::Clear { .. } => reached(area(clip)),
+        DrawOp::Rect { x, y, w, h, .. } | DrawOp::Image { x, y, w, h, .. } => {
+            reached(within([x, y, x + w, y + h]))
+        }
+        DrawOp::Path {
+            ref points, width, ..
+        } => {
+            let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for &(x, y) in points {
+                (l, t, r, b) = (l.min(x), t.min(y), r.max(x), b.max(y));
+            }
+            let half = width / 2.0;
+            reached(within([l - half, t - half, r + half, b + half]))
+        }
+        DrawOp::Text {
+            x,
+            y,
+            size,
+            ref text,
+            ..
+        } => {
+            if size * sy > MAX_TEXT_PX {
+                return None;
+            }
+            // Glyphs are about a font size wide (and a character takes at least a byte);
+            // the text may sit left or right of `x`. Where they may reach is wider: some
+            // glyphs are wider than that, and marks go above and below the line.
+            let wide = size * text.len() as f32;
+            let reach = [x - 2.0 * wide, y - size, x + 2.0 * wide, y + 2.2 * size];
+            reached(within(reach))?;
+            let covered = within([x - wide, y, x + wide, y + size * 1.2]);
+            Some(covered + TEXT_OP_COST + TEXT_BYTE_COST * text.len() as f64)
+        }
+        DrawOp::PushClip { .. } | DrawOp::PopClip => Some(0.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -611,6 +765,139 @@ mod tests {
         );
         assert_eq!(pixel(&pixels, 4, 0, 0), [0, 0, 0, 255]);
         assert_eq!(pixel(&pixels, 4, 1, 1), [0; 4]);
+    }
+
+    /// A frame painted in bands is the frame painted in one piece: clips, text, shapes and
+    /// fills that cross the bands' edges included.
+    #[test]
+    fn bands_paint_what_one_piece_does() {
+        let (width, height) = (1024, 1024);
+        let cores = std::thread::available_parallelism().unwrap().get();
+        assert!(bands(width, height) > 1 || cores == 1);
+        let text = |y: f32| DrawOp::Text {
+            x: 10.0,
+            y,
+            size: 40.0,
+            color: 0xffffffcc,
+            family: String::new(),
+            weight: 400,
+            italic: true,
+            align: 0,
+            text: "Across the bands".into(),
+        };
+        let ops = vec![
+            DrawOp::Clear { color: 0x203040ff },
+            DrawOp::PushClip {
+                x: 20.5,
+                y: 100.25,
+                w: 300.0,
+                h: 250.0,
+            },
+            rect(0.0, 0.0, 512.0, 512.0, 0xff800080),
+            text(110.0),
+            DrawOp::PopClip,
+            DrawOp::Rect {
+                x: 100.0,
+                y: 200.0,
+                w: 200.0,
+                h: 200.0,
+                radius: 100.0,
+                color: 0x00ff0099,
+            },
+            DrawOp::Path {
+                points: vec![(0.0, 0.0), (500.0, 511.0), (20.0, 400.0)],
+                width: 3.5,
+                color: 0xffffffff,
+            },
+            text(248.0),
+        ];
+        let banded = paint_ops(ops.clone(), width, height, 2.0);
+        let list = DisplayList {
+            size: (width, height),
+            ops,
+            images: Vec::new(),
+            pixmaps: Vec::new(),
+        };
+        let scene = Scene {
+            list: Some(&list),
+            list_scale: (2.0, 2.0),
+            overlay: &[],
+            overlay_scale: (1.0, 1.0),
+        };
+        let whole = paint_counted(&scene, width, height, 1);
+        // Shapes are placed relative to each band, so rounding can shade an anti-aliased edge
+        // pixel a little differently; nothing else may differ.
+        let differ: Vec<u8> = banded
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(whole.as_chunks::<4>().0)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| (0..4).map(|i| a[i].abs_diff(b[i])).max().unwrap())
+            .collect();
+        let most = differ.iter().copied().max().unwrap_or(0);
+        eprintln!("{} pixels differ, by at most {most}", differ.len());
+        assert!(differ.len() < 1000, "{} pixels differ", differ.len());
+        assert!(most <= 40, "a pixel differs by {most}");
+    }
+
+    /// Paints `scene` into a `width` × `height` buffer in `count` bands and returns it.
+    fn paint_counted(scene: &Scene<'_>, width: u32, height: u32, count: u32) -> Vec<u8> {
+        let mut pixels = vec![0xaa; (4 * width * height) as usize];
+        let frame = Frame {
+            pixels: &mut pixels,
+            size: BufferSize { width, height },
+            stride: 4 * width as usize,
+        };
+        paint_in_bands(frame, scene, count).unwrap();
+        pixels
+    }
+
+    /// The budget is the frame's, not each band's: a list whose work sits in a few bands is
+    /// painted as far as it is in one piece, whatever the number of bands.
+    #[test]
+    fn the_budget_picks_the_same_ops_for_any_number_of_bands() {
+        let (width, height) = (1024, 1024);
+        let list = |rects: usize| {
+            let mut ops = vec![DrawOp::Clear { color: 0x000000ff }];
+            // Full-width strips over the top 100 rows, each in its own shade of blue.
+            ops.extend(
+                (0..rects).map(|i| rect(0.0, 0.0, 1024.0, 100.0, (i % 256) as u32 * 256 + 0xff)),
+            );
+            // And one at the bottom, after them.
+            ops.push(rect(0.0, 900.0, 1024.0, 100.0, 0xffffffff));
+            DisplayList {
+                size: (width, height),
+                ops,
+                images: Vec::new(),
+                pixmaps: Vec::new(),
+            }
+        };
+        let scene = |list| Scene {
+            list: Some(list),
+            list_scale: (1.0, 1.0),
+            overlay: &[],
+            overlay_scale: (1.0, 1.0),
+        };
+        // 60 strips are 6 M pixels of work, well within the frame's 16.8 M, but more than an
+        // eighth of it: all are painted, in one band or in eight.
+        let fits = list(60);
+        let one = paint_counted(&scene(&fits), width, height, 1);
+        assert_eq!(pixel(&one, width, 0, 0), [59, 0, 0, 255]);
+        assert_eq!(pixel(&one, width, 0, 950), [255; 4]);
+        assert!(one == paint_counted(&scene(&fits), width, height, 8));
+        // 300 strips are more than the frame's budget: after the page's clear, 153 fit, and
+        // painting stops there (the strip at the bottom is not painted either).
+        let over = list(300);
+        let one = paint_counted(&scene(&over), width, height, 1);
+        assert_eq!(pixel(&one, width, 0, 0), [152, 0, 0, 255]);
+        assert_eq!(pixel(&one, width, 0, 950), [0, 0, 0, 255]);
+        for count in [2, 3, 8] {
+            assert!(
+                one == paint_counted(&scene(&over), width, height, count),
+                "{count} bands"
+            );
+        }
     }
 
     #[test]

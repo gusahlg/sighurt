@@ -1,0 +1,23 @@
+# The rewrite's `sig` (branch `rewrite`): CPU chrome and engines compiled in, in one process.
+# bench/rewrite/build.sh builds a revision into its own directory, ~/sighurt-bench/builds/<rev>,
+# never written again, and points `rewrite-latest` at it. bench/run resolves the link when a set
+# starts; `--build-dir ~/sighurt-bench/builds/<rev>` measures an earlier build.
+description = "rewrite: CPU chrome, Servo and Wasm engines in sig's process, no IPC"
+dir = "~/sighurt-bench/builds/rewrite-latest"
+sig = "sig"
+engines = "in-process"
+binaries = ["sig"]
+# Written by the build: revision, features, rustc, sha256.
+info = "build-info.json"
+# benchlib/parsers.py SigDiag: sig's SIG_DIAG=1 lines, including counters, which it prints when
+# it gets SIGUSR1 (bench/measure sends it at every mark).
+parsers = ["sig-diag"]
+counters_signal = "SIGUSR1"
+config = "rewrite.config.toml"
+# sighurt-ui's layout: tab strip 40 + toolbar 44 above, the status strip 20 below. The screen
+# probe looks inside what is left.
+chrome_top = 84
+chrome_bottom = 20
+
+[env]
+SIG_DIAG = "1"

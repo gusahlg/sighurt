@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generates the benchmark's article, long page, images and busy Wasm guest, deterministically.
+"""Generates the benchmark's article, long page, images and hand-assembled Wasm guests (busy,
+flood, workers), deterministically.
 
 The outputs are checked in, so running the benchmark never needs this; it exists so they can be
 reviewed and regenerated. Same script, same bytes: text comes from a fixed seed and the PNGs are
@@ -310,31 +311,270 @@ def section(id_, body):
     return bytes([id_]) + uleb(len(body)) + body
 
 
+I32, I64, F32 = 0x7F, 0x7E, 0x7D
+
+
+def functype(params, results=()):
+    return b"\x60" + vec([bytes([p]) for p in params]) + vec([bytes([r]) for r in results])
+
+
+def i32_const(v):
+    return b"\x41" + sleb(v)
+
+
+def f32_const(v):
+    return b"\x43" + struct.pack("<f", v)
+
+
+def call(f):
+    return b"\x10" + uleb(f)
+
+
+def local_get(i):
+    return b"\x20" + uleb(i)
+
+
+def local_set(i):
+    return b"\x21" + uleb(i)
+
+
+def global_get(i):
+    return b"\x23" + uleb(i)
+
+
+def global_set(i):
+    return b"\x24" + uleb(i)
+
+
+# Opcodes without immediates, and memory accesses with their alignment and offset 0.
+I32_ADD, I32_SUB, I32_AND, I32_SHL, I32_SHR_U, I32_LT_U = b"\x6a", b"\x6b", b"\x71", b"\x74", b"\x76", b"\x49"
+I64_LT_S, F32_CONVERT_I32_U, DROP, END = b"\x53", b"\xb3", b"\x1a", b"\x0b"
+I32_LOAD, I32_STORE = b"\x28\x02\x00", b"\x36\x02\x00"
+LOOP, BLOCK = b"\x03\x40", b"\x02\x40"
+
+
+def br(depth):
+    return b"\x0c" + uleb(depth)
+
+
+def br_if(depth):
+    return b"\x0d" + uleb(depth)
+
+
+def count_down(local, n):
+    """(local.set L n) (loop (local.set L (i32.sub (local.get L) 1)) (br_if 0 (local.get L))):
+    6 operators an iteration."""
+    return (i32_const(n) + local_set(local) + LOOP + local_get(local) + i32_const(1) + I32_SUB + local_set(local)
+            + local_get(local) + br_if(0) + END)
+
+
+def module(types, imports, functions, exports, bodies, memory=False, globals_=(), data=()):
+    """A module: `imports` are (name, type index) from "oxide", `functions` the type index of
+    each defined function, `exports` (name, function index), `bodies` (locals, code) with
+    locals as (count, type) pairs, `memory` one exported page, `globals_` mutable i32s with
+    these initial values, `data` (offset, bytes) segments."""
+    out = b"\x00asm\x01\x00\x00\x00" + section(1, vec(types))
+    out += section(2, vec([name("oxide") + name(n) + b"\x00" + uleb(t) for n, t in imports]))
+    out += section(3, vec([uleb(t) for t in functions]))
+    if memory:
+        out += section(5, vec([b"\x00" + uleb(1)]))
+    if globals_:
+        out += section(6, vec([bytes([I32, 1]) + i32_const(v) + END for v in globals_]))
+    exported = [name(n) + b"\x00" + uleb(f) for n, f in exports]
+    if memory:
+        exported.append(name("memory") + b"\x02" + uleb(0))
+    out += section(7, vec(exported))
+    code = [vec([uleb(n) + bytes([t]) for n, t in locals_]) + body for locals_, body in bodies]
+    out += section(10, vec([uleb(len(c)) + c for c in code]))
+    if data:
+        out += section(11, vec([b"\x00" + i32_const(offset) + END + vec([bytes([b]) for b in blob]) for offset, blob in data]))
+    return out
+
+
 def busy_wasm():
-    i32, f32, func = 0x7F, 0x7D, 0x60
-    functype = lambda params: bytes([func]) + vec([bytes([p]) for p in params]) + vec([])  # noqa: E731
-    i32_const = lambda v: b"\x41" + sleb(v)  # noqa: E731
-    f32_const = lambda v: b"\x43" + struct.pack("<f", v)  # noqa: E731
-    call = lambda f: b"\x10" + uleb(f)  # noqa: E731
-    types = [functype([i32] * 4), functype([f32] * 4 + [i32] * 4), functype([]), functype([i32])]
-    imports = [name("oxide") + name("api_canvas_clear") + b"\x00" + uleb(0),
-               name("oxide") + name("api_canvas_rect") + b"\x00" + uleb(1)]
-    exports = [name("start_app") + b"\x00" + uleb(2), name("on_frame") + b"\x00" + uleb(3)]
-    start_app = vec([]) + b"\x0b"
+    types = [functype([I32] * 4), functype([F32] * 4 + [I32] * 4), functype([]), functype([I32])]
     on_frame = (
-        vec([uleb(1) + bytes([i32])])
-        + b"".join(i32_const(v) for v in (20, 24, 32, 255)) + call(0)
+        b"".join(i32_const(v) for v in (20, 24, 32, 255)) + call(0)
         + b"".join(f32_const(v) for v in (40, 40, 400, 200))
         + b"".join(i32_const(v) for v in (200, 90, 40, 255)) + call(1)
-        + i32_const(BUSY_ITERATIONS) + b"\x21\x01"  # local.set 1
-        + b"\x03\x40"  # loop
-        + b"\x20\x01" + i32_const(1) + b"\x6b" + b"\x21\x01"  # local.get 1, i32.const 1, i32.sub, local.set 1
-        + b"\x20\x01" + b"\x0d\x00"  # local.get 1, br_if 0
-        + b"\x0b\x0b"  # end loop, end function
+        + count_down(1, BUSY_ITERATIONS) + END
     )
-    code = [uleb(len(body)) + body for body in (start_app, on_frame)]
-    return (b"\x00asm\x01\x00\x00\x00" + section(1, vec(types)) + section(2, vec(imports))
-            + section(3, vec([uleb(2), uleb(3)])) + section(7, vec(exports)) + section(10, vec(code)))
+    return module(types, [("api_canvas_clear", 0), ("api_canvas_rect", 1)], [2, 3],
+                  [("start_app", 2), ("on_frame", 3)], [([], END), ([(1, I32)], on_frame)])
+
+
+# ── An output flood ─────────────────────────────────────────────────────────────────────────
+#
+# §26's "output limits": a guest that asks the host for more than it should keep, every frame,
+# without running out of fuel. Equivalent to
+#
+#   (module
+#     (import "oxide" "api_canvas_clear" (func $clear (param i32 i32 i32 i32)))
+#     (import "oxide" "api_canvas_rect" (func $rect (param f32 f32 f32 f32 i32 i32 i32 i32)))
+#     (import "oxide" "api_log" (func $log (param i32 i32)))
+#     (memory (export "memory") 1)
+#     (data (i32.const 0) "<FLOOD_LINE>")
+#     (global $frame (mut i32) (i32.const 0))
+#     (func (export "start_app"))
+#     (func (export "on_frame") (param i32) (local $i i32)
+#       (global.set $frame (i32.add (global.get $frame) (i32.const 1)))
+#       (call $clear (i32.const 16) (i32.const 16) (i32.const 20) (i32.const 255))
+#       (loop                              ;; FLOOD_RECTS 4x4 rectangles, moving every frame
+#         (call $rect (f32.convert_i32_u (i32.add (i32.and (local.get $i) (i32.const 1023))
+#                                                 (i32.and (global.get $frame) (i32.const 63))))
+#                     (f32.convert_i32_u (i32.shr_u (local.get $i) (i32.const 10)))
+#                     (f32.const 4) (f32.const 4)
+#                     (i32.const 200) (i32.and (local.get $i) (i32.const 255)) (i32.const 60) (i32.const 255))
+#         (local.set $i (i32.add (local.get $i) (i32.const 1)))
+#         (br_if 0 (i32.lt_u (local.get $i) (i32.const FLOOD_RECTS))))
+#       (local.set $i (i32.const 0))
+#       (loop                              ;; FLOOD_LOGS console lines
+#         (call $log (i32.const 0) (i32.const <length of FLOOD_LINE>))
+#         (local.set $i (i32.add (local.get $i) (i32.const 1)))
+#         (br_if 0 (i32.lt_u (local.get $i) (i32.const FLOOD_LOGS))))))
+#
+# 250 000 draw commands a frame is more than the rewrite's Wasm engine keeps (200 000,
+# sighurt-engine-wasm MAX_COMMANDS), and 200 console lines a frame fill its 1000-line console in
+# five frames; the old sig-wasm has neither limit. The rectangles move one pixel a frame, so the
+# draw list changes every frame (the old sig-wasm sends only changed lists). About 30 operators
+# a rectangle: some 8M of the 50M fuel a frame.
+
+FLOOD_RECTS = 250_000
+FLOOD_LOGS = 200
+FLOOD_LINE = b"flood: one of many console lines this guest writes on every frame, 100 bytes long, for the limits."
+
+
+def flood_wasm():
+    types = [functype([I32] * 4), functype([F32] * 4 + [I32] * 4), functype([I32] * 2), functype([]), functype([I32])]
+    frame, i = 0, 1
+    rect = (
+        local_get(i) + i32_const(1023) + I32_AND + global_get(frame) + i32_const(63) + I32_AND + I32_ADD + F32_CONVERT_I32_U
+        + local_get(i) + i32_const(10) + I32_SHR_U + F32_CONVERT_I32_U + f32_const(4) + f32_const(4)
+        + i32_const(200) + local_get(i) + i32_const(255) + I32_AND + i32_const(60) + i32_const(255) + call(1)
+    )
+    increment = local_get(i) + i32_const(1) + I32_ADD + local_set(i)
+    on_frame = (
+        global_get(frame) + i32_const(1) + I32_ADD + global_set(frame)
+        + b"".join(i32_const(v) for v in (16, 16, 20, 255)) + call(0)
+        + LOOP + rect + increment + local_get(i) + i32_const(FLOOD_RECTS) + I32_LT_U + br_if(0) + END
+        + i32_const(0) + local_set(i)
+        + LOOP + i32_const(0) + i32_const(len(FLOOD_LINE)) + call(2) + increment
+        + local_get(i) + i32_const(FLOOD_LOGS) + I32_LT_U + br_if(0) + END
+        + END
+    )
+    return module(types, [("api_canvas_clear", 0), ("api_canvas_rect", 1), ("api_log", 2)], [3, 4],
+                  [("start_app", 3), ("on_frame", 4)], [([], END), ([(1, I32)], on_frame)],
+                  memory=True, globals_=[0], data=[(0, FLOOD_LINE)])
+
+
+# ── Background workers ──────────────────────────────────────────────────────────────────────
+#
+# §26's "worker fairness": a page whose workers keep WORKERS threads busy while it animates.
+# The page, workers-main.wasm:
+#
+#   (module
+#     (import "oxide" "api_canvas_clear" (func $clear (param i32 i32 i32 i32)))
+#     (import "oxide" "api_canvas_rect" (func $rect (param f32 f32 f32 f32 i32 i32 i32 i32)))
+#     (import "oxide" "api_get_url" (func $get_url (param i32 i32) (result i32)))
+#     (import "oxide" "api_spawn_worker" (func $spawn (param i32 i32) (result i32)))
+#     (import "oxide" "api_worker_post_message" (func $post (param i32 i32 i32) (result i32)))
+#     (import "oxide" "api_worker_recv" (func $recv (param i32 i32 i32) (result i64)))
+#     (memory (export "memory") 1)
+#     (global $frame (mut i32) (i32.const 0))
+#     (func (export "start_app") (local $len i32) (local $w i32) (local $h i32) (local $k i32)
+#       ;; Its own URL ".../workers-main.wasm" at 0, made ".../workers-busy.wasm".
+#       (local.set $len (call $get_url (i32.const 0) (i32.const 4096)))
+#       (i32.store (i32.sub (local.get $len) (i32.const 9)) (i32.const 0x79737562))  ;; "busy"
+#       (loop                                ;; WORKERS workers, handles at 8192
+#         (local.set $h (call $spawn (i32.const 0) (local.get $len)))
+#         (i32.store (i32.add (i32.const 8192) (i32.shl (local.get $w) (i32.const 2))) (local.get $h))
+#         (local.set $k (i32.const 0))
+#         (loop                              ;; IN_FLIGHT messages each to start with
+#           (drop (call $post (local.get $h) (i32.const 0) (i32.const 1)))
+#           (local.set $k (i32.add (local.get $k) (i32.const 1)))
+#           (br_if 0 (i32.lt_u (local.get $k) (i32.const IN_FLIGHT))))
+#         (local.set $w (i32.add (local.get $w) (i32.const 1)))
+#         (br_if 0 (i32.lt_u (local.get $w) (i32.const WORKERS)))))
+#     (func (export "on_frame") (param i32) (local $w i32) (local $h i32)
+#       (global.set $frame (i32.add (global.get $frame) (i32.const 1)))
+#       (call $clear (i32.const 20) (i32.const 24) (i32.const 32) (i32.const 255))
+#       ;; A square crossing the page, 1 px a frame: an animation.
+#       (call $rect (f32.convert_i32_u (i32.and (global.get $frame) (i32.const 511))) (f32.const 100)
+#                   (f32.const 80) (f32.const 80) (i32.const 90) (i32.const 160) (i32.const 220) (i32.const 255))
+#       (loop                                ;; every reply is answered with a new message
+#         (local.set $h (i32.load (i32.add (i32.const 8192) (i32.shl (local.get $w) (i32.const 2)))))
+#         (block (loop
+#           (br_if 1 (i64.lt_s (call $recv (local.get $h) (i32.const 4096) (i32.const 64)) (i64.const 0)))
+#           (drop (call $post (local.get $h) (i32.const 0) (i32.const 1)))
+#           (br 0)))
+#         (local.set $w (i32.add (local.get $w) (i32.const 1)))
+#         (br_if 0 (i32.lt_u (local.get $w) (i32.const WORKERS))))))
+#
+# and each worker, workers-busy.wasm:
+#
+#   (module
+#     (import "oxide" "api_worker_post" (func $reply (param i32 i32) (result i32)))
+#     (memory (export "memory") 1)
+#     (func (export "start_app"))
+#     (func (export "on_message") (param i32) (local $n i32)
+#       <count down from WORKER_ITERATIONS>
+#       (drop (call $reply (i32.const 0) (i32.const 1)))))
+#
+# A message costs a worker WORKER_ITERATIONS * 6 = 42M of its 50M fuel (about 4 ms on louise-pc,
+# from busy.wasm's cost); with IN_FLIGHT messages queued each, a worker always has the next one
+# while the page answers the last at its next frame, so WORKERS threads stay busy. The queues
+# stay at IN_FLIGHT one-byte messages.
+
+WORKERS = 4
+IN_FLIGHT = 8
+WORKER_ITERATIONS = 7_000_000
+
+
+def workers_main_wasm():
+    types = [functype([I32] * 4), functype([F32] * 4 + [I32] * 4), functype([I32] * 2, [I32]),
+             functype([I32] * 3, [I32]), functype([I32] * 3, [I64]), functype([]), functype([I32])]
+    imports = [("api_canvas_clear", 0), ("api_canvas_rect", 1), ("api_get_url", 2), ("api_spawn_worker", 2),
+               ("api_worker_post_message", 3), ("api_worker_recv", 4)]
+    clear, rect, get_url, spawn, post, recv = range(6)
+    frame = 0
+    handle_at = lambda w: i32_const(8192) + local_get(w) + i32_const(2) + I32_SHL + I32_ADD  # noqa: E731
+    length, w, h, k = 0, 1, 2, 3
+    start_app = (
+        i32_const(0) + i32_const(4096) + call(get_url) + local_set(length)
+        + local_get(length) + i32_const(9) + I32_SUB + i32_const(0x79737562) + I32_STORE
+        + LOOP
+        + i32_const(0) + local_get(length) + call(spawn) + local_set(h)
+        + handle_at(w) + local_get(h) + I32_STORE
+        + i32_const(0) + local_set(k)
+        + LOOP + local_get(h) + i32_const(0) + i32_const(1) + call(post) + DROP
+        + local_get(k) + i32_const(1) + I32_ADD + local_set(k) + local_get(k) + i32_const(IN_FLIGHT) + I32_LT_U + br_if(0) + END
+        + local_get(w) + i32_const(1) + I32_ADD + local_set(w) + local_get(w) + i32_const(WORKERS) + I32_LT_U + br_if(0) + END
+        + END
+    )
+    w, h = 1, 2  # on_frame's param is local 0
+    on_frame = (
+        global_get(frame) + i32_const(1) + I32_ADD + global_set(frame)
+        + b"".join(i32_const(v) for v in (20, 24, 32, 255)) + call(clear)
+        + global_get(frame) + i32_const(511) + I32_AND + F32_CONVERT_I32_U
+        + b"".join(f32_const(v) for v in (100, 80, 80)) + b"".join(i32_const(v) for v in (90, 160, 220, 255)) + call(rect)
+        + LOOP
+        + handle_at(w) + I32_LOAD + local_set(h)
+        + BLOCK + LOOP
+        + local_get(h) + i32_const(4096) + i32_const(64) + call(recv) + b"\x42" + sleb(0) + I64_LT_S + br_if(1)
+        + local_get(h) + i32_const(0) + i32_const(1) + call(post) + DROP + br(0)
+        + END + END
+        + local_get(w) + i32_const(1) + I32_ADD + local_set(w) + local_get(w) + i32_const(WORKERS) + I32_LT_U + br_if(0) + END
+        + END
+    )
+    return module(types, imports, [5, 6], [("start_app", 6), ("on_frame", 7)],
+                  [([(4, I32)], start_app), ([(2, I32)], on_frame)], memory=True, globals_=[0])
+
+
+def workers_busy_wasm():
+    types = [functype([I32] * 2, [I32]), functype([]), functype([I32])]
+    on_message = count_down(1, WORKER_ITERATIONS) + i32_const(0) + i32_const(1) + call(0) + DROP + END
+    return module(types, [("api_worker_post", 0)], [1, 2], [("start_app", 1), ("on_message", 2)],
+                  [([], END), ([(1, I32)], on_message)], memory=True)
 
 
 def main():
@@ -345,6 +585,9 @@ def main():
     (HERE / "long.html").write_text(long_page())
     (HERE / "wasm").mkdir(exist_ok=True)
     (HERE / "wasm" / "busy.wasm").write_bytes(busy_wasm())
+    (HERE / "wasm" / "flood.wasm").write_bytes(flood_wasm())
+    (HERE / "wasm" / "workers-main.wasm").write_bytes(workers_main_wasm())
+    (HERE / "wasm" / "workers-busy.wasm").write_bytes(workers_busy_wasm())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Measures a build's cost for M7: each step is a cargo release build from an empty target
+directory, under tools/heavy (the machine's heavy-job lock, 8 jobs, nothing else building), timed
+by cargo's own "Finished … in" line, which excludes the wait for the lock. It also counts the
+packages in the lockfiles. Run it on the benchmark machine, through bench/remote:
+
+  bench/remote --detach bench/build-cost --label baseline --tree ~/sighurt-baseline \\
+    --step "sig + sig-wasm=cargo build --release -p sighurt-ui -p sighurt-engine-wasm" \\
+    --step "sig-servo=cargo build --release --manifest-path sighurt-engine-servo/Cargo.toml" \\
+    --lockfile Cargo.lock --lockfile sighurt-engine-servo/Cargo.lock
+
+Writes <out>/<host>/build-cost/<label>-<timestamp>.json. The target directories are removed
+afterwards; the crates must already be in cargo's download cache (they are after any build).
+"""
+
+import argparse
+import json
+import os
+import pathlib
+import platform
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = pathlib.Path(__file__).resolve().parent
+FINISHED = re.compile(r"Finished .* in (?:(\d+)h )?(?:(\d+)m )?([\d.]+)s")
+
+
+def cargo_seconds(log):
+    """The time in cargo's last "Finished … in 1h 2m 3.4s" line, or None."""
+    found = FINISHED.findall(log)
+    if not found:
+        return None
+    h, m, s = found[-1]
+    return int(h or 0) * 3600 + int(m or 0) * 60 + float(s)
+
+
+def packages(lockfile):
+    return lockfile.read_text().count("\n[[package]]\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--label", required=True)
+    ap.add_argument("--tree", required=True, help="the source tree to build")
+    ap.add_argument("--step", action="append", required=True, help='"<name>=<cargo command>"')
+    ap.add_argument("--lockfile", action="append", default=[], help="relative to the tree")
+    ap.add_argument("--out", default=os.path.expanduser("~/sighurt-bench/results"))
+    args = ap.parse_args()
+
+    tree = pathlib.Path(os.path.expanduser(args.tree)).resolve()
+    record = {
+        "label": args.label,
+        "host": socket.gethostname(),
+        "tree": str(tree),
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "cpu": next((line.split(":", 1)[1].strip() for line in pathlib.Path("/proc/cpuinfo").read_text().splitlines()
+                     if line.startswith("model name")), None),
+        "cpus": os.cpu_count(),
+        "kernel": platform.release(),
+        "rustc": subprocess.run(["rustc", "--version"], capture_output=True, text=True).stdout.strip(),
+        "jobs": os.environ.get("SIG_JOBS", "8"),
+        "lockfiles": {name: packages(tree / name) for name in args.lockfile},
+        "steps": [],
+    }
+    for step in args.step:
+        name, _, command = step.partition("=")
+        target = pathlib.Path(tempfile.mkdtemp(prefix="build-cost-", dir=os.path.expanduser("~/sighurt-bench")))
+        try:
+            env = dict(os.environ, PWD=str(tree), CARGO_TARGET_DIR=str(target), SIG_WHAT=f"bench: build cost of {args.label}: {name}",
+                       SIG_MEM=os.environ.get("SIG_MEM", "11G"))
+            proc = subprocess.run([str(HERE.parent / "tools/heavy"), *shlex.split(command)], cwd=tree, env=env,
+                                  capture_output=True, text=True)
+        finally:
+            shutil.rmtree(target, ignore_errors=True)
+        log = proc.stdout + proc.stderr
+        seconds = cargo_seconds(log)
+        record["steps"].append({"name": name, "command": command, "status": proc.returncode, "cargo_s": seconds,
+                                "finished": [m[0] for m in FINISHED.finditer(log)][-1] if seconds is not None else None,
+                                "compiled_crates": log.count("Compiling "), "log_tail": log[-2000:]})
+        print(f"{name}: status {proc.returncode}, {seconds} s", flush=True)
+        if proc.returncode != 0:
+            break
+    record["total_cargo_s"] = sum(s["cargo_s"] or 0 for s in record["steps"])
+    out = pathlib.Path(args.out) / record["host"] / "build-cost" / f"{args.label}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(record, indent=1))
+    print(out)
+    sys.exit(0 if all(s["status"] == 0 for s in record["steps"]) else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+# sig's configuration for benchmark runs of the rewrite, in the format of decision 28
+# (version 1: bindings in [keys], not the baseline's [ui.keys]). The same keys do the same
+# things as in baseline.config.toml, because the interaction scripts press them. bench/measure
+# replaces "{workloads}" with the absolute path of bench/workloads.
+version = 1
+
+[keys]
+"ctrl-l" = "location.focus"
+"ctrl-tab" = "tab.next"
+"ctrl-q" = "browser.quit"
+"ctrl-t" = "tab.new"
+"ctrl-w" = "tab.close"
+"ctrl-o" = "page.open {workloads}/article.html"

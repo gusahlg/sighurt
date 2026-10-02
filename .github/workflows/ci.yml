@@ -26,16 +26,20 @@ jobs:
             libasound2-dev \
             pkg-config libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
             libavdevice-dev libswscale-dev libswresample-dev \
-            libv4l-dev libudev-dev
+            libv4l-dev libudev-dev \
+            libwayland-dev libfontconfig1-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
-      # Everything except Servo, which servo.yml checks: `--workspace` alone, or sighurt-browser
-      # with its default features, would compile Servo (see CLAUDE.md, "Build commands").
+      # Everything except Servo, which servo.yml checks. These build Servo and are left out:
+      # sighurt-engine-servo, sig's default features (sighurt-browser is checked below with the
+      # other engines), and the M0 and M1 experiments. `--workspace` alone would compile Servo
+      # (see CLAUDE.md, "Build commands").
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -43,6 +47,7 @@ jobs:
         run: >
           cargo clippy --workspace
           --exclude sighurt-engine-servo --exclude sighurt-browser
+          --exclude m0-coexist --exclude m1-mixed
           --all-targets -- -D warnings
 
       - name: Clippy (sig without Servo)
@@ -50,8 +55,22 @@ jobs:
           cargo clippy -p sighurt-browser --no-default-features --features engine-demo,engine-wasm
           --all-targets -- -D warnings
 
+      # The Wasm engine's tests run these example guests (sighurt-engine-wasm/tests/).
+      - name: Build the example guests the Wasm engine's tests run
+        run: >
+          cargo build --target wasm32-unknown-unknown --release
+          -p hello-sighurt -p raf-demo -p gradient-demo -p typography-demo
+
       - name: Test (workspace without Servo)
-        run: cargo test --workspace --exclude sighurt-engine-servo --exclude sighurt-browser
+        run: >
+          cargo test --workspace
+          --exclude sighurt-engine-servo --exclude sighurt-browser
+          --exclude m0-coexist --exclude m1-mixed
+
+      # Unit tests only: the end-to-end tests (sighurt-browser/tests/headless.sh) need a
+      # compositor and run on a developer machine.
+      - name: Test (sig without Servo)
+        run: cargo test -p sighurt-browser --no-default-features --features engine-demo,engine-wasm
 
   check-wasm:
     name: Check SDK and examples (wasm32)

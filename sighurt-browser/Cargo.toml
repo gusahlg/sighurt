@@ -28,3 +28,30 @@ sighurt-ui = { path = "../sighurt-ui" }
 sighurt-engine-servo = { path = "../sighurt-engine-servo", optional = true }
 sighurt-engine-wasm = { path = "../sighurt-engine-wasm", optional = true }
 sighurt-engine-demo = { path = "../sighurt-engine-demo", optional = true }
+# The owner loop.
+calloop.workspace = true
+# The self-pipe for signals, the configuration watch (inotify) and CLOCK_MONOTONIC for the
+# diagnostics lines.
+rustix = { workspace = true, features = ["fs"] }
+# SIGUSR1 (diagnostics), SIGTERM and SIGINT (a clean quit), each handled by writing to a pipe.
+signal-hook-registry = "1.4"
+libc = "0.2"
+dirs = "5"
+serde.workspace = true
+serde_json = "1"
+url.workspace = true
+percent-encoding = "2"
+# The process's logger without Servo (decision 26).
+log = "0.4"
+env_logger = "0.11"
+# Downloads, with the features the Wasm engine uses, so both share one build of it.
+reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "stream"], default-features = false }
+# `sig` installs the TLS provider before anything builds a TLS configuration (decision 26).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
+[dev-dependencies]
+tempfile = "3"
+# The `virtual-pointer` example, a test helper that keeps one pointer plugged into a private
+# compositor.
+wayland-client.workspace = true
+smithay-client-toolkit.workspace = true

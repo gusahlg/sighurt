@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>history 0</title>
+<style>body { font: 20px sans-serif; margin: 24px; background: #eef4ee; }</style>
+<h1>Same-document history</h1>
+<p>After loading, this page adds two entries without leaving the document: a fragment
+(<code>#one</code>) and <code>history.pushState</code> (<code>#two</code>).</p>
+<script>
+  addEventListener("load", () => {
+    setTimeout(() => { location.hash = "one"; document.title = "history 1"; }, 200);
+    setTimeout(() => { history.pushState(null, "", "#two"); document.title = "history 2"; }, 400);
+  });
+</script>

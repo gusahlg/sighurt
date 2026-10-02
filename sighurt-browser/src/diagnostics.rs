@@ -1,9 +1,444 @@
-//! Logging setup and the measurements that show whether the architecture holds.
+//! The measurements that show whether the architecture holds, printed on demand and at exit.
 //!
-//! Counts and times input reception, effect dispatch, engine pumps, frame-ready notifications,
-//! paints, submissions and presentation feedback, kept distinct (submission is not display);
-//! reports each engine's version, graphics driver and presentation path (including any readback
-//! fallback), logical and buffer sizes, scale, layout epoch, buffer counts and bytes, queue
-//! depths and the last error. Never logs clipboard contents, credentials or page data.
+//! Counts loop wakeups and iterations, input events, core events and effects, engine pumps and
+//! their events, frame-ready notifications, page frames presented (and not ready), chrome
+//! paints per surface, placements, and the deepest queues seen; times the longest pump,
+//! present and chrome paint; keeps the most SHM buffers any target held, sampled after every
+//! presentation (where buffers are allocated). The host adds, per target, its metrics and its
+//! permits, submissions, frame callbacks, buffer releases and presentation feedback, kept
+//! distinct (submission is not display), and its buffers and bytes. Each engine is listed with
+//! how it renders (for Servo, the actual GL renderer and whether it is a software fallback),
+//! whether it runs, and the page readbacks it counted itself.
+//!
+//! Page readbacks are the engines' own counts (Servo counts every `read_to_image`; `sig` has
+//! no readback path of its own), taken after each frame an engine submits and at each report:
+//! `page_readbacks` is their number and `readback_bytes` their size, each counted as a whole
+//! buffer of the frame it came with (or of the page area, for one found at a report).
+//!
+//! Output, all machine-readable:
+//!
+//! - with `SIG_DIAG=1`, one stderr line per page frame and chrome paint, in the format
+//!   `bench/benchlib/parsers.py` (`SigDiag`) reads: `sig-diag t=<CLOCK_MONOTONIC s> <kind>
+//!   key=value ...`; a `renderer` line for each engine at its first frame (`mode=cpu`, or
+//!   `mode=hardware|software gl="<GL_RENDERER>"`); a `first-frame` line for a navigation
+//!   started in the active tab, at the view's first frame after it;
+//! - on SIGUSR1 and at exit (at exit only with `SIG_DIAG=1`), a `counters` line (cumulative
+//!   counts, as bench/ takes them), a `peaks` line (queue depths, longest calls) and one line
+//!   per target and engine;
+//! - with `--diagnostics FILE`, the same as JSON in FILE, rewritten on SIGUSR1 and at exit.
+//!
+//! Never logs clipboard contents, credentials, URLs or other page data.
 //!
 //! Must not own: decisions based on these numbers.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::Serialize;
+use serde_json::{json, Value};
+
+/// CLOCK_MONOTONIC in seconds: the clock of the `t=` field, which bench/ compares with its own.
+pub fn monotonic() -> f64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    now.tv_sec as f64 + now.tv_nsec as f64 / 1e9
+}
+
+/// Cumulative counts since `sig` started, never reset.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Counters {
+    /// Times the loop woke up from waiting.
+    pub wakeups: u64,
+    /// Loop iterations, with or without waiting before them.
+    pub iterations: u64,
+    /// Input events from the host.
+    pub input_events: u64,
+    /// Pointer motion events dropped because a newer one for the same target followed.
+    pub motions_coalesced: u64,
+    /// Events handed to the core.
+    pub core_events: u64,
+    /// Effects the core returned.
+    pub effects: u64,
+    /// Engine pumps.
+    pub pumps: u64,
+    /// Events engines reported.
+    pub engine_events: u64,
+    /// `FrameReady` events.
+    pub frame_ready: u64,
+    /// Page frames an engine painted. The same as `page_frames_presented` in `sig`: an engine
+    /// reports a frame only by submitting it (a frame it painted and threw away is its own).
+    pub page_frames_painted: u64,
+    /// Page frames an engine submitted to the compositor (not proof they were displayed).
+    pub page_frames_presented: u64,
+    /// Permits an engine had no frame for yet.
+    pub page_not_ready: u64,
+    /// Permits an engine had nothing new for.
+    pub page_unchanged: u64,
+    /// `present` calls that failed.
+    pub present_errors: u64,
+    /// Page readbacks to the CPU the engines counted.
+    pub page_readbacks: u64,
+    /// Their bytes, each readback counted as a whole buffer of its page.
+    pub readback_bytes: u64,
+    /// Chrome-drawn surfaces painted, all of them.
+    pub chrome_paints: u64,
+    /// The chrome surface at the top painted.
+    pub paints_chrome: u64,
+    /// The status strip painted.
+    pub paints_status: u64,
+    /// A page the chrome draws (`sig://home`, errors) painted.
+    pub paints_page: u64,
+    /// Placements applied.
+    pub placements: u64,
+    /// Placements the host refused.
+    pub placement_errors: u64,
+    /// Configuration reloads, valid or not.
+    pub config_reloads: u64,
+    /// Session snapshots handed to the writer.
+    pub session_saves: u64,
+}
+
+/// The largest values seen since `sig` started: queue depths and the longest calls.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Peaks {
+    /// The most host events handled in one pass.
+    pub max_host_queue: u64,
+    /// The most events one engine pump reported.
+    pub max_pump_events: u64,
+    /// The longest engine pump, in microseconds.
+    pub max_pump_us: u64,
+    /// The longest `present`, in microseconds.
+    pub max_present_us: u64,
+    /// The longest chrome paint, in microseconds.
+    pub max_chrome_paint_us: u64,
+    /// The most SHM buffers one target held, of every generation.
+    pub max_target_buffers: u64,
+    /// The most superseded generations one target still held.
+    pub max_retiring_generations: u64,
+    /// The most bytes of SHM buffers all targets held together.
+    pub max_buffer_bytes: u64,
+}
+
+/// One target, as the host and `sig` see it.
+#[derive(Clone, Debug, Serialize)]
+pub struct TargetReport {
+    /// What it is: "chrome", "status", "page" (drawn by the chrome) or "view".
+    pub role: &'static str,
+    /// For a view, its engine and its tab's position in the tab strip, from 1.
+    pub engine: Option<String>,
+    pub tab: Option<usize>,
+    /// Logical size and buffer size, and the scale's numerator over 120.
+    pub width: u32,
+    pub height: u32,
+    pub buffer_width: u32,
+    pub buffer_height: u32,
+    pub scale: u32,
+    pub mapped: bool,
+    pub shown: bool,
+    pub awaiting_callback: bool,
+    pub permits: u64,
+    pub submissions: u64,
+    pub frame_callbacks: u64,
+    pub releases: u64,
+    pub presented: u64,
+    pub discarded: u64,
+    pub late: u64,
+    pub buffers: usize,
+    pub buffer_bytes: usize,
+    pub retiring_generations: usize,
+    pub retiring_bytes: usize,
+}
+
+/// One compiled-in engine.
+#[derive(Clone, Debug, Serialize)]
+pub struct EngineReport {
+    pub name: &'static str,
+    /// How it renders and presents.
+    pub renderer: &'static str,
+    /// For a GL engine once it has a context: "hardware" or "software", and the GL renderer.
+    pub gl: Option<String>,
+    /// Page readbacks to the CPU the engine counted (Servo's `read_to_image`); 0 on the
+    /// display path and for the CPU engines, which paint into the host's buffers.
+    pub readbacks: u64,
+    /// "not started", "running", "shut down" or "failed: why".
+    pub state: String,
+}
+
+/// Everything printed at once.
+pub struct Report {
+    pub counters: Counters,
+    pub peaks: Peaks,
+    pub targets: Vec<TargetReport>,
+    pub engines: Vec<EngineReport>,
+    /// The active tab's position in the tab strip, from 1.
+    pub active_tab: usize,
+    /// What the status strip shows: "notice", "page" or "error" (never the text itself).
+    pub status: Option<&'static str>,
+    /// The compositor's optional protocols, as the host reports them.
+    pub capabilities: String,
+    /// Host events not taken yet.
+    pub pending_host_events: usize,
+    pub last_error: Option<String>,
+}
+
+/// Where diagnostics go.
+pub struct Diagnostics {
+    /// `SIG_DIAG=1`: frame and paint lines on stderr.
+    lines: bool,
+    /// `--diagnostics FILE`.
+    file: Option<PathBuf>,
+    pub counters: Counters,
+    pub peaks: Peaks,
+    last_error: Option<String>,
+    /// Each engine's readback count already accounted for.
+    readbacks_seen: BTreeMap<String, u64>,
+    /// The engines whose renderer line was printed.
+    renderers: BTreeSet<String>,
+}
+
+impl Diagnostics {
+    pub fn new(file: Option<PathBuf>) -> Self {
+        Self {
+            lines: std::env::var_os("SIG_DIAG").is_some_and(|v| v == "1"),
+            file,
+            counters: Counters::default(),
+            peaks: Peaks::default(),
+            last_error: None,
+            readbacks_seen: BTreeMap::new(),
+            renderers: BTreeSet::new(),
+        }
+    }
+
+    /// Records an error for the report, and logs it.
+    pub fn error(&mut self, error: String) {
+        log::warn!("{error}");
+        self.last_error = Some(error);
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.clone()
+    }
+
+    fn line(&self, kind: &str, fields: std::fmt::Arguments<'_>) {
+        eprintln!("sig-diag t={:.6} {kind} {fields}", monotonic());
+    }
+
+    /// Whether `engine`'s renderer line was printed.
+    pub fn knows_renderer(&self, engine: &str) -> bool {
+        self.renderers.contains(engine)
+    }
+
+    /// How `engine` renders: `mode` is "cpu", "hardware" or "software", `gl` the GL renderer.
+    /// Printed once per engine.
+    pub fn renderer(&mut self, engine: &str, mode: &str, gl: Option<&str>) {
+        if !self.renderers.insert(engine.to_owned()) || !self.lines {
+            return;
+        }
+        match gl {
+            Some(gl) => self.line(
+                "renderer",
+                format_args!("engine={engine} mode={mode} gl={gl:?}"),
+            ),
+            None => self.line("renderer", format_args!("engine={engine} mode={mode}")),
+        }
+    }
+
+    /// `engine` has counted `total` page readbacks so far: counts the new ones, each as
+    /// `bytes_each`, and returns their bytes.
+    pub fn readbacks(&mut self, engine: &str, total: u64, bytes_each: u64) -> u64 {
+        let seen = self.readbacks_seen.entry(engine.to_owned()).or_default();
+        let new = total.saturating_sub(*seen);
+        *seen = total;
+        let bytes = new.saturating_mul(bytes_each);
+        self.counters.page_readbacks += new;
+        self.counters.readback_bytes += bytes;
+        bytes
+    }
+
+    /// A page frame an engine submitted, `paint` after `present` was called, with the bytes
+    /// of the readbacks counted since the engine's previous frame.
+    pub fn frame(
+        &mut self,
+        engine: &str,
+        view: &str,
+        size: (u32, u32),
+        paint: Duration,
+        readback_bytes: u64,
+    ) {
+        self.counters.page_frames_painted += 1;
+        self.counters.page_frames_presented += 1;
+        self.peaks.max_present_us = self.peaks.max_present_us.max(micros(paint));
+        if self.lines {
+            self.line(
+                "frame",
+                format_args!(
+                    "engine={engine} view={view} w={} h={} presented=1 readback_bytes={readback_bytes} paint_ms={:.3}",
+                    size.0,
+                    size.1,
+                    paint.as_secs_f64() * 1e3
+                ),
+            );
+        }
+    }
+
+    /// The SHM buffers the targets hold now, per target (buffers, retiring generations) and in
+    /// bytes altogether: keeps the largest.
+    pub fn buffers(&mut self, per_target: impl Iterator<Item = (usize, usize)>, bytes: usize) {
+        let p = &mut self.peaks;
+        for (buffers, retiring) in per_target {
+            p.max_target_buffers = p.max_target_buffers.max(buffers as u64);
+            p.max_retiring_generations = p.max_retiring_generations.max(retiring as u64);
+        }
+        p.max_buffer_bytes = p.max_buffer_bytes.max(bytes as u64);
+    }
+
+    /// A view's first frame after it was asked to navigate, `after` the request.
+    pub fn first_frame(&self, engine: &str, after: Duration) {
+        if self.lines {
+            self.line(
+                "first-frame",
+                format_args!(
+                    "engine={engine} after_navigate_ms={:.3}",
+                    after.as_secs_f64() * 1e3
+                ),
+            );
+        }
+    }
+
+    /// A chrome-drawn surface painted.
+    pub fn chrome(&mut self, surface: &'static str, draw: Duration) {
+        let c = &mut self.counters;
+        c.chrome_paints += 1;
+        match surface {
+            "chrome" => c.paints_chrome += 1,
+            "status" => c.paints_status += 1,
+            _ => c.paints_page += 1,
+        }
+        let p = &mut self.peaks;
+        p.max_chrome_paint_us = p.max_chrome_paint_us.max(micros(draw));
+        if self.lines {
+            self.line(
+                "chrome",
+                format_args!("surface={surface} draw_ms={:.3}", draw.as_secs_f64() * 1e3),
+            );
+        }
+    }
+
+    /// An engine pump took `took` and reported `events`.
+    pub fn pump(&mut self, events: usize, took: Duration) {
+        self.counters.pumps += 1;
+        self.counters.engine_events += events as u64;
+        let p = &mut self.peaks;
+        p.max_pump_events = p.max_pump_events.max(events as u64);
+        p.max_pump_us = p.max_pump_us.max(micros(took));
+    }
+
+    /// Prints `report` on stderr (on SIGUSR1; at exit with `SIG_DIAG=1`) and writes the file.
+    pub fn report(&self, report: &Report, at_exit: bool) {
+        if !at_exit || self.lines {
+            let counters = serde_json::to_value(&report.counters).expect("plain counters");
+            self.line("counters", format_args!("{}", pairs(&counters)));
+            let peaks = serde_json::to_value(&report.peaks).expect("plain numbers");
+            self.line("peaks", format_args!("{}", pairs(&peaks)));
+            for target in &report.targets {
+                let value = serde_json::to_value(target).expect("plain data");
+                self.line("target", format_args!("{}", pairs(&value)));
+            }
+            for engine in &report.engines {
+                let value = serde_json::to_value(engine).expect("plain data");
+                self.line("engine", format_args!("{}", pairs(&value)));
+            }
+        }
+        if let Some(file) = &self.file {
+            let value = json!({
+                "t": monotonic(),
+                "exit": at_exit,
+                "counters": report.counters,
+                "peaks": report.peaks,
+                "targets": report.targets,
+                "engines": report.engines,
+                "active_tab": report.active_tab,
+                "status": report.status,
+                "capabilities": report.capabilities,
+                "pending_host_events": report.pending_host_events,
+                "last_error": report.last_error,
+            });
+            let text = serde_json::to_string_pretty(&value).expect("plain data");
+            if let Err(error) = std::fs::write(file, text + "\n") {
+                log::warn!(
+                    "cannot write the diagnostics to {}: {error}",
+                    file.display()
+                );
+            }
+        }
+    }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// An object's fields as `key=value` pairs, strings quoted when they need it, booleans 0 or 1.
+fn pairs(object: &Value) -> String {
+    let Value::Object(fields) = object else {
+        return String::new();
+    };
+    let mut out = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        let value = match value {
+            Value::Null => continue,
+            Value::Bool(b) => u8::from(*b).to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::String(s) if !s.is_empty() && !s.contains([' ', '"', '\'', '\\']) => s.clone(),
+            Value::String(s) => format!("{s:?}"),
+            other => format!("{:?}", other.to_string()),
+        };
+        out.push(format!("{key}={value}"));
+    }
+    out.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairs_are_what_the_bench_parser_splits() {
+        let value = json!({"a": 1, "b": true, "c": "two words", "d": null, "e": "x"});
+        assert_eq!(pairs(&value), r#"a=1 b=1 c="two words" e=x"#);
+    }
+
+    #[test]
+    fn readbacks_are_counted_once_each() {
+        let mut diag = Diagnostics::new(None);
+        assert_eq!(diag.readbacks("servo", 0, 400), 0);
+        assert_eq!(diag.readbacks("servo", 2, 400), 800);
+        assert_eq!(diag.readbacks("servo", 2, 400), 0);
+        assert_eq!(diag.readbacks("demo", 1, 100), 100);
+        assert_eq!(diag.readbacks("servo", 3, 50), 50);
+        assert_eq!(diag.counters.page_readbacks, 4);
+        assert_eq!(diag.counters.readback_bytes, 950);
+    }
+
+    #[test]
+    fn buffer_peaks_keep_the_largest() {
+        let mut diag = Diagnostics::new(None);
+        diag.buffers([(2, 0), (3, 1)].into_iter(), 1000);
+        diag.buffers([(1, 2)].into_iter(), 500);
+        let p = &diag.peaks;
+        assert_eq!(
+            (
+                p.max_target_buffers,
+                p.max_retiring_generations,
+                p.max_buffer_bytes
+            ),
+            (3, 2, 1000)
+        );
+    }
+
+    #[test]
+    fn the_clock_is_monotonic_seconds() {
+        let (a, b) = (monotonic(), monotonic());
+        assert!(a > 0.0 && b >= a);
+    }
+}

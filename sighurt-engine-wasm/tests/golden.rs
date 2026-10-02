@@ -165,3 +165,41 @@ fn painting_a_large_page() {
         );
     }
 }
+
+/// How long painting holds the owner thread for a laptop-sized page, 1280×800 logical pixels
+/// at 100 % and 200 % (a 2560×1600 buffer), while the guest animates: the time `present` spends
+/// painting into the buffer it was lent. Prints the median and the slowest of 60 frames; run it
+/// in a release build (`cargo test --release -p sighurt-engine-wasm --test golden presenting --
+/// --nocapture --test-threads=1`).
+#[test]
+fn presenting_at_laptop_sizes() {
+    for name in ["raf-demo", "gradient-demo", "typography-demo"] {
+        for scale in [120, 240] {
+            let mut host = Host::new();
+            let (view, shown) = host.open(1280, 800, scale);
+            host.navigate(view, &example(name));
+            host.until(Duration::from_secs(20), is_frame_ready(view));
+            host.run_for(Duration::from_millis(100));
+            let mut times = Vec::new();
+            for _ in 0..60 {
+                // The guest's next frame (raf-demo moves its ball), then a new layout epoch at
+                // the same size, so the static gradient-demo is painted again too.
+                host.run_for(Duration::from_millis(16));
+                host.command(
+                    view,
+                    EngineCommand::SetMetrics(common::metrics(1280, 800, scale)),
+                );
+                assert_eq!(host.present(view), PresentOutcome::Submitted);
+                times.push(shown.painting());
+            }
+            times.sort();
+            eprintln!(
+                "{name} 1280x800 @{}: median {:?}, slowest {:?}",
+                f64::from(scale) / 120.0,
+                times[times.len() / 2],
+                times[times.len() - 1]
+            );
+            assert!(times.iter().all(|t| *t < Duration::from_secs(1)));
+        }
+    }
+}

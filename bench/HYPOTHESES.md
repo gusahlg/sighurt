@@ -14,6 +14,14 @@ differ by more than the larger IQR.
 
 The baseline numbers each hypothesis starts from are in [`results/BASELINE.md`](results/BASELINE.md).
 
+**Amended on 27 September 2026, before any build of the rewrite was measured** (the review of
+the harness): `ipc_out_mib_per_s` measures what engine *processes* write, so for the in-process
+rewrite it is 0 by construction and says nothing about copies; `bench/compare` leaves it and the
+`_browser`/`_engines` split out when the builds place engines differently. H2 and H8 now name
+the metrics that do measure it. The chrome-input latencies of H5 and H9 are now
+`input_to_pixels` (screenshots of the chrome), since GPUI's draw log misses the redraws a key
+causes (README, "Known limits"). H10 and H11 are new, for the two workloads added then.
+
 ## Open
 
 ### H1: Direct presentation removes Servo's readback (M1, M4)
@@ -30,10 +38,11 @@ The baseline numbers each hypothesis starts from are in [`results/BASELINE.md`](
 
 - **Change:** the same, seen from the browser: no frame crosses a pipe and GPUI no longer
   uploads it as a texture and draws it.
-- **Prediction:** `ipc_pixel_mib_per_s` and `ipc_out_mib_per_s` fall to 0 on every workload,
-  and `active.cpu_pct` and `steady.cpu_pct` fall on the animation workloads (`css-animation`,
-  `canvas`, `webgl`), by at least the baseline's CPU share of reading, comparing and sending
-  frames (`read_p50_ms` + `send_p50_ms` per produced frame, times the frame rate).
+- **Prediction:** `ipc_pixel_mib_per_s` falls to 0 on every workload (the new build reports
+  its frames with `ipc_pixel_bytes = 0`; there is no pipe), and `active.cpu_pct` and
+  `steady.cpu_pct` fall on the animation workloads (`css-animation`, `canvas`, `webgl`), by at
+  least the baseline's CPU share of reading, comparing and sending frames (`read_p50_ms` +
+  `send_p50_ms` per produced frame, times the frame rate).
 - **Guards:** `active.input_to_screen_p50_ms` on `long` and `article`; `steady.fps_produced`
   on the animations must not drop.
 
@@ -64,7 +73,7 @@ The baseline numbers each hypothesis starts from are in [`results/BASELINE.md`](
   runtime, font and GL context each).
 - **Risk:** hidden WebViews may keep GPU memory (§27): watch `steady.gpu_fb_tree_mib` and
   `steady.gpu_mem_used_mib`.
-- **Guards:** `active.input_to_screen_p50_ms` (tab switches) on `many-tabs`.
+- **Guards:** `active.input_to_pixels_p50_ms` (tab switches) on `many-tabs`.
 
 ### H6: Resizes stay bounded (M1, M3)
 
@@ -85,17 +94,38 @@ The baseline numbers each hypothesis starts from are in [`results/BASELINE.md`](
 - **Change:** the Wasm engine draws its guests on the CPU into its own surface (§15) instead of
   sending draw lists for GPUI to paint.
 - **Prediction:** no change beyond noise in `steady.cpu_pct` and `active.cpu_pct` on
-  `wasm-hello`, `wasm-gradient`, `wasm-raf` and `wasm-timer`; `ipc_out_mib_per_s` falls to 0.
-  This is a guard hypothesis (§27: CPU Wasm rendering may be too slow), not an expected gain.
+  `wasm-hello`, `wasm-gradient`, `wasm-raf` and `wasm-timer` (whole tree: the baseline's
+  `sig-wasm` process is in it). This is a guard hypothesis (§27: CPU Wasm rendering may be too
+  slow), not an expected gain.
 
 ### H9: A busy guest in the same process doesn't slow the chrome (M5)
 
 - **Change:** the Wasm engine runs in `sig`'s process (§15, §18) instead of its own.
-- **Prediction:** on `wasm-busy`, `active.input_to_screen_p50_ms` and `_p95_ms` (opening and
+- **Prediction:** on `wasm-busy`, `active.input_to_pixels_p50_ms` and `_p95_ms` (opening and
   closing a tab while the guest burns most of its fuel every frame) are not higher than the
   baseline's beyond noise, where the guest has its own process. This is M5's "guest activity
   does not starve chrome input", measured.
 - **Guards:** `steady.cpu_pct` on `wasm-busy` (the guest's own cost should not change much).
+
+### H10: The host bounds what a flooding guest makes it keep (M5)
+
+- **Change:** the Wasm engine's limits on draw commands (200 000 a frame), raster work and
+  console lines (§15, §25, decision 43), with the guest in `sig`'s process.
+- **Prediction:** on `wasm-flood`, `active.pss_growth_mib` and `active.pss_peak_mib` are not
+  higher than the baseline's beyond noise, and neither is `active.input_to_pixels_p50_ms`
+  (chrome input while the guest floods).
+- **Guards:** no run of `wasm-flood` has an anomaly (a crash or a forced quit).
+
+### H11: Busy background workers don't starve the page or the chrome (M5)
+
+- **Change:** Wasm workers become threads of `sig`'s process (§15, §18) instead of threads of
+  the page's `sig-wasm` process.
+- **Prediction:** on `wasm-workers`, `active.input_to_pixels_p50_ms` and `_p95_ms` are not
+  higher than the baseline's beyond noise.
+- **Guards:** `steady.cpu_pct` on `wasm-workers` (four busy workers cost about four CPUs either
+  way). The page's animation rate is a secondary observation, compared by hand: the baseline
+  shows it only as GPUI window draws (`steady.browser_fps`), the rewrite as its own presented
+  frames (`steady.fps_delivered`).
 
 ## Tested
 

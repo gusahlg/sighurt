@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use servo::{
-    EventLoopWaker, JSValue, JavaScriptEvaluationError, Opts, RenderingContext, Servo,
+    EventLoopWaker, JSValue, JavaScriptEvaluationError, Opts, Preferences, RenderingContext, Servo,
     ServoBuilder, ServoDelegate, ServoError, SoftwareRenderingContext, WebView, WebViewBuilder,
     WebViewDelegate,
 };
@@ -31,7 +31,8 @@ pub struct View {
 
 impl Web {
     /// Builds Servo with `profile` as its profile directory. `hard_fail` is off: Servo's default
-    /// exits the whole process when a page panics.
+    /// exits the whole process when a page panics. Pages get `ServoTestUtils`, so one can panic
+    /// its script thread.
     pub fn new(profile: PathBuf) -> Self {
         let waker = Waker::default();
         let servo = ServoBuilder::default()
@@ -39,6 +40,10 @@ impl Web {
                 hard_fail: false,
                 config_dir: Some(profile),
                 ..Opts::default()
+            })
+            .preferences(Preferences {
+                dom_servo_helpers_enabled: true,
+                ..Preferences::default()
             })
             .event_loop_waker(Box::new(waker.clone()))
             .build();

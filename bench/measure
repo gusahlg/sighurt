@@ -7,9 +7,9 @@ lock) and tools/headless-sway (a private compositor). By hand:
     bench/measure --build bench/builds/baseline.toml --workload article --out /tmp/run.json
 
 It waits for the machine to be quiet, starts `sig` with fresh profile and config directories,
-samples the process tree, GPU and screen, drives the interaction script with a virtual pointer
-(benchlib/pointer.py), wtype and swaymsg, quits through the build's key binding and computes the
-metrics (benchlib/metrics.py).
+samples the process tree, GPU and screen, drives the interaction script with a virtual pointer and
+keyboard (benchlib/seat.py) and swaymsg, quits through the build's key binding, checks how `sig`
+ended and computes the metrics (benchlib/metrics.py).
 """
 
 import argparse
@@ -18,6 +18,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import resource
 import shutil
 import signal
@@ -31,7 +32,7 @@ import tomllib
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from benchlib import metrics, parsers, pointer, probes  # noqa: E402
+from benchlib import metrics, parsers, probes, seat  # noqa: E402
 
 OUTPUT = "HEADLESS-1"
 
@@ -39,27 +40,41 @@ OUTPUT = "HEADLESS-1"
 # ── Interaction scripts ─────────────────────────────────────────────────────────────────────
 #
 # Each gets the run's context and the active window's length, and returns when it is over.
-# The pointer is one virtual device for the whole run (benchlib/pointer.py). Keys go through a
-# wtype process per action, which creates (and removes) a virtual keyboard with its keymap each
-# time; the seat keeps its keyboard capability, so no key is lost, and the keymap churn is part
-# of every workload and the same for every build.
+# The pointer and the keyboard are one virtual device each for the whole run (benchlib/seat.py),
+# created before `sig` starts, so the seat has both from its first frame on and no event is lost
+# to a device coming and going.
 
 
 def run_tool(*args):
     subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
 
 
-def send_input(ctx, kind, *args):
-    """Runs an input tool and records when it returned, as the input's time for the latency
-    metrics (metrics.latency): the event has reached the compositor by then. `kind` is "page"
-    for input the page handles, "chrome" for input the browser handles."""
-    run_tool(*args)
-    ctx["inputs"].append((time.monotonic(), kind))
+def chrome_keys(ctx, combo, limit):
+    """Presses `combo` ("ctrl+t"), input the browser itself handles, and records when it was
+    sent (the events are in the compositor's socket by then) for the latency metrics
+    (metrics.latency, from the build's diagnostics), and how long until the chrome's pixels
+    changed on screen (metrics.pixel_latency): screenshots of the chrome, one after another,
+    for at most `limit` seconds. That needs nothing from the build, which matters: GPUI logs only
+    the draws of its frame callback, not the one it makes while dispatching a key."""
+    before = probes.screenshot(ctx["chrome_region"]) if ctx["chrome_region"] else None
+    ctx["seat"].press(combo)
+    sent = time.monotonic()
+    ctx["inputs"].append((sent, "chrome"))
+    if before is None:
+        return
+    while time.monotonic() < sent + limit:
+        shot = probes.screenshot(ctx["chrome_region"])
+        if shot and shot[2] != before[2]:
+            # When the screenshot that shows the change was taken: at most one screenshot
+            # (about 16 ms) after the change.
+            ctx["pixels"].append((sent, time.monotonic() - sent))
+            return
+    ctx["pixels"].append((sent, None))
 
 
 def move_to_page(ctx, x, y):
     """Puts the pointer at (x, y) of the page area."""
-    ctx["pointer"].move_to(x, ctx["page_top"] + y, *ctx["output"])
+    ctx["seat"].move_to(x, ctx["page_top"] + y, *ctx["output"])
 
 
 def at_rate(period, duration, action):
@@ -85,7 +100,7 @@ def scroll(notches):
         n = int(duration * 10)
 
         def turn(k):
-            ctx["pointer"].scroll(notches(k, n))
+            ctx["seat"].scroll(notches(k, n))
             ctx["inputs"].append((time.monotonic(), "page"))
 
         at_rate(0.1, duration, turn)
@@ -104,16 +119,16 @@ def script_type_url(ctx, duration):
     """Focuses the URL bar, types into it five characters a second, and leaves it with Escape
     (which drops the text and gives the page the focus again)."""
     start = time.monotonic()
-    run_tool("wtype", "-M", "ctrl", "-k", "l", "-m", "ctrl")
+    ctx["seat"].press("ctrl+l")
     time.sleep(0.5)
-    run_tool("wtype", "-d", "200", "sighurt benchmark typing test")
+    ctx["seat"].type("sighurt benchmark typing test", 0.2)
     time.sleep(0.5)
-    run_tool("wtype", "-k", "Escape")
+    ctx["seat"].press("escape")
     time.sleep(max(0.0, start + duration - time.monotonic()))
 
 
 def script_cycle_tabs(ctx, duration):
-    at_rate(1.0, duration, lambda k: send_input(ctx, "chrome", "wtype", "-M", "ctrl", "-k", "Tab", "-m", "ctrl"))
+    at_rate(1.0, duration, lambda k: chrome_keys(ctx, "ctrl+tab", limit=0.9))
 
 
 def script_tab_toggle(ctx, duration):
@@ -121,11 +136,11 @@ def script_tab_toggle(ctx, duration):
     whose latency to the browser's next frame is measured."""
 
     def toggle(k):
-        send_input(ctx, "chrome", "wtype", "-M", "ctrl", "-k", "tw"[k % 2], "-m", "ctrl")
+        chrome_keys(ctx, "ctrl+" + "tw"[k % 2], limit=0.45)
 
     at_rate(0.5, duration, toggle)
     if int(duration / 0.5) % 2:
-        run_tool("wtype", "-M", "ctrl", "-k", "w", "-m", "ctrl")
+        ctx["seat"].press("ctrl+w")
 
 
 def script_tab_churn(ctx, duration):
@@ -133,11 +148,11 @@ def script_tab_churn(ctx, duration):
     (ctrl+w): an engine view created and destroyed per cycle."""
 
     def cycle(k):
-        run_tool("wtype", "-M", "ctrl", "-k", "t", "-m", "ctrl")
+        ctx["seat"].press("ctrl+t")
         time.sleep(0.3)
-        run_tool("wtype", "-M", "ctrl", "-k", "o", "-m", "ctrl")
+        ctx["seat"].press("ctrl+o")
         time.sleep(1.2)
-        run_tool("wtype", "-M", "ctrl", "-k", "w", "-m", "ctrl")
+        ctx["seat"].press("ctrl+w")
 
     at_rate(2.0, duration, cycle)
 
@@ -155,7 +170,7 @@ def script_timer_clicks(ctx, duration):
     for x, y in TIMER_BUTTONS:
         move_to_page(ctx, x, y)
         time.sleep(0.1)
-        ctx["pointer"].click()
+        ctx["seat"].click()
         time.sleep(0.2)
     move_to_page(ctx, 600, 500)
     time.sleep(max(0.0, start + duration - time.monotonic()))
@@ -276,9 +291,25 @@ def alive(pids):
     return out
 
 
+# Lines on stderr that mean something crashed, whichever process wrote them: a Rust panic, an
+# abort, a fatal signal or a lost GPU. Each is an anomaly of the run (the baseline's first set
+# counted a GPU crash as a clean run).
+CRASH = re.compile(r"panicked at|fatal runtime error|Segmentation fault|SIGSEGV|core dumped|GPU has crashed|VK_ERROR_DEVICE_LOST")
+
+
+def exit_description(code):
+    """What a Popen returncode says about how the process ended."""
+    if code is None:
+        return "still running"
+    if code < 0:
+        return f"killed by {signal.Signals(-code).name}"
+    return f"exit status {code}"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build", required=True, help="builds/<name>.toml")
+    ap.add_argument("--build-dir", help="the build's directory, instead of the toml's `dir`")
     ap.add_argument("--workload", required=True)
     ap.add_argument("--workloads", default=str(HERE / "workloads.toml"))
     ap.add_argument("--out", required=True, help="the run's JSON file")
@@ -292,7 +323,7 @@ def main():
     build_path = pathlib.Path(args.build).resolve()
     build = tomllib.loads(build_path.read_text())
     build_name = build_path.stem
-    build_dir = pathlib.Path(os.path.expanduser(build["dir"]))
+    build_dir = pathlib.Path(os.path.expanduser(args.build_dir or build["dir"]))
     workload = tomllib.loads(pathlib.Path(args.workloads).read_text())[args.workload]
     script_name = workload.get("script", "none")
     script = SCRIPTS[script_name]
@@ -300,6 +331,10 @@ def main():
     raw = pathlib.Path(args.raw) if args.raw else None
     if raw:
         raw.mkdir(parents=True, exist_ok=True)
+    # The signal that makes the build print its counters (benchlib/parsers.py, "counters"),
+    # sent at every mark after the first frame. Only for builds that handle it: by default it
+    # would kill the process.
+    counters_signal = signal.Signals[build["counters_signal"]] if build.get("counters_signal") else None
 
     gate = quiesce(args.max_busy_cores, args.max_gpu, args.max_wait)
     width, height = output_size()
@@ -321,6 +356,7 @@ def main():
 
     parse = parsers.make(build.get("parsers", []))
     events = []
+    crashes, unparsed = [], []
     stderr_log = open(raw / "stderr.log", "w") if raw else None
     gpu = probes.GpuSampler()
     gpu.start()
@@ -328,9 +364,10 @@ def main():
     env_before = dynamic_environment()
 
     top, bottom = build.get("chrome_top", 0), build.get("chrome_bottom", 0)
-    # The pointer exists before sig starts, so the seat has a pointer from its first frame on.
+    # The seat's pointer and keyboard exist before sig starts, so it has both from its first
+    # frame on.
     ctx = {"output": (width, height), "page_top": top, "page_center": (width // 2, (height - top - bottom) // 2),
-           "pointer": pointer.VirtualPointer(), "inputs": []}
+           "chrome_region": (0, 0, width, top) if top else None, "seat": seat.Seat(), "inputs": [], "pixels": []}
 
     usage_before = [resource.getrusage(who) for who in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)]
     launch = time.monotonic()
@@ -356,14 +393,23 @@ def main():
             text = line.decode(errors="replace").rstrip("\n")
             if stderr_log:
                 stderr_log.write(f"{t - launch:9.4f} {text}\n")
-            if (event := parse(text)) is not None:
-                events.append((t, event))
+            if CRASH.search(text):
+                crashes.append((t, text))
+            try:
+                event = parse(text)
+            except ValueError as e:
+                unparsed.append(f"{e}: {text[:200]}")
+                continue
+            if event is not None:
+                # An event stamped by the build (CLOCK_MONOTONIC, like time.monotonic()) is
+                # placed at that time, not when this thread read it.
+                events.append((event.pop("t", t), event))
 
     reader = threading.Thread(target=read_stderr, daemon=True)
     reader.start()
 
     screen = probes.ScreenWatcher(
-        chrome_region=(0, 0, width, top) if top else None,
+        chrome_region=ctx["chrome_region"],
         page_region=(40, top + 16, width - 80, height - top - bottom - 32),
     )
     screen.watch(since=launch, stop_if=lambda: proc.poll() is not None)
@@ -381,6 +427,8 @@ def main():
     def mark(name):
         sampler.mark(name)
         gpu.snapshot(name)
+        if counters_signal and proc.poll() is None:
+            os.kill(proc.pid, counters_signal)
 
     windows = [("startup", "launch", "steady_start"), ("steady", "steady_start", "steady_end"),
                ("active", "steady_end", "active_end"), ("total", "launch", "active_end")]
@@ -396,7 +444,7 @@ def main():
     if raw:
         run_tool("grim", str(raw / "active-end.png"))
     if proc.poll() is not None:
-        anomalies.append(f"sig exited during the run with status {proc.returncode}")
+        anomalies.append(f"sig ended during the run: {exit_description(proc.returncode)}")
 
     # The harness's own CPU from launch to here (sampling, parsing, grim and the input tools),
     # which runs beside the browser: it isn't in the tree's numbers, but it shares the machine.
@@ -409,11 +457,11 @@ def main():
     seen = list(sampler.full[-1][1])
     sampler.stop()
     quit_at = time.monotonic()
-    run_tool("wtype", "-M", "ctrl", "-k", "q", "-m", "ctrl")
+    ctx["seat"].press("ctrl+q")
     forced = None
     for sig, wait in [(None, 10), (signal.SIGTERM, 5), (signal.SIGKILL, 5)]:
         if sig is not None:
-            forced = sig.name
+            forced = sig
             for pid in alive(seen):
                 try:
                     os.kill(pid, sig)
@@ -431,14 +479,24 @@ def main():
     if not alive(seen):
         # Everything exited: don't signal pids that may be reused by now.
         atexit.unregister(kill_leftovers)
+        proc.wait()
     reader.join(timeout=5)
-    ctx["pointer"].close()
+    ctx["seat"].close()
     gpu.stop()
     if stderr_log:
         stderr_log.close()
     shutil.rmtree(home, ignore_errors=True)
     if forced:
-        anomalies.append(f"did not quit within 10 s of ctrl-q; sent {forced}")
+        anomalies.append(f"did not quit within 10 s of ctrl-q; sent {forced.name}")
+    # How sig ended: anything but a clean exit, or the signal the harness itself sent, is a
+    # crash (an abort while quitting, say) that the numbers must not silently include.
+    if proc.returncode != 0 and not (forced and proc.returncode == -forced):
+        anomalies.append(f"sig ended abnormally: {exit_description(proc.returncode)}")
+    if crashes:
+        t, text = crashes[0]
+        anomalies.append(f"stderr has {len(crashes)} crash line(s), the first at {t - launch:.2f} s: {text[:200]}")
+    if unparsed:
+        anomalies.append(f"{len(unparsed)} diagnostics line(s) not understood, the first: {unparsed[0]}")
 
     result = {
         "workload": args.workload,
@@ -452,8 +510,10 @@ def main():
         "processes": {str(pid): {"comm": sampler.comms.get(pid), "ppid": sampler.parents.get(pid)} for pid in sampler.comms if pid != sway_pid},
         "screen_polls": screen.polls,
         "harness_cpu": harness_cpu,
+        "exit": {"returncode": proc.returncode, "description": exit_description(proc.returncode),
+                 "signal_sent": forced.name if forced else None},
         "anomalies": anomalies,
-        "metrics": metrics.run_metrics(sampler, gpu, events, sway_pid, launch, screen, windows, ctx["inputs"]),
+        "metrics": metrics.run_metrics(sampler, gpu, events, sway_pid, launch, screen, windows, ctx["inputs"], ctx["pixels"]),
     }
     result["metrics"]["shutdown.s"] = shutdown_s
     result["metrics"]["shutdown.forced"] = 0 if forced is None else 1

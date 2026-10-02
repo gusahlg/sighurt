@@ -14,17 +14,47 @@ def load(path):
     return {"path": path, "set": json.loads((path / "set.json").read_text()), "runs": runs}
 
 
-def values(result_set):
-    """{workload: {metric: [values of the measured (non-warmup) runs]}}."""
+def values(result_set, exclude_anomalous=False):
+    """{workload: {metric: [values of the measured (non-warmup) runs]}}, without the runs that
+    have anomalies if `exclude_anomalous`."""
     out = {}
     for run in result_set["runs"]:
-        if run.get("warmup"):
+        if run.get("warmup") or (exclude_anomalous and run.get("anomalies")):
             continue
         per = out.setdefault(run["workload"], {})
         for metric, value in run["metrics"].items():
             if isinstance(value, (int, float)):
                 per.setdefault(metric, []).append(value)
     return out
+
+
+def problems(result_set):
+    """{workload: (runs with anomalies, failed runs)}, for the measured rounds only."""
+    warmup = result_set["set"]["warmup_rounds"]
+    out = {}
+    for run in result_set["runs"]:
+        if not run.get("warmup") and run.get("anomalies"):
+            anomalous, failed = out.get(run["workload"], (0, 0))
+            out[run["workload"]] = (anomalous + 1, failed)
+    for failure in result_set["set"]["failures"]:
+        round_, workload = failure["run"].split("-", 1)
+        if int(round_) >= warmup:
+            anomalous, failed = out.get(workload, (0, 0))
+            out[workload] = (anomalous, failed + 1)
+    return out
+
+
+def engine_placement(result_set):
+    """Where the build runs its engines, from its definition's `engines`: "processes" (the
+    baseline: a process per page) or "in-process". Sets from before the key existed are the
+    baseline's."""
+    return result_set["set"]["build"]["definition"].get("engines", "processes")
+
+
+# Metrics that describe the split between the browser process and engine processes. Across
+# builds that place engines differently they compare process layouts, not work: in-process,
+# `_engines` and `ipc_out_` are 0 by construction and `_browser` holds everything.
+PROCESS_SPLIT = re.compile(r"_(browser|engines)$|\.ipc_out_")
 
 
 # Metrics where a lower value is better. The rest (frame counts and rates, window lengths,
@@ -75,6 +105,9 @@ KEY_METRICS = [
     "active.input_to_frame_p50_ms",
     "active.input_to_screen_p50_ms",
     "active.input_to_screen_p95_ms",
+    "active.input_to_pixels_p50_ms",
+    "active.input_to_pixels_p95_ms",
+    "active.input_to_pixels_missed",
     "active.readback_mib_per_s",
     "active.ipc_pixel_mib_per_s",
     "active.ipc_out_mib_per_s",
@@ -104,6 +137,7 @@ OVERVIEW = [
     "active.readback_mib_per_s",
     "active.ipc_out_mib_per_s",
     "active.input_to_screen_p50_ms",
+    "active.input_to_pixels_p50_ms",
 ]
 
 

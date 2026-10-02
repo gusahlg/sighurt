@@ -16,9 +16,10 @@
 //! waits; so is a closed view, before the owner drops its target.
 //!
 //! Presenting is "paint the latest display list into this buffer while the host's permit
-//! allows it": [`present`] rasterizes on the owner thread, into memory the view's
-//! [`CpuTarget`] lends for that one frame. The executable implements [`CpuTarget`] for the
-//! Wayland host's shared-memory target lease.
+//! allows it": [`present`] rasterizes into memory the view's [`CpuTarget`] lends for that one
+//! frame, a large frame in bands on helper threads while the owner paints one of them and
+//! waits for the rest (`raster.rs`). `sig` gives views the Wayland host's shared-memory target
+//! lease, which implements [`CpuTarget`] (`wayland.rs`).
 //!
 //! Owns: the views, the pools and the completion channel. Must not own: browser policy (which
 //! URL opens where, permissions beyond the guest's own prompt) or native surfaces.
@@ -57,8 +58,8 @@ const LOADERS: usize = 2;
 
 /// Where a view presents: the host's target lease for a CPU-drawn (shared-memory) page surface.
 ///
-/// The executable implements this for `sighurt_wayland`'s lease and frame permit; tests use an
-/// in-memory target. The runtime drops a view's target on the owner thread when the view closes
+/// `sighurt_wayland`'s [`TargetLease`](sighurt_wayland::TargetLease) implements it, with its
+/// [`FramePermit`](sighurt_wayland::FramePermit); tests use an in-memory target. The runtime drops a view's target on the owner thread when the view closes
 /// or the runtime shuts down, after it has stopped the view's guest; the guest's state, which
 /// doesn't refer to the target, is dropped on another thread.
 pub trait CpuTarget {

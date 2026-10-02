@@ -2,7 +2,13 @@
 //!
 //! Wires the pieces together: the core's state and policy, the Wayland host, the chrome, and the
 //! engines selected at build time by Cargo features. It owns process-wide setup (logging, the
-//! TLS provider, panic handling), the owner event loop, and every effect with I/O.
+//! TLS provider, the panic hook, signals), the owner event loop ([`app`]), and every effect with
+//! I/O.
+//!
+//! Process-wide setup follows decision 26, before any engine starts: the panic hook logs and
+//! never exits; rustls gets the aws-lc-rs provider; the one `log` logger is Servo's when Servo
+//! is compiled in and enabled, `env_logger` otherwise (see [`registry`]). SIGUSR1 prints the diagnostics, SIGTERM and SIGINT quit
+//! cleanly (the session is saved); their handlers only write to a pipe the loop reads.
 //!
 //! Sighurt is based on Oxide by Nikhil Ranjan (<https://github.com/niklabh/oxide>).
 
@@ -13,7 +19,14 @@ mod persistence;
 mod registry;
 mod services;
 
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+
+use sighurt_core::config::DEFAULT_CONFIG;
+use sighurt_core::router;
+use sighurt_core::OpenRequest;
 
 const USAGE: &str = "\
 Usage: sig [OPTIONS] [URL|PATH ...]
@@ -21,34 +34,178 @@ Usage: sig [OPTIONS] [URL|PATH ...]
 Opens each URL or file in its own tab, or the home page when none is given.
 
 Options:
-  -h, --help     Print this help and exit
-  -V, --version  Print the version and exit
+      --default-config     Print the built-in configuration and exit
+      --diagnostics FILE   Write the diagnostics to FILE as JSON at exit and on SIGUSR1
+  -h, --help               Print this help and exit
+  -V, --version            Print the version and exit
+
+Environment:
+  SIG_DIAG=1   Print a diagnostics line for every page frame and chrome paint on stderr
+  RUST_LOG     Log filter, such as RUST_LOG=debug
+
+Signals: SIGUSR1 prints the diagnostics on stderr; SIGTERM and SIGINT quit, saving the tabs.
 ";
 
-fn main() -> ExitCode {
-    for arg in std::env::args().skip(1) {
+/// What the command line asks for.
+pub struct Args {
+    /// URLs and paths to open, as the core takes them.
+    pub open: Vec<OpenRequest>,
+    /// Where to write the diagnostics as JSON.
+    pub diagnostics: Option<PathBuf>,
+}
+
+/// The command line: arguments to run with, or the exit code of an option that did its job.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, ExitCode> {
+    let mut parsed = Args {
+        open: Vec::new(),
+        diagnostics: None,
+    };
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
-                return ExitCode::SUCCESS;
+                return Err(ExitCode::SUCCESS);
             }
             "-V" | "--version" => {
                 println!(
                     "sig {} (Sighurt, based on Oxide by Nikhil Ranjan)",
                     env!("CARGO_PKG_VERSION")
                 );
-                return ExitCode::SUCCESS;
+                return Err(ExitCode::SUCCESS);
             }
+            "--default-config" => {
+                print!("{DEFAULT_CONFIG}");
+                return Err(ExitCode::SUCCESS);
+            }
+            "--diagnostics" => match args.next() {
+                Some(file) => parsed.diagnostics = Some(file.into()),
+                None => return Err(usage_error("--diagnostics needs a file")),
+            },
             option if option.starts_with('-') && option.len() > 1 => {
-                eprint!("sig: unknown option {option}\n\n{USAGE}");
-                return ExitCode::from(2);
+                return Err(usage_error(&format!("unknown option {option}")))
             }
-            _ => {}
+            _ => parsed.open.push(open_request(&arg)),
         }
     }
-    eprintln!(
-        "sig: the rewrite is in progress and this build cannot show pages yet \
-         (see docs/rewrite/STATUS.md)"
-    );
-    ExitCode::FAILURE
+    Ok(parsed)
+}
+
+fn usage_error(message: &str) -> ExitCode {
+    eprint!("sig: {message}\n\n{USAGE}");
+    ExitCode::from(2)
+}
+
+/// A path that exists becomes an absolute `file:` URL; anything else is left for the core to
+/// read as an address or a search.
+fn open_request(arg: &str) -> OpenRequest {
+    let path = Path::new(arg);
+    let input = match path.exists() {
+        true => router::file_url(&std::path::absolute(path).unwrap_or_else(|_| path.into())),
+        false => arg.to_owned(),
+    };
+    OpenRequest {
+        input,
+        engine: None,
+    }
+}
+
+/// The panic hook of decision 26: the default report, logged too, and never an exit.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Panics Servo catches itself (image decoding).
+        #[cfg(feature = "engine-servo")]
+        if sighurt_engine_servo::should_panic_hook_suppress_termination() {
+            return;
+        }
+        // Servo turns a script thread's logged panic into `notify_crashed`.
+        log::error!("panic: {info}");
+        default(info);
+    }));
+}
+
+/// The signals `sig` handles, and the pipe their handlers write the signal number to.
+fn install_signal_handlers() -> std::io::Result<OwnedFd> {
+    use rustix::pipe::{pipe_with, PipeFlags};
+    let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+    let write = Arc::new(write);
+    for signal in [libc::SIGUSR1, libc::SIGTERM, libc::SIGINT] {
+        let write = Arc::clone(&write);
+        // SAFETY: the action only calls write(2) on a non-blocking pipe, which is
+        // async-signal-safe; it allocates nothing and takes no lock. A full pipe loses the
+        // byte, and the loop already has the same signal to read.
+        unsafe {
+            signal_hook_registry::register(signal, move || {
+                let _ = rustix::io::write(&*write, &[signal as u8]);
+            })?;
+        }
+    }
+    Ok(read)
+}
+
+fn main() -> ExitCode {
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(code) => return code,
+    };
+    install_panic_hook();
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        log::warn!("a TLS provider was already installed");
+    }
+    let signals = match install_signal_handlers() {
+        Ok(signals) => signals,
+        Err(error) => {
+            eprintln!("sig: cannot handle signals: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match app::run(args, signals) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("sig: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Result<Args, ExitCode> {
+        parse_args(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn paths_become_file_urls_and_the_rest_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("page.html");
+        std::fs::write(&file, "").unwrap();
+        let parsed = args(&[file.to_str().unwrap(), "example.com", "demo:pattern"])
+            .ok()
+            .unwrap();
+        let inputs: Vec<_> = parsed.open.iter().map(|r| r.input.as_str()).collect();
+        assert_eq!(
+            inputs,
+            [
+                format!("file://{}", file.display()).as_str(),
+                "example.com",
+                "demo:pattern"
+            ]
+        );
+    }
+
+    #[test]
+    fn options() {
+        let parsed = args(&["--diagnostics", "/tmp/d.json", "x"]).ok().unwrap();
+        assert_eq!(parsed.diagnostics, Some(PathBuf::from("/tmp/d.json")));
+        assert_eq!(parsed.open.len(), 1);
+        assert!(args(&["--diagnostics"]).is_err());
+        assert!(args(&["--frobnicate"]).is_err());
+        assert!(args(&["--version"]).is_err());
+    }
 }

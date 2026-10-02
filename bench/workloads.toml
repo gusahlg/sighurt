@@ -88,3 +88,13 @@ script = "tab-churn"
 description = "The article while the output changes size and scale four times a second (plan §25 resize storm); restored and measured 3 s later."
 open = ["article.html"]
 script = "resize-storm"
+
+[wasm-flood]
+description = "Plan §26's output limits: a guest (workloads/generate.py) that draws 250 000 moving rectangles and writes 200 console lines on every frame, more than the rewrite's Wasm engine keeps. Chrome input in the active window: a new tab and closing it again, twice a second."
+open = ["wasm/flood.wasm"]
+script = "tab-toggle"
+
+[wasm-workers]
+description = "Plan §26's worker fairness: a guest (workloads/generate.py) animating a square while four background workers each burn about 42M fuel per message, with eight messages queued each, so four threads stay busy. Chrome input in the active window: a new tab and closing it again, twice a second."
+open = ["wasm/workers-main.wasm"]
+script = "tab-toggle"

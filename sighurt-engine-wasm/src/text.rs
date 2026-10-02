@@ -6,16 +6,17 @@
 //! picked the way the pre-rewrite browser (GPUI on Linux) picked them: the requested family,
 //! then a fixed list of fallbacks.
 //!
-//! Guests measure on worker threads and the rasterizer paints on the owner thread, so each has
+//! Guests measure on worker threads and the rasterizer paints for the owner thread, so each has
 //! a font system of its own, made from one scan of the system fonts: a guest measuring long
-//! text never holds a lock that painting needs.
+//! text never holds a lock that painting needs. Painting holds its lock to lay a line out and
+//! find its glyphs' images, not to blend them, so bands of a frame blend text at once.
 //!
-//! Owns: the font systems, the measurement cache and the glyph cache, each bounded. Must not
-//! own: where text goes (the rasterizer).
+//! Owns: the font systems, the measurement cache, the cache of lines laid out for painting and
+//! the glyph cache, each bounded. Must not own: where text goes (the rasterizer).
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use cosmic_text::fontdb::{Database, Query};
 use cosmic_text::{
@@ -57,6 +58,8 @@ static PAINTING: LazyLock<Mutex<Painting>> = LazyLock::new(|| {
     Mutex::new(Painting {
         system: font_system(),
         glyphs: Glyphs::default(),
+        lines: HashMap::new(),
+        line_glyphs: 0,
     })
 });
 
@@ -76,6 +79,12 @@ struct Measuring {
 struct Painting {
     system: FontSystem,
     glyphs: Glyphs,
+    /// Lines of up to [`MAX_CACHED_TEXT`] bytes laid out, by a hash of their [`Key`] as in
+    /// [`Measuring::measured`]: guests draw the same strings every frame, and shaping them again
+    /// would cost most of a frame. At most 4096 lines and [`MAX_CACHED_GLYPHS`] glyphs.
+    lines: HashMap<u64, (Key, Option<LayoutLine>)>,
+    /// The glyphs `lines` holds.
+    line_glyphs: usize,
 }
 
 /// What a measurement depends on: line, size bits, family, weight and italic.
@@ -84,6 +93,9 @@ type Key = (String, u32, String, u16, bool);
 /// Longest line plus family name, in bytes, whose measurement is kept. Longer text is rare,
 /// and would make the cache hold whatever megabytes a guest passes.
 const MAX_CACHED_TEXT: usize = 1024;
+/// Most glyphs of laid-out lines kept; past it the cache starts over. A laid-out glyph takes 80
+/// bytes, so this is about 5 MiB, whatever lines a guest draws (and their keys at most 4 MiB).
+const MAX_CACHED_GLYPHS: usize = 64 * 1024;
 /// Most bytes of glyph images kept; past it the cache starts over.
 const MAX_GLYPH_BYTES: usize = 32 * 1024 * 1024;
 
@@ -91,12 +103,12 @@ const MAX_GLYPH_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Default)]
 struct Glyphs {
     scaler: Option<SwashCache>,
-    images: HashMap<CacheKey, Option<SwashImage>>,
+    images: HashMap<CacheKey, Option<Arc<SwashImage>>>,
     bytes: usize,
 }
 
 impl Glyphs {
-    fn get(&mut self, system: &mut FontSystem, key: CacheKey) -> Option<&SwashImage> {
+    fn get(&mut self, system: &mut FontSystem, key: CacheKey) -> Option<Arc<SwashImage>> {
         if !self.images.contains_key(&key) {
             if self.bytes > MAX_GLYPH_BYTES {
                 self.images.clear();
@@ -105,9 +117,9 @@ impl Glyphs {
             let scaler = self.scaler.get_or_insert_with(SwashCache::new);
             let image = scaler.get_image_uncached(system, key);
             self.bytes += image.as_ref().map_or(0, |image| image.data.len());
-            self.images.insert(key, image);
+            self.images.insert(key, image.map(Arc::new));
         }
-        self.images[&key].as_ref()
+        self.images[&key].clone()
     }
 }
 
@@ -131,11 +143,7 @@ pub fn measure(text: &str, size: f32, family: &str, weight: u16, italic: bool) -
         ));
     }
     let key = (line, size.to_bits(), family, weight, italic);
-    let hash = {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        hasher.finish()
-    };
+    let hash = hash_key(&key);
     if let Some(((l, s, f, w, i), metrics)) = fonts.measured.get(&hash) {
         if (l.as_str(), *s, f.as_str(), *w, *i) == key {
             return *metrics;
@@ -170,13 +178,25 @@ pub struct Line<'a> {
 
 /// Lays `line` out, asks `place` where the baseline starts given the line's width, ascent and
 /// descent, and hands the image of every glyph that may reach into `area` (left, top, right,
-/// bottom, in the same pixels) to `glyph` with the position of its top-left pixel.
+/// bottom, in the same pixels) to `glyph` with the position of its top-left pixel. `glyph` runs
+/// without the painting lock.
 pub fn draw(
     line: Line<'_>,
     place: impl FnOnce([f32; 3]) -> (f32, f32),
-    [left, top, right, bottom]: [f32; 4],
+    area: [f32; 4],
     mut glyph: impl FnMut(&SwashImage, i32, i32),
 ) {
+    for (image, x, y) in glyphs(line, place, area) {
+        glyph(&image, x, y);
+    }
+}
+
+/// The glyphs [`draw`] hands over, found under the painting lock.
+fn glyphs(
+    line: Line<'_>,
+    place: impl FnOnce([f32; 3]) -> (f32, f32),
+    [left, top, right, bottom]: [f32; 4],
+) -> Vec<(Arc<SwashImage>, i32, i32)> {
     let mut fonts = lock(&PAINTING);
     let fonts = &mut *fonts;
     let Line {
@@ -186,18 +206,39 @@ pub fn draw(
         weight,
         italic,
     } = line;
-    let line = layout_line(
-        &mut fonts.system,
-        first_line(text),
-        size,
-        family,
-        weight,
-        italic,
-    );
+    let text = first_line(text);
+    let shaped;
+    let line = if text.len() + family.len() > MAX_CACHED_TEXT {
+        shaped = layout_line(&mut fonts.system, text, size, family, weight, italic);
+        shaped.as_ref()
+    } else {
+        let key = (text, size.to_bits(), family, weight, italic);
+        let hash = hash_key(&key);
+        let known = fonts
+            .lines
+            .get(&hash)
+            .is_some_and(|((l, s, f, w, i), _)| (l.as_str(), *s, f.as_str(), *w, *i) == key);
+        if !known {
+            let line = layout_line(&mut fonts.system, text, size, family, weight, italic);
+            let glyphs = line.as_ref().map_or(0, |line| line.glyphs.len());
+            // Bound the memory a guest drawing ever new strings can take.
+            if fonts.lines.len() >= 4096 || fonts.line_glyphs + glyphs > MAX_CACHED_GLYPHS {
+                fonts.lines.clear();
+                fonts.line_glyphs = 0;
+            }
+            let key = (text.to_string(), key.1, family.to_string(), weight, italic);
+            if let Some((_, Some(old))) = fonts.lines.insert(hash, (key, line)) {
+                fonts.line_glyphs -= old.glyphs.len();
+            }
+            fonts.line_glyphs += glyphs;
+        }
+        fonts.lines[&hash].1.as_ref()
+    };
     let Some(line) = line else {
-        return;
+        return Vec::new();
     };
     let origin = place([line.w, line.max_ascent, line.max_descent]);
+    let mut found = Vec::new();
     for layout in &line.glyphs {
         let physical = layout.physical(origin, 1.0);
         // The glyph's advance, and a font size around it for what sticks out.
@@ -210,10 +251,21 @@ pub fn draw(
             continue;
         }
         if let Some(image) = fonts.glyphs.get(&mut fonts.system, physical.cache_key) {
-            let (left, top) = (image.placement.left, image.placement.top);
-            glyph(image, physical.x + left, physical.y - top);
+            let (x, y) = (
+                physical.x + image.placement.left,
+                physical.y - image.placement.top,
+            );
+            found.push((image, x, y));
         }
     }
+    found
+}
+
+/// The hash of a [`Key`], borrowed.
+fn hash_key(key: &(&str, u32, &str, u16, bool)) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn first_line(text: &str) -> &str {
@@ -315,6 +367,36 @@ mod tests {
             .measured
             .values()
             .all(|((line, ..), _)| line.len() <= MAX_CACHED_TEXT));
+    }
+
+    #[test]
+    fn laid_out_lines_kept_are_bounded() {
+        // About 100 000 glyphs of distinct lines just under the cached length.
+        for i in 0..100 {
+            let text = format!("{i:03} {}", "lorem ipsum ".repeat(84));
+            assert!(text.len() <= MAX_CACHED_TEXT);
+            let line = Line {
+                text: &text,
+                size: 12.0,
+                family: "",
+                weight: 400,
+                italic: false,
+            };
+            draw(line, |_| (0.0, 0.0), [0.0; 4], |_, _, _| {});
+        }
+        let fonts = lock(&PAINTING);
+        let kept: usize = fonts
+            .lines
+            .values()
+            .filter_map(|(_, line)| line.as_ref())
+            .map(|line| line.glyphs.len())
+            .sum();
+        assert_eq!(kept, fonts.line_glyphs);
+        assert!(kept > 0 && kept <= MAX_CACHED_GLYPHS, "{kept} glyphs kept");
+        eprintln!(
+            "{kept} glyphs kept, {} bytes each",
+            std::mem::size_of::<cosmic_text::LayoutGlyph>()
+        );
     }
 
     #[test]

@@ -1,0 +1,36 @@
+{
+ "label": "baseline",
+ "host": "louise",
+ "tree": "/home/gusahlg/sighurt-baseline",
+ "started": "2026-09-27T08:34:53+0200",
+ "cpu": "AMD Ryzen 5 5500",
+ "cpus": 12,
+ "kernel": "6.18.35",
+ "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+ "jobs": "8",
+ "lockfiles": {
+  "Cargo.lock": 1026,
+  "sighurt-engine-servo/Cargo.lock": 836
+ },
+ "steps": [
+  {
+   "name": "sig + sig-wasm",
+   "command": "cargo build --release -p sighurt-ui -p sighurt-engine-wasm",
+   "status": 0,
+   "cargo_s": 392.0,
+   "finished": "Finished `release` profile [optimized] target(s) in 6m 32s",
+   "compiled_crates": 766,
+   "log_tail": "ng utf-8 v0.7.6\n   Compiling gilrs v0.11.1\n   Compiling dasp_sample v0.11.0\n   Compiling inventory v0.3.24\n   Compiling tungstenite v0.24.0\n   Compiling gilrs-core v0.6.7\n   Compiling libwayshot v0.2.0\n   Compiling fxprof-processed-profile v0.6.0\n   Compiling symphonia v0.5.5\n   Compiling dtls v0.17.1\n   Compiling wasmtime-internal-cranelift v36.0.8\n   Compiling webrtc-data v0.17.1\n   Compiling rand_distr v0.6.0\n   Compiling sdp v0.17.1\n   Compiling ittapi v0.4.0\n   Compiling display-info v0.4.8\n   Compiling nokhwa-bindings-linux v0.1.4\n   Compiling wat v1.249.0\n   Compiling webrtc-ice v0.17.1\n   Compiling dbus v0.9.11\n   Compiling interceptor v0.17.1\n   Compiling tokio-native-tls v0.3.1\n   Compiling webrtc-media v0.17.1\n   Compiling nokhwa-bindings-windows v0.4.6\n   Compiling addr2line v0.25.1\n   Compiling tracing-log v0.2.0\n   Compiling memfd v0.6.5\n   Compiling wasmtime-internal-jit-icache-coherence v36.0.8\n   Compiling sharded-slab v0.1.7\n   Compiling uom v0.38.0\n   Compiling thread_local v1.1.10\n   Compiling pollster v0.4.0\n   Compiling rtrb v0.3.4\n   Compiling nu-ansi-term v0.50.3\n   Compiling urlencoding v2.1.3\n   Compiling iana-time-zone v0.1.65\n   Compiling wasmtime-internal-slab v36.0.8\n   Compiling chrono v0.4.44\n   Compiling tracing-subscriber v0.3.23\n   Compiling rodio v0.22.2\n   Compiling nokhwa v0.10.11\n   Compiling webrtc v0.17.1\n   Compiling sighurt-core v0.7.0 (/home/gusahlg/sighurt-baseline/sighurt-core)\n   Compiling tokio-tungstenite v0.24.0\n   Compiling screenshots v0.8.10\n   Compiling sighurt-ui v0.7.0 (/home/gusahlg/sighurt-baseline/sighurt-ui)\n   Compiling sighurt-engine-wasm v0.7.0 (/home/gusahlg/sighurt-baseline/sighurt-engine-wasm)\n    Finished `release` profile [optimized] target(s) in 6m 32s\nwarning: the following packages contain code that will be rejected by a future version of Rust: screenshots v0.8.10\nnote: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`\n"
+  },
+  {
+   "name": "sig-servo",
+   "command": "cargo build --release --manifest-path sighurt-engine-servo/Cargo.toml",
+   "status": 0,
+   "cargo_s": 572.0,
+   "finished": "Finished `release` profile [optimized] target(s) in 9m 32s",
+   "compiled_crates": 627,
+   "log_tail": " Compiling gaol v0.2.1\n   Compiling unicode_categories v0.1.1\n   Compiling option-ext v0.2.0\n   Compiling dirs-sys v0.4.1\n   Compiling arboard v3.6.1\n   Compiling env_logger v0.11.11\n   Compiling sea-query-rusqlite v0.8.0\n   Compiling dirs v5.0.1\n   Compiling sighurt-ipc v0.1.0 (/home/gusahlg/sighurt-baseline/sighurt-ipc)\n   Compiling servo-malloc-size-of v0.5.0\n   Compiling servo-base v0.5.0\n   Compiling servo-url v0.5.0\n   Compiling servo-profile-traits v0.5.0\n   Compiling servo-pixels v0.5.0\n   Compiling servo-geometry v0.5.0\n   Compiling servo-fonts-traits v0.5.0\n   Compiling servo-media-streams v0.5.0\n   Compiling servo-media-traits v0.5.0\n   Compiling servo-media-player v0.5.0\n   Compiling servo-media-webrtc v0.5.0\n   Compiling servo-paint-api v0.5.0\n   Compiling servo-webxr-api v0.5.0\n   Compiling servo-net-traits v0.5.0\n   Compiling servo-canvas-traits v0.5.0\n   Compiling servo-devtools-traits v0.5.0\n   Compiling servo-media-audio v0.5.0\n   Compiling servo-media v0.5.0\n   Compiling servo-storage-traits v0.5.0\n   Compiling servo-constellation-traits v0.5.0\n   Compiling servo-media-thread v0.5.0\n   Compiling servo-fonts v0.5.0\n   Compiling servo-script-traits v0.5.0\n   Compiling servo-background-hang-monitor-api v0.5.0\n   Compiling servo-timers v0.5.0\n   Compiling servo-net v0.5.0\n   Compiling servo-layout-api v0.5.0\n   Compiling servo-metrics v0.5.0\n   Compiling servo-xpath v0.5.0\n   Compiling servo-background-hang-monitor v0.5.0\n   Compiling servo-canvas v0.5.0\n   Compiling servo-webgl v0.5.0\n   Compiling servo-paint v0.5.0\n   Compiling servo-constellation v0.5.0\n   Compiling servo-storage v0.5.0\n   Compiling servo-media-dummy v0.5.0\n   Compiling servo-default-resources v0.5.0\n   Compiling servo-wakelock v0.5.0\n   Compiling servo-profile v0.5.0\n   Compiling servo-layout v0.5.0\n   Compiling servo v0.5.0\n   Compiling sighurt-engine-servo v0.1.0 (/home/gusahlg/sighurt-baseline/sighurt-engine-servo)\n    Finished `release` profile [optimized] target(s) in 9m 32s\n"
+  }
+ ],
+ "total_cargo_s": 964.0
+}

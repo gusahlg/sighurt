@@ -6,10 +6,17 @@
 //! step job queues the guest's next step itself ([`Spawner::spawn_at`]), so a guest keeps its
 //! cadence without the owner thread.
 //!
+//! A job that waits (a synchronous fetch, a file dialog: see [`blocking`]) hands its place to a
+//! spare thread while it waits, so `n` guests waiting on a slow server don't stop every other
+//! guest. Spares are bounded ([`MAX_SPARE_THREADS`] per pool); past that, waiting jobs hold
+//! their threads until their own timeouts. A spare ends once the pool has its `n` running
+//! threads again.
+//!
 //! Owns: its threads, and the jobs queued on it: when the pool is dropped, its threads drop the
 //! jobs still queued (and what they hold) rather than the thread that drops the pool. Must not
 //! own: what the jobs do, or their results (jobs send those to the owner loop themselves).
 
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 use std::io;
@@ -19,6 +26,16 @@ use std::time::Instant;
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Most threads a pool starts beyond its size for jobs that wait.
+pub const MAX_SPARE_THREADS: usize = 16;
+
+thread_local! {
+    /// The pool this thread works for, if any.
+    static POOL: RefCell<Weak<Shared>> = const { RefCell::new(Weak::new()) };
+    /// Whether this thread is in [`blocking`].
+    static BLOCKED: Cell<bool> = const { Cell::new(false) };
+}
+
 pub struct Pool {
     shared: Arc<Shared>,
 }
@@ -27,10 +44,12 @@ pub struct Pool {
 #[derive(Clone)]
 pub struct Spawner(Weak<Shared>);
 
-#[derive(Default)]
 struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
+    name: String,
+    /// Threads that run jobs, not counting those blocked in [`blocking`].
+    size: usize,
 }
 
 #[derive(Default)]
@@ -40,6 +59,9 @@ struct Queue {
     /// Orders jobs queued for the same time.
     serial: u64,
     closed: bool,
+    /// Threads alive, and how many of them are in [`blocking`].
+    threads: usize,
+    blocked: usize,
 }
 
 /// A job queued for a time. The heap's greatest is the one due first.
@@ -72,12 +94,15 @@ impl Eq for Timed {}
 impl Pool {
     /// Starts `threads` threads named `name`.
     pub fn new(name: &str, threads: usize) -> io::Result<Self> {
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            queue: Mutex::default(),
+            ready: Condvar::new(),
+            name: name.into(),
+            size: threads,
+        });
         for _ in 0..threads {
-            let shared = shared.clone();
-            thread::Builder::new()
-                .name(name.into())
-                .spawn(move || shared.work())?;
+            shared.start()?;
+            shared.lock().threads += 1;
         }
         Ok(Self { shared })
     }
@@ -101,9 +126,58 @@ impl Spawner {
     }
 }
 
+/// Runs `f`, which waits for something other than the CPU (the network, the user), on a pool
+/// thread's behalf: while it waits, a spare thread runs the pool's other jobs. Outside a pool,
+/// or already within `blocking`, it just runs `f`.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    let pool = POOL.with(|pool| pool.borrow().upgrade());
+    let Some(shared) = pool.filter(|_| !BLOCKED.get()) else {
+        return f();
+    };
+    /// Unblocks the thread however `f` ends.
+    struct Unblock(Arc<Shared>);
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            BLOCKED.set(false);
+            self.0.lock().blocked -= 1;
+            // Any thread that looks now finds the pool a thread over, and a spare ends.
+            self.0.ready.notify_one();
+        }
+    }
+    shared.block();
+    BLOCKED.set(true);
+    let _unblock = Unblock(shared);
+    f()
+}
+
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Starts a thread working for the pool; the caller counts it.
+    fn start(self: &Arc<Self>) -> io::Result<()> {
+        let shared = self.clone();
+        thread::Builder::new()
+            .name(self.name.clone())
+            .spawn(move || {
+                POOL.with(|pool| *pool.borrow_mut() = Arc::downgrade(&shared));
+                shared.work()
+            })
+            .map(drop)
+    }
+
+    /// The calling thread starts waiting: a spare takes its place if the pool has room.
+    fn block(self: &Arc<Self>) {
+        let mut queue = self.lock();
+        queue.blocked += 1;
+        let running = queue.threads - queue.blocked;
+        if !queue.closed && running < self.size && queue.threads < self.size + MAX_SPARE_THREADS {
+            // A thread that can't be started leaves the pool a thread short while this waits.
+            if self.start().is_ok() {
+                queue.threads += 1;
+            }
+        }
     }
 
     fn push(&self, at: Option<Instant>, job: Job) {
@@ -129,6 +203,11 @@ impl Shared {
             let job = {
                 let mut queue = self.lock();
                 loop {
+                    if queue.threads - queue.blocked > self.size {
+                        // A spare, and the thread it stood in for is back.
+                        queue.threads -= 1;
+                        return;
+                    }
                     if queue.closed {
                         let left = (
                             std::mem::take(&mut queue.jobs),
@@ -204,6 +283,72 @@ mod tests {
         pool.spawn(move || tx.send(()).unwrap());
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(block);
+    }
+
+    /// Waits until `shared` has `threads` threads, or panics.
+    fn wait_for_threads(shared: &Shared, threads: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.lock().threads != threads {
+            assert!(
+                Instant::now() < deadline,
+                "{} threads",
+                shared.lock().threads
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_waiting_job_hands_its_place_to_a_spare() {
+        let pool = Pool::new("test", 1).unwrap();
+        let (release, released) = mpsc::channel::<()>();
+        let (tx, rx) = mpsc::channel();
+        let waiting = tx.clone();
+        pool.spawn(move || {
+            blocking(|| released.recv()).unwrap();
+            waiting.send("waited").unwrap();
+        });
+        pool.spawn(move || tx.send("ran").unwrap());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("ran"));
+        assert_eq!(pool.shared.lock().threads, 2);
+        release.send(()).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("waited"));
+        // The spare ends once the thread it stood in for is back.
+        wait_for_threads(&pool.shared, 1);
+    }
+
+    #[test]
+    fn spares_are_bounded() {
+        let pool = Pool::new("test", 1).unwrap();
+        let (release, released) = mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        let (tx, rx) = mpsc::channel();
+        let jobs = 1 + MAX_SPARE_THREADS + 3;
+        for _ in 0..jobs {
+            let (tx, released) = (tx.clone(), released.clone());
+            pool.spawn(move || {
+                tx.send(()).unwrap();
+                blocking(|| released.lock().unwrap().recv()).unwrap();
+            });
+        }
+        // Every thread the pool may have is waiting; the other jobs stay queued.
+        for _ in 0..1 + MAX_SPARE_THREADS {
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert_eq!(pool.shared.lock().threads, 1 + MAX_SPARE_THREADS);
+        for _ in 0..jobs {
+            release.send(()).unwrap();
+        }
+        for _ in 0..3 {
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        wait_for_threads(&pool.shared, 1);
+    }
+
+    #[test]
+    fn blocking_outside_a_pool_just_runs() {
+        assert_eq!(blocking(|| blocking(|| 7)), 7);
     }
 
     #[test]

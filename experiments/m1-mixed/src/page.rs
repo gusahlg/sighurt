@@ -8,7 +8,7 @@
 //! `glReadPixels`/`glGetTexImage` WebRender makes on this context.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -63,8 +63,9 @@ pub struct Page {
     egl: egl::Display,
     /// Set by every call into Servo, so the owner pumps it in the same loop turn.
     pub called: bool,
-    /// Keys the page has seen go down and not up, released on blur.
-    pressed: HashSet<u32>,
+    /// Keys the page has seen go down and not up, with the key value each press sent; released
+    /// on blur with that value, so a page tracking keys by `KeyboardEvent.key` sees them go up.
+    pressed: HashMap<u32, Key>,
     focused: bool,
 }
 
@@ -124,7 +125,7 @@ impl Page {
             waker,
             egl,
             called: true,
-            pressed: HashSet::new(),
+            pressed: HashMap::new(),
             focused: false,
         };
         Ok((page, info))
@@ -183,10 +184,10 @@ impl Page {
         if focused {
             self.webview.focus();
         } else {
-            for code in std::mem::take(&mut self.pressed) {
+            for (code, key) in std::mem::take(&mut self.pressed) {
                 let key = KeyboardEvent::new_without_event(
                     KeyState::Up,
-                    Key::Named(NamedKey::Unidentified),
+                    key,
                     code_of(code),
                     location_of(code),
                     Modifiers::empty(),
@@ -207,19 +208,20 @@ impl Page {
         modifiers: keyboard::Modifiers,
         repeat: bool,
     ) {
+        let key = key_of(event, modifiers);
         match state {
             KeyState::Down => {
-                self.pressed.insert(event.raw_code);
+                self.pressed.insert(event.raw_code, key.clone());
             }
             KeyState::Up => {
-                if !self.pressed.remove(&event.raw_code) {
+                if self.pressed.remove(&event.raw_code).is_none() {
                     return;
                 }
             }
         }
         let key = KeyboardEvent::new_without_event(
             state,
-            key_of(event, modifiers),
+            key,
             code_of(event.raw_code),
             location_of(event.raw_code),
             modifiers_of(modifiers),
@@ -232,7 +234,7 @@ impl Page {
 
     /// Whether the page holds `code` down (so its release belongs to the page).
     pub fn holds(&self, code: u32) -> bool {
-        self.pressed.contains(&code)
+        self.pressed.contains_key(&code)
     }
 
     /// Pointer input at `point`, in the page's buffer (device) pixels, converted once from the
