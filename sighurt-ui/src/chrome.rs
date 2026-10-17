@@ -17,7 +17,8 @@
 //! after it, such as `:tab.close 2`, so every command can be reached without a key binding. Its
 //! right end shows the keymap's indicator, if the keymap has one ("NORMAL"), and before it the
 //! engine of the active tab's page while the line isn't focused, as each engine page's tab does
-//! (`[chrome.standard] engine-label`).
+//! (`[chrome.standard] engine-label`). A click on that label, exactly where it is drawn, runs
+//! `page.switch-engine`. Hovering it changes nothing: the pointer stays the address line's.
 //!
 //! The chrome marks what needs repainting ([`Damage`]) only after an edit, a hover change, a
 //! snapshot change it shows, a configuration change or a layout change: a static chrome needs
@@ -477,6 +478,7 @@ impl Model {
         if !self.state.window_active {
             self.state.pressed = None;
             self.state.selecting = false;
+            self.state.label_pressed = false;
         }
         // Only the focused address line looks different: its caret and selection show while
         // the window is active.
@@ -829,6 +831,12 @@ impl Model {
     }
 
     fn press(&mut self, point: WindowPoint, extend: bool, actions: &mut Vec<ChromeAction>) {
+        if self.on_engine_label(point) {
+            self.state.label_pressed = true;
+            self.state.pressed = None;
+            return;
+        }
+        self.state.label_pressed = false;
         let target = hit_test(&self.layout, point).filter(|&target| self.enabled(target));
         self.state.pressed = target;
         match target {
@@ -857,6 +865,13 @@ impl Model {
 
     fn release(&mut self, point: WindowPoint, actions: &mut Vec<ChromeAction>) {
         self.state.selecting = false;
+        let on_label = std::mem::take(&mut self.state.label_pressed);
+        if on_label {
+            if self.on_engine_label(point) {
+                actions.push(ChromeAction::Command(Command::PageSwitchEngine));
+            }
+            return;
+        }
         let pressed = self.state.pressed.take();
         let target = hit_test(&self.layout, point).filter(|&target| self.enabled(target));
         if pressed.is_none() || pressed != target {
@@ -875,6 +890,20 @@ impl Model {
             Some(Target::Address) | None => return,
         };
         actions.push(action);
+    }
+
+    /// Whether `point` lies in the engine label's line box: the text that is drawn, and nothing
+    /// around it. Half-open, like the chrome's other rectangles. The label is not a hover target.
+    fn on_engine_label(&mut self, point: WindowPoint) -> bool {
+        let Some((x, y, width, height)) = self
+            .address_view()
+            .engine
+            .map(|(shaped, x, y)| (x, y, shaped.width, shaped.height))
+        else {
+            return false;
+        };
+        let (px, py) = (point.x as f32, point.y as f32);
+        px >= x && py >= y && px < x + width && py < y + height
     }
 
     /// Whether `target` reacts now: back and forward only when there is somewhere to go, and

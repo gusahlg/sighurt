@@ -34,6 +34,7 @@ Opens each URL or file in its own tab, or the home page when none is given.
 Options:
       --default-config     Print the built-in configuration and exit
       --diagnostics FILE   Write the diagnostics to FILE as JSON at exit and on SIGUSR1
+      --engine ENGINE      The engine this run starts with, overriding [engines] default
   -h, --help               Print this help and exit
   -V, --version            Print the version and exit
 
@@ -51,6 +52,8 @@ struct Args {
     open: Vec<OpenRequest>,
     /// Where to write the diagnostics as JSON.
     diagnostics: Option<PathBuf>,
+    /// The engine this run starts with, overriding `[engines] default`.
+    engine: Option<String>,
 }
 
 /// The command line: arguments to run with, or the exit code of an option that did its job.
@@ -58,6 +61,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, ExitCode> 
     let mut parsed = Args {
         open: Vec::new(),
         diagnostics: None,
+        engine: None,
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -82,6 +86,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, ExitCode> 
             "--diagnostics" => match args.next() {
                 Some(file) => parsed.diagnostics = Some(file.into()),
                 None => return Err(usage_error("--diagnostics needs a file")),
+            },
+            "--engine" => match args.next() {
+                Some(name) => parsed.engine = Some(name),
+                None => return Err(usage_error("--engine needs an engine")),
             },
             option if option.starts_with('-') && option.len() > 1 => {
                 return Err(usage_error(&format!("unknown option {option}")))
@@ -177,6 +185,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The core applies this on top of the configuration, including every reload. It has to be
+    // set on this thread: that is the thread that reads the configuration.
+    sighurt_core::set_starting_engine(args.engine);
     let options = Options {
         open: args.open,
         diagnostics: args.diagnostics,
@@ -225,5 +236,16 @@ mod tests {
         assert!(args(&["--diagnostics"]).is_err());
         assert!(args(&["--frobnicate"]).is_err());
         assert!(args(&["--version"]).is_err());
+    }
+
+    #[test]
+    fn engine_is_the_engine_this_run_starts_with() {
+        let parsed = args(&["--engine", "wpe", "example.com"]).ok().unwrap();
+        assert_eq!(parsed.engine.as_deref(), Some("wpe"));
+        assert_eq!(parsed.open.len(), 1);
+        assert_eq!(parsed.open[0].input, "example.com");
+        assert!(args(&["--engine"]).is_err());
+        assert!(args(&["--nope"]).is_err());
+        assert!(USAGE.contains("--engine ENGINE"));
     }
 }

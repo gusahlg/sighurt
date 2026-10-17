@@ -49,6 +49,8 @@ zoom = 1.0
 
 [engines]
 # Opens http and https URLs, and the files and URLs that no routing rule below claims.
+# `sig --engine <name>` uses another engine for this run. One the build lacks, or one not
+# enabled below, is an error at startup and names the engines available.
 default = "servo"
 # The engines that may open new pages. Leave it out to allow every engine in the build.
 # Pages already open in an engine that you take out stay open until closed.
@@ -175,14 +177,21 @@ forward = "page.forward"
 # command. These bindings have no key sequences such as "g g"; the modal keymap has them.
 #
 # Commands: tab.new, tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last,
-# page.open <url>, page.open-in <engine> [url], page.reload, page.stop, page.back,
-# page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
+# page.open <url>, page.open-in <engine> [url], page.switch-engine, page.reload, page.stop,
+# page.back, page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
 # location.focus, browser.home, browser.quit, and the chrome's own, chrome.<action>. Tabs
 # count from 1.
 #
 # page.open-in opens the URL, or the page shown, in the engine named, whatever the routing
 # says ("ctrl-alt-w" = "page.open-in servo"); back returns to the page in the engine it was
 # in. Nothing of the page comes along but its address.
+#
+# page.switch-engine reopens the page shown in the next web engine (one that opens http and
+# https pages), among those this build has and [engines] enabled allows, wrapping around
+# ("ctrl-alt-e" = "page.switch-engine"). It chooses that engine as page.open-in does, so the
+# page's links stay until an address is typed. With fewer than two such engines, or a page
+# that isn't http, https or a file, it shows a notice and the page stays. The terminal binds
+# it to e, below. The windowed frontend binds nothing until the lines above do.
 #
 # page.send-key presses and releases a key in the page while the page has the keyboard, as if
 # you pressed it: down, up, left, right, pageup, pagedown, home, end, space, enter, escape,
@@ -252,6 +261,7 @@ default-keys = true
 "H" = "page.back"
 "L" = "page.forward"
 "r" = "page.reload"
+"e" = "page.switch-engine"
 "ctrl-r" = "page.reload"
 "j" = "page.send-key ArrowDown"
 "k" = "page.send-key ArrowUp"

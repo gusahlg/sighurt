@@ -45,6 +45,10 @@ pub enum Command {
         /// selected tab's address again.
         address: Option<String>,
     },
+    /// `page.switch-engine`: reopen the page shown in the next web engine, wrapping
+    /// around. Which engines those are, and whether this page can move, is decided when
+    /// the command runs.
+    PageSwitchEngine,
     /// `page.reload`.
     PageReload,
     /// `page.stop`: stop loading.
@@ -76,7 +80,7 @@ pub enum Command {
 
 impl Command {
     /// Every command name. The chrome's commands, `chrome.<action>`, depend on the chrome.
-    pub const NAMES: [&'static str; 19] = [
+    pub const NAMES: [&'static str; 20] = [
         "tab.new",
         "tab.close",
         "tab.next",
@@ -85,6 +89,7 @@ impl Command {
         "tab.last",
         "page.open",
         "page.open-in",
+        "page.switch-engine",
         "page.reload",
         "page.stop",
         "page.back",
@@ -109,6 +114,7 @@ impl Command {
             Self::TabLast => "tab.last",
             Self::PageOpen(_) => "page.open",
             Self::PageOpenIn { .. } => "page.open-in",
+            Self::PageSwitchEngine => "page.switch-engine",
             Self::PageReload => "page.reload",
             Self::PageStop => "page.stop",
             Self::PageBack => "page.back",
@@ -189,6 +195,7 @@ impl FromStr for Command {
             "page.zoom-in" => Self::PageZoomIn,
             "page.zoom-out" => Self::PageZoomOut,
             "page.zoom-reset" => Self::PageZoomReset,
+            "page.switch-engine" => Self::PageSwitchEngine,
             "location.focus" => Self::LocationFocus,
             "browser.home" => Self::BrowserHome,
             "browser.quit" => Self::BrowserQuit,
@@ -488,6 +495,7 @@ mod tests {
             "page.open https://example.com/a b",
             "page.open-in wpe",
             "page.open-in wasm https://example.com/app.wasm?x y",
+            "page.switch-engine",
             "page.zoom-reset",
             "page.send-key ArrowDown",
             "page.send-key shift-space",
@@ -514,6 +522,10 @@ mod tests {
             Err(Unknown("appearance.theme".into()))
         );
         assert_eq!(parse("tab.new now"), Err(UnexpectedArgument("tab.new")));
+        assert_eq!(
+            parse("page.switch-engine wpe"),
+            Err(UnexpectedArgument("page.switch-engine"))
+        );
         assert_eq!(parse("tab.select"), Err(MissingArgument("tab.select")));
         assert_eq!(parse("page.open  "), Err(MissingArgument("page.open")));
         assert_eq!(parse("tab.select 0"), Err(InvalidTabNumber("0".into())));

@@ -226,6 +226,17 @@ In this order:
 `page.open-in <engine>` overrides all of it for one page. There is no network probe: an engine
 that gets content it can't show downloads it or says so.
 
+`sig --engine <name>` is the engine this run starts with, overriding `[engines] default`: the
+engine that opens http(s) and file URLs no routing rule claims. An engine the build lacks, or
+one the configuration does not enable, is an error at startup that names the engines available.
+The choice stays for the whole run, including when the configuration is read again.
+
+`page.switch-engine` reopens the page shown in the next web engine among those compiled in and
+enabled, in the build's order, wrapping around. It chooses that engine the way `page.open-in`
+does. With fewer than two such engines, or a page that isn't http, https or a file, it shows a
+notice and the page stays. Clicking the engine's name at the right end of the address field, or
+at the end of the line chrome, runs it. The terminal binds it to `e`.
+
 Links follow the routing too. When you click a link to an address the routing gives another
 engine, the tab opens it there and back returns to the page. Everything else a page does (a
 script's redirect, a frame loading, a link opened with the keyboard, a form) stays in its engine,
@@ -245,6 +256,7 @@ command, typed into the address line) all run them.
 | `tab.next`, `tab.previous`, `tab.last`, `tab.select <n>` | switch tabs |
 | `page.open <url>` | open an address or a search in the active tab |
 | `page.open-in <engine> [url]` | open the address, or the page shown, in the engine named, whatever the routing says |
+| `page.switch-engine` | reopen the page shown in the next web engine |
 | `page.reload`, `page.stop`, `page.back`, `page.forward` | the page's own |
 | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` | page zoom |
 | `page.send-key <key>` | press and release a named key in the page, as if typed: `down`, `pageup`, `end`, `space`, `enter`, `f5`, `shift-space`, … |

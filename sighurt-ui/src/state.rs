@@ -190,6 +190,9 @@ pub struct ChromeState {
     pub hover: Option<Target>,
     /// What the primary button went down on, until it comes up.
     pub pressed: Option<Target>,
+    /// The primary button went down on the address field's engine label. A release still on
+    /// that label runs `page.switch-engine`. The label has no hover of its own.
+    pub label_pressed: bool,
     /// Whether dragging with the button down selects text in the address line.
     pub selecting: bool,
     /// Why the last `:command` typed into the address line failed, until the line changes.

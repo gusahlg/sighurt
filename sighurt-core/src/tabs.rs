@@ -246,9 +246,10 @@ impl View {
     }
 
     /// Whether it is chosen: opened, or last navigated by the user, in an engine the user chose
-    /// (`page.open-in`, or an `OpenRequest` naming an engine). Typing an address, `page.open`
-    /// and `browser.home` make it unchosen; the page's own navigations leave it as it is. The
-    /// links of a chosen view's pages stay in its engine, wherever routing would send them.
+    /// (`page.open-in`, `page.switch-engine`, or an `OpenRequest` naming an engine). Typing an
+    /// address, `page.open` and `browser.home` make it unchosen; the page's own navigations
+    /// leave it as it is. The links of a chosen view's pages stay in its engine, wherever
+    /// routing would send them.
     pub fn chosen(&self) -> bool {
         self.chosen
     }

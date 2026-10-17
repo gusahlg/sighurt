@@ -9,9 +9,11 @@
 //! the status text, cut to fit: the status always has up to half the line, so `sig`'s notices
 //! stay visible however long the address. At its end, small and muted, is the engine the active
 //! tab's page runs in, if it fits whole in a quarter of the line (`[chrome.line] engine-label =
-//! false` leaves it out); `sig:` pages, blank tabs and errors have none. A click on the line, or
-//! `location.focus`, makes it an editor: Enter opens what was typed, a line starting with `:`
-//! runs a command, and Escape gives the page the keyboard. There are no buttons, no tab strip
+//! false` leaves it out). A click on that label, exactly where it is drawn, runs
+//! `page.switch-engine`, and hovering it changes nothing. `sig:` pages, blank tabs and errors
+//! have none. A click on the rest of the line, or `location.focus`, makes it an editor: Enter
+//! opens what was typed, a line starting with `:` runs a command, and Escape gives the page the
+//! keyboard. There are no buttons, no tab strip
 //! and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
 //! shows no engine's page (`sig://home`, an error), a few lines of text say what there is.
 //!
@@ -28,7 +30,7 @@ use std::rc::Rc;
 
 use sighurt_api::commands::Command;
 use sighurt_api::events::Cursor;
-use sighurt_api::geometry::{LogicalSize, Metrics, SurfaceRect, WindowRect};
+use sighurt_api::geometry::{LogicalSize, Metrics, SurfacePoint, SurfaceRect, WindowRect};
 use sighurt_api::ids::RequestId;
 use sighurt_api::input::{
     ButtonState, FocusEvent, Key, KeyEvent, KeyboardFocus, PointerButton, PointerEvent,
@@ -269,7 +271,9 @@ impl Line {
                     modifiers,
                 },
             ) => {
-                if self.focused {
+                if self.on_engine_label(*position) {
+                    actions.push(ChromeAction::Command(Command::PageSwitchEngine));
+                } else if self.focused {
                     let x = self.line_rect().x as f32 + position.x as f32;
                     let view = self.view();
                     if view.preedit.is_none() {
@@ -304,6 +308,22 @@ impl Line {
             _ => {}
         }
         actions
+    }
+
+    /// Whether `position` (local to the line's surface) lies in the engine label's line box.
+    /// Half-open. The label is not a hover target: motion over the line stays a text cursor.
+    fn on_engine_label(&mut self, position: SurfacePoint) -> bool {
+        let line = self.line_rect();
+        let px = line.x as f32 + position.x as f32;
+        let py = line.y as f32 + position.y as f32;
+        let Some((x, y, width, height)) = self
+            .view()
+            .engine
+            .map(|(shaped, x, y)| (x, y, shaped.width, shaped.height))
+        else {
+            return false;
+        };
+        px >= x && py >= y && px < x + width && py < y + height
     }
 
     fn set_cursor(&mut self, cursor: Cursor, actions: &mut Vec<ChromeAction>) {

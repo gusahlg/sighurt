@@ -12,6 +12,9 @@
 //!   again, in the engine named, as a new navigation of the tab (the old page is a segment back
 //!   in its history); the view it opens is chosen (`View::chosen`). An engine the build lacks,
 //!   or one not enabled, and `sig:` pages are the tab's error, as when typed.
+//! - `page.switch-engine` does that for the next web engine ([`Environment::web_engines`],
+//!   the ones compiled in and enabled), wrapping around. Fewer than two, or a page that is
+//!   not http(s) or a file, shows a notice and leaves the page.
 //! - `browser.home` opens the home page in the active tab.
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
 //!   `Effect::Focus`. Commands that change what the page area shows give the page the keyboard.
@@ -28,6 +31,7 @@ use sighurt_api::commands::Command;
 use sighurt_api::ids::TabId;
 use sighurt_api::input::KeyboardFocus;
 
+use crate::navigation::Segment;
 use crate::state::{BrowserState, By, Effect, Fx};
 
 /// Page zoom levels in percent, as in common browsers.
@@ -96,6 +100,7 @@ impl BrowserState {
                 }
                 Some(KeyboardFocus::Page)
             }
+            Command::PageSwitchEngine => self.switch_engine(active, fx),
             Command::PageReload => {
                 self.reload(active, fx);
                 None
@@ -140,6 +145,75 @@ impl BrowserState {
         if let Some(focus) = focus {
             self.move_focus(focus, fx);
         }
+    }
+
+    /// Reopens the page in the next enabled web engine, in [`Environment::web_engines`] order,
+    /// wrapping around. The navigation is `page.open-in` of that engine. Anything else is a
+    /// notice, and the page stays.
+    fn switch_engine(&mut self, tab: usize, fx: &mut Fx) -> Option<KeyboardFocus> {
+        let url = self.address(tab).filter(|url| !url.is_empty());
+        let Some(url) = url else {
+            return self.switch_notice(tab, "This tab has no page to open in another engine.", fx);
+        };
+        let web = url::Url::parse(&url)
+            .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "file"));
+        if !web {
+            return self.switch_notice(
+                tab,
+                "page.switch-engine opens http, https and file pages. This page stays where it is.",
+                fx,
+            );
+        }
+        let enabled: Vec<String> = self
+            .web_engines()
+            .iter()
+            .filter(|name| self.has_engine(name) && self.config.is_enabled(name))
+            .cloned()
+            .collect();
+        if enabled.len() < 2 {
+            let message = match enabled.as_slice() {
+                [only] => format!(
+                    "Only the {only} engine is enabled, so there is no other web engine to open \
+                     this page in."
+                ),
+                _ => "No web engine is enabled, so this page stays where it is.".to_owned(),
+            };
+            return self.switch_notice(tab, &message, fx);
+        }
+        let next = match self
+            .shown_engine(tab)
+            .as_deref()
+            .and_then(|name| enabled.iter().position(|engine| engine == name))
+        {
+            Some(index) => enabled[(index + 1) % enabled.len()].clone(),
+            None => enabled[0].clone(),
+        };
+        self.navigate(tab, url, By::User(Some(&next)), fx);
+        Some(KeyboardFocus::Page)
+    }
+
+    /// The engine of the page tab `tab` shows. A page still loading its first view, and a
+    /// record of one, still have an engine; a replacement that has not committed does not
+    /// count, because the page it replaces is what is shown.
+    fn shown_engine(&self, tab: usize) -> Option<String> {
+        let tab = &self.tabs[tab];
+        if let Some(id) = tab.current_view() {
+            return self.view(id).map(|view| view.engine().to_owned());
+        }
+        if let Some(Segment::Record(record)) = tab.current() {
+            return Some(record.engine.clone());
+        }
+        tab.switch
+            .and_then(|switch| self.view(switch.view).map(|view| view.engine().to_owned()))
+    }
+
+    /// Says `message` about tab `tab` and leaves the keyboard where it is.
+    fn switch_notice(&mut self, tab: usize, message: &str, fx: &mut Fx) -> Option<KeyboardFocus> {
+        fx.push(Effect::Notice {
+            tab: Some(self.tabs[tab].id),
+            message: message.to_owned(),
+        });
+        None
     }
 
     /// Runs the command `command` makes of tab `tab`'s number, as a tab clicked in the chrome

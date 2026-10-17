@@ -369,18 +369,25 @@ impl<T: 'static, P: 'static> Registry<T, P> {
         chromes: Vec<ChromeChecks>,
         color_names: &'static [&'static str],
     ) -> Environment {
+        let web_engines = crate::engines::descriptors()
+            .into_iter()
+            .filter(|desc| desc.web && self.engine(desc.name).is_some())
+            .map(|desc| desc.name.to_owned())
+            .collect();
         let engines = self.engines.iter();
         Environment {
             engines: engines
                 .clone()
                 .map(|e| (e.name.into(), e.capabilities))
                 .collect(),
+            web_engines,
             engine_settings: engines.map(|e| (e.name.into(), e.honors)).collect(),
             home_dir: dirs::home_dir(),
             keymaps: KEYMAPS.to_vec(),
             chromes,
             color_names,
             frontend: Frontend::Gui,
+            starting_engine: None,
         }
     }
 

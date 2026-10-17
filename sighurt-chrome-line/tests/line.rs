@@ -644,3 +644,127 @@ fn golden_images() {
     type_text(&mut *chrome, "https://exempel.se/sök?q=blåbär och lingon");
     golden("engine-typing-150", &paint(&mut *chrome, LINE, 180));
 }
+
+/// The pixels where `a` and `b` differ.
+fn differing(a: &Image, b: &Image) -> Vec<(u32, u32)> {
+    assert_eq!((a.width, a.height), (b.width, b.height));
+    let mut pixels = Vec::new();
+    for y in 0..a.height {
+        for x in 0..a.width {
+            if a.pixel(x, y) != b.pixel(x, y) {
+                pixels.push((x, y));
+            }
+        }
+    }
+    pixels
+}
+
+fn motion(chrome: &mut dyn Chrome, (x, y): (f64, f64)) -> Vec<ChromeAction> {
+    chrome.handle(ChromeEvent::Pointer {
+        surface: LINE,
+        event: PointerEvent::Motion {
+            position: SurfacePoint { x, y },
+            modifiers: Modifiers::default(),
+        },
+    })
+}
+
+/// A click on the engine name at the line's end runs `page.switch-engine`. The hit is the text
+/// that is drawn: beside it the click focuses the line, hovering it is the line's text cursor,
+/// and a click while typing does not move the caret.
+#[test]
+fn a_click_on_the_lines_engine_label_switches_engine() {
+    let page = |engine: bool| {
+        let mut snapshot = showing("https://a.example/", TabContent::Engine);
+        if engine {
+            snapshot.tabs[0].engine = Some("wpe".into());
+        }
+        snapshot
+    };
+    let off = Table::from([("engine-label".to_owned(), Value::Boolean(false))]);
+    let labelled = |settings: Table, bottom: bool| {
+        let settings = if bottom {
+            let mut settings = settings;
+            settings.insert("position".into(), Value::String("bottom".into()));
+            settings
+        } else {
+            settings
+        };
+        let mut chrome = line(settings, 700, 400);
+        chrome.handle(ChromeEvent::Snapshot(page(true)));
+        chrome
+    };
+    let mut chrome = labelled(Table::new(), false);
+    let mut bare = labelled(off.clone(), false);
+    let image = paint(&mut *chrome, LINE, 120);
+    let plain = paint(&mut *bare, LINE, 120);
+    let label = differing(&image, &plain);
+    assert!(!label.is_empty(), "the line shows no engine label");
+    let (left, right, top, bottom) = label
+        .iter()
+        .fold((u32::MAX, 0, u32::MAX, 0), |(l, r, t, b), &(x, y)| {
+            (l.min(x), r.max(x), t.min(y), b.max(y))
+        });
+    let (cx, cy) = ((left + right) / 2, (top + bottom) / 2);
+    let (x, y) = label
+        .iter()
+        .copied()
+        .min_by_key(|&(px, py)| {
+            let (dx, dy) = (px as i32 - cx as i32, py as i32 - cy as i32);
+            dx * dx + dy * dy
+        })
+        .unwrap();
+    // At 100 % a buffer pixel is one logical pixel. The click is its centre.
+    let at = (f64::from(x) + 0.5, f64::from(y) + 0.5);
+    let actions = click(&mut *chrome, LINE, at);
+    assert_eq!(commands(&actions), [Command::PageSwitchEngine]);
+    assert!(actions
+        .iter()
+        .all(|action| { !matches!(action, ChromeAction::Focus(_) | ChromeAction::TextInput(_)) }));
+
+    let beside_x = left.saturating_sub(4);
+    assert!(label.iter().all(|&(px, _)| px != beside_x));
+    let beside = (f64::from(beside_x) + 0.5, f64::from(cy) + 0.5);
+    let actions = click(&mut *chrome, LINE, beside);
+    assert!(commands(&actions).is_empty());
+    assert!(actions
+        .iter()
+        .any(|action| { matches!(action, ChromeAction::Focus(KeyboardFocus::Chrome)) }));
+    type_text(&mut *chrome, "z");
+    let actions = click(&mut *chrome, LINE, at);
+    assert_eq!(commands(&actions), [Command::PageSwitchEngine]);
+    // The caret stays: moving it would report a new text field.
+    assert!(actions
+        .iter()
+        .all(|action| { !matches!(action, ChromeAction::TextInput(_) | ChromeAction::Focus(_)) }));
+
+    let actions = motion(&mut *chrome, at);
+    assert!(commands(&actions).is_empty());
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, ChromeAction::Cursor(Cursor::Text))));
+    let again = motion(&mut *chrome, at);
+    assert!(again
+        .iter()
+        .all(|action| { !matches!(action, ChromeAction::Cursor(_) | ChromeAction::Command(_)) }));
+
+    let actions = click(&mut *bare, LINE, at);
+    assert!(commands(&actions).is_empty());
+    assert!(actions
+        .iter()
+        .any(|action| { matches!(action, ChromeAction::Focus(KeyboardFocus::Chrome)) }));
+
+    // The line at the bottom: the label's hit is still where it is drawn.
+    let mut chrome = labelled(Table::new(), true);
+    let mut bare = labelled(off, true);
+    let image = paint(&mut *chrome, LINE, 120);
+    let plain = paint(&mut *bare, LINE, 120);
+    let label = differing(&image, &plain);
+    assert!(
+        !label.is_empty(),
+        "the line at the bottom shows no engine label"
+    );
+    let (x, y) = label[label.len() / 2];
+    let actions = click(&mut *chrome, LINE, (f64::from(x) + 0.5, f64::from(y) + 0.5));
+    assert_eq!(commands(&actions), [Command::PageSwitchEngine]);
+}

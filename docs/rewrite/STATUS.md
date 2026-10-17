@@ -3254,3 +3254,38 @@ Newest last. Each entry says what was decided and why.
     opens a view in another in-process runtime (no IPC). Upgrading Servo past 0.5 (0.7.0 was
     released 5 October 2026) is tried in parallel, in a worktree of its own, and adopted only
     on measured results.
+95. **`page.switch-engine` reopens the page in the next web engine, and `sig --engine` is the
+    engine a run starts with** (decision 94). (1) `page.switch-engine` reopens the page the tab
+    shows in the next web engine, wrapping around, in the build's descriptor order, among those
+    compiled in and enabled (`[engines] enabled`). It is `page.open-in` of that engine: the same
+    history, and the view is chosen the same way, so the page's links stay until an address is
+    typed. A web engine opens http(s) pages. That is `Descriptor::web` in sighurt-runtime,
+    copied into `Environment::web_engines`; the core does not name engines. Servo and WPE are
+    web engines; Wasm and the demo engine are not. A page still loading counts, including one
+    whose view is only the tab's pending switch, so the cycle continues from the engine that is
+    opening it. Fewer than two enabled web engines, or a page that is not http, https or a file,
+    shows a notice and leaves the page. (2) `sig --engine <name>` overrides `[engines] default`
+    for the run, including every configuration reload. An engine the build lacks, or one the
+    configuration does not enable, is an error at startup that names the engines available.
+    `--help` documents it. The core applies the override on top of the file
+    (`set_starting_engine`); it is not written into the file. (3) A click on the engine label
+    at the address field's right end, or at the end of the line chrome, runs the command. The
+    hit is the text that is drawn; hovering it changes nothing else, and no golden image
+    changes. (4) The terminal's built-in `[tui.keys]` binds `e` to it. The windowed frontend
+    still binds nothing; the default file documents the command with an example binding
+    (`ctrl-alt-e`). *Why:* decision 94: which engine shows a site is the user's choice, at
+    runtime and in the configuration, and the browser ships no compatibility list. Evidence:
+    sighurt-core's `switch_engine_cycles_web_engines_in_descriptor_order`,
+    `switch_engine_leaves_the_page_and_says_why`, `switch_engine_matches_page_open_in`,
+    `a_typed_address_after_switching_engines_routes_as_after_open_in`,
+    `the_starting_engine_overrides_the_default_across_a_reload`,
+    `starting_engine_overrides_the_configured_default`,
+    `starting_engine_names_the_engines_it_can_be`,
+    `a_rejected_starting_engine_fails_the_builtin_fallback_too`,
+    `the_terminal_installs_its_default_keys_and_the_window_does_not` and
+    `the_built_in_table_is_the_one_documented`; sighurt-api's
+    `display_gives_the_canonical_string_back` and `bad_commands_are_errors`; sighurt-runtime's
+    `the_core_learns_what_each_engine_honors`; sighurt-ui's
+    `a_click_on_the_address_fields_engine_label_switches_engine`; sighurt-chrome-line's
+    `a_click_on_the_lines_engine_label_switches_engine`; sighurt-browser's
+    `engine_is_the_engine_this_run_starts_with`.

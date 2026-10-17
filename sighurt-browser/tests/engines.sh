@@ -62,6 +62,8 @@
 #   labels  the engine labels: a Servo page, a page [routing.wpe] hosts gives WPE and sig://home
 #           are labelled servo, wpe and nothing, in their tabs and the address bar; engine-label =
 #           false turns them off while sig runs; the line chrome names the page's engine too
+#   switch  page.switch-engine moves https://example.com/ from Servo to WPE and back, checked
+#           from the diagnostics and the session's history segments
 #
 # Exits with the number of failed checks.
 set -u
@@ -75,7 +77,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: engines.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase labels)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase labels switch)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (the demo engine's tests build it with other
   # features); this link keeps the binary these runs use. It is made under the same hold of the
@@ -1238,6 +1240,27 @@ CONF
   point 1000 700
   sleep 1
   shot_ppm 07-line-wpe
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+  ;;
+
+switch)
+  step "https://example.com/ opens in Servo, the default engine"
+  start_sig "https://example.com/"
+  check "example.com opens in Servo" \
+    "$(sess 30 "url(1)=='https://example.com/' and seg(1)['engine']=='servo' and seg(1).get('title')=='Example Domain', (seg(1)['engine'], url(1), seg(1).get('title'))")"
+  check "the tab shows its Servo view" "$(shows_tab 1 servo)"
+  step "page.switch-engine reopens it in the next web engine, WPE"
+  open ":page.switch-engine"
+  check "page.switch-engine opens example.com in WPE" \
+    "$(sess 30 "url(1)=='https://example.com/' and seg(1)['engine']=='wpe' and segs(1)==[('servo', 1, 0), ('wpe', 1, 0)], (segs(1), url(1))")"
+  check "the tab shows its WPE view" "$(shows_tab 1 wpe)"
+  step "page.switch-engine again returns it to Servo"
+  open ":page.switch-engine"
+  check "page.switch-engine opens example.com in Servo again" \
+    "$(sess 30 "url(1)=='https://example.com/' and seg(1)['engine']=='servo' and segs(1)==[('servo', 1, 0), ('wpe', 1, 0), ('servo', 1, 0)], (segs(1), url(1))")"
+  check "the tab shows its Servo view again" "$(shows_tab 1 servo)"
   key -M ctrl q -m ctrl
   wait "$sig_pid"; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"

@@ -6,7 +6,9 @@
 //! starts on its target, how its views present and the renderer label. The core's
 //! [`Environment`](sighurt_core::Environment) is built from these descriptors.
 //!
-//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, the demo engine.
+//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, the demo engine. The
+//! web engines, those that open http(s) pages, are the ones `page.switch-engine` cycles, in
+//! that same order.
 //!
 //! Must not own: how a runtime is constructed or how it presents. Those name the frontend's
 //! target and permit types.
@@ -17,6 +19,9 @@ use sighurt_api::engine::EngineCapabilities;
 pub struct Descriptor {
     /// Its name in the configuration.
     pub name: &'static str,
+    /// Whether it opens http(s) pages. `page.switch-engine` cycles these, in [`descriptors`]
+    /// order, among the ones the configuration enables.
+    pub web: bool,
     /// What it supports. The core needs this before the runtime exists.
     pub capabilities: EngineCapabilities,
     /// The settings of `[engines.<name>]` it honors.
@@ -29,24 +34,28 @@ pub fn descriptors() -> Vec<Descriptor> {
         #[cfg(feature = "engine-servo")]
         Descriptor {
             name: "servo",
+            web: true,
             capabilities: sighurt_engine_servo::CAPABILITIES,
             honors: &["user-agent", "storage"],
         },
         #[cfg(feature = "engine-wasm")]
         Descriptor {
             name: "wasm",
+            web: false,
             capabilities: wasm_capabilities(),
             honors: &["storage"],
         },
         #[cfg(feature = "engine-wpe")]
         Descriptor {
             name: "wpe",
+            web: true,
             capabilities: sighurt_engine_wpe::CAPABILITIES,
             honors: &["user-agent", "storage"],
         },
         #[cfg(feature = "engine-demo")]
         Descriptor {
             name: "demo",
+            web: false,
             // `sighurt_engine_demo::CAPABILITIES` is every field false, which is `Default`.
             // Repeated here so this crate does not depend on the demo engine: that crate names
             // the host's target types. `Registry::start` warns if a runtime reports otherwise.
@@ -115,5 +124,21 @@ mod tests {
         assert_eq!(env.engine_settings["wpe"], ["user-agent", "storage"]);
         #[cfg(feature = "engine-demo")]
         assert!(env.engine_settings["demo"].is_empty());
+        // Web engines are a property of the descriptors, in their order, whatever this build
+        // compiled in. Servo and WPE open http(s) pages; Wasm and the demo engine do not.
+        let web: Vec<String> = descriptors()
+            .iter()
+            .filter(|desc| desc.web)
+            .map(|desc| desc.name.to_owned())
+            .collect();
+        assert_eq!(env.web_engines, web);
+        for desc in descriptors() {
+            assert_eq!(
+                desc.web,
+                matches!(desc.name, "servo" | "wpe"),
+                "{}",
+                desc.name
+            );
+        }
     }
 }

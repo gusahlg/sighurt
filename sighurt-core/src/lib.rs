@@ -36,6 +36,7 @@ pub mod session;
 pub mod state;
 pub mod tabs;
 
+pub use config::set_starting_engine;
 pub use state::{
     update, BrowserEvent, BrowserState, ChromeChecks, Effect, Environment, Frontend, OpenRequest,
 };

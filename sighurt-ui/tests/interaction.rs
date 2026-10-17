@@ -1553,3 +1553,132 @@ fn the_tree_names_each_tabs_engine() {
     });
     assert_eq!(descriptions(&mut chrome), [None, None, None]);
 }
+
+/// A click on the engine label at the address field's right end runs `page.switch-engine`.
+/// The hit is the text that is drawn: beside it the click is an address click, hovering it is
+/// hovering the address line, and releasing elsewhere runs nothing.
+#[test]
+fn a_click_on_the_address_fields_engine_label_switches_engine() {
+    let options = LayoutOptions::default();
+    let without = LayoutOptions {
+        engine_label: false,
+        ..options
+    };
+    let mut snapshot = labelled(three_tabs(), &["servo"]);
+    snapshot.tabs[0].url = "https://a.test/".into();
+    let colors = Colors::default();
+    let mut chrome = arranged(800, 600, snapshot.clone(), colors, options);
+    let mut bare = arranged(800, 600, snapshot.clone(), colors, without);
+    let rect = chrome.layout().chrome;
+    let field = chrome.layout().address;
+    let image = paint(&mut chrome, CHROME, 120);
+    let unlabelled = paint(&mut bare, CHROME, 120);
+    let label: Vec<(u32, u32)> = differing(&image, &unlabelled)
+        .into_iter()
+        .filter(|&(x, y)| field.contains(window_point(&image, rect, x, y)))
+        .collect();
+    assert!(!label.is_empty(), "the address field shows no engine label");
+    let (left, right, top, bottom) = label
+        .iter()
+        .fold((u32::MAX, 0, u32::MAX, 0), |(l, r, t, b), &(x, y)| {
+            (l.min(x), r.max(x), t.min(y), b.max(y))
+        });
+    let (cx, cy) = ((left + right) / 2, (top + bottom) / 2);
+    let (x, y) = label
+        .iter()
+        .copied()
+        .min_by_key(|&(px, py)| {
+            let (dx, dy) = (px as i32 - cx as i32, py as i32 - cy as i32);
+            dx * dx + dy * dy
+        })
+        .unwrap();
+    let at = window_point(&image, rect, x, y);
+
+    let actions = click(&mut chrome, at);
+    assert_eq!(commands(&actions), [Command::PageSwitchEngine]);
+    assert!(!chrome.state().focused);
+    assert!(actions
+        .iter()
+        .all(|action| !matches!(action, ChromeAction::Focus(_))));
+
+    // Just left of the drawn label is still the address line.
+    let beside_x = left.saturating_sub(4);
+    assert!(label.iter().all(|&(px, _)| px != beside_x));
+    let beside = window_point(&image, rect, beside_x, cy);
+    assert!(
+        field.contains(beside),
+        "{beside:?} is outside the field {field:?}"
+    );
+    let actions = click(&mut chrome, beside);
+    assert!(commands(&actions).is_empty());
+    assert!(chrome.state().focused);
+    assert!(actions
+        .iter()
+        .any(|action| { matches!(action, ChromeAction::Focus(KeyboardFocus::Chrome)) }));
+    // While the line is focused the label is hidden, so that point places the caret.
+    let actions = click(&mut chrome, at);
+    assert!(commands(&actions).is_empty());
+    assert!(chrome.state().focused);
+
+    // With the label turned off, the same point is an address click.
+    let actions = click(&mut bare, at);
+    assert!(commands(&actions).is_empty());
+    assert!(bare.state().focused);
+
+    let button_at = |chrome: &mut Model, at: WindowPoint, state: ButtonState| {
+        let surface = chrome.layout().chrome;
+        chrome.pointer(
+            surface,
+            &PointerEvent::Button {
+                button: PointerButton::Left,
+                state,
+                position: surface.to_surface(at),
+                modifiers: Modifiers::default(),
+            },
+        )
+    };
+    // Hovering the label is hovering the address line, and a second move changes nothing.
+    let mut chrome = arranged(800, 600, snapshot.clone(), colors, options);
+    let surface = chrome.layout().chrome;
+    let motion = |chrome: &mut Model| {
+        chrome.pointer(
+            surface,
+            &PointerEvent::Motion {
+                position: surface.to_surface(at),
+                modifiers: Modifiers::default(),
+            },
+        )
+    };
+    let actions = motion(&mut chrome);
+    assert!(commands(&actions).is_empty());
+    assert_eq!(chrome.state().hover, Some(Target::Address));
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, ChromeAction::Cursor(Cursor::Text))));
+    let again = motion(&mut chrome);
+    assert!(again
+        .iter()
+        .all(|action| { !matches!(action, ChromeAction::Cursor(_) | ChromeAction::Command(_)) }));
+
+    // Press on the label and release elsewhere: no command, and the line stays unfocused.
+    let mut actions = button_at(&mut chrome, at, ButtonState::Pressed);
+    let outside = WindowPoint { x: 0.0, y: 0.0 };
+    actions.extend(button_at(&mut chrome, outside, ButtonState::Released));
+    assert!(commands(&actions).is_empty());
+    assert!(!chrome.state().focused);
+
+    // A drag that starts in the address text and ends on the label does not switch.
+    let mut chrome = arranged(800, 600, snapshot.clone(), colors, options);
+    let mut actions = button_at(&mut chrome, beside, ButtonState::Pressed);
+    actions.extend(button_at(&mut chrome, at, ButtonState::Released));
+    assert!(commands(&actions).is_empty());
+    assert!(chrome.state().focused);
+
+    // Losing the window between the press and the release cancels the click.
+    let mut chrome = arranged(800, 600, snapshot, colors, options);
+    let mut actions = button_at(&mut chrome, at, ButtonState::Pressed);
+    actions.extend(chrome.window_focus(FocusEvent::Deactivated));
+    actions.extend(button_at(&mut chrome, at, ButtonState::Released));
+    assert!(commands(&actions).is_empty());
+    assert!(!chrome.state().focused);
+}

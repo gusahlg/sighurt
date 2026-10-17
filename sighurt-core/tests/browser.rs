@@ -120,6 +120,17 @@ impl Harness {
         harness
     }
 
+    /// A browser whose build is `env`, with `config` (without its version line).
+    fn with_env(config: &str, env: Environment) -> Self {
+        let config = Config::parse(Some(&format!("version = 1\n{config}")), &env).unwrap();
+        Self {
+            state: BrowserState::new(config, env),
+            now: Instant::now(),
+            views: BTreeMap::new(),
+            seat: SeatId::next(),
+        }
+    }
+
     /// Applies one event; the engines don't answer.
     fn update(&mut self, event: BrowserEvent) -> Vec<Effect> {
         let effects = update(&mut self.state, event);
@@ -3104,6 +3115,253 @@ fn open_in_says_why_it_cant() {
         message.contains("the wasm engine doesn't open data: URLs"),
         "{message}"
     );
+}
+
+/// Servo and WPE are web engines, in that order; Wasm and the demo engine are not.
+fn web_env() -> Environment {
+    let mut env = environment();
+    env.engines = engines(&["servo", "wasm", "wpe", "demo"]);
+    env.web_engines = vec!["servo".into(), "wpe".into()];
+    env
+}
+
+fn web_start(config: &str, urls: &[&str]) -> Harness {
+    let mut harness = Harness::with_env(config, web_env());
+    harness.apply(BrowserEvent::Start {
+        session: None,
+        open: urls.iter().map(|url| open(url)).collect(),
+    });
+    harness
+}
+
+/// One saved history segment: its engine, entries and which entry is current.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SavedSegment {
+    engine: Option<String>,
+    entries: Vec<String>,
+    current: usize,
+}
+
+/// The active tab's saved history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SavedHistory {
+    /// Which segment is current.
+    current: usize,
+    segments: Vec<SavedSegment>,
+}
+
+/// The active tab's saved history: which segment, then each segment's engine and entries.
+fn history(b: &Harness) -> SavedHistory {
+    let session = b.state.session();
+    let tab = &session.tabs[session.active];
+    let segments = tab
+        .segments
+        .iter()
+        .map(|segment| SavedSegment {
+            engine: segment.engine.clone(),
+            entries: segment.entries.clone(),
+            current: segment.current,
+        })
+        .collect();
+    SavedHistory {
+        current: tab.current,
+        segments,
+    }
+}
+
+fn shown_choice(b: &Harness) -> (String, bool) {
+    let view = b.state.view(b.shown()).unwrap();
+    (view.engine().to_owned(), view.chosen())
+}
+
+#[test]
+fn switch_engine_cycles_web_engines_in_descriptor_order() {
+    let mut b = web_start("", &["https://a.test/"]);
+    assert_eq!(shown_choice(&b).0, "servo");
+    b.apply(command("page.switch-engine"));
+    assert_eq!(shown_choice(&b), ("wpe".into(), true));
+    b.apply(command("page.switch-engine"));
+    assert_eq!(shown_choice(&b), ("servo".into(), true));
+    // Wasm sits between them in the build and is not a web engine.
+    let engines: Vec<_> = history(&b)
+        .segments
+        .into_iter()
+        .map(|segment| segment.engine)
+        .collect();
+    assert_eq!(
+        engines,
+        [
+            Some("servo".into()),
+            Some("wpe".into()),
+            Some("servo".into())
+        ]
+    );
+
+    // Enabled order is not the cycle order: the descriptor order is.
+    let mut b = web_start(
+        "[engines]\ndefault = \"wpe\"\nenabled = [\"wpe\", \"servo\", \"wasm\"]",
+        &["https://a.test/"],
+    );
+    assert_eq!(shown_choice(&b).0, "wpe");
+    b.apply(command("page.switch-engine"));
+    assert_eq!(shown_choice(&b).0, "servo");
+
+    // A page in an engine that is not a web engine moves to the first one.
+    let mut env = web_env();
+    env.web_engines = vec!["wpe".into(), "servo".into()];
+    let mut b = Harness::with_env("", env);
+    b.apply(BrowserEvent::Start {
+        session: None,
+        open: vec![open("https://a.test/")],
+    });
+    b.apply(command("page.open-in wasm"));
+    assert_eq!(shown_choice(&b).0, "wasm");
+    b.apply(command("page.switch-engine"));
+    assert_eq!(shown_choice(&b).0, "wpe");
+}
+
+#[test]
+fn switch_engine_leaves_the_page_and_says_why() {
+    let stayed = |b: &mut Harness, config_note: &str| {
+        let before = b.shown();
+        let effects = b.apply(command("page.switch-engine"));
+        assert!(
+            opened(&effects).is_empty() && notices(&effects).len() == 1,
+            "{config_note}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Focus(_))),
+            "{config_note}"
+        );
+        assert_eq!(b.shown(), before, "{config_note}");
+        assert!(b.active().error.is_none(), "{config_note}");
+        notices(&effects)[0].to_owned()
+    };
+    let mut b = web_start(
+        "[engines]\nenabled = [\"servo\", \"wasm\"]",
+        &["https://a.test/"],
+    );
+    let message = stayed(&mut b, "one web engine");
+    assert!(
+        message.contains("Only the servo engine") && message.contains("no other web engine"),
+        "{message}"
+    );
+
+    let mut env = web_env();
+    env.web_engines.clear();
+    let mut b = Harness::with_env("", env);
+    b.apply(BrowserEvent::Start {
+        session: None,
+        open: vec![open("https://a.test/")],
+    });
+    let message = stayed(&mut b, "no web engine");
+    assert!(message.contains("No web engine is enabled"), "{message}");
+
+    let mut b = web_start("", &["sig://home"]);
+    let effects = b.apply(command("page.switch-engine"));
+    let message = notices(&effects)[0];
+    assert!(
+        opened(&effects).is_empty() && message.contains("http, https and file"),
+        "{message}"
+    );
+    assert!(matches!(b.active().content, Content::Internal(_)));
+
+    let mut b = web_start("", &["data:text/html,x"]);
+    assert_eq!(shown_choice(&b).0, "servo");
+    let message = stayed(&mut b, "data:");
+    assert!(message.contains("http, https and file"), "{message}");
+    assert_eq!(shown_choice(&b).0, "servo");
+}
+
+#[test]
+fn switch_engine_matches_page_open_in() {
+    let run = |command_text: &str| {
+        let mut b = web_start("", &["https://a.test/"]);
+        b.apply(command(command_text));
+        let chosen = shown_choice(&b);
+        let saved = history(&b);
+        b.apply(command("page.back"));
+        let back = (shown_choice(&b), history(&b));
+        b.apply(command("page.forward"));
+        let forward = (shown_choice(&b), history(&b));
+        (chosen, saved, back, forward)
+    };
+    let switched = run("page.switch-engine");
+    let opened_in = run("page.open-in wpe");
+    assert_eq!(switched, opened_in);
+    assert_eq!(switched.0, ("wpe".into(), true));
+
+    // A page still loading, and a file, the same way.
+    let loading = |command_text: &str| {
+        let mut b = Harness::with_env("", web_env());
+        b.update(BrowserEvent::Start {
+            session: None,
+            open: vec![open("https://slow.test/")],
+        });
+        let effects = b.update(command(command_text));
+        let (view, engine, _) = opened(&effects)[0];
+        (engine.to_owned(), navigation(&effects, view).1)
+    };
+    assert_eq!(
+        loading("page.switch-engine"),
+        loading("page.open-in wpe https://slow.test/")
+    );
+    let file = |command_text: &str| {
+        let mut b = web_start("", &["file:///tmp/page.html"]);
+        b.apply(command(command_text));
+        (shown_choice(&b), history(&b))
+    };
+    assert_eq!(file("page.switch-engine"), file("page.open-in wpe"));
+}
+
+#[test]
+fn a_typed_address_after_switching_engines_routes_as_after_open_in() {
+    let after = |command_text: &str| {
+        let mut b = web_start("[routing.wpe]\nhosts = [\"b.test\"]", &["https://a.test/"]);
+        b.apply(command(command_text));
+        let wpe = b.shown();
+        // The page's own navigation leaves the view chosen (routing sends b.test to wpe).
+        let effects = b.engine(EngineEvent::OpenRequested {
+            view: wpe,
+            document: b.document(wpe),
+            url: "https://b.test/next".into(),
+            disposition: OpenDisposition::CurrentView,
+        });
+        navigation(&effects, wpe);
+        let stayed = shown_choice(&b);
+        // An address the same engine opens unchooses it, in the same view.
+        let effects = b.apply(command("page.open https://b.test/"));
+        let same = (opened(&effects).len(), b.shown() == wpe, shown_choice(&b));
+        // An address routing gives another engine opens there, unchosen.
+        b.apply(command("page.open https://d.test/"));
+        let routed = shown_choice(&b);
+        (stayed, same, routed)
+    };
+    let switched = after("page.switch-engine");
+    let opened_in = after("page.open-in wpe");
+    assert_eq!(switched, opened_in);
+    assert_eq!(switched.0, ("wpe".into(), true));
+    assert_eq!(switched.1, (0, true, ("wpe".into(), false)));
+    assert_eq!(switched.2, ("servo".into(), false));
+}
+
+#[test]
+fn the_starting_engine_overrides_the_default_across_a_reload() {
+    let mut env = web_env();
+    env.starting_engine = Some("wpe".into());
+    let mut b = Harness::with_env("", env.clone());
+    b.apply(BrowserEvent::Start {
+        session: None,
+        open: vec![open("https://a.test/")],
+    });
+    assert_eq!(shown_choice(&b), ("wpe".into(), false));
+    let config = Config::parse(Some("version = 1\n[engines]\ndefault = \"servo\""), &env).unwrap();
+    assert_eq!(config.default_engine(), "wpe");
+    b.apply(config_reloaded(Ok(config)));
+    b.apply(command("page.open https://c.test/"));
+    assert_eq!(shown_choice(&b), ("wpe".into(), false));
 }
 
 #[test]

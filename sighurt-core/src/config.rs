@@ -16,6 +16,9 @@
 //! build has, and so is a key table no keymap reads. Only the user's file gets these notices.
 //! The routing rules of an engine the build lacks are checked and left out, so what they claim
 //! goes to the default engine; the user's `[engines] default` must name an engine of the build.
+//! [`set_starting_engine`] (and [`Environment::starting_engine`]) names the engine this run
+//! starts with instead. Parsing applies it on top of a valid file, and again on every later
+//! parse, so reloading the file does not put `[engines] default` back.
 //!
 //! `[input] keymap` chooses the keymap (the core's own `bindings`, which reads `[keys]`, unless
 //! it names another); `[input] scroll-speed` scales the scrolling pages get, and
@@ -41,6 +44,7 @@
 //! Must not own: reading or watching files, which the executable does, or deciding what a
 //! reload means for open pages ([`crate::state`]).
 
+use std::cell::RefCell;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -350,9 +354,68 @@ struct RawButtons {
     forward: Option<String>,
 }
 
+thread_local! {
+    /// `--engine`, for this process. [`Environment::starting_engine`] wins when it is set, so
+    /// a test can name an override without touching this.
+    static STARTING_ENGINE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Why the user's file rejected `--engine`. The executable's fallback parse of the
+    /// built-in file would otherwise accept an engine that file turned off.
+    static STARTING_REJECTED: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The engine `sig --engine` named, or `None` to use `[engines] default`.
+///
+/// [`Config::parse`] applies it on top of the file, including every reload during the run.
+/// An engine the build lacks, or one the configuration does not enable, is an error that
+/// names the engines available. The windowed frontend retries a failed user file with the
+/// built-in configuration; a rejection of a file that was otherwise valid fails that retry
+/// too, so `sig` does not start on the built-in file with an engine the user turned off.
+pub fn set_starting_engine(engine: Option<String>) {
+    STARTING_ENGINE.with(|slot| *slot.borrow_mut() = engine);
+    STARTING_REJECTED.with(|slot| slot.borrow_mut().take());
+}
+
+/// Puts the process-wide `--engine` aside so [`Config::default`] stays the built-in file.
+struct HiddenStarting {
+    engine: Option<String>,
+    rejected: Option<String>,
+}
+
+impl HiddenStarting {
+    fn hide() -> Self {
+        Self {
+            engine: STARTING_ENGINE.with(|slot| slot.borrow_mut().take()),
+            rejected: STARTING_REJECTED.with(|slot| slot.borrow_mut().take()),
+        }
+    }
+}
+
+impl Drop for HiddenStarting {
+    fn drop(&mut self) {
+        let engine = self.engine.take();
+        let rejected = self.rejected.take();
+        STARTING_ENGINE.with(|slot| *slot.borrow_mut() = engine);
+        STARTING_REJECTED.with(|slot| *slot.borrow_mut() = rejected);
+    }
+}
+
+fn process_starting() -> Option<String> {
+    STARTING_ENGINE.with(|slot| slot.borrow().clone())
+}
+
+fn take_rejection() -> Option<String> {
+    STARTING_REJECTED.with(|slot| slot.borrow_mut().take())
+}
+
+fn set_rejection(message: String) {
+    STARTING_REJECTED.with(|slot| *slot.borrow_mut() = Some(message));
+}
+
 impl Default for Config {
     /// The built-in configuration, for a build with no engines: so with no routing rules.
     fn default() -> Self {
+        // `--engine` belongs to a real build's parse, not to this empty environment.
+        let _hidden = HiddenStarting::hide();
         Self::parse(None, &Environment::default()).expect("the built-in configuration is valid")
     }
 }
@@ -360,7 +423,20 @@ impl Default for Config {
 impl Config {
     /// Parses `user`, the text of the user's file (`None` if there is none), over
     /// [`DEFAULT_CONFIG`], for a build with what `env` lists.
+    ///
+    /// [`Environment::starting_engine`], or else [`set_starting_engine`], replaces
+    /// `[engines] default` once the file is otherwise valid. A file that was valid except
+    /// for that engine leaves a rejection: the next parse of the built-in file (`user` is
+    /// `None`, and `env` names no starting engine of its own) returns it, so a fallback to
+    /// the built-in configuration does not accept the engine.
     pub fn parse(user: Option<&str>, env: &Environment) -> Result<Self, ConfigError> {
+        if user.is_some() || env.starting_engine.is_some() {
+            take_rejection();
+        } else if let Some(message) = take_rejection() {
+            if process_starting().is_some() {
+                return Err(ConfigError::one(message));
+            }
+        }
         let mut defaults: Raw = toml::from_str(DEFAULT_CONFIG).map_err(toml_error)?;
         let builtin_keys = take_keys(&mut defaults.tui);
         let Some(user) = user else {
@@ -932,7 +1008,7 @@ fn validate(
     if !problems.is_empty() {
         return Err(ConfigError { problems });
     }
-    Ok(Config {
+    let mut config = Config {
         home,
         search,
         zoom,
@@ -954,7 +1030,60 @@ fn validate(
         restore_session: raw.session.restore.unwrap_or(true),
         tui,
         notices,
-    })
+    };
+    if let Err(problem) = apply_starting_engine(&mut config, env) {
+        return Err(ConfigError::one(problem));
+    }
+    Ok(config)
+}
+
+/// The engine this run starts with, and whether it came from [`set_starting_engine`] rather
+/// than [`Environment::starting_engine`].
+fn starting_override(env: &Environment) -> Option<(String, bool)> {
+    if let Some(name) = env.starting_engine.clone() {
+        return Some((name, false));
+    }
+    process_starting().map(|name| (name, true))
+}
+
+/// Sets `config`'s default engine to the run's override. A name the build lacks, or one
+/// `config` does not enable, is the error, and names the engines that can be chosen.
+fn apply_starting_engine(config: &mut Config, env: &Environment) -> Result<(), String> {
+    let Some((name, from_process)) = starting_override(env) else {
+        return Ok(());
+    };
+    let available = list(
+        env.engines
+            .keys()
+            .map(String::as_str)
+            .filter(|engine| config.is_enabled(engine)),
+    );
+    let problem = if !env.engines.contains_key(&name) {
+        Some(format!(
+            "--engine {name:?}: this build has no engine {name:?} (available: {available})"
+        ))
+    } else if !config.is_enabled(&name) {
+        Some(format!(
+            "--engine {name:?}: the {name} engine is not enabled (available: {available})"
+        ))
+    } else {
+        None
+    };
+    match problem {
+        None => {
+            config.default_engine = name;
+            if from_process {
+                take_rejection();
+            }
+            Ok(())
+        }
+        Some(problem) => {
+            if from_process {
+                set_rejection(problem.clone());
+            }
+            Err(problem)
+        }
+    }
 }
 
 /// The commands `[keys]` and `[input.buttons]` may bind for the frontend that is running.
@@ -1521,6 +1650,8 @@ mod tests {
             chromes: vec![STANDARD],
             color_names: &COLORS,
             frontend: Frontend::Gui,
+            web_engines: Vec::new(),
+            starting_engine: None,
         }
     }
 
@@ -1582,9 +1713,10 @@ mod tests {
     fn the_terminal_installs_its_default_keys_and_the_window_does_not() {
         let config = Config::parse(None, &terminal_env()).unwrap();
         assert_eq!(config.tui(), &TuiConfig::default());
-        assert_eq!(config.keymap_settings.len(), 31);
+        assert_eq!(config.keymap_settings.len(), 32);
         let bound = |key: &str| config.keymap_settings[key].as_str();
         assert_eq!(bound("q"), Some("browser.quit"));
+        assert_eq!(bound("e"), Some("page.switch-engine"));
         assert_eq!(bound("j"), Some("page.send-key ArrowDown"));
         assert_eq!(bound("ctrl-r"), Some("page.reload"));
         assert_eq!(bound("ctrl-l"), Some("chrome.refresh"));
@@ -2381,5 +2513,100 @@ mod tests {
             "version = 1\n[session]\nsave = false",
             "[session]: unknown field `save`",
         );
+    }
+
+    /// Clears [`set_starting_engine`] when the test ends, including on a panic. Cargo reuses
+    /// the thread.
+    struct ClearStarting;
+
+    impl Drop for ClearStarting {
+        fn drop(&mut self) {
+            set_starting_engine(None);
+        }
+    }
+
+    #[test]
+    fn starting_engine_overrides_the_configured_default() {
+        let mut env = env();
+        env.starting_engine = Some("wasm".into());
+        let servo = "version = 1\n[engines]\ndefault = \"servo\"";
+        let config = Config::parse(Some(servo), &env).unwrap();
+        assert_eq!(config.default_engine(), "wasm");
+        // A reload that names another default keeps the run's engine.
+        let demo = "version = 1\n[engines]\ndefault = \"demo\"";
+        let again = Config::parse(Some(demo), &env).unwrap();
+        assert_eq!(again.default_engine(), "wasm");
+        // The field wins over the process-wide choice.
+        let _keep = ClearStarting;
+        set_starting_engine(Some("demo".into()));
+        assert_eq!(
+            Config::parse(Some(servo), &env).unwrap().default_engine(),
+            "wasm"
+        );
+    }
+
+    #[test]
+    fn starting_engine_names_the_engines_it_can_be() {
+        let mut env = env();
+        env.starting_engine = Some("nope".into());
+        assert_eq!(
+            problems_of(&env, "version = 1"),
+            [
+                "--engine \"nope\": this build has no engine \"nope\" (available: demo, servo, \
+              wasm)"
+            ]
+        );
+        env.starting_engine = Some("demo".into());
+        let enabled =
+            "version = 1\n[engines]\ndefault = \"servo\"\nenabled = [\"servo\", \"wasm\"]";
+        assert_eq!(
+            problems_of(&env, enabled),
+            ["--engine \"demo\": the demo engine is not enabled (available: servo, wasm)"]
+        );
+        // A file that is already invalid is reported as itself. The override is not a second
+        // problem, and it does not reject the built-in fallback.
+        env.starting_engine = None;
+        let _keep = ClearStarting;
+        set_starting_engine(Some("wasm".into()));
+        assert!(Config::parse(Some("version = 1\nhome = \"not a url\""), &env).is_err());
+        assert_eq!(Config::parse(None, &env).unwrap().default_engine(), "wasm");
+    }
+
+    #[test]
+    fn a_rejected_starting_engine_fails_the_builtin_fallback_too() {
+        let _keep = ClearStarting;
+        let env = env();
+        set_starting_engine(Some("demo".into()));
+        let user = "version = 1\n[engines]\ndefault = \"servo\"\nenabled = [\"servo\"]";
+        let rejected = Config::parse(Some(user), &env).unwrap_err();
+        assert_eq!(
+            rejected.problems(),
+            ["--engine \"demo\": the demo engine is not enabled (available: servo)"]
+        );
+        // The windowed frontend then parses the built-in file, which enables every engine.
+        let fallback = Config::parse(None, &env).unwrap_err();
+        assert_eq!(fallback.problems(), rejected.problems());
+        // No file at all: the built-in configuration enables it, so the run starts there.
+        set_starting_engine(Some("wasm".into()));
+        assert_eq!(Config::parse(None, &env).unwrap().default_engine(), "wasm");
+        set_starting_engine(Some("nope".into()));
+        let missing = Config::parse(None, &env).unwrap_err();
+        assert_eq!(
+            missing.problems(),
+            [
+                "--engine \"nope\": this build has no engine \"nope\" (available: demo, servo, \
+              wasm)"
+            ]
+        );
+        assert_eq!(
+            Config::parse(None, &env).unwrap_err().problems(),
+            missing.problems()
+        );
+    }
+
+    fn problems_of(env: &Environment, user: &str) -> Vec<String> {
+        Config::parse(Some(user), env)
+            .expect_err("invalid")
+            .problems
     }
 }

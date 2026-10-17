@@ -88,6 +88,10 @@ pub struct Environment {
     /// gets a view per page, each page a segment of the tab's history; one without page zoom is
     /// never sent `SetZoom`.
     pub engines: BTreeMap<String, EngineCapabilities>,
+    /// The web engines, in the build's descriptor order: engines that open http(s) pages.
+    /// `page.switch-engine` cycles the ones compiled in and enabled. Empty when the build
+    /// names none.
+    pub web_engines: Vec<String>,
     /// Which settings of `[engines.<engine>]` each engine of the build honors, by engine
     /// ("user-agent", "storage"). An engine left out honors none.
     pub engine_settings: BTreeMap<String, &'static [&'static str]>,
@@ -103,6 +107,10 @@ pub struct Environment {
     /// Which frontend is running. [`Frontend::Gui`] when left out, which keeps the window's
     /// chrome checks and installs no terminal keys.
     pub frontend: Frontend,
+    /// The engine this run starts with, overriding `[engines] default`. [`Config::parse`]
+    /// applies it on top of every file it reads, so a reload keeps it. `None` uses the
+    /// process-wide choice from [`crate::config::set_starting_engine`], if one was set.
+    pub starting_engine: Option<String>,
 }
 
 /// What the core needs of a chrome of the build: its name, the check of its
@@ -637,6 +645,16 @@ impl BrowserState {
     /// What `engine` supports.
     fn capabilities(&self, engine: &str) -> EngineCapabilities {
         self.env.engines.get(engine).copied().unwrap_or_default()
+    }
+
+    /// The build's web engines, in descriptor order.
+    pub(crate) fn web_engines(&self) -> &[String] {
+        &self.env.web_engines
+    }
+
+    /// Whether `name` is an engine compiled into this build.
+    pub(crate) fn has_engine(&self, name: &str) -> bool {
+        self.env.engines.contains_key(name)
     }
 
     /// Whether back or forward stays in `view`'s own history.

@@ -32,6 +32,7 @@ const DEFAULT_KEYS: &[(&str, &str)] = &[
     ("H", "page.back"),
     ("L", "page.forward"),
     ("r", "page.reload"),
+    ("e", "page.switch-engine"),
     ("ctrl-r", "page.reload"),
     ("j", "page.send-key ArrowDown"),
     ("k", "page.send-key ArrowUp"),
@@ -385,7 +386,7 @@ fn text_field(view: ViewId) -> EngineEvent {
 
 #[test]
 fn the_built_in_table_is_the_one_documented() {
-    assert_eq!(DEFAULT_KEYS.len(), 31);
+    assert_eq!(DEFAULT_KEYS.len(), 32);
     for (key, command) in DEFAULT_KEYS {
         let line = format!("\"{key}\" = \"{command}\"");
         assert!(
