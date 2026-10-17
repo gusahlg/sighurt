@@ -9,3 +9,17 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+calloop.workspace = true
+rustix = { workspace = true, features = ["event", "fs", "process", "pty", "stdio", "termios"] }
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+libc = "0.2"
+# The demo's `--worker crossterm` has to link it. Dev-dependencies are not
+# available to binaries. The prototype itself does not use crossterm.
+crossterm = "0.29"
+
+[dev-dependencies]
+vte = "0.15"
+termwiz = "0.23"
+libc = "0.2"
+rustix = { workspace = true, features = ["event", "fs", "process", "pty", "termios"] }
