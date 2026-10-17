@@ -10254,6 +10254,14 @@ name = "sighurt-sdk"
 version = "0.7.0"
 
 [[package]]
+name = "sighurt-semantic"
+version = "0.7.0"
+dependencies = [
+ "serde_json",
+ "sighurt-api",
+]
+
+[[package]]
 name = "sighurt-tui"
 version = "0.7.0"
 dependencies = [
@@ -10269,6 +10277,7 @@ dependencies = [
  "sighurt-engine-demo",
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
+ "sighurt-engine-wpe",
  "sighurt-runtime",
  "unicode-segmentation",
  "unicode-width",

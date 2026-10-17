@@ -12,6 +12,8 @@ members = [
     "sighurt-gui",
     # Chromes besides the standard one, compiled into `sig` through sighurt-browser's features.
     "sighurt-chrome-line",
+    # DOM extraction shared by the Servo and WPE adapters (docs/rewrite/TUI.md §3).
+    "sighurt-semantic",
     # Engines, compiled into `sig` through sighurt-browser's features.
     "sighurt-engine-servo",
     "sighurt-engine-wasm",

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Frames</title>
+</head>
+<body>
+  <!--
+    The srcdoc frame is same-origin: its heading and paragraph are part of the walk.
+    The example.com frame is cross-origin: a container labelled with that absolute URL,
+    and "Cross origin body" is not in the snapshot.
+  -->
+  <iframe title="inner" srcdoc="&lt;h1&gt;Inner heading&lt;/h1&gt;&lt;p&gt;Same origin body&lt;/p&gt;"></iframe>
+  <iframe title="cross" src="https://example.com/sighurt-cross-frame"></iframe>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Shadow</title>
+</head>
+<body>
+  <!--
+    The open root is walked: "Open shadow text", the slotted "Slotted light", and the fallback
+    "Fallback text". The closed root's SIGHURT_CLOSED_SHADOW_SENTINEL is not visible to script.
+    The closed host's light text may still appear, because a closed root cannot be detected.
+  -->
+  <div id="host"><span>Slotted light</span></div>
+  <div id="emptyhost"></div>
+  <div id="closed">Closed host light text</div>
+  <script>
+    var host = document.getElementById("host");
+    host.attachShadow({ mode: "open" }).innerHTML = "<p>Open shadow text</p><slot></slot>";
+    var empty = document.getElementById("emptyhost");
+    empty.attachShadow({ mode: "open" }).innerHTML = "<slot>Fallback text</slot>";
+    var closed = document.getElementById("closed");
+    closed.attachShadow({ mode: "closed" }).innerHTML = "<p>SIGHURT_CLOSED_SHADOW_SENTINEL</p>";
+  </script>
+</body>
+</html>
