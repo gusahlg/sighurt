@@ -78,4 +78,6 @@ poll input each frame. A text field is a rectangle the app draws itself, fed by
 
 ## License
 
-Apache-2.0. Based on Oxide by Nikhil Ranjan (github.com/niklabh/oxide).
+Apache-2.0 (see [LICENSE-APACHE](../LICENSE-APACHE)), unlike the rest of Sighurt, which is
+AGPL-3.0-or-later: apps built with the SDK may use any license. Based on Oxide by Nikhil Ranjan
+(github.com/niklabh/oxide).

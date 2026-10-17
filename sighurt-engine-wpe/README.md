@@ -81,5 +81,5 @@ own too; WebKit's thread code takes the signal from it all the same.
 
 ## License
 
-Apache-2.0, like the rest of Sighurt. WPE WebKit is linked dynamically and keeps its own licenses
+AGPL-3.0-or-later, like the rest of Sighurt. WPE WebKit is loaded dynamically and keeps its own licenses
 (LGPL-2.1 and BSD).

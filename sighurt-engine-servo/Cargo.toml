@@ -6,8 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 # Source files adapted from Servo stay under Servo's MPL-2.0 and keep their MPL notices; the
-# rest of the crate is Apache-2.0. Servo itself is MPL-2.0. See NOTICE.
-license = "Apache-2.0 AND MPL-2.0"
+# rest of the crate is AGPL-3.0-or-later. Servo itself is MPL-2.0. See NOTICE.
+license = "AGPL-3.0-or-later AND MPL-2.0"
 
 [dependencies]
 sighurt-api = { path = "../sighurt-api" }

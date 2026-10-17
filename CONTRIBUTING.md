@@ -99,4 +99,4 @@ Describe what changed, why and how you tested it. PRs are squash-merged. To repo
 
 ## License
 
-Sighurt is licensed under Apache-2.0 (see [LICENSE](./LICENSE) and [NOTICE](./NOTICE)); `sighurt-engine-servo` is `Apache-2.0 AND MPL-2.0`. By contributing, you agree that your contributions are licensed the same way.
+Sighurt is licensed under `AGPL-3.0-or-later` (see [LICENSE](./LICENSE) and [NOTICE](./NOTICE)); `sighurt-engine-servo` is `AGPL-3.0-or-later AND MPL-2.0`, and `sighurt-sdk` and the example apps are `Apache-2.0` (see [LICENSE-APACHE](./LICENSE-APACHE)). By contributing, you agree that your contributions are licensed the same way as the files you contribute to.

@@ -74,7 +74,7 @@ measured rendering costs.
 
 ## License
 
-`Apache-2.0 AND MPL-2.0`. Files adapted from Servo stay under the
+`AGPL-3.0-or-later AND MPL-2.0`. Files adapted from Servo stay under the
 [Mozilla Public License 2.0](https://mozilla.org/MPL/2.0/) and keep their notices (there are none
-at the moment); the rest of the crate is Apache-2.0 like the rest of Sighurt. Servo itself is
+at the moment); the rest of the crate is AGPL-3.0-or-later like the rest of Sighurt. Servo itself is
 MPL-2.0. See [NOTICE](../NOTICE).

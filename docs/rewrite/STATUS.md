@@ -3161,3 +3161,21 @@ Newest last. Each entry says what was decided and why.
     (Servo, WPE through a `[routing.wpe] hosts` rule and sig://home labelled servo, wpe and
     nothing in the diagnostics and on screen; `engine-label = false` while `sig` runs; the line
     chrome's "wpe" after a restart).
+88. **Sighurt is licensed AGPL-3.0-or-later; the guest SDK and the example apps stay
+    Apache-2.0.** The user's request ("change the licensing to AGPL instead of the current
+    Apache license … still pay respects to Oxide's licensing requirements"); the version (3 or
+    later) and the SDK's exception are the user's choices. `LICENSE` is the AGPL's text,
+    `LICENSE-APACHE` is Oxide's license notice (the old `LICENSE`, unchanged) followed by the
+    Apache License, Version 2.0, and `NOTICE` says what came from Oxide, that Oxide's code stays
+    Apache-2.0 from Oxide, and the exceptions: `sighurt-sdk` and `examples/` (`license =
+    "Apache-2.0"` in each manifest), so apps built with the SDK may use any license, as with
+    upstream `oxide-sdk`; `sighurt-engine-servo` is `AGPL-3.0-or-later AND MPL-2.0`; WPE WebKit's
+    libraries keep their own licenses. The workspace's `license` is `AGPL-3.0-or-later`, and
+    `sig --version` names the license under the Oxide attribution. *Why it may:* Apache-2.0 code
+    may be included in a work under GPLv3 or AGPLv3, which keeps its notices (Apache-2.0 §4);
+    MPL-2.0 allows combination with the GPL family (MPL-2.0 §3.3); and every dependency in
+    `Cargo.lock` was checked with `cargo metadata` on 17 October 2026: all are under licenses
+    compatible with AGPLv3 (aws-lc-sys 0.45 and ring 0.17.14 no longer carry the OpenSSL
+    license; mozjpeg's IJG, ffmpeg-next's WTFPL and webpki-roots' CDLA-Permissive-2.0 are
+    permissive). The only contributor outside the Sighurt contributors besides Oxide's author
+    is one Oxide-era commit, under Oxide's Apache-2.0.

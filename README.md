@@ -471,7 +471,10 @@ engine, a command or a host function. [ROADMAP.md](./ROADMAP.md) lists what is n
 
 Sighurt started as a fork of [Oxide](https://github.com/niklabh/oxide) by Nikhil Ranjan.
 
-Licensed under Apache-2.0, like Oxide. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE). The
-exception is `sighurt-engine-servo`, which is `Apache-2.0 AND MPL-2.0`; `sig` built with Servo
-links Servo, which is MPL-2.0, and `sig` built with WPE WebKit links WPE WebKit's libraries
-(LGPL and BSD licenses) dynamically.
+Licensed under the GNU Affero General Public License, version 3 or later (`AGPL-3.0-or-later`);
+see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). Oxide is Apache-2.0: its license notice and the
+Apache License are in [LICENSE-APACHE](./LICENSE-APACHE), and the code that came from it remains
+available under Apache-2.0 from Oxide. The guest SDK (`sighurt-sdk`) and the example apps stay
+Apache-2.0, so Wasm apps built with them may use any license. `sighurt-engine-servo` is
+`AGPL-3.0-or-later AND MPL-2.0`; `sig` built with Servo links Servo, which is MPL-2.0, and `sig`
+built with WPE WebKit loads WPE WebKit's libraries (LGPL and BSD licenses) dynamically.

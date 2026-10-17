@@ -77,7 +77,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, ExitCode> 
             }
             "-V" | "--version" => {
                 println!(
-                    "sig {} (Sighurt, based on Oxide by Nikhil Ranjan)",
+                    "sig {} (Sighurt, based on Oxide by Nikhil Ranjan)\n\
+                     License AGPL-3.0-or-later <https://gnu.org/licenses/agpl.html>; \
+                     Oxide's code is Apache-2.0. There is NO WARRANTY.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Err(ExitCode::SUCCESS);
