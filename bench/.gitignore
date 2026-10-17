@@ -1,2 +1,7 @@
 results/raw/
 __pycache__/
+# Screenshots and full logs from bench/compat. report.md, runs.json and
+# example-routing.toml stay, the same way results/raw/ stays out of git.
+compat/results/*/shots/
+compat/results/*/logs/
+compat/results/*/parts/
