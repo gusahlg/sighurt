@@ -35,6 +35,10 @@ members = [
     "experiments/m1-mixed",
     # WPE WebKit beside Servo and Wasmtime in one process (docs/rewrite/WPE.md).
     "experiments/wpe-coexist",
+    # The terminal frontend's risk-killing prototypes (docs/rewrite/TUI.md §8, phase 0).
+    "experiments/tui-servo",
+    "experiments/wpe-cpu",
+    "experiments/tty-io",
 ]
 # Resolver 3 picks dependency versions that support `rust-version` below: the Rust of the nixpkgs
 # pin in nix/nixpkgs.nix, which both machines build with.

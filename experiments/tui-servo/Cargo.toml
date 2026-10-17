@@ -1,0 +1,11 @@
+[package]
+name = "tui-servo"
+description = "Phase 0a: Servo 0.5 rendering offscreen with no display server, frames to a terminal (docs/rewrite/TUI.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

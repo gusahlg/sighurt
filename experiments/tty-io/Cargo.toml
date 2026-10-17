@@ -1,0 +1,11 @@
+[package]
+name = "tty-io"
+description = "Phase 0c: terminal I/O, input parsing and a cell-grid writer under a pty (docs/rewrite/TUI.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

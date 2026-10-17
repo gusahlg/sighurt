@@ -3179,3 +3179,26 @@ Newest last. Each entry says what was decided and why.
     license; mozjpeg's IJG, ffmpeg-next's WTFPL and webpki-roots' CDLA-Permissive-2.0 are
     permissive). The only contributor outside the Sighurt contributors besides Oxide's author
     is one Oxide-era commit, under Oxide's Apache-2.0.
+89. **Sighurt gets a terminal frontend; the GUI is one of two frontends** (amends 2: Sighurt was
+    Wayland-only; the GUI still is). The user's request: a terminal crate, a GUI crate and a
+    shared core connecting both to the engines, in one binary `sig`, with no IPC, all of
+    Sighurt's own code in Rust. The design is [TUI.md](TUI.md) (Fable's design, Astra's review,
+    and §8's amendments, which win). The crates: `sighurt-core` stays pure; the new
+    `sighurt-runtime` (the user's name) takes the engine registry, effects, services,
+    persistence and diagnostics out of `sighurt-browser`; `sighurt-gui` is the Wayland owner
+    loop; `sighurt-tui` is the terminal; `sig`'s `main` parses arguments and picks a frontend:
+    `--dump` prints, `--gui`/`--tui` win, else a TTY on stdout (and `TERM` not `dumb`) opens the
+    terminal, else the GUI (the user's choice). *Why:* the user's request; plan §4's layering
+    carried to a second frontend (TUI.md §1); decision 27 keeps the core free of I/O.
+90. **The terminal shows pages with the existing engines: graphics first, then text from a
+    semantic snapshot** (the user's decision; no HTML/CSS engine of Sighurt's own). Graphics go
+    through the kitty and sixel protocols from CPU frames of a second, offscreen presenter per
+    engine (the plan's zero-readback criterion stays the GUI's; the terminal's bound is TUI.md
+    §2 and §8.6). Text comes from an optional `semantic` capability of the engine contract:
+    bounded snapshots and actions tied to their `DocumentGeneration` (§3, §8.4–§8.5), produced by
+    DOM extraction in Servo and WPE (Servo 0.5's AccessKit tree lacks link URLs, field values
+    and actions: §8.3). *Why:* the user's decision; §8's review.
+91. **The terminal's defaults: `[tui] mode = "auto"`, a small default terminal key table, and
+    `--dump` as text with link footnotes** (the user's answers; the default table amends the
+    rule that keys live only in the user's configuration, for the terminal only, since a fresh
+    terminal session would otherwise have no way to its command line or to quit).
