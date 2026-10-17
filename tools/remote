@@ -8,7 +8,9 @@
 #   tools/remote --no-sync ls target/debug
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
-dest=repos/sighurt-rewrite
+# SIG_REMOTE_DEST picks another copy on louise (its own target/), e.g. for a worktree that must
+# not share Servo's build with this tree.
+dest=${SIG_REMOTE_DEST:-repos/sighurt-rewrite}
 sync=1
 [[ ${1:-} == --no-sync ]] && { sync=0; shift; }
 # While the user is using louise-pc (gaming), nothing heavy runs there: say so before syncing.
@@ -19,7 +21,7 @@ if ssh -o BatchMode=yes -o ConnectTimeout=8 louise-pc \
   exit 75
 fi
 # One remote run at a time from this machine, so a sync never changes the tree under a build.
-exec 9>/tmp/sighurt-remote.lock
+exec 9>"/tmp/sighurt-remote${SIG_REMOTE_DEST:+-${SIG_REMOTE_DEST//\//-}}.lock"
 if ! flock -n 9; then
   echo "tools/remote: waiting for another remote run from this machine" >&2
   flock 9
