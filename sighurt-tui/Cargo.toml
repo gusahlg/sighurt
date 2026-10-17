@@ -9,3 +9,14 @@ authors.workspace = true
 
 [dependencies]
 sighurt-api = { path = "../sighurt-api" }
+base64 = "0.22"
+calloop.workspace = true
+flate2 = "1.1"
+libc = "0.2"
+rustix = { workspace = true, features = ["event", "fs", "process", "pty", "stdio", "termios"] }
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+
+[[bin]]
+name = "sighurt-tui-worker"
+path = "src/bin/worker.rs"

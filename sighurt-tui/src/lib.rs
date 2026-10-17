@@ -4,3 +4,10 @@
 //! Owns: terminal I/O, capability detection, the cell grid and its writer, the terminal chrome,
 //! graphics encoding, key and mouse mapping. Must not own: browser policy (the core), engines,
 //! or anything of Wayland.
+
+pub mod chrome;
+pub mod grid;
+pub mod input;
+pub mod kitty;
+pub mod sanitize;
+pub mod term;
