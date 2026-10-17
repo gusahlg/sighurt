@@ -3304,3 +3304,14 @@ Newest last. Each entry says what was decided and why.
     shows only the active tab, so there is no tab click yet. The end-to-end tests run the real
     `sig` from `sighurt-browser/tests/tui.rs`. *Why:* the user's request; TUI.md §8.6 and §8.8.
     Evidence: the tests named under phase 2 above.
+98. **Page extraction is page behaviour in Servo, and its bounds become real budgets** (TUI.md
+    §11; amends 90 and 93's wording, which promised more than a main world can give). An
+    independent review (GPT-6 Astra) of `sighurt-semantic` found, to fix: traversal work not
+    bounded (depth counts emitted nodes; label, text and option helpers scan without budgets;
+    quadratic button folding) → iterative traversal with visited-node, DOM-depth, child and
+    scanned-character budgets; a password field whose `type` throws is read as text → fail closed;
+    `parse` materializes a `serde_json::Value` before the node limit → bounded visitors; the
+    reverse id map grows without bound and falls back to strong references → capped, weak only;
+    `Object.prototype` pollution and inherited `toJSON` reach the output → null-prototype records
+    and own-property reads; actions on disabled or read-only controls, and `submit` fallback
+    bypassing validation → refused. *Why:* plan §17 (page data is untrusted) and TUI.md §8.5.

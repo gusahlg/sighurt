@@ -385,3 +385,29 @@ Where it differs from the sketches in §2–§3:
   snapshot's document with the core's, since the commit before it may still be queued for the
   core: a snapshot of a just-replaced document reaches the frontend, and an action on it is
   dropped by the core and the engine.
+
+## 11. What page extraction can and can't guarantee (review, 17 October 2026)
+
+An independent review (GPT-6 Astra) of `sighurt-semantic` (5d6e651), with the findings to fix
+listed in `docs/rewrite/STATUS.md` decision 98. What the design now says:
+
+- **In Servo, extraction and actions are unauthenticated page behaviour.** Servo 0.5 has no
+  isolated script world, so `EXTRACT` and the action scripts run in the page's main world, after
+  the page's own scripts. The page can replace every built-in the script uses, read the state
+  slot's name (`Reflect.ownKeys`), and redirect the id map, so the snapshot may not match the DOM
+  and an action may reach another node than the one the user chose. Native code guarantees only
+  the shape and bounds of what it accepts (`parse`, `SemanticSnapshot::check`), never that it is
+  true. That is acceptable for a page's own content (a page can always lie about itself, and an
+  action can only do what the page's own script could), and it is said in the user
+  documentation. Trustworthy dispatch needs engine-owned handles (Servo's accessibility tree with
+  actions, if a later Servo has them) or an isolated world.
+- **In WPE WebKit, the scripts run in the isolated world `sighurt`**, so the page can't see or
+  replace the script's built-ins or state; the DOM it walks is still the page's, so getters on
+  page objects (custom elements, shadow roots) are still page code.
+- **Execution is cooperative.** The 50 ms budget is checked by the script; a getter that never
+  returns can't be interrupted from JavaScript. The adapters never wait for a result on the owner
+  thread, so a hung extraction costs that page, not the browser; an engine-level interrupt is a
+  separate decision.
+- **Passwords:** a field identified as a password never has its value read; a field whose type
+  can't be read is treated as a password. A page can still copy its own secrets into text, which
+  no extraction can prevent. Adapters never log action scripts (`SetValue` carries plaintext).
