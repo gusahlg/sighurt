@@ -3240,3 +3240,17 @@ Newest last. Each entry says what was decided and why.
     `a_link_activated_in_text_is_a_click_on_it`, `what_a_frontend_does_on_its_own_is_no_click`
     and `an_action_for_a_replaced_document_or_a_hidden_view_is_dropped`; clippy clean on the
     workspace and, on louise-pc, with Servo and WPE.
+94. **Which engine shows a site is the user's choice, made at runtime or in the configuration;
+    the browser ships no compatibility list** (the user, 17 October 2026, after chatgpt.com and
+    github.com failed in Servo 0.5: "Let the user choose when the browser should use servo and
+    when it should use WPE … compatibility lists are not up to the browser but rather things
+    that should live in a configuration"). The mechanisms: `[engines] default` and a `--engine
+    <name>` argument for the engine `sig` starts with; `[routing.<engine>] hosts` for per-site
+    choices; switching a page's engine at once with `page.open-in <engine>` and a new
+    `page.switch-engine` (the next web engine), bound like any command and reachable from the
+    chromes; Servo's off-by-default web-platform features through `[engines.servo]` settings.
+    A measured site corpus (`bench/compat/`) shows what works where and yields an *example*
+    configuration in the documentation, never a default. Engines stay compiled in; switching
+    opens a view in another in-process runtime (no IPC). Upgrading Servo past 0.5 (0.7.0 was
+    released 5 October 2026) is tried in parallel, in a worktree of its own, and adopted only
+    on measured results.
