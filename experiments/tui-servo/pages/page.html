@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sighurt offscreen</title>
+<style>
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 22px/1.4 sans-serif;
+    background: #1b4f72;
+    color: #f7f1e3;
+  }
+  header {
+    background: #e67e22;
+    color: #1a1a1a;
+    padding: 28px 36px;
+  }
+  h1 { margin: 0; font-size: 56px; letter-spacing: 1px; }
+  h2 { color: #f4d03f; margin: 0 0 12px; font-size: 32px; }
+  main { padding: 28px 36px; }
+  a { color: #85c1e9; }
+  .row { display: flex; gap: 24px; align-items: flex-start; margin-top: 20px; }
+  .box {
+    width: 140px;
+    height: 140px;
+    background: #e74c3c;
+    animation: slide 2.4s linear infinite;
+  }
+  @keyframes slide {
+    from { transform: translateX(0); }
+    to { transform: translateX(360px); }
+  }
+  form {
+    margin-top: 28px;
+    background: #196f3d;
+    color: #f7f1e3;
+    padding: 16px 20px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  input, textarea, select, button { font-size: 18px; }
+  .marker {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    width: 96px;
+    height: 96px;
+    background: #ff00ff;
+  }
+</style>
+</head>
+<body>
+<header><h1>OFFSCREEN</h1></header>
+<main>
+  <h2>Second heading</h2>
+  <p>This page is painted by Servo into an offscreen framebuffer. No display server is involved.</p>
+  <p class="row">
+    <a href="https://example.com/">Example</a>
+    <a href="#form">The form</a>
+    <a href="https://example.org/other">Other</a>
+  </p>
+  <div class="box"></div>
+  <form id="form">
+    <label>Name <input name="name" value="ada"></label>
+    <label>Note <textarea rows="1">hello</textarea></label>
+    <select><option>one</option><option>two</option></select>
+    <button type="submit">Send</button>
+  </form>
+</main>
+<div class="marker"></div>
+</body>
+</html>

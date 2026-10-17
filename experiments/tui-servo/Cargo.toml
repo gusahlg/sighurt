@@ -9,3 +9,19 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+servo.workspace = true
+surfman.workspace = true
+url.workspace = true
+# The versions Servo 0.5's `RenderingContext` is built against.
+dpi = "0.1"
+euclid = "0.22"
+gleam = "0.15"
+glow = "0.17"
+# PNG of the last frame. Already in the graph through servo-paint-api.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Servo's network stack needs a TLS provider; the Servo engine installs this one too.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+libc = "0.2"
+# Kitty graphics payload. Both are already in the lockfile.
+base64 = "0.22"
+flate2 = "1"

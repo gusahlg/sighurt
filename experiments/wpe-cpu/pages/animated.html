@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>wpe-cpu animated</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #202020; }
+  #bar {
+    position: absolute; top: 0; left: 0; width: 35%; height: 100%;
+    background: #ff3300;
+    animation: sweep 0.8s linear infinite alternate;
+  }
+  @keyframes sweep {
+    from { transform: translateX(0); background: #ff3300; }
+    to { transform: translateX(180%); background: #0044ff; }
+  }
+  h1 { position: relative; margin: 12px; color: #fff; font: 20px sans-serif; }
+</style>
+</head>
+<body>
+  <div id="bar"></div>
+  <h1>Animated</h1>
+  <h2>Motion</h2>
+  <p><a href="second.html">second page</a></p>
+  <form><input type="text" name="q"></form>
+  <script>window.__sighurtPage = "page-world";</script>
+</body>
+</html>

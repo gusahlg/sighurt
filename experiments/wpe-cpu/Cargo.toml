@@ -9,3 +9,8 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+sighurt-api = { path = "../../sighurt-api" }
+# The engine's public WPE platform (`Display::new(None)`), GLib loop and `ffi`. This binary never
+# opens Wayland; the engine crate links the client library because its presenter does.
+sighurt-engine-wpe = { path = "../../sighurt-engine-wpe" }
+glib = "0.22"

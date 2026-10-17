@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>wpe-cpu second</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #102010; }
+  #bar {
+    position: absolute; top: 0; left: 0; width: 30%; height: 100%;
+    background: #20ff80;
+    animation: sweep 0.7s linear infinite alternate;
+  }
+  @keyframes sweep {
+    from { transform: translateX(0); background: #20ff80; }
+    to { transform: translateX(200%); background: #e0ff20; }
+  }
+  h1, h2, p, form { position: relative; margin: 8px; color: #fff; font: 16px sans-serif; }
+</style>
+</head>
+<body>
+  <div id="bar"></div>
+  <h1>Second</h1>
+  <h2>Alpha</h2>
+  <h2>Beta</h2>
+  <p><a href="animated.html">back</a></p>
+  <p><a href="https://example.com/other">other</a></p>
+  <form>
+    <input type="text" name="name">
+    <input type="email" name="email">
+  </form>
+  <script>window.__sighurtPage = "page-world";</script>
+</body>
+</html>
