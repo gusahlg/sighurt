@@ -5,9 +5,11 @@ The Servo (HTML, CSS, JavaScript) engine for Sighurt: a library that `sig` compi
 See `sighurt-rewrite-plan.md` §14 for the design and `docs/rewrite/STATUS.md` (M4) for what has
 been shown to work.
 
-It is pinned at Servo 0.5 and surfman 0.13. Building it compiles Servo: do that on louise-pc
+It is pinned at Servo 0.7 (with the `webgl` feature) and surfman 0.14. Building it compiles
+Servo: do that on louise-pc
 (`SIG_WHAT="servo build" tools/remote tools/cargo build -p sighurt-engine-servo`), not casually
-here.
+here. What 0.7 changed for this adapter is in `SERVO-0.7.md`. On the `servo-0.7` branch the
+remote copy is `SIG_REMOTE_DEST=repos/sighurt-servo07`.
 
 ## Using it
 
@@ -25,7 +27,7 @@ SIG_WHAT="servo build (m4)" tools/remote tools/cargo build -p sighurt-engine-ser
 tools/headless-sway --renderer gles2 -- target/debug/examples/servo-window --exit-after 10 PAGE...
 ```
 
-## How it maps onto Servo 0.5
+## How it maps onto Servo 0.7
 
 - **Presentation.** Each Wayland view has its own `WindowRenderingContext` on its lease's
   handles, swap interval 0. The host issues a frame permit only after the frame callback of the
@@ -42,27 +44,28 @@ tools/headless-sway --renderer gles2 -- target/debug/examples/servo-window --exi
   `read_to_image`. `ServoTiming::swap` is that readback and is logged as `swap_ms`.
   `LIBGL_ALWAYS_SOFTWARE` and `DRI_PRIME` are restored after the context exists.
 - **Navigation and history.** Servo's history reports are the truth. Each commit is attributed
-  to the browser's pending navigation that fits it (Servo 0.5 gives no ids) or gets an id of its
-  own; a new document is known from Servo's `LoadStatus::Started` and from each entry's document,
-  never from comparing URLs (`src/navigation.rs` has the rules and their limits). Servo 0.5
-  drops a load asked for while another is in flight, so such a navigation waits for that load's
-  document. Network errors commit Servo's own error page; an address that isn't one fails the
-  navigation.
+  to the browser's pending navigation that fits it (Servo 0.7's public history report still
+  gives no navigation id) or gets an id of its own; a new document is known from Servo's
+  `LoadStatus::Started` and from each entry's document, never from comparing URLs
+  (`src/navigation.rs` has the rules and their limits). Servo 0.7 still drops a load asked for
+  while another is in flight, so such a navigation waits for that load's document. Network
+  errors commit Servo's own error page; an address that isn't one fails the navigation.
 - **Input.** Keys by W3C code and key value (dead keys arrive composed, AltGr is `AltGraph`),
   held keys released on blur, input-method text as composition events, positions converted
   once to device pixels.
 - **Services.** Clipboard reads and writes, permissions (camera, microphone, geolocation) and
   file pickers are service requests the browser decides on; anything else Servo asks for is
   refused. `<select>`, colour pickers, `alert`/`confirm`/`prompt`, context menus and HTTP
-  authentication are resolved closed (decision 16). Servo 0.5 has no downloads and no stop: `Stop`
+  authentication are resolved closed (decision 16). Servo 0.7 still has no stop API: `Stop`
   runs `window.stop()`.
 - **Failures.** A page crash is `ViewFailed`: Servo shows its crash page, and the view's next
   navigation loads in a new WebView, since Servo keeps sending the crashed site's pages to the
   dead script thread. A view that can't get a GL context is `ViewFailed` then `ViewClosed`;
   losing Servo's backend is `RuntimeFailed`, and web pages then need a restart of `sig`. After a
-  page crash or a lost backend Servo 0.5 can't shut down (its constellation waits for pipelines
-  that will never exit), so `shutdown` leaves it running and `ServoDiagnostics::leaked` tells
-  the executable to end the process without running exit handlers.
+  page crash or a lost backend, Servo 0.5 could not shut down (its constellation waited for
+  pipelines that would never exit). `shutdown` still leaves it running and
+  `ServoDiagnostics::leaked` tells the executable to end the process without running exit
+  handlers, until `tests/crash.rs` shows that 0.7 finishes (see `SERVO-0.7.md`).
 
 Servo's preferences are the old `sig-servo`'s (`preferences()` in `src/runtime.rs`, reasons
 there): grid and other features on, `SharedWorker`, `IntersectionObserver` and

@@ -15,11 +15,12 @@
 //! queue.
 //!
 //! Before Servo carries out a navigation a page started that it would load itself (a link, a
-//! form, a script, of the top-level document or of a frame: Servo 0.5 doesn't say which), the
+//! form, a script, of the top-level document or of a frame: Servo doesn't say which), the
 //! view asks the browser (`NavigationRequested`) and holds Servo's request until the answer
 //! (`AnswerNavigation`), at most [`MAX_ASKED`] per view; beyond them, or without a committed
 //! document to ask for, the navigation goes ahead without asking, and so does the browser's own
-//! reload, which Servo 0.5 carries out as the page's navigation to its address. A new document,
+//! reload, which Servo 0.5 carried out as the page's navigation to its address (kept; see
+//! `SERVO-0.7.md`). A new document,
 //! a crash, closing the view and shutting down deny what is still held. A navigation Servo
 //! doesn't load itself (another scheme; a local file from a web page) is denied and handed to
 //! the browser (`OpenRequested`).
@@ -27,16 +28,17 @@
 //! `Stop` cancels a navigation still queued (see [`crate::view`]), gives up on a top-level load
 //! that has shown no sign of life for [`LOAD_WAIT`](crate::view::LOAD_WAIT) (its
 //! `NavigationFailed` is `Cancelled`), and stops the document's own loading (`window.stop()`).
-//! Servo 0.5 can't cancel a top-level load still waiting for its response: that one goes on and
-//! commits when its response comes.
+//! Servo 0.7 still has no API to cancel a top-level load that is waiting for its response: that
+//! one goes on and commits when its response comes.
 //!
 //! Servo keeps its profile (cookies, local storage, HSTS, HTTP authentication) in the directory
 //! the executable passes, written by this runtime only: it holds `{profile}/lock` from before
 //! Servo is built until Servo has shut down (Servo writes the profile while it shuts down), and
 //! a second process that finds the lock taken runs Servo without a profile (M0, decision 26).
 //!
-//! A crashed page's view loads its next navigation in a new WebView on the same context: Servo
-//! 0.5 keeps sending the crashed site's documents to the dead script thread.
+//! A crashed page's view loads its next navigation in a new WebView on the same context. On
+//! Servo 0.5 the crashed site's documents kept going to the dead script thread; that workaround
+//! stays until `tests/crash.rs` shows 0.7 can shut down afterwards (see `SERVO-0.7.md`).
 //!
 //! Timing ([`ServoTiming`]): every submitted frame's paint (`WebView::paint`) and swap, and how
 //! long the browser's navigations took to their document's first frame, in
@@ -59,9 +61,10 @@
 //! [`EngineRuntime::shutdown`] closes in the order M1 established: the WebViews, then Servo
 //! (which spins until its constellation, WebGL and paint threads are done), then each view's
 //! GL context, then the EGL display, then the target leases; the host releases its Wayland
-//! objects after that. After a page crash or a lost backend, Servo 0.5 never finishes shutting
-//! down (its constellation waits for the dead script thread's pipelines), so the runtime leaves
-//! it running instead of hanging: [`ServoDiagnostics::leaked`].
+//! objects after that. After a page crash or a lost backend, Servo 0.5 never finished shutting
+//! down (its constellation waited for the dead script thread's pipelines). The runtime still
+//! leaves it running instead of hanging ([`ServoDiagnostics::leaked`]) until that is shown to
+//! have changed (see `SERVO-0.7.md`).
 //!
 //! Must not own: process lifetime, logging or TLS setup, the allocator (the executable): no
 //! `process::exit`, `_exit`, panic hook, logger or crypto provider here.
@@ -259,7 +262,8 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// Views closed while something still held their context: kept, with their target, until
     /// it is released.
     closing: Vec<View<T>>,
-    /// Servo's keyboard focus is one WebView at a time; `blur` blurs whichever has it.
+    /// The view whose WebView this runtime last gave system focus. Servo 0.7's focus is
+    /// per WebView and does not clear the others; a new WebView starts focused.
     servo_focus: Option<ViewId>,
     events: Events,
     /// Notes of WebViews whose last history change may be a traversal whose completion hasn't
@@ -276,8 +280,9 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// Held from before Servo is built until it has shut down.
     profile_lock: Option<File>,
     failed: Option<String>,
-    /// A page's script thread panicked. Servo 0.5 then never finishes shutting down: its
-    /// constellation waits for the dead thread's pipelines to exit (`Constellation::run`).
+    /// A page's script thread panicked. On Servo 0.5 the constellation then never finished
+    /// shutting down (it waited for the dead thread's pipelines). Shutdown still leaks Servo
+    /// rather than hang; see `SERVO-0.7.md`.
     page_crashed: bool,
     leaked: bool,
 }
@@ -418,10 +423,10 @@ impl<T: ServoTarget> ServoRuntime<T> {
         Ok(())
     }
 
-    /// Loads `url` for `navigation` in a new WebView, after the page crashed. Servo 0.5 keeps
-    /// sending the crashed site's documents to the dead script thread ("crash page crashed"), so
-    /// the old WebView can't load again. The new one shares the view's context and target, and
-    /// its history starts with this navigation.
+    /// Loads `url` for `navigation` in a new WebView, after the page crashed. On Servo 0.5 the
+    /// crashed site's documents kept going to the dead script thread ("crash page crashed"), so
+    /// the old WebView is not reused (see `SERVO-0.7.md`). The new one shares the view's context
+    /// and target, and its history starts with this navigation.
     fn restart(&mut self, id: ViewId, navigation: NavigationId, url: Url) {
         let view = self.views.get_mut(&id).expect("checked by the caller");
         let old = view.webview.take();
@@ -461,9 +466,11 @@ impl<T: ServoTarget> ServoRuntime<T> {
         self.close_view(id);
     }
 
-    /// Gives or takes Servo's keyboard focus for `id`: the view has it while it has the
-    /// browser's focus, is shown and the window is active. Servo's `blur` blurs whichever
-    /// WebView has focus, so only the view that has it blurs.
+    /// Gives or takes Servo's system focus for `id`: the view has it while it has the
+    /// browser's focus, is shown and the window is active. Servo 0.7's `set_focused` is per
+    /// WebView and does not clear the others. A new WebView starts focused, in the embedder
+    /// and in the constellation, so one that should not have focus is unfocused even when this
+    /// runtime never focused it. `set_focused` sends nothing when the flag is already right.
     fn apply_focus(&mut self, id: ViewId) {
         let Some(view) = self.views.get_mut(&id) else {
             return;
@@ -473,14 +480,16 @@ impl<T: ServoTarget> ServoRuntime<T> {
         };
         let wanted = view.focused && view.visible && view.active;
         if wanted && self.servo_focus != Some(id) {
-            webview.focus();
+            webview.set_focused(true);
             self.servo_focus = Some(id);
-        } else if !wanted && self.servo_focus == Some(id) {
-            let releases = view.keys.release_all();
-            view.send(releases);
-            view.composition.reset();
-            webview.blur();
-            self.servo_focus = None;
+        } else if !wanted {
+            if self.servo_focus == Some(id) {
+                let releases = view.keys.release_all();
+                view.send(releases);
+                view.composition.reset();
+                self.servo_focus = None;
+            }
+            webview.set_focused(false);
         }
     }
 
@@ -787,8 +796,10 @@ impl<T: ServoTarget> ServoRuntime<T> {
                     .delegate(Rc::clone(&self.delegate) as _)
                     .clipboard_delegate(Rc::clone(&self.delegate) as _)
                     .build();
-                // It shares the page's rendering context and must never paint over it.
+                // It shares the page's rendering context and must never paint over it. A new
+                // WebView also starts with system focus; this one is not the focused view.
                 popup.hide();
+                popup.set_focused(false);
                 self.owners.insert(popup.id(), Owner::Popup(id, document));
                 view.popups.push(popup);
             }
@@ -1159,8 +1170,9 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                 if let Some((old, _)) = view.queued.take() {
                     push(&mut self.events, cancelled(id, old));
                 }
-                // Servo 0.5 can't cancel a top-level load awaiting its response; one that has
-                // shown no sign of life for `LOAD_WAIT` is given up.
+                // Servo 0.7 still can't cancel a top-level load awaiting its response (there is
+                // no public stop, and `load_url` still drops a load while one is in flight).
+                // One that has shown no sign of life for `LOAD_WAIT` is given up.
                 if view.load.is_some_and(|load| !load.alive(now)) {
                     if let Some(given_up) = view.give_up_load() {
                         push(&mut self.events, cancelled(id, given_up));
@@ -1412,9 +1424,9 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
             self.leaked = true;
             return;
         }
-        // Servo 0.5 shuts down only in `Drop`: it tells the constellation to exit and spins
-        // until the constellation, WebGL and paint threads are done, releasing its clones of
-        // the rendering contexts. It writes the profile on the way, under the lock.
+        // Servo shuts down only in `Drop`: it tells the constellation to exit and spins until
+        // the constellation, WebGL and paint threads are done, releasing its clones of the
+        // rendering contexts. It writes the profile on the way, under the lock.
         drop(servo);
         let mut contexts_leaked = false;
         let mut leases = Vec::new();
@@ -1475,8 +1487,9 @@ fn preferences(user_agent: Option<&str>) -> Preferences {
         Some(agent) => agent.to_owned(),
         None => firefox_user_agent(&prefs.user_agent),
     };
-    // Web platform features that Servo 0.5 implements but leaves off, and that common sites use.
-    // Without grid, sites like mozilla.org and theguardian.com lose their layout.
+    // Web platform features common sites use. Several were off by default in Servo 0.5;
+    // setting them keeps that set on 0.7 even where a default has flipped. Without grid,
+    // sites like mozilla.org and theguardian.com lose their layout.
     prefs.dom_exec_command_enabled = true;
     prefs.dom_fontface_enabled = true;
     prefs.dom_indexeddb_enabled = true;
@@ -1488,9 +1501,10 @@ fn preferences(user_agent: Option<&str>) -> Preferences {
     prefs.layout_container_queries_enabled = true;
     prefs.layout_grid_enabled = true;
     prefs.layout_variable_fonts_enabled = true;
-    // Left off because they break common sites: with `IntersectionObserver` script spins forever
-    // and the page stays blank (reddit.com, microsoft.com), a Servo 0.5 layout bug fixed upstream
-    // in servo/servo#47693, and with `adoptedStyleSheets` layout panics (microsoft.com).
+    // Left off because they broke common sites on Servo 0.5: with `IntersectionObserver`
+    // script spun forever and the page stayed blank (reddit.com, microsoft.com), a layout bug
+    // fixed upstream in servo/servo#47693, and with `adoptedStyleSheets` layout panicked
+    // (microsoft.com). Not turned on in this port; see `SERVO-0.7.md`.
     //
     // Off: a page's shared worker never exits, so Servo can't shut down (x.com) and the browser's
     // exit would wait forever on it (M0, open problem 5).
@@ -1503,8 +1517,9 @@ fn preferences(user_agent: Option<&str>) -> Preferences {
 }
 
 /// Servo's user agent with its `Servo/<version>` token replaced by Firefox's `Gecko/20100101`.
-/// Servo already claims to be Firefox 140, but some sites turn away a user agent that isn't
-/// exactly Firefox's: web.whatsapp.com asks for "Firefox 115+" instead of showing its login.
+/// Servo 0.7's default claims Firefox 153 and still includes a `Servo/` token. Some sites turn
+/// away a user agent that isn't exactly Firefox's: web.whatsapp.com asks for "Firefox 115+"
+/// instead of showing its login.
 fn firefox_user_agent(servo: &str) -> String {
     let tokens = servo.split(' ').map(|token| {
         if token.starts_with("Servo/") {

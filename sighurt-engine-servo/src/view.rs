@@ -7,14 +7,17 @@
 //! one without would put `about:blank` into its history. Until then the view keeps its first
 //! navigation and its settings. A hidden view keeps its WebView, but Servo throttles it and it
 //! presents nothing. A Wayland view gives its EGL window surface back while hidden; an offscreen
-//! view keeps its framebuffer. Servo 0.5 throttles the document a WebView shows when asked, not
-//! the WebView: a hidden view's first document, and each it navigates to, would run unthrottled,
-//! so every history change of a hidden view asks again ([`View::keep_throttled`]). Closing it
-//! drops the WebView (which drops Servo's painter and its reference to the context), then the
-//! context, then the target, in that order, on the owner thread.
+//! view keeps its framebuffer. Servo 0.7 stores hidden on the WebView (`WebView::hide`) and new
+//! documents inherit it. `hide` does not resend when paint already recorded hidden, and a hide
+//! sent before the constellation has the WebView is dropped, so a view that is hidden before its
+//! WebView exists is hidden again once the WebView is built and at each history change
+//! ([`View::keep_throttled`]). Closing it drops the WebView (which drops Servo's painter and its
+//! reference to the context), then the context, then the target, in that order, on the owner
+//! thread.
 //!
-//! Servo 0.5 drops a `WebView::load` for a browsing context that has a load in flight
-//! (`Constellation::load_url`), and tells the embedder nothing when one ends without a document:
+//! Servo 0.7 still drops a `WebView::load` for a browsing context that has a load in flight
+//! (`Constellation::load_url` returns without telling the embedder), and tells the embedder
+//! nothing when one ends without a document:
 //! a 204 or 205 response aborts it (`AbortLoadUrl`). So a browser navigation asked for while a
 //! top-level load may be in flight waits in [`View::queued`] until that load's document arrives
 //! or it has shown no sign of life for [`LOAD_WAIT`] ([`Load`]), and is then sent.
@@ -52,7 +55,8 @@ pub(crate) enum Pending {
 /// How long a top-level load may go without a sign of life (being asked for, its document
 /// `Started`) before the view stops waiting for it: long enough for a slow server's response,
 /// short enough that a navigation queued behind a load Servo silently dropped (a 204 response)
-/// or behind an iframe's navigation (which Servo 0.5 doesn't tell apart) isn't held for long.
+/// or behind an iframe's navigation (which Servo's public API still doesn't tell apart) isn't
+/// held for long.
 pub(crate) const LOAD_WAIT: Duration = Duration::from_secs(5);
 
 /// A top-level load Servo may still be carrying out, which it would drop a new load for.
@@ -113,9 +117,9 @@ pub(crate) struct View<T: ServoTarget> {
     /// Navigations the current document asked for, waiting for the browser's answer. Dropped
     /// (with the document, the view or the runtime), they are denied.
     pub asked: Vec<(RequestId, PageNavigation)>,
-    /// The browser asked for a reload, which Servo 0.5 carries out as the page's own navigation
+    /// The browser asked for a reload, which Servo 0.5 carried out as the page's own navigation
     /// to its address (`Location::reload`): that navigation is the browser's, and goes ahead
-    /// without asking.
+    /// without asking (kept; see `SERVO-0.7.md`).
     pub reloading: bool,
     /// Hidden WebViews for pages the view's current document opened, until their first
     /// navigation says where they go.
@@ -210,10 +214,14 @@ impl<T: ServoTarget> View<T> {
         if self.zoom != 1.0 {
             webview.set_page_zoom(self.zoom as f32);
         }
-        // The context was made at the metrics of its time, which may have changed since. A
-        // hidden view is throttled at its first history change (`keep_throttled`): asked now,
-        // before its browsing context exists, Servo drops the request.
+        // The context was made at the metrics of its time, which may have changed since.
+        // `NewWebView` is already queued. `hide` behind it is applied once the constellation
+        // has the WebView, and later documents inherit the flag. `keep_throttled` repeats it
+        // for a view that was hidden with no WebView yet; a repeat does not resend.
         webview.resize(physical(self.metrics.buffer()));
+        if !self.visible {
+            webview.hide();
+        }
         // A new WebView's load status starts as `Started` without a report, so its first
         // document's own `Started` is suppressed as unchanged.
         self.navigator.load_status(true, true);
@@ -239,7 +247,7 @@ impl<T: ServoTarget> View<T> {
         given_up
     }
 
-    /// Lets a navigation the page asked for go ahead. If it is the top level's (Servo 0.5 doesn't
+    /// Lets a navigation the page asked for go ahead. If it is the top level's (Servo doesn't
     /// say whether it is an iframe's), Servo would drop a browser navigation until it has its
     /// document: a load already in flight goes on, and one that showed no sign of life for
     /// [`LOAD_WAIT`] is given up for it. Returns the browser navigation given up.
@@ -266,7 +274,7 @@ impl<T: ServoTarget> View<T> {
     /// too, so its page is laid out at the page area's size while hidden, as a shown one is
     /// (decision 13); without an EGL window surface, surfman's resize on Wayland only records
     /// the size. (Resized only when shown, Servo 0.5 kept a page with a running CSS animation
-    /// at its old layout.)
+    /// at its old layout. The resize-while-hidden workaround stays; see `SERVO-0.7.md`.)
     pub fn set_metrics(&mut self, metrics: Metrics) {
         if metrics.is_empty() {
             return;
@@ -279,41 +287,45 @@ impl<T: ServoTarget> View<T> {
         self.needs_submit = true;
     }
 
-    /// Throttles the document a hidden view shows now. Servo 0.5 applies `set_throttled` to the
-    /// browsing context's current document only (`Constellation::set_webview_throttled`), and a
-    /// new document starts unthrottled: a new WebView's first one, whose browsing context
-    /// doesn't exist yet when the WebView is built (the request is dropped), and every one it
-    /// navigates to. Called at each history change, when a new document has become current.
+    /// Hides the WebView again when this view is hidden. Servo 0.7 stores that on the WebView
+    /// and new documents inherit it. `hide` sends nothing when paint already recorded hidden,
+    /// so this only matters for a WebView built while the view was still shown, or for one
+    /// whose first `hide` was dropped because the constellation did not have it yet.
     pub fn keep_throttled(&self) {
         if let (false, Some(webview)) = (self.visible, &self.webview) {
-            webview.set_throttled(true);
+            webview.hide();
         }
     }
 
     /// Shows or hides the view. Hidden, Servo throttles it (no animations, slow timers) and it
     /// presents nothing. A Wayland view's EGL window surface is destroyed, and shown again it
-    /// gets a new one; an offscreen framebuffer stays. A view just shown presents at the next
-    /// permit without waiting for anything.
+    /// gets a new one; an offscreen framebuffer stays. Showing recreates the surface before
+    /// `WebView::show`, so the first frame has one. Hiding tells Servo first, then releases
+    /// the surface. A view just shown presents at the next permit without waiting for anything.
     pub fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if visible == self.visible {
             return Ok(());
         }
         self.visible = visible;
-        if let Some(webview) = &self.webview {
-            webview.set_throttled(!visible);
-        }
-        let Some(context) = &self.context else {
-            return Ok(());
-        };
         if visible {
-            self.target.show(context, self.metrics.buffer())?;
+            if let Some(context) = &self.context {
+                self.target.show(context, self.metrics.buffer())?;
+            }
             if let Some(webview) = &self.webview {
                 webview.resize(physical(self.metrics.buffer()));
+                webview.show();
             }
-            self.needs_submit = true;
-            self.frame_requested = false;
+            if self.context.is_some() {
+                self.needs_submit = true;
+                self.frame_requested = false;
+            }
         } else {
-            self.target.hide(context);
+            if let Some(webview) = &self.webview {
+                webview.hide();
+            }
+            if let Some(context) = &self.context {
+                self.target.hide(context);
+            }
         }
         Ok(())
     }

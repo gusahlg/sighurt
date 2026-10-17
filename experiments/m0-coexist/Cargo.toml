@@ -19,7 +19,7 @@ url.workspace = true
 # (FFmpeg, ALSA, OpenSSL, libudev, v4l, WebRTC, ...) links into this executable too.
 sighurt-engine-wasm = { path = "../../sighurt-engine-wasm" }
 sighurt-api = { path = "../../sighurt-api" }
-# Versions Servo 0.5 itself uses, for its rendering context and GL diagnostics.
+# Versions Servo 0.7 itself uses, for its rendering context and GL diagnostics.
 dpi = "0.1"
 gleam = "0.15"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }

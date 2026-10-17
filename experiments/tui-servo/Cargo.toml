@@ -1,6 +1,6 @@
 [package]
 name = "tui-servo"
-description = "Phase 0a: Servo 0.5 rendering offscreen with no display server, frames to a terminal (docs/rewrite/TUI.md)"
+description = "Phase 0a: Servo 0.7 rendering offscreen with no display server, frames to a terminal (docs/rewrite/TUI.md)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,7 @@ publish = false
 servo.workspace = true
 surfman.workspace = true
 url.workspace = true
-# The versions Servo 0.5's `RenderingContext` is built against.
+# The versions Servo 0.7's `RenderingContext` is built against.
 dpi = "0.1"
 euclid = "0.22"
 gleam = "0.15"

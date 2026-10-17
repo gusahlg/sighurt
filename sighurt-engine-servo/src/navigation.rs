@@ -10,8 +10,9 @@
 //!
 //! - **Which navigation.** A traversal the browser asked for is known exactly: Servo's
 //!   constellation reports the history change a `go_back`/`go_forward` made right before that
-//!   traversal's `notify_traversal_complete`, and the runtime passes its id in. Servo 0.5's
-//!   `WebView::load` returns no id, so any other commit is attributed to the latest pending
+//!   traversal's `notify_traversal_complete`, and the runtime passes its id in. Servo 0.7's
+//!   `WebView::load` still returns no id, and `notify_history_changed` still carries no
+//!   navigation id, so any other commit is attributed to the latest pending
 //!   navigation the browser asked for that fits it (the API allows this): `Navigate` a new
 //!   document in a new entry, `Reload` a new document in the same entry. Anything else is the
 //!   page's own navigation (its `history.back()` included), with an id allocated here. An
@@ -29,14 +30,16 @@
 //!   shape this doesn't recognise.
 //! - **What is reported.** A commit that changes neither the document nor the address and that
 //!   the browser didn't ask for (an iframe's navigation) updates the history only.
-//! - **The entries' addresses.** Servo 0.5's report names an entry that `pushState` or
+//! - **The entries' addresses.** Servo 0.5's report named an entry that `pushState` or
 //!   `replaceState` made after its neighbour nearer the current one (its projection has no
-//!   address for such entries: `Constellation::notify_history_changed`), while the current
+//!   address for such entries: `Constellation::notify_history_changed`). That workaround stays
+//!   (not re-checked against 0.7's projection; see `SERVO-0.7.md`), while the current
 //!   entry's address is always right. So each entry keeps the address it had when it was last
 //!   current, carried along as the list changes shape, like the document keys; the history the
 //!   browser gets (and saves) names every entry rightly.
 //!
-//! Limits of Servo 0.5, all erring towards "new document" except the first: a page navigation
+//! Limits carried from Servo 0.5, all erring towards "new document" except the first: a page
+//! navigation
 //! from a document that never got a `<body>` (still `Started`) arrives without its own
 //! `Started`, which Servo suppresses as unchanged, and is taken for a same-document commit; a
 //! same-document commit that lands while a browser `Navigate`/`Reload` is loading and the

@@ -1,7 +1,8 @@
 //! A page crash fails the view's document, not the view or the runtime (plan §25): the view
-//! loads again, in a new WebView, and the other views go on. Afterwards Servo 0.5 can't shut
-//! down (its constellation waits forever for the dead script thread's pipelines), so the
-//! runtime leaves it running and says so.
+//! loads again, in a new WebView, and the other views go on. On Servo 0.5, afterwards Servo
+//! could not shut down (its constellation waited forever for the dead script thread's
+//! pipelines), so the runtime leaves it running and says so. That workaround stays until this
+//! test shows 0.7 finishes shutting down (see `SERVO-0.7.md`).
 //!
 //! A process of its own with its own `main` (`harness = false`): with Servo left running, the
 //! process has to end without exit handlers (`_exit`), as `sig` must after `leaked`; the

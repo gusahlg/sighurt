@@ -55,9 +55,9 @@ pub(crate) fn pointer(event: &PointerEvent, metrics: &Metrics) -> ServoInput {
                 ButtonState::Released => MouseButtonAction::Up,
             };
             let button = match *button {
-                PointerButton::Left => MouseButton::Left,
-                PointerButton::Middle => MouseButton::Middle,
-                PointerButton::Right => MouseButton::Right,
+                PointerButton::Left => MouseButton::Primary,
+                PointerButton::Middle => MouseButton::Auxiliary,
+                PointerButton::Right => MouseButton::Secondary,
                 PointerButton::Back => MouseButton::Back,
                 PointerButton::Forward => MouseButton::Forward,
                 PointerButton::Other(code) => MouseButton::Other(code as u16),
