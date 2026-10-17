@@ -66,6 +66,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     pointer_lock: false,
     native_popups: false,
     process_per_view: false,
+    semantics: false,
 };
 
 /// How long `demo:slow` takes to have a frame for a new layout: longer than the host's resize
@@ -460,6 +461,10 @@ impl EngineRuntime for DemoRuntime {
             // resolve or answer.
             EngineCommand::ResolveServiceRequest { .. }
             | EngineCommand::AnswerNavigation { .. } => {}
+            // Content as structure is not implemented yet (TUI.md §8, phases 2 and 4).
+            EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
+                return Err(EngineError::Unsupported("semantics"))
+            }
         }
         Ok(())
     }

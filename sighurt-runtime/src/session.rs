@@ -314,6 +314,13 @@ impl<F: Frontend> Session<F> {
         opened
     }
 
+    /// Starts or stops `view`'s content snapshots ([`Frontend::semantics_changed`]), for a
+    /// frontend that shows the page as text. A frontend's choice, not the core's: an engine
+    /// without the capability refuses, and the refusal is not the core's to handle.
+    pub fn set_semantics(&mut self, view: ViewId, on: bool) {
+        self.engine_command(view, EngineCommand::SetSemantics(on), false);
+    }
+
     /// Hands `command` to `view`'s engine. A refusal goes to the core if `report`.
     pub fn engine_command(&mut self, view: ViewId, command: EngineCommand, report: bool) {
         let Some(entry) = self.views.get(&view) else {
@@ -396,6 +403,21 @@ impl<F: Frontend> Session<F> {
         event: EngineEvent,
         at: Instant,
     ) {
+        // Page content the core never reads: checked, then the frontend's.
+        let event = match event {
+            EngineEvent::SemanticsChanged { view, snapshot } => {
+                if self.views.get(&view).is_some_and(|e| e.engine == engine) {
+                    match snapshot.check() {
+                        Ok(()) => frontend.semantics_changed(view, snapshot),
+                        Err(error) => self.diag.error(format!(
+                            "the {engine} engine sent malformed page content: {error}"
+                        )),
+                    }
+                }
+                return;
+            }
+            event => event,
+        };
         match &event {
             // The core ignores it: presentation is scheduled by the frontend.
             EngineEvent::FrameReady { view } => {

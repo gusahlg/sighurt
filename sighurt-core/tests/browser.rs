@@ -12,6 +12,7 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus,
     Modifiers, PointerButton, PointerEvent, ScrollDelta, TextInputState, TextPurpose,
 };
+use sighurt_api::semantic::{NodeId, SemanticAction};
 use sighurt_api::services::{
     ClipboardData, DownloadSource, Permission, Selection, Service, ServiceError, ServiceReply,
     ServiceRequest,
@@ -1700,6 +1701,129 @@ fn a_chosen_views_links_stay_in_its_engine_until_an_address_is_typed() {
     let (allowed, effects) = asks(&mut b, servo, "https://apps.test/");
     assert!(!allowed);
     assert_eq!(opened(&effects)[0].1, "wasm");
+}
+
+/// The semantic action `action` on the page in `view`, chosen in `document`'s snapshot.
+fn act(
+    b: &mut Harness,
+    view: ViewId,
+    document: DocumentGeneration,
+    action: SemanticAction,
+    link: Option<&str>,
+) -> Vec<Effect> {
+    let event = BrowserEvent::Semantic {
+        view,
+        document,
+        action,
+        link: link.map(Into::into),
+        at: b.now,
+    };
+    b.apply(event)
+}
+
+fn sent_semantic(effects: &[Effect]) -> Vec<(DocumentGeneration, SemanticAction)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Engine {
+                command: EngineCommand::Semantic { document, action },
+                ..
+            } => Some((*document, action.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_link_activated_in_text_is_a_click_on_it() {
+    let mut b = Harness::start(
+        "[routing.wasm]\nhosts = [\"apps.test\"]",
+        &["https://a.test/"],
+    );
+    let servo = b.shown();
+    let document = b.document(servo);
+    let effects = act(
+        &mut b,
+        servo,
+        document,
+        SemanticAction::Activate(NodeId(7)),
+        Some("https://apps.test/"),
+    );
+    assert_eq!(
+        sent_semantic(&effects),
+        [(document, SemanticAction::Activate(NodeId(7)))]
+    );
+    // The engine asks about the link it follows: it goes where routing sends it.
+    let (allowed, effects) = asks(&mut b, servo, "https://apps.test/");
+    assert!(!allowed);
+    assert_eq!(opened(&effects)[0].1, "wasm");
+}
+
+#[test]
+fn what_a_frontend_does_on_its_own_is_no_click() {
+    let mut b = Harness::start(
+        "[routing.wasm]\nhosts = [\"apps.test\"]",
+        &["https://a.test/"],
+    );
+    let servo = b.shown();
+    let document = b.document(servo);
+    // Focus and scrolling go to the engine, but count as no activation and name no link.
+    for action in [
+        SemanticAction::Focus(NodeId(7)),
+        SemanticAction::ScrollIntoView(NodeId(7)),
+    ] {
+        let effects = act(
+            &mut b,
+            servo,
+            document,
+            action.clone(),
+            Some("https://apps.test/"),
+        );
+        assert_eq!(sent_semantic(&effects), [(document, action)]);
+    }
+    let (allowed, effects) = asks(&mut b, servo, "https://apps.test/");
+    assert!(allowed && opened(&effects).is_empty());
+    // A form action is the user's activation, but the link is only an activated link's.
+    act(
+        &mut b,
+        servo,
+        document,
+        SemanticAction::Submit(NodeId(8)),
+        Some("https://apps.test/"),
+    );
+    let (allowed, effects) = asks(&mut b, servo, "https://apps.test/");
+    assert!(allowed && opened(&effects).is_empty());
+}
+
+#[test]
+fn an_action_for_a_replaced_document_or_a_hidden_view_is_dropped() {
+    let mut b = Harness::start("", &["https://a.test/", "https://b.test/"]);
+    let first = b.shown();
+    let old = b.document(first);
+    b.apply(command("page.open https://a.test/next"));
+    assert_eq!(b.shown(), first);
+    assert_ne!(b.document(first), old, "a new document");
+    let effects = act(
+        &mut b,
+        first,
+        old,
+        SemanticAction::Activate(NodeId(1)),
+        None,
+    );
+    assert!(
+        sent_semantic(&effects).is_empty(),
+        "the snapshot's document is gone"
+    );
+    let current = b.document(first);
+    b.apply(command("tab.next"));
+    let effects = act(
+        &mut b,
+        first,
+        current,
+        SemanticAction::Activate(NodeId(1)),
+        None,
+    );
+    assert!(sent_semantic(&effects).is_empty(), "the view isn't shown");
 }
 
 #[test]

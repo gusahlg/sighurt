@@ -118,6 +118,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     pointer_lock: false,
     native_popups: false,
     process_per_view: false,
+    semantics: false,
 };
 
 /// What the executable decides for the Servo runtime.
@@ -1209,6 +1210,10 @@ impl EngineRuntime for ServoRuntime {
                         false => drop(navigation),
                     }
                 }
+            }
+            // Content as structure is not implemented yet (TUI.md §8, phase 4).
+            EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
+                return Err(EngineError::Unsupported("semantics"))
             }
         }
         Ok(())

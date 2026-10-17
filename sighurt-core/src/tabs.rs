@@ -212,6 +212,11 @@ impl View {
         self.id
     }
 
+    /// The document it shows, once one committed.
+    pub fn document(&self) -> Option<DocumentGeneration> {
+        self.document
+    }
+
     /// The engine it runs in.
     pub fn engine(&self) -> &str {
         &self.engine

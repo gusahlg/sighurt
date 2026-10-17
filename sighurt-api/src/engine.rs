@@ -17,8 +17,9 @@ use std::time::Instant;
 
 use crate::events::EngineEvent;
 use crate::geometry::Metrics;
-use crate::ids::{NavigationId, RequestId, ViewId};
+use crate::ids::{DocumentGeneration, NavigationId, RequestId, ViewId};
 use crate::input::InputEvent;
+use crate::semantic::SemanticAction;
 use crate::services::ServiceResult;
 
 /// One engine kind's runtime, serving any number of views.
@@ -85,7 +86,8 @@ pub trait EngineRuntime {
     /// [`CursorChanged`](EngineEvent::CursorChanged),
     /// [`LoadingChanged`](EngineEvent::LoadingChanged),
     /// [`HistoryChanged`](EngineEvent::HistoryChanged),
-    /// [`TextInputChanged`](EngineEvent::TextInputChanged) and
+    /// [`TextInputChanged`](EngineEvent::TextInputChanged),
+    /// [`SemanticsChanged`](EngineEvent::SemanticsChanged) and
     /// [`FrameReady`](EngineEvent::FrameReady) per view until it is delivered, so a page
     /// changing its title in a loop adds one event, not millions. Every other event is ordered
     /// and delivered, none dropped.
@@ -141,6 +143,9 @@ pub struct EngineCapabilities {
     /// view kept alive while hidden, such as a page in a tab's history, costs that process. Not
     /// an operation: the core keeps fewer such views alive.
     pub process_per_view: bool,
+    /// Snapshots of a document's content as structure, and actions on its nodes
+    /// ([`crate::semantic`]; [`EngineCommand::SetSemantics`], [`EngineCommand::Semantic`]).
+    pub semantics: bool,
 }
 
 /// How a view starts.
@@ -212,6 +217,20 @@ pub enum EngineCommand {
         request: RequestId,
         /// The answer.
         result: ServiceResult,
+    },
+    /// Start or stop reporting the view's content as
+    /// [`SemanticsChanged`](crate::events::EngineEvent::SemanticsChanged) snapshots. Off when a
+    /// view opens; nothing is extracted while it is off. Turning it on reports the current
+    /// document's content.
+    SetSemantics(bool),
+    /// Act on a node of `document`'s content. The engine drops the action if `document` is no
+    /// longer the view's, and refuses it on a node that is gone or doesn't take it; either way it
+    /// reports nothing but the snapshots that follow what did happen.
+    Semantic {
+        /// The document of the snapshot the action was chosen in.
+        document: DocumentGeneration,
+        /// The action.
+        action: SemanticAction,
     },
     /// The answer to the view's
     /// [`NavigationRequested`](crate::events::EngineEvent::NavigationRequested) `request`:

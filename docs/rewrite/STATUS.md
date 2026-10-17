@@ -3229,3 +3229,14 @@ Newest last. Each entry says what was decided and why.
     glvnd, also with `/dev/dri` hidden; llvmpipe only where no GPU driver is present), and WPE's
     terminal presenter is its existing SHM path without a Wayland lease, bounded by acknowledging
     frames at the terminal's rate (`experiments/tui-servo`, `experiments/wpe-cpu`).
+93. **The CPU frame and the semantic snapshot are part of sighurt-api** (TUI.md §10; amends 22
+    and 45, which kept `CpuTarget` in the Wasm engine). One pixel format, ARGB8888, for every CPU
+    target; the semantic snapshot is bounded and checked by `SemanticSnapshot::check` before a
+    frontend sees it; semantic actions reach the engine only through the core
+    (`BrowserEvent::Semantic`), tied to the snapshot's document, and count as the user's
+    activation only when the user's input caused them. *Why:* TUI.md §8.4–§8.5 and plan §28's
+    second question (a delayed action identifies its document). Evidence: sighurt-api's
+    `semantic` tests (tree shape, bounds, password values) and sighurt-core's
+    `a_link_activated_in_text_is_a_click_on_it`, `what_a_frontend_does_on_its_own_is_no_click`
+    and `an_action_for_a_replaced_document_or_a_hidden_view_is_dropped`; clippy clean on the
+    workspace and, on louise-pc, with Servo and WPE.

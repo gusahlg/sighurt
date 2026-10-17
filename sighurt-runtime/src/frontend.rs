@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use sighurt_api::events::Cursor;
 use sighurt_api::ids::{TargetId, ViewId};
 use sighurt_api::input::{InputEvent, KeyboardFocus, TextInputState};
+use sighurt_api::semantic::SemanticSnapshot;
 use sighurt_core::BrowserEvent;
 
 use crate::diagnostics::Diagnostics;
@@ -84,4 +85,14 @@ pub trait Frontend: Clipboard {
     /// §8.8). The terminal frontend restores the terminal here. Destructors do not run after
     /// this returns.
     fn before_forced_exit(&mut self);
+
+    /// A view's content as structure, after the frontend turned it on
+    /// ([`Session::set_semantics`](crate::session::Session::set_semantics)). The runtime has
+    /// checked its bounds and shape ([`SemanticSnapshot::check`]); its strings are still page
+    /// data. A snapshot may be of a document the core has just replaced: an action on it is
+    /// dropped by the core and the engine, and the new document's snapshot follows. A frontend
+    /// that shows pixels ignores it.
+    fn semantics_changed(&mut self, view: ViewId, snapshot: Box<SemanticSnapshot>) {
+        let _ = (view, snapshot);
+    }
 }

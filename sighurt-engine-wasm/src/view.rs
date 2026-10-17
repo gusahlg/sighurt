@@ -340,6 +340,10 @@ impl View {
             // about none.
             EngineCommand::ResolveServiceRequest { .. }
             | EngineCommand::AnswerNavigation { .. } => {}
+            // A guest draws on a canvas: there is no content as structure (TUI.md §3).
+            EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
+                return Err(EngineError::Unsupported("semantics"))
+            }
         }
         Ok(())
     }

@@ -356,3 +356,32 @@ All three prototypes pass; details and numbers in each `experiments/*/RESULTS.md
   restoration on exit, panic, SIGTSTP/SIGCONT, SIGHUP and before a forced exit) passes 38 tests,
   14 under a pty with watchdogs. Not yet run in a real terminal (foot or kitty in a private
   compositor): phase 2.
+
+## 10. The contract as built (phase 2's start)
+
+Where it differs from the sketches in §2–§3:
+
+- `sighurt_api::present` has the CPU frame, moved up from the Wasm engine: `Frame { pixels,
+  size, stride }` and `CpuTarget`. There is **one pixel format**, wl_shm's ARGB8888
+  (premultiplied, B, G, R, A in memory, top row first): no `PixelFormat`, so no target converts;
+  an engine whose renderer reads back RGBA bottom-up (Servo's GL) converts while it copies.
+- `sighurt_api::semantic`: `SemanticSnapshot` (stamped with its `DocumentGeneration`), its nodes
+  and `NodeKind`s, `SemanticAction` (`Activate`, `Focus`, `SetValue`, `SelectOption`, `Submit`,
+  `ScrollIntoView`; a checkbox is toggled by `Activate`), the bounds (`MAX_NODES` 20 000,
+  `MAX_DEPTH` 256, `MAX_STRING_BYTES` 16 KiB, `MAX_TOTAL_BYTES` 1 MiB, `MAX_OPTIONS` 1 000), and
+  `SemanticSnapshot::check`, which also refuses a password field with a value.
+  `SemanticAction::is_activation` says which actions only a user's input may cause.
+- The engine contract: `EngineCapabilities::semantics`, `EngineCommand::SetSemantics(bool)` and
+  `EngineCommand::Semantic { document, action }`, and `EngineEvent::SemanticsChanged { view,
+  snapshot }`, which is replaceable. Every engine declares `semantics: false` and refuses both
+  commands with `Unsupported` until it implements them.
+- The core: `BrowserEvent::Semantic { view, document, action, link, at }`, dropped unless the
+  view is shown and `document` is still its document; an activation records the user's
+  activation, with `link` only for `Activate`, and gives the page the keyboard. The core ignores
+  `SemanticsChanged`.
+- The runtime: `Session::set_semantics(view, on)` (the frontend's choice; a refusal is not
+  reported to the core) and `Frontend::semantics_changed(view, snapshot)`, called with snapshots
+  that passed `check` (a malformed one is logged as an error). The runtime does not compare a
+  snapshot's document with the core's, since the commit before it may still be queued for the
+  core: a snapshot of a just-replaced document reaches the frontend, and an action on it is
+  dropped by the core and the engine.

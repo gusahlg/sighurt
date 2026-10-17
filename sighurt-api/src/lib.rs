@@ -13,6 +13,9 @@
 //! - [`engine`]: the [`EngineRuntime`](engine::EngineRuntime) trait engines implement, what the
 //!   host tells an engine, and the waker engines use to ask for attention.
 //! - [`events`]: what an engine reports back.
+//! - [`present`]: the shape of a frame painted on the CPU, which every frontend can show.
+//! - [`semantic`]: a document's content as structure, and actions on it, for frontends that
+//!   show text instead of pixels.
 //! - [`services`]: privileged requests (clipboard, downloads, file pickers, external URLs,
 //!   permissions) and their answers.
 //! - [`commands`]: the browser commands users bind keys to, such as `tab.new`.
@@ -34,5 +37,7 @@ pub mod geometry;
 pub mod ids;
 pub mod input;
 pub mod keymap;
+pub mod present;
+pub mod semantic;
 pub mod services;
 pub mod settings;

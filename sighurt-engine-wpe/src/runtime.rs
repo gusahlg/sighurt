@@ -86,6 +86,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     pointer_lock: false,
     native_popups: false,
     process_per_view: true,
+    semantics: false,
 };
 
 /// The `log` target of the timing lines: `RUST_LOG=sighurt_engine_wpe::timing=debug`.
@@ -1327,6 +1328,10 @@ impl EngineRuntime for WpeRuntime {
                         }
                     }
                 }
+            }
+            // Content as structure is not implemented yet (TUI.md §8, phase 4).
+            EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
+                return Err(EngineError::Unsupported("semantics"))
             }
         }
         self.handle_notes();

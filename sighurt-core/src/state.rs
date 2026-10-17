@@ -21,7 +21,8 @@
 //!   ones about views it has closed or replaced and requests from replaced documents, and
 //!   answers every navigation a view it knows asks about (`NavigationRequested`): a link the
 //!   user clicked goes where routing sends its address, perhaps to another engine.
-//!   `FrameReady` is the executable's to schedule presentation from; the core ignores it;
+//!   `FrameReady` is the executable's to schedule presentation from, and `SemanticsChanged`
+//!   page content for a frontend that shows text; the core ignores both;
 //! - what its own calls and services produced: [`BrowserEvent::OpenFailed`],
 //!   [`BrowserEvent::CommandFailed`], [`BrowserEvent::ServiceDone`],
 //!   [`BrowserEvent::PermissionAnswered`], [`BrowserEvent::ConfigReloaded`].
@@ -47,6 +48,7 @@ use sighurt_api::input::{
     ScrollDelta, TextInputState,
 };
 use sighurt_api::keymap::{KeyContext, KeymapKind};
+use sighurt_api::semantic::SemanticAction;
 use sighurt_api::services::{
     Permission, Service, ServiceError, ServiceReply, ServiceRequest, ServiceResult,
 };
@@ -200,6 +202,23 @@ pub enum BrowserEvent {
         command: EngineCommand,
         /// Why.
         error: EngineError,
+    },
+    /// A frontend that shows a page as text acts on a node of it (TUI.md §3, §8.4): the user
+    /// chose `action` in the snapshot of `document` that the frontend showed. Dropped unless
+    /// `view` is the view shown and `document` still its document. An action the user's input
+    /// caused ([`SemanticAction::is_activation`]) counts as a click in the page, over `link`
+    /// when it activates a link: the address of the node in that snapshot.
+    Semantic {
+        /// The view.
+        view: ViewId,
+        /// The document of the snapshot the action was chosen in.
+        document: DocumentGeneration,
+        /// The action.
+        action: SemanticAction,
+        /// The link the action activates, if any: its node's address in the snapshot.
+        link: Option<String>,
+        /// When the user acted.
+        at: Instant,
     },
     /// A service the core asked for ([`Effect::Service`]) is done, or failed.
     ServiceDone {
@@ -385,6 +404,13 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
         BrowserEvent::Keyboard { event, at } => state.keyboard(event, at, &mut fx),
         BrowserEvent::Pointer { view, event, at } => state.pointer(view, event, at, &mut fx),
         BrowserEvent::Button { view, event, at } => state.button(view, event, at, &mut fx),
+        BrowserEvent::Semantic {
+            view,
+            document,
+            action,
+            link,
+            at,
+        } => state.semantic(view, document, action, link, at, &mut fx),
         BrowserEvent::Focus(focus) => {
             state.focus = focus;
             fx.chrome = true;
@@ -1341,7 +1367,7 @@ impl BrowserState {
                     state
                 })
             }
-            EngineEvent::FrameReady { .. } => {}
+            EngineEvent::FrameReady { .. } | EngineEvent::SemanticsChanged { .. } => {}
             EngineEvent::ServiceRequested(request) => self.service_requested(request, at, fx),
             EngineEvent::ServiceCancelled { request, .. } => {
                 if self.requests.get(request).is_some_and(|p| p.view == id) {
@@ -1805,6 +1831,39 @@ impl BrowserState {
             return self.button(Some(view), event, at, fx);
         }
         self.page_pointer(view, event, at, fx);
+    }
+
+    /// An action on a node of the shown page's content, chosen in `document`'s snapshot: one the
+    /// user's input caused is their activation, as a press in the page is
+    /// ([`Self::page_pointer`]), and gives the page the keyboard.
+    fn semantic(
+        &mut self,
+        view: ViewId,
+        document: DocumentGeneration,
+        action: SemanticAction,
+        link: Option<String>,
+        at: Instant,
+        fx: &mut Fx,
+    ) {
+        if self.shown_view() != Some(view) {
+            return;
+        }
+        let v = self.views.get_mut(&view).expect("shown");
+        if v.document != Some(document) {
+            return;
+        }
+        if action.is_activation() {
+            let link = link
+                .filter(|l| matches!(action, SemanticAction::Activate(_)) && l.len() <= MAX_URL);
+            v.activated(at, link);
+            if self.focus != KeyboardFocus::Page {
+                self.move_focus(KeyboardFocus::Page, fx);
+            }
+        }
+        fx.push(Effect::Engine {
+            view,
+            command: EngineCommand::Semantic { document, action },
+        });
     }
 
     /// A side button over `view`, or over the chrome: a press `[input.buttons]` binds runs its

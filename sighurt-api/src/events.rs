@@ -42,6 +42,7 @@ use std::fmt;
 
 use crate::ids::{DocumentGeneration, NavigationId, RequestId, ViewId};
 use crate::input::TextInputState;
+use crate::semantic::SemanticSnapshot;
 use crate::services::ServiceRequest;
 
 /// Something an engine reports.
@@ -143,6 +144,15 @@ pub enum EngineEvent {
         /// The view.
         view: ViewId,
     },
+    /// The view's content, after [`EngineCommand::SetSemantics`](crate::engine::EngineCommand)
+    /// turned it on: a whole snapshot that replaces the last ([`crate::semantic`]). Page data the
+    /// core never reads; the runtime hands it to the frontend after checking it.
+    SemanticsChanged {
+        /// The view.
+        view: ViewId,
+        /// The content, stamped with the document it came from.
+        snapshot: Box<SemanticSnapshot>,
+    },
     /// The view asks for a privileged service.
     ServiceRequested(ServiceRequest),
     /// The view no longer wants the result of a service request, e.g. because the page closed
@@ -236,6 +246,7 @@ impl EngineEvent {
             | Self::CursorChanged { view, .. }
             | Self::TextInputChanged { view, .. }
             | Self::FrameReady { view }
+            | Self::SemanticsChanged { view, .. }
             | Self::ServiceCancelled { view, .. }
             | Self::NavigationRequested { view, .. }
             | Self::OpenRequested { view, .. }
