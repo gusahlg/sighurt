@@ -1,17 +1,17 @@
-//! Painting the demo pages into a lent SHM frame: ARGB8888, premultiplied, little-endian
+//! Painting the demo pages into a lent CPU frame: ARGB8888, premultiplied, little-endian
 //! (bytes B, G, R, A), every pixel of the buffer.
 //!
-//! Sizes come from the frame's metrics: lengths given in logical pixels are converted with the
-//! ratio of the actual, rounded buffer size to the logical size, so the drawing follows every
-//! scale exactly. Rows are built once and copied, which keeps a full-page paint cheap even in a
-//! debug build.
+//! Sizes come from the frame and the view's metrics: lengths given in logical pixels are
+//! converted with the ratio of the actual, rounded buffer size to the logical size, so the
+//! drawing follows every scale exactly. Rows are built once and copied, which keeps a full-page
+//! paint cheap even in a debug build.
 //!
-//! Must not own: when to paint (the runtime) or buffer lifetime (the host).
+//! Must not own: when to paint (the runtime) or buffer lifetime (the target).
 
 use std::time::Duration;
 
-use sighurt_api::geometry::{BufferPoint, SurfacePoint};
-use sighurt_wayland::ShmFrame;
+use sighurt_api::geometry::{BufferPoint, Metrics, SurfacePoint};
+use sighurt_api::present::Frame;
 
 use crate::Page;
 
@@ -78,14 +78,17 @@ impl Canvas<'_> {
     }
 }
 
-/// Paints `scene` into all of `frame`.
-pub(crate) fn paint(frame: &mut ShmFrame, scene: &Scene) {
-    let metrics = frame.metrics();
-    let (size, stride) = (frame.size(), frame.stride());
+/// Paints `scene` into all of `frame`. Lengths in logical pixels use `metrics`.
+pub(crate) fn paint(frame: Frame<'_>, scene: &Scene, metrics: Metrics) {
+    let Frame {
+        pixels,
+        size,
+        stride,
+    } = frame;
     let logical = metrics.rect();
     let ratio = |buffer: u32, logical: u32| f64::from(buffer) / f64::from(logical.max(1));
     let mut canvas = Canvas {
-        pixels: frame.pixels(),
+        pixels,
         width: size.width as usize,
         height: size.height as usize,
         stride,

@@ -18,7 +18,8 @@
 //! budget of its own, so no list can hide it. Images are converted for painting when the list
 //! is made, on the guest's worker ([`convert_images`]), not here.
 //!
-//! A large frame is painted in horizontal bands at once, straight into the lent buffer ([`paint`]).
+//! A large frame is painted in horizontal bands at once, straight into the lent buffer ([`paint`]),
+//! a [`Frame`](sighurt_api::present::Frame).
 //! Which ops fit the budget is decided first, once for the whole frame ([`select`]); each band
 //! then paints the part of those ops that reaches its rows. So the same ops are painted
 //! whatever the number of bands, and the bands together do the frame's work, not more. Shapes
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use sighurt_api::geometry::BufferSize;
+pub use sighurt_api::present::Frame;
 use tiny_skia::{
     Color, FillRule, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, PixmapMut, PixmapPaint,
     Rect, SpreadMode, Stroke, Transform,
@@ -52,17 +54,6 @@ const TEXT_BYTE_COST: f64 = 150.0;
 /// Largest text painted, in buffer pixels: past it the glyphs of one line take hundreds of
 /// megabytes, and such text is not painted.
 const MAX_TEXT_PX: f32 = 2048.0;
-
-/// Memory to paint one frame into, lent by the target's presenter.
-pub struct Frame<'a> {
-    /// `size.height` rows of `stride` bytes. Each pixel is wl_shm ARGB8888: premultiplied
-    /// alpha, little-endian (B, G, R, A in memory).
-    pub pixels: &'a mut [u8],
-    /// The buffer's size in pixels: the size of the permit's metrics.
-    pub size: BufferSize,
-    /// Bytes per row. Only `4 * size.width` is supported.
-    pub stride: usize,
-}
 
 /// What to paint: a guest's display list and an overlay on top of it (the permission prompt).
 pub struct Scene<'a> {

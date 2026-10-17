@@ -16,7 +16,8 @@ screen-capture = ["dep:screenshots"]
 
 [dependencies]
 sighurt-api = { path = "../sighurt-api" }
-# The SHM target lease and frame permit views present into (`wayland.rs`).
+# The example and the compositor test mount views on the host's SHM lease. The lease
+# implements `CpuTarget` in sighurt-wayland.
 sighurt-wayland = { path = "../sighurt-wayland" }
 wasmtime.workspace = true
 tiny-skia.workspace = true

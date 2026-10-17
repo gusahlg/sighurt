@@ -18,8 +18,9 @@
 //! Presenting is "paint the latest display list into this buffer while the host's permit
 //! allows it": [`present`] rasterizes into memory the view's [`CpuTarget`] lends for that one
 //! frame, a large frame in bands on helper threads while the owner paints one of them and
-//! waits for the rest (`raster.rs`). `sig` gives views the Wayland host's shared-memory target
-//! lease, which implements [`CpuTarget`] (`wayland.rs`).
+//! waits for the rest (`raster.rs`). [`CpuTarget`] is
+//! [`sighurt_api::present::CpuTarget`](sighurt_api::present::CpuTarget). `sig` gives views the
+//! Wayland host's shared-memory target lease, which implements it in `sighurt-wayland`.
 //!
 //! Owns: the views, the pools and the completion channel. Must not own: browser policy (which
 //! URL opens where, permissions beyond the guest's own prompt) or native surfaces.
@@ -38,15 +39,14 @@ use sighurt_api::engine::{
     PumpStatus, ViewOptions,
 };
 use sighurt_api::events::EngineEvent;
-use sighurt_api::geometry::Metrics;
-use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, NavigationId, ViewId};
+use sighurt_api::present::CpuTarget;
 
 use crate::capabilities::{ConsoleEntry, ConsoleLevel, HostState};
 use crate::draw::DisplayList;
 use crate::engine::{WasmConfig, WasmEngine};
 use crate::live::{LiveGuest, Seen, Step};
 use crate::pool::{Pool, Spawner};
-use crate::raster::Frame;
 use crate::runtime::{self, Loaded};
 use crate::view::{Jobs, Outbox, Readiness, View};
 
@@ -56,33 +56,13 @@ pub const MAX_COMPLETIONS_PER_PUMP: usize = 64;
 /// the guests that are running.
 const LOADERS: usize = 2;
 
-/// Where a view presents: the host's target lease for a CPU-drawn (shared-memory) page surface.
-///
-/// `sighurt_wayland`'s [`TargetLease`](sighurt_wayland::TargetLease) implements it, with its
-/// [`FramePermit`](sighurt_wayland::FramePermit); tests use an in-memory target. The runtime drops a view's target on the owner thread when the view closes
-/// or the runtime shuts down, after it has stopped the view's guest; the guest's state, which
-/// doesn't refer to the target, is dropped on another thread.
-pub trait CpuTarget {
-    /// Permission to present one frame at one layout epoch.
-    type Permit;
-
-    /// The target's metrics when the view opens; later ones arrive as
-    /// [`EngineCommand::SetMetrics`].
-    fn metrics(&self) -> Metrics;
-
-    /// The layout epoch `permit` allows a frame for.
-    fn permit_epoch(permit: &Self::Permit) -> LayoutEpoch;
-
-    /// Lends a free buffer the size of the permit's metrics to `paint`, then submits it,
-    /// consuming the permit. If `paint` fails, nothing is submitted.
-    fn submit(
-        &mut self,
-        permit: Self::Permit,
-        paint: &mut dyn FnMut(Frame<'_>) -> Result<(), String>,
-    ) -> Result<(), String>;
-}
-
 /// The Wasm engine's runtime, serving views that present into `T`.
+///
+/// `T` is a [`CpuTarget`]. `sig` uses the Wayland host's shared-memory target lease, which
+/// implements it in `sighurt-wayland` with the host's frame permit; tests use an in-memory
+/// target. The runtime drops a view's target on the owner thread when the view closes or the
+/// runtime shuts down, after it has stopped the view's guest; the guest's state, which doesn't
+/// refer to the target, is dropped on another thread.
 pub struct WasmRuntime<T: CpuTarget> {
     engine: WasmEngine,
     views: HashMap<ViewId, (View, T)>,

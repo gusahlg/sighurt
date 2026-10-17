@@ -1,8 +1,9 @@
 //! A demo engine that exists to test the host, the chrome and the engine contract without
 //! building Servo (`sig` with `--no-default-features --features engine-demo`).
 //!
-//! Implements `sighurt_api::engine::EngineRuntime` with CPU drawing into the Wayland host's
-//! shared-memory targets ([`DemoRuntime`]). Its pages, by URL ([`Page`]):
+//! Implements `sighurt_api::engine::EngineRuntime` with CPU drawing through a
+//! [`CpuTarget`](sighurt_api::present::CpuTarget) ([`DemoRuntime`]). `sig` binds the default,
+//! the Wayland host's shared-memory target lease. Its pages, by URL ([`Page`]):
 //!
 //! - `demo:pattern`: a static pattern. It paints once per size and then does nothing while idle.
 //! - `demo:animation`: an animation paced by the host's frame callbacks: after each presented
@@ -50,7 +51,8 @@ use sighurt_api::events::{Cursor, EngineEvent, NavigationError};
 use sighurt_api::geometry::{Metrics, SurfacePoint};
 use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, ViewId};
 use sighurt_api::input::{ButtonState, InputKind, Key, PointerEvent};
-use sighurt_wayland::{FramePermit, TargetLease};
+use sighurt_api::present::CpuTarget;
+use sighurt_wayland::TargetLease;
 
 /// The engine's name in the configuration and the registry.
 pub const NAME: &str = "demo";
@@ -128,8 +130,8 @@ impl Page {
 }
 
 /// One view: its target and what its page shows.
-struct View {
-    target: TargetLease,
+struct View<T: CpuTarget> {
+    target: T,
     metrics: Metrics,
     visible: bool,
     focused: bool,
@@ -148,8 +150,8 @@ struct View {
     dirty: bool,
 }
 
-impl View {
-    fn new(target: TargetLease, options: ViewOptions) -> Self {
+impl<T: CpuTarget> View<T> {
+    fn new(target: T, options: ViewOptions) -> Self {
         Self {
             metrics: target.metrics(),
             target,
@@ -215,15 +217,26 @@ impl View {
 }
 
 /// The demo engine's runtime: every demo view of the browser.
-#[derive(Default)]
-pub struct DemoRuntime {
-    views: BTreeMap<ViewId, View>,
+///
+/// Views present into `T`. The default is the Wayland host's shared-memory [`TargetLease`].
+pub struct DemoRuntime<T: CpuTarget = TargetLease> {
+    views: BTreeMap<ViewId, View<T>>,
     /// Events not handed over yet, in order.
     queue: Vec<EngineEvent>,
     shut_down: bool,
 }
 
-impl DemoRuntime {
+impl<T: CpuTarget> Default for DemoRuntime<T> {
+    fn default() -> Self {
+        Self {
+            views: BTreeMap::new(),
+            queue: Vec::new(),
+            shut_down: false,
+        }
+    }
+}
+
+impl<T: CpuTarget> DemoRuntime<T> {
     /// A runtime with no views.
     pub fn new() -> Self {
         Self::default()
@@ -395,9 +408,9 @@ fn coalesce(events: &mut Vec<EngineEvent>) {
     events.retain(|_| keep.next().unwrap_or(true));
 }
 
-impl EngineRuntime for DemoRuntime {
-    type Target = TargetLease;
-    type FramePermit = FramePermit;
+impl<T: CpuTarget> EngineRuntime for DemoRuntime<T> {
+    type Target = T;
+    type FramePermit = T::Permit;
 
     fn capabilities(&self) -> EngineCapabilities {
         CAPABILITIES
@@ -407,7 +420,7 @@ impl EngineRuntime for DemoRuntime {
         &mut self,
         view: ViewId,
         options: ViewOptions,
-        target: TargetLease,
+        target: T,
     ) -> Result<(), EngineError> {
         self.running()?;
         if self.views.contains_key(&view) {
@@ -505,29 +518,23 @@ impl EngineRuntime for DemoRuntime {
         }
     }
 
-    fn present(&mut self, id: ViewId, permit: FramePermit) -> Result<PresentOutcome, EngineError> {
+    fn present(&mut self, id: ViewId, permit: T::Permit) -> Result<PresentOutcome, EngineError> {
         self.running()?;
         let view = self
             .views
             .get_mut(&id)
             .ok_or(EngineError::UnknownView(id))?;
-        if permit.target() != view.target.id() {
-            return Err(EngineError::View {
-                view: id,
-                message: format!("a permit for {:?} is not this view's", permit.target()),
-            });
-        }
         let Some(page) = view.page() else {
             return Ok(PresentOutcome::NotReady);
         };
-        let epoch = permit.metrics().epoch();
-        if page == Page::Slow && view.rendered != Some(epoch) {
+        // The permit is for one layout epoch. `demo:slow` shows nothing until its frame for
+        // that epoch is ready; dropping the permit presents nothing.
+        if page == Page::Slow && view.rendered != Some(T::permit_epoch(&permit)) {
             return Ok(PresentOutcome::NotReady);
         }
-        let mut frame = permit.shm_frame().map_err(|error| EngineError::View {
-            view: id,
-            message: error.to_string(),
-        })?;
+        // The host issues the permit for the target's current metrics. `SetMetrics` for that
+        // layout can still be queued, so the view's copy may be one layout behind.
+        let metrics = view.target.metrics();
         let scene = paint::Scene {
             page,
             failed: view.failed,
@@ -535,8 +542,12 @@ impl EngineRuntime for DemoRuntime {
             pointer: view.pointer,
             elapsed: view.started.elapsed(),
         };
-        paint::paint(&mut frame, &scene);
-        frame.submit();
+        view.target
+            .submit(permit, &mut |frame| {
+                paint::paint(frame, &scene, metrics);
+                Ok(())
+            })
+            .map_err(|message| EngineError::View { view: id, message })?;
         // An animation asks for its next frame as soon as this one is submitted; the host's
         // frame callback paces it.
         view.dirty |= page == Page::Animation && !view.failed;
@@ -544,7 +555,7 @@ impl EngineRuntime for DemoRuntime {
     }
 
     fn close_view(&mut self, id: ViewId) {
-        // Dropping the view retires its target lease.
+        // Dropping the view drops its target. A Wayland lease retires the host's target.
         if self.views.remove(&id).is_some() {
             self.queue.retain(|event| event.view() != Some(id));
             self.queue.push(EngineEvent::ViewClosed { view: id });

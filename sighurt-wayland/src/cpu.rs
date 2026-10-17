@@ -1,20 +1,21 @@
-//! The Wayland host's shared-memory target as a [`CpuTarget`]: what `sig` gives each Wasm view.
+//! The host's shared-memory [`TargetLease`] as a [`CpuTarget`].
 //!
-//! A view presents into a `sighurt_wayland` [`TargetLease`] created with `PresentMode::Shm`.
-//! Presenting turns the host's [`FramePermit`] into the [`ShmFrame`] it lends, paints the frame
-//! at the permit's metrics straight into that shared memory, and submits it; the host commits
-//! the leaf there and nowhere else. A frame that fails to paint is not submitted: dropping the
-//! [`ShmFrame`] gives its buffer back unused.
+//! [`CpuTarget`] lives in [`sighurt_api::present`](sighurt_api::present): the one CPU frame
+//! shape every frontend can show. A view presents into a [`TargetLease`] created with
+//! [`PresentMode::Shm`](crate::PresentMode::Shm). Presenting turns the host's [`FramePermit`]
+//! into the [`ShmFrame`] it lends, paints the frame at the permit's metrics straight into that
+//! shared memory, and submits it; the host commits the leaf there and nowhere else. A frame
+//! that fails to paint is not submitted: dropping the [`ShmFrame`] gives its buffer back unused.
 //!
 //! Owns: the step from permit to painted, submitted buffer. Must not own: when a permit is
 //! issued (the host's scheduler), buffer reuse (the host's swapchain) or the surface.
 
 use sighurt_api::geometry::Metrics;
 use sighurt_api::ids::LayoutEpoch;
-use sighurt_wayland::{FramePermit, ShmFrame, TargetLease};
+use sighurt_api::present::{CpuTarget, Frame};
 
-use crate::adapter::CpuTarget;
-use crate::raster::Frame;
+use crate::shm::ShmFrame;
+use crate::targets::{FramePermit, TargetLease};
 
 impl CpuTarget for TargetLease {
     type Permit = FramePermit;

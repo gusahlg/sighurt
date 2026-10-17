@@ -9,8 +9,10 @@
 //! with one shared Wasmtime engine serves every Wasm view, each document in a store of its own.
 //! Guests run on worker threads under fuel and time limits ([`engine`]) and reach only the
 //! capabilities registered in [`capabilities`], with no WASI. Their drawing is painted on the
-//! CPU (`raster.rs`) into buffers the host lends through a [`CpuTarget`]; `sig` gives each view
-//! a `sighurt_wayland::TargetLease` of an SHM target, which implements it (`wayland.rs`).
+//! CPU (`raster.rs`) into a [`Frame`] the host lends through a [`CpuTarget`]. Both live in
+//! [`sighurt_api::present`](sighurt_api::present) and are re-exported here. `sig` gives each
+//! view a `sighurt_wayland::TargetLease` of an SHM target, which implements [`CpuTarget`] in
+//! `sighurt-wayland`.
 //!
 //! Being in-process makes this cooperative, not a sandbox: Wasmtime isolates a guest's memory
 //! and the linker limits what it can call, but a bug in the engine or a host function is a bug
@@ -47,10 +49,9 @@ pub mod url;
 pub mod video;
 pub mod video_format;
 mod view;
-mod wayland;
 pub mod websocket;
 pub mod worker;
 
-pub use adapter::{CpuTarget, WasmRuntime};
+pub use adapter::WasmRuntime;
 pub use engine::{default_aot_cache, SandboxPolicy, WasmConfig};
-pub use raster::Frame;
+pub use sighurt_api::present::{CpuTarget, Frame};

@@ -249,11 +249,13 @@ fn demo(
     use sighurt_engine_demo::DemoRuntime;
     use sighurt_runtime::registry::Runtime;
 
-    Ok(Runtime::Demo(Box::new(Bound(DemoRuntime::new()))))
+    Ok(Runtime::Demo(Box::new(Bound(
+        DemoRuntime::<TargetLease>::new(),
+    ))))
 }
 
 #[cfg(feature = "engine-demo")]
 impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
-    for Bound<sighurt_engine_demo::DemoRuntime>
+    for Bound<sighurt_engine_demo::DemoRuntime<TargetLease>>
 {
 }

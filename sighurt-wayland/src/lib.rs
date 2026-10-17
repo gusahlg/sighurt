@@ -18,13 +18,15 @@
 //!
 //! The executable's side is small: [`Host`] (with [`Host::new`], windows, targets, placements,
 //! permits and [`Host::next_event`]), [`TargetLease`] and [`FramePermit`] for presenters,
-//! [`ShmFrame`] for CPU painters, and [`Placement`] for the chrome's layout. The module
-//! documentation of each part states its rules.
+//! [`ShmFrame`] for CPU painters, and [`Placement`] for the chrome's layout. A shared-memory
+//! [`TargetLease`] implements [`CpuTarget`](sighurt_api::present::CpuTarget) ([`cpu`]). The
+//! module documentation of each part states its rules.
 
 #![warn(missing_docs)]
 
 pub mod clipboard;
 pub mod connection;
+pub mod cpu;
 pub mod input;
 pub mod placement;
 pub mod scale;
