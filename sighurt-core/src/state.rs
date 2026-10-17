@@ -67,6 +67,18 @@ use crate::tabs::{
     bounded, clamp, display_title, Content, LoadError, Tab, TabSummary, View, MAX_TEXT, MAX_URL,
 };
 
+/// Which frontend is running. [`crate::config::Config::parse`] checks `chrome.<action>`
+/// against that frontend's chrome, and installs the terminal's default keys only for
+/// [`Frontend::Terminal`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Frontend {
+    /// The Wayland window. The default, so a caller that doesn't say keeps the window's checks.
+    #[default]
+    Gui,
+    /// The terminal. `chrome.<action>` is checked against the terminal chrome's commands.
+    Terminal,
+}
+
 /// What the executable tells the core about the world it runs in: what the build has, which
 /// the configuration is checked against ([`Config::parse`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -88,6 +100,9 @@ pub struct Environment {
     pub chromes: Vec<ChromeChecks>,
     /// The color names `[ui.colors]` takes: the chrome's (`sighurt_ui::Colors::NAMES`).
     pub color_names: &'static [&'static str],
+    /// Which frontend is running. [`Frontend::Gui`] when left out, which keeps the window's
+    /// chrome checks and installs no terminal keys.
+    pub frontend: Frontend,
 }
 
 /// What the core needs of a chrome of the build: its name, the check of its

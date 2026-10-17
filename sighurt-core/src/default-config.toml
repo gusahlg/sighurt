@@ -3,9 +3,10 @@
 # This is the built-in default, and `sig --default-config` prints it. Your own file is
 # ~/.config/sighurt/config.toml. It starts with `version = 1`, the version of this format;
 # every other key is optional and keeps the value below when you leave it out. [routing]
-# tables merge by engine, field by field, and [engines], [input], [input.buttons], [downloads]
-# and [session] key by key; [keywords], [engines.*], [keys], [keymap.*], [ui] and [chrome.*]
-# are yours alone.
+# tables merge by engine, field by field, and [engines], [input], [input.buttons], [downloads],
+# [session] and [tui] key by key; [keywords], [engines.*], [keys], [keymap.*], [ui] and
+# [chrome.*] are yours alone. [tui.keys] in your file is a separate table, over [keys], and
+# applies only in the terminal; it does not replace the built-in [tui.keys] below.
 #
 # The problems in the file are reported together. A file with any problem is not used: at
 # startup sig runs with these defaults, and when the file is loaded again the configuration in
@@ -13,9 +14,10 @@
 # a problem, so one file can serve several builds: sig says so, names what it has, and goes on
 # (an absent engine's routing rules are left out, so what they claim opens in the default engine).
 # Key bindings, the keymap, the mouse's buttons, scrolling, colors, fonts, the chrome's
-# options, the home page, search, keywords, zoom, routing, the download folder and session
-# restore apply as soon as they are loaded; pages already open stay in the engine they are open
-# in. The chrome and the engines' own settings change when sig starts again.
+# options, the terminal's mode, graphics, frame rate, mouse and keys, the home page, search,
+# keywords, zoom, routing, the download folder and session restore apply as soon as they are
+# loaded; pages already open stay in the engine they are open in. The chrome and the engines'
+# own settings change when sig starts again.
 
 version = 1
 
@@ -138,7 +140,8 @@ forward = "page.forward"
 
 # ── Keys ─────────────────────────────────────────────────────────────────────────────────
 #
-# sig has no default key bindings: nothing is bound until you bind it here. The tab strip,
+# The windowed frontend has no default key bindings: nothing is bound until you bind it here.
+# The terminal has a small table of its own, [tui.keys] below, used only there. The tab strip,
 # the toolbar and the address bar work without any.
 #
 #   [keys]                                # everywhere
@@ -185,7 +188,91 @@ forward = "page.forward"
 # you pressed it: down, up, left, right, pageup, pagedown, home, end, space, enter, escape,
 # tab, f1 to f24, or a W3C key name such as BrowserBack, with modifiers ("shift-space"). It
 # never types a character. chrome.<action> runs one of the commands of the chrome that draws
-# the window; the UI section says which they are.
+# the window; the UI section says which the windowed chrome has, and the Terminal section
+# which the terminal's chrome has. In [tui.keys] the commands are the terminal's, in either
+# frontend.
+
+# ── Terminal ─────────────────────────────────────────────────────────────────────────────
+#
+# [tui] is the terminal frontend's. The windowed frontend reads it and does nothing with it,
+# so one file serves both. It applies as soon as the file is loaded.
+#
+# mode: "auto" (the default) follows the terminal, graphics where it can show them and text
+# otherwise; "text" is reflowed text; "graphics" is the page's pixels.
+# graphics: "auto" (the default) picks kitty where the terminal speaks it, otherwise sixel,
+# otherwise text; or "kitty", "sixel", or "none" (text only).
+# fps: how many frames of the page graphics mode shows a second, a whole number from 1 to 60.
+# The default is 10.
+# mouse: whether the terminal's mouse reports clicks and scrolling to the page. The default
+# is true.
+# default-keys: whether the built-in key table below is in use. The default is true. false
+# drops that whole table. Keys you bind yourself stay.
+#
+#   [tui]
+#   mode = "text"
+#   graphics = "kitty"
+#   fps = 30
+#   mouse = false
+#   default-keys = false
+#
+# The keys below are used only in the terminal, and only while default-keys is true. They sit
+# under [keys]: a binding you write in [keys] for the same keystroke wins. [tui.keys] in your
+# own file sits over [keys], applies only in the terminal, and does not replace this table, so
+# leaving a line out of a [tui.keys] you write does not unbind the built-in one. Setting
+# default-keys to false does, for every built-in line. [tui.keys.page] and [tui.keys.location]
+# are the same contexts as [keys.page] and [keys.location].
+#
+# A keystroke that types a character (no modifier but shift) does not run while you type in a
+# text field of the page or in the terminal's line, the same as in [keys]. A ctrl- or alt-
+# binding still runs.
+#
+# The terminal's chrome commands, chrome.<action>, are chrome.toggle-mode (text or graphics),
+# chrome.text-mode, chrome.graphics-mode and chrome.refresh (draw the page again).
+#
+#   [tui.keys]
+#   "m" = "chrome.toggle-mode"
+#   [tui.keys.page]
+#   "r" = "page.reload"
+
+[tui]
+mode = "auto"
+graphics = "auto"
+fps = 10
+mouse = true
+default-keys = true
+
+[tui.keys]
+"q" = "browser.quit"
+"o" = "location.focus"
+":" = "location.focus"
+"t" = "tab.new"
+"x" = "tab.close"
+"J" = "tab.next"
+"K" = "tab.previous"
+"H" = "page.back"
+"L" = "page.forward"
+"r" = "page.reload"
+"ctrl-r" = "page.reload"
+"j" = "page.send-key ArrowDown"
+"k" = "page.send-key ArrowUp"
+"ctrl-d" = "page.send-key PageDown"
+"ctrl-u" = "page.send-key PageUp"
+"g" = "page.send-key Home"
+"G" = "page.send-key End"
+"+" = "page.zoom-in"
+"-" = "page.zoom-out"
+"=" = "page.zoom-reset"
+"m" = "chrome.toggle-mode"
+"ctrl-l" = "chrome.refresh"
+"alt-1" = "tab.select 1"
+"alt-2" = "tab.select 2"
+"alt-3" = "tab.select 3"
+"alt-4" = "tab.select 4"
+"alt-5" = "tab.select 5"
+"alt-6" = "tab.select 6"
+"alt-7" = "tab.select 7"
+"alt-8" = "tab.select 8"
+"alt-9" = "tab.select 9"
 
 # ── UI ───────────────────────────────────────────────────────────────────────────────────
 #

@@ -1,13 +1,16 @@
 //! Keys: the `bindings` keymap, which reads the user's `[keys]` configuration, and the core's
 //! record of the presses taken, which holds whatever keymap is in use.
 //!
-//! Bindings come only from the configuration: there are none by default and no key handlers in
-//! code. `[keys]` applies everywhere, `[keys.page]` while the page has focus and
-//! `[keys.location]` while the chrome (the address bar) has; a binding of the focused part wins
-//! over a global one. Keystrokes are `sighurt_api::keymap::Chord`s, matched as that type says:
-//! by the layout's meaning unless they name a physical key, and AltGr never Ctrl+Alt. While the
+//! Bindings come only from the configuration: there are no key handlers in code. The windowed
+//! frontend has none until the user binds them. In the terminal, `[tui] default-keys` adds the
+//! built-in `[tui.keys]` table under the user's `[keys]`, and a `[tui.keys]` the user writes
+//! sits over `[keys]` and applies only there. `[keys]` applies everywhere, `[keys.page]` while
+//! the page has focus and `[keys.location]` while the chrome (the address bar) has; a binding
+//! of the focused part wins over a global one in the same layer, and a higher layer wins over
+//! a lower one. Keystrokes are `sighurt_api::keymap::Chord`s, matched as that type says: by
+//! the layout's meaning unless they name a physical key, and AltGr never Ctrl+Alt. While the
 //! user types, in the address bar or a page's text field, a binding that would type a character
-//! (no modifier but Shift) lets the key type.
+//! (no modifier but Shift) lets the key type, and the search continues with the other bindings.
 //!
 //! [`KeyState`] keeps the guarantees of `sighurt_api::keymap` for any keymap: a press taken
 //! also takes its release and its auto-repeats, so the page or the address bar never sees half a
@@ -35,8 +38,37 @@ pub const KIND: KeymapKind = KeymapKind {
 
 fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
     let mut problems = Vec::new();
-    Bindings::from_table(table, commands, &mut problems);
+    Bindings::from_table(table, "keys", commands, &mut problems);
     problems
+}
+
+/// The three layers of a terminal `bindings` table, highest priority first. A checked `[keys]`
+/// table cannot have these names: they are unknown contexts there.
+pub(crate) const LAYER_TUI: &str = "tui";
+/// The user's `[keys]`, under [`LAYER_TUI`] and over [`LAYER_BUILTIN`].
+pub(crate) const LAYER_USER: &str = "user";
+/// The built-in terminal key table, the lowest layer.
+pub(crate) const LAYER_BUILTIN: &str = "builtin";
+
+/// One key table, or the three terminal layers when at least two of them have bindings.
+/// An empty layer is left out of a single table and kept, empty, in a layered one, so the
+/// layered shape stays recognizable.
+pub(crate) fn combine(tui: Table, user: Table, builtin: Table) -> Table {
+    let nonempty = [&tui, &user, &builtin]
+        .iter()
+        .filter(|table| !table.is_empty())
+        .count();
+    if nonempty < 2 {
+        return [tui, user, builtin]
+            .into_iter()
+            .find(|table| !table.is_empty())
+            .unwrap_or_default();
+    }
+    Table::from([
+        (LAYER_TUI.to_owned(), Value::Table(tui)),
+        (LAYER_USER.to_owned(), Value::Table(user)),
+        (LAYER_BUILTIN.to_owned(), Value::Table(builtin)),
+    ])
 }
 
 fn new() -> Box<dyn Keymap> {
@@ -49,6 +81,9 @@ pub struct Bindings {
     global: Vec<Binding>,
     page: Vec<Binding>,
     location: Vec<Binding>,
+    /// Layers under this one, in the order they are searched: the user's `[keys]`, then the
+    /// built-in terminal table. Empty when the table is a single layer.
+    below: Vec<Bindings>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,55 +95,93 @@ struct Binding {
 }
 
 impl Bindings {
-    /// Reads the `[keys]` table, with its commands parsed by `commands`, adding what is wrong
-    /// with it to `problems`.
+    /// Reads a key table (`section` is `keys` or `tui.keys`), with its commands parsed by
+    /// `commands`, adding what is wrong with it to `problems`.
     pub(crate) fn from_table(
         keys: &Table,
+        section: &str,
         commands: &CommandSet<'_>,
         problems: &mut Vec<String>,
     ) -> Self {
         let mut bindings = Self::default();
+        let head = format!("[{section}]");
         for (key, value) in keys {
             match value {
                 Value::String(command) => add(
                     &mut bindings.global,
-                    "[keys]",
+                    &head,
                     key,
                     command,
                     commands,
                     problems,
                 ),
                 Value::Table(table) => {
-                    let (list, section) = match key.as_str() {
-                        "page" => (&mut bindings.page, "[keys.page]"),
-                        "location" => (&mut bindings.location, "[keys.location]"),
+                    let nested = format!("[{section}.{key}]");
+                    let list = match key.as_str() {
+                        "page" => &mut bindings.page,
+                        "location" => &mut bindings.location,
                         other => {
                             problems.push(format!(
-                                "[keys.{other}]: unknown context (use [keys.page] or [keys.location])"
+                                "[{section}.{other}]: unknown context (use [{section}.page] or \
+                                 [{section}.location])"
                             ));
                             continue;
                         }
                     };
                     for (key, value) in table {
                         match value.as_str() {
-                            Some(command) => add(list, section, key, command, commands, problems),
+                            Some(command) => add(list, &nested, key, command, commands, problems),
                             None => problems
-                                .push(format!("{section} {key:?}: expected a command in quotes")),
+                                .push(format!("{nested} {key:?}: expected a command in quotes")),
                         }
                     }
                 }
                 _ => problems.push(format!(
-                    "[keys] {key:?}: expected a command in quotes, or a [keys.page] or \
-                     [keys.location] table"
+                    "[{section}] {key:?}: expected a command in quotes, or a [{section}.page] or \
+                     [{section}.location] table"
                 )),
             }
         }
         bindings
     }
 
+    /// The bindings `settings` describes: one key table, or the terminal's three layers.
+    fn from_settings(settings: &Table) -> Self {
+        let mut problems = Vec::new();
+        let bindings = match layered(settings) {
+            Some([tui, user, builtin]) => {
+                let mut top = Self::from_table(tui, "tui.keys", &CommandSet::ANY, &mut problems);
+                for (table, section) in [(user, "keys"), (builtin, "tui.keys")] {
+                    let layer = Self::from_table(table, section, &CommandSet::ANY, &mut problems);
+                    if !layer.is_empty() {
+                        top.below.push(layer);
+                    }
+                }
+                top
+            }
+            None => Self::from_table(settings, "keys", &CommandSet::ANY, &mut problems),
+        };
+        // Each layer was checked when the configuration loaded.
+        debug_assert!(problems.is_empty(), "{problems:?}");
+        bindings
+    }
+
+    fn is_empty(&self) -> bool {
+        self.global.is_empty() && self.page.is_empty() && self.location.is_empty()
+    }
+
     /// The command bound to `event` while `focus` has the keyboard. `typing` says the focused
-    /// part is a text field, where keystrokes that type characters are left to it.
+    /// part is a text field, where keystrokes that type characters are left to it. A binding
+    /// that does not fire is skipped, including one in a layer under this one.
     pub fn find(&self, focus: KeyboardFocus, typing: bool, event: &KeyEvent) -> Option<&Command> {
+        self.find_here(focus, typing, event).or_else(|| {
+            self.below
+                .iter()
+                .find_map(|layer| layer.find(focus, typing, event))
+        })
+    }
+
+    fn find_here(&self, focus: KeyboardFocus, typing: bool, event: &KeyEvent) -> Option<&Command> {
         let context = match focus {
             KeyboardFocus::Page => &self.page,
             KeyboardFocus::Chrome => &self.location,
@@ -121,10 +194,21 @@ impl Bindings {
     }
 }
 
+/// The three layers, when `settings` is the table [`combine`] builds for them.
+fn layered(settings: &Table) -> Option<[&Table; 3]> {
+    if settings.len() != 3 {
+        return None;
+    }
+    Some([
+        settings.get(LAYER_TUI)?.as_table()?,
+        settings.get(LAYER_USER)?.as_table()?,
+        settings.get(LAYER_BUILTIN)?.as_table()?,
+    ])
+}
+
 impl Keymap for Bindings {
     fn configure(&mut self, settings: &Table) {
-        // `check` accepted the table, so reading it finds nothing wrong.
-        *self = Bindings::from_table(settings, &CommandSet::ANY, &mut Vec::new());
+        *self = Bindings::from_settings(settings);
     }
 
     fn press(&mut self, key: &KeyEvent, context: KeyContext) -> KeyAction {
@@ -338,7 +422,7 @@ mod tests {
     fn bindings(text: &str) -> Result<Bindings, Vec<String>> {
         let mut problems = Vec::new();
         let commands = CommandSet::new("standard", &[]);
-        let bindings = Bindings::from_table(&table(text), &commands, &mut problems);
+        let bindings = Bindings::from_table(&table(text), "keys", &commands, &mut problems);
         problems.is_empty().then_some(bindings).ok_or(problems)
     }
 
@@ -379,6 +463,60 @@ mod tests {
         );
         assert_eq!(bindings.find(KeyboardFocus::Page, true, &j), None);
         assert_eq!(bindings.find(KeyboardFocus::Chrome, true, &j), None);
+    }
+
+    #[test]
+    fn a_higher_layer_wins_and_typing_does_not_hide_other_keys() {
+        // [tui.keys] over [keys] over the built-in terminal table.
+        let settings = combine(
+            table(
+                r#"
+                "j" = "tab.close"
+                "ctrl-t" = "browser.quit"
+                "#,
+            ),
+            table(
+                r#"
+                "j" = "tab.next"
+                [page]
+                "ctrl-t" = "tab.new"
+                "#,
+            ),
+            table(
+                r#"
+                "j" = "page.send-key down"
+                "q" = "browser.quit"
+                "ctrl-d" = "page.reload"
+                "#,
+            ),
+        );
+        let mut bindings = Bindings::default();
+        bindings.configure(&settings);
+        let j = press(36, character("j"), NONE, NONE);
+        assert_eq!(
+            bindings.find(KeyboardFocus::Page, false, &j),
+            Some(&Command::TabClose(None))
+        );
+        // j would type, so it is left alone, in every layer.
+        assert_eq!(bindings.find(KeyboardFocus::Page, true, &j), None);
+        assert_eq!(bindings.find(KeyboardFocus::Chrome, true, &j), None);
+        // A modifier in a lower layer still fires while a character binding is suppressed.
+        let ctrl_d = press(32, character("d"), CTRL, NONE);
+        assert_eq!(
+            bindings.find(KeyboardFocus::Page, true, &ctrl_d),
+            Some(&Command::PageReload)
+        );
+        // A global binding in the higher layer beats a page binding under it.
+        let ctrl_t = press(20, character("t"), CTRL, NONE);
+        assert_eq!(
+            bindings.find(KeyboardFocus::Page, false, &ctrl_t),
+            Some(&Command::BrowserQuit)
+        );
+        let q = press(KEY_Q, character("q"), NONE, NONE);
+        assert_eq!(
+            bindings.find(KeyboardFocus::Page, false, &q),
+            Some(&Command::BrowserQuit)
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ use std::time::Instant;
 use sighurt_api::engine::{EngineCapabilities, EngineRuntime, EngineWaker, PumpStatus};
 use sighurt_api::keymap::KeymapKind;
 use sighurt_core::config::{Config, EngineSettings};
-use sighurt_core::{ChromeChecks, Environment};
+use sighurt_core::{ChromeChecks, Environment, Frontend};
 use tempfile::TempDir;
 
 /// What a running engine adds to the contract, for diagnostics and shutdown.
@@ -380,6 +380,7 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             keymaps: KEYMAPS.to_vec(),
             chromes,
             color_names,
+            frontend: Frontend::Gui,
         }
     }
 

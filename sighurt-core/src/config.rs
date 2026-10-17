@@ -23,6 +23,13 @@
 //! shares: which chrome draws the window (`chrome`, used from the next start), its font and
 //! size, and `[ui.colors]`.
 //!
+//! `[tui]` is the terminal's: how it shows pages, and its keys ([`TuiConfig`]). The windowed
+//! frontend accepts the table and does not use it, so one file serves both. `[tui.keys]`, the
+//! user's and the built-in one, is checked against the terminal chrome's commands in either
+//! frontend. `[keys]`, `[keymap.<name>]` and `[input.buttons]` are checked against the chrome
+//! of the frontend that is running ([`Environment::frontend`]). Every `[tui]` field applies
+//! when the file is loaded.
+//!
 //! `zoom` is the page zoom new tabs start at and `page.zoom-reset` returns to, and
 //! `[keywords]` names search templates for the address line ([`crate::router::fixup`]).
 //! `[engines.<engine>]` holds an engine's settings from a small neutral vocabulary
@@ -48,7 +55,7 @@ use sighurt_api::settings::{Table, Value};
 
 use crate::commands::ZOOM_STEPS;
 use crate::keys;
-use crate::state::Environment;
+use crate::state::{Environment, Frontend};
 
 /// The built-in configuration, which also documents the format.
 pub const DEFAULT_CONFIG: &str = include_str!("default-config.toml");
@@ -58,6 +65,14 @@ pub const VERSION: i64 = 1;
 
 /// The chrome of `[ui] chrome` when the file names none: sighurt-ui's, in every build.
 pub const DEFAULT_CHROME: &str = "standard";
+
+/// The terminal chrome's `chrome.<action>` commands, without the `chrome.` prefix.
+///
+/// The terminal frontend has no chrome crate of its own yet, so the core checks bindings
+/// against this list when the running frontend is the terminal, and whenever it reads
+/// `[tui.keys]` (that table is the terminal's, in either frontend).
+pub const TERMINAL_CHROME_COMMANDS: &[&str] =
+    &["toggle-mode", "text-mode", "graphics-mode", "refresh"];
 
 /// The chrome's font size, in logical pixels, when `[ui] font-size` is left out.
 pub const DEFAULT_FONT_SIZE: u16 = 14;
@@ -124,6 +139,60 @@ pub enum Storage {
     Ephemeral,
 }
 
+/// `[tui]`: the terminal frontend's settings. The windowed frontend accepts the table and
+/// does not use it, so one file serves both. Every field applies when the file is loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TuiConfig {
+    /// `mode`: how the terminal shows pages.
+    pub mode: TuiMode,
+    /// `graphics`: which graphics protocol to use when the mode shows pixels.
+    pub graphics: GraphicsProtocol,
+    /// `fps`: page frames a second in graphics mode, from 1 to 60.
+    pub fps: u32,
+    /// `mouse`: whether the terminal's mouse is sent to the page.
+    pub mouse: bool,
+    /// `default-keys`: whether the built-in terminal key table is installed under `[keys]`.
+    pub default_keys: bool,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            mode: TuiMode::Auto,
+            graphics: GraphicsProtocol::Auto,
+            fps: 10,
+            mouse: true,
+            default_keys: true,
+        }
+    }
+}
+
+/// How the terminal shows pages (`[tui] mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TuiMode {
+    /// `"auto"`: graphics where the terminal can show them, text otherwise.
+    #[default]
+    Auto,
+    /// `"text"`: reflowed text.
+    Text,
+    /// `"graphics"`: the page's pixels.
+    Graphics,
+}
+
+/// Which graphics protocol the terminal uses (`[tui] graphics`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GraphicsProtocol {
+    /// `"auto"`: kitty where the terminal speaks it, otherwise sixel, otherwise text.
+    #[default]
+    Auto,
+    /// `"kitty"`.
+    Kitty,
+    /// `"sixel"`.
+    Sixel,
+    /// `"none"`: text only.
+    None,
+}
+
 /// A complete, valid configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -151,6 +220,8 @@ pub struct Config {
     chrome_settings: BTreeMap<String, Table>,
     downloads: Option<PathBuf>,
     restore_session: bool,
+    /// `[tui]`. The windowed frontend leaves it unused.
+    tui: TuiConfig,
     notices: Vec<String>,
 }
 
@@ -226,6 +297,9 @@ struct Raw {
     downloads: RawDownloads,
     #[serde(default)]
     session: RawSession,
+    /// `[tui]`, including `[tui.keys]` until that table is split out.
+    #[serde(default)]
+    tui: toml::Table,
 }
 
 #[derive(Deserialize, Default)]
@@ -287,9 +361,10 @@ impl Config {
     /// Parses `user`, the text of the user's file (`None` if there is none), over
     /// [`DEFAULT_CONFIG`], for a build with what `env` lists.
     pub fn parse(user: Option<&str>, env: &Environment) -> Result<Self, ConfigError> {
-        let defaults: Raw = toml::from_str(DEFAULT_CONFIG).map_err(toml_error)?;
+        let mut defaults: Raw = toml::from_str(DEFAULT_CONFIG).map_err(toml_error)?;
+        let builtin_keys = take_keys(&mut defaults.tui);
         let Some(user) = user else {
-            return validate(defaults, env, Vec::new(), Vec::new());
+            return validate(defaults, builtin_keys, None, env, Vec::new(), Vec::new());
         };
         let table: toml::Table = toml::from_str(user).map_err(toml_error)?;
         match table.get("version") {
@@ -309,7 +384,7 @@ impl Config {
             }
         }
         let mut problems = Vec::new();
-        let user = sections(table, &mut problems);
+        let mut user = sections(table, &mut problems);
         let default = user
             .engines
             .default
@@ -322,7 +397,15 @@ impl Config {
             ));
         }
         let notices = engine_notices(&user, env);
-        validate(merge(defaults, user), env, problems, notices)
+        let user_keys = take_keys(&mut user.tui);
+        validate(
+            merge(defaults, user),
+            builtin_keys,
+            user_keys,
+            env,
+            problems,
+            notices,
+        )
     }
 
     /// The page shown at startup and in new tabs: an absolute URL.
@@ -423,6 +506,12 @@ impl Config {
     /// it starts with the home page and leaves the session file as it is.
     pub fn restore_session(&self) -> bool {
         self.restore_session
+    }
+
+    /// `[tui]`: the terminal's settings. The windowed frontend accepts them and does not use
+    /// them.
+    pub fn tui(&self) -> &TuiConfig {
+        &self.tui
     }
 
     /// What the user should know about the file although it is valid: tables for keymaps,
@@ -528,6 +617,7 @@ fn sections(mut table: toml::Table, problems: &mut Vec<String>) -> Raw {
         chrome: user_tables(&mut table, "chrome", problems),
         downloads: section(&mut table, "downloads", problems).unwrap_or_default(),
         session: section(&mut table, "session", problems).unwrap_or_default(),
+        tui: user_table(&mut table, "tui", problems).unwrap_or_default(),
     };
     for key in table.keys() {
         problems.push(match key.as_str() {
@@ -540,7 +630,8 @@ fn sections(mut table: toml::Table, problems: &mut Vec<String>) -> Raw {
 
 /// `user`'s settings over `defaults`. `[keywords]`, `[keys]`, `[keymap.*]`, `[ui]` and
 /// `[chrome.*]` are the user's alone, and so is `[engines.*]`, which the built-in file can't
-/// hold.
+/// hold. `[tui]` merges key by key; `[tui.keys]` was split out of both tables first, because
+/// the user's is a separate layer rather than a replacement of the built-in one.
 fn merge(defaults: Raw, user: Raw) -> Raw {
     let mut routing = defaults.routing;
     for (engine, user) in user.routing {
@@ -589,6 +680,28 @@ fn merge(defaults: Raw, user: Raw) -> Raw {
         session: RawSession {
             restore: user.session.restore.or(defaults.session.restore),
         },
+        tui: merge_table(defaults.tui, user.tui),
+    }
+}
+
+/// `user`'s keys over `base`'s. A key the user sets replaces the default; the rest stay.
+fn merge_table(mut base: toml::Table, user: toml::Table) -> toml::Table {
+    for (key, value) in user {
+        base.insert(key, value);
+    }
+    base
+}
+
+/// Removes `[tui.keys]` from `tui` when it is a table. Anything else stays, so [`check_tui`]
+/// can say it is not a table.
+fn take_keys(tui: &mut toml::Table) -> Option<toml::Table> {
+    match tui.remove("keys") {
+        Some(toml::Value::Table(keys)) => Some(keys),
+        Some(other) => {
+            tui.insert("keys".into(), other);
+            None
+        }
+        None => None,
     }
 }
 
@@ -612,9 +725,12 @@ fn engine_notices(user: &Raw, env: &Environment) -> Vec<String> {
 }
 
 /// Checks everything in `raw` and turns it into a [`Config`] for a build with what `env`
-/// lists, unless it or reading it (`problems`) found a problem.
+/// lists, unless it or reading it (`problems`) found a problem. `builtin_keys` is the default
+/// file's `[tui.keys]`; `user_tui_keys` is the user's, when they wrote one.
 fn validate(
     raw: Raw,
+    builtin_keys: Option<toml::Table>,
+    user_tui_keys: Option<toml::Table>,
     env: &Environment,
     mut problems: Vec<String>,
     mut notices: Vec<String>,
@@ -748,9 +864,14 @@ fn validate(
     }
 
     let ui = check_ui(raw.ui.unwrap_or_default(), env, &mut problems);
-    // Commands are bound with the selected chrome's actions.
-    let chrome = env.chromes.iter().find(|chrome| chrome.name == ui.chrome);
-    let commands = CommandSet::new(&ui.chrome, chrome.map_or(&[], |chrome| chrome.commands));
+    let tui = check_tui(raw.tui, &mut problems);
+    // `[keys]` and the buttons use the running frontend's chrome. `[tui.keys]` is the
+    // terminal's in either frontend, so it is checked against the terminal chrome.
+    let commands = running_commands(env, &ui.chrome);
+    let terminal = CommandSet::new("terminal", TERMINAL_CHROME_COMMANDS);
+    let user_wrote_tui_keys = user_tui_keys.is_some();
+    let builtin_keys = read_keys(builtin_keys, &terminal, &mut problems);
+    let user_tui_keys = read_keys(user_tui_keys, &terminal, &mut problems);
     let chrome_settings = check_chromes(raw.chrome, env, &mut problems, &mut notices);
     let scroll_speed = raw.input.scroll_speed.unwrap_or(1.0);
     if !(0.1..=10.0).contains(&scroll_speed) {
@@ -777,7 +898,31 @@ fn validate(
         keys: raw.keys,
         tables: raw.keymap,
     };
-    let (keymap, keymap_settings) = keymaps.check(env, &commands, &mut problems, &mut notices);
+    let (keymap, selected) = keymaps.check(env, &commands, &mut problems, &mut notices);
+    let keymap_settings = if keymap == keys::KIND {
+        let on_terminal = env.frontend == Frontend::Terminal;
+        keys::combine(
+            if on_terminal {
+                user_tui_keys
+            } else {
+                Table::new()
+            },
+            selected,
+            if on_terminal && tui.default_keys {
+                builtin_keys
+            } else {
+                Table::new()
+            },
+        )
+    } else {
+        if env.frontend == Frontend::Terminal && user_wrote_tui_keys {
+            notices.push(format!(
+                "[tui.keys] is not used: [input] keymap is {:?}, which reads [keymap.{}]",
+                keymap.name, keymap.name
+            ));
+        }
+        selected
+    };
     let downloads = raw.downloads.directory.and_then(|directory| {
         directory_path(&directory, env.home_dir.as_deref())
             .map_err(|e| problems.push(format!("[downloads] directory: {e}")))
@@ -807,8 +952,88 @@ fn validate(
         chrome_settings,
         downloads,
         restore_session: raw.session.restore.unwrap_or(true),
+        tui,
         notices,
     })
+}
+
+/// The commands `[keys]` and `[input.buttons]` may bind for the frontend that is running.
+fn running_commands<'a>(env: &'a Environment, chrome: &'a str) -> CommandSet<'a> {
+    match env.frontend {
+        Frontend::Terminal => CommandSet::new("terminal", TERMINAL_CHROME_COMMANDS),
+        Frontend::Gui => {
+            let found = env
+                .chromes
+                .iter()
+                .find(|candidate| candidate.name == chrome);
+            CommandSet::new(chrome, found.map_or(&[], |chrome| chrome.commands))
+        }
+    }
+}
+
+/// `[tui.keys]` as settings, checked against the terminal chrome. An absent table is empty.
+fn read_keys(
+    table: Option<toml::Table>,
+    commands: &CommandSet<'_>,
+    problems: &mut Vec<String>,
+) -> Table {
+    let settings = settings(table.unwrap_or_default(), "[tui.keys]", problems);
+    let mut found = Vec::new();
+    let _ = keys::Bindings::from_table(&settings, "tui.keys", commands, &mut found);
+    problems.extend(found);
+    settings
+}
+
+/// `[tui]`, key by key, so one bad value does not hide the others. A bad value keeps the
+/// default and is reported; any problem rejects the whole configuration.
+fn check_tui(table: toml::Table, problems: &mut Vec<String>) -> TuiConfig {
+    let mut checked = TuiConfig::default();
+    for (key, value) in table {
+        match key.as_str() {
+            "mode" => match value.as_str() {
+                Some("auto") => checked.mode = TuiMode::Auto,
+                Some("text") => checked.mode = TuiMode::Text,
+                Some("graphics") => checked.mode = TuiMode::Graphics,
+                _ => problems.push(format!(
+                    "[tui] mode: expected \"auto\", \"text\" or \"graphics\", not {value}"
+                )),
+            },
+            "graphics" => match value.as_str() {
+                Some("auto") => checked.graphics = GraphicsProtocol::Auto,
+                Some("kitty") => checked.graphics = GraphicsProtocol::Kitty,
+                Some("sixel") => checked.graphics = GraphicsProtocol::Sixel,
+                Some("none") => checked.graphics = GraphicsProtocol::None,
+                _ => problems.push(format!(
+                    "[tui] graphics: expected \"auto\", \"kitty\", \"sixel\" or \"none\", not \
+                     {value}"
+                )),
+            },
+            "fps" => match value.as_integer() {
+                Some(fps @ 1..=60) => checked.fps = fps as u32,
+                _ => problems.push(format!(
+                    "[tui] fps: expected a whole number from 1 to 60, not {value}"
+                )),
+            },
+            "mouse" => match value.as_bool() {
+                Some(mouse) => checked.mouse = mouse,
+                None => problems.push(format!("[tui] mouse: expected true or false, not {value}")),
+            },
+            "default-keys" => match value.as_bool() {
+                Some(enabled) => checked.default_keys = enabled,
+                None => problems.push(format!(
+                    "[tui] default-keys: expected true or false, not {value}"
+                )),
+            },
+            "keys" => problems.push(format!(
+                "[tui] keys: expected a [tui.keys] table, not {value}"
+            )),
+            other => problems.push(format!(
+                "[tui] {other}: unknown key ([tui] has mode, graphics, fps, mouse, default-keys \
+                 and [tui.keys])"
+            )),
+        }
+    }
+    checked
 }
 
 /// Whether `template`, with `{}` filled in, is an http(s) URL.
@@ -1233,7 +1458,7 @@ mod tests {
     use sighurt_api::engine::EngineCapabilities;
 
     use super::*;
-    use crate::state::ChromeChecks;
+    use crate::state::{ChromeChecks, Frontend};
 
     /// A keymap of the build besides `bindings`: its table maps keys to commands.
     const FAKE: KeymapKind = KeymapKind {
@@ -1295,6 +1520,7 @@ mod tests {
             keymaps: vec![FAKE],
             chromes: vec![STANDARD],
             color_names: &COLORS,
+            frontend: Frontend::Gui,
         }
     }
 
@@ -1330,6 +1556,7 @@ mod tests {
         assert!(wasm.origins.is_empty());
         assert_eq!(config.keymap, keys::KIND);
         assert!(config.keymap_settings.is_empty(), "no default bindings");
+        assert_eq!(config.tui(), &TuiConfig::default());
         assert_eq!(config.chrome(), DEFAULT_CHROME);
         assert_eq!(
             (config.font(), config.font_size()),
@@ -1342,6 +1569,39 @@ mod tests {
         assert_eq!(config.downloads(), None);
         assert!(config.restore_session());
         assert_eq!(parse("version = 1"), Ok(config));
+    }
+
+    fn terminal_env() -> Environment {
+        Environment {
+            frontend: Frontend::Terminal,
+            ..env()
+        }
+    }
+
+    #[test]
+    fn the_terminal_installs_its_default_keys_and_the_window_does_not() {
+        let config = Config::parse(None, &terminal_env()).unwrap();
+        assert_eq!(config.tui(), &TuiConfig::default());
+        assert_eq!(config.keymap_settings.len(), 31);
+        let bound = |key: &str| config.keymap_settings[key].as_str();
+        assert_eq!(bound("q"), Some("browser.quit"));
+        assert_eq!(bound("j"), Some("page.send-key ArrowDown"));
+        assert_eq!(bound("ctrl-r"), Some("page.reload"));
+        assert_eq!(bound("ctrl-l"), Some("chrome.refresh"));
+        assert_eq!(bound("m"), Some("chrome.toggle-mode"));
+        assert_eq!(bound("alt-1"), Some("tab.select 1"));
+        assert_eq!(bound("alt-9"), Some("tab.select 9"));
+        assert_eq!(bound("+"), Some("page.zoom-in"));
+        assert_eq!(bound(":"), Some("location.focus"));
+        assert_eq!(bound("-"), Some("page.zoom-out"));
+        // The window keeps an empty [keys] table, and still accepts the terminal's commands
+        // where only the terminal reads them.
+        let window = parse(
+            "version = 1\n[tui.keys]\n\"m\" = \"chrome.toggle-mode\"\n[keys]\n\"j\" = \"tab.next\"",
+        )
+        .unwrap();
+        assert_eq!(window.keymap_settings.len(), 1);
+        assert_eq!(window.keymap_settings["j"].as_str(), Some("tab.next"));
     }
 
     #[test]

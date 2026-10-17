@@ -37,5 +37,5 @@ pub mod state;
 pub mod tabs;
 
 pub use state::{
-    update, BrowserEvent, BrowserState, ChromeChecks, Effect, Environment, OpenRequest,
+    update, BrowserEvent, BrowserState, ChromeChecks, Effect, Environment, Frontend, OpenRequest,
 };
