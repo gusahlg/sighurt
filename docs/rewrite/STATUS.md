@@ -32,6 +32,56 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   WebKit is opened on first use and its processes end with the last WPE page, retained views are
   bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
 
+### Paused on 17 October 2026 (evening): where the terminal frontend and compatibility work stand
+
+Committed on `rewrite` today (decisions 88–98): the AGPL relicensing; the split of `sig` into
+`sighurt-runtime`, `sighurt-gui` and a thin `main`; the CPU frame and semantic contract in
+`sighurt-api`; `sig --tui` in graphics mode (kitty) with Servo, WPE, Wasm and the demo engine;
+`[tui]` and the terminal's default keys; `page.switch-engine` and `--engine`; Servo's
+off-by-default features in `[engines.servo]`; the site corpus (`bench/compat/`); and
+`sighurt-semantic` (extraction script and parser, not yet run in a page).
+
+**Unfinished work** is saved on branch `wip/2026-10-17-shutdown` (one snapshot commit on top of
+`rewrite`, not built or tested as a whole; the same changes are still uncommitted in the
+working tree). Resume each from there:
+
+1. **Keys in real terminals (highest priority: the user can't use `sig --tui` in Rio).**
+   Reproduced in Rio 0.5.28 with the user's config in a private headless sway: pages render, but
+   Enter isn't recognized (Rio sends kitty CSI-u, e.g. `\x1b[13u`) and characters typed right
+   after `o` reach the keymap before the address line opens (`google.com` became `ogle.com`).
+   Partial fix in `sighurt-tui/src/term/{keys,parser}.rs` and `app.rs`; a real-terminal check
+   `sighurt-tui/tests/real-terminals.sh` (Rio and kitty in headless sway) was being written. Then
+   refresh `target/try/sig`, which the user runs.
+2. **The terminal review's findings** (GPT-6 Astra, after the keys): restoration can be cut
+   short under output backpressure (also seen as a truncated last kitty frame at quit); a resize
+   can stall Servo's frames (`frame_requested` stays set); input reading unbounded; the kitty
+   encoder allocates before its cap; late capability replies never relayout; mouse releases
+   outside the page dropped.
+3. **R1** (partial in `sighurt-runtime/src/session.rs`): forget the frontend's target when
+   `open_view` fails; and Servo's offscreen context mutates `DRI_PRIME`/`LIBGL_ALWAYS_SOFTWARE`
+   after Servo's threads exist (possible UB) — not started.
+4. **Text mode**: the renderer `sighurt-tui/src/textmode/` (partial, untested), WPE semantics
+   `sighurt-engine-wpe/src/semantic.rs` (partial), then Servo semantics, the app-loop
+   integration and `--dump`; plus decision 98's hardening of `sighurt-semantic`.
+5. **The GUI's engine button** (the user's feedback: no button look, no hover/pressed, no sign a
+   switch is under way; repeated clicks): partial in sighurt-ui, sighurt-chrome-line,
+   sighurt-gui/src/chrome.rs and sighurt-core.
+6. **Investigations without reports yet**: Servo on github.com (a frozen, uninteractive page)
+   and chatgpt.com (the login code field can't be focused or typed in) —
+   `experiments/servo-input/`; WPE's green video rectangle on github.com, its "Can't connect to
+   a11y bus" warning, and "ERROR: invalid option: JSC_SIGNAL_FOR_GC=12" from WebKit's child
+   processes (JSC's option parser rejects the variable `sig` sets for WTF, decision 78) —
+   `experiments/wpe-issues/` (its generated test videos are not committed).
+7. **Servo 0.7** on branch `servo-0.7` (worktree `../sighurt-servo07`, built on louise-pc in
+   `~/repos/sighurt-servo07`): passes its library and offscreen tests, clippy and engines.sh (0
+   failed). Its corpus run, and the 0.5 corpus reruns with `experimental-features` and with
+   `bench/compat/example-servo-compat.toml`, were queued on louise-pc and not finished; any
+   partial results are in louise-pc:~/repos/sighurt-rewrite/bench/compat/results/. Adopt 0.7 only
+   on those numbers.
+
+Grok Build is no longer used (its balance ran out; the user said so): implementation goes to
+Claude Sonnet and Opus subagents, reviews to GPT-6 Astra.
+
 ## Milestones (§23)
 
 ### M0 — Record the baseline and prove engine coexistence
