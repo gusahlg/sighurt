@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>colours</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b4f72; overflow: hidden; }
+  #header { position: absolute; top: 0; left: 0; right: 0; height: 40px; background: #e67e22; }
+  #box { position: absolute; left: 80px; top: 80px; width: 48px; height: 48px; background: #00ff00; }
+  /* Animated away from the sampled points, so WebKit always has another frame to render. */
+  #pulse { position: absolute; left: 240px; top: 150px; width: 40px; height: 40px;
+           animation: pulse 0.5s linear infinite alternate; }
+  @keyframes pulse { from { background: #ffff00; } to { background: #00ffff; } }
+  #corner { position: absolute; right: 0; bottom: 0; width: 24px; height: 24px; background: #ff00ff; }
+</style>
+</head>
+<body>
+<div id="header"></div>
+<div id="box"></div>
+<div id="pulse"></div>
+<div id="corner"></div>
+</body>
+</html>

@@ -25,14 +25,12 @@ use std::time::Instant;
 use glib::prelude::*;
 use glib::translate::*;
 use sighurt_api::events::NavigationError;
-use sighurt_api::geometry::SurfaceRect;
+use sighurt_api::geometry::{BufferSize, SurfaceRect};
 use sighurt_api::ids::{LayoutEpoch, RequestId, ViewId};
 use sighurt_api::input::SurroundingText;
 use sighurt_api::services::{
     Permission, PickMode, Service, ServiceReply, ServiceRequest, ServiceResult,
 };
-use sighurt_wayland::TargetLease;
-use wayland_client::protocol::wl_surface::WlSurface;
 
 use crate::clipboard::ClipboardCall;
 use crate::ffi;
@@ -40,7 +38,7 @@ use crate::ime::Ime;
 use crate::input::Input;
 use crate::navigation::{Navigator, Snapshot};
 use crate::platform::{Buffer, View};
-use crate::present::ShmBuffers;
+use crate::target::{WaylandSlot, WpeTarget};
 
 /// Service requests a view may have outstanding; WebKit's beyond them are refused.
 pub const MAX_REQUESTS: usize = 16;
@@ -169,13 +167,12 @@ pub enum Answer {
     Withdraw(Vec<RequestId>),
 }
 
-/// One view. Fields are dropped in order: WebKit's objects first, the lease last.
-pub struct Page {
+/// One view. `close` drops WebKit's objects first and the target last; the field order is not
+/// that sequence.
+pub struct Page<T: WpeTarget> {
     pub id: ViewId,
     pub web_view: glib::Object,
     pub view: View,
-    pub surface: WlSurface,
-    pub shm: ShmBuffers,
     pub input: Input,
     /// The latest frame WebKit rendered that is not yet shown.
     pub pending: Option<(Buffer, Vec<ffi::WPERectangle>)>,
@@ -189,10 +186,17 @@ pub struct Page {
     pub held: Vec<(RequestId, PageNavigation, Instant)>,
     /// The focused editable element, while there is one.
     pub text_input: Option<TextInput>,
-    pub lease: TargetLease,
+    /// The layout epoch last applied. A CPU permit must name it. A Wayland permit does not.
+    pub(crate) epoch: LayoutEpoch,
+    /// The buffer size of [`epoch`](Self::epoch).
+    pub(crate) buffer: BufferSize,
+    /// Wayland surface and shared-memory buffers. None when the target has no display.
+    pub(crate) slot: Option<WaylandSlot>,
+    /// Dropped after WebKit's objects and, on Wayland, after `slot`.
+    pub(crate) target: T,
 }
 
-impl Page {
+impl<T: WpeTarget> Page<T> {
     pub fn wpe(&self) -> *mut ffi::WPEView {
         self.view.as_ptr()
     }

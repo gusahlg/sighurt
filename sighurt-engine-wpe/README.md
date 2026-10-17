@@ -20,10 +20,16 @@ engine compiled in loads WebKit only when it starts the runtime.
 refused), on the owner thread, before WebKit is used: it sets JavaScriptCore's options that keep it off
 signals in this process (decision 66) and takes GLib's default main context, whose watch thread
 wakes the owner through the `EngineWaker` (decision 64). The runtime implements `EngineRuntime`
-with `sighurt_wayland::TargetLease` (a `PresentMode::Gl` target per view: the presenter, not the
-host, attaches and commits) and `FramePermit`. `CAPABILITIES` is what it supports;
-`diagnostics()` names the transport, the DRM device and driver, frames, copies (the
-shared-memory fallback's) and present times, and `Diagnostics::renderer()` says it in one line.
+with `sighurt_wayland::TargetLease` by default (a `PresentMode::Gl` target per view: the
+presenter, not the host, attaches and commits) and `FramePermit`. `WpeRuntime<Offscreen<C>>`
+presents into any `CpuTarget` with no Wayland connection: WebKit's shared-memory frames
+(`WPE_PIXEL_FORMAT_ARGB8888`, premultiplied, top-down) are copied into the lent frame, counted
+in `diagnostics().present.shm_copies`, and acknowledged only when `present` holds a permit, so
+the frontend's frame rate bounds WebKit. `SetMetrics` resizes the view; an empty metrics keeps
+the last size. `CAPABILITIES` is what it supports; `diagnostics()` names the transport, the DRM
+device and driver, frames, copies and present times, and `Diagnostics::renderer()` says it in
+one line. `libgl_always_software` and `dri_prime` record those variables as the first view opens,
+just before WebKit starts the processes that inherit them.
 `tests/common/mod.rs` is an owner loop that does all of this; `examples/wpe-window.rs` is a window
 built on it:
 
@@ -49,7 +55,9 @@ own too; WebKit's thread code takes the signal from it all the same.
   view's input-method context.
 - **Presentation**: WebKit's DMA-BUFs attached to the view's subsurface as `wl_buffer`s, no CPU
   copy; where the compositor has no DMA-BUF (or with `force_shm`), shared memory with one copy per
-  frame, logged and counted. Frames are paced by the host's permits and frame callbacks.
+  frame, logged and counted. Frames are paced by the host's permits and frame callbacks. A CPU
+  target (`Offscreen`) never connects to Wayland: the same shared-memory frames are copied into
+  the lent buffer and released when presented, so WebKit waits while permits are withheld.
 - **Navigation and history**: WebKit's back-forward list is the truth; commits get their
   `HistoryEffect` from it by entry identity. The browser's latest request takes the next load
   WebKit starts; the page's own loads and same-document navigations get ids of their own
@@ -76,6 +84,11 @@ own too; WebKit's thread code takes the signal from it all the same.
   signals on WebKit's own class, the GLib loop, without a compositor.
 - `sighurt-engine-wpe/tests/headless.sh [pixman]`: the compositor test (`tests/engine.rs`, plan
   §25's engine tests) in a private headless sway on a D-Bus session of its own.
+- `sighurt-engine-wpe/tests/offscreen.sh`: the CPU target (`tests/offscreen.rs`) with no display,
+  on a private D-Bus session. `tests/tui-wpe.sh [OUT]` runs `sig --tui --engine wpe
+  https://example.com/` in a pty, decodes the last kitty image to `OUT/wpe/page.png`, and checks
+  that WebKit's processes inherit neither `LIBGL_ALWAYS_SOFTWARE` nor `DRI_PRIME`, also with a
+  Servo tab in the same process, and that none outlives `sig`.
 - `tests/window-checks.sh`: `wpe-window` driven with input, the clipboard, scales, tabs, two views,
   a video, history, a crash and an https page.
 

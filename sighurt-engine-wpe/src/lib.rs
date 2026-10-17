@@ -10,9 +10,11 @@
 //! presenter run in it (CLAUDE.md, "Security").
 //!
 //! It embeds WebKit through the WPE Platform API: Sighurt's own `WPEDisplay` and `WPEView`
-//! ([`platform`]) receive WebKit's frames as DMA-BUF or shared-memory buffers, which [`present`]
-//! attaches to the host's page subsurface with no CPU copy (DMA-BUF) or one counted copy (the
-//! shared-memory fallback); WebKit's GLib main context runs inside the owner loop
+//! ([`platform`]) receive WebKit's frames as DMA-BUF or shared-memory buffers. On a Wayland
+//! target [`present`] attaches them to the host's page subsurface with no CPU copy (DMA-BUF) or
+//! one counted copy (the shared-memory fallback). On [`Offscreen`] there is no Wayland
+//! connection: WebKit's shared-memory frame is copied into the lent CPU frame, and acknowledged
+//! only when that present holds a permit. WebKit's GLib main context runs inside the owner loop
 //! ([`glib_loop`]); input is translated in [`input`] and [`ime`]; the clipboard is the browser's
 //! ([`clipboard`]); navigations and history come from WebKit's back-forward list
 //! ([`navigation`]); each view's WebKit objects and signals are in [`view`]. The executable needs
@@ -30,6 +32,8 @@ pub mod navigation;
 pub mod platform;
 pub mod present;
 pub mod runtime;
+pub mod target;
 pub mod view;
 
 pub use runtime::{Diagnostics, Transport, WpeConfig, WpeRuntime, CAPABILITIES};
+pub use target::{Offscreen, WpeTarget};

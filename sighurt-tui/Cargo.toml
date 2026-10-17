@@ -13,8 +13,8 @@ authors.workspace = true
 default = []
 engine-servo = ["sighurt-runtime/engine-servo", "dep:sighurt-engine-servo"]
 engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
-# The registry's WPE variant, so a page routed there is the core's error. No WPE presenter.
-engine-wpe = ["sighurt-runtime/engine-wpe"]
+# WebKit presents into the terminal's CPU target: shared-memory frames, one copy each.
+engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
 keymap-modal = ["sighurt-runtime/keymap-modal"]
 
@@ -23,6 +23,7 @@ sighurt-api = { path = "../sighurt-api" }
 sighurt-core = { path = "../sighurt-core" }
 sighurt-runtime = { path = "../sighurt-runtime", default-features = false }
 sighurt-engine-servo = { path = "../sighurt-engine-servo", optional = true }
+sighurt-engine-wpe = { path = "../sighurt-engine-wpe", optional = true }
 sighurt-engine-wasm = { path = "../sighurt-engine-wasm", optional = true }
 sighurt-engine-demo = { path = "../sighurt-engine-demo", optional = true }
 base64 = "0.22"

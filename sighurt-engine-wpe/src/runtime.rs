@@ -1,5 +1,10 @@
-//! The WPE runtime: one per process, serving every WPE view behind `EngineRuntime`, with the
-//! host's target leases and frame permits.
+//! The WPE runtime: one per process, serving every WPE view behind `EngineRuntime`.
+//!
+//! The default target is the host's lease and frame permit. [`Offscreen`](crate::Offscreen) is
+//! the other: any [`CpuTarget`](sighurt_api::present::CpuTarget), with no Wayland connection.
+//! WebKit then renders shared-memory frames, and each one is copied into the lent frame only
+//! when `present` holds a permit. A frame is acknowledged when it is presented or discarded, so
+//! withholding permits is what bounds WebKit's rendering.
 //!
 //! WebKit runs its pages in its own web and network processes; that is WebKit's architecture,
 //! not Sighurt IPC. Its UI-process side lives here, on the owner thread: GLib's default context
@@ -42,28 +47,28 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use glib::prelude::*;
 use glib::translate::*;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use sighurt_api::engine::{
     EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, PresentOutcome,
     PumpStatus, ViewOptions,
 };
 use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{Metrics, SurfaceRect};
-use sighurt_api::ids::{NavigationId, RequestId, ViewId};
+use sighurt_api::ids::{LayoutEpoch, NavigationId, RequestId, ViewId};
 use sighurt_api::input::{
     ButtonState, FocusEvent, InputKind, PointerEvent, TextInputState, TextPurpose,
 };
 use sighurt_api::services::{DownloadSource, Selection, Service, ServiceRequest};
-use sighurt_wayland::{FramePermit, PresentMode, TargetLease};
+use sighurt_wayland::TargetLease;
 
 use crate::clipboard::{self, ClipboardCall};
 use crate::ffi;
@@ -73,6 +78,7 @@ use crate::input::Input;
 use crate::navigation::Commit;
 use crate::platform::{Buffer, Call, Display, View};
 use crate::present::{self, BufferKey, PresentStats, Wayland};
+use crate::target::WpeTarget;
 use crate::view::{self, Answer, Note, Page, RequestKind, Shared, TextInput};
 
 /// What the WPE engine supports, for the executable's registry before the runtime exists.
@@ -153,6 +159,19 @@ pub struct Diagnostics {
     /// The longest and the total time `present` took for submitted frames.
     pub max_present: Duration,
     pub total_present: Duration,
+    /// Frames WebKit handed over, including ones still held for a permit.
+    pub produced: u64,
+    /// The longest and the total time a CPU-target copy took. The Wayland path's copy is part
+    /// of `total_present` and is not split out.
+    pub max_copy: Duration,
+    pub total_copy: Duration,
+    /// The target has no Wayland connection: every frame is a shared-memory copy.
+    pub offscreen: bool,
+    /// Set in this process when the first view opened, just before WebKit starts its processes,
+    /// which inherit the environment. `None` when unset. Servo sets one of them only while it
+    /// makes a context, on the same thread, and restores it.
+    pub libgl_always_software: Option<String>,
+    pub dri_prime: Option<String>,
 }
 
 impl Diagnostics {
@@ -170,6 +189,9 @@ impl Diagnostics {
                 self.device.as_deref().unwrap_or("?"),
                 self.driver.as_deref().unwrap_or("?")
             ),
+            Transport::Shm if self.offscreen => {
+                "WebKit, shared memory, no display: one CPU copy per frame".into()
+            }
             Transport::Shm => "WebKit, SHARED-MEMORY FALLBACK: one CPU copy per frame".into(),
         })
     }
@@ -177,7 +199,7 @@ impl Diagnostics {
 
 /// The display and presenter, made with the first view.
 struct Platform {
-    wayland: Wayland,
+    wayland: Option<Wayland>,
     display: Display,
     session: glib::Object,
     /// The views' web context, while there are views.
@@ -192,12 +214,15 @@ struct Platform {
 }
 
 /// The WPE engine's runtime. See the module documentation.
-pub struct WpeRuntime {
+///
+/// `T` defaults to the Wayland host's [`TargetLease`]. [`crate::Offscreen`] is any
+/// [`CpuTarget`](sighurt_api::present::CpuTarget), with no display connection.
+pub struct WpeRuntime<T: WpeTarget = TargetLease> {
     config: WpeConfig,
     waker: EngineWaker,
     glib: Option<GlibLoop>,
     platform: Option<Platform>,
-    pages: HashMap<ViewId, Page>,
+    pages: HashMap<ViewId, Page<T>>,
     inbox: Shared,
     events: Vec<EngineEvent>,
     /// Our DMA-BUF `wl_buffer`s the compositor holds, with the WebKit buffer to release.
@@ -207,6 +232,11 @@ pub struct WpeRuntime {
     rounded_frames: u64,
     max_present: Duration,
     total_present: Duration,
+    produced: u64,
+    max_copy: Duration,
+    total_copy: Duration,
+    libgl_always_software: Option<String>,
+    dri_prime: Option<String>,
     scripts: Vec<(ViewId, Result<String, String>)>,
     /// The view whose page last got a click or key press: the one the clipboard acts for.
     last_input: Option<ViewId>,
@@ -217,7 +247,7 @@ pub struct WpeRuntime {
     shut_down: bool,
 }
 
-impl WpeRuntime {
+impl<T: WpeTarget> WpeRuntime<T> {
     /// Starts the runtime on the owner thread: loads WPE WebKit's library ([`ffi::load`]), keeps
     /// JavaScriptCore off signals and takes GLib's default context, which WebKit's UI-process
     /// side will use. WebKit itself starts with the first view. Fails if a WPE runtime was started
@@ -249,6 +279,11 @@ impl WpeRuntime {
             rounded_frames: 0,
             max_present: Duration::ZERO,
             total_present: Duration::ZERO,
+            produced: 0,
+            max_copy: Duration::ZERO,
+            total_copy: Duration::ZERO,
+            libgl_always_software: None,
+            dri_prime: None,
             scripts: Vec::new(),
             last_input: None,
             profile,
@@ -260,7 +295,9 @@ impl WpeRuntime {
 
     pub fn diagnostics(&self) -> Diagnostics {
         let platform = self.platform.as_ref();
-        let (imports, failed_imports) = platform.map_or((0, 0), |p| p.wayland.imports());
+        let (imports, failed_imports) = platform
+            .and_then(|p| p.wayland.as_ref())
+            .map_or((0, 0), |wayland| wayland.imports());
         Diagnostics {
             transport: platform.map(|p| p.transport),
             device: platform.and_then(|p| p.device.clone()),
@@ -279,6 +316,12 @@ impl WpeRuntime {
             profile: self.profile.clone(),
             max_present: self.max_present,
             total_present: self.total_present,
+            produced: self.produced,
+            max_copy: self.max_copy,
+            total_copy: self.total_copy,
+            offscreen: platform.is_some_and(|p| p.wayland.is_none()),
+            libgl_always_software: self.libgl_always_software.clone(),
+            dri_prime: self.dri_prime.clone(),
         }
     }
 
@@ -332,22 +375,22 @@ impl WpeRuntime {
         }
     }
 
-    /// Makes the display, presenter and network session on the host's connection, from the
-    /// first lease.
-    fn platform(&mut self, lease: &TargetLease) -> Result<&mut Platform, EngineError> {
+    /// Makes the display and network session from the first view. A Wayland `display` also makes
+    /// the presenter on that connection. `None` is the CPU path: `Display::new` with no DMA-BUF
+    /// device, so WebKit's frames are shared memory and nothing here connects to Wayland.
+    fn platform(&mut self, display: Option<NonNull<c_void>>) -> Result<&mut Platform, EngineError> {
         if self.platform.is_none() {
             let runtime = |e: String| EngineError::Runtime(e);
-            // SAFETY: the presenter's objects (our queue, buffers and surface proxies) are
-            // destroyed before the leases go (`close`, `shutdown`).
-            let handles = unsafe { lease.gl_handles() }.ok_or(EngineError::Unsupported(
-                "WPE views present on native targets",
-            ))?;
-            let display = match handles.display_handle().map(|h| h.as_raw()) {
-                Ok(RawDisplayHandle::Wayland(h)) => h.display,
-                _ => return Err(runtime("no Wayland display".into())),
+            let (wayland, dmabuf) = match display {
+                Some(display) => {
+                    // SAFETY: the presenter's objects (our queue, buffers and surface proxies)
+                    // are destroyed before the leases go (`close`, `shutdown`).
+                    let wayland = unsafe { Wayland::new(display) }.map_err(runtime)?;
+                    let dmabuf = wayland.dmabuf().filter(|_| !self.config.force_shm);
+                    (Some(wayland), dmabuf)
+                }
+                None => (None, None),
             };
-            let wayland = unsafe { Wayland::new(display) }.map_err(runtime)?;
-            let dmabuf = wayland.dmabuf().filter(|_| !self.config.force_shm);
             let transport = match dmabuf {
                 Some(_) => Transport::Dmabuf,
                 None => Transport::Shm,
@@ -356,29 +399,54 @@ impl WpeRuntime {
                 let node = d.render.as_ref().unwrap_or(&d.primary);
                 node.to_string_lossy().into_owned()
             });
-            let driver = dmabuf.as_ref().and_then(|_| wayland.driver());
+            let driver = dmabuf
+                .as_ref()
+                .and_then(|_| wayland.as_ref().and_then(Wayland::driver));
             let formats = dmabuf.as_ref().map_or(0, |d| d.formats.len());
+            // WebKit's processes inherit this process's environment. Record it before the first
+            // web view, which is what spawns them. Servo puts these two back after its own
+            // context; if they are still set here, the web process gets them.
+            let libgl = std::env::var("LIBGL_ALWAYS_SOFTWARE").ok();
+            let dri = std::env::var("DRI_PRIME").ok();
+            if libgl.is_some() || dri.is_some() {
+                log::warn!(
+                    "wpe: LIBGL_ALWAYS_SOFTWARE={libgl:?} DRI_PRIME={dri:?} are set as WebKit's \
+                     processes start, and those processes inherit this environment"
+                );
+            }
+            self.libgl_always_software = libgl;
+            self.dri_prime = dri;
             let inbox = Rc::downgrade(&self.inbox);
             let clipboard = Rc::new(move |call| {
                 if let Some(inbox) = inbox.upgrade() {
                     inbox.borrow_mut().clipboard.push(call);
                 }
             });
-            let display = Display::new(dmabuf, clipboard).map_err(|e| runtime(e.to_string()))?;
+            let wpe_display =
+                Display::new(dmabuf, clipboard).map_err(|e| runtime(e.to_string()))?;
             let session = network_session(self.profile.as_deref());
             let downloads = view::connect_downloads(&session, &self.inbox);
-            match transport {
-                Transport::Dmabuf => {}
-                Transport::Shm => {
+            match (wayland.is_some(), transport) {
+                (_, Transport::Dmabuf) => {}
+                (true, Transport::Shm) => {
                     log::warn!(
-                    "wpe: SHARED-MEMORY FALLBACK: no DMA-BUF{}; every frame is copied on the CPU",
-                    if self.config.force_shm { " (forced)" } else { " from the compositor" }
-                )
+                        "wpe: SHARED-MEMORY FALLBACK: no DMA-BUF{}; every frame is copied on the CPU",
+                        if self.config.force_shm {
+                            " (forced)"
+                        } else {
+                            " from the compositor"
+                        }
+                    )
+                }
+                (false, Transport::Shm) => {
+                    log::info!(
+                        "wpe: no display connection: shared-memory frames, one CPU copy each"
+                    );
                 }
             }
             self.platform = Some(Platform {
                 wayland,
-                display,
+                display: wpe_display,
                 handlers: vec![(session.clone(), downloads)],
                 session,
                 context: None,
@@ -432,6 +500,7 @@ impl WpeRuntime {
         let events = &mut self.events;
         match note {
             Note::Frame(buffer, damage) => {
+                self.produced += 1;
                 if let Some((old, _)) = page.pending.replace((buffer, damage)) {
                     self.stats.dropped += 1;
                     finish_unshown(page.wpe(), &old);
@@ -695,12 +764,16 @@ impl WpeRuntime {
         }
     }
 
-    /// Gives WebKit back the buffers the compositor released.
+    /// Gives WebKit back the buffers the compositor released. A CPU runtime has no compositor
+    /// queue, so this is a no-op there.
     fn release_buffers(&mut self) {
-        let Some(platform) = self.platform.as_mut() else {
-            return;
+        let dispatched = {
+            let Some(wayland) = self.platform.as_mut().and_then(|p| p.wayland.as_mut()) else {
+                return;
+            };
+            wayland.dispatch()
         };
-        let released = match platform.wayland.dispatch() {
+        let released = match dispatched {
             Ok(released) => released,
             Err(error) => return self.fail(format!("the compositor connection failed: {error}")),
         };
@@ -710,11 +783,10 @@ impl WpeRuntime {
                 if let Some(page) = self.pages.get(&view) {
                     unsafe { ffi::wpe_view_buffer_released(page.wpe(), buffer.as_ptr()) };
                 }
-            } else if let Some((&view, page)) = self
-                .pages
-                .iter_mut()
-                .find_map(|(view, page)| page.shm.release(key).then_some((view, page)))
-            {
+            } else if let Some((&view, page)) = self.pages.iter_mut().find_map(|(view, page)| {
+                let released = page.slot.as_mut().is_some_and(|slot| slot.shm.release(key));
+                released.then_some((view, page))
+            }) {
                 // A frame that waited for a free SHM buffer can be shown now.
                 if page.pending.is_some() {
                     push(&mut self.events, EngineEvent::FrameReady { view });
@@ -738,8 +810,12 @@ impl WpeRuntime {
             return;
         };
         if metrics.is_empty() {
-            return; // No room: keep the last size (plan §11).
+            // No room: keep the last size and its epoch, so a CPU permit for this empty layout
+            // is not the view's current one (plan §11).
+            return;
         }
+        page.epoch = metrics.epoch();
+        page.buffer = metrics.buffer();
         let size = metrics.rect().size();
         let (width, height) = (size.width as i32, size.height as i32);
         unsafe {
@@ -830,9 +906,8 @@ impl WpeRuntime {
         let Page {
             web_view,
             view: wpe_view,
-            lease,
-            surface,
-            shm,
+            slot,
+            target,
             requests,
             held,
             navigator,
@@ -843,23 +918,200 @@ impl WpeRuntime {
         drop(navigator);
         drop(wpe_view);
         drop(web_view);
-        drop(shm);
-        drop(surface);
-        lease.retire();
-        // The last view takes the web context with it (`WebContext`).
+        if let Some(slot) = slot {
+            drop(slot.shm);
+            drop(slot.surface);
+        }
+        target.retire();
+        // The last view takes the web context with it (`WebContext`). At shutdown on a CPU
+        // target, GLib runs between those drops here, since the owner loop will not run it
+        // again: otherwise the web and network processes stay up (experiments/wpe-cpu). While
+        // the runtime lives, the owner loop's pumps do that.
         if self.pages.is_empty() {
-            let platform = self.platform.as_mut();
-            if let Some(context) = platform.and_then(|p| p.context.take()) {
+            let drain = self.shut_down
+                && self
+                    .platform
+                    .as_ref()
+                    .is_some_and(|platform| platform.wayland.is_none());
+            if drain {
+                self.drain_glib(Duration::from_millis(400));
+            }
+            if let Some(context) = self
+                .platform
+                .as_mut()
+                .and_then(|platform| platform.context.take())
+            {
                 context.end();
+            }
+            if drain {
+                self.drain_glib(Duration::from_millis(400));
             }
         }
         true
+    }
+
+    /// Runs GLib until `total` has passed, so WebKit's teardown timeouts can fire. A turn that
+    /// has nothing ready sleeps until the next source, at most 50 ms.
+    fn drain_glib(&mut self, total: Duration) {
+        let end = Instant::now() + total;
+        while Instant::now() < end {
+            let next = self.glib.as_mut().and_then(GlibLoop::iterate);
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let pause = match next {
+                Some(at) => at.saturating_duration_since(Instant::now()).min(left),
+                None => left.min(Duration::from_millis(20)),
+            };
+            if !pause.is_zero() {
+                std::thread::sleep(pause.min(Duration::from_millis(50)));
+            }
+        }
+    }
+
+    /// Attaches a DMA-BUF, or copies shared memory into a `wl_shm` buffer. A frame more than one
+    /// pixel off the permit's buffer is stale and not shown. One pixel off is shown: WebKit
+    /// floors `logical × scale` where the host rounds half away from zero.
+    fn present_wayland(
+        &mut self,
+        view: ViewId,
+        permit: T::Permit,
+        epoch: LayoutEpoch,
+        unchanged: PresentOutcome,
+        start: Instant,
+    ) -> Result<PresentOutcome, EngineError> {
+        let page = self.pages.get_mut(&view).expect("present checked the view");
+        let (frame, damage) = page.pending.take().expect("checked");
+        let buffer = T::permit_buffer(&permit, page.buffer);
+        let size = (buffer.width, buffer.height);
+        let (width, height) = frame.size();
+        if width.abs_diff(size.0) > 1 || height.abs_diff(size.1) > 1 {
+            self.stale_frames += 1;
+            self.stats.dropped += 1;
+            finish_unshown(page.wpe(), &frame);
+            T::dismiss(permit, unchanged);
+            return Ok(unchanged);
+        }
+        if (width, height) != size {
+            self.rounded_frames += 1;
+        }
+        let size = (width, height);
+        let imported = if frame.is_dma_buf() {
+            self.platform
+                .as_mut()
+                .expect("a page has a platform")
+                .wayland
+                .as_mut()
+                .expect("a Wayland view has a presenter")
+                .dmabuf_buffer(&frame)
+                .map(|buffer| Some((buffer, false)))
+        } else {
+            let platform = self.platform.as_mut().expect("a page has a platform");
+            let wayland = platform
+                .wayland
+                .as_mut()
+                .expect("a Wayland view has a presenter");
+            page.slot
+                .as_mut()
+                .expect("a Wayland view")
+                .shm
+                .copy(wayland, &frame)
+                .map(|buffer| buffer.map(|buffer| (buffer, true)))
+        }
+        .map_err(|message| EngineError::View { view, message })?;
+        let Some(((wl_buffer, key), copied)) = imported else {
+            // Every SHM buffer of ours is still with the compositor: keep the frame.
+            page.pending = Some((frame, damage));
+            T::dismiss(permit, unchanged);
+            return Ok(unchanged);
+        };
+        let surface = &page.slot.as_ref().expect("a Wayland view").surface;
+        surface.attach(Some(&wl_buffer), 0, 0);
+        present::damage(surface, if copied { &[] } else { &damage }, size);
+        surface.commit();
+        page.presented = Some(epoch);
+        unsafe { ffi::wpe_view_buffer_rendered(page.wpe(), frame.as_ptr()) };
+        if copied {
+            self.stats.shm_copies += 1;
+            self.stats.shm_bytes += u64::from(size.0) * u64::from(size.1) * 4;
+            unsafe { ffi::wpe_view_buffer_released(page.wpe(), frame.as_ptr()) };
+        } else {
+            self.stats.dmabuf_frames += 1;
+            self.in_flight.insert(key, (view, frame));
+        }
+        T::dismiss(permit, PresentOutcome::Submitted);
+        self.account_present(start);
+        Ok(PresentOutcome::Submitted)
+    }
+
+    /// Copies the held shared-memory frame into the lent CPU frame, then acknowledges it. The
+    /// size must match the view's buffer exactly. A mismatch is acknowledged and not shown, so
+    /// WebKit can render the new size. The copy consumes the permit. On a copy error the WebKit
+    /// buffer goes back to `pending` and is not acknowledged.
+    fn present_cpu(
+        &mut self,
+        view: ViewId,
+        permit: T::Permit,
+        epoch: LayoutEpoch,
+        unchanged: PresentOutcome,
+        start: Instant,
+    ) -> Result<PresentOutcome, EngineError> {
+        let page = self.pages.get_mut(&view).expect("present checked the view");
+        let (frame, damage) = page.pending.take().expect("checked");
+        if frame.is_dma_buf() {
+            finish_unshown(page.wpe(), &frame);
+            T::dismiss(permit, PresentOutcome::NotReady);
+            return Err(EngineError::View {
+                view,
+                message: "a DMA-BUF frame on a CPU target".into(),
+            });
+        }
+        let (width, height) = frame.size();
+        let buffer = T::permit_buffer(&permit, page.buffer);
+        if width != buffer.width || height != buffer.height {
+            self.stale_frames += 1;
+            self.stats.dropped += 1;
+            finish_unshown(page.wpe(), &frame);
+            T::dismiss(permit, unchanged);
+            return Ok(unchanged);
+        }
+        match page.target.copy_shm(permit, &frame) {
+            Ok(took) => {
+                self.max_copy = self.max_copy.max(took);
+                self.total_copy += took;
+                self.stats.shm_copies += 1;
+                self.stats.shm_bytes += u64::from(width) * u64::from(height) * 4;
+                page.presented = Some(epoch);
+                unsafe {
+                    ffi::wpe_view_buffer_rendered(page.wpe(), frame.as_ptr());
+                    ffi::wpe_view_buffer_released(page.wpe(), frame.as_ptr());
+                }
+                self.account_present(start);
+                Ok(PresentOutcome::Submitted)
+            }
+            Err(message) => {
+                page.pending = Some((frame, damage));
+                Err(EngineError::View { view, message })
+            }
+        }
+    }
+
+    fn account_present(&mut self, start: Instant) {
+        let took = start.elapsed();
+        self.max_present = self.max_present.max(took);
+        self.total_present += took;
+        self.handle_notes();
+        // Events reach the owner only through `pump`: ask for one.
+        if !self.events.is_empty() {
+            self.waker.wake();
+        }
     }
 }
 
 /// Reports `commit`: the navigation and the history after it. A new document's requests and
 /// held navigations end with the old one: dropping WebKit's objects refuses them.
-fn committed(page: &mut Page, events: &mut Vec<EngineEvent>, commit: Commit) {
+fn committed<T: WpeTarget>(page: &mut Page<T>, events: &mut Vec<EngineEvent>, commit: Commit) {
     let view = page.id;
     if commit.new_document {
         page.requests.clear();
@@ -902,7 +1154,7 @@ fn cancelled(view: ViewId, navigation: NavigationId) -> EngineEvent {
 }
 
 /// The input method's view of `page`'s focused field. A password's text never leaves.
-fn text_input_state(page: &Page) -> Option<TextInputState> {
+fn text_input_state<T: WpeTarget>(page: &Page<T>) -> Option<TextInputState> {
     let input = page.text_input.as_ref()?;
     let purpose = page
         .view
@@ -1117,9 +1369,9 @@ unsafe extern "C" fn script_done(
     }
 }
 
-impl EngineRuntime for WpeRuntime {
-    type Target = TargetLease;
-    type FramePermit = FramePermit;
+impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
+    type Target = T;
+    type FramePermit = T::Permit;
 
     fn capabilities(&self) -> EngineCapabilities {
         CAPABILITIES
@@ -1129,28 +1381,26 @@ impl EngineRuntime for WpeRuntime {
         &mut self,
         view: ViewId,
         options: ViewOptions,
-        lease: TargetLease,
+        target: T,
     ) -> Result<(), EngineError> {
         self.alive()?;
         if self.pages.contains_key(&view) {
             return Err(EngineError::Runtime(format!("{view:?} is open already")));
         }
-        if lease.mode() != PresentMode::Gl {
-            return Err(EngineError::Unsupported(
-                "WPE views present on native targets",
-            ));
+        if let Some(reason) = target.unsupported() {
+            return Err(EngineError::Unsupported(reason));
         }
+        let display = target.wayland_display()?;
         let inbox = Rc::clone(&self.inbox);
-        let platform = self.platform(&lease)?;
-        // SAFETY: the proxy is dropped before the lease (`close`).
-        let surface = match unsafe { lease.gl_handles() }
-            .map(|h| h.window_handle().map(|w| w.as_raw()))
-        {
-            Some(Ok(RawWindowHandle::Wayland(h))) => unsafe { platform.wayland.surface(h.surface) },
-            _ => Err("no wl_surface".to_string()),
-        }
-        .map_err(EngineError::Runtime)?;
-        let shm = platform.wayland.shm_buffers();
+        let platform = self.platform(display)?;
+        let slot = match platform.wayland.is_some() {
+            true => Some(
+                target
+                    .open_slot(platform.wayland.as_ref().expect("a Wayland presenter"))
+                    .map_err(EngineError::Runtime)?,
+            ),
+            false => None,
+        };
         let web_view =
             glib::Object::builder_with_type(unsafe { from_glib(ffi::webkit_web_view_get_type()) })
                 .property("display", platform.display.clone())
@@ -1193,15 +1443,13 @@ impl EngineRuntime for WpeRuntime {
         })));
         view::connect(&web_view, &inbox, view);
         unsafe { ffi::webkit_web_view_set_zoom_level(web_view.as_ptr().cast(), options.zoom) };
-        let metrics = lease.metrics();
+        let metrics = target.metrics();
         self.pages.insert(
             view,
             Page {
                 id: view,
                 web_view,
                 view: wpe_view,
-                surface,
-                shm,
                 input: Input::default(),
                 pending: None,
                 presented: None,
@@ -1210,7 +1458,10 @@ impl EngineRuntime for WpeRuntime {
                 requests: Vec::new(),
                 held: Vec::new(),
                 text_input: None,
-                lease,
+                epoch: metrics.epoch(),
+                buffer: metrics.buffer(),
+                slot,
+                target,
             },
         );
         self.apply_metrics(view, metrics);
@@ -1331,7 +1582,7 @@ impl EngineRuntime for WpeRuntime {
             }
             // Content as structure is not implemented yet (TUI.md §8, phase 4).
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
-                return Err(EngineError::Unsupported("semantics"))
+                return Err(EngineError::Unsupported("semantics"));
             }
         }
         self.handle_notes();
@@ -1359,11 +1610,7 @@ impl EngineRuntime for WpeRuntime {
         }
     }
 
-    fn present(
-        &mut self,
-        view: ViewId,
-        permit: FramePermit,
-    ) -> Result<PresentOutcome, EngineError> {
+    fn present(&mut self, view: ViewId, permit: T::Permit) -> Result<PresentOutcome, EngineError> {
         self.alive()?;
         let start = Instant::now();
         self.release_buffers();
@@ -1372,71 +1619,29 @@ impl EngineRuntime for WpeRuntime {
             .pages
             .get_mut(&view)
             .ok_or(EngineError::UnknownView(view))?;
-        let epoch = permit.metrics().epoch();
+        let epoch = T::permit_epoch(&permit);
         let unchanged = match page.presented == Some(epoch) {
             true => PresentOutcome::Unchanged,
             false => PresentOutcome::NotReady,
         };
-        if !permit.is_current() || page.pending.is_none() {
-            permit.finish(unchanged);
-            return Ok(unchanged);
+        // A retired Wayland permit keeps the old outcome: Unchanged when that epoch was
+        // submitted. A CPU permit names one layout; one for a layout the view has left is
+        // not ready, even when that layout was shown.
+        let current = T::permit_is_current(&permit, page.epoch);
+        if !current || page.pending.is_none() {
+            let outcome = if current || page.slot.is_some() {
+                unchanged
+            } else {
+                PresentOutcome::NotReady
+            };
+            T::dismiss(permit, outcome);
+            return Ok(outcome);
         }
-        let (frame, damage) = page.pending.take().expect("checked");
-        let buffer = permit.metrics().buffer();
-        let size = (buffer.width, buffer.height);
-        let (width, height) = frame.size();
-        if width.abs_diff(size.0) > 1 || height.abs_diff(size.1) > 1 {
-            self.stale_frames += 1;
-            self.stats.dropped += 1;
-            finish_unshown(page.wpe(), &frame);
-            permit.finish(unchanged);
-            return Ok(unchanged);
-        }
-        if (width, height) != size {
-            self.rounded_frames += 1;
-        }
-        let size = (width, height);
-        let platform = self.platform.as_mut().expect("a page has a platform");
-        let imported = if frame.is_dma_buf() {
-            platform
-                .wayland
-                .dmabuf_buffer(&frame)
-                .map(|b| Some((b, false)))
+        if page.slot.is_some() {
+            self.present_wayland(view, permit, epoch, unchanged, start)
         } else {
-            page.shm
-                .copy(&mut platform.wayland, &frame)
-                .map(|b| b.map(|b| (b, true)))
+            self.present_cpu(view, permit, epoch, unchanged, start)
         }
-        .map_err(|message| EngineError::View { view, message })?;
-        let Some(((wl_buffer, key), copied)) = imported else {
-            // Every SHM buffer of ours is still with the compositor: keep the frame.
-            page.pending = Some((frame, damage));
-            permit.finish(unchanged);
-            return Ok(unchanged);
-        };
-        page.surface.attach(Some(&wl_buffer), 0, 0);
-        present::damage(&page.surface, if copied { &[] } else { &damage }, size);
-        page.surface.commit();
-        page.presented = Some(epoch);
-        unsafe { ffi::wpe_view_buffer_rendered(page.wpe(), frame.as_ptr()) };
-        if copied {
-            self.stats.shm_copies += 1;
-            self.stats.shm_bytes += u64::from(size.0) * u64::from(size.1) * 4;
-            unsafe { ffi::wpe_view_buffer_released(page.wpe(), frame.as_ptr()) };
-        } else {
-            self.stats.dmabuf_frames += 1;
-            self.in_flight.insert(key, (view, frame));
-        }
-        permit.finish(PresentOutcome::Submitted);
-        let took = start.elapsed();
-        self.max_present = self.max_present.max(took);
-        self.total_present += took;
-        self.handle_notes();
-        // Events reach the owner only through `pump`: ask for one.
-        if !self.events.is_empty() {
-            self.waker.wake();
-        }
-        Ok(PresentOutcome::Submitted)
     }
 
     fn close_view(&mut self, view: ViewId) {
@@ -1463,12 +1668,20 @@ impl EngineRuntime for WpeRuntime {
         }
         *self.inbox.borrow_mut() = view::Inbox::default();
         self.events.clear();
+        let offscreen = self
+            .platform
+            .as_ref()
+            .is_some_and(|platform| platform.wayland.is_none());
         if let Some(platform) = self.platform.as_mut() {
             for (object, handler) in platform.handlers.drain(..) {
                 object.disconnect(handler);
             }
         }
         self.platform = None;
+        if offscreen {
+            // The network process exits when the session is gone, after this loop runs.
+            self.drain_glib(Duration::from_millis(300));
+        }
         self.glib = None;
         self.profile_lock = None;
     }

@@ -3,8 +3,7 @@
 //! The runtime lists each engine's name, capabilities and settings. This module supplies how
 //! to start the runtime on [`TermTarget`] and [`TermPermit`]. Servo renders offscreen and reads
 //! one frame back into that target. Wasm and the demo engine paint straight into it. WPE WebKit
-//! is bound so the registry's list stays complete, and its start fails: the terminal has no
-//! presenter for it yet, and a page routed there shows the core's error.
+//! copies its shared-memory frames into that target, with no Wayland connection.
 //!
 //! Must not own: when a runtime starts (the registry, on first use, except Servo at launch) or
 //! what it is asked to do.
@@ -12,12 +11,14 @@
 #[cfg(any(
     feature = "engine-servo",
     feature = "engine-wasm",
+    feature = "engine-wpe",
     feature = "engine-demo"
 ))]
 use sighurt_api::engine::EngineRuntime;
 #[cfg(any(
     feature = "engine-servo",
     feature = "engine-wasm",
+    feature = "engine-wpe",
     feature = "engine-demo"
 ))]
 use sighurt_api::ids::ViewId;
@@ -43,7 +44,7 @@ pub fn build() -> Registry<TermTarget, TermPermit> {
         #[cfg(feature = "engine-wpe")]
         Binding {
             name: "wpe",
-            renderer: "unavailable in the terminal",
+            renderer: "cpu, kitty graphics",
             start: wpe,
         },
         #[cfg(feature = "engine-demo")]
@@ -242,12 +243,95 @@ impl sighurt_runtime::registry::Running<TermTarget, TermPermit>
 {
 }
 
+/// WebKit's runtime wants `Offscreen<TermTarget>` as its target. The session's target is
+/// [`TermTarget`], so this wrapper puts the offscreen buffer around it at `open_view`.
+#[cfg(feature = "engine-wpe")]
+struct WpeBound(sighurt_engine_wpe::WpeRuntime<sighurt_engine_wpe::Offscreen<TermTarget>>);
+
+#[cfg(feature = "engine-wpe")]
+impl EngineRuntime for WpeBound {
+    type Target = TermTarget;
+    type FramePermit = TermPermit;
+
+    fn capabilities(&self) -> sighurt_api::engine::EngineCapabilities {
+        self.0.capabilities()
+    }
+
+    fn open_view(
+        &mut self,
+        view: ViewId,
+        options: sighurt_api::engine::ViewOptions,
+        target: Self::Target,
+    ) -> Result<(), sighurt_api::engine::EngineError> {
+        self.0
+            .open_view(view, options, sighurt_engine_wpe::Offscreen(target))
+    }
+
+    fn command(
+        &mut self,
+        view: ViewId,
+        command: sighurt_api::engine::EngineCommand,
+    ) -> Result<(), sighurt_api::engine::EngineError> {
+        self.0.command(view, command)
+    }
+
+    fn pump(
+        &mut self,
+        events: &mut Vec<sighurt_api::events::EngineEvent>,
+    ) -> sighurt_api::engine::PumpStatus {
+        self.0.pump(events)
+    }
+
+    fn present(
+        &mut self,
+        view: ViewId,
+        permit: Self::FramePermit,
+    ) -> Result<sighurt_api::engine::PresentOutcome, sighurt_api::engine::EngineError> {
+        self.0.present(view, permit)
+    }
+
+    fn close_view(&mut self, view: ViewId) {
+        self.0.close_view(view);
+    }
+
+    fn shutdown(&mut self) {
+        self.0.shutdown();
+    }
+}
+
 #[cfg(feature = "engine-wpe")]
 fn wpe(
-    _waker: sighurt_api::engine::EngineWaker,
-    _launch: sighurt_runtime::registry::Launch<'_>,
+    waker: sighurt_api::engine::EngineWaker,
+    launch: sighurt_runtime::registry::Launch<'_>,
 ) -> Result<sighurt_runtime::registry::Runtime<TermTarget, TermPermit>, String> {
-    Err("WPE WebKit isn't available in the terminal yet".into())
+    use sighurt_engine_wpe::WpeRuntime;
+    use sighurt_runtime::registry::{self, Runtime};
+
+    // shell.nix sets them; without them https: and media fail inside WebKit.
+    for variable in ["GIO_EXTRA_MODULES", "GST_PLUGIN_SYSTEM_PATH_1_0"] {
+        if std::env::var_os(variable).is_none() {
+            log::warn!("wpe: {variable} is not set: run sig in the repository's nix-shell");
+        }
+    }
+    WpeRuntime::new(registry::wpe_config(launch.settings), waker)
+        .map(|runtime| Runtime::Wpe(Box::new(WpeBound(runtime))))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "engine-wpe")]
+impl sighurt_runtime::registry::Running<TermTarget, TermPermit> for WpeBound {
+    /// `None` until WebKit's display exists. Its web process may still rasterise on the GPU;
+    /// what reaches the terminal is shared memory.
+    fn renderer(&self) -> Option<(&'static str, Option<String>)> {
+        let diagnostics = self.0.diagnostics();
+        diagnostics.transport?;
+        Some(("cpu", diagnostics.renderer()))
+    }
+
+    /// The shared-memory frames copied into the terminal's buffer.
+    fn readbacks(&self) -> u64 {
+        self.0.diagnostics().present.shm_copies
+    }
 }
 
 #[cfg(feature = "engine-demo")]

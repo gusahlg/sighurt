@@ -13,7 +13,8 @@
 //! once per WebKit buffer (cached in the buffer's user data, destroyed with it): no copy. An SHM
 //! frame (`WPEBufferSHM`, ARGB8888 like `wl_shm`'s) is copied into one of at most
 //! [`SHM_BUFFERS`] buffers of ours per view, which are reused only after the compositor
-//! releases them.
+//! releases them. On a CPU target ([`crate::Offscreen`]) there is no compositor: `copy_argb`
+//! copies the SHM frame into the frame the target lends, row by row, with no conversion.
 //!
 //! [`PresentMode::Gl`]: sighurt_wayland::PresentMode::Gl
 //!
@@ -25,6 +26,7 @@ use std::ffi::{c_void, CString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::NonNull;
 
+use sighurt_api::present::Frame;
 use wayland_client::backend::{Backend, ObjectId};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
@@ -564,6 +566,65 @@ pub struct PresentStats {
     pub dropped: u64,
     /// Releases of our buffers by the compositor.
     pub releases: u64,
+}
+
+/// Copies a `WPEBufferSHM` into `frame`.
+///
+/// WebKit's only shared-memory format is `WPE_PIXEL_FORMAT_ARGB8888`: premultiplied alpha,
+/// little-endian (B, G, R, A), the first row at the top. That is the CPU frame's format, so
+/// this is a row copy and not a conversion. A different format is an error.
+pub(crate) fn copy_argb(buffer: &Buffer, frame: Frame<'_>) -> Result<(), String> {
+    if buffer.is_dma_buf() {
+        return Err("a DMA-BUF frame has no shared-memory pixels".into());
+    }
+    let (width, height) = buffer.size();
+    if frame.size.width != width || frame.size.height != height {
+        return Err(format!(
+            "frame is {}×{}, the SHM buffer is {width}×{height}",
+            frame.size.width, frame.size.height
+        ));
+    }
+    let raw = buffer.as_ptr();
+    // SAFETY: `buffer` is a live `WPEBufferSHM` this process holds until it is released. The
+    // bytes are only read, into `frame`, which the caller lends for this call.
+    unsafe {
+        let format = ffi::wpe_buffer_shm_get_format(raw);
+        if format != ffi::WPE_PIXEL_FORMAT_ARGB8888 {
+            return Err(format!("SHM format {format} is not ARGB8888"));
+        }
+        let stride = ffi::wpe_buffer_shm_get_stride(raw) as usize;
+        let bytes = ffi::wpe_buffer_shm_get_data(raw);
+        if bytes.is_null() {
+            return Err("SHM frame has no bytes".into());
+        }
+        let mut len = 0usize;
+        let data = glib::ffi::g_bytes_get_data(bytes, &mut len);
+        if data.is_null() {
+            return Err("SHM frame data is null".into());
+        }
+        let row = width as usize * 4;
+        if stride < row || frame.stride < row || !frame.stride.is_multiple_of(4) {
+            return Err(format!(
+                "SHM stride {stride} or frame stride {} does not cover {row} bytes",
+                frame.stride
+            ));
+        }
+        let need = stride
+            .checked_mul(height as usize)
+            .ok_or_else(|| format!("SHM frame {width}×{height} is too large"))?;
+        if len < need || frame.pixels.len() < frame.stride * height as usize {
+            return Err(format!(
+                "SHM frame is {len} bytes, {width}×{height} stride {stride} needs {need}"
+            ));
+        }
+        let source = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        for y in 0..height as usize {
+            let from = y * stride;
+            let to = y * frame.stride;
+            frame.pixels[to..to + row].copy_from_slice(&source[from..from + row]);
+        }
+    }
+    Ok(())
 }
 
 /// Damage for `wl_surface.damage_buffer`, or the whole buffer.

@@ -330,7 +330,10 @@ fn wpe_views_navigate_present_ask_and_fail_distinctly() {
     };
     let mut d = Driver::new(config, Layout::Stack);
     // WebKit's UI-process state is global: one runtime per process.
-    let again = WpeRuntime::new(WpeConfig::default(), EngineWaker::new(|| {}));
+    let again = WpeRuntime::<sighurt_wayland::TargetLease>::new(
+        WpeConfig::default(),
+        EngineWaker::new(|| {}),
+    );
     assert!(
         matches!(again, Err(EngineError::Runtime(_))),
         "a second runtime is refused"
