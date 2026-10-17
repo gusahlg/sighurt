@@ -33,8 +33,8 @@ use glib::prelude::*;
 use glib::translate::{from_glib, from_glib_full, from_glib_none, ToGlibPtr};
 use sighurt_api::engine::EngineWaker;
 use sighurt_engine_wpe::clipboard::{ClipboardCall, ClipboardSink};
-use sighurt_engine_wpe::glib_loop::GlibLoop;
 use sighurt_engine_wpe::ffi;
+use sighurt_engine_wpe::glib_loop::GlibLoop;
 use sighurt_engine_wpe::platform::{Buffer, Call, Display, View};
 
 /// `WebKitLoadEvent::WEBKIT_LOAD_FINISHED` (WebKitWebView.h: STARTED, REDIRECTED, COMMITTED, FINISHED).
@@ -54,8 +54,7 @@ const DOM_SCRIPT: &str = r#"JSON.stringify({title:document.title,headings:docume
 
 const ISOLATED_PROBE: &str = r#"JSON.stringify({marker:(typeof window.__sighurtPage==="string")?window.__sighurtPage:null,dom_title:document.title})"#;
 
-const MAIN_PROBE: &str =
-    r#"JSON.stringify({marker:(typeof window.__sighurtPage==="string")?window.__sighurtPage:null})"#;
+const MAIN_PROBE: &str = r#"JSON.stringify({marker:(typeof window.__sighurtPage==="string")?window.__sighurtPage:null})"#;
 
 fn main() {
     let config = match Config::parse(std::env::args().skip(1)) {
@@ -188,8 +187,7 @@ fn as_url(arg: &str) -> Result<String, String> {
 fn sibling_second(url: &str) -> Option<String> {
     let path = url.strip_prefix("file://")?;
     let next = Path::new(path).parent()?.join("second.html");
-    next.is_file()
-        .then(|| format!("file://{}", next.display()))
+    next.is_file().then(|| format!("file://{}", next.display()))
 }
 
 fn run(config: &Config) -> Result<(), String> {
@@ -335,7 +333,10 @@ fn phase_navigate_resize(
         format_sizes(&during.sizes)
     ));
     if !loaded {
-        return Err(format!("the second page did not finish loading ({})", session.status()));
+        return Err(format!(
+            "the second page did not finish loading ({})",
+            session.status()
+        ));
     }
     let leaf = url_leaf(&config.next);
     if !session.uri().contains(leaf) {
@@ -413,7 +414,9 @@ fn check_dom_json(json: &str) -> Result<(), String> {
         ));
     }
     if !href.contains("animated.html") {
-        return Err(format!("first_link_href {href} does not point at animated.html"));
+        return Err(format!(
+            "first_link_href {href} does not point at animated.html"
+        ));
     }
     Ok(())
 }
@@ -611,13 +614,12 @@ impl Session {
         log.line("wpe-cpu: display SighurtWPEDisplay primary dmabuf=none (WPEBufferSHM)");
         let context = web_context();
         let network = network_session();
-        let web_view = glib::Object::builder_with_type(unsafe {
-            from_glib(ffi::webkit_web_view_get_type())
-        })
-        .property("display", display.clone())
-        .property("web-context", &context)
-        .property("network-session", &network)
-        .build();
+        let web_view =
+            glib::Object::builder_with_type(unsafe { from_glib(ffi::webkit_web_view_get_type()) })
+                .property("display", display.clone())
+                .property("web-context", &context)
+                .property("network-session", &network)
+                .build();
         connect_signals(&web_view, &shared);
         let view = wpe_view(&web_view)?;
         let sink_shared = Rc::clone(&shared);
@@ -648,7 +650,8 @@ impl Session {
 
     fn resize(&mut self, size: (i32, i32)) -> Result<(), String> {
         let view = self.view_ptr()?;
-        let object: glib::Object = unsafe { from_glib_none(view.cast::<glib::gobject_ffi::GObject>()) };
+        let object: glib::Object =
+            unsafe { from_glib_none(view.cast::<glib::gobject_ffi::GObject>()) };
         let toplevel: glib::Object = object.property("toplevel");
         let top = toplevel.as_ptr().cast();
         unsafe {
@@ -1129,7 +1132,8 @@ unsafe extern "C" fn script_done(
 }
 
 fn differing_pixels(first: &Image, last: &Image) -> Result<usize, String> {
-    if (first.width, first.height) != (last.width, last.height) || first.bgra.len() != last.bgra.len()
+    if (first.width, first.height) != (last.width, last.height)
+        || first.bgra.len() != last.bgra.len()
     {
         return Err(format!(
             "frame sizes {}x{} and {}x{}",
@@ -1150,7 +1154,10 @@ fn sample(image: &Image) -> String {
     let pixel = |x: u32, y: u32| {
         let index = (y as usize * image.width as usize + x as usize) * 4;
         let pixel = &image.bgra[index..index + 4];
-        format!("#{:02x}{:02x}{:02x}{:02x}", pixel[2], pixel[1], pixel[0], pixel[3])
+        format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            pixel[2], pixel[1], pixel[0], pixel[3]
+        )
     };
     format!(
         "{}x{} tl={} center={} br={}",
@@ -1419,7 +1426,9 @@ fn process_tree(root: u32) -> Vec<Proc> {
         }
         index += 1;
     }
-    all.into_iter().filter(|proc| pids.contains(&proc.pid)).collect()
+    all.into_iter()
+        .filter(|proc| pids.contains(&proc.pid))
+        .collect()
 }
 
 fn is_webkit(proc: &Proc) -> bool {
@@ -1532,7 +1541,10 @@ fn device_fds(pid: u32, unix: &HashMap<String, String>) -> Vec<String> {
             continue;
         };
         let text = target.display().to_string();
-        if let Some(inode) = text.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) {
+        if let Some(inode) = text
+            .strip_prefix("socket:[")
+            .and_then(|s| s.strip_suffix(']'))
+        {
             if let Some(path) = unix.get(inode) {
                 if path.contains("wayland") || path.contains("/dev/dri") || path.contains("nvidia")
                 {

@@ -14,7 +14,10 @@ pub fn write_rgba(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(
     let row = width as usize * 4;
     let rows = height as usize;
     if row == 0 || rgba.len() != row * rows {
-        return Err(format!("png: {width}x{height} does not match {} bytes", rgba.len()));
+        return Err(format!(
+            "png: {width}x{height} does not match {} bytes",
+            rgba.len()
+        ));
     }
     let mut raw = Vec::with_capacity(rows * (row + 1));
     for y in 0..rows {
