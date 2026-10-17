@@ -1894,10 +1894,12 @@ The phases of [TUI.md](TUI.md) §8, each passing only with the evidence named.
 - [x] **Phase 0: the risks.** Servo 0.5 renders offscreen with no display server on NVIDIA,
   WPE WebKit renders to shared memory with no compositor, and the terminal I/O prototype passes
   under a pty (TUI.md §9; `experiments/tui-servo`, `wpe-cpu`, `tty-io` and their RESULTS.md).
-- [ ] **Phase 1: the split.** `sig` is `sighurt-runtime`, `sighurt-gui` and a thin `main` with no
-  behaviour change (b04ebf4: engines.sh 271/271 on louise-pc, headless.sh and sighurt-ui's
-  headless.sh pass; the review's fixes and the runtime's shutdown, presenting and engine
-  descriptors are pending).
+- [x] **Phase 1: the split.** `sig` is `sighurt-runtime`, `sighurt-gui` and a thin `main` with no
+  behaviour change; the runtime owns shutdown (§20, decision 54 behind
+  `Frontend::before_forced_exit`), presenting with its diagnostics, and the engine descriptors
+  (b04ebf4, 8e8d576; an independent review found the diagnostics, effect order and shutdown
+  order unchanged; engines.sh 271/271 on louise-pc, headless.sh 75/75, sighurt-ui's headless.sh
+  35/35, clippy clean with no features and with all).
 - [ ] **Phase 2: the demo engine in the terminal**, graphics and text, `--dump`.
 - [ ] **Phase 3: Servo's and WPE's CPU presenters**, graphics mode with real pages.
 - [ ] **Phase 4: semantics** in Servo and WPE; text mode and `--dump` with real pages.

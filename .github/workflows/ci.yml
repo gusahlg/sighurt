@@ -50,6 +50,7 @@ jobs:
           cargo clippy --workspace
           --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-browser
           --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
+          --exclude tui-servo --exclude wpe-cpu
           --all-targets -- -D warnings
 
       - name: Clippy (sig without Servo and WPE WebKit)
@@ -70,6 +71,7 @@ jobs:
           cargo test --workspace
           --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-browser
           --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
+          --exclude tui-servo --exclude wpe-cpu
 
       # Unit tests only: the end-to-end tests (sighurt-browser/tests/headless.sh and engines.sh)
       # need a compositor and run on a developer machine.

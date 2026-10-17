@@ -73,7 +73,7 @@ An engine is a crate `sighurt-engine-<name>` that depends on `sighurt-api` and `
 4. Declare what you support in `EngineCapabilities` and return `EngineError::Unsupported` for the rest. Set `process_per_view` if each view is an OS process of its own: a tab then keeps fewer of your views alive in its history.
 5. Shut down in an explicit order in `shutdown`; never exit the process or install process-wide handlers.
 
-Then add a feature `engine-<name>` to `sighurt-browser/Cargo.toml` and the engine to `sighurt-browser/src/registry.rs`, which starts it and says which `[engines.<name>]` settings it honors. `sighurt-engine-demo` is the smallest complete engine.
+Then add a feature `engine-<name>` to `sighurt-browser/Cargo.toml`, `sighurt-runtime/Cargo.toml` and `sighurt-gui/Cargo.toml`, the engine's descriptor to `sighurt-runtime/src/engines.rs` (its name, capabilities and the `[engines.<name>]` settings it honors), and how the GUI starts it to `sighurt-gui/src/engines.rs`. `sighurt-engine-demo` is the smallest complete engine.
 
 ## Adding a keymap or a chrome
 

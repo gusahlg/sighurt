@@ -14,10 +14,12 @@ on the CPU. Three engines come with it:
 A fourth, the demo engine, exists to test the host and the chrome without a real engine.
 
 ```text
- sig (sighurt-browser): configuration and session files, the engine registry, the event loop
+ sig (sighurt-browser): arguments, process-wide setup, the choice of frontend
+  ├── sighurt-gui       the Wayland frontend: the event loop, the chrome's surfaces
+  │    ├── sighurt-ui        the chrome: tabs, address and command line, drawn on the CPU
+  │    └── sighurt-wayland   the window and its surfaces, input, scaling, frame scheduling
+  ├── sighurt-runtime   configuration and session files, the engine registry, effects, services
   ├── sighurt-core      tabs, commands, keymaps, routing, history across engines, permissions
-  ├── sighurt-ui        the chrome: tabs, address and command line, drawn on the CPU
-  ├── sighurt-wayland   the window and its surfaces, input, scaling, frame scheduling
   └── engines           servo · wpe · wasm · demo, each one a library behind sighurt-api
 
  One Wayland window: the chrome's surfaces and one page surface per engine view, which the
@@ -382,7 +384,7 @@ paints a surface into a buffer the host lends. Its kind checks `[chrome.<name>]`
 `Canvas`) are there to use.
 
 To add either to `sig`: a feature in `sighurt-browser/Cargo.toml` and the kind in the list in
-`sighurt-browser/src/registry.rs` (`KEYMAPS` or `CHROMES`):
+`sighurt-runtime/src/registry.rs` (`KEYMAPS`) or `sighurt-gui/src/chrome.rs` (`CHROMES`):
 
 ```toml
 [features]
@@ -410,7 +412,9 @@ worked examples are [`sighurt-keymap-modal`](./sighurt-keymap-modal/) and
 
 | Crate | What it is |
 |---|---|
-| [`sighurt-browser`](./sighurt-browser/) | `sig`: configuration and session files, the engine registry, the event loop, downloads and the clipboard, diagnostics |
+| [`sighurt-browser`](./sighurt-browser/) | `sig`: arguments, process-wide setup, the choice of frontend |
+| [`sighurt-runtime`](./sighurt-runtime/) | what every frontend shares: configuration and session files, the engine registry, carrying out the core's effects, downloads, diagnostics, shutdown |
+| [`sighurt-gui`](./sighurt-gui/) | the Wayland frontend: the event loop, the chrome's surfaces, engines bound to Wayland targets, the clipboard |
 | [`sighurt-core`](./sighurt-core/) | browser state and policy: tabs, commands, the `bindings` keymap, routing, history across engines, permissions, configuration; no I/O |
 | [`sighurt-api`](./sighurt-api/) | the contract between them: ids, geometry, input, the engine trait and its events, services, commands, the keymap API |
 | [`sighurt-wayland`](./sighurt-wayland/) | the Wayland host: window, surfaces, targets, scaling, input, clipboard, shared-memory buffers, frame scheduling |
