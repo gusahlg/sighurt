@@ -266,9 +266,10 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// per WebView and does not clear the others; a new WebView starts focused.
     servo_focus: Option<ViewId>,
     events: Events,
-    /// Notes of WebViews whose last history change may be a traversal whose completion hasn't
-    /// arrived, held in order for the next absorb, with whether each was counted already.
-    held: Vec<(WebViewId, Note, bool)>,
+    /// Notes of WebViews held for the next absorb, in order. The flags are whether a `Started`
+    /// or `HeadParsed` was already counted with the history change it belongs to, and whether a
+    /// history change has already waited one batch for that evidence.
+    held: Vec<(WebViewId, Note, bool, bool)>,
     readbacks: Readbacks,
     gl: Option<GlInfo>,
     /// Set from the first offscreen context. Stays `None` on the Wayland path.
@@ -533,10 +534,12 @@ impl<T: ServoTarget> ServoRuntime<T> {
             );
             self.failed = Some(message);
         }
-        // Each note, and whether it is a `Started` already counted with the history change it
-        // belongs to: the two arrive on different channels, so within one batch the history
-        // change may come first. Notes held back last time come first.
-        let fresh = self.delegate.take().into_iter().map(|(w, n)| (w, n, false));
+        // Each note, and whether it is a `Started` or `HeadParsed` already counted with the
+        // history change it belongs to: the two arrive on different channels, so within one
+        // batch the history change may come first, and on 0.7 it often comes in the batch
+        // before. Notes held back last time come first. `waited` is a history change that
+        // already waited one batch for evidence of its document.
+        let fresh = self.delegate.take().into_iter().map(|(w, n)| (w, n, false, false));
         let mut notes: Vec<_> = std::mem::take(&mut self.held)
             .into_iter()
             .chain(fresh)
@@ -544,11 +547,11 @@ impl<T: ServoTarget> ServoRuntime<T> {
             .collect();
         let mut holding = Vec::new();
         for index in 0..notes.len() {
-            let Some((webview, note, counted)) = notes[index].take() else {
+            let Some((webview, note, counted, waited)) = notes[index].take() else {
                 continue;
             };
             if holding.contains(&webview) {
-                self.held.push((webview, note, counted));
+                self.held.push((webview, note, counted, waited));
                 continue;
             }
             match self.owners.get(&webview).copied() {
@@ -563,20 +566,21 @@ impl<T: ServoTarget> ServoRuntime<T> {
                                 // Its completion comes with Servo's next batch: this note and
                                 // the WebView's later ones wait for it, in order.
                                 holding.push(webview);
-                                self.held.push((webview, note, counted));
+                                self.held.push((webview, note, counted, waited));
                                 continue;
                             }
                         }
-                        let later = notes[index + 1..].iter_mut().flatten().find(|(id, n, c)| {
+                        let later = notes[index + 1..].iter_mut().flatten().find(|(id, n, c, _)| {
                             *id == webview && !*c && matches!(n, Note::Load(LoadStatus::Started))
                         });
-                        if let Some((.., counted)) = later {
+                        if let Some((_, _, counted, _)) = later {
                             *counted = true;
                             started_later = true;
                         }
                         // Servo 0.7 drops `Started` while the WebView is still `Started`. The
-                        // new document's `HeadParsed` is in this batch, before any later history
-                        // change. Pairing it is what attributes the browser's navigation.
+                        // new document's `HeadParsed` then arrives with this change, or in the
+                        // next batch. A head that is followed by another history change belongs
+                        // to that one.
                         if !started_later
                             && traversal.is_none()
                             && self
@@ -584,19 +588,48 @@ impl<T: ServoTarget> ServoRuntime<T> {
                                 .get(&view)
                                 .is_some_and(|v| v.navigator.pending_load_needs_evidence())
                         {
-                            for (id, n, counted) in notes[index + 1..].iter_mut().flatten() {
+                            let mut head = None;
+                            let mut history_after = false;
+                            for (offset, slot) in notes[index + 1..].iter().enumerate() {
+                                let Some((id, n, counted, _)) = slot else {
+                                    continue;
+                                };
                                 if *id != webview {
                                     continue;
                                 }
                                 if matches!(n, Note::History(..)) {
+                                    if head.is_some() {
+                                        history_after = true;
+                                    }
                                     break;
                                 }
-                                if !*counted && matches!(n, Note::Load(LoadStatus::HeadParsed)) {
-                                    *counted = true;
-                                    started_later = true;
-                                    break;
+                                if head.is_none()
+                                    && !*counted
+                                    && matches!(n, Note::Load(LoadStatus::HeadParsed))
+                                {
+                                    head = Some(offset);
                                 }
                             }
+                            if let Some(offset) = head.filter(|_| !history_after) {
+                                if let Some((_, _, counted, _)) = notes[index + 1 + offset].as_mut()
+                                {
+                                    *counted = true;
+                                    started_later = true;
+                                }
+                            }
+                        }
+                        if !started_later
+                            && traversal.is_none()
+                            && !waited
+                            && self
+                                .views
+                                .get(&view)
+                                .is_some_and(|v| v.navigator.pending_load_needs_evidence())
+                        {
+                            // One batch: `Started` or `HeadParsed` is usually the next spin.
+                            holding.push(webview);
+                            self.held.push((webview, note, counted, true));
+                            continue;
                         }
                     }
                     self.view_note(view, note, started_later || counted, traversal);
@@ -616,16 +649,16 @@ impl<T: ServoTarget> ServoRuntime<T> {
         &self,
         view: ViewId,
         webview: WebViewId,
-        rest: &[Option<(WebViewId, Note, bool)>],
+        rest: &[Option<(WebViewId, Note, bool, bool)>],
     ) -> Traversal {
         let Some(view) = self.views.get(&view).filter(|v| !v.traversals.is_empty()) else {
             return Traversal::No;
         };
-        let next = rest.iter().flatten().find(|(id, note, _)| {
+        let next = rest.iter().flatten().find(|(id, note, _, _)| {
             *id == webview && matches!(note, Note::History(..) | Note::TraversalComplete(_))
         });
         match next {
-            Some((_, Note::TraversalComplete(done), _)) => view
+            Some((_, Note::TraversalComplete(done), _, _)) => view
                 .traversals
                 .iter()
                 .find(|(t, _)| t == done)

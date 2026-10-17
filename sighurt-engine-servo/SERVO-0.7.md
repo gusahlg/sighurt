@@ -72,11 +72,12 @@ can show is marked as not measured.
   a document navigated to before the previous one has reported `HeadParsed` or `Complete` is
   still `Started`, so the new document's `LoadStatus::Started` never reaches the embedder.
   Its `<body>` still reports `HeadParsed` (`HTMLBodyElement::bind_to_tree`). The adapter
-  treats a second `HeadParsed`, or one in the same batch after the history change while a
-  browser `Navigate` is waiting with no `Started`, as that document. The headless run showed
-  `self.html` and `crash.html` committing as same-document pushes under a fresh id, with the
-  next push taking the browser's id; `LoadingChanged { loading: true }` (the head) followed
-  the commit in the same batch. The re-run is the check that this pairing holds.
+  treats a second `HeadParsed`, or one beside the history change while a browser `Navigate`
+  is waiting with no `Started`, as that document. The headless run showed `self.html` and
+  `crash.html` committing as same-document pushes under a fresh id, with the next push taking
+  the browser's id. `LoadingChanged { loading: true }` followed the commit on the next spin, so
+  the history change waits one batch for `Started` or `HeadParsed` before it is reported. A
+  head followed by another history change is left for that change.
 - **A load in flight is still dropped.** `Constellation::load_url` returns `None` with no
   embedder message when that browsing context is already in `pending_changes`. The queued
   navigation in `View::queued` stays. `AbortLoadUrl` still exists for 204/205.
