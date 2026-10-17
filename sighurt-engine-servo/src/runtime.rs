@@ -552,7 +552,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             .collect();
         let mut holding = Vec::new();
         for index in 0..notes.len() {
-            let Some((webview, note, counted, _waited)) = notes[index].take() else {
+            let Some((webview, note, counted, waited)) = notes[index].take() else {
                 continue;
             };
             if holding.contains(&webview) {
