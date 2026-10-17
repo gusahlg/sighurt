@@ -574,6 +574,30 @@ impl<T: ServoTarget> ServoRuntime<T> {
                             *counted = true;
                             started_later = true;
                         }
+                        // Servo 0.7 drops `Started` while the WebView is still `Started`. The
+                        // new document's `HeadParsed` is in this batch, before any later history
+                        // change. Pairing it is what attributes the browser's navigation.
+                        if !started_later
+                            && traversal.is_none()
+                            && self
+                                .views
+                                .get(&view)
+                                .is_some_and(|v| v.navigator.pending_load_needs_evidence())
+                        {
+                            for (id, n, counted) in notes[index + 1..].iter_mut().flatten() {
+                                if *id != webview {
+                                    continue;
+                                }
+                                if matches!(n, Note::History(..)) {
+                                    break;
+                                }
+                                if !*counted && matches!(n, Note::Load(LoadStatus::HeadParsed)) {
+                                    *counted = true;
+                                    started_later = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                     self.view_note(view, note, started_later || counted, traversal);
                 }
@@ -639,6 +663,9 @@ impl<T: ServoTarget> ServoRuntime<T> {
             Note::Load(status) => {
                 let started = status == LoadStatus::Started;
                 view.navigator.load_status(started, counted);
+                if status == LoadStatus::HeadParsed {
+                    view.navigator.head_parsed(counted);
+                }
                 if let (true, Some(load)) = (started, &mut view.load) {
                     // Its document is on its way: the commit follows.
                     load.since = Instant::now();

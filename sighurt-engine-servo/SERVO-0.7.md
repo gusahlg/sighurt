@@ -67,6 +67,16 @@ can show is marked as not measured.
 - **No navigation id.** `notify_history_changed` is still `(WebView, Vec<Url>, usize)`.
   `WebView::load` still returns nothing. The task's example of "which navigation committed"
   is not in the published embedder API. Attribution stays in `navigation.rs`.
+- **`Started` is dropped while the WebView is already `Started`.** `WebView::set_load_status`
+  returns without notifying when the status is unchanged. A new WebView starts `Started`, and
+  a document navigated to before the previous one has reported `HeadParsed` or `Complete` is
+  still `Started`, so the new document's `LoadStatus::Started` never reaches the embedder.
+  Its `<body>` still reports `HeadParsed` (`HTMLBodyElement::bind_to_tree`). The adapter
+  treats a second `HeadParsed`, or one in the same batch after the history change while a
+  browser `Navigate` is waiting with no `Started`, as that document. The headless run showed
+  `self.html` and `crash.html` committing as same-document pushes under a fresh id, with the
+  next push taking the browser's id; `LoadingChanged { loading: true }` (the head) followed
+  the commit in the same batch. The re-run is the check that this pairing holds.
 - **A load in flight is still dropped.** `Constellation::load_url` returns `None` with no
   embedder message when that browsing context is already in `pending_changes`. The queued
   navigation in `View::queued` stays. `AbortLoadUrl` still exists for 204/205.

@@ -38,16 +38,22 @@
 //!   current, carried along as the list changes shape, like the document keys; the history the
 //!   browser gets (and saves) names every entry rightly.
 //!
+//! Servo 0.7 drops `LoadStatus::Started` when the WebView's status is already `Started`
+//! (`set_load_status` ignores an unchanged value). A new WebView starts `Started`, and so does
+//! a document the browser navigates to before the previous one has reported `HeadParsed` or
+//! `Complete`. The new document's `<body>` still reports `HeadParsed`. That report is evidence
+//! of the new document: a second `HeadParsed` before the history change it belongs to, or one
+//! the runtime sees in the same batch after that change while a browser load is waiting and no
+//! `Started` arrived (`started_later`).
+//!
 //! Limits carried from Servo 0.5, all erring towards "new document" except the first: a page
-//! navigation
-//! from a document that never got a `<body>` (still `Started`) arrives without its own
-//! `Started`, which Servo suppresses as unchanged, and is taken for a same-document commit; a
-//! same-document commit that lands while a browser `Navigate`/`Reload` is loading and the
-//! current document is still `Started` is taken for that navigation; a history reshaped in a
-//! way this doesn't recognise (Servo trimming it) starts every entry afresh. A page's own step
-//! forward to the last entry (`history.forward()`) looks like a `pushState` that replaced the
-//! one entry after it; without a new document it is taken for a traversal and its effect is
-//! unknown.
+//! navigation from a document that never got a `<body>` (still `Started`) arrives without its
+//! own `Started` or `HeadParsed`, and is taken for a same-document commit; a same-document
+//! commit that lands while a browser `Navigate`/`Reload` is loading and the current document is
+//! still `Started` is taken for that navigation; a history reshaped in a way this doesn't
+//! recognise (Servo trimming it) starts every entry afresh. A page's own step forward to the
+//! last entry (`history.forward()`) looks like a `pushState` that replaced the one entry after
+//! it; without a new document it is taken for a traversal and its effect is unknown.
 //!
 //! Must not own: cross-engine history (the core).
 
@@ -124,6 +130,11 @@ pub(crate) struct Navigator {
     started: bool,
     /// The load status is `Started` as far as Servo knows (it suppresses a repeated `Started`).
     loading_started: bool,
+    /// The current document has reported `HeadParsed`.
+    saw_head: bool,
+    /// A further `HeadParsed` arrived before the history change of the document it belongs to.
+    /// Servo had already dropped that document's `Started`.
+    fresh_head: bool,
 }
 
 impl Navigator {
@@ -144,6 +155,35 @@ impl Navigator {
     pub fn load_status(&mut self, started: bool, counted: bool) {
         self.loading_started = started;
         self.started |= started && !counted;
+    }
+
+    /// Servo reported `HeadParsed`. The current document's first one is recorded. Another one
+    /// is a new document whose `Started` Servo dropped; `counted` means the history change
+    /// already consumed it.
+    pub fn head_parsed(&mut self, counted: bool) {
+        if counted {
+            self.saw_head = true;
+            self.fresh_head = false;
+            return;
+        }
+        if self.saw_head {
+            self.fresh_head = true;
+        } else {
+            self.saw_head = true;
+        }
+    }
+
+    /// A browser `Navigate` or `Reload` is waiting, and nothing yet says its document has
+    /// started. The runtime then pairs a `HeadParsed` later in the same batch with the history
+    /// change: Servo may have dropped `Started`.
+    pub fn pending_load_needs_evidence(&self) -> bool {
+        !self.started
+            && !self.loading_started
+            && !self.fresh_head
+            && self
+                .pending
+                .iter()
+                .any(|(_, request)| matches!(request, Request::Navigate | Request::Reload))
     }
 
     /// The current document, once one has committed.
@@ -169,9 +209,10 @@ impl Navigator {
     }
 
     /// Servo reported its history: `entries`, the current one at `current`. `started_later` says
-    /// whether Servo's `Started` for this view arrived in the same batch of callbacks after this
+    /// whether evidence of this document arrived in the same batch of callbacks after this
     /// report (the two come on different channels, so their order within one batch is
-    /// arbitrary). `traversal` is the browser's traversal this change carried out, if Servo said
+    /// arbitrary): `Started`, or a `HeadParsed` while a browser load is waiting and `Started`
+    /// never came. `traversal` is the browser's traversal this change carried out, if Servo said
     /// so (`notify_traversal_complete`). Returns the commit to report, if any.
     pub fn history_changed(
         &mut self,
@@ -186,6 +227,7 @@ impl Navigator {
         let old = self.reported.then_some((self.entries.len(), self.current));
         let shape = shape(old, (entries.len(), current));
         let started = self.started || started_later;
+        let fresh_head = self.fresh_head;
 
         // The browser request this commit carries out, if any: the traversal Servo named, or
         // the latest navigation or reload that fits.
@@ -199,7 +241,7 @@ impl Navigator {
             Request::Reload => shape == Shape::Replace,
             Request::Traverse(_) => false,
         };
-        let evidence_of_a_new_document = started || self.loading_started;
+        let evidence_of_a_new_document = started || self.loading_started || fresh_head;
         let attributed = match traversal {
             Some(id) => self.pending.iter().position(|&(other, _)| other == id),
             None => self
@@ -239,6 +281,10 @@ impl Navigator {
         self.reported = true;
         if new_document || self.document.is_none() {
             self.started = false;
+            // A head that arrived before this change belongs to the new document. One that
+            // arrives later (paired in the same batch) is applied by `head_parsed`.
+            self.saw_head = fresh_head;
+            self.fresh_head = false;
             self.document = Some(DocumentGeneration::next());
         }
         let history = match shape {
@@ -589,6 +635,47 @@ mod tests {
         n.forget(given_up);
         let late = load(&mut n, &["https://a/", "https://b/"], 1);
         assert_ne!(late.navigation, given_up);
+    }
+
+    /// Servo 0.7 drops `Started` while the WebView is still `Started`. The new document's
+    /// `HeadParsed` arrives first and is what attributes the browser's navigation.
+    #[test]
+    fn a_swallowed_started_is_replaced_by_the_new_documents_head() {
+        let mut n = Navigator::default();
+        n.request(NavigationId::next(), Request::Navigate);
+        let first = load(&mut n, &["https://a/"], 0);
+        n.head_parsed(false);
+        let next = NavigationId::next();
+        n.request(next, Request::Navigate);
+        n.head_parsed(false);
+        let commit = n
+            .history_changed(urls(&["https://a/", "https://b/"]), 1, false, None)
+            .unwrap();
+        assert_eq!(commit.navigation, next);
+        assert_ne!(commit.document, first.document);
+        assert_eq!(commit.history, Some(HistoryEffect::Push));
+        // The head was this document's. A fragment after it stays in the document.
+        let hash = page(&mut n, &["https://a/", "https://b/", "https://b/#x"], 2).unwrap();
+        assert_eq!(hash.document, commit.document);
+        assert_ne!(hash.navigation, next);
+    }
+
+    /// The current document's own `HeadParsed` is not a new document, so a fragment while a
+    /// navigation is pending keeps the document and its own id.
+    #[test]
+    fn the_current_documents_head_does_not_take_a_pending_navigation() {
+        let mut n = Navigator::default();
+        n.request(NavigationId::next(), Request::Navigate);
+        let doc = load(&mut n, &["https://a/"], 0).document;
+        n.head_parsed(false);
+        assert!(!n.pending_load_needs_evidence());
+        let to_b = NavigationId::next();
+        n.request(to_b, Request::Navigate);
+        assert!(n.pending_load_needs_evidence());
+        let hash = page(&mut n, &["https://a/", "https://a/#x"], 1).unwrap();
+        assert_ne!(hash.navigation, to_b);
+        assert_eq!(hash.document, doc);
+        assert!(n.pending_load_needs_evidence(), "b is still waiting");
     }
 
     #[test]
