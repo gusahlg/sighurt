@@ -11,26 +11,30 @@
 //!
 //! [`Session::pump`] pumps every runtime that was called, woke, or whose deadline passed, and
 //! feeds the events back through `run_core`. Frame-ready does not go to the core; the frontend
-//! is told, and it schedules presentation.
+//! is told, and it schedules presentation. [`Session::present`] hands a permit to the view's
+//! engine and records the frame. [`Session::shutdown`] runs the part of plan §20 that is not
+//! the frontend's own teardown.
 //!
 //! Must not own: browser policy (the core), drawing, or windows. The frontend owns those, and
 //! the loop that calls in.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::marker::PhantomData;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sighurt_api::engine::{EngineCommand, EngineError, EngineWaker};
+use sighurt_api::engine::{EngineCommand, EngineError, EngineWaker, PresentOutcome};
 use sighurt_api::events::EngineEvent;
+use sighurt_api::geometry::BufferSize;
 use sighurt_api::ids::{RequestId, TargetId, ViewId};
 use sighurt_api::services::{ClipboardData, ServiceError};
 use sighurt_core::{BrowserEvent, BrowserState, Effect, Environment};
 
-use crate::diagnostics::Diagnostics;
+use crate::diagnostics::{Diagnostics, EngineReport};
 use crate::frontend::Frontend;
 use crate::persistence::{Paths, SessionWriter};
-use crate::registry::Registry;
+use crate::registry::{Registry, State};
 use crate::services::{Completion, Services};
 use crate::view::ViewEntry;
 
@@ -40,40 +44,47 @@ const MAX_COMPLETIONS: usize = 64;
 const SESSION_DELAY: Duration = Duration::from_secs(1);
 
 /// The frontend-neutral half of the owner loop.
-pub struct Session<T: 'static, P: 'static> {
+///
+/// `F` ties the registry's target and permit: they are [`Frontend::Target`] and
+/// [`Frontend::Permit`], so a frontend cannot be given a session built for another pair.
+///
+/// [`Frontend::Target`]: crate::frontend::Frontend::Target
+/// [`Frontend::Permit`]: crate::frontend::Frontend::Permit
+pub struct Session<F: Frontend> {
     /// Browser policy.
-    pub core: BrowserState,
+    core: BrowserState,
     /// Events for the core, in order.
-    pub queue: VecDeque<BrowserEvent>,
+    queue: VecDeque<BrowserEvent>,
     /// What the build has.
-    pub registry: Registry<T, P>,
+    registry: Registry<F::Target, F::Permit>,
     /// Live engine views.
-    pub views: BTreeMap<ViewId, ViewEntry>,
-    /// Downloads and the page's clipboard bookkeeping.
-    pub services: Services,
+    views: BTreeMap<ViewId, ViewEntry>,
+    /// Downloads and the page's clipboard bookkeeping. `None` once shutdown has taken it.
+    services: Option<Services>,
     /// Counters and the diagnostics file.
-    pub diag: Diagnostics,
+    diag: Diagnostics,
     /// Configuration and session paths.
-    pub paths: Paths,
+    paths: Paths,
     /// Writes the session, when `[session] restore` is on and the file could be opened.
-    pub session: Option<SessionWriter>,
+    session: Option<SessionWriter>,
     /// When the changed session should be written. `None` when nothing is waiting.
-    pub session_due: Option<Instant>,
+    session_due: Option<Instant>,
     /// What configurations are checked against. Kept for reloads.
-    pub env: Environment,
+    env: Environment,
     /// Set when the loop must end, with the exit code.
-    pub quit: Option<ExitCode>,
+    quit: Option<ExitCode>,
     /// Engine wakers and service threads call this.
     wake: Arc<dyn Fn() + Send + Sync>,
+    _frontend: PhantomData<fn() -> F>,
 }
 
-impl<T: 'static, P: 'static> Session<T, P> {
+impl<F: Frontend> Session<F> {
     /// A session that has not started. `wake` is how engines and downloads reach the loop.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         core: BrowserState,
         env: Environment,
-        registry: Registry<T, P>,
+        registry: Registry<F::Target, F::Permit>,
         services: Services,
         paths: Paths,
         session: Option<SessionWriter>,
@@ -85,7 +96,7 @@ impl<T: 'static, P: 'static> Session<T, P> {
             queue: VecDeque::new(),
             registry,
             views: BTreeMap::new(),
-            services,
+            services: Some(services),
             diag,
             paths,
             session,
@@ -93,12 +104,73 @@ impl<T: 'static, P: 'static> Session<T, P> {
             env,
             quit: None,
             wake,
+            _frontend: PhantomData,
         }
+    }
+
+    /// Browser policy. Effects change it; a frontend only reads it.
+    pub fn core(&self) -> &BrowserState {
+        &self.core
+    }
+
+    /// Events waiting for the core, in order. The frontend pushes what its loop received.
+    pub fn queue_mut(&mut self) -> &mut VecDeque<BrowserEvent> {
+        &mut self.queue
+    }
+
+    /// The build's engines. Starting, pumping and shutting them down go through the session.
+    pub fn registry(&self) -> &Registry<F::Target, F::Permit> {
+        &self.registry
+    }
+
+    /// Live engine views. The frontend places them; the session records them.
+    pub fn views(&self) -> &BTreeMap<ViewId, ViewEntry> {
+        &self.views
+    }
+
+    /// Configuration and session paths.
+    pub fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
+    /// What configurations are checked against.
+    pub fn environment(&self) -> &Environment {
+        &self.env
+    }
+
+    /// Counters and the diagnostics file.
+    pub fn diagnostics(&self) -> &Diagnostics {
+        &self.diag
+    }
+
+    /// Counters and the diagnostics file.
+    pub fn diagnostics_mut(&mut self) -> &mut Diagnostics {
+        &mut self.diag
+    }
+
+    /// Whether the loop must end.
+    pub fn has_quit(&self) -> bool {
+        self.quit.is_some()
+    }
+
+    /// The loop must end with `code`. A later [`Effect::Quit`] does not replace it.
+    pub fn set_quit(&mut self, code: ExitCode) {
+        self.quit = Some(code);
+    }
+
+    /// When the changed session should be written. `None` when nothing is waiting.
+    pub fn session_due(&self) -> Option<Instant> {
+        self.session_due
+    }
+
+    /// Downloads and the page's clipboard bookkeeping.
+    fn services(&mut self) -> &mut Services {
+        self.services.as_mut().expect("services are shut down")
     }
 
     /// Hands queued events to the core and carries out its effects, until nothing is queued.
     /// Frontend work runs inside each effect, before the next one.
-    pub fn run_core(&mut self, frontend: &mut impl Frontend<Target = T>) {
+    pub fn run_core(&mut self, frontend: &mut F) {
         while let Some(event) = self.queue.pop_front() {
             self.diag.counters.core_events += 1;
             let effects = sighurt_core::update(&mut self.core, event);
@@ -110,7 +182,7 @@ impl<T: 'static, P: 'static> Session<T, P> {
     }
 
     /// Carries out one effect of the core.
-    fn apply(&mut self, frontend: &mut impl Frontend<Target = T>, effect: Effect) {
+    fn apply(&mut self, frontend: &mut F, effect: Effect) {
         match effect {
             Effect::OpenView {
                 view,
@@ -170,14 +242,14 @@ impl<T: 'static, P: 'static> Session<T, P> {
                     .downloads()
                     .map(std::path::Path::to_owned);
                 let performed =
-                    self.services
+                    self.services()
                         .perform(frontend, request, service, downloads.as_deref());
                 if let Some(result) = performed {
                     self.queue
                         .push_back(BrowserEvent::ServiceDone { request, result });
                 }
             }
-            Effect::CancelService(request) => self.services.cancel(frontend, request),
+            Effect::CancelService(request) => self.services().cancel(frontend, request),
             Effect::Prompt {
                 request,
                 origin,
@@ -206,7 +278,7 @@ impl<T: 'static, P: 'static> Session<T, P> {
     /// Opens `view` on `engine` with a new target, placed before the engine gets it.
     fn open_view(
         &mut self,
-        frontend: &mut impl Frontend<Target = T>,
+        frontend: &mut F,
         view: ViewId,
         engine: &str,
         options: sighurt_api::engine::ViewOptions,
@@ -267,7 +339,7 @@ impl<T: 'static, P: 'static> Session<T, P> {
 
     /// `view` is gone from its engine: forget it, and tell the frontend to drop its target's
     /// keyboard and text field.
-    pub fn forget_view(&mut self, frontend: &mut impl Frontend<Target = T>, view: ViewId) {
+    pub fn forget_view(&mut self, frontend: &mut F, view: ViewId) {
         let Some(entry) = self.views.remove(&view) else {
             return;
         };
@@ -280,7 +352,7 @@ impl<T: 'static, P: 'static> Session<T, P> {
         request: RequestId,
         result: Result<ClipboardData, ServiceError>,
     ) {
-        if let Some(result) = self.services.clipboard_read(request, result) {
+        if let Some(result) = self.services().clipboard_read(request, result) {
             self.queue
                 .push_back(BrowserEvent::ServiceDone { request, result });
         }
@@ -288,8 +360,8 @@ impl<T: 'static, P: 'static> Session<T, P> {
 
     /// Takes what service threads reported. A status line becomes a notice. Returns whether
     /// there was anything.
-    pub fn service_completions(&mut self, frontend: &mut impl Frontend<Target = T>) -> bool {
-        let completions = self.services.completions(MAX_COMPLETIONS);
+    pub fn service_completions(&mut self, frontend: &mut F) -> bool {
+        let completions = self.services().completions(MAX_COMPLETIONS);
         let worked = !completions.is_empty();
         for completion in completions {
             match completion {
@@ -301,7 +373,7 @@ impl<T: 'static, P: 'static> Session<T, P> {
     }
 
     /// Pumps the runtimes that are due and hands their events on. Returns whether any was.
-    pub fn pump(&mut self, frontend: &mut impl Frontend<Target = T>) -> bool {
+    pub fn pump(&mut self, frontend: &mut F) -> bool {
         let now = Instant::now();
         let due = self.registry.due(now);
         for &engine in &due {
@@ -319,7 +391,7 @@ impl<T: 'static, P: 'static> Session<T, P> {
 
     fn engine_event(
         &mut self,
-        frontend: &mut impl Frontend<Target = T>,
+        frontend: &mut F,
         engine: &'static str,
         event: EngineEvent,
         at: Instant,
@@ -401,6 +473,184 @@ impl<T: 'static, P: 'static> Session<T, P> {
     pub fn session_changed(&mut self) {
         self.session_due
             .get_or_insert_with(|| Instant::now() + SESSION_DELAY);
+    }
+
+    /// Asks the frontend to place every view. Returns whether the placement changed.
+    pub fn place(&mut self, frontend: &mut F) -> bool {
+        frontend.place(&self.views, &mut self.diag)
+    }
+
+    /// A navigation whose tab the user left is no longer waited for: its first frame is not a
+    /// `first-frame` line.
+    pub fn release_inactive_navigations(&mut self) {
+        let active = self.core.tabs().nth(self.core.active()).map(|tab| tab.id);
+        let stale: Vec<ViewId> = self
+            .views
+            .keys()
+            .copied()
+            .filter(|&view| self.core.view(view).map(|v| v.tab()) != active)
+            .collect();
+        for view in stale {
+            if let Some(entry) = self.views.get_mut(&view) {
+                entry.navigated = None;
+            }
+        }
+    }
+
+    /// The engine `view` runs in, and its tab's position in the tab strip, from 1.
+    pub fn view_report(&self, view: ViewId) -> (String, Option<usize>) {
+        let engine = self.views[&view].engine.clone();
+        let tab_id = self.core.view(view).map(|view| view.tab());
+        let tab = tab_id.and_then(|id| {
+            self.core
+                .tabs()
+                .position(|tab| tab.id == id)
+                .map(|index| index + 1)
+        });
+        (engine, tab)
+    }
+
+    /// Readbacks made since each running engine's last frame, each as big as `bytes_each`.
+    /// Called when a report is built, before the runtimes shut down.
+    pub fn account_readbacks(&mut self, bytes_each: u64) {
+        let pending: Vec<(&'static str, u64)> = self
+            .registry
+            .engines()
+            .filter_map(|engine| match engine.state() {
+                State::Running(runtime) => Some((engine.name, runtime.readbacks())),
+                _ => None,
+            })
+            .collect();
+        for (name, total) in pending {
+            self.diag.readbacks(name, total, bytes_each);
+        }
+    }
+
+    /// Every compiled-in engine, as a diagnostics report says it.
+    pub fn engine_reports(&self) -> Vec<EngineReport> {
+        self.registry
+            .engines()
+            .map(|engine| {
+                let running = match engine.state() {
+                    State::Running(runtime) => Some(runtime),
+                    _ => None,
+                };
+                EngineReport {
+                    name: engine.name,
+                    renderer: engine.renderer,
+                    gl: running
+                        .and_then(|runtime| runtime.renderer())
+                        .and_then(|(mode, gl)| gl.map(|gl| format!("{mode}: {gl}"))),
+                    readbacks: running.map_or(0, |runtime| runtime.readbacks()),
+                    gl_reads: running.and_then(|runtime| runtime.gl_reads()),
+                    state: match engine.state() {
+                        State::NotStarted => "not started".into(),
+                        State::Running(_) => "running".into(),
+                        State::ShutDown => "shut down".into(),
+                        State::Failed(why) => format!("failed: {why}"),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Presents `view` with `permit` and records the `frame`, `renderer`, `first-frame` and
+    /// readback lines. `buffer_size` is the permit's buffer, which a frontend knows and the
+    /// permit type here does not. `None` when the view is gone or its engine is not running:
+    /// the permit is dropped and nothing is counted. Otherwise what the engine's `present` did.
+    pub fn present(
+        &mut self,
+        view: ViewId,
+        permit: F::Permit,
+        buffer_size: BufferSize,
+    ) -> Option<Result<PresentOutcome, EngineError>> {
+        let Session {
+            views,
+            registry,
+            diag,
+            ..
+        } = self;
+        let entry = views.get_mut(&view)?;
+        let runtime = registry.running(&entry.engine)?;
+        let started = Instant::now();
+        let outcome = runtime.present(view, permit);
+        let took = started.elapsed();
+        match &outcome {
+            Ok(PresentOutcome::Submitted) => {
+                if !diag.knows_renderer(&entry.engine) {
+                    if let Some((mode, gl)) = runtime.renderer() {
+                        diag.renderer(&entry.engine, mode, gl.as_deref());
+                    }
+                }
+                let buffer = u64::from(buffer_size.width) * u64::from(buffer_size.height) * 4;
+                let readback_bytes = diag.readbacks(&entry.engine, runtime.readbacks(), buffer);
+                let size = (buffer_size.width, buffer_size.height);
+                let paint = runtime.paint_time().unwrap_or(took);
+                diag.frame(
+                    &entry.engine,
+                    view.serial(),
+                    size,
+                    (paint, took),
+                    readback_bytes,
+                );
+                if let Some(asked) = entry.navigated.take() {
+                    diag.first_frame(&entry.engine, asked.elapsed());
+                }
+            }
+            Ok(PresentOutcome::NotReady) => diag.counters.page_not_ready += 1,
+            Ok(PresentOutcome::Unchanged) => diag.counters.page_unchanged += 1,
+            Err(error) => {
+                diag.counters.present_errors += 1;
+                let message = format!("{} could not present {view:?}: {error}", entry.engine);
+                diag.error(message);
+            }
+        }
+        Some(outcome)
+    }
+
+    /// Shuts down the part of plan §20 that is not the frontend tearing itself down, and returns
+    /// the exit code. The order is fixed: cancel downloads, write the session and finish the
+    /// writer, forget and close every view, `report` (the final diagnostics, while the runtimes
+    /// can still say how they render), shut the runtimes down, shut services down, delete scratch
+    /// directories. If a runtime had to be left running (decision 54), the frontend is asked to
+    /// clean up and the process ends with [`exit_now`]; destructors do not run. Otherwise the
+    /// caller tears the frontend down after this returns: the session stays alive until the
+    /// caller drops it, so those destructors still run after the frontend's own.
+    pub fn shutdown(
+        &mut self,
+        frontend: &mut F,
+        report: impl FnOnce(&mut Self, &mut F),
+    ) -> ExitCode {
+        let code = self.quit.take().unwrap_or(ExitCode::SUCCESS);
+        self.services().cancel_downloads();
+        if let Some(writer) = self.session.take() {
+            if self.core.config().restore_session() {
+                writer.save(self.core.session().to_text());
+            }
+            writer.finish();
+        }
+        let views: Vec<(ViewId, String)> = self
+            .views
+            .iter()
+            .map(|(&view, entry)| (view, entry.engine.clone()))
+            .collect();
+        for (view, engine) in views {
+            self.forget_view(frontend, view);
+            if let Some(runtime) = self.registry.running(&engine) {
+                runtime.close_view(view);
+            }
+        }
+        report(self, frontend);
+        self.registry.shutdown();
+        let services = self.services.take().expect("shutdown once");
+        services.shutdown();
+        // Late, so that no guest still finishing its last call writes there again.
+        self.registry.remove_scratch();
+        if self.registry.leaked() {
+            frontend.before_forced_exit();
+            exit_now(code);
+        }
+        code
     }
 }
 

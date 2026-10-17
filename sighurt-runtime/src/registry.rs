@@ -23,12 +23,14 @@
 //! The keymaps of the build are listed here ([`KEYMAPS`]), as engines are: compiled in, chosen
 //! by `[input] keymap`. Chromes are the frontend's.
 //!
-//! Each engine declares the settings of `[engines.<name>]` it honors (`user-agent`, `storage`),
-//! which the core checks the configuration against, and every runtime starts with the settings
-//! of the configuration the process started with, whenever it starts ([`Launch`]). The
-//! frontend makes the engine's own configuration (`ServoConfig`, `WasmConfig`, `WpeConfig`)
-//! from the helpers here. An engine started with `storage = "ephemeral"` that has to write
-//! while it runs gets a directory of its own under `$XDG_RUNTIME_DIR` ([`Launch::scratch`]),
+//! What each engine supports, and which settings of `[engines.<name>]` it honors, is the
+//! build's [`crate::engines::descriptors`], so every frontend's [`Environment`] says the same
+//! thing. A frontend binds each descriptor with a renderer label and a start function
+//! ([`Registry::bind`]) and makes the engine's own configuration (`ServoConfig`, `WasmConfig`,
+//! `WpeConfig`) from the helpers here. Every runtime starts with the settings of the
+//! configuration the process started with, whenever it starts ([`Launch`]). An engine started
+//! with `storage = "ephemeral"` that has to write while it runs gets a directory of its own
+//! under `$XDG_RUNTIME_DIR` ([`Launch::scratch`]),
 //! which [`Registry::remove_scratch`] deletes at the end of shutdown, after everything that
 //! could still write there has stopped.
 //!
@@ -210,6 +212,18 @@ impl Launch<'_> {
     }
 }
 
+/// What a frontend adds to one compiled-in engine: which one, how its views present, and how
+/// to start its runtime bound to the frontend's target and permit. The name, capabilities and
+/// honored settings come from [`crate::engines::descriptors`].
+pub struct Binding<T: 'static, P: 'static> {
+    /// The engine's name. One of [`crate::engines::descriptors`], bound once.
+    pub name: &'static str,
+    /// How it renders, for diagnostics and the home page.
+    pub renderer: &'static str,
+    /// Builds the runtime. Called on first use, and for Servo at launch when it is enabled.
+    pub start: fn(EngineWaker, Launch<'_>) -> Result<Runtime<T, P>, String>,
+}
+
 /// One compiled-in engine.
 pub struct Engine<T: 'static, P: 'static> {
     /// Its name in the configuration.
@@ -307,12 +321,44 @@ pub struct Registry<T: 'static, P: 'static> {
 }
 
 impl<T: 'static, P: 'static> Registry<T, P> {
-    /// `engines`, none started. The frontend builds the list, in the order they shut down.
+    /// `engines`, none started. [`Registry::bind`] is how a frontend builds this: the order is
+    /// the descriptor order, which is the shutdown order.
     pub fn new(engines: Vec<Engine<T, P>>) -> Self {
         Self {
             engines,
             leaked: false,
         }
+    }
+
+    /// The build's engines, each bound once, in descriptor order (the shutdown order). `bindings`
+    /// names each engine of [`crate::engines::descriptors`] and no other.
+    pub fn bind(bindings: Vec<Binding<T, P>>) -> Self {
+        let descriptors = crate::engines::descriptors();
+        let engines = descriptors
+            .iter()
+            .map(|desc| {
+                let found: Vec<_> = bindings.iter().filter(|b| b.name == desc.name).collect();
+                assert!(
+                    found.len() == 1,
+                    "the {} engine is compiled in: the frontend must bind it once (it bound it {} times)",
+                    desc.name,
+                    found.len()
+                );
+                let binding = found[0];
+                Engine::new(
+                    desc.name,
+                    desc.capabilities,
+                    binding.renderer,
+                    desc.honors,
+                    binding.start,
+                )
+            })
+            .collect();
+        assert!(
+            bindings.len() == descriptors.len(),
+            "the frontend bound an engine this build does not have"
+        );
+        Self::new(engines)
     }
 
     /// What the core checks configurations against: the build's engines, with what each

@@ -20,6 +20,6 @@ pub struct ViewEntry {
     /// Whether the core shows it (`SetVisibility`).
     pub visible: bool,
     /// When it was last asked to navigate while its tab was the active one, until its next
-    /// frame or until another tab becomes active.
-    pub navigated: Option<Instant>,
+    /// frame or until another tab becomes active. The session clears it; a frontend does not.
+    pub(crate) navigated: Option<Instant>,
 }

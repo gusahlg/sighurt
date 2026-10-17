@@ -54,15 +54,15 @@ use std::time::{Duration, Instant};
 use calloop::generic::Generic;
 use calloop::ping::make_ping;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
-use sighurt_api::engine::{EngineCommand, EngineWaker, PresentOutcome};
+use sighurt_api::engine::{EngineCommand, EngineWaker};
 use sighurt_api::events::Cursor;
-use sighurt_api::geometry::LogicalSize;
+use sighurt_api::geometry::{LogicalSize, WindowRect};
 use sighurt_api::ids::{RequestId, SeatId, TargetId, ViewId, WindowId};
 use sighurt_api::input::{InputEvent, InputKind, KeyboardFocus, PointerButton, PointerEvent};
 use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_core::tabs::{Content, TabSummary};
 use sighurt_core::{BrowserEvent, BrowserState, OpenRequest};
-use sighurt_runtime::diagnostics::{Diagnostics, EngineReport, Report, TabReport, TargetReport};
+use sighurt_runtime::diagnostics::{Diagnostics, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
 use sighurt_runtime::registry::State;
@@ -138,7 +138,7 @@ struct Gui {
 /// The owner loop's state: the window and the session, and what the loop's sources report.
 struct App {
     gui: Gui,
-    session: Session<TargetLease, FramePermit>,
+    session: Session<Gui>,
     config_changed: bool,
     signals: Vec<u8>,
 }
@@ -155,12 +155,12 @@ pub fn run(options: Options, signals: OwnedFd) -> Result<ExitCode, String> {
         .map_err(|e| e.error.to_string())?;
     let mut app = App::new(host, ping, options)?;
     // From here on every way out goes through `App::shutdown`, which releases in §20's order.
-    match watch(&handle, signals, &app.session.paths) {
+    match watch(&handle, signals, app.session.paths()) {
         Ok(()) => app.start(),
         Err(error) => app.fail(error),
     }
     let mut busy = true;
-    while app.session.quit.is_none() {
+    while !app.session.has_quit() {
         let timeout = if busy {
             Some(Duration::ZERO)
         } else {
@@ -171,7 +171,7 @@ pub fn run(options: Options, signals: OwnedFd) -> Result<ExitCode, String> {
             break;
         }
         if timeout != Some(Duration::ZERO) {
-            app.session.diag.counters.wakeups += 1;
+            app.session.diagnostics_mut().counters.wakeups += 1;
         }
         busy = app.iterate();
     }
@@ -241,6 +241,7 @@ impl Clipboard for Gui {
 
 impl Frontend for Gui {
     type Target = TargetLease;
+    type Permit = FramePermit;
 
     fn open_target(
         &mut self,
@@ -504,25 +505,24 @@ impl Gui {
     /// chrome's surface with its text field (or its first surface), the shown view, or the
     /// chrome's surface at the page's rectangle while it draws the page.
     fn sync_keyboard_focus(&mut self, focus: KeyboardFocus, shown: Option<TargetId>) {
-        let layout = self.chrome.layout().clone();
-        let listed = |leases: &BTreeMap<SurfaceName, TargetLease>, rect: Option<_>| {
-            layout
-                .surfaces
-                .iter()
-                .filter(|surface| rect.is_none_or(|rect| surface.rect == rect))
-                .find_map(|surface| leases.get(surface.name).map(TargetLease::id))
-        };
-        let wanted = match focus {
-            KeyboardFocus::Chrome => self
-                .chrome_text_target
-                .or_else(|| listed(&self.leases, None)),
-            KeyboardFocus::Page => shown.or_else(|| {
-                let page = layout.page;
-                listed(
-                    &self.leases,
-                    Some(page).filter(|page| !page.size().is_empty()),
-                )
-            }),
+        let chrome_text = self.chrome_text_target;
+        let wanted = {
+            let layout = self.chrome.layout();
+            let leases = &self.leases;
+            let listed = |rect: Option<WindowRect>| {
+                layout
+                    .surfaces
+                    .iter()
+                    .filter(|surface| rect.is_none_or(|rect| surface.rect == rect))
+                    .find_map(|surface| leases.get(surface.name).map(TargetLease::id))
+            };
+            match focus {
+                KeyboardFocus::Chrome => chrome_text.or_else(|| listed(None)),
+                KeyboardFocus::Page => shown.or_else(|| {
+                    let page = layout.page;
+                    listed(Some(page).filter(|page| !page.size().is_empty()))
+                }),
+            }
         };
         if wanted != self.keyboard_target {
             self.keyboard_target = wanted;
@@ -624,8 +624,8 @@ impl App {
             keyboard_target: None,
             page_text_target: None,
         };
-        gui.chrome_actions(&mut session.queue, configured);
-        session.queue.push_back(BrowserEvent::Start {
+        gui.chrome_actions(session.queue_mut(), configured);
+        session.queue_mut().push_back(BrowserEvent::Start {
             session: None,
             open: options.open,
         });
@@ -643,8 +643,8 @@ impl App {
     /// Restores the session, unless `[session] restore` is off, and opens the command line's
     /// pages.
     fn start(&mut self) {
-        let path = self.session.paths.session.as_deref();
-        let path = path.filter(|_| self.session.core.config().restore_session());
+        let restore = self.session.core().config().restore_session();
+        let path = self.session.paths().session.as_deref().filter(|_| restore);
         let restored = match path.map(persistence::load_session) {
             Some(Ok(session)) => session,
             Some(Err(error)) => {
@@ -654,7 +654,9 @@ impl App {
             }
             None => None,
         };
-        if let Some(BrowserEvent::Start { session: slot, .. }) = self.session.queue.front_mut() {
+        if let Some(BrowserEvent::Start { session: slot, .. }) =
+            self.session.queue_mut().front_mut()
+        {
             *slot = restored;
         }
         self.session.run_core(&mut self.gui);
@@ -663,7 +665,7 @@ impl App {
     /// One iteration of the loop, after it woke. Returns whether work is left that shouldn't
     /// wait: the next iteration then starts at once.
     fn iterate(&mut self) -> bool {
-        self.session.diag.counters.iterations += 1;
+        self.session.diagnostics_mut().counters.iterations += 1;
         self.handle_signals();
         if std::mem::take(&mut self.config_changed) {
             self.reload_config();
@@ -687,31 +689,31 @@ impl App {
                 busy = false;
                 break;
             }
-            if self.session.quit.is_some() {
+            if self.session.has_quit() {
                 break;
             }
         }
         if self
             .session
-            .session_due
+            .session_due()
             .is_some_and(|due| due <= Instant::now())
         {
             self.session.save_session();
         }
         self.gui.host.flush();
-        busy && self.session.quit.is_none()
+        busy && !self.session.has_quit()
     }
 
     /// How long the loop may sleep: until the earliest pump deadline, session save or notice
     /// giving way to the page's status, or until something happens.
     fn timeout(&self) -> Option<Duration> {
         let now = Instant::now();
-        let pump = match self.session.registry.next_pump() {
+        let pump = match self.session.registry().next_pump() {
             Some(None) => return Some(Duration::ZERO),
             Some(Some(at)) => Some(at),
             None => None,
         };
-        let next = [pump, self.session.session_due, self.gui.notice_first]
+        let next = [pump, self.session.session_due(), self.gui.notice_first]
             .into_iter()
             .flatten()
             .min();
@@ -720,16 +722,16 @@ impl App {
 
     /// `sig` can't go on: reports `error` and quits with a failure.
     fn fail(&mut self, error: String) {
-        self.session.diag.error(error);
-        self.session.quit = Some(ExitCode::FAILURE);
+        self.session.diagnostics_mut().error(error);
+        self.session.set_quit(ExitCode::FAILURE);
     }
 
     fn handle_signals(&mut self) {
         for signal in std::mem::take(&mut self.signals) {
             match i32::from(signal) {
-                libc::SIGUSR1 => self.report(false),
+                libc::SIGUSR1 => report(&self.gui, &mut self.session, false),
                 libc::SIGTERM | libc::SIGINT => {
-                    self.session.queue.push_back(BrowserEvent::Command(
+                    self.session.queue_mut().push_back(BrowserEvent::Command(
                         sighurt_api::commands::Command::BrowserQuit,
                     ));
                     self.session.run_core(&mut self.gui);
@@ -747,10 +749,10 @@ impl App {
                 break;
             };
             if push_coalesced(&mut batch, event) {
-                self.session.diag.counters.motions_coalesced += 1;
+                self.session.diagnostics_mut().counters.motions_coalesced += 1;
             }
         }
-        let peaks = &mut self.session.diag.peaks;
+        let peaks = &mut self.session.diagnostics_mut().peaks;
         peaks.max_host_queue = peaks.max_host_queue.max(batch.len() as u64);
         let worked = !batch.is_empty();
         for event in batch {
@@ -766,10 +768,10 @@ impl App {
             HostEvent::WindowConfigured { size, .. } => {
                 self.gui.size = Some(size);
                 let actions = self.gui.chrome.handle(ChromeEvent::Resize(size));
-                self.gui.chrome_actions(&mut self.session.queue, actions);
+                self.gui.chrome_actions(self.session.queue_mut(), actions);
                 self.gui.place_now = true;
             }
-            HostEvent::CloseRequested { .. } => self.session.queue.push_back(
+            HostEvent::CloseRequested { .. } => self.session.queue_mut().push_back(
                 BrowserEvent::Command(sighurt_api::commands::Command::BrowserQuit),
             ),
             HostEvent::MetricsChanged { target, metrics } => {
@@ -779,7 +781,7 @@ impl App {
                 }
             }
             HostEvent::Input { target, event, .. } => {
-                self.session.diag.counters.input_events += 1;
+                self.session.diagnostics_mut().counters.input_events += 1;
                 self.input(target, event, at);
             }
             HostEvent::ClipboardRead { request, result } => {
@@ -791,7 +793,7 @@ impl App {
                             .gui
                             .chrome
                             .handle(ChromeEvent::Pasted { request, text });
-                        self.gui.chrome_actions(&mut self.session.queue, actions);
+                        self.gui.chrome_actions(self.session.queue_mut(), actions);
                     }
                 } else {
                     self.session.clipboard_done(request, result);
@@ -820,7 +822,7 @@ impl App {
                 if side {
                     let view = target.and_then(|t| self.session.view_of(t));
                     self.session
-                        .queue
+                        .queue_mut()
                         .push_back(BrowserEvent::Button { view, event, at });
                 } else if let Some(surface) = target.and_then(|t| self.gui.surface_of(t)) {
                     let event = pointer.clone();
@@ -828,23 +830,23 @@ impl App {
                         .gui
                         .chrome
                         .handle(ChromeEvent::Pointer { surface, event });
-                    self.gui.chrome_actions(&mut self.session.queue, actions);
+                    self.gui.chrome_actions(self.session.queue_mut(), actions);
                 } else if let Some(view) = target.and_then(|t| self.session.view_of(t)) {
                     self.session
-                        .queue
+                        .queue_mut()
                         .push_back(BrowserEvent::Pointer { view, event, at });
                 }
             }
             InputKind::Focus(focus) => {
                 let actions = self.gui.chrome.handle(ChromeEvent::WindowFocus(*focus));
-                self.gui.chrome_actions(&mut self.session.queue, actions);
+                self.gui.chrome_actions(self.session.queue_mut(), actions);
                 self.session
-                    .queue
+                    .queue_mut()
                     .push_back(BrowserEvent::Keyboard { event, at });
             }
             InputKind::Key(_) | InputKind::TextInput(_) => self
                 .session
-                .queue
+                .queue_mut()
                 .push_back(BrowserEvent::Keyboard { event, at }),
         }
     }
@@ -860,21 +862,15 @@ impl App {
             }
             let snapshot = self.snapshot();
             let actions = self.gui.chrome.handle(ChromeEvent::Snapshot(snapshot));
-            self.gui.chrome_actions(&mut self.session.queue, actions);
+            self.gui.chrome_actions(self.session.queue_mut(), actions);
             self.session.run_core(&mut self.gui);
             worked = true;
             // A navigation whose tab the user left is no longer waited for.
-            let active = self.active_tab().map(|tab| tab.id);
-            let Session { core, views, .. } = &mut self.session;
-            for (view, entry) in views.iter_mut() {
-                if core.view(*view).map(|v| v.tab()) != active {
-                    entry.navigated = None;
-                }
-            }
+            self.session.release_inactive_navigations();
         }
-        worked |= self.gui.place(&self.session.views, &mut self.session.diag);
+        worked |= self.session.place(&mut self.gui);
         let shown = self.session.shown_view().map(|(_, entry)| entry.target);
-        let focus = self.session.core.focus();
+        let focus = self.session.core().focus();
         self.gui.sync_keyboard_focus(focus, shown);
         worked
     }
@@ -882,46 +878,53 @@ impl App {
     /// What the chrome shows: the core's tabs, the status line and the home page, contained.
     fn snapshot(&self) -> Snapshot {
         let status = |tab: &TabSummary<'_>| self.status(tab).map(|(_, text)| text.to_owned());
-        chrome::snapshot(&self.session.core, self.home_info(), status)
+        chrome::snapshot(self.session.core(), self.home_info(), status)
     }
 
     /// What `sig://home` says: the configuration file and the engines of this build.
     fn home_info(&self) -> HomeInfo {
-        let config = self.session.core.config();
-        let engines = self
+        let listed: Vec<_> = self
             .session
-            .registry
+            .registry()
             .engines()
             .map(|engine| {
-                let mut detail = vec![format!("compiled in, {}", engine.renderer)];
-                if engine.name == config.default_engine() {
+                let failed = match engine.state() {
+                    State::Failed(why) => Some(why.to_owned()),
+                    _ => None,
+                };
+                (engine.name, engine.renderer, failed)
+            })
+            .collect();
+        let config_path = self
+            .session
+            .paths()
+            .config
+            .as_ref()
+            .map_or_else(String::new, |path| path.display().to_string());
+        let config = self.session.core().config();
+        let engines = listed
+            .into_iter()
+            .map(|(name, renderer, failed)| {
+                let mut detail = vec![format!("compiled in, {renderer}")];
+                if name == config.default_engine() {
                     detail.push("default".into());
                 }
-                let enabled = config.is_enabled(engine.name);
+                let enabled = config.is_enabled(name);
                 if !enabled {
                     detail.push("disabled in the configuration".into());
                 }
-                let failed = match engine.state() {
-                    State::Failed(why) => Some(why),
-                    _ => None,
-                };
-                if let Some(why) = failed {
+                if let Some(why) = &failed {
                     detail.push(format!("failed: {why}"));
                 }
                 EngineRow {
-                    name: engine.name.to_owned(),
+                    name: name.to_owned(),
                     detail: detail.join(" · "),
                     available: enabled && failed.is_none(),
                 }
             })
             .collect();
         HomeInfo {
-            config_path: self
-                .session
-                .paths
-                .config
-                .as_ref()
-                .map_or_else(String::new, |p| p.display().to_string()),
+            config_path,
             engines,
         }
     }
@@ -941,11 +944,6 @@ impl App {
         )
     }
 
-    /// The active tab.
-    fn active_tab(&self) -> Option<TabSummary<'_>> {
-        self.session.core.tabs().nth(self.session.core.active())
-    }
-
     /// Hands each permit the host issues to its presenter. Returns whether there were any.
     fn present(&mut self) -> bool {
         let permits = self.gui.host.permits();
@@ -955,7 +953,8 @@ impl App {
             if let Some(surface) = self.gui.surface_of(target) {
                 self.paint_chrome(surface, permit);
             } else if let Some(view) = self.session.view_of(target) {
-                self.present_view(view, permit);
+                let size = permit.metrics().buffer();
+                let _ = self.session.present(view, permit, size);
             }
             // Otherwise the target is being retired: dropping the permit presents nothing.
         }
@@ -971,7 +970,9 @@ impl App {
                 })
                 .collect();
             let bytes = host.targets.iter().map(|t| t.buffers.bytes).sum();
-            self.session.diag.buffers(per_target.into_iter(), bytes);
+            self.session
+                .diagnostics_mut()
+                .buffers(per_target.into_iter(), bytes);
         }
         worked
     }
@@ -982,7 +983,7 @@ impl App {
             Ok(frame) => frame,
             Err(error) => {
                 self.session
-                    .diag
+                    .diagnostics_mut()
                     .error(format!("no buffer for the chrome's {surface}: {error}"));
                 return;
             }
@@ -998,80 +999,36 @@ impl App {
         match self.gui.chrome.paint(surface, &metrics, buffer) {
             Ok(()) => {
                 frame.submit();
-                self.session.diag.chrome(surface, started.elapsed());
+                self.session
+                    .diagnostics_mut()
+                    .chrome(surface, started.elapsed());
             }
             // The buffer goes back unsubmitted.
             Err(error) => self
                 .session
-                .diag
+                .diagnostics_mut()
                 .error(format!("painting the chrome's {surface} failed: {error}")),
         }
     }
 
-    fn present_view(&mut self, view: ViewId, permit: FramePermit) {
-        let Session {
-            views,
-            registry,
-            diag,
-            ..
-        } = &mut self.session;
-        let Some(entry) = views.get_mut(&view) else {
-            return;
-        };
-        let size = permit.metrics().buffer();
-        let Some(runtime) = registry.running(&entry.engine) else {
-            return;
-        };
-        let started = Instant::now();
-        let outcome = runtime.present(view, permit);
-        let took = started.elapsed();
-        match outcome {
-            Ok(PresentOutcome::Submitted) => {
-                if !diag.knows_renderer(&entry.engine) {
-                    if let Some((mode, gl)) = runtime.renderer() {
-                        diag.renderer(&entry.engine, mode, gl.as_deref());
-                    }
-                }
-                let buffer = u64::from(size.width) * u64::from(size.height) * 4;
-                let readback_bytes = diag.readbacks(&entry.engine, runtime.readbacks(), buffer);
-                let size = (size.width, size.height);
-                let paint = runtime.paint_time().unwrap_or(took);
-                diag.frame(
-                    &entry.engine,
-                    view.serial(),
-                    size,
-                    (paint, took),
-                    readback_bytes,
-                );
-                if let Some(asked) = entry.navigated.take() {
-                    diag.first_frame(&entry.engine, asked.elapsed());
-                }
-            }
-            Ok(PresentOutcome::NotReady) => diag.counters.page_not_ready += 1,
-            Ok(PresentOutcome::Unchanged) => diag.counters.page_unchanged += 1,
-            Err(error) => {
-                diag.counters.present_errors += 1;
-                let message = format!("{} could not present {view:?}: {error}", entry.engine);
-                diag.error(message);
-            }
-        }
-    }
-
     fn reload_config(&mut self) {
-        self.session.diag.counters.config_reloads += 1;
-        match persistence::load_config(self.session.paths.config.as_deref(), &self.session.env) {
+        self.session.diagnostics_mut().counters.config_reloads += 1;
+        match persistence::load_config(
+            self.session.paths().config.as_deref(),
+            self.session.environment(),
+        ) {
             Ok(config) => {
                 // Saving the session again: the tabs as they are now go to the file soon.
-                if config.restore_session() && !self.session.core.config().restore_session() {
+                if config.restore_session() && !self.session.core().config().restore_session() {
                     self.session.session_changed();
                 }
                 let actions = self
                     .gui
                     .chrome
                     .handle(chrome::configure(&config, self.gui.chrome_name));
-                self.gui.chrome_actions(&mut self.session.queue, actions);
+                self.gui.chrome_actions(self.session.queue_mut(), actions);
                 self.session
-                    .queue
+                    .queue_mut()
                     .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
                 self.gui.notice_first = None;
                 if self.gui.notice.take().is_some() {
@@ -1081,7 +1038,7 @@ impl App {
             Err(persistence::LoadError::Config(error)) => {
                 log::warn!("the configuration in use stays: {error}");
                 self.session
-                    .queue
+                    .queue_mut()
                     .push_back(BrowserEvent::ConfigReloaded(Err(error)));
             }
             Err(persistence::LoadError::Other(message)) => {
@@ -1094,165 +1051,17 @@ impl App {
         self.session.run_core(&mut self.gui);
     }
 
-    fn report(&mut self, at_exit: bool) {
-        // Readbacks made since the engines' last frames, each as big as the page area.
-        let scale = self
-            .gui
-            .leases
-            .values()
-            .next()
-            .map(|lease| lease.metrics().scale());
-        let page = scale.map(|scale| scale.buffer_size(self.gui.chrome.layout().page.size()));
-        let page_bytes = page.map_or(0, |b| u64::from(b.width) * u64::from(b.height) * 4);
-        for engine in self.session.registry.engines() {
-            if let State::Running(runtime) = engine.state() {
-                self.session
-                    .diag
-                    .readbacks(engine.name, runtime.readbacks(), page_bytes);
-            }
-        }
-        let host = self.gui.host.diagnostics();
-        let targets = host
-            .targets
-            .iter()
-            .map(|t| {
-                let (role, engine, tab) = match (
-                    self.gui.surface_of(t.target),
-                    self.session.view_of(t.target),
-                ) {
-                    (Some(surface), _) => (surface, None, None),
-                    (None, Some(view)) => (
-                        "view",
-                        Some(self.session.views[&view].engine.clone()),
-                        self.session.core.view(view).and_then(|v| {
-                            self.session.core.tabs().position(|tab| tab.id == v.tab())
-                        }),
-                    ),
-                    (None, None) => ("retiring", None, None),
-                };
-                let (rect, buffer) = (t.metrics.rect(), t.metrics.buffer());
-                TargetReport {
-                    role,
-                    engine,
-                    tab: tab.map(|i| i + 1),
-                    width: rect.width,
-                    height: rect.height,
-                    buffer_width: buffer.width,
-                    buffer_height: buffer.height,
-                    scale: t.metrics.scale().numerator(),
-                    mapped: t.mapped,
-                    shown: t.shown,
-                    awaiting_callback: t.awaiting_callback,
-                    permits: t.stats.permits,
-                    submissions: t.stats.submissions,
-                    frame_callbacks: t.stats.frame_callbacks,
-                    releases: t.stats.releases,
-                    presented: t.stats.presented,
-                    discarded: t.stats.discarded,
-                    late: t.stats.late,
-                    buffers: t.buffers.buffers,
-                    buffer_bytes: t.buffers.bytes,
-                    retiring_generations: t.buffers.retiring_generations,
-                    retiring_bytes: t.buffers.retiring_bytes,
-                }
-            })
-            .collect();
-        let engines = self
-            .session
-            .registry
-            .engines()
-            .map(|engine| {
-                let running = match engine.state() {
-                    State::Running(runtime) => Some(runtime),
-                    _ => None,
-                };
-                EngineReport {
-                    name: engine.name,
-                    renderer: engine.renderer,
-                    gl: running
-                        .and_then(|r| r.renderer())
-                        .and_then(|(mode, gl)| gl.map(|gl| format!("{mode}: {gl}"))),
-                    readbacks: running.map_or(0, |r| r.readbacks()),
-                    gl_reads: running.and_then(|r| r.gl_reads()),
-                    state: match engine.state() {
-                        State::NotStarted => "not started".into(),
-                        State::Running(_) => "running".into(),
-                        State::ShutDown => "shut down".into(),
-                        State::Failed(why) => format!("failed: {why}"),
-                    },
-                }
-            })
-            .collect();
-        let tabs = self
-            .session
-            .core
-            .tabs()
-            .map(|tab| TabReport {
-                loading: tab.loading,
-                can_go_back: tab.can_go_back,
-                can_go_forward: tab.can_go_forward,
-                reloads: tab.reloads,
-                error: tab.error.is_some(),
-                engine: chrome::engine(&self.session.core, &tab).map(str::to_owned),
-            })
-            .collect();
-        let report = Report {
-            counters: self.session.diag.counters.clone(),
-            peaks: self.session.diag.peaks.clone(),
-            targets,
-            engines,
-            tabs,
-            active_tab: self.session.core.active() + 1,
-            status: self
-                .active_tab()
-                .and_then(|tab| self.status(&tab).map(|(from, _)| from)),
-            capabilities: format!("{:?}", host.capabilities),
-            pending_host_events: host.pending_events,
-            last_error: self.session.diag.last_error(),
-            // The Wayland window adds nothing. An empty map keeps the lines and the JSON as
-            // they were.
-            extra: Default::default(),
-        };
-        self.session.diag.report(&report, at_exit);
-    }
-
-    /// Shuts down in the order of plan §20 and returns the exit code. If an engine could not
-    /// shut down (decision 54), the process ends here with `_exit` once the session is written
-    /// and the downloads have ended or been deleted. The frontend cleans up first: this window
-    /// has nothing to restore, and dropping it would release Wayland objects the engine may
-    /// still use.
+    /// Shuts down in the order of plan §20 and returns the exit code. [`Session::shutdown`]
+    /// cancels downloads, writes the session, closes the views, writes the final report, shuts
+    /// the engines and services down and deletes scratch. If an engine could not shut down
+    /// (decision 54), that ends the process with `_exit` after this window is asked to clean
+    /// up, and the rest of this function does not run: dropping the window would release
+    /// Wayland objects the engine may still use. Otherwise this window drops its leases, closes
+    /// itself and drops the host.
     fn shutdown(mut self) -> ExitCode {
-        let code = self.session.quit.take().unwrap_or(ExitCode::SUCCESS);
-        self.session.services.cancel_downloads();
-        if let Some(writer) = self.session.session.take() {
-            if self.session.core.config().restore_session() {
-                writer.save(self.session.core.session().to_text());
-            }
-            writer.finish();
-        }
-        let views: Vec<(ViewId, String)> = self
+        let code = self
             .session
-            .views
-            .iter()
-            .map(|(&view, entry)| (view, entry.engine.clone()))
-            .collect();
-        for (view, engine) in views {
-            self.session.forget_view(&mut self.gui, view);
-            if let Some(runtime) = self.session.registry.running(&engine) {
-                runtime.close_view(view);
-            }
-        }
-        // Before the runtimes go: they know their renderer and readbacks.
-        self.report(true);
-        self.session.registry.shutdown();
-        let services = self.session.services;
-        services.shutdown();
-        // Late, so that no guest still finishing its last call writes there again.
-        self.session.registry.remove_scratch();
-        if self.session.registry.leaked() {
-            self.gui.before_forced_exit();
-            sighurt_runtime::exit_now(code);
-        }
+            .shutdown(&mut self.gui, |session, gui| report(gui, session, true));
         let leases = std::mem::take(&mut self.gui.leases);
         drop(leases);
         let window = self.gui.window;
@@ -1261,6 +1070,108 @@ impl App {
         drop(self.gui.host);
         code
     }
+}
+
+/// The diagnostics report. Called on SIGUSR1 and, from [`Session::shutdown`], at exit, while
+/// the runtimes can still say how they render.
+fn report(gui: &Gui, session: &mut Session<Gui>, at_exit: bool) {
+    // Readbacks made since the engines' last frames, each as big as the page area.
+    let scale = gui
+        .leases
+        .values()
+        .next()
+        .map(|lease| lease.metrics().scale());
+    let page = scale.map(|scale| scale.buffer_size(gui.chrome.layout().page.size()));
+    let page_bytes = page.map_or(0, |b| u64::from(b.width) * u64::from(b.height) * 4);
+    session.account_readbacks(page_bytes);
+    let host = gui.host.diagnostics();
+    let targets = host
+        .targets
+        .iter()
+        .map(|t| {
+            let (role, engine, tab) = match (gui.surface_of(t.target), session.view_of(t.target)) {
+                (Some(surface), _) => (surface, None, None),
+                (None, Some(view)) => {
+                    let (engine, tab) = session.view_report(view);
+                    ("view", Some(engine), tab)
+                }
+                (None, None) => ("retiring", None, None),
+            };
+            let (rect, buffer) = (t.metrics.rect(), t.metrics.buffer());
+            TargetReport {
+                role,
+                engine,
+                tab,
+                width: rect.width,
+                height: rect.height,
+                buffer_width: buffer.width,
+                buffer_height: buffer.height,
+                scale: t.metrics.scale().numerator(),
+                mapped: t.mapped,
+                shown: t.shown,
+                awaiting_callback: t.awaiting_callback,
+                permits: t.stats.permits,
+                submissions: t.stats.submissions,
+                frame_callbacks: t.stats.frame_callbacks,
+                releases: t.stats.releases,
+                presented: t.stats.presented,
+                discarded: t.stats.discarded,
+                late: t.stats.late,
+                buffers: t.buffers.buffers,
+                buffer_bytes: t.buffers.bytes,
+                retiring_generations: t.buffers.retiring_generations,
+                retiring_bytes: t.buffers.retiring_bytes,
+            }
+        })
+        .collect();
+    let engines = session.engine_reports();
+    let tabs = {
+        let core = session.core();
+        core.tabs()
+            .map(|tab| TabReport {
+                loading: tab.loading,
+                can_go_back: tab.can_go_back,
+                can_go_forward: tab.can_go_forward,
+                reloads: tab.reloads,
+                error: tab.error.is_some(),
+                engine: chrome::engine(core, &tab).map(str::to_owned),
+            })
+            .collect()
+    };
+    let active_tab = session.core().active() + 1;
+    let status = {
+        let core = session.core();
+        let index = core.active();
+        core.tabs().nth(index).and_then(|tab| {
+            let error = tab
+                .error
+                .filter(|_| !matches!(tab.content, Content::Blank))
+                .map(|error| error.message.as_str());
+            status_line(
+                gui.notice.as_deref(),
+                gui.notice_first.is_some(),
+                tab.status,
+                error,
+            )
+            .map(|(from, _)| from)
+        })
+    };
+    let counters = session.diagnostics().counters.clone();
+    let peaks = session.diagnostics().peaks.clone();
+    let last_error = session.diagnostics().last_error();
+    let report = Report {
+        counters,
+        peaks,
+        targets,
+        engines,
+        tabs,
+        active_tab,
+        status,
+        capabilities: format!("{:?}", host.capabilities),
+        pending_host_events: host.pending_events,
+        last_error,
+    };
+    session.diagnostics_mut().report(&report, at_exit);
 }
 
 /// What the status strip shows, and where it comes from: a notice of `sig`'s own while it is

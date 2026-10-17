@@ -30,6 +30,11 @@ pub trait Frontend: Clipboard {
     /// The engine's `Target`. The Wayland GUI uses the host's target lease.
     type Target: 'static;
 
+    /// The engine's `FramePermit`. The Wayland GUI uses the host's frame permit. A session is
+    /// [`Session<Self>`](crate::session::Session), so the registry's target and permit types are
+    /// this frontend's pair, not two types that happen to match.
+    type Permit: 'static;
+
     /// Create the view's target. The engine is already started. `Err` means no target exists.
     fn open_target(
         &mut self,

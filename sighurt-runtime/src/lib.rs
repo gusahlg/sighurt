@@ -7,10 +7,10 @@
 //! supplies targets, permits, the clipboard and the chrome through [`frontend::Frontend`].
 //!
 //! Must not own: windows, terminals, pixels, chrome layout, or a Wayland or chrome type. Those
-//! reach this crate only as the `Target` and `FramePermit` type parameters of
-//! [`registry::Registry`].
+//! reach this crate only as the [`frontend::Frontend`]'s `Target` and `Permit`.
 
 pub mod diagnostics;
+pub mod engines;
 pub mod frontend;
 pub mod persistence;
 pub mod registry;

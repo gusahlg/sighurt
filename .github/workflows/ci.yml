@@ -54,7 +54,8 @@ jobs:
 
       - name: Clippy (sig without Servo and WPE WebKit)
         run: >
-          cargo clippy -p sighurt-browser --no-default-features
+          cargo clippy -p sighurt-browser -p sighurt-runtime -p sighurt-gui
+          --no-default-features
           --features engine-demo,engine-wasm,keymap-modal,chrome-line
           --all-targets -- -D warnings
 
@@ -74,7 +75,8 @@ jobs:
       # need a compositor and run on a developer machine.
       - name: Test (sig without Servo and WPE WebKit)
         run: >
-          cargo test -p sighurt-browser --no-default-features
+          cargo test -p sighurt-browser -p sighurt-runtime -p sighurt-gui
+          --no-default-features
           --features engine-demo,engine-wasm,keymap-modal,chrome-line
 
   check-wasm:

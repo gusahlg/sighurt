@@ -34,10 +34,6 @@
 //!
 //! Never logs clipboard contents, credentials, URLs or other page data.
 //!
-//! A frontend adds its own fields through [`Report::extra`]. Empty, they change neither the
-//! `sig-diag` lines nor the JSON keys below; when present they are one more `frontend` line and
-//! extra keys on the JSON object, after the keys this module has always written.
-//!
 //! Must not own: decisions based on these numbers, or a frontend's own counters.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -213,10 +209,6 @@ pub struct Report {
     /// Host events not taken yet.
     pub pending_host_events: usize,
     pub last_error: Option<String>,
-    /// Fields a frontend adds. Empty for the Wayland GUI, which keeps the document this
-    /// module has always written. Not serialized with the fixed keys: [`Diagnostics::report`]
-    /// merges it afterwards, and omits it entirely when it is empty.
-    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Where diagnostics go.
@@ -397,13 +389,9 @@ impl Diagnostics {
                 let value = serde_json::to_value(engine).expect("plain data");
                 self.line("engine", format_args!("{}", pairs(&value)));
             }
-            if !report.extra.is_empty() {
-                let value = Value::Object(report.extra.clone());
-                self.line("frontend", format_args!("{}", pairs(&value)));
-            }
         }
         if let Some(file) = &self.file {
-            let mut value = json!({
+            let value = json!({
                 "t": monotonic(),
                 "exit": at_exit,
                 "counters": report.counters,
@@ -417,11 +405,6 @@ impl Diagnostics {
                 "pending_host_events": report.pending_host_events,
                 "last_error": report.last_error,
             });
-            if let Value::Object(fields) = &mut value {
-                for (key, extra) in &report.extra {
-                    fields.insert(key.clone(), extra.clone());
-                }
-            }
             let text = serde_json::to_string_pretty(&value).expect("plain data");
             if let Err(error) = std::fs::write(file, text + "\n") {
                 log::warn!(

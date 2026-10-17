@@ -10,10 +10,12 @@ authors.workspace = true
 [features]
 # No engines by default: a frontend (today, sighurt-gui) enables the ones it binds.
 default = []
-# Gates the registry's variant for that engine. Servo, Wasm and WPE are also depended on
-# here for the configuration their runtimes start with (`servo_config` and the rest) and,
-# for Servo, nothing else: the logger flag lives here, the call to `setup_logging` in the
-# frontend that constructs the runtime. The demo engine's concrete type never appears here.
+# Gates the registry's variant and the engine's descriptor (its name, capabilities and the
+# settings of `[engines.<name>]` it honors). Servo, Wasm and WPE are also depended on here
+# for that and for the configuration their runtimes start with (`servo_config` and the rest).
+# For Servo, the logger flag lives here and the call to `setup_logging` in the frontend that
+# constructs the runtime. The demo engine's concrete type never appears here: its descriptor
+# is the name `demo` and no capabilities, so this crate does not depend on it.
 engine-servo = ["dep:sighurt-engine-servo"]
 engine-wasm = ["dep:sighurt-engine-wasm"]
 engine-wpe = ["dep:sighurt-engine-wpe"]
