@@ -270,6 +270,10 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// or `HeadParsed` was already counted with the history change it belongs to, and whether a
     /// history change has already waited one batch for that evidence.
     held: Vec<(WebViewId, Note, bool, bool)>,
+    /// How long a history change with a browser load waiting, and no `Started` yet, is held
+    /// back. Servo 0.7 often delivers `HeadParsed` a few spins later; an immediate re-spin
+    /// (this batch also queued a title or a frame) would otherwise commit too soon.
+    history_hold: HashMap<WebViewId, Instant>,
     readbacks: Readbacks,
     gl: Option<GlInfo>,
     /// Set from the first offscreen context. Stays `None` on the Wayland path.
@@ -325,6 +329,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             servo_focus: None,
             events: Events::default(),
             held: Vec::new(),
+            history_hold: HashMap::new(),
             readbacks,
             gl: None,
             offscreen_adapter: None,
@@ -547,7 +552,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             .collect();
         let mut holding = Vec::new();
         for index in 0..notes.len() {
-            let Some((webview, note, counted, waited)) = notes[index].take() else {
+            let Some((webview, note, counted, _waited)) = notes[index].take() else {
                 continue;
             };
             if holding.contains(&webview) {
@@ -620,17 +625,25 @@ impl<T: ServoTarget> ServoRuntime<T> {
                         }
                         if !started_later
                             && traversal.is_none()
-                            && !waited
                             && self
                                 .views
                                 .get(&view)
                                 .is_some_and(|v| v.navigator.pending_load_needs_evidence())
                         {
-                            // One batch: `Started` or `HeadParsed` is usually the next spin.
-                            holding.push(webview);
-                            self.held.push((webview, note, counted, true));
-                            continue;
+                            // An immediate re-spin still has no `HeadParsed`. Keep the change
+                            // until it arrives, or until this window passes (a same-document
+                            // commit while a load is pending).
+                            let now = Instant::now();
+                            let until = *self.history_hold.entry(webview).or_insert(
+                                now + Duration::from_millis(100),
+                            );
+                            if now < until {
+                                holding.push(webview);
+                                self.held.push((webview, note, counted, true));
+                                continue;
+                            }
                         }
+                        self.history_hold.remove(&webview);
                     }
                     self.view_note(view, note, started_later || counted, traversal);
                 }

@@ -76,8 +76,10 @@ can show is marked as not measured.
   is waiting with no `Started`, as that document. The headless run showed `self.html` and
   `crash.html` committing as same-document pushes under a fresh id, with the next push taking
   the browser's id. `LoadingChanged { loading: true }` followed the commit on the next spin, so
-  the history change waits one batch for `Started` or `HeadParsed` before it is reported. A
-  head followed by another history change is left for that change.
+  the history change is held for up to 100 ms for `Started` or `HeadParsed`. One spin is not
+  enough: the batch that carries the history also queues a title or a frame, and the next spin
+  is immediate, before the script has sent the head. A head followed by another history change
+  is left for that change.
 - **A load in flight is still dropped.** `Constellation::load_url` returns `None` with no
   embedder message when that browsing context is already in `pending_changes`. The queued
   navigation in `View::queued` stays. `AbortLoadUrl` still exists for 204/205.

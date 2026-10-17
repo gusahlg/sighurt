@@ -174,8 +174,8 @@ impl Navigator {
     }
 
     /// A browser `Navigate` or `Reload` is waiting, and nothing yet says its document has
-    /// started. The runtime pairs a `HeadParsed` in this batch or the next with the history
-    /// change: Servo may have dropped `Started`, and the history report often arrives first.
+    /// started. The runtime holds the history change briefly and pairs a `HeadParsed` with it:
+    /// Servo may have dropped `Started`, and the history report often arrives first.
     pub fn pending_load_needs_evidence(&self) -> bool {
         !self.started
             && !self.loading_started
