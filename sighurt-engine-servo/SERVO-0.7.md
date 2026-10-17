@@ -128,10 +128,21 @@ sha1 0.10.7 to 0.10.6; `quinn-proto`'s wasm-only `getrandom = "0.4"` from 0.4.3 
 0.4.1. After that the lock parses with no ambiguous line and no dependency on a
 missing package except the workspace's `servo` dependency, which cargo fills in.
 
-`cargo fetch` on louise reconciles this seed against the workspace. Versions that
-drift off Servo's tested versions are pinned back with `cargo update -p NAME --precise
-VER` when the requirement allows it. What that run actually changed is recorded after
-it finishes.
+`cargo fetch` on louise (Rust 1.98.1, via `tools/cargo`) reconciled the seed.
+It added `servo` 0.7.0 and pruned 302 package versions the workspace does not
+reach: WebGPU, WebXR, Bluetooth, GStreamer, winit, and crates only those
+features used (including calloop 0.13 and smithay-client-toolkit 0.19).
+Sighurt's own copies stay: calloop 0.14.4, smithay-client-toolkit 0.20.0,
+wayland-client 0.30.2 beside 0.31.15, wasmtime 36.0.16. No package was
+resolved to a version present in neither Servo's published lock nor
+Sighurt's previous lock. Direct dependencies of `servo` 0.7.0 that this
+feature set keeps (`webgl` plus Servo's defaults, multiprocess compiled
+and off) match the published lock's versions. Two Windows-only edges
+moved, which this Linux build does not compile: `arboard` 3.6.1's
+`windows-sys` from 0.52.0 to 0.60.2, and `rustix` 0.38.44's `windows-sys`
+from 0.52.0 to 0.59.0. Cargo also dropped version suffixes on dependency
+lines that the prune left unambiguous, and dropped optional-feature edges
+this resolve does not enable. Nothing was pinned back with `--precise`.
 
 Coupled crates that were already at Servo's numbers and did not move: euclid 0.22,
 dpi 0.1, gleam 0.15, glow 0.17, keyboard-types 0.8. surfman moved from 0.13.0 to 0.14.0.
