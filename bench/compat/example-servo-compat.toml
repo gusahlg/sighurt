@@ -1,0 +1,14 @@
+# Servo's experimental web-platform features plus the ones the corpus's failures name, for a
+# bench/compat run (and an example of what a user may put in their own configuration).
+# Append with: bench/compat/run --config-extra bench/compat/example-servo-compat.toml
+#
+# Off by default: Servo marks these unstable. Read when sig starts.
+
+[engines.servo]
+experimental-features = true
+
+[engines.servo.preferences]
+# document.adoptedStyleSheets (chatgpt.com).
+dom_adoptedstylesheet_enabled = true
+# Element.animate and getAnimations (reddit, YouTube).
+dom_web_animations_enabled = true
