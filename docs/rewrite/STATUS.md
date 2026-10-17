@@ -1900,8 +1900,12 @@ The phases of [TUI.md](TUI.md) §8, each passing only with the evidence named.
   (b04ebf4, 8e8d576; an independent review found the diagnostics, effect order and shutdown
   order unchanged; engines.sh 271/271 on louise-pc, headless.sh 75/75, sighurt-ui's headless.sh
   35/35, clippy clean with no features and with all).
-- [ ] **Phase 2: the demo engine in the terminal**, graphics and text, `--dump`.
-- [ ] **Phase 3: Servo's and WPE's CPU presenters**, graphics mode with real pages.
+- [x] **Phase 2 (reordered, decision 97): `sig --tui` in graphics mode with Servo, Wasm and the
+  demo engine** (07f7e36): `sighurt-browser/tests/tui.rs`'s two end-to-end tests of `sig --tui`
+  in a pty (image sized to the page rows, address line, resize, quit and SIGTERM restoring the
+  terminal, ≤ fps frames), sighurt-tui's 36 unit and 13 pty tests, and example.com through Servo
+  decoded from the kitty stream on the RTX 3070 with no display server.
+- [ ] **Phase 3: WPE's CPU presenter** (Servo's is done: 79be7f7), sixel; text mode and `--dump`.
 - [ ] **Phase 4: semantics** in Servo and WPE; text mode and `--dump` with real pages.
 - [ ] **Phase 5:** the Wasm engine in the terminal, mouse, the stdin pager, the documents.
 
@@ -3289,3 +3293,14 @@ Newest last. Each entry says what was decided and why.
     `a_click_on_the_address_fields_engine_label_switches_engine`; sighurt-chrome-line's
     `a_click_on_the_lines_engine_label_switches_engine`; sighurt-browser's
     `engine_is_the_engine_this_run_starts_with`.
+97. **The terminal frontend shipped graphics mode first, with Servo** (the user, 17 October 2026:
+    try the TUI as soon as possible, in a kitty-protocol terminal; amends TUI.md §8's phase order,
+    which put a demo-engine slice and text mode first). `sig` runs in the terminal when stdout is
+    one and `TERM` is set and not `dumb`, and opens the window otherwise; `--tui` and `--gui`
+    override, and `--tui` without a terminal or the `frontend-tui` feature is an error (exit 2).
+    The terminal writes to its fd from one place per pass, only when the previous bytes have left
+    (a write source while bytes wait, no timer), so no escape sequence is ever cut. In the
+    terminal, stderr (the engines' logs) goes to `$XDG_STATE_HOME/sighurt/tui.log`. The top line
+    shows only the active tab, so there is no tab click yet. The end-to-end tests run the real
+    `sig` from `sighurt-browser/tests/tui.rs`. *Why:* the user's request; TUI.md §8.6 and §8.8.
+    Evidence: the tests named under phase 2 above.
