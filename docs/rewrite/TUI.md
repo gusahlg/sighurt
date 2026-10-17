@@ -328,3 +328,31 @@ The phases, as amended:
   pages; engines.sh's `text` scenario.
 - **Phase 5**: the Wasm engine in the terminal (graphics only), mouse, the stdin pager, the
   documents.
+
+## 9. Phase 0's results (17 October 2026)
+
+All three prototypes pass; details and numbers in each `experiments/*/RESULTS.md`.
+
+- **0a Servo offscreen** (`experiments/tui-servo`, louise-pc over ssh, no `WAYLAND_DISPLAY` or
+  `DISPLAY`, RTX 4060): surfman's Mesa surfaceless backend with the hardware adapter renders real
+  pages on the NVIDIA GPU through glvnd, also with `/dev/dri` hidden. At 1280×720: paint 0.25 ms
+  median, readback (glReadPixels into our buffer) 1.0 ms; 1920×1080 readback 2.0 ms. With only
+  Mesa's EGL vendor visible it falls back to llvmpipe (paint 1.2 ms, first paint 1.3 s). Script
+  evaluation works offscreen. `--adapter sw` does not move NVIDIA to llvmpipe and sets
+  `LIBGL_ALWAYS_SOFTWARE=1` for every later child; the hardware adapter sets `DRI_PRIME=1`. The
+  presenter uses the hardware adapter; WebKit's processes must not inherit either variable
+  (§8.2's coexistence check is still open: phase 3).
+- **0b WPE without a compositor** (`experiments/wpe-cpu`, same machine): `Display::new(None, ..)`
+  without any Wayland connection delivers changing SHM frames, navigates, resizes, evaluates
+  script in the isolated world `sighurt` (the page's main world can't see or forge it) and shuts
+  down with its web and network processes gone; also with `/dev/dri` hidden. Copying a 640×480
+  frame takes 0.08 ms. **WebKit produces no new frame until the last one is acknowledged**
+  (1 produced, 0 acknowledged in 2 s), so pacing acknowledgements bounds its rendering (§8.6).
+- **0c Terminal I/O** (`experiments/tty-io`): a small parser of our own (§8.7): `vte` 0.15 drops
+  APC bodies and saturates parameters at `u16`; termwiz 0.23's `InputParser` does not classify
+  terminal replies or parse kitty's colon fields; crossterm 0.29 owns stdin and drops kitty's
+  base-layout key and associated text. The prototype (raw mode, the batched probe with a
+  deadline, keys, mouse, paste, the grid and diff writer, bounded nonblocking output,
+  restoration on exit, panic, SIGTSTP/SIGCONT, SIGHUP and before a forced exit) passes 38 tests,
+  14 under a pty with watchdogs. Not yet run in a real terminal (foot or kitty in a private
+  compositor): phase 2.

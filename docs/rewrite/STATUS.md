@@ -1887,6 +1887,22 @@ Wasm view handing over downloads and its queue bound; the redundant clearing of 
 hand-off was the one that failed nothing, and was removed.
 
 
+### Terminal frontend (TUI.md, decisions 89–92)
+
+The phases of [TUI.md](TUI.md) §8, each passing only with the evidence named.
+
+- [x] **Phase 0: the risks.** Servo 0.5 renders offscreen with no display server on NVIDIA,
+  WPE WebKit renders to shared memory with no compositor, and the terminal I/O prototype passes
+  under a pty (TUI.md §9; `experiments/tui-servo`, `wpe-cpu`, `tty-io` and their RESULTS.md).
+- [ ] **Phase 1: the split.** `sig` is `sighurt-runtime`, `sighurt-gui` and a thin `main` with no
+  behaviour change (b04ebf4: engines.sh 271/271 on louise-pc, headless.sh and sighurt-ui's
+  headless.sh pass; the review's fixes and the runtime's shutdown, presenting and engine
+  descriptors are pending).
+- [ ] **Phase 2: the demo engine in the terminal**, graphics and text, `--dump`.
+- [ ] **Phase 3: Servo's and WPE's CPU presenters**, graphics mode with real pages.
+- [ ] **Phase 4: semantics** in Servo and WPE; text mode and `--dump` with real pages.
+- [ ] **Phase 5:** the Wasm engine in the terminal, mouse, the stdin pager, the documents.
+
 ## Decisions log
 
 Newest last. Each entry says what was decided and why.
@@ -3202,3 +3218,12 @@ Newest last. Each entry says what was decided and why.
     `--dump` as text with link footnotes** (the user's answers; the default table amends the
     rule that keys live only in the user's configuration, for the terminal only, since a fresh
     terminal session would otherwise have no way to its command line or to quit).
+92. **The terminal frontend parses what the terminal sends with a small parser of its own, and
+    the offscreen presenters use the GPU when there is one** (TUI.md §9). Evidence: phase 0 on
+    17 October 2026. `vte`, termwiz and crossterm each miss inputs the frontend needs (APC
+    replies, kitty's base-layout key and colon fields, reply classification) or own stdin
+    against the calloop loop (`experiments/tty-io/RESULTS.md`, 38 tests). Servo's offscreen
+    context opens surfman's Mesa surfaceless backend with the hardware adapter (on NVIDIA through
+    glvnd, also with `/dev/dri` hidden; llvmpipe only where no GPU driver is present), and WPE's
+    terminal presenter is its existing SHM path without a Wayland lease, bounded by acknowledging
+    frames at the terminal's rate (`experiments/tui-servo`, `experiments/wpe-cpu`).
