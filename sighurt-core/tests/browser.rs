@@ -59,8 +59,8 @@ struct Harness {
     seat: SeatId,
 }
 
-/// A build with every engine (Servo honoring both engine settings, Wasm `storage`), the test
-/// keymap `script`, and two chromes with no options: the standard one with the command
+/// A build with every engine (Servo honoring its settings, Wasm `storage`), the test keymap
+/// `script`, and two chromes with no options: the standard one with the command
 /// `chrome.toggle-tabs`, and the line chrome with none.
 fn environment() -> Environment {
     let chrome = |name, commands| ChromeChecks {
@@ -69,7 +69,15 @@ fn environment() -> Environment {
         commands,
     };
     let settings: [(&str, &'static [&'static str]); 2] = [
-        ("servo", &["user-agent", "storage"]),
+        (
+            "servo",
+            &[
+                "user-agent",
+                "storage",
+                "experimental-features",
+                "preferences",
+            ],
+        ),
         ("wasm", &["storage"]),
     ];
     Environment {
@@ -3389,4 +3397,31 @@ fn a_reload_that_changes_engine_settings_says_they_apply_at_restart() {
     );
     // Back to what the engines started with: nothing to say.
     assert_eq!(reloaded(&mut b, same), [] as [String; 0]);
+}
+
+#[test]
+fn a_reload_that_changes_servo_features_says_they_apply_at_restart() {
+    let mut b = Harness::start("[engines.servo]\nstorage = \"ephemeral\"", &["sig://home"]);
+    let reloaded = |b: &mut Harness, config: &str| {
+        let config = Config::parse(Some(&format!("version = 1\n{config}")), &environment());
+        let effects = b.update(config_reloaded(config));
+        notices(&effects)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let started = "[engines.servo]\nstorage = \"ephemeral\"";
+    let notice = "[engines.servo] applies when sig starts again; the servo engine keeps the \
+                  settings it started with until then.";
+    assert_eq!(reloaded(&mut b, started), [] as [String; 0]);
+    // The flag, written as false, is the setting the engine started with.
+    let off = "[engines.servo]\nstorage = \"ephemeral\"\nexperimental-features = false";
+    assert_eq!(reloaded(&mut b, off), [] as [String; 0]);
+    let features = "[engines.servo]\nstorage = \"ephemeral\"\nexperimental-features = true";
+    assert_eq!(reloaded(&mut b, features), [notice.to_owned()]);
+    assert_eq!(reloaded(&mut b, started), [] as [String; 0]);
+    let prefs = "[engines.servo]\nstorage = \"ephemeral\"\n\
+                 [engines.servo.preferences]\ndom_adoptedstylesheet_enabled = true";
+    assert_eq!(reloaded(&mut b, prefs), [notice.to_owned()]);
+    assert_eq!(reloaded(&mut b, started), [] as [String; 0]);
 }

@@ -74,7 +74,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use servo::{
-    EmbedderControl, EventLoopWaker, LoadStatus, Opts, PermissionFeature, Preferences,
+    EmbedderControl, EventLoopWaker, LoadStatus, Opts, PermissionFeature, PrefValue, Preferences,
     RenderingContext, Servo, ServoBuilder, WebViewId,
 };
 use sighurt_api::engine::{
@@ -138,6 +138,29 @@ pub struct ServoConfig {
     /// Counts every `glReadPixels`/`glGetTexImage` WebRender makes, for tests and diagnostics.
     /// It times every GL call, so it is off for normal use; `read_to_image` is always counted.
     pub audit_gl: bool,
+    /// Turn on the preferences servoshell enables with
+    /// `--enable-experimental-web-platform-features`. `false` is Servo's own default.
+    /// Applied after Sighurt's baseline preferences and before [`Self::preferences`].
+    pub experimental_features: bool,
+    /// Servo preference overrides, applied last, so one feature can be turned on or off on
+    /// its own. Names are Servo 0.5 `Preferences` fields. The core rejects an unknown name
+    /// or a value of the wrong type before this is built.
+    pub preferences: Vec<(String, ServoPreference)>,
+}
+
+/// A Servo preference value. The variants match Servo 0.5's field types.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServoPreference {
+    /// A `bool` preference.
+    Bool(bool),
+    /// An `i64` preference.
+    Int(i64),
+    /// A `u64` preference.
+    Uint(u64),
+    /// A `String` preference.
+    String(String),
+    /// `shell_background_color_rgba`.
+    Rgba([f64; 4]),
 }
 
 /// What the runtime reports about itself.
@@ -291,6 +314,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
     ///
     /// If Servo was built before in this process ("Already initialized").
     pub fn new(config: ServoConfig, waker: EngineWaker) -> Self {
+        let prefs = preferences(&config);
         let profile_lock = config.profile.as_deref().and_then(lock_profile);
         let profile = profile_lock.as_ref().and(config.profile);
         let readbacks = Readbacks {
@@ -304,7 +328,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                 config_dir: profile.clone(),
                 ..Opts::default()
             })
-            .preferences(preferences(config.user_agent.as_deref()))
+            .preferences(prefs)
             .event_loop_waker(Box::new(Waker(waker.clone())))
             .build();
         let delegate = Rc::new(Delegate::default());
@@ -1466,12 +1490,42 @@ fn resolve(pending: Pending, result: ServiceResult) {
     }
 }
 
+/// Preferences servoshell turns on with `--enable-experimental-web-platform-features`.
+///
+/// Servo 0.5, `ports/servoshell/prefs.rs` `EXPERIMENTAL_PREFS`, at the published crate's
+/// commit `77fccacc1f1fdce10498d50173aafaa09d02879e`. Each is a bool field Servo leaves
+/// false. Copy it again from that list when Servo is upgraded;
+/// `experimental_preferences_are_documented` checks the docs name every one.
+const EXPERIMENTAL_PREFS: &[&str] = &[
+    "dom_async_clipboard_enabled",
+    "dom_exec_command_enabled",
+    "dom_fontface_enabled",
+    "dom_indexeddb_enabled",
+    "dom_intersection_observer_enabled",
+    "dom_navigator_protocol_handlers_enabled",
+    "dom_notification_enabled",
+    "dom_offscreen_canvas_enabled",
+    "dom_permissions_enabled",
+    "dom_sanitizer_enabled",
+    "dom_storage_manager_api_enabled",
+    "dom_webgl2_enabled",
+    "dom_webgpu_enabled",
+    "layout_css_alpha_color_function_enabled",
+    "layout_css_attr_enabled",
+    "layout_css_ellipse_corners_enabled",
+    "layout_css_progress_function_enabled",
+    "layout_columns_enabled",
+    "layout_container_queries_enabled",
+    "layout_grid_enabled",
+    "layout_variable_fonts_enabled",
+];
+
 /// Servo's preferences: its defaults with the changes the old `sig-servo` made, for the
-/// reasons its README records (`gpui-baseline:sighurt-engine-servo/README.md`), and
-/// `user_agent` if the executable sets one.
-fn preferences(user_agent: Option<&str>) -> Preferences {
+/// reasons its README records (`gpui-baseline:sighurt-engine-servo/README.md`), then the
+/// experimental set when asked, then `preferences` last so one feature can be set on its own.
+fn preferences(config: &ServoConfig) -> Preferences {
     let mut prefs = Preferences::default();
-    prefs.user_agent = match user_agent {
+    prefs.user_agent = match config.user_agent.as_deref() {
         Some(agent) => agent.to_owned(),
         None => firefox_user_agent(&prefs.user_agent),
     };
@@ -1488,18 +1542,42 @@ fn preferences(user_agent: Option<&str>) -> Preferences {
     prefs.layout_container_queries_enabled = true;
     prefs.layout_grid_enabled = true;
     prefs.layout_variable_fonts_enabled = true;
-    // Left off because they break common sites: with `IntersectionObserver` script spins forever
-    // and the page stays blank (reddit.com, microsoft.com), a Servo 0.5 layout bug fixed upstream
-    // in servo/servo#47693, and with `adoptedStyleSheets` layout panics (microsoft.com).
+    // Left off unless `experimental-features` or a preference says otherwise.
+    // `IntersectionObserver` makes script spin forever and the page stay blank (reddit.com,
+    // microsoft.com), a Servo 0.5 layout bug fixed upstream in servo/servo#47693. It is in
+    // [`EXPERIMENTAL_PREFS`], so the flag turns it on. `adoptedStyleSheets` panics layout
+    // (microsoft.com) and is not in that set: set `dom_adoptedstylesheet_enabled` to ask for it.
+    // Web animations (`Element.animate`) and `requestIdleCallback` are not in the set either;
+    // only the first has a preference (`dom_web_animations_enabled`).
     //
-    // Off: a page's shared worker never exits, so Servo can't shut down (x.com) and the browser's
-    // exit would wait forever on it (M0, open problem 5).
+    // Off, and not in the experimental set, so the flag does not turn it back on: a page's
+    // shared worker never exits, so Servo can't shut down (x.com) and the browser's exit would
+    // wait forever on it (M0, open problem 5).
     prefs.dom_sharedworker_enabled = false;
     // With Servo's default of 3, parallel styling races and panics a style thread on
     // developer.mozilla.org in ~40% of loads (14 of 36), and the page stops rendering. With 2 it
-    // didn't happen in 30 loads.
+    // didn't happen in 30 loads. A preference can set it afterwards.
     prefs.layout_threads = 2;
+    if config.experimental_features {
+        for name in EXPERIMENTAL_PREFS {
+            prefs.set_value(name, PrefValue::Bool(true));
+        }
+    }
+    for (name, value) in &config.preferences {
+        prefs.set_value(name, pref_value(value));
+    }
     prefs
+}
+
+/// `value` as Servo's `PrefValue`. The core has already checked the type.
+fn pref_value(value: &ServoPreference) -> PrefValue {
+    match value {
+        ServoPreference::Bool(value) => PrefValue::Bool(*value),
+        ServoPreference::Int(value) => PrefValue::Int(*value),
+        ServoPreference::Uint(value) => PrefValue::UInt(*value),
+        ServoPreference::String(value) => PrefValue::Str(value.clone()),
+        ServoPreference::Rgba(value) => PrefValue::from(*value),
+    }
 }
 
 /// Servo's user agent with its `Servo/<version>` token replaced by Firefox's `Gecko/20100101`.
@@ -1578,10 +1656,93 @@ mod tests {
         );
         let default = firefox_user_agent(&Preferences::default().user_agent);
         assert!(default.contains(" Gecko/20100101 Firefox/"), "{default}");
-        assert_eq!(preferences(None).user_agent, default);
-        // The executable's, as it is.
+        assert_eq!(preferences(&ServoConfig::default()).user_agent, default);
+        // The executable's, as it is, unless a preference overrides it afterwards.
         let agent = "Mozilla/5.0 (X11; Linux x86_64) Sighurt/0.1";
-        assert_eq!(preferences(Some(agent)).user_agent, agent);
+        let config = ServoConfig {
+            user_agent: Some(agent.into()),
+            ..ServoConfig::default()
+        };
+        assert_eq!(preferences(&config).user_agent, agent);
+        let config = ServoConfig {
+            user_agent: Some(agent.into()),
+            preferences: vec![(
+                "user_agent".into(),
+                ServoPreference::String("FromPref".into()),
+            )],
+            ..ServoConfig::default()
+        };
+        assert_eq!(preferences(&config).user_agent, "FromPref");
+    }
+
+    #[test]
+    fn experimental_features_set_servos_experimental_preferences() {
+        let off = preferences(&ServoConfig::default());
+        assert!(!off.dom_intersection_observer_enabled);
+        assert!(!off.dom_async_clipboard_enabled);
+        assert!(!off.dom_adoptedstylesheet_enabled);
+        assert!(!off.dom_web_animations_enabled);
+        assert!(off.layout_grid_enabled);
+        assert!(off.dom_indexeddb_enabled);
+        assert!(!off.dom_sharedworker_enabled);
+        assert_eq!(off.layout_threads, 2);
+
+        let on = preferences(&ServoConfig {
+            experimental_features: true,
+            ..ServoConfig::default()
+        });
+        for name in EXPERIMENTAL_PREFS {
+            assert_eq!(on.get_value(name), PrefValue::Bool(true), "{name}");
+        }
+        // Not in servoshell's set, so the flag leaves them as the baseline did.
+        assert!(!on.dom_adoptedstylesheet_enabled);
+        assert!(!on.dom_web_animations_enabled);
+        assert!(!on.dom_sharedworker_enabled);
+        assert_eq!(on.layout_threads, 2);
+
+        let config = ServoConfig {
+            experimental_features: true,
+            preferences: vec![
+                (
+                    "dom_intersection_observer_enabled".into(),
+                    ServoPreference::Bool(false),
+                ),
+                (
+                    "dom_adoptedstylesheet_enabled".into(),
+                    ServoPreference::Bool(true),
+                ),
+                (
+                    "dom_web_animations_enabled".into(),
+                    ServoPreference::Bool(true),
+                ),
+                ("layout_threads".into(), ServoPreference::Int(4)),
+                ("layout_grid_enabled".into(), ServoPreference::Bool(false)),
+            ],
+            ..ServoConfig::default()
+        };
+        let prefs = preferences(&config);
+        assert!(!prefs.dom_intersection_observer_enabled);
+        assert!(prefs.dom_adoptedstylesheet_enabled);
+        assert!(prefs.dom_web_animations_enabled);
+        assert_eq!(prefs.layout_threads, 4);
+        assert!(!prefs.layout_grid_enabled);
+        assert!(!prefs.dom_sharedworker_enabled);
+    }
+
+    #[test]
+    fn experimental_preferences_are_documented() {
+        let readme = include_str!("../README.md");
+        let config = include_str!("../../sighurt-core/src/default-config.toml");
+        for name in EXPERIMENTAL_PREFS {
+            assert!(
+                readme.contains(name),
+                "{name} missing from the engine README"
+            );
+            assert!(
+                config.contains(name),
+                "{name} missing from default-config.toml"
+            );
+        }
     }
 
     /// Servo's constellation can't be killed from outside, so this reports its loss the way

@@ -38,7 +38,10 @@
 //! `[engines.<engine>]` holds an engine's settings from a small neutral vocabulary
 //! ([`EngineSettings`]), each checked here for its form, and against what the build says that
 //! engine honors (`Environment::engine_settings`): setting what an engine can't honor is an
-//! error, never ignored. `[downloads] directory` and `[session] restore` are the executable's,
+//! error, never ignored. `experimental-features` turns on Servo's experimental web-platform
+//! preferences (off by default, which is Servo's own default). `preferences` then sets
+//! individual Servo 0.5 preferences by field name; an unknown name or a value of the wrong
+//! type is an error. `[downloads] directory` and `[session] restore` are the executable's,
 //! checked here.
 //!
 //! Must not own: reading or watching files, which the executable does, or deciding what a
@@ -60,6 +63,10 @@ use sighurt_api::settings::{Table, Value};
 use crate::commands::ZOOM_STEPS;
 use crate::keys;
 use crate::state::{Environment, Frontend};
+
+// A submodule of this file would be `config/servo_prefs.rs`. The catalog stays beside it.
+#[path = "servo_prefs.rs"]
+mod servo_prefs;
 
 /// The built-in configuration, which also documents the format.
 pub const DEFAULT_CONFIG: &str = include_str!("default-config.toml");
@@ -88,11 +95,20 @@ const FIXED_SCHEMES: [&str; 4] = ["sig", "http", "https", "file"];
 /// How one setting of `[engines.<engine>]` is read into [`EngineSettings`].
 type ReadSetting = fn(&toml::Value, &mut EngineSettings) -> Result<(), String>;
 
-/// The settings `[engines.<engine>]` may hold, by name, each with how it is read. An engine of
-/// the build honors those `Environment::engine_settings` lists for it, so a new setting is a
-/// line here, a field of [`EngineSettings`], and the names in the registry of the engines that
-/// honor it.
-const ENGINE_SETTINGS: [(&str, ReadSetting); 2] = [
+/// The settings `[engines.<engine>]` may hold. An unknown key reports this list. A new setting
+/// is a name here, a line of [`ENGINE_SETTINGS`] (or [`read_preferences`], which reports one
+/// error per preference), a field of [`EngineSettings`], and the names in the registry of the
+/// engines that honor it.
+const ENGINE_SETTING_NAMES: &[&str] = &[
+    "user-agent",
+    "storage",
+    "experimental-features",
+    "preferences",
+];
+
+/// How each setting except `preferences` is read. `preferences` is its own table, so one bad
+/// preference is its own error ([`read_preferences`]).
+const ENGINE_SETTINGS: [(&str, ReadSetting); 3] = [
     ("user-agent", |value, settings| {
         // Printable ASCII is what an HTTP header may hold; Servo's network code unwraps the
         // parse of its user agent as a header.
@@ -119,18 +135,48 @@ const ENGINE_SETTINGS: [(&str, ReadSetting); 2] = [
         };
         Ok(())
     }),
+    ("experimental-features", |value, settings| {
+        match value.as_bool() {
+            Some(enabled) => {
+                settings.experimental_features = enabled;
+                Ok(())
+            }
+            None => Err(format!("expected true or false, not {value}")),
+        }
+    }),
 ];
+
+/// A value of `[engines.<engine>.preferences]`, of that Servo preference's type.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServoPrefValue {
+    /// A `bool` preference.
+    Bool(bool),
+    /// An `i64` preference.
+    Int(i64),
+    /// A `u64` preference. The file writes an integer from 0 up.
+    Uint(u64),
+    /// A `String` preference.
+    String(String),
+    /// `shell_background_color_rgba`: red, green, blue and alpha.
+    Rgba([f64; 4]),
+}
 
 /// What `[engines.<engine>]` sets for one engine. An engine of the build is started with these
 /// once, so they apply when `sig` starts; the configuration never holds one the engine can't
 /// honor.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct EngineSettings {
     /// `user-agent`: the user agent the engine's requests send and its pages see, instead of
     /// its own.
     pub user_agent: Option<String>,
     /// `storage`: whether the engine keeps cookies and site data.
     pub storage: Storage,
+    /// `experimental-features`: turn on the web-platform preferences Servo marks experimental.
+    /// `false`, the default, is Servo's own default for that switch.
+    pub experimental_features: bool,
+    /// `preferences`: Servo preference overrides by field name, applied after
+    /// `experimental-features`. Empty when the file sets none.
+    pub preferences: BTreeMap<String, ServoPrefValue>,
 }
 
 /// Where an engine keeps cookies, site data and caches (`[engines.<engine>] storage`).
@@ -1205,7 +1251,7 @@ fn check_engines(
     env: &Environment,
     problems: &mut Vec<String>,
 ) -> BTreeMap<String, EngineSettings> {
-    let names = list(ENGINE_SETTINGS.iter().map(|(name, _)| *name));
+    let names = list(ENGINE_SETTING_NAMES.iter().copied());
     let mut checked = BTreeMap::new();
     for (engine, table) in tables {
         let section = format!("[engines.{engine}]");
@@ -1218,6 +1264,18 @@ fn check_engines(
         let in_build = env.engines.contains_key(&engine);
         let mut settings = EngineSettings::default();
         for (key, value) in &table {
+            if key == "preferences" {
+                read_preferences(
+                    &section,
+                    &engine,
+                    in_build,
+                    honors,
+                    value,
+                    &mut settings,
+                    problems,
+                );
+                continue;
+            }
             let setting = ENGINE_SETTINGS.iter().find(|(name, _)| name == key);
             let problem = match (setting, key.as_str()) {
                 (Some(_), _) if in_build && !honors.contains(&key.as_str()) => format!(
@@ -1244,6 +1302,99 @@ fn check_engines(
         checked.insert(engine, settings);
     }
     checked
+}
+
+/// `[engines.<engine>.preferences]`: Servo 0.5 preference names and values. One bad preference
+/// is one error. A table for an engine the build lacks is still checked, like the other
+/// settings; what an engine of the build does not honor is an error and is not read further.
+fn read_preferences(
+    section: &str,
+    engine: &str,
+    in_build: bool,
+    honors: &[&str],
+    value: &toml::Value,
+    settings: &mut EngineSettings,
+    problems: &mut Vec<String>,
+) {
+    if in_build && !honors.contains(&"preferences") {
+        problems.push(format!(
+            "{section} preferences: the {engine} engine can't honor it (it honors: {})",
+            list(honors.iter().copied())
+        ));
+        return;
+    }
+    let Some(table) = value.as_table() else {
+        problems.push(format!(
+            "{section} preferences: expected a [preferences] table, not {value}"
+        ));
+        return;
+    };
+    let mut prefs = BTreeMap::new();
+    let mut found = Vec::new();
+    for (name, pref) in table {
+        match parse_preference(name, pref) {
+            Ok(parsed) => {
+                prefs.insert(name.clone(), parsed);
+            }
+            Err(problem) => found.push(format!("[engines.{engine}.preferences] {problem}")),
+        }
+    }
+    if found.is_empty() {
+        settings.preferences = prefs;
+    } else {
+        problems.extend(found);
+    }
+}
+
+/// One Servo preference. The name and the value's type are Servo 0.5's `Preferences` fields
+/// ([`servo_prefs`], regenerated from `prefs.rs` when Servo is upgraded).
+fn parse_preference(name: &str, value: &toml::Value) -> Result<ServoPrefValue, String> {
+    let kind = servo_prefs::kind_of(name).ok_or_else(|| {
+        format!(
+            "{name}: unknown Servo preference (names are the fields of Servo 0.5's Preferences)"
+        )
+    })?;
+    match kind {
+        servo_prefs::ServoPrefKind::Bool => match value.as_bool() {
+            Some(flag) => Ok(ServoPrefValue::Bool(flag)),
+            None => Err(format!("{name}: expected true or false, not {value}")),
+        },
+        servo_prefs::ServoPrefKind::Int => match value.as_integer() {
+            Some(number) => Ok(ServoPrefValue::Int(number)),
+            None => Err(format!("{name}: expected an integer, not {value}")),
+        },
+        servo_prefs::ServoPrefKind::Uint => match value.as_integer() {
+            Some(number) if number >= 0 => Ok(ServoPrefValue::Uint(number as u64)),
+            _ => Err(format!(
+                "{name}: expected an integer from 0 up, not {value}"
+            )),
+        },
+        servo_prefs::ServoPrefKind::String => match value.as_str() {
+            Some(text) => Ok(ServoPrefValue::String(text.to_owned())),
+            None => Err(format!("{name}: expected a string, not {value}")),
+        },
+        servo_prefs::ServoPrefKind::Rgba => parse_rgba(name, value),
+    }
+}
+
+/// `shell_background_color_rgba`: four numbers. An integer is that number exactly.
+fn parse_rgba(name: &str, value: &toml::Value) -> Result<ServoPrefValue, String> {
+    let bad = || format!("{name}: expected an array of 4 numbers, not {value}");
+    let Some(values) = value.as_array() else {
+        return Err(bad());
+    };
+    if values.len() != 4 {
+        return Err(bad());
+    }
+    let mut rgba = [0.0; 4];
+    for (index, item) in values.iter().enumerate() {
+        rgba[index] = match item {
+            toml::Value::Float(number) => *number,
+            toml::Value::Integer(number) => *number as f64,
+            _ => return Err(bad()),
+        };
+    }
+    Ok(ServoPrefValue::Rgba(rgba))
 }
 
 /// `[downloads] directory` as a path: absolute, or `~/…` in `home`.
@@ -1632,14 +1783,22 @@ mod tests {
         "error",
     ];
 
-    /// A build with three engines (Servo honoring both engine settings, Wasm only `storage`,
-    /// the demo engine none), the fake keymap, the standard chrome and its colors, for a user
-    /// whose home is /home/me.
+    /// A build with three engines (Servo honoring its settings, Wasm only `storage`, the demo
+    /// engine none), the fake keymap, the standard chrome and its colors, for a user whose
+    /// home is /home/me.
     fn env() -> Environment {
         let engines =
             ["servo", "wasm", "demo"].map(|e| (e.to_owned(), EngineCapabilities::default()));
         let settings: [(_, &'static [&'static str]); 2] = [
-            ("servo", &["user-agent", "storage"]),
+            (
+                "servo",
+                &[
+                    "user-agent",
+                    "storage",
+                    "experimental-features",
+                    "preferences",
+                ],
+            ),
             ("wasm", &["storage"]),
         ];
         Environment {
@@ -1772,6 +1931,14 @@ mod tests {
         assert_eq!(wpe.hosts, ["*.google.com", "google.com"]);
         assert_eq!(config.keywords().len(), 2);
         assert_eq!(config.engine_settings("servo").storage, Storage::Ephemeral);
+        assert!(config.engine_settings("servo").experimental_features);
+        assert_eq!(
+            config
+                .engine_settings("servo")
+                .preferences
+                .get("dom_adoptedstylesheet_enabled"),
+            Some(&ServoPrefValue::Bool(true))
+        );
         assert_eq!(config.downloads(), Some(Path::new("/home/me/Downloads")));
     }
 
@@ -2429,7 +2596,7 @@ mod tests {
             "[engines.servo] user-agent: expected 1 to 512 printable ASCII characters, not",
             "[engines.servo] storage: expected \"profile\" or \"ephemeral\", not \"kept\"",
             "[engines.servo] javascript: unknown key (an engine's settings are user-agent, \
-             storage)",
+             storage, experimental-features, preferences)",
             "[engines.wasm] user-agent: the wasm engine can't honor it (it honors: storage)",
             "[engines.demo] storage: the demo engine can't honor it (it honors: none)",
             "[engines.Servo]: \"Servo\" is not an engine name",
@@ -2463,6 +2630,122 @@ mod tests {
             "version = 1\n[engines]\ndefualt = \"servo\"\n[engines.servo]\nstorage = \"profile\"",
             "[engines]: unknown field `defualt`",
         );
+    }
+
+    #[test]
+    fn servo_preferences_are_checked_when_the_configuration_loads() {
+        // Servo 0.5's `Preferences` field count. Update it when regenerating servo_prefs.rs.
+        assert_eq!(servo_prefs::PREFERENCE_NAMES.len(), 171);
+        assert_eq!(
+            servo_prefs::PREFERENCE_NAMES.len(),
+            servo_prefs::PREFERENCE_KINDS.len()
+        );
+        assert_eq!(servo_prefs::PREFERENCE_COUNT, 171);
+
+        let config = parse(
+            r#"
+            version = 1
+            [engines.servo]
+            experimental-features = true
+            [engines.servo.preferences]
+            dom_adoptedstylesheet_enabled = true
+            dom_intersection_observer_enabled = false
+            layout_threads = 1
+            thread_pool_workers_max = 4
+            user_agent = "Sighurt"
+            shell_background_color_rgba = [0, 0.0, 0, 1]
+            "#,
+        )
+        .unwrap();
+        let servo = config.engine_settings("servo");
+        assert!(servo.experimental_features);
+        assert_eq!(
+            servo.preferences.get("dom_adoptedstylesheet_enabled"),
+            Some(&ServoPrefValue::Bool(true))
+        );
+        assert_eq!(
+            servo.preferences.get("dom_intersection_observer_enabled"),
+            Some(&ServoPrefValue::Bool(false))
+        );
+        assert_eq!(
+            servo.preferences.get("layout_threads"),
+            Some(&ServoPrefValue::Int(1))
+        );
+        assert_eq!(
+            servo.preferences.get("thread_pool_workers_max"),
+            Some(&ServoPrefValue::Uint(4))
+        );
+        assert_eq!(
+            servo.preferences.get("user_agent"),
+            Some(&ServoPrefValue::String("Sighurt".into()))
+        );
+        assert_eq!(
+            servo.preferences.get("shell_background_color_rgba"),
+            Some(&ServoPrefValue::Rgba([0.0, 0.0, 0.0, 1.0]))
+        );
+        // Left out, both stay at Servo's own default for the switch: off, and no overrides.
+        let defaults = parse("version = 1").unwrap().engine_settings("servo");
+        assert!(!defaults.experimental_features);
+        assert!(defaults.preferences.is_empty());
+        // `false` written out is the same settings the engines start from.
+        let written = parse("version = 1\n[engines.servo]\nexperimental-features = false")
+            .unwrap()
+            .engine_settings("servo");
+        assert_eq!(written, EngineSettings::default());
+
+        let problems = problems(
+            r#"
+            version = 1
+            [engines.servo]
+            experimental-features = "yes"
+            [engines.servo.preferences]
+            not_a_pref = true
+            dom_adoptedstylesheet_enabled = "yes"
+            layout_threads = 1.5
+            thread_pool_workers_max = -1
+            fonts_default = 3
+            shell_background_color_rgba = [1, 1, 1]
+            [engines.wasm]
+            experimental-features = true
+            [engines.wasm.preferences]
+            dom_indexeddb_enabled = true
+            [engines.demo]
+            preferences = false
+            "#,
+        );
+        let expected = [
+            "[engines.servo] experimental-features: expected true or false, not \"yes\"",
+            "[engines.servo.preferences] not_a_pref: unknown Servo preference",
+            "[engines.servo.preferences] dom_adoptedstylesheet_enabled: expected true or false, \
+             not \"yes\"",
+            "[engines.servo.preferences] layout_threads: expected an integer, not 1.5",
+            "[engines.servo.preferences] thread_pool_workers_max: expected an integer from 0 up, \
+             not -1",
+            "[engines.servo.preferences] fonts_default: expected a string, not 3",
+            "[engines.servo.preferences] shell_background_color_rgba: expected an array of 4 \
+             numbers, not [1, 1, 1]",
+            "[engines.wasm] experimental-features: the wasm engine can't honor it (it honors: \
+             storage)",
+            "[engines.wasm] preferences: the wasm engine can't honor it (it honors: storage)",
+            "[engines.demo] preferences: the demo engine can't honor it (it honors: none)",
+        ];
+        for part in expected {
+            assert!(
+                problems.iter().any(|p| p.contains(part)),
+                "{part:?} not in {problems:#?}"
+            );
+        }
+        assert_eq!(problems.len(), expected.len(), "{problems:#?}");
+        // An engine the build lacks: the form is still checked.
+        assert_problem(
+            "version = 1\n[engines.wpe.preferences]\nnot_a_pref = true",
+            "[engines.wpe.preferences] not_a_pref: unknown Servo preference",
+        );
+        let wpe = "version = 1\n[engines.wpe]\nexperimental-features = true\n\
+                   [engines.wpe.preferences]\ndom_adoptedstylesheet_enabled = true";
+        let config = parse(wpe).unwrap();
+        assert!(config.engine_settings("wpe").experimental_features);
+        assert!(config.notices().iter().any(|n| n.contains("doesn't have")));
     }
 
     #[test]

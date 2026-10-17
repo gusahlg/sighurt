@@ -36,7 +36,12 @@ pub fn descriptors() -> Vec<Descriptor> {
             name: "servo",
             web: true,
             capabilities: sighurt_engine_servo::CAPABILITIES,
-            honors: &["user-agent", "storage"],
+            honors: &[
+                "user-agent",
+                "storage",
+                "experimental-features",
+                "preferences",
+            ],
         },
         #[cfg(feature = "engine-wasm")]
         Descriptor {
@@ -104,6 +109,8 @@ mod tests {
         let valid = |name: &str| match name {
             "user-agent" => "\"Sighurt\"",
             "storage" => "\"ephemeral\"",
+            "experimental-features" => "true",
+            "preferences" => "{ dom_adoptedstylesheet_enabled = true }",
             other => panic!("no valid value of {other} here"),
         };
         for engine in registry.engines() {
@@ -117,7 +124,15 @@ mod tests {
             assert!(config.is_ok(), "{}: {config:?}", engine.name);
         }
         #[cfg(feature = "engine-servo")]
-        assert_eq!(env.engine_settings["servo"], ["user-agent", "storage"]);
+        assert_eq!(
+            env.engine_settings["servo"],
+            [
+                "user-agent",
+                "storage",
+                "experimental-features",
+                "preferences"
+            ]
+        );
         #[cfg(feature = "engine-wasm")]
         assert_eq!(env.engine_settings["wasm"], ["storage"]);
         #[cfg(feature = "engine-wpe")]

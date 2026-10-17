@@ -32,7 +32,9 @@ pub(crate) mod target;
 pub mod view;
 
 pub use presentation::{GlInfo, OffscreenAdapter};
-pub use runtime::{ServoConfig, ServoDiagnostics, ServoRuntime, ServoTiming, CAPABILITIES};
+pub use runtime::{
+    ServoConfig, ServoDiagnostics, ServoPreference, ServoRuntime, ServoTiming, CAPABILITIES,
+};
 /// Whether a panic is one Servo catches itself (image decoding), which the executable's panic
 /// hook passes over.
 pub use servo::should_panic_hook_suppress_termination;

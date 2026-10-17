@@ -66,9 +66,49 @@ tools/headless-sway --renderer gles2 -- target/debug/examples/servo-window --exi
 
 Servo's preferences are the old `sig-servo`'s (`preferences()` in `src/runtime.rs`, reasons
 there): grid and other features on, `SharedWorker`, `IntersectionObserver` and
-`adoptedStyleSheets` off, two layout threads, a Firefox user agent. The previous out-of-process
-engine, `sig-servo`, is at git tag `gpui-baseline`; its README records site compatibility and
-measured rendering costs.
+`adoptedStyleSheets` off, two layout threads, a Firefox user agent. `[engines.servo]` can turn
+the experimental set on and set any preference; see below. The previous out-of-process engine,
+`sig-servo`, is at git tag `gpui-baseline`; its README records site compatibility and measured
+rendering costs.
+
+## Experimental web-platform features
+
+`[engines.servo] experimental-features` (default `false`, Servo's own default) turns on the
+preferences servoshell enables with `--enable-experimental-web-platform-features`. Servo 0.5's
+list, from `ports/servoshell/prefs.rs` at the published crate's commit `77fccacc` (not every
+`// feature:` comment in `prefs.rs`):
+
+`dom_async_clipboard_enabled`, `dom_exec_command_enabled`, `dom_fontface_enabled`,
+`dom_indexeddb_enabled`, `dom_intersection_observer_enabled`,
+`dom_navigator_protocol_handlers_enabled`, `dom_notification_enabled`,
+`dom_offscreen_canvas_enabled`, `dom_permissions_enabled`, `dom_sanitizer_enabled`,
+`dom_storage_manager_api_enabled`, `dom_webgl2_enabled`, `dom_webgpu_enabled`,
+`layout_columns_enabled`, `layout_container_queries_enabled`, `layout_grid_enabled`,
+`layout_variable_fonts_enabled`, `layout_css_alpha_color_function_enabled`,
+`layout_css_attr_enabled`, `layout_css_ellipse_corners_enabled`,
+`layout_css_progress_function_enabled`.
+
+They can be unstable. IntersectionObserver, in particular, makes script spin and pages stay
+blank on Servo 0.5 (a layout bug fixed upstream). The flag does not enable adopted stylesheets
+(`dom_adoptedstylesheet_enabled`) or web animations (`dom_web_animations_enabled`), and Servo
+has no preference for `requestIdleCallback`. It also does not turn `SharedWorker` back on or
+change the two layout threads: both are outside the set, for the reasons above.
+
+`[engines.servo.preferences]` is a table of Servo 0.5 preference names (the fields of
+`Preferences`) to values, applied after the flag, so one feature can be turned on or off on its
+own. A value is a boolean, an integer or a string, of that field's type, or four numbers for
+`shell_background_color_rgba`. An unknown name or a value of the wrong type is an error when
+the configuration loads. The name and type list is generated from `prefs.rs` 0.5
+(`sighurt-core/tests/gen_servo_prefs.py`). Both settings are read when `sig` starts.
+
+```toml
+[engines.servo]
+experimental-features = true
+
+[engines.servo.preferences]
+dom_adoptedstylesheet_enabled = true
+dom_intersection_observer_enabled = false
+```
 
 ## Tests
 

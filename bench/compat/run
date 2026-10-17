@@ -9,6 +9,7 @@ JSON carries no address and no title, so after the screenshot the harness turns 
 final URL from the session file sig then writes.
 
   tools/heavy bench/compat/run --reps 1
+  tools/heavy bench/compat/run --reps 1 --config-extra bench/compat/example-servo-experimental.toml
   bench/compat/run --self-test
   bench/compat/run --reclassify bench/compat/results/<date>-<rev>
 
@@ -489,9 +490,9 @@ def host_of(url):
     return name.lower() if name else None
 
 
-def config_text(engine, restore):
+def config_text(engine, restore, extra=""):
     flag = "true" if restore else "false"
-    return (
+    text = (
         "version = 1\n\n"
         "[engines]\n"
         f'default = "{engine}"\n\n'
@@ -502,6 +503,10 @@ def config_text(engine, restore):
         "[session]\n"
         f"restore = {flag}\n"
     )
+    extra = extra.strip()
+    if extra:
+        text += "\n" + extra + "\n"
+    return text
 
 
 def write_atomic(path, text):
@@ -890,7 +895,10 @@ def run_one_inside(args):
         log_path.parent.mkdir(parents=True, exist_ok=True)
         Path(args.shot).parent.mkdir(parents=True, exist_ok=True)
         diag_path = base / "diag.json"
-        write_atomic(config, config_text(args.engine, restore=False))
+        extra = ""
+        if args.config_extra:
+            extra = Path(args.config_extra).read_text()
+        write_atomic(config, config_text(args.engine, restore=False, extra=extra))
         env = os.environ.copy()
         env.update(
             {
@@ -931,7 +939,9 @@ def run_one_inside(args):
             record["crash_reason"] = "sig exited before it was asked to quit"
         if sig_proc.poll() is None:
             observe_screen(record, sig_proc.pid, args.shot)
-            diag = enable_session_restore(sig_proc, diag_path, diag, config, args.engine) or diag
+            diag = enable_session_restore(
+                sig_proc, diag_path, diag, config, args.engine, extra
+            ) or diag
         if diag:
             record["frames"] = frames_of(diag)
     except Exception as error:
@@ -1047,11 +1057,11 @@ def observe_screen(record, pid, shot):
         record.update(measured)
 
 
-def enable_session_restore(sig_proc, diag_path, diag, config, engine):
+def enable_session_restore(sig_proc, diag_path, diag, config, engine, extra):
     """Turn session restore on so sig writes the title and URL, and return the latest diagnostics."""
     before = ((diag or {}).get("counters") or {}).get("config_reloads", 0)
     mtime = None
-    write_atomic(config, config_text(engine, restore=True))
+    write_atomic(config, config_text(engine, restore=True, extra=extra))
     deadline = time.monotonic() + 3
     latest = diag
     while time.monotonic() < deadline and sig_proc.poll() is None:
@@ -1166,6 +1176,11 @@ def run_corpus(args):
             sys.exit(f"bench/compat/run: engine must be servo or wpe, not {engine}")
     if args.reps < 1:
         sys.exit("bench/compat/run: --reps must be at least 1")
+    if args.config_extra:
+        extra_path = Path(args.config_extra)
+        if not extra_path.is_file():
+            sys.exit(f"bench/compat/run: --config-extra {args.config_extra} is not a file")
+        args.config_extra = str(extra_path.resolve())
     sig_path = args.sig or str(ROOT / "target/debug/sig")
     if not os.access(sig_path, os.X_OK):
         sys.exit(f"bench/compat/run: no sig binary at {sig_path}")
@@ -1190,6 +1205,8 @@ def run_corpus(args):
         "distinct_blank": DISTINCT_BLANK,
         "stride": STRIDE,
     }
+    if args.config_extra:
+        meta["config_extra"] = args.config_extra
     runs = []
     jobs = [(site, engine, rep) for site in sites for engine in engines for rep in range(1, args.reps + 1)]
     for index, (site, engine, rep) in enumerate(jobs, start=1):
@@ -1223,6 +1240,8 @@ def run_corpus(args):
             "--result", str(part),
             "--sig", sig_path,
         ]
+        if args.config_extra:
+            cmd += ["--config-extra", args.config_extra]
         proc = subprocess.Popen(cmd, start_new_session=True)
         try:
             proc.wait(timeout=args.job_timeout)
@@ -1412,6 +1431,12 @@ title = "Example Domain"
     check("servo group has the promise", any("nope" in key or "Unhandled" in key for key, _slot in groups), str(groups))
     text = render_routing({"date": "2026-10-17", "rev": "abc"}, hosts, notes)
     check("routing header", "decision 94" in text and 'hosts = [' in text and '"chatgpt.com"' in text)
+    extra = config_text("servo", False, "[engines.servo]\nexperimental-features = true")
+    check(
+        "config extra",
+        'storage = "ephemeral"' in extra and "experimental-features = true" in extra,
+        extra,
+    )
 
     box = page_box(1600, 1000)
     check("page box", box == (0, 84, 1600, 896), str(box))
@@ -1456,6 +1481,12 @@ def main():
     parser.add_argument("--shot", default="")
     parser.add_argument("--log", default="")
     parser.add_argument("--result", default="")
+    parser.add_argument(
+        "--config-extra",
+        default="",
+        metavar="FILE",
+        help="TOML appended to every run's generated configuration",
+    )
     args = parser.parse_args()
     if args.self_test:
         sys.exit(self_test())

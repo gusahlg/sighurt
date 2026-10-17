@@ -611,19 +611,37 @@ pub fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
 }
 
 /// Servo's configuration: its profile in the user's data directory, or with
-/// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set.
+/// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set;
+/// `experimental-features` and `preferences`, applied when Servo is built.
 #[cfg(feature = "engine-servo")]
 pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoConfig {
-    use sighurt_core::config::Storage;
+    use sighurt_core::config::{ServoPrefValue, Storage};
+    use sighurt_engine_servo::ServoPreference;
     let profile = match settings.storage {
         Storage::Profile => dirs::data_dir().map(|d| d.join("sighurt").join("servo")),
         Storage::Ephemeral => None,
     };
+    let preferences = settings
+        .preferences
+        .iter()
+        .map(|(name, value)| {
+            let value = match value {
+                ServoPrefValue::Bool(value) => ServoPreference::Bool(*value),
+                ServoPrefValue::Int(value) => ServoPreference::Int(*value),
+                ServoPrefValue::Uint(value) => ServoPreference::Uint(*value),
+                ServoPrefValue::String(value) => ServoPreference::String(value.clone()),
+                ServoPrefValue::Rgba(value) => ServoPreference::Rgba(*value),
+            };
+            (name.clone(), value)
+        })
+        .collect();
     sighurt_engine_servo::ServoConfig {
         profile,
         user_agent: settings.user_agent.clone(),
         // Times every GL call: for tests and measurements only.
         audit_gl: std::env::var_os("SIG_AUDIT_GL").is_some_and(|v| v == "1"),
+        experimental_features: settings.experimental_features,
+        preferences,
     }
 }
 
@@ -643,19 +661,37 @@ mod tests {
     #[cfg(feature = "engine-servo")]
     #[test]
     fn servos_configuration_follows_its_settings() {
+        use sighurt_core::config::ServoPrefValue;
         use sighurt_core::config::Storage;
-        let ephemeral = EngineSettings {
+        use sighurt_engine_servo::ServoPreference;
+        let mut ephemeral = EngineSettings {
             user_agent: Some("Sighurt/1".into()),
             storage: Storage::Ephemeral,
+            experimental_features: true,
+            ..EngineSettings::default()
         };
+        ephemeral.preferences.insert(
+            "dom_adoptedstylesheet_enabled".into(),
+            ServoPrefValue::Bool(true),
+        );
         let config = servo_config(&ephemeral);
         assert_eq!(
             (config.profile, config.user_agent.as_deref()),
             (None, Some("Sighurt/1"))
         );
+        assert!(config.experimental_features);
+        assert_eq!(
+            config.preferences,
+            vec![(
+                "dom_adoptedstylesheet_enabled".into(),
+                ServoPreference::Bool(true)
+            )]
+        );
         let config = servo_config(&EngineSettings::default());
         let profile = dirs::data_dir().map(|d| d.join("sighurt").join("servo"));
         assert_eq!((config.profile, config.user_agent), (profile, None));
+        assert!(!config.experimental_features);
+        assert!(config.preferences.is_empty());
     }
 
     #[cfg(feature = "engine-wpe")]
@@ -665,6 +701,7 @@ mod tests {
         let ephemeral = EngineSettings {
             user_agent: Some("Sighurt/1".into()),
             storage: Storage::Ephemeral,
+            ..EngineSettings::default()
         };
         let config = wpe_config(&ephemeral);
         assert_eq!(

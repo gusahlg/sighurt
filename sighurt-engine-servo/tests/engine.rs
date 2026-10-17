@@ -464,6 +464,7 @@ fn servo_views_navigate_present_and_fail_distinctly() {
         profile: Some(profile.clone()),
         user_agent: Some(AGENT.into()),
         audit_gl: true,
+        ..ServoConfig::default()
     };
     let mut d = Driver::new(config, Layout::Stack);
     assert_eq!(
