@@ -1,179 +1,160 @@
 //! The engines compiled into this build, and their runtimes.
 //!
 //! Cargo features decide which engines exist (`engine-servo`, `engine-wasm`, `engine-wpe`,
-//! `engine-demo`);
-//! runtime configuration decides which of them may open new views (the core checks it). A
-//! runtime is created on first use, one per engine kind, with the [`EngineWaker`] it needs, and
-//! its `Target` and `FramePermit` bound to `sighurt_wayland`'s types. The registry also knows
-//! what each engine supports before its runtime exists, since the core needs that from the
-//! start, and how its views present (shared memory, or native targets for Servo's GL and
-//! WebKit's DMA-BUFs), since the host creates their targets.
+//! `engine-demo`); runtime configuration decides which of them may open new views (the core
+//! checks it). A runtime is created on first use, one per engine kind, with the [`EngineWaker`]
+//! it needs. Its `Target` and `FramePermit` are the frontend's: the registry holds
+//! `Box<dyn Running<T, P>>`, and the frontend supplies the value when it starts the engine.
+//! The registry knows what each engine supports before its runtime exists, since the core needs
+//! that from the start.
 //!
 //! Each runtime remembers why it must be pumped: it was called this iteration, its waker fired,
 //! or its pump deadline passed. The registry also remembers a runtime that its `shutdown` had
-//! to leave running (Servo after a page crash or a lost backend, decision 54), so that `sig`
-//! knows to end with `_exit`.
+//! to leave running (Servo after a page crash or a lost backend, decision 54), so the process
+//! knows to end with [`crate::exit_now`].
 //!
 //! Servo is the exception to starting on first use (decision 26): when it is compiled in and
-//! enabled, it starts with `sig`, because its logger must be the process's one `log` logger
-//! (the only way script-thread panics reach Servo) and Servo can be built only once per
-//! process. Without it, `sig` installs `env_logger`; a Servo started later, by a configuration
-//! that enables it, then logs through that one ([`install_logger`]).
+//! enabled, it starts with the process, because its logger must be the process's one `log`
+//! logger (the only way script-thread panics reach Servo) and Servo can be built only once per
+//! process. Without it, [`install_logger`] installs `env_logger`; a Servo started later, by a
+//! configuration that enables it, then logs through that one. The frontend's start function
+//! calls [`claim_logger`] and, when it wins, Servo's `setup_logging`.
 //!
-//! The chromes and keymaps of the build are listed here too ([`CHROMES`], [`KEYMAPS`]), as
-//! engines are: compiled in, chosen by the configuration (`[ui] chrome` at startup, `[input]
-//! keymap` live).
+//! The keymaps of the build are listed here ([`KEYMAPS`]), as engines are: compiled in, chosen
+//! by `[input] keymap`. Chromes are the frontend's.
 //!
 //! Each engine declares the settings of `[engines.<name>]` it honors (`user-agent`, `storage`),
 //! which the core checks the configuration against, and every runtime starts with the settings
-//! of the configuration `sig` started with, whenever it starts ([`Launch`]): its own
-//! configuration (`ServoConfig`, `WasmConfig`, `WpeConfig`) is made from them here. An engine
-//! started with
-//! `storage = "ephemeral"` that has to write while it runs gets a directory of its own under
-//! `$XDG_RUNTIME_DIR` ([`Launch::scratch`]), which [`Registry::remove_scratch`] deletes at the
-//! end of shutdown, after everything that could still write there has stopped.
+//! of the configuration the process started with, whenever it starts ([`Launch`]). The
+//! frontend makes the engine's own configuration (`ServoConfig`, `WasmConfig`, `WpeConfig`)
+//! from the helpers here. An engine started with `storage = "ephemeral"` that has to write
+//! while it runs gets a directory of its own under `$XDG_RUNTIME_DIR` ([`Launch::scratch`]),
+//! which [`Registry::remove_scratch`] deletes at the end of shutdown, after everything that
+//! could still write there has stopped.
 //!
-//! Must not own: routing policy (the core decides which engine opens a URL).
+//! Must not own: routing policy (the core decides which engine opens a URL), windows, or the
+//! concrete target and permit types.
 
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use sighurt_api::engine::{EngineCapabilities, EngineRuntime, EngineWaker, PumpStatus};
 use sighurt_api::keymap::KeymapKind;
 use sighurt_core::config::{Config, EngineSettings};
 use sighurt_core::{ChromeChecks, Environment};
-use sighurt_ui::extension::ChromeKind;
-use sighurt_ui::Colors;
-use sighurt_wayland::{FramePermit, PresentMode, TargetLease};
 use tempfile::TempDir;
 
-/// The contract every engine's runtime implements, bound to the host's types.
-pub type Contract = dyn EngineRuntime<Target = TargetLease, FramePermit = FramePermit>;
-
-/// A running engine: the contract, and the concrete runtime for what only it can tell
-/// ([`Runtime::renderer`], [`Runtime::readbacks`]).
-pub enum Runtime {
-    #[cfg(feature = "engine-servo")]
-    Servo(Box<sighurt_engine_servo::ServoRuntime>),
-    #[cfg(feature = "engine-wasm")]
-    Wasm(Box<sighurt_engine_wasm::WasmRuntime<TargetLease>>),
-    #[cfg(feature = "engine-wpe")]
-    Wpe(Box<sighurt_engine_wpe::WpeRuntime>),
-    #[cfg(feature = "engine-demo")]
-    Demo(Box<sighurt_engine_demo::DemoRuntime>),
-}
-
-impl Deref for Runtime {
-    type Target = Contract;
-
-    fn deref(&self) -> &Contract {
-        match *self {
-            #[cfg(feature = "engine-servo")]
-            Self::Servo(ref runtime) => &**runtime,
-            #[cfg(feature = "engine-wasm")]
-            Self::Wasm(ref runtime) => &**runtime,
-            #[cfg(feature = "engine-wpe")]
-            Self::Wpe(ref runtime) => &**runtime,
-            #[cfg(feature = "engine-demo")]
-            Self::Demo(ref runtime) => &**runtime,
-        }
-    }
-}
-
-impl DerefMut for Runtime {
-    fn deref_mut(&mut self) -> &mut Contract {
-        match *self {
-            #[cfg(feature = "engine-servo")]
-            Self::Servo(ref mut runtime) => &mut **runtime,
-            #[cfg(feature = "engine-wasm")]
-            Self::Wasm(ref mut runtime) => &mut **runtime,
-            #[cfg(feature = "engine-wpe")]
-            Self::Wpe(ref mut runtime) => &mut **runtime,
-            #[cfg(feature = "engine-demo")]
-            Self::Demo(ref mut runtime) => &mut **runtime,
-        }
-    }
-}
-
-impl Runtime {
-    /// How it renders, once it knows: "cpu" for the CPU engines; for Servo, after its first
-    /// view has a context, "hardware" or "software" (a software rasterizer: the diagnosed
-    /// fallback) and the GL renderer; for WPE, after its first view, "hardware" (WebKit's
-    /// DMA-BUFs on the GPU) or "fallback" (shared memory, a CPU copy per frame) and how.
-    pub fn renderer(&self) -> Option<(&'static str, Option<String>)> {
-        match *self {
-            #[cfg(feature = "engine-servo")]
-            Self::Servo(ref runtime) => runtime.diagnostics().gl.map(|gl| {
-                let mode = if gl.software { "software" } else { "hardware" };
-                (mode, Some(gl.renderer))
-            }),
-            #[cfg(feature = "engine-wpe")]
-            Self::Wpe(ref runtime) => {
-                use sighurt_engine_wpe::Transport;
-                let diagnostics = runtime.diagnostics();
-                let mode = match diagnostics.transport? {
-                    Transport::Dmabuf => "hardware",
-                    Transport::Shm => "fallback",
-                };
-                Some((mode, diagnostics.renderer()))
-            }
-            #[allow(unreachable_patterns)]
-            _ => Some(("cpu", None)),
-        }
+/// What a running engine adds to the contract, for diagnostics and shutdown.
+///
+/// The frontend implements this for each concrete runtime and stores it in [`Runtime`]. The
+/// defaults are a CPU engine that counts no readbacks and shuts down cleanly.
+pub trait Running<T, P>: EngineRuntime<Target = T, FramePermit = P> {
+    /// How it renders, once it knows. `None` until a GL engine has a context. The default is
+    /// a CPU engine.
+    fn renderer(&self) -> Option<(&'static str, Option<String>)> {
+        Some(("cpu", None))
     }
 
-    /// Page readbacks to the CPU the engine made: Servo counts `read_to_image` and, when
-    /// auditing, GL reads; WPE the frames of its shared-memory fallback, which WebKit reads back
-    /// and the presenter copies. 0 for the CPU engines, which paint into the host's buffers.
-    pub fn readbacks(&self) -> u64 {
-        match *self {
-            #[cfg(feature = "engine-servo")]
-            Self::Servo(ref runtime) => {
-                let d = runtime.diagnostics();
-                d.read_to_image + d.gl_reads.unwrap_or(0)
-            }
-            #[cfg(feature = "engine-wpe")]
-            Self::Wpe(ref runtime) => runtime.diagnostics().present.shm_copies,
-            #[allow(unreachable_patterns)]
-            _ => 0,
-        }
+    /// Page readbacks to the CPU the engine made. 0 for the CPU engines.
+    fn readbacks(&self) -> u64 {
+        0
     }
 
     /// How long the engine itself took to paint the frame it last submitted, when it times
-    /// that apart from presenting: Servo's `WebView::paint` (WebRender drawing the frame),
-    /// without its spin and swap. `None` for the CPU engines, whose `present` is the painting.
-    pub fn paint_time(&self) -> Option<Duration> {
-        match *self {
-            #[cfg(feature = "engine-servo")]
-            Self::Servo(ref runtime) => Some(runtime.diagnostics().timing.paint),
-            #[allow(unreachable_patterns)]
-            _ => None,
-        }
+    /// that apart from presenting. `None` for the CPU engines, whose `present` is the painting.
+    fn paint_time(&self) -> Option<std::time::Duration> {
+        None
     }
 
-    /// The GL reads among [`Runtime::readbacks`], when the engine audits its GL calls (Servo
-    /// with `SIG_AUDIT_GL=1`).
-    pub fn gl_reads(&self) -> Option<u64> {
-        match *self {
-            #[cfg(feature = "engine-servo")]
-            Self::Servo(ref runtime) => runtime.diagnostics().gl_reads,
-            #[allow(unreachable_patterns)]
-            _ => None,
-        }
+    /// The GL reads among [`Running::readbacks`], when the engine audits its GL calls.
+    fn gl_reads(&self) -> Option<u64> {
+        None
     }
 
-    /// Whether `shutdown` had to leave the engine running: Servo after a page crash or a lost
-    /// backend (decision 54). Its threads still use GL state on the host's connection, so the
-    /// process must end without exit handlers.
+    /// Whether `shutdown` had to leave the engine running (decision 54).
     fn leaked(&self) -> bool {
-        match *self {
+        false
+    }
+}
+
+/// A running engine, distinguished so each kind can be named, holding the frontend's target
+/// and permit types.
+pub enum Runtime<T: 'static, P: 'static> {
+    #[cfg(feature = "engine-servo")]
+    Servo(Box<dyn Running<T, P>>),
+    #[cfg(feature = "engine-wasm")]
+    Wasm(Box<dyn Running<T, P>>),
+    #[cfg(feature = "engine-wpe")]
+    Wpe(Box<dyn Running<T, P>>),
+    #[cfg(feature = "engine-demo")]
+    Demo(Box<dyn Running<T, P>>),
+    /// Present only when no engine is compiled in, so the type still names `T` and `P`.
+    /// Never constructed.
+    #[cfg(not(any(
+        feature = "engine-servo",
+        feature = "engine-wasm",
+        feature = "engine-wpe",
+        feature = "engine-demo"
+    )))]
+    #[allow(dead_code)]
+    None(std::marker::PhantomData<fn(T, P)>),
+}
+
+impl<T: 'static, P: 'static> Runtime<T, P> {
+    fn as_running(&self) -> &(dyn Running<T, P> + 'static) {
+        match self {
             #[cfg(feature = "engine-servo")]
-            Self::Servo(ref runtime) => runtime.diagnostics().leaked,
-            #[allow(unreachable_patterns)]
-            _ => false,
+            Self::Servo(engine) => engine.as_ref(),
+            #[cfg(feature = "engine-wasm")]
+            Self::Wasm(engine) => engine.as_ref(),
+            #[cfg(feature = "engine-wpe")]
+            Self::Wpe(engine) => engine.as_ref(),
+            #[cfg(feature = "engine-demo")]
+            Self::Demo(engine) => engine.as_ref(),
+            #[cfg(not(any(
+                feature = "engine-servo",
+                feature = "engine-wasm",
+                feature = "engine-wpe",
+                feature = "engine-demo"
+            )))]
+            Self::None(_) => unreachable!("no engine is compiled in"),
         }
+    }
+
+    fn as_running_mut(&mut self) -> &mut (dyn Running<T, P> + 'static) {
+        match self {
+            #[cfg(feature = "engine-servo")]
+            Self::Servo(engine) => engine.as_mut(),
+            #[cfg(feature = "engine-wasm")]
+            Self::Wasm(engine) => engine.as_mut(),
+            #[cfg(feature = "engine-wpe")]
+            Self::Wpe(engine) => engine.as_mut(),
+            #[cfg(feature = "engine-demo")]
+            Self::Demo(engine) => engine.as_mut(),
+            #[cfg(not(any(
+                feature = "engine-servo",
+                feature = "engine-wasm",
+                feature = "engine-wpe",
+                feature = "engine-demo"
+            )))]
+            Self::None(_) => unreachable!("no engine is compiled in"),
+        }
+    }
+}
+
+impl<T: 'static, P: 'static> Deref for Runtime<T, P> {
+    type Target = dyn Running<T, P>;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_running()
+    }
+}
+
+impl<T: 'static, P: 'static> DerefMut for Runtime<T, P> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_running_mut()
     }
 }
 
@@ -187,12 +168,11 @@ pub fn install_logger() {
     }
 }
 
-/// The chromes compiled into this build: the standard one always, then those of features.
-pub const CHROMES: &[ChromeKind] = &[
-    sighurt_ui::standard::KIND,
-    #[cfg(feature = "chrome-line")]
-    sighurt_chrome_line::KIND,
-];
+/// Marks the process logger as taken. Returns whether it was taken already. The frontend
+/// calls this when it starts Servo: the first caller installs Servo's logger.
+pub fn claim_logger() -> bool {
+    LOGGER.swap(true, Ordering::SeqCst)
+}
 
 /// The keymaps compiled into this build besides the core's own `bindings`.
 pub const KEYMAPS: &[KeymapKind] = &[
@@ -200,27 +180,11 @@ pub const KEYMAPS: &[KeymapKind] = &[
     sighurt_keymap_modal::KIND,
 ];
 
-/// The chrome of this build called `name`. A configuration checked against [`CHROMES`] names
-/// one of them; the standard chrome stands in otherwise.
-pub fn chrome(name: &str) -> ChromeKind {
-    let found = CHROMES.iter().find(|chrome| chrome.name == name);
-    found.copied().unwrap_or(sighurt_ui::standard::KIND)
-}
-
-/// What the core checks of `chrome`.
-pub fn checks(chrome: &ChromeKind) -> ChromeChecks {
-    ChromeChecks {
-        name: chrome.name,
-        check: chrome.check,
-        commands: chrome.commands,
-    }
-}
-
 /// What a runtime is started with.
 // Only the Wasm engine needs a scratch directory, and the demo engine reads nothing.
 #[cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
 pub struct Launch<'a> {
-    /// `[engines.<name>]` of the configuration `sig` started with.
+    /// `[engines.<name>]` of the configuration the process started with.
     pub settings: &'a EngineSettings,
     scratch: &'a mut Option<TempDir>,
     name: &'static str,
@@ -228,9 +192,9 @@ pub struct Launch<'a> {
 
 #[cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
 impl Launch<'_> {
-    /// A directory of the engine's own for what it keeps only while `sig` runs, made now:
-    /// under `$XDG_RUNTIME_DIR` (or the temporary directory), readable by the user alone, and
-    /// deleted at the end of `sig`'s shutdown.
+    /// A directory of the engine's own for what it keeps only while the process runs, made
+    /// now: under `$XDG_RUNTIME_DIR` (or the temporary directory), readable by the user alone,
+    /// and deleted at the end of shutdown.
     pub fn scratch(&mut self) -> Result<PathBuf, String> {
         if self.scratch.is_none() {
             use std::os::unix::fs::PermissionsExt;
@@ -247,23 +211,21 @@ impl Launch<'_> {
 }
 
 /// One compiled-in engine.
-pub struct Engine {
+pub struct Engine<T: 'static, P: 'static> {
     /// Its name in the configuration.
     pub name: &'static str,
     /// What it supports; the core needs this before the runtime exists.
     pub capabilities: EngineCapabilities,
-    /// How its views present.
-    pub mode: PresentMode,
     /// How it renders, for diagnostics and the home page.
     pub renderer: &'static str,
     /// The settings of `[engines.<name>]` it honors.
     pub honors: &'static [&'static str],
-    start: fn(EngineWaker, Launch<'_>) -> Result<Runtime, String>,
-    /// What it starts with: the configuration's when `sig` started.
+    start: fn(EngineWaker, Launch<'_>) -> Result<Runtime<T, P>, String>,
+    /// What it starts with: the configuration's when the process started.
     settings: EngineSettings,
-    /// Its directory for what it keeps only while `sig` runs, once it has one.
+    /// Its directory for what it keeps only while the process runs, once it has one.
     scratch: Option<TempDir>,
-    state: State,
+    state: State<T, P>,
     waker: Option<EngineWaker>,
     /// Called since its last pump.
     called: bool,
@@ -278,7 +240,7 @@ enum PumpDue {
 }
 
 /// Where a runtime is in its life.
-pub enum State {
+pub enum State<T: 'static, P: 'static> {
     /// Not needed yet.
     #[cfg_attr(
         not(any(
@@ -291,14 +253,15 @@ pub enum State {
     )]
     NotStarted,
     /// Running.
-    Running(Runtime),
+    Running(Runtime<T, P>),
     /// Starting it failed, or it reported `RuntimeFailed`: why.
     Failed(String),
     /// `EngineRuntime::shutdown` was called.
     ShutDown,
 }
 
-impl Engine {
+impl<T: 'static, P: 'static> Engine<T, P> {
+    /// An engine that is not started yet. `start` builds its runtime, bound to `T` and `P`.
     #[cfg_attr(
         not(any(
             feature = "engine-servo",
@@ -308,18 +271,16 @@ impl Engine {
         )),
         allow(dead_code)
     )]
-    fn new(
+    pub fn new(
         name: &'static str,
         capabilities: EngineCapabilities,
-        mode: PresentMode,
         renderer: &'static str,
         honors: &'static [&'static str],
-        start: fn(EngineWaker, Launch<'_>) -> Result<Runtime, String>,
+        start: fn(EngineWaker, Launch<'_>) -> Result<Runtime<T, P>, String>,
     ) -> Self {
         Self {
             name,
             capabilities,
-            mode,
             renderer,
             honors,
             start,
@@ -333,31 +294,21 @@ impl Engine {
     }
 
     /// Where the runtime is in its life.
-    pub fn state(&self) -> &State {
+    pub fn state(&self) -> &State<T, P> {
         &self.state
     }
 }
 
 /// Every compiled-in engine.
-pub struct Registry {
-    engines: Vec<Engine>,
-    /// A runtime that was shut down is still running ([`Runtime::leaked`]).
+pub struct Registry<T: 'static, P: 'static> {
+    engines: Vec<Engine<T, P>>,
+    /// A runtime that was shut down is still running ([`Running::leaked`]).
     leaked: bool,
 }
 
-impl Registry {
-    /// The engines of this build, none started.
-    pub fn compiled() -> Self {
-        let engines = vec![
-            #[cfg(feature = "engine-servo")]
-            servo(),
-            #[cfg(feature = "engine-wasm")]
-            wasm(),
-            #[cfg(feature = "engine-wpe")]
-            wpe(),
-            #[cfg(feature = "engine-demo")]
-            demo(),
-        ];
+impl<T: 'static, P: 'static> Registry<T, P> {
+    /// `engines`, none started. The frontend builds the list, in the order they shut down.
+    pub fn new(engines: Vec<Engine<T, P>>) -> Self {
         Self {
             engines,
             leaked: false,
@@ -365,8 +316,13 @@ impl Registry {
     }
 
     /// What the core checks configurations against: the build's engines, with what each
-    /// supports and which settings it honors, its keymaps, its chromes and their colors.
-    pub fn environment(&self) -> Environment {
+    /// supports and which settings it honors, its keymaps, and the chromes and color names the
+    /// frontend passes.
+    pub fn environment(
+        &self,
+        chromes: Vec<ChromeChecks>,
+        color_names: &'static [&'static str],
+    ) -> Environment {
         let engines = self.engines.iter();
         Environment {
             engines: engines
@@ -376,24 +332,24 @@ impl Registry {
             engine_settings: engines.map(|e| (e.name.into(), e.honors)).collect(),
             home_dir: dirs::home_dir(),
             keymaps: KEYMAPS.to_vec(),
-            chromes: CHROMES.iter().map(checks).collect(),
-            color_names: &Colors::NAMES,
+            chromes,
+            color_names,
         }
     }
 
     /// Every engine, in build order.
-    pub fn engines(&self) -> impl Iterator<Item = &Engine> {
+    pub fn engines(&self) -> impl Iterator<Item = &Engine<T, P>> {
         self.engines.iter()
     }
 
     /// `name`'s engine.
-    pub fn engine(&self, name: &str) -> Option<&Engine> {
+    pub fn engine(&self, name: &str) -> Option<&Engine<T, P>> {
         self.engines.iter().find(|e| e.name == name)
     }
 
-    /// Takes the settings every runtime starts with from `config`, the configuration `sig`
-    /// starts with, then starts the engines that start with `sig` rather than on first use:
-    /// Servo, when it is compiled in and `config` enables it (decision 26).
+    /// Takes the settings every runtime starts with from `config`, the configuration the
+    /// process starts with, then starts the engines that start with the process rather than on
+    /// first use: Servo, when it is compiled in and `config` enables it (decision 26).
     #[cfg_attr(not(feature = "engine-servo"), allow(unused_variables))]
     pub fn start_at_launch(&mut self, config: &Config, waker: impl FnOnce() -> EngineWaker) {
         for engine in &mut self.engines {
@@ -417,7 +373,7 @@ impl Registry {
         &mut self,
         name: &str,
         waker: impl FnOnce() -> EngineWaker,
-    ) -> Result<&mut Runtime, String> {
+    ) -> Result<&mut Runtime<T, P>, String> {
         let engine = self
             .engines
             .iter_mut()
@@ -455,7 +411,7 @@ impl Registry {
     }
 
     /// `name`'s runtime if it is running, marked as called.
-    pub fn running(&mut self, name: &str) -> Option<&mut Runtime> {
+    pub fn running(&mut self, name: &str) -> Option<&mut Runtime<T, P>> {
         let engine = self.engines.iter_mut().find(|e| e.name == name)?;
         match &mut engine.state {
             State::Running(runtime) => {
@@ -545,14 +501,14 @@ impl Registry {
     }
 
     /// Whether a runtime that was shut down, or failed, had to be left running (decision 54):
-    /// then `sig` must end with `_exit` once its own state is saved.
+    /// then the process must end with [`crate::exit_now`] once its own state is saved.
     pub fn leaked(&self) -> bool {
         self.leaked
     }
 
-    /// Deletes the engines' directories for what they keep only while `sig` runs. Called at
-    /// the end of shutdown: a guest still finishing its last call when its runtime shut down
-    /// could otherwise write there again.
+    /// Deletes the engines' directories for what they keep only while the process runs. Called
+    /// at the end of shutdown: a guest still finishing its last call when its runtime shut
+    /// down could otherwise write there again.
     pub fn remove_scratch(&mut self) {
         for engine in &mut self.engines {
             let Some(dir) = engine.scratch.take() else {
@@ -566,48 +522,11 @@ impl Registry {
     }
 }
 
-#[cfg(feature = "engine-demo")]
-fn demo() -> Engine {
-    use sighurt_engine_demo::{DemoRuntime, CAPABILITIES, NAME};
-    Engine::new(
-        NAME,
-        CAPABILITIES,
-        PresentMode::Shm,
-        "cpu, wl_shm",
-        &[],
-        |_waker, _launch| Ok(Runtime::Demo(Box::new(DemoRuntime::new()))),
-    )
-}
-
-#[cfg(feature = "engine-wasm")]
-fn wasm() -> Engine {
-    use sighurt_engine_wasm::WasmRuntime;
-    // What `WasmRuntime::capabilities` reports; `Registry::start` warns if they ever differ.
-    let capabilities = EngineCapabilities {
-        history_traversal: true,
-        page_zoom: true,
-        ..EngineCapabilities::default()
-    };
-    Engine::new(
-        "wasm",
-        capabilities,
-        PresentMode::Shm,
-        "cpu (tiny-skia), wl_shm",
-        // Not `user-agent`: guests make their own requests.
-        &["storage"],
-        |waker, launch| {
-            WasmRuntime::<TargetLease>::new(wasm_config(launch)?, waker)
-                .map(|runtime| Runtime::Wasm(Box::new(runtime)))
-                .map_err(|e| e.to_string())
-        },
-    )
-}
-
 /// The Wasm runtime's directories: the key-value store in the user's data directory and
 /// compiled modules in the cache, or with `storage = "ephemeral"` the store in the engine's
-/// scratch directory and no cache, so nothing outlives `sig`.
+/// scratch directory and no cache, so nothing outlives the process.
 #[cfg(feature = "engine-wasm")]
-fn wasm_config(mut launch: Launch<'_>) -> Result<sighurt_engine_wasm::WasmConfig, String> {
+pub fn wasm_config(mut launch: Launch<'_>) -> Result<sighurt_engine_wasm::WasmConfig, String> {
     use sighurt_core::config::Storage;
     use sighurt_engine_wasm::{default_aot_cache, kv, SandboxPolicy, WasmConfig};
     let (kv_root, aot_cache) = match launch.settings.storage {
@@ -621,34 +540,10 @@ fn wasm_config(mut launch: Launch<'_>) -> Result<sighurt_engine_wasm::WasmConfig
     })
 }
 
-#[cfg(feature = "engine-wpe")]
-fn wpe() -> Engine {
-    use sighurt_engine_wpe::{WpeRuntime, CAPABILITIES};
-    Engine::new(
-        "wpe",
-        CAPABILITIES,
-        // A native target: WebKit's frames are attached by the engine, not painted by the host.
-        PresentMode::Gl,
-        "WebKit: its DMA-BUFs straight into the page's subsurface",
-        &["user-agent", "storage"],
-        |waker, launch| {
-            // shell.nix sets them; without them https: and media fail inside WebKit.
-            for variable in ["GIO_EXTRA_MODULES", "GST_PLUGIN_SYSTEM_PATH_1_0"] {
-                if std::env::var_os(variable).is_none() {
-                    log::warn!("wpe: {variable} is not set: run sig in the repository's nix-shell");
-                }
-            }
-            WpeRuntime::new(wpe_config(launch.settings), waker)
-                .map(|runtime| Runtime::Wpe(Box::new(runtime)))
-                .map_err(|e| e.to_string())
-        },
-    )
-}
-
 /// WebKit's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps everything in memory; the user agent, if one is set.
 #[cfg(feature = "engine-wpe")]
-fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
+pub fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
     use sighurt_core::config::Storage;
     let profile = match settings.storage {
         Storage::Profile => dirs::data_dir().map(|d| d.join("sighurt").join("wpe")),
@@ -661,33 +556,10 @@ fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
     }
 }
 
-#[cfg(feature = "engine-servo")]
-fn servo() -> Engine {
-    use sighurt_engine_servo::{ServoRuntime, CAPABILITIES};
-    Engine::new(
-        "servo",
-        CAPABILITIES,
-        PresentMode::Gl,
-        "gl, straight into the page's subsurface",
-        &["user-agent", "storage"],
-        |waker, launch| {
-            let runtime = ServoRuntime::new(servo_config(launch.settings), waker);
-            if !LOGGER.swap(true, Ordering::SeqCst) {
-                runtime.setup_logging();
-            } else {
-                log::warn!(
-                    "Servo started after the logger: its script-thread panics are not caught"
-                );
-            }
-            Ok(Runtime::Servo(Box::new(runtime)))
-        },
-    )
-}
-
 /// Servo's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set.
 #[cfg(feature = "engine-servo")]
-fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoConfig {
+pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoConfig {
     use sighurt_core::config::Storage;
     let profile = match settings.storage {
         Storage::Profile => dirs::data_dir().map(|d| d.join("sighurt").join("servo")),
@@ -706,37 +578,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_core_learns_what_each_engine_honors() {
-        let registry = Registry::compiled();
-        let env = registry.environment();
-        assert_eq!(
-            env.engine_settings.keys().collect::<Vec<_>>(),
-            env.engines.keys().collect::<Vec<_>>()
-        );
-        // A valid value of each setting the core knows; an engine honoring another fails here.
-        let valid = |name: &str| match name {
-            "user-agent" => "\"Sighurt\"",
-            "storage" => "\"ephemeral\"",
-            other => panic!("no valid value of {other} here"),
-        };
-        for engine in registry.engines() {
-            let settings: String = engine
-                .honors
-                .iter()
-                .map(|name| format!("{name} = {}\n", valid(name)))
-                .collect();
-            let text = format!("version = 1\n[engines.{}]\n{settings}", engine.name);
-            let config = Config::parse(Some(&text), &env);
-            assert!(config.is_ok(), "{}: {config:?}", engine.name);
-        }
-        #[cfg(feature = "engine-servo")]
-        assert_eq!(env.engine_settings["servo"], ["user-agent", "storage"]);
-        #[cfg(feature = "engine-wasm")]
-        assert_eq!(env.engine_settings["wasm"], ["storage"]);
-        #[cfg(feature = "engine-wpe")]
-        assert_eq!(env.engine_settings["wpe"], ["user-agent", "storage"]);
-        #[cfg(feature = "engine-demo")]
-        assert!(env.engine_settings["demo"].is_empty());
+    fn keymaps_follow_the_build() {
+        let registry = Registry::<(), ()>::new(Vec::new());
+        let env = registry.environment(Vec::new(), &[]);
+        assert!(env.engines.is_empty());
+        assert_eq!(env.keymaps, KEYMAPS.to_vec());
+        assert!(env.chromes.is_empty());
     }
 
     #[cfg(feature = "engine-servo")]
@@ -812,10 +659,57 @@ mod tests {
     #[test]
     fn an_ephemeral_engines_directory_lasts_until_the_end_of_shutdown() {
         use std::os::unix::fs::PermissionsExt;
-        let mut registry = Registry::compiled();
+
+        use sighurt_api::geometry::Metrics;
+        use sighurt_api::ids::LayoutEpoch;
+        use sighurt_engine_wasm::{CpuTarget, Frame, WasmRuntime};
+
+        /// An in-memory target, so this test starts the real Wasm runtime without a display.
+        struct MemTarget;
+        struct MemPermit;
+
+        impl CpuTarget for MemTarget {
+            type Permit = MemPermit;
+
+            fn metrics(&self) -> Metrics {
+                unimplemented!("the test never presents")
+            }
+
+            fn permit_epoch(_permit: &MemPermit) -> LayoutEpoch {
+                unimplemented!("the test never presents")
+            }
+
+            fn submit(
+                &mut self,
+                _permit: MemPermit,
+                _paint: &mut dyn FnMut(Frame<'_>) -> Result<(), String>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        impl Running<MemTarget, MemPermit> for WasmRuntime<MemTarget> {}
+
+        let engine = Engine::new(
+            "wasm",
+            EngineCapabilities {
+                history_traversal: true,
+                page_zoom: true,
+                ..EngineCapabilities::default()
+            },
+            "cpu (tiny-skia), wl_shm",
+            &["storage"],
+            |waker, launch| {
+                WasmRuntime::new(wasm_config(launch)?, waker)
+                    .map(|runtime| Runtime::Wasm(Box::new(runtime)))
+                    .map_err(|e| e.to_string())
+            },
+        );
+
+        let mut registry = Registry::new(vec![engine]);
         let text = "version = 1\n[engines]\ndefault = \"wasm\"\nenabled = [\"wasm\"]\n\
                     [engines.wasm]\nstorage = \"ephemeral\"";
-        let config = Config::parse(Some(text), &registry.environment()).unwrap();
+        let config = Config::parse(Some(text), &registry.environment(Vec::new(), &[])).unwrap();
         registry.start_at_launch(&config, || -> EngineWaker { unreachable!("no Servo") });
         assert!(registry.start("wasm", || EngineWaker::new(|| {})).is_ok());
         let wasm = registry.engine("wasm").unwrap();

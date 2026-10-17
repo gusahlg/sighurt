@@ -6,6 +6,8 @@ members = [
     "sighurt-wayland",
     "sighurt-ui",
     "sighurt-browser",
+    "sighurt-runtime",
+    "sighurt-gui",
     # Chromes besides the standard one, compiled into `sig` through sighurt-browser's features.
     "sighurt-chrome-line",
     # Engines, compiled into `sig` through sighurt-browser's features.

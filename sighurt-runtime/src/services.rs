@@ -1,8 +1,13 @@
-//! Performing the privileged services the core allowed: clipboard transfers through the host,
-//! downloads into the download folder, and handing URLs to the desktop.
+//! Performing the privileged services the core allowed: downloads into the download folder,
+//! handing URLs to the desktop, and clipboard transfers through the frontend
+//! ([`Clipboard`]).
 //!
-//! Work that takes time runs off the owner thread (downloads on threads of their own, clipboard
-//! reads as the host's asynchronous pipes) and reports back with its `RequestId` through a
+//! The clipboard itself belongs to the frontend (the Wayland host, or later the terminal).
+//! This module decides nothing about selections; it asks the frontend to read, write and
+//! cancel, and reports the answer to the core.
+//!
+//! Work that takes time runs off the owner thread (downloads on threads of their own; clipboard
+//! reads however the frontend carries them out) and reports back with its `RequestId` through a
 //! channel that wakes the loop. Downloads report progress as short status lines for the status
 //! strip, as the old browser did: saved as `name`, `name (1)`, ... in the download folder
 //! (`[downloads] directory`, else the desktop's, else `~/Downloads`; made by the download that
@@ -26,9 +31,34 @@ use std::time::{Duration, Instant};
 
 use sighurt_api::ids::RequestId;
 use sighurt_api::services::{
-    ClipboardData, DownloadSource, Service, ServiceError, ServiceReply, ServiceResult,
+    ClipboardData, DownloadSource, Selection, Service, ServiceError, ServiceReply, ServiceResult,
 };
-use sighurt_wayland::Host;
+
+/// The clipboard, as the frontend's platform provides it.
+///
+/// Page services reach the clipboard only through this. The frontend carries a read out
+/// asynchronously and later hands the bytes back; a write is answered at once.
+pub trait Clipboard {
+    /// Start reading `selection` in the first of `mime_types` it offers, at most `limit` bytes.
+    /// The outcome is not returned here: the frontend delivers it later, tagged with `request`.
+    fn read(
+        &mut self,
+        request: RequestId,
+        selection: Selection,
+        mime_types: &[String],
+        limit: usize,
+    );
+
+    /// Replace `selection` with `items`.
+    fn write(
+        &mut self,
+        selection: Selection,
+        items: Vec<ClipboardData>,
+    ) -> Result<(), ServiceError>;
+
+    /// Abandon the read for `request`. Nothing is reported for it.
+    fn cancel(&mut self, request: RequestId);
+}
 
 /// How often a running download reports its progress.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
@@ -94,10 +124,10 @@ impl Services {
 
     /// Performs `service` for `request`, a download into `downloads` if the configuration names
     /// a folder. `Some` is the answer now; `None` means it comes later, through
-    /// [`Services::clipboard_read`].
+    /// [`Services::clipboard_read`]. Clipboard work is asked of `clipboard`.
     pub fn perform(
         &mut self,
-        host: &mut Host,
+        clipboard: &mut impl Clipboard,
         request: RequestId,
         service: Service,
         downloads: Option<&Path>,
@@ -109,11 +139,12 @@ impl Services {
                 limit,
             } => {
                 self.clipboard_reads.insert(request);
-                host.clipboard_read(request, selection, &mime_types, limit.min(MAX_CLIPBOARD));
+                clipboard.read(request, selection, &mime_types, limit.min(MAX_CLIPBOARD));
                 None
             }
             Service::ClipboardWrite { selection, items } => Some(
-                host.clipboard_write(selection, items)
+                clipboard
+                    .write(selection, items)
                     .map(|()| ServiceReply::Done),
             ),
             Service::Download {
@@ -131,7 +162,7 @@ impl Services {
         }
     }
 
-    /// The host finished a clipboard read: the answer for the page, if the read was a page's.
+    /// The frontend finished a clipboard read: the answer for the page, if the read was a page's.
     pub fn clipboard_read(
         &mut self,
         request: RequestId,
@@ -143,9 +174,9 @@ impl Services {
     }
 
     /// Stops work on `request`; nothing is reported for it.
-    pub fn cancel(&mut self, host: &mut Host, request: RequestId) {
+    pub fn cancel(&mut self, clipboard: &mut impl Clipboard, request: RequestId) {
         if self.clipboard_reads.remove(&request) {
-            host.clipboard_cancel(request);
+            clipboard.cancel(request);
         }
     }
 

@@ -1,5 +1,5 @@
-//! The application owner loop, built on calloop, and the wiring of core, host, chrome and
-//! engines.
+//! The Wayland owner loop, built on calloop, and the wiring of the host, the chrome and the
+//! session.
 //!
 //! Its sources are the Wayland connection (calloop-wayland-source's prepare-read, read,
 //! dispatch and flush cycle, inside the host), one ping that engine wakers and service threads
@@ -12,7 +12,8 @@
 //! 1. Collect ready input and completions: at most [`MAX_HOST_EVENTS`] host events a pass, with
 //!    consecutive pointer motion over the same target coalesced to the latest; key transitions
 //!    and everything else keep their order.
-//! 2. Hand them to the core (`sighurt_core::update`) and carry out its effects ([`effects`]).
+//! 2. Hand them to the core (`sighurt_core::update`, inside the session) and carry out its
+//!    effects.
 //! 3. Deliver engine commands (as effects) and pump every runtime that was called, woke, or
 //!    whose deadline passed.
 //! 4. Hand their events to the core after the pumps return.
@@ -28,63 +29,62 @@
 //! Nothing ticks at a fixed rate: an idle browser sleeps until the compositor, an engine, a
 //! service or a signal wakes it. Downloads and session writes run on threads of their own.
 //!
-//! The chrome is the one `[ui] chrome` names when `sig` starts ([`registry::CHROMES`]), driven
+//! The chrome is the one `[ui] chrome` names when `sig` starts ([`chrome::CHROMES`]), driven
 //! through `sighurt_ui::extension::Chrome`: its surfaces are SHM targets by name
-//! ([`ChromeTargets`]), created when it first lists them.
+//! ([`ChromeTargets`](crate::chrome::ChromeTargets)), created when it first lists them.
 //!
 //! Shutdown (plan §20): stop taking input, cancel downloads, write the session (at once, whole),
 //! close every view and shut every runtime down (each releases its target leases), wait a moment
 //! for the downloads (deleting the files of those still waiting on a server), delete what
 //! engines kept only for this run (`storage = "ephemeral"`), retire the chrome's leases, close
 //! the window, and only then drop the host. If a runtime could not shut down (Servo after a
-//! crash, decision 54), the process ends with `_exit` after that, releasing nothing that runtime
-//! may still use. With `[session] restore` off, the session is neither read nor written.
+//! crash, decision 54), the frontend is asked to clean up and the process ends with `_exit`,
+//! releasing nothing that runtime may still use. With `[session] restore` off, the session is
+//! neither read nor written.
 //!
-//! Must not own: browser policy (the core) or drawing (the chrome and engines).
-//!
-//! [`effects`]: crate::effects
-//! [`registry::CHROMES`]: crate::registry::CHROMES
+//! Must not own: browser policy (the core) or which effect runs (the session). Drawing belongs
+//! to the chrome and the engines.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
-use calloop::ping::{make_ping, Ping};
+use calloop::ping::make_ping;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
-use sighurt_api::engine::{EngineCommand, EngineError, EngineWaker};
-use sighurt_api::events::{Cursor, EngineEvent};
+use sighurt_api::engine::{EngineCommand, EngineWaker, PresentOutcome};
+use sighurt_api::events::Cursor;
 use sighurt_api::geometry::LogicalSize;
 use sighurt_api::ids::{RequestId, SeatId, TargetId, ViewId, WindowId};
 use sighurt_api::input::{InputEvent, InputKind, KeyboardFocus, PointerButton, PointerEvent};
-use sighurt_api::services::{ClipboardData, Selection};
+use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_core::tabs::{Content, TabSummary};
-use sighurt_core::{BrowserEvent, BrowserState, Environment};
+use sighurt_core::{BrowserEvent, BrowserState, OpenRequest};
+use sighurt_runtime::diagnostics::{Diagnostics, EngineReport, Report, TabReport, TargetReport};
+use sighurt_runtime::frontend::Frontend;
+use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
+use sighurt_runtime::registry::State;
+use sighurt_runtime::services::{Clipboard, Services};
+use sighurt_runtime::session::Session;
+use sighurt_runtime::view::ViewEntry;
 use sighurt_ui::extension::{
     Chrome, ChromeAction, ChromeEvent, SurfaceName, TextField, MAX_SURFACES,
 };
-use sighurt_ui::{EngineRow, HomeInfo, PixelBuffer, Snapshot};
+use sighurt_ui::{Colors, EngineRow, HomeInfo, PixelBuffer, Snapshot};
 use sighurt_wayland::{
     FramePermit, Host, HostEvent, InputRegion, Placement, PresentMode, TargetLease,
     TargetPlacement, WindowOptions,
 };
 
 use crate::chrome::{self, ChromeTargets};
-use crate::diagnostics::{Diagnostics, EngineReport, Report, TabReport, TargetReport};
-use crate::persistence::{self, ConfigWatch, Paths, SessionWriter};
-use crate::registry::{self, Registry, State};
-use crate::services::{Completion, Services};
-use crate::Args;
+use crate::engines;
 
 /// Most host events handled in one pass.
 pub const MAX_HOST_EVENTS: usize = 256;
 /// Most passes of steps 1–6 in one iteration before the loop goes round without sleeping.
 pub const MAX_PASSES: usize = 8;
-/// Most service completions handled in one pass.
-const MAX_COMPLETIONS: usize = 64;
-/// How long a changed session waits before it is written, so a burst of changes is one write.
-const SESSION_DELAY: Duration = Duration::from_secs(1);
 /// How long a notice of `sig`'s own comes before the page's status text in the status strip.
 const NOTICE_FIRST: Duration = Duration::from_secs(5);
 /// The most clipboard text the address line takes.
@@ -92,29 +92,22 @@ const MAX_PASTE: usize = 1024 * 1024;
 /// Clipboard types for text, most preferred first.
 const TEXT_TYPES: [&str; 3] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
 
-/// A live engine view, as `sig` knows it.
-pub(crate) struct ViewEntry {
-    pub engine: String,
-    pub target: TargetId,
-    /// Whether the core shows it (`SetVisibility`).
-    pub visible: bool,
-    /// When it was last asked to navigate while its tab was the active one, until its next
-    /// frame or until another tab becomes active.
-    pub navigated: Option<Instant>,
+/// What the command line asks the window to do.
+pub struct Options {
+    /// URLs and paths to open, as the core takes them.
+    pub open: Vec<OpenRequest>,
+    /// Where to write the diagnostics as JSON.
+    pub diagnostics: Option<PathBuf>,
 }
 
-/// Everything the owner loop owns.
-pub struct App {
-    pub(crate) host: Host,
-    pub(crate) window: WindowId,
-    pub(crate) core: BrowserState,
-    /// Events for the core, in order.
-    pub(crate) queue: VecDeque<BrowserEvent>,
-    /// What the build has, which configurations are checked against.
-    env: Environment,
-    pub(crate) chrome: Box<dyn Chrome>,
+/// The Wayland window: the host, the chrome and the targets. The session is beside it, so the
+/// two can be borrowed apart.
+struct Gui {
+    host: Host,
+    window: WindowId,
+    chrome: Box<dyn Chrome>,
     /// The chrome's name: the configuration's `[ui] chrome` when `sig` started.
-    pub(crate) chrome_name: &'static str,
+    chrome_name: &'static str,
     /// The chrome's surfaces as targets, and their leases by name.
     chrome_targets: ChromeTargets,
     leases: BTreeMap<SurfaceName, TargetLease>,
@@ -123,54 +116,51 @@ pub struct App {
     chrome_text_target: Option<TargetId>,
     /// The pointer's shape over the chrome, for targets made later.
     chrome_cursor: Cursor,
-    pub(crate) registry: Registry,
-    pub(crate) views: BTreeMap<ViewId, ViewEntry>,
-    pub(crate) services: Services,
-    paths: Paths,
-    pub(crate) session: Option<SessionWriter>,
-    pub(crate) session_due: Option<Instant>,
-    pub(crate) diag: Diagnostics,
-    /// Engine wakers and service threads ping this.
-    pub(crate) wake: Ping,
+    /// How each engine's views present. Built with the registry, so the two name the same engines.
+    modes: Vec<(&'static str, PresentMode)>,
     /// The window's size, from its latest configure.
     size: Option<LogicalSize>,
     /// The placement last applied, and whether the next must be applied even if equal.
     placed: Option<Placement>,
     place_now: bool,
-    pub(crate) snapshot_dirty: bool,
+    snapshot_dirty: bool,
     /// The latest notice or download status, for the status strip.
-    pub(crate) notice: Option<String>,
+    notice: Option<String>,
     /// Until when that notice comes before the page's own status text.
     notice_first: Option<Instant>,
     /// The chrome's clipboard read in flight.
     paste: Option<RequestId>,
     keyboard_target: Option<TargetId>,
     /// The target whose text field the input method has.
-    pub(crate) page_text_target: Option<TargetId>,
-    config_changed: bool,
-    signals: Vec<u8>,
-    /// Set when the loop must end, with the exit code.
-    pub(crate) quit: Option<ExitCode>,
+    page_text_target: Option<TargetId>,
 }
 
-/// Runs `sig` until it quits.
-pub fn run(args: Args, signals: OwnedFd) -> Result<ExitCode, String> {
+/// The owner loop's state: the window and the session, and what the loop's sources report.
+struct App {
+    gui: Gui,
+    session: Session<TargetLease, FramePermit>,
+    config_changed: bool,
+    signals: Vec<u8>,
+}
+
+/// Runs the Wayland frontend until it quits.
+pub fn run(options: Options, signals: OwnedFd) -> Result<ExitCode, String> {
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|e| format!("cannot create the event loop: {e}"))?;
     let handle = event_loop.handle();
-    let host = Host::new(&handle, |app: &mut App| &mut app.host).map_err(|e| e.to_string())?;
-    let (wake, wake_source) = make_ping().map_err(|e| e.to_string())?;
+    let host = Host::new(&handle, |app: &mut App| &mut app.gui.host).map_err(|e| e.to_string())?;
+    let (ping, wake_source) = make_ping().map_err(|e| e.to_string())?;
     handle
         .insert_source(wake_source, |(), &mut (), _| {})
         .map_err(|e| e.error.to_string())?;
-    let mut app = App::new(host, wake, args)?;
+    let mut app = App::new(host, ping, options)?;
     // From here on every way out goes through `App::shutdown`, which releases in §20's order.
-    match watch(&handle, signals, &app.paths) {
+    match watch(&handle, signals, &app.session.paths) {
         Ok(()) => app.start(),
         Err(error) => app.fail(error),
     }
     let mut busy = true;
-    while app.quit.is_none() {
+    while app.session.quit.is_none() {
         let timeout = if busy {
             Some(Duration::ZERO)
         } else {
@@ -181,7 +171,7 @@ pub fn run(args: Args, signals: OwnedFd) -> Result<ExitCode, String> {
             break;
         }
         if timeout != Some(Duration::ZERO) {
-            app.diag.counters.wakeups += 1;
+            app.session.diag.counters.wakeups += 1;
         }
         busy = app.iterate();
     }
@@ -224,300 +214,176 @@ fn watch(handle: &LoopHandle<'static, App>, signals: OwnedFd, paths: &Paths) -> 
     Ok(())
 }
 
-impl App {
-    fn new(mut host: Host, wake: Ping, args: Args) -> Result<Self, String> {
-        let paths = Paths::from_env();
-        let mut registry = Registry::compiled();
-        let env = registry.environment();
-        let mut notice = None;
-        let config = match persistence::load_config(paths.config.as_deref(), &env) {
-            Ok(config) => config,
+impl Clipboard for Gui {
+    fn read(
+        &mut self,
+        request: RequestId,
+        selection: Selection,
+        mime_types: &[String],
+        limit: usize,
+    ) {
+        self.host
+            .clipboard_read(request, selection, mime_types, limit);
+    }
+
+    fn write(
+        &mut self,
+        selection: Selection,
+        items: Vec<ClipboardData>,
+    ) -> Result<(), ServiceError> {
+        self.host.clipboard_write(selection, items)
+    }
+
+    fn cancel(&mut self, request: RequestId) {
+        self.host.clipboard_cancel(request);
+    }
+}
+
+impl Frontend for Gui {
+    type Target = TargetLease;
+
+    fn open_target(
+        &mut self,
+        view: ViewId,
+        engine: &str,
+    ) -> Result<(TargetId, TargetLease), String> {
+        let mode = self
+            .modes
+            .iter()
+            .find(|(name, _)| *name == engine)
+            .map(|(_, mode)| *mode)
+            .ok_or_else(|| format!("the {engine} engine is not part of this build"))?;
+        let lease = self
+            .host
+            .create_target(self.window, mode, Some(view))
+            .map_err(|e| e.to_string())?;
+        let id = lease.id();
+        Ok((id, lease))
+    }
+
+    fn place(&mut self, views: &BTreeMap<ViewId, ViewEntry>, diag: &mut Diagnostics) -> bool {
+        let Some(placement) = self.placement(views, diag) else {
+            return false;
+        };
+        if !self.place_now && self.placed.as_ref() == Some(&placement) {
+            return false;
+        }
+        match self.host.apply_placement(placement.clone()) {
+            Ok(()) => {
+                diag.counters.placements += 1;
+                self.placed = Some(placement);
+                self.place_now = false;
+                true
+            }
             Err(error) => {
-                log::warn!("the configuration can't be used: {error}");
-                notice = Some(format!(
-                    "{error}\nsig runs with the built-in configuration until the file is fixed."
-                ));
-                persistence::load_config(None, &env).map_err(|e| e.to_string())?
+                // A stale size means a newer configure is queued; it brings its own placement.
+                diag.counters.placement_errors += 1;
+                diag.error(format!("placement refused: {error}"));
+                false
             }
+        }
+    }
+
+    fn forget_target(&mut self, target: TargetId) {
+        if self.page_text_target == Some(target) {
+            self.host.set_text_input(self.window, target, None);
+            self.page_text_target = None;
+        }
+        if self.keyboard_target == Some(target) {
+            self.host.set_keyboard_focus(self.window, None);
+            self.keyboard_target = None;
+        }
+    }
+
+    fn focus(&mut self, focus: KeyboardFocus, queue: &mut VecDeque<BrowserEvent>) {
+        let actions = self.chrome.handle(ChromeEvent::Focus(focus));
+        self.chrome_actions(queue, actions);
+    }
+
+    fn chrome_input(&mut self, event: InputEvent, queue: &mut VecDeque<BrowserEvent>) {
+        let event = match event.kind {
+            InputKind::Key(key) => ChromeEvent::Key(key),
+            InputKind::TextInput(text) => ChromeEvent::TextInput(text),
+            // Window focus reached the chrome already, whoever has the keyboard.
+            InputKind::Focus(_) | InputKind::Pointer(_) => return,
         };
-        let servo_wake = wake.clone();
-        registry.start_at_launch(&config, || EngineWaker::new(move || servo_wake.ping()));
-        // Servo's logger, if it started; otherwise env_logger.
-        crate::registry::install_logger();
-        let kind = registry::chrome(config.chrome());
-        let mut chrome = (kind.new)();
-        let window = WindowId::next();
-        let bg = chrome::theme(&config).colors.bg;
-        host.create_window(
-            window,
-            WindowOptions {
-                title: "Sighurt".into(),
-                app_id: "sighurt".into(),
-                background: [bg.r, bg.g, bg.b],
-                ..WindowOptions::default()
-            },
-        );
-        let configured = chrome.handle(chrome::configure(&config, kind.name));
-        let session = match &paths.session {
-            Some(path) => match SessionWriter::new(path.clone()) {
-                Ok(writer) => Some(writer),
-                Err(error) => {
-                    log::warn!("cannot save the session: {error}");
-                    None
-                }
-            },
-            None => None,
+        let actions = self.chrome.handle(event);
+        self.chrome_actions(queue, actions);
+    }
+
+    fn chrome_command(&mut self, action: String, queue: &mut VecDeque<BrowserEvent>) {
+        match chrome::command(&chrome::chrome(self.chrome_name), action) {
+            Ok(event) => {
+                let actions = self.chrome.handle(event);
+                self.chrome_actions(queue, actions);
+            }
+            Err(notice) => self.show_notice(notice),
+        }
+    }
+
+    fn page_cursor(&mut self, target: Option<TargetId>, cursor: Cursor) {
+        if let Some(target) = target {
+            self.host.set_cursor(target, cursor);
+        }
+    }
+
+    fn page_text_input(
+        &mut self,
+        shown: Option<TargetId>,
+        state: Option<sighurt_api::input::TextInputState>,
+    ) {
+        let target = match &state {
+            Some(_) => shown,
+            None => self.page_text_target,
         };
-        let services_wake = wake.clone();
-        let mut app = Self {
-            host,
-            window,
-            core: BrowserState::new(config, env.clone()),
-            queue: VecDeque::new(),
-            env,
-            chrome,
-            chrome_name: kind.name,
-            chrome_targets: ChromeTargets::default(),
-            leases: BTreeMap::new(),
-            chrome_text: None,
-            chrome_text_target: None,
-            chrome_cursor: Cursor::Default,
-            registry,
-            views: BTreeMap::new(),
-            services: Services::new(move || services_wake.ping()),
-            paths,
-            session,
-            session_due: None,
-            diag: Diagnostics::new(args.diagnostics),
-            wake,
-            size: None,
-            placed: None,
-            place_now: false,
-            snapshot_dirty: true,
-            notice: None,
-            notice_first: None,
-            paste: None,
-            keyboard_target: None,
-            page_text_target: None,
-            config_changed: false,
-            signals: Vec::new(),
-            quit: None,
-        };
-        app.chrome_actions(configured);
-        app.queue.push_back(BrowserEvent::Start {
-            session: None,
-            open: args.open,
-        });
-        if let Some(notice) = notice {
-            app.show_notice(notice);
-        }
-        Ok(app)
-    }
-
-    /// Restores the session, unless `[session] restore` is off, and opens the command line's
-    /// pages.
-    fn start(&mut self) {
-        let path = self.paths.session.as_deref();
-        let path = path.filter(|_| self.core.config().restore_session());
-        let session = match path.map(persistence::load_session) {
-            Some(Ok(session)) => session,
-            Some(Err(error)) => {
-                self.show_notice(format!("The saved tabs can't be restored: {error}"));
-                None
-            }
-            None => None,
-        };
-        if let Some(BrowserEvent::Start { session: slot, .. }) = self.queue.front_mut() {
-            *slot = session;
-        }
-        self.run_core();
-    }
-
-    /// One iteration of the loop, after it woke. Returns whether work is left that shouldn't
-    /// wait: the next iteration then starts at once.
-    fn iterate(&mut self) -> bool {
-        self.diag.counters.iterations += 1;
-        self.handle_signals();
-        if std::mem::take(&mut self.config_changed) {
-            self.reload_config();
-        }
-        if self
-            .notice_first
-            .is_some_and(|until| until <= Instant::now())
-        {
-            self.notice_first = None;
-            self.snapshot_dirty = true;
-        }
-        let mut busy = true;
-        for _ in 0..MAX_PASSES {
-            let mut worked = self.drain_host_events();
-            worked |= self.service_completions();
-            worked |= self.pump_engines();
-            worked |= self.refresh_chrome();
-            worked |= self.present();
-            if !worked {
-                busy = false;
-                break;
-            }
-            if self.quit.is_some() {
-                break;
-            }
-        }
-        if self.session_due.is_some_and(|due| due <= Instant::now()) {
-            self.save_session();
-        }
-        self.host.flush();
-        busy && self.quit.is_none()
-    }
-
-    /// How long the loop may sleep: until the earliest pump deadline, session save or notice
-    /// giving way to the page's status, or until something happens.
-    fn timeout(&self) -> Option<Duration> {
-        let now = Instant::now();
-        let pump = match self.registry.next_pump() {
-            Some(None) => return Some(Duration::ZERO),
-            Some(Some(at)) => Some(at),
-            None => None,
-        };
-        let next = [pump, self.session_due, self.notice_first]
-            .into_iter()
-            .flatten()
-            .min();
-        next.map(|at| at.saturating_duration_since(now))
-    }
-
-    /// `sig` can't go on: reports `error` and quits with a failure.
-    fn fail(&mut self, error: String) {
-        self.diag.error(error);
-        self.quit = Some(ExitCode::FAILURE);
-    }
-
-    fn handle_signals(&mut self) {
-        for signal in std::mem::take(&mut self.signals) {
-            match i32::from(signal) {
-                libc::SIGUSR1 => self.report(false),
-                libc::SIGTERM | libc::SIGINT => {
-                    self.queue.push_back(BrowserEvent::Command(
-                        sighurt_api::commands::Command::BrowserQuit,
-                    ));
-                    self.run_core();
-                }
-                _ => {}
-            }
+        if let Some(target) = target {
+            self.host.set_text_input(self.window, target, state.clone());
+            self.page_text_target = state.map(|_| target);
         }
     }
 
-    // ── Steps 1 and 2: input and completions ─────────────────────────────────────────────
-
-    /// Handles the host's events, at most [`MAX_HOST_EVENTS`]. Returns whether there were any.
-    fn drain_host_events(&mut self) -> bool {
-        let mut batch: Vec<HostEvent> = Vec::new();
-        while batch.len() < MAX_HOST_EVENTS {
-            let Some(event) = self.host.next_event() else {
-                break;
-            };
-            if push_coalesced(&mut batch, event) {
-                self.diag.counters.motions_coalesced += 1;
-            }
-        }
-        let peaks = &mut self.diag.peaks;
-        peaks.max_host_queue = peaks.max_host_queue.max(batch.len() as u64);
-        let worked = !batch.is_empty();
-        for event in batch {
-            self.host_event(event);
-            self.run_core();
-        }
-        worked
+    fn notice(&mut self, message: String) {
+        self.show_notice(message);
     }
 
-    fn host_event(&mut self, event: HostEvent) {
-        let at = Instant::now();
-        match event {
-            HostEvent::WindowConfigured { size, .. } => {
-                self.size = Some(size);
-                let actions = self.chrome.handle(ChromeEvent::Resize(size));
-                self.chrome_actions(actions);
-                self.place_now = true;
-            }
-            HostEvent::CloseRequested { .. } => self.queue.push_back(BrowserEvent::Command(
-                sighurt_api::commands::Command::BrowserQuit,
-            )),
-            HostEvent::MetricsChanged { target, metrics } => {
-                if let Some(view) = self.view_of(target) {
-                    self.engine_command(view, EngineCommand::SetMetrics(metrics), false);
-                }
-            }
-            HostEvent::Input { target, event, .. } => {
-                self.diag.counters.input_events += 1;
-                self.input(target, event, at);
-            }
-            HostEvent::ClipboardRead { request, result } => {
-                if self.paste == Some(request) {
-                    self.paste = None;
-                    if let Ok(data) = result {
-                        let text = String::from_utf8_lossy(&data.data).into_owned();
-                        let actions = self.chrome.handle(ChromeEvent::Pasted { request, text });
-                        self.chrome_actions(actions);
-                    }
-                } else if let Some(result) = self.services.clipboard_read(request, result) {
-                    self.queue
-                        .push_back(BrowserEvent::ServiceDone { request, result });
-                }
-            }
-            HostEvent::ConnectionLost { error } => {
-                self.fail(format!("the Wayland connection is gone: {error}"))
-            }
-        }
+    fn redraw(&mut self) {
+        self.snapshot_dirty = true;
     }
 
-    /// Routes input: pointer input to the chrome surface or page it is over, except the mouse's
-    /// side buttons, which go to the core wherever the pointer is (`[input.buttons]`); keys,
-    /// input-method text and window focus to the core, which binds keys and hands the rest to
-    /// the page or the chrome.
-    fn input(&mut self, target: Option<TargetId>, event: InputEvent, at: Instant) {
-        match &event.kind {
-            InputKind::Pointer(pointer) => {
-                let side = matches!(
-                    pointer,
-                    PointerEvent::Button {
-                        button: PointerButton::Back | PointerButton::Forward,
-                        ..
-                    }
-                );
-                if side {
-                    let view = target.and_then(|t| self.view_of(t));
-                    self.queue
-                        .push_back(BrowserEvent::Button { view, event, at });
-                } else if let Some(surface) = target.and_then(|t| self.surface_of(t)) {
-                    let event = pointer.clone();
-                    let actions = self.chrome.handle(ChromeEvent::Pointer { surface, event });
-                    self.chrome_actions(actions);
-                } else if let Some(view) = target.and_then(|t| self.view_of(t)) {
-                    self.queue
-                        .push_back(BrowserEvent::Pointer { view, event, at });
-                }
-            }
-            InputKind::Focus(focus) => {
-                let actions = self.chrome.handle(ChromeEvent::WindowFocus(*focus));
-                self.chrome_actions(actions);
-                self.queue.push_back(BrowserEvent::Keyboard { event, at });
-            }
-            InputKind::Key(_) | InputKind::TextInput(_) => {
-                self.queue.push_back(BrowserEvent::Keyboard { event, at })
-            }
-        }
+    fn show(&mut self, _view: ViewId, _visible: bool) {
+        // `ViewEntry::visible` is already updated. The next `place` maps or unmaps the target,
+        // which is when the core's show and hide took effect before.
+    }
+
+    fn frame_ready(&mut self, target: TargetId) {
+        self.host.invalidate(target);
+    }
+
+    fn before_forced_exit(&mut self) {
+        // Wayland is released by dropping the host, and a leaked engine cannot allow that
+        // (decision 54): its threads may still use the connection. Nothing to restore. The
+        // terminal frontend restores the terminal here, before `_exit` skips destructors.
+    }
+}
+
+impl Gui {
+    /// Shows `message` in the status strip until another replaces it, for [`NOTICE_FIRST`]
+    /// before anything the page says there. Not logged: notices can hold page data (an origin,
+    /// a URL, a downloaded file's name).
+    fn show_notice(&mut self, message: String) {
+        self.notice = Some(message);
+        self.notice_first = Some(Instant::now() + NOTICE_FIRST);
+        self.snapshot_dirty = true;
     }
 
     /// Carries out what the chrome asks for.
-    pub(crate) fn chrome_actions(&mut self, actions: Vec<ChromeAction>) {
+    fn chrome_actions(&mut self, queue: &mut VecDeque<BrowserEvent>, actions: Vec<ChromeAction>) {
         for action in actions {
             match action {
-                ChromeAction::Command(command) => {
-                    self.queue.push_back(BrowserEvent::Command(command))
-                }
-                ChromeAction::SelectTab(tab) => self.queue.push_back(BrowserEvent::SelectTab(tab)),
-                ChromeAction::CloseTab(tab) => self.queue.push_back(BrowserEvent::CloseTab(tab)),
-                ChromeAction::Focus(focus) => self.queue.push_back(BrowserEvent::Focus(focus)),
+                ChromeAction::Command(command) => queue.push_back(BrowserEvent::Command(command)),
+                ChromeAction::SelectTab(tab) => queue.push_back(BrowserEvent::SelectTab(tab)),
+                ChromeAction::CloseTab(tab) => queue.push_back(BrowserEvent::CloseTab(tab)),
+                ChromeAction::Focus(focus) => queue.push_back(BrowserEvent::Focus(focus)),
                 ChromeAction::Copy(text) => {
                     let item = ClipboardData {
                         mime_type: TEXT_TYPES[0].into(),
@@ -572,128 +438,416 @@ impl App {
         self.chrome_text_target = wanted;
     }
 
-    /// Hands queued events to the core and carries out its effects, until nothing is queued.
-    pub(crate) fn run_core(&mut self) {
-        while let Some(event) = self.queue.pop_front() {
-            self.diag.counters.core_events += 1;
-            let effects = sighurt_core::update(&mut self.core, event);
-            self.diag.counters.effects += effects.len() as u64;
-            for effect in effects {
-                self.apply(effect);
+    /// The window's layout for the host: every view (only the shown one visible) at the page
+    /// rectangle, the chrome's surfaces above them in its order. A surface name the chrome
+    /// hasn't used before gets a target here.
+    fn placement(
+        &mut self,
+        views: &BTreeMap<ViewId, ViewEntry>,
+        diag: &mut Diagnostics,
+    ) -> Option<Placement> {
+        let size = self.size?;
+        let placing = self.chrome_targets.place(self.chrome.layout(), size);
+        for name in placing.refused {
+            diag.error(format!(
+                "the chrome uses more than {MAX_SURFACES} surfaces: {name} is not shown"
+            ));
+        }
+        let mut targets: Vec<TargetPlacement> = views
+            .values()
+            .map(|entry| TargetPlacement {
+                target: entry.target,
+                rect: placing.page,
+                visible: entry.visible,
+                input: InputRegion::Whole,
+            })
+            .collect();
+        let mut created = false;
+        for placed in placing.surfaces {
+            let target = match self.leases.get(placed.name) {
+                Some(lease) => lease.id(),
+                None => match self.host.create_target(self.window, PresentMode::Shm, None) {
+                    Ok(lease) => {
+                        let target = lease.id();
+                        self.host.set_cursor(target, self.chrome_cursor);
+                        // Its first frame, whatever the chrome asked to repaint before.
+                        self.host.invalidate(target);
+                        self.leases.insert(placed.name, lease);
+                        created = true;
+                        target
+                    }
+                    Err(error) => {
+                        let name = placed.name;
+                        diag.error(format!("no target for the chrome's {name}: {error}"));
+                        continue;
+                    }
+                },
+            };
+            targets.push(TargetPlacement {
+                target,
+                rect: placed.rect,
+                visible: placed.visible,
+                input: placed.input,
+            });
+        }
+        if created {
+            self.sync_chrome_text();
+        }
+        Some(Placement {
+            window: self.window,
+            size,
+            targets,
+        })
+    }
+
+    /// Gives the host's logical keyboard focus to whatever the core says has the keyboard: the
+    /// chrome's surface with its text field (or its first surface), the shown view, or the
+    /// chrome's surface at the page's rectangle while it draws the page.
+    fn sync_keyboard_focus(&mut self, focus: KeyboardFocus, shown: Option<TargetId>) {
+        let layout = self.chrome.layout().clone();
+        let listed = |leases: &BTreeMap<SurfaceName, TargetLease>, rect: Option<_>| {
+            layout
+                .surfaces
+                .iter()
+                .filter(|surface| rect.is_none_or(|rect| surface.rect == rect))
+                .find_map(|surface| leases.get(surface.name).map(TargetLease::id))
+        };
+        let wanted = match focus {
+            KeyboardFocus::Chrome => self
+                .chrome_text_target
+                .or_else(|| listed(&self.leases, None)),
+            KeyboardFocus::Page => shown.or_else(|| {
+                let page = layout.page;
+                listed(
+                    &self.leases,
+                    Some(page).filter(|page| !page.size().is_empty()),
+                )
+            }),
+        };
+        if wanted != self.keyboard_target {
+            self.keyboard_target = wanted;
+            self.host.set_keyboard_focus(self.window, wanted);
+        }
+    }
+
+    /// The chrome's surface that `target` is.
+    fn surface_of(&self, target: TargetId) -> Option<SurfaceName> {
+        self.leases
+            .iter()
+            .find(|(_, lease)| lease.id() == target)
+            .map(|(&name, _)| name)
+    }
+
+    /// The target of the chrome's surface `surface`, once it has one.
+    fn target_of(&self, surface: SurfaceName) -> Option<TargetId> {
+        self.leases.get(surface).map(TargetLease::id)
+    }
+}
+
+impl App {
+    fn new(mut host: Host, ping: calloop::ping::Ping, options: Options) -> Result<Self, String> {
+        let paths = Paths::from_env();
+        let (mut registry, modes) = engines::build();
+        let env = registry.environment(chrome::checks_all(), &Colors::NAMES);
+        let mut notice = None;
+        let config = match persistence::load_config(paths.config.as_deref(), &env) {
+            Ok(config) => config,
+            Err(error) => {
+                log::warn!("the configuration can't be used: {error}");
+                notice = Some(format!(
+                    "{error}\nsig runs with the built-in configuration until the file is fixed."
+                ));
+                persistence::load_config(None, &env).map_err(|e| e.to_string())?
+            }
+        };
+        let servo_wake = ping.clone();
+        registry.start_at_launch(&config, || EngineWaker::new(move || servo_wake.ping()));
+        // Servo's logger, if it started; otherwise env_logger. The ping's clones, in the
+        // wakers below, are what keep it alive.
+        sighurt_runtime::registry::install_logger();
+        let kind = chrome::chrome(config.chrome());
+        let mut chrome = (kind.new)();
+        let window = WindowId::next();
+        let bg = chrome::theme(&config).colors.bg;
+        host.create_window(
+            window,
+            WindowOptions {
+                title: "Sighurt".into(),
+                app_id: "sighurt".into(),
+                background: [bg.r, bg.g, bg.b],
+                ..WindowOptions::default()
+            },
+        );
+        let configured = chrome.handle(chrome::configure(&config, kind.name));
+        let session_writer = match &paths.session {
+            Some(path) => match SessionWriter::new(path.clone()) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    log::warn!("cannot save the session: {error}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let services_wake = ping.clone();
+        let services = Services::new(move || services_wake.ping());
+        let wake = std::sync::Arc::new(move || ping.ping());
+        let diag = Diagnostics::new(options.diagnostics);
+        let mut session = Session::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            services,
+            paths,
+            session_writer,
+            diag,
+            wake,
+        );
+        let mut gui = Gui {
+            host,
+            window,
+            chrome,
+            chrome_name: kind.name,
+            chrome_targets: ChromeTargets::default(),
+            leases: BTreeMap::new(),
+            chrome_text: None,
+            chrome_text_target: None,
+            chrome_cursor: Cursor::Default,
+            modes,
+            size: None,
+            placed: None,
+            place_now: false,
+            snapshot_dirty: true,
+            notice: None,
+            notice_first: None,
+            paste: None,
+            keyboard_target: None,
+            page_text_target: None,
+        };
+        gui.chrome_actions(&mut session.queue, configured);
+        session.queue.push_back(BrowserEvent::Start {
+            session: None,
+            open: options.open,
+        });
+        if let Some(notice) = notice {
+            gui.show_notice(notice);
+        }
+        Ok(Self {
+            gui,
+            session,
+            config_changed: false,
+            signals: Vec::new(),
+        })
+    }
+
+    /// Restores the session, unless `[session] restore` is off, and opens the command line's
+    /// pages.
+    fn start(&mut self) {
+        let path = self.session.paths.session.as_deref();
+        let path = path.filter(|_| self.session.core.config().restore_session());
+        let restored = match path.map(persistence::load_session) {
+            Some(Ok(session)) => session,
+            Some(Err(error)) => {
+                self.gui
+                    .show_notice(format!("The saved tabs can't be restored: {error}"));
+                None
+            }
+            None => None,
+        };
+        if let Some(BrowserEvent::Start { session: slot, .. }) = self.session.queue.front_mut() {
+            *slot = restored;
+        }
+        self.session.run_core(&mut self.gui);
+    }
+
+    /// One iteration of the loop, after it woke. Returns whether work is left that shouldn't
+    /// wait: the next iteration then starts at once.
+    fn iterate(&mut self) -> bool {
+        self.session.diag.counters.iterations += 1;
+        self.handle_signals();
+        if std::mem::take(&mut self.config_changed) {
+            self.reload_config();
+        }
+        if self
+            .gui
+            .notice_first
+            .is_some_and(|until| until <= Instant::now())
+        {
+            self.gui.notice_first = None;
+            self.gui.snapshot_dirty = true;
+        }
+        let mut busy = true;
+        for _ in 0..MAX_PASSES {
+            let mut worked = self.drain_host_events();
+            worked |= self.session.service_completions(&mut self.gui);
+            worked |= self.session.pump(&mut self.gui);
+            worked |= self.refresh_chrome();
+            worked |= self.present();
+            if !worked {
+                busy = false;
+                break;
+            }
+            if self.session.quit.is_some() {
+                break;
+            }
+        }
+        if self
+            .session
+            .session_due
+            .is_some_and(|due| due <= Instant::now())
+        {
+            self.session.save_session();
+        }
+        self.gui.host.flush();
+        busy && self.session.quit.is_none()
+    }
+
+    /// How long the loop may sleep: until the earliest pump deadline, session save or notice
+    /// giving way to the page's status, or until something happens.
+    fn timeout(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let pump = match self.session.registry.next_pump() {
+            Some(None) => return Some(Duration::ZERO),
+            Some(Some(at)) => Some(at),
+            None => None,
+        };
+        let next = [pump, self.session.session_due, self.gui.notice_first]
+            .into_iter()
+            .flatten()
+            .min();
+        next.map(|at| at.saturating_duration_since(now))
+    }
+
+    /// `sig` can't go on: reports `error` and quits with a failure.
+    fn fail(&mut self, error: String) {
+        self.session.diag.error(error);
+        self.session.quit = Some(ExitCode::FAILURE);
+    }
+
+    fn handle_signals(&mut self) {
+        for signal in std::mem::take(&mut self.signals) {
+            match i32::from(signal) {
+                libc::SIGUSR1 => self.report(false),
+                libc::SIGTERM | libc::SIGINT => {
+                    self.session.queue.push_back(BrowserEvent::Command(
+                        sighurt_api::commands::Command::BrowserQuit,
+                    ));
+                    self.session.run_core(&mut self.gui);
+                }
+                _ => {}
             }
         }
     }
 
-    /// Takes what service threads reported. Returns whether there was anything.
-    fn service_completions(&mut self) -> bool {
-        let completions = self.services.completions(MAX_COMPLETIONS);
-        let worked = !completions.is_empty();
-        for completion in completions {
-            match completion {
-                Completion::Status(line) => self.show_notice(line),
-                Completion::Finished(_) => {}
+    /// Handles the host's events, at most [`MAX_HOST_EVENTS`]. Returns whether there were any.
+    fn drain_host_events(&mut self) -> bool {
+        let mut batch: Vec<HostEvent> = Vec::new();
+        while batch.len() < MAX_HOST_EVENTS {
+            let Some(event) = self.gui.host.next_event() else {
+                break;
+            };
+            if push_coalesced(&mut batch, event) {
+                self.session.diag.counters.motions_coalesced += 1;
             }
+        }
+        let peaks = &mut self.session.diag.peaks;
+        peaks.max_host_queue = peaks.max_host_queue.max(batch.len() as u64);
+        let worked = !batch.is_empty();
+        for event in batch {
+            self.host_event(event);
+            self.session.run_core(&mut self.gui);
         }
         worked
     }
 
-    // ── Steps 3 and 4: engines ────────────────────────────────────────────────────────────
-
-    /// Pumps the runtimes that are due and hands their events on. Returns whether any was.
-    fn pump_engines(&mut self) -> bool {
-        let now = Instant::now();
-        let due = self.registry.due(now);
-        for &engine in &due {
-            let mut events = Vec::new();
-            let started = Instant::now();
-            self.registry.pump(engine, &mut events);
-            self.diag.pump(events.len(), started.elapsed());
-            for event in events {
-                self.engine_event(engine, event, now);
+    fn host_event(&mut self, event: HostEvent) {
+        let at = Instant::now();
+        match event {
+            HostEvent::WindowConfigured { size, .. } => {
+                self.gui.size = Some(size);
+                let actions = self.gui.chrome.handle(ChromeEvent::Resize(size));
+                self.gui.chrome_actions(&mut self.session.queue, actions);
+                self.gui.place_now = true;
             }
-            self.run_core();
-        }
-        !due.is_empty()
-    }
-
-    fn engine_event(&mut self, engine: &'static str, event: EngineEvent, at: Instant) {
-        match &event {
-            // The core ignores it: presentation is scheduled here.
-            EngineEvent::FrameReady { view } => {
-                self.diag.counters.frame_ready += 1;
-                if let Some(entry) = self.views.get(view).filter(|e| e.engine == engine) {
-                    self.host.invalidate(entry.target);
-                }
-                return;
-            }
-            EngineEvent::ViewClosed { view } => {
-                if self.views.get(view).is_some_and(|e| e.engine == engine) {
-                    self.forget_view(*view);
+            HostEvent::CloseRequested { .. } => self.session.queue.push_back(
+                BrowserEvent::Command(sighurt_api::commands::Command::BrowserQuit),
+            ),
+            HostEvent::MetricsChanged { target, metrics } => {
+                if let Some(view) = self.session.view_of(target) {
+                    self.session
+                        .engine_command(view, EngineCommand::SetMetrics(metrics), false);
                 }
             }
-            EngineEvent::RuntimeFailed { message } => {
-                self.diag
-                    .error(format!("the {engine} engine failed: {message}"));
-                self.registry.failed(engine, message);
-                let gone: Vec<ViewId> = self
-                    .views
-                    .iter()
-                    .filter(|(_, e)| e.engine == engine)
-                    .map(|(&v, _)| v)
-                    .collect();
-                for view in gone {
-                    self.forget_view(view);
-                }
-                self.snapshot_dirty = true;
+            HostEvent::Input { target, event, .. } => {
+                self.session.diag.counters.input_events += 1;
+                self.input(target, event, at);
             }
-            _ => {}
-        }
-        self.queue.push_back(BrowserEvent::Engine {
-            engine: engine.to_owned(),
-            event,
-            at,
-        });
-    }
-
-    /// Hands `command` to `view`'s engine. A refusal goes to the core if `report`.
-    pub(crate) fn engine_command(&mut self, view: ViewId, command: EngineCommand, report: bool) {
-        let Some(entry) = self.views.get(&view) else {
-            return;
-        };
-        let engine = entry.engine.clone();
-        let result = match self.registry.running(&engine) {
-            Some(runtime) => runtime.command(view, command.clone()),
-            None => Err(EngineError::Runtime(format!(
-                "the {engine} engine is not running"
-            ))),
-        };
-        match result {
-            Ok(()) => {}
-            Err(error) if report => self.queue.push_back(BrowserEvent::CommandFailed {
-                view,
-                command,
-                error,
-            }),
-            Err(error) => log::debug!("{engine} refused a command for {view:?}: {error}"),
+            HostEvent::ClipboardRead { request, result } => {
+                if self.gui.paste == Some(request) {
+                    self.gui.paste = None;
+                    if let Ok(data) = result {
+                        let text = String::from_utf8_lossy(&data.data).into_owned();
+                        let actions = self
+                            .gui
+                            .chrome
+                            .handle(ChromeEvent::Pasted { request, text });
+                        self.gui.chrome_actions(&mut self.session.queue, actions);
+                    }
+                } else {
+                    self.session.clipboard_done(request, result);
+                }
+            }
+            HostEvent::ConnectionLost { error } => {
+                self.fail(format!("the Wayland connection is gone: {error}"))
+            }
         }
     }
 
-    /// `view` is gone from its engine: forget it and its target.
-    pub(crate) fn forget_view(&mut self, view: ViewId) {
-        let Some(entry) = self.views.remove(&view) else {
-            return;
-        };
-        if self.page_text_target == Some(entry.target) {
-            self.host.set_text_input(self.window, entry.target, None);
-            self.page_text_target = None;
-        }
-        if self.keyboard_target == Some(entry.target) {
-            self.host.set_keyboard_focus(self.window, None);
-            self.keyboard_target = None;
+    /// Routes input: pointer input to the chrome surface or page it is over, except the mouse's
+    /// side buttons, which go to the core wherever the pointer is (`[input.buttons]`); keys,
+    /// input-method text and window focus to the core, which binds keys and hands the rest to
+    /// the page or the chrome.
+    fn input(&mut self, target: Option<TargetId>, event: InputEvent, at: Instant) {
+        match &event.kind {
+            InputKind::Pointer(pointer) => {
+                let side = matches!(
+                    pointer,
+                    PointerEvent::Button {
+                        button: PointerButton::Back | PointerButton::Forward,
+                        ..
+                    }
+                );
+                if side {
+                    let view = target.and_then(|t| self.session.view_of(t));
+                    self.session
+                        .queue
+                        .push_back(BrowserEvent::Button { view, event, at });
+                } else if let Some(surface) = target.and_then(|t| self.gui.surface_of(t)) {
+                    let event = pointer.clone();
+                    let actions = self
+                        .gui
+                        .chrome
+                        .handle(ChromeEvent::Pointer { surface, event });
+                    self.gui.chrome_actions(&mut self.session.queue, actions);
+                } else if let Some(view) = target.and_then(|t| self.session.view_of(t)) {
+                    self.session
+                        .queue
+                        .push_back(BrowserEvent::Pointer { view, event, at });
+                }
+            }
+            InputKind::Focus(focus) => {
+                let actions = self.gui.chrome.handle(ChromeEvent::WindowFocus(*focus));
+                self.gui.chrome_actions(&mut self.session.queue, actions);
+                self.session
+                    .queue
+                    .push_back(BrowserEvent::Keyboard { event, at });
+            }
+            InputKind::Key(_) | InputKind::TextInput(_) => self
+                .session
+                .queue
+                .push_back(BrowserEvent::Keyboard { event, at }),
         }
     }
-
-    // ── Step 5: the chrome and the layout ─────────────────────────────────────────────────
 
     /// Brings the chrome, the placement and the keyboard focus up to date. Returns whether
     /// anything changed.
@@ -701,37 +855,41 @@ impl App {
         let mut worked = false;
         // The chrome's actions can change the core, which can change the snapshot again.
         for _ in 0..4 {
-            if !std::mem::take(&mut self.snapshot_dirty) {
+            if !std::mem::take(&mut self.gui.snapshot_dirty) {
                 break;
             }
             let snapshot = self.snapshot();
-            let actions = self.chrome.handle(ChromeEvent::Snapshot(snapshot));
-            self.chrome_actions(actions);
-            self.run_core();
+            let actions = self.gui.chrome.handle(ChromeEvent::Snapshot(snapshot));
+            self.gui.chrome_actions(&mut self.session.queue, actions);
+            self.session.run_core(&mut self.gui);
             worked = true;
             // A navigation whose tab the user left is no longer waited for.
             let active = self.active_tab().map(|tab| tab.id);
-            for (view, entry) in &mut self.views {
-                if self.core.view(*view).map(|v| v.tab()) != active {
+            let Session { core, views, .. } = &mut self.session;
+            for (view, entry) in views.iter_mut() {
+                if core.view(*view).map(|v| v.tab()) != active {
                     entry.navigated = None;
                 }
             }
         }
-        worked |= self.place();
-        self.sync_keyboard_focus();
+        worked |= self.gui.place(&self.session.views, &mut self.session.diag);
+        let shown = self.session.shown_view().map(|(_, entry)| entry.target);
+        let focus = self.session.core.focus();
+        self.gui.sync_keyboard_focus(focus, shown);
         worked
     }
 
     /// What the chrome shows: the core's tabs, the status line and the home page, contained.
     fn snapshot(&self) -> Snapshot {
         let status = |tab: &TabSummary<'_>| self.status(tab).map(|(_, text)| text.to_owned());
-        chrome::snapshot(&self.core, self.home_info(), status)
+        chrome::snapshot(&self.session.core, self.home_info(), status)
     }
 
     /// What `sig://home` says: the configuration file and the engines of this build.
     fn home_info(&self) -> HomeInfo {
-        let config = self.core.config();
+        let config = self.session.core.config();
         let engines = self
+            .session
             .registry
             .engines()
             .map(|engine| {
@@ -759,6 +917,7 @@ impl App {
             .collect();
         HomeInfo {
             config_path: self
+                .session
                 .paths
                 .config
                 .as_ref()
@@ -775,8 +934,8 @@ impl App {
             .filter(|_| !matches!(tab.content, Content::Blank))
             .map(|e| e.message.as_str());
         status_line(
-            self.notice.as_deref(),
-            self.notice_first.is_some(),
+            self.gui.notice.as_deref(),
+            self.gui.notice_first.is_some(),
             tab.status,
             error,
         )
@@ -784,187 +943,35 @@ impl App {
 
     /// The active tab.
     fn active_tab(&self) -> Option<TabSummary<'_>> {
-        self.core.tabs().nth(self.core.active())
+        self.session.core.tabs().nth(self.session.core.active())
     }
-
-    /// Whether `view` belongs to the active tab.
-    pub(crate) fn in_active_tab(&self, view: ViewId) -> bool {
-        let tab = self.core.view(view).map(|v| v.tab());
-        tab.is_some() && tab == self.active_tab().map(|t| t.id)
-    }
-
-    /// Shows `message` in the status strip until another replaces it, for [`NOTICE_FIRST`]
-    /// before anything the page says there. Not logged: notices can hold page data (an origin,
-    /// a URL, a downloaded file's name).
-    pub(crate) fn show_notice(&mut self, message: String) {
-        self.notice = Some(message);
-        self.notice_first = Some(Instant::now() + NOTICE_FIRST);
-        self.snapshot_dirty = true;
-    }
-
-    /// The window's layout for the host: every view (only the shown one visible) at the page
-    /// rectangle, the chrome's surfaces above them in its order. A surface name the chrome
-    /// hasn't used before gets a target here.
-    fn placement(&mut self) -> Option<Placement> {
-        let size = self.size?;
-        let placing = self.chrome_targets.place(self.chrome.layout(), size);
-        for name in placing.refused {
-            self.diag.error(format!(
-                "the chrome uses more than {MAX_SURFACES} surfaces: {name} is not shown"
-            ));
-        }
-        let mut targets: Vec<TargetPlacement> = self
-            .views
-            .values()
-            .map(|entry| TargetPlacement {
-                target: entry.target,
-                rect: placing.page,
-                visible: entry.visible,
-                input: InputRegion::Whole,
-            })
-            .collect();
-        let mut created = false;
-        for placed in placing.surfaces {
-            let target = match self.leases.get(placed.name) {
-                Some(lease) => lease.id(),
-                None => match self.host.create_target(self.window, PresentMode::Shm, None) {
-                    Ok(lease) => {
-                        let target = lease.id();
-                        self.host.set_cursor(target, self.chrome_cursor);
-                        // Its first frame, whatever the chrome asked to repaint before.
-                        self.host.invalidate(target);
-                        self.leases.insert(placed.name, lease);
-                        created = true;
-                        target
-                    }
-                    Err(error) => {
-                        let name = placed.name;
-                        self.diag
-                            .error(format!("no target for the chrome's {name}: {error}"));
-                        continue;
-                    }
-                },
-            };
-            targets.push(TargetPlacement {
-                target,
-                rect: placed.rect,
-                visible: placed.visible,
-                input: placed.input,
-            });
-        }
-        if created {
-            self.sync_chrome_text();
-        }
-        Some(Placement {
-            window: self.window,
-            size,
-            targets,
-        })
-    }
-
-    /// Applies the placement if it changed, or must answer a configure. Returns whether it did.
-    pub(crate) fn place(&mut self) -> bool {
-        let Some(placement) = self.placement() else {
-            return false;
-        };
-        if !self.place_now && self.placed.as_ref() == Some(&placement) {
-            return false;
-        }
-        match self.host.apply_placement(placement.clone()) {
-            Ok(()) => {
-                self.diag.counters.placements += 1;
-                self.placed = Some(placement);
-                self.place_now = false;
-                true
-            }
-            Err(error) => {
-                // A stale size means a newer configure is queued; it brings its own placement.
-                self.diag.counters.placement_errors += 1;
-                self.diag.error(format!("placement refused: {error}"));
-                false
-            }
-        }
-    }
-
-    /// Gives the host's logical keyboard focus to whatever the core says has the keyboard: the
-    /// chrome's surface with its text field (or its first surface), the shown view, or the
-    /// chrome's surface at the page's rectangle while it draws the page.
-    fn sync_keyboard_focus(&mut self) {
-        let layout = self.chrome.layout();
-        let listed = |rect: Option<_>| {
-            let surfaces = layout.surfaces.iter();
-            let mut surfaces = surfaces.filter(|s| rect.is_none_or(|rect| s.rect == rect));
-            surfaces.find_map(|surface| self.target_of(surface.name))
-        };
-        let wanted = match self.core.focus() {
-            KeyboardFocus::Chrome => self.chrome_text_target.or_else(|| listed(None)),
-            KeyboardFocus::Page => self
-                .shown_view()
-                .map(|(_, entry)| entry.target)
-                .or_else(|| listed(Some(layout.page).filter(|page| !page.size().is_empty()))),
-        };
-        if wanted != self.keyboard_target {
-            self.keyboard_target = wanted;
-            self.host.set_keyboard_focus(self.window, wanted);
-        }
-    }
-
-    /// The view the page area shows, if an engine's.
-    pub(crate) fn shown_view(&self) -> Option<(ViewId, &ViewEntry)> {
-        self.views
-            .iter()
-            .find(|(_, entry)| entry.visible)
-            .map(|(&view, entry)| (view, entry))
-    }
-
-    fn view_of(&self, target: TargetId) -> Option<ViewId> {
-        self.views
-            .iter()
-            .find(|(_, entry)| entry.target == target)
-            .map(|(&view, _)| view)
-    }
-
-    /// The chrome's surface that `target` is.
-    fn surface_of(&self, target: TargetId) -> Option<SurfaceName> {
-        let mut leases = self.leases.iter();
-        leases
-            .find(|(_, lease)| lease.id() == target)
-            .map(|(&name, _)| name)
-    }
-
-    /// The target of the chrome's surface `surface`, once it has one.
-    fn target_of(&self, surface: SurfaceName) -> Option<TargetId> {
-        self.leases.get(surface).map(TargetLease::id)
-    }
-
-    // ── Step 6: presenting ────────────────────────────────────────────────────────────────
 
     /// Hands each permit the host issues to its presenter. Returns whether there were any.
     fn present(&mut self) -> bool {
-        let permits = self.host.permits();
+        let permits = self.gui.host.permits();
         let worked = !permits.is_empty();
         for permit in permits {
             let target = permit.target();
-            if let Some(surface) = self.surface_of(target) {
+            if let Some(surface) = self.gui.surface_of(target) {
                 self.paint_chrome(surface, permit);
-            } else if let Some(view) = self.view_of(target) {
+            } else if let Some(view) = self.session.view_of(target) {
                 self.present_view(view, permit);
             }
             // Otherwise the target is being retired: dropping the permit presents nothing.
         }
         if worked {
             // Buffers are allocated while presenting, so this sees every peak.
-            let host = self.host.diagnostics();
+            let host = self.gui.host.diagnostics();
             let per_target: Vec<_> = host
                 .targets
                 .iter()
                 .map(|t| {
-                    let chrome = self.surface_of(t.target).is_some();
+                    let chrome = self.gui.surface_of(t.target).is_some();
                     (t.buffers.buffers, t.buffers.retiring_generations, chrome)
                 })
                 .collect();
             let bytes = host.targets.iter().map(|t| t.buffers.bytes).sum();
-            self.diag.buffers(per_target.into_iter(), bytes);
+            self.session.diag.buffers(per_target.into_iter(), bytes);
         }
         worked
     }
@@ -974,7 +981,8 @@ impl App {
         let mut frame = match permit.shm_frame() {
             Ok(frame) => frame,
             Err(error) => {
-                self.diag
+                self.session
+                    .diag
                     .error(format!("no buffer for the chrome's {surface}: {error}"));
                 return;
             }
@@ -987,43 +995,48 @@ impl App {
             height: size.height,
             stride,
         };
-        match self.chrome.paint(surface, &metrics, buffer) {
+        match self.gui.chrome.paint(surface, &metrics, buffer) {
             Ok(()) => {
                 frame.submit();
-                self.diag.chrome(surface, started.elapsed());
+                self.session.diag.chrome(surface, started.elapsed());
             }
             // The buffer goes back unsubmitted.
             Err(error) => self
+                .session
                 .diag
                 .error(format!("painting the chrome's {surface} failed: {error}")),
         }
     }
 
     fn present_view(&mut self, view: ViewId, permit: FramePermit) {
-        let Some(entry) = self.views.get_mut(&view) else {
+        let Session {
+            views,
+            registry,
+            diag,
+            ..
+        } = &mut self.session;
+        let Some(entry) = views.get_mut(&view) else {
             return;
         };
         let size = permit.metrics().buffer();
-        let Some(runtime) = self.registry.running(&entry.engine) else {
+        let Some(runtime) = registry.running(&entry.engine) else {
             return;
         };
         let started = Instant::now();
         let outcome = runtime.present(view, permit);
         let took = started.elapsed();
         match outcome {
-            Ok(sighurt_api::engine::PresentOutcome::Submitted) => {
-                if !self.diag.knows_renderer(&entry.engine) {
+            Ok(PresentOutcome::Submitted) => {
+                if !diag.knows_renderer(&entry.engine) {
                     if let Some((mode, gl)) = runtime.renderer() {
-                        self.diag.renderer(&entry.engine, mode, gl.as_deref());
+                        diag.renderer(&entry.engine, mode, gl.as_deref());
                     }
                 }
                 let buffer = u64::from(size.width) * u64::from(size.height) * 4;
-                let readback_bytes =
-                    self.diag
-                        .readbacks(&entry.engine, runtime.readbacks(), buffer);
+                let readback_bytes = diag.readbacks(&entry.engine, runtime.readbacks(), buffer);
                 let size = (size.width, size.height);
                 let paint = runtime.paint_time().unwrap_or(took);
-                self.diag.frame(
+                diag.frame(
                     &entry.engine,
                     view.serial(),
                     size,
@@ -1031,106 +1044,89 @@ impl App {
                     readback_bytes,
                 );
                 if let Some(asked) = entry.navigated.take() {
-                    self.diag.first_frame(&entry.engine, asked.elapsed());
+                    diag.first_frame(&entry.engine, asked.elapsed());
                 }
             }
-            Ok(sighurt_api::engine::PresentOutcome::NotReady) => {
-                self.diag.counters.page_not_ready += 1
-            }
-            Ok(sighurt_api::engine::PresentOutcome::Unchanged) => {
-                self.diag.counters.page_unchanged += 1
-            }
+            Ok(PresentOutcome::NotReady) => diag.counters.page_not_ready += 1,
+            Ok(PresentOutcome::Unchanged) => diag.counters.page_unchanged += 1,
             Err(error) => {
-                self.diag.counters.present_errors += 1;
+                diag.counters.present_errors += 1;
                 let message = format!("{} could not present {view:?}: {error}", entry.engine);
-                self.diag.error(message);
+                diag.error(message);
             }
         }
     }
 
-    // ── Files ─────────────────────────────────────────────────────────────────────────────
-
     fn reload_config(&mut self) {
-        self.diag.counters.config_reloads += 1;
-        match persistence::load_config(self.paths.config.as_deref(), &self.env) {
+        self.session.diag.counters.config_reloads += 1;
+        match persistence::load_config(self.session.paths.config.as_deref(), &self.session.env) {
             Ok(config) => {
                 // Saving the session again: the tabs as they are now go to the file soon.
-                if config.restore_session() && !self.core.config().restore_session() {
-                    self.session_changed();
+                if config.restore_session() && !self.session.core.config().restore_session() {
+                    self.session.session_changed();
                 }
                 let actions = self
+                    .gui
                     .chrome
-                    .handle(chrome::configure(&config, self.chrome_name));
-                self.chrome_actions(actions);
-                self.queue
+                    .handle(chrome::configure(&config, self.gui.chrome_name));
+                self.gui.chrome_actions(&mut self.session.queue, actions);
+                self.session
+                    .queue
                     .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
-                self.notice_first = None;
-                if self.notice.take().is_some() {
-                    self.snapshot_dirty = true;
+                self.gui.notice_first = None;
+                if self.gui.notice.take().is_some() {
+                    self.gui.snapshot_dirty = true;
                 }
             }
             Err(persistence::LoadError::Config(error)) => {
                 log::warn!("the configuration in use stays: {error}");
-                self.queue
+                self.session
+                    .queue
                     .push_back(BrowserEvent::ConfigReloaded(Err(error)));
             }
             Err(persistence::LoadError::Other(message)) => {
                 log::warn!("the configuration in use stays: {message}");
-                self.show_notice(format!("{message}\nThe configuration in use stays."))
+                self.gui
+                    .show_notice(format!("{message}\nThe configuration in use stays."))
             }
         }
-        self.snapshot_dirty = true;
-        self.run_core();
+        self.gui.snapshot_dirty = true;
+        self.session.run_core(&mut self.gui);
     }
-
-    /// Hands the session to the writer now, unless `[session] restore` is off: then the file
-    /// stays as it is.
-    pub(crate) fn save_session(&mut self) {
-        self.session_due = None;
-        let writer = self.session.as_ref();
-        if let Some(writer) = writer.filter(|_| self.core.config().restore_session()) {
-            writer.save(self.core.session().to_text());
-            self.diag.counters.session_saves += 1;
-        }
-    }
-
-    /// The core changed what the session holds: save it soon.
-    pub(crate) fn session_changed(&mut self) {
-        self.session_due
-            .get_or_insert_with(|| Instant::now() + SESSION_DELAY);
-    }
-
-    // ── Diagnostics and shutdown ──────────────────────────────────────────────────────────
 
     fn report(&mut self, at_exit: bool) {
         // Readbacks made since the engines' last frames, each as big as the page area.
         let scale = self
+            .gui
             .leases
             .values()
             .next()
             .map(|lease| lease.metrics().scale());
-        let page = scale.map(|scale| scale.buffer_size(self.chrome.layout().page.size()));
+        let page = scale.map(|scale| scale.buffer_size(self.gui.chrome.layout().page.size()));
         let page_bytes = page.map_or(0, |b| u64::from(b.width) * u64::from(b.height) * 4);
-        for engine in self.registry.engines() {
+        for engine in self.session.registry.engines() {
             if let State::Running(runtime) = engine.state() {
-                self.diag
+                self.session
+                    .diag
                     .readbacks(engine.name, runtime.readbacks(), page_bytes);
             }
         }
-        let host = self.host.diagnostics();
+        let host = self.gui.host.diagnostics();
         let targets = host
             .targets
             .iter()
             .map(|t| {
-                let (role, engine, tab) = match (self.surface_of(t.target), self.view_of(t.target))
-                {
+                let (role, engine, tab) = match (
+                    self.gui.surface_of(t.target),
+                    self.session.view_of(t.target),
+                ) {
                     (Some(surface), _) => (surface, None, None),
                     (None, Some(view)) => (
                         "view",
-                        Some(self.views[&view].engine.clone()),
-                        self.core
-                            .view(view)
-                            .and_then(|v| self.core.tabs().position(|tab| tab.id == v.tab())),
+                        Some(self.session.views[&view].engine.clone()),
+                        self.session.core.view(view).and_then(|v| {
+                            self.session.core.tabs().position(|tab| tab.id == v.tab())
+                        }),
                     ),
                     (None, None) => ("retiring", None, None),
                 };
@@ -1162,6 +1158,7 @@ impl App {
             })
             .collect();
         let engines = self
+            .session
             .registry
             .engines()
             .map(|engine| {
@@ -1187,6 +1184,7 @@ impl App {
             })
             .collect();
         let tabs = self
+            .session
             .core
             .tabs()
             .map(|tab| TabReport {
@@ -1195,86 +1193,74 @@ impl App {
                 can_go_forward: tab.can_go_forward,
                 reloads: tab.reloads,
                 error: tab.error.is_some(),
-                engine: chrome::engine(&self.core, &tab).map(str::to_owned),
+                engine: chrome::engine(&self.session.core, &tab).map(str::to_owned),
             })
             .collect();
         let report = Report {
-            counters: self.diag.counters.clone(),
-            peaks: self.diag.peaks.clone(),
+            counters: self.session.diag.counters.clone(),
+            peaks: self.session.diag.peaks.clone(),
             targets,
             engines,
             tabs,
-            active_tab: self.core.active() + 1,
+            active_tab: self.session.core.active() + 1,
             status: self
                 .active_tab()
                 .and_then(|tab| self.status(&tab).map(|(from, _)| from)),
             capabilities: format!("{:?}", host.capabilities),
             pending_host_events: host.pending_events,
-            last_error: self.diag.last_error(),
+            last_error: self.session.diag.last_error(),
+            // The Wayland window adds nothing. An empty map keeps the lines and the JSON as
+            // they were.
+            extra: Default::default(),
         };
-        self.diag.report(&report, at_exit);
+        self.session.diag.report(&report, at_exit);
     }
 
     /// Shuts down in the order of plan §20 and returns the exit code. If an engine could not
     /// shut down (decision 54), the process ends here with `_exit` once the session is written
-    /// and the downloads have ended or been deleted.
+    /// and the downloads have ended or been deleted. The frontend cleans up first: this window
+    /// has nothing to restore, and dropping it would release Wayland objects the engine may
+    /// still use.
     fn shutdown(mut self) -> ExitCode {
-        let code = self.quit.take().unwrap_or(ExitCode::SUCCESS);
-        self.services.cancel_downloads();
-        if let Some(writer) = self.session.take() {
-            if self.core.config().restore_session() {
-                writer.save(self.core.session().to_text());
+        let code = self.session.quit.take().unwrap_or(ExitCode::SUCCESS);
+        self.session.services.cancel_downloads();
+        if let Some(writer) = self.session.session.take() {
+            if self.session.core.config().restore_session() {
+                writer.save(self.session.core.session().to_text());
             }
             writer.finish();
         }
         let views: Vec<(ViewId, String)> = self
+            .session
             .views
             .iter()
             .map(|(&view, entry)| (view, entry.engine.clone()))
             .collect();
         for (view, engine) in views {
-            self.forget_view(view);
-            if let Some(runtime) = self.registry.running(&engine) {
+            self.session.forget_view(&mut self.gui, view);
+            if let Some(runtime) = self.session.registry.running(&engine) {
                 runtime.close_view(view);
             }
         }
         // Before the runtimes go: they know their renderer and readbacks.
         self.report(true);
-        self.registry.shutdown();
-        let Self {
-            mut host,
-            window,
-            leases,
-            services,
-            mut registry,
-            ..
-        } = self;
+        self.session.registry.shutdown();
+        let services = self.session.services;
         services.shutdown();
         // Late, so that no guest still finishing its last call writes there again.
-        registry.remove_scratch();
-        if registry.leaked() {
-            exit_now(code);
+        self.session.registry.remove_scratch();
+        if self.session.registry.leaked() {
+            self.gui.before_forced_exit();
+            sighurt_runtime::exit_now(code);
         }
+        let leases = std::mem::take(&mut self.gui.leases);
         drop(leases);
-        host.close_window(window);
-        host.flush();
-        drop(host);
+        let window = self.gui.window;
+        self.gui.host.close_window(window);
+        self.gui.host.flush();
+        drop(self.gui.host);
         code
     }
-}
-
-/// Ends the process now, with `code`, without exit handlers or destructors: what decision 54
-/// prescribes after Servo was left running. Its threads still use GL contexts, the EGL display
-/// and the Wayland connection, which exit handlers (the driver's) and the host's destructors
-/// would tear down under them; the compositor cleans up after the closed connection.
-fn exit_now(code: ExitCode) -> ! {
-    log::error!("an engine could not shut down; sig ends without running exit handlers");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    let status = if code == ExitCode::SUCCESS { 0 } else { 1 };
-    // SAFETY: `_exit` ends the process at once. Nothing here relies on a destructor or exit
-    // handler running: the session file and the diagnostics are written and closed, and the
-    // downloads have ended or their files are deleted.
-    unsafe { libc::_exit(status) }
 }
 
 /// What the status strip shows, and where it comes from: a notice of `sig`'s own while it is

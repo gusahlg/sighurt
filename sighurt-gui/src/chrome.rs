@@ -6,21 +6,50 @@
 //! (`sighurt_ui::extension`): one target for each name the chrome has used, at most
 //! `MAX_SURFACES`; a listed surface at its rectangle clipped to the window, taking input on its
 //! input area clipped to it; a name no longer listed hidden at its last rectangle. It is plain
-//! bookkeeping: the app creates a target for each name it hasn't seen and hands the placement
-//! to the host, which validates it.
+//! bookkeeping: the owner loop creates a target for each name it hasn't seen and hands the
+//! placement to the host, which validates it. The chromes of the build are listed here
+//! ([`CHROMES`]), compiled in and chosen by `[ui] chrome` at startup.
 //!
 //! Must not own: the chrome's layout and painting (the chrome), browser state (the core), or
-//! targets' lifetimes (the app and the host).
+//! targets' lifetimes (the owner loop and the host).
 
 use sighurt_api::geometry::{LogicalSize, SurfaceRect, WindowRect};
 use sighurt_core::config::Config;
 use sighurt_core::tabs::{Content, TabSummary};
-use sighurt_core::BrowserState;
+use sighurt_core::{BrowserState, ChromeChecks};
 use sighurt_ui::extension::{
     ChromeEvent, ChromeKind, ChromeLayout, InputArea, SurfaceName, Theme, MAX_SURFACES,
 };
 use sighurt_ui::{HomeInfo, Snapshot, TabContent, TabSnapshot};
 use sighurt_wayland::InputRegion;
+
+/// The chromes compiled into this build: the standard one always, then those of features.
+pub const CHROMES: &[ChromeKind] = &[
+    sighurt_ui::standard::KIND,
+    #[cfg(feature = "chrome-line")]
+    sighurt_chrome_line::KIND,
+];
+
+/// The chrome of this build called `name`. A configuration checked against [`CHROMES`] names
+/// one of them; the standard chrome stands in otherwise.
+pub fn chrome(name: &str) -> ChromeKind {
+    let found = CHROMES.iter().find(|chrome| chrome.name == name);
+    found.copied().unwrap_or(sighurt_ui::standard::KIND)
+}
+
+/// What the core checks of `chrome`.
+pub fn checks(chrome: &ChromeKind) -> ChromeChecks {
+    ChromeChecks {
+        name: chrome.name,
+        check: chrome.check,
+        commands: chrome.commands,
+    }
+}
+
+/// What the core checks of every chrome of this build.
+pub fn checks_all() -> Vec<ChromeChecks> {
+    CHROMES.iter().map(checks).collect()
+}
 
 /// What a chrome called `name` is told of `config`: `[ui]`, and `[chrome.<name>]`.
 pub fn configure(config: &Config, name: &str) -> ChromeEvent {

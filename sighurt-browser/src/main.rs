@@ -1,30 +1,20 @@
 //! `sig`, the Sighurt browser executable.
 //!
-//! Wires the pieces together: the core's state and policy, the Wayland host, the chrome, and the
-//! engines selected at build time by Cargo features (with the chromes and keymaps, listed in
-//! [`registry`]). It owns process-wide setup (logging, the TLS provider, the panic hook,
-//! signals), the owner event loop ([`app`]), and every effect with I/O.
+//! Process-wide setup and the choice of frontend. Setup follows decision 26, before any engine
+//! starts: the panic hook logs and never exits; rustls gets the aws-lc-rs provider; the one
+//! `log` logger is Servo's when Servo is compiled in and enabled, `env_logger` otherwise (the
+//! frontend's launch does that). SIGUSR1 prints the diagnostics, SIGTERM and SIGINT quit cleanly
+//! (the session is saved); their handlers only write to a pipe the loop reads. With WPE WebKit
+//! compiled in, its JavaScriptCore suspends threads with SIGUSR2 instead of SIGUSR1
+//! (`keep_webkit_off_sigusr1`). The one forced exit is the runtime's, after an engine that could
+//! not shut down (decision 54), and the frontend is asked to clean up first.
 //!
-//! Process-wide setup follows decision 26, before any engine starts: the panic hook logs and
-//! never exits; rustls gets the aws-lc-rs provider; the one `log` logger is Servo's when Servo
-//! is compiled in and enabled, `env_logger` otherwise (see [`registry`]). SIGUSR1 prints the
-//! diagnostics, SIGTERM and SIGINT quit cleanly (the session is saved); their handlers only
-//! write to a pipe the loop reads. With WPE WebKit compiled in, its JavaScriptCore suspends
-//! threads with SIGUSR2 instead of SIGUSR1 (`keep_webkit_off_sigusr1`). The one forced exit is
-//! [`app`]'s, after a Servo that could not shut down (decision 54).
+//! The Wayland window is the only frontend today ([`sighurt_gui::run`]).
 //!
-//! Must not own: browser policy (the core), drawing (the chrome and the engines), or any
-//! engine's internals.
+//! Must not own: browser policy (the core), the owner loop (the frontend), drawing (the chrome
+//! and the engines), or any engine's internals.
 //!
 //! Sighurt is based on Oxide by Nikhil Ranjan (<https://github.com/niklabh/oxide>).
-
-mod app;
-mod chrome;
-mod diagnostics;
-mod effects;
-mod persistence;
-mod registry;
-mod services;
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -34,6 +24,7 @@ use std::sync::Arc;
 use sighurt_core::config::DEFAULT_CONFIG;
 use sighurt_core::router;
 use sighurt_core::OpenRequest;
+use sighurt_gui::Options;
 
 const USAGE: &str = "\
 Usage: sig [OPTIONS] [URL|PATH ...]
@@ -55,11 +46,11 @@ Signals: SIGUSR1 prints the diagnostics on stderr; SIGTERM and SIGINT quit, savi
 ";
 
 /// What the command line asks for.
-pub struct Args {
+struct Args {
     /// URLs and paths to open, as the core takes them.
-    pub open: Vec<OpenRequest>,
+    open: Vec<OpenRequest>,
     /// Where to write the diagnostics as JSON.
-    pub diagnostics: Option<PathBuf>,
+    diagnostics: Option<PathBuf>,
 }
 
 /// The command line: arguments to run with, or the exit code of an option that did its job.
@@ -186,7 +177,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match app::run(args, signals) {
+    let options = Options {
+        open: args.open,
+        diagnostics: args.diagnostics,
+    };
+    match sighurt_gui::run(options, signals) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("sig: {error}");
