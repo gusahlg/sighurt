@@ -73,23 +73,28 @@ can show is marked as not measured.
   still `Started`, so the new document's `LoadStatus::Started` never reaches the embedder.
   Its `<body>` still reports `HeadParsed` (`HTMLBodyElement::bind_to_tree`). The adapter
   treats a second `HeadParsed`, or one beside the history change while a browser `Navigate`
-  is waiting with no `Started`, as that document. The headless run showed `self.html` and
-  `crash.html` committing as same-document pushes under a fresh id, with the next push taking
-  the browser's id. `LoadingChanged { loading: true }` followed the commit on the next spin, so
-  the history change is held for up to 100 ms for `Started` or `HeadParsed`. One spin is not
-  enough: the batch that carries the history also queues a title or a frame, and the next spin
-  is immediate, before the script has sent the head. A head followed by another history change
-  is left for that change.
+  is waiting with no `Started`, as that document. Holding the history change for one extra
+  spin was not enough: that batch also queues a title or a frame, so the runtime spins again
+  immediately, before the script has sent the head, and the commit was already reported. The
+  history change is held for up to 100 ms for `Started` or `HeadParsed`. A head followed by
+  another history change is left for that change. Measured on louise after that hold
+  (`sighurt-engine-servo/tests/headless.sh`, 2026-10-17): `after-204.html` committed as
+  `NavigationId(13)` / `DocumentGeneration(8)`, `self.html` as `NavigationId(14)` /
+  `DocumentGeneration(9)`, and `slow/own.html` as `NavigationId(16)` /
+  `DocumentGeneration(10)`. `engine.rs`, `crash.rs` and `unavailable_context.rs` passed.
 - **A load in flight is still dropped.** `Constellation::load_url` returns `None` with no
   embedder message when that browsing context is already in `pending_changes`. The queued
   navigation in `View::queued` stays. `AbortLoadUrl` still exists for 204/205.
 - **No stop API.** `Stop` is still `window.stop()`, plus giving up on a load that has been
   quiet for `LOAD_WAIT`. Decision 80 stays unless a run shows otherwise.
-- **Crash leak is not re-measured.** The same-process script thread is still the 0.5
-  design while `Opts.multiprocess` is false. `shutdown` still leaks Servo after a page
-  crash or a lost backend rather than hang. `tests/crash.rs` is the measurement. Do not
-  treat a green test as proof that 0.7 shuts down cleanly unless its log says shutdown
-  finished; the test expects the leak.
+- **Crash still leaks, and that is re-measured.** The same-process script thread is still
+  the 0.5 design while `Opts.multiprocess` is false. `shutdown` still leaks Servo after a
+  page crash rather than hang (decision 54). `tests/crash.rs` passed on louise
+  (2026-10-17): `crash.html` committed as `NavigationId(3)` on `DocumentGeneration(3)`,
+  the script panic became `ViewFailed`, and the reload committed as `NavigationId(4)`.
+  The log says `Servo can't shut down after a crash; leaving it running`, and the
+  constellation still logs `Did not successfully request EventLoop exit: Disconnected`.
+  The test expects the leak. A green run is not a clean shutdown.
 - **Workarounds kept without re-reading the 0.7 script or layout code:** history names for
   `pushState` / `replaceState` (the projection workaround in `navigation.rs`), reload
   reported as the page's own navigation, resize-while-hidden so a CSS animation does not
