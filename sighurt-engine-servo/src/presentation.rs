@@ -9,10 +9,12 @@
 //! surface back ([`PageContext::release_surface`]) and makes a new one when shown again; the
 //! GL context stays.
 //!
-//! Nothing reads page pixels back on this path: every `read_to_image` is counted, and with
-//! [`crate::runtime::ServoConfig::audit_gl`] every `glReadPixels`/`glGetTexImage` WebRender makes
-//! is counted too. Diagnostics name the GL renderer, so a software fallback (llvmpipe) can't
-//! pass for the GPU path.
+//! [`PageSurface`] is the part this Wayland surface and the offscreen surface in
+//! [`crate::offscreen`] both implement, so the runtime can present either. This module owns
+//! only the Wayland surface. Nothing reads page pixels back on this path: every `read_to_image`
+//! is counted, and with [`crate::runtime::ServoConfig::audit_gl`] every
+//! `glReadPixels`/`glGetTexImage` WebRender makes is counted too. Diagnostics name the GL
+//! renderer, so a software fallback (llvmpipe) can't pass for the GPU path.
 //!
 //! The EGL display is one per Wayland connection, shared by every view's context and Servo's
 //! WebGL thread, so [`Egl::terminate`] runs once, at shutdown, after Servo and every context.
@@ -31,6 +33,7 @@ use gleam::gl::{self, Gl, ProfilingGl};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use servo::{DeviceIntRect, RefreshDriver, RenderingContext, RgbaImage, WindowRenderingContext};
 use sighurt_api::geometry::BufferSize;
+use sighurt_api::present::Frame;
 use sighurt_wayland::GlHandles;
 use surfman::{Connection as SurfmanConnection, Surface, SurfaceTexture};
 
@@ -51,11 +54,59 @@ pub struct GlInfo {
 }
 
 /// Readbacks of page pixels to the CPU. Both stay 0 on the normal display path.
+/// An offscreen present increments [`Self::read_to_image`] once per successful read into a
+/// lent frame, through glow, so [`Self::gl_reads`] stays the audit of WebRender's own calls.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Readbacks {
     pub read_to_image: Rc<Cell<u64>>,
     /// `glReadPixels`/`glGetTexImage` calls, when auditing.
     pub gl_reads: Option<Rc<Cell<u64>>>,
+}
+
+/// Which surfaceless adapter an offscreen view asked for.
+///
+/// `Hardware` is surfman's hardware adapter (`DRI_PRIME=1` while the context was created).
+/// `Software` is used only after that adapter failed to produce a context. The GL renderer can
+/// still be llvmpipe when the hardware adapter was asked for; [`GlInfo::software`] says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OffscreenAdapter {
+    /// Surfman's hardware adapter.
+    Hardware,
+    /// Surfman's software adapter, after the hardware one failed.
+    Software,
+}
+
+impl std::fmt::Display for OffscreenAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Hardware => "hardware",
+            Self::Software => "software",
+        })
+    }
+}
+
+/// What a view's GL surface must do for the runtime, beyond Servo's [`RenderingContext`].
+///
+/// The Wayland surface swaps. The offscreen surface reads one frame back. Must not own the
+/// target's buffers or the view's document.
+pub(crate) trait PageSurface: RenderingContext {
+    /// The GL strings of this context, with EGL's.
+    fn gl_info(&self, egl: &Egl) -> GlInfo;
+
+    /// Whether a present can show pixels. False while a Wayland view has given its window
+    /// surface back. An offscreen framebuffer stays bound.
+    fn surface_is_bound(&self) -> bool;
+
+    /// The surfaceless adapter this surface was opened with. `None` for a Wayland surface.
+    fn offscreen_adapter(&self) -> Option<OffscreenAdapter> {
+        None
+    }
+
+    /// Reads the framebuffer into `frame` as ARGB8888, top row first.
+    /// A Wayland surface swaps instead, and never calls this.
+    fn read_argb(&self, _frame: Frame<'_>) -> Result<(), String> {
+        Err("this surface does not read pixels back".into())
+    }
 }
 
 /// Servo's `WindowRenderingContext` on a view's page surface, with every readback counted.
@@ -159,6 +210,16 @@ impl PageContext {
             log::warn!("servo: making the page's context current failed: {error:?}");
         }
         self.window.present();
+    }
+}
+
+impl PageSurface for PageContext {
+    fn gl_info(&self, egl: &Egl) -> GlInfo {
+        self.info(egl)
+    }
+
+    fn surface_is_bound(&self) -> bool {
+        self.is_bound()
     }
 }
 
@@ -329,7 +390,7 @@ impl Egl {
         Ok(())
     }
 
-    fn vendor_and_version(&self) -> String {
+    pub(crate) fn vendor_and_version(&self) -> String {
         let query = |name| {
             // SAFETY: a valid display; the result is a static NUL-terminated string or null.
             let s = unsafe { (self.query_string)(self.display, name) };

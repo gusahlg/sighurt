@@ -49,6 +49,10 @@
 //! servo-timing navigation-answered view=3 held_ms=0.412
 //! ```
 //!
+//! On an offscreen target `swap_ms` is the readback into the lent frame. The line stays this
+//! shape either way. The Wayland path swaps GL into the subsurface and does not read the page
+//! back.
+//!
 //! The last is how long a navigation the page asked for waited for the browser's answer, from
 //! Servo's request to the answer.
 //!
@@ -83,13 +87,14 @@ use sighurt_api::services::{
     ClipboardData, Permission, PickMode, Selection, Service, ServiceReply, ServiceRequest,
     ServiceResult,
 };
-use sighurt_wayland::{FramePermit, PresentMode, TargetLease};
+use sighurt_wayland::TargetLease;
 use url::Url;
 
 use crate::delegate::{Coalescing, Delegate, Note};
 use crate::input::text_input_state;
 use crate::navigation::{Navigator, Request};
-use crate::presentation::{physical, Egl, GlInfo, Readbacks};
+use crate::presentation::{physical, Egl, GlInfo, OffscreenAdapter, PageSurface, Readbacks};
+use crate::target::ServoTarget;
 use crate::view::{Load, Pending, View};
 
 /// Events handed over per pump; the rest wait for the next.
@@ -142,19 +147,26 @@ pub struct ServoDiagnostics {
     pub gl: Option<GlInfo>,
     /// The profile in use, or `None`: none was configured, or another process holds it.
     pub profile: Option<PathBuf>,
-    /// Page readbacks to the CPU (`RenderingContext::read_to_image`). 0 on the display path.
+    /// Page readbacks to the CPU. On the Wayland path this is `RenderingContext::read_to_image`
+    /// and stays 0. On an offscreen target each successful `glReadPixels` into a
+    /// [`CpuTarget`](sighurt_api::present::CpuTarget) frame counts once here.
     pub read_to_image: u64,
-    /// `glReadPixels`/`glGetTexImage` calls, with [`ServoConfig::audit_gl`]. 0 on the display
+    /// `glReadPixels`/`glGetTexImage` calls WebRender makes, with [`ServoConfig::audit_gl`].
+    /// The offscreen present reads through glow, so it is not counted here. 0 on the display
     /// path.
     pub gl_reads: Option<u64>,
-    /// Frames swapped into targets.
+    /// Frames submitted into targets.
     pub frames: u64,
     /// Open views.
     pub views: usize,
     /// Navigations the views' pages asked for that wait for the browser's answer.
     pub asked: usize,
-    /// How long painting and navigating took.
+    /// How long painting and navigating took. On an offscreen target [`ServoTiming::swap`] is
+    /// the readback.
     pub timing: ServoTiming,
+    /// The surfaceless adapter the first offscreen context asked for. `None` when views present
+    /// straight into Wayland subsurfaces.
+    pub offscreen_adapter: Option<OffscreenAdapter>,
     /// Servo was left running when the runtime shut down (after a page crash or a lost
     /// backend, it can't shut down): its threads outlive the runtime, the profile wasn't
     /// written, and the executable should end the process without running exit handlers.
@@ -162,13 +174,14 @@ pub struct ServoDiagnostics {
 }
 
 /// Paint and swap times of the frames submitted so far, and how long the browser's latest
-/// navigation took to show (the baseline's `SIG_SERVO_TIMING`). A swap never waits (swap
-/// interval 0), so it measures the driver's submission, not the display.
+/// navigation took to show (the baseline's `SIG_SERVO_TIMING`). A Wayland swap never waits
+/// (swap interval 0), so it measures the driver's submission, not the display. On an offscreen
+/// target [`Self::swap`] is the `glReadPixels` into the lent frame, logged as `swap_ms`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ServoTiming {
     /// `WebView::paint` of the last frame submitted: WebRender drawing the frame.
     pub paint: Duration,
-    /// The swap of the last frame submitted.
+    /// The swap of the last frame submitted, or the offscreen readback.
     pub swap: Duration,
     /// The longest paint and swap so far.
     pub max_paint: Duration,
@@ -231,16 +244,21 @@ enum Traversal {
 }
 
 /// The one Servo runtime of the process. See the module documentation.
-pub struct ServoRuntime {
+///
+/// `T` is the presentation target. It defaults to the Wayland host's [`TargetLease`]: GL goes
+/// straight into the subsurface and nothing is read back. [`crate::Offscreen`] is a
+/// [`CpuTarget`](sighurt_api::present::CpuTarget) with no display connection. [`Self::new`] is
+/// the constructor for both; the target kind is the type of the targets passed to `open_view`.
+pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// `None` once shut down.
     servo: Option<Servo>,
     delegate: Rc<Delegate>,
     waker: EngineWaker,
-    views: HashMap<ViewId, View>,
+    views: HashMap<ViewId, View<T>>,
     owners: HashMap<WebViewId, Owner>,
-    /// Views closed while something still held their context: kept, with their lease, until
+    /// Views closed while something still held their context: kept, with their target, until
     /// it is released.
-    closing: Vec<View>,
+    closing: Vec<View<T>>,
     /// Servo's keyboard focus is one WebView at a time; `blur` blurs whichever has it.
     servo_focus: Option<ViewId>,
     events: Events,
@@ -249,6 +267,8 @@ pub struct ServoRuntime {
     held: Vec<(WebViewId, Note, bool)>,
     readbacks: Readbacks,
     gl: Option<GlInfo>,
+    /// Set from the first offscreen context. Stays `None` on the Wayland path.
+    offscreen_adapter: Option<OffscreenAdapter>,
     egl: Option<Egl>,
     frames: u64,
     timing: ServoTiming,
@@ -262,7 +282,7 @@ pub struct ServoRuntime {
     leaked: bool,
 }
 
-impl ServoRuntime {
+impl<T: ServoTarget> ServoRuntime<T> {
     /// Builds Servo, which can happen once per process. Its threads start in the background;
     /// pages cost their script threads when they open. `waker` wakes the owner loop for
     /// Servo's work.
@@ -301,6 +321,7 @@ impl ServoRuntime {
             held: Vec::new(),
             readbacks,
             gl: None,
+            offscreen_adapter: None,
             egl: None,
             frames: 0,
             timing: ServoTiming::default(),
@@ -331,6 +352,7 @@ impl ServoRuntime {
             views: self.views.len(),
             asked: self.views.values().map(|view| view.asked.len()).sum(),
             timing: self.timing,
+            offscreen_adapter: self.offscreen_adapter,
             leaked: self.leaked,
         }
     }
@@ -364,7 +386,11 @@ impl ServoRuntime {
             if self.egl.is_none() {
                 // The context is current: its display is the one every view shares.
                 let egl = Egl::load()?;
-                let info = context.info(&egl);
+                let info = context.gl_info(&egl);
+                if let Some(adapter) = context.offscreen_adapter() {
+                    log::info!("servo: offscreen {adapter} adapter");
+                    self.offscreen_adapter = Some(adapter);
+                }
                 log::info!(
                     "servo: GL {} ({}; {}), EGL {}",
                     info.renderer,
@@ -915,9 +941,9 @@ impl ServoRuntime {
         );
     }
 
-    /// Drops what Servo made for a view, then the context, then the lease. Returns the view
-    /// back if something still holds the context, so its lease isn't dropped under it.
-    fn release(&mut self, mut view: View) -> Option<View> {
+    /// Drops what Servo made for a view, then the context, then the target. Returns the view
+    /// back if something still holds the context, so its target isn't dropped under it.
+    fn release(&mut self, mut view: View<T>) -> Option<View<T>> {
         // Denied while their WebView still exists.
         view.asked.clear();
         for popup in view.popups.drain(..) {
@@ -950,22 +976,43 @@ impl ServoRuntime {
         }
     }
 
-    /// Paints `id`'s frame at `size` and swaps it in, timing both.
-    fn paint(&mut self, id: ViewId, size: dpi::PhysicalSize<u32>) {
-        let Some(view) = self.views.get_mut(&id) else {
-            return;
-        };
+    /// Whether `view` can show a frame for `permit`: a visible page, a bound surface, and a
+    /// permit that is still the current layout.
+    fn can_show(view: &View<T>, permit: &T::Permit) -> bool {
+        matches!(
+            (&view.webview, &view.context),
+            (Some(_), Some(context))
+                if view.visible
+                    && context.surface_is_bound()
+                    && T::permit_is_current(permit, view.metrics.epoch())
+        )
+    }
+
+    /// Paints `id`'s frame at `size`. The caller delivers it (a swap, or one readback).
+    fn draw(&mut self, id: ViewId, size: dpi::PhysicalSize<u32>) -> Duration {
+        let view = self.views.get_mut(&id).expect("present checked the view");
         let (Some(webview), Some(context)) = (&view.webview, &view.context) else {
-            return;
+            return Duration::ZERO;
         };
         if context.size() != size {
             webview.resize(size);
         }
         let start = Instant::now();
         webview.paint();
-        let painted = Instant::now();
-        context.swap();
-        let (paint, swap) = (painted - start, painted.elapsed());
+        start.elapsed()
+    }
+
+    /// Records a submitted frame. `swap` is the Wayland swap or the offscreen readback.
+    fn account_frame(
+        &mut self,
+        id: ViewId,
+        size: dpi::PhysicalSize<u32>,
+        paint: Duration,
+        swap: Duration,
+    ) {
+        let Some(view) = self.views.get_mut(&id) else {
+            return;
+        };
         self.frames += 1;
         let t = &mut self.timing;
         t.paint = paint;
@@ -995,9 +1042,9 @@ impl ServoRuntime {
     }
 }
 
-impl EngineRuntime for ServoRuntime {
-    type Target = TargetLease;
-    type FramePermit = FramePermit;
+impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
+    type Target = T;
+    type FramePermit = T::Permit;
 
     fn capabilities(&self) -> EngineCapabilities {
         CAPABILITIES
@@ -1007,13 +1054,11 @@ impl EngineRuntime for ServoRuntime {
         &mut self,
         view: ViewId,
         options: ViewOptions,
-        target: TargetLease,
+        target: T,
     ) -> Result<(), EngineError> {
         self.alive()?;
-        if target.mode() != PresentMode::Gl {
-            return Err(EngineError::Unsupported(
-                "presenting into a shared-memory target",
-            ));
+        if let Some(reason) = target.unsupported() {
+            return Err(EngineError::Unsupported(reason));
         }
         if self.views.contains_key(&view) {
             return Err(EngineError::View {
@@ -1252,10 +1297,10 @@ impl EngineRuntime for ServoRuntime {
         }
     }
 
-    fn present(&mut self, id: ViewId, permit: FramePermit) -> Result<PresentOutcome, EngineError> {
+    fn present(&mut self, id: ViewId, permit: T::Permit) -> Result<PresentOutcome, EngineError> {
         self.alive()?;
         let view = self.views.get(&id).ok_or(EngineError::UnknownView(id))?;
-        if permit.view() != Some(id) {
+        if !T::permit_is_for(&permit, id) {
             return Err(EngineError::View {
                 view: id,
                 message: "a frame permit for another view's target".into(),
@@ -1269,35 +1314,62 @@ impl EngineRuntime for ServoRuntime {
             driver.start_frame();
             self.spin();
         }
-        let view = self
-            .views
-            .get_mut(&id)
-            .ok_or(EngineError::UnknownView(id))?;
-        view.frame_requested = false;
-        let epoch = permit.metrics().epoch();
-        let ready = matches!(
-            (&view.webview, &view.context),
-            (Some(_), Some(context)) if view.visible && context.is_bound() && permit.is_current()
-        );
-        let outcome = match ready {
-            true if view.frame_ready || view.needs_submit || view.presented != Some(epoch) => {
-                // At a new size this is WebRender's current scene at that size: Servo lays the
-                // page out again asynchronously and gives no sign when it has (decision 56).
-                view.frame_ready = false;
-                view.needs_submit = false;
-                view.presented = Some(epoch);
-                self.paint(id, physical(permit.metrics().buffer()));
-                PresentOutcome::Submitted
-            }
-            true => PresentOutcome::Unchanged,
-            false => PresentOutcome::NotReady,
+        let ready = {
+            let view = self
+                .views
+                .get_mut(&id)
+                .ok_or(EngineError::UnknownView(id))?;
+            view.frame_requested = false;
+            let epoch = T::permit_epoch(&permit);
+            Self::can_show(view, &permit)
+                && (view.frame_ready || view.needs_submit || view.presented != Some(epoch))
         };
-        permit.finish(outcome);
-        if spun && !self.events.is_empty() {
-            // What the spin produced is delivered by the next pump.
-            self.waker.wake();
+        if !ready {
+            let view = self.views.get(&id).ok_or(EngineError::UnknownView(id))?;
+            let outcome = if Self::can_show(view, &permit) {
+                PresentOutcome::Unchanged
+            } else {
+                PresentOutcome::NotReady
+            };
+            T::dismiss(permit, outcome);
+            if spun && !self.events.is_empty() {
+                self.waker.wake();
+            }
+            return Ok(outcome);
         }
-        Ok(outcome)
+        // At a new size this is WebRender's current scene at that size: Servo lays the page
+        // out again asynchronously and gives no sign when it has (decision 56).
+        let (size, context, previous) = {
+            let view = self
+                .views
+                .get_mut(&id)
+                .ok_or(EngineError::UnknownView(id))?;
+            let epoch = T::permit_epoch(&permit);
+            view.frame_ready = false;
+            view.needs_submit = false;
+            let previous = view.presented.replace(epoch);
+            let size = physical(T::permit_buffer(&permit, view.metrics.buffer()));
+            let context = Rc::clone(view.context.as_ref().expect("present found a context"));
+            (size, context, previous)
+        };
+        let paint = self.draw(id, size);
+        let view = self.views.get_mut(&id).expect("present checked the view");
+        match view.target.deliver(&context, permit) {
+            Ok(swap) => {
+                self.account_frame(id, size, paint, swap);
+                if spun && !self.events.is_empty() {
+                    self.waker.wake();
+                }
+                Ok(PresentOutcome::Submitted)
+            }
+            Err(message) => {
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.presented = previous;
+                    view.needs_submit = true;
+                }
+                Err(EngineError::View { view: id, message })
+            }
+        }
     }
 
     fn close_view(&mut self, id: ViewId) {
@@ -1317,7 +1389,7 @@ impl EngineRuntime for ServoRuntime {
         let Some(servo) = self.servo.take() else {
             return;
         };
-        let mut views: Vec<View> = self.views.drain().map(|(_, view)| view).collect();
+        let mut views: Vec<View<T>> = self.views.drain().map(|(_, view)| view).collect();
         views.append(&mut self.closing);
         for view in &mut views {
             view.asked.clear();
@@ -1521,7 +1593,8 @@ mod tests {
         use sighurt_api::engine::EngineCommand;
 
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let mut runtime = ServoRuntime::new(ServoConfig::default(), EngineWaker::new(|| {}));
+        let mut runtime: ServoRuntime =
+            ServoRuntime::new(ServoConfig::default(), EngineWaker::new(|| {}));
         let mut events = Vec::new();
         assert_eq!(runtime.pump(&mut events), PumpStatus::Idle);
         assert!(events.is_empty());

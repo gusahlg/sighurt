@@ -1,17 +1,17 @@
-//! One Servo view: its WebView, target lease and rendering context, with its visibility, focus,
-//! zoom, current metrics, navigations, held keys, input-method state, pending service requests,
-//! the navigations its pages asked the browser about and the pop-ups it opened.
+//! One Servo view: its WebView, presentation target and rendering context, with its visibility,
+//! focus, zoom, current metrics, navigations, held keys, input-method state, pending service
+//! requests, the navigations its pages asked the browser about and the pop-ups it opened.
 //!
 //! The WebView is made once the view has room (non-empty metrics, so a GL context can exist)
 //! and its first navigation: Servo loads a WebView's first URL as it builds it, and building
 //! one without would put `about:blank` into its history. Until then the view keeps its first
-//! navigation and its settings. A hidden view keeps its WebView, but Servo throttles it, it
-//! presents nothing and its EGL window surface is given back. Servo 0.5 throttles the document
-//! a WebView shows when asked, not the WebView: a hidden view's first document, and each it
-//! navigates to, would run unthrottled, so every history change of a hidden view asks again
-//! ([`View::keep_throttled`]). Closing it drops the WebView
-//! (which drops Servo's painter and its reference to the context), then the context, then the
-//! lease, in that order, on the owner thread.
+//! navigation and its settings. A hidden view keeps its WebView, but Servo throttles it and it
+//! presents nothing. A Wayland view gives its EGL window surface back while hidden; an offscreen
+//! view keeps its framebuffer. Servo 0.5 throttles the document a WebView shows when asked, not
+//! the WebView: a hidden view's first document, and each it navigates to, would run unthrottled,
+//! so every history change of a hidden view asks again ([`View::keep_throttled`]). Closing it
+//! drops the WebView (which drops Servo's painter and its reference to the context), then the
+//! context, then the target, in that order, on the owner thread.
 //!
 //! Servo 0.5 drops a `WebView::load` for a browsing context that has a load in flight
 //! (`Constellation::load_url`), and tells the embedder nothing when one ends without a document:
@@ -33,13 +33,13 @@ use sighurt_api::engine::ViewOptions;
 use sighurt_api::geometry::Metrics;
 use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, RequestId, ViewId};
 use sighurt_api::input::InputEvent;
-use sighurt_wayland::TargetLease;
 use url::Url;
 
 use crate::delegate::{Delegate, PageNavigation};
 use crate::input::{Composition, Keys};
 use crate::navigation::{Navigator, Request};
-use crate::presentation::{physical, FrameDriver, PageContext, Readbacks};
+use crate::presentation::{physical, FrameDriver, Readbacks};
+use crate::target::ServoTarget;
 
 /// A service request of the view the browser hasn't answered yet, with what Servo waits on.
 pub(crate) enum Pending {
@@ -83,7 +83,7 @@ impl Load {
     }
 }
 
-pub(crate) struct View {
+pub(crate) struct View<T: ServoTarget> {
     pub id: ViewId,
     pub metrics: Metrics,
     pub visible: bool,
@@ -92,7 +92,7 @@ pub(crate) struct View {
     /// The window has the compositor's keyboard focus.
     pub active: bool,
     pub zoom: f64,
-    pub context: Option<Rc<PageContext>>,
+    pub context: Option<Rc<T::Surface>>,
     pub driver: Rc<FrameDriver>,
     pub webview: Option<WebView>,
     /// The first navigation and where it goes, until the WebView exists to carry it out.
@@ -135,15 +135,15 @@ pub(crate) struct View {
     /// its first frame is timed.
     pub navigated: Option<(NavigationId, Instant, bool)>,
     /// Dropped last, after the context and everything Servo made from it.
-    pub lease: TargetLease,
+    pub target: T,
 }
 
-impl View {
-    pub fn new(id: ViewId, options: ViewOptions, lease: TargetLease) -> Self {
+impl<T: ServoTarget> View<T> {
+    pub fn new(id: ViewId, options: ViewOptions, target: T) -> Self {
         Self {
             id,
-            metrics: lease.metrics(),
-            lease,
+            metrics: target.metrics(),
+            target,
             visible: options.visible,
             focused: false,
             active: true,
@@ -174,27 +174,19 @@ impl View {
         }
     }
 
-    /// Makes the GL context once the view has room for one. A hidden view gives its window
-    /// surface back at once.
+    /// Makes the GL context once the view has room for one. A hidden Wayland view gives its
+    /// window surface back at once; an offscreen view keeps the framebuffer.
     pub fn ensure_context(&mut self, readbacks: &Readbacks) -> Result<(), String> {
         if self.context.is_some() || self.metrics.is_empty() {
             return Ok(());
         }
-        // SAFETY: everything made from these handles (the EGL window surface and
-        // `wl_egl_window` inside the context) is destroyed before the lease is dropped:
-        // `release` drops the WebView and the context first, and keeps the lease while anything
-        // still holds the context. The EGL display is terminated at shutdown, after every
-        // context and Servo, while the host (and so the connection) still exists; it is shared
-        // by every view's context and can't be terminated per lease (see `presentation`).
-        let handles = unsafe { self.lease.gl_handles() }.ok_or("the target isn't a GL target")?;
-        let context = PageContext::new(
-            handles,
+        let context = self.target.create_context(
             self.metrics.buffer(),
             Rc::clone(&self.driver),
             readbacks,
         )?;
         if !self.visible {
-            context.release_surface();
+            self.target.hide(&context);
         }
         self.context = Some(Rc::new(context));
         Ok(())
@@ -206,7 +198,8 @@ impl View {
         if self.webview.is_some() {
             return None;
         }
-        let context: Rc<dyn servo::RenderingContext> = self.context.clone()?;
+        let context = self.context.clone()?;
+        let context: Rc<dyn servo::RenderingContext> = context;
         let (navigation, url) = self.first.take()?;
         let webview = WebViewBuilder::new(servo, context)
             .url(url)
@@ -297,9 +290,10 @@ impl View {
         }
     }
 
-    /// Shows or hides the view. Hidden, Servo throttles it (no animations, slow timers), it
-    /// presents nothing and its EGL window surface is destroyed; shown, it gets a new one and
-    /// presents at the next permit without waiting for anything.
+    /// Shows or hides the view. Hidden, Servo throttles it (no animations, slow timers) and it
+    /// presents nothing. A Wayland view's EGL window surface is destroyed, and shown again it
+    /// gets a new one; an offscreen framebuffer stays. A view just shown presents at the next
+    /// permit without waiting for anything.
     pub fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if visible == self.visible {
             return Ok(());
@@ -312,17 +306,14 @@ impl View {
             return Ok(());
         };
         if visible {
-            // SAFETY: as in `ensure_context`; the new surface belongs to the same context.
-            let handles =
-                unsafe { self.lease.gl_handles() }.ok_or("the target isn't a GL target")?;
-            context.bind_surface(handles, self.metrics.buffer())?;
+            self.target.show(context, self.metrics.buffer())?;
             if let Some(webview) = &self.webview {
                 webview.resize(physical(self.metrics.buffer()));
             }
             self.needs_submit = true;
             self.frame_requested = false;
         } else {
-            context.release_surface();
+            self.target.hide(context);
         }
         Ok(())
     }

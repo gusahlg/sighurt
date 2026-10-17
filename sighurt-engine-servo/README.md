@@ -27,12 +27,20 @@ tools/headless-sway --renderer gles2 -- target/debug/examples/servo-window --exi
 
 ## How it maps onto Servo 0.5
 
-- **Presentation.** Each view has its own `WindowRenderingContext` on its lease's handles, swap
-  interval 0. The host issues a frame permit only after the frame callback of the last swap, so
-  a permit starts the frame Servo's refresh driver waits for, and `present` paints and swaps at
-  the permit's buffer size. A hidden view is throttled, presents nothing and gives its EGL
-  window surface back; showing it makes a new one and presents at once. No page pixels are
-  read back (`ServoDiagnostics` counts `read_to_image`, and with `audit_gl` every GL read).
+- **Presentation.** Each Wayland view has its own `WindowRenderingContext` on its lease's
+  handles, swap interval 0. The host issues a frame permit only after the frame callback of the
+  last swap, so a permit starts the frame Servo's refresh driver waits for, and `present` paints
+  and swaps at the permit's buffer size. A hidden view is throttled, presents nothing and gives
+  its EGL window surface back; showing it makes a new one and presents at once. No page pixels
+  are read back on this path (`ServoDiagnostics::read_to_image` stays 0, and with `audit_gl`
+  every GL read WebRender makes is counted in `gl_reads`).
+- **Offscreen.** `ServoRuntime<Offscreen<C>>` takes any `sighurt_api::present::CpuTarget` and
+  no Wayland connection. Each view has its own Mesa surfaceless framebuffer (hardware adapter,
+  software only if that context cannot be made; `ServoDiagnostics::offscreen_adapter` says
+  which was asked for). `present` paints, then one `glReadPixels` straight into the lent frame,
+  converting RGBA bottom-up to ARGB8888 top-down in that pass. Each successful read counts in
+  `read_to_image`. `ServoTiming::swap` is that readback and is logged as `swap_ms`.
+  `LIBGL_ALWAYS_SOFTWARE` and `DRI_PRIME` are restored after the context exists.
 - **Navigation and history.** Servo's history reports are the truth. Each commit is attributed
   to the browser's pending navigation that fits it (Servo 0.5 gives no ids) or gets an id of its
   own; a new document is known from Servo's `LoadStatus::Started` and from each entry's document,
@@ -75,6 +83,7 @@ measured rendering costs.
 ## License
 
 `AGPL-3.0-or-later AND MPL-2.0`. Files adapted from Servo stay under the
-[Mozilla Public License 2.0](https://mozilla.org/MPL/2.0/) and keep their notices (there are none
-at the moment); the rest of the crate is AGPL-3.0-or-later like the rest of Sighurt. Servo itself is
+[Mozilla Public License 2.0](https://mozilla.org/MPL/2.0/) and keep their notices: `src/offscreen.rs`,
+adapted from `experiments/tui-servo` (itself from servo-paint-api's `SoftwareRenderingContext`).
+The rest of the crate is AGPL-3.0-or-later like the rest of Sighurt. Servo itself is
 MPL-2.0. See [NOTICE](../NOTICE).
