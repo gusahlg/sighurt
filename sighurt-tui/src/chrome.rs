@@ -145,11 +145,16 @@ pub struct Cursor {
 }
 
 /// A single-line editor. The cursor is always on a grapheme boundary.
+///
+/// [`Self::select_all`] marks the whole line. The next insert or delete
+/// replaces it; a motion collapses the selection to one end and clears the mark.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineEditor {
     text: String,
     /// Byte index into [`Self::text`].
     cursor: usize,
+    /// The whole line is selected.
+    selected: bool,
 }
 
 impl Default for LineEditor {
@@ -164,6 +169,7 @@ impl LineEditor {
         Self {
             text: String::new(),
             cursor: 0,
+            selected: false,
         }
     }
 
@@ -171,7 +177,22 @@ impl LineEditor {
     pub fn from_text(text: impl Into<String>) -> Self {
         let text = sanitize(&text.into());
         let cursor = text.len();
-        Self { text, cursor }
+        Self {
+            text,
+            cursor,
+            selected: false,
+        }
+    }
+
+    /// Select the whole line. The cursor sits at the end. An empty line stays unselected.
+    pub fn select_all(&mut self) {
+        self.selected = !self.text.is_empty();
+        self.cursor = self.text.len();
+    }
+
+    /// Whether [`Self::select_all`] is in effect.
+    pub fn selected(&self) -> bool {
+        self.selected
     }
 
     /// The text, already sanitized.
@@ -185,47 +206,75 @@ impl LineEditor {
     }
 
     /// Insert `text` at the cursor. Controls and bidi marks are removed.
+    /// A selected line is replaced.
     pub fn insert(&mut self, text: &str) {
+        if self.selected {
+            self.text.clear();
+            self.cursor = 0;
+            self.selected = false;
+        }
         let text = sanitize(text);
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
     }
 
-    /// Delete the grapheme before the cursor.
+    /// Delete the grapheme before the cursor. A selected line is cleared.
     pub fn backspace(&mut self) {
+        if self.take_selection() {
+            return;
+        }
         let previous = prev_boundary(&self.text, self.cursor);
         self.text.replace_range(previous..self.cursor, "");
         self.cursor = previous;
     }
 
-    /// Delete the grapheme after the cursor.
+    /// Delete the grapheme after the cursor. A selected line is cleared.
     pub fn delete(&mut self) {
+        if self.take_selection() {
+            return;
+        }
         let next = next_boundary(&self.text, self.cursor);
         self.text.replace_range(self.cursor..next, "");
     }
 
-    /// Move one grapheme left.
+    /// Move one grapheme left. A selection collapses to the start.
     pub fn left(&mut self) {
+        if self.collapse(false) {
+            return;
+        }
         self.cursor = prev_boundary(&self.text, self.cursor);
     }
 
-    /// Move one grapheme right.
+    /// Move one grapheme right. A selection collapses to the end.
     pub fn right(&mut self) {
+        if self.collapse(true) {
+            return;
+        }
         self.cursor = next_boundary(&self.text, self.cursor);
     }
 
-    /// Move to the start.
+    /// Move to the start. A selection collapses there.
     pub fn home(&mut self) {
+        if self.collapse(false) {
+            return;
+        }
         self.cursor = 0;
     }
 
-    /// Move to the end.
+    /// Move to the end. A selection collapses there.
     pub fn end(&mut self) {
+        if self.collapse(true) {
+            return;
+        }
         self.cursor = self.text.len();
     }
 
     /// Move to the start of the previous word. A word is a run of non-whitespace graphemes.
+    /// A selection collapses to the start.
     pub fn word_left(&mut self) {
+        if self.collapse(false) {
+            return;
+        }
         let marks = boundaries(&self.text);
         let mut index = marks
             .iter()
@@ -244,8 +293,11 @@ impl LineEditor {
         self.cursor = marks[index];
     }
 
-    /// Move to the end of the next word.
+    /// Move to the end of the next word. A selection collapses to the end.
     pub fn word_right(&mut self) {
+        if self.collapse(true) {
+            return;
+        }
         let marks = boundaries(&self.text);
         let mut index = marks
             .iter()
@@ -261,6 +313,24 @@ impl LineEditor {
         self.cursor = marks[index];
     }
 
+    /// Delete from the cursor to the end of the next word (`forward`) or the start of the
+    /// previous one, as [`Self::word_right`] and [`Self::word_left`] move. A selected line is
+    /// cleared.
+    pub fn delete_word(&mut self, forward: bool) {
+        if self.take_selection() {
+            return;
+        }
+        let from = self.cursor;
+        if forward {
+            self.word_right();
+        } else {
+            self.word_left();
+        }
+        let (start, end) = (from.min(self.cursor), from.max(self.cursor));
+        self.text.replace_range(start..end, "");
+        self.cursor = start;
+    }
+
     /// Insert `text` at the cursor, same as [`Self::insert`].
     pub fn paste(&mut self, text: &str) {
         self.insert(text);
@@ -270,6 +340,30 @@ impl LineEditor {
         let column = self.cursor_column();
         self.text = sanitize(&self.text);
         self.cursor = byte_at_column(&self.text, column);
+        if self.text.is_empty() {
+            self.selected = false;
+        }
+    }
+
+    /// Clear a selected line. Returns whether there was a selection.
+    fn take_selection(&mut self) -> bool {
+        if !self.selected {
+            return false;
+        }
+        self.text.clear();
+        self.cursor = 0;
+        self.selected = false;
+        true
+    }
+
+    /// Collapse a selection to the start (`to_end` false) or the end. Returns whether it did.
+    fn collapse(&mut self, to_end: bool) -> bool {
+        if !self.selected {
+            return false;
+        }
+        self.selected = false;
+        self.cursor = if to_end { self.text.len() } else { 0 };
+        true
     }
 }
 
@@ -589,5 +683,43 @@ mod tests {
         state.address_editing.as_mut().unwrap().left();
         let page = state.draw(&mut grid);
         assert_eq!(page.cursor, Some(Cursor { column: 3, row: 3 }));
+    }
+
+    #[test]
+    fn select_all_is_replaced_by_the_next_insert_and_collapsed_by_motion() {
+        let mut editor = LineEditor::from_text("demo:pattern");
+        editor.select_all();
+        assert!(editor.selected());
+        editor.insert("demo:resize");
+        assert_eq!(editor.text(), "demo:resize");
+        assert!(!editor.selected());
+
+        editor.select_all();
+        editor.backspace();
+        assert_eq!(editor.text(), "");
+        assert!(!editor.selected());
+
+        editor.insert("ab");
+        editor.select_all();
+        editor.left();
+        assert_eq!(editor.cursor_column(), 0);
+        assert!(!editor.selected());
+        editor.select_all();
+        editor.right();
+        assert_eq!(editor.cursor_column(), editor.text().len());
+    }
+
+    #[test]
+    fn delete_word_removes_what_word_motion_crosses() {
+        let mut editor = LineEditor::from_text("open  demo://resize now");
+        editor.delete_word(false);
+        assert_eq!(editor.text(), "open  demo://resize ");
+        editor.home();
+        editor.delete_word(true);
+        assert_eq!(editor.text(), "  demo://resize ");
+        assert_eq!(editor.cursor_column(), 0);
+        editor.select_all();
+        editor.delete_word(true);
+        assert_eq!(editor.text(), "");
     }
 }

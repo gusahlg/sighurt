@@ -101,6 +101,12 @@ pub struct Counters {
     pub config_reloads: u64,
     /// Session snapshots handed to the writer.
     pub session_saves: u64,
+    /// Bytes of page frames a frontend encoded to send on. The terminal counts each kitty
+    /// image it handed to the output buffer. A frontend that doesn't encode leaves this at 0.
+    pub encoded_bytes: u64,
+    /// Page frames a frontend dropped before they were shown: the encode didn't fit, or the
+    /// reader was behind. Distinct from `page_frames_presented`, which counts submissions.
+    pub frames_dropped: u64,
 }
 
 /// The largest values seen since `sig` started: queue depths and the longest calls.

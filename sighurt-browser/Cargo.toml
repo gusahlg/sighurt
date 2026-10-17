@@ -17,18 +17,20 @@ path = "src/main.rs"
 # Which compiled engines may open pages is runtime configuration. WPE WebKit needs the prefix
 # nix/build-wpewebkit.sh installs (docs/rewrite/WPE.md); without it, build with
 # `--no-default-features --features engine-servo,engine-wasm`.
-default = ["frontend-gui", "engine-servo", "engine-wasm", "engine-wpe"]
+default = ["frontend-gui", "frontend-tui", "engine-servo", "engine-wasm", "engine-wpe"]
 # Empty, and not what enables the GUI. `--no-default-features` is a GUI with no engines, and
 # the headless builds name engine features without this one, so sighurt-gui is an unconditional
 # dependency: an empty feature cannot both enable an optional dependency and stay on when
-# default features are off. A later `frontend-tui` can sit beside it.
+# default features are off.
 frontend-gui = []
-engine-servo = ["sighurt-gui/engine-servo", "dep:sighurt-engine-servo"]
-engine-wasm = ["sighurt-gui/engine-wasm"]
-engine-wpe = ["sighurt-gui/engine-wpe"]
-engine-demo = ["sighurt-gui/engine-demo"]
+# The terminal frontend. Off in the headless GUI builds, which name engine features only.
+frontend-tui = ["dep:sighurt-tui"]
+engine-servo = ["sighurt-gui/engine-servo", "sighurt-tui?/engine-servo", "dep:sighurt-engine-servo"]
+engine-wasm = ["sighurt-gui/engine-wasm", "sighurt-tui?/engine-wasm"]
+engine-wpe = ["sighurt-gui/engine-wpe", "sighurt-tui?/engine-wpe"]
+engine-demo = ["sighurt-gui/engine-demo", "sighurt-tui?/engine-demo"]
 # Keymaps besides the core's own `bindings`, chosen by `[input] keymap`.
-keymap-modal = ["sighurt-gui/keymap-modal"]
+keymap-modal = ["sighurt-gui/keymap-modal", "sighurt-tui?/keymap-modal"]
 # Chromes besides sighurt-ui's `standard`, chosen by `[ui] chrome`.
 chrome-line = ["sighurt-gui/chrome-line"]
 
@@ -36,6 +38,8 @@ chrome-line = ["sighurt-gui/chrome-line"]
 sighurt-core = { path = "../sighurt-core" }
 # The Wayland frontend. Not optional: see `frontend-gui` above.
 sighurt-gui = { path = "../sighurt-gui" }
+# The terminal frontend. Optional: the headless GUI builds leave `frontend-tui` off.
+sighurt-tui = { path = "../sighurt-tui", optional = true, default-features = false }
 # The panic hook asks Servo whether it caught the panic (decision 26). Linking the engine
 # itself is sighurt-gui's.
 sighurt-engine-servo = { path = "../sighurt-engine-servo", optional = true }
@@ -47,6 +51,11 @@ libc = "0.2"
 log = "0.4"
 # `sig` installs the TLS provider before anything builds a TLS configuration (decision 26).
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
+# `sig --tui` in a pty, with a fake terminal on the other side (tests/tui.rs).
+[[test]]
+name = "tui"
+required-features = ["frontend-tui", "engine-demo"]
 
 [dev-dependencies]
 # The argument tests' temporary files.

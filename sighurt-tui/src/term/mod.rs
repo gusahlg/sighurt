@@ -197,6 +197,12 @@ impl Terminal {
         self.session.write_frame(frame)
     }
 
+    /// Drop bytes not yet written. Only after a resume: `SIGCONT` already sent [`ENTER`], so
+    /// the tail of a sequence cut off by the suspension would show as text.
+    pub fn discard_pending(&mut self) {
+        self.session.discard_pending();
+    }
+
     /// Bytes still waiting in the output cap.
     pub fn pending_len(&self) -> usize {
         self.session.pending_len()

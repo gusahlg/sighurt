@@ -158,6 +158,10 @@ pub fn delete(image_id: u32) -> Vec<u8> {
     format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\").into_bytes()
 }
 
+/// Delete every image and placement on the screen (`a=d,d=A`), as a full redraw does before it
+/// sends what is shown again.
+pub const DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
+
 fn to_rgba(frame: &Frame<'_>, row_bytes: usize) -> Vec<u8> {
     let height = usize::try_from(frame.size.height).unwrap_or(0);
     let mut rgba = Vec::with_capacity(row_bytes * height);

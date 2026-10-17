@@ -214,6 +214,11 @@ impl Session {
         self.output.write_frame(&self.fd, frame)
     }
 
+    /// Drop bytes not yet written. See [`super::Terminal::discard_pending`].
+    pub fn discard_pending(&mut self) {
+        self.output.clear();
+    }
+
     /// Send the startup queries and collect replies until DA1 or `deadline`.
     ///
     /// A read happens only after `poll` says the fd is readable, and only for
@@ -524,10 +529,18 @@ extern "C" fn handle_cont(_signal: libc::c_int) {
     };
     if state.suspended.swap(false, Ordering::AcqRel) {
         reenter(state);
+        // The owner loop is blocked in `poll`. Wake it so the resumed session
+        // redraws without waiting for the next key.
+        wake_winch();
     }
 }
 
 extern "C" fn handle_winch(_signal: libc::c_int) {
+    wake_winch();
+}
+
+/// One byte on the `SIGWINCH` pipe. Async-signal-safe: a `write` of one byte.
+fn wake_winch() {
     let fd = WINCH_WRITE.load(Ordering::Acquire);
     if fd < 0 {
         return;

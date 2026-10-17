@@ -271,6 +271,12 @@ impl Grid {
         out
     }
 
+    /// Something else moved the terminal's cursor: the next diff addresses its first cell
+    /// absolutely instead of moving from where the last diff left the cursor.
+    pub fn forget_cursor(&mut self) {
+        self.cursor = None;
+    }
+
     fn index(&self, col: u16, row: u16) -> usize {
         usize::from(row) * usize::from(self.cols) + usize::from(col)
     }
