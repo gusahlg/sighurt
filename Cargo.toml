@@ -6,6 +6,8 @@ members = [
     "sighurt-wayland",
     "sighurt-ui",
     "sighurt-browser",
+    # The terminal frontend (docs/rewrite/TUI.md).
+    "sighurt-tui",
     "sighurt-runtime",
     "sighurt-gui",
     # Chromes besides the standard one, compiled into `sig` through sighurt-browser's features.
