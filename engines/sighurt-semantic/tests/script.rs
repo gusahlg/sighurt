@@ -27,6 +27,10 @@ fn bounds_are_the_api_constants() {
     assert!(src.contains("JSON.stringify"));
     assert!(src.contains("Never read el.value for a password field."));
     assert!(src.contains("obj.password = true"));
+    assert!(src.contains("Object.create"));
+    assert!(src.contains("new WeakRef("));
+    assert!(src.contains("var stack"));
+    assert!(!src.contains("deref: function"));
     assert!(src.trim_start().starts_with("/*") || src.trim_start().starts_with('('));
 }
 
@@ -49,7 +53,14 @@ fn actions_name_their_node_and_do_that_action() {
     assert!(focus.contains("node.focus()"));
     let submit = action_script(&SemanticAction::Submit(id));
     assert!(submit.contains("requestSubmit"));
-    assert!(submit.contains("form.submit()"));
+    assert!(
+        !submit.contains("form.submit()") && !submit.contains(".submit()"),
+        "submit must not fall back to HTMLFormElement.submit"
+    );
+    assert!(activate.contains("\"disabled\""));
+    assert!(activate.contains("fail(\"readonly\")"));
+    assert!(!focus.contains("fail(\"readonly\")"));
+    assert!(submit.contains("\"disabled\""));
     let scroll = action_script(&SemanticAction::ScrollIntoView(id));
     assert!(scroll.contains("scrollIntoView({ block: \"center\" })"));
     let select = action_script(&SemanticAction::SelectOption { node: id, index: 3 });
@@ -107,6 +118,7 @@ fn page_fixtures_are_present() {
         "shadow.html",
         "landmarks.html",
         "huge-list.html",
+        "harden.html",
     ] {
         let path = root.join(name);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path:?}: {err}"));

@@ -763,6 +763,99 @@ fn semantic_snapshots_and_actions_without_a_display() {
 
     open_page(
         &mut session,
+        "harden.html",
+        Duration::from_secs(20),
+        |snapshot| {
+            field(snapshot, NodeKind::TextField, "Throwing").is_some_and(|node| node.password)
+                && field(snapshot, NodeKind::TextField, "Locked")
+                    .is_some_and(|node| node.value.as_deref() == Some("keep-disabled"))
+                && field(snapshot, NodeKind::TextField, "Frozen")
+                    .is_some_and(|node| node.value.as_deref() == Some("keep-readonly"))
+                && snapshot
+                    .nodes
+                    .iter()
+                    .any(|node| node.kind == NodeKind::Button && node.text.as_deref() == Some("Go"))
+        },
+    );
+    let harden = session.latest.as_ref().expect("harden snapshot");
+    assert!(
+        !blob(harden).contains("SIGHURT_THROWING_PASSWORD_SENTINEL"),
+        "throwing password leaked\n{}",
+        describe(harden)
+    );
+    let (document, locked, frozen, go) = {
+        let snapshot = session.latest.as_ref().expect("harden snapshot");
+        let locked = must_field(snapshot, NodeKind::TextField, "Locked");
+        assert!(locked.disabled, "locked disabled flag");
+        let frozen = must_field(snapshot, NodeKind::TextField, "Frozen");
+        let go = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Button && node.text.as_deref() == Some("Go"))
+            .expect("Go button");
+        (snapshot.document, locked.id, frozen.id, go.id)
+    };
+    for (node, value, stuck) in [
+        (locked, "changed-disabled", "keep-disabled"),
+        (frozen, "changed-readonly", "keep-readonly"),
+    ] {
+        session
+            .runtime
+            .command(
+                session.view,
+                EngineCommand::Semantic {
+                    document,
+                    action: SemanticAction::SetValue {
+                        node,
+                        value: value.to_owned(),
+                    },
+                },
+            )
+            .unwrap_or_else(|error| panic!("set {stuck}: {error}"));
+        let from = Instant::now();
+        let label = if stuck == "keep-disabled" {
+            "Locked"
+        } else {
+            "Frozen"
+        };
+        while from.elapsed() < Duration::from_millis(800) {
+            session.step();
+            let snapshot = session.latest.as_ref().expect("harden snapshot");
+            let current = field(snapshot, NodeKind::TextField, label);
+            assert_eq!(
+                current.and_then(|item| item.value.as_deref()),
+                Some(stuck),
+                "wrote a refused field\n{}",
+                describe(snapshot)
+            );
+        }
+    }
+    session.urls.clear();
+    session
+        .runtime
+        .command(
+            session.view,
+            EngineCommand::Semantic {
+                document,
+                action: SemanticAction::Submit(go),
+            },
+        )
+        .unwrap_or_else(|error| panic!("submit: {error}"));
+    let submitted = Instant::now();
+    while submitted.elapsed() < Duration::from_millis(1000) {
+        session.step();
+        assert!(
+            !session
+                .urls
+                .iter()
+                .any(|url| url.contains("sighurt-harden-submitted")),
+            "invalid submit navigated: {:?}",
+            session.urls
+        );
+    }
+
+    open_page(
+        &mut session,
         "shadow.html",
         Duration::from_secs(20),
         |snapshot| {

@@ -9,21 +9,26 @@ value is a JSON string. Pass it to `parse(json, document)` with the document gen
 adapter is extracting: the script cannot name a document, and a `document` field in the JSON is
 ignored. Evaluate `action_script(&action)` in the **same world** to act on a node id from that
 snapshot. Its value is `{"ok":true}` or `{"ok":false,"why":"..."}` (`missing`, `detached`,
-`kind`, `range`, `threw`).
+`kind`, `range`, `threw`, `disabled`, `readonly`). A disabled control is refused.
+A read-only control refuses set, select and activate. Submit calls `requestSubmit` only,
+so constraint validation runs; there is no `submit()` fallback.
 
 `EXTRACT` is built on first use. The bounds in the script are `MAX_NODES`, `MAX_DEPTH`,
 `MAX_STRING_BYTES`, `MAX_TOTAL_BYTES` and `MAX_OPTIONS` from `sighurt_api::semantic`, plus
 `TIME_BUDGET_MS` (50). A per-process unguessable name holds a `WeakMap` of nodes and a `Map` of
-`WeakRef`s on a non-enumerable property of `globalThis`, so ids stay stable for the document and
-are never reused.
+`WeakRef`s, capped at twice `MAX_NODES` (the previous generation is dropped first), on a
+non-enumerable property of `globalThis`. Ids are not recycled. If `WeakRef` is missing the map
+stays empty and actions miss; the script does not keep a strong reference.
 
 Password values are never read. Setting one with `SemanticAction::SetValue` is allowed. File
 input values are not read either.
 
-`parse` refuses input longer than `max_input_bytes()` before parsing it, refuses a `nodes` array
-longer than `MAX_NODES` before building those nodes, maps an unknown kind (and a heading level
-outside 1..=6, and an unknown landmark name) to `Container`, then runs `SemanticSnapshot::check`.
-A failure is an error, not a partial snapshot.
+`parse` refuses input longer than `max_input_bytes()` before scanning it. The scan builds nodes
+directly and stops at `MAX_NODES`, `MAX_STRING_BYTES`, `MAX_TOTAL_BYTES` and a nesting depth,
+without a `serde_json::Value` tree. `max_input_bytes()` is larger than the text budget because
+JSON escaping can double a string. An unknown kind (and a heading level outside 1..=6, and an
+unknown landmark name) becomes `Container`, then `SemanticSnapshot::check` runs. A failure is an
+error, not a partial snapshot. The walk's own budgets set `truncated` instead of failing.
 
 ## JSON
 

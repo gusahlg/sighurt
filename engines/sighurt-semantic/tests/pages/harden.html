@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Harden</title>
+</head>
+<body>
+  <!--
+    The password input's own type getter throws. Its value is the sentinel
+    SIGHURT_THROWING_PASSWORD_SENTINEL and must not appear; the field is a password.
+    Locked is disabled. Frozen is read-only. Neither value may change. The form's
+    required field is empty, so requestSubmit must not navigate to
+    /sighurt-harden-submitted.
+  -->
+  <form id="f" action="/sighurt-harden-submitted" method="get">
+    <label for="pw">Throwing</label>
+    <input id="pw" type="password" value="SIGHURT_THROWING_PASSWORD_SENTINEL">
+    <label for="dis">Locked</label>
+    <input id="dis" type="text" disabled value="keep-disabled">
+    <label for="ro">Frozen</label>
+    <input id="ro" type="text" readonly value="keep-readonly">
+    <input id="need" name="need" required value="">
+    <button type="submit" id="go">Go</button>
+  </form>
+  <script>
+    var field = document.getElementById("pw");
+    try {
+      Object.defineProperty(field, "type", {
+        configurable: true,
+        get: function () { throw new Error("type"); }
+      });
+    } catch (e) { /* the IDL accessor is not configurable; type=password still holds */ }
+  </script>
+</body>
+</html>

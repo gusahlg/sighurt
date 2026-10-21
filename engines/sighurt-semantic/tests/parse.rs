@@ -339,6 +339,81 @@ fn flat(count: usize) -> String {
     )
 }
 
+#[test]
+fn deep_nesting_is_an_error_not_a_panic() {
+    let mut json = String::new();
+    for _ in 0..1_000 {
+        json.push('[');
+    }
+    json.push('1');
+    for _ in 0..1_000 {
+        json.push(']');
+    }
+    assert!(
+        matches!(parse(&json, document()), Err(ParseError::Syntax(_))),
+        "deep arrays"
+    );
+    let mut objects = String::new();
+    for _ in 0..1_000 {
+        objects.push_str("{\"a\":");
+    }
+    objects.push('1');
+    for _ in 0..1_000 {
+        objects.push('}');
+    }
+    assert!(
+        matches!(parse(&objects, document()), Err(ParseError::Syntax(_))),
+        "deep objects"
+    );
+}
+
+#[test]
+fn a_huge_string_under_the_byte_ceiling_is_too_much_text() {
+    let body = "z".repeat(1 << 20);
+    let json = format!(
+        r#"{{"root":1,"nodes":[{{"id":1,"kind":"text","text":{}}}]}}"#,
+        serde_json::to_string(&body).unwrap()
+    );
+    assert!(json.len() <= max_input_bytes());
+    assert!(json.len() > MAX_STRING_BYTES);
+    assert_eq!(
+        parse(&json, document()).unwrap_err(),
+        ParseError::Snapshot(SnapshotError::TooMuchText)
+    );
+}
+
+#[test]
+fn the_node_cap_does_not_read_a_huge_tail() {
+    let mut json = flat(MAX_NODES);
+    assert!(json.ends_with("]}"), "{json} tail");
+    let huge = "y".repeat(1 << 20);
+    let extra = format!(
+        r#",{{"id":1,"kind":"text","text":{}}}"#,
+        serde_json::to_string(&huge).unwrap()
+    );
+    json.truncate(json.len() - 2);
+    json.push_str(&extra);
+    json.push_str("]}");
+    assert!(json.len() <= max_input_bytes());
+    match parse(&json, document()) {
+        Err(ParseError::Snapshot(SnapshotError::NodeCount(count))) => {
+            assert_eq!(count, MAX_NODES + 1);
+        }
+        other => panic!("expected NodeCount without reading the tail, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_repeated_text_key_keeps_the_last_value() {
+    let big = "x".repeat(MAX_STRING_BYTES);
+    let json = format!(
+        r#"{{"root":1,"nodes":[{{"id":1,"kind":"document","text":{},"text":"z"}}]}}"#,
+        serde_json::to_string(&big).unwrap()
+    );
+    let snapshot = parse_ok(&json);
+    assert_eq!(snapshot.nodes[0].text.as_deref(), Some("z"));
+}
+
 fn texts(count: usize, piece: &str) -> String {
     let encoded = serde_json::to_string(piece).unwrap();
     let mut children = Vec::with_capacity(count);
