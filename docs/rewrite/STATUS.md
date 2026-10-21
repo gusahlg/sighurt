@@ -32,6 +32,54 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   WebKit is opened on first use and its processes end with the last WPE page, retained views are
   bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
 
+### Paused on 21 October 2026 (evening): close to 0.8.0
+
+Everything verified is committed on `rewrite` (`git log f096f08..rewrite`): the terminal keys
+in Rio and kitty, the GUI's engine button, WPE semantics, text mode in `sig --tui` and
+`sig --dump` (38 of the 40 corpus sites read well, `bench/compat/results/2026-10-21-dump-wpe-frames/`),
+two rounds of terminal review fixes (GPT-6 Astra), the hardening of `sighurt-semantic`
+(decision 98), WPE's video and a11y fixes (decision 103), Servo 0.7 merged (decision 101; Servo
+0.7 is built only on louise-pc so far, in `~/repos/sighurt-servo07`), README and CLAUDE.md for the
+terminal frontend. `rewrite` passes the non-Servo suites here; with Servo 0.7, louise-pc ran
+build, clippy and the engine, runtime and GUI tests (engines.sh 279/0 on the merge's branch).
+
+**Saved, not on `rewrite`:**
+- `wip/2026-10-21-servo-review` (627a061, b2771c9): fixes for an Opus review of the Servo 0.7
+  merge, by Grok, stopped at wrap-up. **P0: Servo 0.7 made `webcrypto` an opt-in feature, so
+  `window.crypto` was missing** — turned on and verified (`crypto.randomUUID()` works; build,
+  clippy, engine lib and offscreen tests pass). This likely explains decision 101's
+  stackoverflow/amazon "0.7 regressions": reopen that diagnosis with the corpus. Also: GitHub
+  body swaps taken as new documents (navigation.rs), held history changes not waking the loop,
+  console logging at debug only with rate limits (page data rule), the dialog stylesheet
+  trimmed, the inert software adapter retry removed, `bench/compat/run --post-settle`. Not run on
+  it: engines.sh, the 40-site corpus, and the IntersectionObserver on/off conclusion (on: 18/18
+  runs; off: stopped at 12/18; results committed on the branch).
+- `wip/2026-10-21-r1-env-seal-not-adopted` (decision 102) and
+  `wip/2026-10-21-pre-move-stash-with-videos` (the stashes, kept as branches).
+- Worker prompts and reports: `~/.local/share/sighurt-handoff/2026-10-21/` (outside the repo;
+  `/tmp` is wiped on reboot). Worker logs: `~/.local/state/ai-worker/logs/`.
+
+**To 0.8.0, in order:**
+1. Finish `wip/2026-10-21-servo-review`: rerun the IntersectionObserver off runs (keep it on
+   only without a post-settle repaint loop), engines.sh and the corpus on louise-pc
+   (`SIG_REMOTE_DEST=repos/sighurt-servo07 tools/remote …`); merge it into `rewrite`; amend
+   decision 101.
+2. Text mode in `sig --tui` has the bug `--dump` had (49d73a7): it gives engines an empty page
+   area and takes no frames, so pages that draw on animation frames (YouTube's consent dialog)
+   or commit only once frames are taken (archive.org) show no text. Give text mode a real page
+   area and present the frames without showing them; amend decision 104.
+3. Rerun the terminal pty tests with every engine compiled in on louise-pc (they failed only
+   on a stale demo library, 6dcd886).
+4. Build Servo 0.7 on this desktop (`SIG_WHAT="servo build" tools/cargo build -p sighurt-browser`,
+   long), run CLAUDE.md's full pre-commit list, `apps/sighurt-browser/tests/engines.sh`,
+   `frontends/sighurt-tui/tests/real-terminals.sh`; copy `target/debug/sig` to `target/try/sig`
+   for the user.
+5. A final GPT-6 Astra review of the day's work (it hit its usage limit on 21 October).
+6. The user's last step: bump `[workspace.package] version` (0.7.0) to 0.8.0, merge `rewrite`
+   into `main`, push.
+After 0.8.0: Servo semantics (text mode for Servo pages), `--dump` printing `<title>` when a
+page has no heading, crate organization steps 2–4 (`docs/crate-organization.md`).
+
 ### Paused on 17 October 2026 (evening): where the terminal frontend and compatibility work stand
 
 Committed on `rewrite` today (decisions 88–98): the AGPL relicensing; the split of `sig` into
