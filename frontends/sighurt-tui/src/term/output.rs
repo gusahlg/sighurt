@@ -7,6 +7,11 @@
 //! Bytes already handed to the kernel are tracked with [`Wire`]. Dropping the
 //! queue finishes that open sequence or ends it (a kitty graphics APC with
 //! `ESC \`) so the terminal is not left inside the sequence.
+//!
+//! A write is split so the state published *before* the syscall is the state
+//! on the wire if that syscall stops early: inside a sequence from its first
+//! byte until the byte that leaves the sequence has been accepted. The session
+//! stores that classification before it calls `write`.
 
 use std::io;
 use std::os::fd::AsFd;
@@ -136,6 +141,46 @@ fn step(wire: Wire, byte: u8) -> Wire {
     }
 }
 
+/// How many leading bytes of `bytes` one `write` may send, and the [`Wire`]
+/// to publish before that syscall.
+///
+/// The published state stays inside a sequence until the byte that reaches
+/// ground is accepted, and it is never [`Wire::StrEsc`] before the `ESC` of
+/// `ST` has been accepted: a fatal handler that runs during the syscall then
+/// sends a terminator that still closes the sequence.
+pub(super) fn plan_write(start: Wire, bytes: &[u8]) -> (usize, Wire) {
+    if bytes.is_empty() {
+        return (0, start);
+    }
+    let mut wire = start;
+    let mut publish = start;
+    for (index, &byte) in bytes.iter().enumerate() {
+        let next = step(wire, byte);
+        // The byte that leaves the sequence is its own syscall. Publish the
+        // state from before it; ground is stored only after `write` returns.
+        if next == Wire::Ground && wire != Wire::Ground {
+            if index == 0 {
+                return (1, wire);
+            }
+            return (index, publish);
+        }
+        // `ESC` of `ST` would be `StrEsc`, whose terminator is only `\`.
+        // Publish the string state (`APC` / `OSC` / …) so the handler sends
+        // the whole `ST` if this `ESC` has not landed yet.
+        if next == Wire::StrEsc && wire != Wire::StrEsc {
+            if index == 0 {
+                return (1, wire);
+            }
+            return (index, publish);
+        }
+        if next != Wire::Ground {
+            publish = next;
+        }
+        wire = next;
+    }
+    (bytes.len(), publish)
+}
+
 /// How many leading bytes finish the open sequence. `None` when they do not.
 fn bytes_until_ground(wire: Wire, bytes: &[u8]) -> Option<usize> {
     if wire == Wire::Ground {
@@ -188,11 +233,6 @@ impl Output {
     /// Wire byte stored for the signal path.
     pub fn wire_byte(&self) -> u8 {
         self.wire.as_u8()
-    }
-
-    /// Generation last taken from the signal path.
-    pub fn seen_gen(&self) -> u64 {
-        self.seen_gen
     }
 
     /// A signal handler moved the terminal on its own.
@@ -252,17 +292,30 @@ impl Output {
     }
 
     /// Write one frame. `EAGAIN` stores what fits; it does not block.
-    pub fn write_frame<Fd: AsFd>(&mut self, fd: Fd, frame: &[u8]) -> io::Result<()> {
-        self.drain(&fd)?;
+    ///
+    /// `publish` runs before each `write` with the [`Wire`] that syscall will
+    /// leave on the wire if it stops early, and again with the exact state
+    /// after the bytes the kernel accepted. `false` means a fatal handler
+    /// moved the wire; this stops and does not queue the rest.
+    pub fn write_frame<Fd, P>(&mut self, fd: Fd, frame: &[u8], mut publish: P) -> io::Result<()>
+    where
+        Fd: AsFd,
+        P: FnMut(Wire) -> bool,
+    {
+        if self.drain(&fd, &mut publish)? {
+            return Ok(());
+        }
         if self.pending.is_empty() && self.wire != Wire::Ground {
             // The previous frame ended on the wire inside a sequence and its
             // tail was not kept. Close it before the next frame.
             self.pending.extend_from_slice(terminator(self.wire));
         }
         if self.pending.is_empty() {
-            let wrote = write_partial(&fd, frame)?;
-            self.wire = advance(self.wire, &frame[..wrote]);
-            let rest = &frame[wrote..];
+            let wrote = self.write_span(&fd, frame, &mut publish)?;
+            if wrote.handoff {
+                return Ok(());
+            }
+            let rest = &frame[wrote.bytes..];
             if !rest.is_empty() {
                 self.queue_rest(rest);
             }
@@ -277,7 +330,7 @@ impl Output {
             return Ok(());
         }
         self.pending.extend_from_slice(frame);
-        self.drain(fd)?;
+        let _ = self.drain(fd, &mut publish)?;
         Ok(())
     }
 
@@ -296,17 +349,90 @@ impl Output {
         }
     }
 
-    fn drain<Fd: AsFd>(&mut self, fd: Fd) -> io::Result<()> {
+    /// `true` when a fatal handler took the wire and the caller must stop.
+    fn drain<Fd, P>(&mut self, fd: Fd, publish: &mut P) -> io::Result<bool>
+    where
+        Fd: AsFd,
+        P: FnMut(Wire) -> bool,
+    {
         while !self.pending.is_empty() {
-            let wrote = write_partial(&fd, &self.pending)?;
+            let (len, announced) = plan_write(self.wire, &self.pending);
+            if len == 0 || !publish(announced) {
+                return Ok(true);
+            }
+            let wrote = match write_partial(&fd, &self.pending[..len]) {
+                Ok(n) => n,
+                Err(err) => {
+                    let _ = publish(self.wire);
+                    return Err(err);
+                }
+            };
             if wrote == 0 {
+                let _ = publish(self.wire);
                 break;
             }
             self.wire = advance(self.wire, &self.pending[..wrote]);
+            let handoff = !publish(self.wire);
             self.pending.drain(..wrote);
+            if handoff || wrote < len {
+                return Ok(handoff);
+            }
         }
-        Ok(())
+        Ok(false)
     }
+
+    fn write_span<Fd, P>(&mut self, fd: &Fd, buf: &[u8], publish: &mut P) -> io::Result<SpanWrite>
+    where
+        Fd: AsFd,
+        P: FnMut(Wire) -> bool,
+    {
+        let mut written = 0;
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let (len, announced) = plan_write(self.wire, rest);
+            if len == 0 || !publish(announced) {
+                return Ok(SpanWrite {
+                    bytes: written,
+                    handoff: true,
+                });
+            }
+            let chunk = &rest[..len];
+            let n = match write_partial(fd, chunk) {
+                Ok(n) => n,
+                Err(err) => {
+                    let _ = publish(self.wire);
+                    if written == 0 {
+                        return Err(err);
+                    }
+                    break;
+                }
+            };
+            if n == 0 {
+                let _ = publish(self.wire);
+                break;
+            }
+            self.wire = advance(self.wire, &chunk[..n]);
+            let handoff = !publish(self.wire);
+            written += n;
+            rest = &rest[n..];
+            if handoff || n < len {
+                return Ok(SpanWrite {
+                    bytes: written,
+                    handoff,
+                });
+            }
+        }
+        Ok(SpanWrite {
+            bytes: written,
+            handoff: false,
+        })
+    }
+}
+
+struct SpanWrite {
+    bytes: usize,
+    /// A fatal handler published its own wire. Do not queue what follows.
+    handoff: bool,
 }
 
 fn write_partial<Fd: AsFd>(fd: Fd, buf: &[u8]) -> io::Result<usize> {
@@ -371,5 +497,35 @@ mod tests {
         let open = advance(Wire::Ground, b"\x1b_Gq=2,m=0;AAAA");
         assert_eq!(open, Wire::Apc);
         assert_eq!(terminator(open), b"\x1b\\");
+    }
+
+    #[test]
+    fn plan_write_keeps_an_apc_open_until_its_terminator_lands() {
+        let bytes = b"\x1b_Gq=2;AAAA\x1b\\";
+        let mut wire = Wire::Ground;
+        let mut rest = &bytes[..];
+        let mut saw_apc = false;
+        while !rest.is_empty() {
+            let (len, publish) = plan_write(wire, rest);
+            assert!(len > 0);
+            if publish == Wire::Apc {
+                saw_apc = true;
+            }
+            // Ground is not published while any byte of this chunk is still unsent.
+            if wire != Wire::Ground || rest[..len].contains(&0x1b) {
+                assert_ne!(publish, Wire::Ground);
+            }
+            wire = advance(wire, &rest[..len]);
+            rest = &rest[len..];
+        }
+        assert!(saw_apc);
+        assert_eq!(wire, Wire::Ground);
+
+        // The ESC of ST is published as APC, not StrEsc: the handler's
+        // terminator is then the whole ST even if that ESC has not landed.
+        assert_eq!(plan_write(Wire::Apc, b"\x1b\\"), (1, Wire::Apc));
+        assert_eq!(plan_write(Wire::StrEsc, b"\\"), (1, Wire::StrEsc));
+        assert_eq!(plan_write(Wire::Csi, b"31m"), (2, Wire::Csi));
+        assert_eq!(plan_write(Wire::Ground, b"text"), (4, Wire::Ground));
     }
 }

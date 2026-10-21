@@ -5,6 +5,22 @@
 //! that lock, allocate, or call the previous owner. `restore` is safe to call
 //! twice. Drop calls it too.
 //!
+//! The owner thread is the only writer, except on a path that has to restore
+//! the terminal before the process dies. `SIGTSTP` and `SIGCONT` only set an
+//! atomic and wake the self-pipe; [`Session::take_resumed`] restores, stops,
+//! and enters raw mode again after `SIGCONT`. `SIGWINCH` only writes that
+//! pipe. `SIGHUP`, the panic hook and [`restore_before_forced_exit`] still
+//! write, and only with async-signal-safe calls (`write`, `poll`, `fcntl`,
+//! `tcsetattr`): no allocation and no lock.
+//!
+//! Those fatal writers see an exact wire classification. Every output `write`
+//! stores it *before* the syscall, as the state the terminal is in if the
+//! kernel accepts a prefix and stops: inside sequence X from its first byte
+//! until the byte that leaves X has been accepted. The classification and its
+//! generation share one atomic, so a handler cannot observe a new generation
+//! with a stale state. After a fatal writer takes the wire it bumps that
+//! generation; the owner then drops the queue instead of resuming the tail.
+//!
 //! Installing handlers leaks the state box. A handler that already loaded the
 //! pointer can still use it after the session is dropped; a handler that loads
 //! afterwards sees a null pointer and does nothing. Tests that install handlers
@@ -17,9 +33,7 @@
 
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -31,7 +45,7 @@ use rustix::pty::OpenptFlags;
 use rustix::termios::{tcgetattr, tcsetattr, OptionalActions, SpecialCodeIndex, Termios, Winsize};
 
 use super::modes::{ENTER, LEAVE, QUERIES};
-use super::output::{advance, terminator, Output, Wire};
+use super::output::{advance, plan_write, terminator, Output, Wire};
 use super::parser::{Input, Parser};
 use super::probe::{self, Caps};
 
@@ -70,13 +84,12 @@ struct Shared {
     leave_at: AtomicUsize,
     /// [`LEAVE`] has been written in full.
     protocol_restored: AtomicBool,
-    /// [`Wire`] of bytes the kernel has accepted. The signal path reads this
-    /// and does not look at the output queue.
-    wire: AtomicU8,
-    /// Bumped when the signal path changes `wire`, so the owner drops a tail
-    /// that path already aborted.
-    wire_gen: AtomicU64,
-    suspended: AtomicBool,
+    /// [`Wire`] in the low 8 bits, generation above that. See the module docs.
+    /// The fatal path reads this and does not look at the output queue.
+    wire_packed: AtomicU64,
+    /// `SIGTSTP` wants the owner to restore and stop. The handler does not
+    /// write the terminal or stop the process itself.
+    suspend_requested: AtomicBool,
     resumed: AtomicBool,
     /// Set before `sigaction`, so drop leaks the box rather than freeing it
     /// under a live handler.
@@ -142,9 +155,8 @@ impl Session {
             active: AtomicBool::new(true),
             leave_at: AtomicUsize::new(0),
             protocol_restored: AtomicBool::new(false),
-            wire: AtomicU8::new(Wire::Ground as u8),
-            wire_gen: AtomicU64::new(0),
-            suspended: AtomicBool::new(false),
+            wire_packed: AtomicU64::new(u64::from(Wire::Ground as u8)),
+            suspend_requested: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
             handlers: AtomicBool::new(false),
         });
@@ -178,7 +190,10 @@ impl Session {
     /// Termios and the reset bytes are tracked apart: a termios success does
     /// not forget a [`LEAVE`] that the terminal did not accept, and a later
     /// call sends the rest. Bytes already started on the wire are finished or
-    /// closed before [`LEAVE`]. The write waits at most [`RESTORE_BUDGET`].
+    /// closed before [`LEAVE`]. The write waits at most [`RESTORE_BUDGET`],
+    /// and every attempt forces non-blocking mode first so a full pty cannot
+    /// block the write. The captured flags are put back afterwards. When the
+    /// reset bytes do not all land, this returns an error; it does not hang.
     /// A call after both parts have succeeded writes nothing.
     pub fn restore(&mut self) -> io::Result<()> {
         let done = !self.shared().active.load(Ordering::Acquire)
@@ -196,18 +211,28 @@ impl Session {
                 write_protocol(self.shared(), deadline);
             }
         }
-        if restore_termios(self.shared()) {
-            Ok(())
-        } else {
-            Err(io::Error::other(
+        if !restore_termios(self.shared()) {
+            return Err(io::Error::other(
                 "tcsetattr failed while restoring the terminal",
-            ))
+            ));
         }
+        // `write_protocol` forced non-blocking mode. Put the captured flags
+        // back now that the writes have stopped, including when they timed out.
+        restore_original_flags(self.shared());
+        if self.shared().protocol_restored.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        log::warn!("terminal protocol was not fully restored");
+        Err(io::Error::new(
+            ErrorKind::TimedOut,
+            "terminal protocol was not fully restored",
+        ))
     }
 
-    /// `SIGTSTP` restores and stops; `SIGCONT` enters again; `SIGHUP` restores
-    /// and re-raises. `SIGWINCH` writes one byte to [`Self::winch_fd`]. The
-    /// state box is leaked.
+    /// `SIGTSTP` asks the owner to stop; the owner does it in
+    /// [`Self::take_resumed`]. `SIGCONT` only wakes the self-pipe. `SIGHUP`
+    /// restores and re-raises, because the process is about to die.
+    /// `SIGWINCH` writes one byte to [`Self::winch_fd`]. The state box is leaked.
     pub fn install_handlers(&mut self) -> io::Result<()> {
         self.shared().handlers.store(true, Ordering::Release);
         install_signal(libc::SIGTSTP, handle_tstp)?;
@@ -236,8 +261,21 @@ impl Session {
         }
     }
 
-    /// Whether `SIGCONT` has re-entered since the last call.
+    /// Performs a pending `SIGTSTP` on this thread, then reports whether
+    /// `SIGCONT` has re-entered since the last call.
+    ///
+    /// The handler only sets a flag. Stopping here, on the owner, is what
+    /// keeps a signal from writing into the middle of an escape sequence.
+    /// The call blocks in `SIGTSTP` until `SIGCONT`. The owner loop calls
+    /// this every turn.
     pub fn take_resumed(&self) -> bool {
+        if self
+            .shared()
+            .suspend_requested
+            .swap(false, Ordering::AcqRel)
+        {
+            self.suspend_owner();
+        }
         self.shared().resumed.swap(false, Ordering::AcqRel)
     }
 
@@ -269,9 +307,11 @@ impl Session {
     /// Queue `frame`. Does not block when the terminal stops reading.
     pub fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         self.sync_wire();
-        let result = self.output.write_frame(&self.fd, frame);
-        self.publish_wire();
-        result
+        let state = self.state;
+        // `state` is this session's box. The closure runs before this returns.
+        self.output.write_frame(&self.fd, frame, |wire| {
+            store_wire_keep_gen(unsafe { &*state }, wire)
+        })
     }
 
     /// Drop bytes not yet written. An open sequence is kept or closed.
@@ -393,6 +433,9 @@ impl Session {
     /// [`Duration::ZERO`] when [`Self::read_input`] left input pending, so the
     /// owner loop does not sleep before the next read.
     pub fn poll_timeout(&self) -> Option<Duration> {
+        if self.shared().suspend_requested.load(Ordering::Acquire) {
+            return Some(Duration::ZERO);
+        }
         if self.more_input || self.held_at < self.held.len() {
             return Some(Duration::ZERO);
         }
@@ -417,23 +460,44 @@ impl Session {
         Ok(true)
     }
 
-    /// Copy a signal handler's wire over the queue when the handler has run.
+    /// Copy a fatal writer's wire over the queue when it has taken the generation.
     fn sync_wire(&mut self) {
-        let wire = self.shared().wire.load(Ordering::Acquire);
-        let gen = self.shared().wire_gen.load(Ordering::Acquire);
-        self.output.sync_handler(wire, gen);
+        let (wire, gen) = load_wire(self.shared());
+        self.output.sync_handler(wire as u8, gen);
     }
 
-    /// Publish the queue's wire unless a handler has moved it since the sync.
+    /// Publish the queue's wire unless a fatal writer has taken it.
     fn publish_wire(&mut self) {
-        let gen = self.shared().wire_gen.load(Ordering::Acquire);
-        if gen != self.output.seen_gen() {
+        let wire = Wire::from_u8(self.output.wire_byte());
+        if !store_wire_keep_gen(self.shared(), wire) {
             self.sync_wire();
-            return;
         }
-        self.shared()
-            .wire
-            .store(self.output.wire_byte(), Ordering::Release);
+    }
+
+    /// Restore, stop, and enter again after `SIGCONT`. Runs on the owner.
+    ///
+    /// The output queue is not written here (`take_resumed` is shared). The
+    /// open sequence is closed from the published wire, then [`LEAVE`].
+    /// [`reenter`] bumps the generation so the next owner write drops the tail.
+    fn suspend_owner(&self) {
+        let state = self.shared();
+        let deadline = Instant::now() + RESTORE_BUDGET;
+        write_protocol(state, deadline);
+        if !restore_termios(state) {
+            log::warn!("tcsetattr failed while suspending");
+        } else {
+            restore_original_flags(state);
+        }
+        if !state.protocol_restored.load(Ordering::Acquire) {
+            log::warn!("terminal protocol was not fully restored before suspend");
+        }
+        // Block in the default stop. `SIGCONT` resumes inside `raise`, and
+        // this thread — not the `SIGCONT` handler — enters raw mode again.
+        set_default(libc::SIGTSTP);
+        unblock_signal(libc::SIGTSTP);
+        unsafe { libc::raise(libc::SIGTSTP) };
+        let _ = install_signal(libc::SIGTSTP, handle_tstp);
+        reenter(state);
     }
 
     /// Write the open sequence's tail, or the bytes that close it.
@@ -447,13 +511,17 @@ impl Session {
             self.publish_wire();
             return true;
         }
-        let n = write_deadline(self.fd.as_raw_fd(), &bytes, deadline);
+        let (n, handoff) = write_tracked(self.shared(), &bytes, Some(deadline));
+        if handoff {
+            // A fatal writer took the wire. The tail belongs to the sequence
+            // it already closed.
+            return false;
+        }
         self.output.advance_wire(&bytes[..n]);
         let done = n == bytes.len();
         if !done {
             self.output.prepend(&bytes[n..]);
         }
-        self.publish_wire();
         done
     }
 
@@ -578,10 +646,20 @@ fn restore_signal_safe(state: &Shared) -> bool {
 /// sequence is closed with [`terminator`] before [`LEAVE`].
 fn restore_with_deadline(state: &Shared, deadline: Instant) -> bool {
     write_protocol(state, deadline);
-    restore_termios(state)
+    let termios_ok = restore_termios(state);
+    if termios_ok {
+        // Writes forced non-blocking mode. The captured flags go back even
+        // when the reset bytes did not all land, so a later retry's first
+        // `write` is not a blocking write on a full pty — that retry forces
+        // non-blocking mode again before it writes.
+        restore_original_flags(state);
+    }
+    // The owner, if this returns, must not resume the queue this closed.
+    take_wire(state);
+    termios_ok && state.protocol_restored.load(Ordering::Acquire)
 }
 
-/// Put the captured termios and file flags back. Does not write.
+/// Put the captured termios back. Does not change file flags and does not write.
 fn restore_termios(state: &Shared) -> bool {
     if !state.active.load(Ordering::Acquire) {
         return true;
@@ -590,10 +668,18 @@ fn restore_termios(state: &Shared) -> bool {
     if tcsetattr(fd, OptionalActions::Now, &state.original).is_err() {
         return false;
     }
-    let fd = unsafe { BorrowedFd::borrow_raw(state.fd) };
-    let _ = rustix::fs::fcntl_setfl(fd, state.original_flags);
     state.active.store(false, Ordering::Release);
     true
+}
+
+fn force_nonblock(state: &Shared) {
+    let fd = unsafe { BorrowedFd::borrow_raw(state.fd) };
+    let _ = rustix::fs::fcntl_setfl(fd, state.raw_flags);
+}
+
+fn restore_original_flags(state: &Shared) {
+    let fd = unsafe { BorrowedFd::borrow_raw(state.fd) };
+    let _ = rustix::fs::fcntl_setfl(fd, state.original_flags);
 }
 
 /// Close an open control sequence, then write [`LEAVE`] from `leave_at`.
@@ -609,34 +695,29 @@ fn write_protocol(state: &Shared, deadline: Instant) {
         off = LEAVE.len();
     }
     if off == 0 {
-        let wire = Wire::from_u8(state.wire.load(Ordering::Acquire));
+        let (wire, _) = load_wire(state);
         let term = terminator(wire);
         if !term.is_empty() {
-            let n = write_deadline(state.fd, term, deadline);
-            if n == 0 {
+            let (n, handoff) = write_tracked(state, term, Some(deadline));
+            if handoff || n == 0 {
                 return;
             }
-            note_wire(state, &term[..n]);
             if n < term.len() {
                 return;
             }
         }
     }
-    let n = write_deadline(state.fd, &LEAVE[off..], deadline);
+    let (n, handoff) = write_tracked(state, &LEAVE[off..], Some(deadline));
     if n > 0 {
-        note_wire(state, &LEAVE[off..off + n]);
         off += n;
         state.leave_at.store(off, Ordering::Release);
+    }
+    if handoff {
+        return;
     }
     if off >= LEAVE.len() {
         state.protocol_restored.store(true, Ordering::Release);
     }
-}
-
-fn note_wire(state: &Shared, bytes: &[u8]) {
-    let wire = advance(Wire::from_u8(state.wire.load(Ordering::Acquire)), bytes);
-    state.wire.store(wire as u8, Ordering::Release);
-    state.wire_gen.fetch_add(1, Ordering::Release);
 }
 
 fn reenter(state: &Shared) {
@@ -650,41 +731,137 @@ fn reenter(state: &Shared) {
     // next one. ENTER is scanned from ground only when that restore finished.
     let restored = state.protocol_restored.swap(false, Ordering::AcqRel);
     state.leave_at.store(0, Ordering::Release);
-    let n = write_all_nb(state.fd, ENTER);
-    let start = if restored {
-        Wire::Ground
-    } else {
-        Wire::from_u8(state.wire.load(Ordering::Acquire))
-    };
-    state
-        .wire
-        .store(advance(start, &ENTER[..n]) as u8, Ordering::Release);
-    state.wire_gen.fetch_add(1, Ordering::Release);
     state.active.store(true, Ordering::Release);
+    if restored {
+        let _ = store_wire_keep_gen(state, Wire::Ground);
+    }
+    let _ = write_tracked(state, ENTER, None);
+    // Drop whatever the suspension cut off, instead of resuming that tail.
+    take_wire(state);
     state.resumed.store(true, Ordering::Release);
 }
 
-/// Non-blocking write used from a signal handler for [`ENTER`]. Returns how
-/// many bytes the kernel accepted. Restoration uses [`write_deadline`] instead.
-fn write_all_nb(fd: RawFd, mut bytes: &[u8]) -> usize {
+/// Write `bytes` from the published wire, storing the classification before
+/// each syscall. See the module docs. `deadline` forces non-blocking mode and
+/// polls until then; `None` is one non-blocking attempt per chunk.
+///
+/// The boolean is `true` when a fatal writer took the generation and this
+/// must not keep writing.
+fn write_tracked(state: &Shared, bytes: &[u8], deadline: Option<Instant>) -> (usize, bool) {
+    if deadline.is_some() {
+        force_nonblock(state);
+    }
+    let (mut start, _) = load_wire(state);
     let mut written = 0;
-    while !bytes.is_empty() {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        match rustix::io::write(borrowed, bytes) {
-            Ok(0) => break,
-            Ok(n) => {
-                bytes = &bytes[n..];
-                written += n;
-            }
-            Err(Errno::INTR) => continue,
-            Err(_) => break,
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (len, publish) = plan_write(start, rest);
+        if len == 0 {
+            break;
+        }
+        if !store_wire_keep_gen(state, publish) {
+            return (written, true);
+        }
+        let n = match deadline {
+            Some(deadline) => write_deadline(state.fd, &rest[..len], deadline),
+            None => write_some_nb(state.fd, &rest[..len]),
+        };
+        if n == 0 {
+            let _ = store_wire_keep_gen(state, start);
+            break;
+        }
+        let exact = advance(start, &rest[..n]);
+        if !store_wire_keep_gen(state, exact) {
+            return (written + n, true);
+        }
+        start = exact;
+        written += n;
+        rest = &rest[n..];
+        if n < len {
+            break;
         }
     }
-    written
+    (written, false)
+}
+
+fn write_some_nb(fd: RawFd, bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    loop {
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match rustix::io::write(borrowed, bytes) {
+            Ok(n) => return n,
+            Err(Errno::INTR) => continue,
+            Err(_) => return 0,
+        }
+    }
+}
+
+fn load_wire(state: &Shared) -> (Wire, u64) {
+    unpack_wire(state.wire_packed.load(Ordering::Acquire))
+}
+
+/// Store `wire` without changing the generation. `false` when a fatal writer
+/// has taken the generation; the previous value is left in place.
+fn store_wire_keep_gen(state: &Shared, wire: Wire) -> bool {
+    let mut current = state.wire_packed.load(Ordering::Acquire);
+    loop {
+        let (_stored, gen) = unpack_wire(current);
+        let next = pack_wire(gen, wire);
+        if next == current {
+            return true;
+        }
+        match state.wire_packed.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => {
+                if unpack_wire(observed).1 != gen {
+                    return false;
+                }
+                current = observed;
+            }
+        }
+    }
+}
+
+/// Publish `wire` and bump the generation, so the owner drops its queue.
+fn take_wire(state: &Shared) {
+    let (wire, _) = load_wire(state);
+    store_wire_bump(state, wire);
+}
+
+fn store_wire_bump(state: &Shared, wire: Wire) {
+    let mut current = state.wire_packed.load(Ordering::Acquire);
+    loop {
+        let gen = unpack_wire(current).1.wrapping_add(1);
+        match state.wire_packed.compare_exchange_weak(
+            current,
+            pack_wire(gen, wire),
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn pack_wire(gen: u64, wire: Wire) -> u64 {
+    (gen << 8) | u64::from(wire as u8)
+}
+
+fn unpack_wire(packed: u64) -> (Wire, u64) {
+    (Wire::from_u8(packed as u8), packed >> 8)
 }
 
 /// `poll` for `POLLOUT` until `deadline`, then `write`. Both are async-signal-safe.
 /// A hard error or a timeout returns how many bytes were accepted.
+/// The fd must already be non-blocking: the first `write` is not preceded by `poll`.
 fn write_deadline(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> usize {
     let mut written = 0;
     while !bytes.is_empty() {
@@ -813,30 +990,15 @@ extern "C" fn handle_tstp(_signal: libc::c_int) {
     let Some(state) = load_state() else {
         return;
     };
-    let _ = restore_signal_safe(state);
-    state.suspended.store(true, Ordering::Release);
-    // The signal is blocked for the rest of this handler, so a `raise` while
-    // it is blocked only marks it pending. Reset the action, unblock, then
-    // raise: the default action stops the process inside `raise`, and
-    // `SIGCONT` resumes there. Reinstall only after that. Reinstalling while
-    // the stop is still pending delivers it back to this handler, and the
-    // process never stops.
-    set_default(libc::SIGTSTP);
-    unblock_signal(libc::SIGTSTP);
-    unsafe { libc::raise(libc::SIGTSTP) };
-    let _ = install_signal(libc::SIGTSTP, handle_tstp);
+    // The owner restores and stops. Writing here would race a partial APC.
+    state.suspend_requested.store(true, Ordering::Release);
+    wake_winch();
 }
 
 extern "C" fn handle_cont(_signal: libc::c_int) {
-    let Some(state) = load_state() else {
-        return;
-    };
-    if state.suspended.swap(false, Ordering::AcqRel) {
-        reenter(state);
-        // The owner loop is blocked in `poll`. Wake it so the resumed session
-        // redraws without waiting for the next key.
-        wake_winch();
-    }
+    // Resuming after our own `SIGTSTP` returns inside the owner's `raise`.
+    // An external continue only has to wake the loop. Neither path writes.
+    wake_winch();
 }
 
 extern "C" fn handle_winch(_signal: libc::c_int) {

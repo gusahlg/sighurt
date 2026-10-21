@@ -581,7 +581,62 @@ fn a_stalled_reader_does_not_block_the_writer() {
     );
     assert!(session.pending_len() <= 4096);
     assert!(start.elapsed() < Duration::from_secs(1));
-    session.restore().expect("restore");
+    let started = Instant::now();
+    let restored = session.restore();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "restore blocked for {:?}",
+        started.elapsed()
+    );
+    // Nobody is reading the pty, so the reset bytes may not land. That is an
+    // error, not a hang, and Drop must return as well.
+    let _ = restored;
+    let started = Instant::now();
+    drop(session);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "drop blocked for {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn restore_and_drop_return_when_the_reader_never_reads() {
+    let _deadline = arm_deadline();
+    let (_master, slave) = open_pty().expect("openpty");
+    let mut session = Terminal::enter_with(slave, 4096).expect("enter");
+    let frame = vec![b'Q'; 1024];
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(800) && session.dropped_frames() == 0 {
+        session.write_frame(&frame).expect("frame");
+    }
+    assert!(session.dropped_frames() > 0, "pty never filled");
+    // A 1024-byte write is rejected while the reset sequence would still fit.
+    // Fill that tail one byte at a time, or restore can finish and this test
+    // never reaches the full-buffer path.
+    session.discard_pending();
+    let tail = Instant::now();
+    while tail.elapsed() < Duration::from_millis(800) && session.pending_len() == 0 {
+        session.write_frame(b"Q").expect("tail");
+    }
+    assert!(session.pending_len() > 0, "the pty still accepted a byte");
+    let started = Instant::now();
+    let error = session
+        .restore()
+        .expect_err("a full pty must report an incomplete reset");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "restore blocked for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let started = Instant::now();
+    drop(session);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "drop blocked for {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

@@ -429,6 +429,9 @@ impl Sink {
             .encode_slice(group, &mut self.b64[start..])
             .expect("one base64 group is 4 bytes");
         debug_assert_eq!(written, 4);
+        if self.b64.len() >= CHUNK_BYTES {
+            self.seal_chunk();
+        }
     }
 
     fn seal_chunk(&mut self) {
@@ -453,6 +456,16 @@ impl Sink {
             return;
         }
         if self.group_len > 0 {
+            // Padding is 4 characters. A chunk that is already full has to be
+            // sealed first: appending here used to emit 4100 payload bytes
+            // when a 3072-byte group landed on the 4096 boundary and one
+            // input byte was still waiting.
+            if self.b64.len() + 4 > CHUNK_BYTES {
+                self.seal_chunk();
+            }
+            if self.over {
+                return;
+            }
             let mut tmp = [0u8; 4];
             let written = STANDARD
                 .encode_slice(&self.group[..self.group_len], &mut tmp)
@@ -634,7 +647,7 @@ fn cursor_to(column: u16, row: u16) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     use flate2::read::ZlibDecoder;
     use sighurt_api::geometry::BufferSize;
@@ -953,5 +966,125 @@ mod tests {
             .encode(&frame_of(&mut one, 1, 1), 7, place, 1024 * 1024)
             .expect("encoder recovers");
         assert!(again.ends_with(b"\x1b[u"));
+    }
+
+    /// Whole-buffer base64, cut every [`CHUNK_BYTES`], framed like [`Sink::emit`].
+    fn eager_compressed(data: &[u8]) -> Vec<u8> {
+        let b64 = STANDARD.encode(data);
+        let chunks = chunks_of(&b64);
+        let mut out = cursor_to(0, 0);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let last = index + 1 == chunks.len();
+            let more = if last { "0" } else { "1" };
+            let control = if index == 0 {
+                format!("a=T,f=32,o=z,t=d,s=1,v=1,i=1,c=1,r=1,C=1,q=2,m={more}")
+            } else {
+                format!("q=2,m={more}")
+            };
+            out.extend_from_slice(b"\x1b_G");
+            out.extend_from_slice(control.as_bytes());
+            out.push(b';');
+            out.extend_from_slice(chunk.as_bytes());
+            out.extend_from_slice(b"\x1b\\");
+        }
+        out.extend_from_slice(b"\x1b[u");
+        out
+    }
+
+    fn sink_encode(data: &[u8], splits: &[usize]) -> Vec<u8> {
+        let mut sink = Sink::new();
+        sink.begin(
+            1,
+            1,
+            1,
+            CellRect {
+                column: 0,
+                row: 0,
+                columns: 1,
+                rows: 1,
+            },
+            usize::MAX,
+        );
+        let mut at = 0;
+        for &split in splits {
+            let end = split.min(data.len());
+            if end > at {
+                sink.write_all(&data[at..end]).expect("fragment");
+                at = end;
+            }
+        }
+        if at < data.len() {
+            sink.write_all(&data[at..]).expect("tail");
+        }
+        sink.finish_apc();
+        assert!(!sink.over);
+        sink.out
+    }
+
+    fn assert_payloads_fit(bytes: &[u8]) {
+        let mut rest = bytes;
+        while let Some(start) = rest.windows(3).position(|window| window == b"\x1b_G") {
+            rest = &rest[start + 3..];
+            let end = rest
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .expect("APC closed");
+            let message = &rest[..end];
+            rest = &rest[end + 2..];
+            let split = message
+                .iter()
+                .position(|byte| *byte == b';')
+                .expect("payload");
+            assert!(
+                message.len() - split - 1 <= CHUNK_BYTES,
+                "payload {} exceeds {CHUNK_BYTES}",
+                message.len() - split - 1
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_writes_match_eager_chunking() {
+        let mut data = Vec::with_capacity(8192);
+        for index in 0..8192u32 {
+            data.push(noise(index));
+        }
+        let sizes = [
+            0, 1, 2, 3, 4, 32, 48, 3068, 3070, 3071, 3072, 3073, 3074, 4095, 6144, 8192,
+        ];
+        for &size in &sizes {
+            let bytes = &data[..size];
+            let eager = eager_compressed(bytes);
+            let mut splits: Vec<Vec<usize>> = vec![Vec::new(), vec![1], vec![2]];
+            if size > 3071 {
+                splits.push(vec![3071]);
+                splits.push(vec![3071, 3073.min(size)]);
+            }
+            if size <= 48 {
+                for split in 1..size {
+                    splits.push(vec![split]);
+                }
+            } else {
+                let mut split = 1;
+                while split < size {
+                    splits.push(vec![split]);
+                    let near = split.saturating_add(3071).min(size.saturating_sub(1));
+                    if near > 0 && near < size {
+                        splits.push(vec![split, near]);
+                    }
+                    split += 64;
+                }
+                for edge in 3068..3076 {
+                    if edge < size {
+                        splits.push(vec![edge]);
+                    }
+                }
+            }
+            for split in &splits {
+                let got = sink_encode(bytes, split);
+                assert_payloads_fit(&got);
+                assert_eq!(got, eager, "size {size} splits {split:?}");
+            }
+        }
     }
 }

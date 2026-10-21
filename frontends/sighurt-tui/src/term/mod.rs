@@ -7,7 +7,13 @@
 //!
 //! Register [`Terminal::fd`] with the calloop loop for readability, and
 //! [`Terminal::winch_fd`] as well once [`Terminal::install_handlers`] has run.
-//! When either is readable, or when [`Terminal::poll_timeout`] elapses, call
+//! The owner thread is the only writer of terminal bytes. `SIGTSTP` only sets
+//! a flag; it and `SIGCONT` wake [`Terminal::winch_fd`]. Call
+//! [`Terminal::take_resumed`] every loop turn to restore, stop, and enter
+//! again. `SIGHUP`, a panic and [`restore_before_forced_exit`] are the
+//! exception: they restore before the process dies, from the wire state
+//! published before each output `write`. When either fd is readable, or when
+//! [`Terminal::poll_timeout`] elapses, call
 //! [`Terminal::read_events`] and [`Terminal::expire_if_due`]. Keys are
 //! [`sighurt_api::input::KeyEvent`]s. Legacy terminals report no evdev code
 //! (`KeyCode(0)`), synthesize a release after each press, and cannot tell Tab
@@ -44,7 +50,9 @@ use session::Session;
 /// Cells of the terminal, and the pixel size of one cell.
 ///
 /// `cell_width` and `cell_height` are 0 when neither `CSI 16 t` nor
-/// `TIOCGWINSZ` reported a pixel size. A probe answer wins over the ioctl.
+/// `TIOCGWINSZ` reported a pixel size. A probe answer wins over the ioctl
+/// until the ioctl's pixel size changes, which drops the cached answer.
+/// When the terminal has answered `CSI 16 t` before, that query is sent again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermSize {
     /// Columns.
@@ -97,6 +105,10 @@ pub struct Terminal {
     caps: Caps,
     size: TermSize,
     ioctl_cell: Option<(u16, u16)>,
+    /// Last `ws_xpixel` and `ws_ypixel`. `None` until the first successful read.
+    ioctl_pixels: Option<(u16, u16)>,
+    /// The terminal has answered `CSI 16 t` at least once.
+    cell_query_ok: bool,
 }
 
 impl Terminal {
@@ -121,6 +133,8 @@ impl Terminal {
                 cell_height: 0,
             },
             ioctl_cell: None,
+            ioctl_pixels: None,
+            cell_query_ok: false,
         };
         terminal.note_winsize();
         Ok(terminal)
@@ -159,6 +173,9 @@ impl Terminal {
     /// also a [`TermEvent::Resize`], so the owner relayouts.
     pub fn probe(&mut self, deadline: Duration) -> io::Result<&Capabilities> {
         self.caps = self.session.probe(deadline)?;
+        if self.caps.cell_pixels.is_some() {
+            self.cell_query_ok = true;
+        }
         self.note_winsize();
         Ok(&self.caps)
     }
@@ -228,19 +245,22 @@ impl Terminal {
         self.session.dropped_frames()
     }
 
-    /// `SIGTSTP` restores and stops; `SIGCONT` enters again; `SIGHUP` restores
-    /// and re-raises; `SIGWINCH` wakes [`Self::winch_fd`].
+    /// `SIGWINCH` wakes [`Self::winch_fd`]. `SIGTSTP` only requests a stop;
+    /// [`Self::take_resumed`] restores, stops, and enters again after
+    /// `SIGCONT`. `SIGHUP` restores from the handler and re-raises.
     pub fn install_handlers(&mut self) -> io::Result<()> {
         self.session.install_handlers()
     }
 
-    /// Whether `SIGCONT` has re-entered since the last call.
+    /// Performs a pending `SIGTSTP` and reports whether `SIGCONT` has
+    /// re-entered since the last call. The owner loop calls this every turn.
     pub fn take_resumed(&self) -> bool {
         self.session.take_resumed()
     }
 
     /// Restore the termios and file flags captured at [`Self::enter`], and send
-    /// [`LEAVE`]. A second call is a success and writes nothing.
+    /// [`LEAVE`]. A second call after that succeeded writes nothing. When the
+    /// reset bytes cannot be written, this returns an error instead of blocking.
     pub fn restore(&mut self) -> io::Result<()> {
         self.session.restore()
     }
@@ -251,6 +271,9 @@ impl Terminal {
                 let before = self.caps.clone();
                 let reply = Input::Reply(reply);
                 probe::absorb(&mut self.caps, &reply);
+                if self.caps.cell_pixels.is_some() {
+                    self.cell_query_ok = true;
+                }
                 self.apply_cells();
                 if probe::affects_layout(&before, &self.caps) {
                     Some(TermEvent::Resize(self.size))
@@ -271,8 +294,7 @@ impl Terminal {
         };
         self.size.cols = ws.ws_col.max(1);
         self.size.rows = ws.ws_row.max(1);
-        self.ioctl_cell = cell_from_winsize(&ws);
-        self.caps.winsize_cell = self.ioctl_cell;
+        self.remember_ioctl(&ws);
         self.apply_cells();
     }
 
@@ -283,8 +305,16 @@ impl Terminal {
         let before = self.size;
         let cols = ws.ws_col.max(1);
         let rows = ws.ws_row.max(1);
-        self.ioctl_cell = cell_from_winsize(&ws);
-        self.caps.winsize_cell = self.ioctl_cell;
+        let raw = (ws.ws_xpixel, ws.ws_ypixel);
+        let pixels_changed = self.ioctl_pixels.is_some_and(|prev| prev != raw);
+        // A cached `CSI 16 t` answer is for the old font. Drop it so this
+        // ioctl's cell size is visible, and ask again when the terminal
+        // has answered that query before.
+        let drop_report = pixels_changed && self.caps.cell_pixels.is_some();
+        if drop_report {
+            self.caps.cell_pixels = None;
+        }
+        self.remember_ioctl(&ws);
         self.size.cols = cols;
         self.size.rows = rows;
         self.apply_cells();
@@ -293,6 +323,15 @@ impl Terminal {
         if self.size != before {
             out.push(TermEvent::Resize(self.size));
         }
+        if drop_report && self.cell_query_ok {
+            let _ = self.session.write_frame(b"\x1b[16t");
+        }
+    }
+
+    fn remember_ioctl(&mut self, ws: &Winsize) {
+        self.ioctl_cell = cell_from_winsize(ws);
+        self.caps.winsize_cell = self.ioctl_cell;
+        self.ioctl_pixels = Some((ws.ws_xpixel, ws.ws_ypixel));
     }
 
     fn apply_cells(&mut self) {
@@ -349,6 +388,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use rustix::fs::OFlags;
     use rustix::io::Errno;
     use rustix::termios::{tcsetwinsize, Winsize};
 
@@ -468,6 +508,100 @@ mod tests {
             terminal.size()
         );
         terminal.restore().expect("restore");
+    }
+
+    #[test]
+    fn a_cached_cell_report_does_not_hide_an_ioctl_pixel_change() {
+        let (master, slave) = open_pty().expect("openpty");
+        let flags = rustix::fs::fcntl_getfl(&master).expect("getfl");
+        rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK).expect("nonblock");
+        tcsetwinsize(
+            &slave,
+            Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 800,
+                ws_ypixel: 480,
+            },
+        )
+        .expect("initial size");
+        let mut terminal = Terminal::enter(slave).expect("enter");
+        assert_eq!(terminal.size().cell_width, 10);
+        assert_eq!(terminal.size().cell_height, 20);
+        let _ = drain_master(&master);
+
+        let reply = read_soon(&mut terminal, &master, b"\x1b[6;30;15t");
+        assert!(
+            reply
+                .iter()
+                .any(|event| matches!(event, TermEvent::Resize(_))),
+            "{reply:?}"
+        );
+        assert_eq!(terminal.size().cell_width, 15);
+        assert_eq!(terminal.size().cell_height, 30);
+        assert_eq!(
+            terminal.capabilities().cell_pixels,
+            Some((30, 15)),
+            "the CSI report is cached"
+        );
+
+        let fd = terminal.try_clone_fd().expect("dup");
+        tcsetwinsize(
+            &fd,
+            Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 1600,
+                ws_ypixel: 960,
+            },
+        )
+        .expect("pixel change");
+        let events = terminal.read_events().expect("read");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TermEvent::Resize(size)
+                    if size.cols == 80
+                        && size.rows == 24
+                        && size.cell_width == 20
+                        && size.cell_height == 40
+            )),
+            "cached report hid the ioctl change: {events:?} size {:?}",
+            terminal.size()
+        );
+        assert_eq!(terminal.capabilities().cell_pixels, None);
+        let output = drain_master(&master);
+        assert!(
+            output.windows(5).any(|window| window == b"\x1b[16t"),
+            "cell size was not queried again: {output:?}"
+        );
+
+        let again = read_soon(&mut terminal, &master, b"\x1b[6;44;22t");
+        assert!(
+            again.iter().any(|event| matches!(
+                event,
+                TermEvent::Resize(size)
+                    if size.cell_width == 22 && size.cell_height == 44
+            )),
+            "{again:?} size {:?}",
+            terminal.size()
+        );
+        assert_eq!(terminal.capabilities().cell_pixels, Some((44, 22)));
+        terminal.restore().expect("restore");
+    }
+
+    fn drain_master(master: &impl AsFd) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match rustix::io::read(master, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(Errno::AGAIN) | Err(Errno::INTR) => break,
+                Err(err) => panic!("drain: {err}"),
+            }
+        }
+        out
     }
 
     #[test]
