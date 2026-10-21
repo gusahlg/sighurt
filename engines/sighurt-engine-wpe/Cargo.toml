@@ -13,6 +13,8 @@ publish = false
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
 sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
+# The extraction script and its parser, shared with the Servo adapter.
+sighurt-semantic = { path = "../sighurt-semantic" }
 # The host's own wl_display, through a second event queue for the page's buffers.
 wayland-client.workspace = true
 wayland-protocols.workspace = true

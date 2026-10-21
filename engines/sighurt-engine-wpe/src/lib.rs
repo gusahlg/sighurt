@@ -32,6 +32,7 @@ pub mod navigation;
 pub mod platform;
 pub mod present;
 pub mod runtime;
+pub mod semantic;
 pub mod target;
 pub mod view;
 

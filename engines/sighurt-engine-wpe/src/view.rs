@@ -89,6 +89,10 @@ pub enum Note {
     Download(String, Option<String>),
     Ime(Ime),
     Script(Result<String, String>),
+    /// A semantic script finished.
+    Semantic(crate::semantic::Tag, Result<String, String>),
+    /// The isolated world's observer saw the DOM change.
+    Mutated,
 }
 
 /// The replaceable things WebKit said about one view: only the latest matters.
@@ -186,6 +190,8 @@ pub struct Page<T: WpeTarget> {
     pub held: Vec<(RequestId, PageNavigation, Instant)>,
     /// The focused editable element, while there is one.
     pub text_input: Option<TextInput>,
+    /// What the frontend asked of the view's semantic snapshots.
+    pub semantics: crate::semantic::Semantics,
     /// The layout epoch last applied. A CPU permit must name it. A Wayland permit does not.
     pub(crate) epoch: LayoutEpoch,
     /// The buffer size of [`epoch`](Self::epoch).

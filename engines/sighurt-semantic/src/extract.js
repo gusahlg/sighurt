@@ -9,8 +9,9 @@
  * so a later action can find the node.
  *
  * Skipped: script, style, template, noscript, head metadata, hidden, aria-hidden=true,
- * display:none, and input type=hidden. visibility:hidden skips that element but not a
- * visible descendant. checkVisibility() is used when it exists, otherwise getComputedStyle.
+ * display:none, and input type=hidden. visibility:hidden skips that element and its own
+ * text, but not a visible descendant. checkVisibility() is used when it exists, otherwise
+ * getComputedStyle.
  * Same-origin iframes are walked. A cross-origin iframe is a container labelled with its
  * absolute URL. Open shadow roots are walked and slots pull assigned light-DOM nodes.
  * A closed shadow root is not visible to script.
@@ -98,7 +99,8 @@
   }
 
   function inputType(el) {
-    try { return String(el.type || "text").toLowerCase(); } catch (e) { return "text"; }
+    // A type that cannot be read is treated as a password: its value is never taken.
+    try { return String(el.type || "text").toLowerCase(); } catch (e) { return "password"; }
   }
 
   function hrefOf(el) {
@@ -310,6 +312,9 @@
             if (style) { vis = style.visibility; display = style.display; }
           }
         } catch (e3) { /* fall through to hiding the subtree */ }
+        // display:contents has no box, so checkVisibility reports the element itself
+        // hidden, but its children (and a slot's assigned nodes) are shown.
+        if (display === "contents") return "show";
         if (vis === "hidden" && display !== "none") return "self";
         return "subtree";
       }
@@ -642,6 +647,21 @@
     return stripEdge(ids, false);
   }
 
+  // Direct text of a visibility:hidden element is hidden. Element children are walked, so a
+  // descendant that is itself visible is kept and one that stays hidden is skipped there.
+  function walkUnhiddenChildren(list, depth, inPre, sectioning) {
+    var ids = [];
+    var count = list ? list.length : 0;
+    for (var i = 0; i < count; i++) {
+      if (overBudget()) break;
+      var node = list[i];
+      if (!node || node.nodeType !== 1) continue;
+      var part = walk(node, depth, inPre, sectioning, false);
+      for (var j = 0; j < part.length; j++) ids.push(part[j]);
+    }
+    return ids;
+  }
+
   function walkList(list, depth, inPre, sectioning, skipText) {
     var ids = [];
     var count = list ? list.length : 0;
@@ -692,15 +712,18 @@
     var tag = tagOf(el);
     if (SKIP[tag]) return [];
     if (tag === "INPUT" && inputType(el) === "hidden") return [];
-    var hide = hiddenKind(el);
-    if (hide === "subtree") return [];
-    if (hide === "self") return walkList(childNodesOf(el), depth, inPre, sectioning, skipText);
-    if (tag === "SLOT" && typeof el.assignedNodes === "function") {
+    // A slot's own box is often display:contents, so it is not "shown", but it still
+    // distributes light-DOM nodes and fallback children. An explicitly hidden slot does not.
+    if (tag === "SLOT" && typeof el.assignedNodes === "function"
+        && !(el.hasAttribute && (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true"))) {
       var assigned = [];
       try { assigned = el.assignedNodes({ flatten: true }); } catch (e) { assigned = []; }
       if (assigned && assigned.length) return walkList(assigned, depth, inPre, sectioning, skipText);
       return walkList(el.childNodes || [], depth, inPre, sectioning, skipText);
     }
+    var hide = hiddenKind(el);
+    if (hide === "subtree") return [];
+    if (hide === "self") return walkUnhiddenChildren(childNodesOf(el), depth, inPre, sectioning);
     if (tag === "BR") {
       if (skipText) return [];
       return emitNewline(el);

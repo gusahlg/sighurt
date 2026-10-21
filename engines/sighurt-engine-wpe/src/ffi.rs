@@ -49,6 +49,7 @@ opaque!(
     WebKitScriptDialog,
     WebKitURIRequest,
     WebKitURIResponse,
+    WebKitUserContentManager,
     WebKitWebView,
     JSCValue,
     GAsyncResult,
@@ -491,6 +492,14 @@ functions! {
         result: *mut GAsyncResult,
         error: *mut *mut GError,
     ) -> *mut JSCValue;
+    pub fn webkit_web_view_get_user_content_manager(
+        web_view: *mut WebKitWebView,
+    ) -> *mut WebKitUserContentManager;
+    pub fn webkit_user_content_manager_register_script_message_handler(
+        manager: *mut WebKitUserContentManager,
+        name: *const c_char,
+        world_name: *const c_char,
+    ) -> gboolean;
 
     // The back-forward list
     pub fn webkit_back_forward_list_get_back_list(list: *mut WebKitBackForwardList) -> *mut GList;

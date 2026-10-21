@@ -10190,6 +10190,7 @@ dependencies = [
  "pkg-config",
  "raw-window-handle",
  "sighurt-api",
+ "sighurt-semantic",
  "sighurt-wayland",
  "smithay-client-toolkit",
  "url",

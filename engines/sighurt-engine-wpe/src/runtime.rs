@@ -32,6 +32,12 @@
 //! ignores it; a new document, a crash, closing the view and shutdown ignore what is still held.
 //! `RUST_LOG=sighurt_engine_wpe::timing=debug` logs how long each waited ([`TIMING`]).
 //!
+//! Semantics stay off until `SetSemantics`. While on, the extraction script runs in the isolated
+//! world `sighurt` after a commit, when loading ends, after an action, and at least 250 ms after
+//! that world's `MutationObserver` posts a change. An extraction is stamped with the document at
+//! its start and dropped when that document or the view is gone. At most one extraction is in
+//! flight per view. Action scripts are not logged: `SetValue` carries plaintext.
+//!
 //! The profile (cookies, storage, caches) is a persistent `WebKitNetworkSession` in the
 //! configured directory, held with `{profile}/lock` for the runtime's life; a second process
 //! that finds it locked, or no directory, gets an ephemeral session. [`WpeConfig::user_agent`]
@@ -78,6 +84,7 @@ use crate::input::Input;
 use crate::navigation::Commit;
 use crate::platform::{Buffer, Call, Display, View};
 use crate::present::{self, BufferKey, PresentStats, Wayland};
+use crate::semantic::{self, Tag};
 use crate::target::WpeTarget;
 use crate::view::{self, Answer, Note, Page, RequestKind, Shared, TextInput};
 
@@ -92,7 +99,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     pointer_lock: false,
     native_popups: false,
     process_per_view: true,
-    semantics: false,
+    semantics: true,
 };
 
 /// The `log` target of the timing lines: `RUST_LOG=sighurt_engine_wpe::timing=debug`.
@@ -333,22 +340,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
             .pages
             .get(&view)
             .ok_or(EngineError::UnknownView(view))?;
-        let script =
-            CString::new(script).map_err(|_| EngineError::Unsupported("NUL in a script"))?;
-        let data = Box::into_raw(Box::new((Rc::downgrade(&self.inbox), view)));
-        unsafe {
-            ffi::webkit_web_view_evaluate_javascript(
-                page.web(),
-                script.as_ptr(),
-                -1,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                Some(script_done),
-                data.cast(),
-            );
-        }
-        Ok(())
+        run_script(page, &self.inbox, script, None, Tag::Test)
     }
 
     /// Script results that arrived, oldest first.
@@ -494,10 +486,15 @@ impl<T: WpeTarget> WpeRuntime<T> {
             self.scripts.push((id, result));
             return;
         }
+        if let Note::Semantic(tag, result) = note {
+            self.semantic_done(id, tag, result);
+            return;
+        }
         let Some(page) = self.pages.get_mut(&id) else {
             return;
         };
         let events = &mut self.events;
+        let mut resample = false;
         match note {
             Note::Frame(buffer, damage) => {
                 self.produced += 1;
@@ -524,6 +521,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
             Note::Committed(url, history) => {
                 let commit = page.navigator.committed(url, history);
                 committed(page, events, commit);
+                resample = true;
             }
             Note::Failed { provisional, error } => {
                 if let Some(navigation) = provisional.then(|| page.navigator.failed()).flatten() {
@@ -554,6 +552,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 {
                     committed(page, events, commit);
                 }
+                resample |= !loading;
                 if loading != page.loading {
                     page.loading = loading;
                     push(events, EngineEvent::LoadingChanged { view: id, loading });
@@ -710,7 +709,158 @@ impl<T: WpeTarget> WpeRuntime<T> {
                     push(events, EngineEvent::TextInputChanged { view: id, state });
                 }
             }
-            Note::Script(_) => unreachable!("handled above"),
+            Note::Mutated => page.semantics.note_mutation(Instant::now()),
+            Note::Script(_) | Note::Semantic(..) => unreachable!("handled above"),
+        }
+        if resample {
+            self.extract(id);
+        }
+    }
+
+    /// Connects the view's mutation channel once, before any observer can post.
+    fn listen(&mut self, view: ViewId) {
+        let manager_ptr = {
+            let Some(page) = self.pages.get(&view) else {
+                return;
+            };
+            if page.semantics.listening {
+                return;
+            }
+            let manager_ptr = unsafe { ffi::webkit_web_view_get_user_content_manager(page.web()) };
+            if manager_ptr.is_null() {
+                return;
+            }
+            manager_ptr
+        };
+        let manager: glib::Object =
+            unsafe { from_glib_none(manager_ptr.cast::<glib::gobject_ffi::GObject>()) };
+        let inbox = Rc::downgrade(&self.inbox);
+        // Connected before the handler is registered, so a post cannot arrive with nobody listening.
+        manager.connect_local("script-message-received::sighurt", false, move |_| {
+            if let Some(inbox) = inbox.upgrade() {
+                inbox.borrow_mut().notes.push((view, Note::Mutated));
+            }
+            None
+        });
+        let registered = unsafe {
+            ffi::webkit_user_content_manager_register_script_message_handler(
+                manager_ptr,
+                semantic::HANDLER.as_ptr(),
+                semantic::WORLD.as_ptr(),
+            )
+        };
+        if let Some(page) = self.pages.get_mut(&view) {
+            page.semantics.listening = true;
+        }
+        if registered == 0 {
+            log::debug!("semantic mutation channel was not registered");
+        }
+    }
+
+    /// Starts an extraction for `view` if it has semantics on and a document. The document
+    /// generation is the one at the start. One already in flight is followed by another when it
+    /// ends. The script installs the observer and then walks; nothing here waits for it.
+    fn extract(&mut self, view: ViewId) {
+        let Some(page) = self.pages.get_mut(&view) else {
+            return;
+        };
+        if !page.semantics.on {
+            page.semantics.due = None;
+            return;
+        }
+        let Some(document) = page.navigator.document() else {
+            // Nothing to extract. Leaving `due` set would make every pump runnable.
+            page.semantics.due = None;
+            return;
+        };
+        if page.semantics.inflight {
+            page.semantics.again = true;
+            return;
+        }
+        page.semantics.inflight = true;
+        page.semantics.again = false;
+        // This walk covers the changes queued so far. A change after it starts posts again.
+        page.semantics.due = None;
+        let script = semantic::extraction_script();
+        if run_script(
+            page,
+            &self.inbox,
+            &script,
+            Some(semantic::WORLD),
+            Tag::Extract(document),
+        )
+        .is_err()
+        {
+            page.semantics.inflight = false;
+        }
+    }
+
+    /// A semantic script finished. A result for a document that is no longer current, or for a
+    /// view that has since closed, is dropped. The action's script is not logged.
+    fn semantic_done(&mut self, view: ViewId, tag: Tag, result: Result<String, String>) {
+        let Some(page) = self.pages.get_mut(&view) else {
+            return;
+        };
+        let current = page.navigator.document();
+        let on = page.semantics.on;
+        let mut deliver = None;
+        let mut extract_again = false;
+        match tag {
+            Tag::Test => {}
+            Tag::Action(document) => {
+                if current == Some(document) && on {
+                    if result.is_err() {
+                        log::debug!("semantic action failed");
+                    }
+                    extract_again = true;
+                }
+            }
+            Tag::Extract(document) => {
+                page.semantics.inflight = false;
+                let again = std::mem::take(&mut page.semantics.again);
+                if current == Some(document) && on {
+                    deliver = Some((document, result));
+                }
+                extract_again = again && on;
+            }
+        }
+        if let Some((document, result)) = deliver {
+            match result {
+                Ok(json) => match sighurt_semantic::parse(&json, document) {
+                    Ok(snapshot) => self.push(EngineEvent::SemanticsChanged {
+                        view,
+                        snapshot: Box::new(snapshot),
+                    }),
+                    Err(error) => {
+                        let head: String = json.chars().take(120).collect();
+                        log::debug!("semantic snapshot dropped: {error}; {head}");
+                    }
+                },
+                Err(message) => {
+                    let head: String = message.chars().take(160).collect();
+                    log::debug!("semantic extraction failed: {head}");
+                }
+            }
+        }
+        if extract_again {
+            self.extract(view);
+        }
+    }
+
+    /// Runs the mutation extractions that have waited out [`semantic::DEBOUNCE`].
+    fn kick_mutations(&mut self) {
+        let now = Instant::now();
+        let due: Vec<ViewId> = self
+            .pages
+            .iter()
+            .filter(|(_, page)| page.semantics.mutation_due(now))
+            .map(|(id, _)| *id)
+            .collect();
+        for view in due {
+            if let Some(page) = self.pages.get_mut(&view) {
+                page.semantics.due = None;
+            }
+            self.extract(view);
         }
     }
 
@@ -1279,6 +1429,7 @@ fn push(events: &mut Vec<EngineEvent>, event: EngineEvent) {
             | EngineEvent::CursorChanged { .. }
             | EngineEvent::HistoryChanged { .. }
             | EngineEvent::TextInputChanged { .. }
+            | EngineEvent::SemanticsChanged { .. }
     );
     if replaceable {
         let kind = std::mem::discriminant(&event);
@@ -1345,13 +1496,39 @@ fn cursor(name: &str) -> Cursor {
         .unwrap_or_default()
 }
 
+/// Evaluates `script` in `page`'s main frame, in the isolated `world` if one is named (the main
+/// world otherwise). The result comes back as a note tagged `tag`; nothing waits for it.
+fn run_script<T: WpeTarget>(
+    page: &Page<T>,
+    inbox: &Shared,
+    script: &str,
+    world: Option<&std::ffi::CStr>,
+    tag: Tag,
+) -> Result<(), EngineError> {
+    let script = CString::new(script).map_err(|_| EngineError::Unsupported("NUL in a script"))?;
+    let data = Box::into_raw(Box::new((Rc::downgrade(inbox), page.id, tag)));
+    unsafe {
+        ffi::webkit_web_view_evaluate_javascript(
+            page.web(),
+            script.as_ptr(),
+            -1,
+            world.map_or(std::ptr::null(), |w| w.as_ptr()),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            Some(script_done),
+            data.cast(),
+        );
+    }
+    Ok(())
+}
+
 unsafe extern "C" fn script_done(
     source: *mut glib::gobject_ffi::GObject,
     result: *mut ffi::GAsyncResult,
     data: glib::ffi::gpointer,
 ) {
-    let data = unsafe { Box::from_raw(data.cast::<(Weak<RefCell<view::Inbox>>, ViewId)>()) };
-    let (inbox, view) = *data;
+    let data = unsafe { Box::from_raw(data.cast::<(Weak<RefCell<view::Inbox>>, ViewId, Tag)>()) };
+    let (inbox, view, tag) = *data;
     let mut error = std::ptr::null_mut();
     let value = unsafe {
         ffi::webkit_web_view_evaluate_javascript_finish(source.cast(), result, &mut error)
@@ -1364,8 +1541,12 @@ unsafe extern "C" fn script_done(
         unsafe { glib::gobject_ffi::g_object_unref(value.cast()) };
         Ok(text.to_string())
     };
+    let note = match tag {
+        Tag::Test => Note::Script(outcome),
+        tag => Note::Semantic(tag, outcome),
+    };
     if let Some(inbox) = inbox.upgrade() {
-        inbox.borrow_mut().notes.push((view, Note::Script(outcome)));
+        inbox.borrow_mut().notes.push((view, note));
     }
 }
 
@@ -1458,6 +1639,7 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                 requests: Vec::new(),
                 held: Vec::new(),
                 text_input: None,
+                semantics: Default::default(),
                 epoch: metrics.epoch(),
                 buffer: metrics.buffer(),
                 slot,
@@ -1484,6 +1666,13 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
             .get_mut(&view)
             .ok_or(EngineError::UnknownView(view))?;
         let web = page.web();
+        // Done after the match, once `page` is no longer borrowed: both call back into the runtime.
+        enum Then {
+            Nothing,
+            Watch,
+            Act(String),
+        }
+        let mut then = Then::Nothing;
         match command {
             EngineCommand::Navigate { navigation, url } => {
                 let url =
@@ -1580,9 +1769,40 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                     }
                 }
             }
-            // Content as structure is not implemented yet (TUI.md §8, phase 4).
-            EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
-                return Err(EngineError::Unsupported("semantics"));
+            EngineCommand::SetSemantics(on) => {
+                page.semantics.on = on;
+                page.semantics.again = false;
+                page.semantics.due = None;
+                if on {
+                    then = Then::Watch;
+                }
+            }
+            EngineCommand::Semantic { document, action } => {
+                // An action for another document is dropped here: its nodes are gone. The script
+                // is not logged.
+                if page.navigator.document() == Some(document) {
+                    then = Then::Act(sighurt_semantic::action_script(&action));
+                }
+            }
+        }
+        match then {
+            Then::Nothing => {}
+            Then::Watch => {
+                self.listen(view);
+                self.extract(view);
+            }
+            Then::Act(script) => {
+                if let Some(page) = self.pages.get(&view) {
+                    if let Some(document) = page.navigator.document() {
+                        run_script(
+                            page,
+                            &self.inbox,
+                            &script,
+                            Some(semantic::WORLD),
+                            Tag::Action(document),
+                        )?;
+                    }
+                }
             }
         }
         self.handle_notes();
@@ -1598,6 +1818,16 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
             self.release_buffers();
             next = self.glib.as_mut().and_then(GlibLoop::iterate);
             self.handle_notes();
+            self.kick_mutations();
+            let semantic = self
+                .pages
+                .values()
+                .filter_map(|p| p.semantics.deadline())
+                .min();
+            next = match (next, semantic) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             if let Some(clipboard) = self.platform.as_ref().and_then(|p| p.display.clipboard()) {
                 clipboard.expire();
             }
