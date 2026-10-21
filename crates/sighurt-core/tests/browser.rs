@@ -3228,6 +3228,78 @@ fn switch_engine_cycles_web_engines_in_descriptor_order() {
     assert_eq!(shown_choice(&b).0, "wpe");
 }
 
+/// While a switch is pending (the new view not committed yet) the tab says which engine it is
+/// switching to, and another `page.switch-engine` does nothing: no second view, no notice.
+#[test]
+fn switch_engine_while_one_is_pending_does_nothing() {
+    let mut b = web_start("", &["https://a.test/"]);
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, None);
+    let shown = b.shown();
+
+    // The engines don't answer, so the switch stays pending.
+    let first = b.update(command("page.switch-engine"));
+    assert_eq!(opened(&first).len(), 1);
+    assert_eq!(opened(&first)[0].1, "wpe");
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, Some("wpe"));
+    assert_eq!(b.shown(), shown);
+
+    let again = b.update(command("page.switch-engine"));
+    assert!(opened(&again).is_empty(), "{again:?}");
+    assert!(notices(&again).is_empty());
+    assert!(!again
+        .iter()
+        .any(|effect| matches!(effect, Effect::CloseView { .. })));
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, Some("wpe"));
+    assert_eq!(b.shown(), shown);
+
+    // Once the engines answer, the switch completes and the next one is allowed again.
+    let mut queue: VecDeque<BrowserEvent> = first.iter().flat_map(|e| b.answer(e)).collect();
+    while let Some(event) = queue.pop_front() {
+        let effects = b.update(event);
+        queue.extend(effects.iter().flat_map(|e| b.answer(e)));
+    }
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, None);
+    assert_eq!(shown_choice(&b).0, "wpe");
+    let next = b.update(command("page.switch-engine"));
+    assert_eq!(opened(&next).len(), 1);
+}
+
+/// `page.open-in` is the same pending switch: the tab names the engine until that view fails
+/// or commits, and `page.switch-engine` does nothing while it is pending.
+#[test]
+fn open_in_is_a_pending_switch_that_blocks_switch_engine() {
+    let mut b = web_start("", &["https://a.test/"]);
+    let shown = b.shown();
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, None);
+
+    let first = b.update(command("page.open-in wpe"));
+    assert_eq!(opened(&first)[0].1, "wpe");
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, Some("wpe"));
+    assert_eq!(b.shown(), shown);
+
+    let again = b.update(command("page.switch-engine"));
+    assert!(opened(&again).is_empty(), "{again:?}");
+    assert!(notices(&again).is_empty());
+    assert!(!again
+        .iter()
+        .any(|effect| matches!(effect, Effect::CloseView { .. })));
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, Some("wpe"));
+    assert_eq!(b.shown(), shown);
+
+    // The new view failing ends the switch; the page stays, and another switch is allowed.
+    let (view, _, _) = opened(&first)[0];
+    b.engine(EngineEvent::ViewFailed {
+        view,
+        message: "stopped".into(),
+    });
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, None);
+    assert_eq!(b.shown(), shown);
+    let next = b.update(command("page.switch-engine"));
+    assert_eq!(opened(&next).len(), 1);
+    assert_eq!(opened(&next)[0].1, "wpe");
+    assert_eq!(b.state.tabs().next().unwrap().switching_to, Some("wpe"));
+}
+
 #[test]
 fn switch_engine_leaves_the_page_and_says_why() {
     let stayed = |b: &mut Harness, config_note: &str| {

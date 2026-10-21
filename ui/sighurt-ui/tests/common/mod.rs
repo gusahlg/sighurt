@@ -70,6 +70,7 @@ pub fn tab(title: &str, url: &str, content: TabContent) -> TabSnapshot {
         active: false,
         content,
         engine: None,
+        switching_to: None,
     }
 }
 

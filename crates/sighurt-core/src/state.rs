@@ -629,6 +629,7 @@ impl BrowserState {
             content,
             error: tab.error.as_ref(),
             reloads,
+            switching_to: switching.map(|v| v.engine()),
         }
     }
 

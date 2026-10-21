@@ -652,7 +652,7 @@ fn a_new_engine_repaints_its_label() {
     );
 
     let left = Table::from([("tabs".to_owned(), text("left"))]);
-    let mut chrome = standard_with(left, 14, 800, 600);
+    let mut chrome = standard_with(left.clone(), 14, 800, 600);
     chrome.handle(ChromeEvent::Snapshot(before.clone()));
     let mut inactive = before.clone();
     inactive.tabs[1].engine = Some("wpe".into());
@@ -662,4 +662,26 @@ fn a_new_engine_repaints_its_label() {
     active.tabs[0].engine = Some("wpe".into());
     let actions = chrome.handle(ChromeEvent::Snapshot(active));
     assert_eq!(repaints(&actions), ["chrome", "tabs"]);
+
+    // A pending switch repaints the toolbar, where the button is, including when the tabs are
+    // on the left. An unchanged snapshot — a page painting a frame — repaints nothing.
+    let mut chrome = standard(800, 600);
+    chrome.handle(ChromeEvent::Snapshot(before.clone()));
+    let mut switching = before.clone();
+    switching.tabs[0].switching_to = Some("wpe".into());
+    assert_eq!(
+        repaints(&chrome.handle(ChromeEvent::Snapshot(switching.clone()))),
+        ["chrome"]
+    );
+    assert!(repaints(&chrome.handle(ChromeEvent::Snapshot(switching))).is_empty());
+
+    let mut chrome = standard_with(left, 14, 800, 600);
+    chrome.handle(ChromeEvent::Snapshot(before.clone()));
+    let mut switching = before;
+    switching.tabs[0].switching_to = Some("wpe".into());
+    assert_eq!(
+        repaints(&chrome.handle(ChromeEvent::Snapshot(switching.clone()))),
+        ["chrome", "tabs"]
+    );
+    assert!(repaints(&chrome.handle(ChromeEvent::Snapshot(switching))).is_empty());
 }

@@ -308,6 +308,9 @@ pub struct TabSummary<'a> {
     pub error: Option<&'a LoadError>,
     /// It shows a record: the page will load again, without its previous state.
     pub reloads: bool,
+    /// The engine of the view the tab is switching to, until that view has committed and can
+    /// present, or the switch fails or is cancelled. It can be the engine the tab shows now.
+    pub switching_to: Option<&'a str>,
 }
 
 /// A short title for a page that doesn't name itself.

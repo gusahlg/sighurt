@@ -120,6 +120,7 @@ pub fn snapshot(
             (Content::Blank, None) => TabContent::Blank,
         };
         let engine = engine(core, &tab).map(str::to_owned);
+        let switching_to = tab.switching_to.map(str::to_owned);
         if index == active {
             snapshot.can_go_back = tab.can_go_back;
             snapshot.can_go_forward = tab.can_go_forward;
@@ -132,6 +133,7 @@ pub fn snapshot(
             loading: tab.loading,
             active: index == active,
             engine,
+            switching_to,
             content,
         });
     }

@@ -2,7 +2,8 @@
 //! its widgets, with stable ids, and a document node for the page area. Only what is shown is
 //! in it: no tab list while the tabs are hidden, no buttons that `[chrome.standard]` leaves out.
 //! An engine page's tab is described by its engine ("Engine: servo") while the chrome labels
-//! tabs with it.
+//! tabs with it. The address field's engine button is "Switch engine (now: servo)", or
+//! "Switching to wpe" and busy while a switch is under way.
 //!
 //! When an engine view shows the page, the document node is the container its accessibility
 //! subtree will hang under once engines provide one; none does yet, and the node says only
@@ -43,6 +44,8 @@ pub enum NodeId {
     ReloadOrStop,
     /// The address line.
     Address,
+    /// The engine button at the address field's right end.
+    EngineSwitch,
     /// The page area.
     Page,
     /// The n-th text block of a page the chrome draws.
@@ -222,6 +225,25 @@ impl Model {
         address.description = state.command_error.clone();
         toolbar.children.push(NodeId::Address);
         nodes.push(address);
+        let tab = snapshot.active().filter(|_| !state.focused);
+        let button = self.address_view().engine;
+        if let (Some(button), Some(engine)) = (button, tab.and_then(|tab| tab.engine_label())) {
+            let name = match tab.and_then(|tab| tab.switching_label()) {
+                Some(target) => format!("Switching to {target}"),
+                None => format!("Switch engine (now: {engine})"),
+            };
+            let [x, y, w, h] = button.rect;
+            let bounds = WindowRect {
+                x: x as i32,
+                y: y as i32,
+                width: w as u32,
+                height: h as u32,
+            };
+            let mut node = node(NodeId::EngineSwitch, Role::Button, name, bounds);
+            node.states.busy = button.busy;
+            toolbar.children.push(NodeId::EngineSwitch);
+            nodes.push(node);
+        }
 
         let title = snapshot.active().map(|tab| tab.display_title());
         let mut page = node(

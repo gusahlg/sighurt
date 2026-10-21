@@ -11,7 +11,9 @@
 //! engine in small muted text before the close button, on the title's baseline and inside the
 //! tab, where a click selects the tab as anywhere else on it; the title is cut before the label,
 //! which shows only whole, and only if it fits in half the tab's room for text less a gap, so
-//! tabs of one width agree whatever their titles.
+//! tabs of one width agree whatever their titles. At the address field's right end the same
+//! name is a button: a rounded outline in the theme's colours, brighter under the pointer,
+//! sunk while held, and naming the engine being opened while a switch is under way.
 //!
 //! Must not own: buffers or their lifetime (the host's SHM presenter), or page pixels.
 
@@ -19,7 +21,8 @@ use sighurt_api::geometry::{Metrics, WindowRect};
 
 use crate::canvas::{Canvas, PaintError, Pen, PixelBuffer};
 use crate::chrome::{
-    engine_label, label_top, Colors, Model, Rgba, Tone, CARET_WIDTH, CHROME, PAGE, STATUS, TABS,
+    engine_label, label_top, Colors, EngineButton, Model, Rgba, Tone, BUTTON_ICON, CARET_WIDTH,
+    CHROME, PAGE, STATUS, TABS,
 };
 use crate::extension::SurfaceName;
 use crate::hit_test::Target;
@@ -342,9 +345,8 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
             field,
         );
     }
-    if let Some((engine, x, y)) = &view.engine {
-        let field = rect_f(field);
-        pen.text(chrome.fonts(), engine, (*x, *y), colors.text_muted, field);
+    if let Some(button) = &view.engine {
+        draw_engine_button(pen, chrome, button, colors);
     }
     if let Some(preedit) = view.preedit.and_then(clipped) {
         let underline = view.y + line - options.scaled(2.0);
@@ -356,6 +358,73 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
             pen.fill([caret, view.y, CARET_WIDTH, line], colors.text);
         }
     }
+}
+
+/// The engine button: a rounded outline that fills when the pointer is over it, sinks while
+/// held, and shows an accent fill and the engine being switched to while a switch is under way.
+fn draw_engine_button(pen: &mut Pen, chrome: &mut Model, button: &EngineButton, colors: &Colors) {
+    let options = chrome.layout().options;
+    let k = |px| options.scaled(px);
+    let state = chrome.state();
+    let over = state.label_hover && !button.busy;
+    let held = over && state.label_pressed;
+    let (fill, border, text) = match (button.busy, held, over) {
+        (true, _, _) => (colors.selection, colors.border, colors.text),
+        (_, true, _) => (colors.bg, colors.focus, colors.text),
+        (_, _, true) => (colors.hover, colors.text_dim, colors.text),
+        _ => (colors.surface, colors.border, colors.text_muted),
+    };
+    pen.bordered(button.rect, k(5.0), fill, border);
+    let [x, y, w, h] = button.rect;
+    let clip = [x, y, w, h];
+    let (name, name_x) = &button.name;
+    pen.text(chrome.fonts(), name, (*name_x, button.text_y), text, clip);
+    let cy = y + h / 2.0;
+    match &button.target {
+        None => swap_icon(pen, options, (button.icon_x, cy), text),
+        Some((target, target_x)) => {
+            arrow(pen, options, (button.icon_x, cy), text);
+            pen.text(
+                chrome.fonts(),
+                target,
+                (*target_x, button.text_y),
+                text,
+                clip,
+            );
+        }
+    }
+}
+
+/// ⇄ in a box [`BUTTON_ICON`] wide starting at `x`: a right arrow above a left one.
+fn swap_icon(pen: &mut Pen, options: LayoutOptions, (x, cy): (f32, f32), color: Rgba) {
+    let k = |px| options.scaled(px);
+    let (w, dy, head) = (k(BUTTON_ICON), k(2.5), k(2.2));
+    pen.stroke(k(1.2), color, |path| {
+        for (row, right) in [(cy - dy, true), (cy + dy, false)] {
+            let (from, to, back) = match right {
+                true => (x, x + w, -head),
+                false => (x + w, x, head),
+            };
+            path.move_to(from, row);
+            path.line_to(to, row);
+            path.move_to(to + back, row - head);
+            path.line_to(to, row);
+            path.line_to(to + back, row + head);
+        }
+    });
+}
+
+/// → in a box [`BUTTON_ICON`] wide starting at `x`.
+fn arrow(pen: &mut Pen, options: LayoutOptions, (x, cy): (f32, f32), color: Rgba) {
+    let k = |px| options.scaled(px);
+    let (w, head) = (k(BUTTON_ICON), k(2.6));
+    pen.stroke(k(1.2), color, |path| {
+        path.move_to(x, cy);
+        path.line_to(x + w, cy);
+        path.move_to(x + w - head, cy - head);
+        path.line_to(x + w, cy);
+        path.line_to(x + w - head, cy + head);
+    });
 }
 
 /// The status line: a strip with a line along its top, or an overlay over the page's corner

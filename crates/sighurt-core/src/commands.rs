@@ -149,8 +149,14 @@ impl BrowserState {
 
     /// Reopens the page in the next enabled web engine, in [`Environment::web_engines`] order,
     /// wrapping around. The navigation is `page.open-in` of that engine. Anything else is a
-    /// notice, and the page stays.
+    /// notice, and the page stays. While the tab is already switching, nothing happens.
     fn switch_engine(&mut self, tab: usize, fx: &mut Fx) -> Option<KeyboardFocus> {
+        // One switch at a time: a repeat while the view it opened is still loading does nothing,
+        // rather than cancelling that view and starting over. A tab still loading its first
+        // page shows nothing to switch from, and may change its mind.
+        if self.tabs[tab].switch.is_some() && self.tabs[tab].current().is_some() {
+            return None;
+        }
         let url = self.address(tab).filter(|url| !url.is_empty());
         let Some(url) = url else {
             return self.switch_notice(tab, "This tab has no page to open in another engine.", fx);

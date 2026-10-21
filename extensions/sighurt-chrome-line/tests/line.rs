@@ -50,6 +50,7 @@ fn tab(title: &str, url: &str, content: TabContent) -> TabSnapshot {
         active: false,
         content,
         engine: None,
+        switching_to: None,
     }
 }
 
@@ -572,7 +573,7 @@ fn the_engine_label() {
     assert_eq!(painted(Table::new(), sent.clone(), 700), labelled);
     sent.contain();
     assert_eq!(painted(Table::new(), sent, 700), labelled);
-    // A name that doesn't fit whole in a quarter of the line isn't drawn.
+    // A name that doesn't fit whole in a third of the line isn't drawn.
     let mut long = five_engine_tabs();
     long.tabs[1].engine = Some("w".repeat(100));
     let mut none = five_engine_tabs();
@@ -607,6 +608,21 @@ fn the_engine_label() {
     );
     moved.tabs[3].engine = Some("wpe".into());
     assert!(repaints(&chrome.handle(ChromeEvent::Snapshot(moved))).is_empty());
+
+    // A pending switch repaints the line even when the page was already loading. The same
+    // snapshot again, as when a page paints a frame, does not.
+    let mut loading = five_engine_tabs();
+    loading.tabs[1].loading = true;
+    assert_eq!(
+        repaints(&chrome.handle(ChromeEvent::Snapshot(loading.clone()))),
+        [LINE]
+    );
+    loading.tabs[1].switching_to = Some("servo".into());
+    assert_eq!(
+        repaints(&chrome.handle(ChromeEvent::Snapshot(loading.clone()))),
+        [LINE]
+    );
+    assert!(repaints(&chrome.handle(ChromeEvent::Snapshot(loading))).is_empty());
 }
 
 /// The line unfocused (place, indicator, decoded address, loading mark, status) at 100 %,
@@ -669,9 +685,9 @@ fn motion(chrome: &mut dyn Chrome, (x, y): (f64, f64)) -> Vec<ChromeAction> {
     })
 }
 
-/// A click on the engine name at the line's end runs `page.switch-engine`. The hit is the text
-/// that is drawn: beside it the click focuses the line, hovering it is the line's text cursor,
-/// and a click while typing does not move the caret.
+/// A click on the engine button at the line's end runs `page.switch-engine`. The hit is the
+/// text that is drawn: beside it the click focuses the line, hovering it is a pointer and
+/// repaints only the line, and a click while typing does not move the caret.
 #[test]
 fn a_click_on_the_lines_engine_label_switches_engine() {
     let page = |engine: bool| {
@@ -740,13 +756,15 @@ fn a_click_on_the_lines_engine_label_switches_engine() {
 
     let actions = motion(&mut *chrome, at);
     assert!(commands(&actions).is_empty());
+    assert_eq!(repaints(&actions), [LINE]);
     assert!(actions
         .iter()
-        .any(|action| matches!(action, ChromeAction::Cursor(Cursor::Text))));
+        .any(|action| matches!(action, ChromeAction::Cursor(Cursor::Pointer))));
     let again = motion(&mut *chrome, at);
     assert!(again
         .iter()
         .all(|action| { !matches!(action, ChromeAction::Cursor(_) | ChromeAction::Command(_)) }));
+    assert!(repaints(&again).is_empty());
 
     let actions = click(&mut *bare, LINE, at);
     assert!(commands(&actions).is_empty());
@@ -767,4 +785,180 @@ fn a_click_on_the_lines_engine_label_switches_engine() {
     let (x, y) = label[label.len() / 2];
     let actions = click(&mut *chrome, LINE, (f64::from(x) + 0.5, f64::from(y) + 0.5));
     assert_eq!(commands(&actions), [Command::PageSwitchEngine]);
+}
+
+fn button(state: ButtonState, (x, y): (f64, f64)) -> ChromeEvent {
+    ChromeEvent::Pointer {
+        surface: LINE,
+        event: PointerEvent::Button {
+            button: PointerButton::Left,
+            state,
+            position: SurfacePoint { x, y },
+            modifiers: Modifiers::default(),
+        },
+    }
+}
+
+/// The line's engine button: held until release, cancelled by releasing elsewhere or losing
+/// the window, and a pending switch reads "[wpe -> servo…]", ignores clicks and is not a hand.
+#[test]
+fn the_lines_engine_button_states() {
+    let mut snapshot = showing("https://a.example/", TabContent::Engine);
+    snapshot.tabs[0].engine = Some("wpe".into());
+    let mut chrome = line(Table::new(), 700, 400);
+    chrome.handle(ChromeEvent::Snapshot(snapshot.clone()));
+    let mut bare = line(
+        Table::from([("engine-label".to_owned(), Value::Boolean(false))]),
+        700,
+        400,
+    );
+    bare.handle(ChromeEvent::Snapshot(snapshot.clone()));
+    let image = paint(&mut *chrome, LINE, 120);
+    let plain = paint(&mut *bare, LINE, 120);
+    let label = differing(&image, &plain);
+    let (left, right, top, bottom) = label
+        .iter()
+        .fold((u32::MAX, 0, u32::MAX, 0), |(l, r, t, b), &(x, y)| {
+            (l.min(x), r.max(x), t.min(y), b.max(y))
+        });
+    let at = (
+        f64::from((left + right) / 2) + 0.5,
+        f64::from((top + bottom) / 2) + 0.5,
+    );
+    let beside = (f64::from(left.saturating_sub(4)) + 0.5, at.1);
+
+    // Press shows it held; the command waits for the release, and only if it is still there.
+    let actions = chrome.handle(button(ButtonState::Pressed, at));
+    assert!(commands(&actions).is_empty());
+    assert_eq!(repaints(&actions), [LINE]);
+    let actions = chrome.handle(button(ButtonState::Released, beside));
+    assert!(commands(&actions).is_empty());
+    let mut actions = chrome.handle(button(ButtonState::Pressed, at));
+    assert!(commands(&actions).is_empty());
+    actions.extend(chrome.handle(ChromeEvent::WindowFocus(FocusEvent::Deactivated)));
+    actions.extend(chrome.handle(button(ButtonState::Released, at)));
+    assert!(commands(&actions).is_empty());
+    chrome.handle(ChromeEvent::WindowFocus(FocusEvent::Activated));
+    let actions = click(&mut *chrome, LINE, at);
+    assert_eq!(commands(&actions), [Command::PageSwitchEngine]);
+
+    // A padding pixel of the text's box still hits; just outside does not.
+    let inside = (f64::from(left) + 0.5, f64::from((top + bottom) / 2) + 0.5);
+    let actions = click(&mut *chrome, LINE, inside);
+    assert_eq!(commands(&actions), [Command::PageSwitchEngine]);
+    let actions = click(&mut *chrome, LINE, beside);
+    assert!(commands(&actions).is_empty());
+
+    snapshot.tabs[0].switching_to = Some("servo".into());
+    let actions = chrome.handle(ChromeEvent::Snapshot(snapshot));
+    assert_eq!(repaints(&actions), [LINE]);
+    let actions = motion(&mut *chrome, at);
+    assert!(actions
+        .iter()
+        .all(|action| !matches!(action, ChromeAction::Cursor(Cursor::Pointer))));
+    let actions = click(&mut *chrome, LINE, at);
+    assert!(commands(&actions).is_empty());
+    assert!(actions
+        .iter()
+        .all(|action| !matches!(action, ChromeAction::Focus(_))));
+}
+
+/// The centre of the engine name in `labelled`, against the same line with the name off.
+///
+/// The name is the rightmost run of pixels that became brighter. A gap of a few columns
+/// splits letters of one word; the address and status that the name pushed aside sit
+/// further left.
+fn engine_name_at(labelled: &Image, plain: &Image) -> (f64, f64) {
+    assert_eq!(
+        (labelled.width, labelled.height),
+        (plain.width, plain.height)
+    );
+    let lum = |pixel: [u8; 4]| u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2]);
+    let mut columns = vec![false; labelled.width as usize];
+    for y in 0..labelled.height {
+        for x in 0..labelled.width {
+            let (drawn, bare) = (labelled.pixel(x, y), plain.pixel(x, y));
+            if lum(drawn) > lum(bare).saturating_add(30) {
+                columns[x as usize] = true;
+            }
+        }
+    }
+    let right = columns
+        .iter()
+        .rposition(|on| *on)
+        .expect("the line shows no engine name") as u32;
+    let mut left = right;
+    let mut previous = right;
+    for x in (0..right).rev() {
+        if !columns[x as usize] {
+            continue;
+        }
+        if previous - x > 6 {
+            break;
+        }
+        left = x;
+        previous = x;
+    }
+    let mut top = u32::MAX;
+    let mut bottom = 0;
+    for x in left..=right {
+        if !columns[x as usize] {
+            continue;
+        }
+        for y in 0..labelled.height {
+            let (drawn, bare) = (labelled.pixel(x, y), plain.pixel(x, y));
+            if lum(drawn) > lum(bare).saturating_add(30) {
+                top = top.min(y);
+                bottom = bottom.max(y);
+            }
+        }
+    }
+    (
+        f64::from((left + right) / 2) + 0.5,
+        f64::from((top + bottom) / 2) + 0.5,
+    )
+}
+
+/// The engine button in text: at rest, under the pointer, held, and switching, at 100 % and 200 %.
+#[test]
+fn golden_engine_button() {
+    let mut chrome = line(Table::new(), 700, 400);
+    chrome.handle(ChromeEvent::Snapshot(five_engine_tabs()));
+    golden("engine-200", &paint(&mut *chrome, LINE, 240));
+
+    let mut bare = line(
+        Table::from([("engine-label".to_owned(), Value::Boolean(false))]),
+        700,
+        400,
+    );
+    bare.handle(ChromeEvent::Snapshot(five_engine_tabs()));
+    let image = paint(&mut *chrome, LINE, 120);
+    let plain = paint(&mut *bare, LINE, 120);
+    // The name is the rightmost run of pixels that became brighter. Turning it on also
+    // shifts the address and the status, so the box of every changed pixel is wider than
+    // the name and its centre misses the name.
+    let at = engine_name_at(&image, &plain);
+    motion(&mut *chrome, at);
+    let hover = paint(&mut *chrome, LINE, 120);
+    assert_ne!(
+        image.rgba, hover.rgba,
+        "hovering the engine name did not change it"
+    );
+    golden("engine-hover-100", &hover);
+    golden("engine-hover-200", &paint(&mut *chrome, LINE, 240));
+    chrome.handle(button(ButtonState::Pressed, at));
+    let pressed = paint(&mut *chrome, LINE, 120);
+    assert_ne!(
+        hover.rgba, pressed.rgba,
+        "holding the engine name did not sink it"
+    );
+    golden("engine-pressed-100", &pressed);
+    golden("engine-pressed-200", &paint(&mut *chrome, LINE, 240));
+
+    let mut switching = five_engine_tabs();
+    switching.tabs[1].switching_to = Some("servo".into());
+    let mut chrome = line(Table::new(), 700, 400);
+    chrome.handle(ChromeEvent::Snapshot(switching));
+    golden("engine-busy-100", &paint(&mut *chrome, LINE, 120));
+    golden("engine-busy-200", &paint(&mut *chrome, LINE, 240));
 }

@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use common::*;
 use sighurt_api::geometry::{SurfacePoint, WindowPoint, WindowRect};
 use sighurt_api::input::{
-    ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerEvent,
-    Preedit, TextInputEvent,
+    ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerButton,
+    PointerEvent, Preedit, TextInputEvent,
 };
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::layout::{Status, Tabs};
@@ -252,6 +252,91 @@ fn golden_engine_labels() {
     many.tabs.push(short);
     let mut chrome = common::chrome(600, 400, many);
     golden("engine-narrow-150", &paint(&mut chrome, CHROME, 180));
+}
+
+/// The engine button at rest, under the pointer, held, and while switching, at 100 % and 200 %.
+#[test]
+fn golden_engine_switch_button() {
+    let snapshot = labelled(three_tabs(), &["servo", "wpe", "servo"]);
+    let colors = Colors::default();
+    let options = LayoutOptions::default();
+    let without = LayoutOptions {
+        engine_label: false,
+        ..options
+    };
+    let mut chrome = arranged(900, 600, snapshot.clone(), colors, options);
+    let mut bare = arranged(900, 600, snapshot.clone(), colors, without);
+    golden("engine-switch-100", &paint(&mut chrome, CHROME, 120));
+    golden("engine-switch-200", &paint(&mut chrome, CHROME, 240));
+
+    let rect = chrome.layout().chrome;
+    let field = chrome.layout().address;
+    let image = paint(&mut chrome, CHROME, 120);
+    let plain = paint(&mut bare, CHROME, 120);
+    let label: Vec<(u32, u32)> = differing_pixels(&image, &plain)
+        .into_iter()
+        .filter(|&(x, y)| field.contains(window_point(&image, rect, x, y)))
+        .collect();
+    let (left, right, top, bottom) = label
+        .iter()
+        .fold((u32::MAX, 0, u32::MAX, 0), |(l, r, t, b), &(x, y)| {
+            (l.min(x), r.max(x), t.min(y), b.max(y))
+        });
+    let at = window_point(&image, rect, (left + right) / 2, (top + bottom) / 2);
+    let surface = chrome.layout().chrome;
+    chrome.pointer(
+        surface,
+        &PointerEvent::Motion {
+            position: surface.to_surface(at),
+            modifiers: Modifiers::default(),
+        },
+    );
+    golden("engine-switch-hover-100", &paint(&mut chrome, CHROME, 120));
+    golden("engine-switch-hover-200", &paint(&mut chrome, CHROME, 240));
+    chrome.pointer(
+        surface,
+        &PointerEvent::Button {
+            button: PointerButton::Left,
+            state: ButtonState::Pressed,
+            position: surface.to_surface(at),
+            modifiers: Modifiers::default(),
+        },
+    );
+    golden(
+        "engine-switch-pressed-100",
+        &paint(&mut chrome, CHROME, 120),
+    );
+    golden(
+        "engine-switch-pressed-200",
+        &paint(&mut chrome, CHROME, 240),
+    );
+
+    let mut switching = snapshot;
+    switching.tabs[0].switching_to = Some("wpe".into());
+    let mut chrome = arranged(900, 600, switching, colors, options);
+    golden("engine-switch-busy-100", &paint(&mut chrome, CHROME, 120));
+    golden("engine-switch-busy-200", &paint(&mut chrome, CHROME, 240));
+}
+
+fn window_point(image: &Image, surface: WindowRect, x: u32, y: u32) -> WindowPoint {
+    WindowPoint {
+        x: f64::from(surface.x)
+            + (f64::from(x) + 0.5) * f64::from(surface.width) / f64::from(image.width),
+        y: f64::from(surface.y)
+            + (f64::from(y) + 0.5) * f64::from(surface.height) / f64::from(image.height),
+    }
+}
+
+fn differing_pixels(a: &Image, b: &Image) -> Vec<(u32, u32)> {
+    let mut pixels = Vec::new();
+    for y in 0..a.height {
+        for x in 0..a.width {
+            if a.pixel(x, y) != b.pixel(x, y) {
+                pixels.push((x, y));
+            }
+        }
+    }
+    pixels
 }
 
 /// Every paint covers the whole buffer: a buffer holding an older frame or garbage comes out

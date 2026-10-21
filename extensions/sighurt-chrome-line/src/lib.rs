@@ -8,10 +8,12 @@
 //! committed address (decoded where that is safe), a mark while the page loads, and on the right
 //! the status text, cut to fit: the status always has up to half the line, so `sig`'s notices
 //! stay visible however long the address. At its end, small and muted, is the engine the active
-//! tab's page runs in, if it fits whole in a quarter of the line (`[chrome.line] engine-label =
-//! false` leaves it out). A click on that label, exactly where it is drawn, runs
-//! `page.switch-engine`, and hovering it changes nothing. `sig:` pages, blank tabs and errors
-//! have none. A click on the rest of the line, or `location.focus`, makes it an editor: Enter
+//! tab's page runs in as a button, "[servo]", if it fits whole in a third of the line
+//! (`[chrome.line] engine-label = false` leaves it out). A click on it, exactly where it is
+//! drawn, runs `page.switch-engine`; it brightens and is underlined under the pointer (which
+//! becomes a hand), and is reversed while held. While a switch is under way it reads
+//! "[servo -> wpe…]" on the selection color and clicks do nothing. `sig:` pages, blank tabs and
+//! errors have none. A click on the rest of the line, or `location.focus`, makes it an editor: Enter
 //! opens what was typed, a line starting with `:` runs a command, and Escape gives the page the
 //! keyboard. There are no buttons, no tab strip
 //! and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
@@ -120,6 +122,10 @@ pub struct Line {
     /// The field the executable was last told about, so only changes are reported.
     text_input: Option<TextInputState>,
     cursor: Cursor,
+    /// The pointer is over the engine button.
+    label_hover: bool,
+    /// The primary button went down on the engine button and is still down.
+    label_pressed: bool,
     /// The line, and the page it draws, show something new.
     line_changed: bool,
     page_changed: bool,
@@ -142,8 +148,9 @@ struct View {
     mark: Option<f32>,
     /// The status text, where it starts, and whether it says what went wrong.
     status: Option<(Rc<ShapedText>, f32, bool)>,
-    /// The engine of the active tab's page, and where its text's origin is.
-    engine: Option<(Rc<ShapedText>, f32, f32)>,
+    /// The engine of the active tab's page as a bracketed button, and where its text's origin
+    /// is, and whether a switch is under way.
+    engine: Option<(Rc<ShapedText>, f32, f32, bool)>,
 }
 
 impl Line {
@@ -155,6 +162,8 @@ impl Line {
             theme: Theme::default(),
             bottom: false,
             engine_label: true,
+            label_hover: false,
+            label_pressed: false,
             window: LogicalSize::default(),
             snapshot: Snapshot::default(),
             layout: ChromeLayout::default(),
@@ -272,7 +281,12 @@ impl Line {
                 },
             ) => {
                 if self.on_engine_label(*position) {
-                    actions.push(ChromeAction::Command(Command::PageSwitchEngine));
+                    // Held until release. While a switch is under way the press is swallowed:
+                    // it neither focuses the line nor runs the command.
+                    if !self.engine_busy() {
+                        self.label_pressed = true;
+                        self.line_changed = true;
+                    }
                 } else if self.focused {
                     let x = self.line_rect().x as f32 + position.x as f32;
                     let view = self.view();
@@ -296,22 +310,53 @@ impl Line {
                 self.unfocus();
                 actions.push(ChromeAction::Focus(KeyboardFocus::Page));
             }
-            (_, PointerEvent::Enter { .. } | PointerEvent::Motion { .. }) => {
-                let cursor = if surface == LINE {
-                    Cursor::Text
-                } else {
-                    Cursor::Default
+            (
+                LINE,
+                PointerEvent::Button {
+                    button: PointerButton::Left,
+                    state: ButtonState::Released,
+                    position,
+                    ..
+                },
+            ) => {
+                // A click: the press landed on the button and the release still does.
+                let pressed = std::mem::take(&mut self.label_pressed);
+                if pressed {
+                    self.line_changed = true;
+                    if self.on_engine_label(*position) && !self.engine_busy() {
+                        actions.push(ChromeAction::Command(Command::PageSwitchEngine));
+                    }
+                }
+            }
+            (_, PointerEvent::Enter { position } | PointerEvent::Motion { position, .. }) => {
+                let over = surface == LINE && self.on_engine_label(*position);
+                if over != self.label_hover {
+                    self.label_hover = over;
+                    self.line_changed = true;
+                }
+                let busy = over && self.engine_busy();
+                let cursor = match (surface, over, busy) {
+                    (LINE, true, false) => Cursor::Pointer,
+                    // Busy: clicks do nothing, so the cursor does not invite another one.
+                    (LINE, true, true) => Cursor::Default,
+                    (LINE, _, _) => Cursor::Text,
+                    _ => Cursor::Default,
                 };
                 self.set_cursor(cursor, &mut actions);
             }
-            (_, PointerEvent::Leave) => self.set_cursor(Cursor::Default, &mut actions),
+            (_, PointerEvent::Leave) => {
+                self.line_changed |= self.label_hover || self.label_pressed;
+                self.label_hover = false;
+                self.label_pressed = false;
+                self.set_cursor(Cursor::Default, &mut actions);
+            }
             _ => {}
         }
         actions
     }
 
-    /// Whether `position` (local to the line's surface) lies in the engine label's line box.
-    /// Half-open. The label is not a hover target: motion over the line stays a text cursor.
+    /// Whether `position` (local to the line's surface) lies in the engine button's line box.
+    /// Half-open.
     fn on_engine_label(&mut self, position: SurfacePoint) -> bool {
         let line = self.line_rect();
         let px = line.x as f32 + position.x as f32;
@@ -319,11 +364,16 @@ impl Line {
         let Some((x, y, width, height)) = self
             .view()
             .engine
-            .map(|(shaped, x, y)| (x, y, shaped.width, shaped.height))
+            .map(|(shaped, x, y, _)| (x, y, shaped.width, shaped.height))
         else {
             return false;
         };
         px >= x && py >= y && px < x + width && py < y + height
+    }
+
+    /// Whether the engine button is shown and a switch is under way.
+    fn engine_busy(&mut self) -> bool {
+        self.view().engine.is_some_and(|(.., busy)| busy)
     }
 
     fn set_cursor(&mut self, cursor: Cursor, actions: &mut Vec<ChromeAction>) {
@@ -426,17 +476,25 @@ impl Line {
         }
         let prefix = self.fonts.line(&prefix, style);
 
-        // The engine at the end, smaller, on the line's baseline, if it fits whole in a quarter
+        // The engine at the end, smaller, on the line's baseline, if it fits whole in a third
         // of the line.
         let small = TextStyle::XS.at(self.theme.font_size);
         let active = self.snapshot.active().filter(|_| self.engine_label);
-        let engine = active.and_then(|tab| tab.engine_label());
-        let engine = engine.map(|text| self.fonts.line(&text, small));
-        let engine = engine.filter(|shaped| shaped.width <= line.width as f32 / 4.0);
+        let engine = active.and_then(|tab| {
+            let name = tab.engine_label()?;
+            let target = tab.switching_label();
+            let busy = target.is_some();
+            Some(match target {
+                Some(target) => (format!("[{name} -> {target}\u{2026}]"), busy),
+                None => (format!("[{name}]"), busy),
+            })
+        });
+        let engine = engine.map(|(text, busy)| (self.fonts.line(&text, small), busy));
+        let engine = engine.filter(|(shaped, _)| shaped.width <= line.width as f32 / 3.0);
         let engine_top = top + self.fonts.baseline(style) - self.fonts.baseline(small);
-        let engine = engine.map(|shaped| (right - shaped.width, shaped));
+        let engine = engine.map(|(shaped, busy)| (right - shaped.width, shaped, busy));
         // Twice the gap before it, since the status beside it is muted too.
-        let right = engine.as_ref().map_or(right, |(x, _)| x - 2.0 * gap);
+        let right = engine.as_ref().map_or(right, |(x, ..)| x - 2.0 * gap);
 
         let status = match (&self.error, &self.snapshot.status) {
             (Some(error), _) => Some((error.clone(), true)),
@@ -489,7 +547,7 @@ impl Line {
             preedit,
             mark,
             status,
-            engine: engine.map(|(x, shaped)| (shaped, x, engine_top)),
+            engine: engine.map(|(x, shaped, busy)| (shaped, x, engine_top, busy)),
         }
     }
 
@@ -613,9 +671,32 @@ impl Line {
             };
             pen.text(&mut self.fonts, status, (*at, view.top), color, all);
         }
-        if let Some((engine, x, top)) = &view.engine {
-            let color = colors.text_muted;
+        if let Some((engine, x, top, busy)) = &view.engine {
+            // Muted at rest, bright and underlined under the pointer, reversed while held, and
+            // on the selection's color while a switch is under way.
+            let over = self.label_hover && !busy;
+            let held = over && self.label_pressed;
+            let (color, back) = match (*busy, held, over) {
+                (true, ..) => (colors.text, Some(colors.selection)),
+                (_, true, _) => (
+                    Rgba {
+                        a: 255,
+                        ..colors.bg
+                    },
+                    Some(colors.text),
+                ),
+                (_, _, true) => (colors.text, None),
+                _ => (colors.text_muted, None),
+            };
+            let bounds = [*x, *top, engine.width, engine.height];
+            if let Some(back) = back {
+                pen.fill(bounds, back);
+            }
             pen.text(&mut self.fonts, engine, (*x, *top), color, all);
+            if over && !held {
+                let under = *top + engine.height - 1.0;
+                pen.fill([*x, under, engine.width, 1.0], color);
+            }
         }
     }
 
@@ -697,9 +778,14 @@ impl Line {
 /// What the line shows of `snapshot`.
 fn in_line(snapshot: &Snapshot) -> impl PartialEq {
     let active = snapshot.tabs.iter().position(|tab| tab.active);
-    let tab = snapshot
-        .active()
-        .map(|tab| (tab.url.clone(), tab.loading, tab.engine_label()));
+    let tab = snapshot.active().map(|tab| {
+        (
+            tab.url.clone(),
+            tab.loading,
+            tab.engine_label(),
+            tab.switching_label(),
+        )
+    });
     let count = snapshot.tabs.len();
     (
         active,
@@ -768,6 +854,10 @@ impl Chrome for Line {
             }
             ChromeEvent::WindowFocus(event) => {
                 self.window_active = event == FocusEvent::Activated;
+                if !self.window_active {
+                    self.line_changed |= self.label_pressed;
+                    self.label_pressed = false;
+                }
                 self.line_changed |= self.focused;
                 Vec::new()
             }

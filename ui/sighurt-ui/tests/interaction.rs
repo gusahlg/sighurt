@@ -16,7 +16,7 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerButton,
     PointerEvent, Preedit, TextInputEvent,
 };
-use sighurt_ui::accessibility::NodeId;
+use sighurt_ui::accessibility::{NodeId, Role};
 use sighurt_ui::chrome::{CHROME, TABS};
 use sighurt_ui::extension::ChromeAction;
 use sighurt_ui::hit_test::{hit_test, Target};
@@ -1554,9 +1554,9 @@ fn the_tree_names_each_tabs_engine() {
     assert_eq!(descriptions(&mut chrome), [None, None, None]);
 }
 
-/// A click on the engine label at the address field's right end runs `page.switch-engine`.
-/// The hit is the text that is drawn: beside it the click is an address click, hovering it is
-/// hovering the address line, and releasing elsewhere runs nothing.
+/// A click on the engine button at the address field's right end runs `page.switch-engine`.
+/// Beside it the click is an address click, releasing elsewhere runs nothing, and hovering it
+/// is a pointer that repaints only the chrome.
 #[test]
 fn a_click_on_the_address_fields_engine_label_switches_engine() {
     let options = LayoutOptions::default();
@@ -1637,7 +1637,8 @@ fn a_click_on_the_address_fields_engine_label_switches_engine() {
             },
         )
     };
-    // Hovering the label is hovering the address line, and a second move changes nothing.
+    // Hovering the button is a pointer, not the address line, and a second move changes
+    // nothing. Only the chrome is repainted.
     let mut chrome = arranged(800, 600, snapshot.clone(), colors, options);
     let surface = chrome.layout().chrome;
     let motion = |chrome: &mut Model| {
@@ -1649,16 +1650,26 @@ fn a_click_on_the_address_fields_engine_label_switches_engine() {
             },
         )
     };
+    chrome.take_damage();
     let actions = motion(&mut chrome);
     assert!(commands(&actions).is_empty());
-    assert_eq!(chrome.state().hover, Some(Target::Address));
+    assert!(chrome.state().label_hover);
+    assert_eq!(chrome.state().hover, None);
     assert!(actions
         .iter()
-        .any(|action| matches!(action, ChromeAction::Cursor(Cursor::Text))));
+        .any(|action| matches!(action, ChromeAction::Cursor(Cursor::Pointer))));
+    assert_eq!(
+        chrome.take_damage(),
+        Damage {
+            chrome: true,
+            ..Damage::default()
+        }
+    );
     let again = motion(&mut chrome);
     assert!(again
         .iter()
         .all(|action| { !matches!(action, ChromeAction::Cursor(_) | ChromeAction::Command(_)) }));
+    assert!(!chrome.take_damage().any());
 
     // Press on the label and release elsewhere: no command, and the line stays unfocused.
     let mut actions = button_at(&mut chrome, at, ButtonState::Pressed);
@@ -1681,4 +1692,182 @@ fn a_click_on_the_address_fields_engine_label_switches_engine() {
     actions.extend(button_at(&mut chrome, at, ButtonState::Released));
     assert!(commands(&actions).is_empty());
     assert!(!chrome.state().focused);
+}
+
+/// The engine button's hit target is the rectangle that is drawn, including its padding, at
+/// 100 % and 200 %. A switch under way names itself, ignores clicks, and a page frame does not
+/// repaint the chrome.
+#[test]
+fn the_engine_button_hits_its_drawn_rect() {
+    let options = LayoutOptions::default();
+    let without = LayoutOptions {
+        engine_label: false,
+        ..options
+    };
+    let mut snapshot = labelled(three_tabs(), &["servo"]);
+    snapshot.tabs[0].url = "https://a.test/".into();
+    let colors = Colors::default();
+    for scale in [120, 240] {
+        let what = format!("at {scale}/120");
+        let mut chrome = arranged(800, 600, snapshot.clone(), colors, options);
+        let mut bare = arranged(800, 600, snapshot.clone(), colors, without);
+        let rect = chrome.layout().chrome;
+        let field = chrome.layout().address;
+        let image = paint(&mut chrome, CHROME, scale);
+        let unlabelled = paint(&mut bare, CHROME, scale);
+        let label: Vec<(u32, u32)> = differing(&image, &unlabelled)
+            .into_iter()
+            .filter(|&(x, y)| field.contains(window_point(&image, rect, x, y)))
+            .collect();
+        assert!(!label.is_empty(), "{what}: no engine button");
+        let (left, right, top, bottom) = label
+            .iter()
+            .fold((u32::MAX, 0, u32::MAX, 0), |(l, r, t, b), &(x, y)| {
+                (l.min(x), r.max(x), t.min(y), b.max(y))
+            });
+        let ink = |x, y| label.contains(&(x, y));
+        let hits = |chrome: &mut Model, x, y| {
+            let at = window_point(&image, rect, x, y);
+            let actions = click(chrome, at);
+            assert_eq!(
+                commands(&actions),
+                [Command::PageSwitchEngine],
+                "{what} ({x}, {y})"
+            );
+            assert!(!chrome.state().focused, "{what}");
+        };
+        // The centre, and points inset from the outline: the padding, not only the glyphs.
+        let (cx, cy) = ((left + right) / 2, (top + bottom) / 2);
+        hits(&mut chrome, cx, cy);
+        let inset = 3;
+        assert!(
+            right - left > 2 * inset && bottom - top > 2 * inset,
+            "{what}"
+        );
+        for (x, y) in [
+            (left + inset, top + inset),
+            (right - inset, top + inset),
+            (left + inset, bottom - inset),
+            (right - inset, bottom - inset),
+        ] {
+            hits(&mut chrome, x, y);
+        }
+        let mut fill = None;
+        for y in top + inset..=bottom - inset {
+            for x in left + inset..=right - inset {
+                if !ink(x, y) {
+                    fill = Some((x, y));
+                }
+            }
+        }
+        let (x, y) =
+            fill.unwrap_or_else(|| panic!("{what}: the button has no padding inside its outline"));
+        hits(&mut chrome, x, y);
+
+        // Just outside the outline is not the button.
+        let mut outside = arranged(800, 600, snapshot.clone(), colors, options);
+        let beside_x = left.saturating_sub(4);
+        assert!(!ink(beside_x, cy), "{what}");
+        let beside = window_point(&image, rect, beside_x, cy);
+        assert!(
+            field.contains(beside),
+            "{what}: {beside:?} outside {field:?}"
+        );
+        let actions = click(&mut outside, beside);
+        assert!(commands(&actions).is_empty(), "{what}");
+        assert!(outside.state().focused, "{what}");
+
+        if scale == 120 {
+            let at = window_point(&image, rect, cx, cy);
+            let tree = chrome.accessibility();
+            let button = tree.node(NodeId::EngineSwitch).unwrap();
+            assert_eq!(button.role, Role::Button);
+            assert_eq!(button.name, "Switch engine (now: servo)");
+            assert!(!button.states.busy);
+            assert!(
+                button.bounds.contains(at),
+                "{:?} does not contain {at:?}",
+                button.bounds
+            );
+            assert!(field.contains(WindowPoint {
+                x: f64::from(button.bounds.x) + 0.5,
+                y: f64::from(button.bounds.y) + 0.5,
+            }));
+
+            // Pressing repaints the chrome and not the page. An unchanged snapshot, as when a
+            // page paints a frame, repaints nothing.
+            chrome.take_damage();
+            let surface = chrome.layout().chrome;
+            chrome.pointer(
+                surface,
+                &PointerEvent::Button {
+                    button: PointerButton::Left,
+                    state: ButtonState::Pressed,
+                    position: surface.to_surface(at),
+                    modifiers: Modifiers::default(),
+                },
+            );
+            assert!(chrome.state().label_pressed);
+            assert_eq!(
+                chrome.take_damage(),
+                Damage {
+                    chrome: true,
+                    ..Damage::default()
+                }
+            );
+            let same = chrome.snapshot().clone();
+            assert!(chrome.set_snapshot(same).is_empty());
+            assert!(!chrome.take_damage().any());
+        }
+    }
+
+    // While a switch is pending the button says so, is busy, and ignores clicks.
+    snapshot.tabs[0].switching_to = Some("wpe".into());
+    let mut chrome = arranged(800, 600, snapshot.clone(), colors, options);
+    let mut bare = arranged(
+        800,
+        600,
+        {
+            let mut bare = snapshot.clone();
+            bare.tabs[0].engine = None;
+            bare.tabs[0].switching_to = None;
+            bare
+        },
+        colors,
+        options,
+    );
+    let rect = chrome.layout().chrome;
+    let field = chrome.layout().address;
+    let image = paint(&mut chrome, CHROME, 120);
+    let unlabelled = paint(&mut bare, CHROME, 120);
+    let label: Vec<(u32, u32)> = differing(&image, &unlabelled)
+        .into_iter()
+        .filter(|&(x, y)| field.contains(window_point(&image, rect, x, y)))
+        .collect();
+    let (left, right, top, bottom) = label
+        .iter()
+        .fold((u32::MAX, 0, u32::MAX, 0), |(l, r, t, b), &(x, y)| {
+            (l.min(x), r.max(x), t.min(y), b.max(y))
+        });
+    let at = window_point(&image, rect, (left + right) / 2, (top + bottom) / 2);
+    let tree = chrome.accessibility();
+    let button = tree.node(NodeId::EngineSwitch).unwrap();
+    assert_eq!(button.name, "Switching to wpe");
+    assert!(button.states.busy);
+    assert!(button.bounds.contains(at));
+    chrome.take_damage();
+    let actions = click(&mut chrome, at);
+    assert!(commands(&actions).is_empty());
+    assert!(!chrome.state().focused);
+    assert!(!chrome.state().label_pressed);
+    assert!(actions
+        .iter()
+        .all(|action| !matches!(action, ChromeAction::Cursor(Cursor::Pointer))));
+    assert_eq!(
+        chrome.take_damage(),
+        Damage {
+            chrome: true,
+            ..Damage::default()
+        }
+    );
 }

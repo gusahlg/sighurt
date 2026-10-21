@@ -16,9 +16,11 @@
 //! The address line doubles as the command line: a line starting with `:` runs the command
 //! after it, such as `:tab.close 2`, so every command can be reached without a key binding. Its
 //! right end shows the keymap's indicator, if the keymap has one ("NORMAL"), and before it the
-//! engine of the active tab's page while the line isn't focused, as each engine page's tab does
-//! (`[chrome.standard] engine-label`). A click on that label, exactly where it is drawn, runs
-//! `page.switch-engine`. Hovering it changes nothing: the pointer stays the address line's.
+//! engine of the active tab's page while the line isn't focused, drawn as a button, as each
+//! engine page's tab names its engine (`[chrome.standard] engine-label`). A click on that
+//! button, exactly on the rectangle that is drawn, runs `page.switch-engine`. Under the pointer
+//! it brightens and the cursor is a hand; while held it sinks; while a switch is under way it
+//! names the engine being opened and ignores clicks.
 //!
 //! The chrome marks what needs repainting ([`Damage`]) only after an edit, a hover change, a
 //! snapshot change it shows, a configuration change or a layout change: a static chrome needs
@@ -314,9 +316,44 @@ pub(crate) struct AddressView {
     pub preedit: Option<(f32, f32)>,
     /// The keymap's indicator at the field's right end, and where it starts.
     pub indicator: Option<(Rc<ShapedText>, f32)>,
-    /// The active tab's engine before the indicator, and where its text's origin is.
-    pub engine: Option<(Rc<ShapedText>, f32, f32)>,
+    /// The active tab's engine button before the indicator.
+    pub engine: Option<EngineButton>,
 }
+
+/// The engine button at the address field's right end, in window coordinates: its engine's
+/// name and a symbol (two arrows to switch, one while switching) and, while switching, the
+/// engine it switches to. The rectangle is what is drawn and what a click hits.
+pub(crate) struct EngineButton {
+    /// Left, top, width, height.
+    pub rect: [f32; 4],
+    /// Whether a switch is under way: the button shows it and ignores clicks.
+    pub busy: bool,
+    /// Where the text's lines start vertically.
+    pub text_y: f32,
+    /// The engine the tab shows, and its origin's x.
+    pub name: (Rc<ShapedText>, f32),
+    /// The symbol's left edge; it is [`BUTTON_ICON`] wide.
+    pub icon_x: f32,
+    /// The engine being switched to, with its "…", and its origin's x.
+    pub target: Option<(Rc<ShapedText>, f32)>,
+}
+
+impl EngineButton {
+    /// Whether `point` (window pixels) is in the button: half-open, like the other rectangles.
+    pub fn contains(&self, (px, py): (f32, f32)) -> bool {
+        let [x, y, w, h] = self.rect;
+        px >= x && py >= y && px < x + w && py < y + h
+    }
+}
+
+/// The engine button's inner padding on the left and right.
+pub(crate) const BUTTON_PAD: f32 = 7.0;
+/// The space between its parts.
+pub(crate) const BUTTON_GAP: f32 = 4.0;
+/// The width of its symbol.
+pub(crate) const BUTTON_ICON: f32 = 11.0;
+/// The space above and below the button inside the address field.
+const BUTTON_MARGIN: f32 = 5.0;
 
 /// The standard chrome: its state, layout and fonts, and what it does with input.
 pub struct Model {
@@ -431,11 +468,18 @@ impl Model {
             let old = std::mem::replace(&mut self.snapshot, snapshot);
             let new = &self.snapshot;
             let tabs = old.tabs != new.tabs;
-            // The toolbar shows where the active tab can go, whether it loads, its engine, and
-            // the keymap's indicator.
+            // The toolbar shows where the active tab can go, whether it loads, its engine,
+            // whether that engine is being switched, and the keymap's indicator.
             let active = |snapshot: &Snapshot| {
                 let tab = snapshot.active();
-                tab.map(|tab| (tab.id, tab.loading, tab.engine_label()))
+                tab.map(|tab| {
+                    (
+                        tab.id,
+                        tab.loading,
+                        tab.engine_label(),
+                        tab.switching_label(),
+                    )
+                })
             };
             let toolbar = old.can_go_back != new.can_go_back
                 || old.can_go_forward != new.can_go_forward
@@ -478,6 +522,9 @@ impl Model {
         if !self.state.window_active {
             self.state.pressed = None;
             self.state.selecting = false;
+            // A held engine button sinks; losing the window cancels that, so it has to be drawn
+            // again.
+            self.damage.chrome |= self.state.label_pressed;
             self.state.label_pressed = false;
         }
         // Only the focused address line looks different: its caret and selection show while
@@ -495,7 +542,10 @@ impl Model {
             PointerEvent::Enter { position } | PointerEvent::Motion { position, .. } => {
                 self.motion(surface.to_window(position));
             }
-            PointerEvent::Leave => self.set_hover(None),
+            PointerEvent::Leave => {
+                self.leave_label();
+                self.set_hover(None);
+            }
             PointerEvent::Button {
                 button,
                 state,
@@ -624,6 +674,7 @@ impl Model {
         if self.layout.first_row != before {
             // Other rows are under the pointer now; the next motion finds which.
             self.set_hover(None);
+            self.leave_label();
         }
     }
 
@@ -799,13 +850,25 @@ impl Model {
     }
 
     fn motion(&mut self, point: WindowPoint) {
+        let over = self.on_engine_label(point);
+        if over != self.state.label_hover {
+            self.state.label_hover = over;
+            self.damage.chrome = true;
+        }
         let target = hit_test(&self.layout, point).filter(|&target| self.enabled(target));
-        self.set_hover(target);
+        self.set_hover(target.filter(|_| !over));
         if self.state.selecting {
             let offset = self.address_offset(point.x as f32);
             let before = self.state.address.clone();
             self.state.address.move_to(offset, true);
             self.edited(&before);
+        }
+    }
+
+    /// The pointer is not over the engine button any more.
+    fn leave_label(&mut self) {
+        if std::mem::take(&mut self.state.label_hover) {
+            self.damage.chrome = true;
         }
     }
 
@@ -832,8 +895,11 @@ impl Model {
 
     fn press(&mut self, point: WindowPoint, extend: bool, actions: &mut Vec<ChromeAction>) {
         if self.on_engine_label(point) {
-            self.state.label_pressed = true;
+            // A press on a busy button is swallowed: it doesn't focus the address line, and its
+            // release runs nothing.
+            self.state.label_pressed = !self.engine_busy();
             self.state.pressed = None;
+            self.damage.chrome = true;
             return;
         }
         self.state.label_pressed = false;
@@ -867,7 +933,8 @@ impl Model {
         self.state.selecting = false;
         let on_label = std::mem::take(&mut self.state.label_pressed);
         if on_label {
-            if self.on_engine_label(point) {
+            self.damage.chrome = true;
+            if self.on_engine_label(point) && !self.engine_busy() {
                 actions.push(ChromeAction::Command(Command::PageSwitchEngine));
             }
             return;
@@ -892,18 +959,18 @@ impl Model {
         actions.push(action);
     }
 
-    /// Whether `point` lies in the engine label's line box: the text that is drawn, and nothing
-    /// around it. Half-open, like the chrome's other rectangles. The label is not a hover target.
+    /// Whether `point` lies in the engine button: the rectangle that is drawn, and nothing
+    /// around it. Half-open, like the chrome's other rectangles. The button is not a hover
+    /// [`Target`]; see [`ChromeState::label_hover`].
     fn on_engine_label(&mut self, point: WindowPoint) -> bool {
-        let Some((x, y, width, height)) = self
-            .address_view()
-            .engine
-            .map(|(shaped, x, y)| (x, y, shaped.width, shaped.height))
-        else {
-            return false;
-        };
-        let (px, py) = (point.x as f32, point.y as f32);
-        px >= x && py >= y && px < x + width && py < y + height
+        let point = (point.x as f32, point.y as f32);
+        let button = self.address_view().engine;
+        button.is_some_and(|button| button.contains(point))
+    }
+
+    /// Whether the engine button is drawn and a switch is already under way.
+    fn engine_busy(&mut self) -> bool {
+        self.address_view().engine.is_some_and(|button| button.busy)
     }
 
     /// Whether `target` reacts now: back and forward only when there is somewhere to go, and
@@ -954,7 +1021,10 @@ impl Model {
             let field = text_input.map(|state| TextField::new(CHROME, state));
             actions.push(ChromeAction::TextInput(field));
         }
+        let idle_button = self.address_view().engine.map(|button| !button.busy);
+        let on_button = self.state.label_hover && idle_button == Some(true);
         let cursor = match self.state.hover {
+            _ if on_button => Cursor::Pointer,
             Some(Target::Address) => Cursor::Text,
             Some(_) => Cursor::Pointer,
             None => Cursor::Default,
@@ -1005,22 +1075,41 @@ impl Model {
             (shaped, x)
         });
         let label_right = indicator.as_ref().map_or(right, |(_, x)| x - padding);
-        // The engine of the active tab's page, before the indicator, if it fits in a quarter of
-        // the field, while the line isn't being edited.
+        // The engine of the active tab's page as a button, before the indicator, if it fits in a
+        // third of the field, while the line isn't being edited.
         let active = self.snapshot.active().filter(|_| !self.state.focused);
-        let engine = active
-            .and_then(|tab| engine_label(&mut self.fonts, options, tab, field.width as f32 / 4.0));
+        let engine = active.and_then(|tab| {
+            engine_button_text(&mut self.fonts, options, tab, field.width as f32 / 3.0)
+        });
         let text_right = engine
             .as_ref()
-            .map_or(label_right, |shaped| label_right - shaped.width - padding);
+            .map_or(label_right, |button| label_right - button.width - padding);
         let clip = (field.x as f32 + padding, text_right.max(field.x as f32));
         let x = clip.0 - editor.scroll();
         // On a whole logical pixel, as the input method's caret rectangle is.
         let y =
             field.y as f32 + ((field.height as f32 - f32::from(style.line_height)) / 2.0).floor();
-        let engine = engine.map(|label| {
-            let top = label_top(&mut self.fonts, options, style, y);
-            (label_right - label.width, top, label)
+        let engine = engine.map(|text| {
+            let k = |px| options.scaled(px);
+            let label_line = f32::from(options.text(LABEL).line_height);
+            let height = (field.height as f32 - 2.0 * k(BUTTON_MARGIN)).max(label_line + 2.0);
+            let top = field.y as f32 + ((field.height as f32 - height) / 2.0).floor();
+            let width = text.width.ceil();
+            let left = (label_right - width).floor();
+            let text_y = top + ((height - label_line) / 2.0).floor();
+            let name_x = left + k(BUTTON_PAD);
+            let icon_x = name_x + text.name.width + k(BUTTON_GAP);
+            let target = text
+                .target
+                .map(|shaped| (shaped, icon_x + k(BUTTON_ICON) + k(BUTTON_GAP)));
+            EngineButton {
+                rect: [left, top, width, height],
+                busy: target.is_some(),
+                text_y,
+                name: (text.name, name_x),
+                icon_x,
+                target,
+            }
         });
         let span = |range: &std::ops::Range<usize>| {
             let (a, b) = (shaped.x_at(range.start), shaped.x_at(range.end));
@@ -1035,7 +1124,7 @@ impl Model {
             y,
             clip,
             indicator,
-            engine: engine.map(|(x, y, shaped)| (shaped, x, y)),
+            engine,
         }
     }
 
@@ -1167,6 +1256,41 @@ pub(crate) fn engine_label(
     let text = tab.engine_label().filter(|_| options.engine_label)?;
     let shaped = fonts.line(&text, options.text(LABEL));
     (shaped.width <= width).then_some(shaped)
+}
+
+/// The pieces of the engine button's text, before it is placed.
+pub(crate) struct ButtonText {
+    name: Rc<ShapedText>,
+    target: Option<Rc<ShapedText>>,
+    /// The button's width: the pieces, the symbol and the padding.
+    width: f32,
+}
+
+/// The engine button's text for `tab` ([`TabSnapshot::engine_label`], and while switching the
+/// engine it switches to), if the button fits whole in `width`: none when `options` leave the
+/// label out or the tab names no engine.
+pub(crate) fn engine_button_text(
+    fonts: &mut Fonts,
+    options: LayoutOptions,
+    tab: &TabSnapshot,
+    width: f32,
+) -> Option<ButtonText> {
+    let text = tab.engine_label().filter(|_| options.engine_label)?;
+    let style = options.text(LABEL);
+    let name = fonts.line(&text, style);
+    let target = tab
+        .switching_label()
+        .map(|target| fonts.line(&format!("{target}\u{2026}"), style));
+    let k = |px| options.scaled(px);
+    let mut total = 2.0 * k(BUTTON_PAD) + name.width + k(BUTTON_GAP) + k(BUTTON_ICON);
+    if let Some(target) = &target {
+        total += k(BUTTON_GAP) + target.width;
+    }
+    (total.ceil() <= width).then_some(ButtonText {
+        name,
+        target,
+        width: total,
+    })
 }
 
 /// Where a line in the label's style starts so that its baseline is that of a line in `style`

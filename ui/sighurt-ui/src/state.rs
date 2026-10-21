@@ -50,6 +50,9 @@ impl Snapshot {
             if let Some(engine) = &mut tab.engine {
                 contain(engine, MAX_ENGINE_NAME);
             }
+            if let Some(engine) = &mut tab.switching_to {
+                contain(engine, MAX_ENGINE_NAME);
+            }
             if let TabContent::Error(message) = &mut tab.content {
                 contain(message, MAX_MESSAGE);
             }
@@ -105,6 +108,10 @@ pub struct TabSnapshot {
     /// The engine its page runs in, by its name in the configuration ("servo"): for an engine
     /// page, and `None` for `sig:` pages, blank tabs and errors. At most 100 characters.
     pub engine: Option<String>,
+    /// The engine the tab is switching to (`page.switch-engine`, `page.open-in`) while that
+    /// switch is under way: the new page has not committed yet and the old one is still shown.
+    /// `None` when no switch is pending. At most 100 characters.
+    pub switching_to: Option<String>,
 }
 
 /// What a tab's page area shows.
@@ -173,6 +180,16 @@ impl TabSnapshot {
         let engine = engine.trim();
         (!engine.is_empty()).then(|| engine.to_owned())
     }
+
+    /// The engine a switch of an engine page is under way to, contained, if it differs from
+    /// the one the tab shows ([`TabSnapshot::engine_label`]); a tab with no engine label has no
+    /// switch to show.
+    pub fn switching_label(&self) -> Option<String> {
+        let current = self.engine_label()?;
+        let target = contained(self.switching_to.as_deref()?, MAX_ENGINE_NAME);
+        let target = target.trim();
+        (!target.is_empty() && target != current).then(|| target.to_owned())
+    }
 }
 
 /// The chrome's temporary interaction and editing state.
@@ -191,8 +208,10 @@ pub struct ChromeState {
     /// What the primary button went down on, until it comes up.
     pub pressed: Option<Target>,
     /// The primary button went down on the address field's engine label. A release still on
-    /// that label runs `page.switch-engine`. The label has no hover of its own.
+    /// that label runs `page.switch-engine`. Not a [`Target`]: see `label_hover`.
     pub label_pressed: bool,
+    /// The pointer is over the engine label (the button at the address field's right end).
+    pub label_hover: bool,
     /// Whether dragging with the button down selects text in the address line.
     pub selecting: bool,
     /// Why the last `:command` typed into the address line failed, until the line changes.
@@ -225,6 +244,7 @@ mod tests {
             active: false,
             content,
             engine: None,
+            switching_to: None,
         }
     }
 
@@ -277,6 +297,7 @@ mod tests {
         );
         tab.active = true;
         tab.engine = Some(long('e', 200));
+        tab.switching_to = Some(long('w', 200));
         let mut snapshot = Snapshot {
             tabs: vec![tab],
             status: Some(long('s', 3000)),
@@ -301,6 +322,7 @@ mod tests {
             (&tab.title, 200),
             (&tab.url, 32 * 1024),
             (tab.engine.as_ref().unwrap(), 100),
+            (tab.switching_to.as_ref().unwrap(), 100),
             (message, 4000),
             (snapshot.status.as_ref().unwrap(), 2000),
             (snapshot.keymap.as_ref().unwrap(), 64),
@@ -330,6 +352,25 @@ mod tests {
         for content in [Blank, Internal, Error("x".into())] {
             assert_eq!(label(content, Some("servo")), None);
         }
+    }
+
+    /// A switch is shown only for an engine page, and only toward a different engine.
+    #[test]
+    fn switching_labels() {
+        let mut tab = tab(TabContent::Engine, "t", "https://a.test");
+        tab.engine = Some("servo".into());
+        tab.switching_to = Some("wpe".into());
+        assert_eq!(tab.switching_label(), Some("wpe".into()));
+        tab.switching_to = Some(" \u{202e}wpe\n".into());
+        assert_eq!(tab.switching_label(), Some("wpe".into()));
+        // The same engine, or none, is not a switch to show.
+        tab.switching_to = Some("servo".into());
+        assert_eq!(tab.switching_label(), None);
+        tab.switching_to = None;
+        assert_eq!(tab.switching_label(), None);
+        tab.content = TabContent::Blank;
+        tab.switching_to = Some("wpe".into());
+        assert_eq!(tab.switching_label(), None);
     }
 
     #[test]
