@@ -43,6 +43,17 @@ use crate::textmode;
 /// already running when the load ended may still deliver an earlier state.
 const SETTLE: Duration = Duration::from_millis(300);
 
+/// A page that builds itself with scripts after its load ended (most of today's sites) is
+/// given this long, from the end of the load, before a snapshot may be taken for it.
+const GRACE: Duration = Duration::from_millis(1500);
+
+/// A snapshot with fewer words than [`THIN`] is probably still being built: it is awaited for
+/// this long from the end of the load before it is printed as it is.
+const GRACE_THIN: Duration = Duration::from_secs(6);
+
+/// Words below which a snapshot looks unfinished.
+const THIN: usize = 30;
+
 /// What `--dump` is asked for.
 pub struct DumpOptions {
     /// The page to print.
@@ -230,7 +241,12 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
     session.run_core(&mut headless);
     let outcome = wait(&mut session, &mut headless, &wake, &options, signals);
     let text = match &outcome {
-        Ok(Some(snapshot)) => Some(textmode::dump(snapshot, options.width)),
+        Ok(Some(snapshot)) => {
+            if std::env::var_os("SIG_DUMP_STATS").is_some() {
+                eprintln!("{}", stats(snapshot));
+            }
+            Some(textmode::dump(snapshot, options.width))
+        }
         _ => None,
     };
     let code = match &outcome {
@@ -270,6 +286,48 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
         Ok(Some(_)) => Ok(code),
         Err(error) => Err(error),
     }
+}
+
+/// How many words the snapshot's nodes hold.
+fn snapshot_words(snapshot: &SemanticSnapshot) -> usize {
+    snapshot
+        .nodes
+        .iter()
+        .map(|node| {
+            node.text
+                .as_deref()
+                .map_or(0, |t| t.split_whitespace().count())
+        })
+        .sum()
+}
+
+/// One line of counts for the corpus harness (`SIG_DUMP_STATS=1`, bench/compat/run --dump):
+/// what the snapshot holds, whatever the layout prints of it.
+fn stats(snapshot: &SemanticSnapshot) -> String {
+    use sighurt_api::semantic::NodeKind;
+    let (mut headings, mut links, mut controls, mut words) = (0, 0, 0, 0);
+    for node in &snapshot.nodes {
+        match node.kind {
+            NodeKind::Heading(_) => headings += 1,
+            NodeKind::Link => links += 1,
+            NodeKind::Button
+            | NodeKind::TextField
+            | NodeKind::TextArea
+            | NodeKind::Checkbox
+            | NodeKind::Radio
+            | NodeKind::Select => controls += 1,
+            _ => {}
+        }
+        words += node
+            .text
+            .as_deref()
+            .map_or(0, |t| t.split_whitespace().count());
+    }
+    format!(
+        "sig-stats nodes={} headings={headings} links={links} controls={controls} words={words} truncated={}",
+        snapshot.nodes.len(),
+        snapshot.truncated
+    )
 }
 
 /// Writes `bytes` to stdout without ever blocking on it: it waits for the pipe to take more, a
@@ -341,12 +399,14 @@ enum Step {
 impl Settle {
     /// `loaded` is the shown document once its load ended (`None` while it loads, or it is
     /// replaced), `count` how many snapshots have arrived, `quiet` that none came for
-    /// [`SETTLE`], and `latest` the document of the latest one.
+    /// [`SETTLE`], `grace` that the page has had the time [`GRACE`] and [`GRACE_THIN`] give
+    /// it, and `latest` the document of the latest one.
     fn step(
         &mut self,
         loaded: Option<DocumentGeneration>,
         count: u64,
         quiet: bool,
+        grace: bool,
         latest: Option<DocumentGeneration>,
     ) -> Step {
         let Some(document) = loaded else {
@@ -361,7 +421,9 @@ impl Settle {
             }
         }
         match self.asked {
-            Some((_, seen)) if count > seen && quiet && latest == Some(document) => Step::Done,
+            Some((_, seen)) if count > seen && quiet && grace && latest == Some(document) => {
+                Step::Done
+            }
             _ => Step::Wait,
         }
     }
@@ -383,6 +445,8 @@ fn wait(
     let deadline = Instant::now() + options.timeout;
     let mut asked = HashSet::new();
     let mut settle = Settle::default();
+    // When the load of the shown document ended.
+    let mut loaded_at: Option<Instant> = None;
     loop {
         let mut byte = [0u8; 1];
         if rustix::io::read(signals, &mut byte).is_ok_and(|n| n > 0) && is_quit(byte[0]) {
@@ -422,8 +486,18 @@ fn wait(
             .filter(|_| loaded);
         let latest = headless.snapshot.as_ref().map(|(_, s)| s.document);
         let quiet = headless.last.elapsed() >= SETTLE;
-        match settle.step(document, headless.count, quiet, latest) {
+        if document.is_none() {
+            loaded_at = None;
+        }
+        let since = loaded_at.get_or_insert_with(Instant::now).elapsed();
+        let thin = headless
+            .snapshot
+            .as_ref()
+            .is_none_or(|(_, snapshot)| snapshot_words(snapshot) < THIN);
+        let grace = since >= GRACE && (!thin || since >= GRACE_THIN);
+        match settle.step(document, headless.count, quiet, grace, latest) {
             Step::Ask => {
+                loaded_at = Some(Instant::now());
                 // Whatever arrives now was extracted after the load ended.
                 if let Some(view) = view {
                     session.set_semantics(view, true);
@@ -443,6 +517,13 @@ fn wait(
         let mut until = deadline;
         if settle.settling(headless.count) {
             until = until.min(headless.last + SETTLE);
+        }
+        if let (Some(at), true) = (loaded_at, document.is_some()) {
+            for wait in [GRACE, GRACE_THIN] {
+                if at + wait > now {
+                    until = until.min(at + wait);
+                }
+            }
         }
         match session.registry().next_pump() {
             Some(None) => continue,
@@ -467,18 +548,20 @@ mod tests {
         let (a, b) = (DocumentGeneration::next(), DocumentGeneration::next());
         let mut settle = Settle::default();
         // While loading nothing is asked or taken.
-        assert_eq!(settle.step(None, 1, true, Some(a)), Step::Wait);
+        assert_eq!(settle.step(None, 1, true, true, Some(a)), Step::Wait);
         // A's load ended: ask. A's earlier snapshot (count 1) does not count.
-        assert_eq!(settle.step(Some(a), 1, true, Some(a)), Step::Ask);
-        assert_eq!(settle.step(Some(a), 1, true, Some(a)), Step::Wait);
+        assert_eq!(settle.step(Some(a), 1, true, true, Some(a)), Step::Ask);
+        assert_eq!(settle.step(Some(a), 1, true, true, Some(a)), Step::Wait);
         // A's answer arrives but is not yet quiet.
-        assert_eq!(settle.step(Some(a), 2, false, Some(a)), Step::Wait);
+        assert_eq!(settle.step(Some(a), 2, false, true, Some(a)), Step::Wait);
         // B replaces A (a redirect) before A settles: start over, and A's snapshot is not B's.
-        assert_eq!(settle.step(None, 2, true, Some(a)), Step::Wait);
-        assert_eq!(settle.step(Some(b), 2, true, Some(a)), Step::Ask);
-        assert_eq!(settle.step(Some(b), 2, true, Some(a)), Step::Wait);
-        assert_eq!(settle.step(Some(b), 3, true, Some(a)), Step::Wait);
-        assert_eq!(settle.step(Some(b), 3, true, Some(b)), Step::Done);
+        assert_eq!(settle.step(None, 2, true, true, Some(a)), Step::Wait);
+        assert_eq!(settle.step(Some(b), 2, true, true, Some(a)), Step::Ask);
+        assert_eq!(settle.step(Some(b), 2, true, true, Some(a)), Step::Wait);
+        assert_eq!(settle.step(Some(b), 3, true, true, Some(a)), Step::Wait);
+        // Quiet is not enough before the page has had its grace time.
+        assert_eq!(settle.step(Some(b), 3, true, false, Some(b)), Step::Wait);
+        assert_eq!(settle.step(Some(b), 3, true, true, Some(b)), Step::Done);
     }
 
     #[test]

@@ -5,3 +5,4 @@ __pycache__/
 compat/results/*/shots/
 compat/results/*/logs/
 compat/results/*/parts/
+compat/results/*/text/

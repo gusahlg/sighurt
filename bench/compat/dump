@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Text-mode corpus: `sig --dump` with WPE WebKit on every site in sites.toml.
+
+One site at a time, on a private D-Bus, no display, a fresh XDG tree. Records exit code, time,
+output size and the snapshot's counts (SIG_DUMP_STATS), saves the text, classifies:
+
+  OK       a heading and at least 20 words, or at least 60 words of text
+  THIN     5 to 59 words (and no heading with 20)
+  EMPTY    fewer than 5 words
+  ERROR    sig exited with an error (1) or crashed
+  TIMEOUT  exit code 2, or killed at the job limit
+
+  tools/heavy bench/compat/dump [--sig target/debug/sig] [--sites a,b] [--out DIR] [--timeout 30]
+  bench/compat/dump --reclassify DIR
+
+`sig` is a build with `frontend-tui` and `engine-wpe` (no Servo is needed):
+  tools/cargo build -p sighurt-browser --no-default-features --features frontend-tui,engine-wpe,engine-wasm
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SITES = ROOT / "bench/compat/sites.toml"
+BUS = ROOT / "engines/sighurt-engine-wpe/tests/private-bus"
+STATS = re.compile(r"sig-stats nodes=(\d+) headings=(\d+) links=(\d+) controls=(\d+) words=(\d+) truncated=(\w+)")
+
+
+def words_of(text):
+    body = text.split("\nReferences\n")[0]
+    return len(re.findall(r"[^\W_]{2,}", body))
+
+
+def classify(rec):
+    if rec["exit"] == 2 or rec.get("killed"):
+        return "TIMEOUT"
+    if rec["exit"] != 0:
+        return "ERROR"
+    words, heading = rec["out_words"], rec["headings"] or 0
+    if words >= 60 or (heading and words >= 20):
+        return "OK"
+    return "THIN" if words >= 5 else "EMPTY"
+
+
+def run_site(site, sig, out, timeout):
+    tmp = tempfile.mkdtemp(prefix="sigdump-")
+    env = {k: v for k, v in os.environ.items() if k not in ("WAYLAND_DISPLAY", "DISPLAY")}
+    for name, sub in (("CONFIG", "c"), ("STATE", "s"), ("DATA", "d"), ("CACHE", "k")):
+        env[f"XDG_{name}_HOME"] = f"{tmp}/{sub}"
+        os.makedirs(f"{tmp}/{sub}")
+    env["SIG_DUMP_STATS"] = "1"
+    cmd = [str(BUS), str(sig), "--dump", site["url"], "--timeout", str(timeout)]
+    t0 = time.monotonic()
+    killed = False
+    try:
+        p = subprocess.run(cmd, env=env, capture_output=True, timeout=timeout + 30)
+        code, stdout, stderr = p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired as e:
+        code, stdout, stderr, killed = -9, e.stdout or b"", e.stderr or b"", True
+    elapsed = time.monotonic() - t0
+    shutil.rmtree(tmp, ignore_errors=True)
+    text = stdout.decode(errors="replace")
+    err = stderr.decode(errors="replace")
+    m = STATS.search(err)
+    rec = {
+        "id": site["id"], "url": site["url"], "category": site.get("category", ""),
+        "exit": code, "killed": killed, "seconds": round(elapsed, 1),
+        "out_bytes": len(stdout), "out_words": words_of(text),
+        "nodes": int(m[1]) if m else None, "headings": int(m[2]) if m else None,
+        "links": int(m[3]) if m else None, "controls": int(m[4]) if m else None,
+        "snapshot_words": int(m[5]) if m else None, "truncated": (m[6] == "true") if m else None,
+        "first_line": next((l.strip() for l in text.splitlines() if l.strip()), "")[:100],
+        "error": "" if code == 0 else "\n".join(
+            l for l in err.splitlines() if l.startswith("sig:"))[:300],
+    }
+    (out / "text").mkdir(exist_ok=True)
+    (out / "text" / f"{site['id']}.txt").write_text(text)
+    rec["class"] = classify(rec)
+    return rec
+
+
+def report(out, recs, meta):
+    order = {"OK": 0, "THIN": 1, "EMPTY": 2, "ERROR": 3, "TIMEOUT": 4}
+    counts = {c: sum(r["class"] == c for r in recs) for c in order}
+    lines = [
+        f"# Text mode on the corpus: `sig --dump` with WPE WebKit ({meta['date']})", "",
+        f"Revision {meta['rev']}, timeout {meta['timeout']} s, width 80, {len(recs)} sites, "
+        "one at a time, private D-Bus, no display. Text in `text/<id>.txt`.", "",
+        "Classes: OK = a heading and 20 words, or 60 words; THIN = 5 to 59 words; EMPTY = under 5 "
+        "words; ERROR = sig failed; TIMEOUT = no page text in time. Words are counted in the "
+        "printed text before the reference list.", "",
+        "Summary: " + ", ".join(f"{c} {n}" for c, n in counts.items()), "",
+        "| Site | Class | Exit | Time s | Out bytes | Words | Headings | Links | Controls | First line |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in recs:
+        first = r["first_line"].replace("|", "\\|")
+        lines.append(
+            f"| {r['id']} | {r['class']} | {r['exit']} | {r['seconds']} | {r['out_bytes']} | "
+            f"{r['out_words']} | {r['headings']} | {r['links']} | {r['controls']} | {first} |")
+    (out / "report.md").write_text("\n".join(lines) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sig", default=str(ROOT / "target/debug/sig"))
+    ap.add_argument("--sites", default="")
+    ap.add_argument("--out", default="")
+    ap.add_argument("--rev", default="")
+    ap.add_argument("--timeout", type=int, default=30)
+    ap.add_argument("--reclassify", default="")
+    a = ap.parse_args()
+    if a.reclassify:
+        out = Path(a.reclassify)
+        data = json.loads((out / "runs.json").read_text())
+        for r in data["runs"]:
+            r["out_words"] = words_of((out / "text" / f"{r['id']}.txt").read_text())
+            r["class"] = classify(r)
+        (out / "runs.json").write_text(json.dumps(data, indent=1))
+        report(out, data["runs"], data["meta"])
+        return
+    sites = tomllib.loads(SITES.read_text())["site"]
+    if a.sites:
+        want = set(a.sites.split(","))
+        sites = [s for s in sites if s["id"] in want]
+    rev = a.rev or subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                                  capture_output=True, text=True).stdout.strip()
+    date = datetime.date.today().isoformat()
+    out = Path(a.out) if a.out else ROOT / f"bench/compat/results/{date}-dump-wpe"
+    out.mkdir(parents=True, exist_ok=True)
+    meta = {"date": date, "rev": rev, "timeout": a.timeout}
+    recs = []
+    for s in sites:
+        r = run_site(s, a.sig, out, a.timeout)
+        print(f"{r['id']:24} {r['class']:8} exit={r['exit']} {r['seconds']}s words={r['out_words']}",
+              flush=True)
+        recs.append(r)
+    (out / "runs.json").write_text(json.dumps({"meta": meta, "runs": recs}, indent=1))
+    report(out, recs, meta)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

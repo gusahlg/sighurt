@@ -603,6 +603,24 @@ fn semantic_snapshots_and_actions_without_a_display() {
             ]
     });
     assert!(headings_ok, "headings\n{}", session.show());
+    // Content a script puts in the body (example.com builds its page that way) is in the snapshot.
+    open_page(
+        &mut session,
+        "scripted.html",
+        Duration::from_secs(20),
+        |snapshot| headings(snapshot) == [(1, "Inserted heading".to_owned())],
+    );
+    {
+        let snapshot = session.latest.as_ref().expect("scripted snapshot");
+        let all = blob(snapshot);
+        assert!(
+            all.contains("Static paragraph.")
+                && all.contains("Inserted paragraph.")
+                && all.contains("Learn more"),
+            "scripted page\n{}",
+            session.show()
+        );
+    }
     let mark = "MUTATION_MARK_42";
     session
         .runtime

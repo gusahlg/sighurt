@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scripted Domain</title>
+<style>body{max-width:26em;margin:auto;padding:25vh 2em 2em;text-align:center}</style>
+</head>
+<body>
+<p>Static paragraph.</p>
+<script>
+  // As example.com does since 2026: the page is built by a script that runs at the end of the
+  // body, and its <title> is the only place the name "Example Domain" ever was.
+  var body = document.body;
+  body.insertAdjacentHTML("afterbegin", "<h1>Inserted heading</h1>");
+  body.insertAdjacentHTML("beforeend", "<p lang=fr>Inserted paragraph.</p><a href=\"https://example.com/more\">Learn more</a>");
+</script>
+</body>
+</html>
