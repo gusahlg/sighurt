@@ -3407,3 +3407,34 @@ Newest last. Each entry says what was decided and why.
     microsoft.com with it on 0.7 (it made them spin in older Servo; github.com loops without it:
     `experiments/servo-input/REPORT.md`), and a user stylesheet that puts `dialog:modal` on top
     (chatgpt.com's login dialog, which Servo doesn't put in the top layer).
+102. **No environment writes after threads exist, and surfman's are patched out rather than
+    intercepted** (21 October 2026). The terminal review's P1 (surfman's
+    `Adapter::set_environment_variables` writes `LIBGL_ALWAYS_SOFTWARE`/`DRI_PRIME` from every
+    `create_context_descriptor`, after Servo's threads exist, WebGL included) was first fixed by
+    detouring SpiderMonkey's own `setenv` interposer at startup (a hand-written x86-64 patch of
+    its prologue, 544 lines). Not adopted: it rewrites another library's code in memory, is
+    tied to one architecture and one compiler output, and was an architectural change made
+    without a decision (saved in `git stash`, "R1 env seal"). Instead the Servo 0.7 merge
+    carries a minimal patched copy of surfman (`[patch.crates-io]`, one change: no
+    `set_environment_variables` in `create_context_descriptor`). The same rule keeps `sig`'s
+    `JSC_SIGNAL_FOR_GC` set: unsetting it once WebKit has read it would be such a write, at a
+    point where WebKit is not known to have read it yet (decision 103).
+103. **WebKit's web processes get no GL video sink and no accessibility bus** (21 October
+    2026; `experiments/wpe-issues/REPORT.md`). `sig` sets `WEBKIT_GST_DISABLE_GL_SINK=1` and an
+    empty `WEBKIT_A11Y_BUS_ADDRESS` at the start of `main` unless the environment sets them:
+    the GL sink imported software decoders' YU12 DMA-BUFs and painted H.264 and AV1 green, and
+    `sig` provides no AT-SPI bus. Measured in a private headless sway: H.264, VP9 and AV1 show
+    their test pattern, and the warning is gone. The web processes still print one
+    "invalid option: JSC_SIGNAL_FOR_GC" line each (JavaScriptCore's option parser sees WTF's
+    variable); harmless, kept for decision 102's reason.
+104. **Text mode belongs to the terminal frontend; the core never knows the page is shown as
+    text** (21 October 2026; TUI.md §10, "Text mode and `--dump` as built"). The mode is the
+    frontend's choice for the run (`chrome.toggle-mode` over `[tui] mode`); text mode gives
+    engines empty metrics, so nothing renders or is read back. Keys still go through the
+    keymap first; what it leaves for the page reaches the frontend through
+    `Frontend::page_input` before the engine, and the terminal turns it into scrolling,
+    focus and activation, sending activations through the core as `BrowserEvent::Semantic`.
+    `sig --dump` waits for the load to end and then for a snapshot with 300 ms of quiet
+    (amends §8.12's "first snapshot after load end": engine events can reach the frontend
+    before the core has handled the load end ahead of them, so the first snapshot may be
+    stale). The demo engine has semantics, so text mode is tested without WebKit.
