@@ -41,10 +41,13 @@
 //! Servo 0.7 drops `LoadStatus::Started` when the WebView's status is already `Started`
 //! (`set_load_status` ignores an unchanged value). A new WebView starts `Started`, and so does
 //! a document the browser navigates to before the previous one has reported `HeadParsed` or
-//! `Complete`. The new document's `<body>` still reports `HeadParsed`. That report is evidence
-//! of the new document: a second `HeadParsed` before the history change it belongs to, or one
-//! the runtime sees in the same batch after that change while a browser load is waiting and no
-//! `Started` arrived (`started_later`).
+//! `Complete`. The new document's `<body>` still reports `HeadParsed`. Servo sends that report
+//! every time a top-level `<body>` is bound, not once per document: Turbo Drive swaps the body
+//! on an in-page navigation. A head is evidence of a new document (`fresh_head`) only when a
+//! browser `Navigate` or `Reload` was issued after the last head or `Complete` and this
+//! document had already reported a head. `Complete` clears `saw_head`. A head the runtime sees
+//! in the same batch after the history change, while a browser load is waiting and no `Started`
+//! arrived, is still `started_later`.
 //!
 //! Limits carried from Servo 0.5, all erring towards "new document" except the first: a page
 //! navigation from a document that never got a `<body>` (still `Started`) arrives without its
@@ -130,16 +133,23 @@ pub(crate) struct Navigator {
     started: bool,
     /// The load status is `Started` as far as Servo knows (it suppresses a repeated `Started`).
     loading_started: bool,
-    /// The current document has reported `HeadParsed`.
+    /// The current document has reported `HeadParsed`. Cleared on `Complete`.
     saw_head: bool,
-    /// A further `HeadParsed` arrived before the history change of the document it belongs to.
-    /// Servo had already dropped that document's `Started`.
+    /// A `HeadParsed` arrived, after a browser `Navigate` or `Reload` issued since the last
+    /// head or `Complete`, before the history change of the document it belongs to. Servo had
+    /// already dropped that document's `Started`. A `<body>` rebound with no such load is not
+    /// one of these.
     fresh_head: bool,
+    /// A browser `Navigate` or `Reload` was issued after the last head or `Complete`.
+    browser_load_since_mark: bool,
 }
 
 impl Navigator {
     /// The browser asked for a navigation.
     pub fn request(&mut self, navigation: NavigationId, request: Request) {
+        if matches!(request, Request::Navigate | Request::Reload) {
+            self.browser_load_since_mark = true;
+        }
         if request == Request::Reload {
             // `WebView::reload` sets Servo's load status to `Started` without reporting it, so
             // the new document's own `Started` is suppressed.
@@ -158,19 +168,30 @@ impl Navigator {
     }
 
     /// Servo reported `HeadParsed`. The current document's first one is recorded. Another one
-    /// is a new document whose `Started` Servo dropped; `counted` means the history change
-    /// already consumed it.
+    /// is a new document whose `Started` Servo dropped only when a browser `Navigate` or
+    /// `Reload` was issued after the last head or `Complete`. `counted` means the history
+    /// change already consumed it.
     pub fn head_parsed(&mut self, counted: bool) {
         if counted {
             self.saw_head = true;
             self.fresh_head = false;
+            self.browser_load_since_mark = false;
             return;
         }
-        if self.saw_head {
+        if self.browser_load_since_mark && self.saw_head {
             self.fresh_head = true;
-        } else {
+        } else if !self.saw_head {
             self.saw_head = true;
         }
+        // This head is the new mark: a load issued before it does not make a later head fresh.
+        self.browser_load_since_mark = false;
+    }
+
+    /// Servo reported `LoadStatus::Complete`. The next `<body>` bind is not a second head of
+    /// this document, and a load issued before this `Complete` does not make it fresh.
+    pub fn load_completed(&mut self) {
+        self.saw_head = false;
+        self.browser_load_since_mark = false;
     }
 
     /// A browser `Navigate` or `Reload` is waiting, and nothing yet says its document has
@@ -255,6 +276,11 @@ impl Navigator {
         };
         if let Some(index) = attributed {
             self.pending.drain(..=index);
+        }
+        if matches!(request, Some((_, Request::Navigate | Request::Reload))) {
+            // The commit is the load the mark was waiting for. A later `<body>` bind is not
+            // evidence of another document.
+            self.browser_load_since_mark = false;
         }
         // The request, when there is one, says which of the two a step forward was.
         let shape = match (shape, request) {
@@ -658,6 +684,44 @@ mod tests {
         let hash = page(&mut n, &["https://a/", "https://b/", "https://b/#x"], 2).unwrap();
         assert_eq!(hash.document, commit.document);
         assert_ne!(hash.navigation, next);
+    }
+
+    /// Turbo Drive binds a new `<body>` on an in-page navigation. That `HeadParsed` is not a
+    /// new document, so a `pushState` while a browser navigation is pending keeps this
+    /// document. The load's own head, after the browser asked, still attributes it.
+    #[test]
+    fn a_body_rebind_does_not_take_a_pending_navigation() {
+        let mut n = Navigator::default();
+        n.request(NavigationId::next(), Request::Navigate);
+        let doc = load(&mut n, &["https://a/"], 0).document;
+        n.head_parsed(false);
+        n.load_completed();
+        n.head_parsed(false);
+        n.head_parsed(false);
+        assert!(
+            !n.fresh_head,
+            "a body swap after Complete is the same document"
+        );
+
+        let to_b = NavigationId::next();
+        n.request(to_b, Request::Navigate);
+        let push = page(&mut n, &["https://a/", "https://a/p"], 1).unwrap();
+        assert_ne!(push.navigation, to_b);
+        assert_eq!(push.document, doc);
+        assert!(n.pending_load_needs_evidence(), "b is still waiting");
+
+        n.head_parsed(false);
+        let commit = n
+            .history_changed(
+                urls(&["https://a/", "https://a/p", "https://b/"]),
+                2,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(commit.navigation, to_b);
+        assert_ne!(commit.document, doc);
+        assert_eq!(commit.history, Some(HistoryEffect::Push));
     }
 
     /// The current document's own `HeadParsed` is not a new document, so a fragment while a

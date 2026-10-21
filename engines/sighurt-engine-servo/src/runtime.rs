@@ -289,10 +289,9 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// per WebView and does not clear the others; a new WebView starts focused.
     servo_focus: Option<ViewId>,
     events: Events,
-    /// Notes of WebViews held for the next absorb, in order. The flags are whether a `Started`
-    /// or `HeadParsed` was already counted with the history change it belongs to, and whether a
-    /// history change has already waited one batch for that evidence.
-    held: Vec<(WebViewId, Note, bool, bool)>,
+    /// Notes of WebViews held for the next absorb, in order. The flag is whether a `Started`
+    /// or `HeadParsed` was already counted with the history change it belongs to.
+    held: Vec<(WebViewId, Note, bool)>,
     /// How long a history change with a browser load waiting, and no `Started` yet, is held
     /// back. Servo 0.7 often delivers `HeadParsed` a few spins later; an immediate re-spin
     /// (this batch also queued a title or a frame) would otherwise commit too soon.
@@ -349,7 +348,6 @@ impl<T: ServoTarget> ServoRuntime<T> {
         // Installed before the first WebView, so each script thread copies it. Servo has no
         // top layer: without this, `<dialog>.showModal()` stays in normal flow and a later
         // sibling with a z-index covers it. User origin plus `!important` beats author styles.
-        // An unknown `::backdrop` selector is a dropped rule, not a failed sheet.
         let user_content = Rc::new(UserContentManager::new(&servo));
         user_content.add_stylesheet(Rc::new(servo::user_contents::UserStyleSheet::new(
             DIALOG_USER_CSS.to_owned(),
@@ -580,13 +578,8 @@ impl<T: ServoTarget> ServoRuntime<T> {
         // Each note, and whether it is a `Started` or `HeadParsed` already counted with the
         // history change it belongs to: the two arrive on different channels, so within one
         // batch the history change may come first, and on 0.7 it often comes in the batch
-        // before. Notes held back last time come first. `waited` is a history change that
-        // already waited one batch for evidence of its document.
-        let fresh = self
-            .delegate
-            .take()
-            .into_iter()
-            .map(|(w, n)| (w, n, false, false));
+        // before. Notes held back last time come first.
+        let fresh = self.delegate.take().into_iter().map(|(w, n)| (w, n, false));
         let mut notes: Vec<_> = std::mem::take(&mut self.held)
             .into_iter()
             .chain(fresh)
@@ -594,11 +587,11 @@ impl<T: ServoTarget> ServoRuntime<T> {
             .collect();
         let mut holding = Vec::new();
         for index in 0..notes.len() {
-            let Some((webview, note, counted, waited)) = notes[index].take() else {
+            let Some((webview, note, counted)) = notes[index].take() else {
                 continue;
             };
             if holding.contains(&webview) {
-                self.held.push((webview, note, counted, waited));
+                self.held.push((webview, note, counted));
                 continue;
             }
             match self.owners.get(&webview).copied() {
@@ -613,20 +606,14 @@ impl<T: ServoTarget> ServoRuntime<T> {
                                 // Its completion comes with Servo's next batch: this note and
                                 // the WebView's later ones wait for it, in order.
                                 holding.push(webview);
-                                self.held.push((webview, note, counted, waited));
+                                self.held.push((webview, note, counted));
                                 continue;
                             }
                         }
-                        let later =
-                            notes[index + 1..]
-                                .iter_mut()
-                                .flatten()
-                                .find(|(id, n, c, _)| {
-                                    *id == webview
-                                        && !*c
-                                        && matches!(n, Note::Load(LoadStatus::Started))
-                                });
-                        if let Some((_, _, counted, _)) = later {
+                        let later = notes[index + 1..].iter_mut().flatten().find(|(id, n, c)| {
+                            *id == webview && !*c && matches!(n, Note::Load(LoadStatus::Started))
+                        });
+                        if let Some((_, _, counted)) = later {
                             *counted = true;
                             started_later = true;
                         }
@@ -644,7 +631,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                             let mut head = None;
                             let mut history_after = false;
                             for (offset, slot) in notes[index + 1..].iter().enumerate() {
-                                let Some((id, n, counted, _)) = slot else {
+                                let Some((id, n, counted)) = slot else {
                                     continue;
                                 };
                                 if *id != webview {
@@ -664,8 +651,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                                 }
                             }
                             if let Some(offset) = head.filter(|_| !history_after) {
-                                if let Some((_, _, counted, _)) = notes[index + 1 + offset].as_mut()
-                                {
+                                if let Some((_, _, counted)) = notes[index + 1 + offset].as_mut() {
                                     *counted = true;
                                     started_later = true;
                                 }
@@ -680,7 +666,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                         {
                             // An immediate re-spin still has no `HeadParsed`. Keep the change
                             // until it arrives, or until this window passes (a same-document
-                            // commit while a load is pending).
+                            // commit while a load is pending). `pump` wakes at `until`.
                             let now = Instant::now();
                             let until = *self
                                 .history_hold
@@ -688,7 +674,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                                 .or_insert(now + Duration::from_millis(100));
                             if now < until {
                                 holding.push(webview);
-                                self.held.push((webview, note, counted, true));
+                                self.held.push((webview, note, counted));
                                 continue;
                             }
                         }
@@ -700,7 +686,9 @@ impl<T: ServoTarget> ServoRuntime<T> {
                     self.popup_note(parent, document, webview, note)
                 }
                 // A WebView being closed; what it says no longer matters.
-                None => {}
+                None => {
+                    self.history_hold.remove(&webview);
+                }
             }
         }
     }
@@ -711,16 +699,16 @@ impl<T: ServoTarget> ServoRuntime<T> {
         &self,
         view: ViewId,
         webview: WebViewId,
-        rest: &[Option<(WebViewId, Note, bool, bool)>],
+        rest: &[Option<(WebViewId, Note, bool)>],
     ) -> Traversal {
         let Some(view) = self.views.get(&view).filter(|v| !v.traversals.is_empty()) else {
             return Traversal::No;
         };
-        let next = rest.iter().flatten().find(|(id, note, _, _)| {
+        let next = rest.iter().flatten().find(|(id, note, _)| {
             *id == webview && matches!(note, Note::History(..) | Note::TraversalComplete(_))
         });
         match next {
-            Some((_, Note::TraversalComplete(done), _, _)) => view
+            Some((_, Note::TraversalComplete(done), _)) => view
                 .traversals
                 .iter()
                 .find(|(t, _)| t == done)
@@ -761,6 +749,9 @@ impl<T: ServoTarget> ServoRuntime<T> {
                 view.navigator.load_status(started, counted);
                 if status == LoadStatus::HeadParsed {
                     view.navigator.head_parsed(counted);
+                }
+                if status == LoadStatus::Complete {
+                    view.navigator.load_completed();
                 }
                 if let (true, Some(load)) = (started, &mut view.load) {
                     // Its document is on its way: the commit follows.
@@ -1087,7 +1078,9 @@ impl<T: ServoTarget> ServoRuntime<T> {
             self.owners.remove(&popup.id());
         }
         if let Some(webview) = view.webview.take() {
-            self.owners.remove(&webview.id());
+            let id = webview.id();
+            self.owners.remove(&id);
+            self.history_hold.remove(&id);
         }
         view.requests.clear();
         if let Some(context) = view.context.take() {
@@ -1404,6 +1397,9 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
 
     fn pump(&mut self, events: &mut Vec<EngineEvent>) -> PumpStatus {
         let mut deadline: Option<Instant> = None;
+        let now = Instant::now();
+        // A console window that closed while the loop slept: the summary has no page text.
+        self.delegate.flush_console_logs(now);
         if self.servo.is_some() && self.failed.is_none() {
             // With a backlog, what Servo has next waits in its own channels.
             if self.events.len() < MAX_EVENTS_PER_PUMP {
@@ -1426,13 +1422,19 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                 }
             }
         }
+        // A held history change has no engine event yet. Without this deadline `pump` returns
+        // `Idle` and the change waits for unrelated Servo activity. Closed WebViews are dropped.
+        deadline = fold_hold_deadline(
+            &mut self.history_hold,
+            |id| self.owners.contains_key(id),
+            deadline,
+        );
+        if let Some(due) = self.delegate.console_log_deadline(Instant::now()) {
+            deadline = Some(deadline.map_or(due, |d| d.min(due)));
+        }
         let count = self.events.len().min(MAX_EVENTS_PER_PUMP);
         events.extend(std::iter::from_fn(|| self.events.pop()).take(count));
-        match (self.events.len(), deadline) {
-            (0, None) => PumpStatus::Idle,
-            (0, deadline) => PumpStatus::Pending { deadline },
-            _ => PumpStatus::Pending { deadline: None },
-        }
+        pump_status(self.events.len(), deadline)
     }
 
     fn present(&mut self, id: ViewId, permit: T::Permit) -> Result<PresentOutcome, EngineError> {
@@ -1542,6 +1544,7 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
             view.requests.clear();
         }
         self.owners.clear();
+        self.history_hold.clear();
         // Navigations in notes not taken in yet are denied with them.
         self.held.clear();
         drop(self.delegate.take());
@@ -1589,6 +1592,33 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
     }
 }
 
+/// Drops holds for WebViews `live` rejects, then the earliest remaining instant, folded into
+/// `deadline`.
+fn fold_hold_deadline<K, F>(
+    holds: &mut HashMap<K, Instant>,
+    mut live: F,
+    mut deadline: Option<Instant>,
+) -> Option<Instant>
+where
+    K: Eq + std::hash::Hash,
+    F: FnMut(&K) -> bool,
+{
+    holds.retain(|id, _| live(id));
+    for hold in holds.values() {
+        deadline = Some(deadline.map_or(*hold, |due| due.min(*hold)));
+    }
+    deadline
+}
+
+/// What `pump` returns once the events for this call have been handed over.
+fn pump_status(remaining: usize, deadline: Option<Instant>) -> PumpStatus {
+    match (remaining, deadline) {
+        (0, None) => PumpStatus::Idle,
+        (0, deadline) => PumpStatus::Pending { deadline },
+        _ => PumpStatus::Pending { deadline: None },
+    }
+}
+
 /// Completes Servo's request object with the browser's answer.
 fn resolve(pending: Pending, result: ServiceResult) {
     match (pending, result) {
@@ -1611,11 +1641,13 @@ fn resolve(pending: Pending, result: ServiceResult) {
 }
 
 /// Servo has no top layer. This user stylesheet makes `<dialog>.showModal()` cover the page.
-/// `::backdrop` is included only as a dimming substitute; CSS error recovery drops it if the
-/// selector is unknown.
+/// The UA rule already sets `position: fixed` on `dialog:modal`; repeating it here is the same
+/// origin and importance as an author `position`, so the author wins and the dialog leaves the
+/// top. `z-index` stays `!important`. Servo never generates a `::backdrop` box, so a backdrop
+/// rule would not dim the page. A `box-shadow` dim is left out until a click on the dialog in
+/// `experiments/servo-input/pages/modal.html` shows it does not take the hit target.
 const DIALOG_USER_CSS: &str = "\
-dialog:modal { position: fixed; z-index: 2147483647 !important; }
-dialog:modal::backdrop { background: rgba(0, 0, 0, 0.4) !important; }
+dialog:modal { z-index: 2147483647 !important; }
 ";
 
 /// Preferences servoshell turns on with `--enable-experimental-web-platform-features`.
@@ -1914,6 +1946,32 @@ mod tests {
         assert!(matches!(
             runtime.command(ViewId::next(), EngineCommand::Stop),
             Err(EngineError::Runtime(_))
+        ));
+    }
+
+    #[test]
+    fn a_held_history_change_wakes_at_the_earliest_live_deadline() {
+        let due = Instant::now() + Duration::from_millis(100);
+        let later = due + Duration::from_secs(5);
+        let sooner = due - Duration::from_millis(40);
+        let mut holds =
+            std::collections::HashMap::from([(1u64, later), (2u64, due), (3u64, sooner)]);
+        let deadline = fold_hold_deadline(&mut holds, |id| *id != 3, None);
+        assert_eq!(deadline, Some(due));
+        assert_eq!(holds.len(), 2, "a closed WebView's hold is dropped");
+        assert!(matches!(
+            pump_status(0, deadline),
+            PumpStatus::Pending { deadline: Some(got) } if got == due
+        ));
+        let earlier = due - Duration::from_millis(10);
+        let folded = fold_hold_deadline(&mut holds, |_| true, Some(earlier));
+        assert_eq!(folded, Some(earlier));
+        holds.clear();
+        assert_eq!(fold_hold_deadline(&mut holds, |_| true, None), None);
+        assert!(matches!(pump_status(0, None), PumpStatus::Idle));
+        assert!(matches!(
+            pump_status(1, Some(due)),
+            PumpStatus::Pending { deadline: None }
         ));
     }
 
