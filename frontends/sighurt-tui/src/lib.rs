@@ -17,5 +17,6 @@ pub mod kitty;
 pub mod sanitize;
 pub mod target;
 pub mod term;
+pub mod textmode;
 
 pub use app::{run, Options};

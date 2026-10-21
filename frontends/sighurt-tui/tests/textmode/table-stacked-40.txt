@@ -1,0 +1,7 @@
+A few crates
+
+Crate / Version / Description of the
+crate that is rather long indeed
+serde / 1.0.200 / Serialization
+framework for everything under the sun
+tokio / 1.40 / Async runtime
