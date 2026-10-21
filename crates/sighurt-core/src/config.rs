@@ -40,7 +40,7 @@
 //! engine honors (`Environment::engine_settings`): setting what an engine can't honor is an
 //! error, never ignored. `experimental-features` turns on Servo's experimental web-platform
 //! preferences (off by default, which is Servo's own default). `preferences` then sets
-//! individual Servo 0.5 preferences by field name; an unknown name or a value of the wrong
+//! individual Servo 0.7 preferences by field name; an unknown name or a value of the wrong
 //! type is an error. `[downloads] directory` and `[session] restore` are the executable's,
 //! checked here.
 //!
@@ -1304,7 +1304,7 @@ fn check_engines(
     checked
 }
 
-/// `[engines.<engine>.preferences]`: Servo 0.5 preference names and values. One bad preference
+/// `[engines.<engine>.preferences]`: Servo 0.7 preference names and values. One bad preference
 /// is one error. A table for an engine the build lacks is still checked, like the other
 /// settings; what an engine of the build does not honor is an error and is not read further.
 fn read_preferences(
@@ -1346,12 +1346,12 @@ fn read_preferences(
     }
 }
 
-/// One Servo preference. The name and the value's type are Servo 0.5's `Preferences` fields
+/// One Servo preference. The name and the value's type are Servo 0.7's `Preferences` fields
 /// ([`servo_prefs`], regenerated from `prefs.rs` when Servo is upgraded).
 fn parse_preference(name: &str, value: &toml::Value) -> Result<ServoPrefValue, String> {
     let kind = servo_prefs::kind_of(name).ok_or_else(|| {
         format!(
-            "{name}: unknown Servo preference (names are the fields of Servo 0.5's Preferences)"
+            "{name}: unknown Servo preference (names are the fields of Servo 0.7's Preferences)"
         )
     })?;
     match kind {
@@ -2634,13 +2634,13 @@ mod tests {
 
     #[test]
     fn servo_preferences_are_checked_when_the_configuration_loads() {
-        // Servo 0.5's `Preferences` field count. Update it when regenerating servo_prefs.rs.
-        assert_eq!(servo_prefs::PREFERENCE_NAMES.len(), 171);
+        // Servo 0.7's `Preferences` field count. Update it when regenerating servo_prefs.rs.
+        assert_eq!(servo_prefs::PREFERENCE_NAMES.len(), 172);
         assert_eq!(
             servo_prefs::PREFERENCE_NAMES.len(),
             servo_prefs::PREFERENCE_KINDS.len()
         );
-        assert_eq!(servo_prefs::PREFERENCE_COUNT, 171);
+        assert_eq!(servo_prefs::PREFERENCE_COUNT, 172);
 
         let config = parse(
             r#"

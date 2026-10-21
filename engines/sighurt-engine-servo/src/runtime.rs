@@ -15,11 +15,12 @@
 //! queue.
 //!
 //! Before Servo carries out a navigation a page started that it would load itself (a link, a
-//! form, a script, of the top-level document or of a frame: Servo 0.5 doesn't say which), the
+//! form, a script, of the top-level document or of a frame: Servo doesn't say which), the
 //! view asks the browser (`NavigationRequested`) and holds Servo's request until the answer
 //! (`AnswerNavigation`), at most [`MAX_ASKED`] per view; beyond them, or without a committed
 //! document to ask for, the navigation goes ahead without asking, and so does the browser's own
-//! reload, which Servo 0.5 carries out as the page's navigation to its address. A new document,
+//! reload, which Servo 0.5 carried out as the page's navigation to its address (kept; see
+//! `SERVO-0.7.md`). A new document,
 //! a crash, closing the view and shutting down deny what is still held. A navigation Servo
 //! doesn't load itself (another scheme; a local file from a web page) is denied and handed to
 //! the browser (`OpenRequested`).
@@ -27,16 +28,17 @@
 //! `Stop` cancels a navigation still queued (see [`crate::view`]), gives up on a top-level load
 //! that has shown no sign of life for [`LOAD_WAIT`](crate::view::LOAD_WAIT) (its
 //! `NavigationFailed` is `Cancelled`), and stops the document's own loading (`window.stop()`).
-//! Servo 0.5 can't cancel a top-level load still waiting for its response: that one goes on and
-//! commits when its response comes.
+//! Servo 0.7 still has no API to cancel a top-level load that is waiting for its response: that
+//! one goes on and commits when its response comes.
 //!
 //! Servo keeps its profile (cookies, local storage, HSTS, HTTP authentication) in the directory
 //! the executable passes, written by this runtime only: it holds `{profile}/lock` from before
 //! Servo is built until Servo has shut down (Servo writes the profile while it shuts down), and
 //! a second process that finds the lock taken runs Servo without a profile (M0, decision 26).
 //!
-//! A crashed page's view loads its next navigation in a new WebView on the same context: Servo
-//! 0.5 keeps sending the crashed site's documents to the dead script thread.
+//! A crashed page's view loads its next navigation in a new WebView on the same context. On
+//! Servo 0.5 the crashed site's documents kept going to the dead script thread; that workaround
+//! stays until `tests/crash.rs` shows 0.7 can shut down afterwards (see `SERVO-0.7.md`).
 //!
 //! Timing ([`ServoTiming`]): every submitted frame's paint (`WebView::paint`) and swap, and how
 //! long the browser's navigations took to their document's first frame, in
@@ -59,9 +61,10 @@
 //! [`EngineRuntime::shutdown`] closes in the order M1 established: the WebViews, then Servo
 //! (which spins until its constellation, WebGL and paint threads are done), then each view's
 //! GL context, then the EGL display, then the target leases; the host releases its Wayland
-//! objects after that. After a page crash or a lost backend, Servo 0.5 never finishes shutting
-//! down (its constellation waits for the dead script thread's pipelines), so the runtime leaves
-//! it running instead of hanging: [`ServoDiagnostics::leaked`].
+//! objects after that. After a page crash or a lost backend, Servo 0.5 never finished shutting
+//! down (its constellation waited for the dead script thread's pipelines). The runtime still
+//! leaves it running instead of hanging ([`ServoDiagnostics::leaked`]) until that is shown to
+//! have changed (see `SERVO-0.7.md`).
 //!
 //! Must not own: process lifetime, logging or TLS setup, the allocator (the executable): no
 //! `process::exit`, `_exit`, panic hook, logger or crypto provider here.
@@ -75,7 +78,7 @@ use std::time::{Duration, Instant};
 
 use servo::{
     EmbedderControl, EventLoopWaker, LoadStatus, Opts, PermissionFeature, PrefValue, Preferences,
-    RenderingContext, Servo, ServoBuilder, WebViewId,
+    RenderingContext, Servo, ServoBuilder, UserContentManager, WebViewId,
 };
 use sighurt_api::engine::{
     EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, PresentOutcome,
@@ -143,12 +146,12 @@ pub struct ServoConfig {
     /// Applied after Sighurt's baseline preferences and before [`Self::preferences`].
     pub experimental_features: bool,
     /// Servo preference overrides, applied last, so one feature can be turned on or off on
-    /// its own. Names are Servo 0.5 `Preferences` fields. The core rejects an unknown name
+    /// its own. Names are Servo 0.7 `Preferences` fields. The core rejects an unknown name
     /// or a value of the wrong type before this is built.
     pub preferences: Vec<(String, ServoPreference)>,
 }
 
-/// A Servo preference value. The variants match Servo 0.5's field types.
+/// A Servo preference value. The variants match Servo 0.7's field types.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServoPreference {
     /// A `bool` preference.
@@ -282,12 +285,18 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// Views closed while something still held their context: kept, with their target, until
     /// it is released.
     closing: Vec<View<T>>,
-    /// Servo's keyboard focus is one WebView at a time; `blur` blurs whichever has it.
+    /// The view whose WebView this runtime last gave system focus. Servo 0.7's focus is
+    /// per WebView and does not clear the others; a new WebView starts focused.
     servo_focus: Option<ViewId>,
     events: Events,
-    /// Notes of WebViews whose last history change may be a traversal whose completion hasn't
-    /// arrived, held in order for the next absorb, with whether each was counted already.
-    held: Vec<(WebViewId, Note, bool)>,
+    /// Notes of WebViews held for the next absorb, in order. The flags are whether a `Started`
+    /// or `HeadParsed` was already counted with the history change it belongs to, and whether a
+    /// history change has already waited one batch for that evidence.
+    held: Vec<(WebViewId, Note, bool, bool)>,
+    /// How long a history change with a browser load waiting, and no `Started` yet, is held
+    /// back. Servo 0.7 often delivers `HeadParsed` a few spins later; an immediate re-spin
+    /// (this batch also queued a title or a frame) would otherwise commit too soon.
+    history_hold: HashMap<WebViewId, Instant>,
     readbacks: Readbacks,
     gl: Option<GlInfo>,
     /// Set from the first offscreen context. Stays `None` on the Wayland path.
@@ -299,10 +308,14 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// Held from before Servo is built until it has shut down.
     profile_lock: Option<File>,
     failed: Option<String>,
-    /// A page's script thread panicked. Servo 0.5 then never finishes shutting down: its
-    /// constellation waits for the dead thread's pipelines to exit (`Constellation::run`).
+    /// A page's script thread panicked. On Servo 0.5 the constellation then never finished
+    /// shutting down (it waited for the dead thread's pipelines). Shutdown still leaks Servo
+    /// rather than hang; see `SERVO-0.7.md`.
     page_crashed: bool,
     leaked: bool,
+    /// User styles for every WebView. Holds a `Servo` clone, so it is dropped before
+    /// [`Self::servo`] in [`Self::shutdown`].
+    user_content: Option<Rc<UserContentManager>>,
 }
 
 impl<T: ServoTarget> ServoRuntime<T> {
@@ -333,6 +346,15 @@ impl<T: ServoTarget> ServoRuntime<T> {
             .build();
         let delegate = Rc::new(Delegate::default());
         servo.set_delegate(Rc::clone(&delegate) as _);
+        // Installed before the first WebView, so each script thread copies it. Servo has no
+        // top layer: without this, `<dialog>.showModal()` stays in normal flow and a later
+        // sibling with a z-index covers it. User origin plus `!important` beats author styles.
+        // An unknown `::backdrop` selector is a dropped rule, not a failed sheet.
+        let user_content = Rc::new(UserContentManager::new(&servo));
+        user_content.add_stylesheet(Rc::new(servo::user_contents::UserStyleSheet::new(
+            DIALOG_USER_CSS.to_owned(),
+            Url::parse("sighurt://user/dialog.css").expect("dialog user stylesheet url"),
+        )));
         Self {
             servo: Some(servo),
             delegate,
@@ -343,6 +365,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             servo_focus: None,
             events: Events::default(),
             held: Vec::new(),
+            history_hold: HashMap::new(),
             readbacks,
             gl: None,
             offscreen_adapter: None,
@@ -354,6 +377,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             failed: None,
             page_crashed: false,
             leaked: false,
+            user_content: Some(user_content),
         }
     }
 
@@ -403,6 +427,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
     /// made fails the view.
     fn start(&mut self, id: ViewId) -> Result<(), String> {
         let servo = self.servo.clone().expect("checked by the caller");
+        let user_content = self.user_content.clone();
         let view = self.views.get_mut(&id).expect("checked by the caller");
         let had_context = view.context.is_some();
         view.ensure_context(&self.readbacks)?;
@@ -432,7 +457,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                 self.egl = Some(egl);
             }
         }
-        if let Some(webview) = view.ensure_webview(&servo, &self.delegate) {
+        if let Some(webview) = view.ensure_webview(&servo, &self.delegate, user_content) {
             self.owners.insert(webview.id(), Owner::View(id));
             if !std::mem::replace(&mut view.ready, true) {
                 push(&mut self.events, EngineEvent::ViewReady { view: id });
@@ -442,10 +467,10 @@ impl<T: ServoTarget> ServoRuntime<T> {
         Ok(())
     }
 
-    /// Loads `url` for `navigation` in a new WebView, after the page crashed. Servo 0.5 keeps
-    /// sending the crashed site's documents to the dead script thread ("crash page crashed"), so
-    /// the old WebView can't load again. The new one shares the view's context and target, and
-    /// its history starts with this navigation.
+    /// Loads `url` for `navigation` in a new WebView, after the page crashed. On Servo 0.5 the
+    /// crashed site's documents kept going to the dead script thread ("crash page crashed"), so
+    /// the old WebView is not reused (see `SERVO-0.7.md`). The new one shares the view's context
+    /// and target, and its history starts with this navigation.
     fn restart(&mut self, id: ViewId, navigation: NavigationId, url: Url) {
         let view = self.views.get_mut(&id).expect("checked by the caller");
         let old = view.webview.take();
@@ -485,9 +510,11 @@ impl<T: ServoTarget> ServoRuntime<T> {
         self.close_view(id);
     }
 
-    /// Gives or takes Servo's keyboard focus for `id`: the view has it while it has the
-    /// browser's focus, is shown and the window is active. Servo's `blur` blurs whichever
-    /// WebView has focus, so only the view that has it blurs.
+    /// Gives or takes Servo's system focus for `id`: the view has it while it has the
+    /// browser's focus, is shown and the window is active. Servo 0.7's `set_focused` is per
+    /// WebView and does not clear the others. A new WebView starts focused, in the embedder
+    /// and in the constellation, so one that should not have focus is unfocused even when this
+    /// runtime never focused it. `set_focused` sends nothing when the flag is already right.
     fn apply_focus(&mut self, id: ViewId) {
         let Some(view) = self.views.get_mut(&id) else {
             return;
@@ -497,14 +524,16 @@ impl<T: ServoTarget> ServoRuntime<T> {
         };
         let wanted = view.focused && view.visible && view.active;
         if wanted && self.servo_focus != Some(id) {
-            webview.focus();
+            webview.set_focused(true);
             self.servo_focus = Some(id);
-        } else if !wanted && self.servo_focus == Some(id) {
-            let releases = view.keys.release_all();
-            view.send(releases);
-            view.composition.reset();
-            webview.blur();
-            self.servo_focus = None;
+        } else if !wanted {
+            if self.servo_focus == Some(id) {
+                let releases = view.keys.release_all();
+                view.send(releases);
+                view.composition.reset();
+                self.servo_focus = None;
+            }
+            webview.set_focused(false);
         }
     }
 
@@ -548,10 +577,16 @@ impl<T: ServoTarget> ServoRuntime<T> {
             );
             self.failed = Some(message);
         }
-        // Each note, and whether it is a `Started` already counted with the history change it
-        // belongs to: the two arrive on different channels, so within one batch the history
-        // change may come first. Notes held back last time come first.
-        let fresh = self.delegate.take().into_iter().map(|(w, n)| (w, n, false));
+        // Each note, and whether it is a `Started` or `HeadParsed` already counted with the
+        // history change it belongs to: the two arrive on different channels, so within one
+        // batch the history change may come first, and on 0.7 it often comes in the batch
+        // before. Notes held back last time come first. `waited` is a history change that
+        // already waited one batch for evidence of its document.
+        let fresh = self
+            .delegate
+            .take()
+            .into_iter()
+            .map(|(w, n)| (w, n, false, false));
         let mut notes: Vec<_> = std::mem::take(&mut self.held)
             .into_iter()
             .chain(fresh)
@@ -559,11 +594,11 @@ impl<T: ServoTarget> ServoRuntime<T> {
             .collect();
         let mut holding = Vec::new();
         for index in 0..notes.len() {
-            let Some((webview, note, counted)) = notes[index].take() else {
+            let Some((webview, note, counted, waited)) = notes[index].take() else {
                 continue;
             };
             if holding.contains(&webview) {
-                self.held.push((webview, note, counted));
+                self.held.push((webview, note, counted, waited));
                 continue;
             }
             match self.owners.get(&webview).copied() {
@@ -578,17 +613,86 @@ impl<T: ServoTarget> ServoRuntime<T> {
                                 // Its completion comes with Servo's next batch: this note and
                                 // the WebView's later ones wait for it, in order.
                                 holding.push(webview);
-                                self.held.push((webview, note, counted));
+                                self.held.push((webview, note, counted, waited));
                                 continue;
                             }
                         }
-                        let later = notes[index + 1..].iter_mut().flatten().find(|(id, n, c)| {
-                            *id == webview && !*c && matches!(n, Note::Load(LoadStatus::Started))
-                        });
-                        if let Some((.., counted)) = later {
+                        let later =
+                            notes[index + 1..]
+                                .iter_mut()
+                                .flatten()
+                                .find(|(id, n, c, _)| {
+                                    *id == webview
+                                        && !*c
+                                        && matches!(n, Note::Load(LoadStatus::Started))
+                                });
+                        if let Some((_, _, counted, _)) = later {
                             *counted = true;
                             started_later = true;
                         }
+                        // Servo 0.7 drops `Started` while the WebView is still `Started`. The
+                        // new document's `HeadParsed` then arrives with this change, or in the
+                        // next batch. A head that is followed by another history change belongs
+                        // to that one.
+                        if !started_later
+                            && traversal.is_none()
+                            && self
+                                .views
+                                .get(&view)
+                                .is_some_and(|v| v.navigator.pending_load_needs_evidence())
+                        {
+                            let mut head = None;
+                            let mut history_after = false;
+                            for (offset, slot) in notes[index + 1..].iter().enumerate() {
+                                let Some((id, n, counted, _)) = slot else {
+                                    continue;
+                                };
+                                if *id != webview {
+                                    continue;
+                                }
+                                if matches!(n, Note::History(..)) {
+                                    if head.is_some() {
+                                        history_after = true;
+                                    }
+                                    break;
+                                }
+                                if head.is_none()
+                                    && !*counted
+                                    && matches!(n, Note::Load(LoadStatus::HeadParsed))
+                                {
+                                    head = Some(offset);
+                                }
+                            }
+                            if let Some(offset) = head.filter(|_| !history_after) {
+                                if let Some((_, _, counted, _)) = notes[index + 1 + offset].as_mut()
+                                {
+                                    *counted = true;
+                                    started_later = true;
+                                }
+                            }
+                        }
+                        if !started_later
+                            && traversal.is_none()
+                            && self
+                                .views
+                                .get(&view)
+                                .is_some_and(|v| v.navigator.pending_load_needs_evidence())
+                        {
+                            // An immediate re-spin still has no `HeadParsed`. Keep the change
+                            // until it arrives, or until this window passes (a same-document
+                            // commit while a load is pending).
+                            let now = Instant::now();
+                            let until = *self
+                                .history_hold
+                                .entry(webview)
+                                .or_insert(now + Duration::from_millis(100));
+                            if now < until {
+                                holding.push(webview);
+                                self.held.push((webview, note, counted, true));
+                                continue;
+                            }
+                        }
+                        self.history_hold.remove(&webview);
                     }
                     self.view_note(view, note, started_later || counted, traversal);
                 }
@@ -607,16 +711,16 @@ impl<T: ServoTarget> ServoRuntime<T> {
         &self,
         view: ViewId,
         webview: WebViewId,
-        rest: &[Option<(WebViewId, Note, bool)>],
+        rest: &[Option<(WebViewId, Note, bool, bool)>],
     ) -> Traversal {
         let Some(view) = self.views.get(&view).filter(|v| !v.traversals.is_empty()) else {
             return Traversal::No;
         };
-        let next = rest.iter().flatten().find(|(id, note, _)| {
+        let next = rest.iter().flatten().find(|(id, note, _, _)| {
             *id == webview && matches!(note, Note::History(..) | Note::TraversalComplete(_))
         });
         match next {
-            Some((_, Note::TraversalComplete(done), _)) => view
+            Some((_, Note::TraversalComplete(done), _, _)) => view
                 .traversals
                 .iter()
                 .find(|(t, _)| t == done)
@@ -636,6 +740,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
         counted: bool,
         traversal: Option<NavigationId>,
     ) {
+        let user_content = self.user_content.clone();
         let Some(view) = self.views.get_mut(&id) else {
             return;
         };
@@ -654,6 +759,9 @@ impl<T: ServoTarget> ServoRuntime<T> {
             Note::Load(status) => {
                 let started = status == LoadStatus::Started;
                 view.navigator.load_status(started, counted);
+                if status == LoadStatus::HeadParsed {
+                    view.navigator.head_parsed(counted);
+                }
                 if let (true, Some(load)) = (started, &mut view.load) {
                     // Its document is on its way: the commit follows.
                     load.since = Instant::now();
@@ -806,13 +914,18 @@ impl<T: ServoTarget> ServoRuntime<T> {
                     return;
                 }
                 let context: Rc<dyn RenderingContext> = context;
-                let popup = request
+                let mut builder = request
                     .builder(context)
                     .delegate(Rc::clone(&self.delegate) as _)
-                    .clipboard_delegate(Rc::clone(&self.delegate) as _)
-                    .build();
-                // It shares the page's rendering context and must never paint over it.
+                    .clipboard_delegate(Rc::clone(&self.delegate) as _);
+                if let Some(manager) = user_content {
+                    builder = builder.user_content_manager(manager);
+                }
+                let popup = builder.build();
+                // It shares the page's rendering context and must never paint over it. A new
+                // WebView also starts with system focus; this one is not the focused view.
                 popup.hide();
+                popup.set_focused(false);
                 self.owners.insert(popup.id(), Owner::Popup(id, document));
                 view.popups.push(popup);
             }
@@ -1183,8 +1296,9 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                 if let Some((old, _)) = view.queued.take() {
                     push(&mut self.events, cancelled(id, old));
                 }
-                // Servo 0.5 can't cancel a top-level load awaiting its response; one that has
-                // shown no sign of life for `LOAD_WAIT` is given up.
+                // Servo 0.7 still can't cancel a top-level load awaiting its response (there is
+                // no public stop, and `load_url` still drops a load while one is in flight).
+                // One that has shown no sign of life for `LOAD_WAIT` is given up.
                 if view.load.is_some_and(|load| !load.alive(now)) {
                     if let Some(given_up) = view.give_up_load() {
                         push(&mut self.events, cancelled(id, given_up));
@@ -1410,6 +1524,12 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
     }
 
     fn shutdown(&mut self) {
+        if self.servo.is_some() {
+            // The manager holds a Servo clone. Drop it while this runtime still holds one,
+            // so it is never the last clone: the crash path below forgets that clone rather
+            // than wait for a constellation that will not exit.
+            self.user_content.take();
+        }
         let Some(servo) = self.servo.take() else {
             return;
         };
@@ -1436,9 +1556,9 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
             self.leaked = true;
             return;
         }
-        // Servo 0.5 shuts down only in `Drop`: it tells the constellation to exit and spins
-        // until the constellation, WebGL and paint threads are done, releasing its clones of
-        // the rendering contexts. It writes the profile on the way, under the lock.
+        // Servo shuts down only in `Drop`: it tells the constellation to exit and spins until
+        // the constellation, WebGL and paint threads are done, releasing its clones of the
+        // rendering contexts. It writes the profile on the way, under the lock.
         drop(servo);
         let mut contexts_leaked = false;
         let mut leases = Vec::new();
@@ -1490,12 +1610,21 @@ fn resolve(pending: Pending, result: ServiceResult) {
     }
 }
 
+/// Servo has no top layer. This user stylesheet makes `<dialog>.showModal()` cover the page.
+/// `::backdrop` is included only as a dimming substitute; CSS error recovery drops it if the
+/// selector is unknown.
+const DIALOG_USER_CSS: &str = "\
+dialog:modal { position: fixed; z-index: 2147483647 !important; }
+dialog:modal::backdrop { background: rgba(0, 0, 0, 0.4) !important; }
+";
+
 /// Preferences servoshell turns on with `--enable-experimental-web-platform-features`.
 ///
-/// Servo 0.5, `ports/servoshell/prefs.rs` `EXPERIMENTAL_PREFS`, at the published crate's
-/// commit `77fccacc1f1fdce10498d50173aafaa09d02879e`. Each is a bool field Servo leaves
+/// Servo 0.7, `ports/servoshell/prefs.rs` `EXPERIMENTAL_PREFS`, at the published crate's
+/// commit `aac43a3f31a259f04a574f5ec4e959c943ad7cc7`. Each is a bool field Servo leaves
 /// false. Copy it again from that list when Servo is upgraded;
 /// `experimental_preferences_are_documented` checks the docs name every one.
+/// `layout_grid_enabled` is not in this set; the baseline below turns it on by itself.
 const EXPERIMENTAL_PREFS: &[&str] = &[
     "dom_async_clipboard_enabled",
     "dom_exec_command_enabled",
@@ -1510,13 +1639,10 @@ const EXPERIMENTAL_PREFS: &[&str] = &[
     "dom_storage_manager_api_enabled",
     "dom_webgl2_enabled",
     "dom_webgpu_enabled",
-    "layout_css_alpha_color_function_enabled",
-    "layout_css_attr_enabled",
     "layout_css_ellipse_corners_enabled",
     "layout_css_progress_function_enabled",
     "layout_columns_enabled",
     "layout_container_queries_enabled",
-    "layout_grid_enabled",
     "layout_variable_fonts_enabled",
 ];
 
@@ -1529,8 +1655,9 @@ fn preferences(config: &ServoConfig) -> Preferences {
         Some(agent) => agent.to_owned(),
         None => firefox_user_agent(&prefs.user_agent),
     };
-    // Web platform features that Servo 0.5 implements but leaves off, and that common sites use.
-    // Without grid, sites like mozilla.org and theguardian.com lose their layout.
+    // Web platform features common sites use. Several were off by default in Servo 0.5;
+    // setting them keeps that set on 0.7 even where a default has flipped. Without grid,
+    // sites like mozilla.org and theguardian.com lose their layout.
     prefs.dom_exec_command_enabled = true;
     prefs.dom_fontface_enabled = true;
     prefs.dom_indexeddb_enabled = true;
@@ -1538,14 +1665,17 @@ fn preferences(config: &ServoConfig) -> Preferences {
     prefs.dom_permissions_enabled = true;
     prefs.dom_storage_manager_api_enabled = true;
     prefs.dom_webgl2_enabled = true;
+    prefs.dom_intersection_observer_enabled = true;
     prefs.layout_columns_enabled = true;
     prefs.layout_container_queries_enabled = true;
     prefs.layout_grid_enabled = true;
     prefs.layout_variable_fonts_enabled = true;
-    // Left off unless `experimental-features` or a preference says otherwise.
-    // `IntersectionObserver` makes script spin forever and the page stay blank (reddit.com,
-    // microsoft.com), a Servo 0.5 layout bug fixed upstream in servo/servo#47693. It is in
-    // [`EXPERIMENTAL_PREFS`], so the flag turns it on. `adoptedStyleSheets` panics layout
+    // On by default. Servo 0.5 spun on reddit.com and microsoft.com (fixed in
+    // servo/servo#47693). On 0.7, bench/compat one rep each (2026-10-21, louise-pc): with it
+    // off, reddit-rust 1.74s CPU / 16 frames, microsoft 9.39s / 44, github-servo 2.42s / 7;
+    // with it on, reddit-rust 3.27s / 411, microsoft 9.52s / 53, github-servo 2.66s / 38.
+    // All six classified OK. None spun, so the baseline turns it on. A preference can turn
+    // it off. `adoptedStyleSheets` panics layout
     // (microsoft.com) and is not in that set: set `dom_adoptedstylesheet_enabled` to ask for it.
     // Web animations (`Element.animate`) and `requestIdleCallback` are not in the set either;
     // only the first has a preference (`dom_web_animations_enabled`).
@@ -1581,8 +1711,9 @@ fn pref_value(value: &ServoPreference) -> PrefValue {
 }
 
 /// Servo's user agent with its `Servo/<version>` token replaced by Firefox's `Gecko/20100101`.
-/// Servo already claims to be Firefox 140, but some sites turn away a user agent that isn't
-/// exactly Firefox's: web.whatsapp.com asks for "Firefox 115+" instead of showing its login.
+/// Servo 0.7's default claims Firefox 153 and still includes a `Servo/` token. Some sites turn
+/// away a user agent that isn't exactly Firefox's: web.whatsapp.com asks for "Firefox 115+"
+/// instead of showing its login.
 fn firefox_user_agent(servo: &str) -> String {
     let tokens = servo.split(' ').map(|token| {
         if token.starts_with("Servo/") {
@@ -1678,7 +1809,7 @@ mod tests {
     #[test]
     fn experimental_features_set_servos_experimental_preferences() {
         let off = preferences(&ServoConfig::default());
-        assert!(!off.dom_intersection_observer_enabled);
+        assert!(off.dom_intersection_observer_enabled);
         assert!(!off.dom_async_clipboard_enabled);
         assert!(!off.dom_adoptedstylesheet_enabled);
         assert!(!off.dom_web_animations_enabled);

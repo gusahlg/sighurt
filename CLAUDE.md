@@ -71,7 +71,7 @@ sighurt/
 | `sighurt-ui` | `state`, `layout`, `hit_test`, `text_edit`, `text`, `chrome`, `canvas`, `paint_cpu`, `accessibility`, `extension` (the chrome API), `standard` (the standard chrome through it) | api (it paints into memory the host lends it) |
 | `sighurt-chrome-line` | `lib` (the line chrome, through the chrome API alone) | api, ui |
 | `sighurt-keymap-modal` | `lib` (the modal keymap: modes and key sequences) | api |
-| `sighurt-engine-servo` | `runtime`, `view`, `delegate`, `presentation`, `input`, `navigation` | api, wayland; Servo 0.5 |
+| `sighurt-engine-servo` | `runtime`, `view`, `delegate`, `presentation`, `input`, `navigation` | api, wayland; Servo 0.7 |
 | `sighurt-engine-wpe` | `runtime`, `view`, `navigation`, `platform` (its `WPEDisplay` and `WPEView`), `present`, `input`, `ime`, `clipboard`, `glib_loop` (WebKit's GLib context in the owner loop), `ffi` | api, wayland; WPE WebKit 2.52 |
 | `sighurt-engine-wasm` | `adapter` (`WasmRuntime`), `view`, `navigation`, `engine` (Wasmtime, limits), `live` and `pool` (guest threads), `capabilities` (host functions), `draw` and `raster` (CPU drawing), `wayland` (its `CpuTarget` for the host's SHM lease), and a module per guest subsystem | api, wayland |
 | `sighurt-engine-demo` | `lib` (the runtime and its pages: static pattern, animation, slow frame, resize, failed navigation, crash), `paint` | api, wayland |
@@ -183,7 +183,7 @@ SIG_WHAT="servo build" tools/cargo test -p sighurt-browser -p sighurt-runtime -p
 - Positions arrive surface-local to the view's target. Convert them once with the view's `Metrics` (`to_buffer`); never subtract the chrome's offset or apply the scale a second time. Buffer sizes come from `Scale::buffer_size`.
 - `FrameReady` means "has something new to paint", not "displayed". Keep invalidation, frame callbacks and buffer release distinct. No unconditional ticks, no page-sized CPU copies on the normal path.
 - Adding an engine: a crate `sighurt-engine-<name>` depending on api and wayland, exporting its `CAPABILITIES` (as the demo, Servo and WPE engines do); a feature `engine-<name>` on `sighurt-browser`, `sighurt-runtime` and `sighurt-gui`; its descriptor in `sighurt-runtime`'s `engines` (name, capabilities, the `[engines.<name>]` settings it honors); and how each frontend starts it (`sighurt-gui`'s `engines`).
-- **Servo** is pinned at 0.5 with surfman 0.13. Read the 0.5 sources in `~/.cargo/registry/src/`, not the current (0.6) documentation. One runtime per process; its API calls and GL presentation stay on the owner thread. The adapter never calls `process::exit` or `_exit` and never installs panic hooks, logging or a TLS provider: the executable owns process-wide setup. The crate is `AGPL-3.0-or-later AND MPL-2.0`; files adapted from Servo keep their MPL notices.
+- **Servo** is pinned at 0.7 with surfman 0.14 (`webgl` enabled; multiprocess compiled but off). Read the 0.7 sources in `~/.cargo/registry/src/`, not a newer upstream. One runtime per process; its API calls and GL presentation stay on the owner thread. The adapter never calls `process::exit` or `_exit` and never installs panic hooks, logging or a TLS provider: the executable owns process-wide setup. The crate is `AGPL-3.0-or-later AND MPL-2.0`; files adapted from Servo keep their MPL notices. What 0.7 changed for the adapter is in `engines/sighurt-engine-servo/SERVO-0.7.md`.
 - **WPE WebKit** is 2.52.6, built from source into a prefix (`nix/build-wpewebkit.sh`; the build script finds it through `SIGHURT_WPE_PKG_CONFIG_PATH`, never `PKG_CONFIG_PATH`, which would rebuild Servo). One runtime per process, on the owner thread; its GLib context runs inside the owner loop. JavaScriptCore stays off signals in `sig`'s process (decision 66), and `sig` sets `JSC_SIGNAL_FOR_GC=12` at the start of `main`, since its default is SIGUSR1, `sig`'s diagnostics signal (decision 78). `sig` is linked with `-Wl,--exclude-libs,ALL` so WebKit can't bind to the C libraries linked into it (decision 65). WebKit's library is not linked: the engine opens it (`ffi::load`) when its runtime first starts, so a session without WPE pages maps none of it (decision 84); call `ffi` only after that.
 
 ## Security
@@ -344,8 +344,8 @@ The engine has no widget kit: guests draw their own UI with the canvas API and p
 
 ## Common pitfalls
 
-- **`Cargo.lock` was seeded from Servo's lockfile** so Servo keeps the dependency versions already compiled. Don't run a broad `cargo update`: changing any of Servo's dependencies means rebuilding all of Servo.
-- **Servo 0.5, not 0.6.** Upstream documentation describes 0.6. Check every API against the pinned sources.
+- **`Cargo.lock` was reseeded from Servo 0.7.0's published lockfile** so Servo keeps the dependency versions that release was tested with. Don't run a broad `cargo update`: changing any of Servo's dependencies means rebuilding all of Servo.
+- **Servo 0.7, surfman 0.14.** Check every API against the pinned 0.7 sources, not a newer upstream.
 - **Scale is a rational.** Keep `Scale` (numerator over 120) and derive buffer sizes and input transforms from the actual rounded dimensions, not from a float factor.
 - **Empty is not hidden.** A zero-sized rectangle means the layout has no room: the host unmaps the surface and the engine keeps its last size, allocates nothing and presents nothing (Servo can't make a 0×0 context). Hiding a view (a background tab) is `SetVisibility(false)` with its metrics unchanged. Never wait for a frame callback on an unmapped or hidden surface.
 - **`HostState.memory` is set before instantiation**, so `caller.data().memory` is always there inside a host function. The helpers `expect` it.

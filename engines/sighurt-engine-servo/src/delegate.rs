@@ -17,7 +17,7 @@
 //! colour, `alert` is acknowledged, `confirm` and `prompt` are cancelled, context menus are
 //! dismissed; Servo's own defaults send no HTTP credentials and refuse protocol handlers,
 //! Bluetooth and devtools.
-//! Console messages are page data and go nowhere.
+//! Console messages are page data: logged at `sighurt::console`, cut and escaped, never trusted.
 //!
 //! Must not own: policy decisions, or process lifetime: backend loss is recorded for the
 //! runtime to report, never an exit.
@@ -29,9 +29,9 @@ use std::mem::Discriminant;
 use std::time::Instant;
 
 use servo::{
-    ClipboardDelegate, CreateNewWebViewRequest, Cursor, EmbedderControl, EmbedderControlId,
-    LoadStatus, NavigationRequest, PermissionRequest, ServoDelegate, ServoError, StringRequest,
-    TraversalId, WebView, WebViewDelegate, WebViewId,
+    ClipboardDelegate, ConsoleLogLevel, CreateNewWebViewRequest, Cursor, EmbedderControl,
+    EmbedderControlId, LoadStatus, NavigationRequest, PermissionRequest, ServoDelegate, ServoError,
+    StringRequest, TraversalId, WebView, WebViewDelegate, WebViewId,
 };
 use url::Url;
 
@@ -122,6 +122,10 @@ impl ServoDelegate for Delegate {
             other => log::warn!("servo: {other:?}"),
         }
     }
+
+    fn show_console_message(&self, level: ConsoleLogLevel, message: String) {
+        log_console(level, &message);
+    }
 }
 
 impl WebViewDelegate for Delegate {
@@ -193,6 +197,50 @@ impl WebViewDelegate for Delegate {
     fn hide_embedder_control(&self, webview: WebView, control: EmbedderControlId) {
         self.note(&webview, Note::HideControl(control));
     }
+
+    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+        log_console(level, &message);
+    }
+}
+
+/// Page console text is untrusted. Errors are `warn`; every other level is `debug`.
+/// The message is cut to 1 KiB on a char boundary, then control characters are escaped,
+/// so the log line can be longer than the cut.
+fn log_console(level: ConsoleLogLevel, message: &str) {
+    let (level, text) = console_line(level, message);
+    log::log!(target: "sighurt::console", level, "{text}");
+}
+
+pub(crate) fn console_line(level: ConsoleLogLevel, message: &str) -> (log::Level, String) {
+    let level = match level {
+        ConsoleLogLevel::Error => log::Level::Warn,
+        _ => log::Level::Debug,
+    };
+    (level, sanitize_console(message))
+}
+
+fn sanitize_console(message: &str) -> String {
+    let cut = truncate_utf8(message, 1024);
+    let mut out = String::new();
+    for ch in cut.chars() {
+        if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn truncate_utf8(message: &str, max: usize) -> &str {
+    if message.len() <= max {
+        return message;
+    }
+    let mut end = max;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
 }
 
 impl ClipboardDelegate for Delegate {
@@ -370,5 +418,36 @@ mod tests {
         assert_eq!((queue.len(), queue.pop()), (0, None));
         queue.push(Some(()), 2);
         assert_eq!(queue.pop(), Some(2));
+    }
+
+    #[test]
+    fn console_messages_are_cut_and_controls_escaped() {
+        let (level, text) = console_line(ConsoleLogLevel::Error, "boom\nline\t");
+        assert_eq!(level, log::Level::Warn);
+        assert_eq!(text, "boom\\nline\\t");
+        assert!(!text.chars().any(char::is_control));
+
+        let (level, text) = console_line(ConsoleLogLevel::Warn, "ok\u{0001}");
+        assert_eq!(level, log::Level::Debug);
+        assert_eq!(text, "ok\\u{1}");
+        for level in [
+            ConsoleLogLevel::Log,
+            ConsoleLogLevel::Debug,
+            ConsoleLogLevel::Info,
+            ConsoleLogLevel::Trace,
+            ConsoleLogLevel::Dir,
+        ] {
+            assert_eq!(console_line(level, "x").0, log::Level::Debug);
+        }
+
+        let long = "é".repeat(600);
+        let (_, text) = console_line(ConsoleLogLevel::Log, &long);
+        assert_eq!(text.len(), 1024);
+        assert_eq!(text.chars().count(), 512);
+
+        let mut mixed = "a".repeat(1023);
+        mixed.push('é');
+        let (_, text) = console_line(ConsoleLogLevel::Info, &mixed);
+        assert_eq!(text, "a".repeat(1023));
     }
 }

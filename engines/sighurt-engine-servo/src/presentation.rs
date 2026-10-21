@@ -65,8 +65,10 @@ pub(crate) struct Readbacks {
 
 /// Which surfaceless adapter an offscreen view asked for.
 ///
-/// `Hardware` is surfman's hardware adapter (`DRI_PRIME=1` while the context was created).
-/// `Software` is used only after that adapter failed to produce a context. The GL renderer can
+/// `Hardware` is surfman's hardware adapter, tried first. Context creation does not set
+/// `DRI_PRIME` or `LIBGL_ALWAYS_SOFTWARE` (`third_party/surfman/SIGHURT-PATCH.md`); Mesa uses
+/// the device the process was started with. `Software` is used only after the hardware adapter
+/// failed to produce a context, and cannot force llvmpipe on its own. The GL renderer can
 /// still be llvmpipe when the hardware adapter was asked for; [`GlInfo::software`] says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OffscreenAdapter {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate crates/sighurt-core/src/servo_prefs.rs from Servo 0.5's prefs.rs.
+"""Regenerate crates/sighurt-core/src/servo_prefs.rs from Servo 0.7's prefs.rs.
 
 The `ServoPreferences` derive names each preference by its field. When Servo
 is upgraded, point this at the new servo-config crate's prefs.rs and run it
@@ -9,12 +9,15 @@ from the repo root, then update the pinned field count in
     python3 crates/sighurt-core/tests/gen_servo_prefs.py
 """
 
+import os
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 OUT = ROOT / "crates/sighurt-core/src/servo_prefs.rs"
+# Published servo-config 0.7.0, commit aac43a3f31a259f04a574f5ec4e959c943ad7cc7.
+COMMIT = "aac43a3f31a259f04a574f5ec4e959c943ad7cc7"
 KINDS = {
     "bool": "Bool",
     "i64": "Int",
@@ -25,9 +28,15 @@ KINDS = {
 
 
 def prefs_source():
-    roots = list(Path.home().glob(".cargo/registry/src/*/servo-config-0.5.0/prefs.rs"))
+    override = os.environ.get("SERVO_PREFS_RS")
+    if override:
+        path = Path(override)
+        if not path.is_file():
+            sys.exit(f"SERVO_PREFS_RS is not a file: {path}")
+        return path
+    roots = list(Path.home().glob(".cargo/registry/src/*/servo-config-0.7.0/prefs.rs"))
     if len(roots) != 1:
-        sys.exit(f"expected one servo-config 0.5.0 prefs.rs, found {roots}")
+        sys.exit(f"expected one servo-config 0.7.0 prefs.rs, found {roots}")
     return roots[0]
 
 
@@ -54,10 +63,10 @@ def main():
     source = prefs_source()
     parsed = fields(source.read_text())
     lines = [
-        "//! Servo 0.5 preference names and the value each takes.",
+        "//! Servo 0.7 preference names and the value each takes.",
         "//!",
-        "//! Generated from `servo-config` 0.5.0 `prefs.rs` (the published crate's commit",
-        "//! `77fccacc1f1fdce10498d50173aafaa09d02879e`; the `ServoPreferences` derive names",
+        "//! Generated from `servo-config` 0.7.0 `prefs.rs` (the published crate's commit",
+        f"//! `{COMMIT}`; the `ServoPreferences` derive names",
         "//! each preference by its field). Do not edit by hand. Regenerate when Servo is",
         "//! upgraded:",
         "//!",
@@ -69,7 +78,7 @@ def main():
         "//!",
         f"//! Source this run read: `{source}`.",
         "",
-        "/// The kind of value a Servo 0.5 preference takes.",
+        "/// The kind of value a Servo 0.7 preference takes.",
         "#[derive(Clone, Copy, Debug, PartialEq, Eq)]",
         "pub(super) enum ServoPrefKind {",
         "    /// `bool`.",
@@ -84,7 +93,7 @@ def main():
         "    Rgba,",
         "}",
         "",
-        "/// How many fields `Preferences` has in Servo 0.5.",
+        "/// How many fields `Preferences` has in Servo 0.7.",
         f"pub(super) const PREFERENCE_COUNT: usize = {len(parsed)};",
         "",
         "/// Preference names, in the order of the fields in `prefs.rs`.",
@@ -111,7 +120,7 @@ def main():
         "    assert!(PREFERENCE_KINDS.len() == PREFERENCE_COUNT);",
         "};",
         "",
-        "/// The kind of preference `name`, or `None` when Servo 0.5 has no such field.",
+        "/// The kind of preference `name`, or `None` when Servo 0.7 has no such field.",
         "pub(super) fn kind_of(name: &str) -> Option<ServoPrefKind> {",
         "    let index = PREFERENCE_NAMES.iter().position(|known| *known == name)?;",
         "    Some(PREFERENCE_KINDS[index])",

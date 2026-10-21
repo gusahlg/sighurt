@@ -404,6 +404,35 @@ fn offscreen_view_presents_argb_frames_without_a_display() {
     present_until_page(&mut runtime, &mut seen, view, new_epoch, new_size, &frames);
     print_timing("after resize", &runtime);
 
+    // An unpresented FrameReady plus another SetMetrics must emit again. A frontend that
+    // paces frames drops readiness on SetMetrics; if frame_requested stayed true, later
+    // pumps would suppress FrameReady and the frontend would never issue a permit.
+    let mid = metrics(480, 220);
+    runtime
+        .command(view, EngineCommand::SetMetrics(mid))
+        .unwrap_or_else(|error| panic!("set metrics 480: {error:?}"));
+    seen.frame_ready = false;
+    pump_until(&mut runtime, &mut seen, LOAD_WAIT, |seen| seen.frame_ready)
+        .unwrap_or_else(|error| panic!("unpresented resize did not rearm: {error}"));
+    let again = metrics(360, 200);
+    let again_epoch = again.epoch();
+    let again_size = again.buffer();
+    runtime
+        .command(view, EngineCommand::SetMetrics(again))
+        .unwrap_or_else(|error| panic!("set metrics 360: {error:?}"));
+    seen.frame_ready = false;
+    pump_until(&mut runtime, &mut seen, LOAD_WAIT, |seen| seen.frame_ready)
+        .unwrap_or_else(|error| panic!("second unpresented resize did not rearm: {error}"));
+    present_until_page(
+        &mut runtime,
+        &mut seen,
+        view,
+        again_epoch,
+        again_size,
+        &frames,
+    );
+    print_timing("after unpresented resizes", &runtime);
+
     let diagnostics = runtime.diagnostics();
     let stored = frames.lock().expect("frames").len() as u64;
     assert_eq!(diagnostics.read_to_image, diagnostics.frames);

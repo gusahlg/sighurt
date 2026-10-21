@@ -1,7 +1,7 @@
-//! Servo 0.5 preference names and the value each takes.
+//! Servo 0.7 preference names and the value each takes.
 //!
-//! Generated from `servo-config` 0.5.0 `prefs.rs` (the published crate's commit
-//! `77fccacc1f1fdce10498d50173aafaa09d02879e`; the `ServoPreferences` derive names
+//! Generated from `servo-config` 0.7.0 `prefs.rs` (the published crate's commit
+//! `aac43a3f31a259f04a574f5ec4e959c943ad7cc7`; the `ServoPreferences` derive names
 //! each preference by its field). Do not edit by hand. Regenerate when Servo is
 //! upgraded:
 //!
@@ -11,9 +11,9 @@
 //!
 //! `config.rs` includes this file with `#[path = "servo_prefs.rs"]`.
 //!
-//! Source this run read: `/home/gusahlg/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/servo-config-0.5.0/prefs.rs`.
+//! Source this run read: `/home/gusahlg/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/servo-config-0.7.0/prefs.rs`.
 
-/// The kind of value a Servo 0.5 preference takes.
+/// The kind of value a Servo 0.7 preference takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ServoPrefKind {
     /// `bool`.
@@ -28,8 +28,8 @@ pub(super) enum ServoPrefKind {
     Rgba,
 }
 
-/// How many fields `Preferences` has in Servo 0.5.
-pub(super) const PREFERENCE_COUNT: usize = 171;
+/// How many fields `Preferences` has in Servo 0.7.
+pub(super) const PREFERENCE_COUNT: usize = 172;
 
 /// Preference names, in the order of the fields in `prefs.rs`.
 pub(super) const PREFERENCE_NAMES: &[&str] = &[
@@ -45,7 +45,6 @@ pub(super) const PREFERENCE_NAMES: &[&str] = &[
     "devtools_server_listen_address",
     "dom_webgpu_enabled",
     "dom_webgpu_wgpu_backend",
-    "dom_abort_controller_enabled",
     "dom_adoptedstylesheet_enabled",
     "dom_allow_preloading_module_descendants",
     "dom_async_clipboard_enabled",
@@ -56,7 +55,6 @@ pub(super) const PREFERENCE_NAMES: &[&str] = &[
     "dom_canvas_text_enabled",
     "dom_canvas_backend",
     "dom_canvas_msg_buffer_size",
-    "dom_clipboardevent_enabled",
     "dom_composition_event_enabled",
     "dom_cookiestore_enabled",
     "dom_credential_management_enabled",
@@ -73,8 +71,6 @@ pub(super) const PREFERENCE_NAMES: &[&str] = &[
     "dom_indexeddb_enabled",
     "dom_intersection_observer_enabled",
     "dom_microdata_testing_enabled",
-    "dom_uievent_which_enabled",
-    "dom_mutation_observer_enabled",
     "dom_navigator_protocol_handlers_enabled",
     "dom_notification_enabled",
     "dom_offscreen_canvas_enabled",
@@ -151,7 +147,9 @@ pub(super) const PREFERENCE_NAMES: &[&str] = &[
     "js_mem_gc_incremental_enabled",
     "js_mem_gc_incremental_slice_ms",
     "js_mem_gc_low_frequency_heap_growth",
+    "js_mem_gc_malloc_threshold_base_mb",
     "js_mem_gc_per_zone_enabled",
+    "js_mem_gc_urgent_threshold_mb",
     "js_mem_gc_zeal_frequency",
     "js_mem_gc_zeal_level",
     "js_mem_max",
@@ -164,10 +162,9 @@ pub(super) const PREFERENCE_NAMES: &[&str] = &[
     "largest_contentful_paint_enabled",
     "layout_animations_test_enabled",
     "layout_columns_enabled",
+    "layout_flexbox_balance",
     "layout_grid_enabled",
     "layout_container_queries_enabled",
-    "layout_css_alpha_color_function_enabled",
-    "layout_css_attr_enabled",
     "layout_css_ellipse_corners_enabled",
     "layout_css_progress_function_enabled",
     "layout_style_sharing_cache_enabled",
@@ -184,6 +181,8 @@ pub(super) const PREFERENCE_NAMES: &[&str] = &[
     "network_enforce_tls_localhost",
     "network_enforce_tls_onion",
     "network_http_cache_disabled",
+    "network_http_disk_cache",
+    "network_http_disk_cache_size",
     "network_http_proxy_uri",
     "network_https_proxy_uri",
     "network_http_no_proxy",
@@ -191,12 +190,14 @@ pub(super) const PREFERENCE_NAMES: &[&str] = &[
     "network_local_directory_listing_enabled",
     "network_use_webpki_roots",
     "network_max_content_length",
+    "perf_thread_boost_enabled",
     "session_history_max_length",
     "shell_background_color_rgba",
     "webgl_testing_context_creation_error",
     "thread_pool_workers_max",
     "thread_pool_fallback_workers",
     "thread_pool_async_runtime_workers_max",
+    "thread_pool_canvas_workers",
     "thread_pool_webrender_workers_max",
     "user_agent",
     "viewport_meta_enabled",
@@ -228,18 +229,14 @@ pub(super) const PREFERENCE_KINDS: &[ServoPrefKind] = &[
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
-    ServoPrefKind::Bool,
     ServoPrefKind::String,
     ServoPrefKind::Uint,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
-    ServoPrefKind::Bool,
     ServoPrefKind::Int,
     ServoPrefKind::Int,
-    ServoPrefKind::Bool,
-    ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
@@ -326,14 +323,15 @@ pub(super) const PREFERENCE_KINDS: &[ServoPrefKind] = &[
     ServoPrefKind::Bool,
     ServoPrefKind::Int,
     ServoPrefKind::Int,
+    ServoPrefKind::Int,
     ServoPrefKind::Bool,
     ServoPrefKind::Int,
     ServoPrefKind::Int,
     ServoPrefKind::Int,
+    ServoPrefKind::Int,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Int,
-    ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
@@ -360,15 +358,19 @@ pub(super) const PREFERENCE_KINDS: &[ServoPrefKind] = &[
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::String,
+    ServoPrefKind::Uint,
+    ServoPrefKind::String,
     ServoPrefKind::String,
     ServoPrefKind::String,
     ServoPrefKind::Uint,
     ServoPrefKind::Bool,
     ServoPrefKind::Bool,
     ServoPrefKind::Uint,
+    ServoPrefKind::Bool,
     ServoPrefKind::Int,
     ServoPrefKind::Rgba,
     ServoPrefKind::Bool,
+    ServoPrefKind::Uint,
     ServoPrefKind::Uint,
     ServoPrefKind::Uint,
     ServoPrefKind::Uint,
@@ -386,7 +388,7 @@ const _: () = {
     assert!(PREFERENCE_KINDS.len() == PREFERENCE_COUNT);
 };
 
-/// The kind of preference `name`, or `None` when Servo 0.5 has no such field.
+/// The kind of preference `name`, or `None` when Servo 0.7 has no such field.
 pub(super) fn kind_of(name: &str) -> Option<ServoPrefKind> {
     let index = PREFERENCE_NAMES.iter().position(|known| *known == name)?;
     Some(PREFERENCE_KINDS[index])

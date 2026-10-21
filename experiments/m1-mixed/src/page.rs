@@ -96,7 +96,7 @@ impl Page {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let waker = EngineWaker::new(wake);
         let preferences = Preferences {
-            // Servo 0.5's parallel styling races with 3 threads (see the old sig-servo).
+            // Servo 0.5's parallel styling raced with 3 threads (see the old sig-servo). Kept.
             layout_threads: 2,
             ..Preferences::default()
         };
@@ -170,7 +170,11 @@ impl Page {
 
     /// A hidden page stops animations and slows its timers; it presents nothing meanwhile.
     pub fn set_hidden(&mut self, hidden: bool) {
-        self.webview.set_throttled(hidden);
+        if hidden {
+            self.webview.hide();
+        } else {
+            self.webview.show();
+        }
         self.called = true;
     }
 
@@ -182,7 +186,7 @@ impl Page {
         }
         self.focused = focused;
         if focused {
-            self.webview.focus();
+            self.webview.set_focused(true);
         } else {
             for (code, key) in std::mem::take(&mut self.pressed) {
                 let key = KeyboardEvent::new_without_event(
@@ -196,7 +200,7 @@ impl Page {
                 );
                 self.webview.notify_input_event(InputEvent::Keyboard(key));
             }
-            self.webview.blur();
+            self.webview.set_focused(false);
         }
         self.called = true;
     }
@@ -254,9 +258,9 @@ impl Page {
         };
         // Linux evdev codes: BTN_LEFT is 0x110.
         let button = match button {
-            0x110 => MouseButton::Left,
-            0x111 => MouseButton::Right,
-            0x112 => MouseButton::Middle,
+            0x110 => MouseButton::Primary,
+            0x111 => MouseButton::Secondary,
+            0x112 => MouseButton::Auxiliary,
             0x113 => MouseButton::Back,
             0x114 => MouseButton::Forward,
             other => MouseButton::Other(other as u16),
@@ -283,8 +287,8 @@ impl Page {
         } = self;
         drop(webview);
         log!("teardown: WebView dropped; Servo shutting down");
-        // Servo 0.5 shuts down only in `Drop`: it tells the constellation to exit and spins
-        // until the constellation, WebGL and paint threads are done.
+        // Servo shuts down only in `Drop`: it tells the constellation to exit and spins until
+        // the constellation, WebGL and paint threads are done.
         drop(servo);
         drop(delegate);
         drop(driver);
@@ -436,10 +440,6 @@ impl WebViewDelegate for Delegate {
 
     fn notify_page_title_changed(&self, _: WebView, title: Option<String>) {
         log!("page: title {title:?}");
-    }
-
-    fn notify_focus_changed(&self, _: WebView, focused: bool) {
-        log!("page: servo reports focus {focused}");
     }
 
     fn notify_load_status_changed(&self, _: WebView, status: LoadStatus) {

@@ -9,25 +9,22 @@
 //! buffer a present reads into.
 //!
 //! Adapted from `experiments/tui-servo/src/context.rs`, itself adapted from
-//! `SoftwareRenderingContext` in servo-paint-api 0.5 (`rendering_context.rs`). That type calls
+//! `SoftwareRenderingContext` in servo-paint-api (`rendering_context.rs`). That type calls
 //! `surfman::Connection::new()`. Here `servo-paint-api` enables surfman's `sm-x11` feature, so
 //! that default is the unix multi backend: Wayland, then X11, and only then Mesa surfaceless,
 //! and only when opening the connection fails. This context opens `surfman::mesa_surfaceless`
-//! directly. The hardware adapter is tried first (`HardwarePrime`, which sets `DRI_PRIME=1`
-//! for the descriptor); the software adapter (`LIBGL_ALWAYS_SOFTWARE=1`) is used only when
-//! that context cannot be made.
+//! directly. The hardware adapter is tried first. The software adapter is used only when that
+//! context cannot be made. Neither attempt writes `LIBGL_ALWAYS_SOFTWARE` or `DRI_PRIME`:
+//! surfman's `create_context_descriptor` no longer does (`third_party/surfman/SIGHURT-PATCH.md`),
+//! and Mesa uses the device this process was started with. The software adapter cannot force
+//! llvmpipe on its own.
 //!
 //! `RenderingContext::connection` returns the multi `Connection`'s `Alternate` around this
 //! surfaceless connection. `Paint::register_rendering_context` calls `create_adapter` on it
 //! and panics when it is `None`. `create_adapter` on `Alternate` does not touch the process
-//! environment. The variables change only in `create_context_descriptor`, and this context
-//! puts them back once the context exists, so a later WPE child does not inherit them.
-//! WebGL later creating a device from the stored connection would ask for a window config and
-//! reset the environment to hardware. Callers that need WebGL have to account for that; the
-//! offscreen test page does not use it.
+//! environment. WebGL later creating a device from the stored connection does not either.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::{OsStr, OsString};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -335,50 +332,13 @@ impl RenderingContext for OffscreenContext {
     }
 }
 
-/// Puts `LIBGL_ALWAYS_SOFTWARE` and `DRI_PRIME` back when dropped.
-///
-/// surfman sets them process-wide inside `create_context_descriptor`. Restoring after the
-/// context exists does not retarget that context, and a WPE child spawned later does not
-/// inherit the adapter selection. `set_var` races any other thread reading the environment,
-/// which is the race surfman already takes while it creates the descriptor.
-struct EnvRestore {
-    libgl: Option<OsString>,
-    dri_prime: Option<OsString>,
-}
-
-impl EnvRestore {
-    fn capture() -> Self {
-        Self {
-            libgl: std::env::var_os("LIBGL_ALWAYS_SOFTWARE"),
-            dri_prime: std::env::var_os("DRI_PRIME"),
-        }
-    }
-}
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        restore_var("LIBGL_ALWAYS_SOFTWARE", self.libgl.as_deref());
-        restore_var("DRI_PRIME", self.dri_prime.as_deref());
-    }
-}
-
-fn restore_var(name: &str, value: Option<&OsStr>) {
-    match value {
-        Some(value) => std::env::set_var(name, value),
-        None => std::env::remove_var(name),
-    }
-}
-
-/// One adapter attempt. The guard is dropped, and the variables restored, before this returns,
-/// including when the attempt fails, so the software attempt does not see the hardware one's
-/// `DRI_PRIME=1` (the software adapter does not clear it).
+/// One adapter attempt. Does not change the process environment (see `SIGHURT-PATCH.md`).
 fn try_adapter(
     size: BufferSize,
     adapter: OffscreenAdapter,
     driver: &Rc<FrameDriver>,
     readbacks: &Readbacks,
 ) -> Result<OffscreenContext, String> {
-    let _guard = EnvRestore::capture();
     build_context(size, adapter, driver, readbacks)
 }
 
@@ -408,8 +368,7 @@ fn build_context(
         GLApi::GLES => GLVersion { major: 3, minor: 0 },
         GLApi::GL => GLVersion { major: 3, minor: 2 },
     };
-    // `create_context_descriptor` calls `Adapter::set_environment_variables` before the driver
-    // is asked for a config. The guard around this function puts the variables back afterwards.
+    // The vendored surfman does not set `LIBGL_ALWAYS_SOFTWARE` or `DRI_PRIME` here.
     let descriptor = device
         .create_context_descriptor(&ContextAttributes {
             flags: ContextAttributeFlags::ALPHA

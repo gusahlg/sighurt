@@ -1,6 +1,6 @@
 [package]
 name = "wpe-coexist"
-description = "WPE WebKit, Servo 0.5 and Wasmtime 36 in one process, mounted as sig mounts them (docs/rewrite/WPE.md)"
+description = "WPE WebKit, Servo 0.7 and Wasmtime 36 in one process, mounted as sig mounts them (docs/rewrite/WPE.md)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

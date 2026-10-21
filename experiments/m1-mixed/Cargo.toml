@@ -20,7 +20,7 @@ cosmic-text.workspace = true
 tiny-skia.workspace = true
 raw-window-handle.workspace = true
 url.workspace = true
-# Types in Servo 0.5's `RenderingContext` trait, at the versions Servo itself uses.
+# Types in Servo 0.7's `RenderingContext` trait, at the versions Servo itself uses.
 dpi = "0.1"
 euclid = "0.22"
 gleam = "0.15"

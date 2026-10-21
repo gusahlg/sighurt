@@ -109,7 +109,7 @@ fn run() -> Result<(), String> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let woken = Arc::new(AtomicBool::new(false));
     let preferences = Preferences {
-        // Servo 0.5's parallel styling races with 3 threads (see experiments/m1-mixed).
+        // Servo 0.5's parallel styling raced with 3 threads (see experiments/m1-mixed). Kept.
         layout_threads: 2,
         ..Preferences::default()
     };
@@ -129,7 +129,7 @@ fn run() -> Result<(), String> {
         .url(args.url.clone())
         .delegate(delegate.clone())
         .build();
-    webview.focus();
+    webview.set_focused(true);
     webview.show();
 
     let loaded = Instant::now();

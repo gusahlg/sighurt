@@ -10,8 +10,8 @@
 //! contexts are not `Send`); that does not mean Servo runs script, layout and networking on
 //! one thread.
 //!
-//! Pinned at Servo 0.5 with surfman 0.13: read the 0.5 sources, not the current upstream
-//! documentation.
+//! Pinned at Servo 0.7 with surfman 0.14: read the 0.7 sources, not a newer upstream.
+//! `SERVO-0.7.md` records what that release changed for this adapter.
 //!
 //! A library, not a process: no `process::exit` or `_exit`, no shutdown watchdog, no panic
 //! hook, logging setup or TLS provider installation here. The executable owns process-wide
