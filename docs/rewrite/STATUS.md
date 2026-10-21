@@ -3365,3 +3365,17 @@ Newest last. Each entry says what was decided and why.
     `Object.prototype` pollution and inherited `toJSON` reach the output → null-prototype records
     and own-property reads; actions on disabled or read-only controls, and `submit` fallback
     bypassing validation → refused. *Why:* plan §17 (page data is untrusted) and TUI.md §8.5.
+99. **The crate organization of `docs/crate-organization.md` is adopted** (the user, 21 October
+    2026: "Apply any suggested changes mentioned there"; the document was written with GPT-6
+    Astra in a separate session). In its order: (1) the crates move into directory groups —
+    `crates/` (api, core, runtime), `frontends/` (gui, tui, wayland), `ui/` (sighurt-ui),
+    `engines/` (servo, wpe, wasm, demo, semantic), `extensions/` (line chrome, modal keymap),
+    `sdk/`, `examples/`, `experiments/` and `apps/` (sig) — keeping every Cargo package name and
+    behaviour; (2) the application supplies the engine, chrome and keymap registrations instead
+    of lists fixed in sighurt-runtime and sighurt-gui, and engine-specific configuration
+    validation and lifecycle move to the adapters (Servo's preference catalog leaves the core);
+    (3) an example configuration outside the workspace builds its own browser with the line
+    chrome, the modal keymap and a new engine name without editing the Sighurt checkout — the
+    acceptance test; (4) the gaps it exposes are fixed. Separate repositories wait until there is
+    a concrete benefit (the document's step 5). Amends 1, 68 and 96 where they put lists or
+    engine knowledge in shared crates.
