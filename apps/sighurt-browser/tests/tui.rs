@@ -770,3 +770,12 @@ fn dump_fails_with_a_message_and_a_nonzero_exit() {
     assert_eq!(status.code(), Some(1), "{err}");
     assert!(out.is_empty() && err.contains("no page text"), "{out}{err}");
 }
+
+#[test]
+fn dump_errors_never_carry_escape_sequences() {
+    let (status, out, err) = dump("hostile", &["demo://\x1b]0;pwned\x07\u{202e}nope"]);
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(out.is_empty(), "{out}");
+    let bad = |c: char| (c.is_control() && c != '\n') || c == '\u{202e}';
+    assert!(!err.chars().any(bad), "{err:?}");
+}

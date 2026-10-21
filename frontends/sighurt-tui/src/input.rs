@@ -4,6 +4,7 @@
 //! the page still belongs to, and the question of whether a key belongs to the address editor. Must not own: the
 //! terminal, the keymap, or what the editor does with the key.
 
+use sighurt_api::geometry::SurfacePoint;
 use sighurt_api::ids::ViewId;
 use sighurt_api::input::{ButtonState, KeyEvent, PointerButton};
 
@@ -76,47 +77,85 @@ pub fn cell_to_page_offset(
     ))
 }
 
-/// The pointer capture of a button pressed over a view: until that button is released, its
-/// releases and the pointer's motion belong to the view, wherever on the screen they happen.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A captured button let go of by the frontend rather than by the user.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Release {
+    /// The view that held it.
+    pub view: ViewId,
+    /// The button.
+    pub button: PointerButton,
+    /// Where the pointer last was, relative to the page.
+    pub position: SurfacePoint,
+}
+
+/// The pointer capture of buttons pressed over a view: until a button is released, its release
+/// and the pointer's motion belong to the view, wherever on the screen they happen.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PointerCapture {
-    held: Option<(ViewId, PointerButton)>,
+    held: Vec<(ViewId, PointerButton)>,
+    last: SurfacePoint,
 }
 
 impl PointerCapture {
     /// `button` went down over `view`.
     pub fn press(&mut self, view: ViewId, button: PointerButton) {
-        self.held = Some((view, button));
+        self.held.retain(|&(_, held)| held != button);
+        self.held.push((view, button));
     }
 
-    /// `view` is gone: nothing is captured on it.
+    /// The pointer is at `position`, relative to the page.
+    pub fn moved(&mut self, position: SurfacePoint) {
+        self.last = position;
+    }
+
+    /// Nothing is captured on `view` any more because it is gone.
     pub fn forget(&mut self, view: ViewId) {
-        if self.held.is_some_and(|(held, _)| held == view) {
-            self.held = None;
-        }
+        self.held.retain(|&(held, _)| held != view);
     }
 
-    /// The view and button captured, if any.
-    pub fn held(&self) -> Option<(ViewId, PointerButton)> {
-        self.held
+    /// The view captured by the oldest held button, if any.
+    pub fn held(&self) -> Option<ViewId> {
+        self.held.first().map(|&(view, _)| view)
     }
 
-    /// The view a motion, or a change of the captured button, belongs to. A release of the
-    /// button ends the capture. Wheel reports and other buttons are not captured.
+    /// Ends every capture, or those on `view`: the releases to send, since the user's will not
+    /// arrive (the mode changed, the view hid, the mouse was turned off, focus left).
+    pub fn cancel(&mut self, view: Option<ViewId>) -> Vec<Release> {
+        let last = self.last;
+        let mut out = Vec::new();
+        self.held.retain(|&(held, button)| {
+            let cancelled = view.is_none_or(|v| v == held);
+            if cancelled {
+                out.push(Release {
+                    view: held,
+                    button,
+                    position: last,
+                });
+            }
+            !cancelled
+        });
+        out
+    }
+
+    /// The view a motion, or a change of a captured button, belongs to. A release of the button
+    /// ends its capture. Wheel reports and other buttons are not captured.
     pub fn route(
         &mut self,
         button: Option<PointerButton>,
         motion: bool,
         state: ButtonState,
     ) -> Option<(ViewId, PointerButton)> {
-        let (view, held) = self.held?;
-        if !motion && button != Some(held) {
-            return None;
+        if motion {
+            return self.held.first().copied();
         }
-        if !motion && state == ButtonState::Released {
-            self.held = None;
+        let at = self
+            .held
+            .iter()
+            .position(|&(_, held)| Some(held) == button)?;
+        match state {
+            ButtonState::Released => Some(self.held.remove(at)),
+            ButtonState::Pressed => Some(self.held[at]),
         }
-        Some((view, held))
     }
 }
 
@@ -238,6 +277,35 @@ mod tests {
         assert!(capture.held().is_some());
         capture.forget(view);
         assert_eq!(capture.held(), None);
+    }
+
+    #[test]
+    fn two_buttons_are_held_apart_and_cancelling_releases_each() {
+        let (a, b) = (ViewId::next(), ViewId::next());
+        let mut capture = PointerCapture::default();
+        use PointerButton::{Left, Right};
+        capture.press(a, Left);
+        capture.press(b, Right);
+        // The second press did not overwrite the first.
+        assert_eq!(
+            capture.route(Some(Left), false, ButtonState::Released),
+            Some((a, Left))
+        );
+        capture.press(a, Left);
+        capture.moved(SurfacePoint { x: 3.0, y: -4.0 });
+        let position = SurfacePoint { x: 3.0, y: -4.0 };
+        assert_eq!(
+            capture.cancel(Some(b)),
+            [Release {
+                view: b,
+                button: Right,
+                position
+            }]
+        );
+        assert_eq!(capture.held(), Some(a));
+        assert_eq!(capture.cancel(None).len(), 1);
+        assert_eq!(capture.held(), None);
+        assert!(capture.cancel(None).is_empty());
     }
 
     #[test]

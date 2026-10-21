@@ -2792,6 +2792,20 @@ fn a_key_sent_by_a_key_press_is_the_users_activation() {
     assert_eq!(b.state.tabs().len(), 2);
 }
 
+#[test]
+fn a_view_shows_when_a_key_press_activated_it_and_a_command_does_not() {
+    let mut b = Harness::start(
+        "[keys]\n\"alt-j\" = \"page.send-key down\"",
+        &["https://a.test/"],
+    );
+    let view = b.shown();
+    let activation = |b: &Harness| b.state.view(view).unwrap().activation();
+    b.update(command("page.send-key down"));
+    assert_eq!(activation(&b), None);
+    b.key(press(36, "j", ALT));
+    assert_eq!(activation(&b), Some(b.now));
+}
+
 /// A side button `button` going `state` over `view`, or over the chrome.
 fn side(
     b: &mut Harness,

@@ -10,15 +10,18 @@
 //! core) or the engines.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::io::{IsTerminal, Write};
-use std::os::fd::OwnedFd;
+use std::io::IsTerminal;
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::io::Errno;
 use std::time::{Duration, Instant};
 
 use sighurt_api::events::Cursor;
 use sighurt_api::geometry::{Metrics, Scale, WindowRect};
-use sighurt_api::ids::{LayoutEpoch, RequestId, TargetId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, RequestId, TargetId, ViewId};
 use sighurt_api::input::{InputEvent, KeyboardFocus, TextInputState};
 use sighurt_api::semantic::SemanticSnapshot;
 use sighurt_api::services::{ClipboardData, Selection, ServiceError};
@@ -32,6 +35,7 @@ use sighurt_runtime::session::Session;
 use sighurt_runtime::view::ViewEntry;
 
 use crate::app::{chrome_checks, error_line, log_path, redirect_stderr, COLOR_NAMES};
+use crate::sanitize::sanitize;
 use crate::target::{TermPermit, TermTarget};
 use crate::textmode;
 
@@ -153,7 +157,8 @@ pub fn run(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> 
         true => Some(redirect_stderr(&log_path())?),
         false => None,
     };
-    let result = dump(options, signals);
+    // Every diagnostic is page data or the user's address: contained before it is printed.
+    let result = dump(options, signals).map_err(|error| sanitize(&error));
     if let (Some(saved), Err(_) | Ok(ExitCode::FAILURE)) = (&saved, &result) {
         let _ = rustix::stdio::dup2_stderr(saved);
     }
@@ -234,14 +239,26 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
         Err(_) => ExitCode::FAILURE,
     };
     // The text is out before the engines shut down, which may end the process.
+    let mut code = code;
+    let mut written = Ok(true);
     if let Some(text) = text {
-        let mut out = std::io::stdout().lock();
-        out.write_all(text.as_bytes())
-            .and_then(|()| out.flush())
-            .map_err(|error| format!("cannot write the page: {error}"))?;
+        written = write_out(text.as_bytes(), signals, options.timeout);
+        match written {
+            Ok(true) => {}
+            Ok(false) => code = ExitCode::from(2),
+            Err(_) => code = ExitCode::FAILURE,
+        }
     }
     session.set_quit(code);
     let _ = session.shutdown(&mut headless, |_, _| {});
+    match written {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("sig: timed out writing the page: nothing reads stdout");
+            return Ok(code);
+        }
+        Err(error) => return Err(error),
+    }
     match outcome {
         Ok(None) => {
             eprintln!(
@@ -255,6 +272,106 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
     }
 }
 
+/// Writes `bytes` to stdout without ever blocking on it: it waits for the pipe to take more, a
+/// chunk at a time, and gives up at `timeout` (`Ok(false)`) or on SIGTERM and SIGINT.
+fn write_out(bytes: &[u8], signals: &OwnedFd, timeout: Duration) -> Result<bool, String> {
+    // A pipe takes a write of this size whole when it reports room.
+    const CHUNK: usize = 4096;
+    let deadline = Instant::now() + timeout;
+    let stdout = std::io::stdout();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        let mut fds = [
+            PollFd::new(&stdout, PollFlags::OUT),
+            PollFd::new(signals, PollFlags::IN),
+        ];
+        let spec = Timespec::try_from(left).map_err(|e| e.to_string())?;
+        match rustix::event::poll(&mut fds, Some(&spec)) {
+            Ok(_) | Err(Errno::INTR) => {}
+            Err(error) => return Err(format!("cannot wait for stdout: {error}")),
+        }
+        if fds[1].revents().contains(PollFlags::IN) {
+            let mut byte = [0u8; 1];
+            if rustix::io::read(signals, &mut byte).is_ok_and(|n| n > 0) && is_quit(byte[0]) {
+                return Err("interrupted".into());
+            }
+        }
+        // Hung up or in error: the write says which.
+        if fds[0].revents().is_empty() {
+            continue;
+        }
+        let chunk = &rest[..rest.len().min(CHUNK)];
+        match rustix::io::write(stdout.as_fd(), chunk) {
+            Ok(n) => rest = &rest[n..],
+            Err(Errno::AGAIN | Errno::INTR) => {}
+            Err(error) => return Err(format!("cannot write the page: {error}")),
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the byte `sig`'s signal pipe carries is a request to quit.
+fn is_quit(byte: u8) -> bool {
+    [libc::SIGTERM as u8, libc::SIGINT as u8].contains(&byte)
+}
+
+/// Where a document is on its way to being printed: which one the snapshot count was taken at
+/// when the engine was asked again after its load ended, so that a snapshot of an earlier
+/// document, or from before the load ended, is never taken for it.
+#[derive(Default)]
+struct Settle {
+    asked: Option<(DocumentGeneration, u64)>,
+}
+
+/// What [`Settle::step`] wants done.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Nothing yet.
+    Wait,
+    /// The load of the document ended: ask the engine for its content again.
+    Ask,
+    /// A snapshot of the document, after it loaded, has settled.
+    Done,
+}
+
+impl Settle {
+    /// `loaded` is the shown document once its load ended (`None` while it loads, or it is
+    /// replaced), `count` how many snapshots have arrived, `quiet` that none came for
+    /// [`SETTLE`], and `latest` the document of the latest one.
+    fn step(
+        &mut self,
+        loaded: Option<DocumentGeneration>,
+        count: u64,
+        quiet: bool,
+        latest: Option<DocumentGeneration>,
+    ) -> Step {
+        let Some(document) = loaded else {
+            self.asked = None;
+            return Step::Wait;
+        };
+        match self.asked {
+            Some((asked, _)) if asked == document => {}
+            _ => {
+                self.asked = Some((document, count));
+                return Step::Ask;
+            }
+        }
+        match self.asked {
+            Some((_, seen)) if count > seen && quiet && latest == Some(document) => Step::Done,
+            _ => Step::Wait,
+        }
+    }
+
+    /// A snapshot arrived after the engine was asked, so only quiet is awaited.
+    fn settling(&self, count: u64) -> bool {
+        self.asked.is_some_and(|(_, seen)| count > seen)
+    }
+}
+
 /// Drives the session until the page's snapshot is in: `Some`, or `None` at the timeout.
 fn wait(
     session: &mut Session<Headless>,
@@ -265,13 +382,10 @@ fn wait(
 ) -> Result<Option<Box<SemanticSnapshot>>, String> {
     let deadline = Instant::now() + options.timeout;
     let mut asked = HashSet::new();
-    // Once the load ended: the count of snapshots then, to see one that came after.
-    let mut loaded_at: Option<u64> = None;
+    let mut settle = Settle::default();
     loop {
         let mut byte = [0u8; 1];
-        if rustix::io::read(signals, &mut byte).is_ok_and(|n| n > 0)
-            && [libc::SIGTERM as u8, libc::SIGINT as u8].contains(&byte[0])
-        {
+        if rustix::io::read(signals, &mut byte).is_ok_and(|n| n > 0) && is_quit(byte[0]) {
             return Err("interrupted".into());
         }
         for request in std::mem::take(&mut headless.reads) {
@@ -302,27 +416,32 @@ fn wait(
         if loaded && tab.url == Some("about:blank") && options.open.input != "about:blank" {
             return Err(format!("cannot load {}", options.open.input));
         }
-        match (loaded, loaded_at) {
-            (true, None) => {
-                // Ask again: whatever arrives now was extracted after the load ended.
+        let document = view
+            .and_then(|view| session.core().view(view))
+            .and_then(|view| view.document())
+            .filter(|_| loaded);
+        let latest = headless.snapshot.as_ref().map(|(_, s)| s.document);
+        let quiet = headless.last.elapsed() >= SETTLE;
+        match settle.step(document, headless.count, quiet, latest) {
+            Step::Ask => {
+                // Whatever arrives now was extracted after the load ended.
                 if let Some(view) = view {
                     session.set_semantics(view, true);
                 }
-                loaded_at = Some(headless.count);
             }
-            (true, Some(seen)) if headless.count > seen && headless.last.elapsed() >= SETTLE => {
+            Step::Done => {
                 if let Some((_, snapshot)) = headless.snapshot.take() {
                     return Ok(Some(snapshot));
                 }
             }
-            _ => {}
+            Step::Wait => {}
         }
         let now = Instant::now();
         if now >= deadline {
             return Ok(None);
         }
         let mut until = deadline;
-        if loaded_at.is_some_and(|seen| headless.count > seen) {
+        if settle.settling(headless.count) {
             until = until.min(headless.last + SETTLE);
         }
         match session.registry().next_pump() {
@@ -336,5 +455,74 @@ fn wait(
                 .saturating_duration_since(now)
                 .min(Duration::from_millis(500)),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_snapshot_counts_only_for_its_document_after_the_load_ended() {
+        let (a, b) = (DocumentGeneration::next(), DocumentGeneration::next());
+        let mut settle = Settle::default();
+        // While loading nothing is asked or taken.
+        assert_eq!(settle.step(None, 1, true, Some(a)), Step::Wait);
+        // A's load ended: ask. A's earlier snapshot (count 1) does not count.
+        assert_eq!(settle.step(Some(a), 1, true, Some(a)), Step::Ask);
+        assert_eq!(settle.step(Some(a), 1, true, Some(a)), Step::Wait);
+        // A's answer arrives but is not yet quiet.
+        assert_eq!(settle.step(Some(a), 2, false, Some(a)), Step::Wait);
+        // B replaces A (a redirect) before A settles: start over, and A's snapshot is not B's.
+        assert_eq!(settle.step(None, 2, true, Some(a)), Step::Wait);
+        assert_eq!(settle.step(Some(b), 2, true, Some(a)), Step::Ask);
+        assert_eq!(settle.step(Some(b), 2, true, Some(a)), Step::Wait);
+        assert_eq!(settle.step(Some(b), 3, true, Some(a)), Step::Wait);
+        assert_eq!(settle.step(Some(b), 3, true, Some(b)), Step::Done);
+    }
+
+    #[test]
+    fn errors_are_contained_before_they_are_printed() {
+        let hostile = "cannot load https://x.test/\x1b]52;c;AAAA\x07\u{202e}evil\n";
+        let clean = sanitize(hostile);
+        assert!(
+            !clean.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{clean:?}"
+        );
+        assert!(clean.starts_with("cannot load https://x.test/"));
+    }
+
+    #[test]
+    fn the_printed_page_has_no_control_or_bidi_characters_even_in_a_link() {
+        use sighurt_api::semantic::{NodeId, NodeKind, SemanticNode};
+        let mut root = SemanticNode {
+            id: NodeId(1),
+            kind: NodeKind::Document,
+            children: vec![NodeId(2)],
+            ..SemanticNode::default()
+        };
+        root.text = Some("t\u{202e}x\x1b[2J".into());
+        let link = SemanticNode {
+            id: NodeId(2),
+            kind: NodeKind::Link,
+            text: Some("go\x1b]52;c;QQ\x07\u{2066}".into()),
+            href: Some("https://x.test/\x1b]52;c;QQ\x07\u{202e}evil".into()),
+            ..SemanticNode::default()
+        };
+        let snapshot = SemanticSnapshot {
+            document: DocumentGeneration::next(),
+            root: NodeId(1),
+            nodes: vec![root, link],
+            focus: None,
+            truncated: false,
+        };
+        let out = textmode::dump(&snapshot, 40);
+        let bad = |c: char| {
+            (c.is_control() && c != '\n')
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)
+        };
+        assert!(!out.chars().any(bad), "{out:?}");
+        assert!(out.contains("https://x.test/"));
     }
 }

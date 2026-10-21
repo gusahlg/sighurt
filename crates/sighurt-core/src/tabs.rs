@@ -207,6 +207,11 @@ impl View {
         self.link = link;
     }
 
+    /// When the user last clicked or pressed a key in it, if they did.
+    pub fn activation(&self) -> Option<Instant> {
+        self.activation
+    }
+
     /// Its id.
     pub fn id(&self) -> ViewId {
         self.id

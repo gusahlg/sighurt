@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use sighurt_api::ids::{DocumentGeneration, ViewId};
 use sighurt_api::input::{ButtonState, Key, KeyEvent};
-use sighurt_api::semantic::{NodeId, SemanticAction, SemanticSnapshot};
+use sighurt_api::semantic::{NodeId, SemanticAction, SemanticSnapshot, MAX_STRING_BYTES};
 
 use crate::chrome::LineEditor;
 use crate::grid::{Attrs, Color, Grid};
@@ -22,6 +22,23 @@ use crate::textmode::{self, Area, Intent, TextDocument, TextView};
 
 /// The most option rows the chooser shows at once.
 const CHOOSER_ROWS: u16 = 8;
+
+/// The longest prefix of `text` that fits `room` bytes, cut at a character boundary.
+fn fit(text: &str, room: usize) -> &str {
+    let mut end = text.len().min(room);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// How many bytes `editor` can still take: a selected line is replaced by what comes next.
+fn room(editor: &LineEditor) -> usize {
+    match editor.selected() {
+        true => MAX_STRING_BYTES,
+        false => MAX_STRING_BYTES.saturating_sub(editor.text().len()),
+    }
+}
 
 /// An action the user chose in a view's page, for the app to hand the core.
 #[derive(Clone, Debug, PartialEq)]
@@ -287,7 +304,7 @@ impl TextPages {
     pub fn paste(&mut self, text: &str) -> bool {
         match &mut self.prompt {
             Some((_, Prompt::Edit { editor, .. })) => {
-                editor.paste(text);
+                editor.paste(fit(text, room(editor)));
                 true
             }
             Some(_) => true,
@@ -317,12 +334,14 @@ impl TextPages {
                 let alt = key.modifiers.alt && !key.consumed.alt;
                 let mut done = None;
                 match named {
-                    Some("Enter") => {
+                    // The action's contract bounds the value; the editor keeps within it.
+                    Some("Enter") if editor.text().len() <= MAX_STRING_BYTES => {
                         done = Some(SemanticAction::SetValue {
                             node: *node,
                             value: editor.text().to_owned(),
                         })
                     }
+                    Some("Enter") => {}
                     Some("ArrowLeft") if word => editor.word_left(),
                     Some("ArrowRight") if word => editor.word_right(),
                     Some("ArrowLeft") => editor.left(),
@@ -336,7 +355,7 @@ impl TextPages {
                     Some(_) => {}
                     None => {
                         if let Some(text) = key.text.as_deref().filter(|_| !alt && !word) {
-                            editor.insert(text);
+                            editor.insert(fit(text, room(editor)));
                         }
                     }
                 }
@@ -567,6 +586,27 @@ mod tests {
         );
         assert_eq!(act.document, document);
         assert!(!pages.prompting());
+    }
+
+    #[test]
+    fn a_field_never_takes_more_than_the_value_bound() {
+        let (mut pages, view, _) = pages();
+        pages.page_key(view, &key("Tab", false));
+        pages.page_key(view, &key("Tab", false));
+        pages.page_key(view, &key("Enter", false));
+        // Pastes of 10 KiB of two-byte characters, three times, and typing after.
+        let paste = "é".repeat(5 * 1024);
+        for _ in 0..3 {
+            assert!(pages.paste(&paste));
+        }
+        pages.prompt_key(&typed("x"));
+        let act = pages.prompt_key(&key("Enter", false)).unwrap();
+        let SemanticAction::SetValue { value, .. } = act.action else {
+            panic!("not a value");
+        };
+        assert!(value.len() <= MAX_STRING_BYTES && value.len() > MAX_STRING_BYTES - 4);
+        assert!(value.starts_with('é'));
+        assert_eq!(fit("aé", 2), "a");
     }
 
     #[test]

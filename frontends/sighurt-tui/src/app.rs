@@ -73,7 +73,7 @@ use crate::chrome::{
 };
 use crate::grid::{Attrs, Color, Grid};
 use crate::input::{
-    cell_to_page_offset, cell_to_page_pixel, CellPixels, PageCells, PointerCapture,
+    cell_to_page_offset, cell_to_page_pixel, CellPixels, PageCells, PointerCapture, Release,
 };
 use crate::kitty::{self, CellRect};
 use crate::target::{TargetHandle, TermPermit, TermTarget};
@@ -181,6 +181,8 @@ struct Tui {
     semantic_on: HashSet<ViewId>,
     /// The view and button of a press in the page, until that button is released.
     capture: PointerCapture,
+    /// Releases of captures ended by the frontend, for the app to send.
+    releases: Vec<Release>,
     /// What every view is given: the page rows' pixels, or nothing.
     metrics: Metrics,
     /// `metrics` changed and the views have not been told.
@@ -456,6 +458,7 @@ impl App {
             text: TextPages::new(size.cols, page_area(size).rows),
             semantic_on: HashSet::new(),
             capture: PointerCapture::default(),
+            releases: Vec::new(),
             page: page_area(size),
             metrics: empty_metrics(),
             metrics_due: false,
@@ -662,7 +665,9 @@ impl App {
     /// Reads the terminal if it woke the loop, and hands at most [`MAX_EVENTS`] events to the
     /// core, one at a time. Returns whether there were any.
     fn drain_input(&mut self) -> bool {
-        if std::mem::take(&mut self.readable) {
+        // One read can hold more events than a pass handles. The terminal is read again only
+        // once those are handled, so the queue stays within one read's bound.
+        if self.input.is_empty() && std::mem::take(&mut self.readable) {
             match self.tui.terminal.read_events() {
                 Ok(events) => self.input.extend(events),
                 Err(error) => {
@@ -671,7 +676,9 @@ impl App {
                 }
             }
         }
-        self.input.extend(self.tui.terminal.expire_if_due());
+        if self.input.is_empty() {
+            self.input.extend(self.tui.terminal.expire_if_due());
+        }
         let peaks = &mut self.session.diagnostics_mut().peaks;
         peaks.max_host_queue = peaks.max_host_queue.max(self.input.len() as u64);
         let count = self.input.len().min(MAX_EVENTS);
@@ -681,6 +688,7 @@ impl App {
         }
         // Read again next pass, in case the terminal had more than one read took.
         self.readable |= count > 0;
+        self.flush_releases();
         count > 0
     }
 
@@ -691,6 +699,10 @@ impl App {
             event: InputEvent { seat, kind },
             at,
         };
+        // A pointer held when the terminal loses focus will not be released where we see it.
+        if event == TermEvent::Focus(false) {
+            self.tui.release_pointer(None);
+        }
         let event = match event {
             TermEvent::Resize(_) => {
                 self.tui.relayout();
@@ -783,7 +795,7 @@ impl App {
         // A button pressed over the page owns the pointer until it is released, wherever the
         // pointer goes: the engine would otherwise stay in a drag.
         if mouse.wheel.is_none() {
-            if let Some((captured, _)) = self.tui.capture.held() {
+            if let Some(captured) = self.tui.capture.held() {
                 if !self.session.views().contains_key(&captured) {
                     self.tui.capture.forget(captured);
                 } else if let Some((captured, held)) =
@@ -792,6 +804,7 @@ impl App {
                         .route(mouse.button, mouse.motion, mouse.state)
                 {
                     let position = self.page_offset(&mouse)?;
+                    self.tui.capture.moved(position);
                     let kind = if mouse.motion {
                         PointerEvent::Motion {
                             position,
@@ -815,6 +828,7 @@ impl App {
             }
         }
         let (view, position) = (view?, point?);
+        self.tui.capture.moved(position);
         let kind = if let Some(wheel) = mouse.wheel {
             let (x, y) = match wheel {
                 Wheel::Up => (0, -120),
@@ -846,6 +860,27 @@ impl App {
         };
         let event = pointer(kind);
         Some(BrowserEvent::Pointer { view, event, at })
+    }
+
+    /// Sends the releases of pointer captures the frontend ended (see [`Tui::release_pointer`]).
+    fn flush_releases(&mut self) {
+        let releases = std::mem::take(&mut self.tui.releases);
+        let (seat, at) = (self.tui.seat, Instant::now());
+        for release in releases {
+            let event = InputEvent {
+                seat,
+                kind: InputKind::Pointer(PointerEvent::Button {
+                    button: release.button,
+                    state: ButtonState::Released,
+                    position: release.position,
+                    modifiers: Default::default(),
+                }),
+            };
+            let view = release.view;
+            self.session
+                .queue_mut()
+                .push_back(BrowserEvent::Pointer { view, event, at });
+        }
     }
 
     /// Text mode's mouse: the wheel scrolls the page, a left press focuses and activates the
@@ -1336,6 +1371,9 @@ impl Tui {
                 false => b"\x1b[?1006l\x1b[?1000l",
             });
             self.mouse_on = settings.mouse;
+            if !settings.mouse {
+                self.release_pointer(None);
+            }
         }
         let interval = frame_interval(settings);
         self.next_frame = self.next_frame.map(|at| at.min(Instant::now() + interval));
@@ -1383,6 +1421,8 @@ impl Tui {
             self.graphics = graphics;
             self.text_mode = text;
             self.clear = true;
+            // The press was in the other mode's page: its release would not reach it now.
+            self.release_pointer(None);
         }
         self.text.set_area(page.cols, page.rows);
         let rect = self.metrics.rect();
@@ -1403,6 +1443,14 @@ impl Tui {
     /// Clears the screen and draws the chrome and the shown page again.
     fn redraw_all(&mut self) {
         self.clear = true;
+    }
+
+    /// Ends the pointer captures of `view` (all of them for `None`) whose release will not come
+    /// from the user: the mode changed, the view hid, the mouse turned off or focus left. The
+    /// releases are sent on the next pass.
+    fn release_pointer(&mut self, view: Option<ViewId>) {
+        let cancelled = self.capture.cancel(view);
+        self.releases.extend(cancelled);
     }
 
     /// `chrome.text-mode` and `chrome.graphics-mode`: this run's mode over `[tui] mode`.
@@ -1643,6 +1691,9 @@ impl Frontend for Tui {
     /// A shown view's last frame is sent again if it is still the layout's, or its next one
     /// is; a hidden view's image is deleted.
     fn show(&mut self, view: ViewId, visible: bool) {
+        if !visible {
+            self.release_pointer(Some(view));
+        }
         let Some(pixels) = self.views.get(&view).and_then(|t| self.targets.get_mut(t)) else {
             return;
         };
@@ -1670,6 +1721,7 @@ impl Frontend for Tui {
         &mut self,
         view: ViewId,
         event: &InputEvent,
+        activation: Option<Instant>,
         queue: &mut VecDeque<BrowserEvent>,
     ) -> bool {
         let InputKind::Key(key) = &event.kind else {
@@ -1679,8 +1731,13 @@ impl Frontend for Tui {
             return false;
         }
         self.chrome_dirty = true;
+        // An action takes the user's activation along only if the core took this key as the
+        // user's: a key a command made (`:page.send-key enter`) scrolls and focuses but follows
+        // nothing.
         if let Some(act) = self.text.page_key(view, key) {
-            queue.push_back(semantic_event(act, Instant::now()));
+            if let Some(at) = activation {
+                queue.push_back(semantic_event(act, at));
+            }
         }
         true
     }

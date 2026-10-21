@@ -11,6 +11,7 @@
 //! Must not own: browser policy, engine runtimes, or how a frontend draws.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
 
 use sighurt_api::events::Cursor;
 use sighurt_api::ids::{TargetId, ViewId};
@@ -91,13 +92,20 @@ pub trait Frontend: Clipboard {
     /// page as text scrolls and activates its own view instead (TUI.md §4). Events it wants the
     /// core to see go to `queue`. Called for the keys of both states, so a press and its release
     /// can be taken together.
+    ///
+    /// `activation` is when the user's own key press activated the page, if the event being
+    /// handled is that press (or a binding of it) and the core counted it as the user's: `None`
+    /// for input a command made (the command line, a button), which the core does not count as a
+    /// key press in the page. An action the frontend derives from this input may claim the user's
+    /// activation only with this time.
     fn page_input(
         &mut self,
         view: ViewId,
         event: &InputEvent,
+        activation: Option<Instant>,
         queue: &mut VecDeque<BrowserEvent>,
     ) -> bool {
-        let _ = (view, event, queue);
+        let _ = (view, event, activation, queue);
         false
     }
 

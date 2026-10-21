@@ -73,6 +73,9 @@ pub struct Session<F: Frontend> {
     env: Environment,
     /// Set when the loop must end, with the exit code.
     quit: Option<ExitCode>,
+    /// When the key event the core is handling happened (`None` for other events): the time its
+    /// activation of a page carries.
+    handling: Option<Instant>,
     /// Engine wakers and service threads call this.
     wake: Arc<dyn Fn() + Send + Sync>,
     _frontend: PhantomData<fn() -> F>,
@@ -103,6 +106,7 @@ impl<F: Frontend> Session<F> {
             session_due: None,
             env,
             quit: None,
+            handling: None,
             wake,
             _frontend: PhantomData,
         }
@@ -173,6 +177,10 @@ impl<F: Frontend> Session<F> {
     pub fn run_core(&mut self, frontend: &mut F) {
         while let Some(event) = self.queue.pop_front() {
             self.diag.counters.core_events += 1;
+            self.handling = match &event {
+                BrowserEvent::Keyboard { at, .. } => Some(*at),
+                _ => None,
+            };
             let effects = sighurt_core::update(&mut self.core, event);
             self.diag.counters.effects += effects.len() as u64;
             for effect in effects {
@@ -212,10 +220,17 @@ impl<F: Frontend> Session<F> {
                         }
                     }
                     // A frontend that shows the page itself may keep the keys from the engine.
-                    EngineCommand::Input(event)
-                        if frontend.page_input(view, event, &mut self.queue) =>
-                    {
-                        return;
+                    EngineCommand::Input(event) => {
+                        // The user's own key press, or a binding of it, if the core took it as
+                        // that: it stamped the view with this event's time.
+                        let activation = self
+                            .core
+                            .view(view)
+                            .and_then(|v| v.activation())
+                            .filter(|&at| Some(at) == self.handling);
+                        if frontend.page_input(view, event, activation, &mut self.queue) {
+                            return;
+                        }
                     }
                     _ => {}
                 }
