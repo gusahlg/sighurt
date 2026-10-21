@@ -51,6 +51,15 @@ const GRACE: Duration = Duration::from_millis(1500);
 /// this long from the end of the load before it is printed as it is.
 const GRACE_THIN: Duration = Duration::from_secs(6);
 
+/// The page area the engine is given. No one sees it, but pages that lay out nothing at zero
+/// size (YouTube shows no content at all) or by media queries need a window of a desktop's size.
+const VIEWPORT: WindowRect = WindowRect {
+    x: 0,
+    y: 0,
+    width: 1280,
+    height: 800,
+};
+
 /// Words below which a snapshot looks unfinished.
 const THIN: usize = 30;
 
@@ -100,6 +109,9 @@ struct Headless {
     count: u64,
     last: Instant,
     reads: Vec<RequestId>,
+    /// The view of each target, and the targets whose engine has a frame to present.
+    views: BTreeMap<TargetId, ViewId>,
+    ready: Vec<TargetId>,
 }
 
 impl Clipboard for Headless {
@@ -120,16 +132,21 @@ impl Frontend for Headless {
     type Target = TermTarget;
     type Permit = TermPermit;
 
-    fn open_target(&mut self, _: ViewId, _: &str) -> Result<(TargetId, TermTarget), String> {
+    fn open_target(&mut self, view: ViewId, _: &str) -> Result<(TargetId, TermTarget), String> {
         let (target, _) = TermTarget::new(self.metrics);
-        Ok((TargetId::next(), target))
+        let id = TargetId::next();
+        self.views.insert(id, view);
+        Ok((id, target))
     }
 
     fn place(&mut self, _: &BTreeMap<ViewId, ViewEntry>, _: &mut Diagnostics) -> bool {
         false
     }
 
-    fn forget_target(&mut self, _: TargetId) {}
+    fn forget_target(&mut self, target: TargetId) {
+        self.views.remove(&target);
+        self.ready.retain(|&ready| ready != target);
+    }
 
     fn focus(&mut self, _: KeyboardFocus, _: &mut VecDeque<BrowserEvent>) {}
 
@@ -147,7 +164,11 @@ impl Frontend for Headless {
 
     fn show(&mut self, _: ViewId, _: bool) {}
 
-    fn frame_ready(&mut self, _: TargetId) {}
+    fn frame_ready(&mut self, target: TargetId) {
+        if !self.ready.contains(&target) {
+            self.ready.push(target);
+        }
+    }
 
     fn before_forced_exit(&mut self) {}
 
@@ -182,22 +203,6 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
         session: None,
     };
     let mut registry = crate::engines::build();
-    let engine = match options.open.engine.clone() {
-        Some(name) => match registry.engine(&name) {
-            Some(engine) if engine.capabilities.semantics => name,
-            Some(_) => return Err(format!("the {name} engine gives no page text for --dump")),
-            None => return Err(format!("the {name} engine is not part of this build")),
-        },
-        None => {
-            let mut with_text = registry.engines().filter(|e| e.capabilities.semantics);
-            let first = with_text.next().map(|e| e.name);
-            let wpe = registry.engine("wpe").filter(|e| e.capabilities.semantics);
-            wpe.map(|e| e.name)
-                .or(first)
-                .ok_or("this sig has no engine that gives page text (WPE WebKit does)")?
-                .to_owned()
-        }
-    };
     let mut env = registry.environment(chrome_checks(), COLOR_NAMES);
     env.frontend = FrontendKind::Terminal;
     let config = match persistence::load_config(paths.config.as_deref(), &env) {
@@ -207,6 +212,15 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
             persistence::load_config(None, &env).map_err(|e| e.to_string())?
         }
     };
+    // Routing, not "WPE first": a demo: URL configured for the demo engine must not be handed
+    // to WPE. TUI.md still asks for WPE when the page is an ordinary http(s) or file URL whose
+    // only claim is the default engine and that engine gives no page text (Servo).
+    let engine = choose_dump_engine(
+        &registry,
+        &config,
+        env.home_dir.as_deref(),
+        &options.open,
+    )?;
     registry.configure(&config);
     sighurt_runtime::registry::install_logger();
     let wake = Arc::new(Wake::default());
@@ -224,11 +238,13 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
         Arc::new(move || session_wake.wake()),
     );
     let mut headless = Headless {
-        metrics: Metrics::new(LayoutEpoch::next(), WindowRect::default(), Scale::ONE),
+        metrics: Metrics::new(LayoutEpoch::next(), VIEWPORT, Scale::ONE),
         snapshot: None,
         count: 0,
         last: Instant::now(),
         reads: Vec::new(),
+        views: BTreeMap::new(),
+        ready: Vec::new(),
     };
     let open = OpenRequest {
         input: options.open.input.clone(),
@@ -457,6 +473,16 @@ fn wait(
         }
         session.service_completions(headless);
         session.pump(headless);
+        // Pages draw and run their animation frames only for a view whose frames are taken.
+        for target in std::mem::take(&mut headless.ready) {
+            if let Some(&view) = headless.views.get(&target) {
+                let permit = TermPermit {
+                    epoch: headless.metrics.epoch(),
+                    size: headless.metrics.buffer(),
+                };
+                let _ = session.present(view, permit, headless.metrics.buffer());
+            }
+        }
         let views: Vec<ViewId> = session.views().keys().copied().collect();
         for view in views {
             if asked.insert(view) {
