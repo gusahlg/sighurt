@@ -17,7 +17,7 @@ frames for the rest of a 2 s window.
 
 `tools/heavy` runs the command in this repo's nix-shell (so `LD_LIBRARY_PATH`,
 `GIO_EXTRA_MODULES`, `GST_PLUGIN_SYSTEM_PATH_1_0` and `SIGHURT_WPE_PREFIX` come from `shell.nix`).
-`sighurt-engine-wpe/tests/private-bus` starts `dbus-run-session` with a temporary config and no
+`engines/sighurt-engine-wpe/tests/private-bus` starts `dbus-run-session` with a temporary config and no
 service activation. The pages are `experiments/wpe-cpu/pages/animated.html` (CSS bar, 0.8 s
 alternate, background `#202020`) and `second.html` (background `#102010`, two headings under the
 `h1`, two links, two inputs).
@@ -25,7 +25,7 @@ alternate, background `#202020`) and `second.html` (background `#102010`, two he
 ```sh
 SIG_WHAT="wpe-cpu run" tools/remote --no-sync tools/heavy \
   env -u WAYLAND_DISPLAY -u DISPLAY \
-  sighurt-engine-wpe/tests/private-bus \
+  engines/sighurt-engine-wpe/tests/private-bus \
   env WEBKIT_DEBUG=PlatformDisplay,Compositing LIBGL_DEBUG=verbose \
   target/debug/wpe-cpu \
   --size 640x480 --seconds 3 --resize 400x300 --out /tmp/wpe-cpu-a \

@@ -1,27 +1,29 @@
 [workspace]
 members = [
     # The browser (see sighurt-rewrite-plan.md §5 for what each crate owns).
-    "sighurt-api",
-    "sighurt-core",
-    "sighurt-wayland",
-    "sighurt-ui",
-    "sighurt-browser",
+    "crates/sighurt-api",
+    "crates/sighurt-core",
+    "frontends/sighurt-wayland",
+    "ui/sighurt-ui",
+    "apps/sighurt-browser",
     # The terminal frontend (docs/rewrite/TUI.md).
-    "sighurt-tui",
-    "sighurt-runtime",
-    "sighurt-gui",
+    "frontends/sighurt-tui",
+    "crates/sighurt-runtime",
+    "frontends/sighurt-gui",
     # Chromes besides the standard one, compiled into `sig` through sighurt-browser's features.
-    "sighurt-chrome-line",
+    "extensions/sighurt-chrome-line",
+    # DOM extraction shared by the Servo and WPE adapters (docs/rewrite/TUI.md §3).
+    "engines/sighurt-semantic",
     # Engines, compiled into `sig` through sighurt-browser's features.
-    "sighurt-engine-servo",
-    "sighurt-engine-wasm",
-    "sighurt-engine-demo",
+    "engines/sighurt-engine-servo",
+    "engines/sighurt-engine-wasm",
+    "engines/sighurt-engine-demo",
     # Needs the WPE WebKit prefix of nix/build-wpewebkit.sh (docs/rewrite/WPE.md).
-    "sighurt-engine-wpe",
+    "engines/sighurt-engine-wpe",
     # Keymaps, compiled into `sig` through sighurt-browser's features.
-    "sighurt-keymap-modal",
+    "extensions/sighurt-keymap-modal",
     # Guest SDK and example guests.
-    "sighurt-sdk",
+    "sdk/sighurt-sdk",
     "examples/hello-sighurt",
     "examples/audio-player",
     "examples/raf-demo",
@@ -90,3 +92,8 @@ url = "2"
 [profile.dev.package."*"]
 opt-level = 3
 debug = false
+
+# surfman 0.14.0 with one change: context creation does not mutate the process
+# environment. See third_party/surfman/SIGHURT-PATCH.md.
+[patch.crates-io]
+surfman = { path = "third_party/surfman" }

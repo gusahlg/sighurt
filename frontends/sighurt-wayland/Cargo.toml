@@ -1,0 +1,26 @@
+[package]
+name = "sighurt-wayland"
+description = "Sighurt's Wayland host: window, surfaces, target leases, scaling, input, SHM presentation, frame scheduling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }
+# The `system` backend: raw-window-handle interop needs libwayland's own `wl_display`.
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+# Registry, seats, pointer frames and cursors, xdg-shell, the raw SHM pool and the data
+# devices. The surface graph, placement, commits, scheduling, buffer lifetime and keyboard
+# translation are the host's own (plan §27: SCTK behind our boundaries).
+smithay-client-toolkit.workspace = true
+calloop.workspace = true
+xkbcommon.workspace = true
+raw-window-handle.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+# The GL-lease test loads libEGL and libwayland-egl at run time, as a presenter would.
+libloading = "0.8"

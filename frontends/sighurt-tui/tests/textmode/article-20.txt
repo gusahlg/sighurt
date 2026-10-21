@@ -1,0 +1,29 @@
+Rust 2030 released
+────────────────────
+
+The language team
+announced the
+edition today, with
+notes on the
+migration guide[1]
+and a changelog[2].
+Readers wrote in at
+length.
+
+Reactions
+
+│ It is the best
+│ release yet, and I
+│ say that every
+│ year.
+
+[image: A crab]
+
+────────────────────
+
+Footer text.
+
+References
+
+1. https://example.com/guide
+2. https://example.com/changes

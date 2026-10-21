@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Landmarks</title>
+</head>
+<body>
+  <!--
+    Banner, navigation, main, complementary, content info, search, form, and a named region.
+    The header inside main is not a banner. pre keeps its spaces; the paragraph does not.
+    The table has a caption, a header row and one body row.
+  -->
+  <header><p>Site banner</p></header>
+  <nav aria-label="Primary"><a href="/home">Home</a></nav>
+  <main>
+    <header><p>Article header</p></header>
+    <h1>Story</h1>
+    <pre>keep   spaces
+and breaks</pre>
+    <p>not   kept</p>
+    <p>Use <code>sig --dump</code> here.</p>
+    <blockquote><p>A quoted paragraph</p></blockquote>
+    <hr>
+    <table>
+      <caption>Prices</caption>
+      <thead><tr><th>Item</th><th>Cost</th></tr></thead>
+      <tbody><tr><td>Tea</td><td>2</td></tr></tbody>
+    </table>
+    <section aria-label="Notes"><p>Named section</p></section>
+  </main>
+  <aside><p>Aside text</p></aside>
+  <search><p>Search region</p></search>
+  <form aria-label="Lookup"><input type="search" aria-label="Query"></form>
+  <div role="region" aria-label="Extra">Region text</div>
+  <footer><p>Site footer</p></footer>
+</body>
+</html>

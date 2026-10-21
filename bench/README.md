@@ -347,6 +347,24 @@ the same guest code (`workloads/wasm/SHA256SUMS`).
   values), add it to `KEY_METRICS` in `benchlib/results.py` if the report should show it, and to
   `LOWER_IS_BETTER` if it has a direction. Add a test with hand-computed numbers.
 
+## Website compatibility
+
+`bench/compat/` measures public pages in Servo and in WPE WebKit and writes the results down.
+It does not teach `sig` a built-in compatibility list: engine choice stays in the user's
+configuration (decision 94). Sites are `bench/compat/sites.toml`. `bench/compat/run` opens each
+one, one at a time, in `target/debug/sig` inside `tools/headless-sway --renderer gles2 --size
+1600x1000` on a private D-Bus, with a fresh config, profile and session. It is a `tools/heavy`
+job, run on louise-pc like the rest of the harness. `bench/compat/results/<date>-<rev>/` gets
+`report.md`, `runs.json` and `example-routing.toml`; screenshots and full logs under that
+directory are not committed, same as `results/raw/`.
+
+```sh
+SIG_WHAT="servo build" tools/remote tools/cargo build -p sighurt-browser
+# louise's copy has no .git (the sync excludes it), so pass the revision from here.
+tools/remote tools/heavy bench/compat/run --reps 1 --rev "$(git rev-parse --short HEAD)"
+rsync -a louise-pc:repos/sighurt-rewrite/bench/compat/results/ bench/compat/results/
+```
+
 ## Files
 
 | Path | What |
@@ -367,5 +385,6 @@ the same guest code (`workloads/wasm/SHA256SUMS`).
 | `results/IPC-REMOVAL.md` | the baseline against the rewrite at 3c510fe: what removing the IPC, GPUI and the readback did |
 | `results/<host>/build-cost/` | `bench/build-cost` records (committed) |
 | `results/raw/` | per run: stderr with timestamps, samples, the sway log, and screenshots after settling and after the active window (not committed) |
+| `compat/` | public-site compatibility of Servo and WPE (`run`, `sites.toml`); screenshots in `compat/results/*/shots/` are not committed |
 | `results/BASELINE.md` | the recorded baseline |
 | `HYPOTHESES.md` | what each change is expected to do, written before it is measured, and the outcome |

@@ -9568,6 +9568,7 @@ dependencies = [
  "sighurt-core",
  "sighurt-engine-servo",
  "sighurt-gui",
+ "sighurt-tui",
  "signal-hook-registry",
  "smithay-client-toolkit",
  "tempfile",
@@ -9678,6 +9679,7 @@ dependencies = [
  "pkg-config",
  "raw-window-handle",
  "sighurt-api",
+ "sighurt-semantic",
  "sighurt-wayland",
  "smithay-client-toolkit",
  "url",
@@ -9742,15 +9744,31 @@ name = "sighurt-sdk"
 version = "0.7.0"
 
 [[package]]
+name = "sighurt-semantic"
+version = "0.7.0"
+dependencies = [
+ "serde_json",
+ "sighurt-api",
+]
+
+[[package]]
 name = "sighurt-tui"
 version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "calloop",
+ "dirs",
  "flate2",
  "libc",
+ "log",
  "rustix 1.1.5",
  "sighurt-api",
+ "sighurt-core",
+ "sighurt-engine-demo",
+ "sighurt-engine-servo",
+ "sighurt-engine-wasm",
+ "sighurt-engine-wpe",
+ "sighurt-runtime",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -10319,8 +10337,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "surfman"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fe194717def845ecb64e7aeda3e2108c4b3b1584a01aa6e545e702cedca2a00"
 dependencies = [
  "bitflags 2.13.2",
  "cfg_aliases",

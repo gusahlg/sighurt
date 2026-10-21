@@ -1,0 +1,12 @@
+[package]
+name = "sighurt-engine-demo"
+description = "A small demo engine for testing Sighurt's host and chrome without Servo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }
+sighurt-wayland = { path = "../../frontends/sighurt-wayland" }

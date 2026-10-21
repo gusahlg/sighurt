@@ -1,0 +1,20 @@
+# Example routing, generated 2026-10-17 from the bench/compat corpus (79be7f7).
+# Hosts that classified OK in WPE and not OK in Servo on that run.
+# Not a built-in list: which engine opens a site stays in the user's configuration (decision 94).
+# Copy what you want into ~/.config/sighurt/config.toml.
+[routing.wpe]
+hosts = [
+  "caniuse.com",
+  "codepen.io",
+  "crates.io",
+  "developer.mozilla.org",
+  "discord.com",
+  "en.wikipedia.org",
+  "medium.com",
+  "www.linkedin.com",
+  "www.notion.so",
+  "www.nytimes.com",
+  "www.reddit.com",
+  "www.twitch.tv",
+  "www.youtube.com",
+]

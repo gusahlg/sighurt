@@ -41,5 +41,12 @@ Exceptions:
   (https://mozilla.org/MPL/2.0/). sig built with the engine-servo feature (one
   of its default features) also links Servo, which is licensed under MPL-2.0.
 
+- third_party/surfman is surfman 0.14.0 (https://github.com/servo/surfman), the
+  version Servo 0.7 uses, under MIT OR Apache-2.0 OR MPL-2.0 (its LICENSE-MIT,
+  LICENSE-APACHE and LICENSE-MPL). One patch, recorded in
+  third_party/surfman/SIGHURT-PATCH.md: `create_context_descriptor` no longer
+  calls `Adapter::set_environment_variables`, which wrote
+  `LIBGL_ALWAYS_SOFTWARE` and `DRI_PRIME` after other threads existed.
+
 - sig built with the engine-wpe feature loads WPE WebKit's libraries
   dynamically; they keep their own licenses (LGPL-2.1 and BSD).

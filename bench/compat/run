@@ -1,0 +1,1506 @@
+#!/usr/bin/env python3
+"""Website compatibility corpus for Servo and WPE WebKit.
+
+Opens each public page in bench/compat/sites.toml in `sig` (the default-features build), once
+per engine, inside tools/headless-sway on a private D-Bus. One site at a time: a fresh config,
+profile and session, no login, no form. The run starts with [session] restore off. Diagnostics
+JSON carries no address and no title, so after the screenshot the harness turns restore on
+(it applies live and nothing is restored from the empty state dir) and reads the title and
+final URL from the session file sig then writes.
+
+  tools/heavy bench/compat/run --reps 1
+  tools/heavy bench/compat/run --reps 1 --config-extra bench/compat/example-servo-experimental.toml
+  bench/compat/run --self-test
+  bench/compat/run --reclassify bench/compat/results/<date>-<rev>
+
+On louise-pc, through tools/remote, as the bench README describes. Classification is
+recomputed from the stored observations by --reclassify, and the screenshots are reread
+with --reanalyze, so a threshold change does not load the sites again.
+"""
+
+import argparse
+import json
+import os
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import urllib.parse
+import zlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SITES = ROOT / "bench/compat/sites.toml"
+ENGINES = ("servo", "wpe")
+
+# Default chrome at font size 14, output scale 1: tab strip 40 + toolbar 44, status strip 20.
+CHROME_TOP = 84
+STATUS_H = 20
+LOAD_TIMEOUT_S = 40
+SETTLE_S = 3
+POLL_S = 0.3
+QUIT_GRACE_S = 10
+SAMPLE_S = 0.2
+# A page counts as rendered when enough pixels leave the dominant colour, or the area has
+# enough distinct colours (antialiased text on a flat background). Both must be tiny for BLANK.
+NONBLANK_RENDERED = 0.02
+DISTINCT_RENDERED = 30
+NONBLANK_BLANK = 0.005
+DISTINCT_BLANK = 8
+STRIDE = 1
+
+CLASS_RANK = {"OK": 0, "PARTIAL": 1, "BLANK": 2, "ERROR": 3, "TIMEOUT": 4, "CRASH": 5}
+
+PAGE = os.sysconf("SC_PAGE_SIZE")
+TICK = os.sysconf("SC_CLK_TCK")
+
+_SCRIPT = __import__("re").compile(r"script::script_runtime")
+_PANIC = __import__("re").compile(
+    r"panicked at|fatal runtime error|Segmentation fault|core dumped|(?:^|\s)panic:",
+    __import__("re").I,
+)
+_ERROR_LEVEL = __import__("re").compile(r"(?:^|\[|\s)ERROR(?:\s|\]|:)")
+_WEBKIT = __import__("re").compile(
+    r"web process (crashed|was terminated|exceeded)|"
+    r"WebKitWebProcess.{0,40}(crash|segfault|killed)|"
+    r"\b(TypeError|ReferenceError|SyntaxError|Uncaught)\b",
+    __import__("re").I,
+)
+_SHUTDOWN_LEAK = "could not shut down"
+# sig sets JSC_SIGNAL_FOR_GC so WebKit's JavaScriptCore does not take SIGUSR1.
+# WebKit's processes print this once each; it is not a page error.
+_JSC_OPTION = "JSC_SIGNAL_FOR_GC"
+_FIRST_FRAME = __import__("re").compile(
+    r"first-frame engine=(\S+) after_navigate_ms=([0-9.]+)"
+)
+_RE = __import__("re")
+
+
+def mib(n):
+    return None if n is None else n / (1024 * 1024)
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode(errors="replace")
+    except OSError:
+        return None
+
+
+def children(pid):
+    out = []
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return out
+    for tid in tids:
+        text = read_text(f"/proc/{pid}/task/{tid}/children")
+        if text:
+            out.extend(int(c) for c in text.split())
+    return out
+
+
+def process_tree(root):
+    pids, todo, seen = [], [root], set()
+    while todo:
+        pid = todo.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if os.path.exists(f"/proc/{pid}"):
+            pids.append(pid)
+            todo.extend(children(pid))
+    return pids
+
+
+def proc_cpu(pid):
+    """(comm, utime+stime seconds) from /proc/<pid>/stat, or None."""
+    text = read_text(f"/proc/{pid}/stat")
+    if not text or ")" not in text:
+        return None
+    comm = text[text.index("(") + 1 : text.rindex(")")]
+    fields = text[text.rindex(")") + 2 :].split()
+    if len(fields) < 13:
+        return None
+    return comm, (int(fields[11]) + int(fields[12])) / TICK
+
+
+def rss_bytes(pid):
+    text = read_text(f"/proc/{pid}/statm")
+    if not text:
+        return None
+    parts = text.split()
+    return int(parts[1]) * PAGE if len(parts) > 1 else None
+
+
+def vmhwm_bytes(pid):
+    text = read_text(f"/proc/{pid}/status")
+    if not text:
+        return None
+    for line in text.splitlines():
+        if line.startswith("VmHWM:"):
+            return int(line.split()[1]) * 1024
+    return None
+
+
+def is_webkit(pid, comm):
+    if comm.startswith("WebKit"):
+        return True
+    cmd = read_text(f"/proc/{pid}/cmdline") or ""
+    return "WebKit" in cmd or "WebProcess" in cmd
+
+
+class Sampler:
+    """Peak RSS and CPU of sig and of WebKit's processes. sig's peak is VmHWM; WebKit's peak
+    is the highest sum of those processes' RSS seen in a sample."""
+
+    def __init__(self, root):
+        self.root = root
+        self.peak_sig = 0
+        self.peak_webkit = 0
+        self.peak_tree = 0
+        self.cpu = {}
+        self.webkit = set()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self.sample()
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+    def _run(self):
+        while not self._stop.is_set():
+            self.sample()
+            self._stop.wait(SAMPLE_S)
+
+    def sample(self):
+        tree_rss = 0
+        webkit_rss = 0
+        for pid in process_tree(self.root):
+            cpu = proc_cpu(pid)
+            rss = rss_bytes(pid)
+            if cpu:
+                comm, seconds = cpu
+                self.cpu[pid] = max(self.cpu.get(pid, 0.0), seconds)
+                if pid != self.root and is_webkit(pid, comm):
+                    self.webkit.add(pid)
+            if rss:
+                tree_rss += rss
+                if pid in self.webkit:
+                    webkit_rss += rss
+            if pid == self.root:
+                hwm = vmhwm_bytes(pid)
+                if hwm:
+                    self.peak_sig = max(self.peak_sig, hwm)
+        self.peak_tree = max(self.peak_tree, tree_rss)
+        self.peak_webkit = max(self.peak_webkit, webkit_rss)
+
+    def cpu_sig(self):
+        return self.cpu.get(self.root, 0.0)
+
+    def cpu_webkit(self):
+        return sum(self.cpu.get(pid, 0.0) for pid in self.webkit)
+
+    def cpu_tree(self):
+        return sum(self.cpu.values())
+
+
+def paeth(a, b, c):
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def decode_png(data):
+    """(width, height, channels, rows) for a non-interlaced 8-bit RGB or RGBA PNG."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a png")
+    pos = 8
+    width = height = color = None
+    idat = []
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        tag = data[pos + 4 : pos + 8]
+        chunk = data[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+        if tag == b"IHDR":
+            width, height, depth, color, comp, filt, inter = struct.unpack(">IIBBBBB", chunk)
+            if depth != 8 or color not in (2, 6) or comp or filt or inter:
+                raise ValueError(f"unsupported png depth={depth} color={color} inter={inter}")
+        elif tag == b"IDAT":
+            idat.append(chunk)
+        elif tag == b"IEND":
+            break
+    if not idat or width is None:
+        raise ValueError("png has no image")
+    raw = zlib.decompress(b"".join(idat))
+    channels = 3 if color == 2 else 4
+    stride = width * channels
+    rows = []
+    prev = bytearray(stride)
+    i = 0
+    for _ in range(height):
+        if i >= len(raw):
+            raise ValueError("png truncated")
+        filt = raw[i]
+        i += 1
+        row = bytearray(raw[i : i + stride])
+        i += stride
+        if len(row) != stride:
+            raise ValueError("png truncated")
+        if filt == 1:
+            for x in range(stride):
+                left = row[x - channels] if x >= channels else 0
+                row[x] = (row[x] + left) & 255
+        elif filt == 2:
+            for x in range(stride):
+                row[x] = (row[x] + prev[x]) & 255
+        elif filt == 3:
+            for x in range(stride):
+                left = row[x - channels] if x >= channels else 0
+                row[x] = (row[x] + ((left + prev[x]) // 2)) & 255
+        elif filt == 4:
+            for x in range(stride):
+                a = row[x - channels] if x >= channels else 0
+                b = prev[x]
+                c = prev[x - channels] if x >= channels else 0
+                row[x] = (row[x] + paeth(a, b, c)) & 255
+        elif filt != 0:
+            raise ValueError(f"bad png filter {filt}")
+        prev = row
+        rows.append(row)
+    return width, height, channels, rows
+
+
+def page_box(width, height):
+    """The page rectangle inside a window screenshot, in image pixels."""
+    top = min(CHROME_TOP, height)
+    status = STATUS_H if height - top > STATUS_H + 20 else 0
+    return (0, top, width, height - top - status)
+
+
+def analyze_rows(rows, channels, box, stride=STRIDE):
+    """Fraction of sampled pixels that differ from the dominant colour, and how many colours."""
+    x0, y0, w, h = box
+    counts = {}
+    n = 0
+    y_end = min(len(rows), y0 + h)
+    for y in range(max(0, y0), y_end, stride):
+        row = rows[y]
+        x_end = min(len(row) // channels, x0 + w)
+        for x in range(max(0, x0), x_end, stride):
+            i = x * channels
+            pix = (row[i], row[i + 1], row[i + 2])
+            counts[pix] = counts.get(pix, 0) + 1
+            n += 1
+    if not n:
+        return None
+    dominant, dom_n = max(counts.items(), key=lambda item: item[1])
+    return {
+        "nonblank": 1 - dom_n / n,
+        "distinct": len(counts),
+        "sampled": n,
+        "dominant": list(dominant),
+    }
+
+
+def analyze_png(path, stride=STRIDE):
+    data = Path(path).read_bytes()
+    width, height, channels, rows = decode_png(data)
+    box = page_box(width, height)
+    measured = analyze_rows(rows, channels, box, stride)
+    if measured is None:
+        return None
+    measured["page_box"] = list(box)
+    measured["image"] = [width, height]
+    return measured
+
+
+def parse_ppm(data):
+    if not data.startswith(b"P6"):
+        raise ValueError("not a ppm")
+    parts = data.split(b"\n", 3)
+    if len(parts) < 4:
+        raise ValueError("short ppm")
+    width, height = (int(v) for v in parts[1].split())
+    row_bytes = width * 3
+    rows = [bytearray(parts[3][y * row_bytes : (y + 1) * row_bytes]) for y in range(height)]
+    return width, height, 3, rows
+
+
+def error_lines(text):
+    """Script and engine errors in sig's log. The shutdown-leak line is not one of them:
+    Servo logs it when a page crash already happened, and also if shutdown itself leaks."""
+    found = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if (
+            not line
+            or "sig-diag " in line
+            or _SHUTDOWN_LEAK in line
+            or _JSC_OPTION in line
+        ):
+            continue
+        script = _SCRIPT.search(line) and _RE.search(r"ERROR|Error|Unhandled|panic", line)
+        if script or _PANIC.search(line) or _WEBKIT.search(line) or _ERROR_LEVEL.search(line):
+            found.append(line)
+    return found
+
+
+def error_key(line):
+    """A stable message for grouping the same Servo failure across sites."""
+    msg = line.strip()
+    bracket = _RE.search(r"\]\s+(.*)$", msg)
+    if bracket and _RE.search(r"\b(ERROR|WARN|INFO)\b", msg):
+        msg = bracket.group(1)
+    else:
+        plain = _RE.match(r"(?:ERROR|WARN|INFO|DEBUG)\s+\S+:\s*(.*)$", msg)
+        if plain:
+            msg = plain.group(1)
+    msg = _RE.sub(r"https?://\S+", "<url>", msg)
+    msg = _RE.sub(r":\d+:\d+", "", msg)
+    msg = _RE.sub(r"\b\d+\b", "N", msg)
+    msg = _RE.sub(r"\s+", " ", msg).strip()
+    return (msg or line.strip())[:240]
+
+
+def crash_from(log, diag):
+    reasons = []
+    for line in (log or "").splitlines():
+        if _SHUTDOWN_LEAK in line:
+            continue
+        if _PANIC.search(line):
+            reasons.append(line.strip()[:240])
+            break
+    for engine in (diag or {}).get("engines") or []:
+        state = str(engine.get("state") or "")
+        if state.startswith("failed"):
+            reasons.append(f"{engine.get('name')}: {state}"[:240])
+    return "; ".join(reasons)
+
+
+def tab_state(diag):
+    if not diag:
+        return None
+    tabs = diag.get("tabs") or []
+    if not tabs:
+        return None
+    active = int(diag.get("active_tab") or 1) - 1
+    if not 0 <= active < len(tabs):
+        active = 0
+    tab = tabs[active]
+    return {
+        "loading": bool(tab.get("loading")),
+        "error": bool(tab.get("error")),
+        "engine": tab.get("engine"),
+    }
+
+
+def frames_of(diag):
+    counters = (diag or {}).get("counters") or {}
+    return counters.get("page_frames_presented")
+
+
+def first_frame_ms(text, engine):
+    """Milliseconds from navigation to the first presented frame, from sig-diag."""
+    for match in _FIRST_FRAME.finditer(text or ""):
+        if match.group(1) == engine:
+            try:
+                return float(match.group(2))
+            except ValueError:
+                return None
+    return None
+
+
+def classify(run):
+    """OK, PARTIAL, BLANK, CRASH, TIMEOUT, or ERROR (the harness could not observe the page)."""
+    if not run.get("started"):
+        return "ERROR", run.get("harness_error") or "sig did not start"
+    if run.get("crash"):
+        return "CRASH", run.get("crash_reason") or "crash"
+    if not run.get("loaded"):
+        return "TIMEOUT", f"loading did not finish within {LOAD_TIMEOUT_S:.0f}s"
+    if run.get("nonblank") is None or run.get("distinct") is None:
+        return "ERROR", run.get("harness_error") or "no page screenshot"
+    nonblank = run["nonblank"]
+    distinct = run["distinct"]
+    rendered = nonblank >= NONBLANK_RENDERED or distinct >= DISTINCT_RENDERED
+    blank = nonblank < NONBLANK_BLANK and distinct < DISTINCT_BLANK
+    title = run.get("title")
+    titled = isinstance(title, str) and title.strip() != ""
+    nerr = run.get("error_count") or 0
+    if blank:
+        return (
+            "BLANK",
+            f"uniform page area ({nonblank:.1%} differ from the dominant colour, {distinct} colours)",
+        )
+    if not rendered or nerr or run.get("tab_error") or not titled:
+        why = []
+        if not rendered:
+            why.append(f"blank-ish ({nonblank:.1%} differ, {distinct} colours)")
+        if nerr:
+            why.append(f"{nerr} script/engine errors")
+        elif run.get("tab_error"):
+            why.append("the tab reports an error")
+        if not titled:
+            why.append("no title")
+        return "PARTIAL", "; ".join(why)
+    return "OK", "loaded, titled, non-blank, no errors"
+
+
+def session_title_url(text):
+    data = tomllib.loads(text)
+    tabs = data.get("tabs") or []
+    if not tabs:
+        return None, None
+    active = int(data.get("active") or 0)
+    if not 0 <= active < len(tabs):
+        active = 0
+    segments = tabs[active].get("segments") or []
+    if not segments:
+        return None, None
+    current = int(tabs[active].get("current") or 0)
+    if not 0 <= current < len(segments):
+        current = 0
+    segment = segments[current]
+    entries = segment.get("entries") or []
+    index = int(segment.get("current") or 0)
+    url = None
+    if entries:
+        url = entries[index] if 0 <= index < len(entries) else entries[-1]
+    title = segment.get("title")
+    return (str(title) if title is not None else None), url
+
+
+def host_of(url):
+    name = urllib.parse.urlparse(url or "").hostname
+    return name.lower() if name else None
+
+
+def config_text(engine, restore, extra=""):
+    flag = "true" if restore else "false"
+    text = (
+        "version = 1\n\n"
+        "[engines]\n"
+        f'default = "{engine}"\n\n'
+        "[engines.servo]\n"
+        'storage = "ephemeral"\n\n'
+        "[engines.wpe]\n"
+        'storage = "ephemeral"\n\n'
+        "[session]\n"
+        f"restore = {flag}\n"
+    )
+    extra = extra.strip()
+    if extra:
+        text += "\n" + extra + "\n"
+    return text
+
+
+def write_atomic(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def dump_json(path, obj):
+    write_atomic(path, json.dumps(obj, indent=2, sort_keys=True) + "\n")
+
+
+def load_sites(path=SITES):
+    data = tomllib.loads(Path(path).read_text())
+    sites = data.get("site") or []
+    for site in sites:
+        if not site.get("id") or not site.get("url"):
+            raise SystemExit(f"bench/compat: a site needs an id and a url ({site!r})")
+    return sites
+
+
+def request_diag(pid, path, previous):
+    """SIGUSR1, then the diagnostics JSON once sig has rewritten it."""
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except OSError:
+        return None
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            mtime = os.stat(path).st_mtime_ns
+        except OSError:
+            time.sleep(0.05)
+            continue
+        if previous is None or mtime > previous:
+            try:
+                return json.loads(Path(path).read_text()), mtime
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.05)
+                continue
+        time.sleep(0.05)
+    return None
+
+
+def sway_tree():
+    try:
+        out = subprocess.run(
+            ["swaymsg", "-t", "get_tree"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def find_window(node, pid):
+    """The sighurt window's rect in output pixels, preferring the deepest matching node."""
+    found = None
+    if isinstance(node, dict):
+        rect = node.get("rect") or {}
+        if rect.get("width", 0) >= 100 and rect.get("height", 0) >= 100:
+            if node.get("app_id") == "sighurt" or node.get("pid") == pid:
+                found = rect
+        for key in ("nodes", "floating_nodes"):
+            for child in node.get(key) or []:
+                child_found = find_window(child, pid)
+                if child_found:
+                    found = child_found
+    return found
+
+
+def cell(run):
+    if run is None:
+        return "—"
+    load = f"{run['load_s']:.1f}s" if run.get("load_s") is not None else "—"
+    if run.get("nonblank") is None:
+        blank = "—"
+    else:
+        blank = f"{run['nonblank'] * 100:.0f}%"
+    rss = "—"
+    if run.get("rss_sig_mib") is not None:
+        rss = f"{run['rss_sig_mib']:.0f}"
+        if run.get("engine") == "wpe" and run.get("rss_webkit_mib"):
+            rss += f"+{run['rss_webkit_mib']:.0f}"
+        rss += " MiB"
+    err = run.get("error_count")
+    err_s = "—" if err is None else f"{err} err"
+    text = f"{run.get('class', '?')} · {load} · {err_s} · {blank} · {rss}"
+    return text.replace("|", "/")
+
+
+def worst(runs):
+    return max(runs, key=lambda run: (CLASS_RANK.get(run.get("class"), -1), run.get("rep") or 0))
+
+
+def totals(runs, engine):
+    counts = {name: 0 for name in CLASS_RANK}
+    mine = [run for run in runs if run.get("engine") == engine]
+    for run in mine:
+        counts[run.get("class", "ERROR")] = counts.get(run.get("class"), 0) + 1
+    loads = [run["load_s"] for run in mine if run.get("load_s") is not None]
+    rss = [run["rss_sig_mib"] for run in mine if run.get("rss_sig_mib") is not None]
+    return counts, (median(loads) if loads else None), (median(rss) if rss else None)
+
+
+def median(values):
+    values = sorted(values)
+    n = len(values)
+    if not n:
+        return None
+    mid = n // 2
+    if n % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2
+
+
+def servo_groups(runs):
+    by_id = {}
+    for run in runs:
+        if run.get("engine") != "servo" or run.get("class") == "OK":
+            continue
+        current = by_id.get(run["id"])
+        if current is None or (not current.get("error_lines") and run.get("error_lines")):
+            by_id[run["id"]] = run
+    groups = {}
+    for run in by_id.values():
+        lines = run.get("error_lines") or []
+        if lines:
+            key = error_key(lines[0])
+            example = lines[0]
+        else:
+            key = f"({run.get('class')}, no script error in the log)"
+            example = ""
+        slot = groups.setdefault(key, {"sites": [], "classes": [], "example": example})
+        slot["sites"].append(run["id"])
+        slot["classes"].append(run.get("class"))
+    return sorted(groups.items(), key=lambda item: (-len(item[1]["sites"]), item[0]))
+
+
+def routing_lists(runs, sites):
+    """Hosts that were OK in WPE and not OK in Servo, plus rendered-but-not-OK hosts as comments."""
+    by_id = {}
+    urls = {site["id"]: site["url"] for site in sites}
+    for run in runs:
+        by_id.setdefault(run["id"], {}).setdefault(run["engine"], []).append(run)
+    hosts = []
+    notes = []
+    for site_id, engines in by_id.items():
+        wpe = engines.get("wpe") or []
+        servo = engines.get("servo") or []
+        if not wpe or not servo:
+            continue
+        host = host_of(urls.get(site_id) or wpe[0].get("url"))
+        if not host:
+            continue
+        wpe_ok = all(run.get("class") == "OK" for run in wpe)
+        servo_ok = all(run.get("class") == "OK" for run in servo)
+        wpe_rendered = any(
+            run.get("class") in ("OK", "PARTIAL")
+            and run.get("nonblank") is not None
+            and (run["nonblank"] >= NONBLANK_RENDERED or (run.get("distinct") or 0) >= DISTINCT_RENDERED)
+            for run in wpe
+        )
+        if wpe_ok and not servo_ok:
+            hosts.append(host)
+        elif wpe_rendered and not wpe_ok and not servo_ok:
+            notes.append(host)
+    return sorted(set(hosts)), sorted(set(notes))
+
+
+def render_report(meta, runs, sites):
+    lines = [
+        f"# Website compatibility {meta['date']} ({meta['rev']})",
+        "",
+        f"`{meta.get('sig_version') or 'sig'}` on {meta.get('host')}. "
+        "Headless sway, GLES2, 1600×1000, scale 1, one private compositor and D-Bus per run. "
+        f"{meta.get('reps')} repetition(s).",
+        "",
+        "A cell is `class · load · script/engine errors · non-blank · RSS`. "
+        "Load is process start until the tab stopped loading (the 3 s settle is extra). "
+        "RSS is sig's peak; a WPE cell adds the sampled peak of WebKit's processes (`sig+webkit`).",
+        "",
+        "| Site | Category | Servo | WPE |",
+        "|---|---|---|---|",
+    ]
+    by_key = {(run["id"], run["engine"]): [] for run in runs}
+    for run in runs:
+        by_key.setdefault((run["id"], run["engine"]), []).append(run)
+    categories = {site["id"]: site.get("category") or "" for site in sites}
+    order = [site["id"] for site in sites]
+    seen = set(order)
+    for run in runs:
+        if run["id"] not in seen:
+            order.append(run["id"])
+            seen.add(run["id"])
+    for site_id in order:
+        servo = by_key.get((site_id, "servo"))
+        wpe = by_key.get((site_id, "wpe"))
+        if not servo and not wpe:
+            continue
+        lines.append(
+            f"| {site_id} | {categories.get(site_id, '')} | "
+            f"{cell(worst(servo) if servo else None)} | {cell(worst(wpe) if wpe else None)} |"
+        )
+    lines += ["", "## Per engine", "", "| Engine | OK | PARTIAL | BLANK | CRASH | TIMEOUT | ERROR | median load s | median RSS MiB |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for engine in ENGINES:
+        counts, load, rss = totals(runs, engine)
+        load_s = "—" if load is None else f"{load:.1f}"
+        rss_s = "—" if rss is None else f"{rss:.0f}"
+        lines.append(
+            f"| {engine} | {counts['OK']} | {counts['PARTIAL']} | {counts['BLANK']} | "
+            f"{counts['CRASH']} | {counts['TIMEOUT']} | {counts['ERROR']} | {load_s} | {rss_s} |"
+        )
+    lines += ["", "## Servo failures by first error", ""]
+    groups = servo_groups(runs)
+    if not groups:
+        lines.append("No Servo run failed.")
+    for key, slot in groups:
+        names = ", ".join(f"{site} ({klass})" for site, klass in zip(slot["sites"], slot["classes"]))
+        lines.append(f"### {len(slot['sites'])} · {key}")
+        lines.append("")
+        lines.append(names)
+        lines.append("")
+        if slot["example"]:
+            lines.append(f"```")
+            lines.append(slot["example"][:500])
+            lines.append("```")
+            lines.append("")
+    lines += ["## Harness limits", ""]
+    for note in LIMITATIONS:
+        lines.append(f"- {note}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+LIMITATIONS = [
+    "The diagnostics JSON never includes an address or a title. Those two fields come from the session file. The run starts with session restore off and turns it on only after the screenshot, so a previous session is never restored; sig writes the snapshot because restore then applies live.",
+    "Servo's delegate drops page console messages (they are page data and go nowhere). Counted log lines are script::script_runtime errors, other ERROR lines, panics and fatal signals, and WebKit crash or exception text that reaches stderr. A JS exception such as adoptedStyleSheets being undefined is absent unless Servo also logs or panics on it. WebKit's `ERROR: invalid option: JSC_SIGNAL_FOR_GC` lines are ignored: sig sets that variable so JavaScriptCore does not take SIGUSR1, and WebKit prints the rejection once per process.",
+    "A WPE run still starts Servo when Servo is compiled in and enabled, because that is how sig installs its logger. sig's RSS on those runs includes Servo.",
+    "The non-blank fraction is pixels of the page rectangle (84 px of chrome at the top, 20 px of status at the bottom; the default chrome at font size 14 and scale 1) that differ from that rectangle's dominant colour. Every pixel is sampled.",
+    "Load time includes engine startup. The first diagnostics poll waits 2 s so SIGUSR1 cannot arrive before the handler, so a page that finished earlier is recorded at about 2 s. After that the flag is polled about every 0.3 s. CPU misses up to one 0.2 s sample of a process that exits between samples. WebKit's RSS peak is that sample's sum, not each process's high-water mark.",
+    "Each run is one public GET. A consent wall or a login form is the page that was measured. Servo can leave the tab's loading flag set after the page is visibly complete, and that run stays TIMEOUT.",
+]
+
+
+def render_routing(meta, hosts, notes):
+    body = [
+        f"# Example routing, generated {meta['date']} from the bench/compat corpus ({meta['rev']}).",
+        "# Hosts that classified OK in WPE and not OK in Servo on that run.",
+        "# Not a built-in list: which engine opens a site stays in the user's configuration (decision 94).",
+        "# Copy what you want into ~/.config/sighurt/config.toml.",
+        "[routing.wpe]",
+        "hosts = [",
+    ]
+    for host in hosts:
+        body.append(f'  "{host}",')
+    body.append("]")
+    if notes:
+        body.append("# Rendered something in WPE but did not classify OK, and were not OK in Servo:")
+        for host in notes:
+            body.append(f'# "{host}"')
+    body.append("")
+    return "\n".join(body)
+
+
+def publish(out, meta, runs, sites):
+    dump_json(out / "runs.json", {"meta": meta, "runs": runs})
+    (out / "report.md").write_text(render_report(meta, runs, sites))
+    hosts, notes = routing_lists(runs, sites)
+    (out / "example-routing.toml").write_text(render_routing(meta, hosts, notes))
+    return hosts
+
+
+def git_rev(explicit):
+    if explicit:
+        return explicit
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "nogit"
+
+
+def sig_version(path):
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return str(error)
+    line = (out.stdout or out.stderr).strip().splitlines()
+    return line[0] if line else ""
+
+
+def reclassify(out, reanalyze):
+    out = Path(out)
+    blob = json.loads((out / "runs.json").read_text())
+    meta = blob["meta"]
+    runs = blob["runs"]
+    sites = load_sites()
+    for run in runs:
+        log_path = out / "logs" / f"{run.get('id')}-{run.get('engine')}-r{run.get('rep')}.log"
+        if log_path.is_file():
+            log = read_text(log_path) or ""
+            lines = error_lines(log)
+            run["error_count"] = len(lines)
+            run["error_lines"] = lines[:20]
+            run["shutdown_leaked"] = _SHUTDOWN_LEAK in log
+            run["shm_fallback"] = "SHARED-MEMORY FALLBACK" in log
+            run["first_frame_ms"] = first_frame_ms(log, run.get("engine"))
+            match = _RE.search(
+                rf"renderer engine={run.get('engine')} mode=\S+(?: gl=\S+)?", log
+            )
+            if match:
+                run["engine_renderer"] = match.group(0)
+        if reanalyze and run.get("shot"):
+            shot = out / run["shot"]
+            if shot.is_file():
+                try:
+                    measured = analyze_png(shot)
+                except (OSError, ValueError) as error:
+                    run["harness_error"] = f"reanalyze: {error}"
+                    measured = None
+                if measured:
+                    run.update(measured)
+        klass, reason = classify(run)
+        run["class"] = klass
+        run["reason"] = reason
+    publish(out, meta, runs, sites)
+    print(f"compat: reclassified {len(runs)} runs in {out}", flush=True)
+
+
+def relative_shot(args):
+    """Screenshot path relative to the results directory: shots/<file>."""
+    path = Path(args.shot)
+    if path.parent.name == "shots":
+        return f"shots/{path.name}"
+    return path.name
+
+
+def quit_proc(proc):
+    try:
+        os.kill(proc.pid, signal.SIGTERM)
+    except OSError:
+        return proc.poll(), False
+    try:
+        return proc.wait(timeout=QUIT_GRACE_S), False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return None, True
+        return proc.returncode, True
+
+
+def run_one_inside(args):
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not (os.environ.get("WAYLAND_DISPLAY") and runtime.startswith("/tmp/sighl.")):
+        sys.exit("bench/compat/run: --inside must run under tools/headless-sway")
+    record = blank_record(args)
+    sig_proc = None
+    sampler = None
+    base = None
+    log_path = None
+    diag_path = None
+    try:
+        if os.environ.get("SIG_SWAY_RENDERER") != "gles2":
+            raise RuntimeError(
+                f"compositor renderer is {os.environ.get('SIG_SWAY_RENDERER')!r}, want gles2"
+            )
+        sig_path = args.sig or str(ROOT / "target/debug/sig")
+        if not os.access(sig_path, os.X_OK):
+            raise RuntimeError(f"no sig binary at {sig_path}")
+        base = Path(tempfile.mkdtemp(prefix="compat."))
+        config = base / "config" / "sighurt" / "config.toml"
+        log_path = Path(args.log) if args.log else base / "sig.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        Path(args.shot).parent.mkdir(parents=True, exist_ok=True)
+        diag_path = base / "diag.json"
+        extra = ""
+        if args.config_extra:
+            extra = Path(args.config_extra).read_text()
+        write_atomic(config, config_text(args.engine, restore=False, extra=extra))
+        env = os.environ.copy()
+        env.update(
+            {
+                "XDG_CONFIG_HOME": str(base / "config"),
+                "XDG_STATE_HOME": str(base / "state"),
+                "XDG_DATA_HOME": str(base / "data"),
+                "XDG_CACHE_HOME": str(base / "cache"),
+                "SIG_DIAG": "1",
+                "RUST_LOG": (
+                    "error,script::script_runtime=info,"
+                    "sighurt_engine_servo=warn,sighurt_engine_wpe=warn"
+                ),
+            }
+        )
+        env.pop("DISPLAY", None)
+        # The child keeps the dup from fork. Close the parent fd so the log can be read
+        # after sig exits, and so a leaked parent handle cannot keep the file open.
+        log_file = open(log_path, "w")
+        try:
+            started = time.monotonic()
+            sig_proc = subprocess.Popen(
+                [sig_path, "--diagnostics", str(diag_path), args.url],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+        finally:
+            log_file.close()
+        record["started"] = True
+        sampler = Sampler(sig_proc.pid)
+        sampler.start()
+        diag, loaded_at, died_early = wait_for_load(sig_proc, diag_path, started)
+        record["loaded"] = loaded_at is not None
+        record["load_s"] = (loaded_at - started) if loaded_at is not None else None
+        if died_early:
+            record["crash"] = True
+            record["crash_reason"] = "sig exited before it was asked to quit"
+        if sig_proc.poll() is None:
+            observe_screen(record, sig_proc.pid, args.shot)
+            diag = enable_session_restore(
+                sig_proc, diag_path, diag, config, args.engine, extra
+            ) or diag
+        if diag:
+            record["frames"] = frames_of(diag)
+    except Exception as error:
+        record["harness_error"] = f"{type(error).__name__}: {error}"
+    finally:
+        collect(record, sig_proc, sampler, base, args, diag_path, log_path)
+    return 0
+
+
+def blank_record(args):
+    return {
+        "id": args.id,
+        "url": args.url,
+        "engine": args.engine,
+        "category": args.category,
+        "rep": args.rep,
+        "started": False,
+        "loaded": False,
+        "load_s": None,
+        "title": None,
+        "final_url": None,
+        "crash": False,
+        "crash_reason": None,
+        "tab_error": False,
+        "error_count": 0,
+        "error_lines": [],
+        "frames": None,
+        "first_frame_ms": None,
+        "nonblank": None,
+        "distinct": None,
+        "sampled": None,
+        "dominant": None,
+        "page_box": None,
+        "image": None,
+        "rss_sig_mib": None,
+        "rss_webkit_mib": None,
+        "rss_tree_mib": None,
+        "cpu_sig_s": None,
+        "cpu_webkit_s": None,
+        "cpu_tree_s": None,
+        "exit_code": None,
+        "shutdown_forced": False,
+        "shutdown_leaked": False,
+        "shm_fallback": False,
+        "renderer": os.environ.get("SIG_SWAY_RENDERER"),
+        "engine_renderer": None,
+        "engine_state": None,
+        "tab_engine": None,
+        "last_error": None,
+        "harness_error": None,
+        "shot": relative_shot(args) if args.shot else None,
+    }
+
+
+def wait_for_load(sig_proc, diag_path, started):
+    """(last diagnostics, monotonic time loading ended or None, whether sig died)."""
+    # The handler is installed in main. engines.sh waits 2 s before the first SIGUSR1:
+    # a debug sig can spend that long in the loader, and SIGUSR1 before the handler kills it.
+    while time.monotonic() - started < 2.0:
+        if sig_proc.poll() is not None:
+            return None, None, True
+        time.sleep(0.1)
+    seen_loading = False
+    loaded_at = None
+    mtime = None
+    diag = None
+    while True:
+        now = time.monotonic()
+        if sig_proc.poll() is not None:
+            return diag, loaded_at, True
+        got = request_diag(sig_proc.pid, diag_path, mtime)
+        if got:
+            diag, mtime = got
+        state = tab_state(diag)
+        if state and state["loading"]:
+            seen_loading = True
+            loaded_at = None
+        elif state and not state["loading"] and (seen_loading or now - started >= 2):
+            if loaded_at is None:
+                loaded_at = now
+        if loaded_at is not None and now - loaded_at >= SETTLE_S:
+            return diag, loaded_at, False
+        if loaded_at is None and now - started >= LOAD_TIMEOUT_S:
+            return diag, None, False
+        time.sleep(POLL_S)
+
+
+def observe_screen(record, pid, shot):
+    tree = sway_tree()
+    window = find_window(tree, pid) if tree else None
+    if not window:
+        record["harness_error"] = "the window was not on the private compositor"
+        return
+    geom = f"{int(window['x'])},{int(window['y'])} {int(window['width'])}x{int(window['height'])}"
+    shot_path = Path(shot)
+    try:
+        shot_run = subprocess.run(
+            ["grim", "-g", geom, str(shot_path)], capture_output=True, timeout=15
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        record["harness_error"] = f"grim: {error}"
+        return
+    if shot_run.returncode != 0 or not shot_path.is_file() or not shot_path.stat().st_size:
+        detail = (shot_run.stderr or b"").decode(errors="replace")[:200]
+        record["harness_error"] = f"grim failed ({detail})"
+        return
+    try:
+        measured = analyze_png(shot_path)
+    except (OSError, ValueError) as error:
+        record["harness_error"] = f"png: {error}"
+        return
+    if measured:
+        record.update(measured)
+
+
+def enable_session_restore(sig_proc, diag_path, diag, config, engine, extra):
+    """Turn session restore on so sig writes the title and URL, and return the latest diagnostics."""
+    before = ((diag or {}).get("counters") or {}).get("config_reloads", 0)
+    mtime = None
+    write_atomic(config, config_text(engine, restore=True, extra=extra))
+    deadline = time.monotonic() + 3
+    latest = diag
+    while time.monotonic() < deadline and sig_proc.poll() is None:
+        got = request_diag(sig_proc.pid, diag_path, mtime)
+        if got:
+            latest, mtime = got
+            if (latest.get("counters") or {}).get("config_reloads", 0) > before:
+                break
+        time.sleep(0.2)
+    # session_changed waits SESSION_DELAY (1 s) and then the writer thread replaces the file.
+    time.sleep(1.5)
+    return latest
+
+
+def collect(record, sig_proc, sampler, base, args, diag_path, log_path):
+    webkit_pids = []
+    try:
+        if sampler is not None:
+            sampler.stop()
+            record["rss_sig_mib"] = mib(sampler.peak_sig)
+            record["rss_webkit_mib"] = mib(sampler.peak_webkit)
+            record["rss_tree_mib"] = mib(sampler.peak_tree)
+            record["cpu_sig_s"] = round(sampler.cpu_sig(), 3)
+            record["cpu_webkit_s"] = round(sampler.cpu_webkit(), 3)
+            record["cpu_tree_s"] = round(sampler.cpu_tree(), 3)
+            webkit_pids = list(sampler.webkit)
+        if sig_proc is not None and sig_proc.poll() is None:
+            record["exit_code"], record["shutdown_forced"] = quit_proc(sig_proc)
+        elif sig_proc is not None:
+            record["exit_code"] = sig_proc.returncode
+        for pid in webkit_pids:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        log = read_text(log_path) if log_path else ""
+        record["shutdown_leaked"] = _SHUTDOWN_LEAK in (log or "")
+        record["shm_fallback"] = "SHARED-MEMORY FALLBACK" in (log or "")
+        record["first_frame_ms"] = first_frame_ms(log, record.get("engine"))
+        match = _RE.search(rf"renderer engine={record['engine']} mode=\S+(?: gl=\S+)?", log or "")
+        if match:
+            record["engine_renderer"] = match.group(0)
+        lines = error_lines(log or "")
+        record["error_count"] = len(lines)
+        record["error_lines"] = lines[:20]
+        diag = None
+        if diag_path and Path(diag_path).is_file():
+            try:
+                diag = json.loads(Path(diag_path).read_text())
+            except (OSError, json.JSONDecodeError):
+                diag = None
+        if diag:
+            record["frames"] = frames_of(diag)
+            state = tab_state(diag)
+            if state:
+                record["tab_error"] = state["error"]
+                record["tab_engine"] = state["engine"]
+            record["engine_state"] = [
+                {
+                    "name": engine.get("name"),
+                    "state": engine.get("state"),
+                    "renderer": engine.get("renderer"),
+                }
+                for engine in diag.get("engines") or []
+            ]
+            record["last_error"] = diag.get("last_error")
+        reason = crash_from(log, diag)
+        if reason:
+            record["crash"] = True
+            record["crash_reason"] = reason
+        session = None if base is None else base / "state" / "sighurt" / "session.toml"
+        if session and session.is_file():
+            try:
+                record["title"], record["final_url"] = session_title_url(session.read_text())
+            except (OSError, tomllib.TOMLDecodeError, ValueError) as error:
+                record["harness_error"] = record["harness_error"] or f"session: {error}"
+    except Exception as error:
+        record["harness_error"] = f"{type(error).__name__}: {error}"
+    record["class"], record["reason"] = classify(record)
+    if args.result:
+        try:
+            dump_json(args.result, record)
+        except OSError as error:
+            print(f"compat: cannot write {args.result}: {error}", file=sys.stderr, flush=True)
+    if base is not None:
+        subprocess.run(["rm", "-rf", str(base)], check=False)
+    print(
+        f"compat: {record.get('engine')} {record.get('id')} {record.get('class')} "
+        f"load={record.get('load_s')} err={record.get('error_count')} "
+        f"nonblank={record.get('nonblank')}",
+        flush=True,
+    )
+
+
+def run_corpus(args):
+    if not os.environ.get("SIG_HEAVY_HELD") and not args.allow_unlocked:
+        sys.exit("bench/compat/run: run it under tools/heavy so it holds the machine lock")
+    sites = load_sites()
+    if args.sites:
+        wanted = {item.strip() for item in args.sites.split(",") if item.strip()}
+        sites = [site for site in sites if site["id"] in wanted]
+        missing = wanted - {site["id"] for site in sites}
+        if missing:
+            sys.exit(f"bench/compat/run: unknown site id(s): {', '.join(sorted(missing))}")
+    engines = [item.strip() for item in args.engines.split(",") if item.strip()]
+    for engine in engines:
+        if engine not in ENGINES:
+            sys.exit(f"bench/compat/run: engine must be servo or wpe, not {engine}")
+    if args.reps < 1:
+        sys.exit("bench/compat/run: --reps must be at least 1")
+    if args.config_extra:
+        extra_path = Path(args.config_extra)
+        if not extra_path.is_file():
+            sys.exit(f"bench/compat/run: --config-extra {args.config_extra} is not a file")
+        args.config_extra = str(extra_path.resolve())
+    sig_path = args.sig or str(ROOT / "target/debug/sig")
+    if not os.access(sig_path, os.X_OK):
+        sys.exit(f"bench/compat/run: no sig binary at {sig_path}")
+    rev = git_rev(args.rev)
+    out = Path(args.out) if args.out else ROOT / "bench/compat/results" / f"{time.strftime('%Y-%m-%d')}-{rev}"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "shots").mkdir(exist_ok=True)
+    (out / "logs").mkdir(exist_ok=True)
+    (out / "parts").mkdir(exist_ok=True)
+    meta = {
+        "date": time.strftime("%Y-%m-%d"),
+        "rev": rev,
+        "host": os.uname().nodename,
+        "sig": sig_path,
+        "sig_version": sig_version(sig_path),
+        "reps": args.reps,
+        "load_timeout_s": LOAD_TIMEOUT_S,
+        "settle_s": SETTLE_S,
+        "nonblank_rendered": NONBLANK_RENDERED,
+        "distinct_rendered": DISTINCT_RENDERED,
+        "nonblank_blank": NONBLANK_BLANK,
+        "distinct_blank": DISTINCT_BLANK,
+        "stride": STRIDE,
+    }
+    if args.config_extra:
+        meta["config_extra"] = args.config_extra
+    runs = []
+    jobs = [(site, engine, rep) for site in sites for engine in engines for rep in range(1, args.reps + 1)]
+    for index, (site, engine, rep) in enumerate(jobs, start=1):
+        part = out / "parts" / f"{site['id']}-{engine}-r{rep}.json"
+        print(f"compat: {index}/{len(jobs)} {engine} {site['id']}", flush=True)
+        if part.is_file() and not args.force:
+            try:
+                runs.append(json.loads(part.read_text()))
+                print(f"compat: reuse {part.name}", flush=True)
+                continue
+            except (OSError, json.JSONDecodeError):
+                pass
+        shot = out / "shots" / f"{site['id']}-{engine}-r{rep}.png"
+        log = out / "logs" / f"{site['id']}-{engine}-r{rep}.log"
+        cmd = [
+            str(ROOT / "tools/headless-sway"),
+            "--renderer", "gles2",
+            "--size", "1600x1000",
+            "--",
+            str(ROOT / "engines/sighurt-engine-wpe/tests/private-bus"),
+            sys.executable,
+            str(ROOT / "bench/compat/run"),
+            "--inside",
+            "--engine", engine,
+            "--url", site["url"],
+            "--id", site["id"],
+            "--category", site.get("category") or "",
+            "--rep", str(rep),
+            "--shot", str(shot),
+            "--log", str(log),
+            "--result", str(part),
+            "--sig", sig_path,
+        ]
+        if args.config_extra:
+            cmd += ["--config-extra", args.config_extra]
+        proc = subprocess.Popen(cmd, start_new_session=True)
+        try:
+            proc.wait(timeout=args.job_timeout)
+        except subprocess.TimeoutExpired:
+            print(f"compat: {engine} {site['id']} exceeded {args.job_timeout:.0f}s; killing it", flush=True)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        if part.is_file():
+            try:
+                runs.append(json.loads(part.read_text()))
+            except (OSError, json.JSONDecodeError) as error:
+                runs.append(failed_job(site, engine, rep, f"unreadable result: {error}"))
+        else:
+            runs.append(failed_job(site, engine, rep, "headless-sway produced no result"))
+        publish(out, meta, runs, sites)
+        if index != len(jobs) and args.pause:
+            time.sleep(args.pause)
+    hosts, _notes = routing_lists(runs, sites)
+    print(f"compat: DONE {out} ({len(runs)} runs, {len(hosts)} WPE-only hosts)", flush=True)
+
+
+def failed_job(site, engine, rep, message):
+    record = {
+        "id": site["id"],
+        "url": site["url"],
+        "engine": engine,
+        "category": site.get("category") or "",
+        "rep": rep,
+        "started": False,
+        "loaded": False,
+        "load_s": None,
+        "title": None,
+        "final_url": None,
+        "crash": False,
+        "crash_reason": None,
+        "tab_error": False,
+        "error_count": 0,
+        "error_lines": [],
+        "frames": None,
+        "nonblank": None,
+        "distinct": None,
+        "rss_sig_mib": None,
+        "rss_webkit_mib": None,
+        "harness_error": message,
+    }
+    record["class"], record["reason"] = classify(record)
+    return record
+
+
+def self_test():
+    failures = []
+
+    def check(name, ok, detail=""):
+        if ok:
+            print(f"PASS {name}")
+        else:
+            failures.append(name)
+            print(f"FAIL {name} {detail}")
+
+    sites = load_sites()
+    ids = [site["id"] for site in sites]
+    check("about 40 sites", 35 <= len(sites) <= 45, str(len(sites)))
+    check("ids unique", len(ids) == len(set(ids)))
+    check("https only", all(site["url"].startswith("https://") for site in sites))
+    check("example is the control", any(site["id"] == "example" for site in sites))
+
+    base = {
+        "started": True,
+        "loaded": True,
+        "title": "Example Domain",
+        "error_count": 0,
+        "tab_error": False,
+        "crash": False,
+        "nonblank": 0.2,
+        "distinct": 100,
+    }
+    check("ok", classify(base)[0] == "OK")
+    check("blank", classify({**base, "nonblank": 0.0, "distinct": 1})[0] == "BLANK")
+    check("errors are partial", classify({**base, "error_count": 2})[0] == "PARTIAL")
+    check("no title is partial", classify({**base, "title": None})[0] == "PARTIAL")
+    check("blank-ish is partial", classify({**base, "nonblank": 0.01, "distinct": 10})[0] == "PARTIAL")
+    check("timeout", classify({**base, "loaded": False})[0] == "TIMEOUT")
+    check("crash", classify({**base, "crash": True, "crash_reason": "panic"})[0] == "CRASH")
+    check("crash beats timeout", classify({**base, "crash": True, "loaded": False})[0] == "CRASH")
+    check("no pixels is an error", classify({**base, "nonblank": None, "distinct": None})[0] == "ERROR")
+    check("did not start", classify({"started": False, "harness_error": "no sig"})[0] == "ERROR")
+
+    log = "\n".join(
+        [
+            "sig-diag t=1.0 frame engine=servo presented=1",
+            "[2026-10-17T00:00:00Z ERROR script::script_runtime] Unhandled promise rejection: e.adoptedStyleSheets is undefined",
+            "[2026-10-17T00:00:01Z ERROR sighurt_runtime] an engine could not shut down; sig ends without running exit handlers",
+            "thread 'script' panicked at layout: boom, src/lib.rs:10:1",
+            "WARN wpe: SHARED-MEMORY FALLBACK: no DMA-BUF",
+            "ERROR: invalid option: JSC_SIGNAL_FOR_GC=12",
+        ]
+    )
+    lines = error_lines(log)
+    check("sig-diag ignored", all("sig-diag" not in line for line in lines))
+    check("shutdown leak ignored", all(_SHUTDOWN_LEAK not in line for line in lines))
+    check("script error kept", any("adoptedStyleSheets" in line for line in lines))
+    check("panic kept", any("panicked at" in line for line in lines))
+    check("fallback warn ignored", all("SHARED-MEMORY" not in line for line in lines), str(lines))
+    check("jsc option ignored", all("JSC_SIGNAL_FOR_GC" not in line for line in lines), str(lines))
+    check(
+        "first frame",
+        first_frame_ms("sig-diag t=1 first-frame engine=wpe after_navigate_ms=693.101\n", "wpe")
+        == 693.101,
+    )
+    check(
+        "error key drops the prefix and the numbers",
+        error_key(lines[0]).startswith("Unhandled promise rejection"),
+        error_key(lines[0]),
+    )
+
+    session = """
+version = 1
+active = 0
+
+[[tabs]]
+current = 0
+zoom = 1.0
+
+[[tabs.segments]]
+engine = "servo"
+entries = ["https://example.com/", "https://example.com/#x"]
+current = 1
+title = "Example Domain"
+"""
+    title, url = session_title_url(session)
+    check("session title", title == "Example Domain", str(title))
+    check("session url is the current entry", url == "https://example.com/#x", str(url))
+
+    width, height = 4, 2
+    # Six white pixels and two black. Dominant is white, non-blank is 2/8.
+    rows = []
+    raw_rows = []
+    for y in range(height):
+        row = bytearray()
+        for x in range(width):
+            colour = (0, 0, 0) if (x, y) == (3, 1) or (x, y) == (2, 1) else (255, 255, 255)
+            row.extend(colour)
+        raw_rows.append(row)
+        rows.append(b"\x00" + bytes(row))
+    png = _png(width, height, b"".join(rows))
+    decoded = decode_png(png)
+    check("png size", decoded[0] == 4 and decoded[1] == 2)
+    check("png pixels", bytes(decoded[3][1][6:9]) == b"\x00\x00\x00", bytes(decoded[3][1][6:9]))
+    # A Sub-filtered row: pixel (10,20,30) then a pixel 1 higher in each channel.
+    sub = bytes([1, 10, 20, 30, 1, 1, 1])
+    sub_png = _png(2, 1, sub, color=2)
+    sub_rows = decode_png(sub_png)[3]
+    check("png sub filter", list(sub_rows[0]) == [10, 20, 30, 11, 21, 31], list(sub_rows[0]))
+    measured = analyze_rows(decoded[3], 3, page_box(4, 2), stride=1)
+    # The page box of a 4x2 image has no room (chrome is taller than the image), so use the whole image.
+    measured = analyze_rows(decoded[3], 3, (0, 0, 4, 2), stride=1)
+    check("dominant fraction", measured and abs(measured["nonblank"] - 0.25) < 1e-9, measured)
+    check("two colours", measured and measured["distinct"] == 2)
+
+    runs = [
+        {**base, "id": "chatgpt", "engine": "wpe", "class": "OK", "url": "https://chatgpt.com/", "rep": 1},
+        {**base, "id": "chatgpt", "engine": "servo", "class": "BLANK", "url": "https://chatgpt.com/", "rep": 1,
+         "error_lines": ["[t ERROR script::script_runtime] Unhandled promise rejection: nope"],
+         "nonblank": 0.0, "distinct": 1},
+        {**base, "id": "example", "engine": "wpe", "class": "OK", "url": "https://example.com/", "rep": 1},
+        {**base, "id": "example", "engine": "servo", "class": "OK", "url": "https://example.com/", "rep": 1},
+        {**base, "id": "github-servo", "engine": "wpe", "class": "PARTIAL", "url": "https://github.com/servo/servo",
+         "rep": 1, "nonblank": 0.4, "distinct": 80, "error_count": 1},
+        {**base, "id": "github-servo", "engine": "servo", "class": "BLANK", "url": "https://github.com/servo/servo",
+         "rep": 1, "nonblank": 0.0, "distinct": 1, "error_lines": []},
+    ]
+    # classify() is what publication uses; the fixture's class fields are the stored verdicts.
+    hosts, notes = routing_lists(runs, [
+        {"id": "chatgpt", "url": "https://chatgpt.com/"},
+        {"id": "example", "url": "https://example.com/"},
+        {"id": "github-servo", "url": "https://github.com/servo/servo"},
+    ])
+    check("wpe-only host", hosts == ["chatgpt.com"], str(hosts))
+    check("partial wpe is a comment", notes == ["github.com"], str(notes))
+    groups = servo_groups(runs)
+    check("servo group has the promise", any("nope" in key or "Unhandled" in key for key, _slot in groups), str(groups))
+    text = render_routing({"date": "2026-10-17", "rev": "abc"}, hosts, notes)
+    check("routing header", "decision 94" in text and 'hosts = [' in text and '"chatgpt.com"' in text)
+    extra = config_text("servo", False, "[engines.servo]\nexperimental-features = true")
+    check(
+        "config extra",
+        'storage = "ephemeral"' in extra and "experimental-features = true" in extra,
+        extra,
+    )
+
+    box = page_box(1600, 1000)
+    check("page box", box == (0, 84, 1600, 896), str(box))
+    if failures:
+        print(f"compat self-test: {len(failures)} failed")
+        return 1
+    print(f"compat self-test: {len(sites)} sites, all checks passed")
+    return 0
+
+
+def _png(width, height, raw, color=2):
+    def chunk(tag, data):
+        crc = zlib.crc32(data, zlib.crc32(tag)) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, color, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Servo and WPE website compatibility corpus")
+    parser.add_argument("--reps", type=int, default=1)
+    parser.add_argument("--engines", default="servo,wpe")
+    parser.add_argument("--sites", default="", help="comma-separated site ids (default: all)")
+    parser.add_argument("--out", default="")
+    parser.add_argument("--rev", default="")
+    parser.add_argument("--sig", default="")
+    parser.add_argument("--force", action="store_true", help="re-run sites that already have a result")
+    parser.add_argument("--pause", type=float, default=1.0, help="seconds between runs")
+    parser.add_argument("--job-timeout", type=float, default=120.0)
+    parser.add_argument("--allow-unlocked", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--reclassify", default="", metavar="DIR")
+    parser.add_argument("--reanalyze", action="store_true")
+    parser.add_argument("--inside", action="store_true")
+    parser.add_argument("--engine", default="")
+    parser.add_argument("--url", default="")
+    parser.add_argument("--id", default="")
+    parser.add_argument("--category", default="")
+    parser.add_argument("--rep", type=int, default=1)
+    parser.add_argument("--shot", default="")
+    parser.add_argument("--log", default="")
+    parser.add_argument("--result", default="")
+    parser.add_argument(
+        "--config-extra",
+        default="",
+        metavar="FILE",
+        help="TOML appended to every run's generated configuration",
+    )
+    args = parser.parse_args()
+    if args.self_test:
+        sys.exit(self_test())
+    if args.list:
+        for site in load_sites():
+            print(f"{site['id']}\t{site.get('category', '')}\t{site['url']}")
+        return
+    if args.reclassify:
+        reclassify(args.reclassify, args.reanalyze)
+        return
+    if args.inside:
+        sys.exit(run_one_inside(args))
+    run_corpus(args)
+
+
+if __name__ == "__main__":
+    main()

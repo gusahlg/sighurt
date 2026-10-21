@@ -1,0 +1,9 @@
+# Servo's experimental web-platform features, for a bench/compat run.
+# Append with: bench/compat/run --config-extra bench/compat/example-servo-experimental.toml
+#
+# Off by default. Servo marks this set unstable, and some of it hangs or breaks pages
+# (IntersectionObserver among them). Read when sig starts. One preference on its own is
+# [engines.servo.preferences], which this file does not set.
+
+[engines.servo]
+experimental-features = true

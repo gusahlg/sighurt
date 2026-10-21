@@ -1,0 +1,65 @@
+[package]
+name = "sighurt-engine-wasm"
+description = "Sighurt's Wasm engine: runs Oxide-format .wasm apps under Wasmtime and draws them on the CPU"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# Screen capture (`api_screen_capture`) through the `screenshots` crate, which opens a Wayland
+# connection of its own (wayland-client 0.30) behind the host's back. Off by default: plan §17
+# treats capture as a capability to validate, and without this feature the call reports that
+# capture failed.
+screen-capture = ["dep:screenshots"]
+
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }
+# The example and the compositor test mount views on the host's SHM lease. The lease
+# implements `CpuTarget` in sighurt-wayland.
+sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
+wasmtime.workspace = true
+tiny-skia.workspace = true
+# Shaping, font fallback and glyph rasterization for guest text.
+cosmic-text.workspace = true
+tracing.workspace = true
+url.workspace = true
+serde.workspace = true
+toml.workspace = true
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "stream"], default-features = false }
+rfd = "0.15"
+anyhow = "1"
+chrono = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+sha2 = "0.10"
+base64 = "0.22"
+dirs = "5"
+percent-encoding = "2"
+getrandom = "0.2"
+rodio = "0.22.2"
+ffmpeg-next = "8.1.0"
+tempfile = "3"
+nokhwa = { version = "0.10.10", features = ["input-native", "camera-sync-impl"] }
+cpal = "0.17.3"
+screenshots = { version = "0.8.10", optional = true }
+webrtc = "0.17.1"
+bytes = "1.11.1"
+serde_json = "1.0.149"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+gilrs = "0.11"
+hmac = "0.12"
+flate2 = "1.1.9"
+sys-locale = "0.3.2"
+iana-time-zone = "0.1.65"
+starship-battery = "0.11.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coremidi = "0.7"
+
+[dev-dependencies]
+wat = "1"
+# The `wasm-view` example's event loop.
+calloop.workspace = true

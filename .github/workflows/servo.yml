@@ -11,24 +11,24 @@ on:
   push:
     branches: ["**"]
     paths:
-      - "sighurt-api/**"
-      - "sighurt-wayland/**"
-      - "sighurt-engine-servo/**"
-      - "sighurt-runtime/**"
-      - "sighurt-gui/**"
-      - "sighurt-browser/**"
+      - "crates/sighurt-api/**"
+      - "frontends/sighurt-wayland/**"
+      - "engines/sighurt-engine-servo/**"
+      - "crates/sighurt-runtime/**"
+      - "frontends/sighurt-gui/**"
+      - "apps/sighurt-browser/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/servo.yml"
   pull_request:
     branches: [main]
     paths:
-      - "sighurt-api/**"
-      - "sighurt-wayland/**"
-      - "sighurt-engine-servo/**"
-      - "sighurt-runtime/**"
-      - "sighurt-gui/**"
-      - "sighurt-browser/**"
+      - "crates/sighurt-api/**"
+      - "frontends/sighurt-wayland/**"
+      - "engines/sighurt-engine-servo/**"
+      - "crates/sighurt-runtime/**"
+      - "frontends/sighurt-gui/**"
+      - "apps/sighurt-browser/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/servo.yml"

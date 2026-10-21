@@ -9,13 +9,13 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-sighurt-api = { path = "../../sighurt-api" }
-sighurt-wayland = { path = "../../sighurt-wayland" }
+sighurt-api = { path = "../../crates/sighurt-api" }
+sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
 # The three engines as `sig` links them: Servo (default features, as `sig`'s build), the Wasm
 # engine with every native library it brings, and the WPE engine.
-sighurt-engine-servo = { path = "../../sighurt-engine-servo" }
-sighurt-engine-wasm = { path = "../../sighurt-engine-wasm" }
-sighurt-engine-wpe = { path = "../../sighurt-engine-wpe" }
+sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo" }
+sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm" }
+sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe" }
 wasmtime.workspace = true
 calloop.workspace = true
 wat = "1"

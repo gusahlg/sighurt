@@ -32,6 +32,56 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   WebKit is opened on first use and its processes end with the last WPE page, retained views are
   bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
 
+### Paused on 17 October 2026 (evening): where the terminal frontend and compatibility work stand
+
+Committed on `rewrite` today (decisions 88–98): the AGPL relicensing; the split of `sig` into
+`sighurt-runtime`, `sighurt-gui` and a thin `main`; the CPU frame and semantic contract in
+`sighurt-api`; `sig --tui` in graphics mode (kitty) with Servo, WPE, Wasm and the demo engine;
+`[tui]` and the terminal's default keys; `page.switch-engine` and `--engine`; Servo's
+off-by-default features in `[engines.servo]`; the site corpus (`bench/compat/`); and
+`sighurt-semantic` (extraction script and parser, not yet run in a page).
+
+**Unfinished work** is saved on branch `wip/2026-10-17-shutdown` (one snapshot commit on top of
+`rewrite`, not built or tested as a whole; the same changes are still uncommitted in the
+working tree). Resume each from there:
+
+1. **Keys in real terminals (highest priority: the user can't use `sig --tui` in Rio).**
+   Reproduced in Rio 0.5.28 with the user's config in a private headless sway: pages render, but
+   Enter isn't recognized (Rio sends kitty CSI-u, e.g. `\x1b[13u`) and characters typed right
+   after `o` reach the keymap before the address line opens (`google.com` became `ogle.com`).
+   Partial fix in `frontends/sighurt-tui/src/term/{keys,parser}.rs` and `app.rs`; a real-terminal check
+   `frontends/sighurt-tui/tests/real-terminals.sh` (Rio and kitty in headless sway) was being written. Then
+   refresh `target/try/sig`, which the user runs.
+2. **The terminal review's findings** (GPT-6 Astra, after the keys): restoration can be cut
+   short under output backpressure (also seen as a truncated last kitty frame at quit); a resize
+   can stall Servo's frames (`frame_requested` stays set); input reading unbounded; the kitty
+   encoder allocates before its cap; late capability replies never relayout; mouse releases
+   outside the page dropped.
+3. **R1** (partial in `crates/sighurt-runtime/src/session.rs`): forget the frontend's target when
+   `open_view` fails; and Servo's offscreen context mutates `DRI_PRIME`/`LIBGL_ALWAYS_SOFTWARE`
+   after Servo's threads exist (possible UB) — not started.
+4. **Text mode**: the renderer `frontends/sighurt-tui/src/textmode/` (partial, untested), WPE semantics
+   `engines/sighurt-engine-wpe/src/semantic.rs` (partial), then Servo semantics, the app-loop
+   integration and `--dump`; plus decision 98's hardening of `sighurt-semantic`.
+5. **The GUI's engine button** (the user's feedback: no button look, no hover/pressed, no sign a
+   switch is under way; repeated clicks): partial in sighurt-ui, sighurt-chrome-line,
+   frontends/sighurt-gui/src/chrome.rs and sighurt-core.
+6. **Investigations without reports yet**: Servo on github.com (a frozen, uninteractive page)
+   and chatgpt.com (the login code field can't be focused or typed in) —
+   `experiments/servo-input/`; WPE's green video rectangle on github.com, its "Can't connect to
+   a11y bus" warning, and "ERROR: invalid option: JSC_SIGNAL_FOR_GC=12" from WebKit's child
+   processes (JSC's option parser rejects the variable `sig` sets for WTF, decision 78) —
+   `experiments/wpe-issues/` (its generated test videos are not committed).
+7. **Servo 0.7** on branch `servo-0.7` (worktree `../sighurt-servo07`, built on louise-pc in
+   `~/repos/sighurt-servo07`): passes its library and offscreen tests, clippy and engines.sh (0
+   failed). Its corpus run, and the 0.5 corpus reruns with `experimental-features` and with
+   `bench/compat/example-servo-compat.toml`, were queued on louise-pc and not finished; any
+   partial results are in louise-pc:~/repos/sighurt-rewrite/bench/compat/results/. Adopt 0.7 only
+   on those numbers.
+
+Grok Build is no longer used (its balance ran out; the user said so): implementation goes to
+Claude Sonnet and Opus subagents, reviews to GPT-6 Astra.
+
 ## Milestones (§23)
 
 ### M0 — Record the baseline and prove engine coexistence
@@ -1900,8 +1950,12 @@ The phases of [TUI.md](TUI.md) §8, each passing only with the evidence named.
   (b04ebf4, 8e8d576; an independent review found the diagnostics, effect order and shutdown
   order unchanged; engines.sh 271/271 on louise-pc, headless.sh 75/75, sighurt-ui's headless.sh
   35/35, clippy clean with no features and with all).
-- [ ] **Phase 2: the demo engine in the terminal**, graphics and text, `--dump`.
-- [ ] **Phase 3: Servo's and WPE's CPU presenters**, graphics mode with real pages.
+- [x] **Phase 2 (reordered, decision 97): `sig --tui` in graphics mode with Servo, Wasm and the
+  demo engine** (07f7e36): `sighurt-browser/tests/tui.rs`'s two end-to-end tests of `sig --tui`
+  in a pty (image sized to the page rows, address line, resize, quit and SIGTERM restoring the
+  terminal, ≤ fps frames), sighurt-tui's 36 unit and 13 pty tests, and example.com through Servo
+  decoded from the kitty stream on the RTX 3070 with no display server.
+- [ ] **Phase 3: WPE's CPU presenter** (Servo's is done: 79be7f7), sixel; text mode and `--dump`.
 - [ ] **Phase 4: semantics** in Servo and WPE; text mode and `--dump` with real pages.
 - [ ] **Phase 5:** the Wasm engine in the terminal, mouse, the stdin pager, the documents.
 
@@ -3254,3 +3308,102 @@ Newest last. Each entry says what was decided and why.
     opens a view in another in-process runtime (no IPC). Upgrading Servo past 0.5 (0.7.0 was
     released 5 October 2026) is tried in parallel, in a worktree of its own, and adopted only
     on measured results.
+95. **`page.switch-engine` reopens the page in the next web engine, and `sig --engine` is the
+    engine a run starts with** (decision 94). (1) `page.switch-engine` reopens the page the tab
+    shows in the next web engine, wrapping around, in the build's descriptor order, among those
+    compiled in and enabled (`[engines] enabled`). It is `page.open-in` of that engine: the same
+    history, and the view is chosen the same way, so the page's links stay until an address is
+    typed. A web engine opens http(s) pages. That is `Descriptor::web` in sighurt-runtime,
+    copied into `Environment::web_engines`; the core does not name engines. Servo and WPE are
+    web engines; Wasm and the demo engine are not. A page still loading counts, including one
+    whose view is only the tab's pending switch, so the cycle continues from the engine that is
+    opening it. Fewer than two enabled web engines, or a page that is not http, https or a file,
+    shows a notice and leaves the page. (2) `sig --engine <name>` overrides `[engines] default`
+    for the run, including every configuration reload. An engine the build lacks, or one the
+    configuration does not enable, is an error at startup that names the engines available.
+    `--help` documents it. The core applies the override on top of the file
+    (`set_starting_engine`); it is not written into the file. (3) A click on the engine label
+    at the address field's right end, or at the end of the line chrome, runs the command. The
+    hit is the text that is drawn; hovering it changes nothing else, and no golden image
+    changes. (4) The terminal's built-in `[tui.keys]` binds `e` to it. The windowed frontend
+    still binds nothing; the default file documents the command with an example binding
+    (`ctrl-alt-e`). *Why:* decision 94: which engine shows a site is the user's choice, at
+    runtime and in the configuration, and the browser ships no compatibility list. Evidence:
+    sighurt-core's `switch_engine_cycles_web_engines_in_descriptor_order`,
+    `switch_engine_leaves_the_page_and_says_why`, `switch_engine_matches_page_open_in`,
+    `a_typed_address_after_switching_engines_routes_as_after_open_in`,
+    `the_starting_engine_overrides_the_default_across_a_reload`,
+    `starting_engine_overrides_the_configured_default`,
+    `starting_engine_names_the_engines_it_can_be`,
+    `a_rejected_starting_engine_fails_the_builtin_fallback_too`,
+    `the_terminal_installs_its_default_keys_and_the_window_does_not` and
+    `the_built_in_table_is_the_one_documented`; sighurt-api's
+    `display_gives_the_canonical_string_back` and `bad_commands_are_errors`; sighurt-runtime's
+    `the_core_learns_what_each_engine_honors`; sighurt-ui's
+    `a_click_on_the_address_fields_engine_label_switches_engine`; sighurt-chrome-line's
+    `a_click_on_the_lines_engine_label_switches_engine`; sighurt-browser's
+    `engine_is_the_engine_this_run_starts_with`.
+97. **The terminal frontend shipped graphics mode first, with Servo** (the user, 17 October 2026:
+    try the TUI as soon as possible, in a kitty-protocol terminal; amends TUI.md §8's phase order,
+    which put a demo-engine slice and text mode first). `sig` runs in the terminal when stdout is
+    one and `TERM` is set and not `dumb`, and opens the window otherwise; `--tui` and `--gui`
+    override, and `--tui` without a terminal or the `frontend-tui` feature is an error (exit 2).
+    The terminal writes to its fd from one place per pass, only when the previous bytes have left
+    (a write source while bytes wait, no timer), so no escape sequence is ever cut. In the
+    terminal, stderr (the engines' logs) goes to `$XDG_STATE_HOME/sighurt/tui.log`. The top line
+    shows only the active tab, so there is no tab click yet. The end-to-end tests run the real
+    `sig` from `sighurt-browser/tests/tui.rs`. *Why:* the user's request; TUI.md §8.6 and §8.8.
+    Evidence: the tests named under phase 2 above.
+98. **Page extraction is page behaviour in Servo, and its bounds become real budgets** (TUI.md
+    §11; amends 90 and 93's wording, which promised more than a main world can give). An
+    independent review (GPT-6 Astra) of `sighurt-semantic` found, to fix: traversal work not
+    bounded (depth counts emitted nodes; label, text and option helpers scan without budgets;
+    quadratic button folding) → iterative traversal with visited-node, DOM-depth, child and
+    scanned-character budgets; a password field whose `type` throws is read as text → fail closed;
+    `parse` materializes a `serde_json::Value` before the node limit → bounded visitors; the
+    reverse id map grows without bound and falls back to strong references → capped, weak only;
+    `Object.prototype` pollution and inherited `toJSON` reach the output → null-prototype records
+    and own-property reads; actions on disabled or read-only controls, and `submit` fallback
+    bypassing validation → refused. *Why:* plan §17 (page data is untrusted) and TUI.md §8.5.
+99. **The crate organization of `docs/crate-organization.md` is adopted** (the user, 21 October
+    2026: "Apply any suggested changes mentioned there"; the document was written with GPT-6
+    Astra in a separate session). In its order: (1) the crates move into directory groups —
+    `crates/` (api, core, runtime), `frontends/` (gui, tui, wayland), `ui/` (sighurt-ui),
+    `engines/` (servo, wpe, wasm, demo, semantic), `extensions/` (line chrome, modal keymap),
+    `sdk/`, `examples/`, `experiments/` and `apps/` (sig) — keeping every Cargo package name and
+    behaviour; (2) the application supplies the engine, chrome and keymap registrations instead
+    of lists fixed in sighurt-runtime and sighurt-gui, and engine-specific configuration
+    validation and lifecycle move to the adapters (Servo's preference catalog leaves the core);
+    (3) an example configuration outside the workspace builds its own browser with the line
+    chrome, the modal keymap and a new engine name without editing the Sighurt checkout — the
+    acceptance test; (4) the gaps it exposes are fixed. Separate repositories wait until there is
+    a concrete benefit (the document's step 5). Amends 1, 68 and 96 where they put lists or
+    engine knowledge in shared crates.
+100. **Servo 0.7 is to be adopted, after its two regressions are explained** (pending; measured
+    21 October 2026 on louise-pc, RTX 4060, the 40-site corpus, Servo only, one repetition each;
+    `bench/compat/results/`): Servo 0.5 with defaults 27 OK / 7 partial / 0 blank / 6 timeouts
+    (2026-10-17-79be7f7); 0.5 with `experimental-features` 29 / 6 / 0 / 5
+    (ac2c9f5-servo-experimental), the same with adopted stylesheets and Web Animations
+    (ac2c9f5-servo-compat); Servo 0.7 (branch `servo-0.7`, 22ffede) 37 / 0 / 2 / 1
+    (servo07-22ffede): pages that never finished loading in 0.5 load (reddit, past its
+    JavaScript challenge; Wikipedia; YouTube), but stackoverflow (Cloudflare's "Just a moment…"
+    stays) and Amazon are blank where 0.5 rendered them minutes earlier. 0.7 logs no script
+    errors to `sig`'s log, so the error counts and PARTIAL→OK changes don't compare across
+    versions; screenshots do. Next: explain the two blanks (user agent? a missing feature in the
+    challenge?), then merge `servo-0.7` into `rewrite` (after the work in progress in
+    sighurt-engine-servo), re-run every suite and the corpus. *Why:* decision 94's measured
+    corpus; Servo's experimental preferences gain 2 sites, 0.7 gains 10.
+101. **Servo 0.7 is adopted** (settles 100). The two regressions are Servo 0.7's, not the
+    adapter's: stackoverflow.com and amazon.com serve bot challenges (Cloudflare's, AWS WAF's)
+    whose scripts 0.5 completes and 0.7 abandons — 0.7 retries the 403 with
+    `cf_chl_rc_ni=1`, or posts the challenge's failure report and never `mp_verify`; swapping the
+    two versions' user agents changes nothing (branch `servo-0.7`, bbefacc,
+    `experiments/servo07-blank/`). 0.7 still renders 37 of 40 sites against 0.5's 27–29, and a
+    user can route the two challenge-gated sites to WPE (decision 94). The missing script errors
+    are the adapter's: 0.7 reports them through `WebViewDelegate::show_console_message` /
+    `ServoDelegate::show_console_message`, which the adapter doesn't implement — the merge
+    implements both and logs error-level messages (cut to 2 KiB, page data never beyond that).
+    Next in that merge: IntersectionObserver on by default after measuring reddit.com and
+    microsoft.com with it on 0.7 (it made them spin in older Servo; github.com loops without it:
+    `experiments/servo-input/REPORT.md`), and a user stylesheet that puts `dialog:modal` on top
+    (chatgpt.com's login dialog, which Servo doesn't put in the top layer).

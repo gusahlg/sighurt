@@ -9,4 +9,4 @@ description = "Gradient showcase for Sighurt"
 crate-type = ["cdylib"]
 
 [dependencies]
-sighurt-sdk = { path = "../../sighurt-sdk" }
+sighurt-sdk = { path = "../../sdk/sighurt-sdk" }

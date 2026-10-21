@@ -1,0 +1,20 @@
+Sign up
+────────────────────────────────────────────────────────────
+
+Name [Ada_______]
+
+Password [********]
+
+[x] Subscribe
+
+( ) Monthly
+
+(o) Yearly
+
+Plan [Pro ▾]
+
+Notes
+[one_______]
+[two_______]
+
+[ Send ] [ Cancel ]

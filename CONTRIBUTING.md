@@ -45,10 +45,10 @@ The tests that need a compositor run in a private headless sway (`tools/headless
 
 | Script | What it runs |
 |---|---|
-| `sighurt-browser/tests/headless.sh OUT` | `sig` with the demo engine: tabs, typing, coordinates, scaling, buffers, idle, the configuration, the modal keymap, settings |
-| `sighurt-browser/tests/engines.sh OUT` | `sig` with Servo, WPE WebKit and Wasm on the GPU: pages, input, history, links between engines, settings, a configuration showcase |
-| `sighurt-ui/tests/headless.sh OUT` | the chromes in `sig`: the line chrome, the status overlay, tabs on the left, fonts |
-| `sighurt-wayland/tests/headless.sh` | the Wayland host against sway |
+| `apps/sighurt-browser/tests/headless.sh OUT` | `sig` with the demo engine: tabs, typing, coordinates, scaling, buffers, idle, the configuration, the modal keymap, settings |
+| `apps/sighurt-browser/tests/engines.sh OUT` | `sig` with Servo, WPE WebKit and Wasm on the GPU: pages, input, history, links between engines, settings, a configuration showcase |
+| `ui/sighurt-ui/tests/headless.sh OUT` | the chromes in `sig`: the line chrome, the status overlay, tabs on the left, fonts |
+| `frontends/sighurt-wayland/tests/headless.sh` | the Wayland host against sway |
 | `sighurt-engine-{servo,wpe,wasm}/tests/headless.sh` | each engine's compositor tests |
 
 They print `PASS` or `FAIL` for each check and leave screenshots to look at in `OUT`.
@@ -73,7 +73,7 @@ An engine is a crate `sighurt-engine-<name>` that depends on `sighurt-api` and `
 4. Declare what you support in `EngineCapabilities` and return `EngineError::Unsupported` for the rest. Set `process_per_view` if each view is an OS process of its own: a tab then keeps fewer of your views alive in its history.
 5. Shut down in an explicit order in `shutdown`; never exit the process or install process-wide handlers.
 
-Then add a feature `engine-<name>` to `sighurt-browser/Cargo.toml`, `sighurt-runtime/Cargo.toml` and `sighurt-gui/Cargo.toml`, the engine's descriptor to `sighurt-runtime/src/engines.rs` (its name, capabilities and the `[engines.<name>]` settings it honors), and how the GUI starts it to `sighurt-gui/src/engines.rs`. `sighurt-engine-demo` is the smallest complete engine.
+Then add a feature `engine-<name>` to `apps/sighurt-browser/Cargo.toml`, `crates/sighurt-runtime/Cargo.toml` and `frontends/sighurt-gui/Cargo.toml`, the engine's descriptor to `crates/sighurt-runtime/src/engines.rs` (its name, capabilities and the `[engines.<name>]` settings it honors), and how the GUI starts it to `frontends/sighurt-gui/src/engines.rs`. `sighurt-engine-demo` is the smallest complete engine.
 
 ## Adding a keymap or a chrome
 
@@ -81,14 +81,14 @@ See [Writing your own keymap or chrome](./README.md#writing-your-own-keymap-or-c
 
 ## Adding a command
 
-1. Add a variant to `Command` in `sighurt-api/src/commands.rs`, with its name in `NAMES`, `name`, its parsing and `Display`.
+1. Add a variant to `Command` in `crates/sighurt-api/src/commands.rs`, with its name in `NAMES`, `name`, its parsing and `Display`.
 2. Carry it out in `sighurt-core`.
-3. List it in `sighurt-core/src/default-config.toml` and in the README's command table.
+3. List it in `crates/sighurt-core/src/default-config.toml` and in the README's command table.
 
 ## Adding a host function
 
-1. Register it with `linker.func_wrap("oxide", "api_<category>_<action>", …)` in `sighurt-engine-wasm/src/capabilities.rs`, or in a module's `register_<feature>_functions`. Read guest memory only through `guest_bytes` / `guest_str` and write it through `write_guest` / `write_prefix`, and bound what a guest can make the host allocate.
-2. Wrap it in `sighurt-sdk/src/lib.rs`: with `host_fns!` when the wrapper passes arguments and results through unchanged, otherwise an `_api_<name>` import plus a hand-written `<category>_<action>` wrapper. Give it a doc comment.
+1. Register it with `linker.func_wrap("oxide", "api_<category>_<action>", …)` in `engines/sighurt-engine-wasm/src/capabilities.rs`, or in a module's `register_<feature>_functions`. Read guest memory only through `guest_bytes` / `guest_str` and write it through `write_guest` / `write_prefix`, and bound what a guest can make the host allocate.
+2. Wrap it in `sdk/sighurt-sdk/src/lib.rs`: with `host_fns!` when the wrapper passes arguments and results through unchanged, otherwise an `_api_<name>` import plus a hand-written `<category>_<action>` wrapper. Give it a doc comment.
 3. Mention it in [DOCS.md](./DOCS.md)'s API overview.
 
 The import module name `"oxide"` is a permanent ABI: never rename it.

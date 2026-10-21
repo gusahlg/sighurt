@@ -35,7 +35,7 @@ The user's machines are shared with another Claude session. Breaking these rules
 | GUI frontend | `sighurt-gui` | The Wayland owner loop, the chrome's targets and placement, binding engines to Wayland targets | Browser policy, engine internals |
 | Executable | `sighurt-browser` (`sig`) | Arguments, process-wide setup, choosing the frontend | Everything else |
 
-- **Engines are compiled in and run in-process; there is no IPC.** Cargo features on `sighurt-browser` (`engine-servo`, `engine-wasm`, `engine-wpe`, `engine-demo`) decide which engines exist: the `default = [...]` line in `sighurt-browser/Cargo.toml` is the list of engines compiled into `sig` (Servo, Wasm and WPE WebKit). Runtime configuration decides which of them may open pages: Servo is the default engine, WPE WebKit opens what `[routing.wpe]` and `page.open-in wpe` give it. One runtime per engine kind serves all of its views. Keymaps and chromes are compiled in the same way (`keymap-modal`, `chrome-line`).
+- **Engines are compiled in and run in-process; there is no IPC.** Cargo features on `sighurt-browser` (`engine-servo`, `engine-wasm`, `engine-wpe`, `engine-demo`) decide which engines exist: the `default = [...]` line in `apps/sighurt-browser/Cargo.toml` is the list of engines compiled into `sig` (Servo, Wasm and WPE WebKit). Runtime configuration decides which of them may open pages: Servo is the default engine, WPE WebKit opens what `[routing.wpe]` and `page.open-in wpe` give it. One runtime per engine kind serves all of its views. Keymaps and chromes are compiled in the same way (`keymap-modal`, `chrome-line`).
 - **The host creates every surface**: the root `xdg_toplevel` (an opaque fallback), a subsurface for each surface the chrome names (at most 8), one page subsurface per live view (mapped only while selected), and overlays. The chrome and the engines present into host-managed targets through a target lease and a per-layout frame permit; the desktop compositor combines the surfaces.
 - **The chrome is drawn on the CPU** with cosmic-text and tiny-skia into shared-memory buffers. GPUI is gone.
 - **Servo presents GL straight into its subsurface** (`WindowRenderingContext` on surfman). The normal display path never reads page pixels back to the CPU.
@@ -44,6 +44,23 @@ The user's machines are shared with another Claude session. Breaking these rules
 - **The Wasm engine is a library too** (decision 22): `sighurt-ipc` and the `sig-wasm` process are gone. Its guests run on its worker threads and draw on the CPU into the host's SHM buffers.
 
 ## Crates and dependency rules
+
+The workspace is one Cargo workspace. Package names are unchanged; the directories are grouped:
+
+```text
+sighurt/
+├── crates/        sighurt-api, sighurt-core, sighurt-runtime
+├── frontends/     sighurt-gui, sighurt-tui, sighurt-wayland
+├── ui/            sighurt-ui
+├── engines/       sighurt-engine-servo, sighurt-engine-wpe, sighurt-engine-wasm,
+│                  sighurt-engine-demo, sighurt-semantic
+├── extensions/    sighurt-chrome-line, sighurt-keymap-modal
+├── sdk/           sighurt-sdk
+├── apps/          sighurt-browser (`sig`)
+├── examples/      Wasm guests
+├── experiments/   standalone investigations
+└── bench/, tools/, nix/, docs/
+```
 
 | Crate | Modules | Project dependencies |
 |---|---|---|
@@ -89,8 +106,8 @@ tools/heavy tools/headless-sway -- target/debug/sig
 # demo engine and the modal keymap; prints PASS or FAIL per check, screenshots and logs in OUT);
 # the chromes' end-to-end tests (the line chrome, the standard chrome's options)
 tools/cargo test -p sighurt-browser -p sighurt-engine-demo --no-default-features --features engine-demo
-sighurt-browser/tests/headless.sh OUT
-sighurt-ui/tests/headless.sh OUT
+apps/sighurt-browser/tests/headless.sh OUT
+ui/sighurt-ui/tests/headless.sh OUT
 
 # Anything that builds Servo or WPE WebKit (sig's default features, sighurt-engine-servo,
 # sighurt-engine-wpe, the experiments). WPE WebKit needs its prefix (nix/build-wpewebkit.sh,
@@ -104,18 +121,18 @@ SIG_WHAT="servo build" tools/remote tools/cargo build -p sighurt-browser
 # its own (with SIG_DIAG=1 it prints each engine's renderer and a line per frame), and its
 # end-to-end tests (Servo, Wasm, WPE WebKit, links across engines, settings, a configuration
 # showcase with the modal keymap and the line chrome)
-tools/heavy tools/headless-sway --renderer gles2 -- sighurt-engine-wpe/tests/private-bus target/debug/sig https://example.com/
-sighurt-browser/tests/engines.sh OUT
+tools/heavy tools/headless-sway --renderer gles2 -- engines/sighurt-engine-wpe/tests/private-bus target/debug/sig https://example.com/
+apps/sighurt-browser/tests/engines.sh OUT
 
 # Wasm guests (always release); the Wasm engine's tests run the first four
 tools/cargo build --target wasm32-unknown-unknown --release -p hello-sighurt -p raf-demo -p gradient-demo -p typography-demo
 tools/cargo build -p sighurt-sdk --target wasm32-unknown-unknown
 
 # Compositor tests of the host and the engines (each script says how to run it)
-sighurt-wayland/tests/headless.sh
-sighurt-engine-wasm/tests/headless.sh [OUT]
-SIG_WHAT="servo test" sighurt-engine-servo/tests/headless.sh
-sighurt-engine-wpe/tests/headless.sh
+frontends/sighurt-wayland/tests/headless.sh
+engines/sighurt-engine-wasm/tests/headless.sh [OUT]
+SIG_WHAT="servo test" engines/sighurt-engine-servo/tests/headless.sh
+engines/sighurt-engine-wpe/tests/headless.sh
 
 # Before a commit: everything but Servo and WPE WebKit (what CI runs), then the rest
 tools/cargo fmt --all
@@ -135,10 +152,10 @@ SIG_WHAT="servo build" tools/cargo test -p sighurt-browser -p sighurt-runtime -p
 
 - Everything the browser does is a named command, `<area>.<action>` with kebab-case actions and an optional argument after whitespace: `tab.new`, `tab.close [n]`, `tab.next`, `tab.previous`, `tab.select <n>`, `tab.last`, `page.open <url>`, `page.open-in <engine> [url]`, `page.reload`, `page.stop`, `page.back`, `page.forward`, `page.zoom-in`, `page.zoom-out`, `page.zoom-reset`, `page.send-key <key>`, `location.focus`, `browser.home`, `browser.quit`, and a chrome's own `chrome.<action>` (no argument; the core hands it to the chrome). Users write these names in their configuration, so keep them.
 - A command string is parsed once into `sighurt_api::commands::Command`; unknown names and bad arguments are errors when the configuration loads. `Display` gives the canonical string back. The core carries commands out, except `location.focus`, which the chrome handles. Keys and buttons use the same path; don't add a second one.
-- To add a command: a variant in `Command` (and `NAMES`, `name`, parsing, `Display`), its handling in `sighurt-core`, the command list in `sighurt-core/src/default-config.toml`, and the README's command table.
+- To add a command: a variant in `Command` (and `NAMES`, `name`, parsing, `Display`), its handling in `sighurt-core`, the command list in `crates/sighurt-core/src/default-config.toml`, and the README's command table.
 - **Keys live only in the user's configuration**: no key handlers in code, no default bindings. Bindings match the layout's key value by default and the physical key when a binding asks for it; AltGr is never Ctrl+Alt. A consumed key press also consumes its release.
 - Keymaps and chromes are compiled in and chosen like engines (`docs/rewrite/extension-api.md`): a keymap implements `sighurt_api::keymap::Keymap` and is chosen by `[input] keymap` (the core's `bindings`, which reads `[keys]`, by default); a chrome implements `sighurt_ui::extension::Chrome` and is chosen by `[ui] chrome` at startup (`standard` by default). Keymaps are listed in `sighurt-runtime`'s `registry` (`KEYMAPS`), chromes in `sighurt-gui`'s `chrome` (`CHROMES`); the defaults go through the same traits.
-- Configuration is TOML: `{config_dir}/sighurt/config.toml` over built-in defaults (`sighurt-core/src/default-config.toml`, which documents every setting), with a schema version, still 1. The core parses and validates it against the build (its engines, keymaps and chromes); the executable reads the file. Unknown keys are errors; a table for something the build lacks gets a notice. An invalid reload keeps the previous configuration and reports the problem. Everything applies live except `[ui] chrome` and the engines' own settings (`[engines.<name>]`), which need a restart.
+- Configuration is TOML: `{config_dir}/sighurt/config.toml` over built-in defaults (`crates/sighurt-core/src/default-config.toml`, which documents every setting), with a schema version, still 1. The core parses and validates it against the build (its engines, keymaps and chromes); the executable reads the file. Unknown keys are errors; a table for something the build lacks gets a notice. An invalid reload keeps the previous configuration and reports the problem. Everything applies live except `[ui] chrome` and the engines' own settings (`[engines.<name>]`), which need a restart.
 
 ## The engine contract
 
@@ -155,7 +172,7 @@ SIG_WHAT="servo build" tools/cargo test -p sighurt-browser -p sighurt-runtime -p
 - Positions arrive surface-local to the view's target. Convert them once with the view's `Metrics` (`to_buffer`); never subtract the chrome's offset or apply the scale a second time. Buffer sizes come from `Scale::buffer_size`.
 - `FrameReady` means "has something new to paint", not "displayed". Keep invalidation, frame callbacks and buffer release distinct. No unconditional ticks, no page-sized CPU copies on the normal path.
 - Adding an engine: a crate `sighurt-engine-<name>` depending on api and wayland, exporting its `CAPABILITIES` (as the demo, Servo and WPE engines do); a feature `engine-<name>` on `sighurt-browser`, `sighurt-runtime` and `sighurt-gui`; its descriptor in `sighurt-runtime`'s `engines` (name, capabilities, the `[engines.<name>]` settings it honors); and how each frontend starts it (`sighurt-gui`'s `engines`).
-- **Servo** is pinned at 0.7 with surfman 0.14 (`webgl` enabled; multiprocess compiled but off). Read the 0.7 sources in `~/.cargo/registry/src/`, not a newer upstream. One runtime per process; its API calls and GL presentation stay on the owner thread. The adapter never calls `process::exit` or `_exit` and never installs panic hooks, logging or a TLS provider: the executable owns process-wide setup. The crate is `AGPL-3.0-or-later AND MPL-2.0`; files adapted from Servo keep their MPL notices. What 0.7 changed for the adapter is in `sighurt-engine-servo/SERVO-0.7.md`.
+- **Servo** is pinned at 0.7 with surfman 0.14 (`webgl` enabled; multiprocess compiled but off). Read the 0.7 sources in `~/.cargo/registry/src/`, not a newer upstream. One runtime per process; its API calls and GL presentation stay on the owner thread. The adapter never calls `process::exit` or `_exit` and never installs panic hooks, logging or a TLS provider: the executable owns process-wide setup. The crate is `AGPL-3.0-or-later AND MPL-2.0`; files adapted from Servo keep their MPL notices. What 0.7 changed for the adapter is in `engines/sighurt-engine-servo/SERVO-0.7.md`.
 - **WPE WebKit** is 2.52.6, built from source into a prefix (`nix/build-wpewebkit.sh`; the build script finds it through `SIGHURT_WPE_PKG_CONFIG_PATH`, never `PKG_CONFIG_PATH`, which would rebuild Servo). One runtime per process, on the owner thread; its GLib context runs inside the owner loop. JavaScriptCore stays off signals in `sig`'s process (decision 66), and `sig` sets `JSC_SIGNAL_FOR_GC=12` at the start of `main`, since its default is SIGUSR1, `sig`'s diagnostics signal (decision 78). `sig` is linked with `-Wl,--exclude-libs,ALL` so WebKit can't bind to the C libraries linked into it (decision 65). WebKit's library is not linked: the engine opens it (`ffi::load`) when its runtime first starts, so a session without WPE pages maps none of it (decision 84); call `ffi` only after that.
 
 ## Security
@@ -200,7 +217,7 @@ Hardware-dependent thresholds come only after a baseline exists, with the machin
 
 All of this happens in `sighurt-engine-wasm` and `sighurt-sdk`; the browser is not involved.
 
-**1. Significant state gets its own module** in `sighurt-engine-wasm/src/` (e.g. `websocket.rs`) with a `<Feature>State` struct and `register_<feature>_functions(linker: &mut Linker<HostState>) -> Result<()>`, called from the bottom of `register_host_functions`. Add `pub mod <feature>;` to `lib.rs`.
+**1. Significant state gets its own module** in `engines/sighurt-engine-wasm/src/` (e.g. `websocket.rs`) with a `<Feature>State` struct and `register_<feature>_functions(linker: &mut Linker<HostState>) -> Result<()>`, called from the bottom of `register_host_functions`. Add `pub mod <feature>;` to `lib.rs`.
 
 **2. Add state to `HostState`** in `capabilities.rs`. It derives `Default`, so a lazily started subsystem is just:
 ```rust
@@ -219,7 +236,7 @@ linker.func_wrap("oxide", "api_my_feature",
 )?;
 ```
 
-**4. Expose it in the SDK** (`sighurt-sdk/src/lib.rs`). A wrapper that takes and returns exactly what the host does is declared with `host_fns!`:
+**4. Expose it in the SDK** (`sdk/sighurt-sdk/src/lib.rs`). A wrapper that takes and returns exactly what the host does is declared with `host_fns!`:
 ```rust
 host_fns! {
     /// Brief doc comment.
@@ -304,7 +321,7 @@ The engine has no widget kit: guests draw their own UI with the canvas API and p
 - `sighurt-api`, `-core`, `-wayland`, `-ui`, `-engine-demo`: `tools/cargo check`, `test` and `clippy -- -D warnings` on the crate.
 - `sighurt-browser`, `sighurt-runtime`, `sighurt-gui`: `tools/cargo check -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features`, plus `--features engine-demo`, plus the feature sets your change touches (`--all-features` covers them all). `sighurt-runtime`'s own code never names a `sighurt_wayland` or `sighurt_ui` type.
 - `sighurt-engine-servo`, `sighurt-engine-wpe`, or anything built with them: `SIG_WHAT="servo build" tools/cargo check -p <crate>` (and `-p sighurt-browser` with its default features), on louise-pc when the desktop is busy.
-- Keymap or chrome change: its crate's tests (they use the API from outside), and `sighurt-browser/tests/headless.sh` or `sighurt-ui/tests/headless.sh`.
+- Keymap or chrome change: its crate's tests (they use the API from outside), and `apps/sighurt-browser/tests/headless.sh` or `ui/sighurt-ui/tests/headless.sh`.
 - WASM engine change: `tools/cargo build -p sighurt-engine-wasm`.
 - SDK change: `tools/cargo build -p sighurt-sdk --target wasm32-unknown-unknown`.
 - Example change: `tools/cargo build --target wasm32-unknown-unknown --release -p <example>`.

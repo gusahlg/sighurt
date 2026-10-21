@@ -9,4 +9,4 @@ description = "Demo hub for Sighurt's WASM engine — links to the other example
 crate-type = ["cdylib"]
 
 [dependencies]
-sighurt-sdk = { path = "../../sighurt-sdk" }
+sighurt-sdk = { path = "../../sdk/sighurt-sdk" }

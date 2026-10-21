@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Forms</title>
+</head>
+<body>
+  <!--
+    The password field's value is the sentinel SIGHURT_PASSWORD_SENTINEL. A snapshot must not
+    contain that string. Labels come from label-for, a wrapping label, aria-label, placeholder,
+    and name, in that order. The select's selected option is Dog.
+  -->
+  <form action="/submit" method="post">
+    <label for="name">Name</label>
+    <input id="name" name="name" type="text" value="Ada">
+
+    <label>Secret <input id="secret" name="secret" type="password" value="SIGHURT_PASSWORD_SENTINEL"></label>
+
+    <input id="nick" type="text" aria-label="Nickname" value="A">
+    <input id="city" type="text" placeholder="City" value="Oslo">
+    <input id="code" type="text" name="postal" value="0150">
+
+    <label for="bio">Biography</label>
+    <textarea id="bio" name="bio">Line one
+Line two</textarea>
+
+    <input id="yes" type="checkbox" checked value="1">
+    <label for="yes">Yes</label>
+    <input id="no" type="checkbox">
+    <label for="no">No</label>
+
+    <input type="radio" name="color" id="red" checked value="red">
+    <label for="red">Red</label>
+    <input type="radio" name="color" id="blue" value="blue">
+    <label for="blue">Blue</label>
+
+    <label for="pet">Pet</label>
+    <select id="pet" name="pet">
+      <option>Cat</option>
+      <option selected>Dog</option>
+      <option>Rat</option>
+    </select>
+
+    <button type="submit">Save</button>
+    <input type="submit" value="Send">
+    <input type="file" id="file" aria-label="Attachment">
+  </form>
+</body>
+</html>

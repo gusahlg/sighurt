@@ -1,0 +1,208 @@
+# Public pages the compatibility corpus opens, one at a time, in Servo and in WPE WebKit.
+# Each run is a single GET of the URL (and the subresources the page asks for). No logins,
+# no form posts, no accounts. Drop a site that has gone rather than pointing it at a parked
+# domain. html5test.com shut down; caniuse.com is the feature page in its place.
+#
+# `id` is the file name of the run's screenshot. `category` is only a label in the report.
+
+[[site]]
+id = "example"
+url = "https://example.com/"
+category = "control"
+note = "Plain page. A rendered run should classify as OK."
+
+[[site]]
+id = "github-servo"
+url = "https://github.com/servo/servo"
+category = "code"
+
+[[site]]
+id = "gitlab"
+url = "https://gitlab.com/"
+category = "code"
+
+[[site]]
+id = "chatgpt"
+url = "https://chatgpt.com/"
+category = "assistant"
+
+[[site]]
+id = "google-search"
+url = "https://www.google.com/search?q=servo"
+category = "search"
+
+[[site]]
+id = "duckduckgo"
+url = "https://duckduckgo.com/?q=servo"
+category = "search"
+
+[[site]]
+id = "youtube"
+url = "https://www.youtube.com/"
+category = "video"
+
+[[site]]
+id = "twitch"
+url = "https://www.twitch.tv/"
+category = "video"
+
+[[site]]
+id = "netflix"
+url = "https://www.netflix.com/"
+category = "video"
+
+[[site]]
+id = "wikipedia"
+url = "https://en.wikipedia.org/wiki/Web_browser"
+category = "reference"
+
+[[site]]
+id = "mdn-grid"
+url = "https://developer.mozilla.org/en-US/docs/Web/CSS/grid"
+category = "docs"
+
+[[site]]
+id = "docsrs"
+url = "https://docs.rs/serde"
+category = "docs"
+
+[[site]]
+id = "crates"
+url = "https://crates.io/"
+category = "docs"
+
+[[site]]
+id = "w3schools"
+url = "https://www.w3schools.com/"
+category = "tutorial"
+
+[[site]]
+id = "codepen"
+url = "https://codepen.io/"
+category = "tutorial"
+
+[[site]]
+id = "caniuse"
+url = "https://caniuse.com/css-grid"
+category = "features"
+
+[[site]]
+id = "rustlang"
+url = "https://www.rust-lang.org/"
+category = "language"
+
+[[site]]
+id = "reddit-rust"
+url = "https://www.reddit.com/r/rust/"
+category = "social"
+
+[[site]]
+id = "x"
+url = "https://x.com/"
+category = "social"
+
+[[site]]
+id = "linkedin"
+url = "https://www.linkedin.com/"
+category = "social"
+
+[[site]]
+id = "instagram"
+url = "https://www.instagram.com/"
+category = "social"
+
+[[site]]
+id = "stackoverflow"
+url = "https://stackoverflow.com/questions/tagged/rust"
+category = "qa"
+
+[[site]]
+id = "hn"
+url = "https://news.ycombinator.com/"
+category = "news"
+
+[[site]]
+id = "bbc"
+url = "https://www.bbc.com/news"
+category = "news"
+
+[[site]]
+id = "nytimes"
+url = "https://www.nytimes.com/"
+category = "news"
+
+[[site]]
+id = "guardian"
+url = "https://www.theguardian.com/international"
+category = "news"
+
+[[site]]
+id = "medium"
+url = "https://medium.com/"
+category = "news"
+
+[[site]]
+id = "amazon"
+url = "https://www.amazon.com/"
+category = "commerce"
+
+[[site]]
+id = "steam"
+url = "https://store.steampowered.com/"
+category = "commerce"
+
+[[site]]
+id = "apple"
+url = "https://www.apple.com/"
+category = "corporate"
+
+[[site]]
+id = "microsoft"
+url = "https://www.microsoft.com/"
+category = "corporate"
+
+[[site]]
+id = "cloudflare"
+url = "https://www.cloudflare.com/"
+category = "infrastructure"
+
+[[site]]
+id = "gmail"
+url = "https://mail.google.com/"
+category = "mail"
+note = "The login page only. The run does not sign in."
+
+[[site]]
+id = "gmaps"
+url = "https://www.google.com/maps"
+category = "maps"
+
+[[site]]
+id = "osm"
+url = "https://www.openstreetmap.org/"
+category = "maps"
+
+[[site]]
+id = "discord"
+url = "https://discord.com/"
+category = "chat"
+
+[[site]]
+id = "notion"
+url = "https://www.notion.so/"
+category = "productivity"
+
+[[site]]
+id = "figma"
+url = "https://www.figma.com/"
+category = "design"
+
+[[site]]
+id = "spotify"
+url = "https://open.spotify.com/"
+category = "media"
+
+[[site]]
+id = "archive"
+url = "https://archive.org/"
+category = "archive"

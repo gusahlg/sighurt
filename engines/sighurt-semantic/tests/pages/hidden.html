@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hidden</title>
+  <style>.gone { display: none; }</style>
+</head>
+<body>
+  <!--
+    Visible text is "Visible" and "but this shows". Everything marked SIGHURT_HIDDEN_SENTINEL
+    is hidden (display:none, the hidden attribute, aria-hidden, script, style, template,
+    noscript) and must not appear. The visibility:hidden paragraph's own words stay hidden;
+    the nested visible span does not.
+  -->
+  <p>Visible</p>
+  <p class="gone">SIGHURT_HIDDEN_SENTINEL display</p>
+  <p style="visibility: hidden">SIGHURT_HIDDEN_SENTINEL visibility <span style="visibility: visible">but this shows</span></p>
+  <p hidden>SIGHURT_HIDDEN_SENTINEL attribute</p>
+  <p aria-hidden="true">SIGHURT_HIDDEN_SENTINEL aria <span>SIGHURT_HIDDEN_SENTINEL child</span></p>
+  <script>var secret = "SIGHURT_HIDDEN_SENTINEL script";</script>
+  <template><p>SIGHURT_HIDDEN_SENTINEL template</p></template>
+  <noscript>SIGHURT_HIDDEN_SENTINEL noscript</noscript>
+  <input type="hidden" name="token" value="SIGHURT_HIDDEN_SENTINEL hidden-input">
+</body>
+</html>
