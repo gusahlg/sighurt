@@ -1,8 +1,10 @@
 # Sighurt
 
-Sighurt (`sig`) is a small, configurable browser for Linux on Wayland. Its content engines are
-compiled into `sig` and run in its process; the browser chrome around them is drawn separately,
-on the CPU. Three engines come with it:
+Sighurt (`sig`) is a small, configurable browser for Linux. It is one binary with two frontends:
+a window on Wayland, and the terminal it is started in, where it shows pages as kitty graphics or
+as reflowed text. Its content engines are compiled into `sig` and run in its process (there is
+no IPC); the browser chrome around them is drawn separately, on the CPU. Three engines come with
+it:
 
 - **Servo** renders the web: HTML, CSS and JavaScript with [Servo](https://servo.org) 0.5. It is
   the default engine, and the long-term one.
@@ -18,15 +20,18 @@ A fourth, the demo engine, exists to test the host and the chrome without a real
   ├── sighurt-gui       the Wayland frontend: the event loop, the chrome's surfaces
   │    ├── sighurt-ui        the chrome: tabs, address and command line, drawn on the CPU
   │    └── sighurt-wayland   the window and its surfaces, input, scaling, frame scheduling
+  ├── sighurt-tui       the terminal frontend: terminal I/O, the chrome as text, pages as
+  │                     kitty graphics or reflowed text, `sig --dump`
   ├── sighurt-runtime   configuration and session files, the engine registry, effects, services
   ├── sighurt-core      tabs, commands, keymaps, routing, history across engines, permissions
   └── engines           servo · wpe · wasm · demo, each one a library behind sighurt-api
 
- One Wayland window: the chrome's surfaces and one page surface per engine view, which the
+ In the GUI, one Wayland window: the chrome's surfaces and one page surface per engine view, which the
  desktop compositor puts together. Servo presents with OpenGL straight into its page surface,
  WPE WebKit attaches its DMA-BUFs to it, the Wasm engine paints into shared memory. No page is
  read back to the CPU to be shown (WPE copies once a frame only where the compositor has no
- DMA-BUF support, and says so).
+ DMA-BUF support, and says so). In the terminal the engines paint into CPU frames instead,
+ which the frontend encodes as kitty graphics, or it shows the page's text.
 ```
 
 The core is ordinary Rust (`update(state, event) -> effects`) with no I/O; engines report facts as
@@ -41,27 +46,40 @@ chrome, engines as separate processes) is at the git tag `gpui-baseline`.
 
 ## Build and run
 
-You need Linux with a Wayland compositor (there is no X11 support), Rust 1.98 or newer, and the
+You need Linux, Rust 1.98 or newer, and the
 native libraries Servo, WPE WebKit and the Wasm engine link. On NixOS, `nix-shell` (see
 [`shell.nix`](./shell.nix)) provides the libraries, from the nixpkgs revision pinned in
 [`nix/nixpkgs.nix`](./nix/nixpkgs.nix); it brings no Rust. The first build compiles Servo, which
-takes a long time and a lot of memory.
+takes a long time and a lot of memory. The window needs a Wayland compositor (there is no X11
+support); the terminal frontend needs none ([below](#in-the-terminal)).
 
 ```bash
 nix-shell                                        # NixOS
-cargo build -p sighurt-browser                   # sig with Servo, WPE WebKit and the Wasm engine
-target/debug/sig https://example.com/
+cargo build -p sighurt-browser                   # sig with Servo, WPE WebKit, the Wasm engine, both frontends
+target/debug/sig https://example.com/            # in a terminal: in it; otherwise: a window
 target/debug/sig --help
 ```
 
 ```text
 Usage: sig [OPTIONS] [URL|PATH ...]
 
-Opens each URL or file in its own tab, or the home page when none is given.
+Opens each URL or file in its own tab, or the home page when none is given. In a terminal
+(stdout is one and TERM isn't dumb) sig runs in it, showing pages as kitty graphics; otherwise
+it opens a Wayland window.
 
 Options:
       --default-config     Print the built-in configuration and exit
+      --dump URL           Print URL's page as reflowed text with numbered links on stdout and
+                           exit, with no terminal or window (needs an engine that gives page
+                           text: WPE WebKit); exit code 2 on a timeout
+      --width N            With --dump, wrap to N columns (default 80)
+      --timeout SECS       With --dump, give up after SECS seconds (default 30)
       --diagnostics FILE   Write the diagnostics to FILE as JSON at exit and on SIGUSR1
+      --engine ENGINE      The engine this run starts with, overriding [engines] default
+      --gui                Open a Wayland window, even from a terminal
+      --tui                Run in the terminal on stdout. Its log, and anything else written
+                           to stderr, goes to $XDG_STATE_HOME/sighurt/tui.log
+                           (~/.local/state/sighurt/tui.log); the directory is created
   -h, --help               Print this help and exit
   -V, --version            Print the version and exit
 
@@ -84,6 +102,8 @@ configuration decides which of them are used.
 
 | Feature | Default | What it adds |
 |---|---|---|
+| `frontend-gui` | yes | the Wayland window (`--gui`) |
+| `frontend-tui` | yes | the terminal frontend (`--tui`, `--dump`) |
 | `engine-servo` | yes | Servo, the engine `servo` |
 | `engine-wasm` | yes | the Wasm engine, `wasm` |
 | `engine-wpe` | yes | WPE WebKit, `wpe` (needs the WPE prefix below) |
@@ -97,7 +117,67 @@ cargo build -p sighurt-browser --no-default-features --features engine-servo,eng
 cargo build -p sighurt-browser --no-default-features --features engine-demo                # no Servo
 ```
 
-The `bindings` keymap and the `standard` chrome are in every build.
+The `bindings` keymap and the `standard` chrome are in every build. A build without
+`frontend-tui` has no terminal frontend: `--tui` and `--dump` are errors there.
+
+### In the terminal
+
+`sig` runs in the terminal it is started in when stdout is a terminal and `TERM` isn't `dumb`,
+and opens a window otherwise; `--gui` and `--tui` override that, and `--tui` without a terminal
+is an error. With no `WAYLAND_DISPLAY` and no terminal, `sig` suggests `--tui`. The terminal
+shows the browser's chrome as two lines of text (the tab's place, address, engine and mode on
+top; status and notices below) and the page between them in one of two modes:
+
+- **Graphics**: the page's pixels as kitty graphics, up to `[tui] fps` frames a second (10 by
+  default). It needs a terminal that speaks the kitty graphics protocol, such as kitty, Rio,
+  ghostty or WezTerm.
+- **Text**: the page's content reflowed into terminal lines, with links and controls you can
+  move to and activate. It works in any terminal, and is the mode `auto` picks where the
+  terminal can't show images. It needs an engine that gives the page's text, which today is
+  WPE WebKit (and the demo engine); the others show a message saying so. `m` switches mode.
+
+`[tui] mode = "auto"` (the default), `"text"` or `"graphics"` chooses the start; the `[tui]`
+table of the [built-in configuration](crates/sighurt-core/src/default-config.toml) also has
+`graphics` (`auto`, `kitty`, `sixel`, `none`), `fps`, `mouse` and `default-keys`. The mouse
+clicks and scrolls the page (in text mode the wheel scrolls three lines and a click activates
+the link or control under it). Logs, and anything else written to stderr, go to
+`$XDG_STATE_HOME/sighurt/tui.log` (`~/.local/state/sighurt/tui.log`). The terminal is restored
+on every way out.
+
+A terminal has no key bindings of its own to start from, so it ships a small table, `[tui.keys]`,
+under your `[keys]` (a binding of yours for the same keystroke wins; `default-keys = false` drops
+the whole table):
+
+| Key | Command |
+|---|---|
+| `q` | `browser.quit` |
+| `o`, `:` | `location.focus` (the address line; `:` then a command runs it) |
+| `t`, `x` | `tab.new`, `tab.close` |
+| `J`, `K` | `tab.next`, `tab.previous` |
+| `alt-1` to `alt-9` | `tab.select 1` to `9` |
+| `H`, `L` | `page.back`, `page.forward` |
+| `r`, `ctrl-r` | `page.reload` |
+| `e` | `page.switch-engine` |
+| `j`, `k` | scroll down, up (`page.send-key ArrowDown`, `ArrowUp`) |
+| `ctrl-d`, `ctrl-u` | page down, up |
+| `g`, `G` | top, bottom of the page |
+| `+`, `-`, `=` | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` |
+| `m` | `chrome.toggle-mode` (text or graphics) |
+| `ctrl-l` | `chrome.refresh` (draw the page again) |
+
+In text mode `Tab` and `Shift-Tab` move between links and controls and `Enter` activates one
+(a text field opens a one-line editor, a list a chooser; `Escape` cancels). The terminal's other
+chrome commands are `chrome.text-mode` and `chrome.graphics-mode`. Terminals that speak the kitty
+keyboard protocol send every key faithfully; in others, `code:` (physical key) bindings never
+match.
+
+`sig --dump URL` prints a page as text and exits, with no terminal or window: the reflowed
+page, then its links numbered. `--width N` wraps at N columns, `--timeout SECS` gives up (exit
+code 2); a page that fails to load exits 1. The engine is `--engine`, else WPE WebKit.
+
+```bash
+target/debug/sig --dump --width 100 https://example.com/ | less
+```
 
 ### WPE WebKit
 
@@ -229,13 +309,15 @@ that gets content it can't show downloads it or says so.
 `sig --engine <name>` is the engine this run starts with, overriding `[engines] default`: the
 engine that opens http(s) and file URLs no routing rule claims. An engine the build lacks, or
 one the configuration does not enable, is an error at startup that names the engines available.
-The choice stays for the whole run, including when the configuration is read again.
+The choice stays for the whole run, including when the configuration is read again. It is also
+the engine `--dump` uses (WPE WebKit without it).
 
 `page.switch-engine` reopens the page shown in the next web engine among those compiled in and
 enabled, in the build's order, wrapping around. It chooses that engine the way `page.open-in`
 does. With fewer than two such engines, or a page that isn't http, https or a file, it shows a
 notice and the page stays. Clicking the engine's name at the right end of the address field, or
-at the end of the line chrome, runs it. The terminal binds it to `e`.
+at the end of the line chrome, runs it. The terminal binds it to `e`; the GUI binds nothing
+until you do.
 
 Links follow the routing too. When you click a link to an address the routing gives another
 engine, the tab opens it there and back returns to the page. Everything else a page does (a
@@ -263,11 +345,12 @@ command, typed into the address line) all run them.
 | `location.focus` | focus the address line with its text selected |
 | `browser.home` | open the home page in the active tab |
 | `browser.quit` | quit, saving the tabs |
-| `chrome.<action>` | one of the chrome's own commands: the standard chrome's is `chrome.toggle-tabs` |
+| `chrome.<action>` | one of the chrome's own commands, no argument: the standard chrome's is `chrome.toggle-tabs`; the terminal's are `chrome.toggle-mode`, `chrome.text-mode`, `chrome.graphics-mode` and `chrome.refresh` |
 
 ### Keys
 
-`sig` has no default key bindings: nothing is bound until you bind it. The tab strip, the toolbar
+The window has no default key bindings: nothing is bound until you bind it (the terminal's small
+default table is [above](#in-the-terminal)). The tab strip, the toolbar
 and the address line work without any. With the `bindings` keymap:
 
 ```toml
@@ -427,6 +510,8 @@ worked examples are [`sighurt-keymap-modal`](extensions/sighurt-keymap-modal/) a
 | [`sighurt-browser`](apps/sighurt-browser/) | `sig`: arguments, process-wide setup, the choice of frontend |
 | [`sighurt-runtime`](crates/sighurt-runtime/) | what every frontend shares: configuration and session files, the engine registry, carrying out the core's effects, downloads, diagnostics, shutdown |
 | [`sighurt-gui`](frontends/sighurt-gui/) | the Wayland frontend: the event loop, the chrome's surfaces, engines bound to Wayland targets, the clipboard |
+| [`sighurt-tui`](frontends/sighurt-tui/) | the terminal frontend: terminal I/O, the cell grid, the chrome as text, pages as kitty graphics or reflowed text, `sig --dump` |
+| [`sighurt-semantic`](engines/sighurt-semantic/) | the DOM extraction script and bounded parser that give text mode a page's content (used by the Servo and WPE adapters) |
 | [`sighurt-core`](crates/sighurt-core/) | browser state and policy: tabs, commands, the `bindings` keymap, routing, history across engines, permissions, configuration; no I/O |
 | [`sighurt-api`](crates/sighurt-api/) | the contract between them: ids, geometry, input, the engine trait and its events, services, commands, the keymap API |
 | [`sighurt-wayland`](frontends/sighurt-wayland/) | the Wayland host: window, surfaces, targets, scaling, input, clipboard, shared-memory buffers, frame scheduling |

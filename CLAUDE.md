@@ -1,6 +1,6 @@
 # Sighurt — CLAUDE.md
 
-Sighurt (binary `sig`) is a small, configurable browser with two frontends in one binary: a Wayland GUI (a host with interchangeable content engines compiled in, and browser chrome drawn independently of them) and, being built, a terminal frontend (`docs/rewrite/TUI.md`, decisions 89–92) that shows the same engines' pages as kitty/sixel graphics or as reflowed text. It is being rewritten on the `rewrite` branch.
+Sighurt (binary `sig`) is a small, configurable browser with two frontends in one binary: a Wayland GUI (a host with interchangeable content engines compiled in, and browser chrome drawn independently of them) and a terminal frontend (`sighurt-tui`; `docs/rewrite/TUI.md`, decisions 89–98) that shows the same engines' pages as kitty graphics (sixel is designed, not built) or as reflowed text from a semantic snapshot of the page (text mode needs an engine with the `semantics` capability: WPE WebKit and the demo engine today), and `sig --dump URL`, which prints a page as text with no terminal or window. `main` picks the frontend: `--gui`/`--tui`, else the terminal when stdout is one and `TERM` isn't `dumb`, else the window. It is being rewritten on the `rewrite` branch.
 
 - **The specification is `sighurt-rewrite-plan.md`.** Read the sections your task touches before you start. README, DOCS, SECURITY and CONTRIBUTING describe the rewrite as it is; where any document disagrees with the plan, the plan wins, as amended by the decisions in STATUS. `docs/rewrite/extension-api.md` is the design of the configuration and of the keymap and chrome APIs, and `docs/rewrite/WPE.md` of the WPE WebKit engine.
 - **The tracker is `docs/rewrite/STATUS.md`**: milestones M0–M7 with their pass criteria, and the log of decisions already made. Don't reopen a logged decision without new evidence. Record new decisions there, and tick a pass criterion only with evidence (a test, a measurement, a run) that you name.
@@ -33,6 +33,7 @@ The user's machines are shared with another Claude session. Breaking these rules
 | Engines | `sighurt-engine-*` | Interpreting, running and rendering content; engine-local state and history | Tab policy, the chrome, global commands |
 | Runtime | `sighurt-runtime` | Frontend-neutral: config and session files, the engine registry and descriptors, carrying out effects, OS services, diagnostics, shutdown; the `Frontend` trait | Browser policy, windows, terminals, pixels |
 | GUI frontend | `sighurt-gui` | The Wayland owner loop, the chrome's targets and placement, binding engines to Wayland targets | Browser policy, engine internals |
+| Terminal frontend | `sighurt-tui` | The terminal owner loop, terminal I/O, the cell grid and the terminal chrome, the page's CPU target and its kitty encoding, text mode (reflowing a semantic snapshot), `--dump`, binding engines to the CPU target | Browser policy, engine internals, anything of Wayland or sighurt-ui |
 | Executable | `sighurt-browser` (`sig`) | Arguments, process-wide setup, choosing the frontend | Everything else |
 
 - **Engines are compiled in and run in-process; there is no IPC.** Cargo features on `sighurt-browser` (`engine-servo`, `engine-wasm`, `engine-wpe`, `engine-demo`) decide which engines exist: the `default = [...]` line in `apps/sighurt-browser/Cargo.toml` is the list of engines compiled into `sig` (Servo, Wasm and WPE WebKit). Runtime configuration decides which of them may open pages: Servo is the default engine, WPE WebKit opens what `[routing.wpe]` and `page.open-in wpe` give it. One runtime per engine kind serves all of its views. Keymaps and chromes are compiled in the same way (`keymap-modal`, `chrome-line`).
@@ -74,6 +75,8 @@ sighurt/
 | `sighurt-engine-wpe` | `runtime`, `view`, `navigation`, `platform` (its `WPEDisplay` and `WPEView`), `present`, `input`, `ime`, `clipboard`, `glib_loop` (WebKit's GLib context in the owner loop), `ffi` | api, wayland; WPE WebKit 2.52 |
 | `sighurt-engine-wasm` | `adapter` (`WasmRuntime`), `view`, `navigation`, `engine` (Wasmtime, limits), `live` and `pool` (guest threads), `capabilities` (host functions), `draw` and `raster` (CPU drawing), `wayland` (its `CpuTarget` for the host's SHM lease), and a module per guest subsystem | api, wayland |
 | `sighurt-engine-demo` | `lib` (the runtime and its pages: static pattern, animation, slow frame, resize, failed navigation, crash), `paint` | api, wayland |
+| `sighurt-semantic` | `extract` (the DOM extraction script), `parse` (its bounded JSON parser), `action` (action scripts), `world` | api; shared by the Servo and WPE adapters |
+| `sighurt-tui` | `app` (the owner loop and its `Frontend`), `term` (terminal I/O, parser, capability probe), `grid`, `chrome` (the terminal chrome), `input`, `kitty` (graphics encoder), `target` (the page's CPU target), `engines` (compiled-in engines bound to it), `text` and `textmode` (reflowing a semantic snapshot), `sanitize`, `dump` (`sig --dump`); binary `sighurt-tui-worker` | api, core, runtime; engines optional (never wayland or ui) |
 | `sighurt-runtime` | `session` (the core, effects, pumps, presenting, shutdown), `frontend`, `registry`, `engines` (descriptors), `view`, `services`, `persistence`, `diagnostics` | api, core; engines optional (never wayland or ui types in its own code) |
 | `sighurt-gui` | `app` (the owner loop), `chrome`, `engines` (engines bound to Wayland targets) | api, core, runtime, wayland, ui; engines optional |
 | `sighurt-browser` | `main` | runtime, gui; engines optional |
@@ -108,6 +111,14 @@ tools/heavy tools/headless-sway -- target/debug/sig
 tools/cargo test -p sighurt-browser -p sighurt-engine-demo --no-default-features --features engine-demo
 apps/sighurt-browser/tests/headless.sh OUT
 ui/sighurt-ui/tests/headless.sh OUT
+
+# The terminal frontend: its unit tests, and sig --tui / sig --dump in a pty with a fake terminal
+# on the master side against the demo engine (tests/tui.rs; needs frontend-tui and engine-demo)
+tools/cargo test -p sighurt-tui --features engine-demo,engine-wasm
+tools/cargo test -p sighurt-browser --no-default-features --features frontend-tui,engine-demo
+# sig --tui in real terminals (Rio, kitty) in a private headless sway: builds sig with default
+# features (Servo, WPE) unless --no-build, and takes the heavy lock itself; PASS or FAIL per check, screenshots and logs in OUT
+frontends/sighurt-tui/tests/real-terminals.sh [--no-build] OUT [rio|kitty]
 
 # Anything that builds Servo or WPE WebKit (sig's default features, sighurt-engine-servo,
 # sighurt-engine-wpe, the experiments). WPE WebKit needs its prefix (nix/build-wpewebkit.sh,
