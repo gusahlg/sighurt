@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>hover-test</title>
+<style>
+  html, body { margin: 0; background: #eeeeee; }
+  #platform {
+    position: absolute; left: 80px; top: 40px; width: 200px; height: 48px;
+    background: #c8c8c8; color: #111; font: 24px sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    text-decoration: none;
+  }
+  #platform:hover { background: #00aa00; color: #fff; }
+  #email {
+    position: absolute; left: 80px; top: 120px; width: 360px; height: 48px;
+    font: 24px sans-serif; box-sizing: border-box;
+  }
+  #out {
+    position: absolute; left: 80px; top: 200px; font: 28px sans-serif; color: #003;
+  }
+</style>
+</head>
+<body>
+  <a id="platform" href="signed-in.html">Platform</a>
+  <input id="email" placeholder="email">
+  <div id="out">ready</div>
+  <script>
+    console.log("hover-page-loaded");
+    const out = document.getElementById("out");
+    function note(s) { out.textContent = s; document.title = s; }
+    document.getElementById("platform").addEventListener("mouseenter", () => note("js-hover"));
+    document.getElementById("email").addEventListener("focus", () => note("js-focus"));
+    document.getElementById("email").addEventListener("input", (e) => note("js-typed:" + e.target.value));
+  </script>
+</body>
+</html>

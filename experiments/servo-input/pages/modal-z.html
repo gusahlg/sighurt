@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>modal-z-test</title>
+<!-- chatgpt.com's shape: a z-indexed composer in the page, and a login form in a modal
+     <dialog> opened with showModal(), which belongs in the top layer above everything.
+     Click "Log in" (80,20 200x48), then the dialog's field (page 640,300), then type. -->
+<style>
+  html, body { margin: 0; background: #eee; font: 24px sans-serif; }
+  #login { position: absolute; left: 80px; top: 20px; width: 200px; height: 48px; }
+  #composer {
+    position: relative; z-index: 10; margin: 260px auto 0; width: 700px; height: 80px;
+    background: #8cf; display: flex; align-items: center; justify-content: center;
+  }
+  dialog { width: 500px; height: 260px; border: 4px solid #c00; padding: 20px; top: 140px; }
+  /* The workaround a user stylesheet could apply: */
+  dialog:modal { z-index: 2147483647; }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+  #email { width: 400px; height: 48px; font: 24px sans-serif; box-sizing: border-box; }
+  #out { position: absolute; left: 80px; top: 560px; font: 28px sans-serif; }
+</style>
+</head>
+<body>
+  <button id="login">Log in</button>
+  <div id="composer" onclick="note('composer-clicked')">Ask (z-index 10)</div>
+  <dialog id="d"><p>Log in or sign up</p><input id="email" placeholder="Email address"></dialog>
+  <div id="out">ready</div>
+  <script>
+    function note(s) { document.getElementById("out").textContent = s; document.title = s; }
+    document.getElementById("login").addEventListener("click", () => {
+      document.getElementById("d").showModal();
+      note("modal-open");
+    });
+    document.getElementById("email").addEventListener("focus", () => note("email-focus"));
+    document.getElementById("email").addEventListener("input", (e) => note("email:" + e.target.value));
+  </script>
+</body>
+</html>
