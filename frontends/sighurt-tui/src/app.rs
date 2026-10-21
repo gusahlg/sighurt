@@ -13,6 +13,13 @@
 //! event or a real deadline: an engine pump, the session save, a notice giving way, a partial
 //! escape sequence, or the next frame's time while a frame is waiting. Nothing ticks.
 //!
+//! Text mode (TUI.md §4, [`crate::text`]): `[tui] mode`, or `chrome.toggle-mode` for the run,
+//! decides whether the page rows show pixels or the page's text. In text mode the shown view's
+//! engine is asked for snapshots ([`Session::set_semantics`]), the others' are not, and the
+//! keys the keymap left for the page, and the mouse, act on the text: scrolling is the
+//! frontend's, an activation goes to the core as `BrowserEvent::Semantic`. A press in the page
+//! in graphics mode captures the pointer until that button is released.
+//!
 //! Page frames (TUI.md §2 and §8.6): a permit only for the shown view, only when its engine has
 //! a new frame, at most `[tui] fps` a second, and only once every byte written before has left
 //! the output buffer: nothing is written while any is waiting, so at most one encoded frame is
@@ -27,7 +34,7 @@
 //!
 //! Must not own: browser policy (the core) or which effect runs (the session).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -46,6 +53,7 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyEvent, KeyboardFocus, PointerButton,
     PointerEvent, ScrollDelta, TextInputEvent, TextInputState,
 };
+use sighurt_api::semantic::SemanticSnapshot;
 use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_api::settings::Table;
 use sighurt_core::config::{GraphicsProtocol, TuiConfig, TuiMode, TERMINAL_CHROME_COMMANDS};
@@ -60,12 +68,18 @@ use sighurt_runtime::services::{Clipboard, Services};
 use sighurt_runtime::session::Session;
 use sighurt_runtime::view::ViewEntry;
 
-use crate::chrome::{ChromeState, LineEditor, PageArea, TabLine, MODE_GRAPHICS, MODE_TEXT};
+use crate::chrome::{
+    ChromeState, Cursor as CellCursor, LineEditor, PageArea, TabLine, MODE_GRAPHICS, MODE_TEXT,
+};
 use crate::grid::{Attrs, Color, Grid};
-use crate::input::{cell_to_page_pixel, CellPixels, PageCells};
+use crate::input::{
+    cell_to_page_offset, cell_to_page_pixel, CellPixels, PageCells, PointerCapture,
+};
 use crate::kitty::{self, CellRect};
 use crate::target::{TargetHandle, TermPermit, TermTarget};
 use crate::term::{MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE};
+use crate::text::{Act, TextPages};
+use crate::textmode::Area;
 
 /// Most terminal events handled in one pass; the rest wait for the next.
 pub const MAX_EVENTS: usize = 256;
@@ -79,9 +93,16 @@ const OUTPUT_CAP: usize = 16 * 1024 * 1024;
 /// The most pasted text the address line or a page's field takes.
 const MAX_PASTE: usize = 1024 * 1024;
 /// The page rows' message when the terminal shows no images.
-const NO_GRAPHICS: &str = "This terminal can't show graphics; text mode is coming";
-/// The page rows' message in `[tui] mode = "text"`.
-const NO_TEXT: &str = "Text mode isn't built yet";
+const NO_GRAPHICS: &str =
+    "This terminal can't show graphics; chrome.text-mode shows the page as text";
+/// The page rows' message in text mode when the shown page's engine gives no page text. The
+/// keys are the built-in `[tui.keys]` ones.
+const NO_SEMANTICS: &str =
+    "No page text from this engine (WPE WebKit has it): e switches engine, m shows graphics";
+/// The page rows' message in text mode until the first snapshot of the page arrives.
+const READING: &str = "Reading the page…";
+/// Lines a wheel notch scrolls in text mode.
+const WHEEL_LINES: isize = 3;
 /// The page rows' message when the page area has more pixels than an image may.
 const TOO_BIG: &str = "The page area is too big for an image";
 /// The page rows' message for a `sig:` page.
@@ -94,7 +115,7 @@ const MESSAGE_URL: usize = 256;
 const WINDOW_CHROMES: [&str; 2] = ["standard", "line"];
 /// The color names `[ui.colors]` takes: `sighurt_ui::Colors::NAMES`, which this crate can't
 /// name (it never depends on sighurt-ui). The terminal chrome doesn't use them yet.
-const COLOR_NAMES: &[&str] = &[
+pub(crate) const COLOR_NAMES: &[&str] = &[
     "bg",
     "surface",
     "hover",
@@ -118,7 +139,7 @@ pub struct Options {
 
 /// `{state_dir}/sighurt/tui.log` (or the data directory's, as for the session file), where the
 /// terminal frontend sends stderr.
-fn log_path() -> PathBuf {
+pub(crate) fn log_path() -> PathBuf {
     dirs::state_dir()
         .or_else(dirs::data_dir)
         .unwrap_or_else(std::env::temp_dir)
@@ -150,6 +171,16 @@ struct Tui {
     graphics: bool,
     /// The page rows.
     page: PageArea,
+    /// The page rows show pages as text.
+    text_mode: bool,
+    /// `chrome.toggle-mode`'s choice for this run (true: text), over `[tui] mode`.
+    mode_override: Option<bool>,
+    /// Each view's page as text, and the field editor over it.
+    text: TextPages,
+    /// The views whose engines were asked for page content.
+    semantic_on: HashSet<ViewId>,
+    /// The view and button of a press in the page, until that button is released.
+    capture: PointerCapture,
     /// What every view is given: the page rows' pixels, or nothing.
     metrics: Metrics,
     /// `metrics` changed and the views have not been told.
@@ -249,7 +280,7 @@ fn run_redirected(options: Options, signals: OwnedFd) -> Result<ExitCode, String
 }
 
 /// Points fd 2 at `path`, creating its directory. Returns the previous stderr.
-fn redirect_stderr(path: &Path) -> Result<OwnedFd, String> {
+pub(crate) fn redirect_stderr(path: &Path) -> Result<OwnedFd, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -336,7 +367,7 @@ fn watch(handle: &LoopHandle<'static, App>, signals: OwnedFd, app: &mut App) -> 
 }
 
 /// The window's chromes, accepted with whatever tables they have (see [`WINDOW_CHROMES`]).
-fn chrome_checks() -> Vec<ChromeChecks> {
+pub(crate) fn chrome_checks() -> Vec<ChromeChecks> {
     fn accept(_: &Table) -> Vec<String> {
         Vec::new()
     }
@@ -420,6 +451,11 @@ impl App {
             seat: SeatId::next(),
             settings,
             graphics: false,
+            text_mode: false,
+            mode_override: None,
+            text: TextPages::new(size.cols, page_area(size).rows),
+            semantic_on: HashSet::new(),
+            capture: PointerCapture::default(),
             page: page_area(size),
             metrics: empty_metrics(),
             metrics_due: false,
@@ -520,6 +556,9 @@ impl App {
             worked |= self.send_metrics();
             self.tui.active_url = active_url(self.session.core());
             worked |= self.session.pump(&mut self.tui);
+            // After the pump, which may have opened a view: nothing is drawn for it before the
+            // engine is asked for its text.
+            worked |= self.sync_semantics();
             worked |= self.write();
             if !worked {
                 busy = false;
@@ -657,6 +696,15 @@ impl App {
                 self.tui.relayout();
                 return self.tui.redraw_all();
             }
+            // A field being edited in text mode or an option being chosen has the keyboard: the
+            // keymap never sees these, so typing `q` into a field is typing.
+            TermEvent::Key(key) if self.tui.text.prompting() => {
+                self.tui.chrome_dirty = true;
+                if let Some(act) = self.tui.text.prompt_key(&key) {
+                    self.session.queue_mut().push_back(semantic_event(act, at));
+                }
+                return;
+            }
             TermEvent::Key(key) => keyboard(InputKind::Key(key)),
             TermEvent::Focus(inside) => keyboard(InputKind::Focus(match inside {
                 true => FocusEvent::Activated,
@@ -685,6 +733,10 @@ impl App {
             }
             text.truncate(end);
         }
+        if self.tui.text.paste(&text) {
+            self.tui.chrome_dirty = true;
+            return None;
+        }
         if let Some(editor) = &mut self.tui.editing {
             editor.paste(&text);
             self.tui.editing_fresh = false;
@@ -709,8 +761,9 @@ impl App {
         let point = self.page_point(&mouse);
         let view = point.and(self.shown()).map(|(view, _)| view);
         let modifiers = mouse.modifiers;
+        let seat = self.tui.seat;
         let pointer = |kind| InputEvent {
-            seat: self.tui.seat,
+            seat,
             kind: InputKind::Pointer(kind),
         };
         if let (Some(button @ (PointerButton::Back | PointerButton::Forward)), None, false) =
@@ -723,6 +776,43 @@ impl App {
                 modifiers,
             });
             return Some(BrowserEvent::Button { view, event, at });
+        }
+        if self.tui.text_mode {
+            return self.text_mouse(&mouse, at);
+        }
+        // A button pressed over the page owns the pointer until it is released, wherever the
+        // pointer goes: the engine would otherwise stay in a drag.
+        if mouse.wheel.is_none() {
+            if let Some((captured, _)) = self.tui.capture.held() {
+                if !self.session.views().contains_key(&captured) {
+                    self.tui.capture.forget(captured);
+                } else if let Some((captured, held)) =
+                    self.tui
+                        .capture
+                        .route(mouse.button, mouse.motion, mouse.state)
+                {
+                    let position = self.page_offset(&mouse)?;
+                    let kind = if mouse.motion {
+                        PointerEvent::Motion {
+                            position,
+                            modifiers,
+                        }
+                    } else {
+                        PointerEvent::Button {
+                            button: held,
+                            state: mouse.state,
+                            position,
+                            modifiers,
+                        }
+                    };
+                    let event = pointer(kind);
+                    return Some(BrowserEvent::Pointer {
+                        view: captured,
+                        event,
+                        at,
+                    });
+                }
+            }
         }
         let (view, position) = (view?, point?);
         let kind = if let Some(wheel) = mouse.wheel {
@@ -743,8 +833,12 @@ impl App {
                 modifiers,
             }
         } else {
+            let button = mouse.button?;
+            if mouse.state == ButtonState::Pressed {
+                self.tui.capture.press(view, button);
+            }
             PointerEvent::Button {
-                button: mouse.button?,
+                button,
                 state: mouse.state,
                 position,
                 modifiers,
@@ -752,6 +846,97 @@ impl App {
         };
         let event = pointer(kind);
         Some(BrowserEvent::Pointer { view, event, at })
+    }
+
+    /// Text mode's mouse: the wheel scrolls the page, a left press focuses and activates the
+    /// link or control under it. Side buttons were the core's already.
+    fn text_mouse(&mut self, mouse: &MouseEvent, at: Instant) -> Option<BrowserEvent> {
+        let (view, _) = self.shown()?;
+        let page = self.tui.page;
+        let inside =
+            (page.row..page.row + page.rows).contains(&mouse.row) && mouse.column < page.cols;
+        if !inside || !self.tui.semantic_on.contains(&view) || self.tui.text.prompting() {
+            return None;
+        }
+        if let Some(wheel) = mouse.wheel {
+            let lines = match wheel {
+                Wheel::Up => -WHEEL_LINES,
+                Wheel::Down => WHEEL_LINES,
+                Wheel::Left | Wheel::Right => 0,
+            };
+            self.tui.text.wheel(view, lines);
+            self.tui.chrome_dirty = true;
+            return None;
+        }
+        if mouse.motion
+            || mouse.state != ButtonState::Pressed
+            || mouse.button != Some(PointerButton::Left)
+        {
+            return None;
+        }
+        self.tui.chrome_dirty = true;
+        let act = self
+            .tui
+            .text
+            .click(view, mouse.column, mouse.row - page.row)?;
+        Some(semantic_event(act, at))
+    }
+
+    /// Where the mouse's cell is relative to the page's top-left, in pixels, also when it is off
+    /// the page.
+    fn page_offset(&self, mouse: &MouseEvent) -> Option<SurfacePoint> {
+        let size = self.tui.terminal.size();
+        let page = PageCells {
+            column: 0,
+            row: self.tui.page.row,
+            columns: self.tui.page.cols,
+            rows: self.tui.page.rows,
+        };
+        let cell = CellPixels {
+            width: size.cell_width,
+            height: size.cell_height,
+        };
+        let (x, y) = cell_to_page_offset(mouse.column, mouse.row, page, cell)?;
+        Some(SurfacePoint {
+            x: x as f64,
+            y: y as f64,
+        })
+    }
+
+    /// Asks the engines for page content where text mode shows it (the shown view, if its
+    /// engine has it), and stops where it no longer does. Returns whether it changed any.
+    fn sync_semantics(&mut self) -> bool {
+        let live: HashSet<ViewId> = self.session.views().keys().copied().collect();
+        self.tui.semantic_on.retain(|view| live.contains(view));
+        let wants: Vec<(ViewId, bool)> = self
+            .session
+            .views()
+            .iter()
+            .map(|(&view, entry)| {
+                let has = self
+                    .session
+                    .registry()
+                    .engine(&entry.engine)
+                    .is_some_and(|engine| engine.capabilities.semantics);
+                (view, self.tui.text_mode && entry.visible && has)
+            })
+            .collect();
+        let mut changed = false;
+        for (view, want) in wants {
+            if want == self.tui.semantic_on.contains(&view) {
+                continue;
+            }
+            self.session.set_semantics(view, want);
+            if want {
+                self.tui.semantic_on.insert(view);
+            } else {
+                self.tui.semantic_on.remove(&view);
+                self.tui.text.forget(view);
+            }
+            self.tui.chrome_dirty = true;
+            changed = true;
+        }
+        changed
     }
 
     /// Where on the page the mouse's cell is, in the page's pixels.
@@ -874,8 +1059,21 @@ impl App {
                     .put_text(column, row, &message, fg, bg, Attrs::default());
             }
         }
+        let mut cursor = area.cursor;
+        if self.tui.text_mode {
+            if let Some((view, _)) = self.shown() {
+                let text_area = Area {
+                    col: 0,
+                    row: area.row,
+                    cols: area.cols,
+                    rows: area.rows,
+                };
+                let edit = self.tui.text.draw(view, &mut self.tui.grid, text_area);
+                cursor = cursor.or(edit.map(|(column, row)| CellCursor { column, row }));
+            }
+        }
         out.extend(self.tui.grid.diff());
-        match area.cursor {
+        match cursor {
             Some(cursor) => {
                 let (row, column) = (cursor.row + 1, cursor.column + 1);
                 out.extend(format!("\x1b[{row};{column}H\x1b[?25h").into_bytes());
@@ -920,14 +1118,22 @@ impl App {
                 (None, None) => None,
             },
             Kind::Internal => Some(error.unwrap_or_else(|| INTERNAL.into())),
+            // The page's text covers these rows once its first snapshot is in.
+            Kind::View if self.tui.text_mode => {
+                let view = self.shown().map(|(view, _)| view)?;
+                if self.tui.text.has(view) {
+                    return None;
+                }
+                let reading = self.tui.semantic_on.contains(&view);
+                Some(error.unwrap_or_else(|| if reading { READING } else { NO_SEMANTICS }.into()))
+            }
             // A frame covers these rows. With none, they would be empty: say what failed.
             Kind::View if self.tui.graphics && self.shown_has_frame() => None,
             Kind::View if self.tui.graphics => error,
             Kind::View => Some(error.unwrap_or_else(|| {
-                match self.tui.settings.mode {
-                    TuiMode::Text => NO_TEXT,
-                    _ if self.tui.can_show_images() => TOO_BIG,
-                    _ => NO_GRAPHICS,
+                match self.tui.images_possible() {
+                    true => TOO_BIG,
+                    false => NO_GRAPHICS,
                 }
                 .into()
             })),
@@ -983,9 +1189,9 @@ impl App {
             tabs,
             active,
             address_editing: self.tui.editing.clone(),
-            mode_label: match self.tui.settings.mode {
-                TuiMode::Text => MODE_TEXT,
-                _ => MODE_GRAPHICS,
+            mode_label: match self.tui.text_mode {
+                true => MODE_TEXT,
+                false => MODE_GRAPHICS,
             }
             .into(),
             keymap_indicator: core.keymap_indicator().map(str::to_owned),
@@ -1133,12 +1339,25 @@ impl Tui {
         }
         let interval = frame_interval(settings);
         self.next_frame = self.next_frame.map(|at| at.min(Instant::now() + interval));
+        if settings.mode != self.settings.mode {
+            self.mode_override = None;
+        }
         self.settings = settings;
         self.relayout();
     }
 
+    /// Whether the page rows are text: what `chrome.toggle-mode` chose, else `[tui] mode`, which
+    /// `auto` leaves to whether the terminal can show images.
+    fn wants_text(&self) -> bool {
+        self.mode_override.unwrap_or(match self.settings.mode {
+            TuiMode::Text => true,
+            TuiMode::Graphics => false,
+            TuiMode::Auto => !self.images_possible(),
+        })
+    }
+
     /// Whether the terminal shows kitty images, as `[tui]` asks.
-    fn can_show_images(&self) -> bool {
+    fn images_possible(&self) -> bool {
         let size = self.terminal.size();
         let kitty = self.terminal.capabilities().kitty_graphics_ok == Some(true);
         let wanted = match self.settings.graphics {
@@ -1146,7 +1365,7 @@ impl Tui {
             // Not implemented yet.
             GraphicsProtocol::Sixel | GraphicsProtocol::None => false,
         };
-        wanted && self.settings.mode != TuiMode::Text && size.cell_width > 0 && size.cell_height > 0
+        wanted && size.cell_width > 0 && size.cell_height > 0
     }
 
     /// The page rows and their pixels for the terminal's size. A changed size is a new layout
@@ -1157,12 +1376,15 @@ impl Tui {
         let width = u32::from(page.cols) * u32::from(size.cell_width);
         let height = u32::from(page.rows) * u32::from(size.cell_height);
         let fits = u64::from(width) * u64::from(height) <= kitty::MAX_PIXELS;
-        let graphics = self.can_show_images() && fits && width > 0 && height > 0;
+        let text = self.wants_text();
+        let graphics = !text && self.images_possible() && fits && width > 0 && height > 0;
         let (width, height) = if graphics { (width, height) } else { (0, 0) };
-        if graphics != self.graphics {
+        if graphics != self.graphics || text != self.text_mode {
             self.graphics = graphics;
+            self.text_mode = text;
             self.clear = true;
         }
+        self.text.set_area(page.cols, page.rows);
         let rect = self.metrics.rect();
         if (rect.width, rect.height) != (width, height) {
             let rect = WindowRect {
@@ -1181,6 +1403,15 @@ impl Tui {
     /// Clears the screen and draws the chrome and the shown page again.
     fn redraw_all(&mut self) {
         self.clear = true;
+    }
+
+    /// `chrome.text-mode` and `chrome.graphics-mode`: this run's mode over `[tui] mode`.
+    fn set_mode(&mut self, text: bool) {
+        if !text && !self.images_possible() {
+            return self.show_notice("This terminal can't show graphics".into());
+        }
+        self.mode_override = Some(text);
+        self.relayout();
     }
 
     fn show_notice(&mut self, message: String) {
@@ -1339,6 +1570,17 @@ impl Frontend for Tui {
     }
 
     fn forget_target(&mut self, target: TargetId) {
+        let gone: Vec<ViewId> = self
+            .views
+            .iter()
+            .filter(|&(_, &kept)| kept == target)
+            .map(|(&view, _)| view)
+            .collect();
+        for view in gone {
+            self.text.forget(view);
+            self.semantic_on.remove(&view);
+            self.capture.forget(view);
+        }
         self.views.retain(|_, &mut kept| kept != target);
         if let Some(pixels) = self.targets.remove(&target) {
             self.control.extend(kitty::delete(pixels.image));
@@ -1370,9 +1612,9 @@ impl Frontend for Tui {
 
     fn chrome_command(&mut self, action: String, _queue: &mut VecDeque<BrowserEvent>) {
         match action.as_str() {
-            "toggle-mode" | "text-mode" => self.show_notice("text mode isn't built yet".into()),
-            "graphics-mode" if !self.graphics => self.show_notice(NO_GRAPHICS.into()),
-            "graphics-mode" => {}
+            "toggle-mode" => self.set_mode(!self.text_mode),
+            "text-mode" => self.set_mode(true),
+            "graphics-mode" => self.set_mode(false),
             "refresh" => self.redraw_all(),
             other => {
                 let has = TERMINAL_CHROME_COMMANDS.join(", chrome.");
@@ -1421,6 +1663,34 @@ impl Frontend for Tui {
     fn before_forced_exit(&mut self) {
         self.leave();
     }
+
+    /// In text mode the shown page's keys scroll, focus and activate its text; nothing reaches
+    /// the engine (TUI.md §8.11).
+    fn page_input(
+        &mut self,
+        view: ViewId,
+        event: &InputEvent,
+        queue: &mut VecDeque<BrowserEvent>,
+    ) -> bool {
+        let InputKind::Key(key) = &event.kind else {
+            return false;
+        };
+        if !self.text_mode || !self.semantic_on.contains(&view) {
+            return false;
+        }
+        self.chrome_dirty = true;
+        if let Some(act) = self.text.page_key(view, key) {
+            queue.push_back(semantic_event(act, Instant::now()));
+        }
+        true
+    }
+
+    fn semantics_changed(&mut self, view: ViewId, snapshot: Box<SemanticSnapshot>) {
+        if self.semantic_on.contains(&view) {
+            self.text.snapshot(view, snapshot);
+            self.chrome_dirty = true;
+        }
+    }
 }
 
 /// The page rows for a terminal of `size`: everything between the chrome's top and bottom
@@ -1432,6 +1702,17 @@ fn page_area(size: TermSize) -> PageArea {
         rows,
         cols: size.cols,
         cursor: None,
+    }
+}
+
+/// The core's event for an action the user chose in the page's text.
+fn semantic_event(act: Act, at: Instant) -> BrowserEvent {
+    BrowserEvent::Semantic {
+        view: act.view,
+        document: act.document,
+        action: act.action,
+        link: act.link,
+        at,
     }
 }
 
@@ -1467,7 +1748,7 @@ fn tab_error<'a>(tab: &TabSummary<'a>) -> Option<&'a LoadError> {
 }
 
 /// The error, and the address that failed when the message does not already name it.
-fn error_line(error: &LoadError) -> String {
+pub(crate) fn error_line(error: &LoadError) -> String {
     match error.url.as_deref() {
         Some(url) if !url.is_empty() && !error.message.contains(url) => {
             let url: String = url.chars().take(MESSAGE_URL).collect();

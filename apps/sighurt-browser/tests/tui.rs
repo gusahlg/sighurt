@@ -59,6 +59,11 @@ impl Terminal {
 
     /// [`Self::start`] for a terminal that answers the probe with `replies`.
     fn start_with(name: &str, args: &[&str], replies: &'static [u8]) -> Self {
+        Self::start_in(name, args, replies, "")
+    }
+
+    /// [`Self::start_with`] with `tui` more lines in the configuration's `[tui]` table.
+    fn start_in(name: &str, args: &[&str], replies: &'static [u8], tui: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("sig-tui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("config/sighurt")).unwrap();
@@ -66,7 +71,7 @@ impl Terminal {
             dir.join("config/sighurt/config.toml"),
             format!(
                 "version = 1\n[engines]\ndefault = \"demo\"\n[routing.demo]\nschemes = \
-                 [\"demo\"]\n[tui]\nfps = {FPS}\n"
+                 [\"demo\"]\n[tui]\nfps = {FPS}\n{tui}\n"
             ),
         )
         .unwrap();
@@ -583,4 +588,185 @@ fn a_legacy_terminal_types_an_address_in_one_write() {
         term.context()
     );
     term.assert_restored();
+}
+
+#[test]
+fn text_mode_shows_the_page_as_text_and_tab_enter_follow_a_link_and_fill_a_field() {
+    let mut term = Terminal::start_in("text", &["demo://pattern"], REPLIES, "mode = \"text\"");
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        shows(got, "Demo: pattern") && shows(got, "Animation page[1]") && shows(got, "TEXT")
+    });
+    assert!(shown, "no page text\n{}", term.context());
+    assert!(
+        images(&term.got).is_empty(),
+        "text mode sent an image\n{}",
+        term.context()
+    );
+
+    // Tab focuses the first link, Enter follows it.
+    let since = term.got.len();
+    term.type_bytes(b"\t\r");
+    let followed = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "Demo: animation")
+    });
+    assert!(
+        followed,
+        "Tab, Enter did not follow the link\n{}",
+        term.context()
+    );
+
+    // Three more Tabs reach the field (link, link, field); Enter edits it, `q` is typed into
+    // it, not run, and Enter sets it.
+    let since = term.got.len();
+    term.type_bytes(b"\t\t\t\r");
+    let editing = term.wait(since, Duration::from_secs(10), |got| shows(got, "Edit:"));
+    assert!(editing, "no field editor\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"zq\r");
+    let set = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "Typed into the page: zq")
+    });
+    assert!(
+        set,
+        "the field's value did not reach the page\n{}",
+        term.context()
+    );
+
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+    term.assert_restored();
+}
+
+#[test]
+fn a_click_follows_a_link_in_text_mode() {
+    let mut term = Terminal::start_in(
+        "text-click",
+        &["demo://pattern"],
+        REPLIES,
+        "mode = \"text\"",
+    );
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        shows(got, "Animation page[1]")
+    });
+    assert!(shown, "no page text\n{}", term.context());
+    // The link is the sixth line of the page, which starts on the second row.
+    let since = term.got.len();
+    term.type_bytes(b"\x1b[<0;3;7M\x1b[<0;3;7m");
+    let followed = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "Demo: animation")
+    });
+    assert!(
+        followed,
+        "the click did not follow the link\n{}",
+        term.context()
+    );
+}
+
+#[test]
+fn m_switches_between_graphics_and_text() {
+    let mut term = Terminal::start("toggle", &["demo://pattern"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440) && shows(got, "GFX")
+    });
+    assert!(shown, "no image\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"m");
+    let text = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "Animation page[1]") && shows(got, "TEXT")
+    });
+    assert!(text, "`m` did not show text\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"m");
+    let graphics = term.wait(since, Duration::from_secs(10), |got| {
+        image(got, 80, 22, 800, 440) && shows(got, "GFX")
+    });
+    assert!(
+        graphics,
+        "`m` did not show graphics again\n{}",
+        term.context()
+    );
+}
+
+#[test]
+fn a_drag_that_leaves_the_page_still_reaches_the_page() {
+    let mut term = Terminal::start("drag", &["demo://resize"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "no image\n{}", term.context());
+    // Press at cell (5, 5) of the screen, then move onto the top line of the chrome with the
+    // button held: the page gets the position above its top edge (one row of 20 pixels).
+    let since = term.got.len();
+    term.type_bytes(b"\x1b[<0;6;6M\x1b[<32;6;1M");
+    let moved = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "50.0, -20.0")
+    });
+    assert!(moved, "the page lost the drag\n{}", term.context());
+    // Released over the chrome: the capture ends, so the next motion up there is nobody's.
+    let since = term.got.len();
+    term.type_bytes(b"\x1b[<0;6;1m\x1b[<35;11;1M");
+    let still = term.wait(since, Duration::from_millis(500), |got| {
+        shows(got, "100.0, -20.0")
+    });
+    assert!(!still, "motion after the release reached the page");
+}
+
+/// `sig --dump ARGS` with the demo engine's configuration, without a terminal.
+fn dump(name: &str, args: &[&str]) -> (ExitStatus, String, String) {
+    let dir = std::env::temp_dir().join(format!("sig-dump-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("config/sighurt")).unwrap();
+    fs::write(
+        dir.join("config/sighurt/config.toml"),
+        "version = 1\n[engines]\ndefault = \"demo\"\n[routing.demo]\nschemes = [\"demo\"]\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sig"))
+        .arg("--dump")
+        .args(args)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    (
+        output.status,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn dump_prints_the_page_as_text_to_a_pipe() {
+    let (status, out, err) = dump("ok", &["demo://pattern", "--width", "40"]);
+    assert!(status.success(), "{status:?}\n{err}");
+    assert!(out.starts_with("Demo: pattern\n"), "{out}");
+    assert!(out.contains("Animation page[1]"), "{out}");
+    assert!(
+        out.contains("References\n\n1. demo:animation\n2. demo:resize\n"),
+        "{out}"
+    );
+    assert!(out.lines().all(|line| line.chars().count() <= 40), "{out}");
+    assert!(!out.contains('\x1b'), "escape sequences in the dump");
+}
+
+#[test]
+fn dump_fails_with_a_message_and_a_nonzero_exit() {
+    let (status, out, err) = dump("fail", &["demo://nope"]);
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.starts_with("sig: ") && err.lines().count() == 1,
+        "{err}"
+    );
+
+    // An engine with no page text says so.
+    let (status, out, err) = dump("no-text", &["demo://pattern", "--engine", "wasm"]);
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert!(out.is_empty() && err.contains("no page text"), "{out}{err}");
 }

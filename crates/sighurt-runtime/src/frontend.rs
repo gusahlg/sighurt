@@ -86,6 +86,21 @@ pub trait Frontend: Clipboard {
     /// this returns.
     fn before_forced_exit(&mut self);
 
+    /// Input the core is about to send `view`'s engine (a key the keymap did not take, or one
+    /// `page.send-key` made). Return `true` to keep it from the engine: a frontend that shows the
+    /// page as text scrolls and activates its own view instead (TUI.md §4). Events it wants the
+    /// core to see go to `queue`. Called for the keys of both states, so a press and its release
+    /// can be taken together.
+    fn page_input(
+        &mut self,
+        view: ViewId,
+        event: &InputEvent,
+        queue: &mut VecDeque<BrowserEvent>,
+    ) -> bool {
+        let _ = (view, event, queue);
+        false
+    }
+
     /// A view's content as structure, after the frontend turned it on
     /// ([`Session::set_semantics`](crate::session::Session::set_semantics)). The runtime has
     /// checked its bounds and shape ([`SemanticSnapshot::check`]); its strings are still page

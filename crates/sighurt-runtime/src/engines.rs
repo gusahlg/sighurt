@@ -61,10 +61,13 @@ pub fn descriptors() -> Vec<Descriptor> {
         Descriptor {
             name: "demo",
             web: false,
-            // `sighurt_engine_demo::CAPABILITIES` is every field false, which is `Default`.
+            // `sighurt_engine_demo::CAPABILITIES` is `Default` and content as structure.
             // Repeated here so this crate does not depend on the demo engine: that crate names
             // the host's target types. `Registry::start` warns if a runtime reports otherwise.
-            capabilities: EngineCapabilities::default(),
+            capabilities: EngineCapabilities {
+                semantics: true,
+                ..EngineCapabilities::default()
+            },
             honors: &[],
         },
     ]

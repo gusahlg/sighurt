@@ -211,6 +211,12 @@ impl<F: Frontend> Session<F> {
                             entry.navigated = active.then(Instant::now);
                         }
                     }
+                    // A frontend that shows the page itself may keep the keys from the engine.
+                    EngineCommand::Input(event)
+                        if frontend.page_input(view, event, &mut self.queue) =>
+                    {
+                        return;
+                    }
                     _ => {}
                 }
                 self.engine_command(view, command, true);

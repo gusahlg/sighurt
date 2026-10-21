@@ -47,17 +47,19 @@ use sighurt_api::engine::{
     EngineCapabilities, EngineCommand, EngineError, EngineRuntime, PresentOutcome, PumpStatus,
     ViewOptions,
 };
-use sighurt_api::events::{Cursor, EngineEvent, NavigationError};
+use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{Metrics, SurfacePoint};
 use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, ViewId};
 use sighurt_api::input::{ButtonState, InputKind, Key, PointerEvent};
 use sighurt_api::present::CpuTarget;
+use sighurt_api::semantic::{NodeId, NodeKind, SemanticAction, SemanticNode, SemanticSnapshot};
 use sighurt_wayland::TargetLease;
 
 /// The engine's name in the configuration and the registry.
 pub const NAME: &str = "demo";
 
-/// What the demo engine supports: none of the optional operations.
+/// What the demo engine supports: content as structure (a small fixed tree, see [`snapshot`]),
+/// and none of the other optional operations.
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     history_traversal: false,
     text_input: false,
@@ -68,7 +70,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     pointer_lock: false,
     native_popups: false,
     process_per_view: false,
-    semantics: false,
+    semantics: true,
 };
 
 /// How long `demo:slow` takes to have a frame for a new layout: longer than the host's resize
@@ -148,6 +150,13 @@ struct View<T: CpuTarget> {
     ready_at: Option<(LayoutEpoch, Instant)>,
     /// Something new to paint, reported as `FrameReady` at the next pump.
     dirty: bool,
+    /// The committed document, which semantic actions must name.
+    document: Option<DocumentGeneration>,
+    /// The frontend asked for content snapshots.
+    semantics: bool,
+    /// The demo form's state: the checkbox and the select's choice.
+    agreed: bool,
+    colour: u32,
 }
 
 impl<T: CpuTarget> View<T> {
@@ -165,7 +174,28 @@ impl<T: CpuTarget> View<T> {
             rendered: None,
             ready_at: None,
             dirty: false,
+            document: None,
+            semantics: false,
+            agreed: false,
+            colour: 0,
         }
+    }
+
+    /// The page's content as the frontend asked for it, if it did and there is a page.
+    fn snapshot_event(&self, id: ViewId) -> Option<EngineEvent> {
+        let (page, _) = self.page.as_ref()?;
+        let document = self.document.filter(|_| self.semantics)?;
+        let snapshot = snapshot(
+            document,
+            page.title(),
+            &self.typed,
+            self.agreed,
+            self.colour,
+        );
+        Some(EngineEvent::SemanticsChanged {
+            view: id,
+            snapshot: Box::new(snapshot),
+        })
     }
 
     fn page(&self) -> Option<Page> {
@@ -272,11 +302,15 @@ impl<T: CpuTarget> DemoRuntime<T> {
                 view.started = Instant::now();
                 view.dirty = true;
                 view.start_slow_frame(Instant::now());
+                let document = DocumentGeneration::next();
+                view.document = Some(document);
+                view.agreed = false;
+                view.colour = 0;
                 queue.push(EngineEvent::NavigationCommitted {
                     view: id,
                     navigation,
                     url,
-                    document: DocumentGeneration::next(),
+                    document,
                     history: None,
                 });
                 queue.push(EngineEvent::TitleChanged {
@@ -293,6 +327,7 @@ impl<T: CpuTarget> DemoRuntime<T> {
                     view: id,
                     text: None,
                 });
+                queue.extend(view.snapshot_event(id));
             }
             Err(error) => queue.push(EngineEvent::NavigationFailed {
                 view: id,
@@ -304,6 +339,52 @@ impl<T: CpuTarget> DemoRuntime<T> {
             view: id,
             loading: false,
         });
+    }
+
+    /// A semantic action on the demo page's fixed tree ([`snapshot`]).
+    fn act(&mut self, id: ViewId, action: SemanticAction) -> Result<(), EngineError> {
+        let view = self.views.get_mut(&id).expect("checked by the caller");
+        match action {
+            SemanticAction::Activate(NodeId(node @ (NODE_LINK_ANIMATION | NODE_LINK_RESIZE))) => {
+                let url = match node {
+                    NODE_LINK_ANIMATION => "demo:animation",
+                    _ => "demo:resize",
+                };
+                self.queue.push(EngineEvent::OpenRequested {
+                    view: id,
+                    document: view.document.expect("checked by the caller"),
+                    url: url.into(),
+                    disposition: OpenDisposition::CurrentView,
+                });
+                return Ok(());
+            }
+            SemanticAction::Activate(NodeId(NODE_CHECKBOX)) => view.agreed = !view.agreed,
+            SemanticAction::Activate(NodeId(NODE_BUTTON)) => {
+                view.typed = "pressed".into();
+                view.typed_changed(id, &mut self.queue);
+            }
+            SemanticAction::SetValue {
+                node: NodeId(NODE_FIELD),
+                value,
+            } => {
+                view.typed = value;
+                keep_last_chars(&mut view.typed, MAX_TYPED);
+                view.typed_changed(id, &mut self.queue);
+            }
+            SemanticAction::SelectOption {
+                node: NodeId(NODE_SELECT),
+                index,
+            } if index < 3 => view.colour = index,
+            SemanticAction::Focus(_) | SemanticAction::ScrollIntoView(_) => return Ok(()),
+            _ => {
+                return Err(EngineError::View {
+                    view: id,
+                    message: "the demo page has no such control".into(),
+                })
+            }
+        }
+        self.queue.extend(view.snapshot_event(id));
+        Ok(())
     }
 
     fn input(&mut self, id: ViewId, kind: InputKind) {
@@ -373,6 +454,78 @@ impl<T: CpuTarget> DemoRuntime<T> {
     }
 }
 
+const NODE_LINK_ANIMATION: u64 = 5;
+const NODE_LINK_RESIZE: u64 = 6;
+const NODE_FIELD: u64 = 7;
+const NODE_CHECKBOX: u64 = 8;
+const NODE_SELECT: u64 = 9;
+const NODE_BUTTON: u64 = 10;
+
+/// The content every demo page reports: a heading, a paragraph, two links to other demo pages, a
+/// text field holding `typed`, a checkbox, a select and a button. Node ids are fixed, so actions
+/// name them.
+fn snapshot(
+    document: DocumentGeneration,
+    title: &str,
+    typed: &str,
+    agreed: bool,
+    colour: u32,
+) -> SemanticSnapshot {
+    let node = |id: u64, kind: NodeKind| SemanticNode {
+        id: NodeId(id),
+        kind,
+        ..SemanticNode::default()
+    };
+    let text = |id: u64, kind: NodeKind, text: &str| SemanticNode {
+        text: Some(text.into()),
+        ..node(id, kind)
+    };
+    let link = |id: u64, label: &str, href: &str| SemanticNode {
+        href: Some(href.into()),
+        ..text(id, NodeKind::Link, label)
+    };
+    let mut root = node(1, NodeKind::Document);
+    // Each control sits in a paragraph of its own (ids 20 to 25), so each is a line.
+    root.children = [2, 3, 20, 21, 22, 23, 24, 25].map(NodeId).to_vec();
+    let mut paragraph = node(3, NodeKind::Paragraph);
+    paragraph.children = vec![NodeId(4)];
+    let mut field = node(NODE_FIELD, NodeKind::TextField);
+    field.label = Some("Name".into());
+    field.value = Some(typed.into());
+    let mut checkbox = node(NODE_CHECKBOX, NodeKind::Checkbox);
+    checkbox.label = Some("Agree".into());
+    checkbox.checked = Some(agreed);
+    let mut select = node(NODE_SELECT, NodeKind::Select);
+    select.label = Some("Colour".into());
+    select.options = ["red", "green", "blue"].map(String::from).to_vec();
+    select.selected = Some(colour.min(2));
+    SemanticSnapshot {
+        document,
+        root: NodeId(1),
+        nodes: vec![
+            root,
+            text(2, NodeKind::Heading(1), title),
+            paragraph,
+            text(4, NodeKind::Text, "This page has content for text mode."),
+            link(NODE_LINK_ANIMATION, "Animation page", "demo:animation"),
+            link(NODE_LINK_RESIZE, "Resize page", "demo:resize"),
+            field,
+            checkbox,
+            select,
+            text(NODE_BUTTON, NodeKind::Button, "Press me"),
+        ]
+        .into_iter()
+        .chain((20..26).map(|id| {
+            let mut line = node(id, NodeKind::Paragraph);
+            line.children = vec![NodeId(id - 15)];
+            line
+        }))
+        .collect(),
+        focus: None,
+        truncated: false,
+    }
+}
+
 /// Keeps the last `max` characters of `text`.
 fn keep_last_chars(text: &mut String, max: usize) {
     let count = text.chars().count();
@@ -395,6 +548,7 @@ fn coalesce(events: &mut Vec<EngineEvent>) {
                 | EngineEvent::HistoryChanged { .. }
                 | EngineEvent::TextInputChanged { .. }
                 | EngineEvent::FrameReady { .. }
+                | EngineEvent::SemanticsChanged { .. }
         )
     }
     let mut seen: HashSet<(Discriminant<EngineEvent>, Option<ViewId>)> = HashSet::new();
@@ -474,9 +628,15 @@ impl<T: CpuTarget> EngineRuntime for DemoRuntime<T> {
             // resolve or answer.
             EngineCommand::ResolveServiceRequest { .. }
             | EngineCommand::AnswerNavigation { .. } => {}
-            // Content as structure is not implemented yet (TUI.md §8, phases 2 and 4).
-            EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
-                return Err(EngineError::Unsupported("semantics"))
+            EngineCommand::SetSemantics(on) => {
+                view.semantics = on;
+                self.queue.extend(view.snapshot_event(id).filter(|_| on));
+            }
+            EngineCommand::Semantic { document, action } => {
+                // An action on a replaced document is dropped.
+                if view.document == Some(document) {
+                    self.act(id, action)?;
+                }
             }
         }
         Ok(())
@@ -615,6 +775,12 @@ mod tests {
                 EngineEvent::FrameReady { view: a },
             ]
         );
+    }
+
+    #[test]
+    fn the_demo_tree_is_well_formed() {
+        let snapshot = snapshot(DocumentGeneration::next(), "t", "x", true, 1);
+        assert_eq!(snapshot.check(), Ok(()));
     }
 
     #[test]

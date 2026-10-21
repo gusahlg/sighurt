@@ -386,6 +386,48 @@ Where it differs from the sketches in §2–§3:
   core: a snapshot of a just-replaced document reaches the frontend, and an action on it is
   dropped by the core and the engine.
 
+### Text mode and `--dump` as built
+
+- **Mode.** `Tui::wants_text`: `chrome.toggle-mode`, `chrome.text-mode` and `chrome.graphics-mode`
+  set a choice for the run; without one, `[tui] mode` (`auto` is text when the terminal can't show
+  kitty images). A changed `[tui] mode` in the file drops the run's choice. Text mode gives the
+  engines empty metrics ("no room"), so nothing is rendered or read back; `graphics-mode` on a
+  terminal without images is a notice.
+- **Semantics.** `App::sync_semantics` asks (`Session::set_semantics`) for exactly the shown view
+  in text mode whose engine declares `semantics`, and stops asking, and drops the view's page,
+  when it is hidden or the mode changes. An engine without them gets the page-rows message "No
+  page text from this engine …" (the keys in it are the built-in `[tui.keys]` ones).
+- **Keys.** The keymap runs first. What it leaves for the page, including `page.send-key
+  ArrowDown` from the built-in `j`, reaches `Frontend::page_input` (new in `sighurt-runtime`:
+  called for each `EngineCommand::Input` before the engine, `true` keeps it from the engine), and
+  in text mode the shown view's keys end there: ArrowUp/Down, PageUp/Down, Home/End scroll, Tab
+  and Shift-Tab move the focus, Enter activates (`text::Nav`). Text mode's navigation is therefore
+  the configured commands plus those named keys; nothing is bound in code.
+- **Activation.** `Action` goes to the core as `BrowserEvent::Semantic` (never to the engine);
+  `EditField` opens a one-line editor over the last page row and `ChooseOption` a list over the
+  bottom rows (8 at most). While one is open every key goes to it before the keymap (typing `q`
+  is typing; Escape cancels, Enter commits as `SetValue` or `SelectOption`; the chooser takes the
+  arrow keys, Home and End). A multi-line text area is edited as one line. A password's value is
+  masked and starts empty. A new document drops an open prompt.
+- **Mouse.** In text mode the wheel scrolls three lines and a left press focuses and activates
+  the link or control under it; other buttons and motion are ignored. In graphics mode a button
+  pressed over the page captures the pointer (`input::PointerCapture`): its motion and its release
+  go to that view with positions relative to the page's top-left, negative above and left of it,
+  until released or the view closes (review finding 8).
+- **`sig --dump URL [--width N] [--timeout SECS]`** (`sighurt_tui::dump`; no terminal, no Wayland,
+  no sighurt-ui, no session file written). The engine is `--engine`, else WPE WebKit, else the
+  first compiled-in engine with `semantics`, else an error. Only that engine's runtime starts
+  (Servo does not, `Registry::configure`). The page is complete when the core's tab is loaded; then
+  the engine is asked for a snapshot again, and the first one that arrives, once 300 ms pass
+  without a newer one (an extraction already running when the load ended may deliver an earlier
+  state), is printed. A navigation error exits 1 with one line on stderr; the timeout (default 30
+  s) exits 2. If stderr is a terminal, logging goes to the log file. The demo engine now has
+  semantics (a heading, a paragraph, two links, a field, a checkbox, a select and a button), so
+  all of this is tested in a pty without WPE (`apps/sighurt-browser/tests/tui.rs`).
+- **Open.** A stale page stays on screen until the new document's first snapshot (the frontend
+  isn't told of commits); WPE text mode and `--dump` against real sites are checked by hand, not by
+  `engines.sh` yet.
+
 ## 11. What page extraction can and can't guarantee (review, 17 October 2026)
 
 An independent review (GPT-6 Astra) of `sighurt-semantic` (5d6e651), with the findings to fix

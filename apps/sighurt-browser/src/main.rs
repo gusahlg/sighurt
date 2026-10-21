@@ -13,6 +13,8 @@
 //! with the `frontend-tui` feature, the terminal (`sighurt_tui::run`). `--gui` and `--tui` pick
 //! one; without either, `sig` opens in the terminal when stdout is one and `TERM` isn't `dumb`,
 //! and in a window otherwise (decision 89).
+//! `--dump URL` needs neither: it prints the page as text from a session with no terminal
+//! (`sighurt_tui::dump`).
 //!
 //! Must not own: browser policy (the core), the owner loop (the frontend), drawing (the chrome
 //! and the engines), or any engine's internals.
@@ -37,6 +39,11 @@ it opens a Wayland window.
 
 Options:
       --default-config     Print the built-in configuration and exit
+      --dump URL           Print URL's page as reflowed text with numbered links on stdout and
+                           exit, with no terminal or window (needs an engine that gives page
+                           text: WPE WebKit); exit code 2 on a timeout
+      --width N            With --dump, wrap to N columns (default 80)
+      --timeout SECS       With --dump, give up after SECS seconds (default 30)
       --diagnostics FILE   Write the diagnostics to FILE as JSON at exit and on SIGUSR1
       --engine ENGINE      The engine this run starts with, overriding [engines] default
       --gui                Open a Wayland window, even from a terminal
@@ -64,6 +71,16 @@ struct Args {
     engine: Option<String>,
     /// `--gui` or `--tui`, if given.
     frontend: Option<Choice>,
+    /// `--dump URL`, with its `--width` and `--timeout`.
+    dump: Option<Dump>,
+}
+
+/// What `--dump` is asked for. Only the terminal frontend runs it.
+#[cfg_attr(not(feature = "frontend-tui"), allow(dead_code))]
+struct Dump {
+    open: OpenRequest,
+    width: u16,
+    timeout: u64,
 }
 
 /// Which frontend runs.
@@ -80,7 +97,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, ExitCode> 
         diagnostics: None,
         engine: None,
         frontend: None,
+        dump: None,
     };
+    let (mut width, mut timeout) = (None, None);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -109,6 +128,27 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, ExitCode> 
                 Some(name) => parsed.engine = Some(name),
                 None => return Err(usage_error("--engine needs an engine")),
             },
+            "--dump" => match args.next() {
+                Some(url) => {
+                    parsed.dump = Some(Dump {
+                        open: open_request(&url),
+                        width: 80,
+                        timeout: 30,
+                    })
+                }
+                None => return Err(usage_error("--dump needs a URL")),
+            },
+            "--width" | "--timeout" => {
+                let value = args.next().and_then(|v| v.parse::<u64>().ok());
+                match (arg.as_str(), value) {
+                    ("--width", Some(n @ 1..=1000)) => width = Some(n as u16),
+                    ("--timeout", Some(n @ 1..=86_400)) => timeout = Some(n),
+                    ("--width", _) => {
+                        return Err(usage_error("--width needs a number from 1 to 1000"))
+                    }
+                    _ => return Err(usage_error("--timeout needs a number of seconds")),
+                }
+            }
             "--gui" | "--tui" => {
                 let choice = if arg == "--gui" {
                     Choice::Gui
@@ -125,6 +165,24 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, ExitCode> 
             }
             _ => parsed.open.push(open_request(&arg)),
         }
+    }
+    match &mut parsed.dump {
+        Some(_) if parsed.frontend.is_some() => {
+            return Err(usage_error("--dump excludes --gui and --tui"))
+        }
+        Some(dump) => {
+            dump.width = width.unwrap_or(dump.width);
+            dump.timeout = timeout.unwrap_or(dump.timeout);
+            if !parsed.open.is_empty() {
+                return Err(usage_error(
+                    "--dump takes one URL, and nothing else to open",
+                ));
+            }
+        }
+        None if width.is_some() || timeout.is_some() => {
+            return Err(usage_error("--width and --timeout are for --dump"))
+        }
+        None => {}
     }
     Ok(parsed)
 }
@@ -264,6 +322,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(dump) = args.dump {
+        return run_dump(dump, args.engine, signals);
+    }
     // The core applies this on top of the configuration, including every reload. It has to be
     // set on this thread: that is the thread that reads the configuration.
     sighurt_core::set_starting_engine(args.engine);
@@ -299,6 +360,32 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `--dump`: the page as text on stdout, in a session with no terminal and no window. `engine`
+/// is `--engine`; without it the engine is WPE WebKit, or another that gives page text.
+#[cfg(feature = "frontend-tui")]
+fn run_dump(dump: Dump, engine: Option<String>, signals: OwnedFd) -> ExitCode {
+    let mut open = dump.open;
+    open.engine = engine;
+    let options = sighurt_tui::DumpOptions {
+        open,
+        width: dump.width,
+        timeout: std::time::Duration::from_secs(dump.timeout),
+    };
+    match sighurt_tui::dump(options, &signals) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("sig: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "frontend-tui"))]
+fn run_dump(_: Dump, _: Option<String>, _: OwnedFd) -> ExitCode {
+    eprintln!("sig: this sig was built without the terminal frontend (feature frontend-tui)");
+    ExitCode::from(2)
 }
 
 #[cfg(test)]
@@ -347,6 +434,27 @@ mod tests {
         assert!(args(&["--engine"]).is_err());
         assert!(args(&["--nope"]).is_err());
         assert!(USAGE.contains("--engine ENGINE"));
+    }
+
+    #[test]
+    fn dump_takes_a_url_a_width_and_a_timeout() {
+        let parsed = args(&["--dump", "example.com", "--width", "100"])
+            .ok()
+            .unwrap();
+        let dump = parsed.dump.unwrap();
+        assert_eq!(
+            (dump.open.input.as_str(), dump.width, dump.timeout),
+            ("example.com", 100, 30)
+        );
+        let parsed = args(&["--timeout", "5", "--dump", "x"]).ok().unwrap();
+        assert_eq!(parsed.dump.map(|d| (d.width, d.timeout)), Some((80, 5)));
+        assert!(args(&["--dump"]).is_err());
+        assert!(args(&["--dump", "x", "--width", "0"]).is_err());
+        assert!(args(&["--dump", "x", "--width", "wide"]).is_err());
+        assert!(args(&["--dump", "x", "--tui"]).is_err());
+        assert!(args(&["--dump", "x", "y"]).is_err());
+        assert!(args(&["--width", "20"]).is_err());
+        assert!(USAGE.contains("--dump URL"));
     }
 
     #[test]

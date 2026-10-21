@@ -402,13 +402,18 @@ impl<T: 'static, P: 'static> Registry<T, P> {
     }
 
     /// Takes the settings every runtime starts with from `config`, the configuration the
-    /// process starts with, then starts the engines that start with the process rather than on
-    /// first use: Servo, when it is compiled in and `config` enables it (decision 26).
-    #[cfg_attr(not(feature = "engine-servo"), allow(unused_variables))]
-    pub fn start_at_launch(&mut self, config: &Config, waker: impl FnOnce() -> EngineWaker) {
+    /// process starts with. Nothing starts.
+    pub fn configure(&mut self, config: &Config) {
         for engine in &mut self.engines {
             engine.settings = config.engine_settings(engine.name);
         }
+    }
+
+    /// [`Self::configure`], then starts the engines that start with the process rather than on
+    /// first use: Servo, when it is compiled in and `config` enables it (decision 26).
+    #[cfg_attr(not(feature = "engine-servo"), allow(unused_variables))]
+    pub fn start_at_launch(&mut self, config: &Config, waker: impl FnOnce() -> EngineWaker) {
+        self.configure(config);
         #[cfg(feature = "engine-servo")]
         if config.is_enabled("servo") {
             if let Err(error) = self.start("servo", waker) {
