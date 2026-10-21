@@ -1,0 +1,5 @@
+<!doctype html><meta charset=utf-8><title>video test</title>
+<style>body{margin:0;background:#fff;font:12px sans-serif}video{width:320px;height:180px;margin:4px;vertical-align:top;background:#800}</style>
+<div id=s></div>
+<video id=a src=h264.mp4 muted autoplay playsinline></video><video id=b src=vp9.webm muted autoplay playsinline></video><video id=c src=av1.mp4 muted autoplay playsinline></video>
+<script>setInterval(()=>{s.textContent=[a,b,c].map(v=>v.error?'ERR'+v.error.code:v.currentTime.toFixed(1)).join(' ')},300)</script>
