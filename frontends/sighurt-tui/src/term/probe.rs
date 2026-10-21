@@ -49,6 +49,16 @@ pub struct XtGetTcap {
     pub entries: Vec<(String, Option<String>)>,
 }
 
+/// Whether `after` would change the page layout relative to `before`.
+///
+/// Graphics support is kitty's answer and sixel in DA1. The cell's pixel size
+/// is the `CSI 16 t` reply. Either one is enough for the owner to relayout.
+pub fn affects_layout(before: &Caps, after: &Caps) -> bool {
+    before.kitty_graphics_ok != after.kitty_graphics_ok
+        || before.sixel != after.sixel
+        || before.cell_pixels != after.cell_pixels
+}
+
 /// Fold one input into `caps`. Returns whether it was the DA1 sentinel.
 pub fn absorb(caps: &mut Caps, input: &Input) -> bool {
     let Input::Reply(reply) = input else {

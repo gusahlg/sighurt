@@ -33,7 +33,9 @@ pub use modes::{ENTER, KITTY_KEYBOARD_FLAGS, LEAVE, QUERIES};
 pub(crate) use modes::{SYNC_BEGIN, SYNC_END};
 pub use parser::{Wheel, ESC_TIMEOUT};
 pub use probe::{Caps as Capabilities, XtGetTcap, PROBE_DEADLINE};
-pub use session::{open_pty, restore_before_forced_exit, termios_matches};
+pub use session::{
+    open_pty, restore_before_forced_exit, termios_matches, INPUT_BYTE_BUDGET, INPUT_EVENT_CAP,
+};
 
 use parser::{Input, MouseButton};
 use probe::Caps;
@@ -153,6 +155,8 @@ impl Terminal {
     ///
     /// A reply that arrives later stays a reply: the next [`Self::read_events`]
     /// folds it into [`Self::capabilities`] and does not report it as a key.
+    /// A late reply that changes graphics support or the cell's pixel size is
+    /// also a [`TermEvent::Resize`], so the owner relayouts.
     pub fn probe(&mut self, deadline: Duration) -> io::Result<&Capabilities> {
         self.caps = self.session.probe(deadline)?;
         self.note_winsize();
@@ -160,6 +164,10 @@ impl Terminal {
     }
 
     /// Read whatever the terminal has already buffered.
+    ///
+    /// One call parses at most [`INPUT_BYTE_BUDGET`] and returns at most about
+    /// [`INPUT_EVENT_CAP`] events. [`Self::input_pending`] is then set, and
+    /// [`Self::poll_timeout`] is zero, so the owner reads again without sleeping.
     pub fn read_events(&mut self) -> io::Result<Vec<TermEvent>> {
         self.session.drain_winch();
         let inputs = self.session.read_input()?;
@@ -174,8 +182,15 @@ impl Terminal {
     }
 
     /// Time until a partial escape sequence should be expired.
+    ///
+    /// [`Duration::ZERO`] when [`Self::input_pending`] is set.
     pub fn poll_timeout(&self) -> Option<Duration> {
         self.session.poll_timeout()
+    }
+
+    /// [`Self::read_events`] stopped while the terminal still had input.
+    pub fn input_pending(&self) -> bool {
+        self.session.input_pending()
     }
 
     /// Expire a partial sequence whose timer has elapsed, and notice a resize.
@@ -233,10 +248,15 @@ impl Terminal {
     fn take_input(&mut self, input: Input) -> Option<TermEvent> {
         match input {
             Input::Reply(reply) => {
+                let before = self.caps.clone();
                 let reply = Input::Reply(reply);
                 probe::absorb(&mut self.caps, &reply);
                 self.apply_cells();
-                None
+                if probe::affects_layout(&before, &self.caps) {
+                    Some(TermEvent::Resize(self.size))
+                } else {
+                    None
+                }
             }
             Input::Key(key) => Some(TermEvent::Key(keys::to_api(key))),
             Input::Mouse(mouse) => Some(TermEvent::Mouse(to_mouse(mouse))),
@@ -260,15 +280,17 @@ impl Terminal {
         let Ok(ws) = self.session.winsize() else {
             return;
         };
+        let before = self.size;
         let cols = ws.ws_col.max(1);
         let rows = ws.ws_row.max(1);
-        let changed = cols != self.size.cols || rows != self.size.rows;
         self.ioctl_cell = cell_from_winsize(&ws);
         self.caps.winsize_cell = self.ioctl_cell;
         self.size.cols = cols;
         self.size.rows = rows;
         self.apply_cells();
-        if changed {
+        // A new cell pixel size with the same rows and columns is still a
+        // resize: the page's pixel buffer changes.
+        if self.size != before {
             out.push(TermEvent::Resize(self.size));
         }
     }
@@ -403,6 +425,71 @@ mod tests {
             "{events:?} size {:?}",
             terminal.size()
         );
+        terminal.restore().expect("restore");
+    }
+
+    #[test]
+    fn a_cell_pixel_change_is_a_resize() {
+        let (_master, slave) = open_pty().expect("openpty");
+        tcsetwinsize(
+            &slave,
+            Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )
+        .expect("initial size");
+        let mut terminal = Terminal::enter(slave).expect("enter");
+        assert_eq!(terminal.size().cell_width, 0);
+        let fd = terminal.try_clone_fd().expect("dup");
+        tcsetwinsize(
+            &fd,
+            Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 800,
+                ws_ypixel: 480,
+            },
+        )
+        .expect("pixel size");
+        let events = terminal.read_events().expect("read");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TermEvent::Resize(size)
+                    if size.cols == 80
+                        && size.rows == 24
+                        && size.cell_width == 10
+                        && size.cell_height == 20
+            )),
+            "{events:?} size {:?}",
+            terminal.size()
+        );
+        terminal.restore().expect("restore");
+    }
+
+    #[test]
+    fn mouse_motion_keeps_only_the_latest() {
+        let (master, slave) = open_pty().expect("openpty");
+        let mut terminal = Terminal::enter(slave).expect("enter");
+        write_all(
+            &master,
+            b"\x1b[<32;5;6M\x1b[<32;8;9M\x1b[<32;3;4M\x1b[<0;1;1M\x1b[<32;2;2M",
+        );
+        let events = terminal.read_events().expect("read");
+        let mice: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TermEvent::Mouse(mouse) => Some(mouse),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mice.len(), 3, "{events:?}");
+        assert!(mice[0].motion && mice[0].column == 2 && mice[0].row == 3);
+        assert!(!mice[1].motion && mice[1].column == 0 && mice[1].row == 0);
+        assert!(mice[2].motion && mice[2].column == 1 && mice[2].row == 1);
         terminal.restore().expect("restore");
     }
 

@@ -14,10 +14,12 @@ pub const KITTY_KEYBOARD_FLAGS: u32 = 1 | 2 | 4 | 8 | 16;
 pub const ENTER: &[u8] =
     b"\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>31u\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[H\x1b[2J";
 
-/// Focus off, mouse off, kitty keyboard pop, bracketed paste off, cursor
-/// shown, leave the alternate screen. The reverse of [`ENTER`] apart from the
-/// clear.
-pub const LEAVE: &[u8] = b"\x1b[?1004l\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?2004l\x1b[?25h\x1b[?1049l";
+/// Synchronized output off, then focus off, mouse off, kitty keyboard pop,
+/// bracketed paste off, cursor shown, leave the alternate screen. The reverse
+/// of [`ENTER`] apart from the clear. `CSI ? 2026 l` is first so a frame that
+/// was cut off cannot leave the terminal inside a synchronized update.
+pub const LEAVE: &[u8] =
+    b"\x1b[?2026l\x1b[?1004l\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?2004l\x1b[?25h\x1b[?1049l";
 
 /// Begin a synchronized frame (`CSI ? 2026 h`).
 pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
@@ -41,6 +43,7 @@ mod tests {
             .windows(b"[>31u".len())
             .any(|window| window == b"[>31u"));
         assert!(LEAVE.windows(3).any(|w| w == b"[<u"));
+        assert!(LEAVE.starts_with(SYNC_END));
         assert!(ENTER.windows(b"[?1004h".len()).any(|w| w == b"[?1004h"));
         assert!(LEAVE.windows(b"[?1004l".len()).any(|w| w == b"[?1004l"));
         assert!(QUERIES

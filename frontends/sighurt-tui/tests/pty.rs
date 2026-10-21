@@ -10,6 +10,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -834,5 +835,143 @@ fn a_helper_panic_does_not_restore_the_terminal() {
         elapsed < Duration::from_millis(400),
         "probe blocked after the helper panic: {elapsed:?}"
     );
+    session.restore().expect("restore");
+}
+
+#[test]
+fn a_slow_reader_still_receives_the_full_restore() {
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    set_nonblock(&master);
+    let mut session = Terminal::enter(slave).expect("enter");
+    let _entered = drain_for(&master, Duration::from_millis(40));
+
+    let mut apc = Vec::with_capacity(128 * 1024);
+    apc.extend_from_slice(b"\x1b_Gq=2,m=0;");
+    apc.extend(std::iter::repeat_n(b'A', 96 * 1024));
+    apc.extend_from_slice(b"\x1b\\");
+    session.write_frame(&apc).expect("apc");
+
+    let master_for_reader = master.try_clone().expect("dup master");
+    let reader = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(40));
+        match wait_for(&master_for_reader, LEAVE, Duration::from_millis(700)) {
+            Ok(got) => got,
+            Err(got) => got,
+        }
+    });
+    session.restore().expect("restore");
+    let got = reader.join().expect("reader");
+    let leave_at = got
+        .windows(LEAVE.len())
+        .position(|window| window == LEAVE)
+        .unwrap_or_else(|| panic!("LEAVE missing from {} bytes: {got:?}", got.len()));
+    assert!(
+        got[..leave_at].windows(2).any(|window| window == b"\x1b\\"),
+        "open APC was not closed before LEAVE"
+    );
+    assert!(got[leave_at..].starts_with(LEAVE));
+    assert!(LEAVE
+        .windows(b"[?2026l".len())
+        .any(|window| window == b"[?2026l"));
+
+    session.restore().expect("second restore");
+    let extra = drain_for(&master, Duration::from_millis(80));
+    assert!(
+        extra.is_empty(),
+        "second restore wrote {} bytes: {extra:?}",
+        extra.len()
+    );
+}
+
+#[test]
+fn a_two_megabyte_paste_is_not_one_batch() {
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    set_nonblock(&master);
+    let mut session = Terminal::enter(slave).expect("enter");
+    let _entered = drain_for(&master, Duration::from_millis(40));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let written = Arc::new(AtomicUsize::new(0));
+    let writer_fd = master.try_clone().expect("dup master");
+    let stop_writer = Arc::clone(&stop);
+    let written_writer = Arc::clone(&written);
+    let writer = thread::spawn(move || {
+        let chunk = [b'a'; 4096];
+        while written_writer.load(Ordering::Relaxed) < 2 * 1024 * 1024
+            && !stop_writer.load(Ordering::Relaxed)
+        {
+            match rustix::io::write(&writer_fd, &chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    written_writer.fetch_add(n, Ordering::Relaxed);
+                }
+                Err(Errno::INTR) => continue,
+                Err(Errno::AGAIN) => thread::sleep(Duration::from_millis(1)),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut batches = 0usize;
+    let mut largest = 0usize;
+    let start = Instant::now();
+    while written.load(Ordering::Relaxed) < 2 * 1024 * 1024
+        && start.elapsed() < Duration::from_secs(6)
+    {
+        let events = session.read_events().expect("read");
+        if events.is_empty() {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        assert!(
+            events.len() <= 512,
+            "one read_events returned {} events",
+            events.len()
+        );
+        largest = largest.max(events.len());
+        batches += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let drain_until = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < drain_until {
+        let events = session.read_events().expect("drain");
+        if !events.is_empty() {
+            assert!(events.len() <= 512, "drain batch {}", events.len());
+        }
+    }
+    writer.join().expect("writer");
+    let sent = written.load(Ordering::Relaxed);
+    assert!(
+        sent > 64 * 1024,
+        "writer only queued {sent} bytes across {batches} batches"
+    );
+    assert!(
+        batches >= 2,
+        "batches {batches}, largest {largest}, sent {sent}"
+    );
+    assert!(largest <= 512 && largest > 0, "largest {largest}");
+    session.restore().expect("restore");
+}
+
+#[test]
+fn a_late_kitty_reply_is_a_resize() {
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    set_nonblock(&master);
+    let mut session = Terminal::enter(slave).expect("enter");
+    let caps = session.probe(Duration::from_millis(30)).expect("probe");
+    assert!(caps.kitty_graphics_ok.is_none(), "{caps:?}");
+    write_all(&master, b"\x1b_Gi=1;OK\x1b\\");
+    let events = session.read_events().expect("read");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TermEvent::Resize(_))),
+        "late kitty reply did not relayout: {events:?} caps {:?}",
+        session.capabilities()
+    );
+    assert_eq!(session.capabilities().kitty_graphics_ok, Some(true));
     session.restore().expect("restore");
 }

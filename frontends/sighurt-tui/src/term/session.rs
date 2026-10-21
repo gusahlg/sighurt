@@ -17,10 +17,13 @@
 
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags};
 use rustix::fs::OFlags;
 use rustix::io::Errno;
 use rustix::pipe::PipeFlags;
@@ -28,11 +31,21 @@ use rustix::pty::OpenptFlags;
 use rustix::termios::{tcgetattr, tcsetattr, OptionalActions, SpecialCodeIndex, Termios, Winsize};
 
 use super::modes::{ENTER, LEAVE, QUERIES};
-use super::output::Output;
+use super::output::{advance, terminator, Output, Wire};
 use super::parser::{Input, Parser};
 use super::probe::{self, Caps};
 
 const DEFAULT_CAP: usize = 256 * 1024;
+/// Bytes one [`Session::read_input`] call parses before it returns.
+pub const INPUT_BYTE_BUDGET: usize = 64 * 1024;
+/// Events one [`Session::read_input`] call returns before it stops.
+///
+/// A legacy key is a press and a release, so the call may overshoot by one
+/// byte's events. The rest stays in the kernel or in [`Session`]'s hold, and
+/// [`Session::input_pending`] is set so the owner reads again without sleeping.
+pub const INPUT_EVENT_CAP: usize = 256;
+/// How long restoration may wait for the terminal to accept bytes.
+const RESTORE_BUDGET: Duration = Duration::from_millis(250);
 
 static LOCK: Mutex<()> = Mutex::new(());
 static STATE: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut());
@@ -50,7 +63,19 @@ struct Shared {
     raw: Termios,
     original_flags: OFlags,
     raw_flags: OFlags,
+    /// Raw mode is in effect. Cleared only after termios restoration succeeds,
+    /// so a later retry can still send [`LEAVE`] when this is already false.
     active: AtomicBool,
+    /// How many bytes of [`LEAVE`] have been written. A retry continues here.
+    leave_at: AtomicUsize,
+    /// [`LEAVE`] has been written in full.
+    protocol_restored: AtomicBool,
+    /// [`Wire`] of bytes the kernel has accepted. The signal path reads this
+    /// and does not look at the output queue.
+    wire: AtomicU8,
+    /// Bumped when the signal path changes `wire`, so the owner drops a tail
+    /// that path already aborted.
+    wire_gen: AtomicU64,
     suspended: AtomicBool,
     resumed: AtomicBool,
     /// Set before `sigaction`, so drop leaks the box rather than freeing it
@@ -64,6 +89,11 @@ pub struct Session {
     state: *mut Shared,
     output: Output,
     parser: Parser,
+    /// Bytes taken from the terminal and not yet parsed.
+    held: Vec<u8>,
+    held_at: usize,
+    /// [`Self::read_input`] stopped with more input already available.
+    more_input: bool,
     /// Read end of the self-pipe the `SIGWINCH` handler writes to.
     winch_read: OwnedFd,
     winch_write: OwnedFd,
@@ -110,6 +140,10 @@ impl Session {
             original_flags,
             raw_flags,
             active: AtomicBool::new(true),
+            leave_at: AtomicUsize::new(0),
+            protocol_restored: AtomicBool::new(false),
+            wire: AtomicU8::new(Wire::Ground as u8),
+            wire_gen: AtomicU64::new(0),
             suspended: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
             handlers: AtomicBool::new(false),
@@ -121,6 +155,9 @@ impl Session {
             state,
             output: Output::new(cap),
             parser: Parser::new(),
+            held: Vec::new(),
+            held_at: 0,
+            more_input: false,
             winch_read,
             winch_write,
             guard: Some(guard),
@@ -136,10 +173,30 @@ impl Session {
     }
 
     /// Restore the termios and file flags captured at [`Self::enter`], and
-    /// send [`LEAVE`]. A second call is a success and writes nothing.
+    /// send [`LEAVE`].
+    ///
+    /// Termios and the reset bytes are tracked apart: a termios success does
+    /// not forget a [`LEAVE`] that the terminal did not accept, and a later
+    /// call sends the rest. Bytes already started on the wire are finished or
+    /// closed before [`LEAVE`]. The write waits at most [`RESTORE_BUDGET`].
+    /// A call after both parts have succeeded writes nothing.
     pub fn restore(&mut self) -> io::Result<()> {
-        self.output.clear();
-        if restore_signal_safe(self.shared()) {
+        let done = !self.shared().active.load(Ordering::Acquire)
+            && self.shared().protocol_restored.load(Ordering::Acquire);
+        if done {
+            return Ok(());
+        }
+        let deadline = Instant::now() + RESTORE_BUDGET;
+        if !self.shared().protocol_restored.load(Ordering::Acquire) {
+            // Once LEAVE has started, the queue was already finished or
+            // abandoned. Cancelling it again would cut the half-written reset.
+            let started = self.shared().leave_at.load(Ordering::Acquire) > 0;
+            let queue_done = started || self.finish_queued(deadline);
+            if queue_done {
+                write_protocol(self.shared(), deadline);
+            }
+        }
+        if restore_termios(self.shared()) {
             Ok(())
         } else {
             Err(io::Error::other(
@@ -211,12 +268,23 @@ impl Session {
 
     /// Queue `frame`. Does not block when the terminal stops reading.
     pub fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
-        self.output.write_frame(&self.fd, frame)
+        self.sync_wire();
+        let result = self.output.write_frame(&self.fd, frame);
+        self.publish_wire();
+        result
     }
 
-    /// Drop bytes not yet written. See [`super::Terminal::discard_pending`].
+    /// Drop bytes not yet written. An open sequence is kept or closed.
+    /// See [`super::Terminal::discard_pending`].
     pub fn discard_pending(&mut self) {
-        self.output.clear();
+        self.sync_wire();
+        self.output.discard_to_boundary();
+        self.publish_wire();
+    }
+
+    /// Whether [`Self::read_input`] left input that a later call should take.
+    pub fn input_pending(&self) -> bool {
+        self.more_input || self.held_at < self.held.len()
     }
 
     /// Send the startup queries and collect replies until DA1 or `deadline`.
@@ -261,24 +329,73 @@ impl Session {
         Ok(caps)
     }
 
-    /// Read whatever is already buffered and parse it with the probe's parser.
+    /// Read what is already buffered, up to [`INPUT_BYTE_BUDGET`] and
+    /// [`INPUT_EVENT_CAP`], and parse it with the probe's parser.
+    ///
+    /// Consecutive mouse-motion reports collapse to the latest one. When the
+    /// budget stops the call early, [`Self::input_pending`] is set and
+    /// [`Self::poll_timeout`] is zero so the owner comes back without sleeping.
     pub fn read_input(&mut self) -> io::Result<Vec<Input>> {
         let mut inputs = Vec::new();
-        loop {
-            if !self.prepare_read()? {
+        let mut parsed = 0usize;
+        let mut hit_budget = false;
+        while inputs.len() < INPUT_EVENT_CAP && parsed < INPUT_BYTE_BUDGET {
+            if self.held_at >= self.held.len() {
+                self.held.clear();
+                self.held_at = 0;
+                if !self.prepare_read()? {
+                    break;
+                }
+                let mut buf = [0u8; 8192];
+                let room = (INPUT_BYTE_BUDGET - parsed).min(buf.len());
+                let n = read_into(&self.fd, &mut buf[..room])?;
+                if n == 0 {
+                    break;
+                }
+                self.held.extend_from_slice(&buf[..n]);
+            }
+            let available = self.held.len() - self.held_at;
+            // A legacy key is two events per byte. Feeding `room / 2` bytes
+            // cannot run far past the event cap; one byte is the minimum.
+            let room = INPUT_EVENT_CAP - inputs.len();
+            let allow = (room / 2)
+                .max(1)
+                .min(available)
+                .min(INPUT_BYTE_BUDGET - parsed);
+            let end = self.held_at + allow;
+            let got = self.parser.feed(&self.held[self.held_at..end]);
+            self.held_at = end;
+            parsed += allow;
+            for input in got {
+                push_coalesced(&mut inputs, input);
+            }
+            if parsed >= INPUT_BYTE_BUDGET || inputs.len() >= INPUT_EVENT_CAP {
+                hit_budget = true;
                 break;
             }
-            let bytes = read_some(&self.fd)?;
-            if bytes.is_empty() {
-                break;
-            }
-            inputs.extend(self.parser.feed(&bytes));
+        }
+        if self.held_at >= self.held.len() {
+            self.held.clear();
+            self.held_at = 0;
+        }
+        let stashed = self.held_at < self.held.len();
+        self.more_input = stashed;
+        if stashed {
+            self.poke_winch();
+        } else if hit_budget {
+            self.more_input = wait_readable(&self.fd, Duration::ZERO).unwrap_or(false);
         }
         Ok(inputs)
     }
 
     /// Time until a partial escape sequence should be expired.
+    ///
+    /// [`Duration::ZERO`] when [`Self::read_input`] left input pending, so the
+    /// owner loop does not sleep before the next read.
     pub fn poll_timeout(&self) -> Option<Duration> {
+        if self.more_input || self.held_at < self.held.len() {
+            return Some(Duration::ZERO);
+        }
         self.parser.poll_timeout()
     }
 
@@ -299,6 +416,53 @@ impl Session {
         }
         Ok(true)
     }
+
+    /// Copy a signal handler's wire over the queue when the handler has run.
+    fn sync_wire(&mut self) {
+        let wire = self.shared().wire.load(Ordering::Acquire);
+        let gen = self.shared().wire_gen.load(Ordering::Acquire);
+        self.output.sync_handler(wire, gen);
+    }
+
+    /// Publish the queue's wire unless a handler has moved it since the sync.
+    fn publish_wire(&mut self) {
+        let gen = self.shared().wire_gen.load(Ordering::Acquire);
+        if gen != self.output.seen_gen() {
+            self.sync_wire();
+            return;
+        }
+        self.shared()
+            .wire
+            .store(self.output.wire_byte(), Ordering::Release);
+    }
+
+    /// Write the open sequence's tail, or the bytes that close it.
+    ///
+    /// `false` means the deadline ran out with bytes still queued. The caller
+    /// must not start [`LEAVE`] on top of that sequence.
+    fn finish_queued(&mut self, deadline: Instant) -> bool {
+        self.sync_wire();
+        let bytes = self.output.take_inflight();
+        if bytes.is_empty() {
+            self.publish_wire();
+            return true;
+        }
+        let n = write_deadline(self.fd.as_raw_fd(), &bytes, deadline);
+        self.output.advance_wire(&bytes[..n]);
+        let done = n == bytes.len();
+        if !done {
+            self.output.prepend(&bytes[n..]);
+        }
+        self.publish_wire();
+        done
+    }
+
+    /// Wake the owner through the `SIGWINCH` pipe. One extra byte only makes
+    /// the loop call [`Self::read_input`] again; the size check is idempotent.
+    fn poke_winch(&self) {
+        let byte = [1u8];
+        let _ = rustix::io::write(&self.winch_write, &byte);
+    }
 }
 
 impl Drop for Session {
@@ -307,8 +471,11 @@ impl Drop for Session {
         if WINCH_WRITE.load(Ordering::Acquire) == write {
             WINCH_WRITE.store(-1, Ordering::Release);
         }
-        let state = self.shared();
-        let _ = restore_signal_safe(state);
+        if std::thread::panicking() {
+            let _ = restore_signal_safe(self.shared());
+        } else {
+            let _ = self.restore();
+        }
         if OWNER.load(Ordering::Acquire) == current_tid() {
             OWNER.store(0, Ordering::Release);
         }
@@ -318,7 +485,7 @@ impl Drop for Session {
         if !std::thread::panicking() {
             uninstall_panic_hook();
         }
-        let handlers = state.handlers.load(Ordering::Acquire);
+        let handlers = self.shared().handlers.load(Ordering::Acquire);
         STATE.store(std::ptr::null_mut(), Ordering::Release);
         if !handlers {
             unsafe { drop(Box::from_raw(self.state)) };
@@ -399,10 +566,26 @@ fn load_state() -> Option<&'static Shared> {
 }
 
 fn restore_signal_safe(state: &Shared) -> bool {
+    restore_with_deadline(state, Instant::now() + RESTORE_BUDGET)
+}
+
+/// Write whatever is left of the reset, then restore termios.
+///
+/// `protocol_restored` and `active` are independent. A full [`LEAVE`] sets the
+/// first. A successful `tcsetattr` clears `active`. Either may already be done.
+/// The write polls for `POLLOUT` until `deadline` and does not allocate.
+/// This is the signal-handler path: it cannot see the output queue, so an open
+/// sequence is closed with [`terminator`] before [`LEAVE`].
+fn restore_with_deadline(state: &Shared, deadline: Instant) -> bool {
+    write_protocol(state, deadline);
+    restore_termios(state)
+}
+
+/// Put the captured termios and file flags back. Does not write.
+fn restore_termios(state: &Shared) -> bool {
     if !state.active.load(Ordering::Acquire) {
         return true;
     }
-    write_all_nb(state.fd, LEAVE);
     let fd = unsafe { BorrowedFd::borrow_raw(state.fd) };
     if tcsetattr(fd, OptionalActions::Now, &state.original).is_err() {
         return false;
@@ -413,6 +596,49 @@ fn restore_signal_safe(state: &Shared) -> bool {
     true
 }
 
+/// Close an open control sequence, then write [`LEAVE`] from `leave_at`.
+///
+/// Once [`LEAVE`] has started, a retry continues it instead of cancelling the
+/// half-written sequence. Nothing is written when the previous call finished.
+fn write_protocol(state: &Shared, deadline: Instant) {
+    if state.protocol_restored.load(Ordering::Acquire) {
+        return;
+    }
+    let mut off = state.leave_at.load(Ordering::Acquire);
+    if off > LEAVE.len() {
+        off = LEAVE.len();
+    }
+    if off == 0 {
+        let wire = Wire::from_u8(state.wire.load(Ordering::Acquire));
+        let term = terminator(wire);
+        if !term.is_empty() {
+            let n = write_deadline(state.fd, term, deadline);
+            if n == 0 {
+                return;
+            }
+            note_wire(state, &term[..n]);
+            if n < term.len() {
+                return;
+            }
+        }
+    }
+    let n = write_deadline(state.fd, &LEAVE[off..], deadline);
+    if n > 0 {
+        note_wire(state, &LEAVE[off..off + n]);
+        off += n;
+        state.leave_at.store(off, Ordering::Release);
+    }
+    if off >= LEAVE.len() {
+        state.protocol_restored.store(true, Ordering::Release);
+    }
+}
+
+fn note_wire(state: &Shared, bytes: &[u8]) {
+    let wire = advance(Wire::from_u8(state.wire.load(Ordering::Acquire)), bytes);
+    state.wire.store(wire as u8, Ordering::Release);
+    state.wire_gen.fetch_add(1, Ordering::Release);
+}
+
 fn reenter(state: &Shared) {
     let fd = unsafe { BorrowedFd::borrow_raw(state.fd) };
     if tcsetattr(fd, OptionalActions::Now, &state.raw).is_err() {
@@ -420,19 +646,97 @@ fn reenter(state: &Shared) {
     }
     let fd = unsafe { BorrowedFd::borrow_raw(state.fd) };
     let _ = rustix::fs::fcntl_setfl(fd, state.raw_flags);
-    write_all_nb(state.fd, ENTER);
+    // `swap` remembers whether the previous restore finished, then arms the
+    // next one. ENTER is scanned from ground only when that restore finished.
+    let restored = state.protocol_restored.swap(false, Ordering::AcqRel);
+    state.leave_at.store(0, Ordering::Release);
+    let n = write_all_nb(state.fd, ENTER);
+    let start = if restored {
+        Wire::Ground
+    } else {
+        Wire::from_u8(state.wire.load(Ordering::Acquire))
+    };
+    state
+        .wire
+        .store(advance(start, &ENTER[..n]) as u8, Ordering::Release);
+    state.wire_gen.fetch_add(1, Ordering::Release);
     state.active.store(true, Ordering::Release);
     state.resumed.store(true, Ordering::Release);
 }
 
-fn write_all_nb(fd: RawFd, mut bytes: &[u8]) {
+/// Non-blocking write used from a signal handler for [`ENTER`]. Returns how
+/// many bytes the kernel accepted. Restoration uses [`write_deadline`] instead.
+fn write_all_nb(fd: RawFd, mut bytes: &[u8]) -> usize {
+    let mut written = 0;
     while !bytes.is_empty() {
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         match rustix::io::write(borrowed, bytes) {
             Ok(0) => break,
-            Ok(n) => bytes = &bytes[n..],
+            Ok(n) => {
+                bytes = &bytes[n..];
+                written += n;
+            }
             Err(Errno::INTR) => continue,
             Err(_) => break,
+        }
+    }
+    written
+}
+
+/// `poll` for `POLLOUT` until `deadline`, then `write`. Both are async-signal-safe.
+/// A hard error or a timeout returns how many bytes were accepted.
+fn write_deadline(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> usize {
+    let mut written = 0;
+    while !bytes.is_empty() {
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match rustix::io::write(borrowed, bytes) {
+            Ok(0) | Err(Errno::AGAIN) => {
+                if !wait_out(fd, deadline) {
+                    break;
+                }
+            }
+            Ok(n) => {
+                bytes = &bytes[n..];
+                written += n;
+            }
+            Err(Errno::INTR) => continue,
+            Err(_) => break,
+        }
+    }
+    written
+}
+
+fn wait_out(fd: RawFd, deadline: Instant) -> bool {
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    wait_ready(
+        borrowed,
+        PollFlags::OUT,
+        deadline.saturating_duration_since(now),
+    )
+    .unwrap_or_default()
+}
+
+fn wait_ready<Fd: AsFd>(fd: Fd, flags: PollFlags, timeout: Duration) -> io::Result<bool> {
+    let mut fds = [PollFd::new(&fd, flags)];
+    let spec = rustix::event::Timespec::try_from(timeout).unwrap_or(rustix::event::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
+    loop {
+        match rustix::event::poll(&mut fds, Some(&spec)) {
+            Ok(0) => return Ok(false),
+            Ok(_) => {
+                let ready = fds[0].revents();
+                return Ok(ready.contains(flags)
+                    || ready.contains(PollFlags::HUP)
+                    || ready.contains(PollFlags::ERR));
+            }
+            Err(Errno::INTR) => continue,
+            Err(err) => return Err(io::Error::from(err)),
         }
     }
 }
@@ -582,6 +886,34 @@ fn wait_readable<Fd: AsFd>(fd: Fd, timeout: Duration) -> io::Result<bool> {
                     || ready.contains(rustix::event::PollFlags::ERR));
             }
             Err(Errno::INTR) => continue,
+            Err(err) => return Err(io::Error::from(err)),
+        }
+    }
+}
+
+fn push_coalesced(out: &mut Vec<Input>, input: Input) {
+    if let Input::Mouse(ref mouse) = input {
+        if mouse.motion {
+            if let Some(Input::Mouse(previous)) = out.last_mut() {
+                if previous.motion {
+                    *previous = mouse.clone();
+                    return;
+                }
+            }
+        }
+    }
+    out.push(input);
+}
+
+fn read_into<Fd: AsFd>(fd: Fd, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        match rustix::io::read(&fd, &mut *buf) {
+            Ok(n) => return Ok(n),
+            Err(Errno::INTR) => continue,
+            Err(Errno::AGAIN) => return Ok(0),
             Err(err) => return Err(io::Error::from(err)),
         }
     }
