@@ -195,6 +195,23 @@ fn keep_webkit_off_sigusr1() {
     }
 }
 
+/// WebKit settings its web processes inherit, unless the environment sets them already: no GL
+/// video sink, which paints H.264 and AV1 from software decoders solid green (it imports their
+/// YU12 DMA-BUFs; `experiments/wpe-issues/REPORT.md`), and no accessibility bus, which `sig`
+/// doesn't provide (each web process warned that it couldn't connect). Changes the
+/// environment, so it runs before any thread.
+#[cfg(feature = "engine-wpe")]
+fn webkit_environment() {
+    for (name, value) in [
+        ("WEBKIT_GST_DISABLE_GL_SINK", "1"),
+        ("WEBKIT_A11Y_BUS_ADDRESS", ""),
+    ] {
+        if std::env::var_os(name).is_none() {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
 /// The signals `sig` handles, and the pipe their handlers write the signal number to.
 fn install_signal_handlers() -> std::io::Result<OwnedFd> {
     use rustix::pipe::{pipe_with, PipeFlags};
@@ -216,7 +233,10 @@ fn install_signal_handlers() -> std::io::Result<OwnedFd> {
 
 fn main() -> ExitCode {
     #[cfg(feature = "engine-wpe")]
-    keep_webkit_off_sigusr1();
+    {
+        keep_webkit_off_sigusr1();
+        webkit_environment();
+    }
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(code) => return code,
