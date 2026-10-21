@@ -3393,3 +3393,17 @@ Newest last. Each entry says what was decided and why.
     challenge?), then merge `servo-0.7` into `rewrite` (after the work in progress in
     sighurt-engine-servo), re-run every suite and the corpus. *Why:* decision 94's measured
     corpus; Servo's experimental preferences gain 2 sites, 0.7 gains 10.
+101. **Servo 0.7 is adopted** (settles 100). The two regressions are Servo 0.7's, not the
+    adapter's: stackoverflow.com and amazon.com serve bot challenges (Cloudflare's, AWS WAF's)
+    whose scripts 0.5 completes and 0.7 abandons — 0.7 retries the 403 with
+    `cf_chl_rc_ni=1`, or posts the challenge's failure report and never `mp_verify`; swapping the
+    two versions' user agents changes nothing (branch `servo-0.7`, bbefacc,
+    `experiments/servo07-blank/`). 0.7 still renders 37 of 40 sites against 0.5's 27–29, and a
+    user can route the two challenge-gated sites to WPE (decision 94). The missing script errors
+    are the adapter's: 0.7 reports them through `WebViewDelegate::show_console_message` /
+    `ServoDelegate::show_console_message`, which the adapter doesn't implement — the merge
+    implements both and logs error-level messages (cut to 2 KiB, page data never beyond that).
+    Next in that merge: IntersectionObserver on by default after measuring reddit.com and
+    microsoft.com with it on 0.7 (it made them spin in older Servo; github.com loops without it:
+    `experiments/servo-input/REPORT.md`), and a user stylesheet that puts `dialog:modal` on top
+    (chatgpt.com's login dialog, which Servo doesn't put in the top layer).
