@@ -197,6 +197,271 @@ pub fn run(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> 
     result
 }
 
+/// The engine `--dump` opens with. An explicit `--engine` must give page text. Otherwise the
+/// engine is the one [`sighurt_core::router`] would open the address with. A specific rule that
+/// names an engine without page text is an error (pass `--engine wpe`). An http(s) or file URL
+/// that only falls through to the default engine uses WPE, or the first compiled-in engine with
+/// page text, when that default has none: TUI.md's WPE default for ordinary pages.
+fn choose_dump_engine(
+    registry: &sighurt_runtime::registry::Registry<TermTarget, TermPermit>,
+    config: &sighurt_core::config::Config,
+    home: Option<&std::path::Path>,
+    open: &OpenRequest,
+) -> Result<String, String> {
+    if let Some(name) = &open.engine {
+        return match registry.engine(name) {
+            Some(engine) if engine.capabilities.semantics => Ok(name.clone()),
+            Some(_) => Err(format!("the {name} engine gives no page text for --dump")),
+            None => Err(format!("the {name} engine is not part of this build")),
+        };
+    }
+    let fixed = sighurt_core::router::fixup(&open.input, config.search(), config.keywords(), home);
+    if fixed.is_empty() {
+        return Err("the address is empty".into());
+    }
+    let Some(address) = Address::parse(&fixed) else {
+        return Err(format!("{fixed} is not an address"));
+    };
+    let name = match routed(&address, config) {
+        Routed::Internal => {
+            return Err("sig: pages are Sighurt's own and have no page text for --dump".into())
+        }
+        Routed::Error(message) => return Err(message),
+        Routed::Engine(name) => name,
+    };
+    if registry
+        .engine(&name)
+        .is_some_and(|engine| engine.capabilities.semantics)
+    {
+        return Ok(name);
+    }
+    if default_without_a_rule(&address, config, &name) {
+        return engine_with_text(registry);
+    }
+    match registry.engine(&name) {
+        Some(_) => Err(format!(
+            "the {name} engine gives no page text for --dump; pass --engine wpe"
+        )),
+        None => Err(format!("the {name} engine is not part of this build")),
+    }
+}
+
+/// Where [`sighurt_core::router::route`] would send `address` with no explicit engine.
+enum Routed {
+    Engine(String),
+    Internal,
+    Error(String),
+}
+
+fn routed(address: &Address, config: &sighurt_core::config::Config) -> Routed {
+    let routes = config.routes();
+    let scheme = address.scheme.as_str();
+    let engine = if scheme == "sig" {
+        return Routed::Internal;
+    } else if !matches!(scheme, "http" | "https" | "file") {
+        match routes
+            .iter()
+            .find(|route| route.schemes.iter().any(|listed| listed == scheme))
+        {
+            Some(route) => route.engine.clone(),
+            None => return Routed::Error(format!("no engine opens {scheme}: URLs")),
+        }
+    } else {
+        match web_rule(routes, address) {
+            Some(route) => route.engine.clone(),
+            None => config.default_engine().to_owned(),
+        }
+    };
+    if !config.is_enabled(&engine) {
+        return Routed::Error(format!(
+            "the {engine} engine is not enabled in the configuration"
+        ));
+    }
+    Routed::Engine(engine)
+}
+
+/// The extension or host rule that claims `address`, if one does. Same order as the core:
+/// a file by its extension; an http(s) URL by origin and extension, else the most specific host.
+fn web_rule<'a>(
+    routes: &'a [sighurt_core::config::EngineRoutes],
+    address: &Address,
+) -> Option<&'a sighurt_core::config::EngineRoutes> {
+    let claims = |route: &&sighurt_core::config::EngineRoutes| {
+        address
+            .extension
+            .as_ref()
+            .is_some_and(|extension| route.extensions.contains(extension))
+    };
+    if address.scheme == "file" {
+        return routes.iter().find(claims);
+    }
+    routes
+        .iter()
+        .filter(claims)
+        .find(|route| route.origins.contains(&address.origin))
+        .or_else(|| claiming_host(routes, &address.host))
+}
+
+/// True when `engine` is the default and no extension or host rule claimed the URL.
+fn default_without_a_rule(
+    address: &Address,
+    config: &sighurt_core::config::Config,
+    engine: &str,
+) -> bool {
+    engine == config.default_engine()
+        && matches!(address.scheme.as_str(), "http" | "https" | "file")
+        && web_rule(config.routes(), address).is_none()
+}
+
+fn claiming_host<'a>(
+    routes: &'a [sighurt_core::config::EngineRoutes],
+    host: &str,
+) -> Option<&'a sighurt_core::config::EngineRoutes> {
+    let specificity = |pattern: &String| match pattern.strip_prefix("*.") {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .is_some_and(|under| under.ends_with('.'))
+            .then_some(suffix.len()),
+        None => (*pattern == host).then_some(usize::MAX),
+    };
+    routes
+        .iter()
+        .flat_map(|route| route.hosts.iter().map(move |pattern| (pattern, route)))
+        .filter_map(|(pattern, route)| Some((specificity(pattern)?, route)))
+        .max_by_key(|&(specificity, _)| specificity)
+        .map(|(_, route)| route)
+}
+
+fn engine_with_text(
+    registry: &sighurt_runtime::registry::Registry<TermTarget, TermPermit>,
+) -> Result<String, String> {
+    if let Some(engine) = registry.engine("wpe").filter(|e| e.capabilities.semantics) {
+        return Ok(engine.name.to_owned());
+    }
+    registry
+        .engines()
+        .find(|engine| engine.capabilities.semantics)
+        .map(|engine| engine.name.to_owned())
+        .ok_or_else(|| "this sig has no engine that gives page text (WPE WebKit does)".into())
+}
+
+/// The parts of an address [`sighurt_core::router::route`] looks at.
+///
+/// Hierarchical URLs are split the way the `url` crate reports them for ASCII hosts: the host
+/// without brackets, lower case, default ports left out of the origin. Non-ASCII hosts are
+/// lowercased but not punycoded.
+struct Address {
+    scheme: String,
+    host: String,
+    origin: String,
+    extension: Option<String>,
+}
+
+impl Address {
+    fn parse(input: &str) -> Option<Self> {
+        let (scheme, rest) = input.split_once(':')?;
+        if scheme.is_empty()
+            || !scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))
+        {
+            return None;
+        }
+        let scheme = scheme.to_ascii_lowercase();
+        if !rest.starts_with("//") {
+            let path = rest.split(['?', '#']).next().unwrap_or("");
+            return Some(Self {
+                scheme,
+                host: String::new(),
+                origin: String::new(),
+                extension: extension_of(path),
+            });
+        }
+        let rest = &rest[2..];
+        let (authority, after) = match rest.find(['/', '?', '#']) {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, ""),
+        };
+        let hostport = match authority.rsplit_once('@') {
+            Some((_, hostport)) => hostport,
+            None => authority,
+        };
+        let (host, port) = split_host_port(hostport)?;
+        let path = after.split(['?', '#']).next().unwrap_or("");
+        let origin = http_origin(&scheme, &host, port);
+        Some(Self {
+            scheme,
+            host,
+            origin,
+            extension: extension_of(path),
+        })
+    }
+}
+
+fn split_host_port(hostport: &str) -> Option<(String, Option<u16>)> {
+    if let Some(host) = hostport.strip_prefix('[') {
+        let (host, rest) = host.split_once(']')?;
+        let port = match rest.strip_prefix(':') {
+            Some(port) => Some(port.parse().ok()?),
+            None if rest.is_empty() => None,
+            None => return None,
+        };
+        // `host_str` keeps the brackets the URL serialization uses.
+        return Some((format!("[{}]", host.to_ascii_lowercase()), port));
+    }
+    match hostport.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some((host.to_ascii_lowercase(), Some(port.parse().ok()?)))
+        }
+        _ => Some((hostport.to_ascii_lowercase(), None)),
+    }
+}
+
+fn http_origin(scheme: &str, host: &str, port: Option<u16>) -> String {
+    if host.is_empty() {
+        return "null".into();
+    }
+    let default = match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        "ftp" => Some(21),
+        _ => None,
+    };
+    match (default, port) {
+        (Some(default), Some(port)) if port == default => format!("{scheme}://{host}"),
+        (Some(_), None) | (None, None) => format!("{scheme}://{host}"),
+        (_, Some(port)) => format!("{scheme}://{host}:{port}"),
+    }
+}
+
+fn extension_of(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next().unwrap_or("");
+    let (_, extension) = name.rsplit_once('.')?;
+    let extension = percent_decode(extension);
+    (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
+
 fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
     let paths = Paths {
         config: Paths::from_env().config,
