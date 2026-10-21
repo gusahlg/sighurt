@@ -129,7 +129,7 @@ the guide to writing them.
 
 Everything is configured in one TOML file, `~/.config/sighurt/config.toml` (`$XDG_CONFIG_HOME`);
 there is no settings screen. The built-in configuration,
-[`sighurt-core/src/default-config.toml`](./sighurt-core/src/default-config.toml), documents every
+[`crates/sighurt-core/src/default-config.toml`](crates/sighurt-core/src/default-config.toml), documents every
 setting; `sig --default-config` prints it. Your file starts with `version = 1`, and every other
 key is optional.
 
@@ -395,8 +395,8 @@ paints a surface into a buffer the host lends. Its kind checks `[chrome.<name>]`
 `chrome.<action>` commands. sighurt-ui's text, editing and painting helpers (`Fonts`, `TextEditor`,
 `Canvas`) are there to use.
 
-To add either to `sig`: a feature in `sighurt-browser/Cargo.toml` and the kind in the list in
-`sighurt-runtime/src/registry.rs` (`KEYMAPS`) or `sighurt-gui/src/chrome.rs` (`CHROMES`):
+To add either to `sig`: a feature in `apps/sighurt-browser/Cargo.toml` and the kind in the list in
+`crates/sighurt-runtime/src/registry.rs` (`KEYMAPS`) or `frontends/sighurt-gui/src/chrome.rs` (`CHROMES`):
 
 ```toml
 [features]
@@ -416,35 +416,35 @@ pub const KEYMAPS: &[KeymapKind] = &[
 ```
 
 Then `[input] keymap = "one"` with `[keymap.one] key = "ctrl-n"` and `run = "tab.next"`. The
-worked examples are [`sighurt-keymap-modal`](./sighurt-keymap-modal/) and
-[`sighurt-chrome-line`](./sighurt-chrome-line/); `sighurt-api/tests/keymap.rs` and
-`sighurt-ui/tests/extension.rs` implement both traits from outside their crates.
+worked examples are [`sighurt-keymap-modal`](extensions/sighurt-keymap-modal/) and
+[`sighurt-chrome-line`](extensions/sighurt-chrome-line/); `crates/sighurt-api/tests/keymap.rs` and
+`ui/sighurt-ui/tests/extension.rs` implement both traits from outside their crates.
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
-| [`sighurt-browser`](./sighurt-browser/) | `sig`: arguments, process-wide setup, the choice of frontend |
-| [`sighurt-runtime`](./sighurt-runtime/) | what every frontend shares: configuration and session files, the engine registry, carrying out the core's effects, downloads, diagnostics, shutdown |
-| [`sighurt-gui`](./sighurt-gui/) | the Wayland frontend: the event loop, the chrome's surfaces, engines bound to Wayland targets, the clipboard |
-| [`sighurt-core`](./sighurt-core/) | browser state and policy: tabs, commands, the `bindings` keymap, routing, history across engines, permissions, configuration; no I/O |
-| [`sighurt-api`](./sighurt-api/) | the contract between them: ids, geometry, input, the engine trait and its events, services, commands, the keymap API |
-| [`sighurt-wayland`](./sighurt-wayland/) | the Wayland host: window, surfaces, targets, scaling, input, clipboard, shared-memory buffers, frame scheduling |
-| [`sighurt-ui`](./sighurt-ui/) | the standard chrome, the chrome API and its helpers |
-| [`sighurt-chrome-line`](./sighurt-chrome-line/) | the line chrome |
-| [`sighurt-keymap-modal`](./sighurt-keymap-modal/) | the modal keymap |
-| [`sighurt-engine-servo`](./sighurt-engine-servo/) | the Servo engine |
-| [`sighurt-engine-wpe`](./sighurt-engine-wpe/) | the WPE WebKit engine |
-| [`sighurt-engine-wasm`](./sighurt-engine-wasm/) | the Wasm engine |
-| [`sighurt-engine-demo`](./sighurt-engine-demo/) | the demo engine |
-| [`sighurt-sdk`](./sighurt-sdk/) | the guest SDK for Wasm apps |
+| [`sighurt-browser`](apps/sighurt-browser/) | `sig`: arguments, process-wide setup, the choice of frontend |
+| [`sighurt-runtime`](crates/sighurt-runtime/) | what every frontend shares: configuration and session files, the engine registry, carrying out the core's effects, downloads, diagnostics, shutdown |
+| [`sighurt-gui`](frontends/sighurt-gui/) | the Wayland frontend: the event loop, the chrome's surfaces, engines bound to Wayland targets, the clipboard |
+| [`sighurt-core`](crates/sighurt-core/) | browser state and policy: tabs, commands, the `bindings` keymap, routing, history across engines, permissions, configuration; no I/O |
+| [`sighurt-api`](crates/sighurt-api/) | the contract between them: ids, geometry, input, the engine trait and its events, services, commands, the keymap API |
+| [`sighurt-wayland`](frontends/sighurt-wayland/) | the Wayland host: window, surfaces, targets, scaling, input, clipboard, shared-memory buffers, frame scheduling |
+| [`sighurt-ui`](ui/sighurt-ui/) | the standard chrome, the chrome API and its helpers |
+| [`sighurt-chrome-line`](extensions/sighurt-chrome-line/) | the line chrome |
+| [`sighurt-keymap-modal`](extensions/sighurt-keymap-modal/) | the modal keymap |
+| [`sighurt-engine-servo`](engines/sighurt-engine-servo/) | the Servo engine |
+| [`sighurt-engine-wpe`](engines/sighurt-engine-wpe/) | the WPE WebKit engine |
+| [`sighurt-engine-wasm`](engines/sighurt-engine-wasm/) | the Wasm engine |
+| [`sighurt-engine-demo`](engines/sighurt-engine-demo/) | the demo engine |
+| [`sighurt-sdk`](sdk/sighurt-sdk/) | the guest SDK for Wasm apps |
 | [`examples/`](./examples/) | Wasm apps, and the native backend of `fullstack-notes` |
 | [`experiments/`](./experiments/) | the proofs the rewrite was built on (Servo and Wasmtime in one process, mixed rendering, WPE beside both) |
 
 ## Writing Wasm apps
 
 A Wasm app is a Rust `cdylib` for `wasm32-unknown-unknown` that depends on
-[`sighurt-sdk`](./sighurt-sdk/) by path (it is not on crates.io). It draws its whole UI on a
+[`sighurt-sdk`](sdk/sighurt-sdk/) by path (it is not on crates.io). It draws its whole UI on a
 canvas and polls input; there are no widgets.
 
 ```rust

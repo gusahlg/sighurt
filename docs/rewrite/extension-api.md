@@ -335,7 +335,7 @@ state stay behind; the other engine makes a plain GET. HTTP redirects don't pass
 **Which engines report it:**
 
 - **Servo** reports `NavigationRequested` for every navigation it would load itself (`loads_itself`
-  in sighurt-engine-servo/src/view.rs:332: http, https, data, blob, about, javascript, and
+  in engines/sighurt-engine-servo/src/view.rs:332: http, https, data, blob, about, javascript, and
   `file:` from a `file:` page). It keeps today's hand-off of everything else as
   `OpenRequested(CurrentView)` (decision 53). The adapter already keeps the owned
   `NavigationRequest` until `pump` (delegate.rs:160, runtime.rs:676). Now it keeps it until the
@@ -348,7 +348,7 @@ state stay behind; the other engine makes a plain GET. HTTP redirects don't pass
   tells frames apart, and can use WebKit's user-gesture flag. This is expected, not checked; the
   WPE track confirms it.
 - **The Wasm engine** changes nothing. It already hands every guest navigation and link to the
-  core as `OpenRequested` (sighurt-engine-wasm/src/view.rs:531–543, 832–849), which routes like
+  core as `OpenRequested` (engines/sighurt-engine-wasm/src/view.rs:531–543, 832–849), which routes like
   a typed address. The activation and chosen rules don't apply there, since these are loads the
   engine can't perform itself.
 - **The demo engine** has no links.
@@ -378,7 +378,7 @@ The settings are a small neutral vocabulary that the core validates:
 
 | Setting | servo (0.5) | wasm | wpe | demo |
 |---|---|---|---|---|
-| `user-agent` | yes: it replaces the Firefox-like string the adapter sets in `Preferences::user_agent` (sighurt-engine-servo/src/runtime.rs:1330), process-wide | no: guests make their own requests | expected (WebKit's `user-agent` setting); the WPE track confirms | no |
+| `user-agent` | yes: it replaces the Firefox-like string the adapter sets in `Preferences::user_agent` (engines/sighurt-engine-servo/src/runtime.rs:1330), process-wide | no: guests make their own requests | expected (WebKit's `user-agent` setting); the WPE track confirms | no |
 | `storage` | yes: `"ephemeral"` builds Servo with `ServoConfig::profile = None`, which keeps nothing | yes: the kv store (`WasmConfig::kv_root`) and the compiled-module cache (`aot_cache`) go to a directory under `$XDG_RUNTIME_DIR`, removed at shutdown | expected (an ephemeral network session) | no |
 
 An engine that needs another setting adds it to this vocabulary, and the other engines declare
@@ -426,7 +426,7 @@ page:
 **`[input.buttons]`** binds the mouse's side buttons, `back` and `forward`, to commands. It uses
 the same command path as keys (CLAUDE.md: "keys and buttons use the same path"). The host
 reports BTN_SIDE and BTN_BACK as `back`, and BTN_EXTRA and BTN_FORWARD as `forward`
-(sighurt-wayland/src/input.rs:688–698). Other buttons are left out until someone asks (§1.10).
+(frontends/sighurt-wayland/src/input.rs:688–698). Other buttons are left out until someone asks (§1.10).
 
 - **Path.** The executable sends every `Back` and `Forward` button event to the core, wherever
   the pointer is, as one new event:
@@ -438,7 +438,7 @@ reports BTN_SIDE and BTN_BACK as `back`, and BTN_EXTRA and BTN_FORWARD as `forwa
   ```
 
   Every other pointer event goes where it goes today. Over the chrome, today's events go
-  straight to the chrome (sighurt-browser/src/app.rs:488–497), and `BrowserEvent::Pointer`
+  straight to the chrome (apps/sighurt-browser/src/app.rs:488–497), and `BrowserEvent::Pointer`
   needs a view. That is why this is a new event.
 - **Taken buttons.** The core keeps a per-seat set of taken buttons, like `KeyState` for keys.
   - A press that `[input.buttons]` binds runs its command and is taken.
@@ -446,7 +446,7 @@ reports BTN_SIDE and BTN_BACK as `back`, and BTN_EXTRA and BTN_FORWARD as `forwa
   - An unbound press over the shown view goes to that view, followed by its release, and counts
     as user activation like any other button.
   - An unbound press over the chrome, or over a view that is no longer shown, goes nowhere.
-- **The chrome loses its side-button code** (sighurt-ui/src/chrome.rs:459–465).
+- **The chrome loses its side-button code** (ui/sighurt-ui/src/chrome.rs:459–465).
 - **The defaults** in the built-in configuration reproduce today's hard-coded behavior exactly
   (decision 27). They are a binding in the built-in file, not code. CLAUDE.md's "no default
   bindings" rule is about keys, and these two were hard-coded before.
@@ -463,7 +463,7 @@ reports BTN_SIDE and BTN_BACK as `back`, and BTN_EXTRA and BTN_FORWARD as `forwa
 - **Only while the page has the keyboard.** Otherwise it does nothing: the core's focus must be
   `Page`, and an engine view must be shown. A `:page.send-key end` typed in the line works,
   because the line gives the page the keyboard before its command runs
-  (sighurt-ui/src/chrome.rs:667–675).
+  (ui/sighurt-ui/src/chrome.rs:667–675).
 - **User activation only from a key press.** When a keymap runs it from a press, the core's
   `keyboard()` has the press's time and records it as the view's activation, as it does for a
   key delivered to the page (state.rs:1512). Run from the command line or a chrome button, it
@@ -1093,7 +1093,7 @@ sighurt-ui's `Chrome` struct keeps all its behavior. It is renamed `Model`, whic
 for the trait. A thin adapter is the `standard` chrome:
 
 ```rust
-// sighurt-ui/src/standard.rs (a sketch: options(), layout_of() and rect() are small helpers
+// ui/sighurt-ui/src/standard.rs (a sketch: options(), layout_of() and rect() are small helpers
 // of that step, and Damage::surfaces() lists the names of the damaged surfaces)
 pub const KIND: ChromeKind = ChromeKind {
     name: "standard",
@@ -1145,7 +1145,7 @@ impl Chrome for Standard {
 `UiAction` becomes `ChromeAction` one to one, with two exceptions: a tab click becomes
 `SelectTab` or `CloseTab`, and `TextInput` names the `"chrome"` surface. The surface names stay
 `"chrome"`, `"status"` and `"page"`, which are the roles in today's diagnostics JSON, so
-`sighurt-browser/tests/headless.sh` keeps working unchanged.
+`apps/sighurt-browser/tests/headless.sh` keeps working unchanged.
 
 On the executable's side, `Surfaces { top, status, page }` becomes a small map from name to target
 lease, and `paint_chrome`, `surface_of`, `surface_rect` and `placement` read the chrome's layout
@@ -1195,7 +1195,7 @@ rows are hit-tested like today's tabs, and the toolbar stays across the top.
 **In the workspace,** like engines (decision 1):
 
 ```toml
-# sighurt-browser/Cargo.toml
+# apps/sighurt-browser/Cargo.toml
 [features]
 default = ["engine-servo", "engine-wasm"]
 chrome-line = ["dep:sighurt-chrome-line"]
@@ -1203,7 +1203,7 @@ keymap-modal = ["dep:sighurt-keymap-modal"]
 ```
 
 ```rust
-// sighurt-browser/src/registry.rs
+// apps/sighurt-browser/src/registry.rs
 pub const CHROMES: &[ChromeKind] = &[
     sighurt_ui::standard::KIND,                             // "standard": always built
     #[cfg(feature = "chrome-line")] sighurt_chrome_line::KIND,
@@ -1258,7 +1258,7 @@ pub struct ChromeChecks {
 puts it into their build of `sig` in four steps. None of them touches the core, the engines or
 the host:
 
-1. In `sighurt-browser/Cargo.toml`, add the dependency and a feature:
+1. In `apps/sighurt-browser/Cargo.toml`, add the dependency and a feature:
    ```toml
    [features]
    chrome-mine = ["dep:sighurt-chrome-mine"]
@@ -1299,8 +1299,8 @@ implementation keeps building.
   change to the keymap module, the extension module, or a type they name gets an entry that
   says what an implementation must change.
 - **Guard tests that implement both traits from outside their crates.** They use only what this
-  part documents: `sighurt-api/tests/keymap.rs` for the keymap API, and
-  `sighurt-ui/tests/extension.rs` for the chrome API. A change that breaks them needs a
+  part documents: `crates/sighurt-api/tests/keymap.rs` for the keymap API, and
+  `ui/sighurt-ui/tests/extension.rs` for the chrome API. A change that breaks them needs a
   changelog entry.
 - **The proofs live in the workspace** and are updated in the change that breaks them.
 
@@ -1360,7 +1360,7 @@ conditions:
 Each step is one reviewable change that leaves everything passing:
 
 - `tools/cargo test` and `clippy -D warnings` on the crates it touches, and `cargo fmt`;
-- where `sig` changes, `sighurt-browser/tests/headless.sh`;
+- where `sig` changes, `apps/sighurt-browser/tests/headless.sh`;
 - where Servo changes, `sighurt-engine-servo`'s tests and clippy, on this desktop or louise-pc.
 
 Each step also documents its keys and commands in `default-config.toml`, where
@@ -1381,14 +1381,14 @@ as "changed".
    - `KeyState` asks `dyn Keymap`.
    - *Tests:*
      - Every existing key test passes after the rename alone. Changed: the `Focus::Location` uses
-       in `keys.rs` and `sighurt-core/tests/browser.rs`, and `focus_follows_the_core` in
-       `sighurt-ui/tests/interaction.rs`.
+       in `keys.rs` and `crates/sighurt-core/tests/browser.rs`, and `focus_follows_the_core` in
+       `ui/sighurt-ui/tests/interaction.rs`.
      - New core tests with a fake keymap:
        `a_taken_press_takes_its_release_whatever_the_keymap_says` (it takes the press, then
        passes the repeat: the release is still taken);
        `run_then_pass_delivers_to_the_new_focus` (`location.focus`, then the press and its
        release arrive as `ChromeInput`); `the_keymap_hears_context_changes`.
-     - `sighurt-api/tests/keymap.rs` implements `Keymap` from outside the crate.
+     - `crates/sighurt-api/tests/keymap.rs` implements `Keymap` from outside the crate.
 2. **`[input] keymap`, the kinds in `Environment`, `Config::parse(.., &Environment)`, notices.**
    - *Tests:*
      - An unknown keymap is an error that lists the build's keymaps.
@@ -1409,7 +1409,7 @@ as "changed".
      - Every sighurt-ui test passes, with the eleven golden images unchanged byte for byte.
        Changed: `tabs_select_close_and_open`, which expects `SelectTab(id)` and `CloseTab(id)`
        instead of numbered commands.
-     - The new `sighurt-ui/tests/extension.rs` drives `Box<dyn Chrome>` only: a tab click gives
+     - The new `ui/sighurt-ui/tests/extension.rs` drives `Box<dyn Chrome>` only: a tab click gives
        `SelectTab(id)`; an identical snapshot gives no `Repaint`; a resize repaints every listed
        surface; painting through the trait matches a golden image.
      - In the core: `closing_a_tab_by_id_after_the_list_shifted`, and
@@ -1489,7 +1489,7 @@ as "changed".
       - Over the chrome, a bound button works and an unbound one goes nowhere.
       - The defaults behave exactly as today: `the_mouse_back_button_goes_back` passes
         unchanged.
-      - Changed: `toolbar_buttons` in `sighurt-ui/tests/interaction.rs` loses its side-button
+      - Changed: `toolbar_buttons` in `ui/sighurt-ui/tests/interaction.rs` loses its side-button
         checks, which move to the core.
 11. **`[keywords]`.**
     - *Tests:* `router::fixup` cases: a keyword with a query, a keyword alone, a template
@@ -1520,7 +1520,7 @@ as "changed".
         - one to the same engine is allowed;
         - one from a replaced document is denied;
         - every `NavigationRequested` gets exactly one `AnswerNavigation`.
-      - Servo, in `sighurt-engine-servo/tests/engine.rs`:
+      - Servo, in `engines/sighurt-engine-servo/tests/engine.rs`:
         - a link click on a test page gives `NavigationRequested`;
         - when it is allowed, the page commits with an adapter id;
         - when it is denied, nothing commits and the page stays;
@@ -1574,7 +1574,7 @@ as "changed".
   using WebKit's user-gesture flag if it has one; and whether `javascript` can be honored.
 - **Host track (optional):** free the free SHM buffers of a hidden target. That would lower
   §2.6's memory bound, for engine views as well. Its test belongs in
-  `sighurt-wayland/tests/headless.rs`.
+  `frontends/sighurt-wayland/tests/headless.rs`.
 - **Orchestrator:** once step 4 lands, CLAUDE.md's crate table needs `settings` and `keymap` in
   sighurt-api's module list and `extension` in sighurt-ui's. Its command list needs
   `page.open-in`, `page.send-key` and `chrome.<action>`. The README's command table needs the
@@ -1645,15 +1645,15 @@ as "changed".
 
 **Existing tests that change:**
 
-- `sighurt-core/src/config.rs`:
+- `crates/sighurt-core/src/config.rs`:
   - `keys_and_ui_are_the_users_alone`: `[ui] font` is valid now, so it asserts a misspelt key
     instead;
   - `an_old_file_with_a_version_says_what_moved`: it expects the per-key `[engines.wasm]` hints
     of §1.11;
   - every test that calls `Config::parse`, for the new `Environment` argument.
-- `sighurt-core/src/keys.rs` and `sighurt-core/tests/browser.rs`: the `Focus::Location` rename.
-- `sighurt-browser/src/persistence.rs`: `unknown_color_names_are_errors` moves to the core.
-- `sighurt-ui/tests/interaction.rs`:
+- `crates/sighurt-core/src/keys.rs` and `crates/sighurt-core/tests/browser.rs`: the `Focus::Location` rename.
+- `apps/sighurt-browser/src/persistence.rs`: `unknown_color_names_are_errors` moves to the core.
+- `ui/sighurt-ui/tests/interaction.rs`:
   - `focus_follows_the_core` (the rename);
   - `tabs_select_close_and_open` (tab actions by id);
   - `toolbar_buttons` (side buttons go to the core).
@@ -1666,12 +1666,12 @@ as "changed".
 
 - **The code facts this design relies on**, read in the tree and in the pinned sources:
   - Plan §8 requires overlay input regions, and the host has `InputRegion`
-    (sighurt-wayland/src/placement.rs:79–90).
+    (frontends/sighurt-wayland/src/placement.rs:79–90).
   - Unmapping keeps a target's buffers (targets.rs:165–172), which are freed only when a new
     size is acquired (shm.rs:178–200).
   - The host folds side buttons into `Back` and `Forward` (input.rs:688–698).
   - The executable sends chrome pointer events straight to the chrome
-    (sighurt-browser/src/app.rs:488–497), and keeps the chrome's page surface hidden rather than
+    (apps/sighurt-browser/src/app.rs:488–497), and keeps the chrome's page surface hidden rather than
     empty (app.rs:823–849).
   - The core records activation only in `keyboard()` and `pointer()` (state.rs:1512, 1544), and
     `BrowserEvent::Command` carries no time (state.rs:103).
@@ -1685,7 +1685,7 @@ as "changed".
   - The Servo adapter holds the request until `pump` (delegate.rs:160, runtime.rs:676–704) and
     decides what it loads in `loads_itself` (view.rs:332–338).
   - The Wasm engine hands every guest navigation and link to the core
-    (sighurt-engine-wasm/src/view.rs:531–543, 832–849).
+    (engines/sighurt-engine-wasm/src/view.rs:531–543, 832–849).
   - servo-config 0.5 has `user_agent` and `js_disable_jit`, but no preference that turns script
     off (prefs.rs:280, 402).
 - **The out-of-tree recipe of §2.9, step 3**, in a scratch workspace outside the repository,
@@ -1694,7 +1694,7 @@ as "changed".
     branch = "rewrite" }` and returned a `Command` and a `TabId`.
   - `host` depended on `sighurt-api` by path and on `thirdparty`, and bound both values to this
     workspace's types.
-  - With `[patch."file:///home/gusahlg/repos/sighurt"] sighurt-api = { path = ".../sighurt-api" }`,
+  - With `[patch."file:///home/gusahlg/repos/sighurt"] sighurt-api = { path = ".../crates/sighurt-api" }`,
     `sighurt-api` compiled once (the path copy) and the program printed `tab.new TabId(1)`.
   - Without the patch, `sighurt-api` compiled twice (the path copy and the git copy at
     3c7f5fd7), and the build failed with E0308: "expected `TabId`, found `sighurt_api::ids::TabId`",
@@ -1774,8 +1774,8 @@ finding was checked against the plan and the code before it was acted on.
   - An ephemeral Wasm engine keeps no module cache at all, not a temporary one (decision 76).
   - The modal keymap's `always` table applies its keys that type nothing while the chrome has
     the keyboard, Enter and Escape included if it binds them (decision 74 (5)).
-  - Guard tests: `sighurt-api/tests/keymap.rs` (a keymap with a two-key sequence, from outside
-    the crate) and `sighurt-ui/tests/extension.rs` (the standard chrome through the trait, and a
+  - Guard tests: `crates/sighurt-api/tests/keymap.rs` (a keymap with a two-key sequence, from outside
+    the crate) and `ui/sighurt-ui/tests/extension.rs` (the standard chrome through the trait, and a
     chrome of its own) pass with these changes.
 - **Engine labels** (2 October 2026, STATUS decision 87): `TabSnapshot::engine` is added after
   all, now that both chromes show it: the configured name of the engine a tab's page runs in,

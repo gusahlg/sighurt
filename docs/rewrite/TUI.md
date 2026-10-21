@@ -158,7 +158,7 @@ action, at }` counts as a click (records activation, sets `View::link` from `hre
   phase 0a shows 0.5's tree carries link URLs, field values and bounds.
 - **Wasm**: no semantics; graphics mode, or a placeholder in terminals without graphics.
 
-Reflow to cells lives only in `sighurt-tui/src/textmode/`.
+Reflow to cells lives only in `frontends/sighurt-tui/src/textmode/`.
 
 ## 4. The terminal frontend (`sighurt-tui`)
 

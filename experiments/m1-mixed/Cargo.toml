@@ -9,7 +9,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-sighurt-api = { path = "../../sighurt-api" }
+sighurt-api = { path = "../../crates/sighurt-api" }
 servo.workspace = true
 surfman.workspace = true
 wayland-client.workspace = true

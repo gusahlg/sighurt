@@ -60,7 +60,7 @@ jobs:
           --features engine-demo,engine-wasm,keymap-modal,chrome-line
           --all-targets -- -D warnings
 
-      # The Wasm engine's tests run these example guests (sighurt-engine-wasm/tests/).
+      # The Wasm engine's tests run these example guests (engines/sighurt-engine-wasm/tests/).
       - name: Build the example guests the Wasm engine's tests run
         run: >
           cargo build --target wasm32-unknown-unknown --release
@@ -73,7 +73,7 @@ jobs:
           --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
           --exclude tui-servo --exclude wpe-cpu
 
-      # Unit tests only: the end-to-end tests (sighurt-browser/tests/headless.sh and engines.sh)
+      # Unit tests only: the end-to-end tests (apps/sighurt-browser/tests/headless.sh and engines.sh)
       # need a compositor and run on a developer machine.
       - name: Test (sig without Servo and WPE WebKit)
         run: >

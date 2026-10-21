@@ -9,4 +9,4 @@ description = "WASM frontend for the fullstack-notes Sighurt example"
 crate-type = ["cdylib"]
 
 [dependencies]
-sighurt-sdk = { path = "../../../sighurt-sdk" }
+sighurt-sdk = { path = "../../../sdk/sighurt-sdk" }

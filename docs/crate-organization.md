@@ -60,11 +60,11 @@ and keymap registrations.
 
 Currently, shared libraries contain several fixed implementation lists:
 
-- [Engine descriptors](../sighurt-runtime/src/engines.rs) enumerate the supported engine names,
+- [Engine descriptors](../crates/sighurt-runtime/src/engines.rs) enumerate the supported engine names,
   capabilities, and honored settings.
-- [The runtime registry](../sighurt-runtime/src/registry.rs) contains named engine variants and
+- [The runtime registry](../crates/sighurt-runtime/src/registry.rs) contains named engine variants and
   a fixed keymap list.
-- [The GUI chrome registry](../sighurt-gui/src/chrome.rs) lists the graphical chromes compiled
+- [The GUI chrome registry](../frontends/sighurt-gui/src/chrome.rs) lists the graphical chromes compiled
   into the browser.
 
 These choices are workable during development, but an external implementation still requires
@@ -86,7 +86,7 @@ This demonstrates engine independence more effectively than repository separatio
 Move implementation-specific configuration and lifecycle knowledge toward the implementation
 that requires it.
 
-For example, [the core configuration module](../sighurt-core/src/config.rs) currently contains
+For example, [the core configuration module](../crates/sighurt-core/src/config.rs) currently contains
 Servo preference types and uses a generated Servo preference catalog. The shared configuration
 system should eventually delegate engine-specific validation to the registered adapter, similar
 to the validation callbacks already provided by keymaps and chromes.

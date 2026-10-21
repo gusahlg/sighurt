@@ -7,7 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -292,6 +292,10 @@ impl PtyChild {
         let original = cooked(&slave);
         let mut command = Command::new(worker_bin());
         command.arg("--worker").arg(worker).stderr(Stdio::piped());
+        // A new process group whose parent is this test, in the same session.
+        // The runner's group is often orphaned, and the kernel then discards
+        // SIGTSTP instead of stopping the process.
+        command.process_group(0);
         if stdin_is_slave {
             command
                 .stdin(Stdio::from(slave.try_clone().expect("dup slave")))

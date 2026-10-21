@@ -49,23 +49,23 @@ working tree). Resume each from there:
    Reproduced in Rio 0.5.28 with the user's config in a private headless sway: pages render, but
    Enter isn't recognized (Rio sends kitty CSI-u, e.g. `\x1b[13u`) and characters typed right
    after `o` reach the keymap before the address line opens (`google.com` became `ogle.com`).
-   Partial fix in `sighurt-tui/src/term/{keys,parser}.rs` and `app.rs`; a real-terminal check
-   `sighurt-tui/tests/real-terminals.sh` (Rio and kitty in headless sway) was being written. Then
+   Partial fix in `frontends/sighurt-tui/src/term/{keys,parser}.rs` and `app.rs`; a real-terminal check
+   `frontends/sighurt-tui/tests/real-terminals.sh` (Rio and kitty in headless sway) was being written. Then
    refresh `target/try/sig`, which the user runs.
 2. **The terminal review's findings** (GPT-6 Astra, after the keys): restoration can be cut
    short under output backpressure (also seen as a truncated last kitty frame at quit); a resize
    can stall Servo's frames (`frame_requested` stays set); input reading unbounded; the kitty
    encoder allocates before its cap; late capability replies never relayout; mouse releases
    outside the page dropped.
-3. **R1** (partial in `sighurt-runtime/src/session.rs`): forget the frontend's target when
+3. **R1** (partial in `crates/sighurt-runtime/src/session.rs`): forget the frontend's target when
    `open_view` fails; and Servo's offscreen context mutates `DRI_PRIME`/`LIBGL_ALWAYS_SOFTWARE`
    after Servo's threads exist (possible UB) — not started.
-4. **Text mode**: the renderer `sighurt-tui/src/textmode/` (partial, untested), WPE semantics
-   `sighurt-engine-wpe/src/semantic.rs` (partial), then Servo semantics, the app-loop
+4. **Text mode**: the renderer `frontends/sighurt-tui/src/textmode/` (partial, untested), WPE semantics
+   `engines/sighurt-engine-wpe/src/semantic.rs` (partial), then Servo semantics, the app-loop
    integration and `--dump`; plus decision 98's hardening of `sighurt-semantic`.
 5. **The GUI's engine button** (the user's feedback: no button look, no hover/pressed, no sign a
    switch is under way; repeated clicks): partial in sighurt-ui, sighurt-chrome-line,
-   sighurt-gui/src/chrome.rs and sighurt-core.
+   frontends/sighurt-gui/src/chrome.rs and sighurt-core.
 6. **Investigations without reports yet**: Servo on github.com (a frozen, uninteractive page)
    and chatgpt.com (the login code field can't be focused or typed in) —
    `experiments/servo-input/`; WPE's green video rectangle on github.com, its "Can't connect to

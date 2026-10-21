@@ -1,6 +1,6 @@
 # WASM engine and SDK guide
 
-The Wasm engine ([`sighurt-engine-wasm`](./sighurt-engine-wasm/)) is Sighurt's engine for WebAssembly apps. It is compiled into `sig` (feature `engine-wasm`, one of its defaults) and runs in `sig`'s process. It fetches the `.wasm`, runs it under Wasmtime with no WASI, one store per page, with the app's callbacks on worker threads, and paints what the app draws on the CPU into a shared-memory buffer that `sig`'s Wayland host lends it. Apps are Rust crates built for `wasm32-unknown-unknown` against [`sighurt-sdk`](./sighurt-sdk/).
+The Wasm engine ([`sighurt-engine-wasm`](engines/sighurt-engine-wasm/)) is Sighurt's engine for WebAssembly apps. It is compiled into `sig` (feature `engine-wasm`, one of its defaults) and runs in `sig`'s process. It fetches the `.wasm`, runs it under Wasmtime with no WASI, one store per page, with the app's callbacks on worker threads, and paints what the app draws on the CPU into a shared-memory buffer that `sig`'s Wayland host lends it. Apps are Rust crates built for `wasm32-unknown-unknown` against [`sighurt-sdk`](sdk/sighurt-sdk/).
 
 The guest ABI is Oxide's: every host function is imported from the WASM module `"oxide"`. Apps built for [Oxide](https://github.com/niklabh/oxide) run unchanged, except ones that use Oxide's widget kit (`ui_*`), which this engine doesn't provide.
 
@@ -19,7 +19,7 @@ cargo new --lib my-app
 crate-type = ["cdylib"]
 
 [dependencies]
-sighurt-sdk = { path = "../sighurt/sighurt-sdk" }
+sighurt-sdk = { path = "../sighurt/sdk/sighurt-sdk" }
 
 [profile.release]
 opt-level = "s"
@@ -113,7 +113,7 @@ pub extern "C" fn start_app() {
 
 The app draws each frame onto a canvas in logical pixels, divided by the page zoom; `canvas_dimensions()` gives its size. The engine paints the canvas itself, at the window's scale, with tiny-skia and cosmic-text, and only when the app drew something new. There are no widgets: buttons, fields and lists are shapes the app draws and hit-tests against `mouse_position()`. Typed text comes from `text_input()`; keys from `key_pressed` / `key_down` with the `KEY_*` constants. For content taller than the page, call `set_content_size` and offset drawing by `scroll_position()`.
 
-The [`draw`](./sighurt-sdk/src/draw.rs) module wraps the canvas functions in `Canvas`, `Color`, `Rect` and `Point2D`:
+The [`draw`](sdk/sighurt-sdk/src/draw.rs) module wraps the canvas functions in `Canvas`, `Color`, `Rect` and `Point2D`:
 
 ```rust
 use sighurt_sdk::draw::*;
@@ -126,7 +126,7 @@ c.text("Hello!", Point2D::new(20.0, 30.0), 24.0, Color::WHITE);
 
 ## API overview
 
-Every function has a doc comment in [`sighurt-sdk/src/lib.rs`](./sighurt-sdk/src/lib.rs) (`cargo doc --no-deps -p sighurt-sdk --open`). The examples in [`examples/`](./examples/) use most of them.
+Every function has a doc comment in [`sdk/sighurt-sdk/src/lib.rs`](sdk/sighurt-sdk/src/lib.rs) (`cargo doc --no-deps -p sighurt-sdk --open`). The examples in [`examples/`](./examples/) use most of them.
 
 | Area | Functions |
 |------|-----------|
@@ -150,7 +150,7 @@ Every function has a doc comment in [`sighurt-sdk/src/lib.rs`](./sighurt-sdk/src
 | MIDI | `midi_input_count`, `midi_output_count`, `midi_open_input`, `midi_open_output`, `midi_send`, `midi_recv`, `midi_close` |
 | Workers | `spawn_worker`, `worker_post_message`, `worker_recv`, `worker_terminate`; inside a worker: `worker_post`, `worker_message_read` |
 | Modules | `load_module`: runs a child `.wasm` with its own memory and fuel |
-| Crypto and encoding | `hash_sha256`, `hash_sha512`, `hmac_sha256` (+ `_hex`), `random_bytes`, `random_u64`, `random_f64`, `uuid_v4`, `base64_encode`, `base64_decode`, `compress`, `decompress`; [`proto`](./sighurt-sdk/src/proto.rs) is a small protobuf codec |
+| Crypto and encoding | `hash_sha256`, `hash_sha512`, `hmac_sha256` (+ `_hex`), `random_bytes`, `random_u64`, `random_f64`, `uuid_v4`, `base64_encode`, `base64_decode`, `compress`, `decompress`; [`proto`](sdk/sighurt-sdk/src/proto.rs) is a small protobuf codec |
 | System | `system_locale`, `system_timezone`, `system_timezone_offset_minutes`, `battery_level`, `battery_charging` |
 
 Present for ABI compatibility but not functional:
@@ -194,7 +194,7 @@ With a manifest, sensitive APIs it doesn't list are denied without a prompt. Wit
 | Time | 10 s for `start_app`, 1 s for each later callback, not counting host functions that wait for the network (at most 30 s of that per call) |
 | Module size | 50 MB |
 
-The guest reaches the outside world only through the host functions registered in `sighurt-engine-wasm/src/capabilities.rs`. Network access goes through the host's HTTP, WebSocket, SSE and WebRTC clients; files only through native dialogs the user answers. Session storage is cleared when a page navigates to another origin; the kv store keeps each origin in its own directory, under `~/.local/share/sighurt/wasm`; with `[engines.wasm] storage = "ephemeral"`, in a directory of the run's own under `$XDG_RUNTIME_DIR`, which `sig` deletes when it quits. Draw lists, images, text, timers, history, workers and network buffers are bounded too, so an app can't make the host allocate without limit. The engine runs in `sig`'s process: Wasmtime's isolation and the registered host functions are what stand between an app and the browser.
+The guest reaches the outside world only through the host functions registered in `engines/sighurt-engine-wasm/src/capabilities.rs`. Network access goes through the host's HTTP, WebSocket, SSE and WebRTC clients; files only through native dialogs the user answers. Session storage is cleared when a page navigates to another origin; the kv store keeps each origin in its own directory, under `~/.local/share/sighurt/wasm`; with `[engines.wasm] storage = "ephemeral"`, in a directory of the run's own under `$XDG_RUNTIME_DIR`, which `sig` deletes when it quits. Draw lists, images, text, timers, history, workers and network buffers are bounded too, so an app can't make the host allocate without limit. The engine runs in `sig`'s process: Wasmtime's isolation and the registered host functions are what stand between an app and the browser.
 
 ## Troubleshooting
 

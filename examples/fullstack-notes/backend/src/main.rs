@@ -1,7 +1,7 @@
 // The SDK's zero-dependency protobuf codec, compiled in directly so the backend
 // speaks exactly the same wire format as the WASM frontend.
 #[allow(dead_code)]
-#[path = "../../../../sighurt-sdk/src/proto.rs"]
+#[path = "../../../../sdk/sighurt-sdk/src/proto.rs"]
 mod proto;
 
 use axum::{

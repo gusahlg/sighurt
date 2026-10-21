@@ -30,8 +30,8 @@ runs again: the source and build tree stay in `~/.cache/sighurt/wpewebkit-2.52.6
 `sha256-xJ+X4hBtOcAFGBOe5nAMyMUeF9foJBmIOu3NjBqBycU=`), with no user configuration or overlays.
 `shell.nix` and `nix/wpewebkit.nix` import it, so every build uses it. Test helpers still take
 their tools (sway, grim, wl-clipboard, lswt) from the machine's `<nixpkgs>`: `tools/headless-sway`,
-`sighurt-wayland/tests/headless.sh`, `sighurt-browser/tests/engines.sh`,
-`sighurt-engine-servo/tests/window-checks.sh`, `bench/run`, `experiments/m1-mixed/live-check.sh`
+`frontends/sighurt-wayland/tests/headless.sh`, `apps/sighurt-browser/tests/engines.sh`,
+`engines/sighurt-engine-servo/tests/window-checks.sh`, `bench/run`, `experiments/m1-mixed/live-check.sh`
 (open problem 1).
 
 That revision is the `sighurt` desktop's system flake input of 2 October 2026 (Rust 1.98.1,
@@ -203,7 +203,7 @@ desktop: `cargo build -v -p sighurt-wayland -p sighurt-engine-wasm` (which build
 `wayland-sys`, `smithay-client-toolkit`, `alsa-sys`, `ffmpeg-sys-next`, `libudev-sys` and
 `openssl-sys`; the other four declare the same variables) reported 549 units `Fresh` both with
 the four variables exported by hand and then in the real shell once the prefix was there. The WPE engine's build script
-(`sighurt-engine-wpe/build.rs`) runs pkg-config with `PKG_CONFIG_PATH=$SIGHURT_WPE_PKG_CONFIG_PATH`
+(`engines/sighurt-engine-wpe/build.rs`) runs pkg-config with `PKG_CONFIG_PATH=$SIGHURT_WPE_PKG_CONFIG_PATH`
 and declares `cargo:rerun-if-env-changed=SIGHURT_WPE_PKG_CONFIG_PATH`; nothing else sees it.
 
 Once the prefix exists, the shell's derivation changes, and with it `out`, `NIX_LDFLAGS`'s
@@ -299,7 +299,7 @@ tools/heavy tools/headless-sway --renderer gles2  -- experiments/wpe-coexist/coe
 **Result: go**, on every question, with two fixes that `sig` needs anyway (below: the executable
 must not export the C libraries linked into it, and JavaScriptCore in `sig`'s process must stay
 off signals). Run outputs are in `experiments/wpe-coexist/runs/` and, for the prototype, at commit
-3c510fe. The prototype's checks now run as `sighurt-engine-wpe/tests/window-checks.sh`.
+3c510fe. The prototype's checks now run as `engines/sighurt-engine-wpe/tests/window-checks.sh`.
 
 | Question | Answer | Evidence |
 |---|---|---|
@@ -638,12 +638,12 @@ around it; `sig` compiles it in with the feature `engine-wpe`, one of its defaul
 
 ```sh
 tools/cargo test -p sighurt-engine-wpe --lib                     # 14 unit tests, no compositor
-sighurt-engine-wpe/tests/headless.sh [pixman]                     # tests/engine.rs in headless sway
+engines/sighurt-engine-wpe/tests/headless.sh [pixman]                     # tests/engine.rs in headless sway
 tools/cargo build -p sighurt-engine-wpe --example wpe-window
 tools/cargo build -p sighurt-browser --no-default-features --example virtual-pointer
-tools/heavy tools/headless-sway --renderer gles2  -- sighurt-engine-wpe/tests/window-checks.sh OUT
-tools/heavy tools/headless-sway --renderer pixman -- sighurt-engine-wpe/tests/window-checks.sh OUT
-tools/heavy tools/headless-sway --renderer gles2  -- sighurt-engine-wpe/tests/window-checks.sh OUT --shm
+tools/heavy tools/headless-sway --renderer gles2  -- engines/sighurt-engine-wpe/tests/window-checks.sh OUT
+tools/heavy tools/headless-sway --renderer pixman -- engines/sighurt-engine-wpe/tests/window-checks.sh OUT
+tools/heavy tools/headless-sway --renderer gles2  -- engines/sighurt-engine-wpe/tests/window-checks.sh OUT --shm
 ```
 
 ## The crate
@@ -817,7 +817,7 @@ process; pointer, `å ä ö` and a dead key typed with `wtype`, a named key, foc
 the Wayland clipboard and paste comes from it (`wl-paste`, `wl-copy`); the wheel; the hovered
 link as status text; scales 1.5, 2, 1.25 and 1 with the page's `devicePixelRatio`, size and
 click positions right; a resize; page zoom (the page sees `devicePixelRatio` 2 and half the size);
-`https://example.com/` loads and is shown. Outputs: `sighurt-engine-wpe/runs/` (`desktop-*`).
+`https://example.com/` loads and is shown. Outputs: `engines/sighurt-engine-wpe/runs/` (`desktop-*`).
 
 `experiments/wpe-coexist` now links the crate (only its dependency changed): `coexist-checks.sh`
 14 of 14 on the desktop (GLES2), Servo, the Wasm engine and WebKit in one process as before.
@@ -833,7 +833,7 @@ Memory (proportional set size, the animation and a static page in two views): 25
 WebKit opens what `[routing.wpe] hosts` gives it and what `page.open-in wpe` asks for (decision
 78). What the integration is:
 
-- **The registry entry `wpe`** (`sighurt-browser/src/registry.rs`): `CAPABILITIES`, native
+- **The registry entry `wpe`** (`apps/sighurt-browser/src/registry.rs`): `CAPABILITIES`, native
   (`PresentMode::Gl`) targets, the settings it honors (`user-agent`, `storage`), and
   `WpeRuntime::new` on first use with `WpeConfig { profile, user_agent }`: the profile is
   `{data_dir}/sighurt/wpe` with `storage = "profile"` and none (an ephemeral session) with
@@ -888,7 +888,7 @@ engine (Servo 0.5's limit too); a script's navigation that a click ran stays in 
 Servo would hand it over. In `sig` the core answered within 0.07–0.23 ms of WebKit's question
 (`wpe-timing navigation-answered`, eight answers over four runs).
 
-**End to end** (`sighurt-browser/tests/engines.sh`, scenario `wpe`, 59 checks, and two of the
+**End to end** (`apps/sighurt-browser/tests/engines.sh`, scenario `wpe`, 59 checks, and two of the
 `settings` scenario; headless sway 1.12 with GLES2 on the desktop's RTX 3070, 2 October 2026; the
 whole of `engines.sh`, 217 checks, passes with them):
 

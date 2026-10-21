@@ -6,12 +6,12 @@
 //! opens Wayland. WebKit is asked for `WPEBufferSHM` frames; each one is copied and then handed
 //! back with `wpe_view_buffer_rendered` and `wpe_view_buffer_released`.
 //!
-//! Run it with `WAYLAND_DISPLAY` and `DISPLAY` unset, on `sighurt-engine-wpe/tests/private-bus`,
+//! Run it with `WAYLAND_DISPLAY` and `DISPLAY` unset, on `engines/sighurt-engine-wpe/tests/private-bus`,
 //! so WebKit's sandbox talks only to a private session bus:
 //!
 //! ```text
 //! tools/heavy env -u WAYLAND_DISPLAY -u DISPLAY \
-//!   sighurt-engine-wpe/tests/private-bus \
+//!   engines/sighurt-engine-wpe/tests/private-bus \
 //!   target/debug/wpe-cpu --size 640x480 --seconds 3 --out /tmp/wpe-cpu-a \
 //!   experiments/wpe-cpu/pages/animated.html
 //! ```

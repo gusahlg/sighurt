@@ -9,4 +9,4 @@ description = "Typography showcase: font family, weight, style, alignment, and m
 crate-type = ["cdylib"]
 
 [dependencies]
-sighurt-sdk = { path = "../../sighurt-sdk" }
+sighurt-sdk = { path = "../../sdk/sighurt-sdk" }

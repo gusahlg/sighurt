@@ -1226,7 +1226,7 @@ def run_corpus(args):
             "--renderer", "gles2",
             "--size", "1600x1000",
             "--",
-            str(ROOT / "sighurt-engine-wpe/tests/private-bus"),
+            str(ROOT / "engines/sighurt-engine-wpe/tests/private-bus"),
             sys.executable,
             str(ROOT / "bench/compat/run"),
             "--inside",
