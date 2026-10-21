@@ -3379,3 +3379,17 @@ Newest last. Each entry says what was decided and why.
     acceptance test; (4) the gaps it exposes are fixed. Separate repositories wait until there is
     a concrete benefit (the document's step 5). Amends 1, 68 and 96 where they put lists or
     engine knowledge in shared crates.
+100. **Servo 0.7 is to be adopted, after its two regressions are explained** (pending; measured
+    21 October 2026 on louise-pc, RTX 4060, the 40-site corpus, Servo only, one repetition each;
+    `bench/compat/results/`): Servo 0.5 with defaults 27 OK / 7 partial / 0 blank / 6 timeouts
+    (2026-10-17-79be7f7); 0.5 with `experimental-features` 29 / 6 / 0 / 5
+    (ac2c9f5-servo-experimental), the same with adopted stylesheets and Web Animations
+    (ac2c9f5-servo-compat); Servo 0.7 (branch `servo-0.7`, 22ffede) 37 / 0 / 2 / 1
+    (servo07-22ffede): pages that never finished loading in 0.5 load (reddit, past its
+    JavaScript challenge; Wikipedia; YouTube), but stackoverflow (Cloudflare's "Just a moment…"
+    stays) and Amazon are blank where 0.5 rendered them minutes earlier. 0.7 logs no script
+    errors to `sig`'s log, so the error counts and PARTIAL→OK changes don't compare across
+    versions; screenshots do. Next: explain the two blanks (user agent? a missing feature in the
+    challenge?), then merge `servo-0.7` into `rewrite` (after the work in progress in
+    sighurt-engine-servo), re-run every suite and the corpus. *Why:* decision 94's measured
+    corpus; Servo's experimental preferences gain 2 sites, 0.7 gains 10.
