@@ -8,10 +8,23 @@
 //!
 //! Bracketed paste is collected until `CSI 201 ~` and is not parsed as keys.
 //! Payloads are capped (64 KiB for APC/OSC/DCS, 1 MiB for paste).
+//!
+//! Releases: once the terminal's reply to `CSI ? u` says it reports event
+//! types (flag 2), a key in an escape sequence (`CSI … u`, `CSI … ~`, the
+//! `CSI` letter forms) is held from its press until the terminal's own
+//! release, which every form may carry as `;mods:3` (kitty and Rio send
+//! `CSI D` for Left, then `CSI 1;1:3 D`). A release with no press reported
+//! before it is dropped: Rio sends Ctrl+L as the byte `0x0c` and its release
+//! as `CSI 108;1:3 u`, with the modifier cleared. Bytes that are not escape sequences (text, C0, SS3,
+//! and every key when the terminal does not report event types) are a press
+//! and a synthesized release.
 
 use std::time::{Duration, Instant};
 
-use super::keys::{kitty_key, kitty_modifiers, legacy_press, ButtonState, Key, KeyKind, Modifiers};
+use super::keys::{
+    kitty_key, kitty_modifiers, legacy_press, named_evdev, release_of, ButtonState, Key, KeyKind,
+    Modifiers,
+};
 
 /// How long a lone Escape waits before it is a key.
 pub const ESC_TIMEOUT: Duration = Duration::from_millis(25);
@@ -24,6 +37,21 @@ const MAX_PASTE: usize = 1024 * 1024;
 const PASTE_END: &[u8] = b"\x1b[201~";
 const MAX_PARAMS: usize = 16;
 const MAX_SUBS: usize = 8;
+/// Most keys held at once; the oldest is forgotten past this.
+const MAX_HELD: usize = 16;
+/// Kitty's "report event types" flag.
+const EVENT_TYPES: u32 = 2;
+
+/// Which key an escape sequence names, to pair a release with its press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyId {
+    /// `CSI code … u`, by its (unshifted) code.
+    Unicode(u32),
+    /// `CSI number … ~`.
+    Tilde(u32),
+    /// `CSI … A` and the other letter forms, by the final byte.
+    Final(u8),
+}
 
 /// One thing the terminal sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,6 +311,10 @@ pub struct Parser {
     esc_only: bool,
     /// An extra Escape was seen before this sequence (`ESC ESC …`).
     prefix_alt: bool,
+    /// The kitty keyboard flags the terminal said are on (`CSI ? flags u`), 0 until then.
+    kitty_flags: u32,
+    /// Keys pressed and not yet released, when the terminal reports releases.
+    held: Vec<(KeyId, super::keys::KeyEvent)>,
 }
 
 impl Default for Parser {
@@ -299,7 +331,40 @@ impl Parser {
             partial_at: None,
             esc_only: false,
             prefix_alt: false,
+            kitty_flags: 0,
+            held: Vec::new(),
         }
+    }
+
+    /// Hands over a key the escape sequence `id` reported. With event types, a press or repeat
+    /// is held until its release, and a release is reported only for a held key, as that key;
+    /// without them, a press is followed by a synthesized release and a release is dropped.
+    fn deliver(
+        &mut self,
+        id: KeyId,
+        event: super::keys::KeyEvent,
+        kind: KeyKind,
+        out: &mut Vec<Input>,
+    ) {
+        if kind == KeyKind::Release {
+            if let Some(at) = self.held.iter().position(|(held, _)| *held == id) {
+                let (_, press) = self.held.remove(at);
+                out.push(Input::Key(release_of(&press, event.modifiers)));
+            }
+            return;
+        }
+        if self.kitty_flags & EVENT_TYPES == 0 {
+            let release = release_of(&event, event.modifiers);
+            out.push(Input::Key(event));
+            out.push(Input::Key(release));
+            return;
+        }
+        self.held.retain(|(held, _)| *held != id);
+        if self.held.len() >= MAX_HELD {
+            self.held.remove(0);
+        }
+        self.held.push((id, event.clone()));
+        out.push(Input::Key(event));
     }
 
     /// Parse the next bytes. Incomplete sequences stay buffered.
@@ -638,6 +703,7 @@ impl Parser {
         }
         if csi.private == Some(b'?') && final_byte == b'u' {
             if let Some(flags) = csi.number(0) {
+                self.kitty_flags = flags;
                 out.push(Input::Reply(Reply::KittyKeyboard { flags }));
             }
             return;
@@ -677,7 +743,8 @@ impl Parser {
                 Some(number) => {
                     if let Some(name) = tilde_key(number) {
                         let modifiers = csi_modifiers(&csi);
-                        self.emit_named(name, modifiers, alt, out);
+                        let kind = csi_kind(&csi);
+                        self.emit_named(KeyId::Tilde(number), name, modifiers, kind, alt, out);
                     }
                 }
                 None => {}
@@ -694,7 +761,8 @@ impl Parser {
                 if final_byte == b'Z' {
                     modifiers.shift = true;
                 }
-                self.emit_named(name, modifiers, alt, out);
+                let kind = csi_kind(&csi);
+                self.emit_named(KeyId::Final(final_byte), name, modifiers, kind, alt, out);
             }
         }
     }
@@ -720,12 +788,8 @@ impl Parser {
             .get(2)
             .map(|param| param.iter().copied().flatten().collect::<Vec<_>>())
             .unwrap_or_default();
-        let kind = match event {
-            2 => KeyKind::Repeat,
-            3 => KeyKind::Release,
-            _ => KeyKind::Press,
-        };
-        out.push(Input::Key(kitty_key(
+        let kind = event_kind(event);
+        let key = kitty_key(
             codepoint,
             shifted,
             base,
@@ -733,13 +797,17 @@ impl Parser {
             kind,
             &text_points,
             alt,
-        )));
+        );
+        self.deliver(KeyId::Unicode(codepoint), key, kind, out);
     }
 
+    /// A named key in a `CSI` letter or `~` form.
     fn emit_named(
         &mut self,
+        id: KeyId,
         name: &'static str,
         modifiers: Modifiers,
+        kind: KeyKind,
         alt: bool,
         out: &mut Vec<Input>,
     ) {
@@ -747,6 +815,20 @@ impl Parser {
         if alt {
             modifiers.alt = true;
         }
+        let mut event = named_key(name, modifiers, kind);
+        // A terminal that speaks the kitty protocol sends these forms for these keys only.
+        if self.kitty_flags != 0 {
+            event.code = super::keys::KeyCode(named_evdev(name));
+        }
+        self.deliver(id, event, kind, out);
+    }
+
+    /// A named key in an `SS3` form, which never says when it is released.
+    fn emit_ss3(&mut self, name: &'static str, alt: bool, out: &mut Vec<Input>) {
+        let modifiers = Modifiers {
+            alt,
+            ..Modifiers::default()
+        };
         extend_keys(
             out,
             legacy_press(Key::Named(name.to_string()), modifiers, false, None),
@@ -770,7 +852,7 @@ impl Parser {
             b'S' => "F4",
             _ => return,
         };
-        self.emit_named(name, Modifiers::default(), alt, out);
+        self.emit_ss3(name, alt, out);
     }
 
     fn osc(&mut self, byte: u8, buf: &mut Buf, out: &mut Vec<Input>) {
@@ -1056,6 +1138,40 @@ fn csi_modifiers(csi: &Csi) -> Modifiers {
     kitty_modifiers(csi.number(1).unwrap_or(1))
 }
 
+/// The event type in the modifier field's second part (`CSI 1;1:3 D`), a press without one.
+fn csi_kind(csi: &Csi) -> KeyKind {
+    let event = csi
+        .params
+        .get(1)
+        .and_then(|param| param.get(1).copied().flatten());
+    event_kind(event.unwrap_or(1))
+}
+
+fn event_kind(event: u32) -> KeyKind {
+    match event {
+        2 => KeyKind::Repeat,
+        3 => KeyKind::Release,
+        _ => KeyKind::Press,
+    }
+}
+
+/// A named key's event: no physical code (the `CSI` forms don't name one), no text.
+fn named_key(name: &str, modifiers: Modifiers, kind: KeyKind) -> super::keys::KeyEvent {
+    super::keys::KeyEvent {
+        code: super::keys::KeyCode(0),
+        key: Key::Named(name.to_string()),
+        state: match kind {
+            KeyKind::Release => ButtonState::Released,
+            KeyKind::Press | KeyKind::Repeat => ButtonState::Pressed,
+        },
+        repeat: kind == KeyKind::Repeat,
+        modifiers,
+        consumed: Modifiers::default(),
+        text: None,
+        ambiguous: false,
+    }
+}
+
 fn legacy_final(final_byte: u8, csi: &Csi) -> Option<&'static str> {
     Some(match final_byte {
         b'A' => "ArrowUp",
@@ -1065,13 +1181,14 @@ fn legacy_final(final_byte: u8, csi: &Csi) -> Option<&'static str> {
         b'H' => "Home",
         b'F' => "End",
         b'Z' => "Tab",
-        b'P' | b'Q' | b'R' | b'S' if !csi.params.is_empty() => match final_byte {
-            b'P' => "F1",
-            b'Q' => "F2",
-            b'R' => "F3",
-            b'S' => "F4",
-            _ => return None,
-        },
+        // The keypad's middle key (kitty's KP_BEGIN), as kitty's table names it.
+        b'E' => "Clear",
+        // Kitty sends F1, F2 and F4 bare (`CSI P`); F3 is `CSI 13 ~`, since a bare `CSI R`
+        // is a cursor position report.
+        b'P' => "F1",
+        b'Q' => "F2",
+        b'S' => "F4",
+        b'R' if !csi.params.is_empty() => "F3",
         _ => return None,
     })
 }
@@ -1248,6 +1365,34 @@ mod tests {
             .collect()
     }
 
+    /// Keys from a parser told that the terminal reports event types, as kitty and Rio do
+    /// after `CSI > 31 u`.
+    fn kitty_keys_of(bytes: &[u8]) -> Vec<KeyEvent> {
+        let mut parser = Parser::new();
+        parser.feed(b"\x1b[?31u");
+        parser
+            .feed(bytes)
+            .into_iter()
+            .filter_map(|input| match input {
+                Input::Key(key) => Some(key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// (key, pressed, text) of each event, for comparing whole sequences.
+    fn summary(keys: &[KeyEvent]) -> Vec<(String, bool, Option<String>)> {
+        keys.iter()
+            .map(|key| {
+                let name = match &key.key {
+                    Key::Character(text) | Key::Named(text) => text.clone(),
+                    other => format!("{other:?}"),
+                };
+                (name, key.state == ButtonState::Pressed, key.text.clone())
+            })
+            .collect()
+    }
+
     fn reply(bytes: &[u8]) -> Reply {
         match Parser::new().feed(bytes).as_slice() {
             [Input::Reply(reply)] => reply.clone(),
@@ -1257,7 +1402,7 @@ mod tests {
 
     #[test]
     fn kitty_shift_a_uses_the_base_layout_and_the_text() {
-        let keys = keys_of(b"\x1b[97:65:97;2:1;65u");
+        let keys = kitty_keys_of(b"\x1b[97:65:97;2:1;65u");
         assert_eq!(
             keys.len(),
             1,
@@ -1272,33 +1417,35 @@ mod tests {
 
     #[test]
     fn kitty_release_and_repeat_keep_their_event_type() {
-        let release = keys_of(b"\x1b[97:65:97;2:3u");
-        assert_eq!(release.len(), 1);
-        assert_eq!(release[0].state, ButtonState::Released);
-        assert!(release[0].text.is_none());
-        let repeat = keys_of(b"\x1b[97::97;1:2u");
+        let keys = kitty_keys_of(b"\x1b[97:65:97;2:1;65u\x1b[97:65:97;2:3u");
+        assert_eq!(keys.len(), 2);
+        let release = &keys[1];
+        assert_eq!(release.state, ButtonState::Released);
+        assert!(release.text.is_none());
+        assert_eq!(release.code, KeyCode(30));
+        let repeat = kitty_keys_of(b"\x1b[97::97;1:2u");
         assert!(repeat[0].repeat && repeat[0].state == ButtonState::Pressed);
         assert_eq!(repeat[0].code, KeyCode(30));
     }
 
     #[test]
     fn emoji_without_a_base_layout_has_no_evdev_code() {
-        let keys = keys_of(b"\x1b[128512u");
+        let keys = kitty_keys_of(b"\x1b[128512u");
         assert_eq!(keys[0].key, Key::Character("😀".into()));
         assert_eq!(keys[0].code, KeyCode(0));
-        let with_base = keys_of(b"\x1b[128512:97:97;1:1;128512u");
+        let with_base = kitty_keys_of(b"\x1b[128512:97:97;1:1;128512u");
         assert_eq!(with_base[0].code, KeyCode(30));
         assert_eq!(with_base[0].text.as_deref(), Some("😀"));
     }
 
     #[test]
     fn tab_and_ctrl_i_stay_distinct_under_kitty() {
-        let tab = keys_of(b"\x1b[9u");
+        let tab = kitty_keys_of(b"\x1b[9u");
         assert_eq!(tab.len(), 1);
         assert_eq!(tab[0].key, Key::Named("Tab".into()));
         assert_eq!(tab[0].code, KeyCode(15));
         assert!(!tab[0].ambiguous);
-        let ctrl_i = keys_of(b"\x1b[105;5u");
+        let ctrl_i = kitty_keys_of(b"\x1b[105;5u");
         assert_eq!(ctrl_i[0].key, Key::Character("i".into()));
         assert!(ctrl_i[0].modifiers.control);
         assert_eq!(ctrl_i[0].code, KeyCode(0));
@@ -1463,9 +1610,191 @@ mod tests {
 
     #[test]
     fn control_suppresses_associated_text() {
-        let keys = keys_of(b"\x1b[97;5;97u");
+        let keys = kitty_keys_of(b"\x1b[97;5;97u");
         assert!(keys[0].modifiers.control);
         assert!(keys[0].text.is_none());
         assert_eq!(keys[0].key, Key::Character("a".into()));
+    }
+
+    /// What Rio 0.5.28 sent after `CSI > 31 u`. Captured in a private sway: wtype held each
+    /// key for 40 ms, and the query reply was `CSI ? 31 u`. A release often clears the
+    /// modifier (`:3` with field 1). wtype's keymap reports Shift+J's text as "j".
+    #[test]
+    fn rio_recorded_sequences() {
+        let owned = |s: &str| s.to_owned();
+        let keys = kitty_keys_of(
+            b"\x1b[111;1;111u\x1b[111;1:3u\x1b[97;1;97u\x1b[97;1:3u\x1b[103;1;103u\x1b[103;1:3u\
+              \x1b[106;2;106u\x1b[106;1:3u\x1b[13u\x1b[13;1:3u\x1b[9u\x1b[9;1:3u\x1b[9;2u\x1b[9;1:3u\
+              \x1b[127u\x1b[127;1:3u\x1b[27u\x1b[27;1:3u",
+        );
+        assert_eq!(
+            summary(&keys),
+            vec![
+                (owned("o"), true, Some(owned("o"))),
+                (owned("o"), false, None),
+                (owned("a"), true, Some(owned("a"))),
+                (owned("a"), false, None),
+                (owned("g"), true, Some(owned("g"))),
+                (owned("g"), false, None),
+                (owned("j"), true, Some(owned("j"))),
+                (owned("j"), false, None),
+                (owned("Enter"), true, None),
+                (owned("Enter"), false, None),
+                (owned("Tab"), true, None),
+                (owned("Tab"), false, None),
+                (owned("Tab"), true, None),
+                (owned("Tab"), false, None),
+                (owned("Backspace"), true, None),
+                (owned("Backspace"), false, None),
+                (owned("Escape"), true, None),
+                (owned("Escape"), false, None),
+            ]
+        );
+        assert!(keys[6].modifiers.shift, "Shift+J");
+        assert!(keys[12].modifiers.shift, "Shift+Tab");
+        assert!(!keys[13].modifiers.shift, "the release clears Shift");
+        assert_eq!(keys[8].code, KeyCode(28));
+        assert!(keys.iter().all(|key| !key.ambiguous));
+
+        let keys = kitty_keys_of(
+            b"\x1b[D\x1b[1;1:3D\x1b[C\x1b[1;1:3C\x1b[A\x1b[1;1:3A\x1b[B\x1b[1;1:3B\
+              \x1b[H\x1b[1;1:3H\x1b[F\x1b[1;1:3F\x1b[5~\x1b[5;1:3~\x1b[6~\x1b[6;1:3~\
+              \x1b[3~\x1b[3;1:3~\x1b[P\x1b[1;1:3P\x1b[Q\x1b[1;1:3Q\x1b[13~\x1b[13;1:3~\
+              \x1b[S\x1b[1;1:3S\x1b[15~\x1b[15;1:3~\x1b[24~\x1b[24;1:3~",
+        );
+        let names = [
+            "ArrowLeft",
+            "ArrowRight",
+            "ArrowUp",
+            "ArrowDown",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Delete",
+            "F1",
+            "F2",
+            "F3",
+            "F4",
+            "F5",
+            "F12",
+        ];
+        let expected: Vec<_> = names
+            .iter()
+            .flat_map(|name| [(owned(name), true, None), (owned(name), false, None)])
+            .collect();
+        assert_eq!(summary(&keys), expected);
+        assert_eq!(keys[0].code, KeyCode(105), "Left has its evdev code");
+
+        // Ctrl+L is a C0 press. The CSI release names no held press, so it adds nothing.
+        let keys = kitty_keys_of(b"\x0c\x1b[108;1:3u");
+        assert_eq!(
+            summary(&keys),
+            vec![(owned("l"), true, None), (owned("l"), false, None)]
+        );
+        assert!(keys[0].modifiers.control);
+
+        // Ctrl+D is a CSI press, not EOF. Alt+1 types nothing. ':' and '+' carry no Shift.
+        let keys = kitty_keys_of(
+            b"\x1b[100;5u\x1b[100;1:3u\x1b[49;3;49u\x1b[49;1:3u\x1b[58;1;58u\x1b[58;1:3u\
+              \x1b[43;1;43u\x1b[43;1:3u",
+        );
+        assert!(keys[0].modifiers.control && keys[0].text.is_none());
+        assert_eq!(keys[0].key, Key::Character("d".into()));
+        assert!(keys[2].modifiers.alt && keys[2].text.is_none());
+        assert!(!keys[2].consumed.alt);
+        assert_eq!(keys[3].key, Key::Character("1".into()));
+        assert!(!keys[3].modifiers.alt, "the release clears Alt");
+        assert_eq!(keys[4].text.as_deref(), Some(":"));
+        assert!(!keys[4].modifiers.shift && !keys[4].consumed.shift);
+        assert_eq!(keys[6].text.as_deref(), Some("+"));
+        assert!(!keys[6].consumed.shift);
+    }
+
+    /// What kitty 0.49.2 sent after `CSI > 31 u`, same capture. Its base-layout field is
+    /// 57344 for a key wtype's one-key keymap invented, which is not a US key.
+    #[test]
+    fn kitty_recorded_sequences() {
+        let keys = kitty_keys_of(
+            b"\x1b[111::57344;;111u\x1b[111::57344;1:3u\x1b[106::57344;2;106u\x1b[106::57344;1:3u\
+              \x1b[13u\x1b[13;1:3u\x1b[9;2u\x1b[9;1:3u\x1b[127u\x1b[127;1:3u\
+              \x1b[108::57344;5u\x1b[108::57344;1:3u\x1b[100::57344;5u\x1b[100::57344;1:3u\
+              \x1b[49::57344;3u\x1b[49::57344;1:3u\x1b[58::57344;;58u\x1b[43::57344;;43u\
+              \x1b[D\x1b[1;1:3D\x1b[24~\x1b[24;1:3~",
+        );
+        assert_eq!(keys[0].key, Key::Character("o".into()));
+        assert_eq!(keys[0].text.as_deref(), Some("o"));
+        assert_eq!(keys[0].code, KeyCode(0), "57344 is not a US key");
+        assert!(keys[2].modifiers.shift && keys[2].key == Key::Character("j".into()));
+        assert!(!keys[3].modifiers.shift);
+        assert_eq!(keys[4].key, Key::Named("Enter".into()));
+        assert!(keys[6].modifiers.shift && keys[6].key == Key::Named("Tab".into()));
+        assert_eq!(keys[8].key, Key::Named("Backspace".into()));
+        assert!(keys[10].modifiers.control && keys[10].text.is_none());
+        assert_eq!(keys[10].key, Key::Character("l".into()));
+        assert!(keys[12].modifiers.control);
+        assert_eq!(keys[12].key, Key::Character("d".into()));
+        assert!(keys[14].modifiers.alt && keys[14].text.is_none());
+        assert_eq!(keys[14].key, Key::Character("1".into()));
+        assert_eq!(keys[16].text.as_deref(), Some(":"));
+        assert_eq!(keys[17].text.as_deref(), Some("+"));
+        assert!(!keys[16].consumed.shift && !keys[17].consumed.shift);
+        assert_eq!(keys[18].key, Key::Named("ArrowLeft".into()));
+        assert_eq!(keys[18].code, KeyCode(105));
+        assert_eq!(keys[20].key, Key::Named("F12".into()));
+        assert_eq!(summary(&keys).len(), 22);
+
+        // A PUA functional key, the form the table is for, and å.
+        let keys = kitty_keys_of(b"\x1b[57350u\x1b[57414u\x1b[229;1;229u");
+        assert_eq!(keys[0].key, Key::Named("ArrowLeft".into()));
+        assert_eq!(keys[0].code, KeyCode(105));
+        assert_eq!(keys[1].key, Key::Named("Enter".into()));
+        assert_eq!(keys[1].code, KeyCode(96));
+        assert_eq!(keys[2].text.as_deref(), Some("å"));
+    }
+
+    #[test]
+    fn a_release_without_its_press_is_dropped_and_repeats_are_held() {
+        // Pressed before sig started, or a press the terminal lost.
+        assert!(kitty_keys_of(b"\x1b[13;1:3u\x1b[1;1:3D").is_empty());
+        let keys = kitty_keys_of(b"\x1b[1;1:2D\x1b[1;1:2D\x1b[1;1:3D");
+        assert_eq!(keys.len(), 3);
+        assert!(keys[0].repeat && keys[1].repeat);
+        assert_eq!(keys[2].state, ButtonState::Released);
+        assert!(!keys[2].repeat);
+    }
+
+    #[test]
+    fn without_event_types_every_form_synthesizes_its_release() {
+        // No reply to `CSI ? u`: the terminal may not send releases.
+        let keys = keys_of(b"\x1b[13u\x1b[D\x1b[1;1:3D");
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        assert_eq!(keys[1].state, ButtonState::Released);
+        assert_eq!(keys[3].state, ButtonState::Released);
+        assert_eq!(keys[2].code, KeyCode(0), "legacy keys have no evdev code");
+    }
+
+    #[test]
+    fn legacy_upper_case_letters_are_shifted() {
+        let keys = keys_of(b"J:");
+        assert!(keys[0].modifiers.shift && keys[0].consumed.shift);
+        assert_eq!(keys[0].text.as_deref(), Some("J"));
+        assert!(!keys[2].modifiers.shift);
+    }
+
+    #[test]
+    fn a_location_line_typed_in_one_read_keeps_every_key() {
+        // `o`, then an address and Enter in the same read, as kitty sends them.
+        let mut bytes = Vec::new();
+        for ch in "ogoogle.com".chars() {
+            let code = ch as u32;
+            bytes.extend(format!("\x1b[{code};1;{code}u\x1b[{code};1:3u").bytes());
+        }
+        bytes.extend(b"\x1b[13u\x1b[13;1:3u");
+        let keys = kitty_keys_of(&bytes);
+        let typed: String = keys.iter().filter_map(|key| key.text.clone()).collect();
+        assert_eq!(typed, "ogoogle.com");
+        assert_eq!(keys.len(), 24);
+        assert_eq!(keys[22].key, Key::Named("Enter".into()));
     }
 }

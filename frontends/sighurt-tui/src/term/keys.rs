@@ -5,10 +5,18 @@
 //! types, and it is never a control character.
 //!
 //! Kitty's base-layout alternate selects the evdev code through a US QWERTY
-//! table. Without that alternate a character key is `KeyCode(0)`. Functional
-//! keys that kitty numbers (C0 9/13/27/127 and the private-use block) still
-//! get an evdev code. Legacy terminals never report a physical key, so their
-//! code stays 0, and each press is followed by a synthesized release.
+//! table. Without that alternate (Rio never sends one) a character key is
+//! `KeyCode(0)`. Functional keys that kitty numbers (C0 9/13/27/127 and the
+//! private-use block) still get an evdev code. Legacy terminals never report a
+//! physical key, so their code stays 0, and each press is followed by a
+//! synthesized release.
+//!
+//! An upper-case letter that arrives without Shift (a legacy byte, or Rio's
+//! `CSI 74 u` for a `J` keysym) is reported with Shift held and consumed, unless
+//! Caps Lock is on: that is how a layout makes it. Associated text that only
+//! repeats the key while Alt is held (Rio's `CSI 120;3;120 u` for Alt+x) is an
+//! Alt chord, which types nothing; text that differs from the key (an Option
+//! character) consumes Alt. The keypad's character keys are characters.
 //!
 //! Legacy `0x1e` is reported as Ctrl+`^` and `0x1f` as Ctrl+`_`, both with
 //! [`KeyEvent::ambiguous`] set. Those bytes are also Ctrl+6 and Ctrl+`-`.
@@ -101,27 +109,66 @@ pub(crate) enum KeyKind {
     Release,
 }
 
-/// A legacy press and the release synthesized immediately after it.
+/// A legacy press and the release synthesized immediately after it. An upper-case letter
+/// without Caps Lock is a shifted one.
 pub(crate) fn legacy_press(
     key: Key,
-    modifiers: Modifiers,
+    mut modifiers: Modifiers,
     ambiguous: bool,
     text: Option<String>,
 ) -> Vec<KeyEvent> {
+    let mut consumed = Modifiers::default();
+    if let Key::Character(ref shown) = key {
+        if !modifiers.caps_lock && upper_letter(shown) {
+            modifiers.shift = true;
+            consumed.shift = true;
+        }
+    }
     let press = KeyEvent {
         code: KeyCode(0),
         key,
         state: ButtonState::Pressed,
         repeat: false,
         modifiers,
-        consumed: Modifiers::default(),
+        consumed,
         text,
         ambiguous,
     };
-    let mut release = press.clone();
-    release.state = ButtonState::Released;
-    release.text = None;
+    let release = release_of(&press, modifiers);
     vec![press, release]
+}
+
+/// The release of `press`: the same key, the modifiers held when it went up, no text.
+pub(crate) fn release_of(press: &KeyEvent, modifiers: Modifiers) -> KeyEvent {
+    KeyEvent {
+        state: ButtonState::Released,
+        repeat: false,
+        modifiers,
+        text: None,
+        ..press.clone()
+    }
+}
+
+/// Shift produced `shown` from a different key, or `shown` is a symbol Shift is held on.
+/// A letter and a digit keep Shift: "J" and "shift-1" stay shifted. Space does too.
+fn layout_used_shift(shown: &str, unshifted: Option<&str>) -> bool {
+    if unshifted.is_some() && unshifted != Some(shown) {
+        return true;
+    }
+    let mut chars = shown.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => !ch.is_alphanumeric() && !ch.is_whitespace(),
+        _ => false,
+    }
+}
+
+/// One upper-case letter that has a lower case: "J", "Å", not "1" or "ß".
+fn upper_letter(text: &str) -> bool {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => ch.is_uppercase() && ch.to_lowercase().ne(ch.to_uppercase()),
+        _ => false,
+    }
 }
 
 /// One kitty `CSI u` event. No synthetic release: the terminal sends its own.
@@ -142,13 +189,23 @@ pub(crate) fn kitty_key(
     }
 
     let unshifted = char::from_u32(codepoint).filter(|ch| !ch.is_control());
-    let mut key = if let Some(name) = functional.map(|(name, _)| name) {
-        Key::Named(name.to_string())
-    } else if let Some(ch) = unshifted {
-        Key::Character(ch.to_string())
-    } else {
-        Key::Unidentified
+    let mut key = match functional.map(|(name, _)| name) {
+        // The keypad's digits and operators.
+        Some(name) if name.chars().count() == 1 => Key::Character(name.to_string()),
+        Some(name) => Key::Named(name.to_string()),
+        None => match unshifted {
+            Some(ch) => Key::Character(ch.to_string()),
+            None => Key::Unidentified,
+        },
     };
+
+    let mut consumed = Modifiers::default();
+    // An upper-case key without Shift: the terminal sent the keysym, not the key.
+    let upper = matches!(key, Key::Character(ref shown) if upper_letter(shown));
+    if upper && functional.is_none() && !modifiers.shift && !modifiers.caps_lock {
+        modifiers.shift = true;
+        consumed.shift = true;
+    }
 
     if modifiers.shift && functional.is_none() {
         if let Some(ch) = shifted.and_then(char::from_u32) {
@@ -160,17 +217,23 @@ pub(crate) fn kitty_key(
         }
     }
 
+    // Alt with text that is only the key itself: an Alt chord, which types nothing.
+    if modifiers.alt && text.is_some() && text_is_key(text.as_deref(), &key) {
+        text = None;
+    }
+
     if let Some(ref typed) = text {
         if !typed.is_empty() {
             key = Key::Character(typed.clone());
         }
     }
 
-    let mut consumed = Modifiers::default();
     if modifiers.shift {
         if let Key::Character(ref shown) = key {
             let plain = unshifted.map(|ch| ch.to_string());
-            if plain.as_deref() != Some(shown.as_str()) {
+            // A letter keeps Shift, so "J" still matches. Anything else Shift produced
+            // (":", "+", "!") must match the unshifted chord.
+            if layout_used_shift(shown, plain.as_deref()) {
                 consumed.shift = true;
             }
         }
@@ -218,6 +281,16 @@ pub(crate) fn kitty_modifiers(field: u32) -> Modifiers {
         caps_lock: bits & 64 != 0,
         num_lock: bits & 128 != 0,
         alt_graph: false,
+    }
+}
+
+/// Whether `text` is what `key` types without Alt, case aside when Caps Lock made it.
+fn text_is_key(text: Option<&str>, key: &Key) -> bool {
+    match (text, key) {
+        (Some(text), Key::Character(shown)) => {
+            text == shown || text.to_lowercase() == shown.to_lowercase()
+        }
+        _ => false,
     }
 }
 
@@ -294,12 +367,21 @@ pub(crate) fn us_evdev(ch: char) -> Option<u32> {
     })
 }
 
+/// The evdev code of a named key that kitty sends in a `CSI` letter or `~` form (Tab, the
+/// arrows, Home, End, paging, Insert, Delete, F1–F12, the keypad's middle key), or 0.
+pub(crate) fn named_evdev(name: &str) -> u32 {
+    (57348..=57375)
+        .chain([9, 13, 27, 127, 57427])
+        .filter_map(functional)
+        .find(|(known, _)| *known == name)
+        .map_or(0, |(_, evdev)| evdev)
+}
+
 /// Kitty's functional number, the W3C name, and the evdev code (0 if none).
 ///
-/// Numbers from 57348 through 57375 sit between the documented anchors
-/// `CAPS_LOCK` = 57358 and `F13` = 57376: Insert, Delete, the arrows, paging,
-/// Home, End, then F1–F12. The protocol table prints the legacy CSI form for
-/// those keys; these are the private-use numbers kitty sends inside `CSI u`.
+/// Kitty's private-use numbers for `CSI u`: Insert is 57348, Caps Lock 57358,
+/// F12 57375, F13 57376, then the keypad and media keys through 57454. The
+/// legacy CSI letter and `~` forms name the same keys.
 fn functional(code: u32) -> Option<(&'static str, u32)> {
     Some(match code {
         9 => ("Tab", 15),
@@ -471,5 +553,59 @@ mod tests {
         assert!(ev.consumed.shift);
         assert_eq!(ev.text.as_deref(), Some("A"));
         assert!(!ev.ambiguous);
+    }
+
+    #[test]
+    fn a_shifted_symbol_matches_its_unshifted_chord() {
+        // The codepoint is already "+" and Shift is still set: the layout used it.
+        let plus = kitty_key(
+            b'+' as u32,
+            None,
+            None,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            KeyKind::Press,
+            &[b'+' as u32],
+            false,
+        );
+        assert_eq!(plus.key, Key::Character("+".into()));
+        assert!(plus.consumed.shift);
+        assert_eq!(plus.text.as_deref(), Some("+"));
+
+        // A letter keeps Shift, including when the text is still the lower case.
+        let jay = kitty_key(
+            b'j' as u32,
+            None,
+            None,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            KeyKind::Press,
+            &[b'j' as u32],
+            false,
+        );
+        assert_eq!(jay.key, Key::Character("j".into()));
+        assert!(jay.modifiers.shift && !jay.consumed.shift);
+    }
+
+    #[test]
+    fn functional_table_covers_kitty_keys() {
+        assert_eq!(functional(13).unwrap().0, "Enter");
+        assert_eq!(functional(57348).unwrap(), ("Insert", 110u32));
+        assert_eq!(functional(57350).unwrap().0, "ArrowLeft");
+        assert_eq!(functional(57358).unwrap().0, "CapsLock");
+        assert_eq!(functional(57364).unwrap().0, "F1");
+        assert_eq!(functional(57375).unwrap().0, "F12");
+        assert_eq!(functional(57376).unwrap().0, "F13");
+        assert_eq!(functional(57387).unwrap().0, "F24");
+        assert_eq!(functional(57388).unwrap().1, 0, "F25 has no evdev code");
+        assert_eq!(functional(57404).unwrap().0, "5");
+        assert_eq!(functional(57414).unwrap(), ("Enter", 96u32));
+        assert_eq!(functional(57454).unwrap().0, "AltGraph");
+        assert!(functional(57347).is_none());
+        assert!(functional(57455).is_none());
     }
 }

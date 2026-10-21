@@ -32,6 +32,8 @@ const DA1: &[u8] = b"\x1b[c";
 /// Kitty graphics, cells of 10×20 pixels, and DA1. No kitty keyboard: keys arrive as a legacy
 /// terminal sends them.
 const REPLIES: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
+/// The same with the kitty keyboard flags `sig` pushes (31), as kitty and Rio answer.
+const KITTY_REPLIES: &[u8] = b"\x1b[?31u\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
 
 /// `sig --tui` on the slave side of a pty, and the fake terminal on the master side.
 struct Terminal {
@@ -43,6 +45,8 @@ struct Terminal {
     /// Everything `sig` wrote.
     got: Vec<u8>,
     answered: bool,
+    /// What the terminal answers the probe with.
+    replies: &'static [u8],
     dir: PathBuf,
     stop: Option<mpsc::Sender<()>>,
 }
@@ -50,6 +54,11 @@ struct Terminal {
 impl Terminal {
     /// Starts `sig --tui --diagnostics DIR/diag.json ARGS` with a configuration of its own.
     fn start(name: &str, args: &[&str]) -> Self {
+        Self::start_with(name, args, REPLIES)
+    }
+
+    /// [`Self::start`] for a terminal that answers the probe with `replies`.
+    fn start_with(name: &str, args: &[&str], replies: &'static [u8]) -> Self {
         let dir = std::env::temp_dir().join(format!("sig-tui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("config/sighurt")).unwrap();
@@ -101,6 +110,7 @@ impl Terminal {
             original,
             got: Vec::new(),
             answered: false,
+            replies,
             dir,
             stop: Some(stop),
         }
@@ -117,7 +127,7 @@ impl Terminal {
                     self.got.extend_from_slice(&buf[..n]);
                     if !self.answered && has(&self.got, DA1) {
                         self.answered = true;
-                        self.type_bytes(REPLIES);
+                        self.type_bytes(self.replies);
                     }
                     if done(&self.got[since.min(self.got.len())..]) {
                         return true;
@@ -191,6 +201,38 @@ impl Terminal {
         digits.parse().unwrap()
     }
 
+    /// The active tab (from 1) and the number of tabs, from a report `sig` writes on SIGUSR1.
+    fn tabs(&mut self) -> (u64, usize) {
+        let path = self.dir.join("diag.json");
+        let _ = fs::remove_file(&path);
+        // SAFETY: kill(2) on the child.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGUSR1) };
+        let start = Instant::now();
+        loop {
+            self.wait(self.got.len(), Duration::from_millis(20), |_| false);
+            let json = fs::read_to_string(&path).unwrap_or_default();
+            if let (Some(active), Some(tabs)) =
+                (json.find("\"active_tab\":"), json.find("\"tabs\":"))
+            {
+                let digits: String = json[active + 13..]
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                // Each tab's report has one "reloads".
+                let count = json[tabs..].matches("\"reloads\"").count();
+                if let Ok(active) = digits.parse() {
+                    return (active, count);
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "no report\n{}",
+                self.context()
+            );
+        }
+    }
+
     /// The terminal is as it was: alternate screen left, termios back.
     fn assert_restored(&self) {
         assert!(
@@ -237,6 +279,48 @@ fn has(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// Whether `text` is on the screen. A space the grid diff left unchanged is `CSI C`, not `0x20`.
+fn shows(bytes: &[u8], text: &str) -> bool {
+    let mut shown = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            if bytes.get(i..i + 3) == Some(b"\x1b[C") {
+                shown.push(' ');
+                i += 3;
+                continue;
+            }
+            i += 1;
+            match bytes.get(i) {
+                Some(b'[') => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                Some(b']' | b'_') => {
+                    i += 1;
+                    while i < bytes.len()
+                        && bytes[i] != 0x07
+                        && bytes.get(i..i + 2) != Some(b"\x1b\\")
+                    {
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let byte = bytes[i];
+        if byte.is_ascii_graphic() || byte == b' ' {
+            shown.push(byte as char);
+        }
+        i += 1;
+    }
+    shown.contains(text)
 }
 
 /// A kitty image transmission placed over `columns`×`rows` cells, `width`×`height` pixels.
@@ -368,4 +452,135 @@ fn sigterm_quits_and_restores_the_terminal() {
         frames <= FPS * seconds,
         "{frames} frames in {seconds} s, above {FPS} a second"
     );
+}
+
+/// `text` as Rio sends it with the kitty keyboard protocol on: each key a press (with its text)
+/// and a release, in `CSI u`, and Enter, Escape and Left as named keys.
+fn kitty_keys(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for ch in text.chars() {
+        let key = match ch {
+            '\r' => "\x1b[13u\x1b[13;1:3u".to_owned(),
+            '\x1b' => "\x1b[27u\x1b[27;1:3u".to_owned(),
+            // Left, as kitty and Rio send it: the press bare, the release with its event type.
+            '←' => "\x1b[D\x1b[1;1:3D".to_owned(),
+            'A'..='Z' => {
+                let (code, shifted) = (ch.to_ascii_lowercase() as u32, ch as u32);
+                format!("\x1b[{code}:{shifted};2;{shifted}u\x1b[{code}:{shifted};2:3u")
+            }
+            _ => {
+                let code = ch as u32;
+                format!("\x1b[{code};1;{code}u\x1b[{code};1:3u")
+            }
+        };
+        out.extend(key.into_bytes());
+    }
+    out
+}
+
+#[test]
+fn kitty_keys_open_addresses_tabs_and_quit() {
+    let mut term = Terminal::start_with("kitty-keys", &["demo://pattern"], KITTY_REPLIES);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440) && has(got, b"[1/1]")
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    let pattern = images(&term.got).last().unwrap().to_vec();
+
+    // `o`, an address and Enter in one write: every key after `o` goes to the address line.
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("odemo://resize\r"));
+    let navigated = term.wait(since, Duration::from_secs(10), |got| {
+        images(got).iter().any(|pixels| *pixels != pattern)
+    });
+    assert!(navigated, "the address was not opened\n{}", term.context());
+
+    // Left moves the cursor once per key press, not once more for its release: "pattrn",
+    // Left, Left, "e" is "pattern".
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("odemo://pattrn←←e\r"));
+    let back = term.wait(since, Duration::from_secs(10), |got| {
+        images(got).last().is_some_and(|pixels| *pixels == pattern)
+    });
+    assert!(
+        back,
+        "the edited address was not demo://pattern\n{}",
+        term.context()
+    );
+
+    // `t` opens a tab with the address line open; Escape closes it, `J` and `K` switch.
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("t"));
+    let opened = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "sig: pages aren't shown in the terminal yet")
+    });
+    assert!(opened, "`t` opened no tab\n{}", term.context());
+    assert_eq!(term.tabs(), (2, 2));
+    for (keys, active) in [("\x1bJ", 1), ("K", 2)] {
+        term.type_bytes(&kitty_keys(keys));
+        let start = Instant::now();
+        while term.tabs().0 != active {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "{keys:?} did not switch to tab {active}\n{}",
+                term.context()
+            );
+        }
+    }
+
+    term.type_bytes(&kitty_keys("q"));
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+}
+
+#[test]
+fn a_kitty_address_typed_in_one_write_opens_google() {
+    // This build has no servo, so the navigation fails. The failure names the address that was
+    // submitted: `https://oogle.com` would mean the `g` reached the page instead of the line.
+    let mut term = Terminal::start_with("kitty-google", &["demo://pattern"], KITTY_REPLIES);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440) && has(got, b"[1/1]")
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("ogoogle.com\r"));
+    let opened = term.wait(since, Duration::from_secs(10), |got| {
+        has(got, b"https://google.com")
+    });
+    assert!(opened, "google.com was not opened\n{}", term.context());
+    let tail = &term.got[since..];
+    assert!(
+        !has(tail, b"https://oogle.com"),
+        "the g was lost\n{}",
+        term.context()
+    );
+}
+
+#[test]
+fn a_legacy_terminal_types_an_address_in_one_write() {
+    let mut term = Terminal::start("legacy-keys", &["demo://pattern"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    let pattern = images(&term.got).last().unwrap().to_vec();
+    let since = term.got.len();
+    term.type_bytes(b"odemo://resize\r");
+    let navigated = term.wait(since, Duration::from_secs(10), |got| {
+        images(got).iter().any(|pixels| *pixels != pattern)
+    });
+    assert!(navigated, "the address was not opened\n{}", term.context());
+    term.type_bytes(b"q");
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
 }

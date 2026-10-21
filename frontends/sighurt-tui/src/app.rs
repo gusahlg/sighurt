@@ -49,7 +49,7 @@ use sighurt_api::input::{
 use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_api::settings::Table;
 use sighurt_core::config::{GraphicsProtocol, TuiConfig, TuiMode, TERMINAL_CHROME_COMMANDS};
-use sighurt_core::tabs::{Content, TabSummary};
+use sighurt_core::tabs::{Content, LoadError, TabSummary};
 use sighurt_core::{
     BrowserEvent, BrowserState, ChromeChecks, Frontend as FrontendKind, OpenRequest,
 };
@@ -86,6 +86,8 @@ const NO_TEXT: &str = "Text mode isn't built yet";
 const TOO_BIG: &str = "The page area is too big for an image";
 /// The page rows' message for a `sig:` page.
 const INTERNAL: &str = "sig: pages aren't shown in the terminal yet";
+/// The most characters of an address the page rows' loading message shows.
+const MESSAGE_URL: usize = 256;
 /// The chromes the window has, by name. The terminal ignores `[ui] chrome` and `[chrome.*]`,
 /// but one configuration file serves both frontends, so it accepts what the window would.
 /// The window checks those tables; here they are taken as they are.
@@ -158,6 +160,9 @@ struct Tui {
     next_image: u32,
     /// The address line, while `location.focus` has it.
     editing: Option<LineEditor>,
+    /// The address line opened during this run of the core and nothing was typed into it yet:
+    /// it starts from the active tab's address as the run left it (`tab.new` opens it).
+    editing_fresh: bool,
     /// The active tab's address when the core last ran, for the address line to start from.
     active_url: String,
     notice: Option<String>,
@@ -422,6 +427,7 @@ impl App {
             views: HashMap::new(),
             next_image: 1,
             editing: None,
+            editing_fresh: false,
             active_url: String::new(),
             notice: None,
             notice_first: None,
@@ -472,11 +478,19 @@ impl App {
         self.run_core();
     }
 
-    /// Hands the queued events to the core. The address line starts from the active tab's
-    /// address as it was before them.
+    /// Hands the queued events to the core. An address line they opened starts from the active
+    /// tab's address as they left it, unless something was typed into it meanwhile.
     fn run_core(&mut self) {
         self.tui.active_url = active_url(self.session.core());
         self.session.run_core(&mut self.tui);
+        if std::mem::take(&mut self.tui.editing_fresh) {
+            let url = active_url(self.session.core());
+            if url != self.tui.active_url {
+                self.tui.active_url = url;
+                self.tui.open_address();
+                self.tui.editing_fresh = false;
+            }
+        }
     }
 
     /// One iteration of the loop, after it woke. Returns whether work is left that shouldn't
@@ -673,6 +687,7 @@ impl App {
         }
         if let Some(editor) = &mut self.tui.editing {
             editor.paste(&text);
+            self.tui.editing_fresh = false;
             self.tui.chrome_dirty = true;
             return None;
         }
@@ -877,21 +892,60 @@ impl App {
 
     /// What the page rows say instead of showing an image, if anything.
     fn page_message(&self) -> Option<String> {
-        let core = self.session.core();
-        let tab = core.tabs().nth(core.active())?;
-        match tab.content {
-            Content::Blank => tab.error.map(|error| error.message.clone()),
-            Content::Internal(_) => Some(INTERNAL.into()),
-            Content::View(_) if self.tui.graphics => None,
-            Content::View(_) => Some(
+        enum Kind {
+            Blank,
+            Internal,
+            View,
+        }
+        let (kind, error, loading) = {
+            let core = self.session.core();
+            let tab = core.tabs().nth(core.active())?;
+            let error = tab.error.map(error_line);
+            let loading = match (tab.loading, tab.requested) {
+                (true, Some(url)) => Some(url.chars().take(MESSAGE_URL).collect::<String>()),
+                _ => None,
+            };
+            let kind = match tab.content {
+                Content::Blank => Kind::Blank,
+                Content::Internal(_) => Kind::Internal,
+                Content::View(_) => Kind::View,
+            };
+            (kind, error, loading)
+        };
+        match kind {
+            Kind::Blank => match (error, loading) {
+                (Some(error), _) => Some(error),
+                // A new tab's first page, until it has something to show.
+                (None, Some(url)) => Some(format!("Loading {url}…")),
+                (None, None) => None,
+            },
+            Kind::Internal => Some(error.unwrap_or_else(|| INTERNAL.into())),
+            // A frame covers these rows. With none, they would be empty: say what failed.
+            Kind::View if self.tui.graphics && self.shown_has_frame() => None,
+            Kind::View if self.tui.graphics => error,
+            Kind::View => Some(error.unwrap_or_else(|| {
                 match self.tui.settings.mode {
                     TuiMode::Text => NO_TEXT,
                     _ if self.tui.can_show_images() => TOO_BIG,
                     _ => NO_GRAPHICS,
                 }
-                .into(),
-            ),
+                .into()
+            })),
         }
+    }
+
+    /// Whether the shown view has a frame for this layout, so the page rows are not empty.
+    fn shown_has_frame(&self) -> bool {
+        let Some((_, target)) = self.shown() else {
+            return false;
+        };
+        let Some(pixels) = self.tui.targets.get(&target) else {
+            return false;
+        };
+        pixels
+            .handle
+            .with_frame(self.tui.metrics.epoch(), |_| ())
+            .is_some()
     }
 
     /// The chrome's lines, from the same facts the window's snapshot has. Contained by the
@@ -903,18 +957,22 @@ impl App {
             .map(|tab| TabLine {
                 engine: tab_engine(core, &tab).map(str::to_owned),
                 title: tab.title.into_owned(),
-                url: tab.url.unwrap_or_default().to_owned(),
+                // What it is loading until something commits: a new tab's first page.
+                url: tab.url.or(tab.requested).unwrap_or_default().to_owned(),
                 loading: tab.loading,
             })
             .collect();
         let active = core.active();
+        let error_text = core
+            .tabs()
+            .nth(active)
+            .and_then(|tab| tab_error(&tab).map(error_line));
         let status = core.tabs().nth(active).and_then(|tab| {
-            let error = tab_error(&tab);
             status_line(
                 self.tui.notice.as_deref(),
                 self.tui.notice_first.is_some(),
                 tab.status,
-                error,
+                error_text.as_deref(),
             )
         });
         let (notice, status) = match status {
@@ -1136,10 +1194,12 @@ impl Tui {
         let mut editor = LineEditor::from_text(self.active_url.as_str());
         editor.select_all();
         self.editing = Some(editor);
+        self.editing_fresh = true;
         self.chrome_dirty = true;
     }
 
     fn close_address(&mut self) {
+        self.editing_fresh = false;
         if self.editing.take().is_some() {
             self.chrome_dirty = true;
         }
@@ -1153,6 +1213,7 @@ impl Tui {
         if event.state == ButtonState::Released {
             return;
         }
+        self.editing_fresh = false;
         // Control as a modifier, not as a key the layout used to make a character.
         let word = event.modifiers.control && !event.consumed.control;
         // Alt the same way: a shortcut the core didn't bind types nothing.
@@ -1299,6 +1360,7 @@ impl Frontend for Tui {
             }) => {
                 if let Some(editor) = &mut self.editing {
                     editor.insert(&text);
+                    self.editing_fresh = false;
                     self.chrome_dirty = true;
                 }
             }
@@ -1400,9 +1462,19 @@ fn tab_engine<'a>(core: &'a BrowserState, tab: &TabSummary<'_>) -> Option<&'a st
 
 /// Why `tab`'s navigation failed, for the bottom line: unless the page rows say it, as they do
 /// for a tab with nothing else to show ([`App::page_message`]), as the window's page area does.
-fn tab_error<'a>(tab: &TabSummary<'a>) -> Option<&'a str> {
-    let error = tab.error.filter(|_| !matches!(tab.content, Content::Blank));
-    error.map(|error| error.message.as_str())
+fn tab_error<'a>(tab: &TabSummary<'a>) -> Option<&'a LoadError> {
+    tab.error.filter(|_| !matches!(tab.content, Content::Blank))
+}
+
+/// The error, and the address that failed when the message does not already name it.
+fn error_line(error: &LoadError) -> String {
+    match error.url.as_deref() {
+        Some(url) if !url.is_empty() && !error.message.contains(url) => {
+            let url: String = url.chars().take(MESSAGE_URL).collect();
+            format!("{} ({url})", error.message)
+        }
+        _ => error.message.clone(),
+    }
 }
 
 /// What the bottom line shows, and where it comes from, as the window's status strip: a notice
@@ -1476,12 +1548,12 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
         .collect();
     let active_tab = core.active() + 1;
     let status = core.tabs().nth(core.active()).and_then(|tab| {
-        let error = tab_error(&tab);
+        let error_text = tab_error(&tab).map(error_line);
         status_line(
             tui.notice.as_deref(),
             tui.notice_first.is_some(),
             tab.status,
-            error,
+            error_text.as_deref(),
         )
         .map(|(from, _)| from)
     });
