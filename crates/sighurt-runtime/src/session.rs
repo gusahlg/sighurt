@@ -308,8 +308,9 @@ impl<F: Frontend> Session<F> {
         let runtime = self.registry.running(engine).expect("started above");
         let opened = runtime.open_view(view, options, target);
         if opened.is_err() {
-            // The engine dropped the target; the next placement leaves it out.
-            self.views.remove(&view);
+            // The engine dropped the target, and no `ViewClosed` follows a refused open: the
+            // frontend forgets the target now, and the next placement leaves it out.
+            self.forget_view(frontend, view);
         }
         opened
     }
@@ -691,4 +692,156 @@ pub fn exit_now(code: ExitCode) -> ! {
     // handler running: the session file and the diagnostics are written and closed, and the
     // downloads have ended or their files are deleted. The frontend has restored what it must.
     unsafe { libc::_exit(status) }
+}
+
+#[cfg(all(test, feature = "engine-demo"))]
+mod tests {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::Arc;
+
+    use sighurt_api::engine::{
+        EngineCapabilities, EngineCommand, EngineError, EngineRuntime, PresentOutcome, PumpStatus,
+        ViewOptions,
+    };
+    use sighurt_api::events::{Cursor, EngineEvent};
+    use sighurt_api::ids::{RequestId, TargetId, ViewId};
+    use sighurt_api::input::{InputEvent, KeyboardFocus, TextInputState};
+    use sighurt_api::services::{ClipboardData, Selection, ServiceError};
+    use sighurt_core::config::Config;
+    use sighurt_core::{BrowserEvent, BrowserState};
+
+    use super::Session;
+    use crate::diagnostics::Diagnostics;
+    use crate::frontend::Frontend;
+    use crate::persistence::Paths;
+    use crate::registry::{Engine, Registry, Running, Runtime};
+    use crate::services::{Clipboard, Services};
+    use crate::view::ViewEntry;
+
+    /// An engine that refuses every view, as Servo does when it can't make a GL context.
+    struct Refusing;
+
+    impl EngineRuntime for Refusing {
+        type Target = ();
+        type FramePermit = ();
+
+        fn capabilities(&self) -> EngineCapabilities {
+            EngineCapabilities::default()
+        }
+
+        fn open_view(&mut self, view: ViewId, _: ViewOptions, _: ()) -> Result<(), EngineError> {
+            Err(EngineError::View {
+                view,
+                message: "no GL context".into(),
+            })
+        }
+
+        fn command(&mut self, view: ViewId, _: EngineCommand) -> Result<(), EngineError> {
+            Err(EngineError::UnknownView(view))
+        }
+
+        fn pump(&mut self, _: &mut Vec<EngineEvent>) -> PumpStatus {
+            PumpStatus::Idle
+        }
+
+        fn present(&mut self, view: ViewId, _: ()) -> Result<PresentOutcome, EngineError> {
+            Err(EngineError::UnknownView(view))
+        }
+
+        fn close_view(&mut self, _: ViewId) {}
+
+        fn shutdown(&mut self) {}
+    }
+
+    impl Running<(), ()> for Refusing {}
+
+    /// Keeps a record per target, as the terminal frontend does, and counts what it forgets.
+    #[derive(Default)]
+    struct Recording {
+        targets: BTreeMap<TargetId, ViewId>,
+        forgotten: Vec<TargetId>,
+    }
+
+    impl Clipboard for Recording {
+        fn read(&mut self, _: RequestId, _: Selection, _: &[String], _: usize) {}
+
+        fn write(&mut self, _: Selection, _: Vec<ClipboardData>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn cancel(&mut self, _: RequestId) {}
+    }
+
+    impl Frontend for Recording {
+        type Target = ();
+        type Permit = ();
+
+        fn open_target(&mut self, view: ViewId, _: &str) -> Result<(TargetId, ()), String> {
+            let target = TargetId::next();
+            self.targets.insert(target, view);
+            Ok((target, ()))
+        }
+
+        fn place(&mut self, _: &BTreeMap<ViewId, ViewEntry>, _: &mut Diagnostics) -> bool {
+            false
+        }
+
+        fn forget_target(&mut self, target: TargetId) {
+            self.targets.remove(&target);
+            self.forgotten.push(target);
+        }
+
+        fn focus(&mut self, _: KeyboardFocus, _: &mut VecDeque<BrowserEvent>) {}
+        fn chrome_input(&mut self, _: InputEvent, _: &mut VecDeque<BrowserEvent>) {}
+        fn chrome_command(&mut self, _: String, _: &mut VecDeque<BrowserEvent>) {}
+        fn page_cursor(&mut self, _: Option<TargetId>, _: Cursor) {}
+        fn page_text_input(&mut self, _: Option<TargetId>, _: Option<TextInputState>) {}
+        fn notice(&mut self, _: String) {}
+        fn redraw(&mut self) {}
+        fn show(&mut self, _: ViewId, _: bool) {}
+        fn frame_ready(&mut self, _: TargetId) {}
+        fn before_forced_exit(&mut self) {}
+    }
+
+    #[test]
+    fn a_refused_open_forgets_the_frontends_target() {
+        let registry = Registry::new(vec![Engine::new(
+            "demo",
+            EngineCapabilities::default(),
+            "cpu",
+            &[],
+            |_, _| Ok(Runtime::Demo(Box::new(Refusing))),
+        )]);
+        let env = registry.environment(Vec::new(), &[]);
+        let text = "version = 1\n[engines]\ndefault = \"demo\"\nenabled = [\"demo\"]";
+        let config = Config::parse(Some(text), &env).expect("config");
+        let mut session = Session::<Recording>::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            Services::new(|| {}),
+            Paths {
+                config: None,
+                session: None,
+            },
+            None,
+            Diagnostics::new(None),
+            Arc::new(|| {}),
+        );
+        let mut frontend = Recording::default();
+        let view = ViewId::next();
+
+        let opened = session.open_view(&mut frontend, view, "demo", ViewOptions::default());
+
+        assert!(
+            matches!(opened, Err(EngineError::View { .. })),
+            "{opened:?}"
+        );
+        assert_eq!(frontend.forgotten.len(), 1, "forget_target once");
+        assert!(frontend.targets.is_empty(), "no target record is left");
+        assert!(session.views.is_empty(), "no view entry is left");
+        // A second forget finds nothing to forget.
+        session.forget_view(&mut frontend, view);
+        assert_eq!(frontend.forgotten.len(), 1);
+    }
 }
