@@ -330,21 +330,23 @@ impl Session {
     /// Send the startup queries and collect replies until DA1 or `deadline`.
     ///
     /// A read happens only after `poll` says the fd is readable, and only for
-    /// the time still inside `deadline`. `O_NONBLOCK` is put back first: a
-    /// panic used to clear it and turn the follow-up `read` into a blocking
-    /// canonical read. A terminal that never answers cannot stall this past
-    /// the deadline.
+    /// the time still inside `deadline`. The timeout is sampled after
+    /// `prepare_read`: those `fcntl` calls can outlast the time remaining, and
+    /// a timeout chosen earlier would let `poll` run past the deadline.
+    /// `O_NONBLOCK` is put back first: a panic used to clear it and turn the
+    /// follow-up `read` into a blocking canonical read. A terminal that never
+    /// answers cannot stall this past the deadline.
     pub fn probe(&mut self, deadline: Duration) -> io::Result<Caps> {
         self.write_frame(QUERIES)?;
         let start = std::time::Instant::now();
         let mut caps = Caps::default();
         let mut saw_da1 = false;
         loop {
-            let remaining = deadline.saturating_sub(start.elapsed());
-            let wait = if saw_da1 { Duration::ZERO } else { remaining };
             if !self.prepare_read()? {
                 break;
             }
+            let remaining = deadline.saturating_sub(start.elapsed());
+            let wait = if saw_da1 { Duration::ZERO } else { remaining };
             if !wait_readable(&self.fd, wait)? {
                 break;
             }

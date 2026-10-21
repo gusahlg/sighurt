@@ -229,6 +229,38 @@ fn reply_after(master: OwnedFd, delay: Duration, bytes: &'static [u8]) -> thread
     })
 }
 
+/// Bounds a missing answer. Not an ordering device: the helper writes only
+/// after it has read the probe's query batch.
+const BATCH_BOUND: Duration = Duration::from_secs(4);
+
+struct QueryReply {
+    /// When the reply bytes had been accepted by the master.
+    wrote: mpsc::Receiver<Instant>,
+    thread: thread::JoinHandle<()>,
+}
+
+/// Write `bytes` once the probe's query batch (`CSI 14 t`, then DA1) is on
+/// `master`. The probe is what unblocks the write.
+fn reply_when_queried(master: OwnedFd, bytes: &'static [u8]) -> QueryReply {
+    let (tx, rx) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        // A panic here would run the session hook on this thread.
+        if wait_for(&master, b"\x1b[14t\x1b[c", BATCH_BOUND).is_err() {
+            return;
+        }
+        if try_write_all(&master, bytes) {
+            let _ = tx.send(Instant::now());
+        }
+    });
+    QueryReply { wrote: rx, thread }
+}
+
+impl QueryReply {
+    fn join(self) {
+        self.thread.join().expect("reply thread");
+    }
+}
+
 fn drain_for(master: &OwnedFd, timeout: Duration) -> Vec<u8> {
     let start = Instant::now();
     let mut got = Vec::new();
@@ -458,11 +490,27 @@ fn probe_accepts_an_immediate_batch() {
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
     let master_for_reply = master.try_clone().expect("dup master");
-    let reply = reply_after(master_for_reply, Duration::ZERO, IMMEDIATE_REPLIES);
+    let reply = reply_when_queried(master_for_reply, IMMEDIATE_REPLIES);
     let mut session = Terminal::enter(slave).expect("enter");
+    // [`PROBE_DEADLINE`] is 150 ms. The helper can easily miss that while it
+    // waits to be scheduled, so this bound only fails a terminal that never
+    // answers. Returning before it means the batch ended the probe.
     let start = Instant::now();
-    let caps = session.probe(PROBE_DEADLINE).expect("probe").clone();
-    assert!(start.elapsed() < PROBE_DEADLINE);
+    let caps = session.probe(BATCH_BOUND).expect("probe").clone();
+    let returned = Instant::now();
+    let wrote = reply
+        .wrote
+        .recv_timeout(BATCH_BOUND)
+        .expect("the batch was written");
+    let elapsed = returned.saturating_duration_since(start);
+    let since_write = returned.saturating_duration_since(wrote);
+    // `wrote` is after the kernel accepted the batch. Lingering until
+    // `BATCH_BOUND` would mean the probe ignored it. Waking a few hundred
+    // milliseconds late under load still passes.
+    assert!(
+        since_write < Duration::from_secs(3) && elapsed < BATCH_BOUND + Duration::from_secs(1),
+        "probe took {elapsed:?}, {since_write:?} after the batch (bound {BATCH_BOUND:?})"
+    );
     assert_eq!(caps.da1.as_deref(), Some(&[62, 4][..]));
     assert!(caps.sixel);
     assert_eq!(caps.kitty_keyboard, Some(31));
@@ -477,7 +525,7 @@ fn probe_accepts_an_immediate_batch() {
     assert_eq!(session.size().cell_width, 10);
     assert_eq!(session.size().cell_height, 20);
     session.restore().expect("restore");
-    reply.join().expect("reply thread");
+    reply.join();
 }
 
 #[test]
@@ -485,18 +533,16 @@ fn probe_keeps_a_late_reply_as_a_reply() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
-    let master_for_reply = master.try_clone().expect("dup master");
-    let reply = reply_after(master_for_reply, Duration::from_millis(120), b"\x1b[?62;4c");
     let mut session = Terminal::enter(slave).expect("enter");
     let start = Instant::now();
-    let caps = session.probe(Duration::from_millis(40)).expect("probe");
+    // No answer exists until this returns. "Late" is that fact, not a sleep
+    // that might not have started yet.
+    let deadline = Duration::from_millis(40);
+    let caps = session.probe(deadline).expect("probe");
     let elapsed = start.elapsed();
     assert!(caps.da1.is_none(), "late DA1 was absorbed: {caps:?}");
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "probe waited {elapsed:?}"
-    );
-    thread::sleep(Duration::from_millis(150));
+    assert!(elapsed < Duration::from_secs(2), "probe waited {elapsed:?}");
+    write_all(&master, b"\x1b[?62;4c");
     let inputs = session.read_events().expect("read");
     assert!(
         inputs
@@ -511,7 +557,6 @@ fn probe_keeps_a_late_reply_as_a_reply() {
     );
     assert_eq!(session.capabilities().da1.as_deref(), Some(&[62, 4][..]));
     session.restore().expect("restore");
-    reply.join().expect("reply thread");
 }
 
 #[test]
