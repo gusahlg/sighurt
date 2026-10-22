@@ -3496,3 +3496,14 @@ Newest last. Each entry says what was decided and why.
     frames are taken gave an empty snapshot at "no room". Evidence is the `sig --dump` change that
     did the same (49d73a7, bench/compat/dump corpus on WPE): youtube 3 to 302 words, archive.org
     error to 565 words, 35 OK / 2 thin / 2 empty / 1 error to 38 / 1 / 1 / 0.
+106. **Sighurt 0.8.0 is released from `rewrite` before the last verification runs finish** (the
+    user, 22 October 2026: "make the new release right now and then let the patches land
+    afterwards"). `main` fast-forwards to `rewrite` at the version bump. Verified at release:
+    the non-Servo suites, the terminal frontend's unit and pty tests (no Servo), the semantic
+    crate and WPE semantic test, the core; Servo 0.7 built here and on louise-pc with build,
+    clippy and engine tests. Still running and landing afterwards as patches: the full
+    pre-commit list with Servo on this desktop, `real-terminals.sh`, `engines.sh` and the
+    40-site corpus with webcrypto on (louise-pc), and the IntersectionObserver record (it
+    stays on: microsoft.com presents more frames with it, at the same CPU, while github.com
+    freezes without it). `sighurt-sdk` keeps its own version (0.7.0): the guest ABI did not
+    change.
