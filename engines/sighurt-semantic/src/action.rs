@@ -14,6 +14,11 @@ const TEMPLATE: &str = r#"(function () {
   var create = Object.create;
   var getOwn = Object.getOwnPropertyDescriptor;
   var mapGet = Map.prototype.get;
+  var elMatches = null;
+  try {
+    var matchDesc = (typeof Element === "function") && getOwn(Element.prototype, "matches");
+    if (matchDesc && typeof matchDesc.value === "function") elMatches = matchDesc.value;
+  } catch (matchErr) { elMatches = null; }
   function result(ok, why) {
     var out = create(null);
     out.ok = ok;
@@ -21,13 +26,33 @@ const TEMPLATE: &str = r#"(function () {
     return stringify(out);
   }
   function fail(why) { return result(false, why); }
+  function effectivelyDisabled(el) {
+    if (!el) return true;
+    try {
+      var fn = elMatches;
+      if (typeof fn !== "function") fn = el.matches;
+      if (typeof fn === "function") return fn.call(el, ":disabled") === true;
+    } catch (e) { return true; }
+    try { return el.disabled === true; }
+    catch (e2) { return true; }
+  }
   function blocked() {
-    try { if (node.disabled === true) return "disabled"; }
-    catch (e) { return "disabled"; }
+    if (effectivelyDisabled(node)) return "disabled";
     try {
       if (typeof node.getAttribute === "function" && node.getAttribute("aria-disabled") === "true") return "disabled";
     } catch (e2) { return "disabled"; }
     return "";
+  }
+  function optionBlocked(option) {
+    if (effectivelyDisabled(option)) return true;
+    var parent = null;
+    try { parent = option.parentNode; } catch (e) { return true; }
+    if (!parent) return false;
+    var tag = "";
+    try { tag = parent.tagName ? String(parent.tagName) : ""; }
+    catch (e2) { return true; }
+    if (tag !== "OPTGROUP") return false;
+    return effectivelyDisabled(parent);
   }
   function readOnly() {
     try { if (node.readOnly === true) return true; }
@@ -119,6 +144,9 @@ fn select_option(node: NodeId, index: u32) -> String {
     if (!node || node.tagName !== "SELECT" || !node.options) return fail("kind");
     var index = {index};
     if (!(index >= 0) || index >= node.options.length) return fail("range");
+    var option = null;
+    try {{ option = node.options[index]; }} catch (optErr) {{ return fail("range"); }}
+    if (!option || optionBlocked(option)) return fail("disabled");
     node.selectedIndex = index;
     if (typeof node.dispatchEvent === "function" && typeof Event === "function") {{
       node.dispatchEvent(new Event("change", {{ bubbles: true }}));

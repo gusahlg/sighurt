@@ -6,13 +6,17 @@
  *
  * One node per content element, parent before children. Ids come from a WeakMap and
  * are never recycled. A Map of WeakRefs, capped at twice MAX_NODES, lives on a
- * non-enumerable property of globalThis so a later action can find the node. There
- * is no strong-reference fallback: if WeakRef is missing, actions miss.
+ * non-enumerable property of globalThis so a later action can find the node. The
+ * cap is the map's own size. Evicting a stale id keeps fresh entries the scan
+ * skipped, so they stay counted and can be evicted later. There is no
+ * strong-reference fallback: if WeakRef is missing, actions miss.
  *
  * The walk is an explicit stack. It counts DOM depth, including elements that are
  * flattened, and it shares one budget for visited nodes, children of one element,
- * and characters read from the page. Label, text and option helpers use that
- * budget. Past a budget the snapshot is truncated; it is still JSON.
+ * and characters read from the page. Label, region and option helpers walk one
+ * child at a time under that same budget: no textContent, no option text or label
+ * getter, and no assignedNodes({flatten:true}). Past a budget the snapshot is
+ * truncated; it is still JSON.
  *
  * Records are null-prototype objects. The JSON is assembled by hand and strings
  * are escaped with the JSON.stringify captured at the start, so a page that
@@ -32,8 +36,8 @@
  * total, is dropped whole. The walk stops, and sets truncated, when a budget is exhausted.
  * Option lists stop at MAX_OPTIONS.
  *
- * Password field values are never read. A type that cannot be read is a password.
- * The flag is set and the value is left out.
+ * Password field values are never read. A type that is missing, not a string, or
+ * that cannot be read is a password. The flag is set and the value is left out.
  */
 (function () {
   "use strict";
@@ -59,6 +63,11 @@
   var mapSet = Map.prototype.set;
   var mapDelete = Map.prototype.delete;
   var mapForEach = Map.prototype.forEach;
+  var mapSizeGet = null;
+  try {
+    var sizeDesc = getOwn(Map.prototype, "size");
+    if (sizeDesc && typeof sizeDesc.get === "function") mapSizeGet = sizeDesc.get;
+  } catch (sizeErr) { mapSizeGet = null; }
   var arrJoin = Array.prototype.join;
   var strSlice = String.prototype.slice;
   var floor = Math.floor;
@@ -179,6 +188,17 @@
     return (again && again.value) || created;
   }
 
+  // -1 when the size getter is missing. Callers then fall back to the counter.
+  function revSize(map) {
+    if (map && typeof mapSizeGet === "function") {
+      try {
+        var n = mapSizeGet.call(map);
+        if (typeof n === "number" && n === n && n >= 0 && n !== Infinity) return n;
+      } catch (e) { /* fall through */ }
+    }
+    return -1;
+  }
+
   function derefOf(ref) {
     if (!ref || typeof ref.deref !== "function") return null;
     try { return ref.deref(); } catch (e) { return null; }
@@ -194,18 +214,23 @@
   }
 
   function compactOrder() {
-    if (state.orderAt > 1024 && state.orderAt * 2 > state.order.length) {
-      var next = [];
-      var n = 0;
-      for (var i = state.orderAt; i < state.order.length; i++) {
-        if (state.order[i] != null) next[n++] = state.order[i];
-      }
-      state.order = next;
-      state.orderAt = 0;
+    var order = state.order;
+    if (!order || order.length < 1024) return;
+    var next = [];
+    var n = 0;
+    var newAt = 0;
+    var at = state.orderAt || 0;
+    for (var i = 0; i < order.length; i++) {
+      if (i === at) newAt = n;
+      if (order[i] != null) next[n++] = order[i];
     }
+    if (at >= order.length) newAt = n;
+    state.order = next;
+    state.orderAt = newAt;
   }
 
-  // Previous generation first (not in state.fresh), then the oldest id of this walk.
+  // A stale id from a previous walk goes first. Fresh ids skipped on the way there
+  // stay in the order: advancing past them left them in the map and out of nrev.
   function dropOldest() {
     var order = state.order;
     var i = state.orderAt || 0;
@@ -218,7 +243,7 @@
       if (!ref) { order[i] = null; i++; continue; }
       if (!state.fresh || state.fresh[id] !== 1) {
         order[i] = null;
-        state.orderAt = i + 1;
+        state.orderAt = oldestFresh < 0 ? i + 1 : oldestFresh;
         forgetRef(id, ref);
         compactOrder();
         return true;
@@ -244,37 +269,62 @@
     state.fresh[id] = 1;
     var existing = null;
     try { existing = mapGet.call(state.rev, id); } catch (e) { existing = null; }
-    if (existing) return;
-    while (state.nrev >= REV_CAP) {
+    if (existing) {
+      var already = revSize(state.rev);
+      if (already >= 0) state.nrev = already;
+      return;
+    }
+    var guard = 0;
+    while (guard <= REV_CAP) {
+      guard++;
+      var held = revSize(state.rev);
+      if (held < 0) held = state.nrev;
+      if (held < REV_CAP) break;
       if (!dropOldest()) break;
     }
-    if (state.nrev >= REV_CAP) return;
+    var after = revSize(state.rev);
+    if (after < 0) after = state.nrev;
+    if (after >= REV_CAP) return;
     var ref = null;
     try { ref = new WeakRef(node); } catch (e2) { return; }
     try { mapSet.call(state.rev, id, ref); } catch (e3) { return; }
     state.order[state.order.length] = id;
-    state.nrev++;
+    var nowHeld = revSize(state.rev);
+    state.nrev = nowHeld < 0 ? after + 1 : nowHeld;
   }
 
   function prune(st) {
     var order = st.order || [];
-    var at = st.orderAt || 0;
     var kept = [];
     var n = 0;
-    for (var i = at; i < order.length; i++) {
+    var seen = blank();
+    for (var i = 0; i < order.length; i++) {
       var id = order[i];
-      if (id == null) continue;
+      if (id == null || seen[id] === 1) continue;
       var ref = null;
       try { ref = mapGet.call(st.rev, id); } catch (e) { ref = null; }
       if (!ref || !derefOf(ref)) {
         try { mapDelete.call(st.rev, id); } catch (e2) { /* gone */ }
         continue;
       }
+      seen[id] = 1;
       kept[n++] = id;
     }
+    // Ids that orderAt jumped over stay in the map and in no generation. Drop the
+    // map entry only. The WeakMap keeps the id so the node is not renumbered.
+    try {
+      var orphans = [];
+      mapForEach.call(st.rev, function (ref, id) {
+        if (seen[id] !== 1) orphans[orphans.length] = id;
+      });
+      for (var j = 0; j < orphans.length; j++) {
+        try { mapDelete.call(st.rev, orphans[j]); } catch (e3) { /* gone */ }
+      }
+    } catch (walk) { /* the map is not iterable */ }
     st.order = kept;
     st.orderAt = 0;
-    st.nrev = n;
+    var size = revSize(st.rev);
+    st.nrev = size < 0 ? n : size;
   }
 
   function fallback(st) {
@@ -323,7 +373,7 @@
     var result = "password";
     try {
       var raw = el.type;
-      if (typeof raw !== "string") result = (raw == null || raw === "") ? "text" : "password";
+      if (typeof raw !== "string") result = "password";
       else if (raw === "") result = "text";
       else if (raw.length > 64) result = "password";
       else result = lowerAscii(raw);
@@ -530,12 +580,83 @@
     return join(out);
   }
 
+  // Callers already charged the scan budget (readStr, boundedText, or attr).
+  // Charging it again drops the text once charsLeft is zero. This only collapses
+  // whitespace and charges the output budget. A missed caller still cannot
+  // publish more than MAX_STRING_BYTES.
   function fitLabel(text) {
     if (!text) return null;
-    var collapsed = trimEndSpaces(trimStartSpaces(collapseWs(readStr(text))));
+    var raw = asString(text);
+    if (raw.length > MAX_STRING_BYTES) {
+      truncated = true;
+      raw = slice(raw, 0, MAX_STRING_BYTES);
+    }
+    var collapsed = trimEndSpaces(trimStartSpaces(collapseWs(raw)));
     if (!collapsed) return null;
     var kept = takeDomText(collapsed, false);
     return kept || null;
+  }
+
+  function textFrame(node, depth) {
+    var fr = blank();
+    fr.node = node;
+    fr.index = 0;
+    fr.depth = depth;
+    fr.entered = false;
+    return fr;
+  }
+
+  // One child index at a time. textContent, option.text and a flattened slot list
+  // would copy the subtree before the caps apply.
+  function boundedText(root, skip) {
+    var parts = [];
+    var chars = 0;
+    var frames = [];
+    frames[0] = textFrame(root, 0);
+    while (frames.length) {
+      if (overBudget() || chars > MAX_STRING_BYTES) break;
+      var fr = frames[frames.length - 1];
+      var node = fr.node;
+      if (!node || node === skip) { frames.length = frames.length - 1; continue; }
+      if (!fr.entered) {
+        fr.entered = true;
+        if (!spendVisit()) break;
+        if (fr.depth > MAX_DEPTH) {
+          truncated = true;
+          frames.length = frames.length - 1;
+          continue;
+        }
+        var type = 0;
+        try { type = node.nodeType; } catch (e) { type = 0; }
+        if (type === 3 || type === 4) {
+          var bit = "";
+          try { bit = readStr(node.nodeValue || ""); } catch (e2) { bit = ""; }
+          if (bit) {
+            parts[parts.length] = bit;
+            chars += bit.length;
+          }
+          frames.length = frames.length - 1;
+          continue;
+        }
+        if (type !== 1) { frames.length = frames.length - 1; continue; }
+        if (SKIP[tagOf(node)]) { frames.length = frames.length - 1; continue; }
+      }
+      var kids = null;
+      try { kids = node.childNodes; } catch (e3) { kids = null; }
+      if (!kids) { frames.length = frames.length - 1; continue; }
+      var n = 0;
+      try { n = kids.length; } catch (e4) { n = 0; }
+      if (typeof n !== "number" || n !== n || n < 0) n = 0;
+      if (n > MAX_CHILDREN) { n = MAX_CHILDREN; truncated = true; }
+      if (fr.index >= n) { frames.length = frames.length - 1; continue; }
+      var child = null;
+      var at = fr.index;
+      fr.index = at + 1;
+      try { child = kids[at]; } catch (e5) { child = null; }
+      if (!child || child === skip) continue;
+      frames[frames.length] = textFrame(child, fr.depth + 1);
+    }
+    return join(parts);
   }
 
   function fitHref(absolute) {
@@ -683,9 +804,7 @@
       var target = null;
       try { target = doc.getElementById(slice(ids, start, i)); } catch (e) { target = null; }
       if (!target) continue;
-      var text = "";
-      try { text = target.textContent || ""; } catch (e2) { text = ""; }
-      text = readStr(text);
+      var text = boundedText(target, null);
       if (!text) continue;
       out[out.length] = text;
       chars += text.length;
@@ -845,32 +964,7 @@
   }
 
   function labelText(label, control) {
-    var parts = [];
-    var pending = [];
-    pending[0] = label;
-    var chars = 0;
-    while (pending.length) {
-      var node = pending[pending.length - 1];
-      pending.length = pending.length - 1;
-      if (!node || node === control || chars > MAX_STRING_BYTES) continue;
-      if (!spendVisit()) break;
-      var type = node.nodeType;
-      if (type === 3) {
-        var bit = readStr(node.nodeValue || "");
-        if (bit) {
-          parts[parts.length] = bit;
-          chars += bit.length;
-        }
-        continue;
-      }
-      if (type !== 1 || SKIP[tagOf(node)]) continue;
-      var kids = node.childNodes;
-      if (!kids) continue;
-      var n = kids.length;
-      if (n > MAX_CHILDREN) { n = MAX_CHILDREN; truncated = true; }
-      for (var i = n - 1; i >= 0; i--) pending[pending.length] = kids[i];
-    }
-    return join(parts);
+    return boundedText(label, control);
   }
 
   function fieldLabel(el) {
@@ -957,6 +1051,14 @@
     }
   }
 
+  function optionText(option) {
+    var text = boundedText(option, null);
+    if (text) return text;
+    var label = attrRaw(option, "label");
+    if (label == null || label === "") return "";
+    return readStr(asString(label));
+  }
+
   function fillSelect(el, obj) {
     var options = [];
     try { options = el.options || []; } catch (e) { options = []; }
@@ -965,10 +1067,10 @@
     try { limit = options.length; } catch (e2) { limit = 0; }
     if (limit > MAX_OPTIONS) { limit = MAX_OPTIONS; truncated = true; }
     for (var i = 0; i < limit; i++) {
-      if (used >= MAX_TOTAL_BYTES || charsLeft <= 0) { truncated = true; break; }
+      if (overBudget()) break;
       var text = "";
-      try { text = options[i].text || options[i].label || ""; } catch (e3) { text = ""; }
-      text = trimEndSpaces(trimStartSpaces(collapseWs(readStr(asString(text)))));
+      try { text = optionText(options[i]); } catch (e3) { text = ""; }
+      text = trimEndSpaces(trimStartSpaces(collapseWs(text)));
       out[out.length] = text ? takeDomText(text, false) : "";
     }
     obj.options = out;
@@ -1194,11 +1296,8 @@
     if (tag === "SLOT" && typeof el.assignedNodes === "function"
         && !(el.hasAttribute && (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true"))) {
       var assigned = [];
-      try {
-        var opt = blank();
-        opt.flatten = true;
-        assigned = el.assignedNodes(opt);
-      } catch (e) { assigned = []; }
+      try { assigned = el.assignedNodes(); }
+      catch (e) { assigned = []; }
       var list = (assigned && assigned.length) ? assigned : (el.childNodes || []);
       fr.nextStage = 1;
       pushList(list, fr.depth + 1, fr.inPre, fr.sectioning, fr.skipText, false);
@@ -1513,6 +1612,8 @@
     docFr.skipText = false;
     pushFrame(docFr);
     root.children = trimEdges(run());
+    var endSize = revSize(state.rev);
+    if (endSize >= 0) state.nrev = endSize;
     return publish(root.id, focusId(document));
   } catch (e) {
     return fallback(state);

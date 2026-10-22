@@ -67,6 +67,9 @@ fn actions_name_their_node_and_do_that_action() {
     assert!(select.contains("var index = 3;"));
     assert!(select.contains("selectedIndex"));
     assert!(select.contains("\"change\""));
+    assert!(activate.contains(":disabled"));
+    assert!(select.contains(":disabled"));
+    assert!(select.contains("OPTGROUP"));
 }
 
 #[test]
@@ -119,6 +122,7 @@ fn page_fixtures_are_present() {
         "landmarks.html",
         "huge-list.html",
         "harden.html",
+        "inherit.html",
     ] {
         let path = root.join(name);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path:?}: {err}"));

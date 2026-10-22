@@ -908,6 +908,94 @@ fn semantic_snapshots_and_actions_without_a_display() {
         session.show()
     );
 
+    open_page(
+        &mut session,
+        "inherit.html",
+        Duration::from_secs(20),
+        |snapshot| {
+            field(snapshot, NodeKind::TextField, "Inside")
+                .is_some_and(|node| node.value.as_deref() == Some("keep-fieldset"))
+                && field(snapshot, NodeKind::Select, "Choice").is_some_and(|node| {
+                    node.options.iter().any(|option| option == "Beta")
+                        && node.options.iter().any(|option| option == "Gamma")
+                        && node.selected == Some(0)
+                })
+                && field(snapshot, NodeKind::TextField, "Untyped").is_some_and(|node| node.password)
+                && !blob(snapshot).contains("SIGHURT_UNDEFINED_TYPE_SENTINEL")
+        },
+    );
+    let (document, inside, choice, beta, gamma) = {
+        let snapshot = session.latest.as_ref().expect("inherit snapshot");
+        let inside = must_field(snapshot, NodeKind::TextField, "Inside");
+        let choice = must_field(snapshot, NodeKind::Select, "Choice");
+        let beta = choice
+            .options
+            .iter()
+            .position(|option| option == "Beta")
+            .expect("Beta") as u32;
+        let gamma = choice
+            .options
+            .iter()
+            .position(|option| option == "Gamma")
+            .expect("Gamma") as u32;
+        assert!(
+            !blob(snapshot).contains("SIGHURT_UNDEFINED_TYPE_SENTINEL"),
+            "untyped input exported its value\n{}",
+            describe(snapshot)
+        );
+        (snapshot.document, inside.id, choice.id, beta, gamma)
+    };
+    session
+        .runtime
+        .command(
+            session.view,
+            EngineCommand::Semantic {
+                document,
+                action: SemanticAction::SetValue {
+                    node: inside,
+                    value: "changed-fieldset".to_owned(),
+                },
+            },
+        )
+        .unwrap_or_else(|error| panic!("set fieldset child: {error}"));
+    let fieldset_from = Instant::now();
+    while fieldset_from.elapsed() < Duration::from_millis(800) {
+        session.step();
+        let snapshot = session.latest.as_ref().expect("inherit snapshot");
+        assert_eq!(
+            field(snapshot, NodeKind::TextField, "Inside").and_then(|node| node.value.as_deref()),
+            Some("keep-fieldset"),
+            "fieldset child accepted SetValue\n{}",
+            describe(snapshot)
+        );
+    }
+    for index in [beta, gamma] {
+        session
+            .runtime
+            .command(
+                session.view,
+                EngineCommand::Semantic {
+                    document,
+                    action: SemanticAction::SelectOption {
+                        node: choice,
+                        index,
+                    },
+                },
+            )
+            .unwrap_or_else(|error| panic!("select {index}: {error}"));
+        let select_from = Instant::now();
+        while select_from.elapsed() < Duration::from_millis(800) {
+            session.step();
+            let snapshot = session.latest.as_ref().expect("inherit snapshot");
+            assert_eq!(
+                field(snapshot, NodeKind::Select, "Choice").and_then(|node| node.selected),
+                Some(0),
+                "selected a disabled option {index}\n{}",
+                describe(snapshot)
+            );
+        }
+    }
+
     let before = session.before.clone();
     drop(session);
     let left = webkit_procs(&before);

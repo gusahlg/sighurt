@@ -119,7 +119,8 @@ impl<'a> Cur<'a> {
     }
 
     fn rest(&self) -> &str {
-        &self.src[self.i..]
+        // A mid-character index is a bug in the scanner. Refuse it instead of panicking.
+        self.src.get(self.i..).unwrap_or("")
     }
 
     fn peek(&self) -> Option<u8> {
@@ -253,12 +254,23 @@ impl<'a> Cur<'a> {
         char::from_u32(u32::from(unit)).ok_or_else(|| syntax("bad unicode escape"))
     }
 
+    /// Exactly four ASCII hex bytes. A multibyte character is rejected before any `str` slice:
+    /// `self.i + 4` can land inside `é` while still being inside the byte length.
     fn hex4(&mut self) -> Result<u16, ParseError> {
-        if self.i + 4 > self.src.len() {
+        let bytes = self.src.as_bytes();
+        if self.i.saturating_add(4) > bytes.len() {
             return Err(syntax("short unicode escape"));
         }
-        let digits = &self.src[self.i..self.i + 4];
-        let value = u16::from_str_radix(digits, 16).map_err(|_| syntax("bad unicode escape"))?;
+        let mut value = 0u16;
+        for offset in 0..4 {
+            let digit = match bytes[self.i + offset] {
+                digit @ b'0'..=b'9' => digit - b'0',
+                digit @ b'a'..=b'f' => digit - b'a' + 10,
+                digit @ b'A'..=b'F' => digit - b'A' + 10,
+                _ => return Err(syntax("bad unicode escape")),
+            };
+            value = (value << 4) | u16::from(digit);
+        }
         self.i += 4;
         Ok(value)
     }
@@ -312,7 +324,9 @@ impl<'a> Cur<'a> {
         if self.i - start > 64 {
             return Err(syntax("number is too long"));
         }
-        Ok(&self.src[start..self.i])
+        self.src
+            .get(start..self.i)
+            .ok_or_else(|| syntax("bad number"))
     }
 
     fn number(&mut self) -> Result<serde_json::Number, ParseError> {

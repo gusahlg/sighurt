@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Inherit</title>
+</head>
+<body>
+  <!--
+    Inside sits in a disabled fieldset. Its own disabled property is false; :disabled matches.
+    SetValue must leave keep-fieldset alone.
+    Choice starts on Alpha. Beta is a disabled option. Gamma's optgroup is disabled.
+    Selecting either must leave Alpha selected.
+    Untyped is a password input whose type getter returns undefined. The sentinel must not
+    appear, and the field is a password. If the isolated world cannot see the override, the
+    content attribute type=password still holds.
+  -->
+  <fieldset disabled>
+    <label for="inside">Inside</label>
+    <input id="inside" type="text" value="keep-fieldset">
+  </fieldset>
+  <label for="choice">Choice</label>
+  <select id="choice">
+    <option>Alpha</option>
+    <option disabled>Beta</option>
+    <optgroup disabled label="group">
+      <option>Gamma</option>
+    </optgroup>
+  </select>
+  <label for="untyped">Untyped</label>
+  <input id="untyped" type="password" value="SIGHURT_UNDEFINED_TYPE_SENTINEL">
+  <script>
+    var field = document.getElementById("untyped");
+    try {
+      Object.defineProperty(field, "type", {
+        configurable: true,
+        get: function () { return undefined; }
+      });
+    } catch (e) { /* the IDL accessor may not be configurable */ }
+  </script>
+</body>
+</html>

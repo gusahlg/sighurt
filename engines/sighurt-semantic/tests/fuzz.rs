@@ -99,7 +99,11 @@ fn rng_text(rng: &mut Rng) -> String {
 }
 
 fn assert_sane(json: &str, generation: DocumentGeneration) {
-    if let Ok(snapshot) = parse(json, generation) {
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse(json, generation)));
+    let Ok(parsed) = parsed else {
+        panic!("parse panicked on {json:?}");
+    };
+    if let Ok(snapshot) = parsed {
         assert_eq!(snapshot.document, generation);
         assert!(snapshot.check().is_ok());
         assert!(snapshot
@@ -107,6 +111,15 @@ fn assert_sane(json: &str, generation: DocumentGeneration) {
             .iter()
             .all(|node| !(node.password && node.value.is_some())));
     }
+}
+
+/// `index` may land inside a multibyte character. Step back to a boundary.
+fn floor_char(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 #[test]
@@ -131,6 +144,70 @@ fn random_inputs_do_not_panic() {
             assert_sane(&json[..mid], generation);
         }
         assert_sane(&format!("{json} trailing"), generation);
+    }
+}
+
+/// Crafted escapes and numbers whose bytes are valid UTF-8 but not ASCII where JSON
+/// wants hex digits. `\u000é` used to pass the length check and slice through `é`.
+#[test]
+fn mutated_unicode_and_numbers_do_not_panic() {
+    let generation = DocumentGeneration::next();
+    let seeds = [
+        r#"{"x":"\u000é"}"#,
+        r#"{"x":"\u00é"}"#,
+        r#"{"x":"\u0é"}"#,
+        r#"{"x":"\ué"}"#,
+        r#"{"x":"\uD800\uDC00"}"#,
+        r#"{"x":"\uD800"}"#,
+        r#"{"x":"\uD800\u"}"#,
+        r#"{"x":"\uD800\uDC0"}"#,
+        r#"{"x":"\uD800\u000é"}"#,
+        r#"{"x":"\uDEAD"}"#,
+        r#"{"x":"\u"}"#,
+        r#"{"x":"\"#,
+        r#"{"x":"\u12"}"#,
+        r#"{"n":1é}"#,
+        r#"{"n":-é}"#,
+        r#"{"n":12.3é}"#,
+        r#"{"n":1eé}"#,
+        r#"{"n":1e+é}"#,
+        r#"{"n":01}"#,
+        r#"{"n":1.}"#,
+        r#"{"n":-}"#,
+        "\"\\u000é\"",
+        "\"\\uD800\\uDC00\"",
+        "\"\\uD800\\u你\"",
+    ];
+    for seed in seeds {
+        assert_sane(seed, generation);
+    }
+    // A well-formed surrogate pair is one character, not an error and not a panic.
+    let decoded = parse(
+        r#"{"root":1,"nodes":[{"id":1,"kind":"text","text":"\uD800\uDC00"}]}"#,
+        generation,
+    )
+    .expect("a surrogate pair is a character");
+    assert_eq!(decoded.nodes[0].text.as_deref(), Some("\u{10000}"));
+
+    let mut rng = Rng(0x00e1_5ca7);
+    let mut corpus: Vec<String> = seeds.iter().map(|seed| (*seed).to_owned()).collect();
+    for _ in 0..80 {
+        corpus.push(random_json(&mut rng, 0));
+    }
+    let splices = ["é", "你", "\u{1F600}", "e", ".", "-", "+", "\\u", "\"", "0"];
+    for _ in 0..400 {
+        let base = &corpus[rng.gen(corpus.len())];
+        let at = floor_char(base, rng.gen(base.len().saturating_add(1)));
+        let splice = splices[rng.gen(splices.len())];
+        let mut mutated = String::with_capacity(base.len() + splice.len());
+        mutated.push_str(&base[..at]);
+        mutated.push_str(splice);
+        mutated.push_str(&base[at..]);
+        assert_sane(&mutated, generation);
+        if let Some(pos) = mutated.find("\\u") {
+            let end = floor_char(&mutated, pos + 2 + rng.gen(6));
+            assert_sane(&mutated[..end], generation);
+        }
     }
 }
 
