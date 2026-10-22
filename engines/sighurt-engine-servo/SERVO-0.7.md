@@ -31,9 +31,15 @@ can show is marked as not measured.
   `thread_pool_canvas_workers` (name from the 0.7 pref list; confirm before using), and
   `dom_webgpu_*`. `thread_pool_canvas_workers` is a `u64` (default 3 in the 0.7 pref
   list). Disk cache and the GC thresholds are the ones most likely to matter.
-- **WebGL is a feature.** 0.5 always compiled it. 0.7's default features are `bundled`,
-  `clipboard`, `js_jit`, `multiprocess`. This workspace enables `webgl` as well. WebGPU
-  stays off, as it was.
+- **WebGL, WebCrypto and brotli compression streams are features.** 0.5 always compiled
+  them. 0.7's default features are `bundled`, `clipboard`, `js_jit`, `multiprocess`. This
+  workspace enables `webgl`, `webcrypto` and `brotli-compression-stream`. Without
+  `webcrypto`, `Crypto.webidl` is skipped and `window.crypto` is missing. WebGPU stays off.
+  `rsa` 0.10.0-rc.18 does not compile against the lock's `pkcs1` 0.8.0-rc.5 (`RsaPrivateKey`
+  gained a lifetime in rc.4 and lost it in rc.5). The lock now pins `pkcs1` 0.8.0-rc.4, the
+  version and checksum in Servo 0.7's published `Cargo.lock`. Nothing else changed version.
+  That pin depends on the already-locked `spki` 0.8.1 (`^0.8.0-rc.4` accepts it). A second
+  `spki` 0.8.0 does not resolve next to `ecdsa`'s locked 0.8.1.
 - **Multiprocess compiles and stays off.** The feature is in Servo's defaults.
   `Opts.multiprocess` still defaults to `false`, and the adapter still passes
   `Opts { hard_fail: false, config_dir, ..default }`. Pages stay in this process.
@@ -71,13 +77,18 @@ can show is marked as not measured.
   returns without notifying when the status is unchanged. A new WebView starts `Started`, and
   a document navigated to before the previous one has reported `HeadParsed` or `Complete` is
   still `Started`, so the new document's `LoadStatus::Started` never reaches the embedder.
-  Its `<body>` still reports `HeadParsed` (`HTMLBodyElement::bind_to_tree`). The adapter
-  treats a second `HeadParsed`, or one beside the history change while a browser `Navigate`
-  is waiting with no `Started`, as that document. Holding the history change for one extra
+  Its `<body>` still reports `HeadParsed` (`HTMLBodyElement::bind_to_tree`). Servo sends
+  that report on every top-level body bind, including a Turbo Drive body swap, so a second
+  head alone is not a new document. A head is evidence of the new document only when a
+  browser `Navigate` or `Reload` was issued after the last head or `Complete`; `Complete`
+  clears `saw_head`. A head beside the history change while a browser `Navigate` is waiting
+  with no `Started` is still that document. Holding the history change for one extra
   spin was not enough: that batch also queues a title or a frame, so the runtime spins again
   immediately, before the script has sent the head, and the commit was already reported. The
-  history change is held for up to 100 ms for `Started` or `HeadParsed`. A head followed by
-  another history change is left for that change. Measured on louise after that hold
+  history change is held for up to 100 ms for `Started` or `HeadParsed`, and `pump` returns
+  `Pending` with that instant so the hold is not stuck until unrelated Servo activity. A head
+  followed by another history change is left for that change. Holds for closed WebViews are
+  dropped. Measured on louise after that hold
   (`sighurt-engine-servo/tests/headless.sh`, 2026-10-17): `after-204.html` committed as
   `NavigationId(13)` / `DocumentGeneration(8)`, `self.html` as `NavigationId(14)` /
   `DocumentGeneration(9)`, and `slow/own.html` as `NavigationId(16)` /
@@ -125,10 +136,13 @@ can show is marked as not measured.
   `set_environment_variables` (`third_party/surfman`, `SIGHURT-PATCH.md`); the offscreen
   path does not set `LIBGL_ALWAYS_SOFTWARE` or `DRI_PRIME`.
   `SoftwareRenderingContext::new(PhysicalSize)` still builds a software adapter through
-  `Connection::new`. A `UserContentManager` installs a user stylesheet so
-  `dialog:modal` is `position: fixed` at the maximum z-index, with a `::backdrop`
-  dimming rule. The manager is dropped before Servo in `shutdown`, because it holds a
-  Servo clone.
+  `Connection::new`. The offscreen path does not retry that adapter: it would use the same
+  initialised EGL display. A hardware-context failure is returned as an error.
+  A `UserContentManager` installs a user stylesheet so `dialog:modal` gets
+  `z-index: 2147483647 !important`. `position: fixed` is left to the UA rule (repeating it
+  loses to an author `position`). Servo does not generate a `::backdrop` box, so there is no
+  backdrop rule and no box-shadow dim (unchecked against clicks). The manager is dropped
+  before Servo in `shutdown`, because it holds a Servo clone.
 
 ## Lockfile
 

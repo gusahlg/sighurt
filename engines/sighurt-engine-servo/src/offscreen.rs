@@ -13,11 +13,11 @@
 //! `surfman::Connection::new()`. Here `servo-paint-api` enables surfman's `sm-x11` feature, so
 //! that default is the unix multi backend: Wayland, then X11, and only then Mesa surfaceless,
 //! and only when opening the connection fails. This context opens `surfman::mesa_surfaceless`
-//! directly. The hardware adapter is tried first. The software adapter is used only when that
-//! context cannot be made. Neither attempt writes `LIBGL_ALWAYS_SOFTWARE` or `DRI_PRIME`:
-//! surfman's `create_context_descriptor` no longer does (`third_party/surfman/SIGHURT-PATCH.md`),
-//! and Mesa uses the device this process was started with. The software adapter cannot force
-//! llvmpipe on its own.
+//! directly. The hardware adapter is the only attempt. A software-adapter retry uses the same
+//! already-initialised EGL display, so it cannot change the result. The call does not write
+//! `LIBGL_ALWAYS_SOFTWARE` or `DRI_PRIME`: surfman's `create_context_descriptor` no longer does
+//! (`third_party/surfman/SIGHURT-PATCH.md`), and Mesa uses the device this process was started
+//! with.
 //!
 //! `RenderingContext::connection` returns the multi `Connection`'s `Alternate` around this
 //! surfaceless connection. `Paint::register_rendering_context` calls `create_adapter` on it
@@ -66,8 +66,9 @@ pub(crate) struct OffscreenContext {
 }
 
 impl OffscreenContext {
-    /// Opens a surfaceless context of `size` on the hardware adapter, or the software adapter
-    /// if that fails. The process environment is whatever it was before the call, either way.
+    /// Opens a surfaceless context of `size` on the hardware adapter. The process environment
+    /// is whatever it was before the call. A failure is returned as-is: retrying the software
+    /// adapter on this display does not produce a different context.
     pub(crate) fn open(
         size: BufferSize,
         driver: Rc<FrameDriver>,
@@ -79,22 +80,9 @@ impl OffscreenContext {
                 size.width, size.height
             ));
         }
-        match try_adapter(size, OffscreenAdapter::Hardware, &driver, readbacks) {
-            Ok(context) => Ok(context),
-            Err(hardware) => {
-                log::warn!(
-                    "servo: offscreen hardware adapter failed ({hardware}); trying the software adapter"
-                );
-                try_adapter(size, OffscreenAdapter::Software, &driver, readbacks).map_err(
-                    |software| {
-                        format!(
-                            "offscreen GL context: hardware adapter failed ({hardware}); \
-                             software adapter failed ({software})"
-                        )
-                    },
-                )
-            }
-        }
+        try_adapter(size, OffscreenAdapter::Hardware, &driver, readbacks).map_err(|hardware| {
+            format!("offscreen GL context: hardware adapter failed ({hardware})")
+        })
     }
 
     /// Reads the whole framebuffer into `frame` as ARGB8888, top row first, in one pass.

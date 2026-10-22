@@ -62,10 +62,11 @@ authors = ["Nikhil Ranjan <niklabh>", "The Sighurt contributors"]
 # reseeded from Servo 0.7.0's published lockfile so Servo's dependencies stay at the versions
 # that release was tested with. Don't run a broad `cargo update`.
 [workspace.dependencies]
-# `webgl` is optional and off by default in 0.7 (it was unconditional in 0.5). The
-# `multiprocess` feature is on by default and only compiles the IPC path; `Opts.multiprocess`
-# stays false, so pages stay in this process.
-servo = { version = "0.7", features = ["webgl"] }
+# `webgl`, `webcrypto` and `brotli-compression-stream` are optional and off by default in
+# 0.7 (0.5 compiled them unconditionally). Without `webcrypto`, `window.crypto` is absent.
+# The `multiprocess` feature is on by default and only compiles the IPC path;
+# `Opts.multiprocess` stays false, so pages stay in this process.
+servo = { version = "0.7", features = ["webgl", "webcrypto", "brotli-compression-stream"] }
 surfman = "0.14"
 wasmtime = "36"
 wayland-client = { version = "0.31", features = ["system"] }

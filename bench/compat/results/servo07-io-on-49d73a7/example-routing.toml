@@ -1,0 +1,7 @@
+# Example routing, generated 2026-10-21 from the bench/compat corpus (49d73a7).
+# Hosts that classified OK in WPE and not OK in Servo on that run.
+# Not a built-in list: which engine opens a site stays in the user's configuration (decision 94).
+# Copy what you want into ~/.config/sighurt/config.toml.
+[routing.wpe]
+hosts = [
+]

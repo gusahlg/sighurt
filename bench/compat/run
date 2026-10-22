@@ -937,6 +937,8 @@ def run_one_inside(args):
         if died_early:
             record["crash"] = True
             record["crash_reason"] = "sig exited before it was asked to quit"
+        if args.post_settle > 0 and sig_proc.poll() is None and sampler is not None:
+            measure_post_settle(record, sig_proc, sampler, diag_path, args.post_settle)
         if sig_proc.poll() is None:
             observe_screen(record, sig_proc.pid, args.shot)
             diag = enable_session_restore(
@@ -1027,6 +1029,34 @@ def wait_for_load(sig_proc, diag_path, started):
         if loaded_at is None and now - started >= LOAD_TIMEOUT_S:
             return diag, None, False
         time.sleep(POLL_S)
+
+
+def measure_post_settle(record, sig_proc, sampler, diag_path, seconds):
+    """Frames presented and sig's CPU during `seconds` after load has settled.
+
+    Both counters are cumulative from process start. The record stores the difference across
+    this window, so a repaint loop shows up as frames and CPU that keep climbing after load.
+    """
+    sampler.sample()
+    start_cpu = sampler.cpu_sig()
+    got = request_diag(sig_proc.pid, diag_path, None)
+    start_frames = frames_of(got[0]) if got else None
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if sig_proc.poll() is not None:
+            break
+        time.sleep(min(0.5, max(0.0, end - time.monotonic())))
+    sampler.sample()
+    end_cpu = sampler.cpu_sig()
+    previous = got[1] if got else None
+    got = request_diag(sig_proc.pid, diag_path, previous)
+    end_frames = frames_of(got[0]) if got else None
+    record["post_settle_s"] = round(seconds, 3)
+    if start_frames is not None and end_frames is not None:
+        record["post_frames"] = max(0, end_frames - start_frames)
+    else:
+        record["post_frames"] = None
+    record["post_cpu_s"] = round(max(0.0, end_cpu - start_cpu), 3)
 
 
 def observe_screen(record, pid, shot):
@@ -1155,7 +1185,12 @@ def collect(record, sig_proc, sampler, base, args, diag_path, log_path):
     print(
         f"compat: {record.get('engine')} {record.get('id')} {record.get('class')} "
         f"load={record.get('load_s')} err={record.get('error_count')} "
-        f"nonblank={record.get('nonblank')}",
+        f"nonblank={record.get('nonblank')}"
+        + (
+            f" post_frames={record.get('post_frames')} post_cpu={record.get('post_cpu_s')}"
+            if record.get("post_settle_s")
+            else ""
+        ),
         flush=True,
     )
 
@@ -1207,6 +1242,8 @@ def run_corpus(args):
     }
     if args.config_extra:
         meta["config_extra"] = args.config_extra
+    if args.post_settle > 0:
+        meta["post_settle_s"] = args.post_settle
     runs = []
     jobs = [(site, engine, rep) for site in sites for engine in engines for rep in range(1, args.reps + 1)]
     for index, (site, engine, rep) in enumerate(jobs, start=1):
@@ -1242,6 +1279,8 @@ def run_corpus(args):
         ]
         if args.config_extra:
             cmd += ["--config-extra", args.config_extra]
+        if args.post_settle > 0:
+            cmd += ["--post-settle", str(args.post_settle)]
         proc = subprocess.Popen(cmd, start_new_session=True)
         try:
             proc.wait(timeout=args.job_timeout)
@@ -1467,6 +1506,12 @@ def main():
     parser.add_argument("--force", action="store_true", help="re-run sites that already have a result")
     parser.add_argument("--pause", type=float, default=1.0, help="seconds between runs")
     parser.add_argument("--job-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--post-settle",
+        type=float,
+        default=0.0,
+        help="seconds to sample frames and CPU after load settles (0 skips)",
+    )
     parser.add_argument("--allow-unlocked", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--list", action="store_true")
