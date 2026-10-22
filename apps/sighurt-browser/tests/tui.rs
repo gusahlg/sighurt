@@ -637,6 +637,30 @@ fn text_mode_shows_the_page_as_text_and_tab_enter_follow_a_link_and_fill_a_field
     term.assert_restored();
 }
 
+/// Decision 105: text mode gives the engine a real page area and takes its frames, but never
+/// encodes or sends one. (The demo engine paints only into a view with room and a permit, so a
+/// presented frame shows both; it cannot model a page that has text only after a frame.)
+#[test]
+fn text_mode_takes_the_engines_frames_and_sends_none() {
+    let mut term = Terminal::start_in(
+        "text-frames",
+        &["demo://animation"],
+        REPLIES,
+        "mode = \"text\"",
+    );
+    let shown = term.wait(0, Duration::from_secs(15), |got| shows(got, "TEXT"));
+    assert!(shown, "no text mode\n{}", term.context());
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = term.tabs();
+    assert!(
+        term.counter("page_frames_presented") > 0,
+        "text mode presented no frame\n{}",
+        term.context()
+    );
+    assert_eq!(term.counter("encoded_bytes"), 0, "{}", term.context());
+    assert!(images(&term.got).is_empty(), "{}", term.context());
+}
+
 #[test]
 fn a_click_follows_a_link_in_text_mode() {
     let mut term = Terminal::start_in(

@@ -3486,3 +3486,13 @@ Newest last. Each entry says what was decided and why.
     (amends §8.12's "first snapshot after load end": engine events can reach the frontend
     before the core has handled the load end ahead of them, so the first snapshot may be
     stale). The demo engine has semantics, so text mode is tested without WebKit.
+105. **Text mode gives engines a real page area and takes their frames** (22 October 2026;
+    TUI.md §10; amends decision 104's "empty metrics"). In text mode the shown view gets the page
+    rows' pixel size as graphics mode computes it (1280x800 at scale 1 when the terminal reports
+    no pixel size), and the frames its engine offers are presented through a permit at the
+    `[tui] fps` pace but never encoded or sent: no kitty output, no copy beyond the target's own
+    frame, so switching back to graphics shows the latest one. Hidden views keep
+    `SetVisibility(false)`. Reason: pages that draw only on animation frames or commit only once
+    frames are taken gave an empty snapshot at "no room". Evidence is the `sig --dump` change that
+    did the same (49d73a7, bench/compat/dump corpus on WPE): youtube 3 to 302 words, archive.org
+    error to 565 words, 35 OK / 2 thin / 2 empty / 1 error to 38 / 1 / 1 / 0.

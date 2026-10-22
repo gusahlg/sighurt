@@ -183,7 +183,8 @@ struct Tui {
     capture: PointerCapture,
     /// Releases of captures ended by the frontend, for the app to send.
     releases: Vec<Release>,
-    /// What every view is given: the page rows' pixels, or nothing.
+    /// What every view is given: the page rows' pixels (a default area in text mode with no pixel
+    /// size), or nothing when no page is shown that way.
     metrics: Metrics,
     /// `metrics` changed and the views have not been told.
     metrics_due: bool,
@@ -624,7 +625,7 @@ impl App {
 
     /// The shown view has a frame the terminal could show.
     fn frame_waiting(&self) -> bool {
-        self.tui.graphics
+        (self.tui.graphics || self.tui.text_mode)
             && self
                 .shown()
                 .and_then(|(_, target)| self.tui.targets.get(&target))
@@ -1246,7 +1247,7 @@ impl App {
             .tui
             .targets
             .get_mut(&target)
-            .filter(|_| self.tui.graphics)
+            .filter(|_| self.tui.graphics || self.tui.text_mode)
         else {
             return;
         };
@@ -1280,7 +1281,8 @@ impl App {
         let Some(pixels) = self.tui.targets.get_mut(&target) else {
             return;
         };
-        if pixels.on_screen {
+        // Text mode takes the frame and shows none of it.
+        if pixels.on_screen || !self.tui.graphics {
             return;
         }
         let page = self.tui.page;
@@ -1416,7 +1418,19 @@ impl Tui {
         let fits = u64::from(width) * u64::from(height) <= kitty::MAX_PIXELS;
         let text = self.wants_text();
         let graphics = !text && self.images_possible() && fits && width > 0 && height > 0;
-        let (width, height) = if graphics { (width, height) } else { (0, 0) };
+        // Text mode shows no pixels but still gives the engine a real page area and takes its
+        // frames (decision 105): pages that draw or commit only for a view whose frames are
+        // taken give no text at none. A terminal without a pixel size gets a desktop's.
+        let (width, height) = if graphics {
+            (width, height)
+        } else if text {
+            match fits && width > 0 && height > 0 {
+                true => (width, height),
+                false => TEXT_AREA,
+            }
+        } else {
+            (0, 0)
+        };
         if graphics != self.graphics || text != self.text_mode {
             self.graphics = graphics;
             self.text_mode = text;
@@ -1772,6 +1786,9 @@ fn semantic_event(act: Act, at: Instant) -> BrowserEvent {
         at,
     }
 }
+
+/// The page area in text mode when the terminal reports no pixel size.
+const TEXT_AREA: (u32, u32) = (1280, 800);
 
 fn empty_metrics() -> Metrics {
     Metrics::new(LayoutEpoch::next(), WindowRect::default(), Scale::ONE)

@@ -391,8 +391,11 @@ Where it differs from the sketches in §2–§3:
 - **Mode.** `Tui::wants_text`: `chrome.toggle-mode`, `chrome.text-mode` and `chrome.graphics-mode`
   set a choice for the run; without one, `[tui] mode` (`auto` is text when the terminal can't show
   kitty images). A changed `[tui] mode` in the file drops the run's choice. Text mode gives the
-  engines empty metrics ("no room"), so nothing is rendered or read back; `graphics-mode` on a
-  terminal without images is a notice.
+  shown view the page rows' pixels (cells times cell pixel size; 1280x800 at scale 1 when the
+  terminal reports none or the area exceeds the image cap) and takes each frame the engine offers
+  at the `[tui] fps` pace, without encoding or sending it (decision 105; pages that draw or commit
+  only for a view whose frames are taken gave no text at empty metrics). Switching to graphics
+  shows the target's latest frame. `graphics-mode` on a terminal without images is a notice.
 - **Semantics.** `App::sync_semantics` asks (`Session::set_semantics`) for exactly the shown view
   in text mode whose engine declares `semantics`, and stops asking, and drops the view's page,
   when it is hidden or the mode changes. An engine without them gets the page-rows message "No
