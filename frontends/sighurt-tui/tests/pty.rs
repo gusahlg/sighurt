@@ -6,7 +6,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::Read;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -406,6 +406,41 @@ impl Drop for PtyChild {
             let _ = handle.join();
         }
     }
+}
+
+fn child_fail(code: i32, msg: &str) -> ! {
+    // `eprintln` lands in libtest's capture, which `_exit` discards.
+    let line = format!("{msg}\n");
+    unsafe {
+        libc::write(2, line.as_ptr().cast(), line.len());
+        libc::_exit(code);
+    }
+}
+
+/// Run this test again in a child whose stdout is `slave`. Handlers must not
+/// land in the test process. The child `_exit`s: flushing stdout would block
+/// once the pty buffer is full.
+fn spawn_self(test: &str, env_key: &str, slave: &OwnedFd) -> Child {
+    let child = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", test, "--nocapture"])
+        .env(env_key, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(slave.try_clone().expect("dup slave")))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn reexec");
+    track_pid(child.id());
+    child
+}
+
+fn read_stderr(child: &mut Child) -> String {
+    let Some(stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut err = String::new();
+    let mut file = stderr;
+    let _ = file.read_to_string(&mut err);
+    err
 }
 
 fn wait_stopped(pty: &mut PtyChild) {
@@ -1074,4 +1109,178 @@ fn a_late_kitty_reply_is_a_resize() {
     );
     assert_eq!(session.capabilities().kitty_graphics_ok, Some(true));
     session.restore().expect("restore");
+}
+
+#[test]
+fn restore_deadline_holds_under_sigwinch() {
+    if std::env::var_os("SIGHURT_RESTORE_WINCH_CHILD").is_some() {
+        restore_deadline_child();
+    }
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    // Keep `master` open and unread so the child's restore has to wait out
+    // the budget, and so closing the master does not deliver `SIGHUP`.
+    let _master = master;
+    let mut child = spawn_self(
+        "restore_deadline_holds_under_sigwinch",
+        "SIGHURT_RESTORE_WINCH_CHILD",
+        &slave,
+    );
+    // The child aims SIGWINCH at its own restore thread. A process-directed
+    // signal can be taken by libtest's other thread and never interrupt poll.
+    let start = Instant::now();
+    let limit = Duration::from_secs(4);
+    let (status, err) = loop {
+        if past_deadline() || start.elapsed() > limit {
+            let _ = child.kill();
+            let status = child.wait().expect("wait after kill");
+            let err = read_stderr(&mut child);
+            if past_deadline() {
+                panic!("test deadline exceeded ({status:?}) stderr {err}");
+            }
+            panic!("restore did not finish under SIGWINCH ({status:?}) stderr {err}");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, read_stderr(&mut child)),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    };
+    assert!(status.success(), "child status {status:?} stderr {err}");
+}
+
+fn restore_deadline_child() -> ! {
+    let slave = match std::io::stdout().as_fd().try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(err) => child_fail(3, &format!("stdout: {err}")),
+    };
+    let mut terminal = match Terminal::enter_with(slave, 4096) {
+        Ok(terminal) => terminal,
+        Err(err) => child_fail(3, &format!("enter: {err}")),
+    };
+    if let Err(err) = terminal.install_handlers() {
+        child_fail(3, &format!("handlers: {err}"));
+    }
+    let frame = vec![b'Z'; 1024];
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(800) && terminal.dropped_frames() == 0 {
+        if terminal.write_frame(&frame).is_err() {
+            child_fail(3, "frame write failed");
+        }
+    }
+    if terminal.dropped_frames() == 0 {
+        child_fail(3, "pty never filled");
+    }
+    terminal.discard_pending();
+    let tail = Instant::now();
+    while tail.elapsed() < Duration::from_millis(800) && terminal.pending_len() == 0 {
+        if terminal.write_frame(b"Q").is_err() {
+            child_fail(3, "tail write failed");
+        }
+    }
+    if terminal.pending_len() == 0 {
+        child_fail(3, "the pty still accepted a byte");
+    }
+    let tid = unsafe { libc::gettid() };
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_signaler = Arc::clone(&stop);
+    let signaler = thread::spawn(move || {
+        while !stop_signaler.load(Ordering::Relaxed) {
+            unsafe { libc::syscall(libc::SYS_tkill, tid, libc::SIGWINCH) };
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let started = Instant::now();
+    let restore_result = terminal.restore();
+    stop.store(true, Ordering::Relaxed);
+    let _ = signaler.join();
+    match restore_result {
+        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+        Err(err) => child_fail(4, &format!("restore error {err:?}")),
+        Ok(()) => child_fail(4, "restore finished; the pty was not full"),
+    }
+    let elapsed = started.elapsed();
+    // The budget is 250 ms. A poll that restarts on each SIGWINCH stays
+    // inside that window only when the remaining time is recomputed.
+    if elapsed > Duration::from_millis(700) {
+        child_fail(2, &format!("restore took {elapsed:?}"));
+    }
+    unsafe { libc::_exit(0) }
+}
+
+#[test]
+fn full_winch_pipe_restores_errno() {
+    if std::env::var_os("SIGHURT_ERRNO_CHILD").is_some() {
+        errno_child();
+    }
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    let _master = master;
+    let mut child = spawn_self(
+        "full_winch_pipe_restores_errno",
+        "SIGHURT_ERRNO_CHILD",
+        &slave,
+    );
+    let start = Instant::now();
+    let limit = Duration::from_secs(4);
+    loop {
+        if past_deadline() || start.elapsed() > limit {
+            let _ = child.kill();
+            let status = child.wait().expect("wait after kill");
+            let err = read_stderr(&mut child);
+            if past_deadline() {
+                panic!("test deadline exceeded ({status:?}) stderr {err}");
+            }
+            panic!("errno child timed out ({status:?}) stderr {err}");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let err = read_stderr(&mut child);
+                assert!(status.success(), "child status {status:?} stderr {err}");
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    }
+}
+
+fn errno_child() -> ! {
+    let slave = match std::io::stdout().as_fd().try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(err) => child_fail(3, &format!("stdout: {err}")),
+    };
+    let mut terminal = match Terminal::enter(slave) {
+        Ok(terminal) => terminal,
+        Err(err) => child_fail(3, &format!("enter: {err}")),
+    };
+    if let Err(err) = terminal.install_handlers() {
+        child_fail(3, &format!("handlers: {err}"));
+    }
+    let fd = terminal.winch_fd().as_raw_fd();
+    let mut cap = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+    if cap > 4096 {
+        let resized = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, 4096) };
+        if resized > 0 {
+            cap = resized;
+        }
+    }
+    if cap <= 0 || cap > 65536 {
+        child_fail(3, &format!("pipe capacity {cap}"));
+    }
+    // One byte per SIGWINCH. `cap` writes fill the pipe; the next one's
+    // `EAGAIN` must not replace the errno the interrupted code had stored.
+    for _ in 0..cap {
+        unsafe { libc::raise(libc::SIGWINCH) };
+    }
+    unsafe { *libc::__errno_location() = libc::ENOENT };
+    unsafe { libc::raise(libc::SIGWINCH) };
+    let now = unsafe { *libc::__errno_location() };
+    if now != libc::ENOENT {
+        child_fail(
+            2,
+            &format!("handler left errno {now}, want {}", libc::ENOENT),
+        );
+    }
+    unsafe { libc::_exit(0) }
 }

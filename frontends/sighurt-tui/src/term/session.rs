@@ -11,7 +11,9 @@
 //! and enters raw mode again after `SIGCONT`. `SIGWINCH` only writes that
 //! pipe. `SIGHUP`, the panic hook and [`restore_before_forced_exit`] still
 //! write, and only with async-signal-safe calls (`write`, `poll`, `fcntl`,
-//! `tcsetattr`): no allocation and no lock.
+//! `tcsetattr`, `clock_gettime`): no allocation and no lock. Handlers that
+//! return save and restore `errno`, so a full self-pipe cannot replace the
+//! interrupted call's error.
 //!
 //! Those fatal writers see an exact wire classification. Every output `write`
 //! stores it *before* the syscall, as the state the terminal is in if the
@@ -35,7 +37,7 @@ use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::OFlags;
@@ -201,7 +203,7 @@ impl Session {
         if done {
             return Ok(());
         }
-        let deadline = Instant::now() + RESTORE_BUDGET;
+        let deadline = mono_after(RESTORE_BUDGET);
         if !self.shared().protocol_restored.load(Ordering::Acquire) {
             // Once LEAVE has started, the queue was already finished or
             // abandoned. Cancelling it again would cut the half-written reset.
@@ -483,7 +485,7 @@ impl Session {
     /// [`reenter`] bumps the generation so the next owner write drops the tail.
     fn suspend_owner(&self) {
         let state = self.shared();
-        let deadline = Instant::now() + RESTORE_BUDGET;
+        let deadline = mono_after(RESTORE_BUDGET);
         write_protocol(state, deadline);
         if !restore_termios(state) {
             log::warn!("tcsetattr failed while suspending");
@@ -506,7 +508,7 @@ impl Session {
     ///
     /// `false` means the deadline ran out with bytes still queued. The caller
     /// must not start [`LEAVE`] on top of that sequence.
-    fn finish_queued(&mut self, deadline: Instant) -> bool {
+    fn finish_queued(&mut self, deadline: Mono) -> bool {
         self.sync_wire();
         let bytes = self.output.take_inflight();
         if bytes.is_empty() {
@@ -636,7 +638,7 @@ fn load_state() -> Option<&'static Shared> {
 }
 
 fn restore_signal_safe(state: &Shared) -> bool {
-    restore_with_deadline(state, Instant::now() + RESTORE_BUDGET)
+    restore_with_deadline(state, mono_after(RESTORE_BUDGET))
 }
 
 /// Write whatever is left of the reset, then restore termios.
@@ -646,7 +648,7 @@ fn restore_signal_safe(state: &Shared) -> bool {
 /// The write polls for `POLLOUT` until `deadline` and does not allocate.
 /// This is the signal-handler path: it cannot see the output queue, so an open
 /// sequence is closed with [`terminator`] before [`LEAVE`].
-fn restore_with_deadline(state: &Shared, deadline: Instant) -> bool {
+fn restore_with_deadline(state: &Shared, deadline: Mono) -> bool {
     write_protocol(state, deadline);
     let termios_ok = restore_termios(state);
     if termios_ok {
@@ -688,7 +690,7 @@ fn restore_original_flags(state: &Shared) {
 ///
 /// Once [`LEAVE`] has started, a retry continues it instead of cancelling the
 /// half-written sequence. Nothing is written when the previous call finished.
-fn write_protocol(state: &Shared, deadline: Instant) {
+fn write_protocol(state: &Shared, deadline: Mono) {
     if state.protocol_restored.load(Ordering::Acquire) {
         return;
     }
@@ -749,7 +751,7 @@ fn reenter(state: &Shared) {
 ///
 /// The boolean is `true` when a fatal writer took the generation and this
 /// must not keep writing.
-fn write_tracked(state: &Shared, bytes: &[u8], deadline: Option<Instant>) -> (usize, bool) {
+fn write_tracked(state: &Shared, bytes: &[u8], deadline: Option<Mono>) -> (usize, bool) {
     if deadline.is_some() {
         force_nonblock(state);
     }
@@ -864,7 +866,8 @@ fn unpack_wire(packed: u64) -> (Wire, u64) {
 /// `poll` for `POLLOUT` until `deadline`, then `write`. Both are async-signal-safe.
 /// A hard error or a timeout returns how many bytes were accepted.
 /// The fd must already be non-blocking: the first `write` is not preceded by `poll`.
-fn write_deadline(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> usize {
+/// `EINTR` does not restart `deadline`; the time left is read again.
+fn write_deadline(fd: RawFd, mut bytes: &[u8], deadline: Mono) -> usize {
     let mut written = 0;
     while !bytes.is_empty() {
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -885,27 +888,85 @@ fn write_deadline(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> usize {
     written
 }
 
-fn wait_out(fd: RawFd, deadline: Instant) -> bool {
-    let now = Instant::now();
-    if now >= deadline {
-        return false;
-    }
+fn wait_out(fd: RawFd, deadline: Mono) -> bool {
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    wait_ready(
-        borrowed,
-        PollFlags::OUT,
-        deadline.saturating_duration_since(now),
-    )
-    .unwrap_or_default()
+    poll_flags(&borrowed, PollFlags::OUT, Some(deadline)).unwrap_or(false)
 }
 
-fn wait_ready<Fd: AsFd>(fd: Fd, flags: PollFlags, timeout: Duration) -> io::Result<bool> {
-    let mut fds = [PollFd::new(&fd, flags)];
-    let spec = rustix::event::Timespec::try_from(timeout).unwrap_or(rustix::event::Timespec {
+/// `CLOCK_MONOTONIC` time. `clock_gettime` is async-signal-safe; this is the
+/// deadline clock for restoration, including the `SIGHUP` handler.
+#[derive(Clone, Copy)]
+struct Mono {
+    sec: i64,
+    nsec: i64,
+}
+
+fn mono_now() -> Mono {
+    let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
-    });
+    };
+    unsafe {
+        let _ = libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    Mono {
+        sec: ts.tv_sec,
+        nsec: ts.tv_nsec,
+    }
+}
+
+fn mono_after(budget: Duration) -> Mono {
+    mono_now().saturating_add(budget)
+}
+
+impl Mono {
+    fn saturating_add(self, extra: Duration) -> Self {
+        let add_sec = i64::try_from(extra.as_secs()).unwrap_or(i64::MAX);
+        let mut sec = self.sec.saturating_add(add_sec);
+        let mut nsec = self.nsec.saturating_add(i64::from(extra.subsec_nanos()));
+        if nsec >= 1_000_000_000 {
+            sec = sec.saturating_add(nsec / 1_000_000_000);
+            nsec %= 1_000_000_000;
+        }
+        Self { sec, nsec }
+    }
+
+    /// Time left until `deadline`. `None` when it has passed.
+    fn remaining_until(self, deadline: Self) -> Option<Duration> {
+        if self.sec > deadline.sec || (self.sec == deadline.sec && self.nsec >= deadline.nsec) {
+            return None;
+        }
+        let mut sec = deadline.sec - self.sec;
+        let mut nsec = deadline.nsec - self.nsec;
+        if nsec < 0 {
+            sec -= 1;
+            nsec += 1_000_000_000;
+        }
+        let secs = u64::try_from(sec).unwrap_or(0);
+        let nanos = u32::try_from(nsec).unwrap_or(0);
+        Some(Duration::new(secs, nanos))
+    }
+}
+
+/// Wait until `fd` matches `flags`.
+///
+/// `deadline` is absolute. `EINTR` reads the clock again and waits only for
+/// what is left, so a repeated `SIGWINCH` cannot extend it. `None` is one
+/// non-blocking check; `EINTR` retries that check and does not wait.
+fn poll_flags<Fd: AsFd>(fd: &Fd, flags: PollFlags, deadline: Option<Mono>) -> io::Result<bool> {
     loop {
+        let timeout = match deadline {
+            Some(deadline) => match mono_now().remaining_until(deadline) {
+                Some(left) => left,
+                None => return Ok(false),
+            },
+            None => Duration::ZERO,
+        };
+        let spec = rustix::event::Timespec::try_from(timeout).unwrap_or(rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        });
+        let mut fds = [PollFd::new(fd, flags)];
         match rustix::event::poll(&mut fds, Some(&spec)) {
             Ok(0) => return Ok(false),
             Ok(_) => {
@@ -989,22 +1050,37 @@ fn set_default(signal: libc::c_int) {
 }
 
 extern "C" fn handle_tstp(_signal: libc::c_int) {
-    let Some(state) = load_state() else {
-        return;
-    };
-    // The owner restores and stops. Writing here would race a partial APC.
-    state.suspend_requested.store(true, Ordering::Release);
-    wake_winch();
+    let saved = errno_raw();
+    if let Some(state) = load_state() {
+        // The owner restores and stops. Writing here would race a partial APC.
+        state.suspend_requested.store(true, Ordering::Release);
+        wake_winch();
+    }
+    set_errno_raw(saved);
 }
 
 extern "C" fn handle_cont(_signal: libc::c_int) {
+    let saved = errno_raw();
     // Resuming after our own `SIGTSTP` returns inside the owner's `raise`.
     // An external continue only has to wake the loop. Neither path writes.
     wake_winch();
+    set_errno_raw(saved);
 }
 
 extern "C" fn handle_winch(_signal: libc::c_int) {
+    let saved = errno_raw();
     wake_winch();
+    set_errno_raw(saved);
+}
+
+fn errno_raw() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+fn set_errno_raw(saved: libc::c_int) {
+    unsafe {
+        *libc::__errno_location() = saved;
+    }
 }
 
 /// One byte on the `SIGWINCH` pipe. Async-signal-safe: a `write` of one byte.
@@ -1020,39 +1096,25 @@ fn wake_winch() {
 }
 
 extern "C" fn handle_hup(_signal: libc::c_int) {
-    let Some(state) = load_state() else {
-        return;
-    };
-    let _ = restore_signal_safe(state);
-    set_default(libc::SIGHUP);
-    // Unblock before `raise`, or the signal stays pending and this handler
-    // returns into the owner loop.
-    unblock_signal(libc::SIGHUP);
-    unsafe { libc::raise(libc::SIGHUP) };
+    let saved = errno_raw();
+    if let Some(state) = load_state() {
+        let _ = restore_signal_safe(state);
+        set_default(libc::SIGHUP);
+        // Unblock before `raise`, or the signal stays pending and this handler
+        // returns into the owner loop.
+        unblock_signal(libc::SIGHUP);
+        unsafe { libc::raise(libc::SIGHUP) };
+    }
+    set_errno_raw(saved);
 }
 
 fn wait_readable<Fd: AsFd>(fd: Fd, timeout: Duration) -> io::Result<bool> {
-    let mut fds = [rustix::event::PollFd::new(
-        &fd,
-        rustix::event::PollFlags::IN,
-    )];
-    let spec = rustix::event::Timespec::try_from(timeout).unwrap_or(rustix::event::Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    });
-    loop {
-        match rustix::event::poll(&mut fds, Some(&spec)) {
-            Ok(0) => return Ok(false),
-            Ok(_) => {
-                let ready = fds[0].revents();
-                return Ok(ready.contains(rustix::event::PollFlags::IN)
-                    || ready.contains(rustix::event::PollFlags::HUP)
-                    || ready.contains(rustix::event::PollFlags::ERR));
-            }
-            Err(Errno::INTR) => continue,
-            Err(err) => return Err(io::Error::from(err)),
-        }
-    }
+    let deadline = if timeout.is_zero() {
+        None
+    } else {
+        Some(mono_after(timeout))
+    };
+    poll_flags(&fd, PollFlags::IN, deadline)
 }
 
 fn push_coalesced(out: &mut Vec<Input>, input: Input) {

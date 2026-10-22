@@ -51,8 +51,9 @@ use session::Session;
 ///
 /// `cell_width` and `cell_height` are 0 when neither `CSI 16 t` nor
 /// `TIOCGWINSZ` reported a pixel size. A probe answer wins over the ioctl
-/// until the ioctl's pixel size changes, which drops the cached answer.
-/// When the terminal has answered `CSI 16 t` before, that query is sent again.
+/// until the ioctl's pixel totals or its derived cell size changes, which
+/// drops the cached answer. When the terminal has answered `CSI 16 t`
+/// before, that query is sent again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermSize {
     /// Columns.
@@ -306,11 +307,15 @@ impl Terminal {
         let cols = ws.ws_col.max(1);
         let rows = ws.ws_row.max(1);
         let raw = (ws.ws_xpixel, ws.ws_ypixel);
+        let derived = cell_from_winsize(&ws);
         let pixels_changed = self.ioctl_pixels.is_some_and(|prev| prev != raw);
-        // A cached `CSI 16 t` answer is for the old font. Drop it so this
-        // ioctl's cell size is visible, and ask again when the terminal
-        // has answered that query before.
-        let drop_report = pixels_changed && self.caps.cell_pixels.is_some();
+        // A cached `CSI 16 t` answer is for the old font. Drop it when the
+        // window's pixel totals change, or when the derived cell size
+        // (pixels/cols, pixels/rows) changes: a font zoom keeps the totals
+        // and still changes the cell. Ask again when the terminal has
+        // answered that query before.
+        let cell_changed = self.ioctl_pixels.is_some() && self.ioctl_cell != derived;
+        let drop_report = (pixels_changed || cell_changed) && self.caps.cell_pixels.is_some();
         if drop_report {
             self.caps.cell_pixels = None;
         }
@@ -587,6 +592,76 @@ mod tests {
             terminal.size()
         );
         assert_eq!(terminal.capabilities().cell_pixels, Some((44, 22)));
+        terminal.restore().expect("restore");
+    }
+
+    #[test]
+    fn a_font_zoom_in_a_fixed_window_drops_the_cached_cell() {
+        let (master, slave) = open_pty().expect("openpty");
+        let flags = rustix::fs::fcntl_getfl(&master).expect("getfl");
+        rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK).expect("nonblock");
+        tcsetwinsize(
+            &slave,
+            Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 800,
+                ws_ypixel: 480,
+            },
+        )
+        .expect("initial size");
+        let mut terminal = Terminal::enter(slave).expect("enter");
+        assert_eq!(terminal.size().cols, 80);
+        assert_eq!(terminal.size().rows, 24);
+        assert_eq!(terminal.size().cell_width, 10);
+        assert_eq!(terminal.size().cell_height, 20);
+        let _ = drain_master(&master);
+
+        // Cache a report that matches the ioctl cell. The window's pixel
+        // totals stay 800×480; only the grid changes.
+        let reply = read_soon(&mut terminal, &master, b"\x1b[6;20;10t");
+        assert!(
+            reply
+                .iter()
+                .any(|event| matches!(event, TermEvent::Resize(_)))
+                || terminal.capabilities().cell_pixels == Some((20, 10)),
+            "{reply:?}"
+        );
+        assert_eq!(terminal.size().cell_width, 10);
+        assert_eq!(terminal.size().cell_height, 20);
+        assert_eq!(terminal.capabilities().cell_pixels, Some((20, 10)));
+        let _ = drain_master(&master);
+
+        let fd = terminal.try_clone_fd().expect("dup");
+        tcsetwinsize(
+            &fd,
+            Winsize {
+                ws_row: 12,
+                ws_col: 40,
+                ws_xpixel: 800,
+                ws_ypixel: 480,
+            },
+        )
+        .expect("font zoom");
+        let events = terminal.read_events().expect("read");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TermEvent::Resize(size)
+                    if size.cols == 40
+                        && size.rows == 12
+                        && size.cell_width == 20
+                        && size.cell_height == 40
+            )),
+            "cached cell hid the zoom: {events:?} size {:?}",
+            terminal.size()
+        );
+        assert_eq!(terminal.capabilities().cell_pixels, None);
+        let output = drain_master(&master);
+        assert!(
+            output.windows(5).any(|window| window == b"\x1b[16t"),
+            "cell size was not queried again: {output:?}"
+        );
         terminal.restore().expect("restore");
     }
 
