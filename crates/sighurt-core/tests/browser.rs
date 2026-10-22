@@ -3511,3 +3511,43 @@ fn a_reload_that_changes_servo_features_says_they_apply_at_restart() {
     assert_eq!(reloaded(&mut b, prefs), [notice.to_owned()]);
     assert_eq!(reloaded(&mut b, started), [] as [String; 0]);
 }
+
+#[test]
+fn only_a_captured_buttons_release_reaches_a_view_that_is_no_longer_shown() {
+    let mut b = Harness::start("", &["https://a.test/"]);
+    let view = b.shown();
+    b.apply(command("tab.new"));
+    b.apply(command("page.open https://b.test/"));
+    let send = |b: &mut Harness, kind: PointerEvent| {
+        let event = InputEvent {
+            seat: b.seat,
+            kind: InputKind::Pointer(kind),
+        };
+        let at = b.now;
+        b.update(BrowserEvent::PointerRelease { view, event, at })
+    };
+    let position = SurfacePoint { x: 5.0, y: 5.0 };
+    let modifiers = Modifiers::default();
+    let button = |button, state| PointerEvent::Button {
+        button,
+        state,
+        position,
+        modifiers,
+    };
+    let released = send(&mut b, button(PointerButton::Left, ButtonState::Released));
+    assert!(pointed(&released, view), "{released:?}");
+    for kind in [
+        button(PointerButton::Left, ButtonState::Pressed),
+        button(PointerButton::Back, ButtonState::Released),
+        PointerEvent::Motion {
+            position,
+            modifiers,
+        },
+    ] {
+        let effects = send(&mut b, kind);
+        assert!(!pointed(&effects, view), "{effects:?}");
+    }
+    // The ordinary path still drops a release for a view not shown.
+    let effects = b.click(view, PointerButton::Left, ButtonState::Released);
+    assert!(!pointed(&effects, view), "{effects:?}");
+}

@@ -531,6 +531,10 @@ impl App {
                 self.tui.editing_fresh = false;
             }
         }
+        // A view the core just hid: its captured buttons are released in this turn.
+        if !self.tui.releases.is_empty() {
+            self.flush_releases();
+        }
     }
 
     /// One iteration of the loop, after it woke. Returns whether work is left that shouldn't
@@ -880,8 +884,9 @@ impl App {
             let view = release.view;
             self.session
                 .queue_mut()
-                .push_back(BrowserEvent::Pointer { view, event, at });
+                .push_back(BrowserEvent::PointerRelease { view, event, at });
         }
+        self.run_core();
     }
 
     /// Text mode's mouse: the wheel scrolls the page, a left press focuses and activates the

@@ -187,6 +187,18 @@ pub enum BrowserEvent {
         /// When it happened.
         at: Instant,
     },
+    /// The frontend ends a button press it captured in `view` (the view hid, the mode changed,
+    /// focus left): `event` is a `PointerEvent::Button` release. The one pointer event a view
+    /// that is no longer shown still gets, so its page does not keep a button pressed; any
+    /// other pointer event, a press, or a side button is dropped.
+    PointerRelease {
+        /// The view that had the press.
+        view: ViewId,
+        /// The event.
+        event: InputEvent,
+        /// When it happened.
+        at: Instant,
+    },
     /// A side button of the mouse (`PointerButton::Back` or `Forward`) went down or up, over
     /// `view`'s target or over the chrome (`None`). `[input.buttons]` binds them to commands;
     /// an unbound one goes to the view shown, like any button. A side button that comes as
@@ -427,6 +439,22 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
         BrowserEvent::Keyboard { event, at } => state.keyboard(event, at, &mut fx),
         BrowserEvent::Pointer { view, event, at } => state.pointer(view, event, at, &mut fx),
         BrowserEvent::Button { view, event, at } => state.button(view, event, at, &mut fx),
+        BrowserEvent::PointerRelease { view, event, .. } => {
+            let release = matches!(
+                &event.kind,
+                InputKind::Pointer(PointerEvent::Button {
+                    button: PointerButton::Left | PointerButton::Right | PointerButton::Middle,
+                    state: ButtonState::Released,
+                    ..
+                })
+            );
+            if release && state.views.contains_key(&view) {
+                fx.push(Effect::Engine {
+                    view,
+                    command: EngineCommand::Input(event),
+                });
+            }
+        }
         BrowserEvent::Semantic {
             view,
             document,
