@@ -111,10 +111,32 @@ can show is marked as not measured.
   reported as the page's own navigation, resize-while-hidden so a CSS animation does not
   keep the old layout, `layout_threads = 2`, `dom_sharedworker_enabled = false`, and
   `adoptedStyleSheets` left off. IntersectionObserver's blank-page bug was fixed
-  upstream in servo/servo#47693 after 0.5. It is on by default after a 2026-10-21
-  bench/compat rep of reddit.com, microsoft.com and github.com with it on and off:
-  all six runs classified OK, and CPU stayed in the same range as the off runs
-  (reddit-rust 3.27s vs 1.74s, microsoft 9.52s vs 9.39s, github-servo 2.66s vs 2.42s).
+  upstream in servo/servo#47693 after 0.5. It stays on (decision 106): github.com
+  freezes without it, and the one site that does more with it on, microsoft.com,
+  presents more frames at the same CPU. A user's file can set
+  `dom_intersection_observer_enabled = false` in `[engines.servo.preferences]`.
+
+  Medians of 3 reps on louise-pc, 2026-10-22, `bench/compat` (`--post-settle 30`,
+  Servo only). Results: `bench/compat/results/servo07-io-off-78f1359` and
+  `servo07-io-on-78f1359`. All 18 runs in each set classified OK. Frames are `frame`
+  lines in the 30 s after load plus the 3 s settle (the harness `post_frames` field
+  is 0 on every run: its second diagnostics read returns the snapshot from the start
+  of the window). CPU is the harness `post_cpu_s`.
+
+  | Site | Off frames | Off CPU s | On frames | On CPU s |
+  |---|---:|---:|---:|---:|
+  | github-servo | 0 | 0.01 | 0 | 0.01 |
+  | youtube | 0 | 0.34 | 0 | 0.34 |
+  | reddit-rust | 3 | 0.38 | 0 | 0.35 |
+  | bbc | 0 | 0.02 | 0 | 0.02 |
+  | nytimes | 11 | 0.49 | 0 | 0.03 |
+  | microsoft | 33 | 29.99 | 124 | 30.13 |
+
+  With the observer on, microsoft.com presented for the whole window (124 frames,
+  every rep, about 4 per second). With it off, the same page presented a short burst
+  (33 frames, done within about 10 s) and then no further frames. CPU stayed one full
+  core in both cases, so the loop shows up in frames. reddit-rust off rep 3 was an
+  outlier (1678 frames, 22.67 s CPU); the median is the other shape.
 - **Default user agent** is Firefox 153 and still contains `Servo/<version>`.
   `firefox_user_agent` still rewrites that token to `Gecko/20100101`.
 - **Removed preferences** that 0.7 no longer has, because the features are always on:

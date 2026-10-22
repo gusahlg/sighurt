@@ -3507,3 +3507,14 @@ Newest last. Each entry says what was decided and why.
     stays on: microsoft.com presents more frames with it, at the same CPU, while github.com
     freezes without it). `sighurt-sdk` keeps its own version (0.7.0): the guest ABI did not
     change.
+107. **Post-release verification of 0.8.0** (22 October 2026; completes 106, amends 101's
+    diagnosis). On this desktop at 846b030: CLAUDE.md's whole pre-commit list with Servo 0.7
+    and WPE passed (fmt, clippy with and without Servo and with all features, every test
+    suite including the terminal pty tests with all engines, 13/13), and
+    `real-terminals.sh` passed 7/7 in Rio and 7/7 in kitty. On louise-pc: the pty tests with
+    all features 13/13 three times; `engines.sh` 278 PASS / 1 FAIL (WPE's WebGL page got no
+    WebGL context title, to investigate); the 40-site corpus (`servo07-78f1359`): Servo 39
+    OK / 1 partial (linkedin), WPE 40 OK. Webcrypto fixed stackoverflow and amazon (BLANK
+    to OK) and notion (TIMEOUT to OK): decision 101's "bot-challenge regressions of 0.7"
+    were the missing `webcrypto` feature, not Servo. IntersectionObserver stays on
+    (post-settle measurement in `engines/sighurt-engine-servo/SERVO-0.7.md`).

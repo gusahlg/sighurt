@@ -1,0 +1,1371 @@
+{
+  "meta": {
+    "config_extra": "/home/gusahlg/repos/sighurt-servo07/bench/compat/results/servo07-io-off-78f1359/config-extra.toml",
+    "date": "2026-10-22",
+    "distinct_blank": 8,
+    "distinct_rendered": 30,
+    "host": "louise",
+    "load_timeout_s": 40,
+    "nonblank_blank": 0.005,
+    "nonblank_rendered": 0.02,
+    "post_settle_s": 30.0,
+    "reps": 3,
+    "rev": "78f1359",
+    "settle_s": 3,
+    "sig": "/home/gusahlg/repos/sighurt-servo07/target/debug/sig",
+    "sig_version": "sig 0.7.0 (Sighurt, based on Oxide by Nikhil Ranjan)",
+    "stride": 1
+  },
+  "runs": [
+    {
+      "category": "code",
+      "class": "OK",
+      "cpu_sig_s": 2.91,
+      "cpu_tree_s": 2.91,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 10618,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://github.com/servo/servo",
+      "first_frame_ms": 781.146,
+      "frames": 49,
+      "harness_error": null,
+      "id": "github-servo",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.003859365999233,
+      "loaded": true,
+      "nonblank": 0.30134765625000004,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.0,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 1,
+      "rss_sig_mib": 496.2734375,
+      "rss_tree_mib": 496.2734375,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/github-servo-servo-r1.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "GitHub - servo/servo: Servo aims to empower developers with a lightweight, high-performance alternative for embedding web technologies in applications. \u00b7 GitHub",
+      "url": "https://github.com/servo/servo"
+    },
+    {
+      "category": "code",
+      "class": "OK",
+      "cpu_sig_s": 3.11,
+      "cpu_tree_s": 3.11,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 10618,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://github.com/servo/servo",
+      "first_frame_ms": 929.236,
+      "frames": 37,
+      "harness_error": null,
+      "id": "github-servo",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.3543005060055293,
+      "loaded": true,
+      "nonblank": 0.30134765625000004,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.01,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 2,
+      "rss_sig_mib": 492.22265625,
+      "rss_tree_mib": 492.22265625,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/github-servo-servo-r2.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "GitHub - servo/servo: Servo aims to empower developers with a lightweight, high-performance alternative for embedding web technologies in applications. \u00b7 GitHub",
+      "url": "https://github.com/servo/servo"
+    },
+    {
+      "category": "code",
+      "class": "OK",
+      "cpu_sig_s": 2.78,
+      "cpu_tree_s": 2.78,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 10618,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://github.com/servo/servo",
+      "first_frame_ms": 601.085,
+      "frames": 33,
+      "harness_error": null,
+      "id": "github-servo",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.0037625300028594,
+      "loaded": true,
+      "nonblank": 0.30134765625000004,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.01,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 3,
+      "rss_sig_mib": 495.421875,
+      "rss_tree_mib": 495.421875,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/github-servo-servo-r3.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "GitHub - servo/servo: Servo aims to empower developers with a lightweight, high-performance alternative for embedding web technologies in applications. \u00b7 GitHub",
+      "url": "https://github.com/servo/servo"
+    },
+    {
+      "category": "video",
+      "class": "OK",
+      "cpu_sig_s": 5.82,
+      "cpu_tree_s": 5.82,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 1092,
+      "dominant": [
+        179,
+        179,
+        179
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.youtube.com/",
+      "first_frame_ms": 308.389,
+      "frames": 25,
+      "harness_error": null,
+      "id": "youtube",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.002641453000251,
+      "loaded": true,
+      "nonblank": 0.49239746093750003,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.35,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 1,
+      "rss_sig_mib": 614.76171875,
+      "rss_tree_mib": 614.61328125,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/youtube-servo-r1.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "YouTube",
+      "url": "https://www.youtube.com/"
+    },
+    {
+      "category": "video",
+      "class": "OK",
+      "cpu_sig_s": 5.72,
+      "cpu_tree_s": 5.72,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 1092,
+      "dominant": [
+        179,
+        179,
+        179
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.youtube.com/",
+      "first_frame_ms": 292.544,
+      "frames": 23,
+      "harness_error": null,
+      "id": "youtube",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.002440055992338,
+      "loaded": true,
+      "nonblank": 0.49239746093750003,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.34,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 2,
+      "rss_sig_mib": 617.69921875,
+      "rss_tree_mib": 617.69921875,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/youtube-servo-r2.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "YouTube",
+      "url": "https://www.youtube.com/"
+    },
+    {
+      "category": "video",
+      "class": "OK",
+      "cpu_sig_s": 5.78,
+      "cpu_tree_s": 5.78,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 1092,
+      "dominant": [
+        179,
+        179,
+        179
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.youtube.com/",
+      "first_frame_ms": 300.92,
+      "frames": 26,
+      "harness_error": null,
+      "id": "youtube",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.002695756003959,
+      "loaded": true,
+      "nonblank": 0.49239746093750003,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.34,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 3,
+      "rss_sig_mib": 615.28125,
+      "rss_tree_mib": 608.15234375,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/youtube-servo-r3.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "YouTube",
+      "url": "https://www.youtube.com/"
+    },
+    {
+      "category": "social",
+      "class": "OK",
+      "cpu_sig_s": 4.32,
+      "cpu_tree_s": 4.32,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 89599,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.reddit.com/r/rust/?solution=77da4813baa03d4f77da4813baa03d4f&js_challenge=1&jsc_token=2824be10929bdc604753c70a67a1c33152e76266461fa0e23945eac278ca4a98&jsc_orig_r=",
+      "first_frame_ms": 189.635,
+      "frames": 68,
+      "harness_error": null,
+      "id": "reddit-rust",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.0031302769930335,
+      "loaded": true,
+      "nonblank": 0.5014634486607144,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.33,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 1,
+      "rss_sig_mib": 604.62890625,
+      "rss_tree_mib": 604.62890625,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/reddit-rust-servo-r1.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "The Rust Programming Language",
+      "url": "https://www.reddit.com/r/rust/"
+    },
+    {
+      "category": "social",
+      "class": "OK",
+      "cpu_sig_s": 4.43,
+      "cpu_tree_s": 4.43,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 89237,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.reddit.com/r/rust/?solution=ef77f662cf22809aef77f662cf22809a&js_challenge=1&jsc_token=2824be10929bdc604753c70a67a1c3314949a2b0953f62edf4bb20bd6e4469a2&jsc_orig_r=",
+      "first_frame_ms": 185.935,
+      "frames": 69,
+      "harness_error": null,
+      "id": "reddit-rust",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.003260876997956,
+      "loaded": true,
+      "nonblank": 0.5809946986607143,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.38,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 2,
+      "rss_sig_mib": 626.91015625,
+      "rss_tree_mib": 622.79296875,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/reddit-rust-servo-r2.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "The Rust Programming Language",
+      "url": "https://www.reddit.com/r/rust/"
+    },
+    {
+      "category": "social",
+      "class": "OK",
+      "cpu_sig_s": 32.11,
+      "cpu_tree_s": 32.11,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 126199,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.reddit.com/r/rust/?solution=54448ffc5dc6dbb954448ffc5dc6dbb9&js_challenge=1&jsc_token=2824be10929bdc604753c70a67a1c3312ad118637e35732f0bfb4fde027af689&jsc_orig_r=",
+      "first_frame_ms": 191.647,
+      "frames": 1964,
+      "harness_error": null,
+      "id": "reddit-rust",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.00338169799943,
+      "loaded": true,
+      "nonblank": 0.5073200334821428,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 22.67,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 3,
+      "rss_sig_mib": 887.83984375,
+      "rss_tree_mib": 887.83984375,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/reddit-rust-servo-r3.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "The Rust Programming Language",
+      "url": "https://www.reddit.com/r/rust/"
+    },
+    {
+      "category": "news",
+      "class": "OK",
+      "cpu_sig_s": 2.83,
+      "cpu_tree_s": 2.83,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 13870,
+      "dominant": [
+        89,
+        89,
+        89
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.bbc.com/news",
+      "first_frame_ms": 222.545,
+      "frames": 35,
+      "harness_error": null,
+      "id": "bbc",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.00345214799745,
+      "loaded": true,
+      "nonblank": 0.6715297154017856,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.02,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 1,
+      "rss_sig_mib": 478.171875,
+      "rss_tree_mib": 478.171875,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/bbc-servo-r1.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "BBC News - Breaking news, video and the latest top stories from the U.S. and around the world",
+      "url": "https://www.bbc.com/news"
+    },
+    {
+      "category": "news",
+      "class": "OK",
+      "cpu_sig_s": 2.86,
+      "cpu_tree_s": 2.86,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 13869,
+      "dominant": [
+        89,
+        89,
+        89
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.bbc.com/news",
+      "first_frame_ms": 183.307,
+      "frames": 42,
+      "harness_error": null,
+      "id": "bbc",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.0036002779961564,
+      "loaded": true,
+      "nonblank": 0.6715297154017856,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.02,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 2,
+      "rss_sig_mib": 487.68359375,
+      "rss_tree_mib": 487.68359375,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/bbc-servo-r2.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "BBC News - Breaking news, video and the latest top stories from the U.S. and around the world",
+      "url": "https://www.bbc.com/news"
+    },
+    {
+      "category": "news",
+      "class": "OK",
+      "cpu_sig_s": 2.91,
+      "cpu_tree_s": 2.91,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 13869,
+      "dominant": [
+        89,
+        89,
+        89
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.bbc.com/news",
+      "first_frame_ms": 230.849,
+      "frames": 41,
+      "harness_error": null,
+      "id": "bbc",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.0028139909991296,
+      "loaded": true,
+      "nonblank": 0.6715297154017856,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.03,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 3,
+      "rss_sig_mib": 483.11328125,
+      "rss_tree_mib": 483.11328125,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/bbc-servo-r3.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "BBC News - Breaking news, video and the latest top stories from the U.S. and around the world",
+      "url": "https://www.bbc.com/news"
+    },
+    {
+      "category": "news",
+      "class": "OK",
+      "cpu_sig_s": 2.2,
+      "cpu_tree_s": 2.2,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 2983,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.nytimes.com/",
+      "first_frame_ms": 210.979,
+      "frames": 39,
+      "harness_error": null,
+      "id": "nytimes",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.0039136790001066,
+      "loaded": true,
+      "nonblank": 0.047494419642857166,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.51,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 1,
+      "rss_sig_mib": 445.66796875,
+      "rss_tree_mib": 445.66796875,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/nytimes-servo-r1.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "nytimes.com",
+      "url": "https://www.nytimes.com/"
+    },
+    {
+      "category": "news",
+      "class": "OK",
+      "cpu_sig_s": 1.46,
+      "cpu_tree_s": 1.46,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 2926,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.nytimes.com/",
+      "first_frame_ms": 231.014,
+      "frames": 16,
+      "harness_error": null,
+      "id": "nytimes",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.0047343670012197,
+      "loaded": true,
+      "nonblank": 0.046015625000000004,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.02,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 2,
+      "rss_sig_mib": 391.296875,
+      "rss_tree_mib": 391.296875,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/nytimes-servo-r2.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "nytimes.com",
+      "url": "https://www.nytimes.com/"
+    },
+    {
+      "category": "news",
+      "class": "OK",
+      "cpu_sig_s": 1.95,
+      "cpu_tree_s": 1.95,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 2990,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.nytimes.com/",
+      "first_frame_ms": 219.574,
+      "frames": 27,
+      "harness_error": null,
+      "id": "nytimes",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 2.0055890060029924,
+      "loaded": true,
+      "nonblank": 0.04745954241071426,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 0.49,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 3,
+      "rss_sig_mib": 417.921875,
+      "rss_tree_mib": 417.921875,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/nytimes-servo-r3.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "nytimes.com",
+      "url": "https://www.nytimes.com/"
+    },
+    {
+      "category": "corporate",
+      "class": "OK",
+      "cpu_sig_s": 39.23,
+      "cpu_tree_s": 39.23,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 24681,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.microsoft.com/sv-se",
+      "first_frame_ms": 334.149,
+      "frames": 63,
+      "harness_error": null,
+      "id": "microsoft",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 3.105823156001861,
+      "loaded": true,
+      "nonblank": 0.7297614397321428,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 30.0,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 1,
+      "rss_sig_mib": 516.87109375,
+      "rss_tree_mib": 516.87109375,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/microsoft-servo-r1.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "Microsoft \u2013 AI, molnet, produktivitet, datorer, spel och appar",
+      "url": "https://www.microsoft.com/"
+    },
+    {
+      "category": "corporate",
+      "class": "OK",
+      "cpu_sig_s": 39.44,
+      "cpu_tree_s": 39.44,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 24681,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.microsoft.com/sv-se",
+      "first_frame_ms": 322.914,
+      "frames": 58,
+      "harness_error": null,
+      "id": "microsoft",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 3.055864934998681,
+      "loaded": true,
+      "nonblank": 0.7297614397321428,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 29.98,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 2,
+      "rss_sig_mib": 526.80078125,
+      "rss_tree_mib": 526.80078125,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/microsoft-servo-r2.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "Microsoft \u2013 AI, molnet, produktivitet, datorer, spel och appar",
+      "url": "https://www.microsoft.com/"
+    },
+    {
+      "category": "corporate",
+      "class": "OK",
+      "cpu_sig_s": 39.47,
+      "cpu_tree_s": 39.47,
+      "cpu_webkit_s": 0,
+      "crash": false,
+      "crash_reason": null,
+      "distinct": 24681,
+      "dominant": [
+        255,
+        255,
+        255
+      ],
+      "engine": "servo",
+      "engine_renderer": "renderer engine=servo mode=hardware gl=\"NVIDIA",
+      "engine_state": [
+        {
+          "name": "servo",
+          "renderer": "gl, straight into the page's subsurface",
+          "state": "running"
+        },
+        {
+          "name": "wasm",
+          "renderer": "cpu (tiny-skia), wl_shm",
+          "state": "not started"
+        },
+        {
+          "name": "wpe",
+          "renderer": "WebKit: its DMA-BUFs straight into the page's subsurface",
+          "state": "not started"
+        }
+      ],
+      "error_count": 0,
+      "error_lines": [],
+      "exit_code": 0,
+      "final_url": "https://www.microsoft.com/sv-se",
+      "first_frame_ms": 401.731,
+      "frames": 62,
+      "harness_error": null,
+      "id": "microsoft",
+      "image": [
+        1600,
+        1000
+      ],
+      "last_error": null,
+      "load_s": 3.405709119004314,
+      "loaded": true,
+      "nonblank": 0.7297614397321428,
+      "page_box": [
+        0,
+        84,
+        1600,
+        896
+      ],
+      "post_cpu_s": 29.99,
+      "post_frames": 0,
+      "post_settle_s": 30.0,
+      "reason": "loaded, titled, non-blank, no errors",
+      "renderer": "gles2",
+      "rep": 3,
+      "rss_sig_mib": 511.15234375,
+      "rss_tree_mib": 511.15234375,
+      "rss_webkit_mib": 0.0,
+      "sampled": 1433600,
+      "shm_fallback": false,
+      "shot": "shots/microsoft-servo-r3.png",
+      "shutdown_forced": false,
+      "shutdown_leaked": false,
+      "started": true,
+      "tab_engine": "servo",
+      "tab_error": false,
+      "title": "Microsoft \u2013 AI, molnet, produktivitet, datorer, spel och appar",
+      "url": "https://www.microsoft.com/"
+    }
+  ]
+}

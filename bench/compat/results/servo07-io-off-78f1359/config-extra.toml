@@ -1,0 +1,2 @@
+[engines.servo.preferences]
+dom_intersection_observer_enabled = false

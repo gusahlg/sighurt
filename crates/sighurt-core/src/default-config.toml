@@ -77,12 +77,14 @@ default = "servo"
 #     Sighurt already enables some of these (columns, IndexedDB and others; the engine's
 #     README names them) because sites need them. Grid (layout_grid_enabled) and
 #     IntersectionObserver (dom_intersection_observer_enabled) are on as their own baseline
-#     preferences, not only through this flag. IntersectionObserver is on by default: on
-#     Servo 0.5 it spun reddit.com and microsoft.com (fixed upstream in servo/servo#47693).
-#     On Servo 0.7, one bench/compat rep on 2026-10-21 (louise-pc) did not spin. Off:
-#     reddit-rust 1.74s CPU / 16 frames, microsoft 9.39s / 44, github-servo 2.42s / 7.
-#     On: reddit-rust 3.27s / 411, microsoft 9.52s / 53, github-servo 2.66s / 38. All six
-#     classified OK. Set the preference to false to turn IntersectionObserver off.
+#     preferences in the engine, not only through this flag. IntersectionObserver stays on
+#     (decision 106): github.com freezes without it. On Servo 0.5 it spun reddit.com and
+#     microsoft.com (fixed upstream in servo/servo#47693). On Servo 0.7 at 78f1359
+#     (louise-pc, 2026-10-22, 3 reps, 30 s after settle) five sites stayed near idle with it
+#     on; microsoft.com kept presenting (124 frames against a burst of 33 with it off) at the
+#     same CPU, a full core either way. The table is in the Servo engine's SERVO-0.7.md. To
+#     turn it off, set `dom_intersection_observer_enabled = false` in your own file's
+#     [engines.servo.preferences].
 #     The flag turns the whole set on. It does not enable adopted stylesheets or web
 #     animations, and Servo has no preference for requestIdleCallback; set a preference on
 #     its own below.
