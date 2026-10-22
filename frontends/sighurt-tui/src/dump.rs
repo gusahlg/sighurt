@@ -11,11 +11,12 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::IsTerminal;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::fs::OFlags;
 use rustix::io::Errno;
 use std::time::{Duration, Instant};
 
@@ -219,15 +220,14 @@ fn choose_dump_engine(
     if fixed.is_empty() {
         return Err("the address is empty".into());
     }
-    let Some(address) = Address::parse(&fixed) else {
-        return Err(format!("{fixed} is not an address"));
-    };
-    let name = match routed(&address, config) {
-        Routed::Internal => {
+    // The core's parser: IDNA hosts and percent-encoded paths, the same ones a tab uses.
+    let (name, matched) = match sighurt_core::router::routed(&fixed, config) {
+        None => return Err(format!("{fixed} is not an address")),
+        Some(sighurt_core::router::Routed::Internal) => {
             return Err("sig: pages are Sighurt's own and have no page text for --dump".into())
         }
-        Routed::Error(message) => return Err(message),
-        Routed::Engine(name) => name,
+        Some(sighurt_core::router::Routed::Error(message)) => return Err(message),
+        Some(sighurt_core::router::Routed::Engine { engine, matched }) => (engine, matched),
     };
     if registry
         .engine(&name)
@@ -235,7 +235,9 @@ fn choose_dump_engine(
     {
         return Ok(name);
     }
-    if default_without_a_rule(&address, config, &name) {
+    // `matched` is false only when an http(s) or file URL fell through to the default
+    // engine. That default may give no page text (Servo); use one that does.
+    if !matched {
         return engine_with_text(registry);
     }
     match registry.engine(&name) {
@@ -244,92 +246,6 @@ fn choose_dump_engine(
         )),
         None => Err(format!("the {name} engine is not part of this build")),
     }
-}
-
-/// Where [`sighurt_core::router::route`] would send `address` with no explicit engine.
-enum Routed {
-    Engine(String),
-    Internal,
-    Error(String),
-}
-
-fn routed(address: &Address, config: &sighurt_core::config::Config) -> Routed {
-    let routes = config.routes();
-    let scheme = address.scheme.as_str();
-    let engine = if scheme == "sig" {
-        return Routed::Internal;
-    } else if !matches!(scheme, "http" | "https" | "file") {
-        match routes
-            .iter()
-            .find(|route| route.schemes.iter().any(|listed| listed == scheme))
-        {
-            Some(route) => route.engine.clone(),
-            None => return Routed::Error(format!("no engine opens {scheme}: URLs")),
-        }
-    } else {
-        match web_rule(routes, address) {
-            Some(route) => route.engine.clone(),
-            None => config.default_engine().to_owned(),
-        }
-    };
-    if !config.is_enabled(&engine) {
-        return Routed::Error(format!(
-            "the {engine} engine is not enabled in the configuration"
-        ));
-    }
-    Routed::Engine(engine)
-}
-
-/// The extension or host rule that claims `address`, if one does. Same order as the core:
-/// a file by its extension; an http(s) URL by origin and extension, else the most specific host.
-fn web_rule<'a>(
-    routes: &'a [sighurt_core::config::EngineRoutes],
-    address: &Address,
-) -> Option<&'a sighurt_core::config::EngineRoutes> {
-    let claims = |route: &&sighurt_core::config::EngineRoutes| {
-        address
-            .extension
-            .as_ref()
-            .is_some_and(|extension| route.extensions.contains(extension))
-    };
-    if address.scheme == "file" {
-        return routes.iter().find(claims);
-    }
-    routes
-        .iter()
-        .filter(claims)
-        .find(|route| route.origins.contains(&address.origin))
-        .or_else(|| claiming_host(routes, &address.host))
-}
-
-/// True when `engine` is the default and no extension or host rule claimed the URL.
-fn default_without_a_rule(
-    address: &Address,
-    config: &sighurt_core::config::Config,
-    engine: &str,
-) -> bool {
-    engine == config.default_engine()
-        && matches!(address.scheme.as_str(), "http" | "https" | "file")
-        && web_rule(config.routes(), address).is_none()
-}
-
-fn claiming_host<'a>(
-    routes: &'a [sighurt_core::config::EngineRoutes],
-    host: &str,
-) -> Option<&'a sighurt_core::config::EngineRoutes> {
-    let specificity = |pattern: &String| match pattern.strip_prefix("*.") {
-        Some(suffix) => host
-            .strip_suffix(suffix)
-            .is_some_and(|under| under.ends_with('.'))
-            .then_some(suffix.len()),
-        None => (*pattern == host).then_some(usize::MAX),
-    };
-    routes
-        .iter()
-        .flat_map(|route| route.hosts.iter().map(move |pattern| (pattern, route)))
-        .filter_map(|(pattern, route)| Some((specificity(pattern)?, route)))
-        .max_by_key(|&(specificity, _)| specificity)
-        .map(|(_, route)| route)
 }
 
 fn engine_with_text(
@@ -343,123 +259,6 @@ fn engine_with_text(
         .find(|engine| engine.capabilities.semantics)
         .map(|engine| engine.name.to_owned())
         .ok_or_else(|| "this sig has no engine that gives page text (WPE WebKit does)".into())
-}
-
-/// The parts of an address [`sighurt_core::router::route`] looks at.
-///
-/// Hierarchical URLs are split the way the `url` crate reports them for ASCII hosts: the host
-/// without brackets, lower case, default ports left out of the origin. Non-ASCII hosts are
-/// lowercased but not punycoded.
-struct Address {
-    scheme: String,
-    host: String,
-    origin: String,
-    extension: Option<String>,
-}
-
-impl Address {
-    fn parse(input: &str) -> Option<Self> {
-        let (scheme, rest) = input.split_once(':')?;
-        if scheme.is_empty()
-            || !scheme
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))
-        {
-            return None;
-        }
-        let scheme = scheme.to_ascii_lowercase();
-        if !rest.starts_with("//") {
-            let path = rest.split(['?', '#']).next().unwrap_or("");
-            return Some(Self {
-                scheme,
-                host: String::new(),
-                origin: String::new(),
-                extension: extension_of(path),
-            });
-        }
-        let rest = &rest[2..];
-        let (authority, after) = match rest.find(['/', '?', '#']) {
-            Some(at) => (&rest[..at], &rest[at..]),
-            None => (rest, ""),
-        };
-        let hostport = match authority.rsplit_once('@') {
-            Some((_, hostport)) => hostport,
-            None => authority,
-        };
-        let (host, port) = split_host_port(hostport)?;
-        let path = after.split(['?', '#']).next().unwrap_or("");
-        let origin = http_origin(&scheme, &host, port);
-        Some(Self {
-            scheme,
-            host,
-            origin,
-            extension: extension_of(path),
-        })
-    }
-}
-
-fn split_host_port(hostport: &str) -> Option<(String, Option<u16>)> {
-    if let Some(host) = hostport.strip_prefix('[') {
-        let (host, rest) = host.split_once(']')?;
-        let port = match rest.strip_prefix(':') {
-            Some(port) => Some(port.parse().ok()?),
-            None if rest.is_empty() => None,
-            None => return None,
-        };
-        // `host_str` keeps the brackets the URL serialization uses.
-        return Some((format!("[{}]", host.to_ascii_lowercase()), port));
-    }
-    match hostport.rsplit_once(':') {
-        Some((host, port))
-            if !host.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            Some((host.to_ascii_lowercase(), Some(port.parse().ok()?)))
-        }
-        _ => Some((hostport.to_ascii_lowercase(), None)),
-    }
-}
-
-fn http_origin(scheme: &str, host: &str, port: Option<u16>) -> String {
-    if host.is_empty() {
-        return "null".into();
-    }
-    let default = match scheme {
-        "http" | "ws" => Some(80),
-        "https" | "wss" => Some(443),
-        "ftp" => Some(21),
-        _ => None,
-    };
-    match (default, port) {
-        (Some(default), Some(port)) if port == default => format!("{scheme}://{host}"),
-        (Some(_), None) | (None, None) => format!("{scheme}://{host}"),
-        (_, Some(port)) => format!("{scheme}://{host}:{port}"),
-    }
-}
-
-fn extension_of(path: &str) -> Option<String> {
-    let name = path.rsplit('/').next().unwrap_or("");
-    let (_, extension) = name.rsplit_once('.')?;
-    let extension = percent_decode(extension);
-    (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
-            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
 }
 
 fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
@@ -480,12 +279,7 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
     // Routing, not "WPE first": a demo: URL configured for the demo engine must not be handed
     // to WPE. TUI.md still asks for WPE when the page is an ordinary http(s) or file URL whose
     // only claim is the default engine and that engine gives no page text (Servo).
-    let engine = choose_dump_engine(
-        &registry,
-        &config,
-        env.home_dir.as_deref(),
-        &options.open,
-    )?;
+    let engine = choose_dump_engine(&registry, &config, env.home_dir.as_deref(), &options.open)?;
     registry.configure(&config);
     sighurt_runtime::registry::install_logger();
     let wake = Arc::new(Wake::default());
@@ -520,7 +314,17 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
         open: vec![open],
     });
     session.run_core(&mut headless);
-    let outcome = wait(&mut session, &mut headless, &wake, &options, signals);
+    // One deadline for the load and for writing the page. The write used to start
+    // `options.timeout` over again once the text was ready.
+    let deadline = Instant::now() + options.timeout;
+    let outcome = wait(
+        &mut session,
+        &mut headless,
+        &wake,
+        &options,
+        signals,
+        deadline,
+    );
     let text = match &outcome {
         Ok(Some(snapshot)) => {
             if std::env::var_os("SIG_DUMP_STATS").is_some() {
@@ -539,7 +343,7 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
     let mut code = code;
     let mut written = Ok(true);
     if let Some(text) = text {
-        written = write_out(text.as_bytes(), signals, options.timeout);
+        written = write_out(text.as_bytes(), signals, deadline);
         match written {
             Ok(true) => {}
             Ok(false) => code = ExitCode::from(2),
@@ -611,24 +415,97 @@ fn stats(snapshot: &SemanticSnapshot) -> String {
     )
 }
 
-/// Writes `bytes` to stdout without ever blocking on it: it waits for the pipe to take more, a
-/// chunk at a time, and gives up at `timeout` (`Ok(false)`) or on SIGTERM and SIGINT.
-fn write_out(bytes: &[u8], signals: &OwnedFd, timeout: Duration) -> Result<bool, String> {
-    // A pipe takes a write of this size whole when it reports room.
-    const CHUNK: usize = 4096;
-    let deadline = Instant::now() + timeout;
+/// Writes `bytes` to stdout without ever blocking on it. Gives up at `deadline`
+/// (`Ok(false)`) or on SIGTERM and SIGINT. `deadline` is the dump's one timeout, not a
+/// fresh one for the write.
+fn write_out(bytes: &[u8], signals: &OwnedFd, deadline: Instant) -> Result<bool, String> {
     let stdout = std::io::stdout();
+    write_fd(stdout.as_fd(), bytes, signals, deadline)
+}
+
+/// Writes `bytes` to `fd`. The fd is non-blocking for the loop and its previous flags are
+/// put back afterwards, including when the write fails. `EAGAIN` means poll again: another
+/// writer can fill a shared pipe after `POLLOUT` and before `write`, and a blocking write
+/// of 4096 bytes then waits forever.
+fn write_fd(
+    fd: BorrowedFd<'_>,
+    bytes: &[u8],
+    signals: &OwnedFd,
+    deadline: Instant,
+) -> Result<bool, String> {
+    if bytes.is_empty() {
+        return Ok(true);
+    }
+    if Instant::now() >= deadline {
+        return Ok(false);
+    }
+    let original = rustix::fs::fcntl_getfl(fd)
+        .map_err(|error| format!("cannot read stdout flags: {error}"))?;
+    rustix::fs::fcntl_setfl(fd, original | OFlags::NONBLOCK)
+        .map_err(|error| format!("cannot set stdout non-blocking: {error}"))?;
+    let mut restore = RestoreFlags {
+        fd,
+        flags: original,
+        pending: true,
+    };
+    let written = write_nonblocking(fd, bytes, signals, deadline);
+    match (written, restore.restore()) {
+        (Ok(done), Ok(())) => Ok(done),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(write), Err(flags)) => Err(format!("{write} ({flags})")),
+    }
+}
+
+/// Puts `fd`'s status flags back. [`Drop`] covers a panic or an early return.
+struct RestoreFlags<'a> {
+    fd: BorrowedFd<'a>,
+    flags: OFlags,
+    pending: bool,
+}
+
+impl RestoreFlags<'_> {
+    fn restore(&mut self) -> Result<(), String> {
+        if !self.pending {
+            return Ok(());
+        }
+        self.pending = false;
+        rustix::fs::fcntl_setfl(self.fd, self.flags)
+            .map_err(|error| format!("cannot restore stdout flags: {error}"))
+    }
+}
+
+impl Drop for RestoreFlags<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            let _ = rustix::fs::fcntl_setfl(self.fd, self.flags);
+            self.pending = false;
+        }
+    }
+}
+
+/// `CHUNK` is `PIPE_BUF`. A pipe reports `POLLOUT` when any byte fits, so a write of that
+/// size can still return `EAGAIN`; the next try is one byte, which fits whenever `POLLOUT`
+/// is set, and `poll` blocks once the pipe is actually full.
+fn write_nonblocking(
+    fd: BorrowedFd<'_>,
+    bytes: &[u8],
+    signals: &OwnedFd,
+    deadline: Instant,
+) -> Result<bool, String> {
+    const CHUNK: usize = 4096;
     let mut rest = bytes;
+    let mut limit = CHUNK;
     while !rest.is_empty() {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Ok(false);
         }
         let mut fds = [
-            PollFd::new(&stdout, PollFlags::OUT),
+            PollFd::new(&fd, PollFlags::OUT),
             PollFd::new(signals, PollFlags::IN),
         ];
-        let spec = Timespec::try_from(left).map_err(|e| e.to_string())?;
+        let spec = Timespec::try_from(left).map_err(|error| error.to_string())?;
         match rustix::event::poll(&mut fds, Some(&spec)) {
             Ok(_) | Err(Errno::INTR) => {}
             Err(error) => return Err(format!("cannot wait for stdout: {error}")),
@@ -643,9 +520,14 @@ fn write_out(bytes: &[u8], signals: &OwnedFd, timeout: Duration) -> Result<bool,
         if fds[0].revents().is_empty() {
             continue;
         }
-        let chunk = &rest[..rest.len().min(CHUNK)];
-        match rustix::io::write(stdout.as_fd(), chunk) {
-            Ok(n) => rest = &rest[n..],
+        let chunk = &rest[..rest.len().min(limit)];
+        match rustix::io::write(fd, chunk) {
+            Ok(0) => {}
+            Ok(n) => {
+                rest = &rest[n..];
+                limit = CHUNK;
+            }
+            Err(Errno::AGAIN) if limit > 1 => limit = 1,
             Err(Errno::AGAIN | Errno::INTR) => {}
             Err(error) => return Err(format!("cannot write the page: {error}")),
         }
@@ -715,15 +597,51 @@ impl Settle {
     }
 }
 
-/// Drives the session until the page's snapshot is in: `Some`, or `None` at the timeout.
+/// How long to sleep. `None` means a pump is already due, so the loop runs again without
+/// sleeping. Otherwise the soonest deadline that is still ahead of `now`, and at most 500 ms
+/// so the signal pipe is checked. A deadline that has passed does not count: once the quiet
+/// period has expired, waiting out [`GRACE`] or [`GRACE_THIN`] must not spin.
+fn sleep_for(
+    now: Instant,
+    deadline: Instant,
+    quiet_at: Option<Instant>,
+    grace_from: Option<Instant>,
+    pump_at: Option<Option<Instant>>,
+) -> Option<Duration> {
+    match pump_at {
+        Some(None) => return None,
+        Some(Some(at)) if at <= now => return None,
+        _ => {}
+    }
+    let mut until = deadline;
+    for at in quiet_at.into_iter().chain(pump_at.flatten()) {
+        if at > now {
+            until = until.min(at);
+        }
+    }
+    if let Some(at) = grace_from {
+        for at in [at + GRACE, at + GRACE_THIN] {
+            if at > now {
+                until = until.min(at);
+            }
+        }
+    }
+    Some(
+        until
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(500)),
+    )
+}
+
+/// Drives the session until the page's snapshot is in: `Some`, or `None` at `deadline`.
 fn wait(
     session: &mut Session<Headless>,
     headless: &mut Headless,
     wake: &Wake,
     options: &DumpOptions,
     signals: &OwnedFd,
+    deadline: Instant,
 ) -> Result<Option<Box<SemanticSnapshot>>, String> {
-    let deadline = Instant::now() + options.timeout;
     let mut asked = HashSet::new();
     let mut settle = Settle::default();
     // When the load of the shown document ended.
@@ -805,28 +723,20 @@ fn wait(
         if now >= deadline {
             return Ok(None);
         }
-        let mut until = deadline;
-        if settle.settling(headless.count) {
-            until = until.min(headless.last + SETTLE);
-        }
-        if let (Some(at), true) = (loaded_at, document.is_some()) {
-            for wait in [GRACE, GRACE_THIN] {
-                if at + wait > now {
-                    until = until.min(at + wait);
-                }
-            }
-        }
-        match session.registry().next_pump() {
-            Some(None) => continue,
-            Some(Some(at)) => until = until.min(at),
-            None => {}
-        }
-        // The signal pipe has no waker: look at it at least twice a second.
-        wake.wait(
-            until
-                .saturating_duration_since(now)
-                .min(Duration::from_millis(500)),
-        );
+        let quiet_at = settle
+            .settling(headless.count)
+            .then_some(headless.last + SETTLE);
+        let grace_from = loaded_at.filter(|_| document.is_some());
+        let Some(pause) = sleep_for(
+            now,
+            deadline,
+            quiet_at,
+            grace_from,
+            session.registry().next_pump(),
+        ) else {
+            continue;
+        };
+        wake.wait(pause);
     }
 }
 
@@ -898,5 +808,216 @@ mod tests {
         };
         assert!(!out.chars().any(bad), "{out:?}");
         assert!(out.contains("https://x.test/"));
+    }
+
+    #[test]
+    fn an_expired_quiet_period_does_not_busy_loop_through_grace() {
+        let now = Instant::now();
+        let loaded = now - Duration::from_millis(400);
+        // Quiet expired at this instant. Grace still has 1.1 s; the wait is the 500 ms cap.
+        let pause = sleep_for(
+            now,
+            now + Duration::from_secs(20),
+            Some(now),
+            Some(loaded),
+            None,
+        )
+        .expect("grace is still ahead");
+        assert_eq!(pause, Duration::from_millis(500), "{pause:?}");
+
+        // Quiet still ahead: wait for it, not the longer grace.
+        let pause = sleep_for(
+            now,
+            now + Duration::from_secs(20),
+            Some(now + Duration::from_millis(200)),
+            Some(loaded),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pause, Duration::from_millis(200));
+
+        // Grace sooner than the cap, quiet already over.
+        let loaded = now - GRACE + Duration::from_millis(120);
+        let pause = sleep_for(
+            now,
+            now + Duration::from_secs(20),
+            Some(now - Duration::from_secs(1)),
+            Some(loaded),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pause, Duration::from_millis(120));
+
+        let pause = sleep_for(now, now + Duration::from_millis(80), None, None, None).unwrap();
+        assert_eq!(pause, Duration::from_millis(80));
+
+        // A pump that is already due is not a zero-length sleep.
+        assert!(sleep_for(
+            now,
+            now + Duration::from_secs(20),
+            Some(now - Duration::from_millis(1)),
+            Some(loaded),
+            Some(None),
+        )
+        .is_none());
+        assert!(sleep_for(
+            now,
+            now + Duration::from_secs(20),
+            None,
+            None,
+            Some(Some(now))
+        )
+        .is_none());
+        let pause = sleep_for(
+            now,
+            now + Duration::from_secs(20),
+            None,
+            None,
+            Some(Some(now + Duration::from_millis(40))),
+        )
+        .unwrap();
+        assert_eq!(pause, Duration::from_millis(40));
+    }
+
+    /// A pipe with one byte of room: `poll` reports `POLLOUT`, and a blocking write of
+    /// 4096 bytes never returns.
+    fn leave_one_byte_free(reader: &OwnedFd, writer: &OwnedFd) {
+        let flags = rustix::fs::fcntl_getfl(writer).unwrap();
+        rustix::fs::fcntl_setfl(writer, flags | OFlags::NONBLOCK).unwrap();
+        let byte = [0u8; 1];
+        loop {
+            match rustix::io::write(writer, &byte) {
+                Ok(1) => {}
+                Err(Errno::AGAIN) => break,
+                other => panic!("filling the pipe: {other:?}"),
+            }
+        }
+        let mut one = [0u8; 1];
+        assert_eq!(rustix::io::read(reader, &mut one).unwrap(), 1);
+        rustix::fs::fcntl_setfl(writer, flags).unwrap();
+    }
+
+    fn signal_pipe() -> (OwnedFd, std::io::PipeWriter) {
+        let (read, write) = std::io::pipe().unwrap();
+        (read.into(), write)
+    }
+
+    #[test]
+    fn a_4096_byte_write_hits_the_deadline_when_the_pipe_has_room_for_less() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let reader = OwnedFd::from(reader);
+        let writer = OwnedFd::from(writer);
+        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        assert!(!flags.contains(OFlags::NONBLOCK), "{flags:?}");
+        leave_one_byte_free(&reader, &writer);
+        let (signals, _keep) = signal_pipe();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let result = write_fd(
+                writer.as_fd(),
+                &[0u8; 4096],
+                &signals,
+                Instant::now() + Duration::from_millis(200),
+            );
+            let after = rustix::fs::fcntl_getfl(&writer).unwrap();
+            let _ = tx.send((result, after));
+        });
+        let (result, after) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the write blocked; stdout was still blocking");
+        assert!(!result.unwrap());
+        assert_eq!(after, flags);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stdout_flags_are_restored_when_the_write_fails() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let writer = OwnedFd::from(writer);
+        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        let (signals, _keep) = signal_pipe();
+        let error = write_fd(
+            writer.as_fd(),
+            b"hello",
+            &signals,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot write"), "{error}");
+        assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
+    }
+
+    #[test]
+    fn an_expired_deadline_writes_nothing() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let writer = OwnedFd::from(writer);
+        let (signals, _keep) = signal_pipe();
+        let start = Instant::now();
+        let wrote = write_fd(
+            writer.as_fd(),
+            b"hello",
+            &signals,
+            start - Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(!wrote);
+        assert!(start.elapsed() < Duration::from_millis(200));
+        let reader = OwnedFd::from(reader);
+        let flags = rustix::fs::fcntl_getfl(&reader).unwrap();
+        rustix::fs::fcntl_setfl(&reader, flags | OFlags::NONBLOCK).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            rustix::io::read(&reader, &mut buf).unwrap_err(),
+            Errno::AGAIN
+        );
+    }
+
+    #[cfg(all(feature = "engine-demo", feature = "engine-wasm"))]
+    #[test]
+    fn dump_routing_uses_the_cores_url_parser() {
+        let registry = crate::engines::build();
+        let mut env = registry.environment(chrome_checks(), COLOR_NAMES);
+        env.frontend = FrontendKind::Terminal;
+        let config = sighurt_core::config::Config::parse(
+            Some("version = 1\n[routing.wasm]\nhosts = [\"bücher.de\"]\n"),
+            &env,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let choose = |input: &str| {
+            choose_dump_engine(
+                &registry,
+                &config,
+                None,
+                &OpenRequest {
+                    input: input.into(),
+                    engine: None,
+                },
+            )
+        };
+        // IDNA: the host rule matches, and wasm gives no page text.
+        let unicode = choose("https://Bücher.de/").unwrap_err();
+        assert!(
+            unicode.contains("wasm") && unicode.contains("page text"),
+            "{unicode}"
+        );
+        let puny = choose("https://xn--bcher-kva.de/a").unwrap_err();
+        assert!(
+            puny.contains("wasm") && puny.contains("page text"),
+            "{puny}"
+        );
+        // `%77` is `w`, but the core keeps the encoding, so this is not a wasm file.
+        let encoded = choose("file:///tmp/app.%77asm").unwrap();
+        assert_eq!(encoded, engine_with_text(&registry).unwrap());
+        let wasm = choose("file:///tmp/app.wasm").unwrap_err();
+        assert!(
+            wasm.contains("wasm") && wasm.contains("page text"),
+            "{wasm}"
+        );
     }
 }

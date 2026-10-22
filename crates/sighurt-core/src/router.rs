@@ -19,6 +19,7 @@
 //! ([`Config::routes`]). Extensions are hints for choosing a loader, not proof of what
 //! the content is. Content the engine can't show becomes a download (the engine asks for one)
 //! or a clear error. The same rules decide where a link a user clicks goes (`crate::state`).
+//! [`routed`] is that choice for a URL string, and says whether a rule named the engine.
 //!
 //! Typed text becomes a URL in [`fixup`]: a URL stays one, then search keywords (`[keywords]`),
 //! paths, host names, and a search for anything else.
@@ -57,37 +58,7 @@ pub fn route(url: &Url, config: &Config, explicit: Option<&str>) -> Route {
             }
             engine.to_owned()
         }
-        None if scheme == "sig" => return Route::Internal,
-        None if !matches!(scheme, "http" | "https" | "file") => {
-            match routes
-                .iter()
-                .find(|r| r.schemes.iter().any(|s| s == scheme))
-            {
-                Some(route) => route.engine.clone(),
-                None => return Route::Error(format!("no engine opens {scheme}: URLs")),
-            }
-        }
-        None => {
-            let extension = extension(url);
-            let claims = |route: &&EngineRoutes| {
-                extension
-                    .as_ref()
-                    .is_some_and(|e| route.extensions.contains(e))
-            };
-            let rule = if scheme == "file" {
-                routes.iter().find(claims)
-            } else {
-                let origin = url.origin().ascii_serialization();
-                let host = url.host_str().unwrap_or_default();
-                routes
-                    .iter()
-                    .filter(claims)
-                    .find(|route| route.origins.contains(&origin))
-                    .or_else(|| claiming_host(routes, host))
-            };
-            rule.map_or(config.default_engine(), |route| &route.engine)
-                .to_owned()
-        }
+        None => return classify(url, config).into(),
     };
     if !config.is_enabled(&engine) {
         return Route::Error(format!(
@@ -95,6 +66,92 @@ pub fn route(url: &Url, config: &Config, explicit: Option<&str>) -> Route {
         ));
     }
     Route::Engine(engine)
+}
+
+/// Where [`route`] sends a URL when the user did not name an engine, and whether a
+/// configured rule named that engine.
+///
+/// Hosts and paths are whatever [`Url`] produced: IDNA for hosts, and the path's
+/// percent-encoded form, not a decoded one. An http(s) or file URL that no rule claims
+/// is the default engine with `matched` false.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Routed {
+    /// A `sig:` URL: one of Sighurt's internal pages, which the chrome draws.
+    Internal,
+    /// An engine opens it.
+    Engine {
+        /// The engine's name.
+        engine: String,
+        /// A scheme, extension, origin or host rule named `engine`. False when no rule
+        /// claimed the URL and it falls through to the default engine.
+        matched: bool,
+    },
+    /// Nothing can open it, and why, for the user.
+    Error(String),
+}
+
+impl From<Routed> for Route {
+    fn from(routed: Routed) -> Self {
+        match routed {
+            Routed::Internal => Self::Internal,
+            Routed::Engine { engine, .. } => Self::Engine(engine),
+            Routed::Error(message) => Self::Error(message),
+        }
+    }
+}
+
+/// Parses `address` with the `url` crate and routes it as [`route`] does when no engine
+/// was chosen explicitly.
+///
+/// `None` means `address` is not a URL. The parse is the one tabs use, so a Unicode host
+/// and a percent-encoded path match the same rules there.
+pub fn routed(address: &str, config: &Config) -> Option<Routed> {
+    Some(classify(&Url::parse(address).ok()?, config))
+}
+
+/// [`route`] with no explicit engine, plus whether a rule matched.
+fn classify(url: &Url, config: &Config) -> Routed {
+    let scheme = url.scheme();
+    let routes = config.routes();
+    let (engine, matched) = if scheme == "sig" {
+        return Routed::Internal;
+    } else if !matches!(scheme, "http" | "https" | "file") {
+        match routes
+            .iter()
+            .find(|r| r.schemes.iter().any(|s| s == scheme))
+        {
+            Some(route) => (route.engine.clone(), true),
+            None => return Routed::Error(format!("no engine opens {scheme}: URLs")),
+        }
+    } else {
+        let extension = extension(url);
+        let claims = |route: &&EngineRoutes| {
+            extension
+                .as_ref()
+                .is_some_and(|e| route.extensions.contains(e))
+        };
+        let rule = if scheme == "file" {
+            routes.iter().find(claims)
+        } else {
+            let origin = url.origin().ascii_serialization();
+            let host = url.host_str().unwrap_or_default();
+            routes
+                .iter()
+                .filter(claims)
+                .find(|route| route.origins.contains(&origin))
+                .or_else(|| claiming_host(routes, host))
+        };
+        match rule {
+            Some(route) => (route.engine.clone(), true),
+            None => (config.default_engine().to_owned(), false),
+        }
+    };
+    if !config.is_enabled(&engine) {
+        return Routed::Error(format!(
+            "the {engine} engine is not enabled in the configuration"
+        ));
+    }
+    Routed::Engine { engine, matched }
 }
 
 fn routes_of<'a>(routes: &'a [EngineRoutes], engine: &str) -> Option<&'a EngineRoutes> {
@@ -442,5 +499,65 @@ mod tests {
         for (input, url) in cases {
             assert_eq!(fixup(input, search, &keywords, home), url, "{input:?}");
         }
+    }
+
+    #[test]
+    fn routed_uses_the_url_parser_and_says_whether_a_rule_matched() {
+        let text = r#"
+            version = 1
+            [routing.wasm]
+            hosts = ["bücher.de"]
+            [routing.demo]
+            schemes = ["demo"]
+            "#;
+        let config = Config::parse(Some(text), &env()).unwrap();
+        let decided = |address: &str| super::routed(address, &config).unwrap();
+        let engine = |name: &str, matched: bool| Routed::Engine {
+            engine: name.into(),
+            matched,
+        };
+        // IDNA, the same host a tab's Url sees: the Unicode form and the punycode form.
+        assert_eq!(decided("https://Bücher.de/"), engine("wasm", true));
+        assert_eq!(decided("https://xn--bcher-kva.de/a"), engine("wasm", true));
+        assert_eq!(decided("https://BÜCHER.DE/x"), engine("wasm", true));
+        // No rule: the default engine, and the caller can tell it was not a rule.
+        assert_eq!(decided("https://other.test/"), engine("servo", false));
+        assert_eq!(decided("file:///tmp/page.html"), engine("servo", false));
+        // The built-in wasm extension. A percent-encoded `%77` is `w`, but the path keeps
+        // the encoding, so this is not the wasm rule.
+        assert_eq!(decided("file:///tmp/app.wasm"), engine("wasm", true));
+        assert_eq!(
+            decided("file:///tmp/app.%77asm"),
+            engine("servo", false),
+            "{:?}",
+            Url::parse("file:///tmp/app.%77asm").unwrap().path()
+        );
+        assert_eq!(decided("demo:pattern"), engine("demo", true));
+        assert_eq!(decided("sig://home"), Routed::Internal);
+        assert!(matches!(decided("ftp://example.com"), Routed::Error(_)));
+        assert!(super::routed("not a url", &config).is_none());
+        // The same destination as route(), including when the engine is disabled.
+        for address in [
+            "https://Bücher.de/",
+            "https://other.test/",
+            "file:///tmp/app.wasm",
+            "file:///tmp/app.%77asm",
+            "demo:pattern",
+            "sig://home",
+            "ftp://example.com",
+        ] {
+            let url = Url::parse(address).unwrap();
+            assert_eq!(
+                route(&url, &config, None),
+                Route::from(super::routed(address, &config).unwrap()),
+                "{address}"
+            );
+        }
+        let disabled = format!("{text}\n[engines]\nenabled = [\"servo\", \"demo\"]");
+        let disabled = Config::parse(Some(&disabled), &env()).unwrap();
+        assert!(matches!(
+            super::routed("https://Bücher.de/", &disabled),
+            Some(Routed::Error(message)) if message.contains("not enabled")
+        ));
     }
 }
