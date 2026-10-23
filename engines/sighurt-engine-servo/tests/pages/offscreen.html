@@ -26,7 +26,6 @@ html, body {
   top: 80px;
   width: 48px;
   height: 48px;
-  background: #00ff00;
 }
 .mark {
   position: fixed;
@@ -40,7 +39,13 @@ html, body {
 </head>
 <body>
 <div class="top"></div>
-<div class="box"></div>
+<canvas class="box" width="48" height="48"></canvas>
+<script>
+// The box is WebGL, cleared green: its surface reaches the offscreen context as a texture.
+var gl = document.querySelector(".box").getContext("webgl", { preserveDrawingBuffer: true });
+gl.clearColor(0, 1, 0, 1);
+gl.clear(gl.COLOR_BUFFER_BIT);
+</script>
 <div class="mark"></div>
 </body>
 </html>

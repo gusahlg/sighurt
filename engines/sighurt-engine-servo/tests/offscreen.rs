@@ -22,7 +22,7 @@ use sighurt_engine_servo::{Offscreen, ServoConfig, ServoRuntime};
 const ORANGE: [u8; 4] = [0x22, 0x7e, 0xe6, 0xff];
 /// Body `#1b4f72`.
 const BLUE: [u8; 4] = [0x72, 0x4f, 0x1b, 0xff];
-/// The box `#00ff00`.
+/// The box, a WebGL canvas cleared to `#00ff00`.
 const GREEN: [u8; 4] = [0x00, 0xff, 0x00, 0xff];
 /// The corner mark `#ff00ff`.
 const MAGENTA: [u8; 4] = [0xff, 0x00, 0xff, 0xff];
@@ -115,7 +115,7 @@ fn sample(frame: &Stored, x: u32, y: u32) -> [u8; 4] {
     frame.pixels[i..i + 4].try_into().expect("pixel")
 }
 
-/// The static page: orange header, blue body, green box, magenta corner. The top row is the
+/// The static page: orange header, blue body, green WebGL box, magenta corner. The top row is the
 /// header, so a bottom-up framebuffer fails here.
 fn page_colours(frame: &Stored) -> Result<(), String> {
     let (w, h) = (frame.size.width, frame.size.height);
@@ -125,7 +125,7 @@ fn page_colours(frame: &Stored) -> Result<(), String> {
         ((w / 2, 8), ORANGE, "header middle"),
         ((w / 2, 70), BLUE, "body"),
         ((0, h - 1), BLUE, "bottom left"),
-        ((100, 100), GREEN, "box"),
+        ((100, 100), GREEN, "box (a WebGL canvas)"),
         ((w - 4, h - 4), MAGENTA, "corner"),
     ];
     for ((x, y), expected, name) in checks {

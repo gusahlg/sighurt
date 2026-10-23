@@ -41,8 +41,8 @@ use surfman::mesa_surfaceless::context::Context as SurfacelessContext;
 use surfman::mesa_surfaceless::device::Device as SurfacelessDevice;
 use surfman::mesa_surfaceless::surface::Surface as SurfacelessSurface;
 use surfman::{
-    Connection, ContextAttributeFlags, ContextAttributes, Error, GLApi, GLVersion, SurfaceAccess,
-    SurfaceType,
+    Connection, ContextAttributeFlags, ContextAttributes, Error, GLApi, GLVersion, Surface,
+    SurfaceAccess, SurfaceTexture, SurfaceType,
 };
 
 use crate::presentation::{
@@ -309,6 +309,51 @@ impl RenderingContext for OffscreenContext {
 
     fn glow_gl_api(&self) -> Arc<glow::Context> {
         Arc::clone(&self.glow)
+    }
+
+    /// A WebGL canvas's surface, sampled by WebRender in this context. Its surfaces come from
+    /// the connection above, so they are the surfaceless (`Alternate`) kind. The trait's default
+    /// would drop the surface, and surfman panics when a surface is dropped undestroyed.
+    fn create_texture(&self, surface: Surface) -> Option<(SurfaceTexture, u32, Size2D<i32>)> {
+        let Surface::Alternate(surface) = surface else {
+            log::warn!("servo: a WebGL surface of another backend is not shown");
+            std::mem::forget(surface);
+            return None;
+        };
+        let device = self.device.borrow();
+        let mut context = self.context.borrow_mut();
+        let size = device.surface_info(&surface).size;
+        match device.create_surface_texture(&mut context, surface) {
+            Ok(texture) => {
+                let object = device
+                    .surface_texture_object(&texture)
+                    .map_or(0, |object| object.0.get());
+                Some((SurfaceTexture::Alternate(texture), object, size))
+            }
+            Err((error, surface)) => {
+                // Only the WebGL context that made it can destroy it; leaked, not dropped.
+                log::warn!("servo: WebGL surface texture: {error:?}");
+                std::mem::forget(surface);
+                None
+            }
+        }
+    }
+
+    fn destroy_texture(&self, texture: SurfaceTexture) -> Option<Surface> {
+        let SurfaceTexture::Alternate(texture) = texture else {
+            std::mem::forget(texture);
+            return None;
+        };
+        let device = self.device.borrow();
+        let mut context = self.context.borrow_mut();
+        match device.destroy_surface_texture(&mut context, texture) {
+            Ok(surface) => Some(Surface::Alternate(surface)),
+            Err((error, texture)) => {
+                log::warn!("servo: destroying a WebGL surface texture: {error:?}");
+                std::mem::forget(texture);
+                None
+            }
+        }
     }
 
     fn connection(&self) -> Option<Connection> {
