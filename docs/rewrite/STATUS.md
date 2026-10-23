@@ -32,6 +32,42 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   WebKit is opened on first use and its processes end with the last WPE page, retained views are
   bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
 
+### Paused on 23 October 2026: the terminal in tmux, Servo text, persistent logins
+
+The user's report ("basically all keybindings in the TUI malfunction") was tmux: sig ran inside
+tmux 3.7 (extended-keys off, no passthrough), so no kitty graphics, so text mode, and Servo had
+no text mode: a blank page where nothing visibly responded. The keys arrived (a byte trace from
+the user's pane, and diagnostics showing `e` switching engines). Done and committed on `rewrite`
+(`git log a54108a..rewrite`): the github.com WebGL abort in the terminal (552c5be), decisions
+108–112 below, the terminal-layer fixes of an Opus review (5a3ffc3), sixel graphics and
+text-mode forms (e56c958), Servo's extraction budget (a3959f3).
+
+**Saved, not on `rewrite`:** `wip/2026-10-23-tui-app-fixes` (4549999), Grok's untested app.rs
+work, also uncommitted in the working tree: the terminal's half of decision 108 (send
+`PageTyping(!text_mode)`), discarding old-layout output on resize, terminal modes off and tty
+input flushed before engines shut down at quit, text-mode presents at most 2 a second and none
+for engines without semantics, the NO_SEMANTICS message, the demo engine reporting a focused
+field. Build, test, review, then commit. Prompts and reports:
+`~/.local/share/sighurt-handoff/2026-10-23/`; the site-data design: [site-data.md](site-data.md).
+
+**Next, in order:**
+1. Finish the WIP above (tests: `tools/cargo test -p sighurt-tui --features engine-demo`,
+   `-p sighurt-browser --no-default-features --features frontend-tui,engine-demo`, clippy).
+2. `sig --dump https://chatgpt.com/ --engine servo` sometimes prints its text and then never
+   exits (1 of 2 runs; Script and ResourceManager threads running, the main thread sleeping;
+   `chatgpt-dump-hang/` in the handoff). Also: when the dump's parent is killed, sig survives
+   as an orphan. Find where the dump's shutdown waits.
+3. Persistent logins, phase 1 (decision 113): WPE persistent SQLite cookies; vendored
+   servo-net with an incremental atomic writer; 0700/0600; EndSession at start. Then GPT-6
+   Astra reviews the design (it hit its usage limit today) before phase 2.
+4. Measure, then speed up, the terminal's graphics path (prompt F in the handoff: 141 ms for
+   one Servo present on the user's machine).
+5. A live check in the user's Rio + tmux with a fresh build (sixel, Servo text, keys), then
+   copy the build to `target/try/sig`.
+6. Docs: CLAUDE.md and README still say sixel is designed, not built; TUI.md §3/§6/§10 on
+   Servo semantics and text-mode fields.
+7. Astra review of the day's commits.
+
 ### Paused on 21 October 2026 (evening): close to 0.8.0
 
 Everything verified is committed on `rewrite` (`git log f096f08..rewrite`): the terminal keys
@@ -3518,3 +3554,56 @@ Newest last. Each entry says what was decided and why.
     to OK) and notion (TIMEOUT to OK): decision 101's "bot-challenge regressions of 0.7"
     were the missing `webcrypto` feature, not Servo. IntersectionObserver stays on
     (post-settle measurement in `engines/sighurt-engine-servo/SERVO-0.7.md`).
+108. **A frontend can tell the core that typing doesn't reach the page's fields**
+    (`BrowserEvent::PageTyping(bool)`; amends 104 by one bit: the core still never learns that the
+    page is shown as text). In text mode the view stays focused (105), so a field the page
+    focused itself made every character binding of `[tui.keys]` silently type into an invisible
+    field. With `PageTyping(false)` the core keeps the engine's text-input state per view but
+    neither lets it suppress character bindings nor reports it as `PageTextInput`; the window
+    never sends it. Design by the deep-design agent (Fable), option B of four (runtime filtering
+    with replay, blurring the engine, a keymap field). Evidence: sighurt-core's
+    `a_page_whose_fields_get_no_typing_keeps_its_character_bindings` (21405b8). The terminal's
+    sender is in `wip/2026-10-23-tui-app-fixes`.
+109. **Servo has semantics: sighurt-semantic's extraction in the main world, with DOM changes
+    noticed through frames** (completes 90/98 for Servo; 96e9b0f, a3959f3). Servo 0.7 has no
+    script-message channel, so the extraction installs a MutationObserver that only sets a
+    dirty flag, and a new frame checks it at most every 250 ms after the last extraction or
+    check (a pump deadline, not a timer), or three times the last extraction's time if longer.
+    Servo's style and layout queries cost about 0.2 ms a node, so its walk has a 500 ms budget
+    (WPE keeps 50 ms; `extract_script(budget_ms)`). Console-message signalling was considered
+    (GPT-6 Astra) and not taken: pages that silence `console` would silently stop updates.
+    `--dump` follows the routing, so it now uses Servo by default. Evidence: the engine's
+    tests/semantic.rs; the dump corpus with Servo, `bench/compat/results/2026-10-23-dump-servo`
+    (36 OK / 1 thin / 1 empty / 1 timeout at the 50 ms budget, half WPE's time per site) and
+    `-budget2000` (Wikipedia 79 → 2,051 words, github 58 → 906).
+110. **The terminal shows sixel where kitty graphics aren't available** (TUI.md §2's design,
+    built; e56c958). `auto`: kitty if the graphics query is answered, else sixel if DA1 lists
+    4, else text. Full frames, fixed 6×7×6 palette, at most 5 a second; the page rows are
+    rewritten where kitty would delete by id. Inside tmux 3.4+ (sixel stored per pane) pages
+    are pixels again. The kitty graphics query is not sent under tmux or screen: tmux takes an
+    APC string as the pane's title (5a3ffc3).
+111. **The terminal's built-in table gains `ctrl-c` = `browser.quit` and `ctrl-o` =
+    `location.focus`** (amends 91's table; fab3f2a). Every quit and address binding was a plain
+    letter, which doesn't run while a page field has the keyboard, and raw mode makes Ctrl-C an
+    ordinary key, so a focused field in graphics mode left no way out.
+112. **The terminal restores itself on fatal signals** (5a3ffc3): SIGABRT, SIGBUS, SIGFPE,
+    SIGILL and SIGSEGV chain to any earlier handler and restore the terminal only when the
+    default action is about to kill the process. Rust's own SIGSEGV/SIGBUS handler (stack
+    overflow) comes first, so an ordinary segfault still dies unrestored; aborts (a panic that
+    can't unwind, as Servo's WebGL panic did) are restored.
+113. **Logins persist; the engines keep their own jars and the browser owns the policy, per
+    site** (the user, 23 October 2026: "the active engine fetches requests to store or access
+    information and the browser decides … privacy first and totally safe"; design by the
+    deep-design agent, [site-data.md](site-data.md); approved by the user: vendor the
+    Servo patch, default `keep = "all"`). Root causes: WPE never called
+    `webkit_cookie_manager_set_persistent_storage`; Servo 0.7 writes cookies only in its
+    shutdown (non-atomic), so aborts, decision 54's `_exit`, SIGHUP, SIGKILL and a second `sig`
+    lose a run's cookies, and it keeps session cookies forever; profile files were 0644. Design:
+    no browser-owned cookie store (plan §16; no per-cookie hook in either engine); WPE persists
+    cookies in SQLite on persistent sessions; servo-net 0.7.0 is vendored with a writer that
+    saves persistent cookies, HSTS and auth atomically (0600) every 5 s if changed; 0700/0600
+    profile directories; session cookies end with the process; later an engine-neutral
+    `site_data` request (List, Forget, ForgetAll, EndSession by registrable domain), `[privacy]`
+    (`keep = "all" | "kept"`, `sites`, `third-party-cookies = "block"`) and `site.keep`,
+    `site.forget`, `site.forget-all`. No encryption at rest yet (no keyring in the process).
+    Pending: implementation (phase 1 first) and a GPT-6 Astra review of the design.
