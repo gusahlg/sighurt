@@ -24,9 +24,9 @@
 //! a new frame, at most `[tui] fps` a second, and only once every byte written before has left
 //! the output buffer: nothing is written while any is waiting, so at most one encoded frame is
 //! ever pending and no write is cut short. The engine paints into its view's [`TermTarget`] and
-//! the frame is encoded as a kitty image over the page rows. A resize is a new layout epoch: a
-//! frame for the old one is never sent, though bytes already on their way finish. A hidden or
-//! closed view's image is deleted.
+//! the frame is encoded as a kitty or sixel image over the page rows. A resize is a new layout
+//! epoch: a frame for the old one is never sent, though bytes already on their way finish. A
+//! hidden or closed view's image is deleted; a sixel, which has no id, by rewriting the page rows.
 //!
 //! Logs go to `{state_dir}/sighurt/tui.log` before any engine starts. The terminal is restored
 //! on every way out: quit, error, panic (the terminal's hook), SIGHUP (its handler) and
@@ -76,8 +76,11 @@ use crate::input::{
     cell_to_page_offset, cell_to_page_pixel, CellPixels, PageCells, PointerCapture, Release,
 };
 use crate::kitty::{self, CellRect};
+use crate::sixel;
 use crate::target::{TargetHandle, TermPermit, TermTarget};
-use crate::term::{MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE};
+use crate::term::{
+    MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE, SYNC_BEGIN, SYNC_END,
+};
 use crate::text::{Act, TextPages};
 use crate::textmode::Area;
 
@@ -147,9 +150,20 @@ pub(crate) fn log_path() -> PathBuf {
         .join("tui.log")
 }
 
+/// Which image protocol the current layout uses. Chosen in [`Tui::relayout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Protocol {
+    /// Text, or graphics the terminal cannot show.
+    None,
+    /// Kitty graphics protocol.
+    Kitty,
+    /// Sixel. Full frame, at most 5 a second.
+    Sixel,
+}
+
 /// One view's target as the loop sees it.
 struct Pixels {
-    /// The kitty image id, from 1, never reused.
+    /// The kitty image id, from 1, never reused. Sixel does not use it.
     image: u32,
     handle: TargetHandle,
     /// The engine has a new frame for the current layout.
@@ -167,8 +181,10 @@ struct Tui {
     grid: Grid,
     seat: SeatId,
     settings: TuiConfig,
-    /// The page rows show kitty images.
+    /// The page rows show images.
     graphics: bool,
+    /// The protocol [`Self::relayout`] chose for this layout.
+    protocol: Protocol,
     /// The page rows.
     page: PageArea,
     /// The page rows show pages as text.
@@ -454,6 +470,7 @@ impl App {
             seat: SeatId::next(),
             settings,
             graphics: false,
+            protocol: Protocol::None,
             text_mode: false,
             mode_override: None,
             text: TextPages::new(size.cols, page_area(size).rows),
@@ -717,7 +734,7 @@ impl App {
             // keymap never sees these, so typing `q` into a field is typing.
             TermEvent::Key(key) if self.tui.text.prompting() => {
                 self.tui.chrome_dirty = true;
-                if let Some(act) = self.tui.text.prompt_key(&key) {
+                for act in self.tui.text.prompt_key(&key) {
                     self.session.queue_mut().push_back(semantic_event(act, at));
                 }
                 return;
@@ -1242,12 +1259,18 @@ impl App {
     }
 
     /// Presents the shown view if its engine has a new frame and its time has come, or sends
-    /// its last frame again if the screen lost it, as a kitty image into `out`.
+    /// its last frame again if the screen lost it, as an image into `out`.
     fn frame(&mut self, out: &mut Vec<u8>) {
         let Some((view, target)) = self.shown() else {
             return;
         };
         let metrics = self.tui.metrics;
+        let interval = frame_interval(self.tui.settings, self.tui.pace_sixel());
+        let protocol = self.tui.protocol;
+        let (cell_width, cell_height) = {
+            let size = self.tui.terminal.size();
+            (size.cell_width, size.cell_height)
+        };
         let Some(pixels) = self
             .tui
             .targets
@@ -1272,7 +1295,7 @@ impl App {
                 Some(Ok(PresentOutcome::Submitted)) => {
                     pixels.presented += 1;
                     pixels.on_screen = false;
-                    self.tui.next_frame = Some(now + frame_interval(self.tui.settings));
+                    self.tui.next_frame = Some(now + interval);
                 }
                 Some(Ok(PresentOutcome::NotReady | PresentOutcome::Unchanged)) => {}
                 // The session counted and logged it.
@@ -1297,11 +1320,34 @@ impl App {
             columns: page.cols,
             rows: page.rows,
         };
-        let max = OUTPUT_CAP.saturating_sub(out.len());
+        // The blank and the synchronized-output brackets sit outside the encoder, so the
+        // image itself still has to fit in what remains of the output cap.
+        let mut prefix = Vec::new();
+        if protocol == Protocol::Sixel {
+            prefix.extend_from_slice(SYNC_BEGIN);
+            blank_page(&mut prefix, page);
+        }
+        let suffix = if protocol == Protocol::Sixel {
+            SYNC_END.len()
+        } else {
+            0
+        };
+        let max = OUTPUT_CAP
+            .saturating_sub(out.len())
+            .saturating_sub(prefix.len())
+            .saturating_sub(suffix);
         let image = pixels.image;
-        let Some(encoded) = pixels.handle.with_frame(metrics.epoch(), |frame| {
-            kitty::encode(frame, image, place, max)
-        }) else {
+        let Some(encoded) = pixels
+            .handle
+            .with_frame(metrics.epoch(), |frame| match protocol {
+                Protocol::Kitty => {
+                    kitty::encode(frame, image, place, max).map_err(|e| e.to_string())
+                }
+                Protocol::Sixel => sixel::encode(frame, place, cell_width, cell_height, max)
+                    .map_err(|e| e.to_string()),
+                Protocol::None => Err("no graphics protocol".into()),
+            })
+        else {
             // No frame for this layout yet: the engine's next one brings it.
             return;
         };
@@ -1309,7 +1355,18 @@ impl App {
         match encoded {
             Ok(bytes) => {
                 diag.counters.encoded_bytes += bytes.len() as u64;
-                out.extend(bytes);
+                if protocol == Protocol::Sixel {
+                    // Spaces update tmux's grid, which drops the previous sixel, and the
+                    // synchronized update keeps those spaces off the outer terminal. The
+                    // sixel itself is written through. The cursor save inside the sixel
+                    // restores the position after the spaces, not the grid's cursor.
+                    out.extend_from_slice(&prefix);
+                    out.extend(bytes);
+                    out.extend_from_slice(SYNC_END);
+                    self.tui.grid.forget_cursor();
+                } else {
+                    out.extend(bytes);
+                }
                 pixels.on_screen = true;
             }
             Err(error) => {
@@ -1382,13 +1439,35 @@ impl Tui {
                 self.release_pointer(None);
             }
         }
-        let interval = frame_interval(settings);
-        self.next_frame = self.next_frame.map(|at| at.min(Instant::now() + interval));
         if settings.mode != self.settings.mode {
             self.mode_override = None;
         }
         self.settings = settings;
         self.relayout();
+        // After relayout, so a switch onto sixel picks up the 5 fps cap.
+        let interval = frame_interval(self.settings, self.pace_sixel());
+        self.next_frame = self.next_frame.map(|at| at.min(Instant::now() + interval));
+    }
+
+    /// Sixel frames are capped at 5 fps. Text mode on a sixel terminal is not.
+    fn pace_sixel(&self) -> bool {
+        self.graphics && self.protocol == Protocol::Sixel
+    }
+
+    /// Drops the image a shown view left on the page. Kitty deletes by id. Sixel rewrites
+    /// the page rows.
+    fn drop_placed(&mut self, image: u32) {
+        match self.protocol {
+            Protocol::Kitty => self.control.extend(kitty::delete(image)),
+            Protocol::Sixel => self.blank_placed(),
+            Protocol::None => {}
+        }
+    }
+
+    /// Writes spaces over the page rows so tmux drops the sixel it is holding there.
+    fn blank_placed(&mut self) {
+        blank_page(&mut self.control, self.page);
+        self.grid.forget_cursor();
     }
 
     /// Whether the page rows are text: what `chrome.toggle-mode` chose, else `[tui] mode`, which
@@ -1401,21 +1480,25 @@ impl Tui {
         })
     }
 
-    /// Whether the terminal shows kitty images, as `[tui]` asks.
+    /// Whether the terminal can show images the way `[tui] graphics` asks, at a known cell size.
     fn images_possible(&self) -> bool {
         let size = self.terminal.size();
-        let kitty = self.terminal.capabilities().kitty_graphics_ok == Some(true);
-        let wanted = match self.settings.graphics {
-            GraphicsProtocol::Auto | GraphicsProtocol::Kitty => kitty,
-            // Not implemented yet.
-            GraphicsProtocol::Sixel | GraphicsProtocol::None => false,
-        };
-        wanted && size.cell_width > 0 && size.cell_height > 0
+        self.protocol != Protocol::None && size.cell_width > 0 && size.cell_height > 0
     }
 
     /// The page rows and their pixels for the terminal's size. A changed size is a new layout
     /// epoch, which the views are told of on the next pass.
     fn relayout(&mut self) {
+        let (kitty_ok, sixel_ok) = {
+            let caps = self.terminal.capabilities();
+            (caps.kitty_graphics_ok, caps.sixel)
+        };
+        let protocol = choose_protocol(self.settings.graphics, kitty_ok, sixel_ok);
+        // Sixel has no id to delete, and a kitty image would be the wrong picture.
+        if protocol != self.protocol && self.graphics {
+            self.clear = true;
+        }
+        self.protocol = protocol;
         let size = self.terminal.size();
         let page = page_area(size);
         let width = u32::from(page.cols) * u32::from(size.cell_width);
@@ -1577,7 +1660,16 @@ impl Tui {
     fn leave(&mut self) {
         self.terminal.discard_pending();
         if self.graphics {
-            let _ = self.terminal.write_frame(kitty::DELETE_ALL);
+            match self.protocol {
+                Protocol::Kitty => {
+                    let _ = self.terminal.write_frame(kitty::DELETE_ALL);
+                }
+                // The alternate screen's images are not dropped by leaving it.
+                Protocol::Sixel => {
+                    let _ = self.terminal.write_frame(b"\x1b[H\x1b[2J");
+                }
+                Protocol::None => {}
+            }
         }
         let _ = self.terminal.restore();
     }
@@ -1650,7 +1742,12 @@ impl Frontend for Tui {
         }
         self.views.retain(|_, &mut kept| kept != target);
         if let Some(pixels) = self.targets.remove(&target) {
-            self.control.extend(kitty::delete(pixels.image));
+            let on_screen = pixels.on_screen;
+            match self.protocol {
+                Protocol::Kitty => self.control.extend(kitty::delete(pixels.image)),
+                Protocol::Sixel if on_screen => self.blank_placed(),
+                Protocol::Sixel | Protocol::None => {}
+            }
         }
     }
 
@@ -1713,14 +1810,23 @@ impl Frontend for Tui {
         if !visible {
             self.release_pointer(Some(view));
         }
-        let Some(pixels) = self.views.get(&view).and_then(|t| self.targets.get_mut(t)) else {
+        let Some(&target) = self.views.get(&view) else {
             return;
         };
-        if !visible && pixels.on_screen {
-            self.control.extend(kitty::delete(pixels.image));
+        let placed = self
+            .targets
+            .get(&target)
+            .map(|pixels| (pixels.image, pixels.on_screen));
+        let Some((image, on_screen)) = placed else {
+            return;
+        };
+        if !visible && on_screen {
+            self.drop_placed(image);
         }
-        pixels.on_screen = false;
-        pixels.ready &= visible;
+        if let Some(pixels) = self.targets.get_mut(&target) {
+            pixels.on_screen = false;
+            pixels.ready &= visible;
+        }
         self.chrome_dirty = true;
     }
 
@@ -1799,8 +1905,39 @@ fn empty_metrics() -> Metrics {
     Metrics::new(LayoutEpoch::next(), WindowRect::default(), Scale::ONE)
 }
 
-fn frame_interval(settings: TuiConfig) -> Duration {
-    Duration::from_secs(1) / settings.fps.max(1)
+fn frame_interval(settings: TuiConfig, sixel: bool) -> Duration {
+    let fps = match sixel {
+        true => settings.fps.clamp(1, 5),
+        false => settings.fps.max(1),
+    };
+    Duration::from_secs(1) / fps
+}
+
+/// Kitty where the terminal answered the graphics query and `[tui] graphics` allows it,
+/// otherwise sixel where DA1 lists it and the setting allows it, otherwise none.
+fn choose_protocol(graphics: GraphicsProtocol, kitty_ok: Option<bool>, sixel: bool) -> Protocol {
+    if matches!(graphics, GraphicsProtocol::Auto | GraphicsProtocol::Kitty)
+        && kitty_ok == Some(true)
+    {
+        return Protocol::Kitty;
+    }
+    if matches!(graphics, GraphicsProtocol::Auto | GraphicsProtocol::Sixel) && sixel {
+        return Protocol::Sixel;
+    }
+    Protocol::None
+}
+
+/// Spaces over every page row. tmux drops a sixel when a character is written on its
+/// cells; erasing a row that is already blank does not.
+fn blank_page(out: &mut Vec<u8>, page: PageArea) {
+    if page.cols == 0 || page.rows == 0 {
+        return;
+    }
+    for row in 0..page.rows {
+        let line = u32::from(page.row) + u32::from(row) + 1;
+        let _ = write!(out, "\x1b[{line};1H");
+        out.extend(std::iter::repeat_n(b' ', usize::from(page.cols)));
+    }
 }
 
 /// The active tab's address, or what it is loading, for the address line.
@@ -1918,7 +2055,11 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
         .map(|(from, _)| from)
     });
     let size = tui.terminal.size();
-    let graphics = if tui.graphics { "kitty" } else { "none" };
+    let graphics = match (tui.graphics, tui.protocol) {
+        (true, Protocol::Sixel) => "sixel",
+        (true, Protocol::Kitty) => "kitty",
+        _ => "none",
+    };
     let report = Report {
         counters: session.diagnostics().counters.clone(),
         peaks: session.diagnostics().peaks.clone(),
@@ -1980,7 +2121,28 @@ mod tests {
             fps,
             ..TuiConfig::default()
         };
-        assert_eq!(frame_interval(fps(10)), Duration::from_millis(100));
-        assert_eq!(frame_interval(fps(0)), Duration::from_secs(1));
+        assert_eq!(frame_interval(fps(10), false), Duration::from_millis(100));
+        assert_eq!(frame_interval(fps(0), false), Duration::from_secs(1));
+        assert_eq!(frame_interval(fps(10), true), Duration::from_millis(200));
+        assert_eq!(frame_interval(fps(5), true), Duration::from_millis(200));
+        assert_eq!(frame_interval(fps(4), true), Duration::from_millis(250));
+        assert_eq!(frame_interval(fps(0), true), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn graphics_protocol_follows_the_terminal_and_the_setting() {
+        use GraphicsProtocol::{Auto, Kitty, None as NoGraphics, Sixel};
+        assert_eq!(choose_protocol(Auto, Some(true), true), Protocol::Kitty);
+        assert_eq!(choose_protocol(Auto, Some(false), true), Protocol::Sixel);
+        assert_eq!(choose_protocol(Auto, None, true), Protocol::Sixel);
+        assert_eq!(choose_protocol(Auto, None, false), Protocol::None);
+        assert_eq!(choose_protocol(Kitty, Some(true), true), Protocol::Kitty);
+        assert_eq!(choose_protocol(Kitty, None, true), Protocol::None);
+        assert_eq!(choose_protocol(Sixel, Some(true), true), Protocol::Sixel);
+        assert_eq!(choose_protocol(Sixel, None, false), Protocol::None);
+        assert_eq!(
+            choose_protocol(NoGraphics, Some(true), true),
+            Protocol::None
+        );
     }
 }

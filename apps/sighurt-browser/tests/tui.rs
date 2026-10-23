@@ -34,6 +34,8 @@ const DA1: &[u8] = b"\x1b[c";
 const REPLIES: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
 /// The same with the kitty keyboard flags `sig` pushes (31), as kitty and Rio answer.
 const KITTY_REPLIES: &[u8] = b"\x1b[?31u\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
+/// Cells of 10×20 pixels and DA1 with sixel, and no kitty graphics reply.
+const SIXEL_REPLIES: &[u8] = b"\x1b[6;20;10t\x1b[?62;4c";
 
 /// `sig --tui` on the slave side of a pty, and the fake terminal on the master side.
 struct Terminal {
@@ -306,7 +308,7 @@ fn shows(bytes: &[u8], text: &str) -> bool {
                     }
                     i += 1;
                 }
-                Some(b']' | b'_') => {
+                Some(b']' | b'_' | b'P') => {
                     i += 1;
                     while i < bytes.len()
                         && bytes[i] != 0x07
@@ -326,6 +328,35 @@ fn shows(bytes: &[u8], text: &str) -> bool {
         i += 1;
     }
     shown.contains(text)
+}
+
+/// A sixel image: `ESC P`, parameters of digits and semicolons, `q`, then `ESC \`.
+/// The probe's `ESC P + q` is not one (`+` is not a parameter).
+fn sixel_image(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] != 0x1b || bytes[i + 1] != b'P' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        if !bytes[j].is_ascii_digit() {
+            i += 2;
+            continue;
+        }
+        while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'q') {
+            i += 2;
+            continue;
+        }
+        if bytes[j + 1..].windows(2).any(|window| window == b"\x1b\\") {
+            return true;
+        }
+        i = j + 1;
+    }
+    false
 }
 
 /// A kitty image transmission placed over `columns`×`rows` cells, `width`×`height` pixels.
@@ -350,7 +381,7 @@ fn images(bytes: &[u8]) -> Vec<&[u8]> {
 fn printable(bytes: &[u8]) -> String {
     let mut out = String::new();
     for apc in bytes.split(|&byte| byte == 0x1b) {
-        let apc = match apc.starts_with(b"_G") {
+        let apc = match apc.starts_with(b"_G") || apc.starts_with(b"P") {
             true => &apc[..apc.len().min(60)],
             false => apc,
         };
@@ -712,6 +743,59 @@ fn m_switches_between_graphics_and_text() {
 }
 
 #[test]
+fn sixel_is_sent_when_the_terminal_has_sixel_and_no_kitty_graphics() {
+    let mut term = Terminal::start_with("sixel", &["demo://pattern"], SIXEL_REPLIES);
+    // 80×22 cells of 10×20 pixels is 800×440, and the sixel height rounds down to a band.
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        sixel_image(got) && has(got, b"\"1;1;800;438") && shows(got, "GFX")
+    });
+    assert!(shown, "no sixel image\n{}", term.context());
+    assert!(
+        !has(&term.got, b"_Ga=T"),
+        "a kitty image was sent\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+    let json = fs::read_to_string(term.dir.join("diag.json")).unwrap_or_default();
+    assert!(
+        json.contains("graphics=sixel"),
+        "capabilities did not say sixel: {json}\n{}",
+        term.context()
+    );
+    assert!(term.counter("encoded_bytes") > 0, "{}", term.context());
+    term.assert_restored();
+}
+
+#[test]
+fn graphics_none_sends_no_sixel() {
+    let mut term = Terminal::start_in(
+        "sixel-none",
+        &["demo://pattern"],
+        SIXEL_REPLIES,
+        "graphics = \"none\"",
+    );
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        shows(got, "TEXT") && shows(got, "Demo: pattern")
+    });
+    assert!(shown, "no text page\n{}", term.context());
+    assert!(
+        !sixel_image(&term.got),
+        "graphics none sent a sixel\n{}",
+        term.context()
+    );
+    assert!(
+        !has(&term.got, b"_Ga=T"),
+        "graphics none sent a kitty image\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+    assert_eq!(term.counter("encoded_bytes"), 0, "{}", term.context());
+    term.assert_restored();
+}
+
+#[test]
 fn a_drag_that_leaves_the_page_still_reaches_the_page() {
     let mut term = Terminal::start("drag", &["demo://resize"]);
     let shown = term.wait(0, Duration::from_secs(15), |got| {
@@ -790,9 +874,11 @@ fn dump_fails_with_a_message_and_a_nonzero_exit() {
     );
 
     // An engine with no page text says so.
-    let (status, out, err) = dump("no-text", &["demo://pattern", "--engine", "wasm"]);
-    assert_eq!(status.code(), Some(1), "{err}");
-    assert!(out.is_empty() && err.contains("no page text"), "{out}{err}");
+    if cfg!(feature = "engine-wasm") {
+        let (status, out, err) = dump("no-text", &["demo://pattern", "--engine", "wasm"]);
+        assert_eq!(status.code(), Some(1), "{err}");
+        assert!(out.is_empty() && err.contains("no page text"), "{out}{err}");
+    }
 }
 
 #[test]

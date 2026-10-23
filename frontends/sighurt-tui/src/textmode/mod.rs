@@ -7,10 +7,12 @@
 //! and `g`/`G` onto [`TextView`]'s scroll operations; this module never reads
 //! input.
 //!
-//! Page strings go through [`crate::sanitize`] before they are stored.
-//! Printable ASCII is copied as-is, because that function would not change it.
-//! Newlines in flowing text become spaces first, so a paragraph still wraps;
-//! preformatted lines are split on newlines and then sanitized.
+//! Strings that are drawn go through [`crate::sanitize`] before they are stored
+//! in a span. Printable ASCII is copied as-is, because that function would not
+//! change it. Newlines in flowing text become spaces first, so a paragraph
+//! still wraps; preformatted lines are split on newlines and then sanitized. A
+//! field's stored value is the snapshot's own string, so editing can commit it
+//! unchanged; it is sanitized when drawn.
 
 mod draw;
 mod dump;

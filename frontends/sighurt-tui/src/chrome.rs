@@ -184,6 +184,21 @@ impl LineEditor {
         }
     }
 
+    /// `text` with the cursor at the end, kept as given.
+    ///
+    /// A field editor uses this so a value the snapshot already checked can be
+    /// committed unchanged. [`Self::insert`] still strips controls from what is
+    /// typed. The caller sanitizes what it draws.
+    pub fn from_raw(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.len();
+        Self {
+            text,
+            cursor,
+            selected: false,
+        }
+    }
+
     /// Select the whole line. The cursor sits at the end. An empty line stays unselected.
     pub fn select_all(&mut self) {
         self.selected = !self.text.is_empty();
@@ -195,14 +210,20 @@ impl LineEditor {
         self.selected
     }
 
-    /// The text, already sanitized.
+    /// The text. [`Self::from_text`] and [`Self::insert`] strip controls;
+    /// [`Self::from_raw`] keeps what it was given.
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    /// The text before the cursor.
+    pub fn before_cursor(&self) -> &str {
+        &self.text[..self.cursor]
+    }
+
     /// Display columns before the cursor.
     pub fn cursor_column(&self) -> usize {
-        self.text[..self.cursor].width()
+        self.before_cursor().width()
     }
 
     /// Insert `text` at the cursor. Controls and bidi marks are removed.
@@ -721,5 +742,15 @@ mod tests {
         editor.select_all();
         editor.delete_word(true);
         assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn from_raw_keeps_what_from_text_strips() {
+        let raw = LineEditor::from_raw("  two  spaces\n\t");
+        assert_eq!(raw.text(), "  two  spaces\n\t");
+        assert_eq!(raw.before_cursor(), raw.text());
+        let clean = LineEditor::from_text("  two  spaces\n\t");
+        assert_eq!(clean.text(), "  two  spaces");
+        assert!(!clean.text().chars().any(|ch| ch.is_control()));
     }
 }

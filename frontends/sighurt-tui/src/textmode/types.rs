@@ -95,7 +95,8 @@ pub struct Item {
     pub ranges: Vec<CellRange>,
     /// A link's sanitized URL. `None` when it has no href.
     pub href: Option<String>,
-    /// A field's sanitized value. Always empty for a password field.
+    /// A field's value as the snapshot gave it. Empty for a password. The
+    /// brackets show a sanitized rendering; editing commits this string.
     pub value: String,
     /// A select's sanitized options, in order. Indexes match the snapshot.
     pub options: Vec<String>,

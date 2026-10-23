@@ -617,3 +617,53 @@ fn draw_paints_styles_and_clips() {
     assert_eq!(grid.cell(0, 0).unwrap().grapheme, " ");
     assert_eq!(grid.cell(0, 7).unwrap().grapheme, " ");
 }
+
+#[test]
+fn a_field_stores_the_raw_value_and_draws_a_sanitized_rendering() {
+    let mut f = Fx::new();
+    let field = f.add(1, NodeKind::TextField, None);
+    f.set(field).value = Some("  two  spaces".into());
+    let leaked = f.add(1, NodeKind::TextField, None);
+    f.set(leaked).password = true;
+    f.set(leaked).value = Some("secret".into());
+    let area = f.add(1, NodeKind::TextArea, None);
+    let mut raw = String::from("keep\tthis\n");
+    for i in 0..25 {
+        raw.push_str(&format!("line {i}\n"));
+    }
+    f.set(area).value = Some(raw.clone());
+    let doc = layout(&f.snap(), 60);
+    let text = doc
+        .items
+        .iter()
+        .find(|item| item.kind == ItemKind::TextField && !item.password)
+        .unwrap();
+    assert_eq!(text.value, "  two  spaces");
+    let drawn = doc.lines.iter().map(text_of).collect::<Vec<_>>().join("\n");
+    assert!(drawn.contains("[two spaces]"), "{drawn}");
+    assert!(!drawn.contains("  two  spaces"), "{drawn}");
+    let password = doc.items.iter().find(|item| item.password).unwrap();
+    assert_eq!(password.value, "");
+    assert!(drawn.contains("********"), "{drawn}");
+    assert!(!drawn.contains("secret"), "{drawn}");
+    let area_at = doc
+        .items
+        .iter()
+        .position(|item| item.kind == ItemKind::TextArea)
+        .unwrap();
+    assert_eq!(doc.items[area_at].value, raw);
+    assert!(doc.items[area_at].value.contains('\t'));
+    assert!(doc.items[area_at].value.contains("line 24"));
+    let area_lines: Vec<_> = doc
+        .lines
+        .iter()
+        .filter(|line| line.spans.iter().any(|span| span.item == Some(area_at)))
+        .map(text_of)
+        .collect();
+    assert_eq!(area_lines.len(), 20, "{area_lines:?}");
+    assert!(area_lines[0].contains("keep    this"), "{area_lines:?}");
+    assert!(area_lines.iter().all(|line| !line.contains('\t')));
+    assert!(area_lines.iter().all(|line| !line.contains("line 19")));
+    assert!(area_lines.iter().all(|line| !line.contains("line 24")));
+    check_widths(&doc);
+}

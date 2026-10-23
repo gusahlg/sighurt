@@ -4,10 +4,12 @@
 //! controls. Must not own: the viewport ([`super::TextView`]), the grid, or the terminal.
 //!
 //! Flowing text breaks at spaces. A word is broken only when it is wider than the line, and
-//! then on grapheme boundaries. Every page string goes through [`crate::sanitize`], except
-//! printable ASCII, which that function would leave unchanged. The snapshot does not say which
-//! lists are ordered, so every item gets a bullet. Each node is laid out at most once and nesting
-//! is capped, so a malformed snapshot cannot loop or blow up.
+//! then on grapheme boundaries. Every string that is drawn goes through [`crate::sanitize`],
+//! except printable ASCII, which that function would leave unchanged. A field's stored value is
+//! the snapshot's own string (a password's is empty), so editing can commit it unchanged; the
+//! brackets show a collapsed rendering. The snapshot does not say which lists are ordered, so
+//! every item gets a bullet. Each node is laid out at most once and nesting is capped, so a
+//! malformed snapshot cannot loop or blow up.
 
 use std::collections::{HashMap, HashSet};
 
@@ -160,6 +162,16 @@ fn flow(text: &str) -> String {
 /// Text with its whitespace collapsed to single spaces and trimmed.
 fn collapse(text: &str) -> String {
     flow(text).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What editing commits. A password's value is never stored: the snapshot is
+/// not supposed to carry one, and the brackets show asterisks either way.
+fn stored_value(node: &SemanticNode) -> String {
+    if node.password {
+        String::new()
+    } else {
+        node.value.clone().unwrap_or_default()
+    }
 }
 
 /// A rule of `cols` columns. `─` is one column; a wider measure is repeated to fit.
@@ -746,18 +758,19 @@ impl<'a> Builder<'a> {
     }
 
     fn text_area(&mut self, node: &'a SemanticNode) {
-        let value = if node.password {
-            String::new()
+        let stored = stored_value(node);
+        // The brackets show a bounded rendering. `stored` is the whole value.
+        let raw = if node.password {
+            ""
         } else {
-            node.value.clone().unwrap_or_default()
+            node.value.as_deref().unwrap_or("")
         };
-        let lines: Vec<String> = value
+        let lines: Vec<String> = raw
             .replace('\r', "")
             .split('\n')
             .take(AREA_LINES)
             .map(|l| sanitize(&l.replace('\t', "    ")))
             .collect();
-        let stored = lines.join("\n");
         let idx = self.control(node, ItemKind::TextArea, stored, Vec::new());
         let style = field(node.disabled);
         self.blank_before();
@@ -1069,11 +1082,11 @@ impl<'a> Builder<'a> {
                 ));
             }
             NodeKind::TextField => {
-                let (shown, stored) = if node.password {
-                    ("********".to_string(), String::new())
+                let stored = stored_value(node);
+                let shown = if node.password {
+                    "********".to_string()
                 } else {
-                    let v = collapse(node.value.as_deref().unwrap_or(""));
-                    (underscored(&v), v)
+                    underscored(&collapse(node.value.as_deref().unwrap_or("")))
                 };
                 let idx = self.control(node, ItemKind::TextField, stored, Vec::new());
                 let st = field(node.disabled);
@@ -1081,17 +1094,13 @@ impl<'a> Builder<'a> {
                 out.push(Tok::Word(format!("[{shown}]"), st, Some(idx)));
             }
             NodeKind::TextArea => {
-                let v = if node.password {
-                    String::new()
-                } else {
-                    node.value.as_deref().map(collapse).unwrap_or_default()
-                };
+                let stored = stored_value(node);
                 let shown = if node.password {
                     "********".into()
                 } else {
-                    underscored(&v)
+                    underscored(&collapse(node.value.as_deref().unwrap_or("")))
                 };
-                let idx = self.control(node, ItemKind::TextArea, v, Vec::new());
+                let idx = self.control(node, ItemKind::TextArea, stored, Vec::new());
                 let st = field(node.disabled);
                 self.label(node, st, idx, out);
                 out.push(Tok::Word(format!("[{shown}]"), st, Some(idx)));

@@ -16,11 +16,11 @@ use super::{ItemKind, TextDocument};
 pub enum Intent {
     /// Send this action. The link is the URL of a followed link, for the app's routing.
     Action(SemanticAction, Option<String>),
-    /// Open the line editor on the field; on commit send `SetValue`.
+    /// Open the line editor on the field.
     EditField {
         /// The field.
         node: NodeId,
-        /// Its current value (empty for a password field).
+        /// Its value as the snapshot gave it (empty for a password field).
         value: String,
     },
     /// Offer the options; on a choice send `SelectOption`.

@@ -8,12 +8,20 @@
 //! `[tui.keys]` table choose what arrives here), the engine (an activation is an [`Act`] the
 //! app sends the core as `BrowserEvent::Semantic`), the layout itself
 //! ([`crate::textmode`]) or when text mode is on (the app).
+//!
+//! Enter in the field editor sends `SetValue` when the text changed and `Submit`
+//! when that field is inside a form. A value with a newline is not edited here:
+//! the one-line editor would have to drop it, so a notice is shown instead.
 
 use std::collections::HashMap;
 
 use sighurt_api::ids::{DocumentGeneration, ViewId};
 use sighurt_api::input::{ButtonState, Key, KeyEvent};
-use sighurt_api::semantic::{NodeId, SemanticAction, SemanticSnapshot, MAX_STRING_BYTES};
+use sighurt_api::semantic::{
+    Landmark, NodeId, NodeKind, SemanticAction, SemanticSnapshot, MAX_STRING_BYTES,
+};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::chrome::LineEditor;
 use crate::grid::{Attrs, Color, Grid};
@@ -38,6 +46,98 @@ fn room(editor: &LineEditor) -> usize {
         true => MAX_STRING_BYTES,
         false => MAX_STRING_BYTES.saturating_sub(editor.text().len()),
     }
+}
+
+/// A newline cannot be shown in the one-line editor without dropping it.
+fn has_newline(text: &str) -> bool {
+    text.as_bytes().iter().any(|b| *b == b'\n' || *b == b'\r')
+}
+
+/// Whether `target` sits inside a form landmark. The snapshot has no separate
+/// flag; the action script still finds a control's form owner from the node.
+fn in_form(snapshot: &SemanticSnapshot, target: NodeId) -> bool {
+    let mut nodes = HashMap::with_capacity(snapshot.nodes.len());
+    for node in &snapshot.nodes {
+        nodes.insert(node.id, node);
+    }
+    let mut stack = vec![(snapshot.root, false)];
+    while let Some((id, inside)) = stack.pop() {
+        let Some(node) = nodes.get(&id) else {
+            continue;
+        };
+        let inside = inside || matches!(node.kind, NodeKind::Landmark(Landmark::Form));
+        if id == target {
+            return inside;
+        }
+        for &child in node.children.iter().rev() {
+            stack.push((child, inside));
+        }
+    }
+    false
+}
+
+/// Graphemes of `text` whose columns start at `start` and cover at most `room`.
+fn slice_columns(text: &str, start: usize, room: usize) -> String {
+    let mut skipped = 0usize;
+    let mut used = 0usize;
+    let mut out = String::new();
+    for cluster in text.graphemes(true) {
+        let width = cluster.width();
+        if skipped < start {
+            skipped += width;
+            continue;
+        }
+        if used + width > room {
+            break;
+        }
+        out.push_str(cluster);
+        used += width;
+    }
+    out
+}
+
+/// The slice of `text` that fits in `room` columns with `cursor` inside it, and
+/// the cursor's column in that slice.
+fn window(text: &str, cursor: usize, room: usize) -> (String, usize) {
+    if room == 0 {
+        return (String::new(), 0);
+    }
+    let start = cursor.saturating_add(1).saturating_sub(room).min(cursor);
+    let visible = slice_columns(text, start, room);
+    let cursor_in = cursor.saturating_sub(start);
+    (visible, cursor_in.min(room.saturating_sub(1)))
+}
+
+/// The editor row and the cursor's column in it. A password is one `*` per
+/// grapheme, which is also how far the cursor moves. Anything else is the
+/// sanitized value, so a control never reaches the terminal.
+fn field_editor_line(editor: &LineEditor, password: bool, cols: usize) -> (String, usize) {
+    let prefix = "Edit: ";
+    let prefix_cols = prefix.width();
+    let shown = if password {
+        "*".repeat(editor.text().graphemes(true).count())
+    } else {
+        sanitize(editor.text())
+    };
+    let cursor = if password {
+        editor.before_cursor().graphemes(true).count()
+    } else {
+        sanitize(editor.before_cursor()).width()
+    };
+    if cols == 0 {
+        return (String::new(), 0);
+    }
+    if prefix_cols >= cols {
+        let visible = slice_columns(prefix, 0, cols);
+        let at = visible.width().saturating_sub(1).min(cols.saturating_sub(1));
+        return (visible, at);
+    }
+    let (body, cursor_in) = window(&shown, cursor, cols - prefix_cols);
+    let cursor_col = prefix_cols + cursor_in;
+    (
+        format!("{prefix}{body}"),
+        cursor_col.min(cols.saturating_sub(1)),
+    )
 }
 
 /// An action the user chose in a view's page, for the app to hand the core.
@@ -104,11 +204,14 @@ impl Nav {
 
 /// What is being asked of the user over the page.
 enum Prompt {
-    /// A field's new value.
+    /// A field's new value. `original` is the snapshot's string, so an edit
+    /// that changes nothing does not send `SetValue`.
     Edit {
         node: NodeId,
         editor: LineEditor,
         password: bool,
+        original: String,
+        in_form: bool,
     },
     /// One of a select's options.
     Choose {
@@ -116,6 +219,8 @@ enum Prompt {
         options: Vec<String>,
         at: usize,
     },
+    /// The one-line editor cannot take this field. Any key dismisses it.
+    Notice(String),
 }
 
 /// One view's page.
@@ -276,14 +381,29 @@ impl TextPages {
                     .items
                     .iter()
                     .any(|item| item.node == node && item.password);
-                let mut editor = LineEditor::from_text(value);
+                // A one-line editor would drop the newline on the way into
+                // `LineEditor` and commit that. Refuse, so the value stays.
+                if !password && has_newline(&value) {
+                    self.prompt = Some((
+                        view,
+                        Prompt::Notice("Can't edit more than one line".into()),
+                    ));
+                    return None;
+                }
+                let in_form = in_form(&page.snapshot, node);
+                let original = value;
+                let mut editor = LineEditor::from_raw(original.clone());
                 editor.select_all();
-                let edit = Prompt::Edit {
-                    node,
-                    editor,
-                    password,
-                };
-                self.prompt = Some((view, edit));
+                self.prompt = Some((
+                    view,
+                    Prompt::Edit {
+                        node,
+                        editor,
+                        password,
+                        original,
+                        in_form,
+                    },
+                ));
                 None
             }
             Intent::ChooseOption {
@@ -313,11 +433,15 @@ impl TextPages {
     }
 
     /// A key for the open prompt (the keymap never sees it: typing `q` into a field is typing).
-    /// Returns the action the prompt finished with, if it did. Without a prompt, does nothing.
-    pub fn prompt_key(&mut self, key: &KeyEvent) -> Option<Act> {
-        let (view, prompt) = self.prompt.as_mut()?;
+    /// Returns the actions the prompt finished with, in the order to send them. Empty when it
+    /// is still open, or it took the key and sent nothing. Without a prompt, does nothing.
+    pub fn prompt_key(&mut self, key: &KeyEvent) -> Vec<Act> {
+        let (view, prompt) = match self.prompt.as_mut() {
+            Some(prompt) => prompt,
+            None => return Vec::new(),
+        };
         if key.state == ButtonState::Released {
-            return None;
+            return Vec::new();
         }
         let view = *view;
         let named = match &key.key {
@@ -326,20 +450,36 @@ impl TextPages {
         };
         if named == Some("Escape") {
             self.prompt = None;
-            return None;
+            return Vec::new();
         }
         let done = match prompt {
-            Prompt::Edit { node, editor, .. } => {
+            Prompt::Notice(_) => Some(Vec::new()),
+            Prompt::Edit {
+                node,
+                editor,
+                original,
+                in_form,
+                ..
+            } => {
                 let word = key.modifiers.control && !key.consumed.control;
                 let alt = key.modifiers.alt && !key.consumed.alt;
                 let mut done = None;
                 match named {
-                    // The action's contract bounds the value; the editor keeps within it.
+                    // SetValue and Submit are activations: only this key, which the user
+                    // pressed, queues them. An unchanged value sends no SetValue, so a field
+                    // is not told it changed. Submit names the field; the action finds its form.
                     Some("Enter") if editor.text().len() <= MAX_STRING_BYTES => {
-                        done = Some(SemanticAction::SetValue {
-                            node: *node,
-                            value: editor.text().to_owned(),
-                        })
+                        let mut actions = Vec::new();
+                        if editor.text() != original.as_str() {
+                            actions.push(SemanticAction::SetValue {
+                                node: *node,
+                                value: editor.text().to_owned(),
+                            });
+                        }
+                        if *in_form {
+                            actions.push(SemanticAction::Submit(*node));
+                        }
+                        done = Some(actions);
                     }
                     Some("Enter") => {}
                     Some("ArrowLeft") if word => editor.word_left(),
@@ -365,10 +505,10 @@ impl TextPages {
                 let mut done = None;
                 match named {
                     Some("Enter") => {
-                        done = Some(SemanticAction::SelectOption {
+                        done = Some(vec![SemanticAction::SelectOption {
                             node: *node,
                             index: u32::try_from(*at).unwrap_or(0),
-                        })
+                        }]);
                     }
                     Some("ArrowDown") => *at = (*at + 1).min(options.len() - 1),
                     Some("ArrowUp") => *at = at.saturating_sub(1),
@@ -379,19 +519,27 @@ impl TextPages {
                 done
             }
         };
-        self.finish(view, done?)
+        match done {
+            Some(actions) => self.finish(view, actions),
+            None => Vec::new(),
+        }
     }
 
-    /// Closes the prompt with `action` for the document its view shows.
-    fn finish(&mut self, view: ViewId, action: SemanticAction) -> Option<Act> {
+    /// Closes the prompt and returns `actions` for the document its view shows.
+    fn finish(&mut self, view: ViewId, actions: Vec<SemanticAction>) -> Vec<Act> {
         self.prompt = None;
-        let document = self.pages.get(&view)?.doc.document;
-        Some(Act {
-            view,
-            document,
-            action,
-            link: None,
-        })
+        let Some(document) = self.pages.get(&view).map(|page| page.doc.document) else {
+            return Vec::new();
+        };
+        actions
+            .into_iter()
+            .map(|action| Act {
+                view,
+                document,
+                action,
+                link: None,
+            })
+            .collect()
     }
 
     /// Paints `view`'s page into `area`, and its prompt over the bottom rows. Returns the cell
@@ -415,12 +563,8 @@ impl TextPages {
                 editor, password, ..
             } => {
                 blank(grid, last, Attrs::default());
-                let prefix = "Edit: ";
-                let shown = match password {
-                    true => "*".repeat(editor.text().chars().count()),
-                    false => editor.text().to_owned(),
-                };
-                let text = sanitize(&format!("{prefix}{shown}"));
+                let cols = usize::from(right.saturating_sub(area.col));
+                let (text, cursor_col) = field_editor_line(editor, *password, cols);
                 grid.put_text(
                     area.col,
                     last,
@@ -429,9 +573,22 @@ impl TextPages {
                     Color::Default,
                     Attrs::default(),
                 );
-                let before = editor.cursor_column();
-                let column = area.col + u16::try_from(prefix.len() + before).unwrap_or(0);
+                let column = area
+                    .col
+                    .saturating_add(u16::try_from(cursor_col).unwrap_or(0));
                 Some((column.min(right.saturating_sub(1)), last))
+            }
+            Prompt::Notice(text) => {
+                blank(grid, last, Attrs::default());
+                grid.put_text(
+                    area.col,
+                    last,
+                    &sanitize(text),
+                    Color::Default,
+                    Color::Default,
+                    Attrs::default(),
+                );
+                None
             }
             Prompt::Choose { options, at, .. } => {
                 let shown = options
@@ -460,7 +617,7 @@ impl TextPages {
 mod tests {
     use super::*;
     use sighurt_api::input::{KeyCode, Modifiers};
-    use sighurt_api::semantic::{NodeKind, SemanticNode};
+    use sighurt_api::semantic::{Landmark, NodeKind, SemanticNode};
 
     fn key(name: &str, shift: bool) -> KeyEvent {
         KeyEvent {
@@ -573,18 +730,19 @@ mod tests {
         assert!(pages.page_key(view, &key("Enter", false)).is_none());
         assert!(pages.prompting());
         // The value starts selected, so typing replaces it. `q` is text here, not a command.
-        assert!(pages.prompt_key(&typed("q")).is_none());
-        assert!(pages.prompt_key(&typed("r")).is_none());
+        assert!(pages.prompt_key(&typed("q")).is_empty());
+        assert!(pages.prompt_key(&typed("r")).is_empty());
         pages.prompt_key(&key("Backspace", false));
-        let act = pages.prompt_key(&key("Enter", false)).unwrap();
+        let acts = pages.prompt_key(&key("Enter", false));
+        assert_eq!(acts.len(), 1);
         assert_eq!(
-            act.action,
+            acts[0].action,
             SemanticAction::SetValue {
                 node: NodeId(3),
                 value: "q".into()
             }
         );
-        assert_eq!(act.document, document);
+        assert_eq!(acts[0].document, document);
         assert!(!pages.prompting());
     }
 
@@ -600,8 +758,8 @@ mod tests {
             assert!(pages.paste(&paste));
         }
         pages.prompt_key(&typed("x"));
-        let act = pages.prompt_key(&key("Enter", false)).unwrap();
-        let SemanticAction::SetValue { value, .. } = act.action else {
+        let acts = pages.prompt_key(&key("Enter", false));
+        let SemanticAction::SetValue { value, .. } = &acts[0].action else {
             panic!("not a value");
         };
         assert!(value.len() <= MAX_STRING_BYTES && value.len() > MAX_STRING_BYTES - 4);
@@ -620,9 +778,9 @@ mod tests {
         pages.page_key(view, &key("Enter", false));
         pages.prompt_key(&key("ArrowDown", false));
         pages.prompt_key(&key("ArrowDown", false));
-        let act = pages.prompt_key(&key("Enter", false)).unwrap();
+        let acts = pages.prompt_key(&key("Enter", false));
         assert_eq!(
-            act.action,
+            acts[0].action,
             SemanticAction::SelectOption {
                 node: NodeId(4),
                 index: 1
@@ -689,5 +847,208 @@ mod tests {
         assert_eq!(pages.place(view), Some((0, None)));
         pages.forget(view);
         assert!(!pages.has(view));
+    }
+
+    /// One field, inside a form landmark when `form` is set.
+    fn field_page(
+        kind: NodeKind,
+        value: &str,
+        password: bool,
+        form: bool,
+    ) -> (TextPages, ViewId, NodeId) {
+        let view = ViewId::next();
+        let field_id = if form { 3 } else { 2 };
+        let mut field = node(field_id, kind);
+        if password {
+            field.password = true;
+        } else {
+            field.value = Some(value.to_string());
+        }
+        let mut root = node(1, NodeKind::Document);
+        let nodes = if form {
+            let mut form_node = node(2, NodeKind::Landmark(Landmark::Form));
+            form_node.children.push(NodeId(field_id));
+            root.children.push(NodeId(2));
+            vec![root, form_node, field]
+        } else {
+            root.children.push(NodeId(field_id));
+            vec![root, field]
+        };
+        let mut pages = TextPages::new(40, 10);
+        pages.snapshot(
+            view,
+            Box::new(SemanticSnapshot {
+                document: DocumentGeneration::next(),
+                root: NodeId(1),
+                nodes,
+                focus: None,
+                truncated: false,
+            }),
+        );
+        (pages, view, NodeId(field_id))
+    }
+
+    fn open_field(pages: &mut TextPages, view: ViewId) {
+        pages.page_key(view, &key("Tab", false));
+        assert!(pages.page_key(view, &key("Enter", false)).is_none());
+        assert!(pages.prompting());
+    }
+
+    fn draw_last(pages: &TextPages, view: ViewId) -> (String, Option<(u16, u16)>) {
+        let mut grid = Grid::new(40, 10);
+        let cursor = pages.draw(
+            view,
+            &mut grid,
+            Area {
+                col: 0,
+                row: 0,
+                cols: 40,
+                rows: 10,
+            },
+        );
+        (row_text(&grid, 9), cursor)
+    }
+
+    #[test]
+    fn spaces_and_newlines_keep_their_value_through_edit_and_commit() {
+        let (mut pages, view, node) = field_page(NodeKind::TextField, "  two  spaces", false, false);
+        open_field(&mut pages, view);
+        let (row, _) = draw_last(&pages, view);
+        assert!(row.starts_with("Edit:   two  spaces"), "{row}");
+        assert!(pages.prompt_key(&key("End", false)).is_empty());
+        assert!(pages.prompt_key(&typed("!")).is_empty());
+        let acts = pages.prompt_key(&key("Enter", false));
+        assert_eq!(acts.len(), 1);
+        assert_eq!(
+            acts[0].action,
+            SemanticAction::SetValue {
+                node,
+                value: "  two  spaces!".into()
+            }
+        );
+
+        // A tab is a control on screen and a real character in the value.
+        let (mut pages, view, node) = field_page(NodeKind::TextField, "  two\tspaces", false, false);
+        open_field(&mut pages, view);
+        let (row, _) = draw_last(&pages, view);
+        assert!(!row.chars().any(|ch| ch.is_control()), "{row:?}");
+        pages.prompt_key(&key("End", false));
+        pages.prompt_key(&typed("!"));
+        let acts = pages.prompt_key(&key("Enter", false));
+        assert_eq!(
+            acts[0].action,
+            SemanticAction::SetValue {
+                node,
+                value: "  two\tspaces!".into()
+            }
+        );
+
+        // A newline is not edited on one line, so commit cannot flatten it.
+        let (mut pages, view, _) = field_page(NodeKind::TextArea, "one\ntwo", false, true);
+        open_field(&mut pages, view);
+        let (row, cursor) = draw_last(&pages, view);
+        assert!(row.starts_with("Can't edit more than one line"), "{row}");
+        assert!(cursor.is_none());
+        assert!(!row.chars().any(|ch| ch.is_control()), "{row:?}");
+        assert!(pages.prompt_key(&typed("!")).is_empty());
+        assert!(!pages.prompting());
+        assert!(pages.prompt_key(&key("Enter", false)).is_empty());
+    }
+
+    #[test]
+    fn enter_without_edits_sends_no_set_value() {
+        let (mut pages, view, node) = field_page(NodeKind::TextField, "  two  spaces", false, true);
+        open_field(&mut pages, view);
+        let (row, _) = draw_last(&pages, view);
+        assert!(row.starts_with("Edit:   two  spaces"), "{row}");
+        let acts = pages.prompt_key(&key("Enter", false));
+        assert!(
+            acts.iter()
+                .all(|act| !matches!(act.action, SemanticAction::SetValue { .. }))
+        );
+        assert_eq!(acts, vec![expected_submit(&acts, node)]);
+        assert!(!pages.prompting());
+
+        let (mut pages, view, _) = field_page(NodeKind::TextArea, "  two  spaces", false, false);
+        open_field(&mut pages, view);
+        assert!(pages.prompt_key(&key("Enter", false)).is_empty());
+        assert!(!pages.prompting());
+    }
+
+    fn expected_submit(acts: &[Act], node: NodeId) -> Act {
+        let mut act = acts[0].clone();
+        act.action = SemanticAction::Submit(node);
+        act
+    }
+
+    #[test]
+    fn enter_in_a_form_field_submits_after_the_value() {
+        let (mut pages, view, node) = field_page(NodeKind::TextField, "old", false, true);
+        open_field(&mut pages, view);
+        assert!(pages.prompt_key(&typed("n")).is_empty());
+        let acts = pages.prompt_key(&key("Enter", false));
+        assert_eq!(
+            acts.iter().map(|act| &act.action).collect::<Vec<_>>(),
+            vec![
+                &SemanticAction::SetValue {
+                    node,
+                    value: "n".into()
+                },
+                &SemanticAction::Submit(node),
+            ]
+        );
+        assert!(acts.iter().all(|act| act.action.is_activation()));
+        assert_eq!(acts[0].document, acts[1].document);
+        assert!(acts[0].link.is_none());
+    }
+
+    #[test]
+    fn the_editor_window_follows_the_cursor() {
+        let value = format!("<{}>", "x".repeat(298));
+        assert_eq!(value.chars().count(), 300);
+        let (mut pages, view, _) = field_page(NodeKind::TextField, &value, false, false);
+        open_field(&mut pages, view);
+        let (row, cursor) = draw_last(&pages, view);
+        let (col, at) = cursor.expect("cursor");
+        assert_eq!(at, 9);
+        assert!(col < 40, "{col}");
+        assert!(row.contains('>'), "{row}");
+        assert!(!row.contains('<'), "{row}");
+
+        assert!(pages.prompt_key(&key("Home", false)).is_empty());
+        let (row, cursor) = draw_last(&pages, view);
+        assert_eq!(cursor, Some((6, 9)));
+        assert!(row.contains('<'), "{row}");
+        assert!(!row.contains('>'), "{row}");
+
+        pages.prompt_key(&key("End", false));
+        pages.prompt_key(&typed("Z"));
+        let (row, cursor) = draw_last(&pages, view);
+        let (col, _) = cursor.expect("cursor");
+        assert!(col < 40, "{col}");
+        assert!(row.contains('Z'), "{row}");
+        assert!(!row.contains('<'), "{row}");
+
+        // One star per grapheme. `😀` is two columns and one star, so the
+        // cursor is not the display width of the password.
+        let (mut pages, view, _) = field_page(NodeKind::TextField, "", true, false);
+        open_field(&mut pages, view);
+        pages.prompt_key(&typed("a"));
+        pages.prompt_key(&typed("😀"));
+        pages.prompt_key(&typed("b"));
+        let (row, cursor) = draw_last(&pages, view);
+        assert_eq!(row.trim_end(), "Edit: ***");
+        assert_eq!(cursor, Some((9, 9)));
+
+        let (mut pages, view, _) = field_page(NodeKind::TextField, "", true, false);
+        open_field(&mut pages, view);
+        assert!(pages.paste(&"a".repeat(300)));
+        let (row, cursor) = draw_last(&pages, view);
+        let (col, _) = cursor.expect("cursor");
+        assert!(col < 40, "{col}");
+        let stars = row.chars().filter(|ch| *ch == '*').count();
+        assert!(stars > 0 && stars < 40, "{stars} in {row:?}");
+        assert_eq!(col as usize, "Edit: ".len() + stars);
+        assert!(!row.contains('a'), "{row}");
     }
 }

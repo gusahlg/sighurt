@@ -1,5 +1,6 @@
 //! Sighurt's terminal frontend (docs/rewrite/TUI.md): the terminal `sig` runs in shows the
-//! browser's chrome as lines of text and pages as kitty graphics, or as text from their content.
+//! browser's chrome as lines of text and pages as kitty or sixel graphics, or as text from their
+//! content.
 //!
 //! Owns: the terminal's owner loop and the [`sighurt_runtime::frontend::Frontend`] it gives the
 //! session ([`app`]), terminal I/O, capability detection, the cell grid and its writer, the
@@ -17,6 +18,7 @@ pub mod grid;
 pub mod input;
 pub mod kitty;
 pub mod sanitize;
+pub mod sixel;
 pub mod target;
 pub mod term;
 pub mod text;
