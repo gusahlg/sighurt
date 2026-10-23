@@ -28,6 +28,7 @@ pub mod navigation;
 pub(crate) mod offscreen;
 pub mod presentation;
 pub mod runtime;
+mod semantic;
 pub(crate) mod target;
 pub mod view;
 

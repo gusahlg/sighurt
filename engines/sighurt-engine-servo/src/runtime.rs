@@ -31,6 +31,15 @@
 //! Servo 0.7 still has no API to cancel a top-level load that is waiting for its response: that
 //! one goes on and commits when its response comes.
 //!
+//! Semantics stay off until `SetSemantics`. While on, the extraction script runs in the page's
+//! main world when it is turned on, after a commit of a new document, when loading ends, after
+//! an action, and when a new frame arrives at least 250 ms after the last extraction or check
+//! started with the document marked dirty. Servo has no script-message channel, so the frame is the
+//! trigger and the debounce is a pump deadline, not a timer. An extraction is stamped with the
+//! document at its start and dropped when that document is gone or semantics is off. At most
+//! one extraction is in flight per view. Action scripts are not logged: `SetValue` carries
+//! plaintext. The snapshot is page data and is never logged beyond a short head on failure.
+//!
 //! Servo keeps its profile (cookies, local storage, HSTS, HTTP authentication) in the directory
 //! the executable passes, written by this runtime only: it holds `{profile}/lock` from before
 //! Servo is built until Servo has shut down (Servo writes the profile while it shuts down), and
@@ -77,8 +86,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use servo::{
-    EmbedderControl, EventLoopWaker, LoadStatus, Opts, PermissionFeature, PrefValue, Preferences,
-    RenderingContext, Servo, ServoBuilder, UserContentManager, WebViewId,
+    EmbedderControl, EventLoopWaker, JSValue, JavaScriptEvaluationError, LoadStatus, Opts,
+    PermissionFeature, PrefValue, Preferences, RenderingContext, Servo, ServoBuilder,
+    UserContentManager, WebViewId,
 };
 use sighurt_api::engine::{
     EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, PresentOutcome,
@@ -97,6 +107,7 @@ use crate::delegate::{Coalescing, Delegate, Note};
 use crate::input::text_input_state;
 use crate::navigation::{Navigator, Request};
 use crate::presentation::{physical, Egl, GlInfo, OffscreenAdapter, PageSurface, Readbacks};
+use crate::semantic::{self, Tag};
 use crate::target::ServoTarget;
 use crate::view::{Load, Pending, View};
 
@@ -126,7 +137,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     pointer_lock: false,
     native_popups: false,
     process_per_view: false,
-    semantics: false,
+    semantics: true,
 };
 
 /// What the executable decides for the Servo runtime.
@@ -246,6 +257,7 @@ fn replaceable(event: &EngineEvent) -> bool {
             | EngineEvent::HistoryChanged { .. }
             | EngineEvent::TextInputChanged { .. }
             | EngineEvent::FrameReady { .. }
+            | EngineEvent::SemanticsChanged { .. }
     )
 }
 
@@ -480,6 +492,10 @@ impl<T: ServoTarget> ServoRuntime<T> {
         view.load = None;
         view.traversals.clear();
         view.navigator = Navigator::default();
+        // The old page's scripts are gone with its WebView. `on` stays, so the new document
+        // extracts. A callback still in flight names the old WebView, which no longer has an
+        // owner, and is dropped.
+        view.semantics.reset_page();
         view.navigator.request(navigation, Request::Navigate);
         view.first = Some((navigation, url));
         view.requests.clear();
@@ -728,13 +744,25 @@ impl<T: ServoTarget> ServoRuntime<T> {
         counted: bool,
         traversal: Option<NavigationId>,
     ) {
+        // Before the view is borrowed: the result may start another script on it.
+        if let Note::Semantic(tag, result) = note {
+            self.semantic_done(id, tag, result);
+            return;
+        }
         let user_content = self.user_content.clone();
+        let delegate = Rc::clone(&self.delegate);
         let Some(view) = self.views.get_mut(&id) else {
             return;
         };
         let events = &mut self.events;
         match note {
-            Note::FrameReady => view.frame_ready = true,
+            Note::FrameReady => {
+                view.frame_ready = true;
+                // A new frame is the only sign Servo gives that the DOM may have changed.
+                if view.semantics.note_frame(Instant::now()) {
+                    begin_check(view, &delegate);
+                }
+            }
             Note::Title(title) => push(events, EngineEvent::TitleChanged { view: id, title }),
             Note::Status(text) => push(events, EngineEvent::StatusTextChanged { view: id, text }),
             Note::Cursor(cursor) => push(
@@ -752,6 +780,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                 }
                 if status == LoadStatus::Complete {
                     view.navigator.load_completed();
+                    begin_extract(view, &delegate);
                 }
                 if let (true, Some(load)) = (started, &mut view.load) {
                     // Its document is on its way: the commit follows.
@@ -814,6 +843,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                                 push(events, cancelled(id, given_up));
                             }
                         }
+                        begin_extract(view, &delegate);
                     }
                 }
                 push(
@@ -837,6 +867,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             }
             Note::Crashed(reason) => {
                 view.crashed = true;
+                view.semantics.reset_page();
                 view.asked.clear();
                 self.page_crashed = true;
                 push(
@@ -1028,6 +1059,83 @@ impl<T: ServoTarget> ServoRuntime<T> {
                     );
                 }
             }
+            // Taken above, before the view is borrowed.
+            Note::Semantic(..) => unreachable!("handled above"),
+        }
+    }
+
+    /// A semantic script finished. A result for a document that is no longer current, for a
+    /// view that has since closed, or after semantics was turned off, is dropped. The action's
+    /// script is not logged.
+    fn semantic_done(&mut self, id: ViewId, tag: Tag, result: Result<String, String>) {
+        let delegate = Rc::clone(&self.delegate);
+        let (deliver, extract_again) = {
+            let Some(view) = self.views.get_mut(&id) else {
+                return;
+            };
+            let current = view.document();
+            let on = view.semantics.on;
+            let crashed = view.crashed;
+            let mut deliver = None;
+            let mut extract_again = false;
+            match tag {
+                Tag::Action(document) => {
+                    if current == Some(document) && on && !crashed {
+                        if result.is_err() {
+                            log::debug!("semantic action failed");
+                        }
+                        extract_again = true;
+                    }
+                }
+                Tag::Extract(document) => {
+                    view.semantics.inflight = false;
+                    let again = std::mem::take(&mut view.semantics.again);
+                    if current == Some(document) && on && !crashed {
+                        deliver = Some((document, result));
+                    }
+                    extract_again = again && on && !crashed;
+                }
+                Tag::Check(token) => {
+                    if view.semantics.check_token == token {
+                        view.semantics.checking = false;
+                        match &result {
+                            Ok(value) if on && !crashed && value == "true" => extract_again = true,
+                            Err(message) => {
+                                let head: String = message.chars().take(160).collect();
+                                log::debug!("semantic change check failed: {head}");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (deliver, extract_again)
+        };
+        if let Some((document, result)) = deliver {
+            deliver_snapshot(&mut self.events, id, document, result);
+        }
+        if extract_again {
+            if let Some(view) = self.views.get_mut(&id) {
+                begin_extract(view, &delegate);
+            }
+        }
+    }
+
+    /// Runs dirty-flag checks that a frame asked for and that have waited out
+    /// [`semantic::DEBOUNCE`].
+    fn kick_semantic(&mut self) {
+        let now = Instant::now();
+        let due: Vec<ViewId> = self
+            .views
+            .iter()
+            .filter(|(_, view)| view.semantics.check_due(now))
+            .map(|(id, _)| *id)
+            .collect();
+        let delegate = Rc::clone(&self.delegate);
+        for id in due {
+            if let Some(view) = self.views.get_mut(&id) {
+                begin_check(view, &delegate);
+            }
         }
     }
 
@@ -1209,6 +1317,7 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
 
     fn command(&mut self, id: ViewId, command: EngineCommand) -> Result<(), EngineError> {
         self.alive()?;
+        let delegate = Rc::clone(&self.delegate);
         let view = self
             .views
             .get_mut(&id)
@@ -1387,9 +1496,36 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                     }
                 }
             }
-            // Content as structure is not implemented yet (TUI.md §8, phase 4).
-            EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
-                return Err(EngineError::Unsupported("semantics"))
+            EngineCommand::SetSemantics(on) => {
+                view.semantics.on = on;
+                view.semantics.again = false;
+                view.semantics.due = None;
+                if !on {
+                    // A check still in flight must not clear, or act for, a later one.
+                    view.semantics.checking = false;
+                    view.semantics.check_token = view.semantics.check_token.wrapping_add(1);
+                }
+                if on {
+                    begin_extract(view, &delegate);
+                }
+            }
+            EngineCommand::Semantic { document, action } => {
+                // An action for another document is dropped here: its nodes are gone. The script
+                // is not logged: SetValue carries plaintext.
+                if view.document() == Some(document) {
+                    if let Some(webview) = view.webview.as_ref() {
+                        let script = sighurt_semantic::action_script(&action);
+                        let delegate = Rc::clone(&delegate);
+                        let webview_id = webview.id();
+                        webview.evaluate_javascript(&script, move |result| {
+                            delegate.script_finished(
+                                webview_id,
+                                Tag::Action(document),
+                                js_outcome(result),
+                            );
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -1419,6 +1555,12 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                 if wants && view.visible && view.webview.is_some() && !view.frame_requested {
                     view.frame_requested = true;
                     push(&mut self.events, EngineEvent::FrameReady { view: view.id });
+                }
+            }
+            self.kick_semantic();
+            for view in self.views.values() {
+                if let Some(due) = view.semantics.deadline() {
+                    deadline = Some(deadline.map_or(due, |d| d.min(due)));
                 }
             }
         }
@@ -1608,6 +1750,119 @@ where
         deadline = Some(deadline.map_or(*hold, |due| due.min(*hold)));
     }
     deadline
+}
+
+/// Starts an extraction when semantics is on and the view has a document. The document
+/// generation is the one at the start. One already in flight is followed by another when it
+/// ends (`again`). Nothing is left due when there is nothing to extract: a due instant would
+/// make every pump runnable.
+fn begin_extract<T: ServoTarget>(view: &mut View<T>, delegate: &Rc<Delegate>) {
+    if !view.semantics.on {
+        view.semantics.due = None;
+        return;
+    }
+    let Some(document) = view.document() else {
+        view.semantics.due = None;
+        return;
+    };
+    let webview = view.webview.clone();
+    let Some(webview) = webview else {
+        view.semantics.due = None;
+        return;
+    };
+    if view.semantics.inflight {
+        view.semantics.again = true;
+        return;
+    }
+    view.semantics.inflight = true;
+    view.semantics.again = false;
+    view.semantics.due = None;
+    view.semantics.started = Some(Instant::now());
+    let script = semantic::extraction_script();
+    let delegate = Rc::clone(delegate);
+    let webview_id = webview.id();
+    webview.evaluate_javascript(&script, move |result| {
+        delegate.script_finished(webview_id, Tag::Extract(document), js_outcome(result));
+    });
+}
+
+/// Reads and clears the document's dirty flag. At most one check is in flight. The token is
+/// the view's `check_token` at the start, so a result from a check that was superseded does
+/// not clear the one running now.
+fn begin_check<T: ServoTarget>(view: &mut View<T>, delegate: &Rc<Delegate>) {
+    if !view.semantics.on || view.semantics.inflight || view.semantics.checking {
+        return;
+    }
+    if view.semantics.started.is_none() {
+        return;
+    }
+    let webview = view.webview.clone();
+    let Some(webview) = webview else {
+        // Nothing to ask. Leaving `due` set would make every pump runnable.
+        view.semantics.due = None;
+        return;
+    };
+    view.semantics.check_token = view.semantics.check_token.wrapping_add(1);
+    let token = view.semantics.check_token;
+    view.semantics.checking = true;
+    view.semantics.checked = Some(Instant::now());
+    view.semantics.due = None;
+    let script = semantic::dirty_script();
+    let delegate = Rc::clone(delegate);
+    let webview_id = webview.id();
+    webview.evaluate_javascript(&script, move |result| {
+        delegate.script_finished(webview_id, Tag::Check(token), js_outcome(result));
+    });
+}
+
+/// The script's value as text, or a short error. A string is kept whole: it is the snapshot
+/// JSON. Anything else that succeeded is not formatted: an object can be page data. An error's
+/// `Debug` is cut here so the note never holds a stack.
+fn js_outcome(result: Result<JSValue, JavaScriptEvaluationError>) -> Result<String, String> {
+    match result {
+        Ok(JSValue::String(value)) => Ok(value),
+        Ok(JSValue::Boolean(value)) => Ok(value.to_string()),
+        Ok(JSValue::Undefined | JSValue::Null) => Err("no value".into()),
+        Ok(
+            JSValue::Number(_)
+            | JSValue::Element(_)
+            | JSValue::ShadowRoot(_)
+            | JSValue::Frame(_)
+            | JSValue::Window(_)
+            | JSValue::Array(_)
+            | JSValue::Object(_),
+        ) => Err("unexpected value".into()),
+        Err(error) => Err(format!("{error:?}").chars().take(160).collect()),
+    }
+}
+
+/// Parses an extraction and pushes the snapshot. A failure is a debug line with a short head
+/// of the JSON or the error, and nothing else: the snapshot is page data.
+fn deliver_snapshot(
+    events: &mut Events,
+    view: ViewId,
+    document: DocumentGeneration,
+    result: Result<String, String>,
+) {
+    match result {
+        Ok(json) => match sighurt_semantic::parse(&json, document) {
+            Ok(snapshot) => push(
+                events,
+                EngineEvent::SemanticsChanged {
+                    view,
+                    snapshot: Box::new(snapshot),
+                },
+            ),
+            Err(error) => {
+                let head: String = json.chars().take(120).collect();
+                log::debug!("semantic snapshot dropped: {error}; {head}");
+            }
+        },
+        Err(message) => {
+            let head: String = message.chars().take(160).collect();
+            log::debug!("semantic extraction failed: {head}");
+        }
+    }
 }
 
 /// What `pump` returns once the events for this call have been handed over.

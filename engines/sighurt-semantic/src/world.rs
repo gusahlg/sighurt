@@ -14,7 +14,12 @@ pub(crate) fn state_key() -> &'static str {
 }
 
 /// [`state_key`] as a JavaScript string literal, quotes included.
-pub(crate) fn state_key_literal() -> String {
+///
+/// An adapter script that must share the extraction slot embeds this same literal. Servo's
+/// mutation flag lives on that object: Servo has no script-message channel, and a new document
+/// has a new `globalThis`, so the flag does not outlive the document. The name is unguessable
+/// and stable for the process.
+pub fn state_key_literal() -> String {
     js_string_literal(state_key())
 }
 

@@ -64,6 +64,9 @@ pub(crate) enum Note {
     ClipboardWrite(Option<String>),
     /// `window.stop()` ran in the page.
     Stopped,
+    /// A script this runtime evaluated finished. The string is its value, or a short error
+    /// with no snapshot body.
+    Semantic(crate::semantic::Tag, Result<String, String>),
 }
 
 impl Note {
@@ -279,6 +282,17 @@ impl Delegate {
     /// holds no WebView handle (it would keep a closed view alive).
     pub fn stopped(&self, webview: WebViewId) {
         self.note_for(webview, Note::Stopped);
+    }
+
+    /// Queues the result of a script this runtime started. The callback only records it;
+    /// the runtime turns it into events after Servo returns.
+    pub fn script_finished(
+        &self,
+        webview: WebViewId,
+        tag: crate::semantic::Tag,
+        result: Result<String, String>,
+    ) {
+        self.note_for(webview, Note::Semantic(tag, result));
     }
 }
 

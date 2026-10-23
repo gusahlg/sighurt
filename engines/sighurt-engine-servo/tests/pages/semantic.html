@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Semantic</title>
+<h1>Servo heading</h1>
+<p>A paragraph of text.</p>
+<p><a href="semantic-next.html">Go next</a></p>
+<label for="name">Name</label>
+<input id="name" type="text" aria-label="Name">
+<script>
+  setTimeout(function () {
+    var p = document.createElement("p");
+    p.textContent = "Added later";
+    document.body.appendChild(p);
+  }, 5000);
+</script>

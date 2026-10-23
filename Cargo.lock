@@ -10338,6 +10338,7 @@ dependencies = [
  "rustls",
  "servo",
  "sighurt-api",
+ "sighurt-semantic",
  "sighurt-wayland",
  "surfman",
  "url",

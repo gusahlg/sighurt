@@ -6,7 +6,8 @@
 //! generation it is extracting, and evaluates [`action_script`] for a
 //! [`SemanticAction`](sighurt_api::semantic::SemanticAction). Both scripts must run in the same
 //! world: that is where the node-id map lives. The script does not say which document it ran
-//! in. [`parse`] stamps the generation the adapter passes.
+//! in. [`parse`] stamps the generation the adapter passes. [`state_key_literal`] is that slot's
+//! name, for an adapter script that has to share it.
 //!
 //! Owns: the extraction script, the action scripts and the bounded JSON parser.
 //! Must not own: calling an engine, laying text out into cells, or browser policy.
@@ -22,3 +23,4 @@ mod world;
 pub use action::action_script;
 pub use extract::{EXTRACT, TIME_BUDGET_MS};
 pub use parse::{max_input_bytes, parse, ParseError, NODE_JSON_OVERHEAD};
+pub use world::state_key_literal;

@@ -42,6 +42,7 @@ use crate::delegate::{Delegate, PageNavigation};
 use crate::input::{Composition, Keys};
 use crate::navigation::{Navigator, Request};
 use crate::presentation::{physical, FrameDriver, Readbacks};
+use crate::semantic::Semantics;
 use crate::target::ServoTarget;
 
 /// A service request of the view the browser hasn't answered yet, with what Servo waits on.
@@ -138,6 +139,8 @@ pub(crate) struct View<T: ServoTarget> {
     /// The browser's latest navigation, when it was asked for, and whether it has committed:
     /// its first frame is timed.
     pub navigated: Option<(NavigationId, Instant, bool)>,
+    /// Semantic snapshots. Off until `SetSemantics`, then at most one extraction at a time.
+    pub semantics: Semantics,
     /// Dropped last, after the context and everything Servo made from it.
     pub target: T,
 }
@@ -175,6 +178,7 @@ impl<T: ServoTarget> View<T> {
             frame_requested: false,
             presented: None,
             navigated: None,
+            semantics: Semantics::default(),
         }
     }
 

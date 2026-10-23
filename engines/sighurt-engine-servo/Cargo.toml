@@ -12,6 +12,8 @@ license = "AGPL-3.0-or-later AND MPL-2.0"
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
 sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
+# The extraction script and its parser, shared with the WPE adapter.
+sighurt-semantic = { path = "../sighurt-semantic" }
 # Pinned at 0.7, with `webgl`, `webcrypto` and `brotli-compression-stream` (optional and
 # off by default in that release). Code against the 0.7 sources, not a newer upstream.
 servo.workspace = true
