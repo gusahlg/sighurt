@@ -5,11 +5,13 @@
 //! types, and it is never a control character.
 //!
 //! Kitty's base-layout alternate selects the evdev code through a US QWERTY
-//! table. Without that alternate (Rio never sends one) a character key is
-//! `KeyCode(0)`. Functional keys that kitty numbers (C0 9/13/27/127 and the
-//! private-use block) still get an evdev code. Legacy terminals never report a
-//! physical key, so their code stays 0, and each press is followed by a
-//! synthesized release.
+//! table. Without that alternate (Rio never sends one) a character key takes
+//! its code from the kitty codepoint through the same table, lower-cased for
+//! letters, and stays `KeyCode(0)` when that codepoint is not a US key.
+//! Functional keys that kitty numbers (C0 9/13/27/127 and the private-use
+//! block) still get an evdev code. Legacy terminals never report a physical
+//! key, so their code stays 0, and each press is followed by a synthesized
+//! release.
 //!
 //! An upper-case letter that arrives without Shift (a legacy byte, or Rio's
 //! `CSI 74 u` for a `J` keysym) is reported with Shift held and consumed, unless
@@ -251,6 +253,8 @@ pub(crate) fn kitty_key(
         KeyCode(evdev)
     } else if let Some(evdev) = base_layout.and_then(char::from_u32).and_then(us_evdev) {
         KeyCode(evdev)
+    } else if let Some(evdev) = us_evdev_codepoint(codepoint) {
+        KeyCode(evdev)
     } else {
         KeyCode(0)
     };
@@ -310,6 +314,25 @@ fn text_from_points(points: &[u32]) -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+/// Evdev code for a kitty codepoint that had no base-layout key.
+///
+/// Letters are lower-cased first, so `A` and `a` share one code and a press
+/// can pair with a release that names the other case. Anything the US table
+/// does not name stays unknown.
+fn us_evdev_codepoint(codepoint: u32) -> Option<u32> {
+    let ch = char::from_u32(codepoint)?;
+    let ch = if ch.is_alphabetic() {
+        let mut lower = ch.to_lowercase();
+        match (lower.next(), lower.next()) {
+            (Some(one), None) => one,
+            _ => ch,
+        }
+    } else {
+        ch
+    };
+    us_evdev(ch)
 }
 
 /// US QWERTY glyph, shifted or not, to an evdev code.

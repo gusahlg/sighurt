@@ -2,10 +2,12 @@
 //!
 //! Owns: the answers collected from terminal replies. Must not own: the file
 //! descriptor or how long the caller waits. The queries go out as one batch
-//! ([`super::modes::QUERIES`]), DA1 last. The probe returns when that reply has
-//! been seen and the input buffer is empty, or when the deadline passes. A
-//! reply that shows up later is still a reply: the same parser classifies it,
-//! so it is not delivered as a key.
+//! ([`super::modes::QUERIES`]), DA1 last. The kitty graphics query in that
+//! batch is omitted when `TMUX` is set or `TERM` starts with `screen` or
+//! `tmux`. The probe returns when the DA1 reply has been seen and the input
+//! buffer is empty, or when the deadline passes. A reply that shows up later
+//! is still a reply: the same parser classifies it, so it is not delivered as
+//! a key.
 
 use std::time::Duration;
 

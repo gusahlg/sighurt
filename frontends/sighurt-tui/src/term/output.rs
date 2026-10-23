@@ -1,8 +1,10 @@
 //! A bounded non-blocking writer.
 //!
 //! The terminal's reader can stop. Writes never wait for it: at most `cap`
-//! bytes sit in `pending`, and a frame that does not fit is dropped so the
-//! newest frame can take its place.
+//! unsent bytes sit in `pending`, and a frame that does not fit is dropped so
+//! the newest frame can take its place. The queue is read from an offset and
+//! compacted once that offset passes half the buffer, so a drain does not
+//! slide the tail on every write.
 //!
 //! Bytes already handed to the kernel are tracked with [`Wire`]. Dropping the
 //! queue finishes that open sequence or ends it (a kitty graphics APC with
@@ -200,12 +202,17 @@ fn bytes_until_ground(wire: Wire, bytes: &[u8]) -> Option<usize> {
 #[derive(Debug)]
 pub struct Output {
     pending: Vec<u8>,
+    /// First byte not yet accepted by `write`. Earlier bytes stay until compact.
+    pending_at: usize,
     cap: usize,
     drops: u64,
     /// Parser state of bytes already accepted by `write`.
     wire: Wire,
     /// Last `wire_gen` applied from the signal path.
     seen_gen: u64,
+    /// Bytes [`Self::compact`] moved. A quadratic drain moves far more than the frame.
+    #[cfg(test)]
+    shifted: u64,
 }
 
 impl Output {
@@ -213,16 +220,19 @@ impl Output {
     pub fn new(cap: usize) -> Self {
         Self {
             pending: Vec::new(),
+            pending_at: 0,
             cap,
             drops: 0,
             wire: Wire::Ground,
             seen_gen: 0,
+            #[cfg(test)]
+            shifted: 0,
         }
     }
 
     /// Bytes still waiting.
     pub fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() - self.pending_at
     }
 
     /// Frames discarded because they did not fit in the cap.
@@ -246,6 +256,7 @@ impl Output {
         self.wire = Wire::from_u8(wire);
         self.seen_gen = gen;
         self.pending.clear();
+        self.pending_at = 0;
         true
     }
 
@@ -259,10 +270,12 @@ impl Output {
         if bytes.is_empty() {
             return;
         }
-        let mut combined = Vec::with_capacity(bytes.len() + self.pending.len());
+        self.reclaim_spent();
+        let mut combined = Vec::with_capacity(bytes.len() + self.pending_len());
         combined.extend_from_slice(bytes);
-        combined.append(&mut self.pending);
+        combined.extend_from_slice(&self.pending[self.pending_at..]);
         self.pending = combined;
+        self.pending_at = 0;
     }
 
     /// Drop everything that has not started on the wire.
@@ -271,15 +284,21 @@ impl Output {
     /// when the end is not in the queue. A kitty APC chunk therefore finishes
     /// or is closed with `ST`.
     pub fn discard_to_boundary(&mut self) {
+        self.reclaim_spent();
         if self.wire == Wire::Ground {
             self.pending.clear();
+            self.pending_at = 0;
             return;
         }
-        match bytes_until_ground(self.wire, &self.pending) {
-            Some(end) => self.pending.truncate(end),
+        match bytes_until_ground(self.wire, &self.pending[self.pending_at..]) {
+            Some(end) => {
+                self.pending.truncate(self.pending_at + end);
+                self.compact();
+            }
             None => {
                 let term = terminator(self.wire);
                 self.pending.clear();
+                self.pending_at = 0;
                 self.pending.extend_from_slice(term);
             }
         }
@@ -288,6 +307,7 @@ impl Output {
     /// [`Self::discard_to_boundary`] and take those bytes. The caller writes them.
     pub fn take_inflight(&mut self) -> Vec<u8> {
         self.discard_to_boundary();
+        self.pending_at = 0;
         std::mem::take(&mut self.pending)
     }
 
@@ -305,12 +325,12 @@ impl Output {
         if self.drain(&fd, &mut publish)? {
             return Ok(());
         }
-        if self.pending.is_empty() && self.wire != Wire::Ground {
+        if self.pending_len() == 0 && self.wire != Wire::Ground {
             // The previous frame ended on the wire inside a sequence and its
             // tail was not kept. Close it before the next frame.
             self.pending.extend_from_slice(terminator(self.wire));
         }
-        if self.pending.is_empty() {
+        if self.pending_len() == 0 {
             let wrote = self.write_span(&fd, frame, &mut publish)?;
             if wrote.handoff {
                 return Ok(());
@@ -321,10 +341,10 @@ impl Output {
             }
             return Ok(());
         }
-        if self.pending.len().saturating_add(frame.len()) > self.cap {
+        if self.pending_len().saturating_add(frame.len()) > self.cap {
             self.drops += 1;
             self.discard_to_boundary();
-            if self.wire == Wire::Ground && self.pending.is_empty() && frame.len() <= self.cap {
+            if self.wire == Wire::Ground && self.pending_len() == 0 && frame.len() <= self.cap {
                 self.pending.extend_from_slice(frame);
             }
             return Ok(());
@@ -355,12 +375,14 @@ impl Output {
         Fd: AsFd,
         P: FnMut(Wire) -> bool,
     {
-        while !self.pending.is_empty() {
-            let (len, announced) = plan_write(self.wire, &self.pending);
+        self.reclaim_spent();
+        while self.pending_at < self.pending.len() {
+            let start = self.pending_at;
+            let (len, announced) = plan_write(self.wire, &self.pending[start..]);
             if len == 0 || !publish(announced) {
                 return Ok(true);
             }
-            let wrote = match write_partial(&fd, &self.pending[..len]) {
+            let wrote = match write_partial(&fd, &self.pending[start..start + len]) {
                 Ok(n) => n,
                 Err(err) => {
                     let _ = publish(self.wire);
@@ -371,14 +393,49 @@ impl Output {
                 let _ = publish(self.wire);
                 break;
             }
-            self.wire = advance(self.wire, &self.pending[..wrote]);
+            self.wire = advance(self.wire, &self.pending[start..start + wrote]);
             let handoff = !publish(self.wire);
-            self.pending.drain(..wrote);
+            self.consume(wrote);
             if handoff || wrote < len {
                 return Ok(handoff);
             }
         }
         Ok(false)
+    }
+
+    fn reclaim_spent(&mut self) {
+        if self.pending_at >= self.pending.len() {
+            self.pending.clear();
+            self.pending_at = 0;
+        }
+    }
+
+    fn consume(&mut self, wrote: usize) {
+        self.pending_at += wrote;
+        if self.pending_at >= self.pending.len() {
+            self.pending.clear();
+            self.pending_at = 0;
+            return;
+        }
+        if self.pending_at > self.pending.len() / 2 {
+            self.compact();
+        }
+    }
+
+    /// Slide the unsent tail to the front. Called once the read offset passes half.
+    fn compact(&mut self) {
+        if self.pending_at == 0 {
+            return;
+        }
+        let from = self.pending_at;
+        let moved = self.pending.len() - from;
+        self.pending.copy_within(from.., 0);
+        self.pending.truncate(moved);
+        self.pending_at = 0;
+        #[cfg(test)]
+        {
+            self.shifted += u64::try_from(moved).unwrap_or(u64::MAX);
+        }
     }
 
     fn write_span<Fd, P>(&mut self, fd: &Fd, buf: &[u8], publish: &mut P) -> io::Result<SpanWrite>
@@ -527,5 +584,49 @@ mod tests {
         assert_eq!(plan_write(Wire::StrEsc, b"\\"), (1, Wire::StrEsc));
         assert_eq!(plan_write(Wire::Csi, b"31m"), (2, Wire::Csi));
         assert_eq!(plan_write(Wire::Ground, b"text"), (4, Wire::Ground));
+    }
+
+    #[test]
+    fn discard_ignores_bytes_already_written() {
+        let mut output = Output::new(64);
+        output.wire = Wire::Apc;
+        output.pending.extend_from_slice(b"SENTAAAA\x1b\\NEXT");
+        output.pending_at = 4;
+        output.discard_to_boundary();
+        assert_eq!(output.pending, b"AAAA\x1b\\");
+        assert_eq!(output.pending_len(), 6);
+        assert_eq!(output.pending_at, 0);
+    }
+
+    /// A 3 MiB kitty frame used to `drain(..wrote)` after every syscall and copy
+    /// gigabytes. Compaction moves each surviving byte a handful of times.
+    #[test]
+    fn draining_a_three_megabyte_frame_copies_linearly() {
+        let mut frame = Vec::new();
+        let payload = vec![b'A'; 4096];
+        while frame.len() < 3 * 1024 * 1024 {
+            frame.extend_from_slice(b"\x1b_Gq=2,m=0;");
+            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(b"\x1b\\");
+        }
+        let n = frame.len();
+        let mut output = Output::new(n);
+        output.pending = frame;
+        let devnull = std::fs::File::options()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null");
+        let handoff = output.drain(&devnull, &mut |_| true).expect("drain");
+        assert!(!handoff);
+        assert_eq!(output.pending_len(), 0);
+        assert!(output.pending.is_empty());
+        assert_eq!(output.wire, Wire::Ground);
+        assert_eq!(output.drops(), 0);
+        assert!(output.shifted > 0, "shifted {}", output.shifted);
+        assert!(
+            output.shifted < (n as u64) * 2,
+            "shifted {} for {n} bytes",
+            output.shifted
+        );
     }
 }

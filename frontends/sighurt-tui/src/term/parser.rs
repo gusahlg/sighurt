@@ -7,7 +7,8 @@
 //! that arrives in pieces is still a reply.
 //!
 //! Bracketed paste is collected until `CSI 201 ~` and is not parsed as keys.
-//! Payloads are capped (64 KiB for APC/OSC/DCS, 1 MiB for paste).
+//! Payloads are capped (64 KiB for APC/OSC/DCS, 1 MiB for paste). Bytes past
+//! the paste cap are discarded until the end marker, and that paste is one event.
 //!
 //! Releases: once the terminal's reply to `CSI ? u` says it reports event
 //! types (flag 2), a key in an escape sequence (`CSI … u`, `CSI … ~`, the
@@ -638,7 +639,11 @@ impl Parser {
                 self.arm(true);
             }
             0x00..=0x1f | 0x7f => {
-                self.state = State::Csi(take_csi(csi));
+                // A C0 byte (Enter, a Ctrl chord) or DEL is not part of the CSI.
+                // Abort and parse it, so Alt+[ does not swallow the next key.
+                self.prefix_alt = false;
+                self.disarm();
+                self.ground(byte, out);
             }
             b'0'..=b'9' => {
                 csi.push_digit(byte - b'0');
@@ -850,7 +855,12 @@ impl Parser {
             b'Q' => "F2",
             b'R' => "F3",
             b'S' => "F4",
-            _ => return,
+            // Not an SS3 key. `ESC O` was Alt+O; this byte is the next key.
+            _ => {
+                self.alt_char(b'O', out);
+                self.byte(byte, out);
+                return;
+            }
         };
         self.emit_ss3(name, alt, out);
     }
@@ -1002,27 +1012,32 @@ impl Parser {
             self.state = State::Paste { data, matched };
             return;
         }
+        // Past the cap, keep discarding until `CSI 201 ~`. Emitting now and
+        // returning to ground would run the rest of the paste as keys.
         if data.len() >= MAX_PASTE {
-            out.push(Input::Paste(String::from_utf8_lossy(&data).into_owned()));
-            self.disarm();
-            self.byte(byte, out);
+            self.state = State::Paste {
+                data,
+                matched: usize::from(byte == PASTE_END[0]),
+            };
             return;
         }
-        data.extend_from_slice(&PASTE_END[..matched]);
-        let restart = byte == PASTE_END[0];
-        if !restart {
-            if data.len() >= MAX_PASTE {
-                out.push(Input::Paste(String::from_utf8_lossy(&data).into_owned()));
-                self.disarm();
-                self.byte(byte, out);
-                return;
-            }
-            data.push(byte);
+        let prefix = &PASTE_END[..matched];
+        let room = MAX_PASTE - data.len();
+        if prefix.len() >= room {
+            data.extend_from_slice(&prefix[..room]);
+            self.state = State::Paste {
+                data,
+                matched: usize::from(byte == PASTE_END[0]),
+            };
+            return;
         }
-        self.state = State::Paste {
-            data,
-            matched: usize::from(restart),
-        };
+        data.extend_from_slice(prefix);
+        if byte == PASTE_END[0] {
+            self.state = State::Paste { data, matched: 1 };
+            return;
+        }
+        data.push(byte);
+        self.state = State::Paste { data, matched: 0 };
     }
 
     fn emit_char(&mut self, ch: Option<char>, alt: bool, out: &mut Vec<Input>) {
@@ -1429,6 +1444,22 @@ mod tests {
     }
 
     #[test]
+    fn rio_csi_u_without_a_base_layout_uses_the_us_evdev_code() {
+        // Rio sends no base-layout field. Press and release share KEY_A, so
+        // the core can pair them. `A` is lower-cased onto the same code.
+        let keys = kitty_keys_of(b"\x1b[97u\x1b[97;1:3u");
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert_eq!(keys[0].code, KeyCode(30), "KEY_A");
+        assert_eq!(keys[1].code, KeyCode(30));
+        assert_eq!(keys[0].key, Key::Character("a".into()));
+        assert_eq!(keys[1].state, ButtonState::Released);
+        let upper = kitty_keys_of(b"\x1b[65u");
+        assert_eq!(upper[0].code, KeyCode(30), "A folds onto KEY_A");
+        let unknown = kitty_keys_of(b"\x1b[229u");
+        assert_eq!(unknown[0].code, KeyCode(0), "å is not a US key");
+    }
+
+    #[test]
     fn emoji_without_a_base_layout_has_no_evdev_code() {
         let keys = kitty_keys_of(b"\x1b[128512u");
         assert_eq!(keys[0].key, Key::Character("😀".into()));
@@ -1448,7 +1479,7 @@ mod tests {
         let ctrl_i = kitty_keys_of(b"\x1b[105;5u");
         assert_eq!(ctrl_i[0].key, Key::Character("i".into()));
         assert!(ctrl_i[0].modifiers.control);
-        assert_eq!(ctrl_i[0].code, KeyCode(0));
+        assert_eq!(ctrl_i[0].code, KeyCode(23), "KEY_I, not Tab");
         assert!(ctrl_i[0].text.is_none());
         assert!(!ctrl_i[0].ambiguous);
     }
@@ -1524,6 +1555,69 @@ mod tests {
             [Input::Reply(Reply::Da1 { sixel: true, .. })] => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_paste_past_the_cap_is_one_paste_and_no_keys() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend(std::iter::repeat_n(b'a', MAX_PASTE));
+        // `q` would quit and `x` would close a tab if this tail were keys.
+        // `\x1b[A` is an arrow only outside a paste.
+        bytes.extend_from_slice(b"q\x1b[Ax\x1b[201~z");
+        let inputs = Parser::new().feed(&bytes);
+        assert_eq!(inputs.len(), 3, "{inputs:?}");
+        match &inputs[0] {
+            Input::Paste(text) => {
+                assert_eq!(text.len(), MAX_PASTE);
+                assert!(
+                    text.bytes().all(|byte| byte == b'a'),
+                    "tail leaked into the paste"
+                );
+            }
+            other => panic!("paste: {other:?}"),
+        }
+        match &inputs[1] {
+            Input::Key(key) => {
+                assert_eq!(key.key, Key::Character("z".into()));
+                assert_eq!(key.state, ButtonState::Pressed);
+            }
+            other => panic!("after the paste: {other:?}"),
+        }
+        assert!(matches!(
+            &inputs[2],
+            Input::Key(key) if key.state == ButtonState::Released
+        ));
+    }
+
+    #[test]
+    fn alt_o_and_alt_bracket_do_not_eat_the_next_key() {
+        let keys = keys_of(b"\x1bOx");
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        assert_eq!(keys[0].key, Key::Character("O".into()));
+        assert!(keys[0].modifiers.alt);
+        assert_eq!(keys[0].state, ButtonState::Pressed);
+        assert_eq!(keys[2].key, Key::Character("x".into()));
+        assert!(!keys[2].modifiers.alt);
+        assert_eq!(keys[2].text.as_deref(), Some("x"));
+
+        // Enter aborts the CSI. It is delivered, and the following key is too.
+        let keys = keys_of(b"\x1b[\rq");
+        assert!(
+            keys.iter()
+                .any(|key| key.key == Key::Named("Enter".into())
+                    && key.state == ButtonState::Pressed),
+            "{keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .any(|key| key.key == Key::Character("q".into())
+                    && key.state == ButtonState::Pressed),
+            "{keys:?}"
+        );
+        // A known SS3 final is still that key, not Alt+O.
+        let f1 = keys_of(b"\x1bOP");
+        assert_eq!(f1[0].key, Key::Named("F1".into()));
     }
 
     #[test]
@@ -1724,7 +1818,11 @@ mod tests {
         );
         assert_eq!(keys[0].key, Key::Character("o".into()));
         assert_eq!(keys[0].text.as_deref(), Some("o"));
-        assert_eq!(keys[0].code, KeyCode(0), "57344 is not a US key");
+        assert_eq!(
+            keys[0].code,
+            KeyCode(24),
+            "57344 is not a US key; o is KEY_O"
+        );
         assert!(keys[2].modifiers.shift && keys[2].key == Key::Character("j".into()));
         assert!(!keys[3].modifiers.shift);
         assert_eq!(keys[4].key, Key::Named("Enter".into()));

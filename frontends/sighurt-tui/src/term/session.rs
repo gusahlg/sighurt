@@ -9,11 +9,15 @@
 //! the terminal before the process dies. `SIGTSTP` and `SIGCONT` only set an
 //! atomic and wake the self-pipe; [`Session::take_resumed`] restores, stops,
 //! and enters raw mode again after `SIGCONT`. `SIGWINCH` only writes that
-//! pipe. `SIGHUP`, the panic hook and [`restore_before_forced_exit`] still
-//! write, and only with async-signal-safe calls (`write`, `poll`, `fcntl`,
-//! `tcsetattr`, `clock_gettime`): no allocation and no lock. Handlers that
-//! return save and restore `errno`, so a full self-pipe cannot replace the
-//! interrupted call's error.
+//! pipe. `SIGHUP`, `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL`, `SIGSEGV`, the
+//! panic hook and [`restore_before_forced_exit`] still write, and only with
+//! async-signal-safe calls (`write`, `poll`, `fcntl`, `tcsetattr`,
+//! `clock_gettime`): no allocation and no lock. A fatal signal chains to the
+//! handler installed before ours and does not touch the terminal when that
+//! handler returns; it restores only when the saved disposition is the
+//! default and the process is about to die. Handlers that return save and
+//! restore `errno`, so a full self-pipe cannot replace the interrupted
+//! call's error.
 //!
 //! Those fatal writers see an exact wire classification. Every output `write`
 //! stores it *before* the syscall, as the state the terminal is in if the
@@ -46,7 +50,7 @@ use rustix::pipe::PipeFlags;
 use rustix::pty::OpenptFlags;
 use rustix::termios::{tcgetattr, tcsetattr, OptionalActions, SpecialCodeIndex, Termios, Winsize};
 
-use super::modes::{ENTER, LEAVE, QUERIES};
+use super::modes::{startup_queries, ENTER, LEAVE};
 use super::output::{advance, plan_write, terminator, Output, Wire};
 use super::parser::{Input, Parser};
 use super::probe::{self, Caps};
@@ -72,6 +76,26 @@ static OWNER: AtomicI32 = AtomicI32::new(0);
 static WINCH_WRITE: AtomicI32 = AtomicI32::new(-1);
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
 static PREV_HOOK: AtomicPtr<PanicHook> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Signals whose default action kills the process and would otherwise leave
+/// the terminal raw. For `SIGABRT` (an abort, including a panic that can't
+/// unwind), `SIGFPE` and `SIGILL` the saved disposition is `SIG_DFL`, and the
+/// terminal is restored. Rust's runtime has its own `SIGSEGV` and `SIGBUS`
+/// handler (stack overflow detection) before `main`; we chain to it, and for
+/// a fault that isn't a guard page it puts back `SIG_DFL` and returns, so the
+/// fault repeats and kills the process without a restore. Engines that install
+/// theirs after ours chain back to us. A handler that returns is a recoverable
+/// fault; the terminal stays raw.
+const FATAL_SIGNALS: [libc::c_int; 5] = [
+    libc::SIGABRT,
+    libc::SIGBUS,
+    libc::SIGFPE,
+    libc::SIGILL,
+    libc::SIGSEGV,
+];
+static FATAL_READY: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
+static FATAL_HANDLER: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+static FATAL_FLAGS: [AtomicI32; 5] = [const { AtomicI32::new(0) }; 5];
 
 struct Shared {
     fd: RawFd,
@@ -234,13 +258,17 @@ impl Session {
     /// `SIGTSTP` asks the owner to stop; the owner does it in
     /// [`Self::take_resumed`]. `SIGCONT` only wakes the self-pipe. `SIGHUP`
     /// restores and re-raises, because the process is about to die.
-    /// `SIGWINCH` writes one byte to [`Self::winch_fd`]. The state box is leaked.
+    /// `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL` and `SIGSEGV` do the same when
+    /// their saved disposition is the default, and otherwise chain to that
+    /// handler without touching the terminal. `SIGWINCH` writes one byte to
+    /// [`Self::winch_fd`]. The state box is leaked.
     pub fn install_handlers(&mut self) -> io::Result<()> {
         self.shared().handlers.store(true, Ordering::Release);
         install_signal(libc::SIGTSTP, handle_tstp)?;
         install_signal(libc::SIGCONT, handle_cont)?;
         install_signal(libc::SIGHUP, handle_hup)?;
         install_signal(libc::SIGWINCH, handle_winch)?;
+        install_fatal_signals()?;
         WINCH_WRITE.store(self.winch_write.as_raw_fd(), Ordering::Release);
         Ok(())
     }
@@ -331,15 +359,21 @@ impl Session {
 
     /// Send the startup queries and collect replies until DA1 or `deadline`.
     ///
-    /// A read happens only after `poll` says the fd is readable, and only for
-    /// the time still inside `deadline`. The timeout is sampled after
+    /// The kitty graphics query is left out when `TMUX` is set or `TERM` starts
+    /// with `screen` or `tmux`. A read happens only after `poll` says the fd is
+    /// readable, and only for the time still inside `deadline`. The timeout is
+    /// sampled after
     /// `prepare_read`: those `fcntl` calls can outlast the time remaining, and
     /// a timeout chosen earlier would let `poll` run past the deadline.
     /// `O_NONBLOCK` is put back first: a panic used to clear it and turn the
     /// follow-up `read` into a blocking canonical read. A terminal that never
     /// answers cannot stall this past the deadline.
     pub fn probe(&mut self, deadline: Duration) -> io::Result<Caps> {
-        self.write_frame(QUERIES)?;
+        let queries = startup_queries(
+            std::env::var_os("TMUX").is_some(),
+            std::env::var_os("TERM").as_deref(),
+        );
+        self.write_frame(queries)?;
         let start = std::time::Instant::now();
         let mut caps = Caps::default();
         let mut saw_da1 = false;
@@ -1106,6 +1140,127 @@ extern "C" fn handle_hup(_signal: libc::c_int) {
         unsafe { libc::raise(libc::SIGHUP) };
     }
     set_errno_raw(saved);
+}
+
+fn fatal_index(signal: libc::c_int) -> Option<usize> {
+    FATAL_SIGNALS.iter().position(|&each| each == signal)
+}
+
+/// Block the fatal signals on this thread, install, then put the mask back.
+///
+/// The saved disposition has to be published before a handler runs. Other
+/// threads can still be delivered one during that window; at startup the
+/// previous disposition is `SIG_DFL`.
+fn install_fatal_signals() -> io::Result<()> {
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut block) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for signal in FATAL_SIGNALS {
+            if libc::sigaddset(&mut block, signal) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut previous) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let installed = install_fatals_locked();
+        let restored = libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        installed?;
+        if restored != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn install_fatals_locked() -> io::Result<()> {
+    for signal in FATAL_SIGNALS {
+        install_fatal(signal)?;
+    }
+    Ok(())
+}
+
+fn install_fatal(signal: libc::c_int) -> io::Result<()> {
+    let Some(index) = fatal_index(signal) else {
+        return Ok(());
+    };
+    // A second install would save our own handler and then chain to itself.
+    if FATAL_READY[index].load(Ordering::Acquire) {
+        return Ok(());
+    }
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        let mut old: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_fatal as *const () as usize;
+        // `SA_ONSTACK` uses an alt stack the engine already installed. With
+        // none set, the kernel runs this handler on the normal stack.
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
+        if libc::sigemptyset(&mut action.sa_mask) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::sigaction(signal, &action, &mut old) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        FATAL_FLAGS[index].store(old.sa_flags, Ordering::Relaxed);
+        FATAL_HANDLER[index].store(old.sa_sigaction, Ordering::Relaxed);
+        FATAL_READY[index].store(true, Ordering::Release);
+    }
+    Ok(())
+}
+
+extern "C" fn handle_fatal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    let saved = errno_raw();
+    let index = fatal_index(sig);
+    let ready = index.is_some_and(|index| FATAL_READY[index].load(Ordering::Acquire));
+    let prev = match index {
+        Some(index) if ready => FATAL_HANDLER[index].load(Ordering::Relaxed),
+        _ => libc::SIG_DFL,
+    };
+    let flags = match index {
+        Some(index) if ready => FATAL_FLAGS[index].load(Ordering::Relaxed),
+        _ => 0,
+    };
+    let ours = handle_fatal as *const () as usize;
+    if prev != libc::SIG_DFL && prev != libc::SIG_IGN && prev != ours {
+        unsafe { chain_previous(prev, flags, sig, info, ctx) };
+        set_errno_raw(saved);
+        return;
+    }
+    if prev == libc::SIG_IGN {
+        set_errno_raw(saved);
+        return;
+    }
+    // Default action kills the process. Restore first, then re-raise so the
+    // termination status is still this signal. Do this even when the session
+    // is already gone: swallowing `SIGSEGV` is worse than a cooked terminal.
+    if let Some(state) = load_state() {
+        let _ = restore_signal_safe(state);
+    }
+    set_default(sig);
+    unblock_signal(sig);
+    unsafe { libc::raise(sig) };
+    set_errno_raw(saved);
+}
+
+/// `prev` is a real handler, not `SIG_DFL`, `SIG_IGN`, or [`handle_fatal`].
+unsafe fn chain_previous(
+    prev: usize,
+    flags: libc::c_int,
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut libc::c_void,
+) {
+    if (flags & libc::SA_SIGINFO) != 0 {
+        let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+            std::mem::transmute(prev);
+        handler(sig, info, ctx);
+    } else {
+        let handler: extern "C" fn(libc::c_int) = std::mem::transmute(prev);
+        handler(sig);
+    }
 }
 
 fn wait_readable<Fd: AsFd>(fd: Fd, timeout: Duration) -> io::Result<bool> {

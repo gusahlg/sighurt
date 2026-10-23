@@ -1284,3 +1284,156 @@ fn errno_child() -> ! {
     }
     unsafe { libc::_exit(0) }
 }
+
+fn wait_child(child: &mut Child, timeout: Duration) -> ExitStatus {
+    let start = Instant::now();
+    loop {
+        if past_deadline() || start.elapsed() > timeout {
+            let _ = child.kill();
+            let status = child.wait().expect("wait after kill");
+            let err = read_stderr(child);
+            if past_deadline() {
+                panic!("test deadline exceeded ({status:?}) stderr {err}");
+            }
+            panic!("child timed out ({status:?}) stderr {err}");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    }
+}
+
+/// `SIGABRT` from an in-process engine must put the terminal back before it dies.
+#[test]
+fn sigabrt_restores_the_terminal() {
+    if std::env::var_os("SIGHURT_SIGABRT_CHILD").is_some() {
+        sigabrt_child();
+    }
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    set_nonblock(&master);
+    let original = cooked(&slave);
+    let mut child = spawn_self(
+        "sigabrt_restores_the_terminal",
+        "SIGHURT_SIGABRT_CHILD",
+        &slave,
+    );
+    let started = read_until(&master, b"READY", Duration::from_secs(2));
+    rustix::process::kill_process(Pid::from_child(&child), Signal::ABORT).expect("SIGABRT");
+    let status = wait_child(&mut child, Duration::from_secs(2));
+    let err = read_stderr(&mut child);
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGABRT),
+        "{status:?} stderr {err}"
+    );
+    let mut all = started;
+    all.extend(drain_for(&master, Duration::from_millis(200)));
+    assert!(
+        contains_in_order(&all, &[ENTER, b"READY", LEAVE]),
+        "{all:?} stderr {err}"
+    );
+    assert!(sighurt_tui::term::termios_matches(
+        &tcgetattr(&slave).expect("termios"),
+        &original
+    ));
+}
+
+fn sigabrt_child() -> ! {
+    let slave = match std::io::stdout().as_fd().try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(err) => child_fail(3, &format!("stdout: {err}")),
+    };
+    let mut terminal = match Terminal::enter(slave) {
+        Ok(terminal) => terminal,
+        Err(err) => child_fail(3, &format!("enter: {err}")),
+    };
+    if let Err(err) = terminal.install_handlers() {
+        child_fail(3, &format!("handlers: {err}"));
+    }
+    if terminal.write_frame(b"READY").is_err() {
+        child_fail(3, "ready");
+    }
+    loop {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+static ABRT_CHAINED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn note_abrt(_signal: libc::c_int) {
+    ABRT_CHAINED.store(true, Ordering::Release);
+}
+
+/// A handler installed before ours must run, and a return must not restore.
+#[test]
+fn sigabrt_chains_and_leaves_the_terminal_raw() {
+    if std::env::var_os("SIGHURT_SIGABRT_CHAIN_CHILD").is_some() {
+        sigabrt_chain_child();
+    }
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    set_nonblock(&master);
+    let original = cooked(&slave);
+    let mut child = spawn_self(
+        "sigabrt_chains_and_leaves_the_terminal_raw",
+        "SIGHURT_SIGABRT_CHAIN_CHILD",
+        &slave,
+    );
+    let status = wait_child(&mut child, Duration::from_secs(2));
+    let err = read_stderr(&mut child);
+    assert!(status.success(), "{status:?} stderr {err}");
+    let output = drain_for(&master, Duration::from_millis(200));
+    assert!(
+        contains_in_order(&output, &[ENTER, b"STILLRAW", LEAVE]),
+        "{output:?} stderr {err}"
+    );
+    assert!(sighurt_tui::term::termios_matches(
+        &tcgetattr(&slave).expect("termios"),
+        &original
+    ));
+}
+
+fn sigabrt_chain_child() -> ! {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = note_abrt as *const () as usize;
+        action.sa_flags = libc::SA_RESTART;
+        if libc::sigemptyset(&mut action.sa_mask) != 0
+            || libc::sigaction(libc::SIGABRT, &action, std::ptr::null_mut()) != 0
+        {
+            child_fail(3, "sigaction");
+        }
+    }
+    let slave = match std::io::stdout().as_fd().try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(err) => child_fail(3, &format!("stdout: {err}")),
+    };
+    let mut terminal = match Terminal::enter(slave) {
+        Ok(terminal) => terminal,
+        Err(err) => child_fail(3, &format!("enter: {err}")),
+    };
+    if let Err(err) = terminal.install_handlers() {
+        child_fail(3, &format!("handlers: {err}"));
+    }
+    unsafe { libc::raise(libc::SIGABRT) };
+    if !ABRT_CHAINED.load(Ordering::Acquire) {
+        child_fail(4, "handler was not chained");
+    }
+    let ios = match tcgetattr(std::io::stdout()) {
+        Ok(ios) => ios,
+        Err(err) => child_fail(3, &format!("tcgetattr: {err}")),
+    };
+    if ios.local_modes.contains(LocalModes::ICANON) {
+        child_fail(5, "terminal was restored by the chained signal");
+    }
+    if terminal.write_frame(b"STILLRAW").is_err() {
+        child_fail(3, "stillraw");
+    }
+    if let Err(err) = terminal.restore() {
+        child_fail(3, &format!("restore: {err}"));
+    }
+    unsafe { libc::_exit(0) }
+}

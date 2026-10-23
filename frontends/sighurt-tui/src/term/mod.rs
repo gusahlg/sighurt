@@ -10,9 +10,11 @@
 //! The owner thread is the only writer of terminal bytes. `SIGTSTP` only sets
 //! a flag; it and `SIGCONT` wake [`Terminal::winch_fd`]. Call
 //! [`Terminal::take_resumed`] every loop turn to restore, stop, and enter
-//! again. `SIGHUP`, a panic and [`restore_before_forced_exit`] are the
-//! exception: they restore before the process dies, from the wire state
-//! published before each output `write`. When either fd is readable, or when
+//! again. `SIGHUP`, `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL` and `SIGSEGV`
+//! (when that signal will kill the process), a panic and
+//! [`restore_before_forced_exit`] are the exception: they restore before the
+//! process dies, from the wire state published before each output `write`.
+//! When either fd is readable, or when
 //! [`Terminal::poll_timeout`] elapses, call
 //! [`Terminal::read_events`] and [`Terminal::expire_if_due`]. Keys are
 //! [`sighurt_api::input::KeyEvent`]s. Legacy terminals report no evdev code
