@@ -83,7 +83,7 @@ default = "servo"
 #     (louise-pc, 2026-10-22, 3 reps, 30 s after settle) five sites stayed near idle with it
 #     on; microsoft.com kept presenting (124 frames against a burst of 33 with it off) at the
 #     same CPU, a full core either way. The table is in the Servo engine's SERVO-0.7.md. To
-#     turn it off, set `dom_intersection_observer_enabled = false` in your own file's
+#     turn it off, set dom_intersection_observer_enabled to false in your own file's
 #     [engines.servo.preferences].
 #     The flag turns the whole set on. It does not enable adopted stylesheets or web
 #     animations, and Servo has no preference for requestIdleCallback; set a preference on
@@ -247,7 +247,7 @@ forward = "page.forward"
 # graphics: "auto" (the default) picks kitty where the terminal speaks it, otherwise sixel,
 # otherwise text; or "kitty", "sixel", or "none" (text only).
 # fps: how many frames of the page graphics mode shows a second, a whole number from 1 to 60.
-# The default is 10.
+# The default is 10. Sixel is sent at most 5 a second, whatever this says.
 # mouse: whether the terminal's mouse reports clicks and scrolling to the page. The default
 # is true.
 # default-keys: whether the built-in key table below is in use. The default is true. false

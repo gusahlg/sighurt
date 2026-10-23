@@ -213,6 +213,11 @@ pub enum BrowserEvent {
     },
     /// The chrome moved the keyboard focus itself.
     Focus(KeyboardFocus),
+    /// Whether typing the keymap leaves for the page reaches the page's text fields. A frontend
+    /// that takes the page's keys itself ([`Effect::PageTextInput`] would mislead it) sends
+    /// `false`: a field the page focuses then keeps no character binding from running, and
+    /// `Effect::PageTextInput` is `None`. `true` at start; the window never sends it.
+    PageTyping(bool),
     /// Something an engine reported.
     Engine {
         /// The engine whose pump reported it.
@@ -419,6 +424,8 @@ pub struct BrowserState {
     /// What the executable was last told the page area looks like.
     cursor: Cursor,
     text_input: Option<TextInputState>,
+    /// [`BrowserEvent::PageTyping`].
+    page_typing: bool,
 }
 
 /// Applies `event` to `state` and returns what the executable should do.
@@ -466,6 +473,7 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             state.focus = focus;
             fx.chrome = true;
         }
+        BrowserEvent::PageTyping(on) => state.page_typing = on,
         BrowserEvent::Engine { engine, event, at } => {
             state.engine_event(&engine, event, at, &mut fx)
         }
@@ -545,6 +553,7 @@ impl BrowserState {
             failed: BTreeMap::new(),
             cursor: Cursor::Default,
             text_input: None,
+            page_typing: true,
         }
     }
 
@@ -1806,9 +1815,10 @@ impl BrowserState {
     /// text (the chrome's line, or a text field of the page).
     fn key_context(&self) -> KeyContext {
         let typing = self.focus == KeyboardFocus::Chrome
-            || self
-                .focused_view()
-                .is_some_and(|view| self.views[&view].text_input.is_some());
+            || (self.page_typing
+                && self
+                    .focused_view()
+                    .is_some_and(|view| self.views[&view].text_input.is_some()));
         KeyContext::new(self.focus, typing)
     }
 
@@ -2035,7 +2045,9 @@ impl BrowserState {
             self.cursor = cursor;
             fx.push(Effect::PageCursor(cursor));
         }
-        let text_input = focused.and_then(|id| self.views[&id].text_input.clone());
+        let text_input = focused
+            .filter(|_| self.page_typing)
+            .and_then(|id| self.views[&id].text_input.clone());
         if text_input != self.text_input {
             self.text_input.clone_from(&text_input);
             fx.push(Effect::PageTextInput(text_input));
