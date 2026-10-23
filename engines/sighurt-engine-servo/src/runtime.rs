@@ -1089,6 +1089,9 @@ impl<T: ServoTarget> ServoRuntime<T> {
                 }
                 Tag::Extract(document) => {
                     view.semantics.inflight = false;
+                    if let Some(started) = view.semantics.started {
+                        view.semantics.took = started.elapsed();
+                    }
                     let again = std::mem::take(&mut view.semantics.again);
                     if current == Some(document) && on && !crashed {
                         deliver = Some((document, result));

@@ -18,8 +18,18 @@ use sighurt_api::ids::DocumentGeneration;
 
 /// How long after an extraction or a check starts before a new frame may check the dirty flag.
 /// A page that animates sends a frame on every Servo spin; this bounds its checks to four a
-/// second.
+/// second. After a long extraction the wait is longer: [`SPACING`] times what it took.
 pub const DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// The extraction's time budget in Servo. Its style and layout queries cost about 0.2 ms a node
+/// (Servo 0.7, RTX 3070 desktop, 23 October 2026), so sighurt-semantic's 50 ms stopped
+/// Wikipedia's article after 269 of its 2,373 nodes; with 2 s the walk finished and printed what
+/// WPE does (2,051 words), and the dump took 0.3 s longer. 500 ms covers such pages.
+pub const BUDGET_MS: u64 = 500;
+
+/// The next check waits at least this many times as long as the last extraction took, so
+/// extractions take at most about a quarter of the page's main thread however often it changes.
+pub const SPACING: u32 = 3;
 
 /// The attribute filter of WPE's observer. A mutation of anything else structural still
 /// counts: `childList` and `characterData` are not filtered.
@@ -33,7 +43,7 @@ const ATTRIBUTE_FILTER: &str = r#"["hidden", "disabled", "checked", "value", "se
 /// counts, and the flag starts clear so a change the walk already covers does not.
 pub fn extraction_script() -> String {
     let key = sighurt_semantic::state_key_literal();
-    let extract = sighurt_semantic::EXTRACT.as_str();
+    let extract = sighurt_semantic::extract_script(BUDGET_MS);
     let mut script = String::with_capacity(extract.len() + 1400);
     script.push_str("(function(){\n");
     script.push_str("var STATE_KEY = ");
@@ -66,7 +76,7 @@ pub fn extraction_script() -> String {
     // block comment, and a newline between `(` and that comment is fine, but the value is the
     // call, not a `return` of it.
     script.push_str("var json = (");
-    script.push_str(extract);
+    script.push_str(&extract);
     script.push_str(");\n");
     script.push_str("try {\n");
     script.push_str("  if (installed) { var after = slot(); if (after) after.watching = true; }\n");
@@ -127,6 +137,8 @@ pub struct Semantics {
     pub started: Option<Instant>,
     /// When the last dirty-flag check started. The debounce also runs from here.
     pub checked: Option<Instant>,
+    /// How long the last extraction took, start to result.
+    pub took: Duration,
     /// A frame arrived before a check could run. Check the dirty flag at this time, once no
     /// script is in flight and the debounce has elapsed. Never set while `on` is false.
     pub due: Option<Instant>,
@@ -175,11 +187,13 @@ impl Semantics {
             && self.due.is_some_and(|at| at <= now)
     }
 
-    /// When a frame may next check: [`DEBOUNCE`] after the later of the last extraction and the
-    /// last check. `None` before the first extraction.
+    /// When a frame may next check: [`DEBOUNCE`], or [`SPACING`] times the last extraction's
+    /// time if that is longer, after the later of the last extraction and the last check.
+    /// `None` before the first extraction.
     fn ready(&self) -> Option<Instant> {
         let started = self.started?;
-        Some(self.checked.map_or(started, |checked| checked.max(started)) + DEBOUNCE)
+        let last = self.checked.map_or(started, |checked| checked.max(started));
+        Some(last + DEBOUNCE.max(self.took * SPACING))
     }
 
     /// When the next dirty-flag check is due, if one is waiting and no script is running.
@@ -230,6 +244,12 @@ mod tests {
         assert_eq!(state.due, Some(now + DEBOUNCE * 2));
         state.checked = None;
         state.due = None;
+        // A slow extraction spaces the next check out.
+        state.took = Duration::from_millis(400);
+        assert!(!state.note_frame(now + DEBOUNCE));
+        assert_eq!(state.due, Some(now + Duration::from_millis(1200)));
+        state.took = Duration::ZERO;
+        state.due = None;
         state.started = Some(now);
         state.checking = true;
         assert!(!state.note_frame(now + DEBOUNCE));
@@ -257,6 +277,7 @@ mod tests {
             "Servo has no script-message channel"
         );
         assert!(script.contains("var MAX_NODES = 20000;"));
+        assert!(script.contains(&format!("var TIME_BUDGET_MS = {BUDGET_MS};")));
         assert!(script.contains("return json;"));
         let observe = script.find("MutationObserver").expect("observer");
         let walk = script.find("var MAX_NODES").expect("walk");

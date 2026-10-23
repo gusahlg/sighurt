@@ -21,6 +21,6 @@ mod parse;
 mod world;
 
 pub use action::action_script;
-pub use extract::{EXTRACT, TIME_BUDGET_MS};
+pub use extract::{extract_script, EXTRACT, TIME_BUDGET_MS};
 pub use parse::{max_input_bytes, parse, ParseError, NODE_JSON_OVERHEAD};
 pub use world::state_key_literal;

@@ -4,7 +4,7 @@
 use sighurt_api::semantic::{
     NodeId, SemanticAction, MAX_DEPTH, MAX_NODES, MAX_OPTIONS, MAX_STRING_BYTES, MAX_TOTAL_BYTES,
 };
-use sighurt_semantic::{action_script, EXTRACT, TIME_BUDGET_MS};
+use sighurt_semantic::{action_script, extract_script, EXTRACT, TIME_BUDGET_MS};
 
 fn state_key_assignment(script: &str) -> &str {
     let marker = "var STATE_KEY = ";
@@ -24,6 +24,13 @@ fn bounds_are_the_api_constants() {
     assert!(src.contains(&format!("var MAX_OPTIONS = {MAX_OPTIONS};")));
     assert!(src.contains(&format!("var TIME_BUDGET_MS = {TIME_BUDGET_MS};")));
     assert!(!src.contains("__SIGHURT_"));
+    let slower = extract_script(500);
+    assert!(slower.contains("var TIME_BUDGET_MS = 500;"));
+    assert_eq!(
+        slower.replace("var TIME_BUDGET_MS = 500;", &format!("var TIME_BUDGET_MS = {TIME_BUDGET_MS};")),
+        *src,
+        "only the budget differs"
+    );
     assert!(src.contains("JSON.stringify"));
     assert!(src.contains("Never read el.value for a password field."));
     assert!(src.contains("obj.password = true"));
