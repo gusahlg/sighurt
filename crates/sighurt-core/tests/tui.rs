@@ -23,7 +23,9 @@ use sighurt_core::{
 
 const DEFAULT_KEYS: &[(&str, &str)] = &[
     ("q", "browser.quit"),
+    ("ctrl-c", "browser.quit"),
     ("o", "location.focus"),
+    ("ctrl-o", "location.focus"),
     (":", "location.focus"),
     ("t", "tab.new"),
     ("x", "tab.close"),
@@ -386,7 +388,7 @@ fn text_field(view: ViewId) -> EngineEvent {
 
 #[test]
 fn the_built_in_table_is_the_one_documented() {
-    assert_eq!(DEFAULT_KEYS.len(), 32);
+    assert_eq!(DEFAULT_KEYS.len(), 34);
     for (key, command) in DEFAULT_KEYS {
         let line = format!("\"{key}\" = \"{command}\"");
         assert!(

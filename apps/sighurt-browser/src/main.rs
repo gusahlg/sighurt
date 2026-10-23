@@ -41,7 +41,7 @@ Options:
       --default-config     Print the built-in configuration and exit
       --dump URL           Print URL's page as reflowed text with numbered links on stdout and
                            exit, with no terminal or window (needs an engine that gives page
-                           text: WPE WebKit); exit code 2 on a timeout
+                           text: Servo or WPE WebKit); exit code 2 on a timeout
       --width N            With --dump, wrap to N columns (default 80)
       --timeout SECS       With --dump, give up after SECS seconds (default 30)
       --diagnostics FILE   Write the diagnostics to FILE as JSON at exit and on SIGUSR1
@@ -363,7 +363,8 @@ fn main() -> ExitCode {
 }
 
 /// `--dump`: the page as text on stdout, in a session with no terminal and no window. `engine`
-/// is `--engine`; without it the engine is WPE WebKit, or another that gives page text.
+/// is `--engine`; without it, the engine the routing names when that one gives page text, else
+/// one that does (WPE WebKit first).
 #[cfg(feature = "frontend-tui")]
 fn run_dump(dump: Dump, engine: Option<String>, signals: OwnedFd) -> ExitCode {
     let mut open = dump.open;

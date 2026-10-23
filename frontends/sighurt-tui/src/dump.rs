@@ -236,7 +236,8 @@ fn choose_dump_engine(
         return Ok(name);
     }
     // `matched` is false only when an http(s) or file URL fell through to the default
-    // engine. That default may give no page text (Servo); use one that does.
+    // engine. That default may give no page text (a configured Wasm default); use one that
+    // does.
     if !matched {
         return engine_with_text(registry);
     }
@@ -278,7 +279,7 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
     };
     // Routing, not "WPE first": a demo: URL configured for the demo engine must not be handed
     // to WPE. TUI.md still asks for WPE when the page is an ordinary http(s) or file URL whose
-    // only claim is the default engine and that engine gives no page text (Servo).
+    // only claim is the default engine and that engine gives no page text.
     let engine = choose_dump_engine(&registry, &config, env.home_dir.as_deref(), &options.open)?;
     registry.configure(&config);
     sighurt_runtime::registry::install_logger();

@@ -269,7 +269,7 @@ forward = "page.forward"
 #
 # A keystroke that types a character (no modifier but shift) does not run while you type in a
 # text field of the page or in the terminal's line, the same as in [keys]. A ctrl- or alt-
-# binding still runs.
+# binding still runs: ctrl-c quits and ctrl-o opens the address line from anywhere.
 #
 # The terminal's chrome commands, chrome.<action>, are chrome.toggle-mode (text or graphics),
 # chrome.text-mode, chrome.graphics-mode and chrome.refresh (draw the page again).
@@ -288,7 +288,9 @@ default-keys = true
 
 [tui.keys]
 "q" = "browser.quit"
+"ctrl-c" = "browser.quit"
 "o" = "location.focus"
+"ctrl-o" = "location.focus"
 ":" = "location.focus"
 "t" = "tab.new"
 "x" = "tab.close"

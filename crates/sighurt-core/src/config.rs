@@ -1872,9 +1872,11 @@ mod tests {
     fn the_terminal_installs_its_default_keys_and_the_window_does_not() {
         let config = Config::parse(None, &terminal_env()).unwrap();
         assert_eq!(config.tui(), &TuiConfig::default());
-        assert_eq!(config.keymap_settings.len(), 32);
+        assert_eq!(config.keymap_settings.len(), 34);
         let bound = |key: &str| config.keymap_settings[key].as_str();
         assert_eq!(bound("q"), Some("browser.quit"));
+        assert_eq!(bound("ctrl-c"), Some("browser.quit"));
+        assert_eq!(bound("ctrl-o"), Some("location.focus"));
         assert_eq!(bound("e"), Some("page.switch-engine"));
         assert_eq!(bound("j"), Some("page.send-key ArrowDown"));
         assert_eq!(bound("ctrl-r"), Some("page.reload"));

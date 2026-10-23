@@ -150,8 +150,8 @@ the whole table):
 
 | Key | Command |
 |---|---|
-| `q` | `browser.quit` |
-| `o`, `:` | `location.focus` (the address line; `:` then a command runs it) |
+| `q`, `ctrl-c` | `browser.quit` |
+| `o`, `:`, `ctrl-o` | `location.focus` (the address line; `:` then a command runs it) |
 | `t`, `x` | `tab.new`, `tab.close` |
 | `J`, `K` | `tab.next`, `tab.previous` |
 | `alt-1` to `alt-9` | `tab.select 1` to `9` |
@@ -173,7 +173,8 @@ match.
 
 `sig --dump URL` prints a page as text and exits, with no terminal or window: the reflowed
 page, then its links numbered. `--width N` wraps at N columns, `--timeout SECS` gives up (exit
-code 2); a page that fails to load exits 1. The engine is `--engine`, else WPE WebKit.
+code 2); a page that fails to load exits 1. The engine is `--engine`, else the one the routing
+names (Servo by default), as in the terminal.
 
 ```bash
 target/debug/sig --dump --width 100 https://example.com/ | less
