@@ -129,12 +129,14 @@ shows the browser's chrome as two lines of text (the tab's place, address, engin
 top; status and notices below) and the page between them in one of two modes:
 
 - **Graphics**: the page's pixels as kitty graphics, up to `[tui] fps` frames a second (10 by
-  default). It needs a terminal that speaks the kitty graphics protocol, such as kitty, Rio,
-  ghostty or WezTerm.
+  default), in a terminal that speaks the kitty graphics protocol (kitty, Rio, ghostty,
+  WezTerm), or as sixel, at most 5 a second, where the terminal has sixel but not kitty
+  graphics: inside tmux 3.4 or later, foot, xterm with sixel.
 - **Text**: the page's content reflowed into terminal lines, with links and controls you can
   move to and activate. It works in any terminal, and is the mode `auto` picks where the
-  terminal can't show images. It needs an engine that gives the page's text, which today is
-  WPE WebKit (and the demo engine); the others show a message saying so. `m` switches mode.
+  terminal can't show images. It needs an engine that gives the page's text: Servo and WPE
+  WebKit do (and the demo engine); the Wasm engine shows a message saying so. `m` switches
+  mode.
 
 `[tui] mode = "auto"` (the default), `"text"` or `"graphics"` chooses the start; the `[tui]`
 table of the [built-in configuration](crates/sighurt-core/src/default-config.toml) also has
@@ -166,7 +168,9 @@ the whole table):
 | `ctrl-l` | `chrome.refresh` (draw the page again) |
 
 In text mode `Tab` and `Shift-Tab` move between links and controls and `Enter` activates one
-(a text field opens a one-line editor, a list a chooser; `Escape` cancels). The terminal's other
+(a text field opens a one-line editor, a list a chooser; `Escape` cancels). `Enter` in the
+editor sets the field, and submits its form where a browser would (a form with a button, or
+with that one field); otherwise activate the form's button. The terminal's other
 chrome commands are `chrome.text-mode` and `chrome.graphics-mode`. Terminals that speak the kitty
 keyboard protocol send every key faithfully; in others, `code:` (physical key) bindings never
 match.
@@ -271,7 +275,7 @@ tabs = "left"
 | `[engines] default` | the engine of the web, and of everything no rule below claims | `"servo"` |
 | `[engines] enabled` | the engines that may open new pages | all in the build |
 | `[engines.<engine>] user-agent` | the user agent the engine sends and its pages see (Servo, WPE) | the engine's own |
-| `[engines.<engine>] storage` | `"profile"` keeps cookies, site data and caches; `"ephemeral"` keeps nothing (Servo, WPE, Wasm) | `"profile"` |
+| `[engines.<engine>] storage` | `"profile"` keeps logins (persistent cookies), site data and caches across runs, in private (0700) directories; `"ephemeral"` keeps nothing (Servo, WPE, Wasm) | `"profile"` |
 | `[routing.<engine>] schemes` | URL schemes the engine opens (not http, https, file or sig) | Servo: `data`, `about` |
 | `[routing.<engine>] extensions` | file extensions it opens from `file:` URLs, and from `origins` | Wasm: `wasm` |
 | `[routing.<engine>] origins` | web servers (`scheme://host[:port]`) whose files with those extensions it opens | none |
@@ -311,7 +315,7 @@ that gets content it can't show downloads it or says so.
 engine that opens http(s) and file URLs no routing rule claims. An engine the build lacks, or
 one the configuration does not enable, is an error at startup that names the engines available.
 The choice stays for the whole run, including when the configuration is read again. It is also
-the engine `--dump` uses (WPE WebKit without it).
+the engine `--dump` uses (without it, the one the routing names).
 
 `page.switch-engine` reopens the page shown in the next web engine among those compiled in and
 enabled, in the build's order, wrapping around. It chooses that engine the way `page.open-in`
@@ -563,6 +567,13 @@ and only the host functions Sighurt registers, with camera, microphone, location
 capture behind a prompt. Servo and WebKit pages get their engines' web security; WebKit's pages
 run in its own sandboxed web processes. To report a vulnerability, see
 [SECURITY.md](./SECURITY.md).
+
+Logins stay across runs: each engine keeps its own cookies in its profile, which only you can
+read (0700 directories, 0600 files). Only persistent cookies are kept; session cookies end with
+`sig`, and HTTP passwords are never written. Servo saves its cookies within 5 s of a change, so
+a crash loses at most that; WebKit saves them as they change and refuses third-party cookies.
+Servo 0.7 doesn't enforce SameSite yet. Per-site controls (`site.forget` and a strict mode that
+keeps only the sites you name) are planned ([site-data.md](./docs/rewrite/site-data.md)).
 
 ## Development
 

@@ -2039,8 +2039,13 @@ The phases of [TUI.md](TUI.md) §8, each passing only with the evidence named.
   in a pty (image sized to the page rows, address line, resize, quit and SIGTERM restoring the
   terminal, ≤ fps frames), sighurt-tui's 36 unit and 13 pty tests, and example.com through Servo
   decoded from the kitty stream on the RTX 3070 with no display server.
-- [ ] **Phase 3: WPE's CPU presenter** (Servo's is done: 79be7f7), sixel; text mode and `--dump`.
-- [ ] **Phase 4: semantics** in Servo and WPE; text mode and `--dump` with real pages.
+- [ ] **Phase 3: WPE's CPU presenter** (Servo's is done: 79be7f7), text mode and `--dump`.
+  Sixel is done (decision 110: sighurt-browser's tui.rs `sixel_is_sent_when_the_terminal_has_sixel_and_no_kitty_graphics`,
+  sixel.rs's unit tests, a private tmux 3.7 server).
+- [x] **Phase 4: semantics** in Servo and WPE; text mode and `--dump` with real pages. WPE:
+  decision 104's corpus (`bench/compat/results/2026-10-21-dump-wpe-frames`, 38/40 OK). Servo:
+  decision 109 (`engines/sighurt-engine-servo/tests/semantic.rs`;
+  `bench/compat/results/2026-10-23-dump-servo` and `-budget2000`).
 - [ ] **Phase 5:** the Wasm engine in the terminal, mouse, the stdin pager, the documents.
 
 ## Decisions log
@@ -3607,3 +3612,24 @@ Newest last. Each entry says what was decided and why.
     (`keep = "all" | "kept"`, `sites`, `third-party-cookies = "block"`) and `site.keep`,
     `site.forget`, `site.forget-all`. No encryption at rest yet (no keyring in the process).
     Pending: implementation (phase 1 first) and a GPT-6 Astra review of the design.
+    *Phase 1 is built* (24 October 2026), revised after GPT-6 Astra's review (in site-data.md):
+    WPE (ba1d3f9): SQLite cookie storage on persistent sessions, no third-party cookies,
+    persistent HTTP credentials off (ITP stays off, WebKit's default here; on, it would override
+    the third-party policy); `tests/cookies.sh` shows a persistent cookie surviving a clean
+    shutdown and SIGKILL, a session cookie not. Servo (6af3e9d): servo-net 0.7.0 vendored in
+    `third_party/servo-net` with one writer thread owning every cookie and HSTS commit (at most
+    5 s apart when dirty, and at Exit; temp file 0600, fsync, rename, fsync of the directory;
+    failures retry, nothing panics), persistent unexpired cookies only, HTTP auth memory-only,
+    no cookie values in logs; the profile lock is leaked with a leaked Servo. Directories 0700,
+    session.toml 0600. Not claimed: SameSite and partitioning in Servo 0.7. Phase 2 (the
+    site-data API, `[privacy]`, `site.*`) waits on the review's points 8-10.
+114. **Every frontend bounds the engines' shutdown at 5 s** (`SHUTDOWN_BOUND` in
+    sighurt-runtime's session; a40b407, 7329d67; amends 54). Servo 0.7's `Drop` sleeps until
+    every script thread has exited, and a page that keeps one busy (chatgpt.com) never lets it:
+    `sig --dump` printed the page and stayed alive for an hour, and quitting the terminal or the
+    window would hang the same way. Past the bound, after the session file is written, a thread
+    writes one line to stderr and ends the process with decision 54's `_exit`. The terminal is
+    restored before the engines shut down (4235bdf) and the window has nothing to restore; with
+    Servo's profile writer (113) at most the last few seconds of cookie changes are lost.
+    Evidence: 10 chatgpt dumps all ended (3 at the bound), sighurt-runtime's `shutdown_bound`
+    tests.
