@@ -23,8 +23,8 @@
 use std::time::{Duration, Instant};
 
 use super::keys::{
-    kitty_key, kitty_modifiers, legacy_press, named_evdev, release_of, ButtonState, Key, KeyKind,
-    Modifiers,
+    kitty_key, kitty_modifiers, legacy_press, named_evdev, release_of, ButtonState, Key, KeyCode,
+    KeyKind, Modifiers,
 };
 
 /// How long a lone Escape waits before it is a key.
@@ -855,14 +855,41 @@ impl Parser {
             b'Q' => "F2",
             b'R' => "F3",
             b'S' => "F4",
-            // Not an SS3 key. `ESC O` was Alt+O; this byte is the next key.
             _ => {
-                self.alt_char(b'O', out);
-                self.byte(byte, out);
+                if let Some((key, code, text)) = ss3_keypad(byte) {
+                    self.emit_keypad(key, code, text, alt, out);
+                } else {
+                    // Not an SS3 key. `ESC O` was Alt+O; this byte is the next key.
+                    self.alt_char(b'O', out);
+                    self.byte(byte, out);
+                }
                 return;
             }
         };
         self.emit_ss3(name, alt, out);
+    }
+
+    /// A keypad key from application mode (DECKPAM). Digits and operators type
+    /// their character; Enter does not. `code` is the keypad's evdev key.
+    fn emit_keypad(
+        &mut self,
+        key: Key,
+        code: u32,
+        text: Option<&str>,
+        alt: bool,
+        out: &mut Vec<Input>,
+    ) {
+        let modifiers = Modifiers {
+            alt,
+            ..Modifiers::default()
+        };
+        // Alt is a chord and types nothing, same as `ESC a`.
+        let text = if alt { None } else { text.map(str::to_string) };
+        let mut events = legacy_press(key, modifiers, false, text);
+        for event in &mut events {
+            event.code = KeyCode(code);
+        }
+        extend_keys(out, events);
     }
 
     fn osc(&mut self, byte: u8, buf: &mut Buf, out: &mut Vec<Input>) {
@@ -1185,6 +1212,34 @@ fn named_key(name: &str, modifiers: Modifiers, kind: KeyKind) -> super::keys::Ke
         text: None,
         ambiguous: false,
     }
+}
+
+/// Application-keypad final (`SS3` after DECKPAM). Arrows and F1–F4 are not here.
+///
+/// Digits and operators are characters. Enter is Enter. The codes are the
+/// keypad's evdev keys, the same ones kitty numbers 57399..=57416.
+fn ss3_keypad(byte: u8) -> Option<(Key, u32, Option<&'static str>)> {
+    Some(match byte {
+        b'p' => (Key::Character("0".to_string()), 82, Some("0")),
+        b'q' => (Key::Character("1".to_string()), 79, Some("1")),
+        b'r' => (Key::Character("2".to_string()), 80, Some("2")),
+        b's' => (Key::Character("3".to_string()), 81, Some("3")),
+        b't' => (Key::Character("4".to_string()), 75, Some("4")),
+        b'u' => (Key::Character("5".to_string()), 76, Some("5")),
+        b'v' => (Key::Character("6".to_string()), 77, Some("6")),
+        b'w' => (Key::Character("7".to_string()), 71, Some("7")),
+        b'x' => (Key::Character("8".to_string()), 72, Some("8")),
+        b'y' => (Key::Character("9".to_string()), 73, Some("9")),
+        b'j' => (Key::Character("*".to_string()), 55, Some("*")),
+        b'k' => (Key::Character("+".to_string()), 78, Some("+")),
+        b'l' => (Key::Character(",".to_string()), 121, Some(",")),
+        b'm' => (Key::Character("-".to_string()), 74, Some("-")),
+        b'n' => (Key::Character(".".to_string()), 83, Some(".")),
+        b'o' => (Key::Character("/".to_string()), 98, Some("/")),
+        b'X' => (Key::Character("=".to_string()), 117, Some("=")),
+        b'M' => (Key::Named("Enter".to_string()), 96, None),
+        _ => return None,
+    })
 }
 
 fn legacy_final(final_byte: u8, csi: &Csi) -> Option<&'static str> {
@@ -1592,14 +1647,15 @@ mod tests {
 
     #[test]
     fn alt_o_and_alt_bracket_do_not_eat_the_next_key() {
-        let keys = keys_of(b"\x1bOx");
+        // `z` is not a keypad final. `x` is numpad 8 (`ESC O x`).
+        let keys = keys_of(b"\x1bOz");
         assert_eq!(keys.len(), 4, "{keys:?}");
         assert_eq!(keys[0].key, Key::Character("O".into()));
         assert!(keys[0].modifiers.alt);
         assert_eq!(keys[0].state, ButtonState::Pressed);
-        assert_eq!(keys[2].key, Key::Character("x".into()));
+        assert_eq!(keys[2].key, Key::Character("z".into()));
         assert!(!keys[2].modifiers.alt);
-        assert_eq!(keys[2].text.as_deref(), Some("x"));
+        assert_eq!(keys[2].text.as_deref(), Some("z"));
 
         // Enter aborts the CSI. It is delivered, and the following key is too.
         let keys = keys_of(b"\x1b[\rq");
@@ -1618,6 +1674,59 @@ mod tests {
         // A known SS3 final is still that key, not Alt+O.
         let f1 = keys_of(b"\x1bOP");
         assert_eq!(f1[0].key, Key::Named("F1".into()));
+    }
+
+    /// DECKPAM sends the numpad as `SS3`. Numpad 1 is `ESC O q`, which must not
+    /// be Alt+O and then `q` (`browser.quit`).
+    #[test]
+    fn application_keypad_ss3_is_a_keypad_key() {
+        let digits = [
+            (b'p', "0", 82u32),
+            (b'q', "1", 79),
+            (b'r', "2", 80),
+            (b's', "3", 81),
+            (b't', "4", 75),
+            (b'u', "5", 76),
+            (b'v', "6", 77),
+            (b'w', "7", 71),
+            (b'x', "8", 72),
+            (b'y', "9", 73),
+        ];
+        for (byte, shown, code) in digits {
+            let keys = keys_of(&[0x1b, b'O', byte]);
+            assert_eq!(keys.len(), 2, "{byte} {keys:?}");
+            assert_eq!(keys[0].key, Key::Character(shown.into()), "{byte}");
+            assert_eq!(keys[0].code, KeyCode(code), "{byte}");
+            assert_eq!(keys[0].text.as_deref(), Some(shown), "{byte}");
+            assert!(!keys[0].modifiers.alt, "{byte}");
+            assert_eq!(keys[0].state, ButtonState::Pressed);
+            assert_eq!(keys[1].state, ButtonState::Released);
+            assert_eq!(keys[1].code, KeyCode(code));
+            assert!(keys[1].text.is_none());
+        }
+        let ops = [
+            (b'j', "*", 55u32),
+            (b'k', "+", 78),
+            (b'l', ",", 121),
+            (b'm', "-", 74),
+            (b'n', ".", 83),
+            (b'o', "/", 98),
+            (b'X', "=", 117),
+        ];
+        for (byte, shown, code) in ops {
+            let keys = keys_of(&[0x1b, b'O', byte]);
+            assert_eq!(keys[0].key, Key::Character(shown.into()), "{byte} {keys:?}");
+            assert_eq!(keys[0].code, KeyCode(code), "{byte}");
+            assert_eq!(keys[0].text.as_deref(), Some(shown));
+            assert!(!keys[0].modifiers.alt);
+        }
+        let enter = keys_of(b"\x1bOM");
+        assert_eq!(enter[0].key, Key::Named("Enter".into()));
+        assert_eq!(enter[0].code, KeyCode(96));
+        assert!(enter[0].text.is_none());
+        assert!(!enter[0].modifiers.alt);
+        assert_eq!(enter[1].state, ButtonState::Released);
+        assert_eq!(enter[1].code, KeyCode(96));
     }
 
     #[test]

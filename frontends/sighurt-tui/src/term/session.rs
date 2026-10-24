@@ -13,11 +13,15 @@
 //! panic hook and [`restore_before_forced_exit`] still write, and only with
 //! async-signal-safe calls (`write`, `poll`, `fcntl`, `tcsetattr`,
 //! `clock_gettime`): no allocation and no lock. A fatal signal chains to the
-//! handler installed before ours and does not touch the terminal when that
-//! handler returns; it restores only when the saved disposition is the
-//! default and the process is about to die. Handlers that return save and
-//! restore `errno`, so a full self-pipe cannot replace the interrupted
-//! call's error.
+//! handler installed before ours. If that handler returns with a handler
+//! still installed, the fault was recoverable and the terminal stays raw.
+//! If the disposition is then `SIG_DFL` (Rust's stack handler resets an
+//! ordinary fault; a saved `SA_RESETHAND` is reset before the call), the
+//! terminal is restored before this handler returns. The faulting instruction
+//! kills the process on re-execution. An asynchronous signal (`SI_USER` or
+//! `SI_TKILL`) has nothing to re-execute, so it is re-raised under `SIG_DFL`.
+//! Handlers that return save and restore `errno`, so a full self-pipe cannot
+//! replace the interrupted call's error.
 //!
 //! Those fatal writers see an exact wire classification. Every output `write`
 //! stores it *before* the syscall, as the state the terminal is in if the
@@ -37,7 +41,9 @@
 //! terminal back into cooked, blocking mode under the owner. `set_hook` is
 //! not called while unwinding: Rust rejects that and aborts the process.
 
+use std::cell::UnsafeCell;
 use std::io::{self, ErrorKind};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -83,12 +89,14 @@ static PREV_HOOK: AtomicPtr<PanicHook> = AtomicPtr::new(std::ptr::null_mut());
 /// Signals whose default action kills the process and would otherwise leave
 /// the terminal raw. For `SIGABRT` (an abort, including a panic that can't
 /// unwind), `SIGFPE` and `SIGILL` the saved disposition is `SIG_DFL`, and the
-/// terminal is restored. Rust's runtime has its own `SIGSEGV` and `SIGBUS`
-/// handler (stack overflow detection) before `main`; we chain to it, and for
-/// a fault that isn't a guard page it puts back `SIG_DFL` and returns, so the
-/// fault repeats and kills the process without a restore. Engines that install
-/// theirs after ours chain back to us. A handler that returns is a recoverable
-/// fault; the terminal stays raw.
+/// terminal is restored. Rust's runtime installs its own `SIGSEGV` and
+/// `SIGBUS` handler (stack overflow) before `main`. We chain to it. A guard
+/// page aborts inside that handler; any other fault is reset to `SIG_DFL`
+/// and returns, and we restore so the repeated fault kills with the terminal
+/// cooked. `kill` (`SI_USER` / `SI_TKILL`) is restored and re-raised, because
+/// nothing re-executes it. Engines that install theirs after ours chain back
+/// to us. A handler that returns without resetting the disposition is a
+/// recoverable fault; the terminal stays raw.
 const FATAL_SIGNALS: [libc::c_int; 5] = [
     libc::SIGABRT,
     libc::SIGBUS,
@@ -99,6 +107,30 @@ const FATAL_SIGNALS: [libc::c_int; 5] = [
 static FATAL_READY: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
 static FATAL_HANDLER: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 static FATAL_FLAGS: [AtomicI32; 5] = [const { AtomicI32::new(0) }; 5];
+/// Previous handler's `sa_mask`. Written once before [`FATAL_READY`]'s release
+/// store and only read after that acquire.
+static FATAL_MASK: [FatalMask; 5] = [const { FatalMask::new() }; 5];
+
+/// `sa_mask` saved from the handler installed before ours.
+struct FatalMask(UnsafeCell<MaybeUninit<libc::sigset_t>>);
+
+impl FatalMask {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+
+    fn store(&self, mask: libc::sigset_t) {
+        unsafe { (*self.0.get()).write(mask) };
+    }
+
+    /// The matching [`Self::store`] ran before `FATAL_READY` was released.
+    fn load(&self) -> libc::sigset_t {
+        unsafe { (*self.0.get()).assume_init() }
+    }
+}
+
+// Published by `FATAL_READY`'s release store. Not written after that.
+unsafe impl Sync for FatalMask {}
 
 struct Shared {
     fd: RawFd,
@@ -1220,6 +1252,7 @@ fn install_fatal(signal: libc::c_int) -> io::Result<()> {
         }
         FATAL_FLAGS[index].store(old.sa_flags, Ordering::Relaxed);
         FATAL_HANDLER[index].store(old.sa_sigaction, Ordering::Relaxed);
+        FATAL_MASK[index].store(old.sa_mask);
         FATAL_READY[index].store(true, Ordering::Release);
     }
     Ok(())
@@ -1238,10 +1271,29 @@ extern "C" fn handle_fatal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *m
         _ => 0,
     };
     let ours = handle_fatal as *const () as usize;
-    if prev != libc::SIG_DFL && prev != libc::SIG_IGN && prev != ours {
-        unsafe { chain_previous(prev, flags, sig, info, ctx) };
-        set_errno_raw(saved);
-        return;
+    // Read this before chaining. The previous handler may clear `si_code`.
+    let from_kill = delivered_by_kill(info);
+    if let Some(index) = index.filter(|_| ready) {
+        if prev != libc::SIG_DFL && prev != libc::SIG_IGN && prev != ours {
+            unsafe { chain_previous(index, prev, flags, sig, info, ctx, saved) };
+            // Rust's stack handler resets an ordinary fault to `SIG_DFL` and
+            // returns. A saved `SA_RESETHAND` was reset before the call. Restore
+            // so the re-executed fault kills with the terminal cooked. `kill`
+            // does not re-execute anything, so re-raise it or it is swallowed.
+            // A handler that stays installed handled the signal; leave the
+            // terminal raw.
+            if disposition_is_default(sig) {
+                if from_kill {
+                    restore_and_reraise(sig, saved);
+                    return;
+                }
+                if let Some(state) = load_state() {
+                    let _ = restore_signal_safe(state);
+                }
+            }
+            set_errno_raw(saved);
+            return;
+        }
     }
     if prev == libc::SIG_IGN {
         set_errno_raw(saved);
@@ -1250,6 +1302,11 @@ extern "C" fn handle_fatal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *m
     // Default action kills the process. Restore first, then re-raise so the
     // termination status is still this signal. Do this even when the session
     // is already gone: swallowing `SIGSEGV` is worse than a cooked terminal.
+    restore_and_reraise(sig, saved);
+}
+
+/// Restore, then re-raise `sig` under `SIG_DFL`.
+fn restore_and_reraise(sig: libc::c_int, saved: libc::c_int) {
     if let Some(state) = load_state() {
         let _ = restore_signal_safe(state);
     }
@@ -1259,14 +1316,48 @@ extern "C" fn handle_fatal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *m
     set_errno_raw(saved);
 }
 
+/// `kill` / `tkill` / `raise`. A synchronous fault has `SEGV_MAPERR` and the like.
+fn delivered_by_kill(info: *mut libc::siginfo_t) -> bool {
+    if info.is_null() {
+        return false;
+    }
+    let code = unsafe { (*info).si_code };
+    code == libc::SI_USER || code == libc::SI_TKILL
+}
+
+/// Current disposition, without changing it. `false` if the read fails.
+fn disposition_is_default(sig: libc::c_int) -> bool {
+    unsafe {
+        let mut cur: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(sig, std::ptr::null(), &mut cur) != 0 {
+            return false;
+        }
+        cur.sa_sigaction == libc::SIG_DFL
+    }
+}
+
 /// `prev` is a real handler, not `SIG_DFL`, `SIG_IGN`, or [`handle_fatal`].
+///
+/// `SA_RESETHAND` is applied first: the kernel would have reset the
+/// disposition before the call. `sa_mask` is blocked for the call and then
+/// put back. `saved_errno` is the interrupted call's `errno`; the syscalls
+/// before the handler would otherwise replace it.
 unsafe fn chain_previous(
+    index: usize,
     prev: usize,
     flags: libc::c_int,
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
     ctx: *mut libc::c_void,
+    saved_errno: libc::c_int,
 ) {
+    if (flags & libc::SA_RESETHAND) != 0 {
+        set_default(sig);
+    }
+    let mask = FATAL_MASK[index].load();
+    let mut old_mask: libc::sigset_t = std::mem::zeroed();
+    let masked = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old_mask) == 0;
+    set_errno_raw(saved_errno);
     if (flags & libc::SA_SIGINFO) != 0 {
         let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
             std::mem::transmute(prev);
@@ -1274,6 +1365,9 @@ unsafe fn chain_previous(
     } else {
         let handler: extern "C" fn(libc::c_int) = std::mem::transmute(prev);
         handler(sig);
+    }
+    if masked {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut());
     }
 }
 

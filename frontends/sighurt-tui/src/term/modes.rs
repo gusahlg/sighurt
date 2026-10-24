@@ -12,13 +12,15 @@
 pub const KITTY_KEYBOARD_FLAGS: u32 = 1 | 2 | 4 | 8 | 16;
 
 /// Alternate screen, hidden cursor, bracketed paste, kitty keyboard push,
-/// SGR mouse, focus events, cursor home, clear screen.
+/// SGR mouse, focus events, numeric keypad (DECKPNM, `ESC >`), cursor home,
+/// clear screen.
 pub const ENTER: &[u8] =
-    b"\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>31u\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[H\x1b[2J";
+    b"\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>31u\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b>\x1b[H\x1b[2J";
 
 /// Synchronized output off, then focus off, mouse off, kitty keyboard pop,
 /// bracketed paste off, cursor shown, leave the alternate screen. The reverse
-/// of [`ENTER`] apart from the clear. `CSI ? 2026 l` is first so a frame that
+/// of [`ENTER`] apart from the clear. Numeric keypad (`ESC >` in [`ENTER`])
+/// is left as it is. `CSI ? 2026 l` is first so a frame that
 /// was cut off cannot leave the terminal inside a synchronized update.
 pub const LEAVE: &[u8] =
     b"\x1b[?2026l\x1b[?1004l\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?2004l\x1b[?25h\x1b[?1049l";
@@ -76,6 +78,9 @@ mod tests {
         assert!(LEAVE.starts_with(SYNC_END));
         assert!(ENTER.windows(b"[?1004h".len()).any(|w| w == b"[?1004h"));
         assert!(LEAVE.windows(b"[?1004l".len()).any(|w| w == b"[?1004l"));
+        // DECKPNM. A program that left DECKPAM on would make the numpad `ESC O`.
+        assert!(ENTER.windows(2).any(|window| window == b"\x1b>"));
+        assert!(LEAVE.windows(2).all(|window| window != b"\x1b>"));
         assert!(QUERIES
             .windows(b"_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA".len())
             .any(|window| { window == b"_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA" }));

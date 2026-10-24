@@ -1455,3 +1455,117 @@ fn sigabrt_chain_child() -> ! {
     }
     unsafe { libc::_exit(0) }
 }
+
+/// A real fault (not `kill`) must restore before the repeated fault kills.
+#[test]
+fn sigsegv_fault_restores_the_terminal() {
+    if std::env::var_os("SIGHURT_SIGSEGV_FAULT_CHILD").is_some() {
+        sigsegv_fault_child();
+    }
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    set_nonblock(&master);
+    let original = cooked(&slave);
+    let mut child = spawn_self(
+        "sigsegv_fault_restores_the_terminal",
+        "SIGHURT_SIGSEGV_FAULT_CHILD",
+        &slave,
+    );
+    let started = read_until(&master, b"READY", Duration::from_secs(2));
+    let status = wait_child(&mut child, Duration::from_secs(2));
+    let err = read_stderr(&mut child);
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGSEGV),
+        "{status:?} stderr {err}"
+    );
+    let mut all = started;
+    all.extend(drain_for(&master, Duration::from_millis(200)));
+    assert!(
+        contains_in_order(&all, &[ENTER, b"READY", LEAVE]),
+        "{all:?} stderr {err}"
+    );
+    assert!(sighurt_tui::term::termios_matches(
+        &tcgetattr(&slave).expect("termios"),
+        &original
+    ));
+}
+
+fn sigsegv_fault_child() -> ! {
+    let slave = match std::io::stdout().as_fd().try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(err) => child_fail(3, &format!("stdout: {err}")),
+    };
+    let mut terminal = match Terminal::enter(slave) {
+        Ok(terminal) => terminal,
+        Err(err) => child_fail(3, &format!("enter: {err}")),
+    };
+    if let Err(err) = terminal.install_handlers() {
+        child_fail(3, &format!("handlers: {err}"));
+    }
+    if terminal.write_frame(b"READY").is_err() {
+        child_fail(3, "ready");
+    }
+    // A store through a null pointer. Volatile so the fault is not deleted.
+    unsafe {
+        let ptr = std::hint::black_box(std::ptr::null_mut::<u8>());
+        std::ptr::write_volatile(ptr, 1);
+    }
+    child_fail(6, "null write returned");
+}
+
+/// `kill -SEGV` is asynchronous: nothing re-executes, so it must be re-raised.
+#[test]
+fn sigsegv_kill_restores_the_terminal() {
+    if std::env::var_os("SIGHURT_SIGSEGV_KILL_CHILD").is_some() {
+        sigsegv_kill_child();
+    }
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    set_nonblock(&master);
+    let original = cooked(&slave);
+    let mut child = spawn_self(
+        "sigsegv_kill_restores_the_terminal",
+        "SIGHURT_SIGSEGV_KILL_CHILD",
+        &slave,
+    );
+    let started = read_until(&master, b"READY", Duration::from_secs(2));
+    rustix::process::kill_process(Pid::from_child(&child), Signal::SEGV).expect("SIGSEGV");
+    let status = wait_child(&mut child, Duration::from_secs(2));
+    let err = read_stderr(&mut child);
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGSEGV),
+        "{status:?} stderr {err}"
+    );
+    let mut all = started;
+    all.extend(drain_for(&master, Duration::from_millis(200)));
+    assert!(
+        contains_in_order(&all, &[ENTER, b"READY", LEAVE]),
+        "{all:?} stderr {err}"
+    );
+    assert!(sighurt_tui::term::termios_matches(
+        &tcgetattr(&slave).expect("termios"),
+        &original
+    ));
+}
+
+fn sigsegv_kill_child() -> ! {
+    let slave = match std::io::stdout().as_fd().try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(err) => child_fail(3, &format!("stdout: {err}")),
+    };
+    let mut terminal = match Terminal::enter(slave) {
+        Ok(terminal) => terminal,
+        Err(err) => child_fail(3, &format!("enter: {err}")),
+    };
+    if let Err(err) = terminal.install_handlers() {
+        child_fail(3, &format!("handlers: {err}"));
+    }
+    if terminal.write_frame(b"READY").is_err() {
+        child_fail(3, "ready");
+    }
+    loop {
+        thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -8,7 +8,8 @@
 //!
 //! Bytes already handed to the kernel are tracked with [`Wire`]. Dropping the
 //! queue finishes that open sequence or ends it (a kitty graphics APC with
-//! `ESC \`) so the terminal is not left inside the sequence.
+//! `ESC \`; an open DCS with `ST` and none of the body still queued) so the
+//! terminal is not left inside the sequence.
 //!
 //! A write is split so the state published *before* the syscall is the state
 //! on the wire if that syscall stops early: inside a sequence from its first
@@ -282,7 +283,9 @@ impl Output {
     ///
     /// An open sequence is kept through its end, or replaced with [`terminator`]
     /// when the end is not in the queue. A kitty APC chunk therefore finishes
-    /// or is closed with `ST`.
+    /// or is closed with `ST`. An open `DCS` is always closed with `ST`: a
+    /// sixel is one DCS, and a truncated sixel is valid, so the rest of the
+    /// body is not kept.
     pub fn discard_to_boundary(&mut self) {
         self.reclaim_spent();
         if self.wire == Wire::Ground {
@@ -290,18 +293,17 @@ impl Output {
             self.pending_at = 0;
             return;
         }
-        match bytes_until_ground(self.wire, &self.pending[self.pending_at..]) {
-            Some(end) => {
+        if self.wire != Wire::Dcs {
+            if let Some(end) = bytes_until_ground(self.wire, &self.pending[self.pending_at..]) {
                 self.pending.truncate(self.pending_at + end);
                 self.compact();
-            }
-            None => {
-                let term = terminator(self.wire);
-                self.pending.clear();
-                self.pending_at = 0;
-                self.pending.extend_from_slice(term);
+                return;
             }
         }
+        let term = terminator(self.wire);
+        self.pending.clear();
+        self.pending_at = 0;
+        self.pending.extend_from_slice(term);
     }
 
     /// [`Self::discard_to_boundary`] and take those bytes. The caller writes them.
@@ -527,6 +529,35 @@ mod tests {
         output.pending.extend_from_slice(b"AAAA\x1b\\NEXT");
         output.discard_to_boundary();
         assert_eq!(output.pending, b"AAAA\x1b\\");
+    }
+
+    /// A resize mid-sixel must not keep the rest of the DCS body. `ST` ends it.
+    #[test]
+    fn an_open_dcs_is_ended_with_st_without_the_body() {
+        let mut output = Output::new(64);
+        output.wire = Wire::Dcs;
+        output.pending.extend_from_slice(b"q\"1;1#0!10~\x1b\\NEXT");
+        output.discard_to_boundary();
+        assert_eq!(output.pending, b"\x1b\\");
+
+        let mut output = Output::new(4096);
+        output.wire = Wire::Dcs;
+        output.pending.extend_from_slice(b"SENT");
+        output.pending_at = 4;
+        output.pending.extend(std::iter::repeat_n(b'~', 2000));
+        output.pending.extend_from_slice(b"\x1b\\");
+        output.discard_to_boundary();
+        assert_eq!(output.pending, b"\x1b\\");
+        assert_eq!(output.pending_at, 0);
+    }
+
+    #[test]
+    fn an_open_osc_is_kept_through_its_end() {
+        let mut output = Output::new(64);
+        output.wire = Wire::Osc;
+        output.pending.extend_from_slice(b"0;title\x07NEXT");
+        output.discard_to_boundary();
+        assert_eq!(output.pending, b"0;title\x07");
     }
 
     #[test]
