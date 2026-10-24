@@ -129,7 +129,10 @@ fn field_editor_line(editor: &LineEditor, password: bool, cols: usize) -> (Strin
     }
     if prefix_cols >= cols {
         let visible = slice_columns(prefix, 0, cols);
-        let at = visible.width().saturating_sub(1).min(cols.saturating_sub(1));
+        let at = visible
+            .width()
+            .saturating_sub(1)
+            .min(cols.saturating_sub(1));
         return (visible, at);
     }
     let (body, cursor_in) = window(&shown, cursor, cols - prefix_cols);
@@ -384,10 +387,8 @@ impl TextPages {
                 // A one-line editor would drop the newline on the way into
                 // `LineEditor` and commit that. Refuse, so the value stays.
                 if !password && has_newline(&value) {
-                    self.prompt = Some((
-                        view,
-                        Prompt::Notice("Can't edit more than one line".into()),
-                    ));
+                    self.prompt =
+                        Some((view, Prompt::Notice("Can't edit more than one line".into())));
                     return None;
                 }
                 let in_form = in_form(&page.snapshot, node);
@@ -911,7 +912,8 @@ mod tests {
 
     #[test]
     fn spaces_and_newlines_keep_their_value_through_edit_and_commit() {
-        let (mut pages, view, node) = field_page(NodeKind::TextField, "  two  spaces", false, false);
+        let (mut pages, view, node) =
+            field_page(NodeKind::TextField, "  two  spaces", false, false);
         open_field(&mut pages, view);
         let (row, _) = draw_last(&pages, view);
         assert!(row.starts_with("Edit:   two  spaces"), "{row}");
@@ -928,7 +930,8 @@ mod tests {
         );
 
         // A tab is a control on screen and a real character in the value.
-        let (mut pages, view, node) = field_page(NodeKind::TextField, "  two\tspaces", false, false);
+        let (mut pages, view, node) =
+            field_page(NodeKind::TextField, "  two\tspaces", false, false);
         open_field(&mut pages, view);
         let (row, _) = draw_last(&pages, view);
         assert!(!row.chars().any(|ch| ch.is_control()), "{row:?}");
@@ -962,10 +965,9 @@ mod tests {
         let (row, _) = draw_last(&pages, view);
         assert!(row.starts_with("Edit:   two  spaces"), "{row}");
         let acts = pages.prompt_key(&key("Enter", false));
-        assert!(
-            acts.iter()
-                .all(|act| !matches!(act.action, SemanticAction::SetValue { .. }))
-        );
+        assert!(acts
+            .iter()
+            .all(|act| !matches!(act.action, SemanticAction::SetValue { .. })));
         assert_eq!(acts, vec![expected_submit(&acts, node)]);
         assert!(!pages.prompting());
 
