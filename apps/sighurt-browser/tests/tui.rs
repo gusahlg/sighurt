@@ -942,3 +942,73 @@ fn dump_errors_never_carry_escape_sequences() {
     let bad = |c: char| (c.is_control() && c != '\n') || c == '\u{202e}';
     assert!(!err.chars().any(bad), "{err:?}");
 }
+
+/// A local page whose script spins after load. `--dump --engine servo` must still exit
+/// inside its timeout plus the shutdown bound. SpiderMonkey often kills that spin, and
+/// Servo then shuts down by itself; a spin that survives is what the bound is for, and
+/// the runtime test is what proves the `_exit`. This test is off unless `sig` is built
+/// with `engine-servo` (`cargo test -p sighurt-browser --all-features --test tui`).
+#[cfg(feature = "engine-servo")]
+#[test]
+fn dump_of_a_busy_script_exits_within_its_deadline() {
+    const PAGE: &str = r#"<!DOCTYPE html>
+<title>Busy</title>
+<h1>Busy page</h1>
+<p>alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu</p>
+<script>
+addEventListener("load", function () {
+  setTimeout(function spin() {
+    var end = performance.now() + 60000;
+    while (performance.now() < end) {}
+    setTimeout(spin, 0);
+  }, 300);
+});
+</script>
+"#;
+    let dir = std::env::temp_dir().join(format!("sig-dump-busy-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("config/sighurt")).unwrap();
+    fs::write(dir.join("config/sighurt/config.toml"), "version = 1\n").unwrap();
+    let page = dir.join("busy.html");
+    fs::write(&page, PAGE).unwrap();
+    let stdout = fs::File::create(dir.join("stdout")).unwrap();
+    let stderr = fs::File::create(dir.join("stderr")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sig"))
+        .arg("--dump")
+        .arg(&page)
+        .args(["--engine", "servo", "--timeout", "8"])
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    // `--timeout 8` plus dump's 5 s shutdown bound, and time for Servo to start.
+    let limit = Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let err = fs::read_to_string(dir.join("stderr")).unwrap_or_default();
+                panic!("still running after {limit:?}\n{err}");
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => panic!("{error}"),
+        }
+    };
+    let err = fs::read_to_string(dir.join("stderr")).unwrap_or_default();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(status.code(), Some(0 | 2)),
+        "exit {status:?} after {:?}\n{err}",
+        started.elapsed()
+    );
+}

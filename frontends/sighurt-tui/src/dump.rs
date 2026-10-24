@@ -4,7 +4,9 @@
 //! loop that opens the page, waits for it to be complete and prints [`textmode::dump`], and
 //! which engine is used. A page is complete when the core says its load ended, and then the
 //! first snapshot the engine sends after being asked again has gone 300 ms without a newer one
-//! (TUI.md §8.12); it fails on the first navigation error, or after the timeout. The session is
+//! (TUI.md §8.12); it fails on the first navigation error, or after the timeout. Shutdown after
+//! that is bounded ([`SHUTDOWN_BOUND`]): Servo's `Drop` sleeps until its script threads exit,
+//! and a page that keeps one busy would otherwise never let `--dump` end. The session is
 //! ephemeral: no session file is read or written, and no terminal, Wayland connection or
 //! sighurt-ui is used. Must not own: the text layout ([`crate::textmode`]), browser policy (the
 //! core) or the engines.
@@ -63,6 +65,13 @@ const VIEWPORT: WindowRect = WindowRect {
 
 /// Words below which a snapshot looks unfinished.
 const THIN: usize = 30;
+
+/// How long the engines may take to shut down after the page is printed or the timeout has
+/// fired. Servo's `Drop` sleeps, 500 µs at a time, until the constellation says every script
+/// thread has exited. A page whose script thread stays busy (chatgpt.com did, for an hour)
+/// never gets there. Past this, the process ends with decision 54's `_exit`, stdout already
+/// flushed. A healthy shutdown is well under it.
+const SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
 
 /// What `--dump` is asked for.
 pub struct DumpOptions {
@@ -351,25 +360,29 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
             Err(_) => code = ExitCode::FAILURE,
         }
     }
+    // Before shutdown: it can `_exit` when the bound passes, and these lines would not run.
+    match &written {
+        Ok(false) => eprintln!("sig: timed out writing the page: nothing reads stdout"),
+        Ok(true) => {
+            if matches!(outcome, Ok(None)) {
+                eprintln!(
+                    "sig: timed out after {} s waiting for the page's text",
+                    options.timeout.as_secs()
+                );
+            }
+        }
+        Err(_) => {}
+    }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let _ = std::io::Write::flush(&mut std::io::stderr());
     session.set_quit(code);
+    session.set_shutdown_bound(SHUTDOWN_BOUND);
     let _ = session.shutdown(&mut headless, |_, _| {});
     match written {
-        Ok(true) => {}
-        Ok(false) => {
-            eprintln!("sig: timed out writing the page: nothing reads stdout");
-            return Ok(code);
-        }
-        Err(error) => return Err(error),
-    }
-    match outcome {
-        Ok(None) => {
-            eprintln!(
-                "sig: timed out after {} s waiting for the page's text",
-                options.timeout.as_secs()
-            );
-            Ok(code)
-        }
-        Ok(Some(_)) => Ok(code),
+        Ok(_) => match outcome {
+            Ok(_) => Ok(code),
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     }
 }

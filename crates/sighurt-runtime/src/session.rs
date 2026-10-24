@@ -13,7 +13,9 @@
 //! feeds the events back through `run_core`. Frame-ready does not go to the core; the frontend
 //! is told, and it schedules presentation. [`Session::present`] hands a permit to the view's
 //! engine and records the frame. [`Session::shutdown`] runs the part of plan §20 that is not
-//! the frontend's own teardown.
+//! the frontend's own teardown. A bound on that wait ([`Session::set_shutdown_bound`]) ends
+//! the process if an engine's shutdown does not return: Servo's `Drop` sleeps until a script
+//! thread that a page can keep busy forever (decision 54).
 //!
 //! Must not own: browser policy (the core), drawing, or windows. The frontend owns those, and
 //! the loop that calls in.
@@ -21,7 +23,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{EngineCommand, EngineError, EngineWaker, PresentOutcome};
@@ -73,6 +77,9 @@ pub struct Session<F: Frontend> {
     env: Environment,
     /// Set when the loop must end, with the exit code.
     quit: Option<ExitCode>,
+    /// How long [`Session::shutdown`] may spend in the engines' shutdown. `None` waits as long
+    /// as they take, which is what the GUI and the terminal do. `--dump` sets a bound.
+    shutdown_bound: Option<Duration>,
     /// When the key event the core is handling happened (`None` for other events): the time its
     /// activation of a page carries.
     handling: Option<Instant>,
@@ -106,6 +113,7 @@ impl<F: Frontend> Session<F> {
             session_due: None,
             env,
             quit: None,
+            shutdown_bound: None,
             handling: None,
             wake,
             _frontend: PhantomData,
@@ -160,6 +168,12 @@ impl<F: Frontend> Session<F> {
     /// The loop must end with `code`. A later [`Effect::Quit`] does not replace it.
     pub fn set_quit(&mut self, code: ExitCode) {
         self.quit = Some(code);
+    }
+
+    /// [`Session::shutdown`] ends the process if the engines' shutdown is still running after
+    /// `bound`. The GUI and the terminal leave this unset and wait the shutdown out.
+    pub fn set_shutdown_bound(&mut self, bound: Duration) {
+        self.shutdown_bound = Some(bound);
     }
 
     /// When the changed session should be written. `None` when nothing is waiting.
@@ -660,6 +674,13 @@ impl<F: Frontend> Session<F> {
     /// clean up and the process ends with [`exit_now`]; destructors do not run. Otherwise the
     /// caller tears the frontend down after this returns: the session stays alive until the
     /// caller drops it, so those destructors still run after the frontend's own.
+    ///
+    /// With [`Session::set_shutdown_bound`], a thread ends the process if this is still inside
+    /// the engines' shutdown when the bound passes. Servo's `Drop` sleeps until its script
+    /// threads exit, and a page that keeps one busy never lets them. Stdout is flushed first.
+    /// That `_exit` does not call `before_forced_exit` (it runs on the bound's thread);
+    /// `--dump`, the only caller that sets a bound, has nothing to restore. No bound leaves
+    /// the GUI and the terminal waiting, as before.
     pub fn shutdown(
         &mut self,
         frontend: &mut F,
@@ -673,6 +694,12 @@ impl<F: Frontend> Session<F> {
             }
             writer.finish();
         }
+        // The session file is written. From here a script thread that will not exit must
+        // not hold the process: Servo's `Drop` sleeps until one does. The guard disarms
+        // the thread when this function returns.
+        let _bound = self
+            .shutdown_bound
+            .map(|bound| arm_shutdown_bound(bound, process_status(&code)));
         let views: Vec<(ViewId, String)> = self
             .views
             .iter()
@@ -685,6 +712,8 @@ impl<F: Frontend> Session<F> {
             }
         }
         report(self, frontend);
+        #[cfg(test)]
+        stall_shutdown_for_tests();
         self.registry.shutdown();
         let services = self.services.take().expect("shutdown once");
         services.shutdown();
@@ -698,6 +727,69 @@ impl<F: Frontend> Session<F> {
     }
 }
 
+/// Sleeps for `SIGHURT_TEST_SHUTDOWN_STALL_MS` so a test can hold shutdown inside the bound.
+#[cfg(test)]
+fn stall_shutdown_for_tests() {
+    let Ok(ms) = std::env::var("SIGHURT_TEST_SHUTDOWN_STALL_MS") else {
+        return;
+    };
+    let Ok(ms) = ms.parse::<u64>() else {
+        return;
+    };
+    if ms > 0 {
+        thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// Set while a shutdown bound is in force. Dropping it disarms the thread: shutdown returned.
+struct ShutdownBound {
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for ShutdownBound {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+/// Ends the process if `shutdown` is still running after `bound`. The thread does not log:
+/// the owner thread may hold the log lock inside Servo's `Drop`.
+fn arm_shutdown_bound(bound: Duration, status: i32) -> ShutdownBound {
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    if let Err(error) = thread::Builder::new()
+        .name("sig-shutdown".into())
+        .spawn(move || {
+            thread::sleep(bound);
+            if flag.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let message =
+                b"sig: an engine did not finish shutting down; ending without exit handlers\n";
+            // SAFETY: write(2) of a fixed string. Not the log: the owner may hold that lock.
+            unsafe {
+                libc::write(
+                    libc::STDERR_FILENO,
+                    message.as_ptr().cast::<libc::c_void>(),
+                    message.len(),
+                );
+            }
+            end_without_destructors(status);
+        })
+    {
+        log::error!("cannot bound shutdown: {error}");
+    }
+    ShutdownBound { done }
+}
+
+fn process_status(code: &ExitCode) -> i32 {
+    if *code == ExitCode::SUCCESS {
+        0
+    } else {
+        1
+    }
+}
+
 /// Ends the process now, with `code`, without exit handlers or destructors: what decision 54
 /// prescribes after an engine was left running. Its threads may still use GL contexts, the EGL
 /// display and the Wayland connection, which exit handlers (the driver's) and the host's
@@ -707,11 +799,16 @@ impl<F: Frontend> Session<F> {
 /// has already returned: a terminal restores itself there, and this function does not.
 pub fn exit_now(code: ExitCode) -> ! {
     log::error!("an engine could not shut down; sig ends without running exit handlers");
+    end_without_destructors(process_status(&code));
+}
+
+/// `_exit` after flushing stdout. The page text is already in the kernel when `--dump` takes
+/// this path (it writes with write(2)); the flush covers anything still in Rust's buffer.
+fn end_without_destructors(status: i32) -> ! {
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    let status = if code == ExitCode::SUCCESS { 0 } else { 1 };
     // SAFETY: `_exit` ends the process at once. Nothing here relies on a destructor or exit
     // handler running: the session file and the diagnostics are written and closed, and the
-    // downloads have ended or their files are deleted. The frontend has restored what it must.
+    // downloads have ended or their files are deleted.
     unsafe { libc::_exit(status) }
 }
 
@@ -864,5 +961,153 @@ mod tests {
         // A second forget finds nothing to forget.
         session.forget_view(&mut frontend, view);
         assert_eq!(frontend.forgotten.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_bound {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::process::{Command, Stdio};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use sighurt_api::events::Cursor;
+    use sighurt_api::ids::{RequestId, TargetId, ViewId};
+    use sighurt_api::input::{InputEvent, KeyboardFocus, TextInputState};
+    use sighurt_api::services::{ClipboardData, Selection, ServiceError};
+    use sighurt_core::config::Config;
+    use sighurt_core::{BrowserEvent, BrowserState};
+
+    use super::Session;
+    use crate::diagnostics::Diagnostics;
+    use crate::frontend::Frontend;
+    use crate::persistence::Paths;
+    use crate::registry::Registry;
+    use crate::services::{Clipboard, Services};
+    use crate::view::ViewEntry;
+
+    /// No targets: the test never opens a view. Shutdown still runs the bound.
+    #[derive(Default)]
+    struct Quiet;
+
+    impl Clipboard for Quiet {
+        fn read(&mut self, _: RequestId, _: Selection, _: &[String], _: usize) {}
+
+        fn write(&mut self, _: Selection, _: Vec<ClipboardData>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn cancel(&mut self, _: RequestId) {}
+    }
+
+    impl Frontend for Quiet {
+        type Target = ();
+        type Permit = ();
+
+        fn open_target(&mut self, _: ViewId, _: &str) -> Result<(TargetId, ()), String> {
+            unreachable!("the bound tests open no view");
+        }
+
+        fn place(&mut self, _: &BTreeMap<ViewId, ViewEntry>, _: &mut Diagnostics) -> bool {
+            false
+        }
+
+        fn forget_target(&mut self, _: TargetId) {}
+        fn focus(&mut self, _: KeyboardFocus, _: &mut VecDeque<BrowserEvent>) {}
+        fn chrome_input(&mut self, _: InputEvent, _: &mut VecDeque<BrowserEvent>) {}
+        fn chrome_command(&mut self, _: String, _: &mut VecDeque<BrowserEvent>) {}
+        fn page_cursor(&mut self, _: Option<TargetId>, _: Cursor) {}
+        fn page_text_input(&mut self, _: Option<TargetId>, _: Option<TextInputState>) {}
+        fn notice(&mut self, _: String) {}
+        fn redraw(&mut self) {}
+        fn show(&mut self, _: ViewId, _: bool) {}
+        fn frame_ready(&mut self, _: TargetId) {}
+        fn before_forced_exit(&mut self) {}
+    }
+
+    fn session() -> Session<Quiet> {
+        let registry = Registry::new(vec![]);
+        let env = registry.environment(Vec::new(), &[]);
+        let config = Config::parse(Some("version = 1\n"), &env).expect("config");
+        Session::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            Services::new(|| {}),
+            Paths {
+                config: None,
+                session: None,
+            },
+            None,
+            Diagnostics::new(None),
+            Arc::new(|| {}),
+        )
+    }
+
+    #[test]
+    fn a_finished_shutdown_disarms_the_bound() {
+        let mut session = session();
+        session.set_shutdown_bound(Duration::from_millis(150));
+        let code = session.shutdown(&mut Quiet, |_, _| {});
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        // Past the bound: the thread must have been disarmed, or this process would be gone.
+        std::thread::sleep(Duration::from_millis(400));
+    }
+
+    /// Holds shutdown with `SIGHURT_TEST_SHUTDOWN_STALL_MS` and expects `_exit`.
+    fn block_until_the_bound_ends_the_process() {
+        let mut session = session();
+        session.set_shutdown_bound(Duration::from_millis(200));
+        let _ = session.shutdown(&mut Quiet, |_, _| {});
+        panic!("the shutdown bound returned");
+    }
+
+    #[test]
+    fn a_shutdown_that_does_not_return_ends_the_process_at_the_bound() {
+        if std::env::var_os("SIGHURT_SHUTDOWN_BOUND_CHILD").is_some() {
+            block_until_the_bound_ends_the_process();
+        }
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .arg("session::shutdown_bound::a_shutdown_that_does_not_return_ends_the_process_at_the_bound")
+            .arg("--exact")
+            .env("SIGHURT_SHUTDOWN_BOUND_CHILD", "1")
+            .env("SIGHURT_TEST_SHUTDOWN_STALL_MS", "30000")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let started = Instant::now();
+        // The stall is 30 s. Anything under that is the bound, not the stall, including
+        // the time the test binary takes to start.
+        let limit = Duration::from_secs(12);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() > limit => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the bound did not end the process within {limit:?}");
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("wait: {error}"),
+            }
+        };
+        let mut err = String::new();
+        let _ = std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err);
+        assert!(
+            status.success(),
+            "bound exit {status:?} after {:?}\n{err}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains("did not finish shutting down"),
+            "the process ended without the bound's _exit:\n{err}"
+        );
+        assert!(
+            started.elapsed() < limit,
+            "exited only after {:?}\n{err}",
+            started.elapsed()
+        );
     }
 }
