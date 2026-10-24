@@ -42,19 +42,18 @@ const QUERIES_WITHOUT_GRAPHICS: &[u8] =
     b"\x1b[?u\x1bP+q524742\x1b\\\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[16t\x1b[14t\x1b[c";
 
 /// Startup batch for this terminal. The kitty graphics query is omitted when
-/// `tmux` is set or `term` starts with `screen` or `tmux`.
-pub(super) fn startup_queries(tmux: bool, term: Option<&std::ffi::OsStr>) -> &'static [u8] {
-    if skip_kitty_graphics_query(tmux, term) {
+/// `term` starts with `screen` or `tmux`, which tmux and screen set in their panes. `$TMUX`
+/// is not the signal: a terminal started from inside tmux inherits it (kitty launched from a
+/// tmux pane is kitty, and its `TERM` says so).
+pub(super) fn startup_queries(term: Option<&std::ffi::OsStr>) -> &'static [u8] {
+    if skip_kitty_graphics_query(term) {
         QUERIES_WITHOUT_GRAPHICS
     } else {
         QUERIES
     }
 }
 
-fn skip_kitty_graphics_query(tmux: bool, term: Option<&std::ffi::OsStr>) -> bool {
-    if tmux {
-        return true;
-    }
+fn skip_kitty_graphics_query(term: Option<&std::ffi::OsStr>) -> bool {
     let Some(term) = term else {
         return false;
     };
@@ -90,34 +89,26 @@ mod tests {
     #[test]
     fn tmux_skips_the_kitty_graphics_query() {
         let graphics = b"_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA";
-        assert_eq!(
-            startup_queries(false, Some(OsStr::new("xterm-kitty"))),
-            QUERIES
-        );
-        assert_eq!(startup_queries(false, Some(OsStr::new("rio"))), QUERIES);
-        assert_eq!(startup_queries(false, None), QUERIES);
-        assert_eq!(startup_queries(false, Some(OsStr::new(""))), QUERIES);
-        // The prefix match is case-sensitive. `TMUX` the variable is separate.
-        assert_eq!(
-            startup_queries(false, Some(OsStr::new("TMUX-256color"))),
-            QUERIES
-        );
+        assert_eq!(startup_queries(Some(OsStr::new("xterm-kitty"))), QUERIES);
+        assert_eq!(startup_queries(Some(OsStr::new("rio"))), QUERIES);
+        assert_eq!(startup_queries(None), QUERIES);
+        assert_eq!(startup_queries(Some(OsStr::new(""))), QUERIES);
+        // The prefix match is case-sensitive.
+        assert_eq!(startup_queries(Some(OsStr::new("TMUX-256color"))), QUERIES);
 
         let skipped = [
-            (true, Some("xterm-kitty")),
-            (true, None),
-            (false, Some("tmux")),
-            (false, Some("tmux-256color")),
-            (false, Some("screen")),
-            (false, Some("screen-256color")),
+            Some("tmux"),
+            Some("tmux-256color"),
+            Some("screen"),
+            Some("screen-256color"),
         ];
-        for (tmux, term) in skipped {
-            let bytes = startup_queries(tmux, term.map(OsStr::new));
+        for term in skipped {
+            let bytes = startup_queries(term.map(OsStr::new));
             assert!(
                 bytes
                     .windows(graphics.len())
                     .all(|window| window != graphics),
-                "tmux={tmux} term={term:?} still queries graphics: {bytes:?}"
+                "term={term:?} still queries graphics: {bytes:?}"
             );
             assert!(bytes.starts_with(b"\x1b[?u"), "{bytes:?}");
             assert!(bytes.ends_with(b"\x1b[14t\x1b[c"), "{bytes:?}");

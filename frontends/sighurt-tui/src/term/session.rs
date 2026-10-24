@@ -405,7 +405,7 @@ impl Session {
 
     /// Send the startup queries and collect replies until DA1 or `deadline`.
     ///
-    /// The kitty graphics query is left out when `TMUX` is set or `TERM` starts
+    /// The kitty graphics query is left out when `TERM` starts
     /// with `screen` or `tmux`. A read happens only after `poll` says the fd is
     /// readable, and only for the time still inside `deadline`. The timeout is
     /// sampled after
@@ -415,10 +415,7 @@ impl Session {
     /// follow-up `read` into a blocking canonical read. A terminal that never
     /// answers cannot stall this past the deadline.
     pub fn probe(&mut self, deadline: Duration) -> io::Result<Caps> {
-        let queries = startup_queries(
-            std::env::var_os("TMUX").is_some(),
-            std::env::var_os("TERM").as_deref(),
-        );
+        let queries = startup_queries(std::env::var_os("TERM").as_deref());
         self.write_frame(queries)?;
         let start = std::time::Instant::now();
         let mut caps = Caps::default();
