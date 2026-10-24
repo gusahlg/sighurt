@@ -1151,7 +1151,7 @@ mod tests {
                     }),
                 });
             }
-            events.extend(self.queue.drain(..));
+            events.append(&mut self.queue);
             PumpStatus::Idle
         }
 
@@ -1197,7 +1197,7 @@ mod tests {
         _: crate::registry::Launch<'_>,
     ) -> Result<Runtime<(), ()>, String> {
         let mut long = "DROPME".to_owned();
-        long.extend(std::iter::repeat('x').take(248));
+        long.extend(std::iter::repeat_n('x', 248));
         Ok(Runtime::Demo(Box::new(scripted(
             "web",
             true,
