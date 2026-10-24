@@ -73,7 +73,7 @@ use sighurt_runtime::diagnostics::{Diagnostics, Report, TabReport, TargetReport}
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
 use sighurt_runtime::services::{Clipboard, Services};
-use sighurt_runtime::session::Session;
+use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
 use sighurt_runtime::view::ViewEntry;
 
 use crate::chrome::{
@@ -1492,6 +1492,8 @@ impl App {
     /// the session restores through [`Frontend::before_forced_exit`] and ends the process.
     fn shutdown(mut self) -> ExitCode {
         self.tui.leave();
+        // A page can keep Servo from ever shutting down; the terminal is already given back.
+        self.session.set_shutdown_bound(SHUTDOWN_BOUND);
         let code = self
             .session
             .shutdown(&mut self.tui, |session, tui| report(tui, session, true));

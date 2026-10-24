@@ -34,7 +34,7 @@ use sighurt_runtime::diagnostics::Diagnostics;
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, Paths};
 use sighurt_runtime::services::{Clipboard, Services};
-use sighurt_runtime::session::Session;
+use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
 use sighurt_runtime::view::ViewEntry;
 
 use crate::app::{chrome_checks, error_line, log_path, redirect_stderr, COLOR_NAMES};
@@ -65,13 +65,6 @@ const VIEWPORT: WindowRect = WindowRect {
 
 /// Words below which a snapshot looks unfinished.
 const THIN: usize = 30;
-
-/// How long the engines may take to shut down after the page is printed or the timeout has
-/// fired. Servo's `Drop` sleeps, 500 µs at a time, until the constellation says every script
-/// thread has exited. A page whose script thread stays busy (chatgpt.com did, for an hour)
-/// never gets there. Past this, the process ends with decision 54's `_exit`, stdout already
-/// flushed. A healthy shutdown is well under it.
-const SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
 
 /// What `--dump` is asked for.
 pub struct DumpOptions {

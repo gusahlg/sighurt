@@ -46,6 +46,13 @@ use crate::view::ViewEntry;
 const MAX_COMPLETIONS: usize = 64;
 /// How long a changed session waits before it is written, so a burst of changes is one write.
 const SESSION_DELAY: Duration = Duration::from_secs(1);
+/// How long every frontend lets the engines shut down before the process ends anyway
+/// ([`Session::set_shutdown_bound`]). Servo's `Drop` sleeps, 500 µs at a time, until the
+/// constellation says every script thread has exited, and a page whose script thread stays busy
+/// (chatgpt.com did, for an hour) never gets there. A healthy shutdown is well under it. Servo's
+/// profile writer commits cookies at most 5 s apart, so ending here loses at most the last
+/// few seconds of cookie changes.
+pub const SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
 
 /// The frontend-neutral half of the owner loop.
 ///
@@ -171,7 +178,7 @@ impl<F: Frontend> Session<F> {
     }
 
     /// [`Session::shutdown`] ends the process if the engines' shutdown is still running after
-    /// `bound`. The GUI and the terminal leave this unset and wait the shutdown out.
+    /// `bound` ([`SHUTDOWN_BOUND`] in every frontend). Unset, it waits the shutdown out.
     pub fn set_shutdown_bound(&mut self, bound: Duration) {
         self.shutdown_bound = Some(bound);
     }
@@ -678,9 +685,9 @@ impl<F: Frontend> Session<F> {
     /// With [`Session::set_shutdown_bound`], a thread ends the process if this is still inside
     /// the engines' shutdown when the bound passes. Servo's `Drop` sleeps until its script
     /// threads exit, and a page that keeps one busy never lets them. Stdout is flushed first.
-    /// That `_exit` does not call `before_forced_exit` (it runs on the bound's thread);
-    /// `--dump`, the only caller that sets a bound, has nothing to restore. No bound leaves
-    /// the GUI and the terminal waiting, as before.
+    /// That `_exit` does not call `before_forced_exit` (it runs on the bound's thread): the
+    /// terminal restores itself before calling this, and the window and `--dump` have nothing
+    /// to restore.
     pub fn shutdown(
         &mut self,
         frontend: &mut F,

@@ -67,7 +67,7 @@ use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
 use sighurt_runtime::registry::State;
 use sighurt_runtime::services::{Clipboard, Services};
-use sighurt_runtime::session::Session;
+use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
 use sighurt_runtime::view::ViewEntry;
 use sighurt_ui::extension::{
     Chrome, ChromeAction, ChromeEvent, SurfaceName, TextField, MAX_SURFACES,
@@ -1059,6 +1059,8 @@ impl App {
     /// Wayland objects the engine may still use. Otherwise this window drops its leases, closes
     /// itself and drops the host.
     fn shutdown(mut self) -> ExitCode {
+        // A page can keep Servo from ever shutting down; the window must not stay up for it.
+        self.session.set_shutdown_bound(SHUTDOWN_BOUND);
         let code = self
             .session
             .shutdown(&mut self.gui, |session, gui| report(gui, session, true));
