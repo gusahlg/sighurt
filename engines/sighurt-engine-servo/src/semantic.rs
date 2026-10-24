@@ -196,10 +196,13 @@ impl Semantics {
         Some(last + DEBOUNCE.max(self.took * SPACING))
     }
 
-    /// When the next dirty-flag check is due, if one is waiting and no script is running.
+    /// When the next dirty-flag check is due, if one is waiting and no script is running: not
+    /// before [`Self::ready`]. An extraction that ended after `due` was set can push `ready`
+    /// past it, and a deadline already passed would make every pump return at once.
     pub fn deadline(&self) -> Option<Instant> {
         if self.on && !self.inflight && !self.checking {
-            self.due
+            let due = self.due?;
+            Some(self.ready().map_or(due, |ready| due.max(ready)))
         } else {
             None
         }
@@ -248,6 +251,11 @@ mod tests {
         state.took = Duration::from_millis(400);
         assert!(!state.note_frame(now + DEBOUNCE));
         assert_eq!(state.due, Some(now + Duration::from_millis(1200)));
+        // A frame recorded before a slow extraction ended: the deadline waits for the spacing
+        // the extraction's time asks for, not for the earlier `due`, which has passed.
+        state.due = Some(now + DEBOUNCE);
+        assert_eq!(state.deadline(), Some(now + Duration::from_millis(1200)));
+        assert!(!state.check_due(now + DEBOUNCE));
         state.took = Duration::ZERO;
         state.due = None;
         state.started = Some(now);
