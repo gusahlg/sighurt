@@ -727,18 +727,33 @@ fn a_page_whose_fields_get_no_typing_keeps_its_character_bindings() {
             .any(|effect| matches!(effect, Effect::PageTextInput(state) if state.is_some() == some))
     };
     assert!(told(&field(&mut terminal), true));
-    assert!(delivered(&page_keys(&terminal.key(press("j", plain)), view), "j"));
+    assert!(delivered(
+        &page_keys(&terminal.key(press("j", plain)), view),
+        "j"
+    ));
 
     // The frontend shows the page itself (text mode): the field is the page's, not the user's.
-    assert!(told(&terminal.update(BrowserEvent::PageTyping(false)), false));
-    assert!(sent(&page_keys(&terminal.key(press("j", plain)), view), "ArrowDown"));
+    assert!(told(
+        &terminal.update(BrowserEvent::PageTyping(false)),
+        false
+    ));
+    assert!(sent(
+        &page_keys(&terminal.key(press("j", plain)), view),
+        "ArrowDown"
+    ));
     // The page focusing a field again changes nothing.
     assert!(!told(&field(&mut terminal), true));
-    assert!(sent(&page_keys(&terminal.key(press("j", plain)), view), "ArrowDown"));
+    assert!(sent(
+        &page_keys(&terminal.key(press("j", plain)), view),
+        "ArrowDown"
+    ));
 
     // Back to the page's own pixels: its focused field types again.
     assert!(told(&terminal.update(BrowserEvent::PageTyping(true)), true));
-    assert!(delivered(&page_keys(&terminal.key(press("j", plain)), view), "j"));
+    assert!(delivered(
+        &page_keys(&terminal.key(press("j", plain)), view),
+        "j"
+    ));
     terminal.update(BrowserEvent::PageTyping(false));
     assert!(terminal.key(press("q", plain)).contains(&Effect::Quit));
 }

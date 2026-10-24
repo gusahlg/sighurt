@@ -27,7 +27,10 @@ fn bounds_are_the_api_constants() {
     let slower = extract_script(500);
     assert!(slower.contains("var TIME_BUDGET_MS = 500;"));
     assert_eq!(
-        slower.replace("var TIME_BUDGET_MS = 500;", &format!("var TIME_BUDGET_MS = {TIME_BUDGET_MS};")),
+        slower.replace(
+            "var TIME_BUDGET_MS = 500;",
+            &format!("var TIME_BUDGET_MS = {TIME_BUDGET_MS};")
+        ),
         *src,
         "only the budget differs"
     );
