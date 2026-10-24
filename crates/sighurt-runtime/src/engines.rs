@@ -14,6 +14,8 @@
 //! target and permit types.
 
 use sighurt_api::engine::EngineCapabilities;
+#[cfg(any(feature = "engine-demo", feature = "engine-wasm"))]
+use sighurt_api::engine::SiteDataKinds;
 
 /// One compiled-in engine, before a frontend binds it to a target and a permit.
 pub struct Descriptor {
@@ -61,11 +63,18 @@ pub fn descriptors() -> Vec<Descriptor> {
         Descriptor {
             name: "demo",
             web: false,
-            // `sighurt_engine_demo::CAPABILITIES` is `Default` and content as structure.
-            // Repeated here so this crate does not depend on the demo engine: that crate names
-            // the host's target types. `Registry::start` warns if a runtime reports otherwise.
+            // `sighurt_engine_demo::CAPABILITIES`: content as structure, and cookies and
+            // storage in memory. Repeated here so this crate does not depend on the demo
+            // engine: that crate names the host's target types. `Registry::start` warns if a
+            // runtime reports otherwise.
             capabilities: EngineCapabilities {
                 semantics: true,
+                site_data: SiteDataKinds {
+                    cookies: true,
+                    storage: true,
+                    caches: false,
+                    hsts: false,
+                },
                 ..EngineCapabilities::default()
             },
             honors: &[],
@@ -79,6 +88,7 @@ fn wasm_capabilities() -> EngineCapabilities {
     EngineCapabilities {
         history_traversal: true,
         page_zoom: true,
+        site_data: SiteDataKinds::default(),
         ..EngineCapabilities::default()
     }
 }

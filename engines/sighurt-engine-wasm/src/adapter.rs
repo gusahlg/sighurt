@@ -184,6 +184,7 @@ impl<T: CpuTarget> EngineRuntime for WasmRuntime<T> {
         EngineCapabilities {
             history_traversal: true,
             page_zoom: true,
+            site_data: sighurt_api::engine::SiteDataKinds::default(),
             ..EngineCapabilities::default()
         }
     }

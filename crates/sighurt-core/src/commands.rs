@@ -16,6 +16,9 @@
 //!   the ones compiled in and enabled), wrapping around. Fewer than two, or a page that is
 //!   not http(s) or a file, shows a notice and leaves the page.
 //! - `browser.home` opens the home page in the active tab.
+//! - `site.forget [host]` forgets that site's cookies and stored data in every engine that
+//!   keeps any. No argument is the page shown. A `sig:` page, a tab with no page, or a host
+//!   that is not one, shows a notice.
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
 //!   `Effect::Focus`. Commands that change what the page area shows give the page the keyboard.
 //! - `page.send-key` presses and releases its key in the page only while the page has the
@@ -135,6 +138,10 @@ impl BrowserState {
             }
             Command::BrowserQuit => {
                 fx.quit = true;
+                None
+            }
+            Command::SiteForget(host) => {
+                self.site_forget(host, fx);
                 None
             }
             Command::Chrome(action) => {

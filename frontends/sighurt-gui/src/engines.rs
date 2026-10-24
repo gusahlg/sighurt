@@ -119,6 +119,13 @@ where
         self.0.pump(events)
     }
 
+    fn site_data(
+        &mut self,
+        request: sighurt_api::engine::SiteDataRequest,
+    ) -> Result<(), sighurt_api::engine::EngineError> {
+        self.0.site_data(request)
+    }
+
     fn present(
         &mut self,
         view: sighurt_api::ids::ViewId,

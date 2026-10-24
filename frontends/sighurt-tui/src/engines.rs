@@ -97,6 +97,13 @@ where
         self.0.pump(events)
     }
 
+    fn site_data(
+        &mut self,
+        request: sighurt_api::engine::SiteDataRequest,
+    ) -> Result<(), sighurt_api::engine::EngineError> {
+        self.0.site_data(request)
+    }
+
     fn present(
         &mut self,
         view: ViewId,
@@ -151,6 +158,13 @@ impl EngineRuntime for ServoBound {
         events: &mut Vec<sighurt_api::events::EngineEvent>,
     ) -> sighurt_api::engine::PumpStatus {
         self.0.pump(events)
+    }
+
+    fn site_data(
+        &mut self,
+        request: sighurt_api::engine::SiteDataRequest,
+    ) -> Result<(), sighurt_api::engine::EngineError> {
+        self.0.site_data(request)
     }
 
     fn present(
@@ -280,6 +294,13 @@ impl EngineRuntime for WpeBound {
         events: &mut Vec<sighurt_api::events::EngineEvent>,
     ) -> sighurt_api::engine::PumpStatus {
         self.0.pump(events)
+    }
+
+    fn site_data(
+        &mut self,
+        request: sighurt_api::engine::SiteDataRequest,
+    ) -> Result<(), sighurt_api::engine::EngineError> {
+        self.0.site_data(request)
     }
 
     fn present(

@@ -350,6 +350,7 @@ command, typed into the address line) all run them.
 | `location.focus` | focus the address line with its text selected |
 | `browser.home` | open the home page in the active tab |
 | `browser.quit` | quit, saving the tabs |
+| `site.forget [host]` | forget that site's cookies and stored data in every engine that keeps them (no argument: the page shown); no wildcards |
 | `chrome.<action>` | one of the chrome's own commands, no argument: the standard chrome's is `chrome.toggle-tabs`; the terminal's are `chrome.toggle-mode`, `chrome.text-mode`, `chrome.graphics-mode` and `chrome.refresh` |
 
 ### Keys

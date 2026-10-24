@@ -21,6 +21,8 @@
 //!   ones about views it has closed or replaced and requests from replaced documents, and
 //!   answers every navigation a view it knows asks about (`NavigationRequested`): a link the
 //!   user clicked goes where routing sends its address, perhaps to another engine.
+//!   `SiteDataDone` finishes a pending `site.forget`: a notice, and a reload of the tabs in
+//!   that engine whose host matches. `SitesListed` is ignored until a command lists sites.
 //!   `FrameReady` is the executable's to schedule presentation from, and `SemanticsChanged`
 //!   page content for a frontend that shows text; the core ignores both;
 //! - what its own calls and services produced: [`BrowserEvent::OpenFailed`],
@@ -35,13 +37,18 @@
 //! Must not own: I/O, timers, threads, surface metrics or anything the chrome draws. It is not a
 //! framework: no event bus, no generic UI tree, no plugin registry.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use sighurt_api::commands::{Command, SentKey};
-use sighurt_api::engine::{EngineCapabilities, EngineCommand, EngineError, ViewOptions};
-use sighurt_api::events::{Cursor, EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
+use sighurt_api::engine::{
+    EngineCapabilities, EngineCommand, EngineError, SiteDataKinds, SiteDataRequest, SiteKey,
+    ViewOptions,
+};
+use sighurt_api::events::{
+    Cursor, EngineEvent, HistoryEffect, NavigationError, OpenDisposition, SiteDataOutcome,
+};
 use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, TabId, ViewId};
 use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, KeyboardFocus, PointerButton, PointerEvent,
@@ -346,6 +353,16 @@ pub enum Effect {
         /// What it asks for.
         permission: Permission,
     },
+    /// List or forget site data ([`EngineRuntime::site_data`](sighurt_api::engine::EngineRuntime::site_data)).
+    /// `engine` is `None` to ask every engine that keeps any kind, or one engine's name. The
+    /// runtime starts an engine that has not started. The outcome comes back as
+    /// [`EngineEvent::SiteDataDone`] or [`EngineEvent::SitesListed`].
+    SiteData {
+        /// One engine, or every engine that declares a kind.
+        engine: Option<String>,
+        /// What to do.
+        request: SiteDataRequest,
+    },
     /// Tell the user something: a blocked pop-up, a configuration error or notice.
     Notice {
         /// The tab it is about, if any.
@@ -421,6 +438,9 @@ pub struct BrowserState {
     requests: Requests,
     /// Engines whose runtime failed, and why. They open nothing more.
     failed: BTreeMap<String, String>,
+    /// `site.forget` requests still waiting for engines to answer. At most
+    /// [`MAX_SITE_REQUESTS`].
+    site_requests: BTreeMap<RequestId, SiteForget>,
     /// What the executable was last told the page area looks like.
     cursor: Cursor,
     text_input: Option<TextInputState>,
@@ -529,6 +549,98 @@ fn answer(view: ViewId, request: RequestId, result: ServiceResult) -> Effect {
     }
 }
 
+/// The most `site.forget` requests left unfinished. Each one is fanned out to every engine.
+const MAX_SITE_REQUESTS: usize = 16;
+
+/// A `site.forget` the core has sent and not heard the end of.
+#[derive(Debug)]
+struct SiteForget {
+    key: SiteKey,
+    /// Engines that have not answered.
+    waiting: BTreeSet<String>,
+}
+
+fn notice(message: String, fx: &mut Fx) {
+    fx.push(Effect::Notice {
+        tab: None,
+        message: clamp(message),
+    });
+}
+
+/// The site of a page address: `file:` is one jar, `sig:` keeps nothing, and anything else is
+/// its host as `url` displays it.
+fn site_of_address(address: &str) -> Result<SiteKey, String> {
+    let url = Url::parse(address).map_err(|_| format!("{address:?} is not an address."))?;
+    match url.scheme() {
+        "file" => Ok(SiteKey::LocalFiles),
+        "sig" => Err("This page is sig:, which keeps no site data.".into()),
+        _ => match url.host() {
+            Some(host) => Ok(SiteKey::Host(host.to_string())),
+            None => Err("This page has no host to forget.".into()),
+        },
+    }
+}
+
+/// `text` as a host, the way [`site_of_address`] reads one. No wildcards.
+fn site_of_host(text: &str) -> Result<SiteKey, String> {
+    match text.contains('*') {
+        true => Err(format!("{text:?} is not a host name.")),
+        false => match url::Host::parse(text) {
+            Ok(host) => Ok(SiteKey::Host(host.to_string())),
+            Err(_) => Err(format!("{text:?} is not a host name.")),
+        },
+    }
+}
+
+/// The kinds a notice names, in a fixed order.
+fn kind_list(kinds: SiteDataKinds) -> String {
+    let mut names = Vec::new();
+    if kinds.cookies {
+        names.push("cookies");
+    }
+    if kinds.storage {
+        names.push("storage");
+    }
+    if kinds.caches {
+        names.push("caches");
+    }
+    if kinds.hsts {
+        names.push("hsts");
+    }
+    match names.as_slice() {
+        [] => "none".to_owned(),
+        names => names.join(", "),
+    }
+}
+
+/// Whether `address` is the forgotten site: `file:` for [`SiteKey::LocalFiles`], or a host
+/// equal to the key or to one of `removed`, or under it (`www.example.com` under `example.com`).
+fn page_matches(address: &str, key: &SiteKey, removed: &[String]) -> bool {
+    let Ok(url) = Url::parse(address) else {
+        return false;
+    };
+    if matches!(key, SiteKey::LocalFiles) && url.scheme() == "file" {
+        return true;
+    }
+    let Some(host) = url.host().map(|host| host.to_string()) else {
+        return false;
+    };
+    let key = match key {
+        SiteKey::Host(host) => host.as_str(),
+        SiteKey::LocalFiles => "",
+    };
+    host_under(&host, key) || removed.iter().any(|name| host_under(&host, name))
+}
+
+/// `host` is `key`, or a name under it. An empty key matches nothing.
+fn host_under(host: &str, key: &str) -> bool {
+    !key.is_empty()
+        && (host == key
+            || host
+                .strip_suffix(key)
+                .is_some_and(|rest| rest.ends_with('.')))
+}
+
 impl BrowserState {
     /// A browser with no tabs yet, using `config`. [`BrowserEvent::Start`] opens them.
     pub fn new(config: Config, env: Environment) -> Self {
@@ -551,6 +663,7 @@ impl BrowserState {
             views: BTreeMap::new(),
             requests: Requests::default(),
             failed: BTreeMap::new(),
+            site_requests: BTreeMap::new(),
             cursor: Cursor::Default,
             text_input: None,
             page_typing: true,
@@ -1369,13 +1482,144 @@ impl BrowserState {
         }
     }
 
+    // ── Site data ─────────────────────────────────────────────────────────────────────────
+
+    /// Forgets `host`, or the page the active tab shows. Asks every engine that keeps any kind.
+    pub(crate) fn site_forget(&mut self, host: Option<String>, fx: &mut Fx) {
+        let key = match host {
+            Some(text) => match site_of_host(&text) {
+                Ok(key) => key,
+                Err(message) => return notice(message, fx),
+            },
+            None => match self.address(self.active) {
+                None => return notice("This tab has no page to forget.".into(), fx),
+                Some(address) => match site_of_address(&address) {
+                    Ok(key) => key,
+                    Err(message) => return notice(message, fx),
+                },
+            },
+        };
+        let waiting: BTreeSet<String> = self
+            .env
+            .engines
+            .iter()
+            .filter(|(_, capabilities)| capabilities.site_data.any())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if waiting.is_empty() {
+            return notice(
+                "No engine in this build can forget site data yet, so nothing was forgotten."
+                    .into(),
+                fx,
+            );
+        }
+        if self.site_requests.len() >= MAX_SITE_REQUESTS {
+            return notice(
+                format!(
+                    "Too many site.forget requests are still unfinished ({MAX_SITE_REQUESTS})."
+                ),
+                fx,
+            );
+        }
+        let request = RequestId::next();
+        self.site_requests.insert(
+            request,
+            SiteForget {
+                key: key.clone(),
+                waiting,
+            },
+        );
+        fx.push(Effect::SiteData {
+            engine: None,
+            request: SiteDataRequest::Forget { request, site: key },
+        });
+    }
+
+    /// `engine` finished `request`. An answer for a request it was not waiting on is dropped,
+    /// and so is a second answer from the same engine.
+    fn site_answered(
+        &mut self,
+        engine: &str,
+        request: RequestId,
+        result: Result<SiteDataOutcome, String>,
+        fx: &mut Fx,
+    ) {
+        let Some(pending) = self.site_requests.get_mut(&request) else {
+            return;
+        };
+        if !pending.waiting.remove(engine) {
+            return;
+        }
+        let key = pending.key.clone();
+        if pending.waiting.is_empty() {
+            self.site_requests.remove(&request);
+        }
+        let label = match &key {
+            SiteKey::Host(host) => host.clone(),
+            SiteKey::LocalFiles => "local files".into(),
+        };
+        let removed = result.as_ref().ok().map(|outcome| outcome.removed.clone());
+        let message = match &result {
+            Ok(outcome) if outcome.profile => {
+                let kinds = kind_list(outcome.kinds);
+                let removed = match outcome.removed.as_slice() {
+                    [] => "nothing".to_owned(),
+                    names => names.join(", "),
+                };
+                format!("{label} forgotten in {engine}: {kinds} (removed: {removed})")
+            }
+            Ok(_) => format!("{label}: nothing on disk changed in {engine} (no profile)"),
+            Err(message) => {
+                format!("{label}: nothing on disk changed in {engine} ({message})")
+            }
+        };
+        notice(message, fx);
+        // An accepted forget reloads the page, so it cannot write the data back, whether or
+        // not this instance has a profile. A failure leaves the page as it is.
+        if let Some(removed) = removed {
+            self.reload_forgotten(engine, &key, &removed, fx);
+        }
+    }
+
+    /// Reloads every tab whose current view runs in `engine` and whose host is `key`, or is
+    /// under it, or is one of `removed` the same way. `file:` pages match [`SiteKey::LocalFiles`].
+    fn reload_forgotten(&mut self, engine: &str, key: &SiteKey, removed: &[String], fx: &mut Fx) {
+        let tabs: Vec<usize> = (0..self.tabs.len())
+            .filter(|&tab| self.tab_matches_site(tab, engine, key, removed))
+            .collect();
+        for tab in tabs {
+            self.reload(tab, fx);
+        }
+    }
+
+    fn tab_matches_site(
+        &self,
+        tab: usize,
+        engine: &str,
+        key: &SiteKey,
+        removed: &[String],
+    ) -> bool {
+        let Some(view) = self.tabs[tab].current_view() else {
+            return false;
+        };
+        if self
+            .views
+            .get(&view)
+            .is_none_or(|view| view.engine != engine)
+        {
+            return false;
+        }
+        let Some(address) = self.address(tab) else {
+            return false;
+        };
+        page_matches(&address, key, removed)
+    }
+
     // ── Engine events ─────────────────────────────────────────────────────────────────────
 
     fn engine_event(&mut self, engine: &str, event: EngineEvent, at: Instant, fx: &mut Fx) {
         let Some(id) = event.view() else {
-            if let EngineEvent::RuntimeFailed { message } = event {
-                self.runtime_failed(engine, clamp(message), fx);
-            }
+            self.runtime_event(engine, event, fx);
             return;
         };
         // Events about views that are gone, being closed, or someone else's, are late.
@@ -1461,7 +1705,34 @@ impl BrowserState {
             EngineEvent::CloseRequested { document, .. } => self.close_requested(id, document, fx),
             EngineEvent::ViewClosed { .. } => self.view_gone(id, None, fx),
             EngineEvent::ViewFailed { message, .. } => self.view_failed(id, clamp(message), fx),
-            EngineEvent::RuntimeFailed { .. } => unreachable!("handled above: it has no view"),
+            EngineEvent::RuntimeFailed { .. }
+            | EngineEvent::SitesListed { .. }
+            | EngineEvent::SiteDataDone { .. } => {
+                unreachable!("handled above: no view")
+            }
+        }
+    }
+
+    /// An event about the runtime rather than a view.
+    fn runtime_event(&mut self, engine: &str, event: EngineEvent, fx: &mut Fx) {
+        match event {
+            EngineEvent::RuntimeFailed { message } => {
+                self.runtime_failed(engine, clamp(message), fx);
+            }
+            // List is not sent this slice.
+            EngineEvent::SitesListed { .. } => {}
+            EngineEvent::SiteDataDone { request, result } => {
+                let mut event = EngineEvent::SiteDataDone { request, result };
+                let result = match event.check() {
+                    Ok(()) => match event {
+                        EngineEvent::SiteDataDone { result, .. } => result,
+                        _ => unreachable!("the same event"),
+                    },
+                    Err(error) => Err(format!("the report was not usable ({error})")),
+                };
+                self.site_answered(engine, request, result, fx);
+            }
+            _ => unreachable!("view() is None only for runtime-level events"),
         }
     }
 

@@ -102,6 +102,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     native_popups: false,
     process_per_view: true,
     semantics: true,
+    site_data: sighurt_api::engine::SiteDataKinds::NONE,
 };
 
 /// The `log` target of the timing lines: `RUST_LOG=sighurt_engine_wpe::timing=debug`.

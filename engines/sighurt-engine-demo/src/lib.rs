@@ -31,8 +31,11 @@
 //! stays false: that flag is IME composition, which this engine does not do.
 //!
 //! The engine has no history of its own (`history_traversal: false`, so the core gives it a view
-//! per page) and no page zoom. Everything happens on the owner thread, synchronously, so it
-//! needs no waker; the slow page's deadline comes back from `pump`.
+//! per page) and no page zoom. Visiting a page records the site name `demo` (a page that fails
+//! to load does not). [`EngineRuntime::site_data`] lists those names and forgets them, in
+//! memory: a forget answers on the next pump with `durable` false and `profile` true, since
+//! the engine has a profile and nothing of it is on disk. Everything happens on the owner
+//! thread, synchronously, so it needs no waker; the slow page's deadline comes back from `pump`.
 //!
 //! Must not own: anything a real engine would not; it goes through the same contract.
 
@@ -41,15 +44,17 @@
 
 mod paint;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem::{discriminant, Discriminant};
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{
     EngineCapabilities, EngineCommand, EngineError, EngineRuntime, PresentOutcome, PumpStatus,
-    ViewOptions,
+    SiteDataKinds, SiteDataRequest, SiteKey, ViewOptions,
 };
-use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
+use sighurt_api::events::{
+    Cursor, EngineEvent, NavigationError, OpenDisposition, SiteDataOutcome, SiteEntry, MAX_SITES,
+};
 use sighurt_api::geometry::{Metrics, SurfacePoint, SurfaceRect};
 use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, ViewId};
 use sighurt_api::input::{ButtonState, InputKind, Key, PointerEvent, TextInputState, TextPurpose};
@@ -61,8 +66,9 @@ use sighurt_wayland::TargetLease;
 pub const NAME: &str = "demo";
 
 /// What the demo engine supports: content as structure (a small fixed tree, see [`snapshot`]),
-/// and none of the other optional operations. `text_input` is IME composition, not the text
-/// field's focus, which is reported as `TextInputChanged`.
+/// and cookies and storage in memory ([`EngineRuntime::site_data`]). None of the other
+/// optional operations. `text_input` is IME composition, not the text field's focus, which is
+/// reported as `TextInputChanged`.
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     history_traversal: false,
     text_input: false,
@@ -74,6 +80,12 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     native_popups: false,
     process_per_view: false,
     semantics: true,
+    site_data: SiteDataKinds {
+        cookies: true,
+        storage: true,
+        caches: false,
+        hsts: false,
+    },
 };
 
 /// How long `demo:slow` takes to have a frame for a new layout: longer than the host's resize
@@ -259,6 +271,10 @@ pub struct DemoRuntime<T: CpuTarget = TargetLease> {
     views: BTreeMap<ViewId, View<T>>,
     /// Events not handed over yet, in order.
     queue: Vec<EngineEvent>,
+    /// Hosts whose pages stored something. Visiting a demo page adds `demo`.
+    sites: BTreeSet<String>,
+    /// Site-data requests accepted and not yet answered. The next pump answers them.
+    site_jobs: Vec<SiteDataRequest>,
     shut_down: bool,
 }
 
@@ -267,6 +283,8 @@ impl<T: CpuTarget> Default for DemoRuntime<T> {
         Self {
             views: BTreeMap::new(),
             queue: Vec::new(),
+            sites: BTreeSet::new(),
+            site_jobs: Vec::new(),
             shut_down: false,
         }
     }
@@ -301,6 +319,7 @@ impl<T: CpuTarget> DemoRuntime<T> {
         });
         match page {
             Ok(page) => {
+                self.sites.insert("demo".into());
                 view.page = Some((page, url.clone()));
                 view.failed = false;
                 view.typed.clear();
@@ -679,10 +698,22 @@ impl<T: CpuTarget> EngineRuntime for DemoRuntime<T> {
         Ok(())
     }
 
+    fn site_data(&mut self, request: SiteDataRequest) -> Result<(), EngineError> {
+        self.running()?;
+        self.site_jobs.push(request);
+        Ok(())
+    }
+
     fn pump(&mut self, events: &mut Vec<EngineEvent>) -> PumpStatus {
         if self.shut_down {
             return PumpStatus::Idle;
         }
+        let jobs = std::mem::take(&mut self.site_jobs);
+        let mut answers = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            answers.push(self.answer_site(job));
+        }
+        self.queue.extend(answers);
         let now = Instant::now();
         let mut deadline: Option<Instant> = None;
         for (&id, view) in &mut self.views {
@@ -762,12 +793,95 @@ impl<T: CpuTarget> EngineRuntime for DemoRuntime<T> {
     fn shutdown(&mut self) {
         self.views.clear();
         self.queue.clear();
+        self.site_jobs.clear();
         self.shut_down = true;
     }
 }
 
+impl<T: CpuTarget> DemoRuntime<T> {
+    /// The kinds a forget or a list reports: cookies and storage, in memory.
+    fn stored_kinds() -> SiteDataKinds {
+        CAPABILITIES.site_data
+    }
+
+    /// The answer to `request`, from the sites visited so far.
+    fn answer_site(&mut self, request: SiteDataRequest) -> EngineEvent {
+        let kinds = Self::stored_kinds();
+        match request {
+            SiteDataRequest::List { request } => {
+                let mut sites: Vec<SiteEntry> = self
+                    .sites
+                    .iter()
+                    .map(|name| SiteEntry {
+                        name: name.clone(),
+                        kinds,
+                    })
+                    .collect();
+                let more = sites.len() > MAX_SITES;
+                sites.truncate(MAX_SITES);
+                EngineEvent::SitesListed {
+                    request,
+                    sites,
+                    more,
+                }
+            }
+            SiteDataRequest::Forget { request, site } => EngineEvent::SiteDataDone {
+                request,
+                result: Ok(self.forget(site)),
+            },
+            SiteDataRequest::ForgetAll { request } => {
+                let removed: Vec<String> = self.sites.iter().cloned().collect();
+                self.sites.clear();
+                EngineEvent::SiteDataDone {
+                    request,
+                    result: Ok(SiteDataOutcome {
+                        removed,
+                        kinds,
+                        durable: false,
+                        profile: true,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Forgets `site` and says what went. Nothing is on disk; the engine still has a profile.
+    fn forget(&mut self, site: SiteKey) -> SiteDataOutcome {
+        let host = match site {
+            SiteKey::Host(host) => Some(host),
+            SiteKey::LocalFiles => None,
+        };
+        let removed: Vec<String> = self
+            .sites
+            .iter()
+            .filter(|name| host.as_ref().is_some_and(|host| site_covers(name, host)))
+            .cloned()
+            .collect();
+        for name in &removed {
+            self.sites.remove(name);
+        }
+        SiteDataOutcome {
+            removed,
+            kinds: Self::stored_kinds(),
+            durable: false,
+            profile: true,
+        }
+    }
+}
+
+/// `name` is `host`, or a name under it (`www.example.com` under `example.com`).
+fn site_covers(name: &str, host: &str) -> bool {
+    !host.is_empty()
+        && (name == host
+            || name
+                .strip_suffix(host)
+                .is_some_and(|rest| rest.ends_with('.')))
+}
+
 #[cfg(test)]
 mod tests {
+    use sighurt_api::ids::RequestId;
+
     use super::*;
 
     #[test]
@@ -952,5 +1066,185 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last_text_input(&pump_all(&mut runtime)), Some(false));
+    }
+
+    fn open_page(runtime: &mut DemoRuntime<Mem>, url: &str) -> ViewId {
+        use sighurt_api::geometry::{Scale, WindowRect};
+        let view = ViewId::next();
+        let metrics = Metrics::new(
+            LayoutEpoch::next(),
+            WindowRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 40,
+            },
+            Scale::ONE,
+        );
+        runtime
+            .open_view(view, ViewOptions::default(), Mem { metrics })
+            .unwrap();
+        runtime
+            .command(
+                view,
+                EngineCommand::Navigate {
+                    navigation: NavigationId::next(),
+                    url: url.into(),
+                },
+            )
+            .unwrap();
+        view
+    }
+
+    fn site_events(events: &[EngineEvent]) -> Vec<&EngineEvent> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    EngineEvent::SitesListed { .. } | EngineEvent::SiteDataDone { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn visiting_a_page_stores_demo_and_a_forget_answers_on_the_next_pump() {
+        let mut runtime = DemoRuntime::new();
+        let view = open_page(&mut runtime, "demo://pattern");
+        // Accepted, and not answered until the pump.
+        let request = RequestId::next();
+        runtime
+            .site_data(SiteDataRequest::Forget {
+                request,
+                site: SiteKey::Host("demo".into()),
+            })
+            .unwrap();
+        let events = pump_all(&mut runtime);
+        let reports = site_events(&events);
+        assert_eq!(reports.len(), 1, "{events:?}");
+        match reports[0] {
+            EngineEvent::SiteDataDone {
+                request: id,
+                result: Ok(outcome),
+            } => {
+                assert_eq!(*id, request);
+                assert_eq!(outcome.removed, ["demo"]);
+                assert!(!outcome.durable);
+                assert!(outcome.profile);
+                assert!(outcome.kinds.cookies && outcome.kinds.storage);
+                assert!(!outcome.kinds.caches && !outcome.kinds.hsts);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A second visit does not store the name twice, and the first forget took it.
+        open_page(&mut runtime, "demo://animation");
+        let again = RequestId::next();
+        runtime
+            .site_data(SiteDataRequest::Forget {
+                request: again,
+                site: SiteKey::Host("demo".into()),
+            })
+            .unwrap();
+        // Two forgets queued before one pump both arrive: the reports are not replaceable.
+        let other = RequestId::next();
+        runtime
+            .site_data(SiteDataRequest::Forget {
+                request: other,
+                site: SiteKey::Host("other.test".into()),
+            })
+            .unwrap();
+        let events = pump_all(&mut runtime);
+        let dones: Vec<_> = site_events(&events)
+            .into_iter()
+            .filter_map(|event| match event {
+                EngineEvent::SiteDataDone {
+                    request,
+                    result: Ok(outcome),
+                } => Some((*request, outcome.removed.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dones,
+            vec![(again, vec!["demo".into()]), (other, Vec::new())]
+        );
+
+        // Closing the view keeps the record; a failed page never adds one.
+        runtime.close_view(view);
+        let _ = pump_all(&mut runtime);
+        let mut fresh = DemoRuntime::new();
+        open_page(&mut fresh, "demo:error");
+        let list = RequestId::next();
+        fresh
+            .site_data(SiteDataRequest::List { request: list })
+            .unwrap();
+        let events = pump_all(&mut fresh);
+        assert!(
+            matches!(
+                site_events(&events).as_slice(),
+                [EngineEvent::SitesListed { sites, more: false, .. }] if sites.is_empty()
+            ),
+            "{events:?}"
+        );
+
+        fresh.shutdown();
+        let error = fresh.site_data(SiteDataRequest::List {
+            request: RequestId::next(),
+        });
+        assert!(matches!(error, Err(EngineError::Runtime(_))), "{error:?}");
+    }
+
+    #[test]
+    fn list_names_the_stored_site_and_forget_all_clears_it() {
+        let mut runtime = DemoRuntime::new();
+        open_page(&mut runtime, "demo:pattern");
+        let _ = pump_all(&mut runtime);
+        let list = RequestId::next();
+        runtime
+            .site_data(SiteDataRequest::List { request: list })
+            .unwrap();
+        let events = pump_all(&mut runtime);
+        match site_events(&events).as_slice() {
+            [EngineEvent::SitesListed {
+                request,
+                sites,
+                more: false,
+            }] => {
+                assert_eq!(*request, list);
+                assert_eq!(sites.len(), 1);
+                assert_eq!(sites[0].name, "demo");
+                assert_eq!(sites[0].kinds, CAPABILITIES.site_data);
+            }
+            other => panic!("{other:?}"),
+        }
+        runtime
+            .site_data(SiteDataRequest::ForgetAll {
+                request: RequestId::next(),
+            })
+            .unwrap();
+        let events = pump_all(&mut runtime);
+        assert!(
+            matches!(
+                site_events(&events).as_slice(),
+                [EngineEvent::SiteDataDone { result: Ok(outcome), .. }]
+                    if outcome.removed == ["demo"] && !outcome.durable && outcome.profile
+            ),
+            "{events:?}"
+        );
+        runtime
+            .site_data(SiteDataRequest::List {
+                request: RequestId::next(),
+            })
+            .unwrap();
+        let events = pump_all(&mut runtime);
+        assert!(
+            matches!(
+                site_events(&events).as_slice(),
+                [EngineEvent::SitesListed { sites, more: false, .. }] if sites.is_empty()
+            ),
+            "{events:?}"
+        );
     }
 }

@@ -30,10 +30,10 @@ use crate::services::ServiceResult;
 /// The trait deliberately doesn't require `Send` or `Sync`: Servo and its rendering context
 /// are bound to the thread that created them. Don't make an engine `Send` with an unsafe impl.
 ///
-/// Returning `Ok` from [`open_view`](Self::open_view) or [`command`](Self::command) means the
-/// request was accepted, not that it finished: results arrive as [`EngineEvent`]s. An
-/// operation the engine doesn't support returns [`EngineError::Unsupported`]; it never
-/// pretends to succeed.
+/// Returning `Ok` from [`open_view`](Self::open_view), [`command`](Self::command) or
+/// [`site_data`](Self::site_data) means the request was accepted, not that it finished:
+/// results arrive as [`EngineEvent`]s. An operation the engine doesn't support returns
+/// [`EngineError::Unsupported`]; it never pretends to succeed.
 ///
 /// # Event delivery
 ///
@@ -74,6 +74,14 @@ pub trait EngineRuntime {
     /// Hands `command` to `view`.
     fn command(&mut self, view: ViewId, command: EngineCommand) -> Result<(), EngineError>;
 
+    /// Lists or forgets site data this runtime keeps. It needs no view: a browser can forget a
+    /// site while none of its pages are open. `Ok` means the request was accepted. The outcome
+    /// arrives later from [`pump`](Self::pump), as [`EngineEvent::SitesListed`] or
+    /// [`EngineEvent::SiteDataDone`], carrying the request's id. The default refuses.
+    fn site_data(&mut self, _request: SiteDataRequest) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported("site data"))
+    }
+
     /// Does a bounded slice of the work that is due and appends what happened to `events`.
     /// Returns whether more work is pending, so the owner loop knows when to call again and
     /// when it may sleep: with work left over, the engine stops and returns
@@ -89,8 +97,8 @@ pub trait EngineRuntime {
     /// [`TextInputChanged`](EngineEvent::TextInputChanged),
     /// [`SemanticsChanged`](EngineEvent::SemanticsChanged) and
     /// [`FrameReady`](EngineEvent::FrameReady) per view until it is delivered, so a page
-    /// changing its title in a loop adds one event, not millions. Every other event is ordered
-    /// and delivered, none dropped.
+    /// changing its title in a loop adds one event, not millions. Every other event, including
+    /// a site-data report, is ordered and delivered, none dropped.
     fn pump(&mut self, events: &mut Vec<EngineEvent>) -> PumpStatus;
 
     /// Paints and submits `view`'s latest frame, if it has one for the permit's layout epoch.
@@ -146,6 +154,92 @@ pub struct EngineCapabilities {
     /// Snapshots of a document's content as structure, and actions on its nodes
     /// ([`crate::semantic`]; [`EngineCommand::SetSemantics`], [`EngineCommand::Semantic`]).
     pub semantics: bool,
+    /// Cookies, storage, caches and HSTS this engine can list and forget per site
+    /// ([`EngineRuntime::site_data`]). All false means it keeps none, and the core does not
+    /// ask it.
+    pub site_data: SiteDataKinds,
+}
+
+/// Which kinds of site data an engine keeps, and can list or forget.
+///
+/// The default is none. An engine reports the kinds a forget actually covered in
+/// [`SiteDataOutcome`](crate::events::SiteDataOutcome); a kind it has no per-site API for stays
+/// false there even when this says the engine keeps it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SiteDataKinds {
+    /// Cookies.
+    pub cookies: bool,
+    /// Web storage: local storage, session storage, and whatever else of the engine's storage
+    /// a per-site forget reaches (IndexedDB, where the engine's API includes it).
+    pub storage: bool,
+    /// HTTP caches.
+    pub caches: bool,
+    /// HSTS state.
+    pub hsts: bool,
+}
+
+impl SiteDataKinds {
+    /// No kind. What an engine that keeps no site data reports, and the default.
+    pub const NONE: Self = Self {
+        cookies: false,
+        storage: false,
+        caches: false,
+        hsts: false,
+    };
+
+    /// Whether any kind is set.
+    pub const fn any(self) -> bool {
+        self.cookies || self.storage || self.caches || self.hsts
+    }
+}
+
+/// Whose site data a request names: the browser's key, not an engine's own grouping.
+///
+/// A host is the string `url`'s `Host` displays: lower-case ASCII (IDNA), an IPv4 address, or
+/// an IPv6 address in brackets (`[::1]`). The core parses what the user typed; an engine maps
+/// the key onto its own records and reports those names back.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SiteKey {
+    /// A host, in the form above.
+    Host(String),
+    /// `file:` pages, which share one jar.
+    LocalFiles,
+}
+
+/// A runtime-level request about site data. It addresses the runtime, not a view.
+///
+/// `Ok` from [`EngineRuntime::site_data`] means it was accepted. The answer is an event from
+/// a later [`EngineRuntime::pump`], carrying [`Self::request`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SiteDataRequest {
+    /// List the sites that have data. Answered by [`EngineEvent::SitesListed`].
+    List {
+        /// Identifies the answer.
+        request: RequestId,
+    },
+    /// Forget one site's data. Answered by [`EngineEvent::SiteDataDone`].
+    Forget {
+        /// Identifies the outcome.
+        request: RequestId,
+        /// Which site.
+        site: SiteKey,
+    },
+    /// Forget every site's data. Answered by [`EngineEvent::SiteDataDone`].
+    ForgetAll {
+        /// Identifies the outcome.
+        request: RequestId,
+    },
+}
+
+impl SiteDataRequest {
+    /// The id the answer carries.
+    pub fn request(&self) -> RequestId {
+        match self {
+            Self::List { request } | Self::Forget { request, .. } | Self::ForgetAll { request } => {
+                *request
+            }
+        }
+    }
 }
 
 /// How a view starts.

@@ -141,6 +141,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     native_popups: false,
     process_per_view: false,
     semantics: true,
+    site_data: sighurt_api::engine::SiteDataKinds::NONE,
 };
 
 /// What the executable decides for the Servo runtime.

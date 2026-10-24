@@ -215,8 +215,14 @@ forward = "page.forward"
 # Commands: tab.new, tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last,
 # page.open <url>, page.open-in <engine> [url], page.switch-engine, page.reload, page.stop,
 # page.back, page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
-# location.focus, browser.home, browser.quit, and the chrome's own, chrome.<action>. Tabs
-# count from 1.
+# location.focus, browser.home, browser.quit, site.forget [host], and the chrome's own,
+# chrome.<action>. Tabs count from 1.
+#
+# site.forget [host] forgets one site's cookies and stored data in every engine that keeps
+# any. With no argument it is the page shown; an argument is that host, and there are no
+# wildcards. Each engine reports what it removed, and every tab it is showing of that site
+# is reloaded so the page does not store the data again. A sig: page, or a tab with no
+# page, shows a notice instead.
 #
 # page.open-in opens the URL, or the page shown, in the engine named, whatever the routing
 # says ("ctrl-alt-w" = "page.open-in servo"); back returns to the page in the engine it was

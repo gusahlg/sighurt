@@ -73,6 +73,10 @@ pub enum Command {
     BrowserHome,
     /// `browser.quit`.
     BrowserQuit,
+    /// `site.forget [host]`: forget that site's cookies and stored data. No argument forgets
+    /// the page shown. The argument is a host, as given (trimmed); wildcards are not special
+    /// here, and a host that is not one is reported when the command runs.
+    SiteForget(Option<String>),
     /// `chrome.<action>`: one of the chrome's own commands, such as `chrome.toggle-tabs`. Holds
     /// the action. Each chrome has its own ([`CommandSet`]); they take no argument.
     Chrome(String),
@@ -80,7 +84,7 @@ pub enum Command {
 
 impl Command {
     /// Every command name. The chrome's commands, `chrome.<action>`, depend on the chrome.
-    pub const NAMES: [&'static str; 20] = [
+    pub const NAMES: [&'static str; 21] = [
         "tab.new",
         "tab.close",
         "tab.next",
@@ -101,6 +105,7 @@ impl Command {
         "location.focus",
         "browser.home",
         "browser.quit",
+        "site.forget",
     ];
 
     /// The command's name, without its argument; `chrome` for every `chrome.<action>`.
@@ -126,6 +131,7 @@ impl Command {
             Self::LocationFocus => "location.focus",
             Self::BrowserHome => "browser.home",
             Self::BrowserQuit => "browser.quit",
+            Self::SiteForget(_) => "site.forget",
             Self::Chrome(_) => "chrome",
         }
     }
@@ -161,6 +167,8 @@ impl FromStr for Command {
             "" => return Err(CommandError::Empty),
             "tab.close" if argument.is_empty() => return Ok(Self::TabClose(None)),
             "tab.close" => return Ok(Self::TabClose(Some(tab_number()?))),
+            "site.forget" if argument.is_empty() => return Ok(Self::SiteForget(None)),
+            "site.forget" => return Ok(Self::SiteForget(Some(argument.to_owned()))),
             "tab.select" => {
                 required("tab.select")?;
                 return Ok(Self::TabSelect(tab_number()?));
@@ -220,6 +228,7 @@ impl fmt::Display for Command {
                 None => write!(f, " {engine}"),
             },
             Self::PageSendKey(key) => write!(f, " {key}"),
+            Self::SiteForget(Some(host)) => write!(f, " {host}"),
             Self::Chrome(action) => write!(f, ".{action}"),
             _ => Ok(()),
         }
@@ -483,6 +492,16 @@ mod tests {
             parse("page.open rust  borrow checker"),
             Ok(Command::PageOpen("rust  borrow checker".into()))
         );
+        assert_eq!(parse("site.forget"), Ok(Command::SiteForget(None)));
+        assert_eq!(
+            parse(" site.forget  example.com "),
+            Ok(Command::SiteForget(Some("example.com".into())))
+        );
+        // A wildcard is still the command: the core says it is not a host when it runs.
+        assert_eq!(
+            parse("site.forget *.example.com"),
+            Ok(Command::SiteForget(Some("*.example.com".into())))
+        );
     }
 
     #[test]
@@ -502,6 +521,8 @@ mod tests {
             "page.send-key ctrl-alt-F5",
             "location.focus",
             "browser.quit",
+            "site.forget",
+            "site.forget example.com",
             "chrome.toggle-tabs",
         ] {
             let command = parse(text).unwrap();

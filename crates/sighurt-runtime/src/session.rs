@@ -10,7 +10,9 @@
 //! `open_view`.
 //!
 //! [`Session::pump`] pumps every runtime that was called, woke, or whose deadline passed, and
-//! feeds the events back through `run_core`. Frame-ready does not go to the core; the frontend
+//! feeds the events back through `run_core`. [`Effect::SiteData`] asks every engine that keeps
+//! site data, starting one that has not started; a refusal comes back as
+//! [`EngineEvent::SiteDataDone`] so the core always hears. Frame-ready does not go to the core; the frontend
 //! is told, and it schedules presentation. [`Session::present`] hands a permit to the view's
 //! engine and records the frame. [`Session::shutdown`] runs the part of plan §20 that is not
 //! the frontend's own teardown. A bound on that wait ([`Session::set_shutdown_bound`]) ends
@@ -28,7 +30,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sighurt_api::engine::{EngineCommand, EngineError, EngineWaker, PresentOutcome};
+use sighurt_api::engine::{
+    EngineCommand, EngineError, EngineWaker, PresentOutcome, SiteDataRequest,
+};
 use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::BufferSize;
 use sighurt_api::ids::{RequestId, TargetId, ViewId};
@@ -53,6 +57,18 @@ const SESSION_DELAY: Duration = Duration::from_secs(1);
 /// profile writer commits cookies at most 5 s apart, so ending here loses at most the last
 /// few seconds of cookie changes.
 pub const SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
+
+/// A forget `name` did not accept, as the event the core is waiting for.
+fn site_refused(engine: &str, request: RequestId, message: String) -> BrowserEvent {
+    BrowserEvent::Engine {
+        engine: engine.to_owned(),
+        event: EngineEvent::SiteDataDone {
+            request,
+            result: Err(message),
+        },
+        at: Instant::now(),
+    }
+}
 
 /// The frontend-neutral half of the owner loop.
 ///
@@ -307,6 +323,7 @@ impl<F: Frontend> Session<F> {
                     allow: false,
                 });
             }
+            Effect::SiteData { engine, request } => self.site_data(engine.as_deref(), request),
             Effect::Notice { message, .. } => frontend.notice(message),
             Effect::RedrawChrome => frontend.redraw(),
             Effect::SaveSession => self.session_changed(),
@@ -446,8 +463,32 @@ impl<F: Frontend> Session<F> {
         event: EngineEvent,
         at: Instant,
     ) {
-        // Page content the core never reads: checked, then the frontend's.
+        // Page content the core never reads: checked, then the frontend's. A site-data report
+        // is checked the same way; a forget the check refuses still answers, so the core's
+        // pending request cannot sit forever.
         let event = match event {
+            EngineEvent::SitesListed { .. } | EngineEvent::SiteDataDone { .. } => {
+                let mut event = event;
+                match event.check() {
+                    Ok(()) => event,
+                    Err(error) => {
+                        self.diag.error(format!(
+                            "the {engine} engine sent a site-data report that is not usable: {error}"
+                        ));
+                        if let EngineEvent::SiteDataDone { request, .. } = event {
+                            self.queue.push_back(BrowserEvent::Engine {
+                                engine: engine.to_owned(),
+                                event: EngineEvent::SiteDataDone {
+                                    request,
+                                    result: Err(format!("the report was not usable ({error})")),
+                                },
+                                at,
+                            });
+                        }
+                        return;
+                    }
+                }
+            }
             EngineEvent::SemanticsChanged { view, snapshot } => {
                 if self.views.get(&view).is_some_and(|e| e.engine == engine) {
                     match snapshot.check() {
@@ -498,6 +539,59 @@ impl<F: Frontend> Session<F> {
             event,
             at,
         });
+    }
+
+    /// Sends `request` to `engine`, or to every registered engine that keeps any kind of site
+    /// data. An engine that has not started is started. A refusal, or a failure to start, is
+    /// reported as [`EngineEvent::SiteDataDone`] so the core always hears back.
+    fn site_data(&mut self, engine: Option<&str>, request: SiteDataRequest) {
+        let targets: Vec<&'static str> = match engine {
+            Some(name) => self
+                .registry
+                .engine(name)
+                .map(|engine| engine.name)
+                .into_iter()
+                .collect(),
+            None => self
+                .registry
+                .engines()
+                .filter(|engine| engine.capabilities.site_data.any())
+                .map(|engine| engine.name)
+                .collect(),
+        };
+        // A named engine this build lacks still has to answer.
+        if let Some(name) = engine.filter(|_| targets.is_empty()) {
+            self.queue.push_back(site_refused(
+                name,
+                request.request(),
+                format!("the {name} engine is not part of this build"),
+            ));
+            return;
+        }
+        for name in targets {
+            if let Err(message) = self.ask_site(name, request.clone()) {
+                self.queue
+                    .push_back(site_refused(name, request.request(), message));
+            }
+        }
+    }
+
+    /// Starts `name` if it has not started and hands it `request`.
+    fn ask_site(&mut self, name: &str, request: SiteDataRequest) -> Result<(), String> {
+        let keeps = match self.registry.engine(name) {
+            None => return Err(format!("the {name} engine is not part of this build")),
+            Some(engine) => engine.capabilities.site_data.any(),
+        };
+        if !keeps {
+            return Err(format!("the {name} engine keeps no site data"));
+        }
+        let wake = Arc::clone(&self.wake);
+        self.registry
+            .start(name, || EngineWaker::new(move || wake()))?;
+        let runtime = self.registry.running(name).expect("started above");
+        runtime
+            .site_data(request)
+            .map_err(|error| error.to_string())
     }
 
     /// The view the page area shows, if an engine's.
@@ -822,24 +916,25 @@ fn end_without_destructors(status: i32) -> ! {
 #[cfg(all(test, feature = "engine-demo"))]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
+    use sighurt_api::commands::Command;
     use sighurt_api::engine::{
         EngineCapabilities, EngineCommand, EngineError, EngineRuntime, PresentOutcome, PumpStatus,
-        ViewOptions,
+        SiteDataKinds, SiteDataRequest, SiteKey, ViewOptions,
     };
-    use sighurt_api::events::{Cursor, EngineEvent};
-    use sighurt_api::ids::{RequestId, TargetId, ViewId};
+    use sighurt_api::events::{Cursor, EngineEvent, SiteDataOutcome};
+    use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, TargetId, ViewId};
     use sighurt_api::input::{InputEvent, KeyboardFocus, TextInputState};
     use sighurt_api::services::{ClipboardData, Selection, ServiceError};
     use sighurt_core::config::Config;
-    use sighurt_core::{BrowserEvent, BrowserState};
+    use sighurt_core::{BrowserEvent, BrowserState, OpenRequest};
 
     use super::Session;
     use crate::diagnostics::Diagnostics;
     use crate::frontend::Frontend;
     use crate::persistence::Paths;
-    use crate::registry::{Engine, Registry, Running, Runtime};
+    use crate::registry::{Engine, Registry, Running, Runtime, State};
     use crate::services::{Clipboard, Services};
     use crate::view::ViewEntry;
 
@@ -885,6 +980,7 @@ mod tests {
     struct Recording {
         targets: BTreeMap<TargetId, ViewId>,
         forgotten: Vec<TargetId>,
+        notices: Vec<String>,
     }
 
     impl Clipboard for Recording {
@@ -921,7 +1017,9 @@ mod tests {
         fn chrome_command(&mut self, _: String, _: &mut VecDeque<BrowserEvent>) {}
         fn page_cursor(&mut self, _: Option<TargetId>, _: Cursor) {}
         fn page_text_input(&mut self, _: Option<TargetId>, _: Option<TextInputState>) {}
-        fn notice(&mut self, _: String) {}
+        fn notice(&mut self, message: String) {
+            self.notices.push(message);
+        }
         fn redraw(&mut self) {}
         fn show(&mut self, _: ViewId, _: bool) {}
         fn frame_ready(&mut self, _: TargetId) {}
@@ -968,6 +1066,283 @@ mod tests {
         // A second forget finds nothing to forget.
         session.forget_view(&mut frontend, view);
         assert_eq!(frontend.forgotten.len(), 1);
+    }
+
+    /// Forgets and reloads recorded by the scripted engines, shared because a runtime is
+    /// built by a function pointer.
+    static SITE_CALLS: Mutex<Vec<(&'static str, SiteDataRequest)>> = Mutex::new(Vec::new());
+    static RELOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct Scripted {
+        name: &'static str,
+        caps: EngineCapabilities,
+        views: BTreeMap<ViewId, String>,
+        queue: Vec<EngineEvent>,
+        /// `Some` answers on the next pump with these removed names. `None` refuses.
+        reply: Option<Vec<String>>,
+        pending: Option<RequestId>,
+    }
+
+    impl Scripted {
+        fn commit(&mut self, view: ViewId, navigation: NavigationId, url: String) {
+            self.queue.push(EngineEvent::NavigationCommitted {
+                view,
+                navigation,
+                url,
+                document: DocumentGeneration::next(),
+                history: None,
+            });
+        }
+    }
+
+    impl EngineRuntime for Scripted {
+        type Target = ();
+        type FramePermit = ();
+
+        fn capabilities(&self) -> EngineCapabilities {
+            self.caps
+        }
+
+        fn open_view(&mut self, view: ViewId, _: ViewOptions, _: ()) -> Result<(), EngineError> {
+            self.views.insert(view, String::new());
+            self.queue.push(EngineEvent::ViewReady { view });
+            Ok(())
+        }
+
+        fn command(&mut self, view: ViewId, command: EngineCommand) -> Result<(), EngineError> {
+            match command {
+                EngineCommand::Navigate { navigation, url } => {
+                    self.views.insert(view, url.clone());
+                    self.commit(view, navigation, url);
+                }
+                EngineCommand::Reload { navigation } => {
+                    let url = self.views.get(&view).cloned().unwrap_or_default();
+                    RELOADS.lock().unwrap().push(url.clone());
+                    self.commit(view, navigation, url);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn site_data(&mut self, request: SiteDataRequest) -> Result<(), EngineError> {
+            SITE_CALLS
+                .lock()
+                .unwrap()
+                .push((self.name, request.clone()));
+            match self.reply.is_some() {
+                true => {
+                    self.pending = Some(request.request());
+                    Ok(())
+                }
+                false => Err(EngineError::Unsupported("site data")),
+            }
+        }
+
+        fn pump(&mut self, events: &mut Vec<EngineEvent>) -> PumpStatus {
+            if let Some(request) = self.pending.take() {
+                self.queue.push(EngineEvent::SiteDataDone {
+                    request,
+                    result: Ok(SiteDataOutcome {
+                        removed: self.reply.clone().unwrap_or_default(),
+                        kinds: self.caps.site_data,
+                        durable: false,
+                        profile: true,
+                    }),
+                });
+            }
+            events.extend(self.queue.drain(..));
+            PumpStatus::Idle
+        }
+
+        fn present(&mut self, view: ViewId, _: ()) -> Result<PresentOutcome, EngineError> {
+            Err(EngineError::UnknownView(view))
+        }
+
+        fn close_view(&mut self, view: ViewId) {
+            self.views.remove(&view);
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    impl Running<(), ()> for Scripted {}
+
+    fn site_caps(keeps: bool) -> EngineCapabilities {
+        EngineCapabilities {
+            history_traversal: true,
+            site_data: SiteDataKinds {
+                cookies: keeps,
+                storage: keeps,
+                caches: false,
+                hsts: false,
+            },
+            ..EngineCapabilities::default()
+        }
+    }
+
+    fn scripted(name: &'static str, keeps: bool, reply: Option<Vec<String>>) -> Scripted {
+        Scripted {
+            name,
+            caps: site_caps(keeps),
+            views: BTreeMap::new(),
+            queue: Vec::new(),
+            reply,
+            pending: None,
+        }
+    }
+
+    fn start_web(
+        _: sighurt_api::engine::EngineWaker,
+        _: crate::registry::Launch<'_>,
+    ) -> Result<Runtime<(), ()>, String> {
+        let mut long = "DROPME".to_owned();
+        long.extend(std::iter::repeat('x').take(248));
+        Ok(Runtime::Demo(Box::new(scripted(
+            "web",
+            true,
+            Some(vec![long, "example.com".into(), "Local files".into()]),
+        ))))
+    }
+
+    fn start_idle(
+        _: sighurt_api::engine::EngineWaker,
+        _: crate::registry::Launch<'_>,
+    ) -> Result<Runtime<(), ()>, String> {
+        Ok(Runtime::Demo(Box::new(scripted("idle", true, None))))
+    }
+
+    fn start_plain(
+        _: sighurt_api::engine::EngineWaker,
+        _: crate::registry::Launch<'_>,
+    ) -> Result<Runtime<(), ()>, String> {
+        Ok(Runtime::Demo(Box::new(scripted("plain", false, None))))
+    }
+
+    #[test]
+    fn site_forget_reaches_every_engine_that_keeps_any_and_a_refusal_answers() {
+        SITE_CALLS.lock().unwrap().clear();
+        RELOADS.lock().unwrap().clear();
+        let registry = Registry::new(vec![
+            Engine::new("web", site_caps(true), "cpu", &[], start_web),
+            Engine::new("idle", site_caps(true), "cpu", &[], start_idle),
+            Engine::new("plain", site_caps(false), "cpu", &[], start_plain),
+        ]);
+        let env = registry.environment(Vec::new(), &[]);
+        let text =
+            "version = 1\n[engines]\ndefault = \"web\"\nenabled = [\"web\", \"idle\", \"plain\"]";
+        let config = Config::parse(Some(text), &env).expect("config");
+        let mut session = Session::<Recording>::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            Services::new(|| {}),
+            Paths {
+                config: None,
+                session: None,
+            },
+            None,
+            Diagnostics::new(None),
+            Arc::new(|| {}),
+        );
+        let mut frontend = Recording::default();
+        session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: [
+                "https://example.com/",
+                "https://www.example.com/a",
+                "https://other.test/",
+            ]
+            .into_iter()
+            .map(|input| OpenRequest {
+                input: input.into(),
+                engine: None,
+            })
+            .collect(),
+        });
+        session.run_core(&mut frontend);
+        assert!(session.pump(&mut frontend), "the pages' engine was called");
+        let urls: Vec<_> = session
+            .core()
+            .tabs()
+            .map(|tab| tab.url.map(str::to_owned))
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                Some("https://example.com/".into()),
+                Some("https://www.example.com/a".into()),
+                Some("https://other.test/".into()),
+            ]
+        );
+        assert!(matches!(
+            session.registry().engine("idle").unwrap().state(),
+            State::NotStarted
+        ));
+
+        session.queue_mut().push_back(BrowserEvent::Command(
+            "site.forget".parse::<Command>().unwrap(),
+        ));
+        session.run_core(&mut frontend);
+        assert!(matches!(
+            session.registry().engine("idle").unwrap().state(),
+            State::Running(_)
+        ));
+        assert!(
+            matches!(
+                session.registry().engine("plain").unwrap().state(),
+                State::NotStarted
+            ),
+            "an engine that keeps nothing is not started"
+        );
+        let calls = std::mem::take(&mut *SITE_CALLS.lock().unwrap());
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].0, calls[1].0), ("web", "idle"));
+        assert_eq!(calls[0].1.request(), calls[1].1.request());
+        assert!(matches!(
+            &calls[0].1,
+            SiteDataRequest::Forget { site: SiteKey::Host(host), .. } if host == "example.com"
+        ));
+        assert_eq!(
+            frontend.notices,
+            ["example.com: nothing on disk changed in idle (site data is not supported)"]
+        );
+        assert!(
+            RELOADS.lock().unwrap().is_empty(),
+            "an error does not reload"
+        );
+
+        assert!(session.pump(&mut frontend));
+        assert_eq!(
+            frontend.notices,
+            [
+                "example.com: nothing on disk changed in idle (site data is not supported)",
+                "example.com forgotten in web: cookies, storage (removed: example.com, Local files)",
+            ]
+        );
+        assert_eq!(
+            std::mem::take(&mut *RELOADS.lock().unwrap()),
+            ["https://example.com/", "https://www.example.com/a"]
+        );
+
+        // The request is finished. A late report for it changes nothing.
+        let request = calls[0].1.request();
+        session.queue_mut().push_back(BrowserEvent::Engine {
+            engine: "web".into(),
+            event: EngineEvent::SiteDataDone {
+                request,
+                result: Ok(SiteDataOutcome {
+                    removed: vec!["example.com".into()],
+                    kinds: site_caps(true).site_data,
+                    durable: false,
+                    profile: true,
+                }),
+            },
+            at: std::time::Instant::now(),
+        });
+        session.run_core(&mut frontend);
+        assert_eq!(frontend.notices.len(), 2);
+        assert!(RELOADS.lock().unwrap().is_empty());
     }
 }
 
