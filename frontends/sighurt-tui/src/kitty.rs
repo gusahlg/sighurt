@@ -560,20 +560,32 @@ pub fn delete(image_id: u32) -> Vec<u8> {
 pub const DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
 
 /// Premultiplied BGRA in `src` becomes straight RGBA in `dst`. Lengths match
-/// and are a multiple of 4. Same bytes as the old whole-frame conversion.
+/// and are a multiple of 4. Opaque pixels (alpha 0 or 255, which is a typical
+/// page) swap channels as one word; the rest go through [`straight`]. Same bytes
+/// as the old per-byte loop.
 fn convert(src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
     debug_assert_eq!(src.len() % 4, 0);
     let mut offset = 0;
     while offset < src.len() {
-        let blue = src[offset];
-        let green = src[offset + 1];
-        let red = src[offset + 2];
-        let alpha = src[offset + 3];
-        dst[offset] = straight(red, alpha);
-        dst[offset + 1] = straight(green, alpha);
-        dst[offset + 2] = straight(blue, alpha);
-        dst[offset + 3] = alpha;
+        let pixel = u32::from_le_bytes([
+            src[offset],
+            src[offset + 1],
+            src[offset + 2],
+            src[offset + 3],
+        ]);
+        let alpha = (pixel >> 24) as u8;
+        let out = if alpha == 0 || alpha == 255 {
+            (pixel & 0xFF00_FF00) | ((pixel & 0x00FF_0000) >> 16) | ((pixel & 0x0000_00FF) << 16)
+        } else {
+            u32::from_le_bytes([
+                straight((pixel >> 16) as u8, alpha),
+                straight((pixel >> 8) as u8, alpha),
+                straight(pixel as u8, alpha),
+                alpha,
+            ])
+        };
+        dst[offset..offset + 4].copy_from_slice(&out.to_le_bytes());
         offset += 4;
     }
 }
@@ -648,6 +660,8 @@ fn cursor_to(column: u16, row: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
+    #[cfg(not(debug_assertions))]
+    use std::time::{Duration, Instant};
 
     use flate2::read::ZlibDecoder;
     use sighurt_api::geometry::BufferSize;
@@ -1086,5 +1100,323 @@ mod tests {
                 assert_eq!(got, eager, "size {size} splits {split:?}");
             }
         }
+    }
+
+    /// Straight alpha, written out here so a change to [`straight`] fails the compare.
+    fn expect_straight(channel: u8, alpha: u8) -> u8 {
+        if alpha == 0 || alpha == 255 {
+            return channel;
+        }
+        let value = (u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha);
+        u8::try_from(value.min(255)).unwrap_or(255)
+    }
+
+    #[test]
+    fn decoded_rgba_matches_opaque_and_translucent() {
+        // Wider than one compressor chunk, so the row loop and the tail both run.
+        const WIDTH: u32 = 3100;
+        const HEIGHT: u32 = 2;
+        let alphas = [0u8, 1, 64, 128, 200, 254, 255];
+        let mut pixels = Vec::with_capacity((WIDTH * HEIGHT) as usize * 4);
+        let mut expected = Vec::with_capacity(pixels.capacity());
+        for index in 0..WIDTH * HEIGHT {
+            let alpha = alphas[(index as usize) % alphas.len()];
+            let red = noise(index).wrapping_add(3);
+            let green = noise(index.wrapping_add(9));
+            let blue = noise(index.wrapping_add(17));
+            // Premultiplied B, G, R, A. Alpha 0 keeps the channels, as `straight` does.
+            let pre = |channel: u8| {
+                if alpha == 0 || alpha == 255 {
+                    channel
+                } else {
+                    u8::try_from((u32::from(channel) * u32::from(alpha)) / 255).unwrap_or(0)
+                }
+            };
+            pixels.extend_from_slice(&[pre(blue), pre(green), pre(red), alpha]);
+            expected.extend_from_slice(&[
+                expect_straight(pre(red), alpha),
+                expect_straight(pre(green), alpha),
+                expect_straight(pre(blue), alpha),
+                alpha,
+            ]);
+        }
+        let bytes = encode_of(WIDTH, HEIGHT, pixels, usize::try_from(WIDTH).unwrap() * 4);
+        assert_eq!(rgba_of(&bytes), expected);
+        let parts = payloads(&bytes);
+        assert!(parts.len() > 1, "the frame spans more than one chunk");
+        assert!(parts[0].0.contains("f=32"), "{}", parts[0].0);
+        assert!(
+            parts.iter().all(|(control, _)| control.contains("q=2")),
+            "{parts:?}"
+        );
+        assert!(parts.last().unwrap().0.contains("m=0"));
+    }
+
+    /// Release timing of [`encode`] at the terminal's page size. Not part of the default
+    /// suite: `tools/cargo test --release -p sighurt-tui --lib graphics_path_timing -- --ignored`.
+    #[test]
+    #[ignore = "release timing of kitty encode; run with --release --ignored"]
+    fn graphics_path_timing() {
+        graphics_path_timing_release();
+    }
+
+    #[cfg(debug_assertions)]
+    fn graphics_path_timing_release() {
+        panic!("time a release build: tools/cargo test --release ...");
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn graphics_path_timing_release() {
+        const WIDTH: u32 = 1876;
+        const HEIGHT: u32 = 1316;
+        const N: usize = 20;
+        let stride = usize::try_from(WIDTH).unwrap() * 4;
+        let pixels_len = stride * usize::try_from(HEIGHT).unwrap();
+        let cpu = std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("model name\t: "))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let mut report = format!(
+            "kitty encode timing\n\
+             machine: {cpu}\n\
+             build: release (debug_assertions off)\n\
+             frame: {WIDTH}x{HEIGHT} tight stride, {pixels_len} bytes, premultiplied BGRA\n\
+             method: {N} calls after 1 warmup; median is samples[n/2], p90 is nearest-rank; \
+             stages are timed apart from encode() on the same pixels (convert, then zlib, then base64)\n"
+        );
+        let _ = std::fs::remove_file("/tmp/sighurt-gfx-kitty.txt");
+        for kind in ["flat", "document", "noise", "mixed"] {
+            let pixels = frame_kind(kind, WIDTH, HEIGHT);
+            let mut warmup = pixels.clone();
+            let _ = std::hint::black_box(encode_timed(&mut warmup, WIDTH, HEIGHT, stride));
+            let mut totals = Vec::with_capacity(N);
+            let mut wires = Vec::with_capacity(N);
+            for _ in 0..N {
+                let mut buf = pixels.clone();
+                let start = Instant::now();
+                let bytes = encode_timed(&mut buf, WIDTH, HEIGHT, stride);
+                totals.push(start.elapsed());
+                wires.push(bytes.len());
+            }
+            let (convert, zlib6, bytes6, zlib1, bytes1, b64_6) =
+                stage_times(&pixels, WIDTH, HEIGHT, stride);
+            let (words_ms, words) = time_convert(&pixels, WIDTH, HEIGHT, stride, true);
+            let (byte_ms, bytes) = time_convert(&pixels, WIDTH, HEIGHT, stride, false);
+            assert_eq!(words, bytes, "{kind}: word convert matches byte convert");
+            let (tmin, tmed, tp90, tmax) = duration_stats(&totals);
+            wires.sort_unstable();
+            report.push_str(&format!(
+                "{kind}: encode n={N} min={tmin:.2} med={tmed:.2} p90={tp90:.2} max={tmax:.2} ms; \
+                 wire med={} bytes\n\
+                 {kind}: convert {convert:.2} ms; zlib-6 {zlib6:.2} ms ({bytes6} bytes); \
+                 zlib-1 {zlib1:.2} ms ({bytes1} bytes); base64-of-zlib6 {b64_6:.2} ms\n\
+                 {kind}: convert-byte med {byte_ms:.2} ms; convert-word med {words_ms:.2} ms\n",
+                wires[wires.len() / 2]
+            ));
+            if kind == "flat" || kind == "document" {
+                let rgba = &bytes;
+                let (z2, b2) = zlib_at(rgba, Compression::new(2));
+                let (z3, b3) = zlib_at(rgba, Compression::new(3));
+                report.push_str(&format!(
+                    "{kind}: zlib-2 {z2:.2} ms ({} bytes); zlib-3 {z3:.2} ms ({} bytes)\n",
+                    b2.len(),
+                    b3.len()
+                ));
+            }
+            print!("{report}");
+            let _ = std::io::stdout().flush();
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/sighurt-gfx-kitty.txt")
+                .and_then(|mut file| std::io::Write::write_all(&mut file, report.as_bytes()));
+            report.clear();
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn encode_timed(pixels: &mut [u8], width: u32, height: u32, stride: usize) -> Vec<u8> {
+        let frame = Frame {
+            pixels,
+            size: BufferSize { width, height },
+            stride,
+        };
+        encode(
+            &frame,
+            7,
+            CellRect {
+                column: 0,
+                row: 1,
+                columns: 80,
+                rows: 40,
+            },
+            64 * 1024 * 1024,
+        )
+        .expect("encode under the timing cap")
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn stage_times(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+    ) -> (f64, f64, usize, f64, usize, f64) {
+        let row_bytes = usize::try_from(width).unwrap() * 4;
+        let height = usize::try_from(height).unwrap();
+        let mut rgba = vec![0u8; row_bytes * height];
+        let start = Instant::now();
+        for row in 0..height {
+            let from = row * stride;
+            let to = row * row_bytes;
+            convert(
+                &pixels[from..from + row_bytes],
+                &mut rgba[to..to + row_bytes],
+            );
+        }
+        let convert_ms = duration_ms(start.elapsed());
+        std::hint::black_box(&rgba);
+        let (zlib6_ms, compressed6) = zlib_at(&rgba, Compression::default());
+        let (zlib1_ms, compressed1) = zlib_at(&rgba, Compression::fast());
+        let start = Instant::now();
+        let encoded = STANDARD.encode(std::hint::black_box(&compressed6));
+        let b64_ms = duration_ms(start.elapsed());
+        std::hint::black_box(&encoded);
+        (
+            convert_ms,
+            zlib6_ms,
+            compressed6.len(),
+            zlib1_ms,
+            compressed1.len(),
+            b64_ms,
+        )
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn zlib_at(rgba: &[u8], level: Compression) -> (f64, Vec<u8>) {
+        let start = Instant::now();
+        let bytes = zlib_bytes(rgba, level);
+        (duration_ms(start.elapsed()), bytes)
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn zlib_bytes(rgba: &[u8], level: Compression) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), level);
+        encoder.write_all(rgba).expect("zlib");
+        let bytes = encoder.finish().expect("zlib finish");
+        std::hint::black_box(bytes)
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn frame_kind(kind: &str, width: u32, height: u32) -> Vec<u8> {
+        let mut pixels =
+            vec![0u8; usize::try_from(width).unwrap() * usize::try_from(height).unwrap() * 4];
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            u8::try_from(state >> 24).unwrap_or(0)
+        };
+        for y in 0..height {
+            for x in 0..width {
+                let i = (usize::try_from(y).unwrap() * usize::try_from(width).unwrap()
+                    + usize::try_from(x).unwrap())
+                    * 4;
+                let (b, g, r, a) = match kind {
+                    "flat" if y < 48 => (0x22, 0x7e, 0xe6, 255),
+                    "flat" => (0x72, 0x4f, 0x1b, 255),
+                    "document" if y < 40 => (0x22, 0x7e, 0xe6, 255),
+                    "document" if (x + y * 3) % 17 < 2 => (0x20, 0x20, 0x20, 255),
+                    "document" if x < 80 && y % 80 < 40 => (0xf0, 0xe6, 0xd2, 255),
+                    "document" => (255, 255, 255, 255),
+                    "mixed" if (x + y) % 5 == 0 => {
+                        let red = next();
+                        let green = next();
+                        let blue = next();
+                        (blue / 2, green / 2, red / 2, 128)
+                    }
+                    _ => (next(), next(), next(), 255),
+                };
+                pixels[i] = b;
+                pixels[i + 1] = g;
+                pixels[i + 2] = r;
+                pixels[i + 3] = a;
+            }
+        }
+        pixels
+    }
+
+    /// The pre-word byte loop, kept so the timing test can check the word swap.
+    #[cfg(not(debug_assertions))]
+    fn convert_bytes(src: &[u8], dst: &mut [u8]) {
+        let mut offset = 0;
+        while offset < src.len() {
+            let blue = src[offset];
+            let green = src[offset + 1];
+            let red = src[offset + 2];
+            let alpha = src[offset + 3];
+            dst[offset] = straight(red, alpha);
+            dst[offset + 1] = straight(green, alpha);
+            dst[offset + 2] = straight(blue, alpha);
+            dst[offset + 3] = alpha;
+            offset += 4;
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn time_convert(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+        words: bool,
+    ) -> (f64, Vec<u8>) {
+        let row_bytes = usize::try_from(width).unwrap() * 4;
+        let height = usize::try_from(height).unwrap();
+        let mut rgba = vec![0u8; row_bytes * height];
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let start = Instant::now();
+            for row in 0..height {
+                let from = row * stride;
+                let to = row * row_bytes;
+                if words {
+                    convert(
+                        &pixels[from..from + row_bytes],
+                        &mut rgba[to..to + row_bytes],
+                    );
+                } else {
+                    convert_bytes(
+                        &pixels[from..from + row_bytes],
+                        &mut rgba[to..to + row_bytes],
+                    );
+                }
+            }
+            std::hint::black_box(rgba.as_ptr());
+            samples.push(start.elapsed());
+        }
+        samples.sort_unstable();
+        (duration_ms(samples[samples.len() / 2]), rgba)
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn duration_ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1e3
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn duration_stats(samples: &[Duration]) -> (f64, f64, f64, f64) {
+        let mut us: Vec<u128> = samples.iter().map(|sample| sample.as_micros()).collect();
+        us.sort_unstable();
+        let n = us.len();
+        let ms = |value: u128| value as f64 / 1000.0;
+        let rank = |p: f64| {
+            let index = ((n as f64) * p).ceil() as usize;
+            us[index.saturating_sub(1).min(n - 1)]
+        };
+        (ms(us[0]), ms(us[n / 2]), ms(rank(0.90)), ms(us[n - 1]))
     }
 }
