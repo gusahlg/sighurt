@@ -32,7 +32,8 @@
 //! with `storage = "ephemeral"` that has to write while it runs gets a directory of its own
 //! under `$XDG_RUNTIME_DIR` ([`Launch::scratch`]),
 //! which [`Registry::remove_scratch`] deletes at the end of shutdown, after everything that
-//! could still write there has stopped.
+//! could still write there has stopped. Persistent engine profiles and `{state_dir}/sighurt`
+//! are mode 0700 ([`crate::persistence::secure_private_dir`]).
 //!
 //! Must not own: routing policy (the core decides which engine opens a URL), windows, or the
 //! concrete target and permit types.
@@ -601,6 +602,7 @@ pub fn wasm_config(mut launch: Launch<'_>) -> Result<sighurt_engine_wasm::WasmCo
 
 /// WebKit's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps everything in memory; the user agent, if one is set.
+/// A persistent profile, and `{data_dir}/sighurt` above it, are mode 0700.
 #[cfg(feature = "engine-wpe")]
 pub fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
     use sighurt_core::config::Storage;
@@ -608,6 +610,9 @@ pub fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
         Storage::Profile => dirs::data_dir().map(|d| d.join("sighurt").join("wpe")),
         Storage::Ephemeral => None,
     };
+    if let Some(profile) = &profile {
+        secure_profile(profile);
+    }
     sighurt_engine_wpe::WpeConfig {
         profile,
         user_agent: settings.user_agent.clone(),
@@ -618,6 +623,7 @@ pub fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
 /// Servo's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set;
 /// `experimental-features` and `preferences`, applied when Servo is built.
+/// A persistent profile, and `{data_dir}/sighurt` above it, are mode 0700.
 #[cfg(feature = "engine-servo")]
 pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoConfig {
     use sighurt_core::config::{ServoPrefValue, Storage};
@@ -626,6 +632,9 @@ pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoCon
         Storage::Profile => dirs::data_dir().map(|d| d.join("sighurt").join("servo")),
         Storage::Ephemeral => None,
     };
+    if let Some(profile) = &profile {
+        secure_profile(profile);
+    }
     let preferences = settings
         .preferences
         .iter()
@@ -647,6 +656,20 @@ pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoCon
         audit_gl: std::env::var_os("SIG_AUDIT_GL").is_some_and(|v| v == "1"),
         experimental_features: settings.experimental_features,
         preferences,
+    }
+}
+
+/// Mode 0700 on `profile` and on the Sighurt directory above it. A failure is logged: the
+/// engine then keeps nothing if it cannot use the directory.
+#[cfg(any(feature = "engine-wpe", feature = "engine-servo"))]
+fn secure_profile(profile: &std::path::Path) {
+    if let Some(root) = profile.parent() {
+        if let Err(error) = crate::persistence::secure_private_dir(root) {
+            log::warn!("cannot make {} private: {error}", root.display());
+        }
+    }
+    if let Err(error) = crate::persistence::secure_private_dir(profile) {
+        log::warn!("cannot make {} private: {error}", profile.display());
     }
 }
 

@@ -219,6 +219,12 @@ pub const WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM: c_uint = 3;
 // WebKitCacheModel
 pub const WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER: c_uint = 2;
 
+// WebKitCookiePersistentStorage. SQLite is the Mozilla cookie-jar format.
+pub const WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE: c_uint = 1;
+
+// WebKitCookieAcceptPolicy. Only cookies set by the main document.
+pub const WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY: c_uint = 2;
+
 // WebKitWebProcessTerminationReason
 pub const WEBKIT_WEB_PROCESS_CRASHED: c_uint = 0;
 pub const WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT: c_uint = 1;
@@ -455,6 +461,17 @@ functions! {
         cache_directory: *const c_char,
     ) -> *mut GObject;
     pub fn webkit_network_session_new_ephemeral() -> *mut GObject;
+    pub fn webkit_network_session_get_cookie_manager(session: *mut GObject) -> *mut GObject;
+    pub fn webkit_network_session_set_persistent_credential_storage_enabled(
+        session: *mut GObject,
+        enabled: gboolean,
+    );
+    pub fn webkit_cookie_manager_set_persistent_storage(
+        manager: *mut GObject,
+        filename: *const c_char,
+        storage: c_uint,
+    );
+    pub fn webkit_cookie_manager_set_accept_policy(manager: *mut GObject, policy: c_uint);
     pub fn webkit_web_view_get_type() -> GType;
     pub fn webkit_web_view_get_wpe_view(web_view: *mut WebKitWebView) -> *mut WPEView;
     pub fn webkit_web_view_get_settings(web_view: *mut WebKitWebView) -> *mut GObject;

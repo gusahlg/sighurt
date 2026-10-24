@@ -1,6 +1,11 @@
 //! Files: reading and watching the configuration (`{config_dir}/sighurt/config.toml`), and
 //! loading and saving the session (`{state_dir}/sighurt/session.toml`).
 //!
+//! Sighurt's own directories (`{data_dir}/sighurt`, the `wpe` and `servo` profiles under it,
+//! and `{state_dir}/sighurt`) are mode 0700. An existing directory that is wider is tightened
+//! to 0700; shared XDG parents are not changed. Files this module writes, including
+//! `session.toml`, are mode 0600.
+//!
 //! The core parses and validates the configuration, against what the build has (its engines,
 //! keymaps and chromes, and the chrome's color names: `sighurt_core::Environment`). A file with
 //! any problem is not used: at startup `sig` runs with the built-in configuration and says why,
@@ -20,6 +25,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
@@ -40,14 +46,68 @@ pub struct Paths {
 
 impl Paths {
     /// The XDG locations (`$XDG_CONFIG_HOME`, `$XDG_STATE_HOME` and their defaults).
+    /// Makes Sighurt's data and state directories private before anything reads them.
     pub fn from_env() -> Self {
-        Self {
+        let paths = Self {
             config: dirs::config_dir().map(|d| d.join("sighurt").join("config.toml")),
             session: dirs::state_dir()
                 .or_else(dirs::data_dir)
                 .map(|d| d.join("sighurt").join("session.toml")),
+        };
+        secure_owned_directories();
+        paths
+    }
+}
+
+/// `{data_dir}/sighurt`, the engine profiles under it, and `{state_dir}/sighurt`, each mode
+/// 0700. Shared XDG parents are created if they are missing and are not chmodded.
+fn secure_owned_directories() {
+    if let Some(data) = dirs::data_dir() {
+        let root = data.join("sighurt");
+        secure_quietly(&root);
+        secure_quietly(&root.join("wpe"));
+        secure_quietly(&root.join("servo"));
+    }
+    if let Some(state) = dirs::state_dir() {
+        secure_quietly(&state.join("sighurt"));
+    }
+}
+
+fn secure_quietly(dir: &Path) {
+    if let Err(error) = secure_private_dir(dir) {
+        log::warn!("cannot make {} private: {error}", dir.display());
+    }
+}
+
+/// Creates `dir` at mode 0700, or tightens a wider existing directory to 0700. A narrower
+/// existing directory is left as it is. Parents are created with the process umask and not
+/// chmodded.
+pub(crate) fn secure_private_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
         }
     }
+    let created = match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error),
+    };
+    let meta = fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    let perms = meta.permissions().mode() & 0o7777;
+    // 0o7077 is setuid, setgid, sticky and group/other: wider than owner rwx. Narrower stays.
+    if (created || (perms & 0o7077) != 0) && perms != 0o700 {
+        let mut permissions = meta.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(dir, permissions)?;
+    }
+    Ok(())
 }
 
 /// Why a configuration file can't be used.
@@ -144,12 +204,22 @@ pub fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("no directory"))?;
-    fs::create_dir_all(dir)?;
+    secure_private_dir(dir)?;
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(format!(".{}.tmp", std::process::id()));
     let temporary = PathBuf::from(temporary);
     let result = (|| {
-        let mut file = fs::File::create(&temporary)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        let mut permissions = file.metadata()?.permissions();
+        if (permissions.mode() & 0o777) != 0o600 {
+            permissions.set_mode(0o600);
+            file.set_permissions(permissions)?;
+        }
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
@@ -261,5 +331,37 @@ mod tests {
         fs::write(&path, "version = 7\n").unwrap();
         assert!(load_session(&path).is_err());
         assert_eq!(load_session(&dir.path().join("none")), Ok(None));
+    }
+
+    #[test]
+    fn private_directories_are_0700_and_session_files_are_0600() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("share");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = parent.join("sighurt");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        secure_private_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700, "a wider directory is tightened");
+        assert_eq!(mode(&parent), 0o755, "a shared parent is not chmodded");
+        secure_private_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+
+        let fresh = parent.join("fresh");
+        secure_private_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700, "a new directory is created private");
+        assert_eq!(mode(&parent), 0o755);
+
+        let path = dir.join("session.toml");
+        write_atomically(&path, "version = 1\n").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&parent), 0o755);
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 }

@@ -40,8 +40,10 @@
 //!
 //! The profile (cookies, storage, caches) is a persistent `WebKitNetworkSession` in the
 //! configured directory, held with `{profile}/lock` for the runtime's life; a second process
-//! that finds it locked, or no directory, gets an ephemeral session. [`WpeConfig::user_agent`]
-//! replaces WebKit's user agent in every view's settings.
+//! that finds it locked, or no directory, gets an ephemeral session. A persistent session
+//! stores non-session cookies in `{profile}/cookies.sqlite`, accepts no third-party cookies
+//! and keeps HTTP credentials in memory. [`WpeConfig::user_agent`] replaces WebKit's user
+//! agent in every view's settings.
 //!
 //! [`EngineRuntime::shutdown`] closes every view (WebKit's view, its buffers and our
 //! `wl_buffer`s, our surface proxy and SHM buffers, then the lease), lets GLib finish WebKit's
@@ -115,8 +117,9 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 /// What the executable decides for the WPE runtime.
 #[derive(Clone, Debug, Default)]
 pub struct WpeConfig {
-    /// WebKit's profile directory (`{data_dir}/sighurt/wpe` in `sig`): cookies, storage, and
-    /// its caches under `cache/`. `None` keeps nothing.
+    /// WebKit's profile directory (`{data_dir}/sighurt/wpe` in `sig`): non-session cookies in
+    /// `cookies.sqlite`, storage, and caches under `cache/`. `None` keeps nothing. The
+    /// directory is mode 0700 while this runtime holds it.
     pub profile: Option<PathBuf>,
     /// What WebKit's requests send and its pages see as the user agent, instead of WebKit's own.
     pub user_agent: Option<String>,
@@ -1348,13 +1351,26 @@ fn keep_jsc_off_signals() -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Takes `{profile}/lock`, creating the directory; `None` if another process holds it or it
-/// can't be made, and then WebKit keeps nothing.
+/// Takes `{profile}/lock`, creating the directory at mode 0700. An existing directory that
+/// grants more than its owner is tightened to 0700 once this process holds the lock. `None`
+/// if another process holds it or the directory can't be made private, and then WebKit keeps
+/// nothing. Parents are not chmodded.
 fn lock_profile(profile: &Path) -> Option<File> {
-    std::fs::create_dir_all(profile).ok()?;
+    if !profile.is_dir() {
+        if let Err(error) = private_dir(profile) {
+            log::warn!("wpe: cannot make {}: {error}", profile.display());
+            return None;
+        }
+    }
     let lock = File::create(profile.join("lock")).ok()?;
     match lock.try_lock() {
-        Ok(()) => Some(lock),
+        Ok(()) => {
+            if let Err(error) = private_dir(profile) {
+                log::warn!("wpe: cannot make {} private: {error}", profile.display());
+                return None;
+            }
+            Some(lock)
+        }
         Err(TryLockError::WouldBlock) => {
             log::warn!(
                 "wpe: another process uses the profile {}; this one keeps nothing",
@@ -1364,6 +1380,39 @@ fn lock_profile(profile: &Path) -> Option<File> {
         }
         Err(TryLockError::Error(_)) => None,
     }
+}
+
+/// Creates `dir` at mode 0700, or tightens a wider existing directory to 0700. A narrower
+/// existing directory is left as it is. Parents are created with the process umask and not
+/// chmodded: a shared directory above the profile stays shared.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if let Some(parent) = dir.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let created = match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error),
+    };
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    let perms = meta.permissions().mode() & 0o7777;
+    // 0o7077 is setuid, setgid, sticky and group/other: wider than owner rwx. Narrower stays.
+    if (created || (perms & 0o7077) != 0) && perms != 0o700 {
+        let mut permissions = meta.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(dir, permissions)?;
+    }
+    Ok(())
 }
 
 /// The views' `WebKitWebContext`, made with the first view and ended with the last, so no web
@@ -1402,16 +1451,43 @@ impl WebContext {
     }
 }
 
-/// WebKit's network session: persistent in `profile` (caches in `profile/cache`), else
-/// ephemeral.
+/// WebKit's network session. Persistent: non-session cookies in `{profile}/cookies.sqlite`,
+/// no third-party cookies, HTTP credentials not stored. Ephemeral: nothing is stored.
+///
+/// Intelligent Tracking Prevention stays at WebKit's default, which is off on WPE
+/// (`WebsiteDataStore::defaultTrackingPreventionEnabled` returns false off Cocoa, in 2.52.6).
+/// Enabling it would make WebKit ignore `WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY` and
+/// accept every cookie. Called before the first view is created.
 fn network_session(profile: Option<&Path>) -> glib::Object {
-    let session = match profile.and_then(|p| {
-        let data = CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
-        let cache = CString::new(p.join("cache").as_os_str().as_encoded_bytes()).ok()?;
-        Some((data, cache))
+    let session = match profile.and_then(|profile| {
+        let data = CString::new(profile.as_os_str().as_encoded_bytes()).ok()?;
+        let cache = CString::new(profile.join("cache").as_os_str().as_encoded_bytes()).ok()?;
+        let cookies = CString::new(
+            profile
+                .join("cookies.sqlite")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .ok()?;
+        Some((data, cache, cookies))
     }) {
-        Some((data, cache)) => unsafe {
-            ffi::webkit_network_session_new(data.as_ptr(), cache.as_ptr())
+        Some((data, cache, cookies)) => unsafe {
+            let session = ffi::webkit_network_session_new(data.as_ptr(), cache.as_ptr());
+            let manager = ffi::webkit_network_session_get_cookie_manager(session);
+            ffi::webkit_cookie_manager_set_persistent_storage(
+                manager,
+                cookies.as_ptr(),
+                ffi::WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE,
+            );
+            ffi::webkit_cookie_manager_set_accept_policy(
+                manager,
+                ffi::WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY,
+            );
+            ffi::webkit_network_session_set_persistent_credential_storage_enabled(
+                session,
+                glib::ffi::GFALSE,
+            );
+            session
         },
         None => unsafe { ffi::webkit_network_session_new_ephemeral() },
     };
