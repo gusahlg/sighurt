@@ -104,3 +104,50 @@ recursive chmod outside Sighurt's own directories.
 
 Not claimed: SameSite and partitioning in Servo 0.7 (TODO upstream); the later API's guarantees
 (deletion with completion, canonical site keys, strict mode as cleanup) wait for phase 2.
+
+## Phase 2, slice 1: `site.forget` (deep-design agent, 24 October 2026)
+
+What phase 1 changed: no `EndSession` request is needed (Servo's loader and WebKit's SQLite
+store never keep session cookies); HTTP credentials are never on disk, so there is no
+credentials category.
+
+**sighurt-api.** `EngineCapabilities::site_data: SiteDataKinds { cookies, storage, caches, hsts }`.
+`SiteKey { Host(String) /* url::Host string: lower-case, IDNA ASCII, IP literal */, LocalFiles }`.
+`SiteDataRequest { List { request }, Forget { request, site }, ForgetAll { request } }` through a
+runtime-level `EngineRuntime::site_data(&mut self, SiteDataRequest) -> Result<(), EngineError>`
+whose default is `Unsupported` (works with no view open). Events, runtime-level (`view()` is
+`None`), not replaceable: `SitesListed { request, sites: Vec<SiteEntry { name, kinds }>, more }`
+(at most 1024 entries; a name is a valid host of at most 253 bytes or dropped, never cut) and
+`SiteDataDone { request, result: Result<SiteDataOutcome { removed: Vec<String>, kinds, durable,
+profile }, String> }`: `removed` names the engine's own records (the real scope), `profile = false`
+when this instance has no profile (nothing on disk changed), `durable` only when committed.
+
+**Keys.** The browser's key is the address's host (or `LocalFiles`); each engine maps it onto its
+own grouping and reports what it removed: Servo by its registrable domain (`reg_host`, Servo's
+own list), WPE by its records' host names (`name == host || name.ends_with(".host")`). No
+browser-side public-suffix list: a third list would match neither engine where they disagree.
+`site.forget` takes no wildcards.
+
+**Engines.** Servo 0.7: cookies and storage (local and session) via `SiteDataManager`; not caches,
+HSTS or IndexedDB (no per-site API; the outcome says what was covered). WPE: cookies, storage
+(incl. IndexedDB, service workers, DOM cache), caches and HSTS via `webkit_website_data_manager_
+fetch/remove`, asynchronously. Demo: in memory, for tests. Wasm: none yet.
+
+**Durability.** The vendored servo-net gains a flush: `DeleteCookiesForSites`, `DeleteCookies`
+and `DeleteSessionCookies` make the profile writer commit the current generation before they
+reply, so a snapshot from before a deletion can never be the last one written (otherwise a crash
+in the next 5 s would resurrect the cookie). WPE: the network process is authoritative.
+
+**Core.** `site.forget [host]` (no argument: the selected tab's host; `sig:` or no page: a
+notice). `Effect::SiteData { engine: None, request }` to every engine declaring a kind (the
+runtime starts one that hasn't started); at most 16 requests pending; on each `SiteDataDone` a
+notice ("example.com forgotten in servo: cookies, storage (removed: example.com)"), and every tab
+whose current view is in that engine and whose host matches is reloaded, so a logged-in page
+doesn't re-set the cookie. An error or `profile = false` says nothing on disk changed.
+
+**Deferred:** `site.list` (a `sig://sites` page), `site.forget-all` (only with the literal
+argument `everything`), `[privacy]`, strict mode (it waits until an engine can refuse storage per
+site; until then "privacy first" is: no third-party cookies in WPE, memory-only credentials,
+session cookies end with the process, `site.forget`, and `storage = "ephemeral"`), Wasm's kv
+store, follower profiles, encryption, a WPE profile lock (two `sig`s share WebKit's SQLite file
+today).
