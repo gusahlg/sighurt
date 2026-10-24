@@ -40,10 +40,12 @@
 //! one extraction is in flight per view. Action scripts are not logged: `SetValue` carries
 //! plaintext. The snapshot is page data and is never logged beyond a short head on failure.
 //!
-//! Servo keeps its profile (cookies, local storage, HSTS, HTTP authentication) in the directory
-//! the executable passes, written by this runtime only: it holds `{profile}/lock` from before
-//! Servo is built until Servo has shut down (Servo writes the profile while it shuts down), and
-//! a second process that finds the lock taken runs Servo without a profile (M0, decision 26).
+//! Servo keeps its profile (cookies, local storage, HSTS) in the directory the executable
+//! passes. HTTP authentication stays in memory and is never written. This runtime holds
+//! `{profile}/lock` from before Servo is built until Servo has shut down: the profile writer
+//! joins during that shutdown, then the lock is released. A second process that finds the lock
+//! taken runs Servo without a profile (M0, decision 26). When Servo is leaked (decision 54) the
+//! lock is leaked with it and stays held until the process exits.
 //!
 //! A crashed page's view loads its next navigation in a new WebView on the same context. On
 //! Servo 0.5 the crashed site's documents kept going to the dead script thread; that workaround
@@ -81,6 +83,7 @@
 use std::collections::HashMap;
 use std::fs::{File, TryLockError};
 use std::mem::Discriminant;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -205,8 +208,10 @@ pub struct ServoDiagnostics {
     /// straight into Wayland subsurfaces.
     pub offscreen_adapter: Option<OffscreenAdapter>,
     /// Servo was left running when the runtime shut down (after a page crash or a lost
-    /// backend, it can't shut down): its threads outlive the runtime, the profile wasn't
-    /// written, and the executable should end the process without running exit handlers.
+    /// backend, it can't shut down): its threads outlive the runtime, the profile lock stays
+    /// held until the process exits, and the executable should end the process without
+    /// running exit handlers. A periodic cookie commit may already be on disk; the writer
+    /// may still be running.
     pub leaked: bool,
 }
 
@@ -1701,12 +1706,16 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
             log::error!("servo: Servo can't shut down after a crash; leaving it running");
             std::mem::forget(servo);
             std::mem::forget(views);
+            // The writer may still commit. Keep the advisory lock until the process exits
+            // so another process does not open this profile (decision 54).
+            std::mem::forget(self.profile_lock.take());
             self.leaked = true;
             return;
         }
         // Servo shuts down only in `Drop`: it tells the constellation to exit and spins until
         // the constellation, WebGL and paint threads are done, releasing its clones of the
-        // rendering contexts. It writes the profile on the way, under the lock.
+        // rendering contexts. The profile writer joins during that Drop, then the lock below
+        // is released.
         drop(servo);
         let mut contexts_leaked = false;
         let mut leases = Vec::new();
@@ -2015,18 +2024,36 @@ fn firefox_user_agent(servo: &str) -> String {
     tokens.collect::<Vec<_>>().join(" ")
 }
 
-/// Takes `{dir}/lock` for this process's Servo, which reads the profile when it starts and
-/// writes it when it shuts down. `None` if the directory can't be made or another process
-/// holds the lock: Servo then runs without a profile rather than race the other's writes.
+/// Takes `{dir}/lock` for this process's Servo. The directory itself is mode 0700 before
+/// Servo reads it; parent directories are left as they are. `None` if the directory can't be
+/// made or restricted, or another process holds the lock: Servo then runs without a profile
+/// rather than race the other's writes.
 fn lock_profile(dir: &Path) -> Option<File> {
-    let locked = std::fs::create_dir_all(dir).and_then(|()| {
-        File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("lock"))
-    });
-    let file = match locked {
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        log::warn!("servo: no profile: cannot use {}: {error}", dir.display());
+        return None;
+    }
+    let mut perms = match std::fs::metadata(dir) {
+        Ok(meta) => meta.permissions(),
+        Err(error) => {
+            log::warn!("servo: no profile: cannot use {}: {error}", dir.display());
+            return None;
+        }
+    };
+    perms.set_mode(0o700);
+    if let Err(error) = std::fs::set_permissions(dir, perms) {
+        log::warn!(
+            "servo: no profile: cannot restrict {}: {error}",
+            dir.display()
+        );
+        return None;
+    }
+    let file = match File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("lock"))
+    {
         Ok(file) => file,
         Err(error) => {
             log::warn!("servo: no profile: cannot use {}: {error}", dir.display());

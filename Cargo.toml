@@ -96,5 +96,8 @@ debug = false
 
 # surfman 0.14.0 with one change: context creation does not mutate the process
 # environment. See third_party/surfman/SIGHURT-PATCH.md.
+# servo-net 0.7.0 with crash-safe cookie and HSTS commits. See
+# third_party/servo-net/SIGHURT-PATCH.md.
 [patch.crates-io]
 surfman = { path = "third_party/surfman" }
+servo-net = { path = "third_party/servo-net" }
