@@ -9,8 +9,9 @@
 //! app sends the core as `BrowserEvent::Semantic`), the layout itself
 //! ([`crate::textmode`]) or when text mode is on (the app).
 //!
-//! Enter in the field editor sends `SetValue` when the text changed and `Submit`
-//! when that field is inside a form. A value with a newline is not edited here:
+//! Enter in the field editor sends `SetValue` when the text changed and `Submit` where HTML
+//! submits implicitly: a single-line field in a form with a button or with no other text
+//! field, never a text area. A value too long to be whole in the snapshot is not edited. A value with a newline is not edited here:
 //! the one-line editor would have to drop it, so a notice is shown instead.
 
 use std::collections::HashMap;
@@ -53,27 +54,62 @@ fn has_newline(text: &str) -> bool {
     text.as_bytes().iter().any(|b| *b == b'\n' || *b == b'\r')
 }
 
-/// Whether `target` sits inside a form landmark. The snapshot has no separate
-/// flag; the action script still finds a control's form owner from the node.
-fn in_form(snapshot: &SemanticSnapshot, target: NodeId) -> bool {
+/// Whether Enter in the single-line field `target` also submits its form, as HTML's implicit
+/// submission does. The snapshot has no submit-button type, so a form with any button node
+/// counts as having a submit button; without one, only a form with exactly one text or
+/// password field submits. A text area, or a field outside a form landmark, never does.
+fn submits_on_enter(snapshot: &SemanticSnapshot, target: NodeId) -> bool {
     let mut nodes = HashMap::with_capacity(snapshot.nodes.len());
     for node in &snapshot.nodes {
         nodes.insert(node.id, node);
     }
-    let mut stack = vec![(snapshot.root, false)];
+    if nodes.get(&target).map(|node| node.kind) != Some(NodeKind::TextField) {
+        return false;
+    }
+    // Walk down, remembering the innermost form seen; find it for `target`, then count in it.
+    let mut stack = vec![(snapshot.root, None::<NodeId>)];
+    let mut form = None;
     while let Some((id, inside)) = stack.pop() {
         let Some(node) = nodes.get(&id) else {
             continue;
         };
-        let inside = inside || matches!(node.kind, NodeKind::Landmark(Landmark::Form));
+        let inside = match node.kind {
+            NodeKind::Landmark(Landmark::Form) => Some(id),
+            _ => inside,
+        };
         if id == target {
-            return inside;
+            form = inside;
+            break;
         }
         for &child in node.children.iter().rev() {
             stack.push((child, inside));
         }
     }
-    false
+    let Some(form) = form else {
+        return false;
+    };
+    let (mut buttons, mut fields) = (0usize, 0usize);
+    let mut stack = vec![form];
+    while let Some(id) = stack.pop() {
+        let Some(node) = nodes.get(&id) else {
+            continue;
+        };
+        match node.kind {
+            NodeKind::Button => buttons += 1,
+            NodeKind::TextField => fields += 1,
+            _ => {}
+        }
+        stack.extend(node.children.iter().copied());
+    }
+    buttons > 0 || fields == 1
+}
+
+/// Whether a field's value may have been cut by the snapshot: `extract.js` keeps at most
+/// `MAX_STRING_BYTES` of a string (less up to a character), and a cut snapshot says only that
+/// something was cut, not what. So a value at that length, or any non-empty one in a truncated
+/// snapshot, is not edited: committing would overwrite the page's full value.
+fn maybe_cut(snapshot: &SemanticSnapshot, value: &str) -> bool {
+    value.len() >= MAX_STRING_BYTES - 4 || (snapshot.truncated && !value.is_empty())
 }
 
 /// Graphemes of `text` whose columns start at `start` and cover at most `room`.
@@ -214,7 +250,11 @@ enum Prompt {
         editor: LineEditor,
         password: bool,
         original: String,
-        in_form: bool,
+        /// Whether Enter also submits the field's form.
+        submits: bool,
+        /// A password field's editor starts empty, so an edit that ends empty again
+        /// is told apart from none by this: any edit key sets it.
+        touched: bool,
     },
     /// One of a select's options.
     Choose {
@@ -331,6 +371,9 @@ impl TextPages {
     /// A key the keymap left for `view`'s page. Returns the action it chose, if any.
     pub fn page_key(&mut self, view: ViewId, key: &KeyEvent) -> Option<Act> {
         let nav = Nav::of(key)?;
+        if nav == Nav::Activate && key.repeat {
+            return None;
+        }
         let rows = self.rows;
         let page = self.pages.get_mut(&view)?;
         let (doc, text) = (&page.doc, &mut page.view);
@@ -386,12 +429,19 @@ impl TextPages {
                     .any(|item| item.node == node && item.password);
                 // A one-line editor would drop the newline on the way into
                 // `LineEditor` and commit that. Refuse, so the value stays.
+                if maybe_cut(&page.snapshot, &value) {
+                    self.prompt = Some((
+                        view,
+                        Prompt::Notice("This value is too long to edit here".into()),
+                    ));
+                    return None;
+                }
                 if !password && has_newline(&value) {
                     self.prompt =
                         Some((view, Prompt::Notice("Can't edit more than one line".into())));
                     return None;
                 }
-                let in_form = in_form(&page.snapshot, node);
+                let submits = submits_on_enter(&page.snapshot, node);
                 let original = value;
                 let mut editor = LineEditor::from_raw(original.clone());
                 editor.select_all();
@@ -402,7 +452,8 @@ impl TextPages {
                         editor,
                         password,
                         original,
-                        in_form,
+                        submits,
+                        touched: false,
                     },
                 ));
                 None
@@ -424,7 +475,13 @@ impl TextPages {
     /// Pasted text for the open field editor. Returns whether a prompt took it (or refused it).
     pub fn paste(&mut self, text: &str) -> bool {
         match &mut self.prompt {
-            Some((_, Prompt::Edit { editor, .. })) => {
+            Some((
+                _,
+                Prompt::Edit {
+                    editor, touched, ..
+                },
+            )) => {
+                *touched = true;
                 editor.paste(fit(text, room(editor)));
                 true
             }
@@ -449,6 +506,10 @@ impl TextPages {
             Key::Named(name) => Some(name.as_str()),
             _ => None,
         };
+        // A held Enter must not activate again: a repeat is not the user's press.
+        if named == Some("Enter") && key.repeat {
+            return Vec::new();
+        }
         if named == Some("Escape") {
             self.prompt = None;
             return Vec::new();
@@ -459,7 +520,9 @@ impl TextPages {
                 node,
                 editor,
                 original,
-                in_form,
+                submits,
+                touched,
+                password,
                 ..
             } => {
                 let word = key.modifiers.control && !key.consumed.control;
@@ -471,13 +534,13 @@ impl TextPages {
                     // is not told it changed. Submit names the field; the action finds its form.
                     Some("Enter") if editor.text().len() <= MAX_STRING_BYTES => {
                         let mut actions = Vec::new();
-                        if editor.text() != original.as_str() {
+                        if editor.text() != original.as_str() || (*password && *touched) {
                             actions.push(SemanticAction::SetValue {
                                 node: *node,
                                 value: editor.text().to_owned(),
                             });
                         }
-                        if *in_form {
+                        if *submits {
                             actions.push(SemanticAction::Submit(*node));
                         }
                         done = Some(actions);
@@ -489,13 +552,26 @@ impl TextPages {
                     Some("ArrowRight") => editor.right(),
                     Some("Home") => editor.home(),
                     Some("End") => editor.end(),
-                    Some("Backspace") if word => editor.delete_word(false),
-                    Some("Delete") if word => editor.delete_word(true),
-                    Some("Backspace") => editor.backspace(),
-                    Some("Delete") => editor.delete(),
+                    Some("Backspace") if word => {
+                        *touched = true;
+                        editor.delete_word(false);
+                    }
+                    Some("Delete") if word => {
+                        *touched = true;
+                        editor.delete_word(true);
+                    }
+                    Some("Backspace") => {
+                        *touched = true;
+                        editor.backspace();
+                    }
+                    Some("Delete") => {
+                        *touched = true;
+                        editor.delete();
+                    }
                     Some(_) => {}
                     None => {
                         if let Some(text) = key.text.as_deref().filter(|_| !alt && !word) {
+                            *touched = true;
                             editor.insert(fit(text, room(editor)));
                         }
                     }
@@ -1002,6 +1078,122 @@ mod tests {
         assert!(acts.iter().all(|act| act.action.is_activation()));
         assert_eq!(acts[0].document, acts[1].document);
         assert!(acts[0].link.is_none());
+    }
+
+    fn a_form_page(fields: Vec<SemanticNode>, truncated: bool) -> (TextPages, ViewId) {
+        let view = ViewId::next();
+        let mut root = node(1, NodeKind::Document);
+        let mut form = node(2, NodeKind::Landmark(Landmark::Form));
+        form.children = fields.iter().map(|f| f.id).collect();
+        root.children.push(form.id);
+        let mut nodes = vec![root, form];
+        nodes.extend(fields);
+        let mut pages = TextPages::new(40, 10);
+        pages.snapshot(
+            view,
+            Box::new(SemanticSnapshot {
+                document: DocumentGeneration::next(),
+                root: NodeId(1),
+                nodes,
+                focus: None,
+                truncated,
+            }),
+        );
+        (pages, view)
+    }
+
+    fn text_field(id: u64, kind: NodeKind, password: bool, value: &str) -> SemanticNode {
+        let mut field = node(id, kind);
+        field.password = password;
+        if !password {
+            field.value = Some(value.into());
+        }
+        field
+    }
+
+    #[test]
+    fn enter_submits_only_where_html_does() {
+        let submits = |fields: Vec<SemanticNode>, tabs: usize| {
+            let (mut pages, view) = a_form_page(fields, false);
+            for _ in 0..tabs {
+                pages.page_key(view, &key("Tab", false));
+            }
+            pages.page_key(view, &key("Enter", false));
+            let acts = pages.prompt_key(&key("Enter", false));
+            acts.iter()
+                .any(|act| matches!(act.action, SemanticAction::Submit(_)))
+        };
+        let tf = |id| text_field(id, NodeKind::TextField, false, "");
+        // Username and password: no submit after the username.
+        assert!(!submits(
+            vec![tf(10), text_field(11, NodeKind::TextField, true, "")],
+            1
+        ));
+        // A lone field submits; so does one beside a button.
+        assert!(submits(vec![tf(10)], 1));
+        assert!(submits(vec![tf(10), tf(11), node(12, NodeKind::Button)], 1));
+        // A text area never does, even alone.
+        assert!(!submits(
+            vec![text_field(10, NodeKind::TextArea, false, "x")],
+            1
+        ));
+    }
+
+    #[test]
+    fn a_value_the_snapshot_may_have_cut_is_not_edited() {
+        let refused = |value: &str, truncated: bool| {
+            let (mut pages, view) = a_form_page(
+                vec![
+                    text_field(10, NodeKind::TextField, false, value),
+                    text_field(11, NodeKind::TextField, false, ""),
+                ],
+                truncated,
+            );
+            pages.page_key(view, &key("Tab", false));
+            pages.page_key(view, &key("Enter", false));
+            let (row, _) = draw_last(&pages, view);
+            row.starts_with("This value is too long to edit here")
+        };
+        assert!(refused(&"x".repeat(MAX_STRING_BYTES - 4), false));
+        assert!(refused(&"x".repeat(MAX_STRING_BYTES), false));
+        assert!(!refused(&"x".repeat(MAX_STRING_BYTES - 5), false));
+        assert!(refused("abc", true));
+        assert!(!refused("", true));
+        assert!(!refused("abc", false));
+    }
+
+    #[test]
+    fn a_held_enter_activates_once() {
+        let (mut pages, view, _) = field_page(NodeKind::TextField, "a", false, true);
+        pages.page_key(view, &key("Tab", false));
+        let mut held = key("Enter", false);
+        held.repeat = true;
+        assert!(pages.page_key(view, &held).is_none());
+        assert!(!pages.prompting());
+        pages.page_key(view, &key("Enter", false));
+        assert!(pages.prompting());
+        pages.prompt_key(&typed("b"));
+        assert!(pages.prompt_key(&held).is_empty());
+        assert!(pages.prompting());
+        assert!(!pages.prompt_key(&key("Enter", false)).is_empty());
+    }
+
+    #[test]
+    fn a_password_can_be_cleared() {
+        let (mut pages, view, node) = field_page(NodeKind::TextField, "", true, false);
+        open_field(&mut pages, view);
+        // Nothing typed: no SetValue.
+        assert!(pages.prompt_key(&key("Enter", false)).is_empty());
+        open_field(&mut pages, view);
+        pages.prompt_key(&key("Backspace", false));
+        let acts = pages.prompt_key(&key("Enter", false));
+        assert_eq!(
+            acts.iter().map(|act| &act.action).collect::<Vec<_>>(),
+            vec![&SemanticAction::SetValue {
+                node,
+                value: String::new()
+            }]
+        );
     }
 
     #[test]

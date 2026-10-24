@@ -1434,6 +1434,7 @@ impl App {
                     out.extend(bytes);
                     out.extend_from_slice(SYNC_END);
                     self.tui.grid.forget_cursor();
+                    self.tui.grid.forget_pen();
                 } else {
                     out.extend(bytes);
                 }
@@ -1578,6 +1579,7 @@ impl Tui {
     fn blank_placed(&mut self) {
         blank_page(&mut self.control, self.page);
         self.grid.forget_cursor();
+        self.grid.forget_pen();
     }
 
     /// Whether the page rows are text: what `chrome.toggle-mode` chose, else `[tui] mode`, which
@@ -2110,11 +2112,13 @@ fn choose_protocol(graphics: GraphicsProtocol, kitty_ok: Option<bool>, sixel: bo
 }
 
 /// Spaces over every page row. tmux drops a sixel when a character is written on its
-/// cells; erasing a row that is already blank does not.
+/// cells; erasing a row that is already blank does not. The spaces are written with plain
+/// attributes, so the caller makes the grid forget its pen.
 fn blank_page(out: &mut Vec<u8>, page: PageArea) {
     if page.cols == 0 || page.rows == 0 {
         return;
     }
+    out.extend_from_slice(b"\x1b[0m");
     for row in 0..page.rows {
         let line = u32::from(page.row) + u32::from(row) + 1;
         let _ = write!(out, "\x1b[{line};1H");
@@ -2280,6 +2284,24 @@ mod tests {
             Some(("error", "failed"))
         );
         assert_eq!(status_line(None, false, None, None), None);
+    }
+
+    #[test]
+    fn blanking_the_page_resets_attributes_and_the_chrome_sends_its_own_again() {
+        let mut grid = Grid::new(20, 6);
+        let state = ChromeState::default();
+        let page = state.draw(&mut grid);
+        let first = grid.diff();
+        assert!(!first.is_empty());
+        let mut blank = Vec::new();
+        blank_page(&mut blank, page);
+        assert!(blank.starts_with(b"\x1b[0m"));
+        grid.forget_cursor();
+        grid.forget_pen();
+        // A redraw that changes a chrome cell must not rely on the pen before the blank.
+        grid.put_cluster(0, 0, "Z", Color::Default, Color::Default, Attrs::default());
+        let diff = grid.diff();
+        assert!(diff.windows(4).any(|w| w == b"\x1b[0m"), "{diff:?}");
     }
 
     #[test]

@@ -110,7 +110,8 @@ pub struct Grid {
     published: Vec<Cell>,
     /// Cursor after the last diff. `None` means the next write must address it.
     cursor: Option<(u16, u16)>,
-    pen: Pen,
+    /// The terminal's current attributes. `None` means unknown: the next write resets them first.
+    pen: Option<Pen>,
 }
 
 impl Grid {
@@ -125,7 +126,7 @@ impl Grid {
             cells: vec![Cell::blank(); n],
             published: vec![Cell::blank(); n],
             cursor: None,
-            pen: Pen::default(),
+            pen: Some(Pen::default()),
         }
     }
 
@@ -249,8 +250,12 @@ impl Grid {
             let row = u16::try_from(index / usize::from(self.cols)).unwrap_or(0);
             self.move_to(&mut body, col, row);
             let pen = Pen::from_cell(&self.cells[index]);
-            write_sgr(&mut body, self.pen, pen);
-            self.pen = pen;
+            let from = self.pen.unwrap_or_else(|| {
+                body.extend_from_slice(b"\x1b[0m");
+                Pen::default()
+            });
+            write_sgr(&mut body, from, pen);
+            self.pen = Some(pen);
             body.extend(self.cells[index].grapheme.as_bytes());
             let next = col.saturating_add(u16::from(width));
             self.cursor = if next >= self.cols {
@@ -275,6 +280,12 @@ impl Grid {
     /// absolutely instead of moving from where the last diff left the cursor.
     pub fn forget_cursor(&mut self) {
         self.cursor = None;
+    }
+
+    /// Something else wrote to the terminal and left its attributes unknown: the next write
+    /// starts from a reset and sends its own.
+    pub fn forget_pen(&mut self) {
+        self.pen = None;
     }
 
     fn index(&self, col: u16, row: u16) -> usize {
@@ -452,6 +463,23 @@ mod tests {
         let diff = grid.diff();
         assert_eq!(diff, b"\x1b[?2026h\x1b[2;4H\x1b[1;38;2;1;2;3mA\x1b[?2026l");
         assert!(grid.diff().is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_pen_is_reset_before_the_next_write() {
+        let mut grid = Grid::new(8, 3);
+        let (fg, attrs) = bold_red();
+        grid.put_cluster(0, 0, "A", fg, Color::Default, attrs);
+        grid.diff();
+        // Same attributes as the pen: nothing is re-sent until the pen is forgotten.
+        grid.put_cluster(1, 0, "B", fg, Color::Default, attrs);
+        assert_eq!(grid.diff(), b"\x1b[?2026hB\x1b[?2026l");
+        grid.forget_pen();
+        grid.put_cluster(2, 0, "C", fg, Color::Default, attrs);
+        assert_eq!(
+            grid.diff(),
+            b"\x1b[?2026h\x1b[0m\x1b[1;38;2;1;2;3mC\x1b[?2026l"
+        );
     }
 
     #[test]
