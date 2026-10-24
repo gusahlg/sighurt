@@ -3633,3 +3633,17 @@ Newest last. Each entry says what was decided and why.
     Servo's profile writer (113) at most the last few seconds of cookie changes are lost.
     Evidence: 10 chatgpt dumps all ended (3 at the bound), sighurt-runtime's `shutdown_bound`
     tests.
+115. **Sighurt 0.9.0** (24 October 2026, the user's go-ahead: release once the running jobs
+    land, the pre-commit list passes with Servo and WPE, and a live check in the user's setup
+    passes). Since 0.8.0: Servo text mode (109), sixel graphics in the terminal, so pages show
+    inside tmux (110), the terminal's key, form, resize, quit and signal fixes (108, 111, 112
+    and three reviews), persistent logins in both engines with private profiles (113, phase 1),
+    every shutdown bounded (114), `site.forget`'s API and command (113, phase 2 slice 1; Servo
+    and WPE answer it in the next slice), and a faster terminal graphics path (BGRA through a
+    pack buffer, 3.2 → 1.2 ms a present; a word-wise kitty conversion). Verified on this
+    commit's tree: CLAUDE.md's whole pre-commit list on this desktop (its all-features test step passed
+    on its own; inside the full run the kernel's OOM killer killed one parallel `ld` in the
+    9 GiB scope, so that step runs with fewer jobs now), `real-terminals.sh` 7/7 in Rio and
+    7/7 in kitty, and a live check in Rio running the user's tmux configuration: sixel with
+    Servo, Servo text mode, `e`, `o` with an address opening chatgpt.com, and `q` quitting in
+    1 s with chatgpt.com open. `sighurt-sdk` keeps 0.7.0 (the guest ABI didn't change).

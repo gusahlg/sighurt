@@ -5334,7 +5334,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "m0-coexist"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "cpal",
  "dpi",
@@ -5356,7 +5356,7 @@ dependencies = [
 
 [[package]]
 name = "m1-mixed"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "calloop",
  "cosmic-text",
@@ -10275,11 +10275,11 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sighurt-api"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "sighurt-browser"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "log",
@@ -10297,7 +10297,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-chrome-line"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "sighurt-api",
  "sighurt-ui",
@@ -10306,7 +10306,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "sighurt-api",
@@ -10316,7 +10316,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-engine-demo"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "sighurt-api",
  "sighurt-wayland",
@@ -10324,7 +10324,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-engine-servo"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "calloop",
  "dpi",
@@ -10345,7 +10345,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-engine-wasm"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -10391,7 +10391,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-engine-wpe"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "calloop",
  "glib",
@@ -10411,7 +10411,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-gui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "calloop",
  "libc",
@@ -10431,7 +10431,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-keymap-modal"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "sighurt-api",
  "toml 1.1.6+spec-1.1.0",
@@ -10439,7 +10439,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-runtime"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "dirs",
  "env_logger",
@@ -10466,7 +10466,7 @@ version = "0.7.0"
 
 [[package]]
 name = "sighurt-semantic"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde_json",
  "sighurt-api",
@@ -10474,7 +10474,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-tui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "calloop",
@@ -10496,7 +10496,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-ui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "cosmic-text",
  "log",
@@ -10508,7 +10508,7 @@ dependencies = [
 
 [[package]]
 name = "sighurt-wayland"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "calloop",
  "libloading",
@@ -12037,7 +12037,7 @@ checksum = "2c591d83f69777866b9126b24c6dd9a18351f177e49d625920d19f989fd31cf8"
 
 [[package]]
 name = "tty-io"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "calloop",
  "crossterm",
@@ -12051,7 +12051,7 @@ dependencies = [
 
 [[package]]
 name = "tui-servo"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "dpi",
@@ -14340,7 +14340,7 @@ dependencies = [
 
 [[package]]
 name = "wpe-coexist"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "calloop",
  "libc",
@@ -14357,7 +14357,7 @@ dependencies = [
 
 [[package]]
 name = "wpe-cpu"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "glib",
  "sighurt-api",
