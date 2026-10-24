@@ -48,7 +48,10 @@ use rustix::fs::OFlags;
 use rustix::io::Errno;
 use rustix::pipe::PipeFlags;
 use rustix::pty::OpenptFlags;
-use rustix::termios::{tcgetattr, tcsetattr, OptionalActions, SpecialCodeIndex, Termios, Winsize};
+use rustix::termios::{
+    tcflush, tcgetattr, tcsetattr, OptionalActions, QueueSelector, SpecialCodeIndex, Termios,
+    Winsize,
+};
 
 use super::modes::{startup_queries, ENTER, LEAVE};
 use super::output::{advance, plan_write, terminator, Output, Wire};
@@ -220,8 +223,19 @@ impl Session {
     /// and every attempt forces non-blocking mode first so a full pty cannot
     /// block the write. The captured flags are put back afterwards. When the
     /// reset bytes do not all land, this returns an error; it does not hang.
-    /// A call after both parts have succeeded writes nothing.
+    /// A call after both parts have succeeded writes nothing. Every call,
+    /// including that one, discards input the terminal has queued
+    /// (`TCIFLUSH`): a key release or a mouse report that arrived in raw mode
+    /// must not reach the shell. The signal-handler path does not flush.
     pub fn restore(&mut self) -> io::Result<()> {
+        let result = self.restore_modes();
+        if let Err(error) = tcflush(&self.fd, QueueSelector::IFlush) {
+            log::warn!("the terminal's pending input was not discarded: {error}");
+        }
+        result
+    }
+
+    fn restore_modes(&mut self) -> io::Result<()> {
         let done = !self.shared().active.load(Ordering::Acquire)
             && self.shared().protocol_restored.load(Ordering::Acquire);
         if done {

@@ -663,7 +663,57 @@ fn text_mode_shows_the_page_as_text_and_tab_enter_follow_a_link_and_fill_a_field
         term.context()
     );
 
+    // The field is focused, and text mode told the core the page is not typing: `q` quits.
     term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+    term.assert_restored();
+}
+
+/// With a field focused, graphics lets the page take letters: `q` types, and Ctrl-C still quits.
+#[test]
+fn graphics_mode_keeps_a_focused_fields_letters_for_the_page() {
+    let mut term = Terminal::start_in(
+        "text-field",
+        &["demo://pattern"],
+        REPLIES,
+        "mode = \"text\"",
+    );
+    let shown = term.wait(0, Duration::from_secs(15), |got| shows(got, "TEXT"));
+    assert!(shown, "no text mode\n{}", term.context());
+    term.type_bytes(b"\t\r");
+    let since = term.got.len();
+    let followed = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "Demo: animation")
+    });
+    assert!(followed, "link not followed\n{}", term.context());
+    term.type_bytes(b"\t\t\t\r");
+    let since = term.got.len();
+    let editing = term.wait(since, Duration::from_secs(10), |got| shows(got, "Edit:"));
+    assert!(editing, "no field editor\n{}", term.context());
+    term.type_bytes(b"zq\r");
+    let since = term.got.len();
+    let set = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "Typed into the page: zq")
+    });
+    assert!(set, "field not set\n{}", term.context());
+
+    let since = term.got.len();
+    term.type_bytes(b"m");
+    let graphics = term.wait(since, Duration::from_secs(10), |got| shows(got, "GFX"));
+    assert!(graphics, "`m` did not show graphics\n{}", term.context());
+    // `q` goes to the page's field and does not run its binding: sig is still up a second on.
+    term.type_bytes(b"q");
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        term.wait(term.got.len(), Duration::from_millis(20), |_| false);
+        assert!(
+            term.child.try_wait().unwrap().is_none(),
+            "q quit while the field was focused in graphics\n{}",
+            term.context()
+        );
+    }
+    // Ctrl-C quits from anywhere, field or not.
+    term.type_bytes(b"\x03");
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
 }
@@ -683,9 +733,12 @@ fn text_mode_takes_the_engines_frames_and_sends_none() {
     assert!(shown, "no text mode\n{}", term.context());
     std::thread::sleep(Duration::from_secs(2));
     let _ = term.tabs();
+    let frames = term.counter("page_frames_presented");
+    // `[tui] fps` is 10. Text mode takes at most 2 a second, including the frames before this
+    // wait and the moment the report is written.
     assert!(
-        term.counter("page_frames_presented") > 0,
-        "text mode presented no frame\n{}",
+        frames > 0 && frames <= 8,
+        "text mode presented {frames} frames\n{}",
         term.context()
     );
     assert_eq!(term.counter("encoded_bytes"), 0, "{}", term.context());

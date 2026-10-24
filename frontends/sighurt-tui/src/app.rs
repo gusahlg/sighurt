@@ -17,20 +17,28 @@
 //! decides whether the page rows show pixels or the page's text. In text mode the shown view's
 //! engine is asked for snapshots ([`Session::set_semantics`]), the others' are not, and the
 //! keys the keymap left for the page, and the mouse, act on the text: scrolling is the
-//! frontend's, an activation goes to the core as `BrowserEvent::Semantic`. A press in the page
-//! in graphics mode captures the pointer until that button is released.
+//! frontend's, an activation goes to the core as `BrowserEvent::Semantic`. Text mode tells the
+//! core `BrowserEvent::PageTyping(false)`, so a focused field does not swallow character
+//! bindings; graphics tells it `true`. A press in the page in graphics mode captures the
+//! pointer until that button is released.
 //!
 //! Page frames (TUI.md §2 and §8.6): a permit only for the shown view, only when its engine has
-//! a new frame, at most `[tui] fps` a second, and only once every byte written before has left
-//! the output buffer: nothing is written while any is waiting, so at most one encoded frame is
-//! ever pending and no write is cut short. The engine paints into its view's [`TermTarget`] and
-//! the frame is encoded as a kitty or sixel image over the page rows. A resize is a new layout
-//! epoch: a frame for the old one is never sent, though bytes already on their way finish. A
-//! hidden or closed view's image is deleted; a sixel, which has no id, by rewriting the page rows.
+//! a new frame, at most `[tui] fps` a second (in text mode at most [`TEXT_FPS`], and only when
+//! that engine gives page text), and only once every byte written before has left the output
+//! buffer: nothing is written while any is waiting, so at most one encoded frame is ever
+//! pending and no write is cut short. The engine paints into its view's [`TermTarget`] and the
+//! frame is encoded as a kitty or sixel image over the page rows. Text mode takes the frame and
+//! does not encode it, so switching back to graphics shows the latest one. A resize is a new
+//! layout epoch: output queued for the old layout is discarded, and a kitty upload the cut
+//! interrupted is ended with an empty `m=0` chunk. Bytes the kernel already accepted cannot be
+//! unsent. A hidden or closed view's image is deleted; a sixel, which has no id, by rewriting
+//! the page rows.
 //!
-//! Logs go to `{state_dir}/sighurt/tui.log` before any engine starts. The terminal is restored
-//! on every way out: quit, error, panic (the terminal's hook), SIGHUP (its handler) and
-//! [`Frontend::before_forced_exit`]; SIGTSTP suspends and SIGCONT redraws everything.
+//! Logs go to `{state_dir}/sighurt/tui.log` before any engine starts. The terminal's modes are
+//! turned off before the engines shut down (its images are deleted first, while the alternate
+//! screen is up), and restored on every other way out: error, panic (the terminal's hook),
+//! SIGHUP (its handler) and [`Frontend::before_forced_exit`]; SIGTSTP suspends and SIGCONT
+//! redraws everything.
 //!
 //! Must not own: browser policy (the core) or which effect runs (the session).
 
@@ -93,6 +101,11 @@ const NOTICE_FIRST: Duration = Duration::from_secs(5);
 /// The most bytes one write may leave waiting for the terminal: the bound on an encoded frame
 /// (8 Mpx of RGBA, compressed, in base64, fits unless the page is noise).
 const OUTPUT_CAP: usize = 16 * 1024 * 1024;
+/// How often text mode takes a frame. Still at most `[tui] fps`. The frame is taken so a page
+/// keeps drawing and graphics shows the latest one, not so it can be read back at `[tui] fps`.
+const TEXT_FPS: u32 = 2;
+/// An empty last chunk. Ends a kitty image upload a resize cut after its `m=1`.
+const KITTY_UPLOAD_END: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
 /// The most pasted text the address line or a page's field takes.
 const MAX_PASTE: usize = 1024 * 1024;
 /// The page rows' message when the terminal shows no images.
@@ -100,8 +113,7 @@ const NO_GRAPHICS: &str =
     "This terminal can't show graphics; chrome.text-mode shows the page as text";
 /// The page rows' message in text mode when the shown page's engine gives no page text. The
 /// keys are the built-in `[tui.keys]` ones.
-const NO_SEMANTICS: &str =
-    "No page text from this engine (WPE WebKit has it): e switches engine, m shows graphics";
+const NO_SEMANTICS: &str = "No page text from this engine: e switches engine, m shows graphics";
 /// The page rows' message in text mode until the first snapshot of the page arrives.
 const READING: &str = "Reading the page…";
 /// Lines a wheel notch scrolls in text mode.
@@ -161,6 +173,31 @@ enum Protocol {
     Sixel,
 }
 
+/// One write that has not finished leaving the output buffer.
+struct Outbound {
+    /// The write's length. Bytes still queued are its suffix.
+    len: usize,
+    /// A chunked kitty upload in that write, if it has an `m=1` chunk.
+    kitty: Option<ChunkedSpan>,
+}
+
+/// Where a kitty upload that started with `m=1` sits in a write.
+///
+/// `open_at` is the first byte after that `m=1`. `close_at` is the first byte after the `m=0`
+/// chunk, or the write's length when the upload does not finish in it. A resize whose
+/// already-sent prefix sits in `[open_at, close_at)` ends the upload, or the terminal waits.
+struct ChunkedSpan {
+    open_at: usize,
+    close_at: usize,
+}
+
+impl ChunkedSpan {
+    /// `sent` bytes of the write have already been accepted, and the cut is inside the upload.
+    fn cut(self, sent: usize) -> bool {
+        sent >= self.open_at && sent < self.close_at
+    }
+}
+
 /// One view's target as the loop sees it.
 struct Pixels {
     /// The kitty image id, from 1, never reused. Sixel does not use it.
@@ -189,6 +226,8 @@ struct Tui {
     page: PageArea,
     /// The page rows show pages as text.
     text_mode: bool,
+    /// The last `PageTyping` sent to the core. `None` until the first.
+    typing_told: Option<bool>,
     /// `chrome.toggle-mode`'s choice for this run (true: text), over `[tui] mode`.
     mode_override: Option<bool>,
     /// Each view's page as text, and the field editor over it.
@@ -230,6 +269,10 @@ struct Tui {
     clear: bool,
     cursor_shown: bool,
     mouse_on: bool,
+    /// The last write still draining, so a resize can see whether it cut a kitty upload.
+    outbound: Option<Outbound>,
+    /// Images were deleted on the way out. A later [`Self::leave`] only restores again.
+    left: bool,
 }
 
 /// The owner loop's state.
@@ -472,6 +515,7 @@ impl App {
             graphics: false,
             protocol: Protocol::None,
             text_mode: false,
+            typing_told: None,
             mode_override: None,
             text: TextPages::new(size.cols, page_area(size).rows),
             semantic_on: HashSet::new(),
@@ -497,6 +541,8 @@ impl App {
             cursor_shown: false,
             // The terminal's enter sequence turns the mouse on.
             mouse_on: true,
+            outbound: None,
+            left: false,
         };
         tui.adopt(settings);
         if let Some(notice) = notice {
@@ -584,6 +630,14 @@ impl App {
             // After the pump, which may have opened a view: nothing is drawn for it before the
             // engine is asked for its text.
             worked |= self.sync_semantics();
+            // Startup in text mode, a resize that loses images, a reload of `[tui] mode`.
+            // `chrome_command` already told the core when `m` changed the mode.
+            let mut typing = VecDeque::new();
+            if self.tui.sync_typing(&mut typing) {
+                self.session.queue_mut().extend(typing);
+                self.run_core();
+                worked = true;
+            }
             worked |= self.write();
             if !worked {
                 busy = false;
@@ -646,11 +700,18 @@ impl App {
 
     /// The shown view has a frame the terminal could show.
     fn frame_waiting(&self) -> bool {
-        (self.tui.graphics || self.tui.text_mode)
-            && self
-                .shown()
-                .and_then(|(_, target)| self.tui.targets.get(&target))
-                .is_some_and(|pixels| pixels.ready)
+        let Some((view, target)) = self.shown() else {
+            return false;
+        };
+        takes_frames(
+            self.tui.graphics,
+            self.tui.text_mode,
+            self.tui.semantic_on.contains(&view),
+        ) && self
+            .tui
+            .targets
+            .get(&target)
+            .is_some_and(|pixels| pixels.ready)
     }
 
     /// `sig` can't go on: reports `error` and quits with a failure.
@@ -677,6 +738,8 @@ impl App {
     /// SIGCONT entered the terminal again: what was waiting is dropped and everything is drawn
     /// again, mouse reporting as configured.
     fn resumed(&mut self) {
+        // The span belonged to the screen `SIGCONT` already left.
+        self.tui.outbound = None;
         self.tui.terminal.discard_pending();
         self.tui.mouse_on = true;
         let settings = self.tui.settings;
@@ -727,6 +790,9 @@ impl App {
         }
         let event = match event {
             TermEvent::Resize(_) => {
+                // The queued bytes are the old layout's. A kitty upload already begun is ended
+                // so the terminal does not wait for the rest of it.
+                self.tui.discard_for_resize();
                 self.tui.relayout();
                 return self.tui.redraw_all();
             }
@@ -1061,6 +1127,9 @@ impl App {
         if let Err(error) = self.tui.terminal.write_frame(&[]) {
             self.fail(format!("writing to the terminal failed: {error}"));
         }
+        if self.tui.terminal.pending_len() == 0 {
+            self.tui.outbound = None;
+        }
         if self.tui.terminal.pending_len() > 0 {
             return false;
         }
@@ -1089,6 +1158,7 @@ impl App {
         if let Err(error) = self.tui.terminal.write_frame(&out) {
             self.fail(format!("writing to the terminal failed: {error}"));
         }
+        self.tui.note_outbound(&out);
         true
     }
 
@@ -1265,18 +1335,18 @@ impl App {
             return;
         };
         let metrics = self.tui.metrics;
-        let interval = frame_interval(self.tui.settings, self.tui.pace_sixel());
+        let interval = frame_interval(self.tui.settings, self.tui.pace_sixel(), self.tui.text_mode);
         let protocol = self.tui.protocol;
         let (cell_width, cell_height) = {
             let size = self.tui.terminal.size();
             (size.cell_width, size.cell_height)
         };
-        let Some(pixels) = self
-            .tui
-            .targets
-            .get_mut(&target)
-            .filter(|_| self.tui.graphics || self.tui.text_mode)
-        else {
+        let takes = takes_frames(
+            self.tui.graphics,
+            self.tui.text_mode,
+            self.tui.semantic_on.contains(&view),
+        );
+        let Some(pixels) = self.tui.targets.get_mut(&target).filter(|_| takes) else {
             return;
         };
         let now = Instant::now();
@@ -1414,10 +1484,13 @@ impl App {
         self.run_core();
     }
 
-    /// Shuts down in plan §20's order ([`Session::shutdown`]), then restores the terminal. If an
-    /// engine could not shut down, the session restores it through
-    /// [`Frontend::before_forced_exit`] and ends the process.
+    /// Turns the terminal's modes off, then shuts the engines down ([`Session::shutdown`]).
+    /// Images are deleted while the alternate screen is still up. Servo can take a while, and
+    /// raw mode would leave the quit key's release in the tty for the shell. The second
+    /// restore discards input that arrived during shutdown. If an engine could not shut down,
+    /// the session restores through [`Frontend::before_forced_exit`] and ends the process.
     fn shutdown(mut self) -> ExitCode {
+        self.tui.leave();
         let code = self
             .session
             .shutdown(&mut self.tui, |session, tui| report(tui, session, true));
@@ -1444,14 +1517,51 @@ impl Tui {
         }
         self.settings = settings;
         self.relayout();
-        // After relayout, so a switch onto sixel picks up the 5 fps cap.
-        let interval = frame_interval(self.settings, self.pace_sixel());
+        // After relayout, so a switch onto sixel picks up the 5 fps cap, and text mode its own.
+        let interval = frame_interval(self.settings, self.pace_sixel(), self.text_mode);
         self.next_frame = self.next_frame.map(|at| at.min(Instant::now() + interval));
     }
 
     /// Sixel frames are capped at 5 fps. Text mode on a sixel terminal is not.
     fn pace_sixel(&self) -> bool {
         self.graphics && self.protocol == Protocol::Sixel
+    }
+
+    /// Tells the core whether a focused field takes character keys. Text mode shows the page
+    /// itself, so it does not. Idempotent: nothing is queued when the core was already told.
+    /// Returns whether it queued `PageTyping`.
+    fn sync_typing(&mut self, queue: &mut VecDeque<BrowserEvent>) -> bool {
+        let typing = !self.text_mode;
+        if self.typing_told == Some(typing) {
+            return false;
+        }
+        self.typing_told = Some(typing);
+        queue.push_back(BrowserEvent::PageTyping(typing));
+        true
+    }
+
+    /// Remember `frame` while any of it is still queued, so a resize can tell a cut kitty
+    /// upload from one the terminal has not started.
+    fn note_outbound(&mut self, frame: &[u8]) {
+        let pending = self.terminal.pending_len();
+        // A queued terminator from an earlier sequence makes `pending` not a suffix of `frame`.
+        self.outbound = (pending > 0 && pending <= frame.len()).then(|| Outbound {
+            len: frame.len(),
+            kitty: chunked_kitty_span(frame),
+        });
+    }
+
+    /// Drop output queued for the layout being replaced. If the bytes already accepted began a
+    /// chunked kitty upload and did not finish it, end it with an empty `m=0` chunk.
+    fn discard_for_resize(&mut self) {
+        let tail = self.outbound.take().is_some_and(|out| {
+            let sent = out.len.saturating_sub(self.terminal.pending_len());
+            out.kitty.is_some_and(|span| span.cut(sent))
+        });
+        self.terminal.discard_pending();
+        if tail {
+            let _ = self.terminal.write_frame(KITTY_UPLOAD_END);
+        }
     }
 
     /// Drops the image a shown view left on the page. Kitty deletes by id. Sixel rewrites
@@ -1655,20 +1765,25 @@ impl Tui {
         }
     }
 
-    /// Deletes every image and gives the terminal back. Bytes still waiting are dropped: what
-    /// they would have drawn is about to be left behind with the alternate screen.
+    /// Deletes every image, once, and gives the terminal back. Bytes still waiting are dropped:
+    /// what they would have drawn is left behind with the alternate screen. A later call only
+    /// restores again, which discards input queued since the first.
     fn leave(&mut self) {
-        self.terminal.discard_pending();
-        if self.graphics {
-            match self.protocol {
-                Protocol::Kitty => {
-                    let _ = self.terminal.write_frame(kitty::DELETE_ALL);
+        if !self.left {
+            self.left = true;
+            self.outbound = None;
+            self.terminal.discard_pending();
+            if self.graphics {
+                match self.protocol {
+                    Protocol::Kitty => {
+                        let _ = self.terminal.write_frame(kitty::DELETE_ALL);
+                    }
+                    // The alternate screen's images are not dropped by leaving it.
+                    Protocol::Sixel => {
+                        let _ = self.terminal.write_frame(b"\x1b[H\x1b[2J");
+                    }
+                    Protocol::None => {}
                 }
-                // The alternate screen's images are not dropped by leaving it.
-                Protocol::Sixel => {
-                    let _ = self.terminal.write_frame(b"\x1b[H\x1b[2J");
-                }
-                Protocol::None => {}
             }
         }
         let _ = self.terminal.restore();
@@ -1774,7 +1889,7 @@ impl Frontend for Tui {
         }
     }
 
-    fn chrome_command(&mut self, action: String, _queue: &mut VecDeque<BrowserEvent>) {
+    fn chrome_command(&mut self, action: String, queue: &mut VecDeque<BrowserEvent>) {
         match action.as_str() {
             "toggle-mode" => self.set_mode(!self.text_mode),
             "text-mode" => self.set_mode(true),
@@ -1787,6 +1902,8 @@ impl Frontend for Tui {
                 ));
             }
         }
+        // `m` then `q` in one read: this queue is drained before the next key is handled.
+        self.sync_typing(queue);
     }
 
     /// A terminal has no pointer shapes.
@@ -1905,12 +2022,77 @@ fn empty_metrics() -> Metrics {
     Metrics::new(LayoutEpoch::next(), WindowRect::default(), Scale::ONE)
 }
 
-fn frame_interval(settings: TuiConfig, sixel: bool) -> Duration {
-    let fps = match sixel {
+fn frame_interval(settings: TuiConfig, sixel: bool, text: bool) -> Duration {
+    let mut fps = match sixel {
         true => settings.fps.clamp(1, 5),
         false => settings.fps.max(1),
     };
+    if text {
+        fps = fps.min(TEXT_FPS);
+    }
     Duration::from_secs(1) / fps
+}
+
+/// Graphics always takes frames. Text mode takes them only for an engine that gives page text:
+/// nothing else reads the pixels.
+fn takes_frames(graphics: bool, text_mode: bool, semantics: bool) -> bool {
+    graphics || (text_mode && semantics)
+}
+
+#[cfg(test)]
+/// Whether `sent` bytes of `frame` already began a chunked kitty upload and have not finished it.
+fn resize_discard_tail(frame: &[u8], sent: usize) -> bool {
+    chunked_kitty_span(frame).is_some_and(|span| span.cut(sent))
+}
+
+/// The first `m=1` kitty chunk in `frame` through its `m=0` chunk, if the upload is chunked.
+fn chunked_kitty_span(frame: &[u8]) -> Option<ChunkedSpan> {
+    let mut index = 0;
+    let mut open_at = None;
+    while let Some(at) = frame[index..]
+        .windows(3)
+        .position(|window| window == b"\x1b_G")
+    {
+        let body = index + at + 3;
+        let rest = &frame[body..];
+        let semi = rest.iter().position(|byte| *byte == b';');
+        let st = rest.windows(2).position(|window| window == b"\x1b\\");
+        // The control is the keys before `;`. A chunk with no `;` stops at `ST`, so a later
+        // chunk's `m=1` is not read as this one's.
+        let control_end = match (semi, st) {
+            (Some(semi), Some(st)) => semi.min(st),
+            (Some(semi), None) => semi,
+            (None, Some(st)) => st,
+            (None, None) => rest.len(),
+        };
+        let control = &rest[..control_end];
+        let chunk_end = st.map_or(frame.len(), |at| body + at + 2);
+        if open_at.is_none() {
+            open_at = control
+                .windows(3)
+                .position(|window| window == b"m=1")
+                .map(|at| body + at + 3);
+        }
+        if let Some(open_at) = open_at {
+            if control.windows(3).any(|window| window == b"m=0") {
+                return Some(ChunkedSpan {
+                    open_at,
+                    close_at: chunk_end,
+                });
+            }
+        }
+        if chunk_end <= body {
+            break;
+        }
+        index = chunk_end;
+        if index >= frame.len() {
+            break;
+        }
+    }
+    open_at.map(|open_at| ChunkedSpan {
+        open_at,
+        close_at: frame.len(),
+    })
 }
 
 /// Kitty where the terminal answered the graphics query and `[tui] graphics` allows it,
@@ -2121,12 +2303,97 @@ mod tests {
             fps,
             ..TuiConfig::default()
         };
-        assert_eq!(frame_interval(fps(10), false), Duration::from_millis(100));
-        assert_eq!(frame_interval(fps(0), false), Duration::from_secs(1));
-        assert_eq!(frame_interval(fps(10), true), Duration::from_millis(200));
-        assert_eq!(frame_interval(fps(5), true), Duration::from_millis(200));
-        assert_eq!(frame_interval(fps(4), true), Duration::from_millis(250));
-        assert_eq!(frame_interval(fps(0), true), Duration::from_secs(1));
+        assert_eq!(
+            frame_interval(fps(10), false, false),
+            Duration::from_millis(100)
+        );
+        assert_eq!(frame_interval(fps(0), false, false), Duration::from_secs(1));
+        assert_eq!(
+            frame_interval(fps(10), true, false),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            frame_interval(fps(5), true, false),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            frame_interval(fps(4), true, false),
+            Duration::from_millis(250)
+        );
+        assert_eq!(frame_interval(fps(0), true, false), Duration::from_secs(1));
+        // Text mode is at most TEXT_FPS, and still at most the sixel cap.
+        assert_eq!(
+            frame_interval(fps(10), false, true),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            frame_interval(fps(2), false, true),
+            Duration::from_millis(500)
+        );
+        assert_eq!(frame_interval(fps(1), false, true), Duration::from_secs(1));
+        assert_eq!(frame_interval(fps(0), false, true), Duration::from_secs(1));
+        assert_eq!(
+            frame_interval(fps(10), true, true),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn text_mode_takes_frames_only_when_the_engine_gives_page_text() {
+        assert!(takes_frames(true, false, false));
+        assert!(takes_frames(true, true, false));
+        assert!(takes_frames(true, false, true));
+        assert!(takes_frames(false, true, true));
+        assert!(!takes_frames(false, true, false));
+        assert!(!takes_frames(false, false, true));
+        assert!(!takes_frames(false, false, false));
+    }
+
+    #[test]
+    fn a_resize_ends_a_chunked_kitty_upload_only_when_the_cut_is_inside_it() {
+        let chunk = |control: &str, payload: &str| {
+            let mut out = b"\x1b_G".to_vec();
+            out.extend_from_slice(control.as_bytes());
+            out.push(b';');
+            out.extend_from_slice(payload.as_bytes());
+            out.extend_from_slice(b"\x1b\\");
+            out
+        };
+        let first = chunk("a=T,q=2,m=1", "AAAA");
+        let last = chunk("q=2,m=0", "BBBB");
+        let mut frame = first.clone();
+        frame.extend_from_slice(&last);
+        let after_m1 = frame
+            .windows(3)
+            .position(|window| window == b"m=1")
+            .unwrap()
+            + 3;
+        assert!(!resize_discard_tail(&frame, 0), "nothing sent");
+        assert!(
+            !resize_discard_tail(&frame, frame.len()),
+            "the m=0 chunk was sent"
+        );
+        assert!(!resize_discard_tail(&frame, after_m1 - 1));
+        assert!(resize_discard_tail(&frame, after_m1));
+        assert!(resize_discard_tail(&frame, first.len()), "between chunks");
+        assert!(resize_discard_tail(&frame, frame.len() - 1));
+
+        let mut prefixed = b"\x1b[H\x1b[2J".to_vec();
+        let prefix = prefixed.len();
+        prefixed.extend_from_slice(&frame);
+        assert!(!resize_discard_tail(&prefixed, prefix), "chrome only");
+        assert!(resize_discard_tail(&prefixed, prefix + after_m1));
+
+        let mut with_cursor = frame.clone();
+        let close = with_cursor.len();
+        with_cursor.extend_from_slice(b"\x1b[u");
+        assert!(!resize_discard_tail(&with_cursor, close));
+        assert!(resize_discard_tail(&with_cursor, close - 1));
+
+        let one = chunk("a=T,q=2,m=0", "AAAA");
+        assert!(!resize_discard_tail(&one, 0));
+        assert!(!resize_discard_tail(&one, one.len() / 2));
+        assert!(!resize_discard_tail(&one, one.len()));
     }
 
     #[test]

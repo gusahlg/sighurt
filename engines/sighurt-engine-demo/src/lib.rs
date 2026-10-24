@@ -26,7 +26,9 @@
 //!
 //! Every page shows a square in its top-left corner, green while the page has the keyboard, and
 //! typing into a page appends the text to its title and shows it in the status line, so a
-//! screenshot shows where keys went.
+//! screenshot shows where keys went. Focusing the text field, or setting its value, through a
+//! semantic action reports `TextInputChanged`; a new document clears it. `CAPABILITIES.text_input`
+//! stays false: that flag is IME composition, which this engine does not do.
 //!
 //! The engine has no history of its own (`history_traversal: false`, so the core gives it a view
 //! per page) and no page zoom. Everything happens on the owner thread, synchronously, so it
@@ -48,9 +50,9 @@ use sighurt_api::engine::{
     ViewOptions,
 };
 use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
-use sighurt_api::geometry::{Metrics, SurfacePoint};
+use sighurt_api::geometry::{Metrics, SurfacePoint, SurfaceRect};
 use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, ViewId};
-use sighurt_api::input::{ButtonState, InputKind, Key, PointerEvent};
+use sighurt_api::input::{ButtonState, InputKind, Key, PointerEvent, TextInputState, TextPurpose};
 use sighurt_api::present::CpuTarget;
 use sighurt_api::semantic::{NodeId, NodeKind, SemanticAction, SemanticNode, SemanticSnapshot};
 use sighurt_wayland::TargetLease;
@@ -59,7 +61,8 @@ use sighurt_wayland::TargetLease;
 pub const NAME: &str = "demo";
 
 /// What the demo engine supports: content as structure (a small fixed tree, see [`snapshot`]),
-/// and none of the other optional operations.
+/// and none of the other optional operations. `text_input` is IME composition, not the text
+/// field's focus, which is reported as `TextInputChanged`.
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     history_traversal: false,
     text_input: false,
@@ -142,6 +145,8 @@ struct View<T: CpuTarget> {
     /// The view's document failed (`demo:crash`); reloading recovers it.
     failed: bool,
     typed: String,
+    /// The text field has focus, as a semantic `Focus` or `SetValue` left it.
+    field: bool,
     pointer: Option<SurfacePoint>,
     /// The animation's clock.
     started: Instant,
@@ -169,6 +174,7 @@ impl<T: CpuTarget> View<T> {
             page: None,
             failed: false,
             typed: String::new(),
+            field: false,
             pointer: None,
             started: Instant::now(),
             rendered: None,
@@ -298,6 +304,7 @@ impl<T: CpuTarget> DemoRuntime<T> {
                 view.page = Some((page, url.clone()));
                 view.failed = false;
                 view.typed.clear();
+                view.field = false;
                 view.pointer = None;
                 view.started = Instant::now();
                 view.dirty = true;
@@ -326,6 +333,10 @@ impl<T: CpuTarget> DemoRuntime<T> {
                 queue.push(EngineEvent::StatusTextChanged {
                     view: id,
                     text: None,
+                });
+                queue.push(EngineEvent::TextInputChanged {
+                    view: id,
+                    state: None,
                 });
                 queue.extend(view.snapshot_event(id));
             }
@@ -369,13 +380,29 @@ impl<T: CpuTarget> DemoRuntime<T> {
             } => {
                 view.typed = value;
                 keep_last_chars(&mut view.typed, MAX_TYPED);
+                view.field = true;
                 view.typed_changed(id, &mut self.queue);
+                self.queue.push(EngineEvent::TextInputChanged {
+                    view: id,
+                    state: Some(text_field_state()),
+                });
             }
             SemanticAction::SelectOption {
                 node: NodeId(NODE_SELECT),
                 index,
             } if index < 3 => view.colour = index,
-            SemanticAction::Focus(_) | SemanticAction::ScrollIntoView(_) => return Ok(()),
+            SemanticAction::Focus(NodeId(node)) => {
+                let focused = node == NODE_FIELD;
+                if view.field != focused {
+                    view.field = focused;
+                    self.queue.push(EngineEvent::TextInputChanged {
+                        view: id,
+                        state: focused.then(text_field_state),
+                    });
+                }
+                return Ok(());
+            }
+            SemanticAction::ScrollIntoView(_) => return Ok(()),
             _ => {
                 return Err(EngineError::View {
                     view: id,
@@ -523,6 +550,16 @@ fn snapshot(
         .collect(),
         focus: None,
         truncated: false,
+    }
+}
+
+/// The text field's input state. The caret is unused: the terminal has no input method.
+fn text_field_state() -> TextInputState {
+    TextInputState {
+        caret: SurfaceRect::default(),
+        surrounding: None,
+        purpose: TextPurpose::Normal,
+        multiline: false,
     }
 }
 
@@ -789,5 +826,131 @@ mod tests {
         keep_last_chars(&mut text, MAX_TYPED);
         assert_eq!(text.chars().count(), MAX_TYPED);
         assert!(text.ends_with("åäö"));
+    }
+
+    /// A target that is never presented. The field's focus does not need pixels.
+    struct Mem {
+        metrics: Metrics,
+    }
+
+    struct Permit {
+        epoch: LayoutEpoch,
+    }
+
+    impl CpuTarget for Mem {
+        type Permit = Permit;
+
+        fn metrics(&self) -> Metrics {
+            self.metrics
+        }
+
+        fn permit_epoch(permit: &Self::Permit) -> LayoutEpoch {
+            permit.epoch
+        }
+
+        fn submit(
+            &mut self,
+            _: Self::Permit,
+            _: &mut dyn FnMut(sighurt_api::present::Frame<'_>) -> Result<(), String>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn pump_all(runtime: &mut DemoRuntime<Mem>) -> Vec<EngineEvent> {
+        let mut all = Vec::new();
+        loop {
+            let mut batch = Vec::new();
+            let status = runtime.pump(&mut batch);
+            all.extend(batch);
+            match status {
+                PumpStatus::Pending { deadline: None } => {}
+                PumpStatus::Idle | PumpStatus::Pending { deadline: Some(_) } => break,
+            }
+        }
+        all
+    }
+
+    fn last_text_input(events: &[EngineEvent]) -> Option<bool> {
+        events.iter().rev().find_map(|event| match event {
+            EngineEvent::TextInputChanged { state, .. } => Some(state.is_some()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn focusing_the_field_reports_text_input_and_a_new_document_clears_it() {
+        use sighurt_api::engine::EngineRuntime;
+        use sighurt_api::geometry::{Scale, WindowRect};
+
+        let mut runtime = DemoRuntime::new();
+        let view = ViewId::next();
+        let metrics = Metrics::new(
+            LayoutEpoch::next(),
+            WindowRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 40,
+            },
+            Scale::ONE,
+        );
+        runtime
+            .open_view(view, ViewOptions::default(), Mem { metrics })
+            .unwrap();
+        runtime
+            .command(
+                view,
+                EngineCommand::Navigate {
+                    navigation: NavigationId::next(),
+                    url: "demo://pattern".into(),
+                },
+            )
+            .unwrap();
+        let events = pump_all(&mut runtime);
+        assert_eq!(last_text_input(&events), Some(false));
+        let document = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::NavigationCommitted { document, .. } => Some(*document),
+                _ => None,
+            })
+            .expect("committed");
+
+        let semantic = |action| EngineCommand::Semantic { document, action };
+        runtime
+            .command(view, semantic(SemanticAction::Focus(NodeId(NODE_FIELD))))
+            .unwrap();
+        assert_eq!(last_text_input(&pump_all(&mut runtime)), Some(true));
+        runtime
+            .command(
+                view,
+                semantic(SemanticAction::SetValue {
+                    node: NodeId(NODE_FIELD),
+                    value: "zq".into(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(last_text_input(&pump_all(&mut runtime)), Some(true));
+        runtime
+            .command(
+                view,
+                semantic(SemanticAction::Focus(NodeId(NODE_LINK_ANIMATION))),
+            )
+            .unwrap();
+        assert_eq!(last_text_input(&pump_all(&mut runtime)), Some(false));
+        runtime
+            .command(view, semantic(SemanticAction::Focus(NodeId(NODE_FIELD))))
+            .unwrap();
+        runtime
+            .command(
+                view,
+                EngineCommand::Navigate {
+                    navigation: NavigationId::next(),
+                    url: "demo://animation".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(last_text_input(&pump_all(&mut runtime)), Some(false));
     }
 }

@@ -520,6 +520,24 @@ fn pty_golden_bytes_and_double_restore() {
 }
 
 #[test]
+fn restore_discards_a_key_release_queued_while_raw() {
+    let _deadline = arm_deadline();
+    let (master, slave) = open_pty().expect("openpty");
+    set_nonblock(&master);
+    let mut session = Terminal::enter(slave).expect("enter");
+    let _entered = read_until(&master, ENTER, Duration::from_secs(1));
+    // A kitty key release, as the quit key's release arrives after the press.
+    write_all(&master, b"\x1b[113;1:3u");
+    session.restore().expect("restore");
+    let slave = session.try_clone_fd().expect("dup");
+    // Restore puts the captured flags back, which may clear the non-blocking bit `enter` set.
+    set_nonblock(&slave);
+    let mut buf = [0u8; 64];
+    let n = read_once(&slave, &mut buf);
+    assert_eq!(n, 0, "the key release was left readable: {:?}", &buf[..n]);
+}
+
+#[test]
 fn probe_accepts_an_immediate_batch() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
