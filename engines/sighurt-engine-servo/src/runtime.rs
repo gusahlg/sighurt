@@ -1092,16 +1092,14 @@ impl<T: ServoTarget> ServoRuntime<T> {
                         extract_again = true;
                     }
                 }
-                Tag::Extract(document) => {
-                    view.semantics.inflight = false;
-                    if let Some(started) = view.semantics.started {
-                        view.semantics.took = started.elapsed();
+                Tag::Extract { document, token } => {
+                    // A result from before a page reset changes nothing.
+                    if let Some(again) = view.semantics.end_extract(token) {
+                        if current == Some(document) && on && !crashed {
+                            deliver = Some((document, result));
+                        }
+                        extract_again = again && on && !crashed;
                     }
-                    let again = std::mem::take(&mut view.semantics.again);
-                    if current == Some(document) && on && !crashed {
-                        deliver = Some((document, result));
-                    }
-                    extract_again = again && on && !crashed;
                 }
                 Tag::Check(token) => {
                     if view.semantics.check_token == token {
@@ -1766,8 +1764,9 @@ where
 
 /// Starts an extraction when semantics is on and the view has a document. The document
 /// generation is the one at the start. One already in flight is followed by another when it
-/// ends (`again`). Nothing is left due when there is nothing to extract: a due instant would
-/// make every pump runnable.
+/// ends (`again`). The result carries the extraction's token, so one that a page reset
+/// superseded is ignored. Nothing is left due when there is nothing to extract: a due
+/// instant would make every pump runnable.
 fn begin_extract<T: ServoTarget>(view: &mut View<T>, delegate: &Rc<Delegate>) {
     if !view.semantics.on {
         view.semantics.due = None;
@@ -1786,15 +1785,16 @@ fn begin_extract<T: ServoTarget>(view: &mut View<T>, delegate: &Rc<Delegate>) {
         view.semantics.again = true;
         return;
     }
-    view.semantics.inflight = true;
-    view.semantics.again = false;
-    view.semantics.due = None;
-    view.semantics.started = Some(Instant::now());
+    let token = view.semantics.begin_extract(Instant::now());
     let script = semantic::extraction_script();
     let delegate = Rc::clone(delegate);
     let webview_id = webview.id();
     webview.evaluate_javascript(&script, move |result| {
-        delegate.script_finished(webview_id, Tag::Extract(document), js_outcome(result));
+        delegate.script_finished(
+            webview_id,
+            Tag::Extract { document, token },
+            js_outcome(result),
+        );
     });
 }
 

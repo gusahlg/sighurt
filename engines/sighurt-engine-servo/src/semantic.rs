@@ -110,8 +110,13 @@ pub fn dirty_script() -> String {
 /// What a finished script was, carried from Servo's callback to the runtime.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Tag {
-    /// An extraction that started for this document.
-    Extract(DocumentGeneration),
+    /// An extraction that started for this document. `token` is [`Semantics::extract_token`]
+    /// at the start, so a result from an extraction that a page reset superseded changes no
+    /// state, and does not end the one running now.
+    Extract {
+        document: DocumentGeneration,
+        token: u64,
+    },
     /// An action that was sent for this document.
     Action(DocumentGeneration),
     /// A dirty-flag check. `token` is [`Semantics::check_token`] at the start, so a result
@@ -128,6 +133,8 @@ pub struct Semantics {
     pub inflight: bool,
     /// Another extraction was asked for while one was in flight.
     pub again: bool,
+    /// [`Tag::Extract`] of the extraction that is running, when `inflight`.
+    pub extract_token: u64,
     /// A dirty-flag check is running.
     pub checking: bool,
     /// [`Tag::Check`] of the check that is running, when `checking`.
@@ -155,6 +162,32 @@ impl Semantics {
         self.started = None;
         self.checked = None;
         self.check_token = self.check_token.wrapping_add(1);
+        self.extract_token = self.extract_token.wrapping_add(1);
+    }
+
+    /// An extraction starts at `now`. Returns its token for [`Tag::Extract`]. Call it only
+    /// when none is in flight.
+    pub fn begin_extract(&mut self, now: Instant) -> u64 {
+        self.inflight = true;
+        self.again = false;
+        self.due = None;
+        self.started = Some(now);
+        self.extract_token = self.extract_token.wrapping_add(1);
+        self.extract_token
+    }
+
+    /// An extraction with `token` finished. A result whose token is not current (a page
+    /// reset came between) changes nothing and returns `None`. Otherwise the extraction is
+    /// no longer in flight, `took` is set, and the result is the `again` that was waiting.
+    pub fn end_extract(&mut self, token: u64) -> Option<bool> {
+        if self.extract_token != token {
+            return None;
+        }
+        self.inflight = false;
+        if let Some(started) = self.started {
+            self.took = started.elapsed();
+        }
+        Some(std::mem::take(&mut self.again))
     }
 
     /// A new frame was reported. Returns whether the dirty flag should be checked now.
@@ -323,6 +356,39 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_extraction_result_changes_no_state() {
+        let mut semantics = Semantics {
+            on: true,
+            ..Semantics::default()
+        };
+        let old = semantics.begin_extract(Instant::now());
+        semantics.again = true;
+        // The page crashed: its scripts are gone, and a new document extracts.
+        semantics.reset_page();
+        assert!(!semantics.inflight);
+        let new = semantics.begin_extract(Instant::now());
+        assert_ne!(old, new);
+        semantics.again = true;
+        let took = semantics.took;
+        let started = semantics.started;
+        // The old extraction's late result must not end the new one.
+        assert_eq!(semantics.end_extract(old), None);
+        assert!(semantics.inflight);
+        assert!(semantics.again);
+        assert_eq!(semantics.took, took);
+        assert_eq!(semantics.started, started);
+        // The current one ends it, and hands back the `again` that waited.
+        assert_eq!(semantics.end_extract(new), Some(true));
+        assert!(!semantics.inflight);
+        assert!(!semantics.again);
+        // A result is stale once the next extraction has begun.
+        let next = semantics.begin_extract(Instant::now());
+        assert_ne!(new, next);
+        assert_eq!(semantics.end_extract(new), None);
+        assert!(semantics.inflight);
     }
 
     fn node_binary() -> Option<std::path::PathBuf> {
