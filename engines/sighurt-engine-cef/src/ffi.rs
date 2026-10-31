@@ -148,11 +148,19 @@ pub fn empty_string() -> CefStringUtf16 {
     }
 }
 
-/// Reads a `const cef_string_t*` CEF passes to a callback. Null is the empty string.
+/// The most UTF-16 units of page text (titles, status text, messages) converted: the core
+/// cuts text to 16 KiB anyway, so more is never allocated.
+pub const MAX_TEXT_UNITS: usize = 16 * 1024;
+/// The most UTF-16 units of an address converted (the core drops a URL over 2 MiB; so does
+/// [`read_url`], which never shortens one).
+pub const MAX_URL_UNITS: usize = 2 * 1024 * 1024;
+
+/// Reads at most `max` units of a `const cef_string_t*` CEF passes to a callback, the rest cut
+/// off before anything is allocated for it. Null is the empty string.
 ///
 /// # Safety
 /// `s` is null or points to a valid `cef_string_t`.
-pub unsafe fn read(s: *const CefStringUtf16) -> String {
+pub unsafe fn read_capped(s: *const CefStringUtf16, max: usize) -> String {
     if s.is_null() {
         return String::new();
     }
@@ -162,21 +170,70 @@ pub unsafe fn read(s: *const CefStringUtf16) -> String {
         if s.str_.is_null() {
             return String::new();
         }
-        String::from_utf16_lossy(std::slice::from_raw_parts(s.str_, s.length))
+        String::from_utf16_lossy(std::slice::from_raw_parts(s.str_, s.length.min(max)))
     }
 }
 
-/// Reads and frees a `cef_string_userfree_t` that CEF returned to us.
+/// [`read_capped`] at the size of page text.
+///
+/// # Safety
+/// As [`read_capped`].
+pub unsafe fn read(s: *const CefStringUtf16) -> String {
+    // SAFETY: by the contract above.
+    unsafe { read_capped(s, MAX_TEXT_UNITS) }
+}
+
+/// An address: `None` when it is longer than [`MAX_URL_UNITS`] (a shortened address would
+/// point somewhere else), checked before it is converted.
+///
+/// # Safety
+/// As [`read_capped`].
+pub unsafe fn read_url(s: *const CefStringUtf16) -> Option<String> {
+    // SAFETY: by the contract above.
+    unsafe {
+        if !s.is_null() && (*s).length > MAX_URL_UNITS {
+            return None;
+        }
+        Some(read_capped(s, MAX_URL_UNITS))
+    }
+}
+
+/// Reads and frees a `cef_string_userfree_t` that CEF returned to us, as [`read_capped`].
 ///
 /// # Safety
 /// `s` is null or came from a CEF getter that returns a string we own.
-pub unsafe fn take(s: *mut CefStringUtf16) -> String {
+pub unsafe fn take_capped(s: *mut CefStringUtf16, max: usize) -> String {
     if s.is_null() {
         return String::new();
     }
     // SAFETY: by the contract above.
     unsafe {
-        let text = read(s);
+        let text = read_capped(s, max);
+        (api().userfree_free)(s);
+        text
+    }
+}
+
+/// [`take_capped`] at the size of page text.
+///
+/// # Safety
+/// As [`take_capped`].
+pub unsafe fn take(s: *mut CefStringUtf16) -> String {
+    // SAFETY: by the contract above.
+    unsafe { take_capped(s, MAX_TEXT_UNITS) }
+}
+
+/// A returned address, as [`read_url`], freed.
+///
+/// # Safety
+/// As [`take_capped`].
+pub unsafe fn take_url(s: *mut CefStringUtf16) -> Option<String> {
+    if s.is_null() {
+        return Some(String::new());
+    }
+    // SAFETY: by the contract above.
+    unsafe {
+        let text = read_url(s);
         (api().userfree_free)(s);
         text
     }
@@ -405,4 +462,33 @@ pub fn post_ui(job: impl FnOnce() + Send + 'static) -> bool {
     // SAFETY: CEF adopts the task's reference; `TID_UI` is 0.
     let posted = unsafe { (api().post_task)(0, task) };
     posted != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_strings_are_cut_before_they_are_converted() {
+        let long = CefStr::new(&"a".repeat(MAX_TEXT_UNITS * 4));
+        let raw = long.raw();
+        // SAFETY: a valid string for the length of the test.
+        unsafe {
+            assert_eq!(read(&raw).len(), MAX_TEXT_UNITS);
+            assert_eq!(read_capped(&raw, 10), "aaaaaaaaaa");
+        }
+    }
+
+    #[test]
+    fn an_address_over_the_bound_is_dropped_never_shortened() {
+        let ok = CefStr::new("https://example.com/");
+        let long = CefStr::new(&"a".repeat(MAX_URL_UNITS + 1));
+        let (ok, long) = (ok.raw(), long.raw());
+        // SAFETY: valid strings for the length of the test.
+        unsafe {
+            assert_eq!(read_url(&ok).as_deref(), Some("https://example.com/"));
+            assert_eq!(read_url(&long), None);
+            assert_eq!(read_url(std::ptr::null()).as_deref(), Some(""));
+        }
+    }
 }

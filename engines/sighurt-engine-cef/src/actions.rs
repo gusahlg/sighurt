@@ -67,33 +67,15 @@ pub enum Action {
     },
     /// Insert committed text at the caret.
     ImeCommit(String),
-    /// Type text as characters (a paste).
-    Type(String),
     /// Show composition text.
     ImeSet(String),
     /// Drop the composition.
     ImeCancel,
-    /// Cut the selection (after the browser took its text).
-    Cut,
     /// Close the browser (forced: its page is not asked).
     Close,
 }
 
 impl Action {
-    /// Whether it may wait for the browser to exist. Input may not: there is no page to type in.
-    pub fn deferrable(&self) -> bool {
-        matches!(
-            self,
-            Self::Load(_)
-                | Self::Reload
-                | Self::Stop
-                | Self::Resize
-                | Self::Hidden(_)
-                | Self::Focus(_)
-                | Self::Zoom(_)
-        )
-    }
-
     /// Does it.
     pub fn perform(&self, browser: &Ref<CefBrowser>, host: &Ref<CefBrowserHost>) {
         let (b, h) = (browser.as_ptr(), host.as_ptr());
@@ -196,23 +178,6 @@ impl Action {
                     let invalid = CefRange { from: -1, to: -1 };
                     call!(h, ime_commit_text, &text.raw(), &invalid, 0);
                 }
-                Self::Type(text) => {
-                    for unit in text.replace('\n', "\r").encode_utf16() {
-                        let event = CefKeyEvent {
-                            size: std::mem::size_of::<CefKeyEvent>(),
-                            type_: KEY_CHAR,
-                            modifiers: 0,
-                            windows_key_code: i32::from(unit),
-                            native_key_code: 0,
-                            is_system_key: 0,
-                            character: unit,
-                            unmodified_character: unit,
-                            focus_on_editable_field: 0,
-                            _pad: 0,
-                        };
-                        call!(h, send_key_event, &event);
-                    }
-                }
                 Self::ImeSet(text) => {
                     let len = i32::try_from(text.encode_utf16().count()).unwrap_or(i32::MAX);
                     let text = CefStr::new(text);
@@ -230,11 +195,6 @@ impl Action {
                 }
                 Self::ImeCancel => call!(h, ime_cancel_composition),
                 Self::Close => call!(h, close_browser, 1),
-                Self::Cut => {
-                    if let Some(frame) = Ref::adopt(call!(b, get_focused_frame)) {
-                        call!(frame.as_ptr(), cut);
-                    }
-                }
             }
         }
     }
