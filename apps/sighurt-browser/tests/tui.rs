@@ -359,21 +359,64 @@ fn sixel_image(bytes: &[u8]) -> bool {
     false
 }
 
+/// Control and payload of each kitty `a=T` chunk whose APC ended with ST (`ESC \`).
+///
+/// The header (`s=`, `c=`) is sent before the payload, and one `write` stops before the `ESC`
+/// of ST. A reader that stops at the header snapshots a prefix. Under load that write is short,
+/// the pty accepts the header and part of the payload, and a later complete frame of the same
+/// page does not compare equal.
+fn kitty_placements(bytes: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] != 0x1b || bytes[i + 1] != b'_' || bytes[i + 2] != b'G' {
+            i += 1;
+            continue;
+        }
+        let control_at = i + 3;
+        let Some(mark) = bytes[control_at..]
+            .iter()
+            .position(|&byte| byte == b';' || byte == 0x1b)
+        else {
+            break;
+        };
+        if bytes[control_at + mark] != b';' {
+            i = control_at + mark;
+            continue;
+        }
+        let control = &bytes[control_at..control_at + mark];
+        let payload_at = control_at + mark + 1;
+        let Some(end) = bytes[payload_at..].iter().position(|&byte| byte == 0x1b) else {
+            break;
+        };
+        let st = payload_at + end;
+        if bytes.get(st + 1) != Some(&b'\\') {
+            i = st + 1;
+            continue;
+        }
+        if control.starts_with(b"a=T,") {
+            out.push((control, &bytes[payload_at..st]));
+        }
+        i = st + 2;
+    }
+    out
+}
+
 /// A kitty image transmission placed over `columns`×`rows` cells, `width`×`height` pixels.
+/// The placement counts once its first chunk's APC has been terminated.
 fn image(bytes: &[u8], columns: u16, rows: u16, width: u32, height: u32) -> bool {
     let size = format!("s={width},v={height},");
     let cells = format!("c={columns},r={rows},");
-    bytes.split(|&byte| byte == 0x1b).any(|apc| {
-        apc.starts_with(b"_Ga=T,") && has(apc, size.as_bytes()) && has(apc, cells.as_bytes())
-    })
+    kitty_placements(bytes)
+        .into_iter()
+        .any(|(control, _payload)| has(control, size.as_bytes()) && has(control, cells.as_bytes()))
 }
 
-/// The start of each kitty image's pixels (its first chunk), in the order they were sent.
+/// The pixels of each finished kitty `a=T` chunk, in the order they were sent.
 fn images(bytes: &[u8]) -> Vec<&[u8]> {
-    bytes
-        .split(|&byte| byte == 0x1b)
-        .filter(|apc| apc.starts_with(b"_Ga=T,"))
-        .filter_map(|apc| apc.iter().position(|&b| b == b';').map(|at| &apc[at + 1..]))
+    kitty_placements(bytes)
+        .into_iter()
+        .map(|(_control, payload)| payload)
         .collect()
 }
 
@@ -582,6 +625,22 @@ fn sigterm_quits_and_restores_the_terminal() {
     );
 }
 
+/// A kitty placement is the frame's pixels only after ST. The header alone is not a frame:
+/// `plan_write` sends it ahead of the payload, and a short write leaves a prefix.
+#[test]
+fn a_partial_kitty_placement_is_not_the_frames_pixels() {
+    let partial = b"\x1b_Ga=T,f=32,o=z,t=d,s=800,v=440,i=1,c=80,r=22,C=1,q=2,m=1;eJzPREFIX";
+    assert!(!image(partial, 80, 22, 800, 440));
+    assert!(images(partial).is_empty());
+    let mut done = partial.to_vec();
+    done.extend_from_slice(b"\x1b\\");
+    assert!(image(&done, 80, 22, 800, 440));
+    assert_eq!(images(&done).as_slice(), [b"eJzPREFIX".as_slice()]);
+    // A later chunk of the same image is not another placement.
+    done.extend_from_slice(b"\x1b_Gq=2,m=0;TAIL\x1b\\");
+    assert_eq!(images(&done).as_slice(), [b"eJzPREFIX".as_slice()]);
+}
+
 /// `text` as Rio sends it with the kitty keyboard protocol on: each key a press (with its text)
 /// and a release, in `CSI u`, and Enter, Escape and Left as named keys.
 fn kitty_keys(text: &str) -> Vec<u8> {
@@ -632,7 +691,9 @@ fn kitty_keys_open_addresses_tabs_and_quit() {
     });
     assert!(
         back,
-        "the edited address was not demo://pattern\n{}",
+        "the edited address was not demo://pattern (snapshot {} bytes, last {:?})\n{}",
+        pattern.len(),
+        images(&term.got[since..]).last().map(|pixels| pixels.len()),
         term.context()
     );
 
@@ -981,6 +1042,7 @@ fn graphics_mode_keeps_a_focused_fields_letters_for_the_page() {
 /// presented frame shows both; it cannot model a page that has text only after a frame.)
 #[test]
 fn text_mode_takes_the_engines_frames_and_sends_none() {
+    let started = Instant::now();
     let mut term = Terminal::start_in(
         "text-frames",
         &["demo://animation"],
@@ -992,11 +1054,13 @@ fn text_mode_takes_the_engines_frames_and_sends_none() {
     std::thread::sleep(Duration::from_secs(2));
     let _ = term.tabs();
     let frames = term.counter("page_frames_presented");
-    // `[tui] fps` is 10. Text mode takes at most 2 a second, including the frames before this
-    // wait and the moment the report is written.
+    // Text mode takes at most 2 frames a second (`TEXT_FPS`), from process start through the
+    // report. Four seconds covers a quiet startup plus this wait; a loaded machine stretches
+    // the startup, and the same cap follows the clock instead of failing a longer run.
+    let seconds = started.elapsed().as_secs() + 1;
     assert!(
-        frames > 0 && frames <= 8,
-        "text mode presented {frames} frames\n{}",
+        frames > 0 && frames <= 2 * seconds.max(4),
+        "text mode presented {frames} frames in {seconds} s\n{}",
         term.context()
     );
     assert_eq!(term.counter("encoded_bytes"), 0, "{}", term.context());

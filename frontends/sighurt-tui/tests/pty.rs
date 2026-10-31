@@ -107,6 +107,32 @@ fn fail_if_late(what: &str) {
     }
 }
 
+/// The hang bound starts again once this test holds the session.
+///
+/// `Session::enter` waits on one process-wide lock while the other pty tests
+/// hold it. That queue is their work. A clock started before `enter` runs out
+/// in the queue under load, and this test then fails before its own condition
+/// (the bytes it asked for, the reply it is waiting on) has happened.
+fn budget_after_enter() {
+    DEADLINE.with(|slot| {
+        if slot.get().is_some() {
+            slot.set(Some(Instant::now() + TEST_LIMIT));
+        }
+    });
+}
+
+fn enter_session(fd: OwnedFd) -> Terminal {
+    let session = Terminal::enter(fd).expect("enter");
+    budget_after_enter();
+    session
+}
+
+fn enter_session_with(fd: OwnedFd, cap: usize) -> Terminal {
+    let session = Terminal::enter_with(fd, cap).expect("enter");
+    budget_after_enter();
+    session
+}
+
 fn worker_bin() -> std::path::PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_sighurt_tui_worker") {
         return std::path::PathBuf::from(path);
@@ -473,7 +499,7 @@ fn pty_golden_bytes_and_double_restore() {
     set_nonblock(&master);
     let flags_before = rustix::fs::fcntl_getfl(&slave).expect("getfl");
     let original = cooked(&slave);
-    let mut session = Terminal::enter(slave).expect("enter");
+    let mut session = enter_session(slave);
     let entered = read_until(&master, ENTER, Duration::from_secs(1));
     assert!(
         entered.windows(ENTER.len()).any(|window| window == ENTER),
@@ -524,7 +550,7 @@ fn restore_discards_a_key_release_queued_while_raw() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
-    let mut session = Terminal::enter(slave).expect("enter");
+    let mut session = enter_session(slave);
     let _entered = read_until(&master, ENTER, Duration::from_secs(1));
     // A kitty key release, as the quit key's release arrives after the press.
     write_all(&master, b"\x1b[113;1:3u");
@@ -543,8 +569,12 @@ fn probe_accepts_an_immediate_batch() {
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
     let master_for_reply = master.try_clone().expect("dup master");
+    let mut session = enter_session(slave);
+    // The query is written by `probe`, which runs only once this test holds
+    // the session. The helper waits for that query. Started before `enter`,
+    // its 4s bound counts the lock queue and it gives up, so the reply
+    // channel disconnects.
     let reply = reply_when_queried(master_for_reply, IMMEDIATE_REPLIES);
-    let mut session = Terminal::enter(slave).expect("enter");
     // [`PROBE_DEADLINE`] is 150 ms. The helper can easily miss that while it
     // waits to be scheduled, so this bound only fails a terminal that never
     // answers. Returning before it means the batch ended the probe.
@@ -586,7 +616,7 @@ fn probe_keeps_a_late_reply_as_a_reply() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
-    let mut session = Terminal::enter(slave).expect("enter");
+    let mut session = enter_session(slave);
     let start = Instant::now();
     // No answer exists until this returns. "Late" is that fact, not a sleep
     // that might not have started yet.
@@ -616,7 +646,7 @@ fn probe_keeps_a_late_reply_as_a_reply() {
 fn probe_with_no_reply_uses_the_deadline() {
     let _deadline = arm_deadline();
     let (_master, slave) = open_pty().expect("openpty");
-    let mut session = Terminal::enter(slave).expect("enter");
+    let mut session = enter_session(slave);
     let start = Instant::now();
     let caps = session.probe(PROBE_DEADLINE).expect("probe");
     let elapsed = start.elapsed();
@@ -635,14 +665,24 @@ fn probe_ignores_malformed_replies_and_later_keys_stay_keys() {
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
     let master_for_reply = master.try_clone().expect("dup master");
+    let mut session = enter_session(slave);
+    // Same as the batch helper: the query does not exist until `probe`, so
+    // the wait to see it starts here, after the session lock.
     let reply = reply_after(
         master_for_reply,
         Duration::ZERO,
         b"\x1b[?62;4x\x1b_Nope\x1b\\\x1b]99;nope\x07",
     );
-    let mut session = Terminal::enter(slave).expect("enter");
     let caps = session.probe(Duration::from_millis(40)).expect("probe");
     assert_eq!(caps, &Capabilities::default());
+    // Under load the helper's write lands after the 40 ms probe. It has
+    // landed once the helper returns, and it is still not a key.
+    reply.join().expect("reply thread");
+    let late = session.read_events().expect("read");
+    assert!(
+        late.iter().all(|event| !matches!(event, TermEvent::Key(_))),
+        "malformed replies became keys: {late:?}"
+    );
     write_all(&master, b"q");
     let inputs = session.read_events().expect("read");
     assert!(
@@ -658,14 +698,13 @@ fn probe_ignores_malformed_replies_and_later_keys_stay_keys() {
         "legacy q should be a press and a synthesized release: {inputs:?}"
     );
     session.restore().expect("restore");
-    reply.join().expect("reply thread");
 }
 
 #[test]
 fn a_stalled_reader_does_not_block_the_writer() {
     let _deadline = arm_deadline();
     let (_master, slave) = open_pty().expect("openpty");
-    let mut session = Terminal::enter_with(slave, 4096).expect("enter");
+    let mut session = enter_session_with(slave, 4096);
     let frame = vec![b'Z'; 1024];
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(800) && session.dropped_frames() == 0 {
@@ -698,26 +737,88 @@ fn a_stalled_reader_does_not_block_the_writer() {
     );
 }
 
+/// Bytes `n_tty` stores for a non-canonical reader: `N_TTY_BUF_SIZE - 1`.
+///
+/// `FIONREAD` on the master reports this count, not the flip buffer behind it.
+const READER_FULL: usize = 4095;
+
+fn reader_queued(master: &OwnedFd) -> usize {
+    let mut queued: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::FIONREAD, &mut queued) };
+    assert_eq!(rc, 0, "FIONREAD: {}", std::io::Error::last_os_error());
+    usize::try_from(queued).unwrap_or(0)
+}
+
+/// `true` when the slave's write room is nonzero.
+///
+/// A refused `write` is not that signal. An atomic buffer allocation can fail
+/// while the pty is still under its memory limit, and `poll` reports that room.
+fn slave_has_write_room(slave: &OwnedFd) -> bool {
+    let mut fds = [PollFd::new(slave, PollFlags::OUT)];
+    let zero = rustix::event::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    loop {
+        match rustix::event::poll(&mut fds, Some(&zero)) {
+            Ok(_) => return fds[0].revents().contains(PollFlags::OUT),
+            Err(Errno::INTR) => continue,
+            Err(err) => panic!("poll: {err}"),
+        }
+    }
+}
+
 #[test]
 fn restore_and_drop_return_when_the_reader_never_reads() {
     let _deadline = arm_deadline();
-    let (_master, slave) = open_pty().expect("openpty");
-    let mut session = Terminal::enter_with(slave, 4096).expect("enter");
-    let frame = vec![b'Q'; 1024];
+    let (master, slave) = open_pty().expect("openpty");
+    let mut session = enter_session_with(slave, 4096);
+    // Slave output lands in a flip buffer. A workqueue publishes it onto the
+    // master's line discipline, and that publication frees room. `enter` puts
+    // the pty in non-canonical mode (the two ends share termios), so the
+    // reader holds at most [`READER_FULL`] bytes. Until it does, a refused
+    // write is the flip buffer racing that worker: `restore` polls for 250 ms,
+    // the worker runs, and the reset fits. A short write is the same race.
+    // Room reported by `poll` is the other false refusal: the memory limit is
+    // not reached, an allocation just failed.
+    let slave_fd = session.try_clone_fd().expect("dup");
+    let block = vec![b'Q'; LEAVE.len()];
     let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(800) && session.dropped_frames() == 0 {
-        session.write_frame(&frame).expect("frame");
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "pty never filled (reader has {} bytes)",
+            reader_queued(&master)
+        );
+        match rustix::io::write(&slave_fd, &block) {
+            Ok(0) | Err(Errno::AGAIN) => {}
+            Ok(_) => continue,
+            Err(Errno::INTR) => continue,
+            Err(err) => panic!("filling the pty: {err}"),
+        }
+        let queued = reader_queued(&master);
+        if queued < READER_FULL {
+            if queued == 0 {
+                let left = Duration::from_secs(2).saturating_sub(start.elapsed());
+                if !left.is_zero() {
+                    poll_in(&master, left.min(Duration::from_millis(50)));
+                }
+            } else {
+                thread::yield_now();
+            }
+            continue;
+        }
+        if slave_has_write_room(&slave_fd) {
+            thread::yield_now();
+            continue;
+        }
+        match rustix::io::write(&slave_fd, &block) {
+            Ok(0) | Err(Errno::AGAIN) => break,
+            Ok(_) => continue,
+            Err(Errno::INTR) => continue,
+            Err(err) => panic!("filling the pty: {err}"),
+        }
     }
-    assert!(session.dropped_frames() > 0, "pty never filled");
-    // A 1024-byte write is rejected while the reset sequence would still fit.
-    // Fill that tail one byte at a time, or restore can finish and this test
-    // never reaches the full-buffer path.
-    session.discard_pending();
-    let tail = Instant::now();
-    while tail.elapsed() < Duration::from_millis(800) && session.pending_len() == 0 {
-        session.write_frame(b"Q").expect("tail");
-    }
-    assert!(session.pending_len() > 0, "the pty still accepted a byte");
     let started = Instant::now();
     let error = session
         .restore()
@@ -877,7 +978,7 @@ fn calloop_reads_the_fd_the_app_owns() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
-    let terminal = Terminal::enter(slave).expect("enter");
+    let terminal = enter_session(slave);
     let read_fd = terminal.try_clone_fd().expect("dup");
     let mut eloop: EventLoop<App> = EventLoop::try_new().expect("loop");
     let source = Generic::new(read_fd, Interest::READ, Mode::Level);
@@ -960,7 +1061,7 @@ fn calloop_reads_the_fd_the_app_owns() {
 fn a_helper_panic_does_not_restore_the_terminal() {
     let _deadline = arm_deadline();
     let (_master, slave) = open_pty().expect("openpty");
-    let mut session = Terminal::enter(slave).expect("enter");
+    let mut session = enter_session(slave);
     let fd = session.try_clone_fd().expect("dup");
     let flags_before = rustix::fs::fcntl_getfl(&fd).expect("getfl");
     assert!(flags_before.contains(OFlags::NONBLOCK));
@@ -996,7 +1097,7 @@ fn a_slow_reader_still_receives_the_full_restore() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
-    let mut session = Terminal::enter(slave).expect("enter");
+    let mut session = enter_session(slave);
     let _entered = drain_for(&master, Duration::from_millis(40));
 
     let mut apc = Vec::with_capacity(128 * 1024);
@@ -1042,7 +1143,7 @@ fn a_two_megabyte_paste_is_not_one_batch() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
-    let mut session = Terminal::enter(slave).expect("enter");
+    let mut session = enter_session(slave);
     let _entered = drain_for(&master, Duration::from_millis(40));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1113,7 +1214,7 @@ fn a_late_kitty_reply_is_a_resize() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
-    let mut session = Terminal::enter(slave).expect("enter");
+    let mut session = enter_session(slave);
     let caps = session.probe(Duration::from_millis(30)).expect("probe");
     assert!(caps.kitty_graphics_ok.is_none(), "{caps:?}");
     write_all(&master, b"\x1b_Gi=1;OK\x1b\\");
