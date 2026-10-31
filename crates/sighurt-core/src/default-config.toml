@@ -6,7 +6,7 @@
 # tables merge by engine, field by field, and [engines], [input], [input.buttons], [downloads],
 # [session] and [tui] key by key; [keywords], [engines.*], [keys], [keymap.*], [ui] and
 # [chrome.*] are yours alone. [tui.keys] in your file is a separate table, over [keys], and
-# applies only in the terminal; it does not replace the built-in [tui.keys] below.
+# applies only in the terminal when the keymap is bindings.
 #
 # The problems in the file are reported together. A file with any problem is not used: at
 # startup sig runs with these defaults, and when the file is loaded again the configuration in
@@ -142,30 +142,12 @@ extensions = ["wasm"]
 # ── Input ────────────────────────────────────────────────────────────────────────────────
 
 [input]
-# The keymap that turns key presses into commands. bindings reads [keys] below; a keymap
-# compiled into sig reads its own table, [keymap.<name>], which its documentation describes.
-# A sig built with the keymap-modal feature has modal: modes and key sequences, vim-style. Its
-# table, for example (the chrome shows the mode, and "NORMAL g" while a sequence waits):
-#
-#  [keymap.modal]
-#  start = "normal"          # the mode it starts in
-#  typing = "insert"         # the mode a text field of the page puts it in, until it leaves
-#  pass = ["insert"]         # modes in which unbound keys reach the page
-#  [keymap.modal.always]     # every mode; the only table while the address line is focused
-#  "ctrl-q" = "browser.quit"
-#  [keymap.modal.normal]
-#  "j" = "page.send-key down"
-#  "g g" = "page.send-key home"
-#  "g t" = "tab.next"
-#  "o" = "location.focus"
-#  ":" = { run = "location.focus", pass = true }   # the command line, with its ":"
-#  "i" = "mode insert"
-#  [keymap.modal.insert]
-#  "escape" = "mode normal"
-#
-# No binding of a mode (with always) may be the start of another, so a sequence never waits
-# for a timeout, and in a pass mode no sequence may start with a key that types.
-keymap = "bindings"
+# The keymap that turns key presses into commands. example is Sighurt's default keys, the
+# same in the window and the terminal. Its table is in
+# extensions/sighurt-config-example/src/table.rs, and the README lists it. bindings reads
+# [keys] below and binds nothing until you do. Another keymap compiled into sig reads its
+# own table, [keymap.<name>], which its documentation describes.
+keymap = "example"
 # How far pages scroll for a notch of the wheel or a swipe on the touchpad, as a multiple:
 # 0.1 to 10. Scrolling over the chrome is the chrome's own.
 scroll-speed = 1.0
@@ -178,9 +160,25 @@ forward = "page.forward"
 
 # ── Keys ─────────────────────────────────────────────────────────────────────────────────
 #
-# The windowed frontend has no default key bindings: nothing is bound until you bind it here.
-# The terminal has a small table of its own, [tui.keys] below, used only there. The tab strip,
-# the toolbar and the address bar work without any.
+# The example configuration binds the keys below in both frontends. With keymap = "bindings"
+# nothing is bound in either frontend until [keys] binds it, and a [tui.keys] you write
+# applies in the terminal only, over [keys]. The tab strip, the toolbar and the address bar
+# work without any.
+#
+# While the page has the keyboard, in both frontends: q quits, o focuses the address line,
+# : focuses it and types itself, ctrl-o focuses it from anywhere, t opens a tab, x closes
+# the tab, J and K move to the next and previous tab, H and L go back and forward, r and
+# ctrl-r reload (ctrl-r from anywhere), e reopens the page in the next web engine, j and k
+# scroll, ctrl-d and ctrl-u scroll a page, g and G go to the top and the bottom, and + - =
+# zoom. alt-1 to alt-9 select those tabs from anywhere. Escape enters INSERT MODE, which
+# shows INSERT MODE and passes every other key until Escape leaves it. y y copies the
+# page's address and c o closes the other tabs, highest number first. Those two are key
+# sequences of the example configuration, not of [keys].
+#
+# In the terminal only: ctrl-c quits and m switches between text and graphics, both while
+# the page has the keyboard, and ctrl-l redraws the page wherever the keyboard is. A
+# keystroke that types a character does not run while a text field of the page has the
+# keyboard; ctrl- and alt- bindings still do.
 #
 #   [keys]                                # everywhere
 #   "ctrl-t" = "tab.new"
@@ -210,13 +208,17 @@ forward = "page.forward"
 # layouts, while a letter keeps its shift: "ctrl-shift-t" and "ctrl-T" are both Ctrl+Shift+T.
 # AltGr is never Ctrl+Alt. While you type, in the address bar or a text field of a page, a
 # keystroke that types a character (no modifier but shift) types it instead of running its
-# command. These bindings have no key sequences such as "g g"; the modal keymap has them.
+# command. [keys] has no key sequences such as "g g". The example configuration's y y and
+# c o are sequences in its own table.
 #
 # Commands: tab.new, tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last,
 # page.open <url>, page.open-in <engine> [url], page.switch-engine, page.reload, page.stop,
 # page.back, page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
-# location.focus, browser.home, browser.quit, site.forget [host], and the chrome's own,
-# chrome.<action>. Tabs count from 1.
+# clipboard.copy <text>, location.focus, browser.home, browser.quit, site.forget [host],
+# and the chrome's own, chrome.<action>. Tabs count from 1.
+#
+# clipboard.copy <text> puts the text on the clipboard. The runtime refuses text over its
+# limit and says so, rather than cutting it.
 #
 # site.forget [host] forgets one site's cookies and stored data in every engine that keeps
 # any. With no argument it is the page shown; an argument is that host, and there are no
@@ -232,8 +234,9 @@ forward = "page.forward"
 # https pages), among those this build has and [engines] enabled allows, wrapping around
 # ("ctrl-alt-e" = "page.switch-engine"). It chooses that engine as page.open-in does, so the
 # page's links stay until an address is typed. With fewer than two such engines, or a page
-# that isn't http, https or a file, it shows a notice and the page stays. The terminal binds
-# it to e, below. The windowed frontend binds nothing until the lines above do.
+# that isn't http, https or a file, it shows a notice and the page stays. The example
+# configuration binds it to e in both frontends. With keymap = "bindings" nothing is bound
+# until the lines above do.
 #
 # page.send-key presses and releases a key in the page while the page has the keyboard, as if
 # you pressed it: down, up, left, right, pageup, pagedown, home, end, space, enter, escape,
@@ -256,8 +259,9 @@ forward = "page.forward"
 # The default is 10. Sixel is sent at most 5 a second, whatever this says.
 # mouse: whether the terminal's mouse reports clicks and scrolling to the page. The default
 # is true.
-# default-keys: whether the built-in key table below is in use. The default is true. false
-# drops that whole table. Keys you bind yourself stay.
+# default-keys: accepted, and it has no effect since 0.10. The terminal's default keys are
+# the example configuration's, in both frontends. A file that sets default-keys gets a
+# notice saying so. The key stays so [tui] still merges key by key.
 #
 #   [tui]
 #   mode = "text"
@@ -266,16 +270,11 @@ forward = "page.forward"
 #   mouse = false
 #   default-keys = false
 #
-# The keys below are used only in the terminal, and only while default-keys is true. They sit
-# under [keys]: a binding you write in [keys] for the same keystroke wins. [tui.keys] in your
-# own file sits over [keys], applies only in the terminal, and does not replace this table, so
-# leaving a line out of a [tui.keys] you write does not unbind the built-in one. Setting
-# default-keys to false does, for every built-in line. [tui.keys.page] and [tui.keys.location]
-# are the same contexts as [keys.page] and [keys.location].
-#
-# A keystroke that types a character (no modifier but shift) does not run while you type in a
-# text field of the page or in the terminal's line, the same as in [keys]. A ctrl- or alt-
-# binding still runs: ctrl-c quits and ctrl-o opens the address line from anywhere.
+# A [tui.keys] you write applies only in the terminal, over [keys], when the keymap is
+# bindings. It does not apply in the window. [tui.keys.page] and [tui.keys.location] are
+# the same contexts as [keys.page] and [keys.location]. A keystroke that types a character
+# (no modifier but shift) does not run while you type in a text field of the page or in the
+# terminal's line, the same as in [keys]. A ctrl- or alt- binding still runs.
 #
 # The terminal's chrome commands, chrome.<action>, are chrome.toggle-mode (text or graphics),
 # chrome.text-mode, chrome.graphics-mode and chrome.refresh (draw the page again).
@@ -291,42 +290,6 @@ graphics = "auto"
 fps = 10
 mouse = true
 default-keys = true
-
-[tui.keys]
-"q" = "browser.quit"
-"ctrl-c" = "browser.quit"
-"o" = "location.focus"
-"ctrl-o" = "location.focus"
-":" = "location.focus"
-"t" = "tab.new"
-"x" = "tab.close"
-"J" = "tab.next"
-"K" = "tab.previous"
-"H" = "page.back"
-"L" = "page.forward"
-"r" = "page.reload"
-"e" = "page.switch-engine"
-"ctrl-r" = "page.reload"
-"j" = "page.send-key ArrowDown"
-"k" = "page.send-key ArrowUp"
-"ctrl-d" = "page.send-key PageDown"
-"ctrl-u" = "page.send-key PageUp"
-"g" = "page.send-key Home"
-"G" = "page.send-key End"
-"+" = "page.zoom-in"
-"-" = "page.zoom-out"
-"=" = "page.zoom-reset"
-"m" = "chrome.toggle-mode"
-"ctrl-l" = "chrome.refresh"
-"alt-1" = "tab.select 1"
-"alt-2" = "tab.select 2"
-"alt-3" = "tab.select 3"
-"alt-4" = "tab.select 4"
-"alt-5" = "tab.select 5"
-"alt-6" = "tab.select 6"
-"alt-7" = "tab.select 7"
-"alt-8" = "tab.select 8"
-"alt-9" = "tab.select 9"
 
 # ── UI ───────────────────────────────────────────────────────────────────────────────────
 #

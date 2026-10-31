@@ -15,8 +15,6 @@ engine-servo = ["sighurt-runtime/engine-servo", "dep:sighurt-engine-servo"]
 engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
-# Keymaps besides the core's own `bindings`, chosen by `[input] keymap`.
-keymap-modal = ["sighurt-runtime/keymap-modal"]
 # Chromes besides sighurt-ui's `standard`, chosen by `[ui] chrome`.
 chrome-line = ["dep:sighurt-chrome-line"]
 

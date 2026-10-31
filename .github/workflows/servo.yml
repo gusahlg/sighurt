@@ -76,5 +76,5 @@ jobs:
       - name: Clippy (sig with Servo, without WPE WebKit)
         run: >
           cargo clippy --locked -p sighurt-browser --no-default-features
-          --features engine-servo,engine-wasm,engine-demo,keymap-modal,chrome-line
+          --features engine-servo,engine-wasm,engine-demo,chrome-line
           --all-targets -- -D warnings

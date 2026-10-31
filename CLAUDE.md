@@ -148,9 +148,9 @@ engines/sighurt-engine-wpe/tests/headless.sh
 # Before a commit: everything but Servo and WPE WebKit (what CI runs), then the rest
 tools/cargo fmt --all
 tools/cargo clippy --workspace --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist --exclude tui-servo --exclude wpe-cpu --all-targets -- -D warnings
-tools/cargo clippy -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features --features engine-demo,engine-wasm,keymap-modal,chrome-line --all-targets -- -D warnings
+tools/cargo clippy -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features --features engine-demo,engine-wasm,chrome-line --all-targets -- -D warnings
 tools/cargo test --workspace --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist --exclude tui-servo --exclude wpe-cpu
-tools/cargo test -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features --features engine-demo,engine-wasm,keymap-modal,chrome-line
+tools/cargo test -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features --features engine-demo,engine-wasm,chrome-line
 SIG_WHAT="servo build" tools/cargo clippy -p sighurt-engine-servo -p sighurt-engine-wpe -p sighurt-browser -p m0-coexist -p m1-mixed -p wpe-coexist -p tui-servo -p wpe-cpu --all-targets -- -D warnings
 SIG_WHAT="servo build" tools/cargo clippy -p sighurt-browser -p sighurt-runtime -p sighurt-gui --all-features --all-targets -- -D warnings
 SIG_WHAT="servo build" tools/cargo test -p sighurt-engine-servo -p sighurt-engine-wpe --lib

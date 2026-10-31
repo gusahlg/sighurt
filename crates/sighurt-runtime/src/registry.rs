@@ -177,11 +177,9 @@ pub fn claim_logger() -> bool {
     LOGGER.swap(true, Ordering::SeqCst)
 }
 
-/// The keymaps compiled into this build besides the core's own `bindings`.
-pub const KEYMAPS: &[KeymapKind] = &[
-    #[cfg(feature = "keymap-modal")]
-    sighurt_keymap_modal::KIND,
-];
+/// The keymaps compiled into this build besides the core's own `bindings`: the example
+/// configuration, which the built-in configuration selects.
+pub const KEYMAPS: &[KeymapKind] = &[sighurt_config_example::KIND];
 
 /// What a runtime is started with.
 // Only the Wasm engine needs a scratch directory, and the demo engine reads nothing.
@@ -684,6 +682,36 @@ mod tests {
         assert!(env.engines.is_empty());
         assert_eq!(env.keymaps, KEYMAPS.to_vec());
         assert!(env.chromes.is_empty());
+    }
+
+    #[test]
+    fn the_examples_terminal_chrome_commands_exist() {
+        use sighurt_api::commands::Command;
+        use sighurt_api::keymap::Frontend;
+        use sighurt_config_example::Action;
+        use sighurt_core::config::TERMINAL_CHROME_COMMANDS;
+        let mut checked = 0;
+        for (keys, action) in sighurt_config_example::bindings(Frontend::Terminal) {
+            let (Action::Run(text) | Action::RunThenPass(text)) = action else {
+                continue;
+            };
+            if let Ok(Command::Chrome(name)) = text.parse() {
+                assert!(
+                    TERMINAL_CHROME_COMMANDS.contains(&name.as_str()),
+                    "{keys}: {text}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 2,
+            "the example binds the terminal's chrome commands"
+        );
+        // The window's chrome commands depend on the chrome; the example binds none of them.
+        let window = sighurt_config_example::bindings(Frontend::Gui).filter(|(_, action)| {
+            matches!(action, Action::Run(text) | Action::RunThenPass(text) if text.starts_with("chrome."))
+        });
+        assert_eq!(window.count(), 0);
     }
 
     #[cfg(feature = "engine-servo")]

@@ -19,6 +19,8 @@
 //! - `site.forget [host]` forgets that site's cookies and stored data in every engine that
 //!   keeps any. No argument is the page shown. A `sig:` page, a tab with no page, or a host
 //!   that is not one, shows a notice.
+//! - `clipboard.copy <text>` puts that text on the clipboard ([`Effect::ClipboardWrite`]).
+//!   The runtime refuses text over its own limit and says so; the core does not cut it.
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
 //!   `Effect::Focus`. Commands that change what the page area shows give the page the keyboard.
 //! - `page.send-key` presses and releases its key in the page only while the page has the
@@ -142,6 +144,10 @@ impl BrowserState {
             }
             Command::SiteForget(host) => {
                 self.site_forget(host, fx);
+                None
+            }
+            Command::ClipboardCopy(text) => {
+                fx.push(Effect::ClipboardWrite(text));
                 None
             }
             Command::Chrome(action) => {

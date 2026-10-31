@@ -10305,6 +10305,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sighurt-config-example"
+version = "0.9.0"
+dependencies = [
+ "sighurt-api",
+]
+
+[[package]]
 name = "sighurt-core"
 version = "0.9.0"
 dependencies = [
@@ -10430,14 +10437,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sighurt-keymap-modal"
-version = "0.9.0"
-dependencies = [
- "sighurt-api",
- "toml 1.1.6+spec-1.1.0",
-]
-
-[[package]]
 name = "sighurt-runtime"
 version = "0.9.0"
 dependencies = [
@@ -10451,11 +10450,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sighurt-api",
+ "sighurt-config-example",
  "sighurt-core",
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",
- "sighurt-keymap-modal",
  "tempfile",
  "url",
 ]

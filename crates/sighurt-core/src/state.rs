@@ -54,7 +54,7 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, KeyboardFocus, PointerButton, PointerEvent,
     ScrollDelta, TextInputState,
 };
-use sighurt_api::keymap::{KeyContext, KeymapKind};
+use sighurt_api::keymap::{Browser, KeyContext, KeymapKind, TabInfo};
 use sighurt_api::semantic::SemanticAction;
 use sighurt_api::services::{
     Permission, Service, ServiceError, ServiceReply, ServiceRequest, ServiceResult,
@@ -74,17 +74,10 @@ use crate::tabs::{
     bounded, clamp, display_title, Content, LoadError, Tab, TabSummary, View, MAX_TEXT, MAX_URL,
 };
 
-/// Which frontend is running. [`crate::config::Config::parse`] checks `chrome.<action>`
-/// against that frontend's chrome, and installs the terminal's default keys only for
-/// [`Frontend::Terminal`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Frontend {
-    /// The Wayland window. The default, so a caller that doesn't say keeps the window's checks.
-    #[default]
-    Gui,
-    /// The terminal. `chrome.<action>` is checked against the terminal chrome's commands.
-    Terminal,
-}
+/// Which frontend is running. The same enum a keymap sees
+/// ([`sighurt_api::keymap::Frontend`]): [`crate::config::Config::parse`] checks
+/// `chrome.<action>` against that frontend's chrome.
+pub use sighurt_api::keymap::Frontend;
 
 /// What the executable tells the core about the world it runs in: what the build has, which
 /// the configuration is checked against ([`Config::parse`]).
@@ -112,7 +105,7 @@ pub struct Environment {
     /// The color names `[ui.colors]` takes: the chrome's (`sighurt_ui::Colors::NAMES`).
     pub color_names: &'static [&'static str],
     /// Which frontend is running. [`Frontend::Gui`] when left out, which keeps the window's
-    /// chrome checks and installs no terminal keys.
+    /// chrome checks.
     pub frontend: Frontend,
     /// The engine this run starts with, overriding `[engines] default`. [`Config::parse`]
     /// applies it on top of every file it reads, so a reload keeps it. `None` uses the
@@ -363,6 +356,9 @@ pub enum Effect {
         /// What to do.
         request: SiteDataRequest,
     },
+    /// Put `text` on the clipboard (`clipboard.copy`). The runtime carries it out and
+    /// refuses text over its own limit.
+    ClipboardWrite(String),
     /// Tell the user something: a blocked pop-up, a configuration error or notice.
     Notice {
         /// The tab it is about, if any.
@@ -641,6 +637,137 @@ fn host_under(host: &str, key: &str) -> bool {
                 .is_some_and(|rest| rest.ends_with('.')))
 }
 
+/// What one tab shows, as [`BrowserState::summary`] and a keymap both read it.
+struct Shown<'a> {
+    view: Option<&'a View>,
+    url: Option<&'a str>,
+    title: Option<&'a str>,
+    content: Content<'a>,
+    reloads: bool,
+    requested: Option<&'a str>,
+    loading: bool,
+    switching: Option<&'a View>,
+    can_go_back: bool,
+    can_go_forward: bool,
+    /// The engine of a page that is shown. `None` for a `sig:` page, a blank tab or an error.
+    engine: Option<&'a str>,
+}
+
+/// The per-tab arithmetic of [`BrowserState::summary`]: the current view, the committed
+/// address and title, whether it is loading, and back and forward.
+fn shown<'a>(tab: &'a Tab, views: &'a BTreeMap<ViewId, View>, env: &Environment) -> Shown<'a> {
+    let view = tab.current_view().and_then(|id| views.get(&id));
+    let (url, title, content, reloads) = match tab.current() {
+        Some(Segment::View(id)) => (
+            view.and_then(|v| v.url.as_deref()),
+            view.and_then(|v| v.title.as_deref()),
+            Content::View(*id),
+            false,
+        ),
+        Some(Segment::Internal(url)) => (Some(url.as_str()), None, Content::Internal(url), false),
+        Some(Segment::Record(record)) => {
+            (record.url(), record.title.as_deref(), Content::Blank, true)
+        }
+        None => (None, None, Content::Blank, false),
+    };
+    let switching = tab.switch.and_then(|switch| views.get(&switch.view));
+    let pending = switching.or(view).and_then(|v| v.navigations.latest());
+    let requested = pending.and_then(|navigation| navigation.url.as_deref());
+    let loading = switching.is_some() || pending.is_some() || view.is_some_and(|v| v.loading);
+    // A failed view is an error, not a page of that engine. A switch that has not replaced
+    // the page leaves the previous view's engine, which is what the tab still shows.
+    let engine = match tab.current() {
+        Some(Segment::View(_)) => view
+            .filter(|view| view.failure.is_none())
+            .map(|view| view.engine()),
+        _ => None,
+    };
+    Shown {
+        view,
+        url,
+        title,
+        content,
+        reloads,
+        requested,
+        loading,
+        switching,
+        can_go_back: tab_can_go(tab, views, env, true),
+        can_go_forward: tab_can_go(tab, views, env, false),
+        engine,
+    }
+}
+
+/// Whether back or forward has somewhere to go: a neighbouring segment, or the view's own
+/// history when its engine can traverse it.
+fn tab_can_go(tab: &Tab, views: &BTreeMap<ViewId, View>, env: &Environment, back: bool) -> bool {
+    let view = tab.current_view().and_then(|id| views.get(&id));
+    let segment = if back {
+        tab.current > 0
+    } else {
+        tab.current + 1 < tab.segments.len()
+    };
+    segment || view.is_some_and(|view| history_can_traverse(view, env, back))
+}
+
+/// Whether back or forward stays in `view`'s own history.
+fn history_can_traverse(view: &View, env: &Environment, back: bool) -> bool {
+    let history = &view.history;
+    let can = if back {
+        history.can_go_back()
+    } else {
+        history.can_go_forward()
+    };
+    can && engine_capabilities(env, &view.engine).history_traversal
+}
+
+/// What `engine` supports. An engine the build lacks supports nothing.
+fn engine_capabilities(env: &Environment, engine: &str) -> EngineCapabilities {
+    env.engines.get(engine).copied().unwrap_or_default()
+}
+
+/// The browser a keymap reads for one key press. Borrowed from the state before the press is
+/// applied, and dropped before any command runs (guarantee 7).
+struct CoreBrowser<'a> {
+    tabs: &'a [Tab],
+    views: &'a BTreeMap<ViewId, View>,
+    active: usize,
+    context: KeyContext,
+    env: &'a Environment,
+}
+
+impl Browser for CoreBrowser<'_> {
+    fn frontend(&self) -> Frontend {
+        self.env.frontend
+    }
+
+    fn context(&self) -> KeyContext {
+        self.context
+    }
+
+    fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    fn active_tab(&self) -> usize {
+        self.active
+    }
+
+    fn tab(&self, index: usize) -> Option<TabInfo<'_>> {
+        let tab = self.tabs.get(index)?;
+        let shown = shown(tab, self.views, self.env);
+        Some(TabInfo::new(
+            tab.id,
+            shown.title,
+            shown.url,
+            shown.loading,
+            shown.engine,
+            tab.zoom,
+            shown.can_go_back,
+            shown.can_go_forward,
+        ))
+    }
+}
+
 impl BrowserState {
     /// A browser with no tabs yet, using `config`. [`BrowserEvent::Start`] opens them.
     pub fn new(config: Config, env: Environment) -> Self {
@@ -745,57 +872,30 @@ impl BrowserState {
     }
 
     fn summary<'a>(&'a self, tab: &'a Tab) -> TabSummary<'a> {
-        let view = tab.current_view().and_then(|id| self.views.get(&id));
-        let (url, title, content, reloads) = match tab.current() {
-            Some(Segment::View(id)) => (
-                view.and_then(|v| v.url.as_deref()),
-                view.and_then(|v| v.title.as_deref()),
-                Content::View(*id),
-                false,
-            ),
-            Some(Segment::Internal(url)) => {
-                (Some(url.as_str()), None, Content::Internal(url), false)
-            }
-            Some(Segment::Record(record)) => {
-                (record.url(), record.title.as_deref(), Content::Blank, true)
-            }
-            None => (None, None, Content::Blank, false),
-        };
-        let switching = tab.switch.and_then(|switch| self.views.get(&switch.view));
-        let pending = switching.or(view).and_then(|v| v.navigations.latest());
-        let requested = pending.and_then(|navigation| navigation.url.as_deref());
-        let loading = switching.is_some() || pending.is_some() || view.is_some_and(|v| v.loading);
+        let shown = shown(tab, &self.views, &self.env);
         TabSummary {
             id: tab.id,
-            title: display_title(title, url.or(requested)),
-            url,
-            requested,
-            loading,
-            can_go_back: self.can_go(tab, true),
-            can_go_forward: self.can_go(tab, false),
+            title: display_title(shown.title, shown.url.or(shown.requested)),
+            url: shown.url,
+            requested: shown.requested,
+            loading: shown.loading,
+            can_go_back: shown.can_go_back,
+            can_go_forward: shown.can_go_forward,
             zoom: tab.zoom,
-            can_zoom: view.is_some_and(|v| self.capabilities(&v.engine).page_zoom),
-            status: view.and_then(|v| v.status.as_deref()),
-            content,
+            can_zoom: shown
+                .view
+                .is_some_and(|view| self.capabilities(&view.engine).page_zoom),
+            status: shown.view.and_then(|view| view.status.as_deref()),
+            content: shown.content,
             error: tab.error.as_ref(),
-            reloads,
-            switching_to: switching.map(|v| v.engine()),
+            reloads: shown.reloads,
+            switching_to: shown.switching.map(|view| view.engine()),
         }
-    }
-
-    fn can_go(&self, tab: &Tab, back: bool) -> bool {
-        let view = tab.current_view().and_then(|id| self.views.get(&id));
-        let segment = if back {
-            tab.current > 0
-        } else {
-            tab.current + 1 < tab.segments.len()
-        };
-        segment || view.is_some_and(|v| self.can_traverse(v, back))
     }
 
     /// What `engine` supports.
     fn capabilities(&self, engine: &str) -> EngineCapabilities {
-        self.env.engines.get(engine).copied().unwrap_or_default()
+        engine_capabilities(&self.env, engine)
     }
 
     /// The build's web engines, in descriptor order.
@@ -810,13 +910,7 @@ impl BrowserState {
 
     /// Whether back or forward stays in `view`'s own history.
     fn can_traverse(&self, view: &View, back: bool) -> bool {
-        let history = &view.history;
-        let can = if back {
-            history.can_go_back()
-        } else {
-            history.can_go_forward()
-        };
-        can && self.capabilities(&view.engine).history_traversal
+        history_can_traverse(view, &self.env, back)
     }
 
     // ── Tabs ──────────────────────────────────────────────────────────────────────────────
@@ -2096,19 +2190,37 @@ impl BrowserState {
     fn keyboard(&mut self, event: InputEvent, at: Instant, fx: &mut Fx) {
         self.seat = event.seat;
         match &event.kind {
-            InputKind::Key(key) => match self.keys.handle(self.key_context(), event.seat, key) {
-                KeyOutcome::Run(command) => {
-                    self.key_ran(&command, at);
-                    return self.run_command(command, fx);
+            InputKind::Key(key) => {
+                // The keymap reads the tabs through a borrow of the fields it needs, which
+                // ends before any command of this press changes them.
+                let context = self.key_context();
+                let outcome = {
+                    let browser = CoreBrowser {
+                        tabs: &self.tabs,
+                        views: &self.views,
+                        active: self.active,
+                        context,
+                        env: &self.env,
+                    };
+                    self.keys.handle(context, event.seat, key, &browser)
+                };
+                match outcome {
+                    KeyOutcome::Run(commands) => {
+                        for command in commands {
+                            self.key_ran(&command, at);
+                            self.run_command(command, fx);
+                        }
+                        return;
+                    }
+                    KeyOutcome::Consumed => return,
+                    // The press goes where the keyboard is after the command.
+                    KeyOutcome::RunThenDeliver(command) => {
+                        self.key_ran(&command, at);
+                        self.run_command(command, fx);
+                    }
+                    KeyOutcome::Deliver => {}
                 }
-                KeyOutcome::Consumed => return,
-                // The press goes where the keyboard is after the command.
-                KeyOutcome::RunThenDeliver(command) => {
-                    self.key_ran(&command, at);
-                    self.run_command(command, fx)
-                }
-                KeyOutcome::Deliver => {}
-            },
+            }
             InputKind::Focus(FocusEvent::Deactivated) => self.keys.forget(event.seat),
             InputKind::Focus(FocusEvent::Activated) | InputKind::TextInput(_) => {}
             // Pointer input comes with the view it is for.

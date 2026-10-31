@@ -36,7 +36,7 @@ use sighurt_api::engine::{
 use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::BufferSize;
 use sighurt_api::ids::{RequestId, TargetId, ViewId};
-use sighurt_api::services::{ClipboardData, ServiceError};
+use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_core::{BrowserEvent, BrowserState, Effect, Environment};
 
 use crate::diagnostics::{Diagnostics, EngineReport};
@@ -324,6 +324,23 @@ impl<F: Frontend> Session<F> {
                 });
             }
             Effect::SiteData { engine, request } => self.site_data(engine.as_deref(), request),
+            Effect::ClipboardWrite(text) => {
+                if text.len() > crate::services::MAX_CLIPBOARD {
+                    frontend.notice(format!(
+                        "Copying refused: the text is {} bytes, over the limit of {}.",
+                        text.len(),
+                        crate::services::MAX_CLIPBOARD
+                    ));
+                } else if let Err(error) = frontend.write(
+                    Selection::Clipboard,
+                    vec![ClipboardData {
+                        mime_type: "text/plain;charset=utf-8".into(),
+                        data: text.into_bytes(),
+                    }],
+                ) {
+                    frontend.notice(format!("Copying failed: {error}"));
+                }
+            }
             Effect::Notice { message, .. } => frontend.notice(message),
             Effect::RedrawChrome => frontend.redraw(),
             Effect::SaveSession => self.session_changed(),
@@ -1490,6 +1507,158 @@ mod shutdown_bound {
             started.elapsed() < limit,
             "exited only after {:?}\n{err}",
             started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_write {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::Arc;
+
+    use sighurt_api::events::Cursor;
+    use sighurt_api::ids::{RequestId, TargetId, ViewId};
+    use sighurt_api::input::{InputEvent, KeyboardFocus, TextInputState};
+    use sighurt_api::services::{ClipboardData, Selection, ServiceError};
+    use sighurt_core::config::Config;
+    use sighurt_core::{BrowserEvent, BrowserState};
+
+    use super::Session;
+    use crate::diagnostics::Diagnostics;
+    use crate::frontend::Frontend;
+    use crate::persistence::Paths;
+    use crate::registry::Registry;
+    use crate::services::{Clipboard, Services};
+    use crate::view::ViewEntry;
+
+    /// Records clipboard writes. `fail` is the message `write` returns.
+    struct Recording {
+        writes: Vec<(Selection, Vec<ClipboardData>)>,
+        notices: Vec<String>,
+        fail: Option<String>,
+    }
+
+    impl Clipboard for Recording {
+        fn read(&mut self, _: RequestId, _: Selection, _: &[String], _: usize) {}
+
+        fn write(
+            &mut self,
+            selection: Selection,
+            items: Vec<ClipboardData>,
+        ) -> Result<(), ServiceError> {
+            match &self.fail {
+                Some(message) => Err(ServiceError::Failed(message.clone())),
+                None => {
+                    self.writes.push((selection, items));
+                    Ok(())
+                }
+            }
+        }
+
+        fn cancel(&mut self, _: RequestId) {}
+    }
+
+    impl Frontend for Recording {
+        type Target = ();
+        type Permit = ();
+
+        fn open_target(&mut self, _: ViewId, _: &str) -> Result<(TargetId, ()), String> {
+            unreachable!("clipboard.copy opens no view");
+        }
+
+        fn place(&mut self, _: &BTreeMap<ViewId, ViewEntry>, _: &mut Diagnostics) -> bool {
+            false
+        }
+
+        fn forget_target(&mut self, _: TargetId) {}
+        fn focus(&mut self, _: KeyboardFocus, _: &mut VecDeque<BrowserEvent>) {}
+        fn chrome_input(&mut self, _: InputEvent, _: &mut VecDeque<BrowserEvent>) {}
+        fn chrome_command(&mut self, _: String, _: &mut VecDeque<BrowserEvent>) {}
+        fn page_cursor(&mut self, _: Option<TargetId>, _: Cursor) {}
+        fn page_text_input(&mut self, _: Option<TargetId>, _: Option<TextInputState>) {}
+        fn notice(&mut self, message: String) {
+            self.notices.push(message);
+        }
+        fn redraw(&mut self) {}
+        fn show(&mut self, _: ViewId, _: bool) {}
+        fn frame_ready(&mut self, _: TargetId) {}
+        fn before_forced_exit(&mut self) {}
+    }
+
+    fn started(fail: Option<&str>) -> (Session<Recording>, Recording) {
+        let registry = Registry::new(vec![]);
+        let env = registry.environment(Vec::new(), &[]);
+        let config = Config::parse(Some("version = 1\n"), &env).expect("config");
+        let mut session = Session::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            Services::new(|| {}),
+            Paths {
+                config: None,
+                session: None,
+            },
+            None,
+            Diagnostics::new(None),
+            Arc::new(|| {}),
+        );
+        let mut frontend = Recording {
+            writes: Vec::new(),
+            notices: Vec::new(),
+            fail: fail.map(str::to_owned),
+        };
+        session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: Vec::new(),
+        });
+        session.run_core(&mut frontend);
+        assert_eq!(session.core().tabs().len(), 1);
+        assert!(frontend.notices.is_empty(), "{:?}", frontend.notices);
+        (session, frontend)
+    }
+
+    fn copy(session: &mut Session<Recording>, frontend: &mut Recording, text: &str) {
+        session.queue_mut().push_back(BrowserEvent::Command(
+            format!("clipboard.copy {text}").parse().unwrap(),
+        ));
+        session.run_core(frontend);
+    }
+
+    #[test]
+    fn clipboard_write_goes_to_the_frontend_and_failures_are_notices() {
+        let (mut session, mut frontend) = started(None);
+        copy(&mut session, &mut frontend, "hello there");
+        assert_eq!(
+            frontend.writes,
+            [(
+                Selection::Clipboard,
+                vec![ClipboardData {
+                    mime_type: "text/plain;charset=utf-8".into(),
+                    data: b"hello there".to_vec(),
+                }]
+            )]
+        );
+        assert!(frontend.notices.is_empty());
+
+        let (mut session, mut frontend) = started(Some("the clipboard is closed"));
+        copy(&mut session, &mut frontend, "hello there");
+        assert!(frontend.writes.is_empty());
+        assert_eq!(
+            frontend.notices,
+            ["Copying failed: the clipboard is closed"]
+        );
+
+        let (mut session, mut frontend) = started(None);
+        let text = "x".repeat(crate::services::MAX_CLIPBOARD + 1);
+        copy(&mut session, &mut frontend, &text);
+        assert!(frontend.writes.is_empty(), "over the limit is not cut");
+        assert_eq!(
+            frontend.notices,
+            [format!(
+                "Copying refused: the text is {} bytes, over the limit of {}.",
+                text.len(),
+                crate::services::MAX_CLIPBOARD
+            )]
         );
     }
 }

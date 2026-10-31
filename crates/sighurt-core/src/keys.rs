@@ -1,9 +1,8 @@
 //! Keys: the `bindings` keymap, which reads the user's `[keys]` configuration, and the core's
 //! record of the presses taken, which holds whatever keymap is in use.
 //!
-//! Bindings come only from the configuration: there are no key handlers in code. The windowed
-//! frontend has none until the user binds them. In the terminal, `[tui] default-keys` adds the
-//! built-in `[tui.keys]` table under the user's `[keys]`, and a `[tui.keys]` the user writes
+//! Bindings come only from the configuration: there are no key handlers in code, and neither
+//! frontend has any until the user binds them. In the terminal, a `[tui.keys]` the user writes
 //! sits over `[keys]` and applies only there. `[keys]` applies everywhere, `[keys.page]` while
 //! the page has focus and `[keys.location]` while the chrome (the address bar) has; a binding
 //! of the focused part wins over a global one in the same layer, and a higher layer wins over
@@ -26,7 +25,7 @@ use std::fmt;
 use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::SeatId;
 use sighurt_api::input::{ButtonState, KeyCode, KeyEvent, KeyboardFocus};
-use sighurt_api::keymap::{Chord, KeyAction, KeyContext, Keymap, KeymapKind};
+use sighurt_api::keymap::{Browser, Chord, KeyAction, KeyContext, Keymap, KeymapKind};
 use sighurt_api::settings::{Table, Value};
 
 /// The `bindings` keymap: the default, which every build has.
@@ -42,24 +41,17 @@ fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
     problems
 }
 
-/// The three layers of a terminal `bindings` table, highest priority first. A checked `[keys]`
+/// The two layers of a terminal `bindings` table, highest priority first. A checked `[keys]`
 /// table cannot have these names: they are unknown contexts there.
 pub(crate) const LAYER_TUI: &str = "tui";
-/// The user's `[keys]`, under [`LAYER_TUI`] and over [`LAYER_BUILTIN`].
+/// The user's `[keys]`, under [`LAYER_TUI`].
 pub(crate) const LAYER_USER: &str = "user";
-/// The built-in terminal key table, the lowest layer.
-pub(crate) const LAYER_BUILTIN: &str = "builtin";
 
-/// One key table, or the three terminal layers when at least two of them have bindings.
-/// An empty layer is left out of a single table and kept, empty, in a layered one, so the
-/// layered shape stays recognizable.
-pub(crate) fn combine(tui: Table, user: Table, builtin: Table) -> Table {
-    let nonempty = [&tui, &user, &builtin]
-        .iter()
-        .filter(|table| !table.is_empty())
-        .count();
-    if nonempty < 2 {
-        return [tui, user, builtin]
+/// One key table, or the two layers when both have bindings. An empty layer is left out, so
+/// a single table stays a single table.
+pub(crate) fn combine(tui: Table, user: Table) -> Table {
+    if tui.is_empty() || user.is_empty() {
+        return [tui, user]
             .into_iter()
             .find(|table| !table.is_empty())
             .unwrap_or_default();
@@ -67,7 +59,6 @@ pub(crate) fn combine(tui: Table, user: Table, builtin: Table) -> Table {
     Table::from([
         (LAYER_TUI.to_owned(), Value::Table(tui)),
         (LAYER_USER.to_owned(), Value::Table(user)),
-        (LAYER_BUILTIN.to_owned(), Value::Table(builtin)),
     ])
 }
 
@@ -81,8 +72,8 @@ pub struct Bindings {
     global: Vec<Binding>,
     page: Vec<Binding>,
     location: Vec<Binding>,
-    /// Layers under this one, in the order they are searched: the user's `[keys]`, then the
-    /// built-in terminal table. Empty when the table is a single layer.
+    /// Layers under this one, in the order they are searched. Empty when the table is a
+    /// single layer.
     below: Vec<Bindings>,
 }
 
@@ -145,17 +136,15 @@ impl Bindings {
         bindings
     }
 
-    /// The bindings `settings` describes: one key table, or the terminal's three layers.
+    /// The bindings `settings` describes: one key table, or `[tui.keys]` over `[keys]`.
     fn from_settings(settings: &Table) -> Self {
         let mut problems = Vec::new();
         let bindings = match layered(settings) {
-            Some([tui, user, builtin]) => {
+            Some([tui, user]) => {
                 let mut top = Self::from_table(tui, "tui.keys", &CommandSet::ANY, &mut problems);
-                for (table, section) in [(user, "keys"), (builtin, "tui.keys")] {
-                    let layer = Self::from_table(table, section, &CommandSet::ANY, &mut problems);
-                    if !layer.is_empty() {
-                        top.below.push(layer);
-                    }
+                let layer = Self::from_table(user, "keys", &CommandSet::ANY, &mut problems);
+                if !layer.is_empty() {
+                    top.below.push(layer);
                 }
                 top
             }
@@ -194,15 +183,14 @@ impl Bindings {
     }
 }
 
-/// The three layers, when `settings` is the table [`combine`] builds for them.
-fn layered(settings: &Table) -> Option<[&Table; 3]> {
-    if settings.len() != 3 {
+/// The two layers, when `settings` is the table [`combine`] builds for them.
+fn layered(settings: &Table) -> Option<[&Table; 2]> {
+    if settings.len() != 2 {
         return None;
     }
     Some([
         settings.get(LAYER_TUI)?.as_table()?,
         settings.get(LAYER_USER)?.as_table()?,
-        settings.get(LAYER_BUILTIN)?.as_table()?,
     ])
 }
 
@@ -211,7 +199,7 @@ impl Keymap for Bindings {
         *self = Bindings::from_settings(settings);
     }
 
-    fn press(&mut self, key: &KeyEvent, context: KeyContext) -> KeyAction {
+    fn press(&mut self, key: &KeyEvent, context: KeyContext, _browser: &dyn Browser) -> KeyAction {
         match self.find(context.focus, context.typing, key) {
             Some(command) => KeyAction::Run(command.clone()),
             None => KeyAction::Pass,
@@ -252,8 +240,8 @@ fn add(
 /// What to do with one key event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum KeyOutcome {
-    /// Run the command. The key goes nowhere else.
-    Run(Command),
+    /// Run the commands, in order. The key goes nowhere else.
+    Run(Vec<Command>),
     /// Run the command, then deliver the key to whatever has focus after it.
     RunThenDeliver(Command),
     /// A press the keymap took, or the release or auto-repeat of one: drop it.
@@ -305,12 +293,14 @@ impl KeyState {
         self.keymap.configure(settings);
     }
 
-    /// Decides what happens to `event`, a key event from `seat` in `context`.
+    /// Decides what happens to `event`, a key event from `seat` in `context`. `browser` is what
+    /// the browser shows before this press.
     pub(crate) fn handle(
         &mut self,
         context: KeyContext,
         seat: SeatId,
         event: &KeyEvent,
+        browser: &dyn Browser,
     ) -> KeyOutcome {
         let key = (seat, event.code);
         match event.state {
@@ -321,14 +311,22 @@ impl KeyState {
             ButtonState::Pressed if event.repeat && !self.taken.contains(&key) => {
                 KeyOutcome::Deliver
             }
-            // A repeat of a press the keymap took may run again, but never passes.
-            ButtonState::Pressed if event.repeat => match self.keymap.press(event, context) {
-                KeyAction::Run(command) | KeyAction::RunThenPass(command) => {
-                    KeyOutcome::Run(command)
+            // A repeat of a press the keymap took may run again, but never passes. `Pass`
+            // counts as `Take`, `RunThenPass` as `Run`, and an empty `RunAll` as `Take`.
+            ButtonState::Pressed if event.repeat => {
+                match self.keymap.press(event, context, browser) {
+                    KeyAction::Run(command) | KeyAction::RunThenPass(command) => {
+                        KeyOutcome::Run(vec![command])
+                    }
+                    KeyAction::RunAll(commands) if !commands.is_empty() => {
+                        KeyOutcome::Run(commands)
+                    }
+                    KeyAction::Pass | KeyAction::Take | KeyAction::RunAll(_) => {
+                        KeyOutcome::Consumed
+                    }
                 }
-                KeyAction::Pass | KeyAction::Take => KeyOutcome::Consumed,
-            },
-            ButtonState::Pressed => match self.keymap.press(event, context) {
+            }
+            ButtonState::Pressed => match self.keymap.press(event, context, browser) {
                 KeyAction::Pass => {
                     self.taken.remove(&key);
                     KeyOutcome::Deliver
@@ -339,11 +337,20 @@ impl KeyState {
                 }
                 KeyAction::Run(command) => {
                     self.taken.insert(key);
-                    KeyOutcome::Run(command)
+                    KeyOutcome::Run(vec![command])
                 }
                 KeyAction::RunThenPass(command) => {
                     self.taken.remove(&key);
                     KeyOutcome::RunThenDeliver(command)
+                }
+                // Empty is `Take`: the key is consumed and nothing runs.
+                KeyAction::RunAll(commands) if commands.is_empty() => {
+                    self.taken.insert(key);
+                    KeyOutcome::Consumed
+                }
+                KeyAction::RunAll(commands) => {
+                    self.taken.insert(key);
+                    KeyOutcome::Run(commands)
                 }
             },
         }
@@ -467,7 +474,7 @@ mod tests {
 
     #[test]
     fn a_higher_layer_wins_and_typing_does_not_hide_other_keys() {
-        // [tui.keys] over [keys] over the built-in terminal table.
+        // [tui.keys] over [keys].
         let settings = combine(
             table(
                 r#"
@@ -478,15 +485,10 @@ mod tests {
             table(
                 r#"
                 "j" = "tab.next"
-                [page]
-                "ctrl-t" = "tab.new"
-                "#,
-            ),
-            table(
-                r#"
-                "j" = "page.send-key down"
                 "q" = "browser.quit"
                 "ctrl-d" = "page.reload"
+                [page]
+                "ctrl-t" = "tab.new"
                 "#,
             ),
         );
@@ -559,11 +561,15 @@ mod tests {
         assert_eq!(keymap, bindings(text).unwrap());
         let ctrl_q = press(KEY_Q, character("q"), CTRL, NONE);
         assert_eq!(
-            keymap.press(&ctrl_q, PAGE),
+            keymap.press(&ctrl_q, PAGE, &NoneBrowser),
             KeyAction::Run(Command::BrowserQuit)
         );
         assert_eq!(
-            keymap.press(&press(KEY_A, character("a"), NONE, NONE), PAGE),
+            keymap.press(
+                &press(KEY_A, character("a"), NONE, NONE),
+                PAGE,
+                &NoneBrowser
+            ),
             KeyAction::Pass
         );
     }
@@ -572,7 +578,7 @@ mod tests {
     fn consumed_presses_consume_their_releases() {
         let mut keys = keys(r#""ctrl-a" = "tab.new""#);
         let seat = SeatId::next();
-        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event);
+        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser);
         let down = press(KEY_A, character("a"), CTRL, NONE);
         let repeat = KeyEvent {
             repeat: true,
@@ -582,8 +588,8 @@ mod tests {
             state: ButtonState::Released,
             ..down.clone()
         };
-        assert_eq!(handle(&down), KeyOutcome::Run(Command::TabNew));
-        assert_eq!(handle(&repeat), KeyOutcome::Run(Command::TabNew));
+        assert_eq!(handle(&down), KeyOutcome::Run(vec![Command::TabNew]));
+        assert_eq!(handle(&repeat), KeyOutcome::Run(vec![Command::TabNew]));
         // Ctrl was let go while A repeats: still the browser's.
         let bare_repeat = KeyEvent {
             modifiers: NONE,
@@ -604,7 +610,7 @@ mod tests {
     fn a_held_key_never_turns_into_a_shortcut() {
         let mut keys = keys(r#""ctrl-r" = "page.reload""#);
         let seat = SeatId::next();
-        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event);
+        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser);
         // R goes down and repeats, and Ctrl goes down while it does.
         let r = press(KEY_R, character("r"), NONE, NONE);
         assert_eq!(handle(&r), KeyOutcome::Deliver);
@@ -624,7 +630,7 @@ mod tests {
             modifiers: CTRL,
             ..r
         };
-        assert_eq!(handle(&ctrl_r), KeyOutcome::Run(Command::PageReload));
+        assert_eq!(handle(&ctrl_r), KeyOutcome::Run(vec![Command::PageReload]));
     }
 
     #[test]
@@ -637,8 +643,90 @@ mod tests {
             modifiers: NONE,
             ..down.clone()
         };
-        keys.handle(PAGE, seat, &down);
+        keys.handle(PAGE, seat, &down, &NoneBrowser);
         keys.forget(seat);
-        assert_eq!(keys.handle(PAGE, seat, &up), KeyOutcome::Deliver);
+        assert_eq!(
+            keys.handle(PAGE, seat, &up, &NoneBrowser),
+            KeyOutcome::Deliver
+        );
+    }
+
+    /// A keymap with no table: `a` runs two commands, `e` runs none.
+    struct Fixed;
+
+    impl Keymap for Fixed {
+        fn configure(&mut self, _: &Table) {}
+
+        fn press(&mut self, key: &KeyEvent, _: KeyContext, _: &dyn Browser) -> KeyAction {
+            match &key.key {
+                Key::Character(text) if text == "a" => {
+                    KeyAction::RunAll(vec![Command::TabNew, Command::PageReload])
+                }
+                Key::Character(text) if text == "e" => KeyAction::RunAll(Vec::new()),
+                _ => KeyAction::Pass,
+            }
+        }
+    }
+
+    #[test]
+    fn run_all_runs_again_on_repeat_and_an_empty_one_is_taken() {
+        let kind = KeymapKind {
+            name: "fixed",
+            check: |_, _| Vec::new(),
+            new: || Box::new(Fixed),
+        };
+        let mut keys = KeyState::new(kind, &Table::new());
+        let seat = SeatId::next();
+        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser);
+        let commands = vec![Command::TabNew, Command::PageReload];
+        let down = press(KEY_A, character("a"), NONE, NONE);
+        let repeat = KeyEvent {
+            repeat: true,
+            ..down.clone()
+        };
+        let up = KeyEvent {
+            state: ButtonState::Released,
+            ..down.clone()
+        };
+        assert_eq!(handle(&down), KeyOutcome::Run(commands.clone()));
+        assert_eq!(handle(&repeat), KeyOutcome::Run(commands));
+        assert_eq!(handle(&up), KeyOutcome::Consumed);
+        let empty = press(18, character("e"), NONE, NONE);
+        let empty_repeat = KeyEvent {
+            repeat: true,
+            ..empty.clone()
+        };
+        let empty_up = KeyEvent {
+            state: ButtonState::Released,
+            ..empty.clone()
+        };
+        assert_eq!(handle(&empty), KeyOutcome::Consumed);
+        assert_eq!(handle(&empty_repeat), KeyOutcome::Consumed);
+        assert_eq!(handle(&empty_up), KeyOutcome::Consumed);
+    }
+
+    /// A browser with nothing to read. `bindings` never looks.
+    struct NoneBrowser;
+
+    impl Browser for NoneBrowser {
+        fn frontend(&self) -> sighurt_api::keymap::Frontend {
+            sighurt_api::keymap::Frontend::Gui
+        }
+
+        fn context(&self) -> KeyContext {
+            KeyContext::new(KeyboardFocus::Page, false)
+        }
+
+        fn tab_count(&self) -> usize {
+            0
+        }
+
+        fn active_tab(&self) -> usize {
+            0
+        }
+
+        fn tab(&self, _: usize) -> Option<sighurt_api::keymap::TabInfo<'_>> {
+            None
+        }
     }
 }

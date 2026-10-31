@@ -85,7 +85,7 @@ if [[ ${1:-} != --inside ]]; then
   link='ln -f target/debug/sig target/debug/sig-engines-e2e'
   if [[ $build == 1 ]]; then
     SIG_WHAT="servo build: sig (default features) for engines.sh" tools/heavy bash -c \
-      "cargo build -p sighurt-browser --features keymap-modal,chrome-line --bins \
+      "cargo build -p sighurt-browser --features chrome-line --bins \
        --example virtual-pointer && $link" || exit 1
     SIG_WHAT="build the example guests for engines.sh" tools/cargo build \
       --target wasm32-unknown-unknown --release "${guests[@]/#/-p}" || exit 1

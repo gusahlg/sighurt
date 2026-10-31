@@ -20,8 +20,6 @@ engine-servo = ["dep:sighurt-engine-servo"]
 engine-wasm = ["dep:sighurt-engine-wasm"]
 engine-wpe = ["dep:sighurt-engine-wpe"]
 engine-demo = []
-# Keymaps besides the core's own `bindings`.
-keymap-modal = ["dep:sighurt-keymap-modal"]
 # Chromes are the frontend's. The feature exists so one `--features` list can name every
 # crate of the `sig` split; it changes nothing here.
 chrome-line = []
@@ -32,7 +30,8 @@ sighurt-core = { path = "../sighurt-core" }
 sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
 sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = true }
-sighurt-keymap-modal = { path = "../../extensions/sighurt-keymap-modal", optional = true }
+# The example configuration, the built-in keymap of every build (docs/rewrite/config-extension.md).
+sighurt-config-example = { path = "../../extensions/sighurt-config-example" }
 # The configuration watch (inotify) and CLOCK_MONOTONIC for the diagnostics lines.
 rustix = { workspace = true, features = ["fs"] }
 # `_exit` after an engine that could not shut down (decision 54).

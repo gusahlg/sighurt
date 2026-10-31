@@ -1,4 +1,4 @@
-//! The terminal's configuration: `[tui]`, its default keys, and chrome commands per frontend.
+//! The terminal's configuration: `[tui]`, its keys, and chrome commands per frontend.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
@@ -20,43 +20,6 @@ use sighurt_core::tabs::Content;
 use sighurt_core::{
     update, BrowserEvent, BrowserState, ChromeChecks, Effect, Environment, Frontend, OpenRequest,
 };
-
-const DEFAULT_KEYS: &[(&str, &str)] = &[
-    ("q", "browser.quit"),
-    ("ctrl-c", "browser.quit"),
-    ("o", "location.focus"),
-    ("ctrl-o", "location.focus"),
-    (":", "location.focus"),
-    ("t", "tab.new"),
-    ("x", "tab.close"),
-    ("J", "tab.next"),
-    ("K", "tab.previous"),
-    ("H", "page.back"),
-    ("L", "page.forward"),
-    ("r", "page.reload"),
-    ("e", "page.switch-engine"),
-    ("ctrl-r", "page.reload"),
-    ("j", "page.send-key ArrowDown"),
-    ("k", "page.send-key ArrowUp"),
-    ("ctrl-d", "page.send-key PageDown"),
-    ("ctrl-u", "page.send-key PageUp"),
-    ("g", "page.send-key Home"),
-    ("G", "page.send-key End"),
-    ("+", "page.zoom-in"),
-    ("-", "page.zoom-out"),
-    ("=", "page.zoom-reset"),
-    ("m", "chrome.toggle-mode"),
-    ("ctrl-l", "chrome.refresh"),
-    ("alt-1", "tab.select 1"),
-    ("alt-2", "tab.select 2"),
-    ("alt-3", "tab.select 3"),
-    ("alt-4", "tab.select 4"),
-    ("alt-5", "tab.select 5"),
-    ("alt-6", "tab.select 6"),
-    ("alt-7", "tab.select 7"),
-    ("alt-8", "tab.select 8"),
-    ("alt-9", "tab.select 9"),
-];
 
 /// A keymap whose table maps keys to commands, so `[keymap.fake]` is checked like a real one.
 const FAKE: KeymapKind = KeymapKind {
@@ -259,17 +222,6 @@ impl Harness {
         })
     }
 
-    /// Like [`Self::key`], then lets the fake engine answer, so a traversal commits.
-    fn apply_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        self.apply(BrowserEvent::Keyboard {
-            event: InputEvent {
-                seat: self.seat,
-                kind: InputKind::Key(key),
-            },
-            at: self.now,
-        })
-    }
-
     fn command(&mut self, text: &str) {
         self.apply(BrowserEvent::Command(text.parse().unwrap()));
     }
@@ -362,18 +314,6 @@ fn reloaded(effects: &[Effect], view: ViewId) -> bool {
     })
 }
 
-fn traversed(effects: &[Effect], view: ViewId, delta: i32) -> bool {
-    effects.iter().any(|effect| {
-        matches!(
-            effect,
-            Effect::Engine {
-                view: id,
-                command: EngineCommand::Traverse { delta: got, .. },
-            } if *id == view && *got == delta
-        )
-    })
-}
-
 fn text_field(view: ViewId) -> EngineEvent {
     EngineEvent::TextInputChanged {
         view,
@@ -387,19 +327,28 @@ fn text_field(view: ViewId) -> EngineEvent {
 }
 
 #[test]
-fn the_built_in_table_is_the_one_documented() {
-    assert_eq!(DEFAULT_KEYS.len(), 34);
-    for (key, command) in DEFAULT_KEYS {
-        let line = format!("\"{key}\" = \"{command}\"");
+fn neither_frontend_has_default_bindings_keys() {
+    for frontend in [Frontend::Gui, Frontend::Terminal] {
+        let mut browser = Harness::start(frontend, "", &["https://a.test/"]);
+        let view = browser.shown();
+        let plain = Modifiers::default();
+        let effects = browser.key(press("j", plain));
         assert!(
-            DEFAULT_CONFIG.contains(&line),
-            "the default file has no {line}"
+            delivered(&page_keys(&effects, view), "j"),
+            "{frontend:?} binds j"
         );
+        assert!(!browser.key(press("q", plain)).contains(&Effect::Quit));
+        assert!(!has_command(&browser.key(press("m", plain)), "toggle-mode"));
+        browser.key(press("+", plain));
+        assert_eq!(browser.zoom(), 1.0);
     }
     assert_eq!(
         TERMINAL_CHROME_COMMANDS,
         ["toggle-mode", "text-mode", "graphics-mode", "refresh"]
     );
+    // The old built-in table is not in the file. Commented examples of a user's
+    // [tui.keys] stay.
+    assert!(!DEFAULT_CONFIG.contains("\n[tui.keys]\n"));
 }
 
 #[test]
@@ -476,96 +425,7 @@ fn the_tui_table_parses_and_reports_every_invalid_value() {
 }
 
 #[test]
-fn the_terminal_gets_the_default_keys_and_the_window_does_not() {
-    let mut terminal = Harness::start(Frontend::Terminal, "", &["https://a.test/"]);
-    let view = terminal.shown();
-    let plain = Modifiers::default();
-    assert!(sent(
-        &page_keys(&terminal.key(press("j", plain)), view),
-        "ArrowDown"
-    ));
-    assert!(sent(
-        &page_keys(&terminal.key(press("k", plain)), view),
-        "ArrowUp"
-    ));
-    assert!(sent(
-        &page_keys(&terminal.key(press("d", ctrl())), view),
-        "PageDown"
-    ));
-    assert!(sent(
-        &page_keys(&terminal.key(press("u", ctrl())), view),
-        "PageUp"
-    ));
-    assert!(sent(
-        &page_keys(&terminal.key(press("g", plain)), view),
-        "Home"
-    ));
-    assert!(sent(
-        &page_keys(&terminal.key(press("G", shift())), view),
-        "End"
-    ));
-    terminal.key(press("+", plain));
-    assert_eq!(terminal.zoom(), 1.1);
-    terminal.key(press("=", plain));
-    assert_eq!(terminal.zoom(), 1.0);
-    terminal.key(press("-", plain));
-    assert_eq!(terminal.zoom(), 0.9);
-    assert!(reloaded(&terminal.key(press("r", plain)), view));
-    assert!(reloaded(&terminal.key(press("r", ctrl())), view));
-    assert!(has_command(&terminal.key(press("m", plain)), "toggle-mode"));
-    assert!(has_command(&terminal.key(press("l", ctrl())), "refresh"));
-    assert!(terminal
-        .key(press("o", plain))
-        .contains(&Effect::Focus(KeyboardFocus::Chrome)));
-    terminal.update(BrowserEvent::Focus(KeyboardFocus::Page));
-    assert!(terminal
-        .key(press(":", plain))
-        .contains(&Effect::Focus(KeyboardFocus::Chrome)));
-    terminal.update(BrowserEvent::Focus(KeyboardFocus::Page));
-    assert!(terminal.key(press("q", plain)).contains(&Effect::Quit));
-
-    let mut tabs = Harness::start(
-        Frontend::Terminal,
-        "",
-        &["https://a.test/", "https://b.test/"],
-    );
-    assert_eq!(tabs.state.active(), 0);
-    tabs.key(press("J", shift()));
-    assert_eq!(tabs.state.active(), 1);
-    tabs.key(press("K", shift()));
-    assert_eq!(tabs.state.active(), 0);
-    tabs.key(press("2", alt()));
-    assert_eq!(tabs.state.active(), 1);
-    tabs.key(press("1", alt()));
-    assert_eq!(tabs.state.active(), 0);
-    tabs.key(press("9", alt()));
-    assert_eq!(tabs.state.active(), 0);
-    tabs.key(press("x", plain));
-    assert_eq!(tabs.state.tabs().len(), 1, "x closes the active tab");
-    tabs.key(press("t", plain));
-    assert_eq!(tabs.state.tabs().len(), 2);
-    assert_eq!(tabs.state.focus(), KeyboardFocus::Chrome);
-
-    let mut history = Harness::start(Frontend::Terminal, "", &["https://a.test/"]);
-    history.command("page.open https://b.test/");
-    let view = history.shown();
-    assert!(traversed(&history.apply_key(press("H", shift())), view, -1));
-    assert!(traversed(&history.apply_key(press("L", shift())), view, 1));
-
-    let mut window = Harness::start(Frontend::Gui, "", &["https://a.test/"]);
-    let view = window.shown();
-    let effects = window.key(press("j", plain));
-    assert!(delivered(&page_keys(&effects, view), "j"));
-    assert!(!effects.contains(&Effect::Quit));
-    assert!(!window.key(press("q", plain)).contains(&Effect::Quit));
-    assert!(!has_command(&window.key(press("m", plain)), "toggle-mode"));
-    assert_eq!(window.zoom(), 1.0);
-    window.key(press("+", plain));
-    assert_eq!(window.zoom(), 1.0, "the window has no default zoom binding");
-}
-
-#[test]
-fn user_keys_override_the_built_in_table_and_default_keys_false_drops_it() {
+fn user_keys_bind_and_default_keys_does_not_remove_them() {
     let mut terminal = Harness::start(
         Frontend::Terminal,
         "[keys]\n\"j\" = \"tab.next\"\n\"q\" = \"page.reload\"\n",
@@ -576,13 +436,11 @@ fn user_keys_override_the_built_in_table_and_default_keys_false_drops_it() {
     assert!(reloaded(&terminal.key(press("q", plain)), view));
     assert!(!terminal.key(press("q", plain)).contains(&Effect::Quit));
     terminal.key(press("j", plain));
-    assert_eq!(
-        terminal.state.active(),
-        1,
-        "[keys] wins over the built-in j"
-    );
-    // A built-in binding the user did not override still fires.
-    assert!(has_command(&terminal.key(press("m", plain)), "toggle-mode"));
+    assert_eq!(terminal.state.active(), 1, "[keys] binds j");
+    assert!(!has_command(
+        &terminal.key(press("m", plain)),
+        "toggle-mode"
+    ));
 
     let mut off = Harness::start(
         Frontend::Terminal,
@@ -600,7 +458,7 @@ fn user_keys_override_the_built_in_table_and_default_keys_false_drops_it() {
         .key(press("m", plain))
         .iter()
         .any(|effect| { matches!(effect, Effect::ChromeCommand(_)) }));
-    // The user's [tui.keys] stays when the built-in table is off, and still beats [keys].
+    // [tui.keys] still beats [keys]. default-keys does not drop it.
     let mut own = Harness::start(
         Frontend::Terminal,
         "[tui]\ndefault-keys = false\n[tui.keys]\n\"q\" = \"browser.quit\"\n\
@@ -710,7 +568,11 @@ fn chrome_commands_are_checked_against_the_running_frontend() {
 
 #[test]
 fn a_page_whose_fields_get_no_typing_keeps_its_character_bindings() {
-    let mut terminal = Harness::start(Frontend::Terminal, "", &["https://a.test/"]);
+    let mut terminal = Harness::start(
+        Frontend::Terminal,
+        "[keys]\n\"j\" = \"page.send-key ArrowDown\"\n\"q\" = \"browser.quit\"\n",
+        &["https://a.test/"],
+    );
     let view = terminal.shown();
     let plain = Modifiers::default();
     let field = |terminal: &mut Harness| {
@@ -760,9 +622,17 @@ fn a_page_whose_fields_get_no_typing_keeps_its_character_bindings() {
 
 #[test]
 fn typing_suppresses_character_bindings_and_not_modifiers() {
+    let keys = "[keys]\n\
+                \"j\" = \"page.send-key ArrowDown\"\n\
+                \"J\" = \"tab.next\"\n\
+                \"ctrl-d\" = \"page.send-key PageDown\"\n\
+                \"alt-1\" = \"tab.select 1\"\n\
+                \"alt-2\" = \"tab.select 2\"\n\
+                \"ctrl-r\" = \"page.reload\"\n\
+                \"ctrl-l\" = \"chrome.refresh\"\n";
     let mut terminal = Harness::start(
         Frontend::Terminal,
-        "",
+        keys,
         &["https://a.test/", "https://b.test/"],
     );
     let view = terminal.shown();
@@ -793,7 +663,7 @@ fn typing_suppresses_character_bindings_and_not_modifiers() {
     );
 
     // The chrome's line is the same: a character binding waits, a modifier runs.
-    let mut line = Harness::start(Frontend::Terminal, "", &["https://a.test/"]);
+    let mut line = Harness::start(Frontend::Terminal, keys, &["https://a.test/"]);
     line.command("location.focus");
     assert_eq!(line.state.focus(), KeyboardFocus::Chrome);
     let effects = line.key(press("j", plain));

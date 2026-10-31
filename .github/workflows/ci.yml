@@ -57,7 +57,7 @@ jobs:
         run: >
           cargo clippy -p sighurt-browser -p sighurt-runtime -p sighurt-gui
           --no-default-features
-          --features engine-demo,engine-wasm,keymap-modal,chrome-line
+          --features engine-demo,engine-wasm,chrome-line
           --all-targets -- -D warnings
 
       # The Wasm engine's tests run these example guests (engines/sighurt-engine-wasm/tests/).
@@ -79,7 +79,7 @@ jobs:
         run: >
           cargo test -p sighurt-browser -p sighurt-runtime -p sighurt-gui
           --no-default-features
-          --features engine-demo,engine-wasm,keymap-modal,chrome-line
+          --features engine-demo,engine-wasm,chrome-line
 
   check-wasm:
     name: Check SDK and examples (wasm32)

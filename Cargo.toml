@@ -21,7 +21,7 @@ members = [
     # Needs the WPE WebKit prefix of nix/build-wpewebkit.sh (docs/rewrite/WPE.md).
     "engines/sighurt-engine-wpe",
     # Keymaps, compiled into `sig` through sighurt-browser's features.
-    "extensions/sighurt-keymap-modal",
+    "extensions/sighurt-config-example",
     # Guest SDK and example guests.
     "sdk/sighurt-sdk",
     "examples/hello-sighurt",

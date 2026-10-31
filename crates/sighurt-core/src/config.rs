@@ -20,18 +20,20 @@
 //! starts with instead. Parsing applies it on top of a valid file, and again on every later
 //! parse, so reloading the file does not put `[engines] default` back.
 //!
-//! `[input] keymap` chooses the keymap (the core's own `bindings`, which reads `[keys]`, unless
-//! it names another); `[input] scroll-speed` scales the scrolling pages get, and
-//! `[input.buttons]` binds the mouse's side buttons to commands. `[ui]` is what every chrome
-//! shares: which chrome draws the window (`chrome`, used from the next start), its font and
-//! size, and `[ui.colors]`.
+//! `[input] keymap` chooses the keymap. The built-in file names `example`, Sighurt's default
+//! keys; a build that lacks it uses `bindings`, which reads `[keys]` and binds nothing until
+//! the file does. A user's file that names a keymap this build lacks is an error.
+//! `[input] scroll-speed` scales the scrolling pages get, and `[input.buttons]` binds the
+//! mouse's side buttons to commands. `[ui]` is what every chrome shares: which chrome draws
+//! the window (`chrome`, used from the next start), its font and size, and `[ui.colors]`.
 //!
-//! `[tui]` is the terminal's: how it shows pages, and its keys ([`TuiConfig`]). The windowed
-//! frontend accepts the table and does not use it, so one file serves both. `[tui.keys]`, the
-//! user's and the built-in one, is checked against the terminal chrome's commands in either
-//! frontend. `[keys]`, `[keymap.<name>]` and `[input.buttons]` are checked against the chrome
-//! of the frontend that is running ([`Environment::frontend`]). Every `[tui]` field applies
-//! when the file is loaded.
+//! `[tui]` is the terminal's: how it shows pages, and its own `[tui.keys]`, which `bindings`
+//! installs over `[keys]` in the terminal only. `[tui] default-keys` is accepted and does
+//! nothing; a user's file that sets it gets a notice. The windowed frontend accepts the table
+//! and does not use it, so one file serves both. `[tui.keys]` is checked against the terminal
+//! chrome's commands in either frontend. `[keys]`, `[keymap.<name>]` and `[input.buttons]`
+//! are checked against the chrome of the frontend that is running
+//! ([`Environment::frontend`]). Every `[tui]` field applies when the file is loaded.
 //!
 //! `zoom` is the page zoom new tabs start at and `page.zoom-reset` returns to, and
 //! `[keywords]` names search templates for the address line ([`crate::router::fixup`]).
@@ -201,7 +203,8 @@ pub struct TuiConfig {
     pub fps: u32,
     /// `mouse`: whether the terminal's mouse is sent to the page.
     pub mouse: bool,
-    /// `default-keys`: whether the built-in terminal key table is installed under `[keys]`.
+    /// `default-keys`: accepted, and ignored since 0.10. The terminal's default keys are the
+    /// example configuration's. A user's file that sets this gets a notice.
     pub default_keys: bool,
 }
 
@@ -486,7 +489,15 @@ impl Config {
         let mut defaults: Raw = toml::from_str(DEFAULT_CONFIG).map_err(toml_error)?;
         let builtin_keys = take_keys(&mut defaults.tui);
         let Some(user) = user else {
-            return validate(defaults, builtin_keys, None, env, Vec::new(), Vec::new());
+            return validate(
+                defaults,
+                builtin_keys,
+                None,
+                env,
+                Vec::new(),
+                Vec::new(),
+                UserKeyChoice::default(),
+            );
         };
         let table: toml::Table = toml::from_str(user).map_err(toml_error)?;
         match table.get("version") {
@@ -519,6 +530,11 @@ impl Config {
             ));
         }
         let notices = engine_notices(&user, env);
+        // Before the built-in file fills these in: only a value the user's file wrote counts.
+        let from_user = UserKeyChoice {
+            keymap: user.input.keymap.clone(),
+            set_default_keys: user.tui.contains_key("default-keys"),
+        };
         let user_keys = take_keys(&mut user.tui);
         validate(
             merge(defaults, user),
@@ -527,6 +543,7 @@ impl Config {
             env,
             problems,
             notices,
+            from_user,
         )
     }
 
@@ -753,7 +770,7 @@ fn sections(mut table: toml::Table, problems: &mut Vec<String>) -> Raw {
 /// `user`'s settings over `defaults`. `[keywords]`, `[keys]`, `[keymap.*]`, `[ui]` and
 /// `[chrome.*]` are the user's alone, and so is `[engines.*]`, which the built-in file can't
 /// hold. `[tui]` merges key by key; `[tui.keys]` was split out of both tables first, because
-/// the user's is a separate layer rather than a replacement of the built-in one.
+/// the user's is a layer of its own over `[keys]`, not a field of `[tui]`.
 fn merge(defaults: Raw, user: Raw) -> Raw {
     let mut routing = defaults.routing;
     for (engine, user) in user.routing {
@@ -846,9 +863,19 @@ fn engine_notices(user: &Raw, env: &Environment) -> Vec<String> {
     settings.chain(routes).chain(enabled).collect()
 }
 
+/// What the user's file said about keys, captured before the built-in file fills it in.
+#[derive(Default)]
+struct UserKeyChoice {
+    /// The keymap the user's file named. `None` when there is no user file, or it names none.
+    keymap: Option<String>,
+    /// Whether the user's file sets `[tui] default-keys`.
+    set_default_keys: bool,
+}
+
 /// Checks everything in `raw` and turns it into a [`Config`] for a build with what `env`
 /// lists, unless it or reading it (`problems`) found a problem. `builtin_keys` is the default
-/// file's `[tui.keys]`; `user_tui_keys` is the user's, when they wrote one.
+/// file's `[tui.keys]`, checked and not installed. `user_tui_keys` is the user's, when they
+/// wrote one. `from_user` is what that file said about the keymap and `[tui] default-keys`.
 fn validate(
     raw: Raw,
     builtin_keys: Option<toml::Table>,
@@ -856,6 +883,7 @@ fn validate(
     env: &Environment,
     mut problems: Vec<String>,
     mut notices: Vec<String>,
+    from_user: UserKeyChoice,
 ) -> Result<Config, ConfigError> {
     let home = raw.home.unwrap_or_default();
     if let Err(error) = url::Url::parse(&home) {
@@ -987,12 +1015,21 @@ fn validate(
 
     let ui = check_ui(raw.ui.unwrap_or_default(), env, &mut problems);
     let tui = check_tui(raw.tui, &mut problems);
+    if from_user.set_default_keys {
+        notices.push(
+            "[tui] default-keys has no effect since 0.10: the terminal's default keys are the \
+             example configuration's"
+                .into(),
+        );
+    }
     // `[keys]` and the buttons use the running frontend's chrome. `[tui.keys]` is the
     // terminal's in either frontend, so it is checked against the terminal chrome.
     let commands = running_commands(env, &ui.chrome);
     let terminal = CommandSet::new("terminal", TERMINAL_CHROME_COMMANDS);
     let user_wrote_tui_keys = user_tui_keys.is_some();
-    let builtin_keys = read_keys(builtin_keys, &terminal, &mut problems);
+    // The built-in file no longer ships a key table. One that appears is still checked, and
+    // not installed: the example configuration owns the default keys.
+    let _ = read_keys(builtin_keys, &terminal, &mut problems);
     let user_tui_keys = read_keys(user_tui_keys, &terminal, &mut problems);
     let chrome_settings = check_chromes(raw.chrome, env, &mut problems, &mut notices);
     let scroll_speed = raw.input.scroll_speed.unwrap_or(1.0);
@@ -1020,7 +1057,13 @@ fn validate(
         keys: raw.keys,
         tables: raw.keymap,
     };
-    let (keymap, selected) = keymaps.check(env, &commands, &mut problems, &mut notices);
+    let (keymap, selected) = keymaps.check(
+        env,
+        &commands,
+        &mut problems,
+        &mut notices,
+        from_user.keymap.as_deref(),
+    );
     let keymap_settings = if keymap == keys::KIND {
         let on_terminal = env.frontend == Frontend::Terminal;
         keys::combine(
@@ -1030,11 +1073,6 @@ fn validate(
                 Table::new()
             },
             selected,
-            if on_terminal && tui.default_keys {
-                builtin_keys
-            } else {
-                Table::new()
-            },
         )
     } else {
         if env.frontend == Frontend::Terminal && user_wrote_tui_keys {
@@ -1476,27 +1514,36 @@ impl KeyTables {
         commands: &CommandSet<'_>,
         problems: &mut Vec<String>,
         notices: &mut Vec<String>,
+        user_keymap: Option<&str>,
     ) -> (KeymapKind, Table) {
         let bindings = keys::KIND;
         let has = list(std::iter::once(bindings.name).chain(env.keymaps.iter().map(|k| k.name)));
-        let name = self.selected.unwrap_or_else(|| bindings.name.into());
+        let mut name = self.selected.unwrap_or_else(|| bindings.name.into());
+        let found = env.keymaps.iter().find(|kind| kind.name == name).copied();
+        // A keymap the user's file names and this build lacks is an error, as `[engines]
+        // default` is. The built-in file's value is not: a build without that keymap uses
+        // bindings. The core has no logger, so that fallback is silent, the same way the
+        // built-in default engine is not checked (decision 82 (3)).
+        let kind = match found {
+            Some(kind) => kind,
+            None if name == bindings.name => bindings,
+            None if user_keymap == Some(name.as_str()) => {
+                problems.push(format!(
+                    "[input] keymap: this build has no keymap {name:?} (it has: {has})"
+                ));
+                bindings
+            }
+            None => {
+                name = bindings.name.to_owned();
+                bindings
+            }
+        };
         let reads = match name == bindings.name {
             true => "[keys]".to_owned(),
             false => format!("[keymap.{name}]"),
         };
         let unused = |table: &str| {
             format!("{table} is not used: [input] keymap is {name:?}, which reads {reads}")
-        };
-        let found = env.keymaps.iter().find(|kind| kind.name == name).copied();
-        let kind = match found {
-            Some(kind) => kind,
-            None if name == bindings.name => bindings,
-            None => {
-                problems.push(format!(
-                    "[input] keymap: this build has no keymap {name:?} (it has: {has})"
-                ));
-                bindings
-            }
         };
 
         let keys_given = self.keys.is_some();
@@ -1861,40 +1908,66 @@ mod tests {
         assert_eq!(parse("version = 1"), Ok(config));
     }
 
-    fn terminal_env() -> Environment {
-        Environment {
-            frontend: Frontend::Terminal,
-            ..env()
-        }
-    }
-
     #[test]
-    fn the_terminal_installs_its_default_keys_and_the_window_does_not() {
-        let config = Config::parse(None, &terminal_env()).unwrap();
-        assert_eq!(config.tui(), &TuiConfig::default());
-        assert_eq!(config.keymap_settings.len(), 34);
-        let bound = |key: &str| config.keymap_settings[key].as_str();
-        assert_eq!(bound("q"), Some("browser.quit"));
-        assert_eq!(bound("ctrl-c"), Some("browser.quit"));
-        assert_eq!(bound("ctrl-o"), Some("location.focus"));
-        assert_eq!(bound("e"), Some("page.switch-engine"));
-        assert_eq!(bound("j"), Some("page.send-key ArrowDown"));
-        assert_eq!(bound("ctrl-r"), Some("page.reload"));
-        assert_eq!(bound("ctrl-l"), Some("chrome.refresh"));
-        assert_eq!(bound("m"), Some("chrome.toggle-mode"));
-        assert_eq!(bound("alt-1"), Some("tab.select 1"));
-        assert_eq!(bound("alt-9"), Some("tab.select 9"));
-        assert_eq!(bound("+"), Some("page.zoom-in"));
-        assert_eq!(bound(":"), Some("location.focus"));
-        assert_eq!(bound("-"), Some("page.zoom-out"));
-        // The window keeps an empty [keys] table, and still accepts the terminal's commands
-        // where only the terminal reads them.
+    fn neither_frontend_has_default_bindings_keys() {
+        for frontend in [Frontend::Gui, Frontend::Terminal] {
+            let env = Environment { frontend, ..env() };
+            let config = Config::parse(None, &env).unwrap();
+            assert_eq!(config.keymap, keys::KIND);
+            assert!(
+                config.keymap_settings.is_empty(),
+                "{frontend:?} installs bindings"
+            );
+            assert!(config.notices().is_empty());
+        }
+        // The window still accepts the terminal's commands where only the terminal reads them,
+        // and does not install [tui.keys].
         let window = parse(
             "version = 1\n[tui.keys]\n\"m\" = \"chrome.toggle-mode\"\n[keys]\n\"j\" = \"tab.next\"",
         )
         .unwrap();
         assert_eq!(window.keymap_settings.len(), 1);
         assert_eq!(window.keymap_settings["j"].as_str(), Some("tab.next"));
+    }
+
+    #[test]
+    fn the_builtin_keymap_falls_back_when_the_build_lacks_it() {
+        let config = Config::parse(None, &Environment::default()).unwrap();
+        assert_eq!(config.keymap, keys::KIND);
+        assert!(config.keymap_settings.is_empty());
+        assert!(config.notices().is_empty());
+        let error = Config::parse(
+            Some("version = 1\n[input]\nkeymap = \"example\"\n"),
+            &Environment::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.problems,
+            ["[input] keymap: this build has no keymap \"example\" (it has: bindings)"]
+        );
+    }
+
+    #[test]
+    fn default_keys_has_no_effect_and_says_so() {
+        let builtin = Config::parse(None, &env()).unwrap();
+        assert!(builtin.tui().default_keys);
+        assert!(builtin.notices().is_empty());
+        assert!(builtin.keymap_settings.is_empty());
+        let said = "[tui] default-keys has no effect since 0.10: the terminal's default keys are \
+                    the example configuration's";
+        let off = parse("version = 1\n[tui]\ndefault-keys = false\n").unwrap();
+        assert!(!off.tui().default_keys);
+        assert!(off.keymap_settings.is_empty());
+        assert_eq!(off.notices(), [said]);
+        let on = parse("version = 1\n[tui]\ndefault-keys = true\n").unwrap();
+        assert!(on.tui().default_keys);
+        assert_eq!(on.notices(), [said]);
+        // The flag does not remove keys the user bound.
+        let keys =
+            parse("version = 1\n[tui]\ndefault-keys = false\n[keys]\n\"j\" = \"tab.next\"\n")
+                .unwrap();
+        assert_eq!(keys.keymap_settings["j"].as_str(), Some("tab.next"));
+        assert_eq!(keys.notices(), [said]);
     }
 
     #[test]

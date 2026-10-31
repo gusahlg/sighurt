@@ -16,7 +16,6 @@ engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 # WebKit presents into the terminal's CPU target: shared-memory frames, one copy each.
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
-keymap-modal = ["sighurt-runtime/keymap-modal"]
 
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }

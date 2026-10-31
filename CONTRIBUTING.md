@@ -25,11 +25,11 @@ cargo clippy --workspace --exclude sighurt-engine-servo --exclude sighurt-engine
   --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist \
   --all-targets -- -D warnings
 cargo clippy -p sighurt-browser --no-default-features \
-  --features engine-demo,engine-wasm,keymap-modal,chrome-line --all-targets -- -D warnings
+  --features engine-demo,engine-wasm,chrome-line --all-targets -- -D warnings
 cargo build --target wasm32-unknown-unknown --release -p hello-sighurt -p raf-demo -p gradient-demo -p typography-demo
 cargo test --workspace --exclude sighurt-engine-servo --exclude sighurt-engine-wpe \
   --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
-cargo test -p sighurt-browser --no-default-features --features engine-demo,engine-wasm,keymap-modal,chrome-line
+cargo test -p sighurt-browser --no-default-features --features engine-demo,engine-wasm,chrome-line
 ```
 
 If you touched an engine or `sig`, also run what builds it:

@@ -2348,15 +2348,18 @@ fn a_failed_page_says_so_when_it_is_shown_again() {
 
 /// `script`, a keymap for these tests. `[keymap.script]` says what a press of a key that types
 /// a character does: `"take"` takes a fresh press and passes its repeats, `"run <command>"`
-/// runs the command, `"then <command>"` runs it and passes the press on. It counts the presses
-/// it is asked about, and shows the count as its indicator. What the core tells it goes into a
-/// log of the thread, so each test sees its own.
+/// runs the command, `"then <command>"` runs it and passes the press on, `"all <commands>"`
+/// runs those commands (separated by `;`) in order, and `"close-titled <title>"` closes the
+/// tab whose own title it read. It counts the presses it is asked about, and shows the count
+/// as its indicator. What the core tells it goes into a log of the thread, so each test sees
+/// its own.
 mod script {
     use std::cell::RefCell;
+    use std::num::NonZeroUsize;
 
     use sighurt_api::commands::{Command, CommandSet};
     use sighurt_api::input::{Key, KeyEvent};
-    use sighurt_api::keymap::{KeyAction, KeyContext, Keymap, KeymapKind};
+    use sighurt_api::keymap::{Browser, KeyAction, KeyContext, Keymap, KeymapKind};
     use sighurt_api::settings::Table;
 
     thread_local! {
@@ -2382,14 +2385,47 @@ mod script {
         Take,
         Run(Command),
         Then(Command),
+        All(Vec<Command>),
+        CloseTitled(String),
     }
 
     fn rule(text: &str, commands: &CommandSet<'_>) -> Result<Rule, String> {
+        if let Some(rest) = text.strip_prefix("all ") {
+            let mut found = Vec::new();
+            for part in rest.split(';') {
+                let part = part.trim();
+                if part.is_empty() {
+                    return Err("all: expected commands separated by ';'".into());
+                }
+                found.push(commands.parse(part)?);
+            }
+            return Ok(Rule::All(found));
+        }
+        if let Some(title) = text.strip_prefix("close-titled ") {
+            return match title.is_empty() {
+                true => Err("close-titled: expected a title".into()),
+                false => Ok(Rule::CloseTitled(title.to_owned())),
+            };
+        }
         match text.split_once(' ') {
             None if text == "take" => Ok(Rule::Take),
             Some(("run", command)) => commands.parse(command).map(Rule::Run),
             Some(("then", command)) => commands.parse(command).map(Rule::Then),
-            _ => Err(format!("{text:?}: expected take, run or then")),
+            _ => Err(format!(
+                "{text:?}: expected take, run, then, all or close-titled"
+            )),
+        }
+    }
+
+    /// `tab.close` of the tab whose own title is `title`, or a taken key when none has it.
+    fn close_titled(browser: &dyn Browser, title: &str) -> KeyAction {
+        let found = (0..browser.tab_count())
+            .find(|&index| browser.tab(index).and_then(|tab| tab.title) == Some(title));
+        match found {
+            Some(index) => KeyAction::Run(Command::TabClose(Some(
+                NonZeroUsize::new(index + 1).expect("tab numbers start at 1"),
+            ))),
+            None => KeyAction::Take,
         }
     }
 
@@ -2423,7 +2459,12 @@ mod script {
             self.rules = rules.collect();
         }
 
-        fn press(&mut self, key: &KeyEvent, _context: KeyContext) -> KeyAction {
+        fn press(
+            &mut self,
+            key: &KeyEvent,
+            _context: KeyContext,
+            browser: &dyn Browser,
+        ) -> KeyAction {
             self.presses += 1;
             self.indicator = self.presses.to_string();
             let Key::Character(text) = &key.key else {
@@ -2433,6 +2474,8 @@ mod script {
                 Some((_, Rule::Take)) if !key.repeat => KeyAction::Take,
                 Some((_, Rule::Run(command))) => KeyAction::Run(command.clone()),
                 Some((_, Rule::Then(command))) => KeyAction::RunThenPass(command.clone()),
+                Some((_, Rule::All(commands))) => KeyAction::RunAll(commands.clone()),
+                Some((_, Rule::CloseTitled(title))) => close_titled(browser, title),
                 _ => KeyAction::Pass,
             }
         }
@@ -2544,6 +2587,59 @@ fn the_keymap_hears_context_changes() {
         at: b.now,
     });
     assert_eq!(script::log(), ["reset"]);
+}
+
+#[test]
+fn a_keymap_reads_the_tabs_it_decides_with() {
+    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\"x\" = \"close-titled Gone\"";
+    let mut b = Harness::start(
+        config,
+        &["https://a.test/", "https://b.test/", "https://c.test/"],
+    );
+    let views: Vec<_> = (0..3)
+        .map(|index| match b.tab(index).content {
+            Content::View(view) => view,
+            other => panic!("tab {index} shows {other:?}"),
+        })
+        .collect();
+    for (view, title) in views.iter().zip(["Keep", "Gone", "Stay"]) {
+        b.engine(EngineEvent::TitleChanged {
+            view: *view,
+            title: Some((*title).into()),
+        });
+    }
+    b.key(typed("x"));
+    assert_eq!(b.state.tabs().len(), 2);
+    assert_eq!(b.tab(0).title, "Keep");
+    assert_eq!(b.tab(1).title, "Stay");
+}
+
+#[test]
+fn run_all_runs_in_order_in_one_update() {
+    let config =
+        "[input]\nkeymap = \"script\"\n[keymap.script]\n\"x\" = \"all tab.close 3; tab.close 2\"";
+    let mut b = Harness::start(
+        config,
+        &[
+            "https://a.test/",
+            "https://b.test/",
+            "https://c.test/",
+            "https://d.test/",
+        ],
+    );
+    // One update: closing 3 then 2 leaves the first and the last. The other order would
+    // leave the first and the third.
+    b.key(typed("x"));
+    assert_eq!(b.state.tabs().len(), 2);
+    assert_eq!(b.tab(0).url, Some("https://a.test/"));
+    assert_eq!(b.tab(1).url, Some("https://d.test/"));
+}
+
+#[test]
+fn clipboard_copy_is_an_effect() {
+    let mut b = Harness::start("", &["sig://home"]);
+    let effects = b.update(command("clipboard.copy hello there"));
+    assert!(effects.contains(&Effect::ClipboardWrite("hello there".into())));
 }
 
 #[test]
