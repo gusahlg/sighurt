@@ -1,0 +1,33 @@
+--- a/Services/WebContent/PageClient.cpp
++++ b/Services/WebContent/PageClient.cpp
+@@ -47,6 +47,7 @@
+ #include <LibWeb/HTML/RemoteNavigable.h>
+ #include <LibWeb/HTML/Scripting/ClassicScript.h>
+ #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
++#include <LibWeb/Streams/ReadableStreamDefaultReader.h>
+ #include <LibWeb/HTML/SessionHistoryEntry.h>
+ #include <LibWeb/HTML/Window.h>
+ #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+@@ -988,11 +989,19 @@
+ 
+     m_canceled_downloads.set(download_id);
+ 
++    // SIGHURT-PATCH: the UI process cancels a download while no script runs here, and cancelling the
++    // stream resolves a promise, which calls into JavaScript: without an execution context that fails
++    // an assertion (VM.h, m_running_execution_context) and aborts this whole process.
++    if (reader.has_value()) {
++        Web::HTML::TemporaryExecutionContext execution_context { reader.value()->closed_promise_realm(), Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
++        if (controller.has_value())
++            controller.value()->stop_fetch();
++        Web::Fetch::Infrastructure::cancel_incremental_read(*reader.value());
++        return;
++    }
++
+     if (controller.has_value())
+         controller.value()->stop_fetch();
+-
+-    if (reader.has_value())
+-        Web::Fetch::Infrastructure::cancel_incremental_read(*reader.value());
+ }
+ 
+ void PageClient::page_did_finish_test(Utf16String const& text)
