@@ -6,14 +6,14 @@
 #
 #   tools/heavy experiments/ladybird-smoke/smoke.sh [OUT_PNG [URL]]
 #
-# Needs network (the page; cache.nixos.org on the first run). Caches (about 340 MB: a copy of Ladybird's source, its generated headers, the build) in /data/storage/sighurt/ladybird-smoke, else ~/.cache/sighurt/ladybird-smoke.
+# Needs network (the page; cache.nixos.org on the first run). Caches (about 340 MB: a copy of Ladybird's source, its generated headers, the build) in /data/sig-builds/ladybird/smoke-cache, else ~/.cache/sighurt/ladybird-smoke.
 # Never touches a Wayland session: WAYLAND_DISPLAY and DISPLAY are unset for the browser.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 out=$(realpath -m "${1:-ladybird-smoke.png}")
 url=${2:-https://example.com/}
 # Big trees stay off the SSD: the HDD directory when it exists (LADYBIRD_SMOKE_CACHE overrides).
-if [[ -d /data/storage/sighurt ]]; then default_cache=/data/storage/sighurt/ladybird-smoke
+if [[ -d /data/sig-builds ]]; then default_cache=/data/sig-builds/ladybird/smoke-cache
 else default_cache=$HOME/.cache/sighurt/ladybird-smoke; fi
 cache=${LADYBIRD_SMOKE_CACHE:-$default_cache}
 if [[ -z ${LADYBIRD:-} ]]; then

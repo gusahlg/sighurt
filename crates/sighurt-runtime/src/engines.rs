@@ -6,7 +6,7 @@
 //! starts on its target, how its views present and the renderer label. The core's
 //! [`Environment`](sighurt_core::Environment) is built from these descriptors.
 //!
-//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, the demo engine. The
+//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, Ladybird, the demo engine. The
 //! web engines, those that open http(s) pages, are the ones `page.switch-engine` cycles, in
 //! that same order.
 //!
@@ -58,6 +58,13 @@ pub fn descriptors() -> Vec<Descriptor> {
             web: true,
             capabilities: sighurt_engine_wpe::CAPABILITIES,
             honors: &["user-agent", "storage"],
+        },
+        #[cfg(feature = "engine-ladybird")]
+        Descriptor {
+            name: "ladybird",
+            web: true,
+            capabilities: sighurt_engine_ladybird::CAPABILITIES,
+            honors: &["storage"],
         },
         #[cfg(feature = "engine-demo")]
         Descriptor {
@@ -150,10 +157,12 @@ mod tests {
         assert_eq!(env.engine_settings["wasm"], ["storage"]);
         #[cfg(feature = "engine-wpe")]
         assert_eq!(env.engine_settings["wpe"], ["user-agent", "storage"]);
+        #[cfg(feature = "engine-ladybird")]
+        assert_eq!(env.engine_settings["ladybird"], ["storage"]);
         #[cfg(feature = "engine-demo")]
         assert!(env.engine_settings["demo"].is_empty());
         // Web engines are a property of the descriptors, in their order, whatever this build
-        // compiled in. Servo and WPE open http(s) pages; Wasm and the demo engine do not.
+        // compiled in. Servo, WPE and Ladybird open http(s) pages; Wasm and the demo engine do not.
         let web: Vec<String> = descriptors()
             .iter()
             .filter(|desc| desc.web)
@@ -163,7 +172,7 @@ mod tests {
         for desc in descriptors() {
             assert_eq!(
                 desc.web,
-                matches!(desc.name, "servo" | "wpe"),
+                matches!(desc.name, "servo" | "wpe" | "ladybird"),
                 "{}",
                 desc.name
             );

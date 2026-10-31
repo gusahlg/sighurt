@@ -1,0 +1,20 @@
+[package]
+name = "sighurt-engine-ladybird"
+description = "The Ladybird (LibWeb) engine for Sighurt: Ladybird's UI process in sig, frames presented on CPU targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+# Ladybird comes from the shim nix/build-ladybird-shim.sh builds against nixpkgs' package
+# (build.rs finds it), opened when the runtime first starts (src/ffi.rs), not linked.
+
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }
+# Origins of committed pages, for service requests.
+url.workspace = true
+# dlopen and poll.
+libc = "0.2"
+# Warnings through the executable's logger.
+log = "0.4"

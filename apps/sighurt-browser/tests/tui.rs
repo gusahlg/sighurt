@@ -515,6 +515,44 @@ fn a_demo_page_is_an_image_in_the_page_rows_and_quitting_restores_the_terminal()
     assert_eq!(term.counter("frames_dropped"), 0, "{}", term.context());
 }
 
+/// Ladybird in the terminal: its frames are copied into the terminal's CPU target and sent as a
+/// kitty image, like any engine's. Needs the shim (nix/build-ladybird-shim.sh); without it the
+/// test says so and passes. Run with `--features frontend-tui,engine-demo,engine-ladybird`.
+#[cfg(feature = "engine-ladybird")]
+#[test]
+fn a_ladybird_page_is_an_image_in_the_page_rows() {
+    if sighurt_engine_ladybird::ffi::load(None).is_err() {
+        eprintln!("skipped: no Ladybird shim (nix/build-ladybird-shim.sh)");
+        return;
+    }
+    let page = std::env::temp_dir().join(format!("sig-tui-ladybird-{}.html", std::process::id()));
+    fs::write(
+        &page,
+        "<!doctype html><title>Ladybird in a terminal</title>\
+         <body style='margin:0;background:#ff0000'><h1>hello</h1>",
+    )
+    .unwrap();
+    let url = format!("file://{}", page.display());
+    let mut term = Terminal::start("ladybird", &["--engine", "ladybird", &url]);
+    let shown = term.wait(0, Duration::from_secs(30), |got| {
+        has(got, b"\x1b[?1049h")
+            && image(got, 80, 22, 800, 440)
+            && has(got, b"[1/1]")
+            && has(got, b"Ladybird in a terminal")
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    term.type_bytes(b"q");
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+    assert_eq!(term.counter("frames_dropped"), 0, "{}", term.context());
+    let _ = fs::remove_file(&page);
+}
+
 #[test]
 fn sigterm_quits_and_restores_the_terminal() {
     let started = Instant::now();

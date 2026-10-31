@@ -12,6 +12,7 @@
     feature = "engine-servo",
     feature = "engine-wasm",
     feature = "engine-wpe",
+    feature = "engine-ladybird",
     feature = "engine-demo"
 ))]
 use sighurt_api::engine::EngineRuntime;
@@ -19,6 +20,7 @@ use sighurt_api::engine::EngineRuntime;
     feature = "engine-servo",
     feature = "engine-wasm",
     feature = "engine-wpe",
+    feature = "engine-ladybird",
     feature = "engine-demo"
 ))]
 use sighurt_api::ids::ViewId;
@@ -47,6 +49,12 @@ pub fn build() -> Registry<TermTarget, TermPermit> {
             renderer: "cpu, kitty graphics",
             start: wpe,
         },
+        #[cfg(feature = "engine-ladybird")]
+        Binding {
+            name: "ladybird",
+            renderer: "cpu, kitty graphics",
+            start: ladybird,
+        },
         #[cfg(feature = "engine-demo")]
         Binding {
             name: "demo",
@@ -58,10 +66,18 @@ pub fn build() -> Registry<TermTarget, TermPermit> {
 }
 
 /// One engine's runtime, bound to [`TermTarget`].
-#[cfg(any(feature = "engine-wasm", feature = "engine-demo"))]
+#[cfg(any(
+    feature = "engine-wasm",
+    feature = "engine-ladybird",
+    feature = "engine-demo"
+))]
 struct Bound<R>(R);
 
-#[cfg(any(feature = "engine-wasm", feature = "engine-demo"))]
+#[cfg(any(
+    feature = "engine-wasm",
+    feature = "engine-ladybird",
+    feature = "engine-demo"
+))]
 impl<R> EngineRuntime for Bound<R>
 where
     R: EngineRuntime<Target = TermTarget, FramePermit = TermPermit>,
@@ -254,6 +270,24 @@ fn wasm(
 #[cfg(feature = "engine-wasm")]
 impl sighurt_runtime::registry::Running<TermTarget, TermPermit>
     for Bound<sighurt_engine_wasm::WasmRuntime<TermTarget>>
+{
+}
+
+#[cfg(feature = "engine-ladybird")]
+fn ladybird(
+    waker: sighurt_api::engine::EngineWaker,
+    launch: sighurt_runtime::registry::Launch<'_>,
+) -> Result<sighurt_runtime::registry::Runtime<TermTarget, TermPermit>, String> {
+    use sighurt_engine_ladybird::LadybirdRuntime;
+    use sighurt_runtime::registry::{self, Runtime};
+
+    LadybirdRuntime::<TermTarget>::new(registry::ladybird_config(launch.settings), waker)
+        .map(|runtime| Runtime::Ladybird(Box::new(Bound(runtime))))
+}
+
+#[cfg(feature = "engine-ladybird")]
+impl sighurt_runtime::registry::Running<TermTarget, TermPermit>
+    for Bound<sighurt_engine_ladybird::LadybirdRuntime<TermTarget>>
 {
 }
 

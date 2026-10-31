@@ -20,6 +20,8 @@ members = [
     "engines/sighurt-engine-demo",
     # Needs the WPE WebKit prefix of nix/build-wpewebkit.sh (docs/rewrite/WPE.md).
     "engines/sighurt-engine-wpe",
+    # Needs the shim of nix/build-ladybird-shim.sh to run, not to build (docs/rewrite/LADYBIRD.md).
+    "engines/sighurt-engine-ladybird",
     # Keymaps, compiled into `sig` through sighurt-browser's features.
     "extensions/sighurt-config-example",
     # Guest SDK and example guests.

@@ -1,9 +1,11 @@
 # Ladybird (LibWeb) for Sighurt: feasibility, build recipe and engine design
 
-Status: **feasibility study with a working smoke test; no engine crate yet.** Written 31 October 2026
-against nixpkgs' `ladybird` `0-unstable-2026-09-18` (the pinned nixpkgs of `nix/nixpkgs.nix`).
-Nothing here changes an existing crate. Decisions are numbered L1.. and are proposals until
-recorded in `STATUS.md`.
+Status: **the engine exists and runs in `sig`** (branch `engine-ladybird`): the shim, the crate, the
+wiring behind `engine-ladybird`, and a screenshot of https://example.com/ in Ladybird inside `sig`
+in a private compositor. See "Implementation status" at the end for what is done, with evidence,
+and what is missing. Written 31 October 2026 against nixpkgs' `ladybird`
+`0-unstable-2026-09-18` (the pinned nixpkgs of `nix/nixpkgs.nix`). Decisions are numbered L1.. and
+are proposals until recorded in `STATUS.md`.
 
 ## Verdict
 
@@ -134,22 +136,30 @@ Rust 1.98.1 for its Rust crates (`libweb_rust`, `libgfx_rust`, ...). Store outpu
   and hides its poll set. The shim installs its own `EventLoopManager` +
   `EventLoopImplementation` (a ~300-line port of the Qt one, `UI/Qt/EventLoopImplementationQt.cpp`,
   539 lines) and returns an `EventLoop` over it from `Application::create_platform_event_loop()`.
-  It keeps one epoll instance holding every registered `Notifier` fd, one `timerfd` for the earliest
-  timer, one `eventfd` for `wake()`/`did_post_event()`, and one `pidfd` per child process
-  (`register_process`; no `SIGCHLD` handler, no `sigaction`: `ProcessMonitor` registers
-  `SIGCHLD` through `register_signal`, which the shim implements as "pidfd readiness" and
-  documents). The epoll fd itself is `lb_loop_fd()`: readable when anything is due. sig registers
-  that one fd as a calloop source; when it fires the runtime calls `lb_pump()`, which does
-  `epoll_wait(0)`, dispatches callbacks and `Core::ThreadEventQueue` events, bounded (at most N
-  events, then reports "more pending"). `PumpStatus::Pending { deadline }` comes from the timerfd's
-  next expiry. This is simpler than WPE's `GlibLoop` (one fd, no per-frame source churn) and
-  satisfies "no unconditional ticks": an idle Ladybird has no timer unless a page has one.
-- **L5. Pin and flag check.** `build-ladybird-shim.sh` fails if the configured source's
-  `ninja -t commands` for LibWebView does not carry exactly the flags recorded in
-  `experiments/ladybird-smoke/CMakeLists.txt`, and the shim exports `lb_abi_check(sizeof...)` values
-  (`sizeof(SharedImageBuffer)`, `sizeof(ViewImplementation)`) that `ffi::load` compares with the
-  values the shim recorded at build time against the libraries' own `lb_abi_probe` (compiled into a
-  one-line helper linked in the same TU set). A mismatch is a load error, not a crash.
+  **As built:** one manager for every thread (Ladybird runs event loops on other threads too, and
+  the stock manager's class is not exported, so it cannot be delegated to): each thread has its own
+  epoll instance, wake `eventfd` and timer table; the owner thread's epoll descriptor is
+  `lb_loop_fd()`, readable when a notifier's descriptor, a wake or a queued event needs a pump.
+  Timers have no descriptor: `lb_pump` returns the milliseconds to the next one, which becomes the
+  `PumpStatus` deadline. Notifiers on one descriptor are merged into one epoll registration.
+  `SIGINT` and `SIGTERM` (registered only in Ladybird's profiling mode) use `sigaction` with the
+  previous handler chained and the owner's wake descriptor as the self-pipe. **`SIGCHLD` is never
+  installed**: `ProcessMonitor`'s handler reaps with `waitpid(-1)`, which would take the exit status
+  of children that are not Ladybird's (WPE's bubblewrap, a program the host started). The loop keeps
+  the handler and never calls it; the shim watches each helper through a pidfd instead (the
+  `ProcessManager`'s `on_process_added`, plus the helpers already started), reaps it by its own pid and
+  does what the monitor would have done (`remove_process`, `save_crash_report`, `on_process_exited`,
+  so a dead RequestServer is still restarted); shutdown reaps the rest by pid. The crate's
+  wait thread polls `lb_loop_fd()` and wakes the owner through the `EngineWaker`; it sleeps until
+  the owner has pumped, so a readable descriptor cannot make it spin. The idle test: 6 pumps and
+  2 loop wakes in 6 s with a static page (Ladybird's own housekeeping timers, no spin).
+- **L5. Pin and flag check.** `nix/build-ladybird-shim.sh` fails if the source's own
+  `ninja -t commands` for LibWebView carries other `-DUSE_*`, `-DHAVE_*`, `-DNDEBUG` or format-check
+  definitions than the shim's `CMakeLists.txt` sets. At load, `ffi::check_abi` compares the ABI
+  version and runs a probe: `lb_abi_describe` makes a `Gfx::SharedImageBuffer` with the library's own
+  constructor and reads it back with the layout of the headers the shim was compiled with; a skewed
+  build reads the wrong member and `ffi::load` fails with a message instead of crashing later. Only
+  `SharedImageBuffer` is probed; `ViewImplementation`'s layout is covered by the flag check alone.
 - **L6. Presentation: zero-copy from Ladybird's backing stores.** The memfd buffers become a
   `wl_shm_pool` per backing store (created once, 3 per view; `wl_shm` accepts any fd
   mmap-able at the size); the dmabuf buffers become `zwp_linux_buffer_params_v1.create_immed`
@@ -257,7 +267,7 @@ only queue events"); `lb_pump` returns after the loop iteration and the crate dr
 | `ResolveServiceRequest` | alert/confirm/prompt: `alert_closed`, `confirm_closed`, `prompt_closed`; clipboard: `insert_clipboard_item`/`clipboard_item()` overrides, page data never stays in Ladybird (as WPE); file picker answered by path |
 | `NavigationRequested/AnswerNavigation` | Ladybird has `NavigationLoader`/`handle_external_url`; first version never asks (like Wasm/demo): every page-started navigation is performed by Ladybird. Later: gate through `on_...` hooks. |
 | `OpenRequested` | `on_new_web_view` (returns a handle: the adapter answers by creating a view and returning its handle string) and `open_url_in_new_window` |
-| `pump` | `lb_pump` (bounded) + drain events; `PumpStatus` from the timerfd deadline; replaceable events coalesced in the crate |
+| `pump` | `lb_pump` (bounded) + drain events; `PumpStatus` from the next timer's deadline; replaceable events coalesced in the crate |
 | `present(view, permit)` | attach the front backing store as a `wl_buffer` (L6); `Unchanged` if no new frame; `NotReady` while `has_usable_bitmap` is false after a resize |
 | `close_view` | `request_close()` then `force_close()` after 1 s as `HeadlessWebView` does; `ViewClosed` from `on_close` |
 | `shutdown` | close views, drain until WebContent exits, destroy `Application` (stops helpers; Ladybird has no `process::exit`-free guarantee: check that it never calls `exit`), unmap buffers, then `dlclose` is *not* called (like WPE) |
@@ -277,7 +287,7 @@ only queue events"); `lb_pump` returns after the loop iteration and the crate dr
    `FONTCONFIG_FILE` (the helpers print "Cannot load default config file" with the store
    fontconfig unless `FONTCONFIG_FILE` is set; set it to the system file for sig's children),
    signal use (Ladybird's `Application` registers `SIGINT/SIGTERM` handlers only in profiling
-   mode; `ProcessMonitor` uses `SIGCHLD`, replaced by pidfds in L4; JIT-less, so no JSC-like signals),
+   mode; `ProcessMonitor` uses `SIGCHLD` and `waitpid(-1)` (see L4); JIT-less, so no JSC-like signals),
    `atexit` handlers, `setenv` calls (`Application` and the smoke test set `XDG_*`: the adapter must
    pass them to children explicitly, never `setenv` in sig's process, decision 102).
 3. **ABI skew.** A header/flag mismatch compiles and silently misreads (seen once, L5). Guard: the
@@ -303,7 +313,7 @@ only queue events"); `lb_pump` returns after the loop iteration and the crate dr
    and set (M3); until then run with `--disable-content-blocker --disable-sql-database` and verify
    with `strace -f -e connect` that the only network traffic is the user's navigation.
 8. **Build cost and fragility of header regeneration.** 2.5 minutes and 340 MB now; breaks
-   if nixpkgs changes the source layout. Cache in `/data/storage/sighurt/` (the HDD) when it
+   if nixpkgs changes the source layout. Cache in `/data/sig-builds/ladybird/` (the HDD) when it
    exists, else `~/.cache/sighurt/` (the smoke script honours `LADYBIRD_SMOKE_CACHE`). Fallback:
    L1's override build on louise-pc, with the user's approval first.
 9. **Licensing.** Ladybird is BSD-2-Clause; the shim is AGPL like the rest of `sig`; keep Ladybird's
@@ -316,8 +326,10 @@ only queue events"); `lb_pump` returns after the loop iteration and the crate dr
 
 Each step is for a worker with no context: read this file, CLAUDE.md, `crates/sighurt-api/src/engine.rs`,
 `docs/rewrite/WPE.md`, and `engines/sighurt-engine-wpe/` as the model. Machine rules apply
-(`tools/cargo`, `tools/heavy`, no Wayland on the desktop, caches under `/data/storage/sighurt` when
+(`tools/cargo`, `tools/heavy`, no Wayland on the desktop, caches under `/data/sig-builds/ladybird` when
 it exists).
+
+(Status of each milestone is in "Implementation status".)
 
 - **M0. Smoke test (done).** `tools/heavy experiments/ladybird-smoke/smoke.sh OUT.png` prints
   `PASS wrote OUT.png`, title "Example Domain" and `frame ...` lines; PNG shows the page.
@@ -379,3 +391,141 @@ these stages, each a product by itself:
   extracted compile flags, includes of the source and ANGLE.
 - `experiments/ladybird-smoke/gen-rust-headers.sh`, `gen-generated-headers.sh`, `smoke.sh`: the
   recipe; `example.png`: the frame of the last run.
+
+## Implementation status
+
+Built and checked on this desktop (nixpkgs pin `4975466d`, Ladybird rev `b90af890`), 31 October 2026.
+
+| Piece | State | Evidence |
+|---|---|---|
+| Shim prefix recipe, `nix/build-ladybird-shim.sh` | done | `tools/heavy nix/build-ladybird-shim.sh` builds `lib/libsighurt-ladybird-shim.so` in `/data/sig-builds/ladybird` (else `~/.cache/sighurt/ladybird`) in 3-4 min from nothing, 20 s again; roots the package in `ladybird-root`; the flag guard |
+| Shim C ABI, custom event loop (M1) | done | `shim/{loop,shim}.cpp`; `tests/loop_probe.c` (no Rust) waits on `lb_loop_fd()` only: title, commit, finish, a frame, the ABI probe, 0 wakeups in 1 s idle; exported symbols are only `lb_*` |
+| Crate `sighurt-engine-ladybird`, `impl EngineRuntime` (M2, M3) | done for the scope below | `tests/headless.rs`: events in order, frames with the page's colour, fragment vs document navigation, history back, a click on a link (hover status, a page-started navigation with its own id), resize, hidden, idle (6 pumps, 2 loop wakes in 6 s), close, shutdown; `clippy -D warnings` clean |
+| ABI-skew guard | done | `ffi::check_abi` and its unit test; the build script's flag check |
+| Wiring: feature `engine-ladybird` on `sighurt-browser`, `-runtime`, `-gui`, `-tui` (not in any default) | done | `tools/cargo check -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo` and with `frontend-tui`; clippy `-D warnings` over browser, runtime, gui, tui with the feature; runtime's descriptor test (24 passed); a build without the feature is unchanged |
+| Reaping only Ladybird's own helpers | done | `tests/headless.rs`: a non-Ladybird zombie child (`sleep 0.2`) stays waitable after a SIGKILLed WebContent was reaped by Ladybird |
+| Services and text input | done | `tests/services.rs`; `sig-shot.sh MODE=typing` |
+| `sig` shows https://example.com/ in Ladybird | done | `tests/sig-shot.sh` in `tools/headless-sway`: `--engine ladybird`, `[routing.ladybird] hosts`, and `page.open-in ladybird` from a demo page (a bound key); screenshots show the page, tab label `ladybird`, title "Example Domain"; sig's diagnostics: `frame engine=ladybird ... readback_bytes=0`; sig and every Ladybird helper process exit cleanly |
+
+Registration is what every engine has and nothing more: a feature, a `Runtime` variant, a
+descriptor (`web: true`, `honors: ["storage"]`, shutdown after WPE), `registry::ladybird_config`
+(profile `{data_dir}/sighurt/ladybird`, or temporary with `storage = "ephemeral"`), a binding in
+`sighurt-gui` (`PresentMode::Shm`) and one in `sighurt-tui` (the terminal's CPU target). Nothing in
+`main`, the core or the runtime's logic knows Ladybird.
+
+### What Ladybird does, as found (differs from the first design)
+
+- **Navigation is announced backwards.** The loading state turning on is the start of a navigation;
+  `on_url_change` is the commit and comes *before* `on_load_start` (which therefore means nothing
+  here); `on_loading_state_change(false)` then `on_load_finish` end it. A page's own hash change
+  commits with no loading at all. So the crate takes `LoadingChanged(true)` as `NavigationStarted`
+  (the browser's pending id, else its own), a commit with a navigation active as a new document, and
+  a commit with none as a same-document change.
+- **A fragment navigation made by `load()` reports loading and never reports it over**, and the next
+  real navigation then reports no start. The shim ends the state itself (`set_loading_state(false)`)
+  when a commit differs from the previous URL only by a fragment (HTML's "navigate to a fragment");
+  the crate uses the same rule to keep the document.
+- **A navigation started before the view's own about:blank has loaded is dropped.** The shim holds the
+  first `lb_navigate` until then and reports `ViewReady` at that moment.
+- **History** comes from `session_history()` of the view (entries and current index) after each
+  commit and load end; commits carry `history: None` (the core then treats a new document as a new
+  navigation). `HistoryChanged` is only sent when it changed.
+- **Frames:** the Compositor fell back to memfd bitmaps here ("no supported DRM format modifiers"), and
+  the crate copies the valid area (`last_painted_size`, not the 1056x856 allocation) into the host's
+  target, one copy per frame (`present_ms` about 1 ms at 1280x696). Zero-copy `wl_shm`/dmabuf import is
+  not done; it is the next step (L6).
+- **A link that opens a window** (`target=_blank`, `window.open`) makes Ladybird ask for a new view
+  with an opener. The shim gives it an internal view the host never sees, and once that has a URL it
+  reports `OpenRequested { NewView }` and closes it: the core opens the URL as it does for any engine.
+  Untested beyond compiling; `window.open` scripts that use the returned window object get a window
+  that is closed once its URL is known.
+
+### The terminal frontend
+
+`apps/sighurt-browser/tests/tui.rs::a_ladybird_page_is_an_image_in_the_page_rows` (needs
+`--features frontend-tui,engine-demo,engine-ladybird` and the shim) runs `sig --tui --engine ladybird
+file://...` in a pty with a fake kitty terminal: the page is an 800x440 kitty image in the 80x22 page
+rows, the top line has the page's title, `q` quits, the terminal is restored, no frame was dropped. Text
+mode and `--dump` need the `semantics` capability, which Ladybird does not have yet. (In the same run
+`kitty_keys_open_addresses_tabs_and_quit` failed once when the whole file ran in parallel with the
+Ladybird test, and passes alone, with and without the Ladybird feature: a timing-sensitive existing
+test under load, not caused by the engine.)
+
+### Text input
+
+`text_input` is true. Ladybird's input-method state (`on_input_method_state_change`) becomes
+`TextInputChanged`: `Some` with the caret rectangle (device pixels from Ladybird, converted to the
+target's logical ones) while an editable field has focus, `None` when it does not, so the core's
+typing state works and a keymap's plain-letter bindings do not fire while the user types in a page.
+The text around the caret is not reported (`surrounding: None`, purpose `Normal`): Ladybird does not
+say whether a field is a password, and a password must not reach the input method. The host's
+`commit` is typed (`commit_text_from_input_method`), and `preedit` is marked text. Evidence:
+`tests/services.rs` (focus a field: `Some` with a caret near it; click away: `None`; a committed
+"hello" is typed) and `sig` in a private sway with `"t" = "tab.new"` bound
+(`MODE=typing tests/sig-shot.sh`): the click focuses a Ladybird field and "tttest" is typed into it,
+with no tab opened.
+
+### What is missing, and why
+
+1. **`NavigationRequested`** (asking the core before a user-clicked link is followed): impossible
+   without patching Ladybird. Navigations are admitted inside `WebContentClient::did_request_navigation_start`,
+   a class `Application` instantiates itself; LibWebView offers no hook to hold or veto one, and
+   WebContent has already started it. Intercepting the click instead would hide it from the page's own
+   handlers. The engine never asks, so links stay in Ladybird; `OpenRequested` (windows) works. A
+   patched Ladybird (an override of nixpkgs' derivation with a hook, built on louise-pc, a multi-hour
+   build that needs the user's go-ahead) would be the way.
+2. **Services (`sighurt_api::services`) as built:** every privileged request of Ladybird's UI half goes
+   to the host, none is performed by Ladybird.
+   - *Copy:* the page's clipboard item becomes `ClipboardWrite` (each text representation; files the
+     user copied on the desktop are never exposed; over 16 MiB is dropped). The primary selection and
+     Ladybird's own menu copies go nowhere.
+   - *Paste:* a paste that finds nothing asks `ClipboardRead` (text/plain, 1 MiB); the granted text
+     stays readable for one second and the shim repeats the paste, as WPE does, so the page sees an empty
+     first paste and then the real one. `navigator.clipboard.read()` gets the empty one.
+   - *Downloads:* Ladybird downloads into a private staging directory of the profile (it names no
+     view or URL in its path callback), the shim polls only while one is staged (a 500 ms timer that
+     exists only then), and the finished file (at most 64 MiB, else dropped) becomes
+     `Download { Data, suggested_name }`; the staged file is deleted. The user's folders are the host's.
+   - *File inputs:* `PickFiles` (one or several; no filters passed yet); the files named in the answer
+     are read (at most 32 MiB each) into the page's file objects.
+   - *External URLs (`mailto:` and so on):* Ladybird's own policy (a user gesture, a scheme not denied)
+     still decides whether to ask; then the request is `OpenExternal` and the host's answer decides.
+     Nothing runs `xdg-open`.
+   - *Attribution:* Ladybird's download and external-URL callbacks do not say which view they are for,
+     so they are attributed to the view the host last gave input, focus or a navigation: with several
+     Ladybird tabs, a request from a background tab can be charged to the wrong view. The core still
+     decides per that view's document and origin.
+   - *Dialogs:* the API has no dialog service, so `alert`, `confirm` and `prompt` are answered as dismissed
+     (a page never hangs on one). Select dropdowns and color pickers are not answered.
+   - Everything else, and every answer that is not `Ok` with the expected reply, is refused.
+   Evidence: `tests/services.rs` plays the core against a page: a copy (`ClipboardWrite` with
+   `text/plain` "hello"), a paste (granted "PASTED" appears in the field), a `data:` download (bytes
+   "hello", name `hello.txt`), a `mailto:` link (`OpenExternal`, denied), a file input (the page reads
+   `picked.txt`).
+3. **Zero-copy presentation and dmabuf** (L6), **frame pacing from the output** (L8).
+4. **Text input:** done (below). **Other capabilities** beyond history traversal, zoom (wired through
+   `SetZoom`, not tested), process-per-view and text input: find in page, screenshots, semantics (so no text mode and no
+   `sig --dump` in the terminal; the TUI frontend binds the engine and shows its frames as graphics,
+   untested), site data.
+5. **Cursor shapes** map only the common `Gfx::StandardCursor`s; image cursors report the arrow.
+6. **Coexistence with Servo, WPE and Wasmtime in one process (M5)** is untested: `sig` was built with
+   Ladybird and the demo engine only. `ProcessMonitor`'s `waitpid(-1)` and Ladybird's `sigaction`
+   for `SIGCHLD` are the known conflicts with WPE's GLib.
+7. **Environment:** the helpers print "Fontconfig error: Cannot load default config file" unless
+   `FONTCONFIG_FILE` is set (the nix store config path is not populated); text still renders. The
+   engine does not set it (no environment writes after startup, decision 102); the scripts set it to
+   `/etc/fonts/fonts.conf`. `Application` raises `RLIMIT_NOFILE` to 65536 (a process-wide effect).
+8. **Ladybird's idle** is not zero: about 1 to 2 wakes a second (its own timers: TabPerformanceMonitor,
+   cookie and HSTS synchronisation, session flush), no spin.
+
+### Run it
+
+```sh
+tools/heavy nix/build-ladybird-shim.sh                 # once: the shim (nixpkgs' Ladybird, no build of it)
+tools/cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
+tools/heavy tools/headless-sway -- engines/sighurt-engine-ladybird/tests/sig-shot.sh OUT [URL]
+#   MODE=route | MODE=open-in selects [routing.ladybird] or page.open-in; screenshots in OUT
+tools/heavy cargo test -p sighurt-engine-ladybird --test headless -- --nocapture
+```
+
+`CARGO_TARGET_DIR=/data/sig-builds/targets/ladybird` keeps the build off the SSD.
