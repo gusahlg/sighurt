@@ -9,7 +9,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{EngineCommand, EngineRuntime, EngineWaker, PumpStatus, ViewOptions};
@@ -160,12 +162,26 @@ impl Driver {
 }
 
 /// An HTTP server that serves `bytes` bytes of a download, `chunk` bytes every `pause`.
-fn serve_download(bytes: u64, chunk: usize, pause: Duration) -> String {
+/// What the test sees of a served download: bytes written so far, and whether a write failed (the
+/// client closed the connection).
+#[derive(Clone)]
+struct Served {
+    sent: Arc<AtomicU64>,
+    broken: Arc<AtomicBool>,
+}
+
+fn serve_download(bytes: u64, chunk: usize, pause: Duration) -> (String, Served) {
+    let served = Served {
+        sent: Arc::new(AtomicU64::new(0)),
+        broken: Arc::new(AtomicBool::new(false)),
+    };
+    let handle = served.clone();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
+            let served = served.clone();
             std::thread::spawn(move || {
                 let mut request = [0u8; 4096];
                 let _ = stream.read(&mut request);
@@ -173,6 +189,7 @@ fn serve_download(bytes: u64, chunk: usize, pause: Duration) -> String {
                     "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"big.bin\"\r\nContent-Length: {bytes}\r\nConnection: close\r\n\r\n"
                 );
                 if stream.write_all(header.as_bytes()).is_err() {
+                    served.broken.store(true, Ordering::SeqCst);
                     return;
                 }
                 let block = vec![7u8; chunk];
@@ -180,15 +197,17 @@ fn serve_download(bytes: u64, chunk: usize, pause: Duration) -> String {
                 while sent < bytes {
                     let n = chunk.min((bytes - sent) as usize);
                     if stream.write_all(&block[..n]).is_err() {
+                        served.broken.store(true, Ordering::SeqCst);
                         return;
                     }
                     sent += n as u64;
+                    served.sent.store(sent, Ordering::SeqCst);
                     std::thread::sleep(pause);
                 }
             });
         }
     });
-    format!("http://127.0.0.1:{port}/big.bin")
+    (format!("http://127.0.0.1:{port}/big.bin"), handle)
 }
 
 fn staged_files(profile: &Path) -> usize {
@@ -206,8 +225,11 @@ fn hostile_pages_and_a_busy_host() {
     let dir = std::env::temp_dir().join(format!("sighurt-ladybird-robust-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let profile = dir.join("profile");
-    let big = serve_download(200 * 1024 * 1024, 1024 * 1024, Duration::from_millis(1));
-    let slow = serve_download(50 * 1024 * 1024, 64 * 1024, Duration::from_millis(5));
+    // About 50 MiB/s: the limit (64 MiB) is passed after a second or so, the whole file would take four.
+    // (At loopback speed the 200 MiB arrive in a quarter of a second, before any 250 ms poll could stop them.)
+    const BIG: u64 = 200 * 1024 * 1024;
+    let (big, big_served) = serve_download(BIG, 1024 * 1024, Duration::from_millis(20));
+    let (slow, _) = serve_download(50 * 1024 * 1024, 64 * 1024, Duration::from_millis(5));
     let two = dir.join("two.html");
     std::fs::write(&two, "<!doctype html><title>two</title>two").unwrap();
     let two_url = format!("file://{}", two.display());
@@ -345,20 +367,44 @@ fn hostile_pages_and_a_busy_host() {
     // directory empties.
     let before_big = d.seen.len();
     d.click(20.0, 55.0);
+    // The transfer starts, and is then stopped before the file is over: the server sees the
+    // connection closed (or the client stop reading) well short of 200 MiB. (Sampling the staging
+    // directory for this is a race: the file lives only from the first bytes to the next 250 ms
+    // poll after the limit.)
     let limit_end = Instant::now() + Duration::from_secs(40);
-    let mut staged_seen = false;
+    let mut last = (0u64, Instant::now());
     loop {
-        d.idle(Duration::from_millis(300));
-        staged_seen |= staged_files(&profile) > 0;
-        if staged_seen && staged_files(&profile) == 0 {
+        d.idle(Duration::from_millis(200));
+        let sent = big_served.sent.load(Ordering::SeqCst);
+        if sent != last.0 {
+            last = (sent, Instant::now());
+        }
+        let stopped = big_served.broken.load(Ordering::SeqCst)
+            || (sent > 0 && last.1.elapsed() > Duration::from_secs(2));
+        if stopped {
             break;
         }
         assert!(
             Instant::now() < limit_end,
-            "the oversized download was not stopped (staged {})",
-            staged_files(&profile)
+            "the oversized download was not stopped (the server sent {sent} of {BIG} bytes)"
         );
     }
+    let sent = big_served.sent.load(Ordering::SeqCst);
+    assert!(sent > 0, "the download never started");
+    assert!(
+        sent < BIG * 3 / 4,
+        "the transfer was not stopped in time: {sent} of {BIG} bytes fetched"
+    );
+    // And what was staged is gone.
+    let gone = Instant::now() + Duration::from_secs(5);
+    while staged_files(&profile) > 0 && Instant::now() < gone {
+        d.idle(Duration::from_millis(200));
+    }
+    assert_eq!(
+        staged_files(&profile),
+        0,
+        "a partial download was left staged"
+    );
     assert!(
         !d.seen.iter().any(|e| matches!(e, EngineEvent::ServiceRequested(r) if matches!(r.service, Service::Download { .. }))),
         "an oversized download was handed over"

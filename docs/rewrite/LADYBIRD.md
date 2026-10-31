@@ -597,7 +597,7 @@ labelled `demo`), because the core answered the request with the other engine.
    never destroyed (it is leaked on purpose: timers unregister at process exit). Test: shutdown in the
    middle of a download leaves nothing staged and does not abort.
 4. *Downloads fill the disk (verified):* the limit (64 MiB) is checked every 250 ms while the download
-   runs and over `total_size`, and the download is cancelled and its file removed; a finished one is
+   runs and over `total_size`, and the download is cancelled and its file removed (so what reaches the disk is the limit plus what arrives in one poll: at loopback speed, 200 MiB in a quarter of a second, a file can complete before the poll sees it; it is then dropped, never handed over, and removed); a finished one is
    handed over with one copy fewer (the bytes are moved, not copied, into the event). Test: a 200 MiB
    download is stopped and nothing is handed over.
 5. *Popups (verified):* see "A link that opens a window" above. An `about:blank` popup is closed after
