@@ -26,6 +26,12 @@
 //! are placed relative to each band, so an anti-aliased edge pixel may be shaded a little
 //! differently than in one piece (`bands_paint_what_one_piece_does`).
 //!
+//! When the caller names a few changed rectangles ([`paint_regions`]), each one is painted on
+//! this thread into a pixmap of that rectangle and copied over the buffer. The copy replaces
+//! those pixels. The rest of the buffer is left as it was, which is only correct when it still
+//! holds a frame the unchanged pixels match. The same ops are selected as for the whole frame,
+//! so a rectangle shows what the full paint would have put there.
+//!
 //! Owns: turning ops into pixels. Must not own: what the ops are (see [`crate::draw`]) or when a
 //! frame is painted (the host grants a frame permit).
 
@@ -35,8 +41,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use sighurt_api::geometry::BufferSize;
 pub use sighurt_api::present::Frame;
 use tiny_skia::{
-    Color, FillRule, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, PixmapMut, PixmapPaint,
-    Rect, SpreadMode, Stroke, Transform,
+    BlendMode, Color, FillRule, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, PixmapMut,
+    PixmapPaint, Rect, SpreadMode, Stroke, Transform,
 };
 
 use crate::capabilities::DecodedImage;
@@ -174,6 +180,68 @@ fn paint_in_bands(frame: Frame<'_>, scene: &Scene<'_>, count: u32) -> Result<(),
     Ok(())
 }
 
+/// Paints `scene` over `rects` of `frame` and leaves every other pixel as the buffer held it.
+/// `rects` are buffer pixels. Fails, changing nothing it has not already copied, for a buffer
+/// whose rows are padded or that is smaller than its size says.
+pub fn paint_regions(
+    frame: Frame<'_>,
+    scene: &Scene<'_>,
+    rects: &[sighurt_wayland::DamageRect],
+) -> Result<(), String> {
+    let BufferSize { width, height } = frame.size;
+    let len = frame.stride * height as usize;
+    if frame.stride != 4 * width as usize || frame.pixels.len() < len || len == 0 {
+        return Err(format!(
+            "unsupported buffer: {width}x{height}, stride {}, {} bytes",
+            frame.stride,
+            frame.pixels.len()
+        ));
+    }
+    let page = [0.0, 0.0, width as f32, height as f32];
+    let budget = MAX_OVERDRAW * f64::from(width) * f64::from(height);
+    let work = Work {
+        scene,
+        list: scene
+            .list
+            .map(|list| select(&list.ops, scene.list_scale, page, budget))
+            .unwrap_or_default(),
+        overlay: select(scene.overlay, scene.overlay_scale, page, budget),
+        width,
+    };
+    let replace = PixmapPaint {
+        blend_mode: BlendMode::Source,
+        ..PixmapPaint::default()
+    };
+    for rect in rects {
+        let Some((x, y, rw, rh)) = rect_in_buffer(*rect, width, height) else {
+            continue;
+        };
+        let mut pixmap = Pixmap::new(rw, rh).ok_or_else(|| format!("a {rw}x{rh} region"))?;
+        paint_into(pixmap.data_mut(), (rw, rh), (x, y), &work);
+        let mut dest = PixmapMut::from_bytes(&mut frame.pixels[..len], width, height)
+            .ok_or_else(|| format!("a {width}x{height} buffer"))?;
+        dest.draw_pixmap(x, y, pixmap.as_ref(), &replace, Transform::identity(), None);
+    }
+    Ok(())
+}
+
+/// `rect` clipped to the buffer: its origin and its size. `None` when nothing remains.
+fn rect_in_buffer(
+    rect: sighurt_wayland::DamageRect,
+    width: u32,
+    height: u32,
+) -> Option<(i32, i32, u32, u32)> {
+    if rect.width <= 0 || rect.height <= 0 {
+        return None;
+    }
+    let (width, height) = (width as i32, height as i32);
+    let x0 = rect.x.max(0);
+    let y0 = rect.y.max(0);
+    let x1 = rect.x.saturating_add(rect.width).min(width);
+    let y1 = rect.y.saturating_add(rect.height).min(height);
+    (x1 > x0 && y1 > y0).then_some((x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
 /// Most threads that paint one frame, the caller's included.
 const MAX_BANDS: u32 = 8;
 /// Pixels a band is worth a thread for.
@@ -248,11 +316,16 @@ fn select(ops: &[DrawOp], scale: (f32, f32), page: Bounds, mut budget: f64) -> S
 fn paint_band(rows: &mut [u8], top: u32, work: &Work<'_>) {
     let width = work.width;
     let height = (rows.len() / (4 * width as usize)) as u32;
-    let Some(mut page) = PixmapMut::from_bytes(rows, width, height) else {
+    paint_into(rows, (width, height), (0, top as i32), work);
+}
+
+/// Paints `work` into `pixels`, a pixmap of `size` whose top-left is `origin` in the buffer.
+fn paint_into(pixels: &mut [u8], (width, height): (u32, u32), origin: (i32, i32), work: &Work<'_>) {
+    let Some(mut page) = PixmapMut::from_bytes(pixels, width, height) else {
         return;
     };
     let scene = work.scene;
-    // A list that starts by painting all of it opaque replaces what the buffer held anyway.
+    // A list that starts by painting all of it opaque replaces what the pixmap held anyway.
     let covered = scene
         .list
         .and_then(|list| list.ops.first())
@@ -262,7 +335,7 @@ fn paint_band(rows: &mut [u8], top: u32, work: &Work<'_>) {
     }
     let mut painter = Painter {
         page,
-        top: top as i32,
+        origin,
         layers: Vec::new(),
     };
     if let Some(list) = scene.list {
@@ -272,10 +345,10 @@ fn paint_band(rows: &mut [u8], top: u32, work: &Work<'_>) {
 }
 
 struct Painter<'a> {
-    /// The rows of the buffer this painter paints: a band, or the whole buffer.
+    /// The pixmap this painter paints: a band, a damage rectangle, or the whole buffer.
     page: PixmapMut<'a>,
-    /// Where they start in the buffer. Everything else is in buffer pixels.
-    top: i32,
+    /// Where that pixmap's top-left sits in the buffer. Everything else is in buffer pixels.
+    origin: (i32, i32),
     /// Open clips, innermost last.
     layers: Vec<Layer>,
 }
@@ -333,7 +406,7 @@ impl Painter<'_> {
             None => {
                 let (width, height) = (self.page.width(), self.page.height());
                 let page = PixmapMut::from_bytes(self.page.data_mut(), width, height)?;
-                Some((page, (0.0, -self.top as f32)))
+                Some((page, (-self.origin.0 as f32, -self.origin.1 as f32)))
             }
         }
     }
@@ -351,9 +424,9 @@ impl Painter<'_> {
             }
             Some(_) => [0.0; 4],
             None => {
-                let top = self.top as f32;
+                let (x, y) = (self.origin.0 as f32, self.origin.1 as f32);
                 let (width, height) = (self.page.width() as f32, self.page.height() as f32);
-                [0.0, top, width, top + height]
+                [x, y, x + width, y + height]
             }
         }
     }
@@ -719,6 +792,61 @@ mod tests {
         assert_eq!(pixel(&pixels, 8, 2, 2), [0, 255, 0, 255]);
         assert_eq!(pixel(&pixels, 8, 3, 3), [0, 255, 0, 255]);
         assert_eq!(pixel(&pixels, 8, 4, 4), [0; 4]);
+    }
+
+    /// Painting the changed rectangles of frame B over a copy of frame A is frame B.
+    #[test]
+    fn a_partial_repaint_matches_the_full_frame() {
+        let clear = DrawOp::Clear { color: 0x203040ff };
+        let before = vec![clear.clone(), rect(10.0, 10.0, 16.0, 12.0, 0xff0000ff)];
+        let after = vec![clear, rect(40.0, 28.0, 16.0, 12.0, 0x00ff00ff)];
+        let (width, height) = (80, 60);
+        let full_before = paint_ops(before.clone(), width, height, 1.0);
+        let full_after = paint_ops(after.clone(), width, height, 1.0);
+        let region = crate::damage::diff(
+            Some(&crate::damage::Snap {
+                ops: &before,
+                images: &[],
+                scale: (1.0, 1.0),
+                overlay: &[],
+                overlay_scale: (1.0, 1.0),
+                buffer: (width, height),
+                canvas: (width, height),
+            }),
+            &crate::damage::Snap {
+                ops: &after,
+                images: &[],
+                scale: (1.0, 1.0),
+                overlay: &[],
+                overlay_scale: (1.0, 1.0),
+                buffer: (width, height),
+                canvas: (width, height),
+            },
+        );
+        let rects = match region {
+            crate::damage::Region::Rects(rects) => rects,
+            crate::damage::Region::Full => panic!("the moved square should not be the whole frame"),
+        };
+        let mut pixels = full_before;
+        let list = DisplayList {
+            size: (width, height),
+            ops: after,
+            images: Vec::new(),
+            pixmaps: Vec::new(),
+        };
+        let scene = Scene {
+            list: Some(&list),
+            list_scale: (1.0, 1.0),
+            overlay: &[],
+            overlay_scale: (1.0, 1.0),
+        };
+        let frame = Frame {
+            pixels: &mut pixels,
+            size: BufferSize { width, height },
+            stride: 4 * width as usize,
+        };
+        paint_regions(frame, &scene, &rects).unwrap();
+        assert_eq!(pixels, full_after);
     }
 
     #[test]

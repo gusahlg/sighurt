@@ -140,7 +140,7 @@ impl Window {
                     ShmBuffer::new(&env.shm, &env.qh, buffer_size, BufferData { owner, key })
                 });
                 // Without a free buffer the old one stays until the next resize.
-                let Ok((key, mut buffer)) = acquired else {
+                let Ok((key, mut buffer, _age)) = acquired else {
                     return;
                 };
                 fill(buffer.pixels(), self.color);

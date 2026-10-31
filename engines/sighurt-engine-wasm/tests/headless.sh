@@ -17,8 +17,9 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
-view=target/debug/examples/wasm-view
-guests=target/wasm32-unknown-unknown/release
+target=${CARGO_TARGET_DIR:-$repo/target}
+view=$target/debug/examples/wasm-view
+guests=$target/wasm32-unknown-unknown/release
 
 # Inside the compositor: runs the example on $2 for 6 s, screenshots and changes the output, and
 # writes its output and exit status to $3.log.
@@ -41,7 +42,7 @@ SIG_WHAT="build the Wasm engine's headless checks" tools/cargo build --target wa
   --release -p raf-demo -p gradient-demo
 tools/cargo build -p sighurt-engine-wasm --example wasm-view
 bin=$(tools/cargo test -p sighurt-engine-wasm --test wayland --no-run 2>&1 | tee /dev/stderr |
-  grep -o 'target/debug/deps/wayland-[0-9a-f]*' | tail -1)
+  grep -oE '/[^[:space:]()]*debug/deps/wayland-[0-9a-f]+' | tail -1)
 [[ -n $bin ]] || { echo "headless.sh: no test binary" >&2; exit 1; }
 
 tools/heavy tools/headless-sway -- env SIGHURT_HEADLESS=1 "$bin" --include-ignored --test-threads 1

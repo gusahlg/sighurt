@@ -23,6 +23,7 @@ pub mod audio;
 pub mod audio_format;
 pub mod capabilities;
 pub mod compression;
+mod damage;
 pub mod download;
 mod draw;
 pub mod engine;

@@ -44,8 +44,11 @@
 //! big enough to show all of it: a page can't hide it and still have it answered.
 //!
 //! Owns: a view's page state (document, history, pointer, prompt, what the browser was told).
-//! Must not own: guest execution (workers do it) or painting (the rasterizer).
+//! Must not own: guest execution (workers do it) or painting (the rasterizer). When the host
+//! lends a buffer that still holds an older frame, the view tells it which pixels changed
+//! ([`crate::damage`]) and the rasterizer paints only those.
 
+use std::collections::VecDeque;
 use std::mem;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -62,6 +65,7 @@ use sighurt_api::input::{
 use sighurt_api::services::{Service, ServiceRequest};
 
 use crate::capabilities::{HostState, MAX_URL};
+use crate::damage::{self, Region, Snap};
 use crate::draw::{DisplayList, DrawOp};
 use crate::engine::WasmEngine;
 use crate::keys;
@@ -207,6 +211,43 @@ pub struct View {
     /// The version of the history the browser was last told about.
     history_version: u64,
     shown: Shown,
+    /// The frame last painted. The next frame's damage is the difference from this.
+    painted: Option<Painted>,
+    /// Per-frame damage, oldest first, not counting the frame being painted. A reused buffer
+    /// needs the union of these back to the frame it still holds.
+    damage_history: VecDeque<Region>,
+}
+
+/// What the last submitted frame showed, for the next damage diff.
+struct Painted {
+    list: Option<Arc<DisplayList>>,
+    overlay: Vec<DrawOp>,
+    list_scale: (f32, f32),
+    overlay_scale: (f32, f32),
+    buffer: (u32, u32),
+    canvas: (u32, u32),
+}
+
+impl Painted {
+    fn snap(&self) -> Snap<'_> {
+        Snap {
+            ops: self
+                .list
+                .as_ref()
+                .map(|list| list.ops.as_slice())
+                .unwrap_or(&[]),
+            images: self
+                .list
+                .as_ref()
+                .map(|list| list.images.as_slice())
+                .unwrap_or(&[]),
+            scale: self.list_scale,
+            overlay: &self.overlay,
+            overlay_scale: self.overlay_scale,
+            buffer: self.buffer,
+            canvas: self.canvas,
+        }
+    }
 }
 
 impl View {
@@ -246,6 +287,8 @@ impl View {
             prompt_shown: false,
             history_version: 0,
             shown: Shown::default(),
+            painted: None,
+            damage_history: VecDeque::new(),
         };
         view.layout();
         view.update_focus();
@@ -703,19 +746,54 @@ impl View {
     }
 
     /// Paints the view's frame into `frame`, which has the size of its metrics.
+    ///
+    /// Inside a host paint ([`sighurt_wayland::buffer_age`]), only the pixels that differ from
+    /// the frame that buffer still holds are painted and reported. Outside one (the terminal,
+    /// tests, a target that does not track age) the whole buffer is painted and nothing is
+    /// reported, so the host damages all of it.
     pub fn paint(&mut self, frame: Frame<'_>) -> Result<(), String> {
         let (rect, buffer) = (self.metrics.rect(), self.metrics.buffer());
         let bx = buffer.width as f32 / rect.width as f32;
         let by = buffer.height as f32 / rect.height as f32;
         let zoom = self.zoom as f32;
         let overlay = self.prompt_ops();
+        let list_scale = (bx * zoom, by * zoom);
+        let overlay_scale = (bx, by);
         let scene = Scene {
             list: self.list.as_deref(),
-            list_scale: (bx * zoom, by * zoom),
+            list_scale,
             overlay: &overlay,
-            overlay_scale: (bx, by),
+            overlay_scale,
         };
-        raster::paint(frame, &scene)?;
+        let painted = Painted {
+            list: self.list.clone(),
+            overlay: overlay.clone(),
+            list_scale,
+            overlay_scale,
+            buffer: (buffer.width, buffer.height),
+            canvas: self.list.as_ref().map(|list| list.size).unwrap_or((0, 0)),
+        };
+        let this = {
+            let previous = self.painted.as_ref().map(Painted::snap);
+            let current = painted.snap();
+            damage::diff(previous.as_ref(), &current)
+        };
+        let age = sighurt_wayland::buffer_age();
+        if let Some(age) = age {
+            let region = damage::region_for_age(&this, &self.damage_history, age, painted.buffer);
+            if let Some(rects) = damage::partial_rects(&region, painted.buffer) {
+                raster::paint_regions(frame, &scene, rects)?;
+            } else {
+                raster::paint(frame, &scene)?;
+            }
+            let (pixels, rects) = damage::reported(&region, painted.buffer);
+            sighurt_wayland::report_damage(&rects);
+            damage::diag(pixels, painted.buffer, rects.len(), age);
+        } else {
+            raster::paint(frame, &scene)?;
+        }
+        damage::remember(&mut self.damage_history, this);
+        self.painted = Some(painted);
         self.presented = Some((self.metrics.epoch(), self.serial));
         let [x, y, w, h] = PROMPT;
         let fits = rect.width as f32 >= x + w + x && rect.height as f32 >= y + h + y;
