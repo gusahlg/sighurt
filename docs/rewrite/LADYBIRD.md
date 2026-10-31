@@ -655,7 +655,7 @@ lost; the realm now comes from `relevant_realm` of the page's active document.) 
 minutes) and pulled, and `tests/robust.rs` checks that cancelling an oversized download raises no
 `ViewFailed` and stops the transfer. Without the patch, or on any other WebContent abort, the engine
 reports `ViewFailed` (the page can be reloaded; `tests/robust.rs` kills a WebContent process and the view
-fails and recovers its helpers). This is an upstream Ladybird bug at the pinned revision, worth reporting
+fails with `ViewFailed`). This is an upstream Ladybird bug at the pinned revision, worth reporting
 with the stack above.
 
 ### The "Fontconfig error" lines
