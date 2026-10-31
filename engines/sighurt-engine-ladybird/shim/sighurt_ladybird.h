@@ -53,6 +53,7 @@ enum {
     LB_EV_DOWNLOAD,         /* s0 = url, s1 = suggested name, data = the file */
     LB_EV_PICK_FILES,       /* i0 = 1 for several files; i1 = token for lb_pick_reply */
     LB_EV_OPEN_EXTERNAL,    /* s0 = url; i1 = token for lb_open_external_reply */
+    LB_EV_COMMIT,           /* Ladybird's top-level navigation commit: a new document is shown (i0 = 1 if history-entry activation) */
     LB_EV_NAVIGATION_REQUESTED /* s0 = url: a page-started navigation is held; i1 = token for lb_navigation_answer */
 };
 

@@ -1,5 +1,5 @@
---- a/Libraries/LibWebView/ViewImplementation.h	2026-10-31 10:04:01.444742340 +0100
-+++ b/Libraries/LibWebView/ViewImplementation.h	2026-10-31 10:04:01.477504272 +0100
+--- a/Libraries/LibWebView/ViewImplementation.h
++++ b/Libraries/LibWebView/ViewImplementation.h
 @@ -397,6 +397,11 @@
      Function<void()> on_ready_to_paint;
      Function<void(TabPerformanceStats const&)> on_performance_stats;
@@ -12,8 +12,8 @@
      Function<void()> on_activate_tab;
      Function<void()> on_close;
      Function<void(URL::URL const&)> on_link_hover;
---- a/Libraries/LibWebView/Application.h	2026-10-31 10:04:01.452458571 +0100
-+++ b/Libraries/LibWebView/Application.h	2026-10-31 10:04:01.477635357 +0100
+--- a/Libraries/LibWebView/Application.h
++++ b/Libraries/LibWebView/Application.h
 @@ -239,6 +239,9 @@
      virtual bool should_capture_web_content_output() const { return false; }
  
@@ -24,8 +24,8 @@
      ErrorOr<LexicalPath> path_for_downloaded_file(ByteString const& file) const;
  
      virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;
---- a/Libraries/LibWebView/WebContentClient.cpp	2026-10-31 10:04:01.448179880 +0100
-+++ b/Libraries/LibWebView/WebContentClient.cpp	2026-10-31 10:04:01.478006559 +0100
+--- a/Libraries/LibWebView/WebContentClient.cpp
++++ b/Libraries/LibWebView/WebContentClient.cpp
 @@ -129,9 +129,9 @@
      return title_utf8;
  }
@@ -47,7 +47,7 @@
      target_navigable->set_ongoing_navigation(CanonicalNavigable::OngoingNavigation {
          .url = move(url),
          .navigation_id = navigation_id,
-@@ -829,24 +831,53 @@
+@@ -829,24 +831,55 @@
      });
      target_navigable->set_navigation_population_worker(*this, page_id);
  
@@ -109,7 +109,9 @@
 +    };
 +
 +    if (target_navigable->is_top_level_traversable()) {
-+        if (auto view = view_for_page_id(page_id); view.has_value() && view->on_navigation_start_requested) {
++        // owning_view_for_page_id also finds the view of a page embedded in it (a cross-process iframe
++        // navigating the top level), which view_for_page_id does not know.
++        if (auto view = owning_view_for_page_id(page_id); view.has_value() && view->on_navigation_start_requested) {
 +            view->on_navigation_start_requested(requested_url, user_activated, move(proceed));
 +            return;
 +        }
@@ -118,7 +120,7 @@
  }
  
  void WebContentClient::did_complete_navigation_unload_check(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id)
-@@ -1357,7 +1388,7 @@
+@@ -1357,7 +1390,7 @@
  
  Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentClient::did_start_download_without_request(Web::PageId page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size)
  {
@@ -127,7 +129,7 @@
      if (!destination.has_value())
          return { Optional<u64> {} };
  
-@@ -1406,7 +1437,7 @@
+@@ -1406,7 +1439,7 @@
      if (!matches_in_flight_navigation)
          return { Optional<u64> {} };
  

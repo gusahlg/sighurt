@@ -36,7 +36,8 @@ pub const EV_CLIPBOARD_WANT: c_int = 18;
 pub const EV_DOWNLOAD: c_int = 19;
 pub const EV_PICK_FILES: c_int = 20;
 pub const EV_OPEN_EXTERNAL: c_int = 21;
-pub const EV_NAVIGATION_REQUESTED: c_int = 22;
+pub const EV_COMMIT: c_int = 22;
+pub const EV_NAVIGATION_REQUESTED: c_int = 23;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

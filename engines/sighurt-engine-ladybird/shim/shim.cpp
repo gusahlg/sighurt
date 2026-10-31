@@ -460,7 +460,11 @@ private:
             push(LB_EV_CRASHED, id, int64_t(reason), 0, &text);
         };
         on_close = [id] { push(LB_EV_CLOSED, id); };
-        on_top_level_navigation_commit = [this] { push_history(); };
+        on_top_level_navigation_commit = [this, id] {
+            if (m_initial_done && !is_popup)
+                push(LB_EV_COMMIT, id);
+            push_history();
+        };
         on_browser_history_traversal_complete = [this] { push_history(); };
         on_input_method_state_change = [this, id] {
             // The caret of the focused editable field, in device pixels. The text around it is
