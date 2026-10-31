@@ -23,6 +23,18 @@
 //!    thread. It sees what the user types, passwords included, and keeps no more of it than an
 //!    unfinished sequence and never logs it.
 //! 6. A changed [`Keymap::indicator`] redraws the chrome.
+//! 7. The [`Browser`] view a press comes with is read-only and lasts that one call: it is built
+//!    from the state before the press is applied. It carries no clock, handle or engine type.
+//! 8. A [`KeyAction::RunAll`] runs whole, in order, in the update of its press. Commands that
+//!    change the tab list change the numbering the later ones see (`tab.close 3` renumbers tab
+//!    4), as typing them one after another would, so a keymap closing several tabs by number
+//!    closes the highest first.
+//!
+//! A keymap is the browser's configuration in Rust (docs/rewrite/config-extension.md): it reads
+//! what the browser shows through [`Browser`], defines its own actions as commands computed from
+//! it, and shows its state in both frontends' chromes through [`Keymap::indicator`]. Titles and
+//! addresses are page data: a keymap may compute with them (an address to copy, a tab to close)
+//! and must not put them in its indicator or log them.
 //!
 //! [`Chord`] is one keystroke of the configuration's syntax, for keymaps to match key events
 //! with.
@@ -33,6 +45,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::commands::{Command, CommandSet};
+use crate::ids::TabId;
 use crate::input::{Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
 use crate::settings::Table;
 
@@ -53,6 +66,80 @@ impl KeyContext {
     }
 }
 
+/// Which frontend runs the browser.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Frontend {
+    /// The Wayland window. The default, so a caller that doesn't say keeps the window's checks.
+    #[default]
+    Gui,
+    /// The terminal.
+    Terminal,
+}
+
+/// What a keymap may read of the browser while it decides one key press. Borrowed from the core
+/// for that call only (guarantee 7).
+pub trait Browser {
+    /// The frontend that runs the browser.
+    fn frontend(&self) -> Frontend;
+    /// The same context [`Keymap::press`] is given.
+    fn context(&self) -> KeyContext;
+    /// How many tabs there are.
+    fn tab_count(&self) -> usize;
+    /// The index of the selected tab, counting from 0 in tab-strip order (`tab.select` counts
+    /// from 1).
+    fn active_tab(&self) -> usize;
+    /// Tab `index`, or `None` past the end.
+    fn tab(&self, index: usize) -> Option<TabInfo<'_>>;
+}
+
+/// One tab, as a keymap sees it.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabInfo<'a> {
+    /// The tab.
+    pub id: TabId,
+    /// The page's own title, if it gave one.
+    pub title: Option<&'a str>,
+    /// The committed address: what the tab shows, not what is loading.
+    pub url: Option<&'a str>,
+    /// Whether the tab is loading.
+    pub loading: bool,
+    /// The engine of the page it shows; `None` for `sig:` pages, blank tabs and errors.
+    pub engine: Option<&'a str>,
+    /// The page zoom, 1.0 being 100 %.
+    pub zoom: f64,
+    /// Whether `page.back` has somewhere to go.
+    pub can_go_back: bool,
+    /// Whether `page.forward` has somewhere to go.
+    pub can_go_forward: bool,
+}
+
+impl<'a> TabInfo<'a> {
+    /// A tab with these fields, for the core and for tests outside the crate.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        id: TabId,
+        title: Option<&'a str>,
+        url: Option<&'a str>,
+        loading: bool,
+        engine: Option<&'a str>,
+        zoom: f64,
+        can_go_back: bool,
+        can_go_forward: bool,
+    ) -> Self {
+        Self {
+            id,
+            title,
+            url,
+            loading,
+            engine,
+            zoom,
+            can_go_back,
+            can_go_forward,
+        }
+    }
+}
+
 /// What the browser does with a key press.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyAction {
@@ -65,6 +152,8 @@ pub enum KeyAction {
     /// The command runs, then the press goes to whatever has focus now, as if passed, so `:`
     /// can focus the command line and type itself into it.
     RunThenPass(Command),
+    /// Taken, and these commands run in order in this update (guarantee 8). Empty is `Take`.
+    RunAll(Vec<Command>),
 }
 
 /// A keymap: turns key presses into [`KeyAction`]s.
@@ -75,9 +164,9 @@ pub trait Keymap {
     fn configure(&mut self, settings: &Table);
 
     /// A fresh key press, or an auto-repeat (`key.repeat`) of a press this keymap took.
-    /// Releases never come here. For a repeat, `Pass` counts as `Take` and `RunThenPass` as
-    /// `Run`.
-    fn press(&mut self, key: &KeyEvent, context: KeyContext) -> KeyAction;
+    /// Releases never come here. For a repeat, `Pass` counts as `Take`, `RunThenPass` as `Run`
+    /// and `RunAll` as itself. `browser` is what the browser shows, before this press.
+    fn press(&mut self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> KeyAction;
 
     /// The context changed between presses: the keyboard moved between page and chrome, or a
     /// text field took or lost it.

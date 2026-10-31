@@ -77,6 +77,9 @@ pub enum Command {
     /// the page shown. The argument is a host, as given (trimmed); wildcards are not special
     /// here, and a host that is not one is reported when the command runs.
     SiteForget(Option<String>),
+    /// `clipboard.copy <text>`: put the text on the clipboard. The argument is kept as given
+    /// (trimmed, never empty); a configuration makes it from what it reads of the browser.
+    ClipboardCopy(String),
     /// `chrome.<action>`: one of the chrome's own commands, such as `chrome.toggle-tabs`. Holds
     /// the action. Each chrome has its own ([`CommandSet`]); they take no argument.
     Chrome(String),
@@ -84,7 +87,7 @@ pub enum Command {
 
 impl Command {
     /// Every command name. The chrome's commands, `chrome.<action>`, depend on the chrome.
-    pub const NAMES: [&'static str; 21] = [
+    pub const NAMES: [&'static str; 22] = [
         "tab.new",
         "tab.close",
         "tab.next",
@@ -106,6 +109,7 @@ impl Command {
         "browser.home",
         "browser.quit",
         "site.forget",
+        "clipboard.copy",
     ];
 
     /// The command's name, without its argument; `chrome` for every `chrome.<action>`.
@@ -132,6 +136,7 @@ impl Command {
             Self::BrowserHome => "browser.home",
             Self::BrowserQuit => "browser.quit",
             Self::SiteForget(_) => "site.forget",
+            Self::ClipboardCopy(_) => "clipboard.copy",
             Self::Chrome(_) => "chrome",
         }
     }
@@ -174,6 +179,9 @@ impl FromStr for Command {
                 return Ok(Self::TabSelect(tab_number()?));
             }
             "page.open" => return Ok(Self::PageOpen(required("page.open")?.to_owned())),
+            "clipboard.copy" => {
+                return Ok(Self::ClipboardCopy(required("clipboard.copy")?.to_owned()))
+            }
             "page.open-in" => {
                 let argument = required("page.open-in")?;
                 let (engine, address) = match argument.split_once(char::is_whitespace) {
@@ -222,7 +230,7 @@ impl fmt::Display for Command {
         f.write_str(self.name())?;
         match self {
             Self::TabClose(Some(n)) | Self::TabSelect(n) => write!(f, " {n}"),
-            Self::PageOpen(input) => write!(f, " {input}"),
+            Self::PageOpen(input) | Self::ClipboardCopy(input) => write!(f, " {input}"),
             Self::PageOpenIn { engine, address } => match address {
                 Some(address) => write!(f, " {engine} {address}"),
                 None => write!(f, " {engine}"),
@@ -502,6 +510,14 @@ mod tests {
             parse("site.forget *.example.com"),
             Ok(Command::SiteForget(Some("*.example.com".into())))
         );
+        assert_eq!(
+            parse("clipboard.copy"),
+            Err(CommandError::MissingArgument("clipboard.copy"))
+        );
+        assert_eq!(
+            parse("clipboard.copy  a  b "),
+            Ok(Command::ClipboardCopy("a  b".into()))
+        );
     }
 
     #[test]
@@ -523,6 +539,7 @@ mod tests {
             "browser.quit",
             "site.forget",
             "site.forget example.com",
+            "clipboard.copy https://a.b/x y",
             "chrome.toggle-tabs",
         ] {
             let command = parse(text).unwrap();
