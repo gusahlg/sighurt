@@ -14,8 +14,13 @@
 //! escape sequence, a clipboard read, or the next frame's time while a frame is waiting. Nothing
 //! ticks.
 //!
-//! The clipboard is the terminal's OSC 52. A write is appended to the control bytes the one
-//! writer sends, and one read at a time waits up to a second for the reply.
+//! The clipboard is the terminal's OSC 52. One unsent write is kept, and a newer write
+//! replaces it. A write over [`MAX_CLIPBOARD`], or whose sequence does not fit the output
+//! cap, is refused before any of it is queued; a write that was queued is not dropped or
+//! cut short by a later frame. One read at a time waits up to a second. A read that is
+//! cancelled or times out stays outstanding until its reply arrives, and that reply is
+//! dropped; a new read fails until then. A reply for the address line belongs to that
+//! line and is dropped when the line closes or is replaced.
 //!
 //! Text mode (TUI.md §4, [`crate::text`]): `[tui] mode`, or `chrome.toggle-mode` for the run,
 //! decides whether the page rows show pixels or the page's text. In text mode the shown view's
@@ -76,7 +81,7 @@ use sighurt_core::{
 use sighurt_runtime::diagnostics::{Diagnostics, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
-use sighurt_runtime::services::{Clipboard, Services};
+use sighurt_runtime::services::{Clipboard, Services, MAX_CLIPBOARD};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
 use sighurt_runtime::view::ViewEntry;
 
@@ -91,8 +96,8 @@ use crate::kitty::{self, CellRect};
 use crate::sixel;
 use crate::target::{TargetHandle, TermPermit, TermTarget};
 use crate::term::{
-    clipboard, MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE, SYNC_BEGIN,
-    SYNC_END,
+    clipboard, ClipboardReply, MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE,
+    SYNC_BEGIN, SYNC_END,
 };
 use crate::text::{Act, TextPages};
 use crate::textmode::Area;
@@ -208,15 +213,32 @@ impl ChunkedSpan {
 }
 
 /// One OSC 52 read waiting for the terminal. A page's is answered through the session; the
-/// address line's is inserted when the reply comes.
+/// address line's is inserted when the reply comes, and only into the line that asked
+/// ([`PendingRead::line_gen`]).
 struct PendingRead {
     request: RequestId,
     /// When the read fails if the terminal has not answered.
     deadline: Instant,
     /// The address line asked, rather than a page.
     for_line: bool,
+    /// [`Tui::line_gen`] when the line asked. A page read leaves this unused.
+    line_gen: u64,
+    /// The selection the query named. The reply has to name it too.
+    selection: Selection,
     /// The most bytes a page accepts. The line also caps at [`MAX_PASTE`].
     limit: usize,
+}
+
+/// The one clipboard read the terminal still owes a reply for.
+///
+/// OSC 52 replies carry no id. After a cancel or a timeout the read stays as
+/// [`Outstanding::Discard`] so the late reply is dropped, and a new read fails
+/// until that reply (or the parser's discarded OSC 52) arrives.
+enum Outstanding {
+    /// The reply is delivered to this read.
+    Live(PendingRead),
+    /// The read was cancelled or timed out. The next matching reply is dropped.
+    Discard { selection: Selection },
 }
 
 /// One view's target as the loop sees it.
@@ -270,6 +292,9 @@ struct Tui {
     next_image: u32,
     /// The address line, while `location.focus` has it.
     editing: Option<LineEditor>,
+    /// Bumped when the address line opens or closes. A paste in flight names the line it
+    /// asked, and a reply for another line is dropped.
+    line_gen: u64,
     /// The address line opened during this run of the core and nothing was typed into it yet:
     /// it starts from the active tab's address as the run left it (`tab.new` opens it).
     editing_fresh: bool,
@@ -281,10 +306,12 @@ struct Tui {
     page_text: bool,
     /// The earliest time the next page frame may be presented.
     next_frame: Option<Instant>,
-    /// The OSC 52 read waiting for the terminal, if there is one.
-    pending: Option<PendingRead>,
+    /// The OSC 52 read the terminal has not answered, if there is one.
+    outstanding: Option<Outstanding>,
     /// Reads that failed before a query was sent. The next pass answers them.
     failed_reads: Vec<(RequestId, ServiceError)>,
+    /// One OSC 52 write not yet accepted by the terminal. A newer write replaces it.
+    clipboard_out: Option<Vec<u8>>,
     /// Bytes for the next write, before the chrome: mode changes and image deletions.
     control: Vec<u8>,
     chrome_dirty: bool,
@@ -551,14 +578,16 @@ impl App {
             views: HashMap::new(),
             next_image: 1,
             editing: None,
+            line_gen: 0,
             editing_fresh: false,
             active_url: String::new(),
             notice: None,
             notice_first: None,
             page_text: false,
             next_frame: None,
-            pending: None,
+            outstanding: None,
             failed_reads: Vec::new(),
+            clipboard_out: None,
             control: Vec::new(),
             chrome_dirty: true,
             clear: false,
@@ -1158,8 +1187,9 @@ impl App {
         !views.is_empty()
     }
 
-    /// Writes what changed: control bytes, the chrome, and at most one page frame, as one
-    /// write, and only once everything written before has left. Returns whether it wrote.
+    /// Writes what changed: a clipboard sequence on its own, then control bytes, the chrome,
+    /// and at most one page frame. Nothing new goes out while bytes are still waiting, except
+    /// a clipboard write replacing one that has not started. Returns whether it wrote.
     fn write(&mut self) -> bool {
         // What the terminal takes now of what was waiting.
         if let Err(error) = self.tui.terminal.write_frame(&[]) {
@@ -1168,8 +1198,21 @@ impl App {
         if self.tui.terminal.pending_len() == 0 {
             self.tui.outbound = None;
         }
+        let mut wrote = false;
+        if let Some(osc) = self.tui.clipboard_out.take() {
+            match self.tui.terminal.write_reliable(&osc) {
+                Ok(true) => wrote = true,
+                // The queue is busy with something else, or this does not fit. Leave it
+                // unsent. An oversized sequence was refused before it was stored here.
+                Ok(false) => self.tui.clipboard_out = Some(osc),
+                Err(error) => {
+                    self.tui.clipboard_out = Some(osc);
+                    self.fail(format!("writing to the terminal failed: {error}"));
+                }
+            }
+        }
         if self.tui.terminal.pending_len() > 0 {
-            return false;
+            return wrote;
         }
         let mut out = std::mem::take(&mut self.tui.control);
         if std::mem::take(&mut self.tui.clear) {
@@ -1191,7 +1234,7 @@ impl App {
         }
         self.frame(&mut out);
         if out.is_empty() {
-            return false;
+            return wrote;
         }
         if let Err(error) = self.tui.terminal.write_frame(&out) {
             self.fail(format!("writing to the terminal failed: {error}"));
@@ -1724,6 +1767,7 @@ impl Tui {
 
     /// `location.focus`: opens the address line on the active tab's address, selected.
     fn open_address(&mut self) {
+        self.line_gen = self.line_gen.wrapping_add(1);
         let mut editor = LineEditor::from_text(self.active_url.as_str());
         editor.select_all();
         self.editing = Some(editor);
@@ -1734,6 +1778,7 @@ impl Tui {
     fn close_address(&mut self) {
         self.editing_fresh = false;
         if self.editing.take().is_some() {
+            self.line_gen = self.line_gen.wrapping_add(1);
             self.chrome_dirty = true;
         }
     }
@@ -1805,13 +1850,17 @@ impl Tui {
     }
 
     /// OSC 52 of the whole line. The editor's selection is the whole line or nothing, so a copy
-    /// with nothing selected is the line. `cut` then clears it.
+    /// with nothing selected is the line. `cut` clears it only when the copy was accepted.
     fn copy_line(&mut self, cut: bool) {
         let Some(text) = self.editing.as_ref().map(|editor| editor.text().to_owned()) else {
             return;
         };
-        self.control
-            .extend(clipboard::set(Selection::Clipboard, text.as_bytes()));
+        if self
+            .queue_clipboard(Selection::Clipboard, text.as_bytes())
+            .is_err()
+        {
+            return;
+        }
         self.editing_fresh = false;
         if !cut {
             return;
@@ -1824,62 +1873,119 @@ impl Tui {
     }
 
     /// Ask the terminal for the clipboard and insert the answer into the line. A read that is
-    /// already waiting is left alone: one query at a time.
+    /// already waiting, or one whose reply has not arrived yet, is left alone: one query at a time.
     fn paste_line(&mut self) {
         self.editing_fresh = false;
-        if self.pending.is_some() {
+        if self.outstanding.is_some() {
             return;
         }
         self.control.extend(clipboard::query(Selection::Clipboard));
-        self.pending = Some(PendingRead {
+        self.outstanding = Some(Outstanding::Live(PendingRead {
             request: RequestId::next(),
             deadline: Instant::now() + CLIPBOARD_WAIT,
             for_line: true,
+            line_gen: self.line_gen,
+            selection: Selection::Clipboard,
             limit: MAX_PASTE,
-        });
+        }));
     }
 
-    /// The terminal answered the waiting read. A page's answer goes back to the session; the
-    /// line's is inserted here, capped, and only when there is text to insert.
+    /// The terminal answered the waiting read.
+    ///
+    /// A reply for another selection is left waiting. A truncated reply is a failure, not a
+    /// prefix. A page's answer goes back to the session. The line's is inserted only when
+    /// `line_gen` is still the line that asked. A discard-only read drops the reply.
     fn clipboard_reply(
         &mut self,
-        data: Option<Vec<u8>>,
+        reply: ClipboardReply,
     ) -> Option<(RequestId, Result<ClipboardData, ServiceError>)> {
-        let pending = self.pending.take()?;
-        if pending.for_line {
-            self.insert_clipboard(data, pending.limit);
-            None
-        } else {
-            Some((pending.request, clipboard_result(data, pending.limit)))
+        let outstanding = self.outstanding.take()?;
+        let wanted = match &outstanding {
+            Outstanding::Live(pending) => pending.selection,
+            Outstanding::Discard { selection } => *selection,
+        };
+        if reply.selection != Some(wanted) {
+            self.outstanding = Some(outstanding);
+            return None;
+        }
+        match outstanding {
+            Outstanding::Discard { .. } => None,
+            Outstanding::Live(pending) => {
+                if reply.truncated {
+                    if pending.for_line {
+                        return None;
+                    }
+                    return Some((
+                        pending.request,
+                        Err(ServiceError::Failed(
+                            "the clipboard reply was cut short".into(),
+                        )),
+                    ));
+                }
+                if pending.for_line {
+                    if pending.line_gen == self.line_gen {
+                        self.insert_clipboard(reply.data, pending.limit);
+                    }
+                    None
+                } else {
+                    Some((pending.request, clipboard_result(reply.data, pending.limit)))
+                }
+            }
         }
     }
 
     /// `now` is past the waiting read. A page's fails; the line's is dropped, with no notice
-    /// (the open line would hide one).
+    /// (the open line would hide one). Either way the read stays outstanding, discard-only,
+    /// until the reply arrives.
     fn expire_clipboard(
         &mut self,
         now: Instant,
     ) -> Option<(RequestId, Result<ClipboardData, ServiceError>)> {
-        let due = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.deadline <= now);
+        let due = matches!(
+            &self.outstanding,
+            Some(Outstanding::Live(pending)) if pending.deadline <= now
+        );
         if !due {
             return None;
         }
-        let pending = self.pending.take()?;
-        if pending.for_line {
+        let Some(Outstanding::Live(pending)) = self.outstanding.take() else {
+            return None;
+        };
+        let selection = pending.selection;
+        let for_line = pending.for_line;
+        let request = pending.request;
+        self.outstanding = Some(Outstanding::Discard { selection });
+        if for_line {
             return None;
         }
         Some((
-            pending.request,
+            request,
             Err(ServiceError::Failed("the terminal didn't answer".into())),
         ))
     }
 
-    /// When the waiting read must be finished. `None` when nothing is waiting.
+    /// When the waiting read must be finished. `None` when nothing is waiting on a timer.
+    /// A discard-only read has no deadline: it ends when the reply arrives.
     fn clipboard_deadline(&self) -> Option<Instant> {
-        self.pending.as_ref().map(|pending| pending.deadline)
+        match &self.outstanding {
+            Some(Outstanding::Live(pending)) => Some(pending.deadline),
+            _ => None,
+        }
+    }
+
+    /// Queue one OSC 52 write, or refuse it before any byte is queued.
+    ///
+    /// Over [`MAX_CLIPBOARD`], or a sequence that does not fit the output cap, is
+    /// [`ServiceError::TooLarge`]. A newer write replaces one not yet given to the terminal.
+    fn queue_clipboard(&mut self, selection: Selection, data: &[u8]) -> Result<(), ServiceError> {
+        if data.len() > MAX_CLIPBOARD || clipboard::set_len(data.len()) > self.terminal.output_cap()
+        {
+            return Err(ServiceError::TooLarge);
+        }
+        let bytes = clipboard::set(selection, data);
+        debug_assert_eq!(bytes.len(), clipboard::set_len(data.len()));
+        self.clipboard_out = Some(bytes);
+        Ok(())
     }
 
     /// Insert a clipboard reply into the address line. Empty text is left out: inserting it
@@ -1970,9 +2076,10 @@ fn clipboard_result(data: Option<Vec<u8>>, limit: usize) -> Result<ClipboardData
 }
 
 impl Clipboard for Tui {
-    /// One OSC 52 query at a time. A second read fails at once, and a read that asks for no
-    /// `text/*` type is unsupported. The answer comes later, as [`Tui::clipboard_reply`] or
-    /// [`Tui::expire_clipboard`].
+    /// One OSC 52 query at a time. A second read fails at once, and so does a read started
+    /// while a cancelled or timed-out read is still waiting for its reply. A read that asks
+    /// for no `text/*` type is unsupported. The answer comes later, as [`Tui::clipboard_reply`]
+    /// or [`Tui::expire_clipboard`].
     fn read(
         &mut self,
         request: RequestId,
@@ -1984,23 +2091,37 @@ impl Clipboard for Tui {
             self.failed_reads.push((request, ServiceError::Unsupported));
             return;
         }
-        if self.pending.is_some() {
-            self.failed_reads.push((
-                request,
-                ServiceError::Failed("another clipboard read is waiting".into()),
-            ));
-            return;
+        match &self.outstanding {
+            Some(Outstanding::Discard { .. }) => {
+                self.failed_reads.push((
+                    request,
+                    ServiceError::Failed("the previous clipboard read was not answered".into()),
+                ));
+                return;
+            }
+            Some(Outstanding::Live(_)) => {
+                self.failed_reads.push((
+                    request,
+                    ServiceError::Failed("another clipboard read is waiting".into()),
+                ));
+                return;
+            }
+            None => {}
         }
         self.control.extend(clipboard::query(selection));
-        self.pending = Some(PendingRead {
+        self.outstanding = Some(Outstanding::Live(PendingRead {
             request,
             deadline: Instant::now() + CLIPBOARD_WAIT,
             for_line: false,
+            line_gen: self.line_gen,
+            selection,
             limit,
-        });
+        }));
     }
 
-    /// The first `text/*` item, as OSC 52. Anything else is unsupported.
+    /// The first `text/*` item, as one OSC 52. Anything else is unsupported. A payload over
+    /// [`MAX_CLIPBOARD`], or whose sequence does not fit the output cap, is refused before it
+    /// is queued.
     fn write(
         &mut self,
         selection: Selection,
@@ -2012,18 +2133,21 @@ impl Clipboard for Tui {
         else {
             return Err(ServiceError::Unsupported);
         };
-        self.control.extend(clipboard::set(selection, &item.data));
-        Ok(())
+        self.queue_clipboard(selection, &item.data)
     }
 
-    /// Drop a read that is still waiting for `request`. A failure not yet delivered is dropped too.
+    /// A read that is still waiting for `request` becomes discard-only: its reply is dropped,
+    /// and nothing is reported for it. A failure not yet delivered is dropped too.
     fn cancel(&mut self, request: RequestId) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.request == request)
-        {
-            self.pending = None;
+        if matches!(
+            &self.outstanding,
+            Some(Outstanding::Live(pending)) if pending.request == request
+        ) {
+            let selection = match self.outstanding.take() {
+                Some(Outstanding::Live(pending)) => pending.selection,
+                _ => return,
+            };
+            self.outstanding = Some(Outstanding::Discard { selection });
         }
         self.failed_reads.retain(|(id, _)| *id != request);
     }
@@ -2682,14 +2806,16 @@ mod tests {
             views: HashMap::new(),
             next_image: 1,
             editing: None,
+            line_gen: 0,
             editing_fresh: false,
             active_url: String::new(),
             notice: None,
             notice_first: None,
             page_text: false,
             next_frame: None,
-            pending: None,
+            outstanding: None,
             failed_reads: Vec::new(),
+            clipboard_out: None,
             control: Vec::new(),
             chrome_dirty: false,
             clear: false,
@@ -2738,6 +2864,14 @@ mod tests {
         }
     }
 
+    fn clip_reply(data: Option<Vec<u8>>) -> ClipboardReply {
+        ClipboardReply {
+            selection: Some(Selection::Clipboard),
+            data,
+            truncated: false,
+        }
+    }
+
     #[test]
     fn write_sends_osc52_for_text_and_refuses_other_types() {
         let (_master, mut tui) = on_pty();
@@ -2747,6 +2881,7 @@ mod tests {
         );
         assert_eq!(refused, Err(ServiceError::Unsupported));
         assert!(tui.control.is_empty());
+        assert!(tui.clipboard_out.is_none());
         tui.write(
             Selection::Clipboard,
             vec![
@@ -2755,7 +2890,51 @@ mod tests {
             ],
         )
         .expect("text");
-        assert_eq!(tui.control, b"\x1b]52;c;aGVq\x1b\\");
+        assert!(tui.control.is_empty());
+        assert_eq!(tui.terminal.pending_len(), 0);
+        assert_eq!(
+            tui.clipboard_out.as_deref(),
+            Some(clipboard::set(Selection::Clipboard, b"hej").as_slice())
+        );
+    }
+
+    #[test]
+    fn an_oversized_clipboard_write_is_refused_before_it_is_queued() {
+        let (_master, mut tui) = on_pty();
+        let cap = tui.terminal.output_cap();
+        let big = vec![b'x'; cap];
+        assert!(clipboard::set_len(big.len()) > cap);
+        let refused = tui.write(Selection::Clipboard, vec![text_item("text/plain", &big)]);
+        assert_eq!(refused, Err(ServiceError::TooLarge));
+        assert!(tui.clipboard_out.is_none());
+        assert!(tui.control.is_empty());
+        assert_eq!(tui.terminal.pending_len(), 0);
+
+        let text = "x".repeat(cap);
+        tui.editing = Some(LineEditor::from_text(&text));
+        tui.chrome_dirty = false;
+        let mut queue = VecDeque::new();
+        tui.edit_key(&ctrl("x"), &mut queue);
+        assert_eq!(tui.editing.as_ref().unwrap().text(), text);
+        assert!(tui.clipboard_out.is_none());
+        assert!(tui.control.is_empty());
+        assert_eq!(tui.terminal.pending_len(), 0);
+        assert!(!tui.chrome_dirty);
+    }
+
+    #[test]
+    fn a_newer_clipboard_write_replaces_an_unsent_one() {
+        let (_master, mut tui) = on_pty();
+        tui.write(Selection::Clipboard, vec![text_item("text/plain", b"one")])
+            .expect("one");
+        tui.write(Selection::Clipboard, vec![text_item("text/plain", b"two")])
+            .expect("two");
+        assert_eq!(
+            tui.clipboard_out.as_deref(),
+            Some(clipboard::set(Selection::Clipboard, b"two").as_slice())
+        );
+        assert!(tui.control.is_empty());
+        assert_eq!(tui.terminal.pending_len(), 0);
     }
 
     #[test]
@@ -2774,18 +2953,37 @@ mod tests {
             )]
         );
         assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
-        let pending = tui.pending.as_ref().expect("the first read still waits");
+        let Outstanding::Live(pending) = tui
+            .outstanding
+            .as_ref()
+            .expect("the first read still waits")
+        else {
+            panic!("the first read is not live");
+        };
         assert_eq!(pending.request, first);
         assert!(!pending.for_line);
+        assert_eq!(pending.selection, Selection::Clipboard);
         let left = pending.deadline.saturating_duration_since(Instant::now());
         assert!(left > Duration::from_millis(500) && left <= CLIPBOARD_WAIT);
         let image = RequestId::next();
         tui.read(image, Selection::Clipboard, &["image/png".into()], 8);
         assert_eq!(tui.failed_reads[1], (image, ServiceError::Unsupported));
+        assert!(matches!(
+            &tui.outstanding,
+            Some(Outstanding::Live(read)) if read.request == first
+        ));
+        // A reply for another selection does not satisfy this read.
         assert!(tui
-            .pending
-            .as_ref()
-            .is_some_and(|read| read.request == first));
+            .clipboard_reply(ClipboardReply {
+                selection: Some(Selection::Primary),
+                data: Some(b"no".to_vec()),
+                truncated: false,
+            })
+            .is_none());
+        assert!(matches!(
+            &tui.outstanding,
+            Some(Outstanding::Live(read)) if read.request == first
+        ));
     }
 
     #[test]
@@ -2802,10 +3000,32 @@ mod tests {
             result,
             Err(ServiceError::Failed("the terminal didn't answer".into()))
         );
-        assert!(tui.pending.is_none());
+        assert!(matches!(
+            tui.outstanding,
+            Some(Outstanding::Discard {
+                selection: Selection::Clipboard
+            })
+        ));
         assert!(tui
             .expire_clipboard(Instant::now() + Duration::from_secs(2))
             .is_none());
+
+        let blocked = RequestId::next();
+        let query = tui.control.clone();
+        tui.read(blocked, Selection::Clipboard, &["text/plain".into()], 8);
+        assert_eq!(
+            tui.failed_reads.last(),
+            Some(&(
+                blocked,
+                ServiceError::Failed("the previous clipboard read was not answered".into())
+            ))
+        );
+        assert_eq!(tui.control, query);
+        assert!(tui
+            .clipboard_reply(clip_reply(Some(b"late".to_vec())))
+            .is_none());
+        assert!(tui.outstanding.is_none());
+        tui.failed_reads.clear();
 
         tui.read(
             RequestId::next(),
@@ -2814,7 +3034,7 @@ mod tests {
             2,
         );
         let (id, result) = tui
-            .clipboard_reply(Some(b"hej".to_vec()))
+            .clipboard_reply(clip_reply(Some(b"hej".to_vec())))
             .expect("over the limit");
         assert_eq!(result, Err(ServiceError::TooLarge));
         assert_ne!(id, request);
@@ -2824,7 +3044,7 @@ mod tests {
             &["text/plain".into()],
             8,
         );
-        let (_, result) = tui.clipboard_reply(None).expect("empty reply");
+        let (_, result) = tui.clipboard_reply(clip_reply(None)).expect("empty reply");
         assert_eq!(
             result,
             Ok(ClipboardData {
@@ -2835,8 +3055,107 @@ mod tests {
         let waiting = RequestId::next();
         tui.read(waiting, Selection::Clipboard, &["text/plain".into()], 8);
         tui.cancel(waiting);
-        assert!(tui.pending.is_none());
-        assert!(tui.clipboard_reply(Some(b"hej".to_vec())).is_none());
+        assert!(matches!(
+            tui.outstanding,
+            Some(Outstanding::Discard {
+                selection: Selection::Clipboard
+            })
+        ));
+        assert!(tui
+            .clipboard_reply(clip_reply(Some(b"hej".to_vec())))
+            .is_none());
+        assert!(tui.outstanding.is_none());
+    }
+
+    #[test]
+    fn a_late_reply_after_cancel_is_discarded_and_the_next_read_fails_closed() {
+        let (_master, mut tui) = on_pty();
+        let first = RequestId::next();
+        tui.read(first, Selection::Clipboard, &["text/plain".into()], 64);
+        tui.cancel(first);
+        assert!(matches!(
+            tui.outstanding,
+            Some(Outstanding::Discard {
+                selection: Selection::Clipboard
+            })
+        ));
+        let second = RequestId::next();
+        let query = tui.control.clone();
+        tui.read(second, Selection::Clipboard, &["text/plain".into()], 64);
+        assert_eq!(
+            tui.failed_reads,
+            vec![(
+                second,
+                ServiceError::Failed("the previous clipboard read was not answered".into())
+            )]
+        );
+        assert_eq!(tui.control, query);
+        assert!(tui
+            .clipboard_reply(ClipboardReply {
+                selection: Some(Selection::Primary),
+                data: Some(b"no".to_vec()),
+                truncated: false,
+            })
+            .is_none());
+        assert!(matches!(
+            tui.outstanding,
+            Some(Outstanding::Discard {
+                selection: Selection::Clipboard
+            })
+        ));
+        assert!(tui
+            .clipboard_reply(clip_reply(Some(b"late".to_vec())))
+            .is_none());
+        assert!(tui.outstanding.is_none());
+
+        let third = RequestId::next();
+        tui.read(third, Selection::Clipboard, &["text/plain".into()], 64);
+        let (id, result) = tui
+            .clipboard_reply(clip_reply(Some(b"ok".to_vec())))
+            .expect("the new read");
+        assert_eq!(id, third);
+        assert_eq!(
+            result,
+            Ok(ClipboardData {
+                mime_type: CLIPBOARD_TYPE.into(),
+                data: b"ok".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_truncated_reply_fails_the_read() {
+        let (_master, mut tui) = on_pty();
+        let request = RequestId::next();
+        tui.read(request, Selection::Clipboard, &["text/plain".into()], 1024);
+        let (id, result) = tui
+            .clipboard_reply(ClipboardReply {
+                selection: Some(Selection::Clipboard),
+                data: Some(vec![b'A'; 8]),
+                truncated: true,
+            })
+            .expect("the read fails");
+        assert_eq!(id, request);
+        assert_eq!(
+            result,
+            Err(ServiceError::Failed(
+                "the clipboard reply was cut short".into()
+            ))
+        );
+        assert!(tui.outstanding.is_none());
+
+        tui.editing = Some(LineEditor::from_text("ab"));
+        let mut queue = VecDeque::new();
+        tui.edit_key(&ctrl("v"), &mut queue);
+        assert!(tui
+            .clipboard_reply(ClipboardReply {
+                selection: Some(Selection::Clipboard),
+                data: Some(b"xy".to_vec()),
+                truncated: true,
+            })
+            .is_none());
+        assert_eq!(tui.editing.as_ref().unwrap().text(), "ab");
+        assert!(tui.outstanding.is_none());
     }
 
     #[test]
@@ -2849,23 +3168,27 @@ mod tests {
         release.state = ButtonState::Released;
         tui.edit_key(&release, &mut queue);
         assert!(tui.control.is_empty());
+        assert!(tui.clipboard_out.is_none());
         tui.edit_key(&ctrl("c"), &mut queue);
         assert_eq!(tui.editing.as_ref().unwrap().text(), line);
         assert!(!tui.editing.as_ref().unwrap().selected());
+        assert!(tui.control.is_empty());
         assert_eq!(
-            tui.control,
-            clipboard::set(Selection::Clipboard, line.as_bytes())
+            tui.clipboard_out.as_deref(),
+            Some(clipboard::set(Selection::Clipboard, line.as_bytes()).as_slice())
         );
         assert!(!tui.editing_fresh);
-        tui.control.clear();
+        tui.clipboard_out = None;
         tui.edit_key(&ctrl("a"), &mut queue);
         assert!(tui.editing.as_ref().unwrap().selected());
         assert!(tui.control.is_empty());
+        assert!(tui.clipboard_out.is_none());
         tui.edit_key(&ctrl("x"), &mut queue);
         assert_eq!(tui.editing.as_ref().unwrap().text(), "");
+        assert!(tui.control.is_empty());
         assert_eq!(
-            tui.control,
-            clipboard::set(Selection::Clipboard, line.as_bytes())
+            tui.clipboard_out.as_deref(),
+            Some(clipboard::set(Selection::Clipboard, line.as_bytes()).as_slice())
         );
         assert!(tui.chrome_dirty);
     }
@@ -2876,26 +3199,67 @@ mod tests {
         tui.editing = Some(LineEditor::from_text("ab"));
         let mut queue = VecDeque::new();
         tui.edit_key(&ctrl("v"), &mut queue);
-        let pending = tui.pending.as_ref().expect("waiting");
+        let Outstanding::Live(pending) = tui.outstanding.as_ref().expect("waiting") else {
+            panic!("the line read is not live");
+        };
         assert!(pending.for_line);
+        assert_eq!(pending.line_gen, tui.line_gen);
         assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
         let again = tui.control.clone();
         tui.edit_key(&ctrl("v"), &mut queue);
         assert_eq!(tui.control, again);
-        assert!(tui.clipboard_reply(Some(b"xy".to_vec())).is_none());
+        assert!(tui
+            .clipboard_reply(clip_reply(Some(b"xy".to_vec())))
+            .is_none());
         assert_eq!(tui.editing.as_ref().unwrap().text(), "abxy");
         let mut selected = LineEditor::from_text("ab");
         selected.select_all();
         tui.editing = Some(selected);
         tui.edit_key(&ctrl("v"), &mut queue);
-        assert!(tui.clipboard_reply(None).is_none());
+        assert!(tui.clipboard_reply(clip_reply(None)).is_none());
         assert_eq!(tui.editing.as_ref().unwrap().text(), "ab");
         assert!(tui.editing.as_ref().unwrap().selected());
         let due = Instant::now() + Duration::from_secs(2);
         tui.edit_key(&ctrl("v"), &mut queue);
         assert!(tui.expire_clipboard(due).is_none());
-        assert!(tui.pending.is_none());
+        assert!(matches!(
+            tui.outstanding,
+            Some(Outstanding::Discard {
+                selection: Selection::Clipboard
+            })
+        ));
+        let query = tui.control.clone();
+        tui.edit_key(&ctrl("v"), &mut queue);
+        assert_eq!(tui.control, query);
+        assert!(tui
+            .clipboard_reply(clip_reply(Some(b"nope".to_vec())))
+            .is_none());
         assert_eq!(tui.editing.as_ref().unwrap().text(), "ab");
+        assert!(tui.outstanding.is_none());
+    }
+
+    #[test]
+    fn a_line_reply_is_dropped_when_the_line_closes() {
+        let (_master, mut tui) = on_pty();
+        tui.active_url = "https://one.test".into();
+        tui.open_address();
+        let asked = tui.line_gen;
+        let mut queue = VecDeque::new();
+        tui.edit_key(&ctrl("v"), &mut queue);
+        assert!(matches!(
+            &tui.outstanding,
+            Some(Outstanding::Live(pending)) if pending.for_line && pending.line_gen == asked
+        ));
+        tui.close_address();
+        tui.active_url = "https://two.test".into();
+        tui.open_address();
+        assert_ne!(tui.line_gen, asked);
+        assert!(tui
+            .clipboard_reply(clip_reply(Some(b"secret".to_vec())))
+            .is_none());
+        assert_eq!(tui.editing.as_ref().unwrap().text(), "https://two.test");
+        assert!(tui.editing.as_ref().unwrap().selected());
+        assert!(tui.outstanding.is_none());
     }
 
     #[cfg(feature = "engine-demo")]
@@ -3086,9 +3450,13 @@ schemes = [\"demo\"]
         );
         app.run_core();
         press_page(app, "z");
+        // The timed-out read stays outstanding until its reply arrives. That
+        // reply is dropped, and only then can the page ask again.
+        app.event(TermEvent::Clipboard(clip_reply(Some(b"late".to_vec()))));
+        assert!(app.tui.outstanding.is_none());
         let request = request_clipboard(app, document);
         assert_eq!(app.tui.control, clipboard::query(Selection::Clipboard));
-        app.event(TermEvent::Clipboard(Some(b"hej".to_vec())));
+        app.event(TermEvent::Clipboard(clip_reply(Some(b"hej".to_vec()))));
         assert_eq!(
             clipboard_answer(app, request),
             Some(Ok(sighurt_api::services::ServiceReply::Clipboard(

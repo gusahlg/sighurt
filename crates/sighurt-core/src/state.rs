@@ -2206,9 +2206,17 @@ impl BrowserState {
                 };
                 match outcome {
                     KeyOutcome::Run(commands) => {
+                        // `settle` runs once, after this press. When several commands run, tell
+                        // the engines which view is shown after each one, so a later
+                        // `page.send-key` follows that view's focus and visibility, as when the
+                        // commands run one by one. One command is left entirely to `settle`.
+                        let between = commands.len() > 1;
                         for command in commands {
                             self.key_ran(&command, at);
                             self.run_command(command, fx);
+                            if between {
+                                self.settle_engines(fx);
+                            }
                         }
                         return;
                     }
@@ -2377,11 +2385,13 @@ impl BrowserState {
 
     // ── Presentation ──────────────────────────────────────────────────────────────────────
 
-    /// Brings the engines, the host and the keymap in line with the state after an update: the
-    /// active tab loads a record it shows, only its view is visible and has the keyboard (when
-    /// the page has it), at the tab's zoom, the host knows the page's cursor and text field, and
-    /// the keymap knows the context; a changed keymap indicator redraws the chrome.
-    fn settle(&mut self, fx: &mut Fx) {
+    /// What [`Self::settle`] tells the engines. The active tab loads a record it shows, every
+    /// other view blurs and hides, and the shown view is visible, focused when the page has the
+    /// keyboard, and at the tab's zoom. A press that runs several commands does this after each
+    /// one, so a later command's input follows the focus and visibility an earlier command
+    /// needs; a single command leaves it to `settle`. Once the engines have been told, doing it
+    /// again adds nothing.
+    fn settle_engines(&mut self, fx: &mut Fx) {
         let unloaded = self.tabs.get(self.active).filter(|t| {
             matches!(t.current(), Some(Segment::Record(_)))
                 && t.switch.is_none()
@@ -2423,6 +2433,16 @@ impl BrowserState {
                 command(EngineCommand::SetFocus(true));
             }
         }
+    }
+
+    /// Brings the engines, the host and the keymap in line with the state after an update: the
+    /// active tab loads a record it shows, only its view is visible and has the keyboard (when
+    /// the page has it), at the tab's zoom, the host knows the page's cursor and text field, and
+    /// the keymap knows the context; a changed keymap indicator redraws the chrome.
+    fn settle(&mut self, fx: &mut Fx) {
+        self.settle_engines(fx);
+        let shown = self.shown_view();
+        let focused = self.focused_view();
         let cursor = shown.map_or(Cursor::Default, |id| self.views[&id].cursor);
         if cursor != self.cursor {
             self.cursor = cursor;

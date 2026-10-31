@@ -2636,6 +2636,120 @@ fn run_all_runs_in_order_in_one_update() {
 }
 
 #[test]
+fn a_run_all_shows_and_focuses_a_tab_before_sending_it_a_key() {
+    // `tab.select 2; page.send-key enter; tab.select 1` in one press, against those commands
+    // as three updates. RedrawChrome and SaveSession are once per update, so the comparison
+    // is everything else: tab 2 is shown and focused before Enter, then hidden again.
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Focus(KeyboardFocus),
+        Engine(usize, EngineCommand),
+        Key(usize, KeyEvent),
+        Other(String),
+    }
+
+    fn tab_views(b: &Harness) -> Vec<ViewId> {
+        (0..b.state.tabs().len())
+            .map(|index| match b.tab(index).content {
+                Content::View(view) => view,
+                other => panic!("tab {index} shows {other:?}"),
+            })
+            .collect()
+    }
+
+    fn steps(effects: &[Effect], views: &[ViewId]) -> Vec<Step> {
+        let tab_of = |view: ViewId| {
+            views.iter().position(|id| *id == view).unwrap_or_else(|| {
+                panic!("an effect for a view that is not a tab's current one: {view:?}")
+            })
+        };
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::RedrawChrome | Effect::SaveSession => None,
+                Effect::Focus(focus) => Some(Step::Focus(*focus)),
+                Effect::Engine {
+                    view,
+                    command:
+                        EngineCommand::Input(InputEvent {
+                            kind: InputKind::Key(key),
+                            ..
+                        }),
+                } => Some(Step::Key(tab_of(*view), key.clone())),
+                Effect::Engine { view, command } => {
+                    Some(Step::Engine(tab_of(*view), command.clone()))
+                }
+                other => Some(Step::Other(format!("{other:?}"))),
+            })
+            .collect()
+    }
+
+    let urls = ["https://a.test/", "https://b.test/"];
+    let config = "\
+[input]
+keymap = \"script\"
+[keymap.script]
+\"x\" = \"all tab.select 2; page.send-key enter; tab.select 1\"";
+    let mut together = Harness::start(config, &urls);
+    let together_views = tab_views(&together);
+    let combined = together.key(typed("x"));
+
+    let mut apart = Harness::start("", &urls);
+    let apart_views = tab_views(&apart);
+    let mut stepped = Vec::new();
+    for text in ["tab.select 2", "page.send-key enter", "tab.select 1"] {
+        stepped.extend(apart.update(command(text)));
+    }
+
+    let combined_steps = steps(&combined, &together_views);
+    let stepped_steps = steps(&stepped, &apart_views);
+    assert_eq!(
+        combined_steps, stepped_steps,
+        "one press should do what the commands do one by one"
+    );
+
+    let tab2 = |step: &Step| matches!(step, Step::Key(1, _));
+    let keys: Vec<usize> = combined_steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| tab2(step))
+        .map(|(index, _)| index)
+        .collect();
+    let find = |want: fn(&Step) -> bool| {
+        combined_steps
+            .iter()
+            .position(want)
+            .expect("tab 2's focus effects")
+    };
+    let show = find(|step| matches!(step, Step::Engine(1, EngineCommand::SetVisibility(true))));
+    let focus = find(|step| matches!(step, Step::Engine(1, EngineCommand::SetFocus(true))));
+    let hide = find(|step| matches!(step, Step::Engine(1, EngineCommand::SetVisibility(false))));
+    let blur = find(|step| matches!(step, Step::Engine(1, EngineCommand::SetFocus(false))));
+    assert_eq!(
+        keys.len(),
+        2,
+        "press and release, to tab 2: {combined_steps:?}"
+    );
+    assert!(
+        show < keys[0]
+            && focus < keys[0]
+            && keys[1] == keys[0] + 1
+            && keys[1] < hide
+            && keys[1] < blur,
+        "tab 2 is shown and focused before Enter, and hidden after it: {combined_steps:?}"
+    );
+    assert_eq!(together.state.active(), apart.state.active());
+    assert_eq!(
+        together.state.view(together_views[0]).unwrap().state(),
+        ViewState::LiveVisible
+    );
+    assert_eq!(
+        together.state.view(together_views[1]).unwrap().state(),
+        ViewState::LiveHidden
+    );
+}
+
+#[test]
 fn clipboard_copy_is_an_effect() {
     let mut b = Harness::start("", &["sig://home"]);
     let effects = b.update(command("clipboard.copy hello there"));

@@ -6,6 +6,11 @@
 //! compacted once that offset passes half the buffer, so a drain does not
 //! slide the tail on every write.
 //!
+//! A clipboard sequence is not a frame. [`Output::write_reliable`] queues one
+//! only when it fits in the cap, and refuses it without writing or queueing
+//! when it does not. A later frame drop keeps those bytes whole. A newer
+//! reliable sequence replaces one that is still wholly unsent.
+//!
 //! Bytes already handed to the kernel are tracked with [`Wire`]. Dropping the
 //! queue finishes that open sequence or ends it (a kitty graphics APC with
 //! `ESC \`; an open DCS with `ST` and none of the body still queued) so the
@@ -206,6 +211,9 @@ pub struct Output {
     /// First byte not yet accepted by `write`. Earlier bytes stay until compact.
     pending_at: usize,
     cap: usize,
+    /// Unsent bytes at the front of the pending tail that must be written whole.
+    /// A frame drop keeps them. Zero when the tail has none.
+    reliable: usize,
     drops: u64,
     /// Parser state of bytes already accepted by `write`.
     wire: Wire,
@@ -223,6 +231,7 @@ impl Output {
             pending: Vec::new(),
             pending_at: 0,
             cap,
+            reliable: 0,
             drops: 0,
             wire: Wire::Ground,
             seen_gen: 0,
@@ -234,6 +243,11 @@ impl Output {
     /// Bytes still waiting.
     pub fn pending_len(&self) -> usize {
         self.pending.len() - self.pending_at
+    }
+
+    /// The most unsent bytes this queue keeps.
+    pub fn cap(&self) -> usize {
+        self.cap
     }
 
     /// Frames discarded because they did not fit in the cap.
@@ -258,6 +272,7 @@ impl Output {
         self.seen_gen = gen;
         self.pending.clear();
         self.pending_at = 0;
+        self.reliable = 0;
         true
     }
 
@@ -285,9 +300,38 @@ impl Output {
     /// when the end is not in the queue. A kitty APC chunk therefore finishes
     /// or is closed with `ST`. An open `DCS` is always closed with `ST`: a
     /// sixel is one DCS, and a truncated sixel is valid, so the rest of the
-    /// body is not kept.
+    /// body is not kept. Reliable bytes are the exception: they stay whole,
+    /// and what follows them is what this drops.
     pub fn discard_to_boundary(&mut self) {
         self.reclaim_spent();
+        if self.reliable > self.pending_len() {
+            self.reliable = self.pending_len();
+        }
+        if self.reliable > 0 {
+            let keep = self.reliable;
+            if self.wire == Wire::Ground {
+                self.pending.truncate(self.pending_at + keep);
+                self.compact();
+                return;
+            }
+            let tail = &self.pending[self.pending_at..self.pending_at + keep];
+            if let Some(end) = bytes_until_ground(self.wire, tail) {
+                self.pending.truncate(self.pending_at + end);
+                self.reliable = end;
+                self.compact();
+                return;
+            }
+            // The reliable prefix does not reach ground. Keep it and close
+            // after it. Never replace the prefix with a short terminator.
+            let term = terminator(self.wire);
+            self.pending.truncate(self.pending_at + keep);
+            if keep + term.len() <= self.cap {
+                self.pending.extend_from_slice(term);
+                self.reliable = keep + term.len();
+            }
+            self.compact();
+            return;
+        }
         if self.wire == Wire::Ground {
             self.pending.clear();
             self.pending_at = 0;
@@ -307,13 +351,79 @@ impl Output {
     }
 
     /// [`Self::discard_to_boundary`] and take those bytes. The caller writes them.
-    pub fn take_inflight(&mut self) -> Vec<u8> {
+    ///
+    /// The `usize` is how many leading bytes of the returned buffer are a
+    /// reliable prefix. [`Self::set_reliable_prefix`] puts that back when the
+    /// write stops early.
+    pub fn take_inflight(&mut self) -> (Vec<u8>, usize) {
         self.discard_to_boundary();
+        let reliable = self.reliable.min(self.pending_len());
         self.pending_at = 0;
-        std::mem::take(&mut self.pending)
+        self.reliable = 0;
+        (std::mem::take(&mut self.pending), reliable)
+    }
+
+    /// Mark `bytes` leading unsent bytes as a reliable prefix.
+    pub fn set_reliable_prefix(&mut self, bytes: usize) {
+        self.reliable = bytes.min(self.pending_len());
+    }
+
+    /// Write `bytes` whole, or write nothing.
+    ///
+    /// `Ok(false)` means `bytes` do not fit in the cap, or the queue holds
+    /// something this must not replace (a frame, or a reliable sequence that
+    /// has already started on the wire). The queue is unchanged then.
+    /// `Ok(true)` means `bytes` were written or queued whole. A wholly unsent
+    /// reliable sequence already queued is replaced.
+    pub fn write_reliable<Fd, P>(
+        &mut self,
+        fd: Fd,
+        bytes: &[u8],
+        mut publish: P,
+    ) -> io::Result<bool>
+    where
+        Fd: AsFd,
+        P: FnMut(Wire) -> bool,
+    {
+        if bytes.is_empty() {
+            return Ok(true);
+        }
+        if bytes.len() > self.cap {
+            return Ok(false);
+        }
+        self.reclaim_spent();
+        if self.reliable > self.pending_len() {
+            self.reliable = self.pending_len();
+        }
+        let replace =
+            self.wire == Wire::Ground && self.reliable > 0 && self.reliable == self.pending_len();
+        if self.pending_len() > 0 || self.wire != Wire::Ground {
+            if !replace {
+                return Ok(false);
+            }
+            self.pending.clear();
+            self.pending_at = 0;
+            self.reliable = 0;
+        }
+        let wrote = self.write_span(&fd, bytes, &mut publish)?;
+        if wrote.handoff {
+            self.reliable = 0;
+            return Ok(true);
+        }
+        let rest = &bytes[wrote.bytes..];
+        if rest.is_empty() {
+            self.reliable = 0;
+            return Ok(true);
+        }
+        self.pending.extend_from_slice(rest);
+        self.reliable = rest.len();
+        Ok(true)
     }
 
     /// Write one frame. `EAGAIN` stores what fits; it does not block.
+    ///
+    /// A frame that does not fit is dropped. Reliable bytes queued by
+    /// [`Self::write_reliable`] are kept whole and are not part of that drop.
     ///
     /// `publish` runs before each `write` with the [`Wire`] that syscall will
     /// leave on the wire if it stops early, and again with the exact state
@@ -413,6 +523,7 @@ impl Output {
     }
 
     fn consume(&mut self, wrote: usize) {
+        self.reliable = self.reliable.saturating_sub(wrote);
         self.pending_at += wrote;
         if self.pending_at >= self.pending.len() {
             self.pending.clear();
@@ -659,5 +770,100 @@ mod tests {
             "shifted {} for {n} bytes",
             output.shifted
         );
+    }
+
+    fn unsent(output: &Output) -> &[u8] {
+        &output.pending[output.pending_at..]
+    }
+
+    fn devnull() -> std::fs::File {
+        std::fs::File::options()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null")
+    }
+
+    /// A pipe whose buffer is full, so the next write returns `EAGAIN`.
+    fn full_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        let (reader, writer) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("pipe");
+        let chunk = vec![0u8; 4096];
+        loop {
+            match rustix::io::write(&writer, &chunk) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(err) => panic!("fill: {err}"),
+            }
+        }
+        (reader, writer)
+    }
+
+    #[test]
+    fn an_oversized_reliable_write_is_refused_before_it_is_queued() {
+        let mut output = Output::new(32);
+        let big = vec![b'x'; 33];
+        assert!(!output
+            .write_reliable(devnull(), &big, |_| true)
+            .expect("write"));
+        assert_eq!(output.pending_len(), 0);
+        assert_eq!(output.reliable, 0);
+
+        output.pending.extend_from_slice(b"keep");
+        output.reliable = 4;
+        assert!(!output
+            .write_reliable(devnull(), &big, |_| true)
+            .expect("write"));
+        assert_eq!(unsent(&output), b"keep");
+        assert_eq!(output.reliable, 4);
+    }
+
+    #[test]
+    fn a_newer_reliable_write_replaces_an_unsent_one_and_a_frame_drop_keeps_it() {
+        let (_reader, writer) = full_pipe();
+        let mut output = Output::new(64);
+        let first = b"\x1b]52;c;YQ==\x1b\\";
+        let second = b"\x1b]52;c;Yg==\x1b\\";
+        assert!(output
+            .write_reliable(&writer, first, |_| true)
+            .expect("write"));
+        assert_eq!(unsent(&output), first);
+        assert!(output
+            .write_reliable(&writer, second, |_| true)
+            .expect("replace"));
+        assert_eq!(unsent(&output), second);
+        assert_eq!(output.wire, Wire::Ground);
+
+        let frame = vec![b'F'; 200];
+        output
+            .write_frame(&writer, &frame, |_| true)
+            .expect("frame");
+        assert_eq!(unsent(&output), second);
+        assert!(output.drops() >= 1);
+        assert!(!unsent(&output).contains(&b'F'));
+
+        // Ground would otherwise drop the whole queue. The clipboard stays, the frame goes.
+        let mut output = Output::new(64);
+        output.pending.extend_from_slice(second);
+        output.pending.extend_from_slice(&frame);
+        output.reliable = second.len();
+        output.discard_to_boundary();
+        assert_eq!(unsent(&output), second);
+
+        // A sequence already started on the wire is not replaced, and its payload is not
+        // swapped for a bare terminator.
+        let mut output = Output::new(64);
+        output.wire = Wire::Osc;
+        output.pending.extend_from_slice(b"aGVq\x1b\\");
+        output.pending.extend_from_slice(&frame);
+        output.reliable = b"aGVq\x1b\\".len();
+        assert!(!output
+            .write_reliable(devnull(), second, |_| true)
+            .expect("in flight"));
+        assert_eq!(&unsent(&output)[..b"aGVq\x1b\\".len()], b"aGVq\x1b\\");
+        output.discard_to_boundary();
+        assert_eq!(unsent(&output), b"aGVq\x1b\\");
     }
 }

@@ -125,6 +125,14 @@ fn selection_byte(selection: Selection) -> u8 {
     }
 }
 
+/// Bytes of [`set`] around the base64: `ESC ] 52 ; <c|p> ;` and `ESC \`.
+pub(crate) const SET_OVERHEAD: usize = 9;
+
+/// How many bytes [`set`] returns for a payload of `data_len`, without encoding it.
+pub(crate) fn set_len(data_len: usize) -> usize {
+    data_len.div_ceil(3) * 4 + SET_OVERHEAD
+}
+
 /// `ESC ] 52 ; c ; <base64> ESC \` (`p` for [`Selection::Primary`]).
 pub(crate) fn set(selection: Selection, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -171,8 +179,13 @@ mod tests {
     #[test]
     fn osc52_bytes_name_the_selection() {
         assert_eq!(set(Selection::Clipboard, b"hej"), b"\x1b]52;c;aGVq\x1b\\");
+        assert_eq!(
+            set_len(b"hej".len()),
+            set(Selection::Clipboard, b"hej").len()
+        );
         assert_eq!(set(Selection::Primary, b"hej"), b"\x1b]52;p;aGVq\x1b\\");
         assert_eq!(set(Selection::Clipboard, b""), b"\x1b]52;c;\x1b\\");
+        assert_eq!(set_len(0), set(Selection::Clipboard, b"").len());
         assert_eq!(query(Selection::Clipboard), b"\x1b]52;c;?\x1b\\");
         assert_eq!(query(Selection::Primary), b"\x1b]52;p;?\x1b\\");
     }

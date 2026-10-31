@@ -10,7 +10,13 @@
 //! Payloads are capped (64 KiB for APC/OSC/DCS, 1 MiB for paste). Bytes past
 //! the paste cap are discarded until the end marker, and that paste is one event.
 //! An OSC 52 reply whose data is `?`, empty or not base64 is a reply with no
-//! data. That payload is capped with the other OSC payloads.
+//! data. That payload is capped with the other OSC payloads; once the cap is
+//! hit the reply is a failure (`truncated`), never a decoded prefix.
+//!
+//! When an OSC, DCS or APC string times out, the bytes still to come are
+//! discarded until its terminator (`ESC \` or, for OSC, BEL) and are not
+//! parsed as keys. A clipboard read's own deadline is separate. A timed-out
+//! OSC 52 is reported as a truncated reply when that terminator arrives.
 //!
 //! Releases: once the terminal's reply to `CSI ? u` says it reports event
 //! types (flag 2), a key in an escape sequence (`CSI … u`, `CSI … ~`, the
@@ -142,8 +148,14 @@ pub enum Reply {
         bell: bool,
     },
     /// OSC 52, the clipboard. `data` is missing when the terminal sent `?`, nothing, or bytes
-    /// that are not base64.
-    Clipboard { data: Option<Vec<u8>> },
+    /// that are not base64 — and when `truncated` is set, which is not a value.
+    /// `selection` is `c` or `p` when the terminal named one of those.
+    Clipboard {
+        selection: Option<u8>,
+        data: Option<Vec<u8>>,
+        /// The buffer filled before the terminator, or a timeout discarded the rest.
+        truncated: bool,
+    },
     /// `CSI 4 ; height ; width t`, the text area in pixels.
     TextAreaPixels { height: u32, width: u32 },
     /// `CSI 6 ; height ; width t`, one cell in pixels.
@@ -280,6 +292,24 @@ impl Dcs {
     }
 }
 
+/// Why bytes are being discarded, after a string timed out.
+#[derive(Clone, Copy, Debug)]
+enum DiscardKind {
+    /// OSC (`bell`), DCS or APC. Not a clipboard reply.
+    String { bell: bool },
+    /// OSC 52. `selection` is `c` or `p` when the buffer named one.
+    Clipboard { selection: Option<u8> },
+}
+
+impl DiscardKind {
+    fn bell(self) -> bool {
+        match self {
+            Self::String { bell } => bell,
+            Self::Clipboard { .. } => true,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum State {
     Ground,
@@ -302,6 +332,14 @@ enum State {
     ApcEsc(Buf),
     Ignore,
     IgnoreEsc,
+    /// A string timed out. Bytes are ignored until ST or, for OSC, BEL.
+    Discard {
+        kind: DiscardKind,
+    },
+    /// Saw `ESC` while discarding. `\` finishes ST; anything else stays discarded.
+    DiscardEsc {
+        kind: DiscardKind,
+    },
     Paste {
         data: Vec<u8>,
         matched: usize,
@@ -400,9 +438,14 @@ impl Parser {
 
     /// The armed timer fired. A lone Escape becomes a key. A bare introducer
     /// becomes Alt plus that byte. Anything with parameters is dropped, not
-    /// reported as keys. Paste is left alone.
+    /// reported as keys. An OSC, DCS or APC string that has started is
+    /// discarded until its terminator, so the rest is not keys. Paste, and a
+    /// string already being discarded, are left alone.
     pub fn expire(&mut self) -> Vec<Input> {
-        if matches!(self.state, State::Paste { .. } | State::Ground) {
+        if matches!(
+            self.state,
+            State::Paste { .. } | State::Ground | State::Discard { .. } | State::DiscardEsc { .. }
+        ) {
             return Vec::new();
         }
         let state = std::mem::replace(&mut self.state, State::Ground);
@@ -422,9 +465,54 @@ impl Parser {
             }
             State::Ss3 => self.alt_char(b'O', &mut out),
             State::Csi(csi) if !csi.started => self.alt_char(b'[', &mut out),
-            State::Osc(buf) if buf.data.is_empty() => self.alt_char(b']', &mut out),
-            State::Apc(buf) if buf.data.is_empty() => self.alt_char(b'_', &mut out),
-            State::Dcs(dcs) if !dcs.csi.started && !dcs.in_data => self.alt_char(b'P', &mut out),
+            State::Osc(buf) => {
+                if buf.data.is_empty() && !buf.truncated {
+                    self.alt_char(b']', &mut out);
+                } else {
+                    self.prefix_alt = false;
+                    self.state = State::Discard {
+                        kind: osc_discard_kind(&buf),
+                    };
+                }
+            }
+            State::OscEsc(buf) => {
+                self.prefix_alt = false;
+                self.state = State::DiscardEsc {
+                    kind: osc_discard_kind(&buf),
+                };
+            }
+            State::Apc(buf) => {
+                if buf.data.is_empty() && !buf.truncated {
+                    self.alt_char(b'_', &mut out);
+                } else {
+                    self.prefix_alt = false;
+                    self.state = State::Discard {
+                        kind: DiscardKind::String { bell: false },
+                    };
+                }
+            }
+            State::ApcEsc(_) => {
+                self.prefix_alt = false;
+                self.state = State::DiscardEsc {
+                    kind: DiscardKind::String { bell: false },
+                };
+            }
+            State::Dcs(dcs) => {
+                if !dcs.csi.started && !dcs.in_data {
+                    self.alt_char(b'P', &mut out);
+                } else {
+                    self.prefix_alt = false;
+                    self.state = State::Discard {
+                        kind: DiscardKind::String { bell: false },
+                    };
+                }
+            }
+            State::DcsEsc(_) => {
+                self.prefix_alt = false;
+                self.state = State::DiscardEsc {
+                    kind: DiscardKind::String { bell: false },
+                };
+            }
             _ => {
                 self.prefix_alt = false;
             }
@@ -498,6 +586,8 @@ impl Parser {
                     self.escape(byte, 1, out);
                 }
             }
+            State::Discard { kind } => self.discard(byte, kind, out),
+            State::DiscardEsc { kind } => self.discard_esc(byte, kind, out),
             State::Paste { data, matched } => self.paste(byte, data, matched, out),
         }
     }
@@ -902,7 +992,7 @@ impl Parser {
             0x07 => {
                 self.disarm();
                 self.prefix_alt = false;
-                dispatch_osc(&buf.data, true, out);
+                dispatch_osc(&buf.data, true, buf.truncated, out);
             }
             0x18 | 0x1a => {
                 self.prefix_alt = false;
@@ -943,7 +1033,7 @@ impl Parser {
             self.disarm();
             self.prefix_alt = false;
             if osc {
-                dispatch_osc(&buf.data, false, out);
+                dispatch_osc(&buf.data, false, buf.truncated, out);
             } else {
                 dispatch_apc(&buf.data, out);
             }
@@ -1016,6 +1106,42 @@ impl Parser {
                 self.prefix_alt = false;
                 self.disarm();
             }
+        }
+    }
+
+    /// Drop bytes of a string that timed out, until ST or (for OSC) BEL.
+    /// Nothing here is a key. CAN and SUB end the string, as they do in ground.
+    fn discard(&mut self, byte: u8, kind: DiscardKind, out: &mut Vec<Input>) {
+        match byte {
+            0x07 if kind.bell() => self.finish_discard(kind, out),
+            0x18 | 0x1a => self.finish_discard(kind, out),
+            0x1b => self.state = State::DiscardEsc { kind },
+            _ => self.state = State::Discard { kind },
+        }
+    }
+
+    fn discard_esc(&mut self, byte: u8, kind: DiscardKind, out: &mut Vec<Input>) {
+        if byte == b'\\' {
+            self.finish_discard(kind, out);
+            return;
+        }
+        if byte == 0x1b {
+            // The previous ESC was not ST. This one might be.
+            self.state = State::DiscardEsc { kind };
+            return;
+        }
+        self.discard(byte, kind, out);
+    }
+
+    fn finish_discard(&mut self, kind: DiscardKind, out: &mut Vec<Input>) {
+        self.disarm();
+        self.prefix_alt = false;
+        if let DiscardKind::Clipboard { selection } = kind {
+            out.push(Input::Reply(Reply::Clipboard {
+                selection,
+                data: None,
+                truncated: true,
+            }));
         }
     }
 
@@ -1344,7 +1470,7 @@ fn mouse_from(csi: &Csi, final_byte: u8) -> Option<MouseEvent> {
     })
 }
 
-fn dispatch_osc(payload: &[u8], bell: bool, out: &mut Vec<Input>) {
+fn dispatch_osc(payload: &[u8], bell: bool, truncated: bool, out: &mut Vec<Input>) {
     let text = String::from_utf8_lossy(payload);
     let Some((index, spec)) = text.split_once(';') else {
         return;
@@ -1353,8 +1479,15 @@ fn dispatch_osc(payload: &[u8], bell: bool, out: &mut Vec<Input>) {
         return;
     };
     if index == 52 {
+        // A prefix of the base64 is not the clipboard. The terminator still ends the string.
         out.push(Input::Reply(Reply::Clipboard {
-            data: clipboard_data(spec),
+            selection: selection_byte(spec),
+            data: if truncated {
+                None
+            } else {
+                clipboard_data(spec)
+            },
+            truncated,
         }));
         return;
     }
@@ -1364,6 +1497,26 @@ fn dispatch_osc(payload: &[u8], bell: bool, out: &mut Vec<Input>) {
             spec: spec.to_string(),
             bell,
         }));
+    }
+}
+
+/// `c` or `p` from OSC 52's selection field, when the terminal named one of those.
+fn selection_byte(spec: &str) -> Option<u8> {
+    match spec.split(';').next().unwrap_or("").trim() {
+        "c" => Some(b'c'),
+        "p" => Some(b'p'),
+        _ => None,
+    }
+}
+
+/// A timed-out OSC is a clipboard reply only when the buffer already says OSC 52.
+fn osc_discard_kind(buf: &Buf) -> DiscardKind {
+    let text = String::from_utf8_lossy(&buf.data);
+    match text.split_once(';') {
+        Some(("52", spec)) => DiscardKind::Clipboard {
+            selection: selection_byte(spec),
+        },
+        _ => DiscardKind::String { bell: true },
     }
 }
 
@@ -1829,24 +1982,137 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match reply(b"\x1b]52;c;aGVq\x1b\\") {
-            Reply::Clipboard { data } => assert_eq!(data.as_deref(), Some(b"hej".as_slice())),
+            Reply::Clipboard {
+                selection: Some(b'c'),
+                data,
+                truncated: false,
+            } => assert_eq!(data.as_deref(), Some(b"hej".as_slice())),
+            other => panic!("{other:?}"),
+        }
+        match reply(b"\x1b]52;p;aGVq\x1b\\") {
+            Reply::Clipboard {
+                selection: Some(b'p'),
+                data,
+                truncated: false,
+            } => assert_eq!(data.as_deref(), Some(b"hej".as_slice())),
             other => panic!("{other:?}"),
         }
         match reply(b"\x1b]52;c;?\x1b\\") {
-            Reply::Clipboard { data: None } => {}
+            Reply::Clipboard {
+                data: None,
+                truncated: false,
+                ..
+            } => {}
             other => panic!("{other:?}"),
         }
         match reply(b"\x1b]52;c;\x1b\\") {
-            Reply::Clipboard { data: None } => {}
+            Reply::Clipboard {
+                data: None,
+                truncated: false,
+                ..
+            } => {}
             other => panic!("{other:?}"),
         }
         match reply(b"\x1b]52;c;!!!!\x1b\\") {
-            Reply::Clipboard { data: None } => {}
+            Reply::Clipboard {
+                data: None,
+                truncated: false,
+                ..
+            } => {}
             other => panic!("{other:?}"),
         }
 
         let focus = Parser::new().feed(b"\x1b[I\x1b[O");
         assert_eq!(focus, vec![Input::Focus(true), Input::Focus(false)]);
+    }
+
+    /// `YWFq` is base64 for `aaj`. The `q` would quit if the tail were keys.
+    #[test]
+    fn a_timeout_mid_osc_yields_no_key_events() {
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b]52;c;").is_empty());
+        assert!(parser.expire().is_empty());
+        // An arrow and a `q` sit in the discarded tail, before ST.
+        let tail = parser.feed(b"YW\x1b[AqFq\x1b\\");
+        assert!(
+            tail.iter().all(|input| !matches!(input, Input::Key(_))),
+            "{tail:?}"
+        );
+        match tail.as_slice() {
+            [Input::Reply(Reply::Clipboard {
+                selection: Some(b'c'),
+                data: None,
+                truncated: true,
+            })] => {}
+            other => panic!("{other:?}"),
+        }
+        let quit = parser.feed(b"q");
+        assert!(
+            matches!(
+                &quit[0],
+                Input::Key(key) if key.key == Key::Character("q".into())
+                    && key.state == ButtonState::Pressed
+            ),
+            "{quit:?}"
+        );
+
+        // BEL ends an OSC the same way. A colour reply is not a clipboard event.
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b]10;rgb:").is_empty());
+        assert!(parser.expire().is_empty());
+        let colour = parser.feed(b"1111\x07");
+        assert!(colour.is_empty(), "{colour:?}");
+
+        // A bare introducer is still Alt plus that byte.
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b]").is_empty());
+        let alt = parser.expire();
+        assert!(
+            matches!(
+                &alt[0],
+                Input::Key(key) if key.key == Key::Character("]".into()) && key.modifiers.alt
+            ),
+            "{alt:?}"
+        );
+
+        // DCS and APC tails are not keys either.
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1bP1+r").is_empty());
+        assert!(parser.expire().is_empty());
+        let dcs = parser.feed(b"q\x1b[A\x1b\\");
+        assert!(
+            dcs.iter().all(|input| !matches!(input, Input::Key(_))),
+            "{dcs:?}"
+        );
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b_Gq=").is_empty());
+        assert!(parser.expire().is_empty());
+        let apc = parser.feed(b"q\x1b\\z");
+        assert_eq!(apc.len(), 2, "{apc:?}");
+        assert!(matches!(
+            &apc[0],
+            Input::Key(key) if key.key == Key::Character("z".into())
+        ));
+    }
+
+    #[test]
+    fn a_truncated_osc52_reply_is_a_failure() {
+        let mut bytes = b"\x1b]52;c;".to_vec();
+        bytes.extend(std::iter::repeat_n(b'A', MAX_PAYLOAD));
+        bytes.extend_from_slice(b"\x1b\\q");
+        let inputs = Parser::new().feed(&bytes);
+        match inputs.as_slice() {
+            [Input::Reply(Reply::Clipboard {
+                selection: Some(b'c'),
+                data: None,
+                truncated: true,
+            }), Input::Key(key), Input::Key(release)] => {
+                assert_eq!(key.key, Key::Character("q".into()));
+                assert_eq!(key.state, ButtonState::Pressed);
+                assert_eq!(release.state, ButtonState::Released);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

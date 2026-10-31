@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use rustix::termios::Winsize;
 use sighurt_api::input::{ButtonState, KeyEvent, Modifiers, PointerButton};
+use sighurt_api::services::Selection;
 
 pub use modes::{ENTER, KITTY_KEYBOARD_FLAGS, LEAVE, QUERIES};
 pub(crate) use modes::{SYNC_BEGIN, SYNC_END};
@@ -101,8 +102,24 @@ pub enum TermEvent {
     Resize(TermSize),
     /// `true` when the terminal gained focus (`CSI I`), `false` when it lost it.
     Focus(bool),
-    /// An OSC 52 reply. `None` when the terminal sent `?`, nothing, or bytes that are not base64.
-    Clipboard(Option<Vec<u8>>),
+    /// An OSC 52 reply. See [`ClipboardReply`].
+    Clipboard(ClipboardReply),
+}
+
+/// One OSC 52 reply from the terminal.
+///
+/// `data` is missing when the terminal sent `?`, nothing, or bytes that are not
+/// base64. It is also missing when `truncated` is set: the parser's buffer
+/// filled, or a timeout discarded the rest of the string, and that is not a
+/// clipboard value. `selection` is set when the terminal named `c` or `p`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardReply {
+    /// `c` or `p`, when the terminal named one of those.
+    pub selection: Option<Selection>,
+    /// Decoded bytes, or nothing. Never a prefix of a truncated payload.
+    pub data: Option<Vec<u8>>,
+    /// The reply is a failure. `data` is not a clipboard value.
+    pub truncated: bool,
 }
 
 /// Raw mode on one terminal, the probe's answers, and the bytes waiting to go out.
@@ -235,6 +252,21 @@ impl Terminal {
         self.session.write_frame(frame)
     }
 
+    /// Queue `bytes` whole, or not at all.
+    ///
+    /// `Ok(false)` means nothing was written and nothing was queued: `bytes`
+    /// do not fit in [`Self::output_cap`], or the queue holds a frame or a
+    /// reliable sequence that has already started. A wholly unsent reliable
+    /// sequence is replaced. A later frame drop does not cut bytes this accepted.
+    pub fn write_reliable(&mut self, bytes: &[u8]) -> io::Result<bool> {
+        self.session.write_reliable(bytes)
+    }
+
+    /// The most unsent bytes the output queue keeps.
+    pub fn output_cap(&self) -> usize {
+        self.session.output_cap()
+    }
+
     /// Drop bytes not yet written. Only after a resume: `SIGCONT` already sent [`ENTER`], so
     /// the tail of a sequence cut off by the suspension would show as text.
     pub fn discard_pending(&mut self) {
@@ -273,7 +305,15 @@ impl Terminal {
 
     fn take_input(&mut self, input: Input) -> Option<TermEvent> {
         match input {
-            Input::Reply(Reply::Clipboard { data }) => Some(TermEvent::Clipboard(data)),
+            Input::Reply(Reply::Clipboard {
+                selection,
+                data,
+                truncated,
+            }) => Some(TermEvent::Clipboard(ClipboardReply {
+                selection: selection.and_then(selection_of),
+                data,
+                truncated,
+            })),
             Input::Reply(reply) => {
                 let before = self.caps.clone();
                 let reply = Input::Reply(reply);
@@ -393,6 +433,14 @@ fn to_mouse(event: parser::MouseEvent) -> MouseEvent {
     }
 }
 
+fn selection_of(byte: u8) -> Option<Selection> {
+    match byte {
+        b'c' => Some(Selection::Clipboard),
+        b'p' => Some(Selection::Primary),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsFd;
@@ -402,6 +450,7 @@ mod tests {
     use rustix::fs::OFlags;
     use rustix::io::Errno;
     use rustix::termios::{tcsetwinsize, Winsize};
+    use sighurt_api::services::Selection;
 
     use super::*;
 
@@ -717,8 +766,18 @@ mod tests {
             &master,
             b"\x1b]52;c;aGVq\x1b\\\x1b]52;c;?\x1b\\",
         );
-        assert!(events.contains(&TermEvent::Clipboard(Some(b"hej".to_vec()))));
-        assert!(events.contains(&TermEvent::Clipboard(None)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TermEvent::Clipboard(reply)
+                if reply.selection == Some(Selection::Clipboard)
+                    && reply.data.as_deref() == Some(b"hej".as_slice())
+                    && !reply.truncated
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TermEvent::Clipboard(reply)
+                if reply.data.is_none() && !reply.truncated
+        )));
         terminal.restore().expect("restore");
     }
 

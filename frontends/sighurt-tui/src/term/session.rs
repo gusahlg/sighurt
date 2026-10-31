@@ -380,6 +380,21 @@ impl Session {
         self.output.drops()
     }
 
+    /// The most unsent bytes the output queue keeps.
+    pub fn output_cap(&self) -> usize {
+        self.output.cap()
+    }
+
+    /// Queue `bytes` whole, or not at all. See [`Output::write_reliable`].
+    pub fn write_reliable(&mut self, bytes: &[u8]) -> io::Result<bool> {
+        self.sync_wire();
+        let state = self.state;
+        // `state` is this session's box. The closure runs before this returns.
+        self.output.write_reliable(&self.fd, bytes, |wire| {
+            store_wire_keep_gen(unsafe { &*state }, wire)
+        })
+    }
+
     /// Queue `frame`. Does not block when the terminal stops reading.
     pub fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         self.sync_wire();
@@ -587,7 +602,7 @@ impl Session {
     /// must not start [`LEAVE`] on top of that sequence.
     fn finish_queued(&mut self, deadline: Mono) -> bool {
         self.sync_wire();
-        let bytes = self.output.take_inflight();
+        let (bytes, reliable) = self.output.take_inflight();
         if bytes.is_empty() {
             self.publish_wire();
             return true;
@@ -602,6 +617,7 @@ impl Session {
         let done = n == bytes.len();
         if !done {
             self.output.prepend(&bytes[n..]);
+            self.output.set_reliable_prefix(reliable.saturating_sub(n));
         }
         done
     }
