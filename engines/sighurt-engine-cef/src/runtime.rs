@@ -37,6 +37,7 @@ use crate::edit::Binding;
 use crate::ffi::{self, call, new_object, zeroed, CefStr, Ref};
 use crate::handlers::{self, origin};
 use crate::keys;
+use crate::present;
 use crate::shared::{lock, Geometry, Shared, ViewShared, MAX_SELECTION};
 
 /// The engine's name in the configuration.
@@ -148,6 +149,8 @@ struct View<T> {
     edits: HashMap<RequestId, (ClipboardOp, Binding)>,
     /// An input method's composition is showing.
     composing: bool,
+    /// What was last written into each buffer the lease has lent: its address, stride and size.
+    buffers: HashMap<(usize, usize, usize, usize), present::BufferState>,
     last_frames: u64,
     last_epoch: Option<sighurt_api::ids::LayoutEpoch>,
 }
@@ -377,6 +380,7 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
             consumed: HashSet::new(),
             edits: HashMap::new(),
             composing: false,
+            buffers: HashMap::new(),
             last_frames: 0,
             last_epoch: None,
         };
@@ -397,6 +401,13 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
         let mut settings: CefBrowserSettings = unsafe { std::mem::zeroed() };
         settings.size = std::mem::size_of::<CefBrowserSettings>();
         settings.windowless_frame_rate = 60;
+        // `background_color` sits at offset 248 of `cef_browser_settings_t` (the 150 headers;
+        // the rest of the struct is the zeroed tail). Alpha 0 turns on transparent painting
+        // for a windowless browser, so a cleared page is a hole. Opaque white, as
+        // `CefSettings.background_color` above.
+        const BACKGROUND_COLOR: usize = 248;
+        let at = BACKGROUND_COLOR - std::mem::offset_of!(CefBrowserSettings, _rest);
+        settings._rest[at..at + 4].copy_from_slice(&0xFFFF_FFFFu32.to_ne_bytes());
         // No initial address: a first navigation would race the browser's own.
         let url = CefStr::new("");
         self.shared
@@ -533,23 +544,25 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
         if staged.frames == view.last_frames && view.last_epoch == Some(epoch) {
             return Ok(PresentOutcome::Unchanged);
         }
-        let (sw, sh) = (staged.width as usize, staged.height as usize);
         let mut bytes = 0usize;
+        let buffers = &mut view.buffers;
         view.target
             .submit(permit, &mut |frame| {
-                let (fw, fh) = (frame.size.width as usize, frame.size.height as usize);
-                let copy = sw.min(fw) * 4;
-                for (y, row) in frame.pixels.chunks_mut(frame.stride).take(fh).enumerate() {
-                    let len = (fw * 4).min(row.len());
-                    let row = &mut row[..len];
-                    if y < sh && copy <= row.len() {
-                        row[..copy].copy_from_slice(&staged.pixels[y * sw * 4..y * sw * 4 + copy]);
-                        row[copy..].fill(0xFF);
-                    } else {
-                        row.fill(0xFF);
-                    }
-                    bytes += row.len();
+                let size = (frame.size.width as usize, frame.size.height as usize);
+                let key = (frame.pixels.as_ptr() as usize, frame.stride, size.0, size.1);
+                let (copied, state) = present::copy_frame(
+                    &staged,
+                    frame.pixels,
+                    frame.stride,
+                    size,
+                    epoch,
+                    buffers.get(&key),
+                );
+                bytes += copied;
+                if buffers.len() >= 8 && !buffers.contains_key(&key) {
+                    buffers.clear();
                 }
+                buffers.insert(key, state);
                 Ok(())
             })
             .map_err(|message| EngineError::View { view: id, message })?;

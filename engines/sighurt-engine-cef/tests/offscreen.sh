@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the engine's offscreen test (Chromium into an in-memory target) in a private headless
-# sway: Chromium needs a display connection even windowless. Never touches the user's desktop.
+# Runs the engine's offscreen test (Chromium into an in-memory target) with no display at all:
+# the engine runs Chromium with no display connection. Never touches the user's desktop.
 #
 #   engines/sighurt-engine-cef/tests/offscreen.sh
 set -euo pipefail
@@ -30,4 +30,5 @@ if pgrep -f '^/[^ ]*/sig-cef-helper --type=' > /dev/null; then echo "cef-offscre
 exit \$rc
 EOS
 chmod +x "$inner"
-SIG_WHAT="cef offscreen test" SIG_MEM=${SIG_MEM:-6G} tools/heavy tools/headless-sway --renderer pixman -- "$inner"
+# No display at all: Chromium runs with no display connection (ozone headless).
+SIG_WHAT="cef offscreen test" SIG_MEM=${SIG_MEM:-6G} tools/heavy env -u WAYLAND_DISPLAY -u DISPLAY "$inner"
