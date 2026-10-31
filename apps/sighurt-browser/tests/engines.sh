@@ -1064,9 +1064,9 @@ CONF
   # run_command COMMAND: ":COMMAND" typed into the address line, as the example binds ":" to open it.
   run_command() { key :; key "$1"; key -k Return; }
   step "the example keymap: J, then K"
-  key J
+  key -M shift j -m shift
   check "J shows the next tab" "$(shows_tab 2 servo)"
-  key K
+  key -M shift k -m shift
   check "K shows the one before" "$(shows_tab 1 wpe)"
   step "a click on the WPE page's field: åäö typed there; Escape is insert mode, Escape again normal mode"
   click $((list + 100)) $((toolbar + 215))
@@ -1144,7 +1144,7 @@ CONF
   check "the line chrome: one line at the top, 32 px at font-size 16" \
     "$(dg 5 "[x['role'] for x in t if x['role'] not in ('view', 'retiring', 'page')]==['line'] and (surface('line')['width'], surface('line')['height'])==(1280, $line), $surfaces")"
   step "K: from the home page in the third tab to the second"
-  key K
+  key -M shift k -m shift
   check "the example keymap drives it: K" "$(shows_tab 2 servo)"
   check "and the page has the window but the line" "$(dg 5 "(shown['width'], shown['height'])==(1280, 800 - $line), (shown['width'], shown['height'])")"
   point 1000 700
