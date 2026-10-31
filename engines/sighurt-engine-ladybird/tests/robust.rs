@@ -343,6 +343,7 @@ fn hostile_pages_and_a_busy_host() {
 
     // A download over the limit is stopped while it runs: nothing is handed over, and the staging
     // directory empties.
+    let before_big = d.seen.len();
     d.click(20.0, 55.0);
     let limit_end = Instant::now() + Duration::from_secs(40);
     let mut staged_seen = false;
@@ -361,6 +362,15 @@ fn hostile_pages_and_a_busy_host() {
     assert!(
         !d.seen.iter().any(|e| matches!(e, EngineEvent::ServiceRequested(r) if matches!(r.service, Service::Download { .. }))),
         "an oversized download was handed over"
+    );
+    // Cancelling it must not take the page's process down (upstream cancels the stream outside an
+    // execution context and aborts WebContent; patch 0002 of nix/ladybird/ fixes that).
+    assert!(
+        !d.seen[before_big..]
+            .iter()
+            .any(|e| matches!(e, EngineEvent::ViewFailed { .. })),
+        "cancelling a download crashed the page: {:#?}",
+        &d.seen[before_big..]
     );
 
     // Ladybird's own pages (about:settings can open a file manager) are never shown, whoever asks.

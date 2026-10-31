@@ -43,7 +43,8 @@ int main(int argc, char** argv)
     char err[256] = "";
     char profile[] = "/tmp/sighurt-ladybird-probe-XXXXXX";
     if (!mkdtemp(profile)) return 1;
-    if (lb_init(NULL, 0, profile, NULL, err, sizeof err)) { fprintf(stderr, "FAIL init: %s\n", err); return 1; }
+    const char* extra[] = { getenv("LB_ARG") };
+    if (lb_init(getenv("LB_ARG") ? extra : NULL, getenv("LB_ARG") ? 1 : 0, profile, NULL, err, sizeof err)) { fprintf(stderr, "FAIL init: %s\n", err); return 1; }
     uint64_t view = lb_view_open(800, 600, 1.0, 1, 1.0);
     lb_navigate(view, argc > 1 ? argv[1] : "https://example.com/");
     int fd = lb_loop_fd();

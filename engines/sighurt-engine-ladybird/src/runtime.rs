@@ -778,11 +778,31 @@ fn settle_commit<T: CpuTarget>(
     // while a navigation to another document is in flight says nothing until that document
     // commits. It is the page's own change only when nothing is loading, or when it is a navigation
     // to a fragment of the document shown.
-    let own_change = view.active.is_none() || is_fragment_navigation(&view.url, url);
+    // (Ladybird does not always report the loading state turning on: it can be on already. The
+    // address the browser itself asked for, to another document, is that same optimistic address.)
+    let asked_by_browser = view.pending.as_ref().is_some_and(
+        |(_, pend)| matches!(pend, Pend::Url(asked) if asked == url && !is_fragment_navigation(&view.url, asked)),
+    );
+    let own_change =
+        (view.active.is_none() && !asked_by_browser) || is_fragment_navigation(&view.url, url);
     match how {
         Settle::Timeout if !own_change => return,
         Settle::Ended if !own_change => {
             view.deferred = None;
+            if asked_by_browser {
+                // The browser's navigation never committed (refused or failed): it fails.
+                if let Some((navigation, _)) = view.pending.take() {
+                    queue.push(EngineEvent::NavigationFailed {
+                        view: id,
+                        navigation,
+                        error: if view.stopped {
+                            NavigationError::Cancelled
+                        } else {
+                            NavigationError::Load("the page did not load".into())
+                        },
+                    });
+                }
+            }
             return;
         }
         _ => {}

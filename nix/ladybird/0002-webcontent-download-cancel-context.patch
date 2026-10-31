@@ -1,0 +1,45 @@
+--- a/Services/WebContent/PageClient.cpp
++++ b/Services/WebContent/PageClient.cpp
+@@ -47,6 +47,7 @@
+ #include <LibWeb/HTML/RemoteNavigable.h>
+ #include <LibWeb/HTML/Scripting/ClassicScript.h>
+ #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
++#include <LibWeb/Streams/ReadableStreamDefaultReader.h>
+ #include <LibWeb/HTML/SessionHistoryEntry.h>
+ #include <LibWeb/HTML/Window.h>
+ #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+@@ -56,7 +57,6 @@
+ #include <LibWeb/Painting/BoxViews.h>
+ #include <LibWeb/Painting/DocumentPaintState.h>
+ #include <LibWeb/Platform/EventLoopPlugin.h>
+-#include <LibWeb/Streams/ReadableStreamDefaultReader.h>
+ #include <LibWeb/WebIDL/Promise.h>
+ #include <LibWebView/Debugger.h>
+ #include <LibWebView/ViewImplementation.h>
+@@ -988,6 +988,26 @@
+ 
+     m_canceled_downloads.set(download_id);
+ 
++    // SIGHURT-PATCH: the UI process cancels a download while no script runs here, and cancelling the
++    // stream resolves a promise, which calls into JavaScript: without an execution context that fails
++    // an assertion (VM.h, m_running_execution_context) and aborts this whole process. Any document of
++    // the page gives the realm to run it in.
++    GC::Ptr<Web::DOM::Document> document;
++    for (auto const& navigable : page().hosted_navigables()) {
++        if (auto active_document = navigable->active_document()) {
++            document = active_document;
++            break;
++        }
++    }
++    if (document) {
++        Web::HTML::TemporaryExecutionContext execution_context { Web::HTML::relevant_realm(*document), Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
++        if (controller.has_value())
++            controller.value()->stop_fetch();
++        if (reader.has_value())
++            Web::Fetch::Infrastructure::cancel_incremental_read(*reader.value());
++        return;
++    }
++
+     if (controller.has_value())
+         controller.value()->stop_fetch();
+ 
