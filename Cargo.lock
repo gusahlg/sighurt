@@ -10315,6 +10315,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sighurt-engine-cef"
+version = "0.9.0"
+dependencies = [
+ "libc",
+ "log",
+ "sighurt-api",
+ "url",
+]
+
+[[package]]
 name = "sighurt-engine-demo"
 version = "0.9.0"
 dependencies = [

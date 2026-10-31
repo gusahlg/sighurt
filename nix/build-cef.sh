@@ -104,10 +104,17 @@ else
   ldd_clean || { echo "build-cef: ldd still reports missing libraries" >&2; exit 1; }
 fi
 
-if [[ ! -x $prefix/dist/sig-cef-helper || ! -x $prefix/dist/cef-smoke ]]; then
-  log "building the smoke test and sig-cef-helper"
+if [[ ! -x $prefix/dist/cef-smoke ]]; then
+  log "building the smoke test"
   nix-shell "$nixfile" -A shell --run \
     "SIGHURT_CEF_PREFIX=$(printf '%q' "$prefix") $(printf '%q' "$repo/experiments/cef-smoke/build.sh") $(printf '%q' "$prefix/dist")"
+fi
+# The helper comes from the engine crate, and is rebuilt whenever its source is newer.
+helper_src=$repo/engines/sighurt-engine-cef/helper
+if [[ ! -x $prefix/dist/sig-cef-helper || $helper_src/helper.c -nt $prefix/dist/sig-cef-helper ]]; then
+  log "building sig-cef-helper"
+  nix-shell "$nixfile" -A shell --run \
+    "SIGHURT_CEF_PREFIX=$(printf '%q' "$prefix") $(printf '%q' "$helper_src/build.sh") $(printf '%q' "$prefix/dist")"
 fi
 
 log "rooting the runtime closure at $prefix.nix-runtime"
