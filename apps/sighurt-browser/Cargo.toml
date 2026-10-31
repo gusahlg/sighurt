@@ -28,6 +28,9 @@ frontend-tui = ["dep:sighurt-tui"]
 engine-servo = ["sighurt-gui/engine-servo", "sighurt-tui?/engine-servo", "dep:sighurt-engine-servo"]
 engine-wasm = ["sighurt-gui/engine-wasm", "sighurt-tui?/engine-wasm"]
 engine-wpe = ["sighurt-gui/engine-wpe", "sighurt-tui?/engine-wpe"]
+# Ladybird (docs/rewrite/LADYBIRD.md): not in `default`; needs the shim of nix/build-ladybird-shim.sh
+# at run time, and nothing at build time.
+engine-ladybird = ["sighurt-gui/engine-ladybird", "sighurt-tui?/engine-ladybird"]
 engine-demo = ["sighurt-gui/engine-demo", "sighurt-tui?/engine-demo"]
 # Keymaps besides the core's own `bindings`, chosen by `[input] keymap`.
 keymap-modal = ["sighurt-gui/keymap-modal", "sighurt-tui?/keymap-modal"]

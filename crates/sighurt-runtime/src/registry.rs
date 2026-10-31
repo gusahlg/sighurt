@@ -1,6 +1,6 @@
 //! The engines compiled into this build, and their runtimes.
 //!
-//! Cargo features decide which engines exist (`engine-servo`, `engine-wasm`, `engine-wpe`,
+//! Cargo features decide which engines exist (`engine-servo`, `engine-wasm`, `engine-wpe`, `engine-ladybird`,
 //! `engine-demo`); runtime configuration decides which of them may open new views (the core
 //! checks it). A runtime is created on first use, one per engine kind, with the [`EngineWaker`]
 //! it needs. Its `Target` and `FramePermit` are the frontend's: the registry holds
@@ -91,6 +91,8 @@ pub enum Runtime<T: 'static, P: 'static> {
     Wasm(Box<dyn Running<T, P>>),
     #[cfg(feature = "engine-wpe")]
     Wpe(Box<dyn Running<T, P>>),
+    #[cfg(feature = "engine-ladybird")]
+    Ladybird(Box<dyn Running<T, P>>),
     #[cfg(feature = "engine-demo")]
     Demo(Box<dyn Running<T, P>>),
     /// Present only when no engine is compiled in, so the type still names `T` and `P`.
@@ -99,6 +101,7 @@ pub enum Runtime<T: 'static, P: 'static> {
         feature = "engine-servo",
         feature = "engine-wasm",
         feature = "engine-wpe",
+        feature = "engine-ladybird",
         feature = "engine-demo"
     )))]
     #[allow(dead_code)]
@@ -114,12 +117,15 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
             Self::Wasm(engine) => engine.as_ref(),
             #[cfg(feature = "engine-wpe")]
             Self::Wpe(engine) => engine.as_ref(),
+            #[cfg(feature = "engine-ladybird")]
+            Self::Ladybird(engine) => engine.as_ref(),
             #[cfg(feature = "engine-demo")]
             Self::Demo(engine) => engine.as_ref(),
             #[cfg(not(any(
                 feature = "engine-servo",
                 feature = "engine-wasm",
                 feature = "engine-wpe",
+                feature = "engine-ladybird",
                 feature = "engine-demo"
             )))]
             Self::None(_) => unreachable!("no engine is compiled in"),
@@ -134,12 +140,15 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
             Self::Wasm(engine) => engine.as_mut(),
             #[cfg(feature = "engine-wpe")]
             Self::Wpe(engine) => engine.as_mut(),
+            #[cfg(feature = "engine-ladybird")]
+            Self::Ladybird(engine) => engine.as_mut(),
             #[cfg(feature = "engine-demo")]
             Self::Demo(engine) => engine.as_mut(),
             #[cfg(not(any(
                 feature = "engine-servo",
                 feature = "engine-wasm",
                 feature = "engine-wpe",
+                feature = "engine-ladybird",
                 feature = "engine-demo"
             )))]
             Self::None(_) => unreachable!("no engine is compiled in"),
@@ -262,6 +271,7 @@ pub enum State<T: 'static, P: 'static> {
             feature = "engine-servo",
             feature = "engine-wasm",
             feature = "engine-wpe",
+            feature = "engine-ladybird",
             feature = "engine-demo"
         )),
         allow(dead_code)
@@ -282,6 +292,7 @@ impl<T: 'static, P: 'static> Engine<T, P> {
             feature = "engine-servo",
             feature = "engine-wasm",
             feature = "engine-wpe",
+            feature = "engine-ladybird",
             feature = "engine-demo"
         )),
         allow(dead_code)
@@ -620,6 +631,25 @@ pub fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
     }
 }
 
+/// Ladybird's configuration: its profile in the user's data directory, or with
+/// `storage = "ephemeral"` a temporary one that is removed at shutdown. A persistent profile, and
+/// `{data_dir}/sighurt` above it, are mode 0700.
+#[cfg(feature = "engine-ladybird")]
+pub fn ladybird_config(settings: &EngineSettings) -> sighurt_engine_ladybird::LadybirdConfig {
+    use sighurt_core::config::Storage;
+    let profile = match settings.storage {
+        Storage::Profile => dirs::data_dir().map(|d| d.join("sighurt").join("ladybird")),
+        Storage::Ephemeral => None,
+    };
+    if let Some(profile) = &profile {
+        secure_profile(profile);
+    }
+    sighurt_engine_ladybird::LadybirdConfig {
+        profile,
+        ..Default::default()
+    }
+}
+
 /// Servo's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set;
 /// `experimental-features` and `preferences`, applied when Servo is built.
@@ -661,7 +691,11 @@ pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoCon
 
 /// Mode 0700 on `profile` and on the Sighurt directory above it. A failure is logged: the
 /// engine then keeps nothing if it cannot use the directory.
-#[cfg(any(feature = "engine-wpe", feature = "engine-servo"))]
+#[cfg(any(
+    feature = "engine-wpe",
+    feature = "engine-servo",
+    feature = "engine-ladybird"
+))]
 fn secure_profile(profile: &std::path::Path) {
     if let Some(root) = profile.parent() {
         if let Err(error) = crate::persistence::secure_private_dir(root) {

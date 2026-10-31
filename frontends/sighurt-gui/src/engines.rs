@@ -3,7 +3,7 @@
 //! The runtime lists each engine's name, capabilities and settings. This module supplies what
 //! is the Wayland frontend's: how to start the runtime on the host's target lease and frame
 //! permit, the present mode its targets are created with, and the renderer label. Shutdown
-//! order is the runtime's descriptor order (Servo, then Wasm, then WPE, then the demo).
+//! order is the runtime's descriptor order (Servo, then Wasm, then WPE, then Ladybird, then the demo).
 //!
 //! Must not own: when a runtime starts (the registry, on first use, except Servo at launch) or
 //! what it is asked to do.
@@ -50,6 +50,15 @@ pub fn build() -> (
             },
             mode: PresentMode::Gl,
         },
+        #[cfg(feature = "engine-ladybird")]
+        WaylandEngine {
+            binding: Binding {
+                name: "ladybird",
+                renderer: "Ladybird: its backing stores copied into wl_shm",
+                start: ladybird,
+            },
+            mode: PresentMode::Shm,
+        },
         #[cfg(feature = "engine-demo")]
         WaylandEngine {
             binding: Binding {
@@ -74,6 +83,7 @@ pub fn build() -> (
     feature = "engine-servo",
     feature = "engine-wasm",
     feature = "engine-wpe",
+    feature = "engine-ladybird",
     feature = "engine-demo"
 ))]
 struct Bound<R>(R);
@@ -82,6 +92,7 @@ struct Bound<R>(R);
     feature = "engine-servo",
     feature = "engine-wasm",
     feature = "engine-wpe",
+    feature = "engine-ladybird",
     feature = "engine-demo"
 ))]
 impl<R> sighurt_api::engine::EngineRuntime for Bound<R>
@@ -246,6 +257,24 @@ impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
     fn readbacks(&self) -> u64 {
         self.0.diagnostics().present.shm_copies
     }
+}
+
+#[cfg(feature = "engine-ladybird")]
+fn ladybird(
+    waker: sighurt_api::engine::EngineWaker,
+    launch: sighurt_runtime::registry::Launch<'_>,
+) -> Result<sighurt_runtime::registry::Runtime<TargetLease, FramePermit>, String> {
+    use sighurt_engine_ladybird::LadybirdRuntime;
+    use sighurt_runtime::registry::{self, Runtime};
+
+    LadybirdRuntime::<TargetLease>::new(registry::ladybird_config(launch.settings), waker)
+        .map(|runtime| Runtime::Ladybird(Box::new(Bound(runtime))))
+}
+
+#[cfg(feature = "engine-ladybird")]
+impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
+    for Bound<sighurt_engine_ladybird::LadybirdRuntime<TargetLease>>
+{
 }
 
 #[cfg(feature = "engine-demo")]

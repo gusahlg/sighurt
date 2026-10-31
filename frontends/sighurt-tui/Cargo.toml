@@ -15,6 +15,7 @@ engine-servo = ["sighurt-runtime/engine-servo", "dep:sighurt-engine-servo"]
 engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 # WebKit presents into the terminal's CPU target: shared-memory frames, one copy each.
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
+engine-ladybird = ["sighurt-runtime/engine-ladybird", "dep:sighurt-engine-ladybird"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
 keymap-modal = ["sighurt-runtime/keymap-modal"]
 
@@ -24,6 +25,7 @@ sighurt-core = { path = "../../crates/sighurt-core" }
 sighurt-runtime = { path = "../../crates/sighurt-runtime", default-features = false }
 sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional = true }
 sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = true }
+sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
 sighurt-engine-demo = { path = "../../engines/sighurt-engine-demo", optional = true }
 base64 = "0.22"

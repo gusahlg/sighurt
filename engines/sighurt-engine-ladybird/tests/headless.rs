@@ -17,8 +17,11 @@ use sighurt_api::engine::{
     EngineCommand, EngineRuntime, EngineWaker, PresentOutcome, PumpStatus, ViewOptions,
 };
 use sighurt_api::events::EngineEvent;
-use sighurt_api::geometry::{BufferSize, Metrics, Scale, WindowRect};
+use sighurt_api::geometry::{BufferSize, Metrics, Scale, SurfacePoint, WindowRect};
 use sighurt_api::ids::{LayoutEpoch, NavigationId, ViewId};
+use sighurt_api::input::{
+    ButtonState, InputEvent, InputKind, Modifiers, PointerButton, PointerEvent,
+};
 use sighurt_api::present::{CpuTarget, Frame};
 use sighurt_engine_ladybird::{ffi, LadybirdConfig, LadybirdRuntime};
 
@@ -181,16 +184,19 @@ fn pages_load_render_navigate_and_idle() {
     }
     let dir = std::env::temp_dir().join(format!("sighurt-ladybird-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let first = page(
-        &dir,
-        "one.html",
-        "<!doctype html><title>First</title><body style='margin:0;background:#ff0000'>\
-         <a id=a href='#frag' style='display:block;height:100px'>fragment</a><div id=frag>x</div>",
-    );
     let second = page(
         &dir,
         "two.html",
         "<!doctype html><title>Second</title><body style='margin:0;background:#0000ff'>two",
+    );
+    let first = page(
+        &dir,
+        "one.html",
+        &format!(
+            "<!doctype html><title>First</title><body style='margin:0;background:#ff0000'>\
+             <a id=a href='#frag' style='display:block;height:100px'>fragment</a>\
+             <a id=b href='{second}' style='display:block;height:100px'>second</a><div id=frag>x</div>"
+        ),
     );
 
     let (wake_tx, wakes) = mpsc::channel();
@@ -419,6 +425,59 @@ fn pages_load_render_navigate_and_idle() {
         })
         .unwrap();
     assert_eq!(history.1, 0, "{history:?}");
+
+    // 5b. A click on a link: the page starts its own navigation, with an id of the engine's own.
+    {
+        let _ = d.until(Duration::from_secs(5), |_| true);
+        let marker = d.seen.len();
+        let seat = sighurt_api::ids::SeatId::next();
+        let position = SurfacePoint { x: 50.0, y: 150.0 };
+        let click = |state| {
+            EngineCommand::Input(InputEvent {
+                seat,
+                kind: InputKind::Pointer(PointerEvent::Button {
+                    button: PointerButton::Left,
+                    state,
+                    position,
+                    modifiers: Modifiers::default(),
+                }),
+            })
+        };
+        d.runtime
+            .command(
+                view,
+                EngineCommand::Input(InputEvent {
+                    seat,
+                    kind: InputKind::Pointer(PointerEvent::Motion {
+                        position,
+                        modifiers: Modifiers::default(),
+                    }),
+                }),
+            )
+            .unwrap();
+        assert!(d.until(Duration::from_secs(10), |e| e[marker..].iter().any(|e| matches!(e, EngineEvent::StatusTextChanged { text: Some(t), .. } if *t == second))), "link hover: {:#?}", &d.seen[marker..]);
+        d.runtime
+            .command(view, click(ButtonState::Pressed))
+            .unwrap();
+        d.runtime
+            .command(view, click(ButtonState::Released))
+            .unwrap();
+        assert!(
+            d.until(Duration::from_secs(20), |e| e[marker..].iter().any(
+                |e| matches!(e, EngineEvent::NavigationCommitted { url, .. } if *url == second)
+            )),
+            "click: {:#?}",
+            &d.seen[marker..]
+        );
+        let started = d.seen[marker..].iter().find_map(|e| match e {
+            EngineEvent::NavigationStarted { navigation, .. } => Some(*navigation),
+            _ => None,
+        });
+        assert!(
+            started.is_some_and(|id| id != back && id != two),
+            "the page's own navigation has its own id"
+        );
+    }
 
     // 6. A resize: Ladybird renders again at the new size; until then the host's permit is not met.
     *metrics_cell.borrow_mut() = metrics(800, 600);
