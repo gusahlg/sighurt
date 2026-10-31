@@ -9,9 +9,9 @@
 //!
 //! The event queue joins the application's calloop loop through calloop-wayland-source, with
 //! the prepare-read, read, dispatch, flush cycle; there are no hand-written polling loops, and
-//! the only blocking roundtrip is the registry's at startup. Key repeat, layout grace periods
-//! and clipboard transfers are calloop sources too. Uses the system libwayland backend, which
-//! raw-window-handle interop requires.
+//! the only blocking roundtrip is the registry's at startup. Key repeat, layout grace periods,
+//! the client-size wait and clipboard transfers are calloop sources too. Uses the system
+//! libwayland backend, which raw-window-handle interop requires.
 //!
 //! A protocol error or a lost connection invalidates the whole connection. The host reports it
 //! once as [`HostEvent::ConnectionLost`], with the protocol error's interface, object and
@@ -260,6 +260,8 @@ impl SurfaceOwner {
 pub(crate) enum TimerEvent {
     KeyRepeat(SeatId),
     LayoutGrace(WindowId),
+    /// No configure has named this window's size yet. Place it at the client default.
+    ClientSize(WindowId),
     Transfer(u64),
 }
 
@@ -589,6 +591,10 @@ impl Host {
             TimerEvent::KeyRepeat(seat) => self.on_key_repeat(seat, now),
             TimerEvent::LayoutGrace(window) => {
                 self.layout_grace_over(window);
+                None
+            }
+            TimerEvent::ClientSize(window) => {
+                self.accept_client_size(window);
                 None
             }
             TimerEvent::Transfer(id) => {

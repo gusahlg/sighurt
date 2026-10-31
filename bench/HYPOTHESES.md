@@ -45,10 +45,40 @@ causes (README, "Known limits"). H10 and H11 are new, for the two workloads adde
   hidden-target bytes 3,563,520 to 0; after returning to home 11,653,120 to 4,526,080.
   `chrome_paints` unchanged (6, 7, 9).
 
-### H-UI2, H-OWN1: not attempted
+### H-UI2: The first chrome frame is the first configure's size
 
-Left open in this pass (lock contention with the engine worktrees' builds and the
-scope change); the triage table in docs/rewrite/optimization-hypotheses.md keeps them.
+- **Seen:** on `home`, startup paints the chrome twice. The triage (31 October 2026) measured
+  6 chrome paints; the hypothesis list says every surface has `permits=2`, `presented=1`,
+  `discarded=1` (three surfaces: page, chrome, status).
+- **Change:** do not paint, and do not create chrome targets, before a configure names a size.
+  A configure that leaves the size to the client (both axes zero) is answered with a root
+  commit only. The first configure that names a size is the first placement and the first
+  paint.
+- **Prediction:** `chrome_paints` on `home` falls from 6 to 3, and the sum of `discarded`
+  over chrome targets falls from 3 to 0. Each chrome target keeps `presented=1`.
+- **Guards:** the window is 1280×800 (the compositor's size, not the 1024×768 fallback);
+  `paints_page`, `paints_chrome` and `paints_status` are each 1; after the first second,
+  further chrome paints stay 0; `placement_errors` stays 0.
+- **Workload:** `sig` with the demo engine, `sig://home`, 1280×800 at scale 1, in
+  `tools/headless-sway` (pixman). Diagnostics: `SIG_DIAG=1` chrome lines and `kill -USR1`
+  after the session file exists. Three runs. Written before the change.
+- **Baseline:** three runs, every count identical. `chrome_paints` 6,
+  `paints_page` / `paints_chrome` / `paints_status` each 2, `discarded` 3, `presented` 3,
+  `permits` 6, `placements` 2, `placement_errors` 0. Final surfaces page 1280×696, chrome
+  1280×84, status 1280×20. `max_chrome_paint_us` 34612, 36931, 34842. A protocol trace (not a
+  repetition) showed the first `xdg_toplevel.configure` at 0×0, the client setting window
+  geometry to 1024×768, then a configure at 1280×800.
+- **After:** three runs, every count identical. `chrome_paints` 3, each paint counter 1,
+  `discarded` 0, `presented` 3, `permits` 3, `placements` 1, `placement_errors` 0, same final
+  size, one paint batch. `max_chrome_paint_us` 35918, 36716, 38796 (medians 34842 → 36716,
+  inside the larger IQR, so not a move).
+- **Outcome:** supported. A sizeless configure commits the root at the client size and does not
+  report `WindowConfigured`. The first configure that names a size is the first placement and
+  the first paint. If none names a size within 20 ms, the client default is reported.
+
+### H-OWN1: not attempted yet
+
+Taken after H-UI2. The triage table in docs/rewrite/optimization-hypotheses.md keeps it open.
 
 ### H-SNAP1: A snapshot costs no more than a copy for ordinary strings
 
