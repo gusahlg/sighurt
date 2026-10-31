@@ -9,6 +9,9 @@
 //! which always comes because every retiring generation but the newest has been superseded by a
 //! later commit. So a resize storm holds at most nine buffers: three sizes of three.
 //!
+//! A hidden (unmapped) surface frees its buffers once the compositor has released them
+//! ([`Swapchain::trim`]); showing it again allocates afresh.
+//!
 //! Every submission damages the whole buffer, and the painter repaints all of it: a reused
 //! buffer holds the frame before last, and there is no damage history yet.
 //!
@@ -202,6 +205,29 @@ impl<B> Swapchain<B> {
         Ok(())
     }
 
+    /// Frees the storage of a surface that is hidden: when every buffer of the current
+    /// generation is free (none drawn into, none with the compositor), they are destroyed and
+    /// the next acquire starts a new generation. Returns whether it did.
+    pub fn trim(&mut self) -> bool {
+        let idle = self
+            .current
+            .slots
+            .iter()
+            .flatten()
+            .all(|s| s.state == BufferState::Free);
+        if !idle || self.current.held().next().is_none() {
+            return false;
+        }
+        let id = self.next_generation;
+        self.next_generation += 1;
+        self.current = Generation {
+            id,
+            size: BufferSize::default(),
+            slots: Vec::new(),
+        };
+        true
+    }
+
     /// The painter finished `key` and gives its storage back: it is attached and committed now.
     pub fn submit(&mut self, key: BufferKey, buffer: B) {
         if let Some(slot) = self.slot_mut(key) {
@@ -393,8 +419,12 @@ impl Dispatch<WlBuffer, BufferData> for Host {
                 if let Some(target) = host.targets.get(&id) {
                     let mut target = target.borrow_mut();
                     target.stats.releases += 1;
+                    let hidden = target.role.is_none();
                     if let Some(buffers) = target.shm.as_mut() {
                         buffers.release(data.key);
+                        if hidden {
+                            buffers.trim();
+                        }
                     }
                 }
             }
@@ -520,6 +550,24 @@ mod tests {
             self.chain.submit(key, buffer);
             key
         }
+    }
+
+    #[test]
+    fn trimming_frees_idle_buffers_and_starts_over() {
+        let mut c = Chain::new();
+        let a = c.frame(100);
+        let b = c.frame(100);
+        assert!(!c.chain.trim(), "buffers with the compositor stay");
+        c.chain.release(a);
+        assert!(!c.chain.trim());
+        c.chain.release(b);
+        assert_eq!(c.alive.get(), 2);
+        assert!(c.chain.trim());
+        assert_eq!(c.alive.get(), 0);
+        assert!(!c.chain.trim(), "nothing left to free");
+        let next = c.frame(100);
+        assert_ne!(next.generation, a.generation);
+        assert_eq!(c.alive.get(), 1);
     }
 
     #[test]

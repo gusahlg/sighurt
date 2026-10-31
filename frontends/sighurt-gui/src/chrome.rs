@@ -535,4 +535,73 @@ mod tests {
         assert_eq!(tab.engine.as_deref(), Some("demo"));
         assert_eq!(snapshot.tabs[1].engine, None);
     }
+
+    /// Time of `snapshot` plus the chrome's equality check per hovered link, with 50 tabs whose
+    /// addresses are 32 Ki characters long (bench/HYPOTHESES.md, H-SNAP1). `cargo test --release
+    /// -- --ignored --nocapture snapshot_cost`; it prints microseconds per snapshot.
+    #[test]
+    #[ignore = "a timing, run by hand"]
+    fn snapshot_cost_with_many_long_tabs() {
+        let engines = [("demo".to_owned(), EngineCapabilities::default())].into();
+        let env = Environment {
+            engines,
+            ..Environment::default()
+        };
+        let config = "version = 1\n[routing.demo]\nschemes = [\"demo\"]";
+        let config = Config::parse(Some(config), &env).unwrap();
+        let mut core = BrowserState::new(config, env);
+        let open = (0..50).map(|n| OpenRequest {
+            input: format!("demo://pattern{n}"),
+            engine: None,
+        });
+        let effects = update(
+            &mut core,
+            BrowserEvent::Start {
+                session: None,
+                open: open.collect(),
+            },
+        );
+        let long = format!("demo://pattern/{}", "a%20b".repeat(6500));
+        for effect in &effects {
+            let Effect::Engine {
+                view,
+                command: EngineCommand::Navigate { navigation, .. },
+            } = effect
+            else {
+                continue;
+            };
+            let document = sighurt_api::ids::DocumentGeneration::next();
+            for event in [
+                EngineEvent::ViewReady { view: *view },
+                EngineEvent::NavigationCommitted {
+                    view: *view,
+                    navigation: *navigation,
+                    url: long.clone(),
+                    document,
+                    history: None,
+                },
+            ] {
+                let at = Instant::now();
+                let engine = "demo".into();
+                update(&mut core, BrowserEvent::Engine { engine, event, at });
+            }
+        }
+        let mut times = Vec::new();
+        let mut previous = snapshot(&core, HomeInfo::default(), |_| None);
+        assert_eq!(previous.tabs.len(), 50);
+        for round in 0..21 {
+            let status = move |_: &TabSummary<'_>| Some(format!("hover {round}"));
+            let start = Instant::now();
+            let next = snapshot(&core, HomeInfo::default(), status);
+            let changed = next != previous;
+            times.push(start.elapsed().as_micros());
+            assert!(changed);
+            previous = next;
+        }
+        times.sort_unstable();
+        eprintln!(
+            "snapshot_cost: median {} us, min {} us, max {} us",
+            times[10], times[0], times[20]
+        );
+    }
 }

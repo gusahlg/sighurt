@@ -36,3 +36,33 @@ Measurable hypotheses proposed by the three independent reviews of wave 2 (commi
 - H-UI1 (hidden chrome page surface): releasing the buffers of an unlisted chrome surface lowers sig's PSS after leaving sig://home by one page-sized buffer (13.6 MiB at 2560×1600 at scale 2; 3.5 MiB at 1280×800). Guard: time from `tab.new` to home shown (one allocation and one paint).
 - H-UI2 (first chrome frame at the right size): not painting before the first configure's size is known brings startup chrome paints from 6 to 3 and `discarded` from 3 to 0 on `home` (today every surface has permits=2, presented=1, discarded=1), and lowers `startup.mapped_s` by about the time of one page-sized paint.
 - H-OWN1 (allocation-free frame path): with counter accessors instead of building diagnostics per frame, no `to_owned` in `Diagnostics::readbacks`, and reused Vecs in `registry.due`, `placement()` and per-pump events, steady-state heap allocations per presented frame on the owner thread fall to ~0 (heaptrack), and owner CPU per frame falls measurably on `css-animation` and `wpe-anim`.
+
+## Triage (optimization pass on branch `opt`, 31 October 2026)
+
+Status from the code and the decisions log. "Engine" means the hypothesis lives in a crate this pass may not change (Servo, WPE) or needs a build of one; those stay open for their owners.
+
+| # | Hypothesis | Status | Why |
+|---|---|---|---|
+| 1 | WPE loop wakeups (calloop sources) | open, engine (WPE) | decision 73 stands; same as the security review's last item and H-WPE5 |
+| 2 | Hidden chrome surfaces free buffers | **done in this pass** | same as H-UI1; `Swapchain::trim`, bench/HYPOTHESES.md H-UI1 |
+| 3 | WPE SHM fallback copies only damage | open, engine (WPE) | same as the security review's SHM item |
+| 4 | Wasm band damage (H14) | assigned to Grok | the Wasm raster repaints the whole lent buffer each frame; damage needs a draw-list diff plus buffer age. Not touched in this pass |
+| 5 | Snapshot cost independent of tab count | **partly done in this pass** | H-SNAP1: 2.0 ms to 0.76 ms; still linear in tabs (the clone and compare) |
+| 6 | Tab-list repaint per row | open | not picked |
+| 7 | Pre-start WPE | open, engine, a trade (latency for PSS) | decision 84 chose lazy |
+| 8 | Hidden animated WPE tab quiet | open, engine (WPE) | = H-WPE6 |
+| 9 | Hand-off retained segments bounded | done | decision 85 (`RETAINED_VIEWS`) |
+| 10 | WPE downloads fetched twice | open, engine (WPE) | |
+| 11 | SHM fallback whole-frame copy | open, engine (WPE) | = 3 |
+| 12 | Long `replaceState` URL repaints | open | not picked |
+| 13 | Wasm `api_download_url` threads | assigned to Grok | decisions 83/1919 queue downloads as throttled `Service::Download` requests, but download.rs still needs checking by the worker |
+| 14 | WPE 4.0 wakeups per frame | open, engine | = 1 |
+| H-WPE1 | Process cache purge | done | decision 84: web processes end with the last WPE page |
+| H-WPE2 | Cross-engine retention | done | decision 85 |
+| H-WPE3 | Lazy WebKit load | done | decision 84 |
+| H-WPE4 | No flite | open, build flag | decision 84 notes it as the alternative not taken |
+| H-WPE5/6/7/8 | watch thread, hidden tabs, bench coverage, GC helpers | open, engine (WPE) | |
+| H-SRV1 | Lazy Servo | open, engine adapter | decision 26 builds it first; not in this pass's crates |
+| H-UI1 | Hidden chrome surface buffers | **done in this pass** | hidden bytes 3.56 MB to 0 (bench/HYPOTHESES.md) |
+| H-UI2 | First chrome frame at the right size | open, not attempted | startup paints are 6 on home (measured); needs the first-configure flow reworked |
+| H-OWN1 | Allocation-free owner frame path | open, not attempted | needs heaptrack and the owner loop; larger than this pass |

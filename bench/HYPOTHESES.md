@@ -24,6 +24,43 @@ causes (README, "Known limits"). H10 and H11 are new, for the two workloads adde
 
 ## Open
 
+### H-UI1: Hidden chrome surfaces hold no SHM buffers
+
+- **Seen:** after `sig://home`, then an engine page, the chrome's `page` surface is unmapped but
+  keeps its free buffers (a page-sized buffer each).
+- **Change:** `Swapchain::trim`: when a target is unmapped and every buffer is free, destroy
+  them (on unmap, and on the release that makes the last one free).
+- **Prediction:** the diagnostics' `buffers.bytes` of the unmapped chrome `page` target goes from
+  at least one page-sized buffer to 0; total chrome `buffer_bytes` falls by that much.
+- **Guards:** time from `tab.new` to home shown (one allocation), `paints_*` counts, the
+  swapchain unit tests.
+- **Finding while measuring:** trimming free buffers alone changed nothing (3 runs each, identical
+  to the baseline): sway keeps the last submitted buffer of an unmapped surface attached, so the
+  hidden surface holds one buffer in `Submitted`, never a free one. The change therefore also
+  attaches a null buffer and commits when an SHM target is unmapped because it is not wanted
+  (`want_shown` false), so the compositor releases it and the release trims.
+- **Outcome:** supported. `sig` (demo, 1280x800, scale 1), `sig://home` then `demo://pattern`
+  and back, `ui1.sh` in tools/headless-sway, three runs per build, every run identical (no
+  spread): after switching to the engine page total `buffer_bytes` 8,089,600 to 4,526,080 and
+  hidden-target bytes 3,563,520 to 0; after returning to home 11,653,120 to 4,526,080.
+  `chrome_paints` unchanged (6, 7, 9).
+
+### H-UI2, H-OWN1: not attempted
+
+Left open in this pass (lock contention with the engine worktrees' builds and the
+scope change); the triage table in docs/rewrite/optimization-hypotheses.md keeps them.
+
+### H-SNAP1: A snapshot costs no more than a copy for ordinary strings
+
+- **Seen:** every core change rebuilds the snapshot, and `contain` rebuilt each string char by
+  char (50 tabs of 32 Ki-character addresses: 2.0 ms per snapshot plus compare).
+- **Change:** a byte scan decides whether a string is already contained (printable ASCII within
+  its bound); only others are rebuilt.
+- **Prediction:** the per-snapshot time (test `snapshot_cost_with_many_long_tabs`, release)
+  falls by at least half.
+- **Outcome:** supported: median 2038 us to 763-806 us (3 runs), kept (written together with its
+  baseline, not before it).
+
 Candidates from the IPC-removal session (`results/IPC-REMOVAL.md`, "Surprises and regressions"),
 each seen there but not predicted, so each still to be tested:
 

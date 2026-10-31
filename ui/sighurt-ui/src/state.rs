@@ -12,7 +12,7 @@
 
 use sighurt_api::ids::{RequestId, TabId};
 
-use crate::extension::contained;
+use crate::extension::{contained, is_contained};
 use crate::hit_test::Target;
 use crate::text_edit::TextEditor;
 
@@ -43,7 +43,11 @@ impl Snapshot {
     /// Makes every string safe to show on one line ([`contained`]) and cuts it to the bound its
     /// field states. The executable does this before a chrome sees a snapshot.
     pub fn contain(&mut self) {
-        let contain = |text: &mut String, max: usize| *text = contained(text, max);
+        let contain = |text: &mut String, max: usize| {
+            if !is_contained(text, max) {
+                *text = contained(text, max);
+            }
+        };
         for tab in &mut self.tabs {
             contain(&mut tab.title, MAX_TITLE);
             contain(&mut tab.url, MAX_URL);
