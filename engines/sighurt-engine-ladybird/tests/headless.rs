@@ -483,6 +483,30 @@ fn pages_load_render_navigate_and_idle() {
         d.runtime
             .command(view, click(ButtonState::Released))
             .unwrap();
+        // The click is the user's: the engine asks before following it (tests/navigation.rs).
+        assert!(
+            d.until(Duration::from_secs(20), |e| e[marker..]
+                .iter()
+                .any(|e| matches!(e, EngineEvent::NavigationRequested { .. }))),
+            "click: {:#?}",
+            &d.seen[marker..]
+        );
+        let request = d.seen[marker..]
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::NavigationRequested { request, .. } => Some(*request),
+                _ => None,
+            })
+            .unwrap();
+        d.runtime
+            .command(
+                view,
+                EngineCommand::AnswerNavigation {
+                    request,
+                    allow: true,
+                },
+            )
+            .unwrap();
         assert!(
             d.until(Duration::from_secs(20), |e| e[marker..].iter().any(
                 |e| matches!(e, EngineEvent::NavigationCommitted { url, .. } if *url == second)

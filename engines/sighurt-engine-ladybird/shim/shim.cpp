@@ -163,15 +163,24 @@ uint64_t g_launch_view = 0;
 int64_t g_next_token = 0;
 HashMap<int64_t, WebView::ExternalURLHandler::LaunchCallback> g_launches;
 HashMap<int64_t, uint64_t> g_pickers;
+// Navigations held for the host (the patched LibWebView's on_navigation_start_requested).
+HashMap<int64_t, Function<void(bool)>> g_held_navigations;
 ByteString g_profile;
-// Staged downloads: destination path -> the name the page suggested.
-HashMap<ByteString, ByteString> g_staged;
+// Staged downloads: destination path -> the name the page suggested and the view it came from
+// (0: not known).
+struct Staged {
+    ByteString name;
+    uint64_t view { 0 };
+};
+HashMap<ByteString, Staged> g_staged;
 RefPtr<Core::Timer> g_download_timer;
 // Most a staged download may be when handed to the host (it travels in memory).
 constexpr u64 max_download_bytes = 64ull * 1024 * 1024;
 constexpr u64 max_picked_file_bytes = 32ull * 1024 * 1024;
 
 void poll_downloads();
+// The shim's id of the view with Ladybird's id, or 0 (defined after LbView).
+uint64_t shim_view_for_ladybird_id(u64);
 
 void ensure_download_timer()
 {
@@ -219,13 +228,24 @@ public:
 
     // A download goes to a private staging directory of the profile, and when it is complete the
     // host is given the file (a Download service request); the user's folders are the host's.
+    virtual ErrorOr<LexicalPath> default_path_for_download(URL::URL const&, Optional<u64> ladybird_view_id, ByteString const& file) const override
+    {
+        // The patched LibWebView says which view the download is for.
+        return stage_download(file, ladybird_view_id.has_value() ? shim_view_for_ladybird_id(*ladybird_view_id) : 0);
+    }
+
     virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const& file) const override
+    {
+        return stage_download(file, 0);
+    }
+
+    ErrorOr<LexicalPath> stage_download(ByteString const& file, uint64_t view) const
     {
         auto directory = ByteString::formatted("{}/downloads-staging", g_profile);
         TRY(Core::Directory::create(directory, Core::Directory::CreateDirectories::Yes));
         static u64 counter = 0;
         auto path = LexicalPath::join(directory, ByteString::formatted("{}-{}.download", getpid(), ++counter));
-        g_staged.set(path.string(), Web::sanitize_suggested_download_filename(file));
+        g_staged.set(path.string(), Staged { Web::sanitize_suggested_download_filename(file), view });
         ensure_download_timer();
         return path;
     }
@@ -270,9 +290,10 @@ void poll_downloads()
         if (contents.is_error())
             continue;
         std::string url = to_std(download.url.serialize());
-        std::string name = to_std(it->value);
+        std::string name = to_std(it->value.name);
+        auto view = it->value.view != 0 ? it->value.view : g_active_view;
         std::string bytes(reinterpret_cast<char const*>(contents.value().data()), contents.value().size());
-        push(LB_EV_DOWNLOAD, g_active_view, 0, 0, &url, &name, &bytes);
+        push(LB_EV_DOWNLOAD, view, 0, 0, &url, &name, &bytes);
     }
     for (auto const& path : finished)
         g_staged.remove(path);
@@ -464,6 +485,20 @@ private:
             return popup->handle();
         };
 
+        // A navigation the page started and the user caused (a click): the host may hand it to
+        // another engine, so it is held until the host answers (patched LibWebView, nix/ladybird.nix).
+        on_navigation_start_requested = [this, id](URL::URL const& url, bool user_activated, Function<void(bool)> proceed) {
+            auto text = to_std(url.serialize());
+            // Only what the user started, and not the page's own fragments or the host's own loads.
+            if (!user_activated || is_popup || !m_initial_done || is_fragment_navigation(m_last_url, text)) {
+                proceed(true);
+                return;
+            }
+            auto token = ++g_next_token;
+            g_held_navigations.set(token, move(proceed));
+            push(LB_EV_NAVIGATION_REQUESTED, id, 0, token, &text);
+        };
+
         // The host has no file picker for pages yet that is not a service: ask it.
         on_request_file_picker = [id](auto const&, auto multiple) {
             auto token = ++g_next_token;
@@ -601,6 +636,14 @@ void set_error(char* err, size_t len, std::string const& message)
 {
     if (err && len)
         snprintf(err, len, "%s", message.c_str());
+}
+
+uint64_t shim_view_for_ladybird_id(u64 ladybird_id)
+{
+    for (auto& entry : LbView::views())
+        if (entry.value->view_id() == ladybird_id)
+            return entry.key;
+    return 0;
 }
 
 using namespace Web::UIEvents;
@@ -1003,6 +1046,12 @@ void lb_open_external_reply(int64_t token, int allowed)
         (*callback)(allowed != 0);
 }
 
+void lb_navigation_answer(int64_t token, int allow)
+{
+    if (auto proceed = g_held_navigations.take(token); proceed.has_value())
+        (*proceed)(allow != 0);
+}
+
 void lb_input_commit_text(uint64_t id, char const* text)
 {
     if (auto* view = LbView::find(id))
@@ -1033,6 +1082,7 @@ void lb_shutdown(void)
     // pumped again: closing is forced, not waited for.
     for (auto& entry : LbView::views())
         entry.value->close_now();
+    g_held_navigations.clear();
     LbView::views().clear();
     g_app = nullptr;
     // The helpers are stopping: reap them by pid, and make sure they do stop.

@@ -106,6 +106,9 @@ enum Pending {
     Open(i64),
 }
 
+/// Navigations held for the browser per view, at most; one more is denied at once.
+const MAX_HELD: usize = 16;
+
 /// Most bytes of text a paste takes.
 const MAX_PASTE: usize = 1024 * 1024;
 
@@ -116,6 +119,8 @@ pub struct LadybirdRuntime<T: CpuTarget> {
     waiter: Option<Waiter>,
     queue: Vec<EngineEvent>,
     services: HashMap<RequestId, (ViewId, Pending)>,
+    /// Navigations Ladybird holds for the browser: its request id, the view, the shim's token.
+    held: HashMap<RequestId, (ViewId, i64)>,
     profile: Option<PathBuf>,
     temporary_profile: bool,
     shut_down: bool,
@@ -194,6 +199,7 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
             waiter: Some(waiter),
             queue: Vec::new(),
             services: HashMap::new(),
+            held: HashMap::new(),
             profile: Some(profile),
             temporary_profile,
             shut_down: false,
@@ -282,6 +288,7 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                 };
                 if new_document {
                     view.document = DocumentGeneration::next();
+                    deny_held(&mut self.held, id);
                 }
                 view.url.clone_from(&url);
                 self.queue.push(EngineEvent::NavigationCommitted {
@@ -442,6 +449,24 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                 self.services
                     .insert(request.id, (id, Pending::Pick(event.i1)));
                 self.queue.push(EngineEvent::ServiceRequested(request));
+            }
+            ffi::EV_NAVIGATION_REQUESTED => {
+                let held = self.held.values().filter(|(v, _)| *v == id).count();
+                if held >= MAX_HELD {
+                    // Too many at once: this one is denied without asking.
+                    unsafe { ffi::lb_navigation_answer(event.i1, 0) };
+                } else if let Some(url) = s0 {
+                    let request = RequestId::next();
+                    self.held.insert(request, (id, event.i1));
+                    self.queue.push(EngineEvent::NavigationRequested {
+                        view: id,
+                        document: view.document,
+                        request,
+                        url,
+                    });
+                } else {
+                    unsafe { ffi::lb_navigation_answer(event.i1, 0) };
+                }
             }
             ffi::EV_OPEN_EXTERNAL => {
                 let request = request(
@@ -644,6 +669,18 @@ fn parse_caret(text: &str) -> [i32; 4] {
     out
 }
 
+/// Denies every navigation held for `view`: its document is replaced or it is closing.
+fn deny_held(held: &mut HashMap<RequestId, (ViewId, i64)>, view: ViewId) {
+    held.retain(|_, (owner, token)| {
+        if *owner == view {
+            unsafe { ffi::lb_navigation_answer(*token, 0) };
+            false
+        } else {
+            true
+        }
+    });
+}
+
 fn modifier_mask(modifiers: &Modifiers) -> c_int {
     c_int::from(modifiers.alt)
         | c_int::from(modifiers.control) << 1
@@ -788,8 +825,12 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             EngineCommand::ResolveServiceRequest { request, result } => {
                 self.resolve(request, result);
             }
-            // The engine never asks about navigations (docs/rewrite/LADYBIRD.md).
-            EngineCommand::AnswerNavigation { .. } => {}
+            EngineCommand::AnswerNavigation { request, allow } => {
+                // An answer for a request that is no longer held does nothing.
+                if let Some((_, token)) = self.held.remove(&request) {
+                    unsafe { ffi::lb_navigation_answer(token, c_int::from(allow)) };
+                }
+            }
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"))
             }
@@ -905,6 +946,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             for request in waiting {
                 self.resolve(request, Err(ServiceError::Cancelled));
             }
+            deny_held(&mut self.held, id);
             self.queue.push(EngineEvent::ViewClosed { view: id });
         }
     }
@@ -917,7 +959,10 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
         if let Some(mut waiter) = self.waiter.take() {
             waiter.stop();
         }
-        // Views first (their targets), then Ladybird itself.
+        // What is held is denied, then views (their targets), then Ladybird itself.
+        for (_, (_, token)) in self.held.drain() {
+            unsafe { ffi::lb_navigation_answer(token, 0) };
+        }
         self.views.clear();
         self.by_lb.clear();
         self.queue.clear();

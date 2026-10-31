@@ -19,7 +19,24 @@ mkdir -p "$XDG_CONFIG_HOME/sighurt"
 # MODE=engine: Ladybird is the default engine (sig --engine ladybird). MODE=route: the demo engine
 # is, and [routing.ladybird] gives Ladybird the host of the URL.
 host=$(sed -E 's|^[a-z]+://([^/:]+).*|\1|' <<<"$url")
-if [[ ${MODE:-engine} == typing ]]; then
+if [[ ${MODE:-engine} == links ]]; then
+  # A click on a link in a Ladybird page to an address the routing gives the demo engine: the
+  # engine asks the browser (NavigationRequested), which opens it in the demo engine.
+  cat > "$home/page.html" <<HTML
+<!doctype html><title>links</title><body style="margin:0">
+<a href="demo://pattern" style="position:absolute;left:0;top:0;width:600px;height:200px;display:block;background:#fc0">to the demo engine</a>
+HTML
+  cat > "$XDG_CONFIG_HOME/sighurt/config.toml" <<CONF
+version = 1
+[engines]
+default = "ladybird"
+enabled = ["ladybird", "demo"]
+[routing.demo]
+schemes = ["demo"]
+CONF
+  engine_args=(--engine ladybird)
+  url_to_open=file://$home/page.html
+elif [[ ${MODE:-engine} == typing ]]; then
   # A plain-letter binding ("t" opens a tab) must not fire while a Ladybird text field has focus.
   cat > "$home/page.html" <<HTML
 <!doctype html><title>typing</title><body style="margin:0">
@@ -73,7 +90,20 @@ check() { if "${@:2}"; then echo "PASS $1"; else echo "FAIL $1"; failures=$((fai
 SIG_DIAG=1 RUST_LOG=info "$sig" --gui "${engine_args[@]}" "${url_to_open:-$url}" > "$out/sig.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 60); do sleep 1; kill -0 "$pid" 2>/dev/null || break; done
-if [[ ${MODE:-engine} == typing ]]; then
+if [[ ${MODE:-engine} == links ]]; then
+  pointer=${CARGO_TARGET_DIR:-$repo/target}/debug/examples/virtual-pointer
+  mkfifo "$XDG_RUNTIME_DIR/pointer"
+  "$pointer" < "$XDG_RUNTIME_DIR/pointer" &
+  pointer_pid=$!
+  exec 3> "$XDG_RUNTIME_DIR/pointer"
+  sleep 6
+  grim "$out/before.png"
+  echo "move 100 150 1280 800" >&3
+  sleep 0.5   # the link under the pointer is the page's status text when the button goes down
+  echo click >&3
+  sleep 4
+  kill $pointer_pid 2>/dev/null
+elif [[ ${MODE:-engine} == typing ]]; then
   wtype -s 3600000 ' ' &
   keyboard=$!
   # A virtual pointer that stays plugged in (wlrctl's events are lost on a new device).
