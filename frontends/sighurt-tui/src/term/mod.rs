@@ -1,9 +1,9 @@
 //! The terminal `sig` runs in.
 //!
-//! Owns: raw mode, the capability probe, the input parser, bounded nonblocking
-//! output, and restoration, including [`restore_before_forced_exit`]. Must not
-//! own: the cell grid, the chrome, page pixels, browser policy, or what a key
-//! does.
+//! Owns: raw mode, the capability probe, the input parser, OSC 52 clipboard
+//! bytes, bounded nonblocking output, and restoration, including
+//! [`restore_before_forced_exit`]. Must not own: the cell grid, the chrome,
+//! page pixels, browser policy, or what a key does.
 //!
 //! Register [`Terminal::fd`] with the calloop loop for readability, and
 //! [`Terminal::winch_fd`] as well once [`Terminal::install_handlers`] has run.
@@ -23,6 +23,7 @@
 //! sequence asks for the kitty keyboard protocol, which keeps them apart.
 //! Mouse coordinates are 0-based cells.
 
+pub(crate) mod clipboard;
 mod keys;
 mod modes;
 mod output;
@@ -45,7 +46,7 @@ pub use session::{
     open_pty, restore_before_forced_exit, termios_matches, INPUT_BYTE_BUDGET, INPUT_EVENT_CAP,
 };
 
-use parser::{Input, MouseButton};
+use parser::{Input, MouseButton, Reply};
 use probe::Caps;
 use session::Session;
 
@@ -100,6 +101,8 @@ pub enum TermEvent {
     Resize(TermSize),
     /// `true` when the terminal gained focus (`CSI I`), `false` when it lost it.
     Focus(bool),
+    /// An OSC 52 reply. `None` when the terminal sent `?`, nothing, or bytes that are not base64.
+    Clipboard(Option<Vec<u8>>),
 }
 
 /// Raw mode on one terminal, the probe's answers, and the bytes waiting to go out.
@@ -270,6 +273,7 @@ impl Terminal {
 
     fn take_input(&mut self, input: Input) -> Option<TermEvent> {
         match input {
+            Input::Reply(Reply::Clipboard { data }) => Some(TermEvent::Clipboard(data)),
             Input::Reply(reply) => {
                 let before = self.caps.clone();
                 let reply = Input::Reply(reply);
@@ -701,6 +705,20 @@ mod tests {
         assert!(mice[0].motion && mice[0].column == 2 && mice[0].row == 3);
         assert!(!mice[1].motion && mice[1].column == 0 && mice[1].row == 0);
         assert!(mice[2].motion && mice[2].column == 1 && mice[2].row == 1);
+        terminal.restore().expect("restore");
+    }
+
+    #[test]
+    fn an_osc52_reply_is_a_clipboard_event() {
+        let (master, slave) = open_pty().expect("openpty");
+        let mut terminal = Terminal::enter(slave).expect("enter");
+        let events = read_soon(
+            &mut terminal,
+            &master,
+            b"\x1b]52;c;aGVq\x1b\\\x1b]52;c;?\x1b\\",
+        );
+        assert!(events.contains(&TermEvent::Clipboard(Some(b"hej".to_vec()))));
+        assert!(events.contains(&TermEvent::Clipboard(None)));
         terminal.restore().expect("restore");
     }
 

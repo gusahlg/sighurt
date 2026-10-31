@@ -11,7 +11,11 @@
 //! said it changed (or the terminal was resized or resumed), and at most one page frame. Passes
 //! repeat until one does nothing, at most [`MAX_PASSES`] times; then the loop sleeps until an
 //! event or a real deadline: an engine pump, the session save, a notice giving way, a partial
-//! escape sequence, or the next frame's time while a frame is waiting. Nothing ticks.
+//! escape sequence, a clipboard read, or the next frame's time while a frame is waiting. Nothing
+//! ticks.
+//!
+//! The clipboard is the terminal's OSC 52. A write is appended to the control bytes the one
+//! writer sends, and one read at a time waits up to a second for the reply.
 //!
 //! Text mode (TUI.md §4, [`crate::text`]): `[tui] mode`, or `chrome.toggle-mode` for the run,
 //! decides whether the page rows show pixels or the page's text. In text mode the shown view's
@@ -87,7 +91,8 @@ use crate::kitty::{self, CellRect};
 use crate::sixel;
 use crate::target::{TargetHandle, TermPermit, TermTarget};
 use crate::term::{
-    MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE, SYNC_BEGIN, SYNC_END,
+    clipboard, MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE, SYNC_BEGIN,
+    SYNC_END,
 };
 use crate::text::{Act, TextPages};
 use crate::textmode::Area;
@@ -108,6 +113,10 @@ const TEXT_FPS: u32 = 2;
 const KITTY_UPLOAD_END: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
 /// The most pasted text the address line or a page's field takes.
 const MAX_PASTE: usize = 1024 * 1024;
+/// How long an OSC 52 read waits for the terminal.
+const CLIPBOARD_WAIT: Duration = Duration::from_secs(1);
+/// What a read reports. The terminal's clipboard is text.
+const CLIPBOARD_TYPE: &str = "text/plain;charset=utf-8";
 /// The page rows' message when the terminal shows no images.
 const NO_GRAPHICS: &str =
     "This terminal can't show graphics; chrome.text-mode shows the page as text";
@@ -198,6 +207,18 @@ impl ChunkedSpan {
     }
 }
 
+/// One OSC 52 read waiting for the terminal. A page's is answered through the session; the
+/// address line's is inserted when the reply comes.
+struct PendingRead {
+    request: RequestId,
+    /// When the read fails if the terminal has not answered.
+    deadline: Instant,
+    /// The address line asked, rather than a page.
+    for_line: bool,
+    /// The most bytes a page accepts. The line also caps at [`MAX_PASTE`].
+    limit: usize,
+}
+
 /// One view's target as the loop sees it.
 struct Pixels {
     /// The kitty image id, from 1, never reused. Sixel does not use it.
@@ -260,8 +281,10 @@ struct Tui {
     page_text: bool,
     /// The earliest time the next page frame may be presented.
     next_frame: Option<Instant>,
-    /// Page clipboard reads, refused on the next pass: the terminal has no clipboard yet.
-    refused_reads: Vec<RequestId>,
+    /// The OSC 52 read waiting for the terminal, if there is one.
+    pending: Option<PendingRead>,
+    /// Reads that failed before a query was sent. The next pass answers them.
+    failed_reads: Vec<(RequestId, ServiceError)>,
     /// Bytes for the next write, before the chrome: mode changes and image deletions.
     control: Vec<u8>,
     chrome_dirty: bool,
@@ -534,7 +557,8 @@ impl App {
             notice_first: None,
             page_text: false,
             next_frame: None,
-            refused_reads: Vec::new(),
+            pending: None,
+            failed_reads: Vec::new(),
             control: Vec::new(),
             chrome_dirty: true,
             clear: false,
@@ -619,10 +643,14 @@ impl App {
             self.tui.notice_first = None;
             self.tui.chrome_dirty = true;
         }
+        if let Some((request, result)) = self.tui.expire_clipboard(Instant::now()) {
+            self.session.clipboard_done(request, result);
+            self.run_core();
+        }
         let mut busy = true;
         for _ in 0..MAX_PASSES {
             let mut worked = self.drain_input();
-            worked |= self.refuse_clipboard_reads();
+            worked |= self.deliver_clipboard_failures();
             worked |= self.session.service_completions(&mut self.tui);
             worked |= self.send_metrics();
             self.tui.active_url = active_url(self.session.core());
@@ -689,6 +717,7 @@ impl App {
             pump,
             self.session.session_due(),
             self.tui.notice_first,
+            self.tui.clipboard_deadline(),
             frame,
             escape,
         ]
@@ -789,6 +818,12 @@ impl App {
             self.tui.release_pointer(None);
         }
         let event = match event {
+            TermEvent::Clipboard(data) => {
+                if let Some((request, result)) = self.tui.clipboard_reply(data) {
+                    self.session.clipboard_done(request, result);
+                }
+                return;
+            }
             TermEvent::Resize(_) => {
                 // The queued bytes are the old layout's. A kitty upload already begun is ended
                 // so the terminal does not wait for the rest of it.
@@ -1090,13 +1125,16 @@ impl App {
             .map(|(view, entry)| (view, entry.target))
     }
 
-    /// Refuses the page clipboard reads asked for since the last pass.
-    fn refuse_clipboard_reads(&mut self) -> bool {
-        let reads = std::mem::take(&mut self.tui.refused_reads);
-        let worked = !reads.is_empty();
-        for request in reads {
-            self.session
-                .clipboard_done(request, Err(ServiceError::Unsupported));
+    /// Answers clipboard reads that failed before a query was sent, and hands those answers to
+    /// the core in this pass.
+    fn deliver_clipboard_failures(&mut self) -> bool {
+        let failed = std::mem::take(&mut self.tui.failed_reads);
+        let worked = !failed.is_empty();
+        for (request, error) in failed {
+            self.session.clipboard_done(request, Err(error));
+        }
+        if worked {
+            self.run_core();
         }
         worked
     }
@@ -1702,12 +1740,15 @@ impl Tui {
 
     /// A key for the address line, as the window's address bar takes it.
     fn edit_key(&mut self, event: &KeyEvent, queue: &mut VecDeque<BrowserEvent>) {
+        if self.editing.is_none() || event.state == ButtonState::Released {
+            return;
+        }
+        if self.clipboard_keys(event) {
+            return;
+        }
         let Some(editor) = self.editing.as_mut() else {
             return;
         };
-        if event.state == ButtonState::Released {
-            return;
-        }
         self.editing_fresh = false;
         // Control as a modifier, not as a key the layout used to make a character.
         let word = event.modifiers.control && !event.consumed.control;
@@ -1741,6 +1782,125 @@ impl Tui {
                 None => return,
             },
         }
+        self.chrome_dirty = true;
+    }
+
+    /// Ctrl+C copies the line, Ctrl+X copies it and clears it, Ctrl+V asks the terminal.
+    /// Ctrl+A is not one of these: the editor selects the line itself. The terminal's own
+    /// bracketed paste still arrives as [`TermEvent::Paste`].
+    fn clipboard_keys(&mut self, event: &KeyEvent) -> bool {
+        if !(event.modifiers.control && !event.consumed.control) {
+            return false;
+        }
+        let Key::Character(letter) = &event.key else {
+            return false;
+        };
+        match letter.as_str() {
+            "c" | "C" => self.copy_line(false),
+            "x" | "X" => self.copy_line(true),
+            "v" | "V" => self.paste_line(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// OSC 52 of the whole line. The editor's selection is the whole line or nothing, so a copy
+    /// with nothing selected is the line. `cut` then clears it.
+    fn copy_line(&mut self, cut: bool) {
+        let Some(text) = self.editing.as_ref().map(|editor| editor.text().to_owned()) else {
+            return;
+        };
+        self.control
+            .extend(clipboard::set(Selection::Clipboard, text.as_bytes()));
+        self.editing_fresh = false;
+        if !cut {
+            return;
+        }
+        if let Some(editor) = &mut self.editing {
+            editor.select_all();
+            editor.backspace();
+        }
+        self.chrome_dirty = true;
+    }
+
+    /// Ask the terminal for the clipboard and insert the answer into the line. A read that is
+    /// already waiting is left alone: one query at a time.
+    fn paste_line(&mut self) {
+        self.editing_fresh = false;
+        if self.pending.is_some() {
+            return;
+        }
+        self.control.extend(clipboard::query(Selection::Clipboard));
+        self.pending = Some(PendingRead {
+            request: RequestId::next(),
+            deadline: Instant::now() + CLIPBOARD_WAIT,
+            for_line: true,
+            limit: MAX_PASTE,
+        });
+    }
+
+    /// The terminal answered the waiting read. A page's answer goes back to the session; the
+    /// line's is inserted here, capped, and only when there is text to insert.
+    fn clipboard_reply(
+        &mut self,
+        data: Option<Vec<u8>>,
+    ) -> Option<(RequestId, Result<ClipboardData, ServiceError>)> {
+        let pending = self.pending.take()?;
+        if pending.for_line {
+            self.insert_clipboard(data, pending.limit);
+            None
+        } else {
+            Some((pending.request, clipboard_result(data, pending.limit)))
+        }
+    }
+
+    /// `now` is past the waiting read. A page's fails; the line's is dropped, with no notice
+    /// (the open line would hide one).
+    fn expire_clipboard(
+        &mut self,
+        now: Instant,
+    ) -> Option<(RequestId, Result<ClipboardData, ServiceError>)> {
+        let due = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.deadline <= now);
+        if !due {
+            return None;
+        }
+        let pending = self.pending.take()?;
+        if pending.for_line {
+            return None;
+        }
+        Some((
+            pending.request,
+            Err(ServiceError::Failed("the terminal didn't answer".into())),
+        ))
+    }
+
+    /// When the waiting read must be finished. `None` when nothing is waiting.
+    fn clipboard_deadline(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|pending| pending.deadline)
+    }
+
+    /// Insert a clipboard reply into the address line. Empty text is left out: inserting it
+    /// would clear a selected line.
+    fn insert_clipboard(&mut self, data: Option<Vec<u8>>, limit: usize) {
+        let Some(bytes) = data else {
+            return;
+        };
+        let owned = String::from_utf8_lossy(&bytes).into_owned();
+        let mut end = limit.min(MAX_PASTE).min(owned.len());
+        while end > 0 && !owned.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            return;
+        }
+        let Some(editor) = &mut self.editing else {
+            return;
+        };
+        editor.insert(&owned[..end]);
+        self.editing_fresh = false;
         self.chrome_dirty = true;
     }
 
@@ -1794,18 +1954,78 @@ impl Tui {
     }
 }
 
+/// A page's clipboard: text, or too much of it, or an empty clipboard when the terminal sent none.
+fn clipboard_result(data: Option<Vec<u8>>, limit: usize) -> Result<ClipboardData, ServiceError> {
+    match data {
+        Some(bytes) if bytes.len() > limit => Err(ServiceError::TooLarge),
+        Some(data) => Ok(ClipboardData {
+            mime_type: CLIPBOARD_TYPE.into(),
+            data,
+        }),
+        None => Ok(ClipboardData {
+            mime_type: CLIPBOARD_TYPE.into(),
+            data: Vec::new(),
+        }),
+    }
+}
+
 impl Clipboard for Tui {
-    /// Refused on the next pass: the terminal has no clipboard to read yet.
-    fn read(&mut self, request: RequestId, _: Selection, _: &[String], _: usize) {
-        self.refused_reads.push(request);
+    /// One OSC 52 query at a time. A second read fails at once, and a read that asks for no
+    /// `text/*` type is unsupported. The answer comes later, as [`Tui::clipboard_reply`] or
+    /// [`Tui::expire_clipboard`].
+    fn read(
+        &mut self,
+        request: RequestId,
+        selection: Selection,
+        mime_types: &[String],
+        limit: usize,
+    ) {
+        if !mime_types.iter().any(|mime| clipboard::is_text(mime)) {
+            self.failed_reads.push((request, ServiceError::Unsupported));
+            return;
+        }
+        if self.pending.is_some() {
+            self.failed_reads.push((
+                request,
+                ServiceError::Failed("another clipboard read is waiting".into()),
+            ));
+            return;
+        }
+        self.control.extend(clipboard::query(selection));
+        self.pending = Some(PendingRead {
+            request,
+            deadline: Instant::now() + CLIPBOARD_WAIT,
+            for_line: false,
+            limit,
+        });
     }
 
-    fn write(&mut self, _: Selection, _: Vec<ClipboardData>) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported)
+    /// The first `text/*` item, as OSC 52. Anything else is unsupported.
+    fn write(
+        &mut self,
+        selection: Selection,
+        items: Vec<ClipboardData>,
+    ) -> Result<(), ServiceError> {
+        let Some(item) = items
+            .into_iter()
+            .find(|item| clipboard::is_text(&item.mime_type))
+        else {
+            return Err(ServiceError::Unsupported);
+        };
+        self.control.extend(clipboard::set(selection, &item.data));
+        Ok(())
     }
 
+    /// Drop a read that is still waiting for `request`. A failure not yet delivered is dropped too.
     fn cancel(&mut self, request: RequestId) {
-        self.refused_reads.retain(|&read| read != request);
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.request == request)
+        {
+            self.pending = None;
+        }
+        self.failed_reads.retain(|(id, _)| *id != request);
     }
 }
 
@@ -2268,6 +2488,8 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
 
 #[cfg(test)]
 mod tests {
+    use sighurt_api::input::{KeyCode, Modifiers};
+
     use super::*;
 
     #[test]
@@ -2435,5 +2657,463 @@ mod tests {
             choose_protocol(NoGraphics, Some(true), true),
             Protocol::None
         );
+    }
+
+    fn bare_tui(terminal: Terminal) -> Tui {
+        let size = terminal.size();
+        Tui {
+            terminal,
+            grid: Grid::new(size.cols, size.rows),
+            seat: SeatId::next(),
+            settings: TuiConfig::default(),
+            graphics: false,
+            protocol: Protocol::None,
+            page: page_area(size),
+            text_mode: false,
+            typing_told: None,
+            mode_override: None,
+            text: TextPages::new(size.cols, page_area(size).rows),
+            semantic_on: HashSet::new(),
+            capture: PointerCapture::default(),
+            releases: Vec::new(),
+            metrics: empty_metrics(),
+            metrics_due: false,
+            targets: HashMap::new(),
+            views: HashMap::new(),
+            next_image: 1,
+            editing: None,
+            editing_fresh: false,
+            active_url: String::new(),
+            notice: None,
+            notice_first: None,
+            page_text: false,
+            next_frame: None,
+            pending: None,
+            failed_reads: Vec::new(),
+            control: Vec::new(),
+            chrome_dirty: false,
+            clear: false,
+            cursor_shown: false,
+            mouse_on: true,
+            outbound: None,
+            left: false,
+        }
+    }
+
+    fn on_pty() -> (std::os::fd::OwnedFd, Tui) {
+        let (master, slave) = crate::term::open_pty().expect("pty");
+        rustix::termios::tcsetwinsize(
+            &slave,
+            rustix::termios::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )
+        .expect("winsize");
+        let terminal = Terminal::enter(slave).expect("enter");
+        (master, bare_tui(terminal))
+    }
+
+    fn ctrl(letter: &str) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode(0),
+            key: Key::Character(letter.into()),
+            state: ButtonState::Pressed,
+            repeat: false,
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            consumed: Modifiers::default(),
+            text: None,
+        }
+    }
+
+    fn text_item(mime: &str, data: &[u8]) -> ClipboardData {
+        ClipboardData {
+            mime_type: mime.into(),
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn write_sends_osc52_for_text_and_refuses_other_types() {
+        let (_master, mut tui) = on_pty();
+        let refused = tui.write(
+            Selection::Clipboard,
+            vec![text_item("image/png", &[1, 2, 3])],
+        );
+        assert_eq!(refused, Err(ServiceError::Unsupported));
+        assert!(tui.control.is_empty());
+        tui.write(
+            Selection::Clipboard,
+            vec![
+                text_item("image/png", &[1]),
+                text_item("text/plain", b"hej"),
+            ],
+        )
+        .expect("text");
+        assert_eq!(tui.control, b"\x1b]52;c;aGVq\x1b\\");
+    }
+
+    #[test]
+    fn a_second_read_fails_while_one_waits() {
+        let (_master, mut tui) = on_pty();
+        let first = RequestId::next();
+        let second = RequestId::next();
+        tui.read(first, Selection::Clipboard, &["text/plain".into()], 1024);
+        assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
+        tui.read(second, Selection::Clipboard, &["text/plain".into()], 1024);
+        assert_eq!(
+            tui.failed_reads,
+            vec![(
+                second,
+                ServiceError::Failed("another clipboard read is waiting".into())
+            )]
+        );
+        assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
+        let pending = tui.pending.as_ref().expect("the first read still waits");
+        assert_eq!(pending.request, first);
+        assert!(!pending.for_line);
+        let left = pending.deadline.saturating_duration_since(Instant::now());
+        assert!(left > Duration::from_millis(500) && left <= CLIPBOARD_WAIT);
+        let image = RequestId::next();
+        tui.read(image, Selection::Clipboard, &["image/png".into()], 8);
+        assert_eq!(tui.failed_reads[1], (image, ServiceError::Unsupported));
+        assert!(tui
+            .pending
+            .as_ref()
+            .is_some_and(|read| read.request == first));
+    }
+
+    #[test]
+    fn a_read_past_its_deadline_is_answered_failed() {
+        let (_master, mut tui) = on_pty();
+        let request = RequestId::next();
+        tui.read(request, Selection::Clipboard, &["text/plain".into()], 2);
+        assert!(tui.expire_clipboard(Instant::now()).is_none());
+        let (id, result) = tui
+            .expire_clipboard(Instant::now() + Duration::from_secs(2))
+            .expect("due");
+        assert_eq!(id, request);
+        assert_eq!(
+            result,
+            Err(ServiceError::Failed("the terminal didn't answer".into()))
+        );
+        assert!(tui.pending.is_none());
+        assert!(tui
+            .expire_clipboard(Instant::now() + Duration::from_secs(2))
+            .is_none());
+
+        tui.read(
+            RequestId::next(),
+            Selection::Clipboard,
+            &["text/plain".into()],
+            2,
+        );
+        let (id, result) = tui
+            .clipboard_reply(Some(b"hej".to_vec()))
+            .expect("over the limit");
+        assert_eq!(result, Err(ServiceError::TooLarge));
+        assert_ne!(id, request);
+        tui.read(
+            RequestId::next(),
+            Selection::Clipboard,
+            &["text/plain".into()],
+            8,
+        );
+        let (_, result) = tui.clipboard_reply(None).expect("empty reply");
+        assert_eq!(
+            result,
+            Ok(ClipboardData {
+                mime_type: CLIPBOARD_TYPE.into(),
+                data: Vec::new(),
+            })
+        );
+        let waiting = RequestId::next();
+        tui.read(waiting, Selection::Clipboard, &["text/plain".into()], 8);
+        tui.cancel(waiting);
+        assert!(tui.pending.is_none());
+        assert!(tui.clipboard_reply(Some(b"hej".to_vec())).is_none());
+    }
+
+    #[test]
+    fn the_line_copies_the_whole_line_and_cut_clears_it() {
+        let (_master, mut tui) = on_pty();
+        let line = "https://example.test/a";
+        tui.editing = Some(LineEditor::from_text(line));
+        let mut queue = VecDeque::new();
+        let mut release = ctrl("c");
+        release.state = ButtonState::Released;
+        tui.edit_key(&release, &mut queue);
+        assert!(tui.control.is_empty());
+        tui.edit_key(&ctrl("c"), &mut queue);
+        assert_eq!(tui.editing.as_ref().unwrap().text(), line);
+        assert!(!tui.editing.as_ref().unwrap().selected());
+        assert_eq!(
+            tui.control,
+            clipboard::set(Selection::Clipboard, line.as_bytes())
+        );
+        assert!(!tui.editing_fresh);
+        tui.control.clear();
+        tui.edit_key(&ctrl("a"), &mut queue);
+        assert!(tui.editing.as_ref().unwrap().selected());
+        assert!(tui.control.is_empty());
+        tui.edit_key(&ctrl("x"), &mut queue);
+        assert_eq!(tui.editing.as_ref().unwrap().text(), "");
+        assert_eq!(
+            tui.control,
+            clipboard::set(Selection::Clipboard, line.as_bytes())
+        );
+        assert!(tui.chrome_dirty);
+    }
+
+    #[test]
+    fn the_line_pastes_the_terminals_reply() {
+        let (_master, mut tui) = on_pty();
+        tui.editing = Some(LineEditor::from_text("ab"));
+        let mut queue = VecDeque::new();
+        tui.edit_key(&ctrl("v"), &mut queue);
+        let pending = tui.pending.as_ref().expect("waiting");
+        assert!(pending.for_line);
+        assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
+        let again = tui.control.clone();
+        tui.edit_key(&ctrl("v"), &mut queue);
+        assert_eq!(tui.control, again);
+        assert!(tui.clipboard_reply(Some(b"xy".to_vec())).is_none());
+        assert_eq!(tui.editing.as_ref().unwrap().text(), "abxy");
+        let mut selected = LineEditor::from_text("ab");
+        selected.select_all();
+        tui.editing = Some(selected);
+        tui.edit_key(&ctrl("v"), &mut queue);
+        assert!(tui.clipboard_reply(None).is_none());
+        assert_eq!(tui.editing.as_ref().unwrap().text(), "ab");
+        assert!(tui.editing.as_ref().unwrap().selected());
+        let due = Instant::now() + Duration::from_secs(2);
+        tui.edit_key(&ctrl("v"), &mut queue);
+        assert!(tui.expire_clipboard(due).is_none());
+        assert!(tui.pending.is_none());
+        assert_eq!(tui.editing.as_ref().unwrap().text(), "ab");
+    }
+
+    #[cfg(feature = "engine-demo")]
+    const DEMO_CONFIG: &str = "\
+version = 1
+[engines]
+default = \"demo\"
+[routing.demo]
+schemes = [\"demo\"]
+";
+
+    /// The pty master stays open for as long as the app does. Closing it would drop the terminal.
+    #[cfg(feature = "engine-demo")]
+    struct DemoApp {
+        _master: std::os::fd::OwnedFd,
+        app: App,
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn demo_app() -> DemoApp {
+        let (master, slave) = crate::term::open_pty().expect("pty");
+        rustix::termios::tcsetwinsize(
+            &slave,
+            rustix::termios::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )
+        .expect("winsize");
+        let terminal = Terminal::enter(slave).expect("enter");
+        let registry = crate::engines::build();
+        let mut env = registry.environment(chrome_checks(), COLOR_NAMES);
+        env.frontend = FrontendKind::Terminal;
+        let config = sighurt_core::config::Config::parse(Some(DEMO_CONFIG), &env)
+            .unwrap_or_else(|error| panic!("config: {error}"));
+        let session = Session::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            Services::new(|| {}),
+            Paths {
+                config: None,
+                session: None,
+            },
+            None,
+            Diagnostics::new(None),
+            std::sync::Arc::new(|| {}),
+        );
+        DemoApp {
+            _master: master,
+            app: App {
+                tui: bare_tui(terminal),
+                session,
+                input: VecDeque::new(),
+                readable: false,
+                config_changed: false,
+                signals: Vec::new(),
+                writable: None,
+            },
+        }
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn shown_document(app: &App) -> Option<sighurt_api::ids::DocumentGeneration> {
+        let view = app.session.shown_view().map(|(view, _)| view)?;
+        app.session.core().view(view)?.document()
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn settle_document(app: &mut App) -> sighurt_api::ids::DocumentGeneration {
+        for _ in 0..8 {
+            app.run_core();
+            let _ = app.session.pump(&mut app.tui);
+            if let Some(document) = shown_document(app) {
+                return document;
+            }
+        }
+        panic!("demo://pattern did not commit: {}", page_debug(app));
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn page_debug(app: &mut App) -> String {
+        let queued = app
+            .session
+            .queue_mut()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let core = app.session.core();
+        let tab = core.tabs().nth(core.active());
+        format!(
+            "tabs={} url={:?} error={:?} views={} queue={queued}",
+            core.tabs().len(),
+            tab.as_ref().and_then(|tab| tab.url),
+            tab.as_ref().and_then(|tab| tab.error),
+            core.views().count(),
+        )
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn press_page(app: &mut App, letter: &str) {
+        let seat = app.tui.seat;
+        app.session.queue_mut().push_back(BrowserEvent::Keyboard {
+            event: InputEvent {
+                seat,
+                kind: InputKind::Key(KeyEvent {
+                    code: KeyCode(0),
+                    key: Key::Character(letter.into()),
+                    state: ButtonState::Pressed,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                    consumed: Modifiers::default(),
+                    text: Some(letter.into()),
+                }),
+            },
+            at: Instant::now(),
+        });
+        app.run_core();
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn request_clipboard(
+        app: &mut App,
+        document: sighurt_api::ids::DocumentGeneration,
+    ) -> RequestId {
+        let view = app.session.shown_view().expect("shown").0;
+        let request = RequestId::next();
+        app.session.queue_mut().push_back(BrowserEvent::Engine {
+            engine: "demo".into(),
+            event: sighurt_api::events::EngineEvent::ServiceRequested(
+                sighurt_api::services::ServiceRequest {
+                    id: request,
+                    view,
+                    document,
+                    origin: Some("demo://pattern".into()),
+                    service: sighurt_api::services::Service::ClipboardRead {
+                        selection: Selection::Clipboard,
+                        mime_types: vec!["text/plain".into()],
+                        limit: 1024,
+                    },
+                },
+            ),
+            at: Instant::now(),
+        });
+        app.tui.control.clear();
+        app.run_core();
+        request
+    }
+
+    #[cfg(feature = "engine-demo")]
+    #[test]
+    fn a_page_read_reaches_clipboard_done() {
+        let mut held = demo_app();
+        let app = &mut held.app;
+        app.session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: vec![OpenRequest {
+                input: "demo://pattern".into(),
+                engine: Some("demo".into()),
+            }],
+        });
+        let document = settle_document(app);
+        press_page(app, "z");
+        let request = request_clipboard(app, document);
+        let control = app.tui.control.clone();
+        let query = clipboard::query(Selection::Clipboard);
+        if control != query {
+            panic!(
+                "the read never asked the terminal: {} bytes={control:?}",
+                page_debug(app)
+            );
+        }
+        let (id, result) = app
+            .tui
+            .expire_clipboard(Instant::now() + Duration::from_secs(2))
+            .expect("the read is due");
+        assert_eq!(id, request);
+        app.session.clipboard_done(id, result);
+        let failed = clipboard_answer(app, request);
+        assert_eq!(
+            failed,
+            Some(Err(ServiceError::Failed(
+                "the terminal didn't answer".into()
+            )))
+        );
+        app.run_core();
+        press_page(app, "z");
+        let request = request_clipboard(app, document);
+        assert_eq!(app.tui.control, clipboard::query(Selection::Clipboard));
+        app.event(TermEvent::Clipboard(Some(b"hej".to_vec())));
+        assert_eq!(
+            clipboard_answer(app, request),
+            Some(Ok(sighurt_api::services::ServiceReply::Clipboard(
+                ClipboardData {
+                    mime_type: CLIPBOARD_TYPE.into(),
+                    data: b"hej".to_vec(),
+                }
+            )))
+        );
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn clipboard_answer(
+        app: &mut App,
+        request: RequestId,
+    ) -> Option<Result<sighurt_api::services::ServiceReply, ServiceError>> {
+        app.session
+            .queue_mut()
+            .iter()
+            .find_map(|event| match event {
+                BrowserEvent::ServiceDone {
+                    request: id,
+                    result,
+                } if *id == request => Some(result.clone()),
+                _ => None,
+            })
     }
 }

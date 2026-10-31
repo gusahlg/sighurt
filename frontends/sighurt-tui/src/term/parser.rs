@@ -1,4 +1,4 @@
-//! What the terminal sends: keys, mouse, paste and capability replies.
+//! What the terminal sends: keys, mouse, paste, capability replies and OSC 52 clipboard replies.
 //!
 //! `feed` never sleeps. A lone Escape arms a 25 ms timer; any longer partial
 //! sequence arms a 1 s timer. The owner loop sleeps for [`Parser::poll_timeout`]
@@ -9,6 +9,8 @@
 //! Bracketed paste is collected until `CSI 201 ~` and is not parsed as keys.
 //! Payloads are capped (64 KiB for APC/OSC/DCS, 1 MiB for paste). Bytes past
 //! the paste cap are discarded until the end marker, and that paste is one event.
+//! An OSC 52 reply whose data is `?`, empty or not base64 is a reply with no
+//! data. That payload is capped with the other OSC payloads.
 //!
 //! Releases: once the terminal's reply to `CSI ? u` says it reports event
 //! types (flag 2), a key in an escape sequence (`CSI … u`, `CSI … ~`, the
@@ -139,6 +141,9 @@ pub enum Reply {
         spec: String,
         bell: bool,
     },
+    /// OSC 52, the clipboard. `data` is missing when the terminal sent `?`, nothing, or bytes
+    /// that are not base64.
+    Clipboard { data: Option<Vec<u8>> },
     /// `CSI 4 ; height ; width t`, the text area in pixels.
     TextAreaPixels { height: u32, width: u32 },
     /// `CSI 6 ; height ; width t`, one cell in pixels.
@@ -1347,12 +1352,29 @@ fn dispatch_osc(payload: &[u8], bell: bool, out: &mut Vec<Input>) {
     let Ok(index) = index.parse::<u16>() else {
         return;
     };
+    if index == 52 {
+        out.push(Input::Reply(Reply::Clipboard {
+            data: clipboard_data(spec),
+        }));
+        return;
+    }
     if index == 10 || index == 11 {
         out.push(Input::Reply(Reply::OscColor {
             index,
             spec: spec.to_string(),
             bell,
         }));
+    }
+}
+
+/// OSC 52's data field: base64, or nothing when it is `?`, empty or not base64.
+fn clipboard_data(spec: &str) -> Option<Vec<u8>> {
+    let data = spec.split_once(';').map(|(_, data)| data).unwrap_or("");
+    let data = data.trim();
+    if data.is_empty() || data == "?" {
+        None
+    } else {
+        super::clipboard::decode(data)
     }
 }
 
@@ -1804,6 +1826,22 @@ mod tests {
                 height: 1080,
                 width: 1920,
             } => {}
+            other => panic!("{other:?}"),
+        }
+        match reply(b"\x1b]52;c;aGVq\x1b\\") {
+            Reply::Clipboard { data } => assert_eq!(data.as_deref(), Some(b"hej".as_slice())),
+            other => panic!("{other:?}"),
+        }
+        match reply(b"\x1b]52;c;?\x1b\\") {
+            Reply::Clipboard { data: None } => {}
+            other => panic!("{other:?}"),
+        }
+        match reply(b"\x1b]52;c;\x1b\\") {
+            Reply::Clipboard { data: None } => {}
+            other => panic!("{other:?}"),
+        }
+        match reply(b"\x1b]52;c;!!!!\x1b\\") {
+            Reply::Clipboard { data: None } => {}
             other => panic!("{other:?}"),
         }
 

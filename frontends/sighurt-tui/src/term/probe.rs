@@ -103,5 +103,7 @@ pub fn absorb(caps: &mut Caps, input: &Input) -> bool {
             caps.text_area_pixels = Some((*height, *width));
             false
         }
+        // Not a capability. During the probe it is discarded; afterwards the owner takes it.
+        Reply::Clipboard { .. } => false,
     }
 }
