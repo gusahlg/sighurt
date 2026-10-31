@@ -13,11 +13,11 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::capi::{
     CefApp, CefBaseRefCounted, CefBrowserSettings, CefClient, CefDictionaryValue, CefMainArgs,
-    CefSettings, CefStringUtf16, CefWindowInfo,
+    CefSettings, CefStringUtf16, CefTask, CefWindowInfo,
 };
 
 /// The API version this crate's bindings are generated for (`CEF_API_VERSION`).
@@ -50,6 +50,8 @@ pub struct Api {
     pub string_list_alloc: unsafe extern "C" fn() -> *mut c_void,
     /// `cef_string_list_append`.
     pub string_list_append: unsafe extern "C" fn(*mut c_void, *const CefStringUtf16),
+    /// `cef_post_task`.
+    pub post_task: unsafe extern "C" fn(i32, *mut CefTask) -> i32,
 }
 
 static API: OnceLock<Api> = OnceLock::new();
@@ -97,6 +99,7 @@ pub fn load(dist: &Path) -> Result<&'static Api, String> {
             userfree_free: cast(sym("cef_string_userfree_utf16_free")?),
             string_list_alloc: cast(sym("cef_string_list_alloc")?),
             string_list_append: cast(sym("cef_string_list_append")?),
+            post_task: cast(sym("cef_post_task")?),
         };
         Ok(API.get_or_init(|| api))
     }
@@ -218,6 +221,7 @@ vtables!(
     CefRenderHandler,
     CefRequestHandler,
     CefNavigationEntryVisitor,
+    CefTask,
 );
 
 /// A heap object implementing a CEF interface: the vtable first (so a pointer to it is a pointer
@@ -377,4 +381,28 @@ impl<T> Drop for Ref<T> {
         // SAFETY: we hold the reference being released.
         unsafe { release_raw(self.0.as_ptr()) };
     }
+}
+
+/// Runs `job` once on CEF's UI thread, after the current callback (if any) has returned. `false`
+/// when CEF would not take it (the job is dropped unrun).
+pub fn post_ui(job: impl FnOnce() + Send + 'static) -> bool {
+    type Job = Mutex<Option<Box<dyn FnOnce() + Send>>>;
+    unsafe extern "C" fn execute(this: *mut CefTask) {
+        // SAFETY: `this` is the task made below.
+        let job = unsafe { data::<CefTask, Job>(this) };
+        let job = job.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(job) = job {
+            // A panic must not unwind into Chromium.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        }
+    }
+    let mut task: CefTask = zeroed();
+    task.execute = Some(execute);
+    let task = new_object(
+        task,
+        Mutex::new(Some(Box::new(job) as Box<dyn FnOnce() + Send>)),
+    );
+    // SAFETY: CEF adopts the task's reference; `TID_UI` is 0.
+    let posted = unsafe { (api().post_task)(0, task) };
+    posted != 0
 }

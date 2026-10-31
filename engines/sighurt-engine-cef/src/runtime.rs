@@ -19,9 +19,9 @@ use sighurt_api::engine::{
 };
 use sighurt_api::events::{EngineEvent, NavigationError};
 use sighurt_api::geometry::{Metrics, SurfaceRect};
-use sighurt_api::ids::{NavigationId, RequestId, ViewId};
+use sighurt_api::ids::{RequestId, ViewId};
 use sighurt_api::input::{
-    ButtonState, FocusEvent, InputEvent, InputKind, KeyEvent, PointerButton, PointerEvent,
+    ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyEvent, PointerButton, PointerEvent,
     ScrollDelta, TextInputEvent,
 };
 use sighurt_api::present::CpuTarget;
@@ -33,7 +33,8 @@ use crate::actions::{Action, KEY_CHAR, KEY_RAW_DOWN, KEY_UP};
 use crate::capi::{
     CefApp, CefBrowserSettings, CefCommandLine, CefMainArgs, CefSettings, CefWindowInfo,
 };
-use crate::ffi::{self, call, new_object, release_raw, zeroed, CefStr, Ref};
+use crate::edit::Binding;
+use crate::ffi::{self, call, new_object, zeroed, CefStr, Ref};
 use crate::handlers::{self, origin};
 use crate::keys;
 use crate::shared::{lock, Geometry, Shared, ViewShared, MAX_SELECTION};
@@ -60,6 +61,8 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
 const MAX_PER_PUMP: usize = 256;
 /// The most clipboard text pasted into a page.
 const MAX_PASTE: usize = MAX_SELECTION;
+/// The most clipboard operations waiting for an answer.
+const MAX_EDITS: usize = 16;
 /// How long `shutdown` waits for the browsers to close.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// What a double click is.
@@ -134,8 +137,8 @@ struct View<T> {
     held: BTreeMap<u32, (i32, u32)>,
     /// Presses the engine took (a clipboard chord): their releases are not sent either.
     consumed: HashSet<u32>,
-    /// Pastes waiting for the browser's clipboard answer.
-    pastes: HashSet<RequestId>,
+    /// Pastes and cuts waiting for the browser's answer, with the document and frame that asked.
+    edits: HashMap<RequestId, (ClipboardOp, Binding)>,
     /// An input method's composition is showing.
     composing: bool,
     last_frames: u64,
@@ -160,13 +163,6 @@ impl<T: CpuTarget> CefRuntime<T> {
                 "CEF is not installed ({}/libcef.so is missing): run nix/build-cef.sh",
                 config.dist.display()
             ));
-        }
-        // Chromium connects to a display even for windowless pages.
-        let has = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
-        if !has("WAYLAND_DISPLAY") && !has("DISPLAY") {
-            return Err(
-                "the cef engine needs a display (Wayland or X11) and this session has none".into(),
-            );
         }
         let helper = helper_path(&config)?;
         if STARTED.swap(true, Ordering::SeqCst) {
@@ -291,6 +287,12 @@ unsafe extern "C" fn on_before_command_line_processing(
             return;
         }
         for switch in [
+            // No display connection at all: nothing of the desktop (its clipboard included) is
+            // reachable from Chromium, and a terminal session without a display can use it.
+            // Frames are painted in software (SwiftShader draws WebGL).
+            "ozone-platform=headless",
+            "use-angle=swiftshader",
+            "enable-unsafe-swiftshader",
             "enable-logging=stderr",
             "disable-component-update",
             "disable-background-networking",
@@ -359,7 +361,7 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
             click: None,
             held: BTreeMap::new(),
             consumed: HashSet::new(),
-            pastes: HashSet::new(),
+            edits: HashMap::new(),
             composing: false,
             last_frames: 0,
             last_epoch: None,
@@ -748,18 +750,17 @@ impl<T> View<T> {
             });
             return;
         }
-        // Copy, cut and paste are the browser's: Chromium never touches the desktop clipboard.
-        let chord = key.modifiers.control
-            && !key.modifiers.alt
-            && !key.modifiers.shift
-            && !key.modifiers.logo;
-        if chord
-            && matches!(virtual_key, 0x43 | 0x58 | 0x56)
-            && !key.repeat
-            && self.clipboard(virtual_key, queue)
-        {
-            self.consumed.insert(code);
+        // Copy, cut and paste are the browser's, whichever way they are typed (the chords, the
+        // Insert and Delete forms, auto-repeat): a press the engine took is not repeated to the
+        // page either.
+        if self.consumed.contains(&code) {
             return;
+        }
+        if let Some(op) = clipboard_op(key) {
+            if self.clipboard(op, queue) {
+                self.consumed.insert(code);
+                return;
+            }
         }
         self.held.insert(code, (virtual_key, modifiers));
         let native_key = i32::try_from(code + 8).unwrap_or(0);
@@ -799,36 +800,48 @@ impl<T> View<T> {
         }
     }
 
-    /// Copy, cut or paste (`C`, `X`, `V`): asks the browser's clipboard. Whether it was taken.
-    fn clipboard(&mut self, virtual_key: i32, queue: &Arc<Shared>) -> bool {
+    /// Copy, cut or paste: asks the browser's clipboard. Whether the key was taken.
+    fn clipboard(&mut self, op: ClipboardOp, queue: &Arc<Shared>) -> bool {
+        let Some(binding) = self.shared.binding() else {
+            return false;
+        };
         let Some(document) = lock(&self.shared.nav).document() else {
             return false;
         };
         let request = RequestId::next();
-        let service = if virtual_key == 0x56 {
-            self.pastes.insert(request);
-            Service::ClipboardRead {
-                selection: Selection::Clipboard,
-                mime_types: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
-                limit: MAX_PASTE,
+        let service = match op {
+            ClipboardOp::Paste => {
+                if self.edits.len() >= MAX_EDITS {
+                    return true;
+                }
+                self.edits.insert(request, (op, binding));
+                Service::ClipboardRead {
+                    selection: Selection::Clipboard,
+                    mime_types: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+                    limit: MAX_PASTE,
+                }
             }
-        } else {
-            let text = lock(&self.shared.selection).clone();
-            if text.is_empty() {
-                return true; // nothing selected: nothing to copy, and the page is not asked
-            }
-            if virtual_key == 0x58 {
-                self.shared.run(Action::Cut);
-            }
-            Service::ClipboardWrite {
-                selection: Selection::Clipboard,
-                items: vec![ClipboardData {
-                    mime_type: "text/plain;charset=utf-8".into(),
-                    data: text.into_bytes(),
-                }],
+            ClipboardOp::Copy | ClipboardOp::Cut => {
+                let text = lock(&self.shared.selection).clone();
+                if text.is_empty() {
+                    return true; // nothing selected: nothing to copy, and the page is not asked
+                }
+                if op == ClipboardOp::Cut {
+                    if self.edits.len() >= MAX_EDITS {
+                        return true;
+                    }
+                    // The selection is deleted only once the write is approved.
+                    self.edits.insert(request, (op, binding));
+                }
+                Service::ClipboardWrite {
+                    selection: Selection::Clipboard,
+                    items: vec![ClipboardData {
+                        mime_type: "text/plain;charset=utf-8".into(),
+                        data: text.into_bytes(),
+                    }],
+                }
             }
         };
-        log::debug!("cef: asking the browser for the clipboard ({virtual_key:#x})");
         queue.push(EngineEvent::ServiceRequested(ServiceRequest {
             id: request,
             view: self.shared.id,
@@ -840,19 +853,11 @@ impl<T> View<T> {
     }
 
     fn resolve(&mut self, request: RequestId, result: ServiceResult) {
-        if !self.pastes.remove(&request) {
+        let Some((op, binding)) = self.edits.remove(&request) else {
             return; // a copy or a download: nothing more to do
-        }
-        log::debug!(
-            "cef: clipboard answer: {:?}",
-            result.as_ref().map(|reply| match reply {
-                ServiceReply::Clipboard(data) =>
-                    format!("{} bytes of {}", data.data.len(), data.mime_type),
-                other => format!("{other:?}"),
-            })
-        );
-        match result {
-            Ok(ServiceReply::Clipboard(data)) => {
+        };
+        match (op, result) {
+            (ClipboardOp::Paste, Ok(ServiceReply::Clipboard(data))) => {
                 let mut text = String::from_utf8_lossy(&data.data).into_owned();
                 if text.len() > MAX_PASTE {
                     let mut end = MAX_PASTE;
@@ -861,12 +866,16 @@ impl<T> View<T> {
                     }
                     text.truncate(end);
                 }
+                // Typed into the document and frame that asked, if they still are the page's.
                 if !text.is_empty() {
-                    self.shared.run(Action::Type(text));
+                    self.shared.insert_text(&text, binding);
                 }
             }
-            Ok(_) | Err(ServiceError::Denied | ServiceError::Cancelled) => {}
-            Err(other) => log::debug!("cef: paste failed: {other}"),
+            (ClipboardOp::Cut, Ok(ServiceReply::Done)) => self.shared.delete_selection(binding),
+            (_, Err(ServiceError::Failed(why))) => {
+                log::debug!("cef: clipboard request failed: {why}");
+            }
+            _ => {}
         }
     }
 
@@ -880,21 +889,101 @@ impl<T> View<T> {
         }
         if let Some(text) = event.commit {
             // Chromium takes a commit only inside a composition it knows of; text with none
-            // is typed, as characters (what a paste does too).
+            // is typed, as characters, into what is the page now.
             if std::mem::take(&mut self.composing) {
                 self.shared.run(Action::ImeCommit(text));
-            } else {
-                self.shared.run(Action::Type(text));
+            } else if let Some(binding) = self.shared.binding() {
+                self.shared.insert_text(&text, binding);
             }
         }
     }
 }
 
-// The navigation id type is only named here so the commands' payloads read naturally.
-#[allow(dead_code)]
-type Id = NavigationId;
-// `release_raw` is part of the handler plumbing this module also uses on failure paths.
-#[allow(dead_code)]
-fn _keep() {
-    let _ = release_raw::<CefApp>;
+/// What a key asks of the clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardOp {
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// The clipboard operation a key press is, in any of its forms: Ctrl+C, Ctrl+X, Ctrl+V,
+/// Ctrl+Insert, Shift+Delete, Shift+Insert.
+fn clipboard_op(key: &KeyEvent) -> Option<ClipboardOp> {
+    let m = &key.modifiers;
+    if m.alt || m.logo || m.alt_graph {
+        return None;
+    }
+    match &key.key {
+        Key::Character(text) if m.control && !m.shift => match text.to_lowercase().as_str() {
+            "c" => Some(ClipboardOp::Copy),
+            "x" => Some(ClipboardOp::Cut),
+            "v" => Some(ClipboardOp::Paste),
+            _ => None,
+        },
+        Key::Named(name) => match (name.as_str(), m.control, m.shift) {
+            ("Insert", true, false) => Some(ClipboardOp::Copy),
+            ("Insert", false, true) => Some(ClipboardOp::Paste),
+            ("Delete", false, true) => Some(ClipboardOp::Cut),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sighurt_api::input::{ButtonState, KeyCode, Modifiers};
+
+    use super::*;
+
+    fn press(key: Key, shift: bool, control: bool) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode(1),
+            key,
+            state: ButtonState::Pressed,
+            repeat: false,
+            modifiers: Modifiers {
+                shift,
+                control,
+                ..Modifiers::default()
+            },
+            consumed: Modifiers::default(),
+            text: None,
+        }
+    }
+
+    #[test]
+    fn every_way_to_use_the_clipboard_is_the_browsers() {
+        let c = |s: &str| Key::Character(s.into());
+        let n = |s: &str| Key::Named(s.into());
+        assert_eq!(
+            clipboard_op(&press(c("c"), false, true)),
+            Some(ClipboardOp::Copy)
+        );
+        assert_eq!(
+            clipboard_op(&press(c("X"), false, true)),
+            Some(ClipboardOp::Cut)
+        );
+        assert_eq!(
+            clipboard_op(&press(c("v"), false, true)),
+            Some(ClipboardOp::Paste)
+        );
+        assert_eq!(
+            clipboard_op(&press(n("Insert"), true, false)),
+            Some(ClipboardOp::Paste)
+        );
+        assert_eq!(
+            clipboard_op(&press(n("Insert"), false, true)),
+            Some(ClipboardOp::Copy)
+        );
+        assert_eq!(
+            clipboard_op(&press(n("Delete"), true, false)),
+            Some(ClipboardOp::Cut)
+        );
+        // Other chords belong to the page.
+        assert_eq!(clipboard_op(&press(c("a"), false, true)), None);
+        assert_eq!(clipboard_op(&press(c("v"), false, false)), None);
+        assert_eq!(clipboard_op(&press(n("Delete"), false, false)), None);
+    }
 }

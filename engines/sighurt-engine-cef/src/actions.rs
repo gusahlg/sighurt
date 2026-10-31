@@ -240,6 +240,27 @@ impl Action {
     }
 }
 
+/// Sends one typed character to the page, as `KEYEVENT_CHAR`.
+///
+/// # Safety
+/// `host` is a live browser host.
+pub unsafe fn send_char(host: *mut CefBrowserHost, unit: u16) {
+    let event = CefKeyEvent {
+        size: std::mem::size_of::<CefKeyEvent>(),
+        type_: KEY_CHAR,
+        modifiers: 0,
+        windows_key_code: i32::from(unit),
+        native_key_code: 0,
+        is_system_key: 0,
+        character: unit,
+        unmodified_character: unit,
+        focus_on_editable_field: 0,
+        _pad: 0,
+    };
+    // SAFETY: by the contract above.
+    unsafe { call!(host, send_key_event, &event) };
+}
+
 fn mouse(x: i32, y: i32, modifiers: u32) -> CefMouseEvent {
     CefMouseEvent { x, y, modifiers }
 }

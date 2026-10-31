@@ -244,6 +244,19 @@ impl ViewShared {
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
+
+    /// The browser's identifier of the focused frame, if there is one.
+    pub fn focused_frame(&self) -> Option<String> {
+        let browser = lock(&self.slot).browser.clone()?;
+        // SAFETY: a live browser reference we hold; the frame is an owned reference.
+        unsafe {
+            let frame = Ref::adopt(crate::ffi::call!(browser.as_ptr(), get_focused_frame))?;
+            Some(crate::ffi::take(crate::ffi::call!(
+                frame.as_ptr(),
+                get_identifier
+            )))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@
 
 pub mod actions;
 pub mod capi;
+pub mod edit;
 pub mod ffi;
 pub mod handlers;
 pub mod keys;
