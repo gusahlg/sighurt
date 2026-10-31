@@ -194,6 +194,22 @@ point() { echo "move $1 $2 $layout_w $layout_h" >&3; }
 # when the button goes down: a link the routing gives another engine follows it only then.
 click() { point "$1" "$2"; sleep 0.3; echo click >&3; sleep 0.2; }
 key() { wtype "$@"; sleep 0.25; }
+# wait_sig: waits for sig to exit, at most 15 s (its shutdown is bounded at 5 s); a sig still
+# running then is killed and the exit code is 124, so a quit that never arrives fails its check
+# instead of hanging the whole run.
+wait_sig() {
+  local i
+  for ((i = 0; i < 150; i++)); do
+    kill -0 "$sig_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$sig_pid" 2>/dev/null; then
+    kill -9 "$sig_pid" 2>/dev/null
+    wait "$sig_pid" 2>/dev/null
+    return 124
+  fi
+  wait "$sig_pid"
+}
 # open URL: types URL into the address bar of the active tab and opens it.
 open() { key -M ctrl l -m ctrl; key "$1"; key -k Return; }
 scale() {
@@ -446,7 +462,7 @@ servo)
 
   step "ctrl-q"
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   check "Servo shut down itself: no forced exit" \
     "$(answer "$(! grep -q 'could not shut down' "$out/sig.log"; echo $?)" "no 'could not shut down' in sig.log")"
@@ -602,7 +618,7 @@ wasm)
 
   step "ctrl-q"
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   check "the session holds every tab" "$(python3 "$probe" session "$session" "len(s['tabs'])==$busy_tab, [url(i).rsplit('/', 1)[-1] for i in range(1, len(s['tabs']) + 1)]")"
   ;;
@@ -651,7 +667,7 @@ cross)
 
   step "restart: the segments are restored as records, which load again when shown"
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   cp "$session" "$out/session-before-restart.toml"
   all_entries="[e for k in range(len(tab(1)['segments'])) for e in entries(1, k)]"
@@ -679,7 +695,7 @@ cross)
     "requests: history.html $(served /history.html), the app $(served /guests/gradient-demo.wasm)")"
   shot 03-restored-servo-segment
   kill -TERM "$sig_pid"
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "SIGTERM exits cleanly" "$(answer "$code" "exit code $code")"
   ;;
 settings)
@@ -740,7 +756,7 @@ CONF
 
   step "ctrl-q"
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   check "Servo kept no profile" "$(answer "$([[ ! -e $out/data/sighurt/servo ]]; echo $?)" "$(ls -A "$out/data/sighurt" 2>&1 | tr '\n' ' ')")"
   webkit=$(find "$out/data" "$out/cache" \( -iname '*wpe*' -o -iname '*webkit*' \) 2>/dev/null | tr '\n' ' ')
@@ -797,7 +813,7 @@ links)
   check "Servo asked about each of the five navigations" "$(answer "$([[ $(wc -w <<< "$held") == 5 ]]; echo $?)" "$(wc -w <<< "$held") answered")"
   step "ctrl-q"
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   ;;
 wpe)
@@ -1000,7 +1016,7 @@ CONF
 
   step "ctrl-q"
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   check "zero CPU copies of WPE frames, all DMA-BUF" \
     "$(python3 -c "import json; d=json.load(open('$out/diag.json')); w=[e for e in d['engines'] if e['name']=='wpe'][0]; print(0 if w['readbacks']==0 else 1, 'wpe copies', w['readbacks'], 'gl', w['gl'])")"
@@ -1063,8 +1079,10 @@ CONF
   check "Escape again: normal mode shows no indicator" "$(dg 3 "d['keymap_indicator'] is None, d['keymap_indicator']")"
   shot 03-normal-mode 0.3
 
-  step "o (location.focus), a keyword search: t åäö"
-  key o
+  # The page's field still has the keyboard, so plain letters type into it (o would too);
+  # ctrl-o is an Always binding of the example configuration and works from a field.
+  step "ctrl-o (location.focus, from the page's field), a keyword search: t åäö"
+  key -M ctrl o -m ctrl
   key 't åäö'
   key -k Return
   check "a [keywords] template opens with the rest as its query, in Servo" \
@@ -1113,7 +1131,7 @@ CONF
   check "a new chrome gets a notice that it applies at restart" "$(dg 5 "d['status']=='notice', d['status']")"
   check "the standard chrome stays meanwhile" "$(dg 3 "surface('tabs')['mapped'] and surface('line') is None, $surfaces")"
   run_command browser.quit
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check ":browser.quit exits cleanly" "$(answer "$code" "exit code $code")"
   check "the session holds the three tabs" \
     "$(python3 "$probe" session "$session" "len(s['tabs'])==3 and [seg(i).get('engine') for i in (1, 2)]==['wpe', 'servo'], [(seg(i).get('engine'), url(i)) for i in range(1, len(s['tabs']) + 1)]")"
@@ -1150,7 +1168,7 @@ CONF
   key -k Return
   check "a command line in the line chrome" "$(shows_tab 1 wpe)"
   run_command browser.quit
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check ":browser.quit exits cleanly" "$(answer "$code" "exit code $code")"
   ;;
 
@@ -1213,7 +1231,7 @@ CONF
   check "the address field's right end named the shown page's engine, and its text stayed" \
     "$(answer "$([[ $servo -gt 20 && $wpe -gt 20 && $text == 0 ]]; echo $?)" "pixels changed at its right end: $servo with Servo, $wpe with WPE; $text in the rest")"
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
 
   step "started again with the line chrome and engine-label on: the WPE tab restored"
@@ -1227,7 +1245,7 @@ CONF
   sleep 1
   shot_ppm 07-line-wpe
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   ;;
 
@@ -1248,7 +1266,7 @@ switch)
     "$(sess 30 "url(1)=='https://example.com/' and seg(1)['engine']=='servo' and segs(1)==[('servo', 1, 0), ('wpe', 1, 0), ('servo', 1, 0)], (segs(1), url(1))")"
   check "the tab shows its Servo view again" "$(shows_tab 1 servo)"
   key -M ctrl q -m ctrl
-  wait "$sig_pid"; code=$?
+  wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
   ;;
 esac
