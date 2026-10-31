@@ -62,6 +62,54 @@ What differs from the design below:
 - **A failed load** still shows NetSurf's own error page and commits it; there is no
   `NavigationFailed` for it yet (risk 4 stands).
 
+## Security patches and process-wide effects
+
+NetSurf was written for a user at a keyboard; sig's engines run on untrusted pages with the
+browser's own policy above them. `build.rs` therefore patches the unpacked source (each patch
+leaves a `SIGHURT PATCH:` marker and fails the build if its anchor text is gone):
+
+- **No certificate exceptions, no planted credentials.** `urldb_set_cert_permissions` does
+  nothing, `urldb_get_cert_permissions` is always false, `urldb_set_auth_details` does
+  nothing, and a navigation to `about:query/*` without `BW_NAVIGATE_INTERNAL` is refused even
+  with POST data. Without these a page could submit a multipart form to `about:query/ssl` with
+  `proceed=1` and turn certificate checks off for a host, or plant HTTP credentials with
+  `about:query/auth`. `tests/engine.rs` loads a page with such a form and then an `openssl
+  s_server` with a self-signed certificate: the form does nothing, the load fails
+  (`NavigationFailed`), and a second attempt fails again.
+- **A failed load is a failed load.** `browser_window__handle_error` reports every failure
+  (a bad certificate, a login request, a timeout, a refused fetch) to the frontend
+  (`NSH_EV_FAILED`) and shows no error page, query page or login form; the runtime sends
+  `NavigationFailed` and the previous page stays.
+- **`file:` is for file pages.** `llcache_handle_retrieve` refuses a `file:` URL whose
+  referrer is not `file:`: a web page's meta refresh, frame, image, stylesheet or link cannot
+  reach local files. A typed address has no referrer and still loads. Links follow
+  `NavigationRequested` as before.
+- **GET forms are asked about like links** (`form_submit` calls the frontend, which holds the
+  navigation while the user's own input is running and emits `NSH_EV_ASK`); the approved URL is
+  followed with the current document as its referrer. POST forms cannot be replayed from a URL
+  and are not asked about (an engine may ask only about what the user started; this one asks
+  about links and GET forms, and a page's script navigations do not exist: JavaScript is off).
+- **Launches and clipboard writes belong to a view.** NetSurf calls `launch_url` for any
+  scheme it cannot fetch, from a meta refresh too. The frontend attributes `launch_url` and
+  `clipboard.set` to the view whose input call (mouse, key, navigate) is running and drops
+  any raised outside one.
+- **Memory.** A closed window is kept as a tombstone until shutdown (the core's download
+  context keeps its window pointer), a downloads whose window is gone is refused, a file
+  input is accepted only from the root window's current content and checked again at the
+  answer, and a `target=_blank` window that the core opened is destroyed at the next pump
+  whether or not it reached `set_url` (a `mailto:` target never does).
+- **Cost.** Every plotter loop is intersected with the clip box before it iterates and uses
+  64-bit arithmetic; stroke width, glyph size (about 1250 px) and image area (64 Mpixel) are
+  capped. `tests/engine.rs` paints a page with a 200000-pixel radio button, a 2-million-pixel
+  dashed border and a huge image and asserts the paint takes under 2 seconds.
+
+Process-wide state, against "the executable owns process-wide setup": `netsurf_init` calls
+`signal(SIGPIPE, SIG_IGN)` (OpenSSL can raise it; Rust's start-up already ignores it, so it
+changes nothing in `sig`), the curl fetcher calls `curl_global_init` once (process-wide and
+not thread-safe, but nothing else in `sig` uses libcurl), and `setlocale` is patched out. They
+are NetSurf's and cannot be moved into `main` without patching; with `engine-netsurf` off none
+of them runs. The engine starts only when the first NetSurf page opens.
+
 ## Verdict
 
 **Feasible, and cheap to build, with one blocker that is the user's decision: the license.**

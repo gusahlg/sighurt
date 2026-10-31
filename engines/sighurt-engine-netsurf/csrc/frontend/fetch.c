@@ -3,6 +3,7 @@
  * GPL-2.0-only. */
 #include "internal.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "netsurf/fetch.h"
@@ -54,6 +55,18 @@ static const char *fetch_filetype(const char *path)
 		if (!strcmp(e, ".svg"))
 			return "image/svg+xml";
 		if (!strcmp(e, ".txt"))
+			return "text/plain";
+	}
+	/* No known extension: text if the first bytes look like it, else a download. */
+	FILE *f = fopen(path, "rb");
+	if (f) {
+		unsigned char buf[512];
+		size_t n = fread(buf, 1, sizeof buf, f);
+		fclose(f);
+		size_t odd = 0;
+		for (size_t i = 0; i < n; i++)
+			odd += buf[i] == 0 || (buf[i] < 9) || (buf[i] > 13 && buf[i] < 32);
+		if (n > 0 && odd == 0)
 			return "text/plain";
 	}
 	return "application/octet-stream";

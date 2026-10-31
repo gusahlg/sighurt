@@ -70,7 +70,13 @@ static FT_Face face_for(const plot_font_style_t *fs)
 	if (!f)
 		f = faces[0][0];
 	/* NetSurf's size is in points; its CSS lengths assume 90 dpi. */
-	FT_Set_Char_Size(f, 0, (FT_F26Dot6)(fs->size / 16), 90, 90);
+	/* Zoom and scale multiply the size; cap it so one glyph is a bounded bitmap (about 1250 px). */
+	long size = fs->size / 16;
+	if (size < 64)
+		size = 64;
+	if (size > 64000)
+		size = 64000;
+	FT_Set_Char_Size(f, 0, (FT_F26Dot6)size, 90, 90);
 	FT_Matrix m = {
 		0x10000,
 		(fs->flags & (FONTF_ITALIC | FONTF_OBLIQUE)) ? 0x3000 : 0,
@@ -179,21 +185,32 @@ nserror nsh_plot_text(const struct redraw_context *ctx, const plot_font_style_t 
 {
 	struct nsh_canvas *cv = ctx->priv;
 	FT_Face f = face_for(fs);
-	int pen = x << 6;
+	long long pen = (long long)x * 64;
+	/* A line wholly above or below the clip draws nothing; the glyphs of a long one stop at its right edge. */
+	long long ppem = (f->size->metrics.y_ppem > 0 ? f->size->metrics.y_ppem : 16);
+	if ((long long)y - 2 * ppem >= cv->clip.y1 || (long long)y + 2 * ppem <= cv->clip.y0)
+		return NSERROR_OK;
 	for (size_t i = 0; i < len;) {
+		if (((pen + 32) >> 6) - 2 * ppem >= cv->clip.x1)
+			break;
 		uint32_t cp = next_cp(s, len, &i);
+		if (((pen + 32) >> 6) + 2 * ppem < cv->clip.x0) {
+			if (!FT_Load_Char(f, cp, FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP))
+				pen += (int)(f->glyph->linearHoriAdvance >> 10);
+			continue;
+		}
 		if (FT_Load_Char(f, cp, FT_LOAD_RENDER | FT_LOAD_NO_HINTING))
 			continue;
 		FT_GlyphSlot g = f->glyph;
-		int gx = ((pen + 32) >> 6) + g->bitmap_left;
-		int gy = y - g->bitmap_top;
+		long long gx = ((pen + 32) >> 6) + g->bitmap_left;
+		long long gy = (long long)y - g->bitmap_top;
 		for (unsigned r = 0; r < g->bitmap.rows; r++) {
 			for (unsigned c = 0; c < g->bitmap.width; c++) {
 				int a = g->bitmap.buffer[r * g->bitmap.pitch + c];
 				if (!a)
 					continue;
-				int px = gx + (int)c;
-				int py = gy + (int)r;
+				long long px = gx + (long long)c;
+				long long py = gy + (long long)r;
 				if (px < cv->clip.x0 || px >= cv->clip.x1 || py < cv->clip.y0 || py >= cv->clip.y1)
 					continue;
 				uint32_t *d = &cv->px[(size_t)py * (size_t)cv->stride + (size_t)px];

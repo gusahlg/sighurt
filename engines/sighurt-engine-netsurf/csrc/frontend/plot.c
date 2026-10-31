@@ -69,36 +69,53 @@ static nserror p_clip(const struct redraw_context *ctx, const struct rect *r)
 	return NSERROR_OK;
 }
 
+/* Every loop below is limited to the clip box before it iterates, in 64-bit arithmetic: a page
+ * controls the sizes (a 2-million-pixel border, a 200000-pixel radio button), and the cost of a
+ * paint must depend on the clip, not on them. */
+static long long lmax(long long a, long long b)
+{
+	return a > b ? a : b;
+}
+
+static long long lmin(long long a, long long b)
+{
+	return a < b ? a : b;
+}
+
 static void hline(struct nsh_canvas *cv, int x0, int x1, int y, colour c, int w, plot_operation_type_t t)
 {
-	int step = w ? w : 1;
-	for (int x = x0; x < x1; x++) {
+	long long step = w ? w : 1;
+	long long xa = lmax(x0, cv->clip.x0), xb = lmin(x1, cv->clip.x1);
+	long long ka = lmax(0, (long long)cv->clip.y0 - y), kb = lmin(w, (long long)cv->clip.y1 - y);
+	for (long long x = xa; x < xb; x++) {
 		if (t == PLOT_OP_TYPE_DOT && ((x - x0) / step) % 2)
 			continue;
 		if (t == PLOT_OP_TYPE_DASH && ((x - x0) / (3 * step)) % 2)
 			continue;
-		for (int k = 0; k < w; k++)
-			put(cv, x, y + k, c, 255);
+		for (long long k = ka; k < kb; k++)
+			put(cv, (int)x, (int)(y + k), c, 255);
 	}
 }
 
 static void vline(struct nsh_canvas *cv, int x, int y0, int y1, colour c, int w, plot_operation_type_t t)
 {
-	int step = w ? w : 1;
-	for (int y = y0; y < y1; y++) {
+	long long step = w ? w : 1;
+	long long ya = lmax(y0, cv->clip.y0), yb = lmin(y1, cv->clip.y1);
+	long long ka = lmax(0, (long long)cv->clip.x0 - x), kb = lmin(w, (long long)cv->clip.x1 - x);
+	for (long long y = ya; y < yb; y++) {
 		if (t == PLOT_OP_TYPE_DOT && ((y - y0) / step) % 2)
 			continue;
 		if (t == PLOT_OP_TYPE_DASH && ((y - y0) / (3 * step)) % 2)
 			continue;
-		for (int k = 0; k < w; k++)
-			put(cv, x + k, y, c, 255);
+		for (long long k = ka; k < kb; k++)
+			put(cv, (int)(x + k), (int)y, c, 255);
 	}
 }
 
 static int stroke_width(const plot_style_t *s)
 {
 	int w = plot_style_fixed_to_int(s->stroke_width);
-	return w < 1 ? 1 : w;
+	return w < 1 ? 1 : (w > 4096 ? 4096 : w);
 }
 
 static nserror p_rect(const struct redraw_context *ctx, const plot_style_t *s, const struct rect *r)
@@ -129,22 +146,50 @@ static nserror p_line(const struct redraw_context *ctx, const plot_style_t *s, c
 		vline(cv, x0, y0 < y1 ? y0 : y1, (y0 < y1 ? y1 : y0) + 1, s->stroke_colour, w, s->stroke_type);
 		return NSERROR_OK;
 	}
-	int dx = abs(x1 - x0), dy = -abs(y1 - y0);
-	int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
-	int err = dx + dy;
+	/* Clip the segment to the clip box (grown by the stroke) with Liang-Barsky, in doubles, so
+	 * the walk below is as long as what is visible. */
+	double ax = x0, ay = y0, dx = (double)x1 - x0, dy = (double)y1 - y0;
+	double t0 = 0, t1 = 1;
+	double xmin = cv->clip.x0 - w, xmax = cv->clip.x1 + w, ymin = cv->clip.y0 - w, ymax = cv->clip.y1 + w;
+	double pq[4][2] = { { -dx, ax - xmin }, { dx, xmax - ax }, { -dy, ay - ymin }, { dy, ymax - ay } };
+	for (int i = 0; i < 4; i++) {
+		double pp = pq[i][0], q = pq[i][1];
+		if (pp == 0) {
+			if (q < 0)
+				return NSERROR_OK;
+			continue;
+		}
+		double r = q / pp;
+		if (pp < 0) {
+			if (r > t1)
+				return NSERROR_OK;
+			if (r > t0)
+				t0 = r;
+		} else {
+			if (r < t0)
+				return NSERROR_OK;
+			if (r < t1)
+				t1 = r;
+		}
+	}
+	long long cx0 = llround(ax + t0 * dx), cy0 = llround(ay + t0 * dy);
+	long long cx1 = llround(ax + t1 * dx), cy1 = llround(ay + t1 * dy);
+	long long ddx = llabs(cx1 - cx0), ddy = -llabs(cy1 - cy0);
+	long long sx = cx0 < cx1 ? 1 : -1, sy = cy0 < cy1 ? 1 : -1;
+	long long err = ddx + ddy;
 	for (;;) {
 		for (int k = 0; k < w; k++)
-			put(cv, x0, y0 + k, s->stroke_colour, 255);
-		if (x0 == x1 && y0 == y1)
+			put(cv, (int)cx0, (int)(cy0 + k), s->stroke_colour, 255);
+		if (cx0 == cx1 && cy0 == cy1)
 			break;
-		int e2 = 2 * err;
-		if (e2 >= dy) {
-			err += dy;
-			x0 += sx;
+		long long e2 = 2 * err;
+		if (e2 >= ddy) {
+			err += ddy;
+			cx0 += sx;
 		}
-		if (e2 <= dx) {
-			err += dx;
-			y0 += sy;
+		if (e2 <= ddx) {
+			err += ddx;
+			cy0 += sy;
 		}
 	}
 	return NSERROR_OK;
@@ -184,9 +229,11 @@ static nserror p_polygon(const struct redraw_context *ctx, const plot_style_t *s
 				xs[b - 1] = t;
 			}
 		}
-		for (unsigned a = 0; a + 1 < k; a += 2)
-			for (int x = xs[a]; x < xs[a + 1]; x++)
-				put(cv, x, y, s->fill_colour, 255);
+		for (unsigned a = 0; a + 1 < k; a += 2) {
+			long long xa = lmax(xs[a], cv->clip.x0), xb = lmin(xs[a + 1], cv->clip.x1);
+			for (long long x = xa; x < xb; x++)
+				put(cv, (int)x, y, s->fill_colour, 255);
+		}
 	}
 	free(xs);
 	return NSERROR_OK;
@@ -197,14 +244,17 @@ static nserror p_disc(const struct redraw_context *ctx, const plot_style_t *s, i
 	struct nsh_canvas *cv = cvof(ctx);
 	if (radius < 0)
 		return NSERROR_OK;
-	int sw = stroke_width(s);
-	for (int y = -radius; y <= radius; y++) {
-		for (int x = -radius; x <= radius; x++) {
-			int d = x * x + y * y;
-			if (has_op(s->fill_type) && d <= radius * radius)
-				put(cv, cx + x, cy + y, s->fill_colour, 255);
-			else if (has_op(s->stroke_type) && d <= radius * radius && d >= (radius - sw) * (radius - sw))
-				put(cv, cx + x, cy + y, s->stroke_colour, 255);
+	long long r = radius, sw = stroke_width(s);
+	long long inner = r - sw > 0 ? (r - sw) * (r - sw) : 0;
+	long long ya = lmax(-r, (long long)cv->clip.y0 - cy), yb = lmin(r, (long long)cv->clip.y1 - 1 - cy);
+	long long xa = lmax(-r, (long long)cv->clip.x0 - cx), xb = lmin(r, (long long)cv->clip.x1 - 1 - cx);
+	for (long long y = ya; y <= yb; y++) {
+		for (long long x = xa; x <= xb; x++) {
+			long long d = x * x + y * y;
+			if (has_op(s->fill_type) && d <= r * r)
+				put(cv, (int)(cx + x), (int)(cy + y), s->fill_colour, 255);
+			else if (has_op(s->stroke_type) && d <= r * r && d >= inner)
+				put(cv, (int)(cx + x), (int)(cy + y), s->stroke_colour, 255);
 		}
 	}
 	return NSERROR_OK;
@@ -218,7 +268,10 @@ static nserror p_arc(const struct redraw_context *ctx, const plot_style_t *s, in
 		a2 += 360;
 	for (int a = a1 * 4; a <= a2 * 4; a++) {
 		double t = a / 4.0 * M_PI / 180.0;
-		put(cv, cx + (int)lround(radius * cos(t)), cy - (int)lround(radius * sin(t)), s->stroke_colour, 255);
+		double px = cx + radius * cos(t), py = cy - radius * sin(t);
+		if (px < -1e9 || px > 1e9 || py < -1e9 || py > 1e9)
+			continue;
+		put(cv, (int)lround(px), (int)lround(py), s->stroke_colour, 255);
 	}
 	return NSERROR_OK;
 }
@@ -242,27 +295,25 @@ static nserror p_bitmap(const struct redraw_context *ctx, struct bitmap *b, int 
 	struct nsh_canvas *cv = cvof(ctx);
 	if (!b || !b->px || w <= 0 || h <= 0)
 		return NSERROR_OK;
-	int x0 = x, x1 = x + w, y0 = y, y1 = y + h;
+	long long x0 = x, x1 = (long long)x + w, y0 = y, y1 = (long long)y + h;
 	if (flags & BITMAPF_REPEAT_X) {
-		x0 = cv->clip.x0 - ((cv->clip.x0 - x) % w + w) % w;
+		x0 = cv->clip.x0 - (((long long)cv->clip.x0 - x) % w + w) % w;
 		x1 = cv->clip.x1;
 	}
 	if (flags & BITMAPF_REPEAT_Y) {
-		y0 = cv->clip.y0 - ((cv->clip.y0 - y) % h + h) % h;
+		y0 = cv->clip.y0 - (((long long)cv->clip.y0 - y) % h + h) % h;
 		y1 = cv->clip.y1;
 	}
-	for (int ty = y0; ty < y1; ty += h) {
-		for (int tx = x0; tx < x1; tx += w) {
-			int ya = ty < cv->clip.y0 ? cv->clip.y0 : ty;
-			int yb = ty + h > cv->clip.y1 ? cv->clip.y1 : ty + h;
-			int xa = tx < cv->clip.x0 ? cv->clip.x0 : tx;
-			int xb = tx + w > cv->clip.x1 ? cv->clip.x1 : tx + w;
-			for (int py = ya; py < yb; py++) {
-				int sy = (int)((int64_t)(py - ty) * b->h / h);
+	for (long long ty = y0; ty < y1; ty += h) {
+		for (long long tx = x0; tx < x1; tx += w) {
+			long long ya = lmax(ty, cv->clip.y0), yb = lmin(ty + h, cv->clip.y1);
+			long long xa = lmax(tx, cv->clip.x0), xb = lmin(tx + w, cv->clip.x1);
+			for (long long py = ya; py < yb; py++) {
+				int sy = (int)((py - ty) * b->h / h);
 				if (sy < 0 || sy >= b->h)
 					continue;
-				for (int px = xa; px < xb; px++) {
-					int sx = (int)((int64_t)(px - tx) * b->w / w);
+				for (long long px = xa; px < xb; px++) {
+					int sx = (int)((px - tx) * b->w / w);
 					if (sx < 0 || sx >= b->w)
 						continue;
 					const uint8_t *src = &b->px[((size_t)sy * (size_t)b->w + (size_t)sx) * 4];

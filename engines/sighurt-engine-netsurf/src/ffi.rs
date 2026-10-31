@@ -209,6 +209,8 @@ mod raw {
         pub fn nsh_view_open(view_id: u64, w: c_int, h: c_int, scale_120: c_int) -> *mut View;
         pub fn nsh_view_close(view: *mut View);
         pub fn nsh_view_navigate(view: *mut View, url: *const c_char) -> c_int;
+        pub fn nsh_view_follow(view: *mut View, url: *const c_char) -> c_int;
+        pub fn nsh_events_overflowed() -> c_int;
         pub fn nsh_view_reload(view: *mut View);
         pub fn nsh_view_stop(view: *mut View);
         pub fn nsh_view_back(view: *mut View);
@@ -276,6 +278,8 @@ mod raw {
     pub const EV_OPEN: u32 = 13;
     pub const EV_FILE: u32 = 14;
     pub const EV_CONSOLE: u32 = 15;
+    pub const EV_FAILED: u32 = 16;
+    pub const EV_ASK: u32 = 17;
 
     pub const MOUSE_HOVER: c_uint = 0;
     pub const MOUSE_PRESS_1: c_uint = 1 << 0;
@@ -353,6 +357,15 @@ impl Handle {
         };
         // SAFETY: live handle, a NUL-terminated string for the call.
         unsafe { raw::nsh_view_navigate(self.0.as_ptr(), url.as_ptr()) != 0 }
+    }
+
+    /// Navigates to `url` as the page's own navigation (the current document is the referrer).
+    pub fn follow(&self, url: &str) -> bool {
+        let Ok(url) = CString::new(url) else {
+            return false;
+        };
+        // SAFETY: live handle, a NUL-terminated string for the call.
+        unsafe { raw::nsh_view_follow(self.0.as_ptr(), url.as_ptr()) != 0 }
     }
 
     /// Reloads.
@@ -516,6 +529,18 @@ pub fn next_event() -> Option<OwnedEvent> {
         u0: event.u0,
         text: event_text(event.text, event.text_len),
     })
+}
+
+/// Whether the core's event queue overflowed (65536 waiting) and lost events.
+pub fn events_overflowed() -> bool {
+    // SAFETY: reads a flag.
+    unsafe { raw::nsh_events_overflowed() != 0 }
+}
+
+/// Releases a download (aborts it if it runs, frees what it holds).
+pub fn release_download(id: u64) {
+    // SAFETY: the C side ignores an id it does not know.
+    unsafe { raw::nsh_download_answer(id, 0) }
 }
 
 /// Replaces the clipboard text `NS_KEY_PASTE` reads.

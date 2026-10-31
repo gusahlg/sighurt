@@ -27,6 +27,7 @@ static struct gui_download_window *downloads;
 static uint64_t next_id = 1;
 
 static void snprintf_copy(char *dst, size_t dst_len, const char *src);
+static void free_dl(struct gui_download_window *d);
 
 static void copy_str(char **dst, const char *src)
 {
@@ -54,12 +55,16 @@ static void release_ctx(struct gui_download_window *d, int abort_fetch)
 
 static struct gui_download_window *dl_create(download_context *ctx, struct gui_window *parent)
 {
+	/* The core keeps the window it was given when the download began: a closed one is a
+	 * tombstone (never freed before shutdown), and its download is refused. */
+	if (!parent || parent->dead || parent->pending)
+		return NULL;
 	struct gui_download_window *d = calloc(1, sizeof *d);
 	if (!d)
 		return NULL;
 	d->id = next_id++;
 	d->ctx = ctx;
-	d->view_id = parent ? parent->view_id : 0;
+	d->view_id = parent->view_id;
 	copy_str(&d->url, nsurl_access(download_context_get_url(ctx)));
 	copy_str(&d->name, download_context_get_filename(ctx));
 	copy_str(&d->mime, download_context_get_mime_type(ctx));
@@ -75,6 +80,9 @@ static nserror dl_data(struct gui_download_window *d, const char *data, unsigned
 		return NSERROR_INVALID;
 	if ((size_t)size > DL_CAP || d->len + (size_t)size > DL_CAP) {
 		d->state = 2;
+		free(d->data);
+		d->data = NULL;
+		d->len = 0;
 		nsh_emit(NSH_EV_DOWNLOAD, d->view_id, 2, 0, 0, 0, d->id, d->url);
 		release_ctx(d, 1);
 		return NSERROR_NOSPACE;
@@ -94,6 +102,9 @@ static void dl_error(struct gui_download_window *d, const char *msg)
 	if (!d || d->state == 3)
 		return;
 	d->state = 2;
+	free(d->data);
+	d->data = NULL;
+	d->len = 0;
 	nsh_emit(NSH_EV_DOWNLOAD, d->view_id, 2, 0, 0, 0, d->id, d->url);
 	release_ctx(d, 0);
 }
@@ -122,17 +133,18 @@ static struct gui_download_window *find_dl(uint64_t id)
 	return NULL;
 }
 
+/* Releases the download: aborts it if it still runs, frees what it holds and unlinks it. The
+ * core is told nothing more after an abort, so nothing calls the freed window. */
 void nsh_download_answer(uint64_t id, int accept)
 {
-	struct gui_download_window *d = find_dl(id);
-	if (!d)
-		return;
-	if (!accept) {
-		d->state = 3;
-		release_ctx(d, 1);
-		free(d->data);
-		d->data = NULL;
-		d->len = 0;
+	(void)accept;
+	for (struct gui_download_window **pp = &downloads; *pp; pp = &(*pp)->next) {
+		if ((*pp)->id == id) {
+			struct gui_download_window *d = *pp;
+			*pp = d->next;
+			free_dl(d);
+			return;
+		}
 	}
 }
 

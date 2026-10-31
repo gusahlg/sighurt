@@ -4,6 +4,7 @@
  * GPL-2.0-only. */
 #include "internal.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,6 +12,9 @@
 #include "netsurf/console.h"
 
 static struct gui_window *windows;
+/* Closed windows. The core can still hold a pointer to a gui_window after it destroyed it (a
+ * download context keeps its parent), so the struct is never freed before shutdown. */
+static struct gui_window *graveyard;
 struct nsh_opening nsh_opening;
 
 struct gui_window *nsh_windows(void)
@@ -85,13 +89,17 @@ static struct gui_window *gw_create(struct browser_window *bw, struct gui_window
 		g->w = nsh_opening.w > 0 ? nsh_opening.w : 1;
 		g->h = nsh_opening.h > 0 ? nsh_opening.h : 1;
 		g->scale_120 = nsh_opening.scale_120 > 0 ? nsh_opening.scale_120 : 120;
-	} else if (existing) {
+	} else {
+		/* The core opened it (target=_blank, window.open): it stays pending until its first
+		 * set_url, and is destroyed when the core call that made it has returned. */
 		g->pending = true;
-		g->opener = existing->view_id;
-		g->w = existing->w;
-		g->h = existing->h;
-		g->scale_120 = existing->scale_120;
-		g->zoom = existing->zoom;
+		if (existing) {
+			g->opener = existing->view_id;
+			g->w = existing->w;
+			g->h = existing->h;
+			g->scale_120 = existing->scale_120;
+			g->zoom = existing->zoom;
+		}
 	}
 	g->next = windows;
 	windows = g;
@@ -110,7 +118,21 @@ static void gw_destroy(struct gui_window *g)
 			break;
 		}
 	}
-	free(g);
+	g->dead = true;
+	g->bw = NULL;
+	g->gadget = NULL;
+	g->gadget_content = NULL;
+	g->next = graveyard;
+	graveyard = g;
+}
+
+void nsh_windows_free_tombstones(void)
+{
+	while (graveyard) {
+		struct gui_window *g = graveyard;
+		graveyard = g->next;
+		free(g);
+	}
 }
 
 static nserror gw_invalidate(struct gui_window *g, const struct rect *rect)
@@ -286,7 +308,13 @@ static void gw_file_open(struct gui_window *g, struct hlcache_handle *hl, struct
 	(void)hl;
 	if (quiet(g))
 		return;
+	/* The gadget belongs to the content that raised it, which dies with its document. Only the
+	 * root's current content is accepted, and it is checked again at the answer. */
+	struct hlcache_handle *root = g->bw ? browser_window_get_content(g->bw) : NULL;
+	if (!root || hl != root)
+		return;
 	g->gadget = gadget;
+	g->gadget_content = root;
 	nsh_emit(NSH_EV_FILE, g->view_id, 0, 0, 0, 0, 0, NULL);
 }
 
@@ -328,10 +356,11 @@ void nsh_reap_doomed(void)
 	struct gui_window *g = windows;
 	while (g) {
 		struct gui_window *next = g->next;
-		if (g->doomed && g->bw) {
+		if ((g->doomed || g->pending) && g->bw) {
 			struct browser_window *bw = g->bw;
 			g->bw = NULL;
 			g->doomed = false;
+			g->pending = false;
 			browser_window_destroy(bw);
 		}
 		g = next;
@@ -474,7 +503,39 @@ void nsh_file_answer(uint64_t view_id, const char *path)
 	if (!g || !g->gadget)
 		return;
 	struct form_control *gadget = g->gadget;
+	void *content = g->gadget_content;
 	g->gadget = NULL;
-	if (path && path[0] && g->bw)
+	g->gadget_content = NULL;
+	if (path && path[0] && g->bw && content && content == browser_window_get_content(g->bw))
 		browser_window_set_gadget_filename(g->bw, gadget, path);
+}
+
+/* Called from the patched browser_window__handle_error (build.rs): a load of a root window
+ * failed. The core shows no error page; the browser decides what to show. Frames are ignored. */
+void nsh_load_failed(struct browser_window *bw, int code, const char *message, const char *url)
+{
+	for (struct gui_window *g = windows; g; g = g->next) {
+		if (g->bw != bw || quiet(g))
+			continue;
+		char text[4096];
+		snprintf(text, sizeof text, "%s\n%s", url ? url : "", message ? message : "");
+		nsh_emit(NSH_EV_FAILED, g->view_id, code, 0, 0, 0, 0, text);
+		return;
+	}
+}
+
+/* Called from the patched form_submit (build.rs) for a GET form: if the user's own input (a
+ * click on a submit button, Enter in a field) is running for a root window, the navigation is
+ * handed to the browser to ask about; 1 means held. 0 means go ahead. */
+int nsh_form_get(struct browser_window *bw, const char *url)
+{
+	if (!nsh_input_view || !url)
+		return 0;
+	for (struct gui_window *g = windows; g; g = g->next) {
+		if (g->bw == bw && g->view_id == nsh_input_view && !quiet(g)) {
+			nsh_emit(NSH_EV_ASK, g->view_id, 0, 0, 0, 0, 0, url);
+			return 1;
+		}
+	}
+	return 0;
 }

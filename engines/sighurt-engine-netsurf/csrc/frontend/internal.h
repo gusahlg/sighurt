@@ -28,6 +28,8 @@ struct gui_window {
 	bool has_dirty;
 	struct rect dirty_r;
 	bool pending; /* spawned for target=_blank; decided at the first set_url */
+	bool dead; /* closed: the struct stays (a tombstone) until shutdown, so a stale pointer reads safely */
+	void *gadget_content; /* the content that raised `gadget` */
 	bool doomed; /* destroy on the next poll, not inside the callback */
 	bool hidden;
 	int pointer;
@@ -101,7 +103,11 @@ void nsh_drop_events(uint64_t view_id);
 void nsh_clear_events(void);
 void nsh_reap_doomed(void);
 
+/* The view a user-input call into the core is running for, or 0. Launches and clipboard writes
+ * are attributed to it, and dropped when the core raised them on its own (a timer, a fetch). */
+extern uint64_t nsh_input_view;
 void nsh_downloads_drop_view(uint64_t view_id);
+void nsh_windows_free_tombstones(void);
 void nsh_clipboard_clear(void);
 
 #endif
