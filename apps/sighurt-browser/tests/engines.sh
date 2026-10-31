@@ -451,7 +451,9 @@ servo)
   one=$(( $(scrolled) - top ))
   key -M alt k -m alt
   sleep 1
-  printf '[input]\nscroll-speed = 3\n' >> "$out/config/sighurt/config.toml"
+  # The base configuration already has an [input] table (keymap = "bindings"); a second one
+  # would make the file invalid, so the setting goes into it.
+  sed -i 's/^\[input\]$/[input]\nscroll-speed = 3/' "$out/config/sighurt/config.toml"
   sleep 0.5
   top=$(scrolled)
   wlrctl pointer scroll 15 0

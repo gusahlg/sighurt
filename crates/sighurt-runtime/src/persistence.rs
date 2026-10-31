@@ -1,9 +1,10 @@
 //! Files: reading and watching the configuration (`{config_dir}/sighurt/config.toml`), and
 //! loading and saving the session (`{state_dir}/sighurt/session.toml`).
 //!
-//! Sighurt's own directories (`{data_dir}/sighurt`, the `wpe` and `servo` profiles under it,
-//! and `{state_dir}/sighurt`) are mode 0700. An existing directory that is wider is tightened
-//! to 0700; shared XDG parents are not changed. Files this module writes, including
+//! Sighurt's own directories (`{data_dir}/sighurt`, the engines' profiles under it, and
+//! `{state_dir}/sighurt`) are mode 0700. An existing directory that is wider is tightened to
+//! 0700; a profile is created only by an engine that keeps one; shared XDG parents are not
+//! changed. Files this module writes, including
 //! `session.toml`, are mode 0600.
 //!
 //! The core parses and validates the configuration, against what the build has (its engines,
@@ -59,16 +60,20 @@ impl Paths {
     }
 }
 
-/// `{data_dir}/sighurt`, the engine profiles under it, and `{state_dir}/sighurt`, each mode
-/// 0700. Shared XDG parents are created if they are missing and are not chmodded.
+/// `{data_dir}/sighurt` and `{state_dir}/sighurt`, each mode 0700, and the engine profiles under
+/// the first that already exist. A profile is made (0700) by its engine's configuration when the
+/// engine keeps one (`registry`'s `secure_profile`), so an ephemeral engine leaves no directory.
+/// Shared XDG parents are created if they are missing and are not chmodded.
 fn secure_owned_directories() {
     if let Some(data) = dirs::data_dir() {
         let root = data.join("sighurt");
         secure_quietly(&root);
-        secure_quietly(&root.join("wpe"));
-        secure_quietly(&root.join("ladybird"));
-        secure_quietly(&root.join("cef"));
-        secure_quietly(&root.join("servo"));
+        for engine in ["wpe", "ladybird", "cef", "servo"] {
+            let profile = root.join(engine);
+            if profile.is_dir() {
+                secure_quietly(&profile);
+            }
+        }
     }
     if let Some(state) = dirs::state_dir() {
         secure_quietly(&state.join("sighurt"));
