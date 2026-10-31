@@ -1,8 +1,9 @@
 # CEF (Chromium) for Sighurt: feasibility, design and smoke test
 
-Status: research and a smoke prototype only. No crate exists yet. This file is the brief for
-`sighurt-engine-cef`, a Chromium engine compiled into `sig` behind the feature `engine-cef`, added
-the way Servo and WPE WebKit are (docs/rewrite/WPE.md is the model for everything below).
+Status: **implemented** (sections 1 to 7 are the study and design the engine followed; section 8
+says what was built, what changed against the design, and the measurements). `sighurt-engine-cef`
+is a Chromium engine compiled into `sig` behind the feature `engine-cef` (in no default feature
+set), added the way Servo and WPE WebKit are (docs/rewrite/WPE.md is the model).
 
 **Verdict: go, with CEF 150.0.22 and `multi_threaded_message_loop`.** The smoke test
 (`experiments/cef-smoke`) loaded https://example.com/ windowless through the C API, with
@@ -237,7 +238,7 @@ plus the first `get_view_rect` answer). Everything below is queued from CEF's UI
 | `NavigationRequested` / `AnswerNavigation` | `cef_request_handler_t::on_before_browse` (has `user_gesture`, `is_redirect`, transition type): for a user-clicked link (`TT_LINK`, gesture) return 1 (cancel) and queue `NavigationRequested`; on an "ours" answer `load_url` again with a one-shot allow flag (the held-navigation model of the contract becomes cancel-and-replay, since CEF has no "hold"). Limit 16 per view; the page cannot tell. Replay loses a POST body (only GET, as WPE) |
 | Frames: `OnPaint` | `PET_VIEW` full-frame BGRA (premultiplied) with dirty rects. See 4.4 |
 | Input: pointer, wheel, keys | `cef_browser_host_t::send_mouse_move/click/wheel_event`, `send_key_event` (`cef_key_event_t`: `windows_key_code` (VKEY from the evdev code via a table), `native_key_code` = evdev+8, `character`, `unmodified_character`, `modifiers`, type `KEYEVENT_RAWKEYDOWN`/`KEYEVENT_CHAR`/`KEYEVENT_KEYUP`; a char event for each `text`). AltGr is never Ctrl+Alt (contract); modifiers from the host. `SetFocus(false)` -> `set_focus(0)` plus key-ups for held keys |
-| IME / text input | `cef_browser_host_t::ime_set_composition`, `ime_commit_text`, `ime_finish_composing_text`, `ime_cancel_composition`; page state out: `on_ime_composition_range_changed`, `on_text_selection_changed`, `on_virtual_keyboard_requested` (`input_mode`: gives `TextInputState` kind; password fields come as `TEXT_INPUT_MODE_...` only through `on_virtual_keyboard_requested`/`FocusedNodeChanged` in the renderer, which needs a render-process handler (DOM node `is_editable`, type=password): step 9 adds that to the helper, or the password hint stays unset and **must fail closed** by never sending surrounding text) |
+| IME / text input | Built as: the helper's render-process handler reports the focused DOM node (`sig.focus` process message: editable, form-control type, bounds), which becomes `TextInputChanged` with the password purpose and no surrounding text; `on_virtual_keyboard_requested` proved unreliable and is not used. Input-method text: `ime_set_composition` while composing, `ime_commit_text` only inside a composition, characters as `KEYEVENT_CHAR` otherwise (a bare `ime_commit_text` does nothing) |
 | Zoom | `set_zoom_level` (log scale, `log(factor)/log(1.2)`) |
 | Visibility | `was_hidden(1/0)` (stops painting; background tab = hidden, empty metrics = `was_resized` is not called, last size kept) |
 | Metrics / scale change | `was_resized`, `notify_screen_info_changed`; an empty rectangle keeps the last size (never `get_view_rect` of 0x0: CEF asserts) |
@@ -351,7 +352,7 @@ path) under headless sway with the NVIDIA driver; software fallback is swiftshad
 | Memory | about 560 MB PSS for one page (10 processes) against WPE's ~170 MB prefix + pages: the heaviest engine; the user's machine has about 3 GB spare while other jobs run, so open-on-demand only (`[routing.cef]`, `page.open-in cef`) |
 | Disk | 2.8 GB per version on HDD; cold start 4.4 s from HDD vs 0.75 s warm: put `dist/libcef.so` where page cache keeps it or accept a first-use delay |
 
-## 5. The crate (to be written)
+## 5. The crate (as designed; the built modules are in section 8)
 
 `engines/sighurt-engine-cef/`, features `engine-cef` on `sighurt-browser`, `sighurt-runtime`,
 `sighurt-gui` (not in the `default` list until step 14, because the prefix is 2.8 GB, so
@@ -467,3 +468,97 @@ build and its acceptance test; log decisions in STATUS.md.
     directories, update procedure for the pin.
 14. **Documentation**: README engines table, STATUS decisions, SECURITY, DOCS; decide whether
     `engine-cef` joins `default`.
+
+## 8. As built
+
+**Where**: `engines/sighurt-engine-cef` (crate; AGPL-3.0-or-later; README with the CEF and Chromium
+BSD notices), `engines/sighurt-engine-cef/helper/` (`sig-cef-helper`, built into `dist/` by
+`nix/build-cef.sh`), registration in `sighurt-runtime` (descriptor `cef`, `cef_config`, registry
+variant), `sighurt-gui` (Wayland SHM targets), `sighurt-tui` (its CPU target) and the feature
+`engine-cef` on `sighurt-browser`, `-runtime`, `-gui`, `-tui` (in no default set; build with
+`--no-default-features --features engine-cef,engine-demo`). `sig`'s `main`, the core and the
+runtime have no CEF code beyond that registration.
+
+| Module | Owns |
+|---|---|
+| `capi` | the C API's layouts (generated by `tools/gen_capi.py`; every vtable's size is asserted against gcc's, and the ones used were re-checked with gcc here) |
+| `ffi` | `dlopen` of `libcef.so` (API hash checked), strings, reference-counted objects (`new_object`, `Ref`), the `call!` macro |
+| `handlers` | the per-view client and its handlers; every callback only updates shared state, queues events and wakes the owner |
+| `shared` | the event queue (replaceable events coalesced, bounded drains), the view's geometry, staged frame, browser slot |
+| `nav` | navigation state as the contract's events (pure, 9 unit tests): ids, documents, history effects, held navigations (at most 16) |
+| `actions` | what the owner asks of a live browser |
+| `keys` | VK codes (the layout's letter first), modifier flags, cursors |
+| `runtime` | `CefRuntime<T: CpuTarget>`: start (once per process), views, input translation, present, shutdown |
+
+**Changes against the design.**
+- **Strings and ownership.** CEF's C API passes every reference-counted callback argument as an
+  *owned* reference, and adopts the reference of every object we pass in (`cef_initialize`'s app,
+  `create_browser`'s client, a visitor): the code releases the former and never the latter.
+- **No initial address.** `create_browser` gets an empty URL; an `about:blank` first load raced
+  the browser's first `Navigate` and took its id. `Nav` also drops a blank commit nobody asked for.
+- **Text input** comes from the helper (above), not from `on_virtual_keyboard_requested`, which
+  fired only sometimes. The helper is now more than `cef_execute_process`: it carries the
+  render-process handler (about 90 lines of C).
+- **Paste** types the text as characters (`ime_commit_text` alone does nothing); Ctrl+C/X/V are
+  recognised by the layout's letter (`Key::Character`), since synthesized keyboards (wtype) send
+  one physical code for every key.
+- **Downloads** need a `can_download` slot or CEF never calls `OnBeforeDownload`.
+- **The CEF distribution is not shared with other users of the prefix**: nothing of sig's own
+  state is read or written by CEF: its root cache is `{data_dir}/sighurt/cef` or, ephemeral, the
+  engine's scratch directory.
+- **`--dump` and text mode** refuse the engine (no `semantics`, as designed); the graphical TUI
+  needs a display: in a session without one the tab says "the cef engine needs a display (Wayland
+  or X11) and this session has none" and nothing crashes (checked with `sig --tui` in tmux).
+- **Zygotes outlive `cef_shutdown`** until the process exits; the helper's other processes end
+  with it. `offscreen.sh` checks that nothing remains after the test process exits.
+- The clipboard is not handled by a CEF hook (there is none): the engine takes the chords
+  before the page sees them and asks the services; Chromium cannot read or write the desktop
+  clipboard in windowless mode anyway (no focused surface), so a page's own `navigator.clipboard`
+  and `copy` events reach only Chromium's internal clipboard.
+
+**Support, as built.** Navigation, history (traverse by delta), reload, stop, held user-clicked
+links (`NavigationRequested`, cancel-and-replay with a one-shot allow), popups and middle clicks
+as `OpenRequested`, `window.close()` as `CloseRequested`, zoom, resize and scale (the buffer is
+what CEF paints; a mismatch with the host's rounding is padded with opaque white), hidden views,
+pointer, wheel, keys with text, focus (held keys released on loss), the cursor, title and status,
+crashes as `ViewFailed` (reload recovers), downloads as `Service::Download`, clipboard as above.
+Refused: JS dialogs (suppressed), permission prompts and media access (denied), file choosers
+(cancelled), context menus (emptied), HTTP authentication and certificate errors (cancelled),
+`javascript:` addresses from the browser. Not supported: `<select>` popups (`PET_POPUP` is
+ignored), drag and drop, find in page, accessibility, semantics, DMA-BUF frames, site data.
+
+**Tests.**
+- `cargo test -p sighurt-engine-cef`: 17 unit tests (navigation, keys, queue, staging).
+- `engines/sighurt-engine-cef/tests/offscreen.sh` (Chromium into an in-memory `CpuTarget`, in a
+  private headless sway, 1 test, about 6 s warm): page pixels (ARGB, top-down, stride padding),
+  started/committed order with a Push, a held link answered, traversal (Traverse; beyond the list
+  Cancelled), the text-input state of a focused field, typing, Ctrl+V through the service, an
+  input-method commit, an `OpenRequested` popup, an attachment as a download request, a resize,
+  idle wakeups (0 in 3 s), `ViewClosed`, and no helper process after `shutdown`.
+- `apps/sighurt-browser/tests/cef.sh` (`sig` with the cef and demo engines, private sway and
+  D-Bus, every XDG directory under OUT): `page.open-in cef https://example.com/` opens in
+  Chromium, the tab is labelled `cef` and shows it (screenshot looked at), a local input page takes
+  typed letters while the keymap's bound plain letter (`h` = `tab.new`) does not fire, Ctrl+V pastes
+  and Ctrl+C copies through the Wayland clipboard, an attachment is saved whole by the download
+  service, `sig` exits with no Chromium process left. 11 checks pass.
+
+**Measured** (desktop RTX 3070, headless sway with pixman, 31 October 2026, debug build of `sig`,
+example.com then a local input page):
+
+| | |
+|---|---|
+| Runtime start (`CefRuntime::new`) | 60-150 ms warm; 4.5-8 s on the first start after a long idle (a cold read of the 1.4 GB `libcef.so` from the HDD) |
+| Process tree | 11 processes, 1.28-1.34 GiB resident |
+| Idle CPU (tree, 10 s) | 0.3-0.7 % of one core |
+| `sig`'s idle wakeups | 1-2 in 10 s (the diagnostics' own); the engine's waker 0 in 3 s |
+| Copies per frame | 2 (CEF's buffer into staging: dirty rectangles only after the first frame; staging into the lease: whole frame); `sig --diag` reports the staged bytes as the engine's readbacks |
+
+**Open problems.**
+1. DMA-BUF (`OnAcceleratedPaint`) still not working (4.4): two CPU copies per frame.
+2. Chromium's `navigator.clipboard`/`copy` events never reach the desktop clipboard.
+3. A password field is reported with the password purpose and no surrounding text, but the
+   composition text a real input method shows is not hidden by anything here.
+4. `<select>` popups, drag and drop, find, accessibility, semantics, site data.
+5. Newer CEF branches (152 and up) do not start here (exit code 28), so the pin stays at 150.
+6. 1.3 GiB for one page; the engine is opt-in for that reason.
+7. Run on louise-pc: not done (the prefix is only on this machine's HDD).
