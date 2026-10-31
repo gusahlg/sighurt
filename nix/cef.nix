@@ -31,4 +31,11 @@ in
     nativeBuildInputs = with pkgs; [ patchelf pkg-config gcc ];
     buildInputs = libs;
   };
+  # shell.nix merges this only when dist/libcef.so exists. Not LD_LIBRARY_PATH:
+  # libcef is dlopened by its absolute path and finds its libraries through the
+  # rpath patched into the copy in dist/. PKG_CONFIG_PATH stays untouched so
+  # Servo's build scripts are not rerun.
+  env = {
+    SIGHURT_CEF_PREFIX = prefix;
+  };
 }

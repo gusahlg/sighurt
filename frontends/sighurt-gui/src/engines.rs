@@ -3,8 +3,8 @@
 //! The runtime lists each engine's name, capabilities and settings. This module supplies what
 //! is the Wayland frontend's: how to start the runtime on the host's target lease and frame
 //! permit, the present mode its targets are created with, and the renderer label. Shutdown
-//! order is the runtime's descriptor order (Servo, then Wasm, then WPE, then Ladybird, then the demo,
-//! then NetSurf).
+//! order is the runtime's descriptor order (Servo, then Wasm, then WPE, then Ladybird, then CEF,
+//! then the demo, then NetSurf).
 //!
 //! Must not own: when a runtime starts (the registry, on first use, except Servo at launch) or
 //! what it is asked to do.
@@ -60,6 +60,15 @@ pub fn build() -> (
             },
             mode: PresentMode::Shm,
         },
+        #[cfg(feature = "engine-cef")]
+        WaylandEngine {
+            binding: Binding {
+                name: "cef",
+                renderer: "Chromium (CEF): windowless frames, cpu, wl_shm",
+                start: cef,
+            },
+            mode: PresentMode::Shm,
+        },
         #[cfg(feature = "engine-demo")]
         WaylandEngine {
             binding: Binding {
@@ -94,6 +103,7 @@ pub fn build() -> (
     feature = "engine-wasm",
     feature = "engine-wpe",
     feature = "engine-ladybird",
+    feature = "engine-cef",
     feature = "engine-demo",
     feature = "engine-netsurf"
 ))]
@@ -104,6 +114,7 @@ struct Bound<R>(R);
     feature = "engine-wasm",
     feature = "engine-wpe",
     feature = "engine-ladybird",
+    feature = "engine-cef",
     feature = "engine-demo",
     feature = "engine-netsurf"
 ))]
@@ -287,6 +298,33 @@ fn ladybird(
 impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
     for Bound<sighurt_engine_ladybird::LadybirdRuntime<TargetLease>>
 {
+}
+
+#[cfg(feature = "engine-cef")]
+fn cef(
+    waker: sighurt_api::engine::EngineWaker,
+    launch: sighurt_runtime::registry::Launch<'_>,
+) -> Result<sighurt_runtime::registry::Runtime<TargetLease, FramePermit>, String> {
+    use sighurt_engine_cef::CefRuntime;
+    use sighurt_runtime::registry::{self, Runtime};
+
+    CefRuntime::<TargetLease>::new(registry::cef_config(launch)?, waker)
+        .map(|runtime| Runtime::Cef(Box::new(Bound(runtime))))
+}
+
+#[cfg(feature = "engine-cef")]
+impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
+    for Bound<sighurt_engine_cef::CefRuntime<TargetLease>>
+{
+    /// Chromium paints on its own GPU process; what reaches the host is its BGRA frame, copied
+    /// twice (CEF's buffer into staging, staging into the lease).
+    fn renderer(&self) -> Option<(&'static str, Option<String>)> {
+        Some(("cpu", Some("Chromium (CEF), OnPaint frames".into())))
+    }
+
+    fn readbacks(&self) -> u64 {
+        self.0.diagnostics().staged_bytes
+    }
 }
 
 #[cfg(feature = "engine-demo")]

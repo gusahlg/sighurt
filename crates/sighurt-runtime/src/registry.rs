@@ -94,6 +94,8 @@ pub enum Runtime<T: 'static, P: 'static> {
     Wpe(Box<dyn Running<T, P>>),
     #[cfg(feature = "engine-ladybird")]
     Ladybird(Box<dyn Running<T, P>>),
+    #[cfg(feature = "engine-cef")]
+    Cef(Box<dyn Running<T, P>>),
     #[cfg(feature = "engine-demo")]
     Demo(Box<dyn Running<T, P>>),
     /// NetSurf (GPL-2.0-only; never a default feature).
@@ -106,6 +108,7 @@ pub enum Runtime<T: 'static, P: 'static> {
         feature = "engine-wasm",
         feature = "engine-wpe",
         feature = "engine-ladybird",
+        feature = "engine-cef",
         feature = "engine-demo",
         feature = "engine-netsurf"
     )))]
@@ -124,6 +127,8 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
             Self::Wpe(engine) => engine.as_ref(),
             #[cfg(feature = "engine-ladybird")]
             Self::Ladybird(engine) => engine.as_ref(),
+            #[cfg(feature = "engine-cef")]
+            Self::Cef(engine) => engine.as_ref(),
             #[cfg(feature = "engine-demo")]
             Self::Demo(engine) => engine.as_ref(),
             #[cfg(feature = "engine-netsurf")]
@@ -133,6 +138,7 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
                 feature = "engine-wasm",
                 feature = "engine-wpe",
                 feature = "engine-ladybird",
+                feature = "engine-cef",
                 feature = "engine-demo",
                 feature = "engine-netsurf"
             )))]
@@ -150,6 +156,8 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
             Self::Wpe(engine) => engine.as_mut(),
             #[cfg(feature = "engine-ladybird")]
             Self::Ladybird(engine) => engine.as_mut(),
+            #[cfg(feature = "engine-cef")]
+            Self::Cef(engine) => engine.as_mut(),
             #[cfg(feature = "engine-demo")]
             Self::Demo(engine) => engine.as_mut(),
             #[cfg(feature = "engine-netsurf")]
@@ -159,6 +167,7 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
                 feature = "engine-wasm",
                 feature = "engine-wpe",
                 feature = "engine-ladybird",
+                feature = "engine-cef",
                 feature = "engine-demo",
                 feature = "engine-netsurf"
             )))]
@@ -203,7 +212,10 @@ pub const KEYMAPS: &[KeymapKind] = &[sighurt_config_example::KIND];
 
 /// What a runtime is started with.
 // Only the Wasm engine needs a scratch directory, and the demo engine reads nothing.
-#[cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "engine-wasm", feature = "engine-cef")),
+    allow(dead_code)
+)]
 pub struct Launch<'a> {
     /// `[engines.<name>]` of the configuration the process started with.
     pub settings: &'a EngineSettings,
@@ -211,7 +223,10 @@ pub struct Launch<'a> {
     name: &'static str,
 }
 
-#[cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "engine-wasm", feature = "engine-cef")),
+    allow(dead_code)
+)]
 impl Launch<'_> {
     /// A directory of the engine's own for what it keeps only while the process runs, made
     /// now: under `$XDG_RUNTIME_DIR` (or the temporary directory), readable by the user alone,
@@ -281,6 +296,7 @@ pub enum State<T: 'static, P: 'static> {
             feature = "engine-wasm",
             feature = "engine-wpe",
             feature = "engine-ladybird",
+            feature = "engine-cef",
             feature = "engine-demo",
             feature = "engine-netsurf"
         )),
@@ -303,6 +319,7 @@ impl<T: 'static, P: 'static> Engine<T, P> {
             feature = "engine-wasm",
             feature = "engine-wpe",
             feature = "engine-ladybird",
+            feature = "engine-cef",
             feature = "engine-demo",
             feature = "engine-netsurf"
         )),
@@ -670,6 +687,31 @@ pub fn netsurf_config(settings: &EngineSettings) -> sighurt_engine_netsurf::NetS
     }
 }
 
+/// Chromium's configuration: its profile in the user's data directory, or with
+/// `storage = "ephemeral"` none (an in-memory session whose bookkeeping lives in the engine's
+/// scratch directory); the user agent, if one is set. Errors say CEF is not installed.
+#[cfg(feature = "engine-cef")]
+pub fn cef_config(mut launch: Launch<'_>) -> Result<sighurt_engine_cef::CefConfig, String> {
+    use sighurt_core::config::Storage;
+    let mut config = sighurt_engine_cef::CefConfig::installed()
+        .ok_or("CEF is not installed: run nix/build-cef.sh (docs/rewrite/CEF.md)")?;
+    match launch.settings.storage {
+        Storage::Profile => {
+            let profile = dirs::data_dir().map(|d| d.join("sighurt").join("cef"));
+            if let Some(profile) = &profile {
+                secure_profile(profile);
+            }
+            config.profile = profile;
+        }
+        Storage::Ephemeral => {}
+    }
+    if config.profile.is_none() {
+        config.scratch = Some(launch.scratch()?);
+    }
+    config.user_agent = launch.settings.user_agent.clone();
+    Ok(config)
+}
+
 /// Servo's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set;
 /// `experimental-features` and `preferences`, applied when Servo is built.
@@ -714,7 +756,8 @@ pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoCon
 #[cfg(any(
     feature = "engine-wpe",
     feature = "engine-servo",
-    feature = "engine-ladybird"
+    feature = "engine-ladybird",
+    feature = "engine-cef"
 ))]
 fn secure_profile(profile: &std::path::Path) {
     if let Some(root) = profile.parent() {

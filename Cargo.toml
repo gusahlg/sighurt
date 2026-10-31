@@ -24,6 +24,8 @@ members = [
     "engines/sighurt-engine-wpe",
     # Needs the shim of nix/build-ladybird-shim.sh to run, not to build (docs/rewrite/LADYBIRD.md).
     "engines/sighurt-engine-ladybird",
+    # Needs the CEF prefix of nix/build-cef.sh (docs/rewrite/CEF.md).
+    "engines/sighurt-engine-cef",
     # Keymaps, compiled into `sig` through sighurt-browser's features.
     "extensions/sighurt-config-example",
     # Guest SDK and example guests.

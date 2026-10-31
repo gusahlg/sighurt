@@ -16,6 +16,8 @@ engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 # WebKit presents into the terminal's CPU target: shared-memory frames, one copy each.
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
 engine-ladybird = ["sighurt-runtime/engine-ladybird", "dep:sighurt-engine-ladybird"]
+# Chromium into the terminal's CPU target; it needs a display connection (docs/rewrite/CEF.md).
+engine-cef = ["sighurt-runtime/engine-cef", "dep:sighurt-engine-cef"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
 engine-netsurf = ["sighurt-runtime/engine-netsurf", "dep:sighurt-engine-netsurf"]
 
@@ -27,6 +29,7 @@ sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional =
 sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = true }
 sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
+sighurt-engine-cef = { path = "../../engines/sighurt-engine-cef", optional = true }
 sighurt-engine-demo = { path = "../../engines/sighurt-engine-demo", optional = true }
 sighurt-engine-netsurf = { path = "../../engines/sighurt-engine-netsurf", optional = true }
 base64 = "0.22"

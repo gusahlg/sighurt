@@ -67,6 +67,7 @@ fn secure_owned_directories() {
         secure_quietly(&root);
         secure_quietly(&root.join("wpe"));
         secure_quietly(&root.join("ladybird"));
+        secure_quietly(&root.join("cef"));
         secure_quietly(&root.join("servo"));
     }
     if let Some(state) = dirs::state_dir() {

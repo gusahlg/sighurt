@@ -10323,6 +10323,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sighurt-engine-cef"
+version = "0.9.0"
+dependencies = [
+ "libc",
+ "log",
+ "sighurt-api",
+ "url",
+]
+
+[[package]]
 name = "sighurt-engine-demo"
 version = "0.9.0"
 dependencies = [
@@ -10448,6 +10458,7 @@ dependencies = [
  "sighurt-api",
  "sighurt-chrome-line",
  "sighurt-core",
+ "sighurt-engine-cef",
  "sighurt-engine-demo",
  "sighurt-engine-ladybird",
  "sighurt-engine-netsurf",
@@ -10475,6 +10486,7 @@ dependencies = [
  "sighurt-api",
  "sighurt-config-example",
  "sighurt-core",
+ "sighurt-engine-cef",
  "sighurt-engine-ladybird",
  "sighurt-engine-netsurf",
  "sighurt-engine-servo",
@@ -10509,6 +10521,7 @@ dependencies = [
  "rustix 1.1.5",
  "sighurt-api",
  "sighurt-core",
+ "sighurt-engine-cef",
  "sighurt-engine-demo",
  "sighurt-engine-ladybird",
  "sighurt-engine-netsurf",

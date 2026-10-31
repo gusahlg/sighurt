@@ -31,6 +31,8 @@ engine-wpe = ["sighurt-gui/engine-wpe", "sighurt-tui?/engine-wpe"]
 # Ladybird (docs/rewrite/LADYBIRD.md): not in `default`; needs the shim of nix/build-ladybird-shim.sh
 # at run time, and nothing at build time.
 engine-ladybird = ["sighurt-gui/engine-ladybird", "sighurt-tui?/engine-ladybird"]
+# Chromium (docs/rewrite/CEF.md): in no default feature set; needs nix/build-cef.sh.
+engine-cef = ["sighurt-gui/engine-cef", "sighurt-tui?/engine-cef"]
 engine-demo = ["sighurt-gui/engine-demo", "sighurt-tui?/engine-demo"]
 # NetSurf (docs/rewrite/NETSURF.md). GPL-2.0-only: never a default feature, and a sig
 # built with it is for personal use and must not be distributed.

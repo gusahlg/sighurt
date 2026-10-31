@@ -6,8 +6,9 @@
 //! starts on its target, how its views present and the renderer label. The core's
 //! [`Environment`](sighurt_core::Environment) is built from these descriptors.
 //!
-//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, Ladybird, the demo engine,
-//! NetSurf. The web engines, those that open http(s) pages, are the ones `page.switch-engine` cycles, in
+//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, Ladybird, CEF, the demo
+//! engine, NetSurf. The web engines, those that open http(s) pages, are the ones
+//! `page.switch-engine` cycles, in
 //! that same order.
 //!
 //! Must not own: how a runtime is constructed or how it presents. Those name the frontend's
@@ -65,6 +66,13 @@ pub fn descriptors() -> Vec<Descriptor> {
             web: true,
             capabilities: sighurt_engine_ladybird::CAPABILITIES,
             honors: &["storage"],
+        },
+        #[cfg(feature = "engine-cef")]
+        Descriptor {
+            name: "cef",
+            web: true,
+            capabilities: sighurt_engine_cef::CAPABILITIES,
+            honors: &["user-agent", "storage"],
         },
         #[cfg(feature = "engine-demo")]
         Descriptor {
@@ -168,6 +176,8 @@ mod tests {
         assert_eq!(env.engine_settings["ladybird"], ["storage"]);
         #[cfg(feature = "engine-netsurf")]
         assert_eq!(env.engine_settings["netsurf"], ["user-agent"]);
+        #[cfg(feature = "engine-cef")]
+        assert_eq!(env.engine_settings["cef"], ["user-agent", "storage"]);
         #[cfg(feature = "engine-demo")]
         assert!(env.engine_settings["demo"].is_empty());
         // Web engines are a property of the descriptors, in their order, whatever this build
@@ -182,7 +192,7 @@ mod tests {
         for desc in descriptors() {
             assert_eq!(
                 desc.web,
-                matches!(desc.name, "servo" | "wpe" | "ladybird" | "netsurf"),
+                matches!(desc.name, "servo" | "wpe" | "ladybird" | "cef" | "netsurf"),
                 "{}",
                 desc.name
             );

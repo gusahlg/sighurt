@@ -22,6 +22,10 @@ let
     curl openssl libjpeg libpng libwebp expat zlib freetype
   ];
   netsurfPerl = pkgs.perl.withPackages (ps: [ ps.HTMLParser ]);
+  # CEF, once nix/build-cef.sh has installed it (docs/rewrite/CEF.md). The shell
+  # only exports the prefix path. libcef is not on the link line or the loader path.
+  cef = import ./nix/cef.nix { inherit pkgs; };
+  hasCef = builtins.pathExists "${cef.prefix}/dist/libcef.so";
 in
 pkgs.mkShell ({
   nativeBuildInputs = with pkgs; [
@@ -52,4 +56,4 @@ pkgs.mkShell ({
   SIGHURT_NETSURF_FONT_SANS_BOLD = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans-Bold.ttf";
   SIGHURT_NETSURF_FONT_SERIF = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSerif.ttf";
   SIGHURT_NETSURF_FONT_MONO = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
-} // pkgs.lib.optionalAttrs hasWpe wpe.env)
+} // pkgs.lib.optionalAttrs hasWpe wpe.env // pkgs.lib.optionalAttrs hasCef cef.env)
