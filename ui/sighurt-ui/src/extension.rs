@@ -280,11 +280,20 @@ impl fmt::Debug for ChromeKind {
 /// embedding, override and isolate controls are dropped, so the text can't reorder what
 /// follows it; at most `max_chars` characters are kept.
 pub fn contained(text: &str, max_chars: usize) -> String {
+    if is_contained(text, max_chars) {
+        return text.to_owned();
+    }
     text.chars()
         .filter(|c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(max_chars)
         .collect()
+}
+
+/// Whether [`contained`] would return `text` unchanged: printable ASCII within `max_chars`
+/// (a byte scan; text with any other character takes the slow path).
+pub(crate) fn is_contained(text: &str, max_chars: usize) -> bool {
+    text.len() <= max_chars && text.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
 /// A committed address as an address line shows it: percent-encoded UTF-8 in its path, query
@@ -393,6 +402,31 @@ fn shows_safely(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_ascii_fast_path_agrees_with_containing() {
+        for text in [
+            "plain https://x.test/a%20b",
+            "tab\there",
+            "del\u{7f}",
+            "bidi\u{202e}x",
+            "ä",
+            "",
+        ] {
+            for max in [0, 3, 100] {
+                let slow: String = text
+                    .chars()
+                    .filter(|c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .take(max)
+                    .collect();
+                assert_eq!(contained(text, max), slow, "{text:?} {max}");
+                if is_contained(text, max) {
+                    assert_eq!(slow, text);
+                }
+            }
+        }
+    }
     use super::*;
 
     #[test]
