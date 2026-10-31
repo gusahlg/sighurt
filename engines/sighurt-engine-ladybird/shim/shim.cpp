@@ -91,6 +91,13 @@ public:
     }
 };
 
+// HTML's "navigate to a fragment": the same address but for a fragment, which `to` has.
+bool is_fragment_navigation(std::string const& from, std::string const& to)
+{
+    auto without = [](std::string const& url) { return url.substr(0, url.find('#')); };
+    return !from.empty() && to.find('#') != std::string::npos && without(from) == without(to);
+}
+
 class LbView final : public WebView::HeadlessWebView {
 public:
     static LbView* create(Core::AnonymousBuffer theme, Web::DevicePixelSize size, double scale)
@@ -147,6 +154,16 @@ public:
     bool is_popup { false };
     uint64_t popup_opener { 0 };
 
+    // Loads `url`, or holds it until the view's initial about:blank has finished.
+    void navigate(URL::URL const& url)
+    {
+        if (m_initial_done)
+            load(url);
+        else
+            m_queued_load = url;
+    }
+    bool initial_done() const { return m_initial_done; }
+
 private:
     LbView(Core::AnonymousBuffer theme, Web::DevicePixelSize size, double scale)
         : HeadlessWebView(move(theme), size)
@@ -164,22 +181,43 @@ private:
             push(LB_EV_TITLE, id, 0, 0, &text);
         };
         on_url_change = [this, id](auto const& url) {
+            if (!m_initial_done)
+                return;
             auto text = to_std(url.serialize());
             if (is_popup) {
                 if (text != "about:blank")
                     finish_popup(text);
                 return;
             }
+            // A navigation to a fragment of the document shown: Ladybird sets loading and never
+            // clears it, so the next real navigation would not report that it started.
+            bool fragment = is_fragment_navigation(m_last_url, text);
+            m_last_url = text;
             push(LB_EV_URL_CHANGED, id, 0, 0, &text);
             push_history();
+            if (fragment && is_loading())
+                set_loading_state(false);
         };
         on_load_start = [this, id] {
-            if (is_popup)
+            if (is_popup || !m_initial_done)
                 return;
             auto text = to_std(url().serialize());
             push(LB_EV_LOAD_START, id, 0, 0, &text);
         };
         on_load_finish = [this, id](auto const& url) {
+            if (!m_initial_done) {
+                // The view's own about:blank is loaded. A navigation started before this is
+                // dropped by Ladybird, so the host's first one waits here.
+                m_initial_done = true;
+                if (!is_popup)
+                    push(LB_EV_VIEW_READY, id);
+                if (m_queued_load.has_value()) {
+                    auto url = m_queued_load.release_value();
+                    m_queued_load.clear();
+                    load(url);
+                }
+                return;
+            }
             if (is_popup)
                 return;
             auto text = to_std(url.serialize());
@@ -187,7 +225,7 @@ private:
             push_history();
         };
         on_loading_state_change = [this, id](bool loading) {
-            if (!is_popup)
+            if (!is_popup && m_initial_done)
                 push(LB_EV_LOADING, id, loading ? 1 : 0);
         };
         on_cursor_change = [id](Gfx::Cursor const& cursor) {
@@ -287,6 +325,9 @@ private:
 
     static inline uint64_t s_next_id { 0 };
     uint64_t m_id;
+    bool m_initial_done { false };
+    std::string m_last_url;
+    Optional<URL::URL> m_queued_load;
 };
 
 OwnPtr<SighurtApplication> g_app;
@@ -494,7 +535,6 @@ uint64_t lb_view_open(int width, int height, double scale, int visible, double z
         view->set_system_visibility_state(Web::HTML::VisibilityState::Hidden);
     if (zoom != 1.0)
         view->set_zoom(zoom);
-    push(LB_EV_VIEW_READY, view->id());
     return view->id();
 }
 
@@ -512,7 +552,7 @@ void lb_navigate(uint64_t id, char const* url)
     if (!view)
         return;
     if (auto parsed = URL::Parser::basic_parse(StringView { url, strlen(url) }); parsed.has_value())
-        view->load(*parsed);
+        view->navigate(*parsed);
 }
 
 void lb_reload(uint64_t id)

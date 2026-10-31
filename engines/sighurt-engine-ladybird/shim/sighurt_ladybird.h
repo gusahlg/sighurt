@@ -32,7 +32,7 @@ typedef struct lb_abi {
 void lb_abi_describe(lb_abi* out);
 
 enum {
-    LB_EV_VIEW_READY = 1,   /* the first frame can be presented */
+    LB_EV_VIEW_READY = 1,   /* the view's own blank page is loaded: it takes navigations */
     LB_EV_LOAD_START,       /* s0 = url */
     LB_EV_URL_CHANGED,      /* s0 = url: a commit or a same-document change */
     LB_EV_LOAD_FINISH,      /* s0 = url */

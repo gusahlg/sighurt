@@ -10323,6 +10323,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sighurt-engine-ladybird"
+version = "0.9.0"
+dependencies = [
+ "libc",
+ "log",
+ "sighurt-api",
+]
+
+[[package]]
 name = "sighurt-engine-servo"
 version = "0.9.0"
 dependencies = [

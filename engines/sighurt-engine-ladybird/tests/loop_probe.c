@@ -26,6 +26,7 @@ typedef uint64_t (*lb_view_open_t)(int, int, double, int, double);
 typedef void (*lb_navigate_t)(uint64_t, const char*);
 typedef int (*lb_frame_get_t)(uint64_t, lb_frame*);
 typedef void (*lb_shutdown_t)(void);
+typedef void (*lb_run_js_t)(uint64_t, const char*, int64_t);
 typedef void (*lb_abi_describe_t)(lb_abi*);
 
 int main(int argc, char** argv)
@@ -34,7 +35,7 @@ int main(int argc, char** argv)
     void* lib = dlopen(path ? path : "libsighurt-ladybird-shim.so", RTLD_NOW | RTLD_LOCAL);
     if (!lib) { fprintf(stderr, "FAIL dlopen: %s\n", dlerror()); return 1; }
     SYM(lb_init) SYM(lb_loop_fd) SYM(lb_pump) SYM(lb_next_event) SYM(lb_wake_count) SYM(lb_view_open)
-    SYM(lb_navigate) SYM(lb_frame_get) SYM(lb_shutdown) SYM(lb_abi_describe)
+    SYM(lb_navigate) SYM(lb_run_js) SYM(lb_frame_get) SYM(lb_shutdown) SYM(lb_abi_describe)
     lb_abi abi; lb_abi_describe(&abi);
     printf("abi version=%u probe=%u dmabuf=%u\n", abi.version, abi.probe_shared_image_buffer, abi.vulkan_dmabuf);
     if (!abi.probe_shared_image_buffer) { fprintf(stderr, "FAIL ABI probe\n"); return 1; }
@@ -52,6 +53,7 @@ int main(int argc, char** argv)
         int64_t next = lb_pump(&more);
         lb_event e;
         while (lb_next_event(&e)) {
+            if (getenv("TRACE")) printf("  ev %d view=%llu i0=%lld i1=%lld s0=%s\n", e.kind, (unsigned long long)e.view, (long long)e.i0, (long long)e.i1, e.s0 ? e.s0 : "(null)");
             if (e.kind == LB_EV_TITLE) { title = 1; printf("title %s\n", e.s0); }
             if (e.kind == LB_EV_URL_CHANGED) { commit = 1; printf("url %s\n", e.s0); }
             if (e.kind == LB_EV_LOAD_FINISH) { finish = 1; printf("finish %s\n", e.s0); }
@@ -66,6 +68,25 @@ int main(int argc, char** argv)
     lb_frame f;
     int have = lb_frame_get(view, &f);
     printf("loops=%d title=%d commit=%d finish=%d frame=%d buffer=%d %dx%d\n", loops, title, commit, finish, frame, have, have ? f.width : 0, have ? f.height : 0);
+    if (getenv("NAV2")) {
+        lb_navigate(view, getenv("NAV2"));
+        double t0 = now();
+        while (now() - t0 < 3) {
+            int more = 0; lb_pump(&more); lb_event e;
+            while (lb_next_event(&e)) printf("  nav2-ev %d i0=%lld s0=%s\n", e.kind, (long long)e.i0, e.s0 ? e.s0 : "(null)");
+            struct pollfd p = { fd, POLLIN, 0 }; poll(&p, 1, 100);
+        }
+    }
+    if (getenv("JS")) {
+        /* Run a script and trace what follows for a few seconds. */
+        lb_run_js(view, getenv("JS"), 1);
+        double t0 = now();
+        while (now() - t0 < 4) {
+            int more = 0; lb_pump(&more); lb_event e;
+            while (lb_next_event(&e)) printf("  js-ev %d i0=%lld i1=%lld s0=%s\n", e.kind, (long long)e.i0, (long long)e.i1, e.s0 ? e.s0 : "(null)");
+            struct pollfd p = { fd, POLLIN, 0 }; poll(&p, 1, 100);
+        }
+    }
     /* Idle: nothing may wake the owner loop. */
     int idle = argc > 2 ? atoi(argv[2]) : 5;
     uint64_t before = lb_wake_count();
