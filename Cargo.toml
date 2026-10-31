@@ -18,6 +18,8 @@ members = [
     "engines/sighurt-engine-servo",
     "engines/sighurt-engine-wasm",
     "engines/sighurt-engine-demo",
+    # NetSurf (docs/rewrite/NETSURF.md). GPL-2.0-only, and never one of sig's default features.
+    "engines/sighurt-engine-netsurf",
     # Needs the WPE WebKit prefix of nix/build-wpewebkit.sh (docs/rewrite/WPE.md).
     "engines/sighurt-engine-wpe",
     # Keymaps, compiled into `sig` through sighurt-browser's features.

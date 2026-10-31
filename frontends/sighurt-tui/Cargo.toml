@@ -16,6 +16,7 @@ engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 # WebKit presents into the terminal's CPU target: shared-memory frames, one copy each.
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
+engine-netsurf = ["sighurt-runtime/engine-netsurf", "dep:sighurt-engine-netsurf"]
 keymap-modal = ["sighurt-runtime/keymap-modal"]
 
 [dependencies]
@@ -26,6 +27,7 @@ sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional =
 sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
 sighurt-engine-demo = { path = "../../engines/sighurt-engine-demo", optional = true }
+sighurt-engine-netsurf = { path = "../../engines/sighurt-engine-netsurf", optional = true }
 base64 = "0.22"
 calloop.workspace = true
 dirs = "5"

@@ -29,6 +29,9 @@ engine-servo = ["sighurt-gui/engine-servo", "sighurt-tui?/engine-servo", "dep:si
 engine-wasm = ["sighurt-gui/engine-wasm", "sighurt-tui?/engine-wasm"]
 engine-wpe = ["sighurt-gui/engine-wpe", "sighurt-tui?/engine-wpe"]
 engine-demo = ["sighurt-gui/engine-demo", "sighurt-tui?/engine-demo"]
+# NetSurf (docs/rewrite/NETSURF.md). GPL-2.0-only: never a default feature, and a sig
+# built with it is for personal use and must not be distributed.
+engine-netsurf = ["sighurt-gui/engine-netsurf", "sighurt-tui?/engine-netsurf"]
 # Keymaps besides the core's own `bindings`, chosen by `[input] keymap`.
 keymap-modal = ["sighurt-gui/keymap-modal", "sighurt-tui?/keymap-modal"]
 # Chromes besides sighurt-ui's `standard`, chosen by `[ui] chrome`.

@@ -12,6 +12,16 @@ let
   # WPE WebKit, once nix/build-wpewebkit.sh has installed it on this machine (docs/rewrite/WPE.md).
   wpe = import ./nix/wpewebkit.nix { inherit pkgs; };
   hasWpe = builtins.pathExists "${wpe.prefix}/lib/pkgconfig/wpe-webkit-2.0.pc";
+  # NetSurf's libraries and tools (docs/rewrite/NETSURF.md). Referenced only by the variables
+  # below, never as buildInputs: a buildInput would land on PKG_CONFIG_PATH, which Servo's
+  # build scripts track, and rebuild Servo. The engine's build.rs reads these and sets
+  # PKG_CONFIG_PATH for its own make only.
+  netsurfLibs = with pkgs; [
+    libcss libdom libhubbub libnsbmp libnsgif libnslog libnspsl libnsutils
+    libparserutils libsvgtiny libutf8proc libwapcaplet
+    curl openssl libjpeg libpng libwebp expat zlib freetype
+  ];
+  netsurfPerl = pkgs.perl.withPackages (ps: [ ps.HTMLParser ]);
 in
 pkgs.mkShell ({
   nativeBuildInputs = with pkgs; [
@@ -32,4 +42,14 @@ pkgs.mkShell ({
   LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs
     + pkgs.lib.optionalString hasWpe ":${wpe.prefix}/lib";
+  # NetSurf (docs/rewrite/NETSURF.md). Not on PKG_CONFIG_PATH: see netsurfLibs above.
+  SIGHURT_NETSURF_SRC = pkgs.netsurf-browser.src;
+  SIGHURT_NETSURF_PKG_CONFIG_PATH = pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" netsurfLibs;
+  SIGHURT_NETSURF_PERL = "${netsurfPerl}/bin/perl";
+  SIGHURT_NETSURF_XXD = "${pkgs.xxd}/bin/xxd";
+  SIGHURT_NETSURF_GPERF = "${pkgs.gperf}/bin/gperf";
+  SIGHURT_NETSURF_FONT_SANS = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
+  SIGHURT_NETSURF_FONT_SANS_BOLD = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans-Bold.ttf";
+  SIGHURT_NETSURF_FONT_SERIF = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSerif.ttf";
+  SIGHURT_NETSURF_FONT_MONO = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
 } // pkgs.lib.optionalAttrs hasWpe wpe.env)

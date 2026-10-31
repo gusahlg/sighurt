@@ -1,0 +1,12 @@
+GPL-2.0-only
+
+The NetSurf core compiled into this crate, the C frontend in csrc/frontend/ and the
+patches in csrc/patches/ are licensed under the GNU General Public License, version 2
+only, the same terms as NetSurf (its COPYING file, and the header of each of its
+sources). There is no "or any later version" grant.
+
+This is not Sighurt's AGPL-3.0-or-later license. A binary of sig that is built with
+the engine-netsurf feature combines the two and must not be distributed. See README.md.
+
+NetSurf's own license text is the file COPYING in the NetSurf 3.11 source
+(SIGHURT_NETSURF_SRC). The MIT-licensed NetSurf libraries are not covered by this note.

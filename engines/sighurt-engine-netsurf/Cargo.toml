@@ -1,0 +1,15 @@
+[package]
+name = "sighurt-engine-netsurf"
+description = "NetSurf as a Sighurt engine. GPL-2.0-only: a sig built with engine-netsurf is for personal use and must not be distributed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Not the workspace license. NetSurf's core is GPL-2.0-only and cannot be
+# combined with Sighurt's AGPL-3.0-or-later in a program that is distributed.
+# See README.md.
+license = "GPL-2.0-only"
+authors.workspace = true
+
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }
+sighurt-wayland = { path = "../../frontends/sighurt-wayland" }

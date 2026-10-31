@@ -10323,6 +10323,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sighurt-engine-netsurf"
+version = "0.9.0"
+dependencies = [
+ "sighurt-api",
+ "sighurt-wayland",
+]
+
+[[package]]
 name = "sighurt-engine-servo"
 version = "0.9.0"
 dependencies = [
@@ -10421,6 +10429,7 @@ dependencies = [
  "sighurt-chrome-line",
  "sighurt-core",
  "sighurt-engine-demo",
+ "sighurt-engine-netsurf",
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",
@@ -10452,6 +10461,7 @@ dependencies = [
  "serde_json",
  "sighurt-api",
  "sighurt-core",
+ "sighurt-engine-netsurf",
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",
@@ -10486,6 +10496,7 @@ dependencies = [
  "sighurt-api",
  "sighurt-core",
  "sighurt-engine-demo",
+ "sighurt-engine-netsurf",
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",

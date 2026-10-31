@@ -1,0 +1,3 @@
+NetSurf calls setlocale(LC_ALL, "") from netsurf_init. sig shares the process with
+the other engines, so the frontend's build removes that call. The marker in the
+patched file is "SIGHURT PATCH: locale". build.rs applies it.

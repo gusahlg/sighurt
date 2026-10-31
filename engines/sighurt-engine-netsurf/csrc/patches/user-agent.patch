@@ -1,0 +1,3 @@
+NetSurf builds its User-Agent in utils/useragent.c and has no setter. The patch adds
+user_agent_override(), which [engines.netsurf] user-agent uses. The marker is
+"SIGHURT PATCH: user-agent". build.rs applies it. GPL-2.0-only, as the file it edits.

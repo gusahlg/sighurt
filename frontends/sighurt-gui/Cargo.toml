@@ -15,6 +15,7 @@ engine-servo = ["sighurt-runtime/engine-servo", "dep:sighurt-engine-servo"]
 engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
+engine-netsurf = ["sighurt-runtime/engine-netsurf", "dep:sighurt-engine-netsurf"]
 # Keymaps besides the core's own `bindings`, chosen by `[input] keymap`.
 keymap-modal = ["sighurt-runtime/keymap-modal"]
 # Chromes besides sighurt-ui's `standard`, chosen by `[ui] chrome`.
@@ -30,6 +31,7 @@ sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional =
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
 sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = true }
 sighurt-engine-demo = { path = "../../engines/sighurt-engine-demo", optional = true }
+sighurt-engine-netsurf = { path = "../../engines/sighurt-engine-netsurf", optional = true }
 sighurt-chrome-line = { path = "../../extensions/sighurt-chrome-line", optional = true }
 # The owner loop.
 calloop.workspace = true
