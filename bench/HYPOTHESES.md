@@ -128,6 +128,91 @@ each seen there but not predicted, so each still to be tested:
 - **Prediction (if it is retention, not a leak):** it levels off within 10 minutes, under 20 MiB
   above the first minute.
 
+### H19: Wasm frames damage only the rects the draw list changed (H14, this machine)
+
+Written on 31 October 2026, before any code change and before this session's measurement.
+H14's numbers (sway 14.7 % → 28.2 % on `wasm-raf`) were taken on louise-pc with the full bench.
+This session repeats the question on this machine, with `sig` built
+`--no-default-features --features engine-wasm`, raf-demo, 30 s, three repetitions, medians and
+spread. The method is the harness's: sway and `sig` CPU are `(utime + stime) / wall`.
+
+- **Metric:** sway's CPU % over 30 s of raf-demo, and the damaged buffer pixels per submitted
+  frame (whole buffer today: `w * h` from `SIG_DIAG=1` frame lines).
+- **Direction:** down.
+- **Expected size:** sway's CPU falls by at least 30 % relative to this machine's whole-surface
+  baseline, toward the IPC-removal baseline's 14.7 % (a full upload of a ~1280×696 frame at 60 Hz
+  is what doubled it). Damaged pixels per frame fall under 25 % of the buffer: raf-demo's list
+  changes the ball, its velocity line and the position text, not the clear. Raster and the copy
+  into the SHM buffer cover only that region when the buffer still holds a frame the unchanged
+  pixels match (its age); otherwise the whole buffer is painted.
+- **Guards:** `sig`'s CPU over the same 30 s does not rise by more than the baseline's spread,
+  and presented frames stay at the output rate (at least 50/s). A wrong damage rect is a
+  corrupted frame, so the partial paint must match a full paint in a unit test and headless.sh
+  must still pass.
+
+Measured on 31 October 2026, before the damage change, debug `sig`
+(`--no-default-features --features engine-wasm`), raf-demo, headless sway gles2, 1280×800,
+30 s × 3. The page buffer is 1280×696 (890880 px) and every frame damages all of it
+(`damage_frac` 1.0, from `w * h` on the `SIG_DIAG=1` frame lines; there is no damage line yet).
+
+| run | sway CPU % | sig CPU % | frames | fps |
+| --- | --- | --- | --- | --- |
+| 1 | 22.83 | 64.77 | 1737 | 57.90 |
+| 2 | 22.73 | 58.23 | 1738 | 57.93 |
+| 3 | 22.73 | 68.20 | 1737 | 57.90 |
+
+Sway median 22.73 % (spread 0.10). sig median 64.77 % (spread 9.97); this is a debug build, so
+the sig number is not the release figure from louise-pc. Frames stay at the output rate.
+A kept result needs sway's median down by more than that 0.10 spread (the prediction is at
+least 30 % relative, to about 15.9 % or below), damaged pixels under 25 % of the buffer, sig's
+median not above 64.77 + 9.97, and fps still at least 50.
+
+**Outcome** (same binary kind, guest, renderer and window, measured after the change on
+31 October 2026, three runs): **Supported.**
+
+| run | sway CPU % | sig CPU % | frames | fps | damage px | damage frac |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 9.37 | 12.93 | 1783 | 59.43 | 6742 | 0.0076 |
+| 2 | 11.30 | 18.53 | 1790 | 59.67 | 6742 | 0.0076 |
+| 3 | 12.07 | 18.90 | 1785 | 59.50 | 6742 | 0.0076 |
+
+Sway median 11.30 % (spread 2.70), down 11.43 points, 50 % relative to 22.73 %, past the 30 %
+prediction and the 0.10 baseline spread. Every run's worst sway (12.07 %) is still under the
+baseline. Damaged pixels are the median of the `SIG_DIAG=1` `damage` lines in the 30 s window:
+6742 of 890880, 0.76 % of the buffer. In run 2, 1921 of 1922 damage lines had buffer age 1 and
+1894 named two rectangles; two lines were a new buffer (age 0, the whole frame). sig median
+18.53 % (spread 5.97), down from 64.77 %, inside the guard. fps median 59.50, still at the
+output rate. Headless screenshots of raf-demo show one ball and intact text, and gradient-demo
+still presents only when its layout changes (4 submissions). Kept.
+
+### H20: `api_download_url` does not start a thread per call
+
+Written on 31 October 2026, before any code change. `docs/rewrite/optimization-hypotheses.md`
+says a guest calling `api_download_url` N times per `on_frame` starts N OS threads at
+`download.rs:113`. The file at that line now queues the request (at most 4, at most 64 MiB of
+guest bytes) and the view hands each one to the browser as `Service::Download`, which the core
+throttles to one a second per tab and `sighurt-runtime` performs on a thread of its own. Measure
+before deciding the line is already gone.
+
+- **Metric:** OS threads and VmRSS of the process after a guest calls `api_download_url` N times
+  in one turn, for N = 1 and N = 32.
+- **Direction:** both flat in N.
+- **Expected size:** the engine itself starts 0 download threads (the requests are queued). In
+  the browser, at most one new download thread per second per tab, so thread count and RSS at
+  N = 32 stay within a thread or two and 10 MiB of N = 1. If the baseline already does this,
+  there is nothing to change.
+- **Guards:** a download the browser accepts is still performed; a fifth queued request still
+  fails; a worker still cannot download.
+
+Measured on 31 October 2026 with `a_burst_of_download_urls_starts_no_thread`, before any change
+to `download.rs`. A guest calling `api_download_url` 32 times in `start_app` produced 4
+`Service::Download` requests (the queue cap; the 5th and the rest fail in the guest, which
+`downloads_are_the_browsers_to_make` already locks). The process went from 22 threads to 22,
+none of them named `sighurt-download`, and VmRSS from 50060 KiB to 50640 KiB (+580 KiB). The
+engine starts no download thread, and thread count and RSS do not grow with N past the queue of
+4. Nothing to change. The burst test stays, so a later path that spawns a thread per call fails
+it.
+
 ## Predictions for the IPC-removal session (gpui-baseline against 3c510fe)
 
 Written on 2 October 2026, before the session's first run. The session measures the baseline

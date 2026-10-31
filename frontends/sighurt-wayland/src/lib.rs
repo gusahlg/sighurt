@@ -27,6 +27,7 @@
 pub mod clipboard;
 pub mod connection;
 pub mod cpu;
+pub mod damage;
 pub mod input;
 pub mod placement;
 pub mod scale;
@@ -37,6 +38,7 @@ pub mod text_input;
 pub mod window;
 
 pub use connection::{Capabilities, Diagnostics, Host, HostError, HostEvent, TargetDiagnostics};
+pub use damage::{begin_paint, buffer_age, end_paint, report_damage, DamageRect};
 pub use placement::{InputRegion, Placement, PlacementError, TargetPlacement, RESIZE_GRACE};
 pub use scheduler::PresentStats;
 pub use shm::{rgba_to_argb8888, BufferStats, ShmFrame, BYTES_PER_PIXEL};

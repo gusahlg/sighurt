@@ -12,8 +12,10 @@
 //! A hidden (unmapped) surface frees its buffers once the compositor has released them
 //! ([`Swapchain::trim`]); showing it again allocates afresh.
 //!
-//! Every submission damages the whole buffer, and the painter repaints all of it: a reused
-//! buffer holds the frame before last, and there is no damage history yet.
+//! A submission damages the rectangles the painter reported ([`crate::damage`]), or the whole
+//! buffer when it reported none. A reused buffer holds an older frame; the swapchain remembers
+//! how many frames ago that was, and the painter covers every pixel that still differs. Age 0
+//! is a new or abandoned buffer, whose pixels are not a frame.
 //!
 //! # Pixel format
 //!
@@ -91,6 +93,9 @@ struct Slot<B> {
     bytes: usize,
     /// The storage; `None` while it is lent to a painter (`Drawing`).
     buffer: Option<B>,
+    /// The swapchain epoch of the frame these pixels show, or `None` when they are not a frame
+    /// this swapchain submitted (a new buffer, or one abandoned mid-paint).
+    content: Option<u64>,
 }
 
 struct Generation<B> {
@@ -107,12 +112,26 @@ impl<B> Generation<B> {
     }
 }
 
+/// How many submits ago `content` was. 0 when the pixels are not a submitted frame.
+fn age_of(epoch: u64, content: Option<u64>) -> u32 {
+    match content {
+        Some(content) => epoch
+            .saturating_sub(content)
+            .saturating_add(1)
+            .min(u32::MAX as u64) as u32,
+        None => 0,
+    }
+}
+
 /// The buffers of one surface, by state: the bookkeeping, generic over the storage so the rules
 /// are tested without a compositor.
 pub(crate) struct Swapchain<B> {
     current: Generation<B>,
     retiring: Vec<Generation<B>>,
     next_generation: u64,
+    /// Frames submitted in the current generation. A buffer's age is how many submits have
+    /// happened since the one whose pixels it still holds.
+    epoch: u64,
 }
 
 impl<B> Swapchain<B> {
@@ -125,32 +144,36 @@ impl<B> Swapchain<B> {
             },
             retiring: Vec::new(),
             next_generation: 1,
+            epoch: 0,
         }
     }
 
-    /// A free buffer of `size` to draw into, lent out with its storage: its slot is `Drawing`
-    /// until [`submit`](Self::submit) or [`abandon`](Self::abandon) gives the storage back.
-    /// `alloc` makes a new one of `bytes` bytes when the current generation has room for one
-    /// more.
+    /// A free buffer of `size` to draw into, lent out with its storage and its age: its slot is
+    /// `Drawing` until [`submit`](Self::submit) or [`abandon`](Self::abandon) gives the storage
+    /// back. The age is 0 when the pixels are not a frame this swapchain submitted, and otherwise
+    /// how many submits ago that frame was (1 is the previous frame). `alloc` makes a new one of
+    /// `bytes` bytes when the current generation has room for one more.
     pub fn acquire(
         &mut self,
         size: BufferSize,
         bytes: usize,
         alloc: impl FnOnce(BufferKey) -> io::Result<B>,
-    ) -> Result<(BufferKey, B), AcquireError> {
+    ) -> Result<(BufferKey, B, u32), AcquireError> {
         if size != self.current.size {
             self.start_generation(size)?;
         }
         let generation = self.current.id;
+        let epoch = self.epoch;
         let slots = &mut self.current.slots;
         let free = slots
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| matches!(slot, Some(s) if s.state == BufferState::Free));
         if let Some((index, Some(slot))) = free {
+            let age = age_of(epoch, slot.content);
             slot.state = BufferState::Drawing;
             let buffer = slot.buffer.take().expect("a free buffer has its storage");
-            return Ok((BufferKey { generation, index }, buffer));
+            return Ok((BufferKey { generation, index }, buffer, age));
         }
         if slots.len() >= MAX_BUFFERS {
             return Err(AcquireError::InUse);
@@ -164,8 +187,9 @@ impl<B> Swapchain<B> {
             state: BufferState::Drawing,
             bytes,
             buffer: None,
+            content: None,
         }));
-        Ok((key, buffer))
+        Ok((key, buffer, 0))
     }
 
     /// Whether [`acquire`](Self::acquire) would lend a buffer of `size` now.
@@ -202,6 +226,8 @@ impl<B> Swapchain<B> {
         if old.held().next().is_some() {
             self.retiring.push(old);
         }
+        // The new size has no frames yet. Ages belong to this generation only.
+        self.epoch = 0;
         Ok(())
     }
 
@@ -230,18 +256,26 @@ impl<B> Swapchain<B> {
 
     /// The painter finished `key` and gives its storage back: it is attached and committed now.
     pub fn submit(&mut self, key: BufferKey, buffer: B) {
-        if let Some(slot) = self.slot_mut(key) {
+        // The epoch is stored only after the slot borrow ends: the slot borrows `self`.
+        let epoch = self.epoch.saturating_add(1);
+        let stored = self.slot_mut(key).is_some_and(|slot| {
             debug_assert_eq!(slot.state, BufferState::Drawing);
+            slot.content = Some(epoch);
             slot.state = BufferState::Submitted;
             slot.buffer = Some(buffer);
+            true
+        });
+        if stored {
+            self.epoch = epoch;
         }
     }
 
     /// The painter gives `key` back without submitting it: free again, or destroyed if its
-    /// generation retired meanwhile.
+    /// generation retired meanwhile. The pixels are not a frame, so the next lend is age 0.
     pub fn abandon(&mut self, key: BufferKey, buffer: B) {
         if let Some(slot) = self.slot_mut(key) {
             slot.buffer = Some(buffer);
+            slot.content = None;
         }
         self.make_free(key);
     }
@@ -439,15 +473,19 @@ impl Dispatch<WlBuffer, BufferData> for Host {
 
 /// A buffer lent to a painter for one frame of an SHM target, from [`FramePermit::shm_frame`].
 ///
-/// Paint every pixel (see the [module documentation](self) for the format), then
-/// [`submit`](Self::submit). Dropping it instead gives the buffer back unshown. The frame owns
-/// the buffer while it is lent, so painting holds no borrow of the host's state: the painter may
-/// ask its lease or the host anything meanwhile.
+/// Paint the pixels that differ from what [`age`](Self::age) says the buffer still holds (every
+/// pixel when that is 0). See the [module documentation](self) for the format. Then
+/// [`submit`](Self::submit), or [`submit_with_damage`](Self::submit_with_damage) with those
+/// rectangles. Dropping it instead gives the buffer back unshown, and the next lend is age 0.
+/// The frame owns the buffer while it is lent, so painting holds no borrow of the host's state:
+/// the painter may ask its lease or the host anything meanwhile.
 pub struct ShmFrame {
     /// The buffer, until it is submitted or given back.
     lent: Option<(BufferKey, ShmBuffer)>,
     size: BufferSize,
     permit: FramePermit,
+    /// How many frames ago these pixels were submitted. 0 means they are not a frame.
+    age: u32,
 }
 
 impl ShmFrame {
@@ -456,12 +494,20 @@ impl ShmFrame {
         key: BufferKey,
         buffer: ShmBuffer,
         size: BufferSize,
+        age: u32,
     ) -> Self {
         Self {
             lent: Some((key, buffer)),
             size,
             permit,
+            age,
         }
+    }
+
+    /// How many frames ago this buffer was submitted. 0 means paint every pixel: the storage is
+    /// new, or the previous paint was abandoned.
+    pub fn age(&self) -> u32 {
+        self.age
     }
 
     /// The buffer's size: the permit's [`Metrics::buffer`].
@@ -479,19 +525,25 @@ impl ShmFrame {
         self.permit.metrics()
     }
 
-    /// The pixels, ARGB8888 premultiplied (B, G, R, A bytes), row after row. They hold whatever
-    /// this buffer showed last, or zeros when it is new: paint all of them.
+    /// The pixels, ARGB8888 premultiplied (B, G, R, A bytes), row after row. They hold the frame
+    /// [`age`](Self::age) says they do, or zeros when the age is 0.
     pub fn pixels(&mut self) -> &mut [u8] {
         // Only `submit`, which consumes the frame, takes the buffer out.
         let (_, buffer) = self.lent.as_mut().expect("a frame has its buffer");
         buffer.pixels()
     }
 
-    /// Attaches the buffer, damages all of it, and commits the target's surface. This is the
-    /// only place the host commits an SHM leaf with a buffer.
-    pub fn submit(mut self) {
+    /// Attaches the buffer, damages all of it, and commits the target's surface.
+    pub fn submit(self) {
+        self.submit_with_damage(None);
+    }
+
+    /// Attaches the buffer, damages `damage`, and commits the target's surface. `None` or an
+    /// empty list damages the whole buffer: a commit with no damage is not a blank frame.
+    /// This is the only place the host commits an SHM leaf with a buffer.
+    pub fn submit_with_damage(mut self, damage: Option<Vec<crate::damage::DamageRect>>) {
         let (key, buffer) = self.lent.take().expect("a frame has its buffer");
-        self.permit.submit_shm(key, buffer);
+        self.permit.submit_shm(key, buffer, damage);
     }
 }
 
@@ -537,6 +589,11 @@ mod tests {
         }
 
         fn acquire(&mut self, width: u32) -> Result<(BufferKey, Tracked), AcquireError> {
+            self.acquire_aged(width)
+                .map(|(key, buffer, _)| (key, buffer))
+        }
+
+        fn acquire_aged(&mut self, width: u32) -> Result<(BufferKey, Tracked, u32), AcquireError> {
             let alive = Rc::clone(&self.alive);
             let size = BufferSize { width, height: 10 };
             self.chain.acquire(size, width as usize * 40, |_| {
@@ -669,6 +726,32 @@ mod tests {
         // Two generations retire, each holding its one frame; the third size must wait.
         assert!(matches!(c.acquire(103), Err(AcquireError::Retiring)));
         assert_eq!(c.alive.get(), 3);
+    }
+
+    #[test]
+    fn a_reused_buffer_reports_how_many_frames_ago_it_was_submitted() {
+        let mut c = Chain::new();
+        let (a, buffer, age) = c.acquire_aged(100).unwrap();
+        assert_eq!(age, 0, "a new buffer has no frame");
+        c.chain.submit(a, buffer);
+        let (b, buffer, age) = c.acquire_aged(100).unwrap();
+        assert_eq!(age, 0);
+        c.chain.submit(b, buffer);
+        c.chain.release(a);
+        // The compositor released the frame before last. That buffer still shows it.
+        let (again, buffer, age) = c.acquire_aged(100).unwrap();
+        assert_eq!(again, a);
+        assert_eq!(age, 2);
+        c.chain.abandon(again, buffer);
+        let (fresh, _, age) = c.acquire_aged(100).unwrap();
+        assert_eq!(fresh, a);
+        assert_eq!(age, 0, "an abandoned paint is not a frame");
+        // The other buffer was submitted and released with nothing in between: it holds the
+        // previous frame.
+        c.chain.release(b);
+        let (immediate, _, age) = c.acquire_aged(100).unwrap();
+        assert_eq!(immediate, b);
+        assert_eq!(age, 1);
     }
 
     #[test]

@@ -419,7 +419,7 @@ impl FramePermit {
         });
         drop(guard);
         match acquired {
-            Ok((key, buffer)) => Ok(ShmFrame::new(self, key, buffer, size)),
+            Ok((key, buffer, age)) => Ok(ShmFrame::new(self, key, buffer, size, age)),
             // `permits` checked availability, so only an allocation can fail here; keep the
             // invalidation for other outcomes anyway.
             Err(AcquireError::Alloc(error)) => Err(PresentError::Buffer(error)),
@@ -452,8 +452,13 @@ impl FramePermit {
     }
 
     /// Attaches, damages and commits SHM buffer `key` at the permit's metrics, and gives it back
-    /// to the target's buffers as submitted.
-    pub(crate) fn submit_shm(&mut self, key: BufferKey, buffer: ShmBuffer) {
+    /// to the target's buffers as submitted. `None` or an empty `damage` damages the whole buffer.
+    pub(crate) fn submit_shm(
+        &mut self,
+        key: BufferKey,
+        buffer: ShmBuffer,
+        damage: Option<Vec<crate::damage::DamageRect>>,
+    ) {
         let metrics = self.metrics;
         let mut target = self.target.borrow_mut();
         let target = &mut *target;
@@ -465,9 +470,18 @@ impl FramePermit {
             metrics.rect().size(),
         );
         target.surface.attach(Some(buffer.wl_buffer()), 0, 0);
-        target
-            .surface
-            .damage_buffer(0, 0, size.width as i32, size.height as i32);
+        let rects = clamp_damage(damage, size);
+        if rects.is_empty() {
+            target
+                .surface
+                .damage_buffer(0, 0, size.width as i32, size.height as i32);
+        } else {
+            for rect in rects {
+                target
+                    .surface
+                    .damage_buffer(rect.x, rect.y, rect.width, rect.height);
+            }
+        }
         if let Some(seq) = target.clock.request_callback() {
             target.surface.frame(
                 &target.env.qh,
@@ -493,6 +507,36 @@ impl FramePermit {
         }
         self.outcome = Some(PresentOutcome::Submitted);
     }
+}
+
+/// `damage` clipped to `size`. Empty means the caller should damage the whole buffer.
+fn clamp_damage(
+    damage: Option<Vec<crate::damage::DamageRect>>,
+    size: sighurt_api::geometry::BufferSize,
+) -> Vec<crate::damage::DamageRect> {
+    let Some(rects) = damage else {
+        return Vec::new();
+    };
+    let (width, height) = (size.width as i32, size.height as i32);
+    let mut kept = Vec::new();
+    for rect in rects {
+        if rect.width <= 0 || rect.height <= 0 {
+            continue;
+        }
+        let x0 = rect.x.max(0);
+        let y0 = rect.y.max(0);
+        let x1 = rect.x.saturating_add(rect.width).min(width);
+        let y1 = rect.y.saturating_add(rect.height).min(height);
+        if x1 > x0 && y1 > y0 {
+            kept.push(crate::damage::DamageRect {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            });
+        }
+    }
+    kept
 }
 
 impl Drop for FramePermit {

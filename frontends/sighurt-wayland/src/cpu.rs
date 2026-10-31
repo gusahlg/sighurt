@@ -4,8 +4,11 @@
 //! shape every frontend can show. A view presents into a [`TargetLease`] created with
 //! [`PresentMode::Shm`](crate::PresentMode::Shm). Presenting turns the host's [`FramePermit`]
 //! into the [`ShmFrame`] it lends, paints the frame at the permit's metrics straight into that
-//! shared memory, and submits it; the host commits the leaf there and nowhere else. A frame
-//! that fails to paint is not submitted: dropping the [`ShmFrame`] gives its buffer back unused.
+//! shared memory, and submits it; the host commits the leaf there and nowhere else. The paint
+//! is wrapped in [`crate::damage::begin_paint`] with the buffer's age, and whatever the painter
+//! reported with [`crate::damage::report_damage`] is what the commit damages. No report damages
+//! the whole buffer. A frame that fails to paint is not submitted: dropping the [`ShmFrame`]
+//! gives its buffer back unused, and that buffer's next age is 0.
 //!
 //! Owns: the step from permit to painted, submitted buffer. Must not own: when a permit is
 //! issued (the host's scheduler), buffer reuse (the host's swapchain) or the surface.
@@ -42,12 +45,15 @@ impl CpuTarget for TargetLease {
         }
         let mut frame: ShmFrame = permit.shm_frame().map_err(|e| e.to_string())?;
         let (size, stride) = (frame.size(), frame.stride());
-        paint(Frame {
+        crate::damage::begin_paint(frame.age());
+        let painted = paint(Frame {
             pixels: frame.pixels(),
             size,
             stride,
-        })?;
-        frame.submit();
+        });
+        let damage = crate::damage::end_paint();
+        painted?;
+        frame.submit_with_damage(damage);
         Ok(())
     }
 }
