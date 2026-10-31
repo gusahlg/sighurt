@@ -61,6 +61,8 @@ name = "tui"
 required-features = ["frontend-tui", "engine-demo"]
 
 [dev-dependencies]
+# The Ladybird test of tests/tui.rs asks whether the shim is there.
+sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird" }
 # The argument tests' temporary files.
 tempfile = "3"
 # The `virtual-pointer` example, a test helper that keeps one pointer plugged into a private

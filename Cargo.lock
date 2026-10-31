@@ -10286,6 +10286,7 @@ dependencies = [
  "rustix 1.1.5",
  "rustls",
  "sighurt-core",
+ "sighurt-engine-ladybird",
  "sighurt-engine-servo",
  "sighurt-gui",
  "sighurt-tui",

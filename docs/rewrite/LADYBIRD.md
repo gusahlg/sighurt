@@ -440,6 +440,17 @@ descriptor (`web: true`, `honors: ["storage"]`, shutdown after WPE), `registry::
   Untested beyond compiling; `window.open` scripts that use the returned window object get a window
   that is closed once its URL is known.
 
+### The terminal frontend
+
+`apps/sighurt-browser/tests/tui.rs::a_ladybird_page_is_an_image_in_the_page_rows` (needs
+`--features frontend-tui,engine-demo,engine-ladybird` and the shim) runs `sig --tui --engine ladybird
+file://...` in a pty with a fake kitty terminal: the page is an 800x440 kitty image in the 80x22 page
+rows, the top line has the page's title, `q` quits, the terminal is restored, no frame was dropped. Text
+mode and `--dump` need the `semantics` capability, which Ladybird does not have yet. (In the same run
+`kitty_keys_open_addresses_tabs_and_quit` failed once when the whole file ran in parallel with the
+Ladybird test, and passes alone, with and without the Ladybird feature: a timing-sensitive existing
+test under load, not caused by the engine.)
+
 ### Text input
 
 `text_input` is true. Ladybird's input-method state (`on_input_method_state_change`) becomes
