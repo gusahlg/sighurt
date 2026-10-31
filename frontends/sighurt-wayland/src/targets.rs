@@ -619,10 +619,24 @@ impl Host {
     /// Permits for every target that may present now: shown, invalidated, not waiting for a
     /// frame callback, and (SHM) with a buffer to lend. Call it once per loop iteration, after
     /// handling events, and hand each permit to the target's presenter.
+    ///
+    /// Allocates the returned list. [`Host::fill_permits`] is the same pass into a reused list.
     pub fn permits(&mut self) -> Vec<FramePermit> {
         let mut permits = Vec::new();
-        let ids: Vec<TargetId> = self.targets.keys().copied().collect();
-        for id in ids {
+        self.fill_permits(&mut permits);
+        permits
+    }
+
+    /// Fills `permits` with one permit per target that may present now.
+    ///
+    /// The same rules as [`Host::permits`]. `permits` is cleared first, and the host keeps the
+    /// id list, so a steady set of targets allocates nothing here.
+    pub fn fill_permits(&mut self, permits: &mut Vec<FramePermit>) {
+        permits.clear();
+        self.permit_ids.clear();
+        self.permit_ids.extend(self.targets.keys().copied());
+        for index in 0..self.permit_ids.len() {
+            let id = self.permit_ids[index];
             let target = Rc::clone(&self.targets[&id]);
             if !target.borrow().can_present() {
                 continue;
@@ -656,7 +670,6 @@ impl Host {
                 outcome: None,
             });
         }
-        permits
     }
 
     /// Forgets targets whose leases are gone. Their native objects are destroyed when the last

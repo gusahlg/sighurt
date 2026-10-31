@@ -7,7 +7,9 @@
 //! `MAX_SURFACES`; a listed surface at its rectangle clipped to the window, taking input on its
 //! input area clipped to it; a name no longer listed hidden at its last rectangle. It is plain
 //! bookkeeping: the owner loop creates a target for each name it hasn't seen and hands the
-//! placement to the host, which validates it. The chromes of the build are listed here
+//! placement to the host, which validates it. [`ChromeTargets::place_into`] writes that
+//! placement into a caller-owned [`Placing`] and reuses the caller's lists. The chromes of the
+//! build are listed here
 //! ([`CHROMES`]), compiled in and chosen by `[ui] chrome` at startup.
 //!
 //! Must not own: the chrome's layout and painting (the chrome), browser state (the core), or
@@ -149,6 +151,8 @@ pub struct ChromeTargets {
     known: Vec<(SurfaceName, WindowRect, InputRegion)>,
     /// Names refused for being one too many, so each is reported once.
     refused: Vec<SurfaceName>,
+    /// Visible surfaces of the placement being built. Cleared each call; its capacity stays.
+    listed: Vec<Placed>,
 }
 
 /// Where one of the chrome's surfaces goes.
@@ -165,7 +169,7 @@ pub struct Placed {
 }
 
 /// The chrome's part of a placement.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Placing {
     /// Where the page goes, inside the window.
     pub page: WindowRect,
@@ -178,18 +182,30 @@ pub struct Placing {
 
 impl ChromeTargets {
     /// Where the surfaces of `layout` go in a window of `window` size. A name listed twice is
-    /// placed once.
+    /// placed once. Allocates; the owner loop uses [`ChromeTargets::place_into`].
+    #[cfg(test)]
     pub fn place(&mut self, layout: &ChromeLayout, window: LogicalSize) -> Placing {
+        let mut out = Placing::default();
+        self.place_into(layout, window, &mut out);
+        out
+    }
+
+    /// Where the surfaces of `layout` go in a window of `window` size, written into `out`.
+    ///
+    /// `out`'s lists are cleared and reused. A name listed twice is placed once.
+    pub fn place_into(&mut self, layout: &ChromeLayout, window: LogicalSize, out: &mut Placing) {
         let bounds = WindowRect {
             x: 0,
             y: 0,
             width: window.width,
             height: window.height,
         };
-        let mut listed: Vec<Placed> = Vec::new();
-        let mut refused = Vec::new();
+        self.listed.clear();
+        out.refused.clear();
+        out.surfaces.clear();
+        out.page = clip(layout.page, bounds);
         for surface in &layout.surfaces {
-            if listed.iter().any(|placed| placed.name == surface.name) {
+            if self.listed.iter().any(|placed| placed.name == surface.name) {
                 continue;
             }
             let known = self
@@ -199,7 +215,7 @@ impl ChromeTargets {
             if known.is_none() && self.known.len() == MAX_SURFACES {
                 if !self.refused.contains(&surface.name) {
                     self.refused.push(surface.name);
-                    refused.push(surface.name);
+                    out.refused.push(surface.name);
                 }
                 continue;
             }
@@ -210,30 +226,25 @@ impl ChromeTargets {
                 Some(i) => self.known[i] = entry,
                 None => self.known.push(entry),
             }
-            listed.push(Placed {
+            self.listed.push(Placed {
                 name: surface.name,
                 rect,
                 visible: true,
                 input,
             });
         }
-        let mut surfaces: Vec<Placed> = self
-            .known
-            .iter()
-            .filter(|(name, ..)| !listed.iter().any(|placed| placed.name == *name))
-            .map(|(name, rect, input)| Placed {
-                name,
-                rect: clip(*rect, bounds),
+        for known in &self.known {
+            if self.listed.iter().any(|placed| placed.name == known.0) {
+                continue;
+            }
+            out.surfaces.push(Placed {
+                name: known.0,
+                rect: clip(known.1, bounds),
                 visible: false,
-                input: input.clone(),
-            })
-            .collect();
-        surfaces.extend(listed);
-        Placing {
-            page: clip(layout.page, bounds),
-            surfaces,
-            refused,
+                input: known.2.clone(),
+            });
         }
+        out.surfaces.append(&mut self.listed);
     }
 }
 
@@ -343,6 +354,25 @@ mod tests {
         let placing = targets.place(&twice, WINDOW);
         assert_eq!(shown(&placing), [("chrome", true), ("page", true)]);
         assert_eq!(placing.surfaces[0].rect, top);
+    }
+
+    #[test]
+    fn place_into_reuses_the_output_lists() {
+        let mut targets = ChromeTargets::default();
+        let (top, page) = (rect(0, 0, 800, 84), rect(0, 84, 800, 516));
+        let layout = layout(&[("page", page), ("chrome", top)]);
+        let mut placing = targets.place(&layout, WINDOW);
+        let surface_cap = placing.surfaces.capacity();
+        placing.refused.reserve(4);
+        let refused_cap = placing.refused.capacity();
+        placing.surfaces.clear();
+        placing.refused.push("stale");
+        targets.place_into(&layout, WINDOW, &mut placing);
+        assert_eq!(shown(&placing), [("page", true), ("chrome", true)]);
+        assert!(placing.refused.is_empty());
+        assert!(placing.surfaces.capacity() >= surface_cap);
+        assert!(placing.refused.capacity() >= refused_cap);
+        assert_eq!(placing, targets.place(&layout, WINDOW));
     }
 
     #[test]

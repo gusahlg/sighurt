@@ -76,9 +76,47 @@ causes (README, "Known limits"). H10 and H11 are new, for the two workloads adde
   report `WindowConfigured`. The first configure that names a size is the first placement and
   the first paint. If none names a size within 20 ms, the client default is reported.
 
-### H-OWN1: not attempted yet
+### H-OWN1: The owner frame path allocates nothing of its own
 
-Taken after H-UI2. The triage table in docs/rewrite/optimization-hypotheses.md keeps it open.
+- **Seen:** every presented frame on the owner thread builds a host diagnostics report
+  (`Host::diagnostics`: a `Vec` of every target), copies the engine name in
+  `Diagnostics::readbacks` (`BTreeMap::entry` takes an owned key), and allocates fresh `Vec`s in
+  `Registry::due`, `Session::pump` (the event buffer), `Gui::placement` and
+  `ChromeTargets::place`. `Host::permits` also allocates its id list and the permit `Vec`.
+- **Change:** read buffer peaks through a counter accessor that does not build the report; look
+  up an engine already in the readbacks map without copying its name; reuse the `Vec`s for due
+  engines, pump events, permits, placement and the chrome's placing.
+- **Prediction:** over presented frames 41–160 of `demo://animation` (120 frames, after startup),
+  heap allocations per frame fall, and process CPU time per frame falls. The floor is the demo
+  engine, which this change does not touch: each animation frame allocates a page-width
+  background row and a page-width run for the sweeping bar (`Canvas::rect`), and `coalesce`
+  allocates a set and a keep-list (`engines/sighurt-engine-demo`). The total does not reach 0.
+  The owner loop's own allocations in the list above go to 0, which is several allocations and
+  one diagnostics `Vec` per frame today.
+- **Guards:** the window still presents (120 frames in the sample); `chrome_paints` stays at the
+  startup count (an animation does not repaint the chrome); `present_errors` stays 0;
+  `placement_errors` stays 0.
+- **Workload:** `sig` with the demo engine, `demo://animation`, 1280×800 at scale 1, in
+  `tools/headless-sway` (pixman). A counting global allocator (installed only for this
+  measurement) records allocations, allocated bytes and `CLOCK_PROCESS_CPUTIME_ID` from the end
+  of presented frame 40 to the end of frame 160. `RUST_LOG=error`, `SIG_DIAG` unset, so the
+  sample is not the log. Three runs. Written before the change.
+- **Baseline:** three runs of the measurement build (counting allocator installed, this change not
+  in it). `sig-alloc` over frames 41–160: allocs 4844, 4844, 4843; bytes 1,898,691, 1,898,691,
+  1,893,571; `cpu_ns` 104,460,485, 110,896,492, 98,843,583. That is 40.37 allocations and about
+  15.8 KiB per frame. Exit diagnostics: `chrome_paints` 2, `present_errors` 0,
+  `placement_errors` 0, `placements` 1, `page_frames_presented` 169, 168, 169.
+- **After:** three runs, allocations and bytes identical. allocs 1719, 1719, 1719; bytes
+  1,320,430, 1,320,430, 1,320,430; `cpu_ns` 94,017,133, 84,854,974, 104,767,885. That is 14.33
+  allocations and 11.0 KiB per frame. Exit diagnostics: `chrome_paints` 2, `present_errors` 0,
+  `placement_errors` 0, `placements` 1, `page_frames_presented` 161, 168, 168.
+- **Outcome:** supported. Medians 4844 → 1719 allocations and 1,898,691 → 1,320,430 bytes over
+  the 120-frame window (26.0 fewer allocations and 4.8 KiB less per frame). The baseline
+  allocation counts differ by 1, so the drop is outside the noise. CPU medians 104,460,485 →
+  94,017,133 ns; the drop sits inside the larger run-to-run span, so CPU is not a move and not
+  a regression. The counting allocator was removed after the measurement. What remains per
+  frame is outside the lists above (the demo painter's row and bar, `coalesce`, and the
+  Wayland client).
 
 ### H-SNAP1: A snapshot costs no more than a copy for ordinary strings
 

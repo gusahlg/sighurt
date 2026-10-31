@@ -108,6 +108,10 @@ pub struct Session<F: Frontend> {
     handling: Option<Instant>,
     /// Engine wakers and service threads call this.
     wake: Arc<dyn Fn() + Send + Sync>,
+    /// Engines due on the current pump. Reused so a pump does not allocate the list.
+    due_scratch: Vec<&'static str>,
+    /// Events from the runtime being pumped. Reused so a pump does not allocate the buffer.
+    event_scratch: Vec<EngineEvent>,
     _frontend: PhantomData<fn() -> F>,
 }
 
@@ -139,6 +143,8 @@ impl<F: Frontend> Session<F> {
             shutdown_bound: None,
             handling: None,
             wake,
+            due_scratch: Vec::new(),
+            event_scratch: Vec::new(),
             _frontend: PhantomData,
         }
     }
@@ -457,20 +463,27 @@ impl<F: Frontend> Session<F> {
     }
 
     /// Pumps the runtimes that are due and hands their events on. Returns whether any was.
+    ///
+    /// The due-engine list and each pump's event list are reused, so a steady pump does not
+    /// allocate them.
     pub fn pump(&mut self, frontend: &mut F) -> bool {
         let now = Instant::now();
-        let due = self.registry.due(now);
+        let mut due = std::mem::take(&mut self.due_scratch);
+        self.registry.due_into(now, &mut due);
+        let pumped = !due.is_empty();
         for &engine in &due {
-            let mut events = Vec::new();
+            let mut events = std::mem::take(&mut self.event_scratch);
             let started = Instant::now();
             self.registry.pump(engine, &mut events);
             self.diag.pump(events.len(), started.elapsed());
-            for event in events {
+            for event in events.drain(..) {
                 self.engine_event(frontend, engine, event, now);
             }
+            self.event_scratch = events;
             self.run_core(frontend);
         }
-        !due.is_empty()
+        self.due_scratch = due;
+        pumped
     }
 
     fn engine_event(

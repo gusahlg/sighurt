@@ -284,10 +284,18 @@ impl Diagnostics {
 
     /// `engine` has counted `total` page readbacks so far: counts the new ones, each as
     /// `bytes_each`, and returns their bytes.
+    ///
+    /// An engine already in the map is updated in place. Its name is copied only the first time
+    /// it is seen.
     pub fn readbacks(&mut self, engine: &str, total: u64, bytes_each: u64) -> u64 {
-        let seen = self.readbacks_seen.entry(engine.to_owned()).or_default();
-        let new = total.saturating_sub(*seen);
-        *seen = total;
+        let new = if let Some(seen) = self.readbacks_seen.get_mut(engine) {
+            let new = total.saturating_sub(*seen);
+            *seen = total;
+            new
+        } else {
+            self.readbacks_seen.insert(engine.to_owned(), total);
+            total
+        };
         let bytes = new.saturating_mul(bytes_each);
         self.counters.page_readbacks += new;
         self.counters.readback_bytes += bytes;

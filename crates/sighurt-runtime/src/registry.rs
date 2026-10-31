@@ -532,10 +532,12 @@ impl<T: 'static, P: 'static> Registry<T, P> {
         }
     }
 
-    /// The engines to pump now: called since their last pump, woken, or past their deadline.
-    /// Takes their wakers' requests first, so a wake during the pump that follows is not lost.
-    pub fn due(&mut self, now: Instant) -> Vec<&'static str> {
-        let mut due = Vec::new();
+    /// The engines to pump now, written into `due` after clearing it.
+    ///
+    /// Called since their last pump, woken, or past their deadline. Takes their wakers' requests
+    /// first, so a wake during the pump that follows is not lost. `due` keeps its capacity.
+    pub fn due_into(&mut self, now: Instant, due: &mut Vec<&'static str>) {
+        due.clear();
         for engine in &mut self.engines {
             if !matches!(engine.state, State::Running(_)) {
                 continue;
@@ -550,6 +552,12 @@ impl<T: 'static, P: 'static> Registry<T, P> {
                 due.push(engine.name);
             }
         }
+    }
+
+    /// The engines to pump now. See [`Registry::due_into`].
+    pub fn due(&mut self, now: Instant) -> Vec<&'static str> {
+        let mut due = Vec::new();
+        self.due_into(now, &mut due);
         due
     }
 
@@ -773,6 +781,17 @@ fn secure_profile(profile: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn due_into_clears_and_keeps_capacity() {
+        let mut registry = Registry::<(), ()>::new(Vec::new());
+        let mut due = Vec::with_capacity(8);
+        due.push("stale");
+        registry.due_into(Instant::now(), &mut due);
+        assert!(due.is_empty());
+        assert!(due.capacity() >= 8);
+        assert!(registry.due(Instant::now()).is_empty());
+    }
 
     #[test]
     fn keymaps_follow_the_build() {

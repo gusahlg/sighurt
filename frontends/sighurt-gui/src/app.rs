@@ -26,6 +26,9 @@
 //! 7. Flush, and sleep until an event or a real deadline. With work left over, the next
 //!    iteration starts without sleeping.
 //!
+//! The permit list, the placement built each refresh and the buffer-peak sample are reused
+//! across passes, so a steady frame does not allocate them.
+//!
 //! Nothing ticks at a fixed rate: an idle browser sleeps until the compositor, an engine, a
 //! service or a signal wakes it. Downloads and session writes run on threads of their own.
 //!
@@ -78,7 +81,7 @@ use sighurt_wayland::{
     TargetPlacement, WindowOptions,
 };
 
-use crate::chrome::{self, ChromeTargets};
+use crate::chrome::{self, ChromeTargets, Placing};
 use crate::engines;
 
 /// Most host events handled in one pass.
@@ -122,6 +125,10 @@ struct Gui {
     size: Option<LogicalSize>,
     /// The placement last applied, and whether the next must be applied even if equal.
     placed: Option<Placement>,
+    /// Built every refresh and compared with `placed`. Cloned only when a placement is applied.
+    placement_buf: Placement,
+    /// The chrome half of `placement_buf`, reused each refresh.
+    placing_buf: Placing,
     place_now: bool,
     snapshot_dirty: bool,
     /// The latest notice or download status, for the status strip.
@@ -141,6 +148,10 @@ struct App {
     session: Session<Gui>,
     config_changed: bool,
     signals: Vec<u8>,
+    /// Permits for this pass. Reused so a steady frame does not allocate the list.
+    permits: Vec<FramePermit>,
+    /// Buffer peaks sampled after a presentation. Reused.
+    buffer_scratch: Vec<(usize, usize, bool)>,
 }
 
 /// Runs the Wayland frontend until it quits.
@@ -263,16 +274,17 @@ impl Frontend for Gui {
     }
 
     fn place(&mut self, views: &BTreeMap<ViewId, ViewEntry>, diag: &mut Diagnostics) -> bool {
-        let Some(placement) = self.placement(views, diag) else {
-            return false;
-        };
-        if !self.place_now && self.placed.as_ref() == Some(&placement) {
+        if self.fill_placement(views, diag).is_none() {
             return false;
         }
-        match self.host.apply_placement(placement.clone()) {
+        if !self.place_now && self.placed.as_ref() == Some(&self.placement_buf) {
+            return false;
+        }
+        let placement = self.placement_buf.clone();
+        match self.host.apply_placement(placement) {
             Ok(()) => {
                 diag.counters.placements += 1;
-                self.placed = Some(placement);
+                self.placed = Some(self.placement_buf.clone());
                 self.place_now = false;
                 true
             }
@@ -442,30 +454,41 @@ impl Gui {
     /// The window's layout for the host: every view (only the shown one visible) at the page
     /// rectangle, the chrome's surfaces above them in its order. A surface name the chrome
     /// hasn't used before gets a target here.
-    fn placement(
+    /// Fills `placement_buf` from `views` and the chrome. `None` until the window has a size.
+    fn fill_placement(
         &mut self,
         views: &BTreeMap<ViewId, ViewEntry>,
         diag: &mut Diagnostics,
-    ) -> Option<Placement> {
+    ) -> Option<()> {
         let size = self.size?;
-        let placing = self.chrome_targets.place(self.chrome.layout(), size);
-        for name in placing.refused {
+        let window = self.window;
+        self.chrome_targets
+            .place_into(self.chrome.layout(), size, &mut self.placing_buf);
+        for &name in &self.placing_buf.refused {
             diag.error(format!(
                 "the chrome uses more than {MAX_SURFACES} surfaces: {name} is not shown"
             ));
         }
-        let mut targets: Vec<TargetPlacement> = views
-            .values()
-            .map(|entry| TargetPlacement {
+        let page = self.placing_buf.page;
+        self.placement_buf.window = window;
+        self.placement_buf.size = size;
+        self.placement_buf.targets.clear();
+        for entry in views.values() {
+            self.placement_buf.targets.push(TargetPlacement {
                 target: entry.target,
-                rect: placing.page,
+                rect: page,
                 visible: entry.visible,
                 input: InputRegion::Whole,
-            })
-            .collect();
+            });
+        }
+        let surfaces = self.placing_buf.surfaces.len();
         let mut created = false;
-        for placed in placing.surfaces {
-            let target = match self.leases.get(placed.name) {
+        for index in 0..surfaces {
+            let name = self.placing_buf.surfaces[index].name;
+            let rect = self.placing_buf.surfaces[index].rect;
+            let visible = self.placing_buf.surfaces[index].visible;
+            let input = self.placing_buf.surfaces[index].input.clone();
+            let target = match self.leases.get(name) {
                 Some(lease) => lease.id(),
                 None => match self.host.create_target(self.window, PresentMode::Shm, None) {
                     Ok(lease) => {
@@ -473,32 +496,27 @@ impl Gui {
                         self.host.set_cursor(target, self.chrome_cursor);
                         // Its first frame, whatever the chrome asked to repaint before.
                         self.host.invalidate(target);
-                        self.leases.insert(placed.name, lease);
+                        self.leases.insert(name, lease);
                         created = true;
                         target
                     }
                     Err(error) => {
-                        let name = placed.name;
                         diag.error(format!("no target for the chrome's {name}: {error}"));
                         continue;
                     }
                 },
             };
-            targets.push(TargetPlacement {
+            self.placement_buf.targets.push(TargetPlacement {
                 target,
-                rect: placed.rect,
-                visible: placed.visible,
-                input: placed.input,
+                rect,
+                visible,
+                input,
             });
         }
         if created {
             self.sync_chrome_text();
         }
-        Some(Placement {
-            window: self.window,
-            size,
-            targets,
-        })
+        Some(())
     }
 
     /// Gives the host's logical keyboard focus to whatever the core says has the keyboard: the
@@ -616,6 +634,12 @@ impl App {
             modes,
             size: None,
             placed: None,
+            placement_buf: Placement {
+                window,
+                size: LogicalSize::default(),
+                targets: Vec::new(),
+            },
+            placing_buf: Placing::default(),
             place_now: false,
             snapshot_dirty: true,
             notice: None,
@@ -637,6 +661,8 @@ impl App {
             session,
             config_changed: false,
             signals: Vec::new(),
+            permits: Vec::new(),
+            buffer_scratch: Vec::new(),
         })
     }
 
@@ -946,9 +972,10 @@ impl App {
 
     /// Hands each permit the host issues to its presenter. Returns whether there were any.
     fn present(&mut self) -> bool {
-        let permits = self.gui.host.permits();
+        let mut permits = std::mem::take(&mut self.permits);
+        self.gui.host.fill_permits(&mut permits);
         let worked = !permits.is_empty();
-        for permit in permits {
+        for permit in permits.drain(..) {
             let target = permit.target();
             if let Some(surface) = self.gui.surface_of(target) {
                 self.paint_chrome(surface, permit);
@@ -958,23 +985,28 @@ impl App {
             }
             // Otherwise the target is being retired: dropping the permit presents nothing.
         }
+        self.permits = permits;
         if worked {
             // Buffers are allocated while presenting, so this sees every peak.
-            let host = self.gui.host.diagnostics();
-            let per_target: Vec<_> = host
-                .targets
-                .iter()
-                .map(|t| {
-                    let chrome = self.gui.surface_of(t.target).is_some();
-                    (t.buffers.buffers, t.buffers.retiring_generations, chrome)
-                })
-                .collect();
-            let bytes = host.targets.iter().map(|t| t.buffers.bytes).sum();
-            self.session
-                .diagnostics_mut()
-                .buffers(per_target.into_iter(), bytes);
+            self.record_buffers();
         }
         worked
+    }
+
+    /// Samples each target's buffer peaks into the reused scratch list.
+    fn record_buffers(&mut self) {
+        self.buffer_scratch.clear();
+        let mut bytes = 0usize;
+        let leases = &self.gui.leases;
+        let scratch = &mut self.buffer_scratch;
+        self.gui.host.for_each_buffer(|id, stats| {
+            let chrome = leases.values().any(|lease| lease.id() == id);
+            scratch.push((stats.buffers, stats.retiring_generations, chrome));
+            bytes += stats.bytes;
+        });
+        self.session
+            .diagnostics_mut()
+            .buffers(self.buffer_scratch.iter().copied(), bytes);
     }
 
     fn paint_chrome(&mut self, surface: SurfaceName, permit: FramePermit) {

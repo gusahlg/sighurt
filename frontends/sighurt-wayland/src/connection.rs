@@ -26,7 +26,8 @@
 //! 2. Each iteration, after dispatching: drain [`Host::next_event`]; answer
 //!    [`HostEvent::WindowConfigured`] with [`Host::apply_placement`]; forward
 //!    [`HostEvent::MetricsChanged`] to the target's presenter and input to its owner;
-//!    [`Host::invalidate`] targets with something new; hand out [`Host::permits`].
+//!    [`Host::invalidate`] targets with something new; hand out [`Host::permits`] (or
+//!    [`Host::fill_permits`] into a reused list).
 //! 3. End the iteration with [`Host::flush`], which commits finished layout transactions,
 //!    forgets retired targets and flushes the connection.
 //!
@@ -109,6 +110,8 @@ pub struct Host {
     pub(crate) clipboard: Clipboard,
     pub(crate) events: VecDeque<HostEvent>,
     pub(crate) presentation_clock: Option<u32>,
+    // Ids walked by `fill_permits`, kept so that pass does not allocate the list.
+    pub(crate) permit_ids: Vec<TargetId>,
     lost: bool,
 }
 
@@ -481,6 +484,7 @@ impl Host {
             clipboard: Clipboard::default(),
             events: VecDeque::new(),
             presentation_clock: None,
+            permit_ids: Vec::new(),
             lost: false,
         };
         // Seats that existed before the registry was read get no `new_seat` call.
@@ -558,6 +562,19 @@ impl Host {
             capabilities: self.capabilities(),
             targets,
             pending_events: self.events.len(),
+        }
+    }
+
+    /// Calls `f` with each target's id and the buffers it holds, without building a report.
+    pub fn for_each_buffer(&self, mut f: impl FnMut(TargetId, BufferStats)) {
+        for target in self.targets.values() {
+            let target = target.borrow();
+            let stats = target
+                .shm
+                .as_ref()
+                .map(|buffers| buffers.stats())
+                .unwrap_or_default();
+            f(target.id, stats);
         }
     }
 
