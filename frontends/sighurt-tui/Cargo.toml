@@ -15,6 +15,8 @@ engine-servo = ["sighurt-runtime/engine-servo", "dep:sighurt-engine-servo"]
 engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 # WebKit presents into the terminal's CPU target: shared-memory frames, one copy each.
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
+# Chromium into the terminal's CPU target; it needs a display connection (docs/rewrite/CEF.md).
+engine-cef = ["sighurt-runtime/engine-cef", "dep:sighurt-engine-cef"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
 keymap-modal = ["sighurt-runtime/keymap-modal"]
 
@@ -25,6 +27,7 @@ sighurt-runtime = { path = "../../crates/sighurt-runtime", default-features = fa
 sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional = true }
 sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
+sighurt-engine-cef = { path = "../../engines/sighurt-engine-cef", optional = true }
 sighurt-engine-demo = { path = "../../engines/sighurt-engine-demo", optional = true }
 base64 = "0.22"
 calloop.workspace = true

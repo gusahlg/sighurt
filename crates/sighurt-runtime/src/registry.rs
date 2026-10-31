@@ -91,6 +91,8 @@ pub enum Runtime<T: 'static, P: 'static> {
     Wasm(Box<dyn Running<T, P>>),
     #[cfg(feature = "engine-wpe")]
     Wpe(Box<dyn Running<T, P>>),
+    #[cfg(feature = "engine-cef")]
+    Cef(Box<dyn Running<T, P>>),
     #[cfg(feature = "engine-demo")]
     Demo(Box<dyn Running<T, P>>),
     /// Present only when no engine is compiled in, so the type still names `T` and `P`.
@@ -99,6 +101,7 @@ pub enum Runtime<T: 'static, P: 'static> {
         feature = "engine-servo",
         feature = "engine-wasm",
         feature = "engine-wpe",
+        feature = "engine-cef",
         feature = "engine-demo"
     )))]
     #[allow(dead_code)]
@@ -114,12 +117,15 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
             Self::Wasm(engine) => engine.as_ref(),
             #[cfg(feature = "engine-wpe")]
             Self::Wpe(engine) => engine.as_ref(),
+            #[cfg(feature = "engine-cef")]
+            Self::Cef(engine) => engine.as_ref(),
             #[cfg(feature = "engine-demo")]
             Self::Demo(engine) => engine.as_ref(),
             #[cfg(not(any(
                 feature = "engine-servo",
                 feature = "engine-wasm",
                 feature = "engine-wpe",
+                feature = "engine-cef",
                 feature = "engine-demo"
             )))]
             Self::None(_) => unreachable!("no engine is compiled in"),
@@ -134,12 +140,15 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
             Self::Wasm(engine) => engine.as_mut(),
             #[cfg(feature = "engine-wpe")]
             Self::Wpe(engine) => engine.as_mut(),
+            #[cfg(feature = "engine-cef")]
+            Self::Cef(engine) => engine.as_mut(),
             #[cfg(feature = "engine-demo")]
             Self::Demo(engine) => engine.as_mut(),
             #[cfg(not(any(
                 feature = "engine-servo",
                 feature = "engine-wasm",
                 feature = "engine-wpe",
+                feature = "engine-cef",
                 feature = "engine-demo"
             )))]
             Self::None(_) => unreachable!("no engine is compiled in"),
@@ -185,7 +194,7 @@ pub const KEYMAPS: &[KeymapKind] = &[
 
 /// What a runtime is started with.
 // Only the Wasm engine needs a scratch directory, and the demo engine reads nothing.
-#[cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "engine-wasm", feature = "engine-cef")), allow(dead_code))]
 pub struct Launch<'a> {
     /// `[engines.<name>]` of the configuration the process started with.
     pub settings: &'a EngineSettings,
@@ -193,7 +202,7 @@ pub struct Launch<'a> {
     name: &'static str,
 }
 
-#[cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "engine-wasm", feature = "engine-cef")), allow(dead_code))]
 impl Launch<'_> {
     /// A directory of the engine's own for what it keeps only while the process runs, made
     /// now: under `$XDG_RUNTIME_DIR` (or the temporary directory), readable by the user alone,
@@ -262,6 +271,7 @@ pub enum State<T: 'static, P: 'static> {
             feature = "engine-servo",
             feature = "engine-wasm",
             feature = "engine-wpe",
+            feature = "engine-cef",
             feature = "engine-demo"
         )),
         allow(dead_code)
@@ -282,6 +292,7 @@ impl<T: 'static, P: 'static> Engine<T, P> {
             feature = "engine-servo",
             feature = "engine-wasm",
             feature = "engine-wpe",
+            feature = "engine-cef",
             feature = "engine-demo"
         )),
         allow(dead_code)
@@ -620,6 +631,31 @@ pub fn wpe_config(settings: &EngineSettings) -> sighurt_engine_wpe::WpeConfig {
     }
 }
 
+/// Chromium's configuration: its profile in the user's data directory, or with
+/// `storage = "ephemeral"` none (an in-memory session whose bookkeeping lives in the engine's
+/// scratch directory); the user agent, if one is set. Errors say CEF is not installed.
+#[cfg(feature = "engine-cef")]
+pub fn cef_config(mut launch: Launch<'_>) -> Result<sighurt_engine_cef::CefConfig, String> {
+    use sighurt_core::config::Storage;
+    let mut config = sighurt_engine_cef::CefConfig::installed()
+        .ok_or("CEF is not installed: run nix/build-cef.sh (docs/rewrite/CEF.md)")?;
+    match launch.settings.storage {
+        Storage::Profile => {
+            let profile = dirs::data_dir().map(|d| d.join("sighurt").join("cef"));
+            if let Some(profile) = &profile {
+                secure_profile(profile);
+            }
+            config.profile = profile;
+        }
+        Storage::Ephemeral => {}
+    }
+    if config.profile.is_none() {
+        config.scratch = Some(launch.scratch()?);
+    }
+    config.user_agent = launch.settings.user_agent.clone();
+    Ok(config)
+}
+
 /// Servo's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set;
 /// `experimental-features` and `preferences`, applied when Servo is built.
@@ -661,7 +697,7 @@ pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoCon
 
 /// Mode 0700 on `profile` and on the Sighurt directory above it. A failure is logged: the
 /// engine then keeps nothing if it cannot use the directory.
-#[cfg(any(feature = "engine-wpe", feature = "engine-servo"))]
+#[cfg(any(feature = "engine-wpe", feature = "engine-servo", feature = "engine-cef"))]
 fn secure_profile(profile: &std::path::Path) {
     if let Some(root) = profile.parent() {
         if let Err(error) = crate::persistence::secure_private_dir(root) {

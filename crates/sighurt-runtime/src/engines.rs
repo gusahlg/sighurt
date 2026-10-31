@@ -6,7 +6,7 @@
 //! starts on its target, how its views present and the renderer label. The core's
 //! [`Environment`](sighurt_core::Environment) is built from these descriptors.
 //!
-//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, the demo engine. The
+//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, CEF, the demo engine. The
 //! web engines, those that open http(s) pages, are the ones `page.switch-engine` cycles, in
 //! that same order.
 //!
@@ -57,6 +57,13 @@ pub fn descriptors() -> Vec<Descriptor> {
             name: "wpe",
             web: true,
             capabilities: sighurt_engine_wpe::CAPABILITIES,
+            honors: &["user-agent", "storage"],
+        },
+        #[cfg(feature = "engine-cef")]
+        Descriptor {
+            name: "cef",
+            web: true,
+            capabilities: sighurt_engine_cef::CAPABILITIES,
             honors: &["user-agent", "storage"],
         },
         #[cfg(feature = "engine-demo")]
@@ -150,6 +157,8 @@ mod tests {
         assert_eq!(env.engine_settings["wasm"], ["storage"]);
         #[cfg(feature = "engine-wpe")]
         assert_eq!(env.engine_settings["wpe"], ["user-agent", "storage"]);
+        #[cfg(feature = "engine-cef")]
+        assert_eq!(env.engine_settings["cef"], ["user-agent", "storage"]);
         #[cfg(feature = "engine-demo")]
         assert!(env.engine_settings["demo"].is_empty());
         // Web engines are a property of the descriptors, in their order, whatever this build
@@ -163,7 +172,7 @@ mod tests {
         for desc in descriptors() {
             assert_eq!(
                 desc.web,
-                matches!(desc.name, "servo" | "wpe"),
+                matches!(desc.name, "servo" | "wpe" | "cef"),
                 "{}",
                 desc.name
             );

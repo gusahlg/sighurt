@@ -12,6 +12,7 @@
     feature = "engine-servo",
     feature = "engine-wasm",
     feature = "engine-wpe",
+    feature = "engine-cef",
     feature = "engine-demo"
 ))]
 use sighurt_api::engine::EngineRuntime;
@@ -19,6 +20,7 @@ use sighurt_api::engine::EngineRuntime;
     feature = "engine-servo",
     feature = "engine-wasm",
     feature = "engine-wpe",
+    feature = "engine-cef",
     feature = "engine-demo"
 ))]
 use sighurt_api::ids::ViewId;
@@ -47,6 +49,12 @@ pub fn build() -> Registry<TermTarget, TermPermit> {
             renderer: "cpu, kitty graphics",
             start: wpe,
         },
+        #[cfg(feature = "engine-cef")]
+        Binding {
+            name: "cef",
+            renderer: "cpu, kitty graphics",
+            start: cef,
+        },
         #[cfg(feature = "engine-demo")]
         Binding {
             name: "demo",
@@ -58,10 +66,10 @@ pub fn build() -> Registry<TermTarget, TermPermit> {
 }
 
 /// One engine's runtime, bound to [`TermTarget`].
-#[cfg(any(feature = "engine-wasm", feature = "engine-demo"))]
+#[cfg(any(feature = "engine-wasm", feature = "engine-demo", feature = "engine-cef"))]
 struct Bound<R>(R);
 
-#[cfg(any(feature = "engine-wasm", feature = "engine-demo"))]
+#[cfg(any(feature = "engine-wasm", feature = "engine-demo", feature = "engine-cef"))]
 impl<R> EngineRuntime for Bound<R>
 where
     R: EngineRuntime<Target = TermTarget, FramePermit = TermPermit>,
@@ -352,6 +360,29 @@ impl sighurt_runtime::registry::Running<TermTarget, TermPermit> for WpeBound {
     /// The shared-memory frames copied into the terminal's buffer.
     fn readbacks(&self) -> u64 {
         self.0.diagnostics().present.shm_copies
+    }
+}
+
+/// Chromium needs a display connection even windowless; a terminal session without one gets
+/// the runtime's own refusal ("the cef engine needs a display"), which the tab shows.
+#[cfg(feature = "engine-cef")]
+fn cef(
+    waker: sighurt_api::engine::EngineWaker,
+    launch: sighurt_runtime::registry::Launch<'_>,
+) -> Result<sighurt_runtime::registry::Runtime<TermTarget, TermPermit>, String> {
+    use sighurt_engine_cef::CefRuntime;
+    use sighurt_runtime::registry::{self, Runtime};
+
+    CefRuntime::<TermTarget>::new(registry::cef_config(launch)?, waker)
+        .map(|runtime| Runtime::Cef(Box::new(Bound(runtime))))
+}
+
+#[cfg(feature = "engine-cef")]
+impl sighurt_runtime::registry::Running<TermTarget, TermPermit>
+    for Bound<sighurt_engine_cef::CefRuntime<TermTarget>>
+{
+    fn readbacks(&self) -> u64 {
+        self.0.diagnostics().staged_bytes
     }
 }
 
