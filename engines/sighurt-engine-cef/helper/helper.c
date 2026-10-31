@@ -12,8 +12,11 @@
 #ifndef CEF_API_VERSION
 #define CEF_API_VERSION 15000
 #endif
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
+#include <unistd.h>
 
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_dom_capi.h"
@@ -70,7 +73,24 @@ static cef_render_process_handler_t* CEF_CALLBACK get_render_process_handler(cef
 }
 static cef_app_t app;
 
+// Chromium's on-device model utility is exec'd by ServiceProcessHost, not forked from the
+// zygote, so it never gets the zygote's PR_SET_PDEATHSIG. Its idle timeout keeps it after
+// cef_shutdown, and when sig exits it is reparented to init. Only this subtype: the death
+// signal is tied to the thread that called fork, and setting it on every helper would kill
+// the network service if that launcher thread exited while sig was still running.
+static int on_device_model_service(int argc, char** argv) {
+  for (int i = 1; i < argc; i++) {
+    if (argv[i] && strstr(argv[i], "on_device_model.mojom.OnDeviceModelService")) return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (on_device_model_service(argc, argv)) {
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) return 4;
+    // The parent can have exited between fork and this call.
+    if (getppid() == 1) return 0;
+  }
   if (strcmp(cef_api_hash(CEF_API_VERSION, 0), CEF_API_HASH_PLATFORM)) return 3;
   render_handler.base.size = sizeof render_handler;
   render_handler.base.add_ref = add_ref;

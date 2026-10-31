@@ -506,8 +506,31 @@ runtime have no CEF code beyond that registration.
   hosts it with no display: `sig --tui --engine cef` with `WAYLAND_DISPLAY` and `DISPLAY` unset
   answered the terminal probe, sent kitty graphics, and exited 0 with no helper left
   (2026-10-31).
-- **Zygotes outlive `cef_shutdown`** until the process exits; the helper's other processes end
-  with it. `offscreen.sh` checks that nothing remains after the test process exits.
+- **Zygotes outlive `cef_shutdown`** until the process exits; they die with it because the
+  zygote sets `PR_SET_PDEATHSIG`. `offscreen.sh` and `cef.sh` then wait 3 s and check that no
+  `sig-cef-helper` is left.
+- **On-device model utility.** CEF 150 compiles `OptimizationGuideOnDeviceModel` enabled.
+  `CanLaunchOnDeviceModelService` is that feature or `LogOnDeviceMetricsOnStartup` (disabled
+  unless a trial turns it on). `OptimizationGuideGlobalState` schedules
+  `PerformanceClassifier::EnsurePerformanceClassAvailable` after
+  `on_device_startup_metric_delay` (default 180 s). That calls `ServiceClient::Get`, and
+  `LaunchService` starts `sig-cef-helper --type=utility
+  --utility-sub-type=on_device_model.mojom.OnDeviceModelService` with
+  `--service-sandbox-type=on_device_model_execution`, plus a `--type=broker` process in the
+  same instant. Neither is a zygote child. The mojo client keeps the service for
+  `on_device_model_service_idle_timeout` (60 s) after the pipe goes idle, and `cef_shutdown`
+  does not finish the pair, so a quit while they are up reparents them to init. A fresh
+  profile on this machine launched the utility at 180 s (17:52:04 start, first seen 17:55:07),
+  wrote `performance_class` 8 and `vram_mb` 0, then the utility died with
+  `stack smashing detected` after Dawn reported `vkCreateInstance: Found no drivers`
+  (SwiftShader has no Vulkan ICD). The coexistence snapshot the same afternoon
+  (`/data/sig-builds/test-out/coexist/final/procs.txt`, headless ozone) caught the utility and
+  its broker still alive, same start time, and the same stack-smash line in `sig.log`. The
+  engine passes one `disable-features` list:
+  `Translate,OptimizationGuideOnDeviceModel,LogOnDeviceMetricsOnStartup`. With the master
+  feature off the classifier records class 2 and does not call `Get`, so neither process is
+  started. The helper also sets `PR_SET_PDEATHSIG` to `SIGKILL` when its command line is this
+  utility, so a launch that still happens dies with the parent thread instead of init.
 - The clipboard is not handled by a CEF hook (there is none): the engine takes the chords
   before the page sees them and asks the services; Chromium cannot read or write the desktop
   clipboard in windowless mode anyway (no focused surface), so a page's own `navigator.clipboard`
@@ -566,7 +589,9 @@ example.com then a local input page):
 The review's 15 findings were checked against the code; all were right. What changed:
 
 - **Chromium has no display connection** (`--ozone-platform=headless`, software compositing with
-  SwiftShader, which also draws WebGL). The study's finding that CEF needs a display was about
+  SwiftShader, which also draws WebGL). The same headless configuration is what the
+  coexistence run was using when its process tree contained the on-device model utility and
+  its broker (section 8). The study's finding that CEF needs a display was about
   the default platform: with headless ozone CEF 150 starts and paints with `WAYLAND_DISPLAY` and
   `DISPLAY` unset (smoke test: first paint 112 ms with `--disable-gpu`, 261 ms with SwiftShader,
   warm; cold 5 to 12 s). So Chromium cannot reach the desktop clipboard or any other part of

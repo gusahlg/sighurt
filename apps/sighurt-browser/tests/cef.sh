@@ -157,6 +157,8 @@ info "tree: $n processes, $rss MiB resident; idle CPU over 10 s: $(python3 -c "p
 check "sig is woken at most a few times in 10 s of idle" "$(python3 -c "print('0' if $w1 - $w0 <= 25 else '1', $w1 - $w0)")"
 kill -TERM "$sig_pid" 2>/dev/null
 for _ in $(seq 50); do kill -0 "$sig_pid" 2>/dev/null || break; sleep 0.2; done
+# 3s after exit: an on-device model utility used to be reparented to init and still be alive.
+sleep 3
 check "sig exits and no Chromium process is left" \
   "$([[ -z $(pgrep -f '^/[^ ]*/sig-cef-helper --type=') ]]; echo "$? left=$(pgrep -fc '^/[^ ]*/sig-cef-helper --type=')")"
 echo "cef.sh: $failures failed check(s); screenshots and logs in $out"
