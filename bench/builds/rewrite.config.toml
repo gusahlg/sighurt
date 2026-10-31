@@ -4,6 +4,11 @@
 # replaces "{workloads}" with the absolute path of bench/workloads.
 version = 1
 
+# The keys below are the `bindings` keymap's; since decision 116 the default is the example
+# configuration, which doesn't read [keys]. 0.9.0 accepts the same line.
+[input]
+keymap = "bindings"
+
 [keys]
 "ctrl-l" = "location.focus"
 "ctrl-tab" = "tab.next"
