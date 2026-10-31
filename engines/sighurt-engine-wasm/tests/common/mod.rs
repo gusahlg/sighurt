@@ -321,18 +321,17 @@ pub fn guest(dir: &Path, name: &str, wat: &str) -> String {
 /// `tools/cargo build --target wasm32-unknown-unknown --release -p <example>`.
 pub fn example(crate_name: &str) -> String {
     let file = format!("{}.wasm", crate_name.replace('-', "_"));
-    // The crate lives in engines/, so the workspace target is two levels up.
-    let path: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "..",
-        "..",
-        "target",
-        "wasm32-unknown-unknown",
-        "release",
-        &file,
-    ]
-    .iter()
-    .collect();
+    // Honour the build's target dir. The crate lives in engines/, so the default is two up.
+    let mut path = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            [env!("CARGO_MANIFEST_DIR"), "..", "..", "target"]
+                .iter()
+                .collect()
+        });
+    path.push("wasm32-unknown-unknown");
+    path.push("release");
+    path.push(&file);
     assert!(
         path.is_file(),
         "{} is missing: build the example guests first with \

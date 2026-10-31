@@ -1535,3 +1535,101 @@ fn downloads_are_the_browsers_to_make() {
     assert!(!escape.exists());
     assert!(!host.dir().join("..").join("escape.txt").exists());
 }
+
+/// `api_download_url` called `n` times from `start_app`. The URL is 25 bytes.
+fn download_burst(n: u32) -> String {
+    format!(
+        r#"(module
+  (import "oxide" "api_download_url" (func $url (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "https://example.invalid/x")
+  (func (export "start_app")
+    (local $i i32)
+    (loop $again
+      (drop (call $url (i32.const 0) (i32.const 25)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $again (i32.lt_u (local.get $i) (i32.const {n}))))))
+"#
+    )
+}
+
+fn task_names() -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return names;
+    };
+    for task in tasks.flatten() {
+        if let Ok(name) = std::fs::read_to_string(task.path().join("comm")) {
+            names.push(name.trim().to_string());
+        }
+    }
+    names
+}
+
+fn vm_rss_kib() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A guest that asks for many URL downloads in one turn does not start a thread per call.
+/// The engine queues at most four and leaves the fetch to the browser.
+#[test]
+fn a_burst_of_download_urls_starts_no_thread() {
+    use sighurt_api::services::Service;
+    let mut host = Host::new();
+    let one = guest(host.dir(), "download-one", &download_burst(1));
+    let (first, _) = load(&mut host, &one);
+    let before = task_names();
+    let rss_before = vm_rss_kib();
+    let many = guest(host.dir(), "download-many", &download_burst(32));
+    let (view, _) = host.open(800, 600, 120);
+    host.navigate(view, &many);
+    let events = host.until(
+        5 * SECS,
+        |e| matches!(e, EngineEvent::LoadingChanged { view: v, loading: false, .. } if *v == view),
+    );
+    let after = task_names();
+    let rss_after = vm_rss_kib();
+    let downloads = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                EngineEvent::ServiceRequested(request)
+                    if request.view == view && matches!(request.service, Service::Download { .. })
+            )
+        })
+        .count();
+    let new_threads: Vec<_> = after
+        .iter()
+        .filter(|name| !before.contains(name) || *name == "sighurt-download")
+        .cloned()
+        .collect();
+    eprintln!(
+        "download burst: requests={downloads} threads {} -> {} ({before:?} -> {after:?}) rss {rss_before} -> {rss_after} KiB; view {first:?}",
+        before.len(),
+        after.len(),
+    );
+    // Four queued, the rest refused. None of them is fetched in this process.
+    assert_eq!(downloads, 4, "{events:#?}");
+    assert!(
+        !after.iter().any(|name| name == "sighurt-download"),
+        "the engine started download threads: {after:?}"
+    );
+    assert!(
+        after.len() <= before.len() + 2,
+        "thread count grew with the burst: {before:?} -> {after:?} (new {new_threads:?})"
+    );
+    assert!(
+        rss_after < rss_before + 10 * 1024,
+        "rss grew by {} KiB",
+        rss_after.saturating_sub(rss_before)
+    );
+}
