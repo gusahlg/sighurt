@@ -27,7 +27,11 @@ if ! flock -n 9; then
   flock 9
 fi
 if [[ $sync == 1 ]]; then
-  rsync -a --delete --exclude /target --exclude /.git --exclude '/bench/results/raw' \
+  # By content, and without the local modification times: a file edited here before a remote
+  # build started would otherwise arrive older than that build's output, and cargo would keep
+  # the stale artifact. A file that changed gets the time it arrives.
+  rsync -a --no-times --checksum --delete --exclude /target --exclude /.git \
+    --exclude '/bench/results/raw' \
     -e 'ssh -o BatchMode=yes' "$repo/" "louise-pc:$dest/"
 fi
 # The remote login shell is fish, so the command goes to bash on stdin rather than through
