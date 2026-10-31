@@ -10326,6 +10326,8 @@ dependencies = [
 name = "sighurt-engine-netsurf"
 version = "0.9.0"
 dependencies = [
+ "libc",
+ "log",
  "sighurt-api",
  "sighurt-wayland",
 ]

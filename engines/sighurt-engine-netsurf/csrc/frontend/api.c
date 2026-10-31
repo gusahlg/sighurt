@@ -236,15 +236,16 @@ static int live_view(const nsh_view *view)
 	return nsh_core_state == 1 && view && view->bw && !view->pending;
 }
 
-void nsh_view_navigate(nsh_view *view, const char *url)
+int nsh_view_navigate(nsh_view *view, const char *url)
 {
 	if (!live_view(view) || !url)
-		return;
+		return 0;
 	struct nsurl *u = NULL;
 	if (nsurl_create(url, &u) != NSERROR_OK)
-		return;
-	browser_window_navigate(view->bw, u, NULL, BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
+		return 0;
+	nserror err = browser_window_navigate(view->bw, u, NULL, BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
 	nsurl_unref(u);
+	return err == NSERROR_OK;
 }
 
 void nsh_view_reload(nsh_view *view)
@@ -286,6 +287,9 @@ void nsh_view_mouse(nsh_view *view, int x, int y, unsigned state, unsigned mods)
 	if (!live_view(view))
 		return;
 	unsigned m = state | mods;
+	/* The core's positions are in the content, not the view: add the scroll offset. */
+	x += view->sx;
+	y += view->sy;
 	unsigned click = NSH_MOUSE_PRESS_1 | NSH_MOUSE_PRESS_2 | NSH_MOUSE_CLICK_1 | NSH_MOUSE_CLICK_2
 		| NSH_MOUSE_DOUBLE_CLICK | NSH_MOUSE_TRIPLE_CLICK | NSH_MOUSE_DRAG_1 | NSH_MOUSE_DRAG_2;
 	if (m & click)
@@ -296,15 +300,35 @@ void nsh_view_mouse(nsh_view *view, int x, int y, unsigned state, unsigned mods)
 
 void nsh_view_scroll(nsh_view *view, int x, int y, int dx, int dy)
 {
-	if (live_view(view))
-		browser_window_scroll_at_point(view->bw, x, y, dx, dy);
+	if (!live_view(view))
+		return;
+	/* Something inside the page that scrolls (a box, a frame) takes it first; the page itself
+	 * is the frontend's to scroll. */
+	if (!browser_window_scroll_at_point(view->bw, x + view->sx, y + view->sy, dx, dy))
+		nsh_scroll_by(view, dx, dy);
 }
 
 int nsh_view_key(nsh_view *view, uint32_t key)
 {
 	if (!live_view(view))
 		return 0;
-	return browser_window_key_press(view->bw, key) ? 1 : 0;
+	if (browser_window_key_press(view->bw, key))
+		return 1;
+	/* Not taken by a field or a selection: scroll the page, as the other frontends do. */
+	int page = view->h * 9 / 10 > 1 ? view->h * 9 / 10 : 1;
+	switch (key) {
+	case NSH_KEY_UP: return nsh_scroll_by(view, 0, -48);
+	case NSH_KEY_DOWN: return nsh_scroll_by(view, 0, 48);
+	case NSH_KEY_LEFT: return nsh_scroll_by(view, -48, 0);
+	case NSH_KEY_RIGHT: return nsh_scroll_by(view, 48, 0);
+	case NSH_KEY_PAGE_UP: return nsh_scroll_by(view, 0, -page);
+	case NSH_KEY_PAGE_DOWN: return nsh_scroll_by(view, 0, page);
+	case NSH_KEY_LINE_START:
+	case NSH_KEY_TEXT_START: return nsh_scroll_by(view, -view->sx, -view->sy);
+	case NSH_KEY_LINE_END:
+	case NSH_KEY_TEXT_END: return nsh_scroll_by(view, 0, 1 << 27);
+	default: return 0;
+	}
 }
 
 int nsh_view_link_at(nsh_view *view, int x, int y, char *buf, size_t buflen)
@@ -314,7 +338,7 @@ int nsh_view_link_at(nsh_view *view, int x, int y, char *buf, size_t buflen)
 	buf[0] = '\0';
 	struct browser_window_features features;
 	memset(&features, 0, sizeof features);
-	if (browser_window_get_features(view->bw, x, y, &features) != NSERROR_OK || !features.link)
+	if (browser_window_get_features(view->bw, x + view->sx, y + view->sy, &features) != NSERROR_OK || !features.link)
 		return 0;
 	const char *s = nsurl_access(features.link);
 	if (!s)
@@ -333,7 +357,7 @@ int nsh_view_form_at(nsh_view *view, int x, int y)
 		return 0;
 	struct browser_window_features features;
 	memset(&features, 0, sizeof features);
-	if (browser_window_get_features(view->bw, x, y, &features) != NSERROR_OK)
+	if (browser_window_get_features(view->bw, x + view->sx, y + view->sy, &features) != NSERROR_OK)
 		return 0;
 	if (features.form_features == CTX_FORM_TEXT)
 		return 1;

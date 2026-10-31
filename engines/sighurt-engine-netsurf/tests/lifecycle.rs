@@ -17,5 +17,9 @@ fn one_runtime_per_process() {
     );
     assert_eq!(ffi::state(), 2);
     ffi::shutdown();
-    assert_eq!(ffi::state(), 2, "shutdown after the runtime is finished does nothing");
+    assert_eq!(
+        ffi::state(),
+        2,
+        "shutdown after the runtime is finished does nothing"
+    );
 }

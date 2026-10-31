@@ -13,3 +13,5 @@ authors.workspace = true
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
 sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
+libc = "0.2"
+log = "0.4"

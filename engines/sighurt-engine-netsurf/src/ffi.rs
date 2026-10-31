@@ -6,7 +6,7 @@
 #![allow(missing_docs)]
 
 use std::ffi::CString;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 
 const CSS_DEFAULT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/res/default.css"));
 const CSS_QUIRKS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/res/quirks.css"));
@@ -46,7 +46,9 @@ fn bytes(data: &'static [u8]) -> NshBytes {
 }
 
 fn optional(text: &Option<CString>) -> *const c_char {
-    text.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null())
+    text.as_ref()
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null())
 }
 
 /// What [`init`] is given. Strings are copied by the core where it keeps them.
@@ -84,10 +86,22 @@ impl Init {
             user_agent: None,
             ca_bundle: optional_env("SSL_CERT_FILE"),
             profile_dir: None,
-            font_sans: font("SIGHURT_NETSURF_FONT_SANS", option_env!("SIGHURT_NETSURF_BUILT_FONT_SANS")),
-            font_sans_bold: font("SIGHURT_NETSURF_FONT_SANS_BOLD", option_env!("SIGHURT_NETSURF_BUILT_FONT_SANS_BOLD")),
-            font_serif: font("SIGHURT_NETSURF_FONT_SERIF", option_env!("SIGHURT_NETSURF_BUILT_FONT_SERIF")),
-            font_mono: font("SIGHURT_NETSURF_FONT_MONO", option_env!("SIGHURT_NETSURF_BUILT_FONT_MONO")),
+            font_sans: font(
+                "SIGHURT_NETSURF_FONT_SANS",
+                option_env!("SIGHURT_NETSURF_BUILT_FONT_SANS"),
+            ),
+            font_sans_bold: font(
+                "SIGHURT_NETSURF_FONT_SANS_BOLD",
+                option_env!("SIGHURT_NETSURF_BUILT_FONT_SANS_BOLD"),
+            ),
+            font_serif: font(
+                "SIGHURT_NETSURF_FONT_SERIF",
+                option_env!("SIGHURT_NETSURF_BUILT_FONT_SERIF"),
+            ),
+            font_mono: font(
+                "SIGHURT_NETSURF_FONT_MONO",
+                option_env!("SIGHURT_NETSURF_BUILT_FONT_MONO"),
+            ),
         }
     }
 }
@@ -194,7 +208,7 @@ mod raw {
 
         pub fn nsh_view_open(view_id: u64, w: c_int, h: c_int, scale_120: c_int) -> *mut View;
         pub fn nsh_view_close(view: *mut View);
-        pub fn nsh_view_navigate(view: *mut View, url: *const c_char);
+        pub fn nsh_view_navigate(view: *mut View, url: *const c_char) -> c_int;
         pub fn nsh_view_reload(view: *mut View);
         pub fn nsh_view_stop(view: *mut View);
         pub fn nsh_view_back(view: *mut View);
@@ -211,7 +225,13 @@ mod raw {
         pub fn nsh_view_mouse(view: *mut View, x: c_int, y: c_int, state: c_uint, mods: c_uint);
         pub fn nsh_view_scroll(view: *mut View, x: c_int, y: c_int, dx: c_int, dy: c_int);
         pub fn nsh_view_key(view: *mut View, key: u32) -> c_int;
-        pub fn nsh_view_link_at(view: *mut View, x: c_int, y: c_int, buf: *mut c_char, buflen: usize) -> c_int;
+        pub fn nsh_view_link_at(
+            view: *mut View,
+            x: c_int,
+            y: c_int,
+            buf: *mut c_char,
+            buflen: usize,
+        ) -> c_int;
         pub fn nsh_view_form_at(view: *mut View, x: c_int, y: c_int) -> c_int;
         pub fn nsh_view_selection(view: *mut View, buf: *mut c_char, buflen: usize) -> c_int;
         pub fn nsh_view_paint(
@@ -307,8 +327,255 @@ mod raw {
     pub const KEY_REDO: u32 = 141;
 }
 
+/// One NetSurf window. Not `Send`: every call is on the owner thread, after [`init`] and
+/// before [`shutdown`] (which closes any view still open: do not use a handle after it).
+pub struct Handle(std::ptr::NonNull<raw::View>);
+
+impl Handle {
+    /// Opens a window of `w` x `h` buffer pixels at `scale_120`.
+    pub fn open(view_id: u64, w: u32, h: u32, scale_120: u32) -> Option<Self> {
+        let clamp = |n: u32| n.clamp(1, i32::MAX as u32) as c_int;
+        // SAFETY: the C side validates its state; a null return is a failure.
+        let ptr = unsafe { raw::nsh_view_open(view_id, clamp(w), clamp(h), clamp(scale_120)) };
+        std::ptr::NonNull::new(ptr).map(Self)
+    }
+
+    /// Closes the window. The handle is gone.
+    pub fn close(self) {
+        // SAFETY: the handle is live and is consumed here.
+        unsafe { raw::nsh_view_close(self.0.as_ptr()) }
+    }
+
+    /// Starts loading `url`. False if the core refused it.
+    pub fn navigate(&self, url: &str) -> bool {
+        let Ok(url) = CString::new(url) else {
+            return false;
+        };
+        // SAFETY: live handle, a NUL-terminated string for the call.
+        unsafe { raw::nsh_view_navigate(self.0.as_ptr(), url.as_ptr()) != 0 }
+    }
+
+    /// Reloads.
+    pub fn reload(&self) {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_reload(self.0.as_ptr()) }
+    }
+
+    /// Stops loading.
+    pub fn stop(&self) {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_stop(self.0.as_ptr()) }
+    }
+
+    /// Resizes to `w` x `h` buffer pixels at `scale_120`.
+    pub fn resize(&self, w: u32, h: u32, scale_120: u32) {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_resize(self.0.as_ptr(), w as c_int, h as c_int, scale_120 as c_int) }
+    }
+
+    /// Page zoom, 1.0 for 100 %.
+    pub fn set_zoom(&self, zoom: f64) {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_set_scale(self.0.as_ptr(), zoom) }
+    }
+
+    /// Hides or shows: a hidden window paints nothing.
+    pub fn set_hidden(&self, hidden: bool) {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_set_hidden(self.0.as_ptr(), c_int::from(hidden)) }
+    }
+
+    /// Mouse state at a buffer position.
+    pub fn mouse(&self, x: i32, y: i32, state: u32, mods: u32) {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_mouse(self.0.as_ptr(), x, y, state, mods) }
+    }
+
+    /// Scrolls the deepest scrollable thing at a buffer position, in pixels.
+    pub fn scroll(&self, x: i32, y: i32, dx: i32, dy: i32) {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_scroll(self.0.as_ptr(), x, y, dx, dy) }
+    }
+
+    /// Sends a key (an `KEY_*` value or a Unicode scalar). True if the core consumed it.
+    pub fn key(&self, key: u32) -> bool {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_key(self.0.as_ptr(), key) != 0 }
+    }
+
+    /// The link under a buffer position, if any.
+    pub fn link_at(&self, x: i32, y: i32) -> Option<String> {
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: live handle; the C side writes at most `buf.len()` bytes with a NUL.
+        let found = unsafe {
+            raw::nsh_view_link_at(self.0.as_ptr(), x, y, buf.as_mut_ptr().cast(), buf.len())
+        };
+        if found == 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+
+    /// Paints the whole view into `pixels` (ARGB8888, premultiplied: opaque), `stride` bytes per
+    /// row. Errs if the memory is not four-byte aligned or too small.
+    pub fn paint(&self, pixels: &mut [u8], w: u32, h: u32, stride: usize) -> Result<bool, String> {
+        if !(pixels.as_ptr() as usize).is_multiple_of(4) || !stride.is_multiple_of(4) {
+            return Err("the frame is not aligned to four bytes".into());
+        }
+        if stride < w as usize * 4 || pixels.len() < stride * h as usize {
+            return Err("the frame is smaller than its size".into());
+        }
+        // SAFETY: live handle; the buffer holds `h` rows of `stride` bytes, aligned for u32, and
+        // the core writes only inside `w` x `h`.
+        let drew = unsafe {
+            raw::nsh_view_paint(
+                self.0.as_ptr(),
+                pixels.as_mut_ptr().cast(),
+                w as c_int,
+                h as c_int,
+                stride,
+                std::ptr::null(),
+            )
+        };
+        Ok(drew != 0)
+    }
+}
+
+/// What the core wants from the owner loop after [`poll`].
+pub struct Poll {
+    /// Milliseconds to the next page-timed callback: `None` nothing, `Some(0)` work is due.
+    pub timeout_ms: Option<u32>,
+    /// Descriptors to wait on, as `(fd, poll events)`.
+    pub fds: Vec<(i32, i16)>,
+}
+
+/// Runs due callbacks and polls the fetchers.
+pub fn poll() -> Poll {
+    let mut info = std::mem::MaybeUninit::<raw::PollInfo>::zeroed();
+    // SAFETY: `info` is a writable PollInfo; zero is a valid value of it, and the C side fills it.
+    let info = unsafe {
+        raw::nsh_poll(info.as_mut_ptr());
+        info.assume_init()
+    };
+    let mut fds: Vec<(i32, i16)> = Vec::new();
+    let mut add = |list: &[c_int], count: c_int, events: i16| {
+        for &fd in list.iter().take(count.max(0) as usize) {
+            match fds.iter_mut().find(|(have, _)| *have == fd) {
+                Some(entry) => entry.1 |= events,
+                None => fds.push((fd, events)),
+            }
+        }
+    };
+    add(&info.read_fds, info.nread, libc::POLLIN);
+    add(&info.write_fds, info.nwrite, libc::POLLOUT);
+    add(&info.except_fds, info.nexcept, libc::POLLPRI);
+    Poll {
+        timeout_ms: u32::try_from(info.timeout_ms).ok(),
+        fds,
+    }
+}
+
+/// One event from the core, with its text copied.
+pub struct OwnedEvent {
+    pub kind: u32,
+    pub view_id: u64,
+    pub i0: i32,
+    pub i1: i32,
+    pub i2: i32,
+    pub i3: i32,
+    pub u0: u64,
+    pub text: Option<String>,
+}
+
+/// The next queued event, if any.
+pub fn next_event() -> Option<OwnedEvent> {
+    let mut event = Event {
+        kind: 0,
+        view_id: 0,
+        i0: 0,
+        i1: 0,
+        i2: 0,
+        i3: 0,
+        u0: 0,
+        text: std::ptr::null(),
+        text_len: 0,
+    };
+    // SAFETY: a writable Event; the text pointer it receives is valid until the next call, and
+    // is copied here.
+    if unsafe { raw::nsh_next_event(&mut event) } == 0 {
+        return None;
+    }
+    Some(OwnedEvent {
+        kind: event.kind,
+        view_id: event.view_id,
+        i0: event.i0,
+        i1: event.i1,
+        i2: event.i2,
+        i3: event.i3,
+        u0: event.u0,
+        text: event_text(event.text, event.text_len),
+    })
+}
+
+/// Replaces the clipboard text `NS_KEY_PASTE` reads.
+pub fn set_clipboard_shadow(text: &str) {
+    // SAFETY: a pointer and length of a live string; the C side copies.
+    unsafe { raw::nsh_clipboard_set_shadow(text.as_ptr().cast(), text.len()) }
+}
+
+/// A finished download's buffered bytes, name and type, and then releases them.
+pub fn take_download(id: u64) -> Option<(String, Option<String>, Vec<u8>)> {
+    let (mut url, mut name, mut mime) = ([0u8; 2048], [0u8; 512], [0u8; 128]);
+    let mut data: *const u8 = std::ptr::null();
+    let mut len = 0usize;
+    // SAFETY: writable buffers with their lengths; `data` and `len` are filled by the C side and
+    // the bytes are copied before the release below.
+    let found = unsafe {
+        raw::nsh_download_info(
+            id,
+            url.as_mut_ptr().cast(),
+            url.len(),
+            name.as_mut_ptr().cast(),
+            name.len(),
+            mime.as_mut_ptr().cast(),
+            mime.len(),
+            &mut data,
+            &mut len,
+        )
+    };
+    if found == 0 {
+        return None;
+    }
+    let bytes = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the C side owns `len` bytes at `data` until the release below.
+        unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+    };
+    // SAFETY: releases the buffered body.
+    unsafe { raw::nsh_download_answer(id, 0) };
+    let text = |b: &[u8]| {
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        String::from_utf8_lossy(&b[..end]).into_owned()
+    };
+    let name = text(&name);
+    Some((text(&url), (!name.is_empty()).then_some(name), bytes))
+}
+
+/// Answers a file input: `None` cancels.
+pub fn answer_file(view_id: u64, path: Option<&str>) {
+    let path = path.and_then(|p| CString::new(p).ok());
+    // SAFETY: a NUL-terminated string or null.
+    unsafe {
+        raw::nsh_file_answer(
+            view_id,
+            path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+        )
+    }
+}
+
 /// A borrowed C string for a URL or path passed into the core for one call.
 pub fn c_str(text: &str) -> CString {
     CString::new(text).expect("text contains a NUL")
 }
-

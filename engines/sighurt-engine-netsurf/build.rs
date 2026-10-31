@@ -181,8 +181,8 @@ void user_agent_override(const char *ua)\n\
 }
 
 fn replace_once(path: &Path, marker: &str, from: &str, to: &str) {
-    let text = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     if text.contains(marker) {
         return;
     }
@@ -237,7 +237,14 @@ fn run_make(source: &Path, pkg_config_path: &str) {
         .unwrap_or_else(|e| panic!("make: {e}"));
     if !status.success() {
         let output = fs::read_to_string(&log_path).unwrap_or_default();
-        let tail: String = output.chars().rev().take(4000).collect::<String>().chars().rev().collect();
+        let tail: String = output
+            .chars()
+            .rev()
+            .take(4000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         panic!("NetSurf make failed (log {}):\n{tail}", log_path.display());
     }
 }

@@ -122,6 +122,39 @@ static nserror gw_invalidate(struct gui_window *g, const struct rect *rect)
 	return NSERROR_OK;
 }
 
+int nsh_clamp_scroll(struct gui_window *g)
+{
+	int ew = 0, eh = 0, ox = g->sx, oy = g->sy;
+	if (g->bw && browser_window_get_extents(g->bw, true, &ew, &eh) == NSERROR_OK) {
+		int mx = ew > g->w ? ew - g->w : 0, my = eh > g->h ? eh - g->h : 0;
+		if (g->sx > mx)
+			g->sx = mx;
+		if (g->sy > my)
+			g->sy = my;
+	}
+	if (g->sx < 0)
+		g->sx = 0;
+	if (g->sy < 0)
+		g->sy = 0;
+	return g->sx != ox || g->sy != oy;
+}
+
+int nsh_scroll_by(struct gui_window *g, int dx, int dy)
+{
+	int ox = g->sx, oy = g->sy;
+	/* Saturating: callers pass "to the end" as a huge offset. */
+	long nx = (long)g->sx + dx, ny = (long)g->sy + dy;
+	g->sx = nx > (1 << 28) ? (1 << 28) : (int)nx;
+	g->sy = ny > (1 << 28) ? (1 << 28) : (int)ny;
+	nsh_clamp_scroll(g);
+	int moved = g->sx != ox || g->sy != oy;
+	if (moved && !quiet(g)) {
+		add_dirty(g, NULL);
+		nsh_emit(NSH_EV_FRAME, g->view_id, 0, 0, 0, 0, 0, NULL);
+	}
+	return moved;
+}
+
 static bool gw_get_scroll(struct gui_window *g, int *sx, int *sy)
 {
 	*sx = g->sx;
@@ -135,6 +168,7 @@ static nserror gw_set_scroll(struct gui_window *g, const struct rect *rect)
 		return NSERROR_BAD_PARAMETER;
 	g->sx = rect->x0;
 	g->sy = rect->y0;
+	nsh_clamp_scroll(g);
 	if (!quiet(g)) {
 		add_dirty(g, NULL);
 		nsh_emit(NSH_EV_FRAME, g->view_id, 0, 0, 0, 0, 0, NULL);
@@ -165,9 +199,11 @@ static nserror gw_event(struct gui_window *g, enum gui_window_event event)
 		break;
 	case GW_EVENT_NEW_CONTENT:
 		g->gadget = NULL;
+		g->sx = g->sy = 0;
 		nsh_emit(NSH_EV_NEW_CONTENT, g->view_id, 0, 0, 0, 0, 0, NULL);
 		break;
 	case GW_EVENT_UPDATE_EXTENT:
+		nsh_clamp_scroll(g);
 		add_dirty(g, NULL);
 		nsh_emit(NSH_EV_FRAME, g->view_id, 0, 0, 0, 0, 0, NULL);
 		break;
@@ -225,7 +261,8 @@ static void gw_place_caret(struct gui_window *g, int x, int y, int height, const
 	(void)clip;
 	if (quiet(g))
 		return;
-	nsh_emit(NSH_EV_CARET, g->view_id, x, y, height, 0, 0, NULL);
+	/* The core places the caret in content space; the browser wants it in the view. */
+	nsh_emit(NSH_EV_CARET, g->view_id, x - g->sx, y - g->sy, height, 0, 0, NULL);
 }
 
 static bool gw_drag_start(struct gui_window *g, gui_drag_type type, const struct rect *rect)
@@ -366,6 +403,7 @@ void nsh_view_resize(nsh_view *view, int w, int h, int scale_120)
 		view->scale_120 = scale_120;
 	view->w = w;
 	view->h = h;
+	nsh_clamp_scroll(view);
 	if (scale_changed)
 		apply_scale(view);
 	else

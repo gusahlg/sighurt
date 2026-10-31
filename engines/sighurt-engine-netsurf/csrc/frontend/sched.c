@@ -17,6 +17,20 @@ struct cb {
 };
 
 static struct cb *cbs;
+
+/* What the core scheduled while it started (the cache cleaners) is housekeeping whenever it is
+ * rescheduled, whatever its delay or argument. */
+enum { KNOWN_MAX = 16 };
+static struct { void (*fn)(void *); void *p; } known[KNOWN_MAX];
+static int nknown;
+
+static int is_known(void (*fn)(void *), void *p)
+{
+	for (int i = 0; i < nknown; i++)
+		if (known[i].fn == fn && known[i].p == p)
+			return 1;
+	return 0;
+}
 static double last_housekeeping;
 
 double nsh_now_ms(void)
@@ -53,7 +67,7 @@ nserror nsh_schedule(int ms, void (*fn)(void *), void *p)
 	c->at = nsh_now_ms() + (double)ms;
 	c->fn = fn;
 	c->p = p;
-	c->housekeeping = (p == NULL && ms >= 5000);
+	c->housekeeping = (p == NULL && ms >= 5000) || is_known(fn, p);
 	c->next = cbs;
 	cbs = c;
 	return NSERROR_OK;
@@ -120,10 +134,19 @@ void nsh_sched_clear(void)
 		cbs = c->next;
 		free(c);
 	}
+	nknown = 0;
 }
 
 /* Set when the core comes up, so the first housekeeping wake is a minute later. */
 void nsh_sched_mark_housekeeping(void)
 {
 	last_housekeeping = nsh_now_ms();
+	for (struct cb *c = cbs; c && nknown < KNOWN_MAX; c = c->next) {
+		c->housekeeping = 1;
+		if (!is_known(c->fn, c->p)) {
+			known[nknown].fn = c->fn;
+			known[nknown].p = c->p;
+			nknown++;
+		}
+	}
 }

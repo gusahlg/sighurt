@@ -15,9 +15,33 @@
 
 #[doc(hidden)]
 pub mod ffi;
+mod input;
+mod runtime;
+mod watcher;
+
+use sighurt_api::engine::{EngineCapabilities, SiteDataKinds};
+
+pub use runtime::{NetSurfConfig, NetSurfRuntime};
 
 /// The Wayland host's shared-memory target. The runtime paints through it.
 pub use sighurt_wayland::TargetLease;
 
 /// The engine's name in the configuration and the registry.
 pub const NAME: &str = "netsurf";
+
+/// What the engine supports: page zoom. `text_input` is IME composition, which it does not do (a
+/// focused field is reported through `TextInputChanged`). No history of its own (the core gives
+/// each page a view), no semantics, no find, no site data yet.
+pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
+    history_traversal: false,
+    text_input: false,
+    accessibility: false,
+    screenshots: false,
+    find_in_page: false,
+    page_zoom: true,
+    pointer_lock: false,
+    native_popups: false,
+    process_per_view: false,
+    semantics: false,
+    site_data: SiteDataKinds::NONE,
+};

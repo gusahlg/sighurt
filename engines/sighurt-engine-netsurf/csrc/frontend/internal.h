@@ -78,6 +78,11 @@ extern struct gui_fetch_table nsh_fetch_table;
 extern struct gui_misc_table nsh_misc_table;
 
 struct gui_window *nsh_windows(void);
+/* Keeps the scroll offset inside the content. Returns 1 if it moved. Offsets are in buffer
+ * (scaled) pixels, as the plotters and the mouse positions are. */
+int nsh_clamp_scroll(struct gui_window *g);
+/* Moves the root scroll by (dx, dy) buffer pixels, queues a frame if it moved. */
+int nsh_scroll_by(struct gui_window *g, int dx, int dy);
 int nsh_live_views(void);
 struct gui_window *nsh_view_by_id(uint64_t view_id);
 

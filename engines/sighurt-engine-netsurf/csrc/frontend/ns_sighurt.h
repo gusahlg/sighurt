@@ -149,7 +149,8 @@ void nsh_shutdown(void);
  * caller's concern: pass the last real size. */
 nsh_view *nsh_view_open(uint64_t view_id, int w, int h, int scale_120);
 void nsh_view_close(nsh_view *view);
-void nsh_view_navigate(nsh_view *view, const char *url);
+/* Returns 1 if the core accepted the navigation, 0 for a bad URL. */
+int nsh_view_navigate(nsh_view *view, const char *url);
 void nsh_view_reload(nsh_view *view);
 void nsh_view_stop(nsh_view *view);
 void nsh_view_back(nsh_view *view);
