@@ -13,11 +13,11 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::capi::{
     CefApp, CefBaseRefCounted, CefBrowserSettings, CefClient, CefDictionaryValue, CefMainArgs,
-    CefSettings, CefStringUtf16, CefWindowInfo,
+    CefSettings, CefStringUtf16, CefTask, CefWindowInfo,
 };
 
 /// The API version this crate's bindings are generated for (`CEF_API_VERSION`).
@@ -50,6 +50,8 @@ pub struct Api {
     pub string_list_alloc: unsafe extern "C" fn() -> *mut c_void,
     /// `cef_string_list_append`.
     pub string_list_append: unsafe extern "C" fn(*mut c_void, *const CefStringUtf16),
+    /// `cef_post_task`.
+    pub post_task: unsafe extern "C" fn(i32, *mut CefTask) -> i32,
 }
 
 static API: OnceLock<Api> = OnceLock::new();
@@ -97,6 +99,7 @@ pub fn load(dist: &Path) -> Result<&'static Api, String> {
             userfree_free: cast(sym("cef_string_userfree_utf16_free")?),
             string_list_alloc: cast(sym("cef_string_list_alloc")?),
             string_list_append: cast(sym("cef_string_list_append")?),
+            post_task: cast(sym("cef_post_task")?),
         };
         Ok(API.get_or_init(|| api))
     }
@@ -145,11 +148,19 @@ pub fn empty_string() -> CefStringUtf16 {
     }
 }
 
-/// Reads a `const cef_string_t*` CEF passes to a callback. Null is the empty string.
+/// The most UTF-16 units of page text (titles, status text, messages) converted: the core
+/// cuts text to 16 KiB anyway, so more is never allocated.
+pub const MAX_TEXT_UNITS: usize = 16 * 1024;
+/// The most UTF-16 units of an address converted (the core drops a URL over 2 MiB; so does
+/// [`read_url`], which never shortens one).
+pub const MAX_URL_UNITS: usize = 2 * 1024 * 1024;
+
+/// Reads at most `max` units of a `const cef_string_t*` CEF passes to a callback, the rest cut
+/// off before anything is allocated for it. Null is the empty string.
 ///
 /// # Safety
 /// `s` is null or points to a valid `cef_string_t`.
-pub unsafe fn read(s: *const CefStringUtf16) -> String {
+pub unsafe fn read_capped(s: *const CefStringUtf16, max: usize) -> String {
     if s.is_null() {
         return String::new();
     }
@@ -159,21 +170,70 @@ pub unsafe fn read(s: *const CefStringUtf16) -> String {
         if s.str_.is_null() {
             return String::new();
         }
-        String::from_utf16_lossy(std::slice::from_raw_parts(s.str_, s.length))
+        String::from_utf16_lossy(std::slice::from_raw_parts(s.str_, s.length.min(max)))
     }
 }
 
-/// Reads and frees a `cef_string_userfree_t` that CEF returned to us.
+/// [`read_capped`] at the size of page text.
+///
+/// # Safety
+/// As [`read_capped`].
+pub unsafe fn read(s: *const CefStringUtf16) -> String {
+    // SAFETY: by the contract above.
+    unsafe { read_capped(s, MAX_TEXT_UNITS) }
+}
+
+/// An address: `None` when it is longer than [`MAX_URL_UNITS`] (a shortened address would
+/// point somewhere else), checked before it is converted.
+///
+/// # Safety
+/// As [`read_capped`].
+pub unsafe fn read_url(s: *const CefStringUtf16) -> Option<String> {
+    // SAFETY: by the contract above.
+    unsafe {
+        if !s.is_null() && (*s).length > MAX_URL_UNITS {
+            return None;
+        }
+        Some(read_capped(s, MAX_URL_UNITS))
+    }
+}
+
+/// Reads and frees a `cef_string_userfree_t` that CEF returned to us, as [`read_capped`].
 ///
 /// # Safety
 /// `s` is null or came from a CEF getter that returns a string we own.
-pub unsafe fn take(s: *mut CefStringUtf16) -> String {
+pub unsafe fn take_capped(s: *mut CefStringUtf16, max: usize) -> String {
     if s.is_null() {
         return String::new();
     }
     // SAFETY: by the contract above.
     unsafe {
-        let text = read(s);
+        let text = read_capped(s, max);
+        (api().userfree_free)(s);
+        text
+    }
+}
+
+/// [`take_capped`] at the size of page text.
+///
+/// # Safety
+/// As [`take_capped`].
+pub unsafe fn take(s: *mut CefStringUtf16) -> String {
+    // SAFETY: by the contract above.
+    unsafe { take_capped(s, MAX_TEXT_UNITS) }
+}
+
+/// A returned address, as [`read_url`], freed.
+///
+/// # Safety
+/// As [`take_capped`].
+pub unsafe fn take_url(s: *mut CefStringUtf16) -> Option<String> {
+    if s.is_null() {
+        return Some(String::new());
+    }
+    // SAFETY: by the contract above.
+    unsafe {
+        let text = read_url(s);
         (api().userfree_free)(s);
         text
     }
@@ -218,6 +278,7 @@ vtables!(
     CefRenderHandler,
     CefRequestHandler,
     CefNavigationEntryVisitor,
+    CefTask,
 );
 
 /// A heap object implementing a CEF interface: the vtable first (so a pointer to it is a pointer
@@ -323,34 +384,39 @@ pub unsafe fn release_raw<T>(p: *mut T) {
     unsafe { ((*base).release.expect("release"))(base) };
 }
 
+/// The CEF interfaces documented as usable from any thread (they forward to the UI thread
+/// themselves). Only these may be shared across threads inside a [`Ref`].
+///
+/// # Safety
+/// Implemented only for interfaces CEF documents as thread-safe.
+pub unsafe trait ThreadSafe {}
+
+// SAFETY: CEF documents `cef_browser_t` and `cef_browser_host_t` as callable from any thread
+// (the host's methods post to the UI thread when called elsewhere).
+unsafe impl ThreadSafe for crate::capi::CefBrowser {}
+// SAFETY: as above.
+unsafe impl ThreadSafe for crate::capi::CefBrowserHost {}
+
 /// A reference we hold to a CEF object, released on drop.
 ///
-/// CEF documents its browser, host, frame and navigation objects as usable from any thread
-/// (they forward to the UI thread themselves), which is what makes the `Send` and `Sync`
-/// implementations sound for the types this crate wraps in it.
+/// Adoption is `unsafe`: the pointer must carry a reference nobody else will release, or the
+/// object is freed twice. `Send` and `Sync` exist only for [`ThreadSafe`] interfaces.
 pub struct Ref<T>(NonNull<T>);
 
-// SAFETY: see the type's documentation; only used for CEF's thread-safe interfaces.
-unsafe impl<T> Send for Ref<T> {}
+// SAFETY: see [`ThreadSafe`]; no other interface is ever moved to another thread.
+unsafe impl<T: ThreadSafe> Send for Ref<T> {}
 // SAFETY: as above.
-unsafe impl<T> Sync for Ref<T> {}
+unsafe impl<T: ThreadSafe> Sync for Ref<T> {}
 
 impl<T> Ref<T> {
-    /// Takes over a reference CEF returned (a new reference, or `add_ref`ed by the caller).
-    /// Null gives `None`.
-    pub fn from_owned(p: *mut T) -> Option<Self> {
-        NonNull::new(p).map(Self)
-    }
-
-    /// A new reference to a pointer CEF lent for the length of a callback.
+    /// Takes over a reference CEF handed to us (a callback argument, a getter's result) or one
+    /// the caller added. Null gives `None`.
     ///
     /// # Safety
-    /// `p` is null or points to a live CEF interface.
-    pub unsafe fn from_borrowed(p: *mut T) -> Option<Self> {
-        let p = NonNull::new(p)?;
-        // SAFETY: by the contract above.
-        unsafe { add_ref_raw(p.as_ptr()) };
-        Some(Self(p))
+    /// `p` is null or points to a live CEF interface, and the reference it carries is ours
+    /// alone: nothing else releases it, and this is the only adoption of it.
+    pub unsafe fn adopt(p: *mut T) -> Option<Self> {
+        NonNull::new(p).map(Self)
     }
 
     /// The raw pointer, for calling its methods.
@@ -371,5 +437,58 @@ impl<T> Drop for Ref<T> {
     fn drop(&mut self) {
         // SAFETY: we hold the reference being released.
         unsafe { release_raw(self.0.as_ptr()) };
+    }
+}
+
+/// Runs `job` once on CEF's UI thread, after the current callback (if any) has returned. `false`
+/// when CEF would not take it (the job is dropped unrun).
+pub fn post_ui(job: impl FnOnce() + Send + 'static) -> bool {
+    type Job = Mutex<Option<Box<dyn FnOnce() + Send>>>;
+    unsafe extern "C" fn execute(this: *mut CefTask) {
+        // SAFETY: `this` is the task made below.
+        let job = unsafe { data::<CefTask, Job>(this) };
+        let job = job.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(job) = job {
+            // A panic must not unwind into Chromium.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        }
+    }
+    let mut task: CefTask = zeroed();
+    task.execute = Some(execute);
+    let task = new_object(
+        task,
+        Mutex::new(Some(Box::new(job) as Box<dyn FnOnce() + Send>)),
+    );
+    // SAFETY: CEF adopts the task's reference; `TID_UI` is 0.
+    let posted = unsafe { (api().post_task)(0, task) };
+    posted != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_strings_are_cut_before_they_are_converted() {
+        let long = CefStr::new(&"a".repeat(MAX_TEXT_UNITS * 4));
+        let raw = long.raw();
+        // SAFETY: a valid string for the length of the test.
+        unsafe {
+            assert_eq!(read(&raw).len(), MAX_TEXT_UNITS);
+            assert_eq!(read_capped(&raw, 10), "aaaaaaaaaa");
+        }
+    }
+
+    #[test]
+    fn an_address_over_the_bound_is_dropped_never_shortened() {
+        let ok = CefStr::new("https://example.com/");
+        let long = CefStr::new(&"a".repeat(MAX_URL_UNITS + 1));
+        let (ok, long) = (ok.raw(), long.raw());
+        // SAFETY: valid strings for the length of the test.
+        unsafe {
+            assert_eq!(read_url(&ok).as_deref(), Some("https://example.com/"));
+            assert_eq!(read_url(&long), None);
+            assert_eq!(read_url(std::ptr::null()).as_deref(), Some(""));
+        }
     }
 }

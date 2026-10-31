@@ -24,7 +24,10 @@ use sighurt_api::input::{TextInputState, TextPurpose};
 use sighurt_api::services::{DownloadSource, Service, ServiceRequest};
 
 use crate::capi::*;
-use crate::ffi::{self, add_ref_raw, call, new_object, read, release_raw, take, zeroed, Ref};
+use crate::ffi::{
+    self, add_ref_raw, call, new_object, read, read_capped, read_url, release_raw, take,
+    take_capped, take_url, zeroed, Ref,
+};
 use crate::keys;
 use crate::nav::Browse;
 use crate::shared::{lock, ViewShared, MAX_SELECTION};
@@ -178,7 +181,7 @@ unsafe fn view<'a, V>(p: *mut V) -> &'a View {
 macro_rules! own {
     ($($p:expr),*) => {$(
         // CEF passes an owned reference (or null) for each of these.
-        let _ = Ref::from_owned($p);
+        let _ = Ref::adopt($p);
     )*};
 }
 
@@ -277,15 +280,10 @@ unsafe extern "C" fn on_text_selection_changed(
 ) {
     own!(browser);
     guard(|| {
-        // SAFETY: as above.
-        let mut selected = unsafe { read(text) };
-        if selected.len() > MAX_SELECTION {
-            let mut end = MAX_SELECTION;
-            while !selected.is_char_boundary(end) {
-                end -= 1;
-            }
-            selected.truncate(end);
-        }
+        // SAFETY: as above. At most MAX_SELECTION bytes: a unit is at most 3 bytes in UTF-8, so
+        // never more units are converted, and nothing larger is allocated.
+        let mut selected = unsafe { read_capped(text, MAX_SELECTION / 3) };
+        selected.shrink_to_fit();
         *lock(&unsafe { view(this) }.selection) = selected;
     });
 }
@@ -344,7 +342,7 @@ unsafe extern "C" fn on_process_message_received(
     own!(browser, frame);
     guard(|| {
         // SAFETY: an owned reference.
-        let Some(message) = Ref::from_owned(message) else {
+        let Some(message) = Ref::adopt(message) else {
             return 0;
         };
         let view = unsafe { &ffi::data::<CefClient, ClientData>(this).view };
@@ -352,8 +350,7 @@ unsafe extern "C" fn on_process_message_received(
         if name != "sig.focus" {
             return 0;
         }
-        let Some(args) = Ref::from_owned(unsafe { call!(message.as_ptr(), get_argument_list) })
-        else {
+        let Some(args) = Ref::adopt(unsafe { call!(message.as_ptr(), get_argument_list) }) else {
             return 1;
         };
         let int = |index: usize| unsafe { call!(args.as_ptr(), get_int, index) };
@@ -401,9 +398,9 @@ unsafe extern "C" fn on_before_popup(
     guard(|| {
         // SAFETY: as above. The popup is never created: the browser decides where the URL goes.
         let view = unsafe { view(this) };
-        let url = unsafe { read(target_url) };
+        let url = unsafe { read_url(target_url) };
         let document = lock(&view.nav).document();
-        if let Some(document) = document {
+        if let (Some(document), Some(url)) = (document, url) {
             view.shared.push(EngineEvent::OpenRequested {
                 view: view.id,
                 document,
@@ -419,28 +416,45 @@ unsafe extern "C" fn on_after_created(this: *mut CefLifeSpanHandler, browser: *m
     guard(|| {
         // SAFETY: `browser` is an owned reference: kept in the slot.
         let view = unsafe { view(this) };
-        let Some(browser) = Ref::from_owned(browser) else {
+        let Some(browser) = (unsafe { Ref::adopt(browser) }) else {
             return;
         };
-        let Some(host) = (unsafe { Ref::from_owned(call!(browser.as_ptr(), get_host)) }) else {
+        let Some(host) = (unsafe { Ref::adopt(call!(browser.as_ptr(), get_host)) }) else {
             return;
         };
-        let mut slot = lock(&view.slot);
+        {
+            let mut slot = lock(&view.slot);
+            slot.browser = Some(browser.clone());
+            slot.host = Some(host.clone());
+        }
         if view.is_closing() {
-            // Closed before it existed.
-            // SAFETY: the host is live.
-            unsafe { call!(host.as_ptr(), close_browser, 1) };
-            slot.browser = Some(browser);
-            slot.host = Some(host);
+            // Closed before it existed. Not from inside this callback, and not with the slot
+            // held: closing can re-enter `OnBeforeClose`.
+            ffi::post_ui(move || {
+                // SAFETY: a live host reference.
+                unsafe { call!(host.as_ptr(), close_browser, 1) };
+            });
             return;
         }
         view.shared.push(EngineEvent::ViewReady { view: view.id });
-        let pending = std::mem::take(&mut slot.pending);
-        for action in &pending {
-            action.perform(&browser, &host);
+        // What was asked meanwhile runs in order, outside the lock; the browser is ready once
+        // nothing more is waiting.
+        loop {
+            let batch = {
+                let mut slot = lock(&view.slot);
+                if slot.pending.is_empty() {
+                    slot.ready = true;
+                    break;
+                }
+                std::mem::take(&mut slot.pending)
+            };
+            for action in &batch {
+                action.perform(&browser, &host);
+                if lock(&view.slot).closed {
+                    return;
+                }
+            }
         }
-        slot.browser = Some(browser);
-        slot.host = Some(host);
     });
 }
 
@@ -515,7 +529,7 @@ fn entries(browser: *mut CefBrowser) -> (Vec<String>, usize) {
     ) -> i32 {
         // SAFETY: `entry` is an owned reference; `this` is the visitor made below.
         unsafe {
-            let Some(entry) = Ref::from_owned(entry) else {
+            let Some(entry) = Ref::adopt(entry) else {
                 return 1;
             };
             let found = ffi::data::<CefNavigationEntryVisitor, Found>(this);
@@ -534,7 +548,7 @@ fn entries(browser: *mut CefBrowser) -> (Vec<String>, usize) {
     let visitor = new_object(visitor, Arc::clone(&found));
     // SAFETY: `browser` is live for this callback.
     unsafe {
-        if let Some(host) = Ref::from_owned(call!(browser, get_host)) {
+        if let Some(host) = Ref::adopt(call!(browser, get_host)) {
             // CEF adopts the visitor's reference.
             call!(host.as_ptr(), get_navigation_entries, visitor, 0);
         } else {
@@ -553,18 +567,30 @@ unsafe extern "C" fn on_load_start(
 ) {
     guard(|| {
         // SAFETY: as above; `browser` is released by the `Ref` below.
-        let _browser = Ref::from_owned(browser);
-        let Some(frame) = Ref::from_owned(frame) else {
+        let _browser = Ref::adopt(browser);
+        let Some(frame) = Ref::adopt(frame) else {
             return;
         };
         if unsafe { call!(frame.as_ptr(), is_main) } == 0 {
             return;
         }
         let view = unsafe { view(this) };
-        let url = unsafe { take(call!(frame.as_ptr(), get_url)) };
+        let url = unsafe { take_url(call!(frame.as_ptr(), get_url)) };
         let (list, current) = entries(browser);
         let mut events = Vec::new();
-        lock(&view.nav).commit(&url, transition, list, current, &mut events);
+        // A new document does not keep the previous field: its text-input state ends here.
+        // The renderer reports the new one, if any, when a node actually gains focus.
+        let before = lock(&view.nav).document();
+        match url {
+            Some(url) => lock(&view.nav).commit(&url, transition, list, current, &mut events),
+            None => lock(&view.nav).failed(0, "the address is too long", &mut events),
+        }
+        if lock(&view.nav).document() != before {
+            events.push(EngineEvent::TextInputChanged {
+                view: view.id,
+                state: None,
+            });
+        }
         view.shared.push_all(events);
     });
 }
@@ -580,7 +606,7 @@ unsafe extern "C" fn on_load_error(
     own!(browser);
     guard(|| {
         // SAFETY: as above.
-        let Some(frame) = Ref::from_owned(frame) else {
+        let Some(frame) = Ref::adopt(frame) else {
             return;
         };
         if unsafe { call!(frame.as_ptr(), is_main) } == 0 {
@@ -604,15 +630,17 @@ unsafe extern "C" fn on_address_change(
 ) {
     guard(|| {
         // SAFETY: as above.
-        let _browser = Ref::from_owned(browser);
-        let Some(frame) = Ref::from_owned(frame) else {
+        let _browser = Ref::adopt(browser);
+        let Some(frame) = Ref::adopt(frame) else {
             return;
         };
         if unsafe { call!(frame.as_ptr(), is_main) } == 0 {
             return;
         }
         let view = unsafe { view(this) };
-        let url = unsafe { read(url) };
+        let Some(url) = (unsafe { read_url(url) }) else {
+            return;
+        };
         let (list, current) = entries(browser);
         let mut events = Vec::new();
         lock(&view.nav).address_changed(&url, list, current, &mut events);
@@ -686,8 +714,8 @@ unsafe extern "C" fn on_before_browse(
     own!(browser);
     guard(|| {
         // SAFETY: as above.
-        let frame = Ref::from_owned(frame);
-        let request = Ref::from_owned(request);
+        let frame = Ref::adopt(frame);
+        let request = Ref::adopt(request);
         let (Some(frame), Some(request)) = (frame, request) else {
             return 0;
         };
@@ -695,14 +723,21 @@ unsafe extern "C" fn on_before_browse(
             return 0;
         }
         let view = unsafe { view(this) };
-        let url = unsafe { take(call!(request.as_ptr(), get_url)) };
+        let Some(url) = (unsafe { take_url(call!(request.as_ptr(), get_url)) }) else {
+            return 1; // an address the browser would drop: not loaded
+        };
         let transition = unsafe { call!(request.as_ptr(), get_transition_type) };
+        // Only a plain GET can be handed over by address; a POST goes ahead in Chromium whole.
+        let get = unsafe { take_capped(call!(request.as_ptr(), get_method), 16) }
+            .eq_ignore_ascii_case("GET")
+            && unsafe { Ref::adopt(call!(request.as_ptr(), get_post_data)) }.is_none();
         let mut events = Vec::new();
         let answer = lock(&view.nav).before_browse(
             &url,
             user_gesture != 0,
             is_redirect != 0,
             transition,
+            get,
             &mut events,
         );
         view.shared.push_all(events);
@@ -745,7 +780,7 @@ unsafe extern "C" fn can_download(
     _method: *const CefStringUtf16,
 ) -> i32 {
     own!(browser);
-    log::debug!("cef: can_download {}", unsafe { read(url) });
+    let _ = url;
     1
 }
 
@@ -756,7 +791,6 @@ unsafe extern "C" fn on_download_updated(
     callback: *mut CefDownloadItemCallback,
 ) {
     own!(browser, item, callback);
-    log::debug!("cef: download updated");
 }
 
 unsafe extern "C" fn on_before_download(
@@ -770,15 +804,14 @@ unsafe extern "C" fn on_before_download(
     guard(|| {
         // SAFETY: as above. The browser fetches it through its download service; returning
         // false without continuing cancels CEF's own download (Alloy style).
-        let Some(item) = Ref::from_owned(item) else {
+        let Some(item) = Ref::adopt(item) else {
             return 0;
         };
         let view = unsafe { view(this) };
-        let url = unsafe { take(call!(item.as_ptr(), get_url)) };
-        let suggested = unsafe { read(suggested) };
-        log::debug!("cef: download of {url} ({suggested})");
+        let url = unsafe { take_url(call!(item.as_ptr(), get_url)) };
+        let suggested = unsafe { read_capped(suggested, 255) };
         let document = lock(&view.nav).document();
-        if let Some(document) = document {
+        if let (Some(document), Some(url)) = (document, url) {
             view.shared
                 .push(EngineEvent::ServiceRequested(ServiceRequest {
                     id: RequestId::next(),
@@ -823,7 +856,7 @@ unsafe extern "C" fn on_before_unload_dialog(
     guard(|| {
         // The page is left without asking, as with the other engines.
         // SAFETY: an owned reference.
-        if let Some(callback) = Ref::from_owned(callback) {
+        if let Some(callback) = Ref::adopt(callback) {
             let empty = ffi::empty_string();
             unsafe { call!(callback.as_ptr(), cont, 1, &empty) };
         }
@@ -843,7 +876,7 @@ unsafe extern "C" fn on_request_media_access_permission(
     guard(|| {
         // Camera, microphone and screen capture fail closed.
         // SAFETY: an owned reference.
-        if let Some(callback) = Ref::from_owned(callback) {
+        if let Some(callback) = Ref::adopt(callback) {
             unsafe { call!(callback.as_ptr(), cancel) };
         }
         1
@@ -862,7 +895,7 @@ unsafe extern "C" fn on_show_permission_prompt(
     guard(|| {
         // Every permission prompt (location, clipboard, notifications) is denied.
         // SAFETY: an owned reference. `CEF_PERMISSION_RESULT_DENY` is 1.
-        if let Some(callback) = Ref::from_owned(callback) {
+        if let Some(callback) = Ref::adopt(callback) {
             unsafe { call!(callback.as_ptr(), cont, 1) };
         }
         1
@@ -884,7 +917,7 @@ unsafe extern "C" fn on_file_dialog(
     guard(|| {
         // No file chooser without the browser's policy: cancelled.
         // SAFETY: an owned reference.
-        if let Some(callback) = Ref::from_owned(callback) {
+        if let Some(callback) = Ref::adopt(callback) {
             unsafe { call!(callback.as_ptr(), cancel) };
         }
         1
@@ -902,7 +935,7 @@ unsafe extern "C" fn on_before_context_menu(
     guard(|| {
         // No native menu: an empty model shows nothing.
         // SAFETY: an owned reference.
-        if let Some(model) = Ref::from_owned(model) {
+        if let Some(model) = Ref::adopt(model) {
             unsafe { call!(model.as_ptr(), clear) };
         }
     });

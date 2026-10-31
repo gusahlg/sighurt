@@ -197,6 +197,10 @@ const _: () = {
     assert!(std::mem::size_of::<CefWindowInfo>() == 88);
     assert!(std::mem::size_of::<CefSettings>() == 448);
     assert!(std::mem::size_of::<CefBrowserSettings>() == 264);
+    // `windowless_frame_rate` is followed by 4 bytes of padding, so `_rest` starts at 12.
+    // `background_color` is at C offset 248 (the 150 headers); runtime.rs writes it there.
+    assert!(std::mem::offset_of!(CefBrowserSettings, _rest) == 12);
+    assert!(248 + 4 <= std::mem::size_of::<CefBrowserSettings>());
 };
 
 #[repr(C)]

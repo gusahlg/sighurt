@@ -58,6 +58,9 @@ pub struct Nav {
     pending: Option<Pending>,
     started: Option<NavigationId>,
     started_kind: Kind,
+    /// A cross-document navigation has started and not committed or failed: address changes
+    /// belong to it.
+    commit_pending: bool,
     document: Option<DocumentGeneration>,
     url: String,
     loading: bool,
@@ -75,6 +78,7 @@ impl Nav {
             pending: None,
             started: None,
             started_kind: Kind::Navigate,
+            commit_pending: false,
             document: None,
             url: String::new(),
             loading: false,
@@ -95,25 +99,34 @@ impl Nav {
         &self.url
     }
 
-    /// The browser asks to load `url`.
-    pub fn request_navigate(&mut self, id: NavigationId) {
-        self.pending = Some(Pending {
-            id,
-            kind: Kind::Navigate,
-        });
+    /// Records the browser's latest request. One that CEF has not started yet is superseded:
+    /// its failure (`Cancelled`) is the event returned, so the new request keeps its own id.
+    fn ask(&mut self, id: NavigationId, kind: Kind) -> Option<EngineEvent> {
+        let superseded = self.pending.replace(Pending { id, kind });
+        superseded.map(|old| EngineEvent::NavigationFailed {
+            view: self.view,
+            navigation: old.id,
+            error: NavigationError::Cancelled,
+        })
+    }
+
+    /// The browser asks to load an address.
+    pub fn request_navigate(&mut self, id: NavigationId) -> Option<EngineEvent> {
+        self.ask(id, Kind::Navigate)
     }
 
     /// The browser asks to reload.
-    pub fn request_reload(&mut self, id: NavigationId) {
-        self.pending = Some(Pending {
-            id,
-            kind: Kind::Reload,
-        });
+    pub fn request_reload(&mut self, id: NavigationId) -> Option<EngineEvent> {
+        self.ask(id, Kind::Reload)
     }
 
-    /// The browser asks to move `delta` entries. `Ok(steps)` is how many single back (negative)
-    /// or forward steps to take; `Err` is the event for a move beyond the list.
-    pub fn request_traverse(&mut self, id: NavigationId, delta: i32) -> Result<i32, EngineEvent> {
+    /// The browser asks to move `delta` entries. `Ok(steps, superseded)` is how many single back
+    /// (negative) or forward steps to take; `Err` is the event for a move beyond the list.
+    pub fn request_traverse(
+        &mut self,
+        id: NavigationId,
+        delta: i32,
+    ) -> Result<(i32, Option<EngineEvent>), EngineEvent> {
         let target = i64::try_from(self.current).unwrap_or(0) + i64::from(delta);
         if delta == 0 || target < 0 || target >= i64::try_from(self.entries.len()).unwrap_or(0) {
             return Err(EngineEvent::NavigationFailed {
@@ -122,11 +135,7 @@ impl Nav {
                 error: NavigationError::Cancelled,
             });
         }
-        self.pending = Some(Pending {
-            id,
-            kind: Kind::Traverse,
-        });
-        Ok(delta)
+        Ok((delta, self.ask(id, Kind::Traverse)))
     }
 
     /// `OnBeforeBrowse` of the main frame. A user's click on a link or form the browser did
@@ -137,6 +146,7 @@ impl Nav {
         user_gesture: bool,
         redirect: bool,
         transition: i32,
+        get: bool,
         events: &mut Vec<EngineEvent>,
     ) -> Browse {
         if redirect {
@@ -147,7 +157,8 @@ impl Nav {
             self.allowed.swap_remove(index);
         } else if self.pending.is_none() {
             let source = transition & TT_SOURCE_MASK;
-            let clicked = user_gesture && matches!(source, TT_LINK | TT_FORM_SUBMIT);
+            // Only a GET can be handed to another engine as an address.
+            let clicked = get && user_gesture && matches!(source, TT_LINK | TT_FORM_SUBMIT);
             if let (true, Some(document)) = (clicked, self.document) {
                 if self.held.len() < MAX_HELD {
                     let request = RequestId::next();
@@ -169,6 +180,7 @@ impl Nav {
         // Kept for the commit, which needs the kind.
         self.started = Some(id);
         self.started_kind = kind;
+        self.commit_pending = true;
         events.push(EngineEvent::NavigationStarted {
             view: self.view,
             navigation: id,
@@ -227,6 +239,7 @@ impl Nav {
             HistoryEffect::Push
         };
         self.started_kind = Kind::Navigate;
+        self.commit_pending = false;
         let document = DocumentGeneration::next();
         self.document = Some(document);
         self.url = url.to_owned();
@@ -241,8 +254,10 @@ impl Nav {
         self.set_history(entries, current, events);
     }
 
-    /// `OnAddressChange` of the main frame. While nothing loads it is the page changing its own
-    /// address inside the document (a fragment, `pushState`, `history.back()`).
+    /// `OnAddressChange` of the main frame. Outside a cross-document navigation it is the page
+    /// changing its own address or history inside the document (a fragment, `pushState`,
+    /// `history.back()`), whether or not something else is still loading, and whether or not
+    /// the address differs (`pushState` of the same address adds an entry).
     pub fn address_changed(
         &mut self,
         url: &str,
@@ -250,21 +265,33 @@ impl Nav {
         current: usize,
         events: &mut Vec<EngineEvent>,
     ) {
-        if self.loading || url == self.url || url.starts_with("chrome-error:") {
+        if self.commit_pending || url.starts_with("chrome-error:") {
             return;
         }
         let Some(document) = self.document else {
             return;
         };
-        let effect = match current.cmp(&self.current) {
-            std::cmp::Ordering::Less => HistoryEffect::Traverse,
-            std::cmp::Ordering::Equal => HistoryEffect::Replace,
-            std::cmp::Ordering::Greater if entries.len() > self.entries.len() => {
-                HistoryEffect::Push
+        if url == self.url && current == self.current && entries.len() == self.entries.len() {
+            return;
+        }
+        let effect = if self.started_kind == Kind::Traverse {
+            HistoryEffect::Traverse
+        } else {
+            match current.cmp(&self.current) {
+                std::cmp::Ordering::Less => HistoryEffect::Traverse,
+                std::cmp::Ordering::Equal => HistoryEffect::Replace,
+                std::cmp::Ordering::Greater if entries.len() > self.entries.len() => {
+                    HistoryEffect::Push
+                }
+                std::cmp::Ordering::Greater => HistoryEffect::Traverse,
             }
-            std::cmp::Ordering::Greater => HistoryEffect::Traverse,
         };
-        let navigation = NavigationId::next();
+        // A command of the browser's that CEF carried out inside the document keeps its id.
+        let navigation = self
+            .pending
+            .take()
+            .map_or_else(NavigationId::next, |pending| pending.id);
+        self.started_kind = Kind::Navigate;
         self.url = url.to_owned();
         events.push(EngineEvent::NavigationStarted {
             view: self.view,
@@ -291,16 +318,17 @@ impl Nav {
         });
     }
 
-    /// `OnLoadError` of the main frame.
+    /// `OnLoadError` of the main frame. `ERR_ABORTED` is a stopped or superseded load (often
+    /// the *previous* navigation's, arriving after a newer one started): the stop is reported
+    /// by [`Nav::loading_changed`], the supersession by the newer navigation itself, so an
+    /// abort never takes the current navigation's id.
     pub fn failed(&mut self, code: i32, text: &str, events: &mut Vec<EngineEvent>) {
-        let navigation = self
-            .started
-            .take()
-            .or_else(|| self.pending.take().map(|pending| pending.id))
-            .unwrap_or_else(NavigationId::next);
-        let error = if code == ERR_ABORTED {
-            NavigationError::Cancelled
-        } else if text.is_empty() {
+        if code == ERR_ABORTED {
+            return;
+        }
+        let navigation = self.started.take().unwrap_or_else(NavigationId::next);
+        self.commit_pending = false;
+        let error = if text.is_empty() {
             NavigationError::Load(format!("the page failed to load (error {code})"))
         } else {
             NavigationError::Load(text.to_owned())
@@ -324,6 +352,7 @@ impl Nav {
         // A navigation that started and neither committed nor failed when loading stopped was
         // stopped.
         if !loading {
+            self.commit_pending = false;
             if let Some(navigation) = self.started.take() {
                 events.push(EngineEvent::NavigationFailed {
                     view: self.view,
@@ -352,7 +381,7 @@ mod tests {
     fn load(nav: &mut Nav, url: &str, entries: &[&str], current: usize) -> Vec<EngineEvent> {
         let mut events = Vec::new();
         nav.loading_changed(true, &mut events);
-        nav.before_browse(url, false, false, 1, &mut events);
+        nav.before_browse(url, false, false, 1, true, &mut events);
         nav.commit(
             url,
             1,
@@ -392,7 +421,7 @@ mod tests {
         load(&mut nav, "https://a/", &["https://a/"], 0);
         let mut events = Vec::new();
         assert_eq!(
-            nav.before_browse("https://b/", true, false, TT_LINK, &mut events),
+            nav.before_browse("https://b/", true, false, TT_LINK, true, &mut events),
             Browse::Hold
         );
         let EngineEvent::NavigationRequested { request, url, .. } = events.remove(0) else {
@@ -402,13 +431,13 @@ mod tests {
         assert_eq!(nav.answer(request, true).as_deref(), Some("https://b/"));
         // The reissued load goes ahead without asking again, as a page-started navigation.
         assert_eq!(
-            nav.before_browse("https://b/", true, false, TT_LINK, &mut events),
+            nav.before_browse("https://b/", true, false, TT_LINK, true, &mut events),
             Browse::Go
         );
         assert!(matches!(events[0], EngineEvent::NavigationStarted { .. }));
         // A denial forgets it, and a late answer does nothing.
         let mut events = Vec::new();
-        nav.before_browse("https://c/", true, false, TT_FORM_SUBMIT, &mut events);
+        nav.before_browse("https://c/", true, false, TT_FORM_SUBMIT, true, &mut events);
         let EngineEvent::NavigationRequested { request, .. } = events.remove(0) else {
             panic!("asked");
         };
@@ -423,7 +452,7 @@ mod tests {
         nav.request_navigate(NavigationId::next());
         let mut events = Vec::new();
         assert_eq!(
-            nav.before_browse("https://b/", true, false, TT_LINK, &mut events),
+            nav.before_browse("https://b/", true, false, TT_LINK, true, &mut events),
             Browse::Go
         );
     }
@@ -436,12 +465,12 @@ mod tests {
         for n in 0..MAX_HELD {
             let url = format!("https://b/{n}");
             assert_eq!(
-                nav.before_browse(&url, true, false, TT_LINK, &mut events),
+                nav.before_browse(&url, true, false, TT_LINK, true, &mut events),
                 Browse::Hold
             );
         }
         assert_eq!(
-            nav.before_browse("https://b/x", true, false, TT_LINK, &mut events),
+            nav.before_browse("https://b/x", true, false, TT_LINK, true, &mut events),
             Browse::Go
         );
     }
@@ -457,6 +486,7 @@ mod tests {
             false,
             false,
             TT_FORWARD_BACK_FLAG | 1,
+            true,
             &mut events,
         );
         nav.commit(
@@ -530,12 +560,104 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // While a load is in progress an address change belongs to that load.
+        // While a cross-document navigation is under way an address change belongs to it.
         let mut events = Vec::new();
-        nav.loading_changed(true, &mut events);
+        nav.before_browse("https://b/", false, false, 1, true, &mut events);
         events.clear();
         nav.address_changed("https://b/", vec![], 0, &mut events);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_push_state_while_something_still_loads_is_seen() {
+        let mut nav = nav();
+        load(&mut nav, "https://a/", &["https://a/"], 0);
+        let mut events = Vec::new();
+        // A subresource is still loading, but no navigation is under way.
+        nav.loading_changed(true, &mut events);
+        events.clear();
+        nav.address_changed(
+            "https://a/x",
+            vec!["https://a/".into(), "https://a/x".into()],
+            1,
+            &mut events,
+        );
+        assert!(matches!(events[1], EngineEvent::NavigationCommitted { .. }));
+        // The same address with a new entry is a navigation too.
+        let mut events = Vec::new();
+        nav.address_changed(
+            "https://a/x",
+            vec![
+                "https://a/".into(),
+                "https://a/x".into(),
+                "https://a/x".into(),
+            ],
+            2,
+            &mut events,
+        );
+        assert!(matches!(
+            events[1],
+            EngineEvent::NavigationCommitted {
+                history: Some(HistoryEffect::Push),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_post_form_is_never_held() {
+        let mut nav = nav();
+        load(&mut nav, "https://a/", &["https://a/"], 0);
+        let mut events = Vec::new();
+        assert_eq!(
+            nav.before_browse(
+                "https://a/login",
+                true,
+                false,
+                TT_FORM_SUBMIT,
+                false,
+                &mut events
+            ),
+            Browse::Go
+        );
+        assert!(matches!(events[0], EngineEvent::NavigationStarted { .. }));
+    }
+
+    #[test]
+    fn a_newer_request_supersedes_an_older_one_and_keeps_its_own_id() {
+        let mut nav = nav();
+        let (first, second) = (NavigationId::next(), NavigationId::next());
+        assert!(nav.request_navigate(first).is_none());
+        let superseded = nav.request_navigate(second);
+        assert!(matches!(
+            superseded,
+            Some(EngineEvent::NavigationFailed { navigation, error: NavigationError::Cancelled, .. })
+                if navigation == first
+        ));
+        let mut events = Vec::new();
+        nav.before_browse("https://b/", false, false, 1, true, &mut events);
+        assert!(matches!(
+            &events[0],
+            EngineEvent::NavigationStarted { navigation, .. } if *navigation == second
+        ));
+    }
+
+    #[test]
+    fn an_abort_never_takes_the_current_navigations_id() {
+        let mut nav = nav();
+        let id = NavigationId::next();
+        nav.request_navigate(id);
+        let mut events = Vec::new();
+        nav.before_browse("https://b/", false, false, 1, true, &mut events);
+        events.clear();
+        // The previous navigation's ERR_ABORTED arrives late.
+        nav.failed(ERR_ABORTED, "", &mut events);
+        assert!(events.is_empty());
+        nav.commit("https://b/", 1, vec!["https://b/".into()], 0, &mut events);
+        assert!(matches!(
+            &events[0],
+            EngineEvent::NavigationCommitted { navigation, .. } if *navigation == id
+        ));
     }
 
     #[test]
@@ -544,7 +666,7 @@ mod tests {
         let id = NavigationId::next();
         nav.request_navigate(id);
         let mut events = Vec::new();
-        nav.before_browse("https://a/", false, false, 1, &mut events);
+        nav.before_browse("https://a/", false, false, 1, true, &mut events);
         nav.failed(-105, "net::ERR_NAME_NOT_RESOLVED", &mut events);
         assert!(matches!(
             &events[1],
@@ -552,7 +674,7 @@ mod tests {
                 if *navigation == id
         ));
         let mut events = Vec::new();
-        nav.before_browse("https://a/", false, false, 1, &mut events);
+        nav.before_browse("https://a/", false, false, 1, true, &mut events);
         nav.loading_changed(true, &mut events);
         nav.loading_changed(false, &mut events);
         assert!(matches!(

@@ -1,8 +1,8 @@
 //! Chromium presenting into an in-memory [`CpuTarget`], through the real `EngineRuntime`.
 //!
 //! One test: CEF starts once per process. Ignored so `cargo test` does not start Chromium;
-//! `tests/offscreen.sh` runs it in a private headless sway (Chromium needs a display
-//! connection). It checks the pages' pixels (ARGB top-down), navigation events in order with
+//! `tests/offscreen.sh` runs it with no display connection (ozone headless). It checks the
+//! pages' pixels (ARGB top-down), navigation events in order with
 //! history, a link the user clicks being held and answered, a popup becoming `OpenRequested`,
 //! typing, the text-input state, a paste through the clipboard service, resizing, idling
 //! without wakeups, and a clean shutdown.
@@ -44,6 +44,10 @@ struct Stored {
 struct Mem {
     metrics: Metrics,
     frames: Arc<Mutex<Vec<Stored>>>,
+    /// A buffer that keeps its content between frames, like a swapchain's: the engine copies
+    /// only what it lacks into it. Every frame is also painted into a fresh buffer, and the two
+    /// must be identical.
+    persistent: Vec<u8>,
 }
 
 struct Permit {
@@ -69,7 +73,16 @@ impl CpuTarget for Mem {
     ) -> Result<(), String> {
         // Padding past each row: a copy that ignores the stride writes into it.
         let stride = 4 * permit.size.width as usize + 16;
-        let mut pixels = vec![0u8; stride * permit.size.height as usize];
+        let len = stride * permit.size.height as usize;
+        if self.persistent.len() != len {
+            self.persistent = vec![0u8; len];
+        }
+        paint(Frame {
+            pixels: &mut self.persistent,
+            size: permit.size,
+            stride,
+        })?;
+        let mut pixels = vec![0u8; len];
         paint(Frame {
             pixels: &mut pixels,
             size: permit.size,
@@ -82,6 +95,13 @@ impl CpuTarget for Mem {
                 .all(|b| *b == 0)),
             "the copy wrote past the row"
         );
+        for y in 0..permit.size.height as usize {
+            assert!(
+                self.persistent[y * stride..y * stride + row]
+                    == pixels[y * stride..y * stride + row],
+                "the partial copy into the kept buffer differs from a whole copy at row {y}"
+            );
+        }
         self.frames.lock().expect("frames").push(Stored {
             size: permit.size,
             stride,
@@ -255,6 +275,82 @@ impl Harness {
             }));
         }
     }
+
+    /// Index just after `navigation`'s commit. `navigate` returns as soon as that event is in
+    /// the log, and the same pump can already hold the new document's focus report.
+    fn after_commit(&self, navigation: NavigationId) -> usize {
+        self.log
+            .iter()
+            .rposition(|e| {
+                matches!(
+                    e,
+                    EngineEvent::NavigationCommitted { navigation: n, .. } if *n == navigation
+                )
+            })
+            .map(|i| i + 1)
+            .unwrap_or(self.log.len())
+    }
+
+    /// The input at (100, 35) of `input.html` has focus in the document `navigation` committed.
+    ///
+    /// A reload can restore the field before this runs, and a click on a field that already
+    /// has focus does not report it again. A click during the swap can also hit the document
+    /// that is leaving, so the click waits until the load has stopped.
+    fn focus_field(&mut self, navigation: NavigationId, why: &str) {
+        let from = self.after_commit(navigation);
+        let focused = |e: &EngineEvent| {
+            matches!(e, EngineEvent::TextInputChanged { state: Some(_), .. }).then_some(())
+        };
+        if self.log[from..].iter().any(|e| focused(e).is_some()) {
+            return;
+        }
+        if self
+            .wait(from, |e| match e {
+                EngineEvent::LoadingChanged { loading: false, .. } => Some(()),
+                _ => None,
+            })
+            .is_none()
+        {
+            panic!("{why}: the load never finished ({})", self.trace(from));
+        }
+        // Leave whatever the reload restored, then enter the field, so this document reports
+        // it. The gap lets the blur land on its own: the two reports would otherwise collapse
+        // into whichever arrived last.
+        let mark = self.log.len();
+        self.click(500.0, 500.0);
+        let pause = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < pause {
+            self.pump();
+            if self.log[mark..]
+                .iter()
+                .any(|e| matches!(e, EngineEvent::TextInputChanged { .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mark = self.log.len();
+        self.click(100.0, 35.0);
+        if self.wait(mark, focused).is_none() {
+            panic!("{why} ({})", self.trace(from));
+        }
+    }
+
+    fn trace(&self, from: usize) -> String {
+        self.log[from..]
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::TextInputChanged { state, .. } => {
+                    Some(format!("text-input:{}", state.is_some()))
+                }
+                EngineEvent::LoadingChanged { loading, .. } => Some(format!("loading:{loading}")),
+                EngineEvent::NavigationCommitted { .. } => Some("commit".into()),
+                EngineEvent::FrameReady { .. } => Some("frame".into()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 /// Writes a frame as a PPM (BGRA to RGB) for looking at after a failure.
@@ -327,6 +423,7 @@ fn chromium_in_the_engine_contract() {
         Mem {
             metrics: size,
             frames,
+            persistent: Vec::new(),
         },
     )
     .expect("open_view");
@@ -336,6 +433,30 @@ fn chromium_in_the_engine_contract() {
             .is_some(),
         "ViewReady"
     );
+
+    // A view closed the moment it is opened: the close meets the browser's creation. Chromium's
+    // thread must neither deadlock nor lose the view's `ViewClosed`.
+    for _ in 0..3 {
+        let quick = ViewId::next();
+        h.rt.open_view(
+            quick,
+            ViewOptions::default(),
+            Mem {
+                metrics: size,
+                frames: Arc::new(Mutex::new(Vec::new())),
+                persistent: Vec::new(),
+            },
+        )
+        .expect("open_view");
+        h.rt.close_view(quick);
+        assert!(
+            h.wait(0, |e| {
+                matches!(e, EngineEvent::ViewClosed { view } if *view == quick).then_some(())
+            })
+            .is_some(),
+            "a view closed during its creation is reported closed"
+        );
+    }
 
     // The page has the keyboard, as the host gives it to the selected view.
     h.send(EngineCommand::SetFocus(true));
@@ -481,6 +602,25 @@ fn chromium_in_the_engine_contract() {
     h.type_key(35, "h", Modifiers::default());
     h.type_key(23, "i", Modifiers::default());
     assert!(h.title(from, "typed:hi"), "typed text reaches the page");
+    // Typing damages a few rows: a buffer that kept the last frame gets those, not the page.
+    h.present();
+    let before = h.rt.diagnostics().presented_bytes;
+    h.type_key(30, "a", Modifiers::default());
+    assert!(h.title(from, "typed:hia"), "more typing");
+    h.present();
+    let copied = h.rt.diagnostics().presented_bytes - before;
+    let whole = 800 * 600 * 4;
+    // Every frame is painted twice by the test target: whole into a fresh buffer (the check),
+    // and into the kept buffer, where only the damage is copied.
+    let kept = copied.saturating_sub(whole);
+    eprintln!("cef-offscreen: a keystroke copied {kept} bytes into the kept buffer of a {whole}-byte frame");
+    assert!(
+        kept < whole / 4,
+        "{kept} bytes into the kept buffer for one keystroke"
+    );
+    let back = h.log.len();
+    h.type_key(14, "", Modifiers::default()); // Backspace: the field is as it was
+    assert!(h.title(back, "typed:hi"), "backspace");
     let from = h.log.len();
     h.type_key(
         47,
@@ -536,24 +676,140 @@ fn chromium_in_the_engine_contract() {
         "{open:?}"
     );
 
-    // An attachment is a download request for the browser's service, not a page.
+    // A paste belongs to the document that asked: answered after a navigation, it goes nowhere.
+    let first = h.navigate(&page("input.html"));
+    h.focus_field(first, "the field of the first document is focused");
+    let from = h.log.len();
+    h.type_key(
+        47,
+        "v",
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        },
+    );
+    let late = h
+        .wait(from, |e| match e {
+            EngineEvent::ServiceRequested(r)
+                if matches!(r.service, Service::ClipboardRead { .. }) =>
+            {
+                Some(r.id)
+            }
+            _ => None,
+        })
+        .expect("the paste is asked for");
+    let second = h.navigate(&page("input.html"));
+    h.focus_field(second, "the field of the second document is focused");
+    h.send(EngineCommand::ResolveServiceRequest {
+        request: late,
+        result: Ok(ServiceReply::Clipboard(ClipboardData {
+            mime_type: "text/plain".into(),
+            data: b"LEAKED".to_vec(),
+        })),
+    });
+    std::thread::sleep(Duration::from_millis(800));
+    let from = h.log.len();
+    h.type_key(44, "z", Modifiers::default());
+    assert!(
+        h.title(from, "typed:z"),
+        "the late paste was not typed into the new document, and typing still works"
+    );
+    assert!(
+        !h.log.iter().any(|e| matches!(e, EngineEvent::TitleChanged { title: Some(t), .. } if t.contains("LEAKED"))),
+        "the late paste reached the page"
+    );
+
+    // A POST form the user submits is not held and asked about (only an address can be handed
+    // to another engine): it goes ahead in Chromium with its body, and an attachment is a
+    // download request for the browser's service, not a page.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
     let port = listener.local_addr().expect("addr").port();
+    let (posted_tx, posted) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         use std::io::{Read, Write};
         while let Ok((mut stream, _)) = listener.accept() {
-            let mut request = [0u8; 2048];
-            let _ = stream.read(&mut request);
-            let body = "downloaded";
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            let (mut head_end, mut want) = (None, 0usize);
+            while let Ok(n) = stream.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if head_end.is_none() {
+                    head_end = request
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4);
+                    if let Some(end) = head_end {
+                        let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        want = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                    }
+                }
+                if head_end.is_some_and(|end| request.len() >= end + want) {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&request).into_owned();
+            let (content_type, extra, body) = if text.starts_with("GET /form") {
+                (
+                    "text/html",
+                    String::new(),
+                    "<!doctype html><title>form</title><form method=post action=/submit>\
+                     <input type=hidden name=a value=b>\
+                     <button style='position:absolute;left:20px;top:20px;width:120px;height:50px'>go\
+                     </button></form>"
+                        .to_owned(),
+                )
+            } else if text.starts_with("POST /submit") {
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned();
+                let _ = posted_tx.send(body);
+                (
+                    "text/html",
+                    String::new(),
+                    "<!doctype html><title>posted</title>ok".to_owned(),
+                )
+            } else {
+                (
+                    "application/octet-stream",
+                    "Content-Disposition: attachment; filename=\"a.txt\"\r\n".to_owned(),
+                    "downloaded".to_owned(),
+                )
+            };
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
-                 Content-Disposition: attachment; filename=\"a.txt\"\r\n\
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{extra}\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
         }
     });
+    h.navigate(&format!("http://127.0.0.1:{port}/form"));
+    h.frame_where(|f| pixel(f, 60, 40) != [0xff; 4]);
+    let from = h.log.len();
+    h.click(60.0, 40.0);
+    let body = posted
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the POST reached the server");
+    assert_eq!(body, "a=b", "the form's body arrived whole");
+    assert!(
+        h.wait(from, |e| {
+            matches!(e, EngineEvent::NavigationCommitted { url, .. } if url.ends_with("/submit"))
+                .then_some(())
+        })
+        .is_some(),
+        "the POST's page committed"
+    );
+    assert!(
+        !h.log[from..]
+            .iter()
+            .any(|e| matches!(e, EngineEvent::NavigationRequested { .. })),
+        "a POST form was held and asked about"
+    );
     let from = h.log.len();
     h.send(EngineCommand::Navigate {
         navigation: NavigationId::next(),

@@ -316,14 +316,20 @@ fn cef(
 impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
     for Bound<sighurt_engine_cef::CefRuntime<TargetLease>>
 {
-    /// Chromium paints on its own GPU process; what reaches the host is its BGRA frame, copied
-    /// twice (CEF's buffer into staging, staging into the lease).
+    /// Chromium paints in software (no display connection); what reaches the host is its BGRA
+    /// frame: the changed part copied into staging, and into each lease buffer what it lacks.
     fn renderer(&self) -> Option<(&'static str, Option<String>)> {
         Some(("cpu", Some("Chromium (CEF), OnPaint frames".into())))
     }
 
     fn readbacks(&self) -> u64 {
         self.0.diagnostics().staged_bytes
+    }
+
+    /// Chromium is still running when a browser never closed in time: the registry then ends
+    /// the process the way it does for any engine that could not shut down.
+    fn leaked(&self) -> bool {
+        self.0.leaked()
     }
 }
 
