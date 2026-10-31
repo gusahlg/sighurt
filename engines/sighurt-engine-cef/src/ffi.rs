@@ -323,34 +323,39 @@ pub unsafe fn release_raw<T>(p: *mut T) {
     unsafe { ((*base).release.expect("release"))(base) };
 }
 
+/// The CEF interfaces documented as usable from any thread (they forward to the UI thread
+/// themselves). Only these may be shared across threads inside a [`Ref`].
+///
+/// # Safety
+/// Implemented only for interfaces CEF documents as thread-safe.
+pub unsafe trait ThreadSafe {}
+
+// SAFETY: CEF documents `cef_browser_t` and `cef_browser_host_t` as callable from any thread
+// (the host's methods post to the UI thread when called elsewhere).
+unsafe impl ThreadSafe for crate::capi::CefBrowser {}
+// SAFETY: as above.
+unsafe impl ThreadSafe for crate::capi::CefBrowserHost {}
+
 /// A reference we hold to a CEF object, released on drop.
 ///
-/// CEF documents its browser, host, frame and navigation objects as usable from any thread
-/// (they forward to the UI thread themselves), which is what makes the `Send` and `Sync`
-/// implementations sound for the types this crate wraps in it.
+/// Adoption is `unsafe`: the pointer must carry a reference nobody else will release, or the
+/// object is freed twice. `Send` and `Sync` exist only for [`ThreadSafe`] interfaces.
 pub struct Ref<T>(NonNull<T>);
 
-// SAFETY: see the type's documentation; only used for CEF's thread-safe interfaces.
-unsafe impl<T> Send for Ref<T> {}
+// SAFETY: see [`ThreadSafe`]; no other interface is ever moved to another thread.
+unsafe impl<T: ThreadSafe> Send for Ref<T> {}
 // SAFETY: as above.
-unsafe impl<T> Sync for Ref<T> {}
+unsafe impl<T: ThreadSafe> Sync for Ref<T> {}
 
 impl<T> Ref<T> {
-    /// Takes over a reference CEF returned (a new reference, or `add_ref`ed by the caller).
-    /// Null gives `None`.
-    pub fn from_owned(p: *mut T) -> Option<Self> {
-        NonNull::new(p).map(Self)
-    }
-
-    /// A new reference to a pointer CEF lent for the length of a callback.
+    /// Takes over a reference CEF handed to us (a callback argument, a getter's result) or one
+    /// the caller added. Null gives `None`.
     ///
     /// # Safety
-    /// `p` is null or points to a live CEF interface.
-    pub unsafe fn from_borrowed(p: *mut T) -> Option<Self> {
-        let p = NonNull::new(p)?;
-        // SAFETY: by the contract above.
-        unsafe { add_ref_raw(p.as_ptr()) };
-        Some(Self(p))
+    /// `p` is null or points to a live CEF interface, and the reference it carries is ours
+    /// alone: nothing else releases it, and this is the only adoption of it.
+    pub unsafe fn adopt(p: *mut T) -> Option<Self> {
+        NonNull::new(p).map(Self)
     }
 
     /// The raw pointer, for calling its methods.

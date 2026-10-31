@@ -178,7 +178,7 @@ unsafe fn view<'a, V>(p: *mut V) -> &'a View {
 macro_rules! own {
     ($($p:expr),*) => {$(
         // CEF passes an owned reference (or null) for each of these.
-        let _ = Ref::from_owned($p);
+        let _ = Ref::adopt($p);
     )*};
 }
 
@@ -344,7 +344,7 @@ unsafe extern "C" fn on_process_message_received(
     own!(browser, frame);
     guard(|| {
         // SAFETY: an owned reference.
-        let Some(message) = Ref::from_owned(message) else {
+        let Some(message) = Ref::adopt(message) else {
             return 0;
         };
         let view = unsafe { &ffi::data::<CefClient, ClientData>(this).view };
@@ -352,8 +352,7 @@ unsafe extern "C" fn on_process_message_received(
         if name != "sig.focus" {
             return 0;
         }
-        let Some(args) = Ref::from_owned(unsafe { call!(message.as_ptr(), get_argument_list) })
-        else {
+        let Some(args) = Ref::adopt(unsafe { call!(message.as_ptr(), get_argument_list) }) else {
             return 1;
         };
         let int = |index: usize| unsafe { call!(args.as_ptr(), get_int, index) };
@@ -419,10 +418,10 @@ unsafe extern "C" fn on_after_created(this: *mut CefLifeSpanHandler, browser: *m
     guard(|| {
         // SAFETY: `browser` is an owned reference: kept in the slot.
         let view = unsafe { view(this) };
-        let Some(browser) = Ref::from_owned(browser) else {
+        let Some(browser) = Ref::adopt(browser) else {
             return;
         };
-        let Some(host) = (unsafe { Ref::from_owned(call!(browser.as_ptr(), get_host)) }) else {
+        let Some(host) = (unsafe { Ref::adopt(call!(browser.as_ptr(), get_host)) }) else {
             return;
         };
         let mut slot = lock(&view.slot);
@@ -515,7 +514,7 @@ fn entries(browser: *mut CefBrowser) -> (Vec<String>, usize) {
     ) -> i32 {
         // SAFETY: `entry` is an owned reference; `this` is the visitor made below.
         unsafe {
-            let Some(entry) = Ref::from_owned(entry) else {
+            let Some(entry) = Ref::adopt(entry) else {
                 return 1;
             };
             let found = ffi::data::<CefNavigationEntryVisitor, Found>(this);
@@ -534,7 +533,7 @@ fn entries(browser: *mut CefBrowser) -> (Vec<String>, usize) {
     let visitor = new_object(visitor, Arc::clone(&found));
     // SAFETY: `browser` is live for this callback.
     unsafe {
-        if let Some(host) = Ref::from_owned(call!(browser, get_host)) {
+        if let Some(host) = Ref::adopt(call!(browser, get_host)) {
             // CEF adopts the visitor's reference.
             call!(host.as_ptr(), get_navigation_entries, visitor, 0);
         } else {
@@ -553,8 +552,8 @@ unsafe extern "C" fn on_load_start(
 ) {
     guard(|| {
         // SAFETY: as above; `browser` is released by the `Ref` below.
-        let _browser = Ref::from_owned(browser);
-        let Some(frame) = Ref::from_owned(frame) else {
+        let _browser = Ref::adopt(browser);
+        let Some(frame) = Ref::adopt(frame) else {
             return;
         };
         if unsafe { call!(frame.as_ptr(), is_main) } == 0 {
@@ -580,7 +579,7 @@ unsafe extern "C" fn on_load_error(
     own!(browser);
     guard(|| {
         // SAFETY: as above.
-        let Some(frame) = Ref::from_owned(frame) else {
+        let Some(frame) = Ref::adopt(frame) else {
             return;
         };
         if unsafe { call!(frame.as_ptr(), is_main) } == 0 {
@@ -604,8 +603,8 @@ unsafe extern "C" fn on_address_change(
 ) {
     guard(|| {
         // SAFETY: as above.
-        let _browser = Ref::from_owned(browser);
-        let Some(frame) = Ref::from_owned(frame) else {
+        let _browser = Ref::adopt(browser);
+        let Some(frame) = Ref::adopt(frame) else {
             return;
         };
         if unsafe { call!(frame.as_ptr(), is_main) } == 0 {
@@ -686,8 +685,8 @@ unsafe extern "C" fn on_before_browse(
     own!(browser);
     guard(|| {
         // SAFETY: as above.
-        let frame = Ref::from_owned(frame);
-        let request = Ref::from_owned(request);
+        let frame = Ref::adopt(frame);
+        let request = Ref::adopt(request);
         let (Some(frame), Some(request)) = (frame, request) else {
             return 0;
         };
@@ -770,7 +769,7 @@ unsafe extern "C" fn on_before_download(
     guard(|| {
         // SAFETY: as above. The browser fetches it through its download service; returning
         // false without continuing cancels CEF's own download (Alloy style).
-        let Some(item) = Ref::from_owned(item) else {
+        let Some(item) = Ref::adopt(item) else {
             return 0;
         };
         let view = unsafe { view(this) };
@@ -823,7 +822,7 @@ unsafe extern "C" fn on_before_unload_dialog(
     guard(|| {
         // The page is left without asking, as with the other engines.
         // SAFETY: an owned reference.
-        if let Some(callback) = Ref::from_owned(callback) {
+        if let Some(callback) = Ref::adopt(callback) {
             let empty = ffi::empty_string();
             unsafe { call!(callback.as_ptr(), cont, 1, &empty) };
         }
@@ -843,7 +842,7 @@ unsafe extern "C" fn on_request_media_access_permission(
     guard(|| {
         // Camera, microphone and screen capture fail closed.
         // SAFETY: an owned reference.
-        if let Some(callback) = Ref::from_owned(callback) {
+        if let Some(callback) = Ref::adopt(callback) {
             unsafe { call!(callback.as_ptr(), cancel) };
         }
         1
@@ -862,7 +861,7 @@ unsafe extern "C" fn on_show_permission_prompt(
     guard(|| {
         // Every permission prompt (location, clipboard, notifications) is denied.
         // SAFETY: an owned reference. `CEF_PERMISSION_RESULT_DENY` is 1.
-        if let Some(callback) = Ref::from_owned(callback) {
+        if let Some(callback) = Ref::adopt(callback) {
             unsafe { call!(callback.as_ptr(), cont, 1) };
         }
         1
@@ -884,7 +883,7 @@ unsafe extern "C" fn on_file_dialog(
     guard(|| {
         // No file chooser without the browser's policy: cancelled.
         // SAFETY: an owned reference.
-        if let Some(callback) = Ref::from_owned(callback) {
+        if let Some(callback) = Ref::adopt(callback) {
             unsafe { call!(callback.as_ptr(), cancel) };
         }
         1
@@ -902,7 +901,7 @@ unsafe extern "C" fn on_before_context_menu(
     guard(|| {
         // No native menu: an empty model shows nothing.
         // SAFETY: an owned reference.
-        if let Some(model) = Ref::from_owned(model) {
+        if let Some(model) = Ref::adopt(model) {
             unsafe { call!(model.as_ptr(), clear) };
         }
     });

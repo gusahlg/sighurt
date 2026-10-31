@@ -102,7 +102,7 @@ impl Action {
         unsafe {
             match self {
                 Self::Load(url) => {
-                    if let Some(frame) = Ref::from_owned(call!(b, get_main_frame)) {
+                    if let Some(frame) = Ref::adopt(call!(b, get_main_frame)) {
                         let url = CefStr::new(url);
                         call!(frame.as_ptr(), load_url, &url.raw());
                     }
@@ -231,7 +231,7 @@ impl Action {
                 Self::ImeCancel => call!(h, ime_cancel_composition),
                 Self::Close => call!(h, close_browser, 1),
                 Self::Cut => {
-                    if let Some(frame) = Ref::from_owned(call!(b, get_focused_frame)) {
+                    if let Some(frame) = Ref::adopt(call!(b, get_focused_frame)) {
                         call!(frame.as_ptr(), cut);
                     }
                 }

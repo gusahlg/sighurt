@@ -284,7 +284,7 @@ unsafe extern "C" fn on_before_command_line_processing(
 ) {
     // SAFETY: CEF's arguments; the command line is an owned reference.
     unsafe {
-        let Some(command_line) = Ref::from_owned(command_line) else {
+        let Some(command_line) = Ref::adopt(command_line) else {
             return;
         };
         if !ffi::read(process_type).is_empty() {
