@@ -9,6 +9,11 @@ log with what was decided instead.
 
 ## Where things stand
 
+**Latest release: 0.10.0** (31 October 2026, decision 120): the configuration extension (116),
+copy and paste everywhere, and three opt-in engines (CEF 117, Ladybird 118, NetSurf 119). The
+snapshot below predates some of the decisions that amend it (Servo is 0.7, the modal keymap is
+now the example configuration); the decisions log is current.
+
 `sig` (`sighurt-browser`) is the rewrite's browser, on Wayland, with its engines compiled in and
 no IPC: Servo 0.5 (the default engine for the web, presenting GL straight into its page
 subsurface), WPE WebKit 2.52.6 (for the sites the configuration gives it, presenting its
@@ -3808,3 +3813,41 @@ Newest last. Each entry says what was decided and why.
     status records: a certificate-error policy test, a disk cache, cookie persistence,
     `site_data`, the `dlopen` question, and the quality pass (glyph cache, SVG paths, shaping,
     semantics, find, JavaScript as a feature).
+120. **Sighurt 0.10.0** (31 October 2026; the user: release once the work and its verification
+    are done, as 0.10.0 rather than 1.0.0, which waits for a later session; the benchmark
+    comparison with 0.9.0 lands afterwards as its own commit). Since 0.9.0: the configuration
+    extension (116: the example configuration, the same keys in the window and the terminal,
+    Escape toggling INSERT MODE, `y y`, `c o`, `clipboard.copy`), copy and paste in the
+    terminal (OSC 52) and in both address lines; three opt-in engines, none of them default:
+    CEF 150 (117), Ladybird on a patched LibWebView (118) and NetSurf 3.11 (119, GPL-2.0-only,
+    never distributed); an independent review of each new engine and of the configuration
+    change, with every finding fixed or answered (CEF: 15, Ladybird: 16, NetSurf: 14, the
+    configuration and terminal clipboard: 8; among them NetSurf's TLS fail-open through
+    `about:query/ssl`, two use-after-frees in its frontend, Chromium's paths to the desktop
+    clipboard, Ladybird reaping other engines' children); a Servo WebGL abort on github.com
+    (`webglbuffer.rs` asserting on an unbalanced attached counter) tolerated by a vendored
+    servo-script patch (`third_party/servo-script`); ephemeral engines no longer leave profile
+    directories; and optimizations kept by measurement: Wasm frames damage only what changed
+    (sway 22.7 → 11.3 % and sig 64.8 → 18.5 % CPU on raf-demo), CEF copies only a lease buffer's
+    missing damage (307,200 → 2,304 bytes a frame for a 24×24 animation), the chrome snapshot
+    (2.0 → 0.8 ms with 50 long-URL tabs), hidden chrome surfaces free their buffers (8.1 → 4.5 MB
+    after leaving `sig://home`), the first chrome frame waits for a sized configure (6 → 3
+    startup paints, 3 → 0 discarded), and the owner frame path reuses its lists. Decision 119's
+    "not done" list is shorter since its review round: the certificate-error test exists (a
+    self-signed server; the load fails as `NavigationFailed`). *Verified* on this commit's tree
+    (desktop RTX 3070 and louise-pc RTX 4060): CLAUDE.md's whole pre-commit list with Servo,
+    WPE, every feature and NetSurf's own clippy and tests; `apps/sighurt-browser/tests/headless.sh`
+    and `ui/sighurt-ui/tests/headless.sh`; the terminal pty suite 30 times in a row under load;
+    `engines.sh` on louise-pc, every scenario passing but WPE's WebGL page, which is flaky as
+    in 107 (it passed in the session's first run); `coexist.sh`, every engine in one process (93
+    of 95; the two failures were Chromium's on-device model utility outliving `sig`, fixed by
+    ac3a037's helper death signal and checked with a 210 s run past Chromium's delay);
+    `real-terminals.sh` (kitty 7/7; Rio through wtype is unreliable in a headless compositor —
+    it drops Escape and repeated keys — and passed what it can drive); a live check in Rio
+    running the user's tmux configuration: sixel with Servo, Escape → INSERT MODE (keys sent
+    through tmux), `q` ignored in insert mode, Servo text mode, `e` to WPE, `o` with chatgpt.com,
+    `q` quitting with chatgpt.com open, and `y y` reaching tmux's clipboard (Rio's hand-off to
+    the Wayland clipboard needs a focused session and was not verifiable headless).
+    `sighurt-sdk` keeps 0.7.0 (the guest ABI didn't change). Work: Claude Opus 5.5
+    (orchestration, integration, review), Claude Sonnet 5.5 and Grok 4.7 (implementation),
+    GPT-6 Astra and Claude Opus 5.5 (reviews), Claude Fable 5.1 (the configuration design).
