@@ -24,8 +24,9 @@ cat > "$inner" <<EOS
 export XDG_CONFIG_HOME=$scratch/config XDG_DATA_HOME=$scratch/data XDG_STATE_HOME=$scratch/state XDG_CACHE_HOME=$scratch/cache
 "$bin" --ignored --nocapture --test-threads=1
 rc=\$?
-# The zygotes go with the browser process: nothing of Chromium may outlive the test.
-sleep 2
+# The zygotes go with the browser process. Anything else (the on-device model utility
+# included) must be gone too; give a reparented helper a moment to exit.
+sleep 3
 if pgrep -f '^/[^ ]*/sig-cef-helper --type=' > /dev/null; then echo "cef-offscreen: helper processes outlived the test"; pgrep -af '^/[^ ]*/sig-cef-helper --type='; rc=1; fi
 exit \$rc
 EOS

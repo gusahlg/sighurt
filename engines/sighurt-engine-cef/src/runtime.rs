@@ -316,7 +316,17 @@ unsafe extern "C" fn on_before_command_line_processing(
             "disable-sync",
             "no-default-browser-check",
             "no-first-run",
-            "disable-features=Translate",
+            // One switch: Chromium keeps a single disable-features list.
+            // Translate is the browser's own UI.
+            // OptimizationGuideOnDeviceModel is compiled on. CanLaunchOnDeviceModelService is
+            // that feature or LogOnDeviceMetricsOnStartup (off unless a trial enables it).
+            // 180s after the optimization guide starts, the performance classifier calls
+            // ServiceClient::Get. LaunchService then starts
+            // `--utility-sub-type=on_device_model.mojom.OnDeviceModelService`
+            // (`--service-sandbox-type=on_device_model_execution`) and a `--type=broker`.
+            // Neither is a zygote child, so neither has a death signal. cef_shutdown does
+            // not finish them, and a quit while they are up reparents them to init.
+            "disable-features=Translate,OptimizationGuideOnDeviceModel,LogOnDeviceMetricsOnStartup",
         ] {
             let (name, value) = switch.split_once('=').unwrap_or((switch, ""));
             let name = CefStr::new(name);
