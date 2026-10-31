@@ -3704,9 +3704,11 @@ Newest last. Each entry says what was decided and why.
     does not stop the build; the runtime then refuses to start. Chromium's renderer, GPU and
     network processes are `sig-cef-helper`. CEF's UI thread runs `multi_threaded_message_loop`;
     callbacks only queue events and wake the owner. Frames are `OnPaint` CPU buffers: dirty
-    rectangles into a staging buffer, then the whole frame into the host's lease. The runtime
-    refuses to start unless the session has `WAYLAND_DISPLAY` or `DISPLAY`, so the terminal
-    runs it only with a display; with neither, the tab says the engine needs a display.
+    rectangles into a staging buffer, then into the host's lease only what that lease buffer
+    lacks (its damage history, trusted only while 32 probe pixels recorded at its last write are
+    still there). Chromium runs with `--ozone-platform=headless` and SwiftShader: it opens no
+    display connection, so it can't reach the desktop clipboard, and it runs in the terminal
+    with no display at all.
     `semantics` is false, so text mode and `sig --dump` do not use it. `engine-cef` is on
     `sighurt-browser`, `sighurt-runtime`, `sighurt-gui` and `sighurt-tui`, in no default set.
     The descriptor `cef` is a web engine (`page.switch-engine` cycles it) and honors
@@ -3730,6 +3732,18 @@ Newest last. Each entry says what was decided and why.
     letter, Wayland clipboard, an attachment saved whole, no Chromium process left at exit).
     Runtime start 60–150 ms warm (4.5–8 s cold); 11 processes, 1.28–1.34 GiB resident; idle
     CPU 0.3–0.7% of one core; `sig`'s idle wakes 1–2 in 10 s.
+    *Review* (GPT-6 Astra, 31 October 2026; CEF.md §9): 15 findings fixed: reference adoption
+    is `unsafe` and only audited interfaces are `Send`/`Sync`; a paste is bound to the document
+    and frame that asked and checked again on CEF's UI thread; every clipboard key form is
+    intercepted and a cut deletes only after the write is approved; closing during creation no
+    longer deadlocks; the event queue has count and byte budgets and page strings are capped
+    before allocation; only GET navigations are held (POST forms go ahead whole); a timed-out
+    shutdown reports the leak; superseded navigations fail as cancelled; `ViewClosed` is never
+    purged; same-document history is tracked while loading; commands before the browser exists
+    are queued; large pastes go in chunks; site data kinds are declared with deletion
+    `Unsupported`; no URLs or file names in logs. A 24×24 animation copies 2,304 bytes a frame
+    instead of 307,200 (`present` 96 → 44 µs, debug build). `offscreen.sh` (POST whole, late
+    paste refused, no display), `cef.sh` and `sig --tui --engine cef` with no display pass.
 118. **Ladybird is an opt-in engine, on a patched LibWebView** (31 October 2026; the user
     approved the LibWebView patch that day; design in `docs/rewrite/LADYBIRD.md`). The package
     is nixpkgs' Ladybird `0-unstable-2026-09-18` (source rev `b90af890`, nixpkgs pin
