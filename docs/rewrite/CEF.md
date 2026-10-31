@@ -171,19 +171,15 @@ users (diagnostics) after CEF started.
 - **One CEF runtime per process** (a CEF rule: `cef_initialize` once, `cef_shutdown` at the end,
   no re-initialization). `CefRuntime::new` on the first CEF page (like WPE's decision 84); a
   session without CEF pages maps no CEF.
-- **Display**: Chromium's ozone layer needs a display connection even windowless. Without
-  `--ozone-platform` it picks Wayland when `WAYLAND_DISPLAY` is set (the smoke test connected to
-  the private sway and logged `wayland_surface` setup), and with no display `cef_initialize`
-  failed: "Failed to initialize Wayland platform". `--ozone-platform=headless` made the GPU
-  process fail EGL init (`Could not open the default X display`) on 150/152. So CEF needs a
-  Wayland display (or X11) in every `sig` mode: GUI is fine; the TUI and `sig --dump` have none
-  guaranteed, so **the CEF engine does not declare the `semantics`/CPU target capability for
-  those frontends** until a no-display mode (headless ozone with swiftshader, untested) is proved.
-  The engine reports `Unsupported` for a CPU-only host.
-- **The connection is Chromium's own**: CEF's browser process opens a second Wayland connection
-  (its ozone layer; it also created Wayland objects of its own). It does not share
-  `sighurt-wayland`'s connection and creates no visible surface in OSR (the smoke compositor showed
-  none; confirm with `swaymsg -t get_tree` in the plan's step 6).
+- **Display**: Chromium runs with `--ozone-platform=headless` and SwiftShader
+  (`use-angle=swiftshader`, `enable-unsafe-swiftshader`). It opens no Wayland or X11 connection.
+  A session with `WAYLAND_DISPLAY` and `DISPLAY` unset still starts the engine: the GUI, the TUI
+  and the offscreen test all do. Without `--ozone-platform` it used to pick Wayland when
+  `WAYLAND_DISPLAY` was set, and headless ozone without SwiftShader failed EGL init
+  (`Could not open the default X display`). There is no GPU rendering. `--dump` still refuses
+  the engine, because it has no semantics. CPU frames are presented, so a CPU host is supported.
+- **No second display connection**: the browser process does not open Wayland, does not share
+  `sighurt-wayland`'s connection, and creates no surface. Frames arrive through `OnPaint`.
 
 ### 4.2 C API and loading
 
@@ -397,8 +393,8 @@ Wayland targets; the TUI does not (4.1).
 4. **Clipboard ownership** (4.5): no CEF hook; Chromium may touch the Wayland clipboard itself;
    plan (2) with key interception, plain text only.
 5. **Memory and process count**: 10 processes, ~560 MB PSS for example.com.
-6. **No display, no engine**: ozone needs a display connection; the TUI/dump frontends cannot host
-   it until a headless mode is found.
+6. **Headless ozone**: proved, with SwiftShader. No display connection, and no GPU rendering.
+   DMA-BUF remains open (section 8).
 7. **Chromium's browser process is `sig`**: a browser-process exploit owns `sig`; same class of
    risk as WPE's UI process, with a far larger attack surface (network service in the browser
    process group, no sandbox for it in this config).
@@ -506,9 +502,10 @@ runtime have no CEF code beyond that registration.
 - **The CEF distribution is not shared with other users of the prefix**: nothing of sig's own
   state is read or written by CEF: its root cache is `{data_dir}/sighurt/cef` or, ephemeral, the
   engine's scratch directory.
-- **`--dump` and text mode** refuse the engine (no `semantics`, as designed); the graphical TUI
-  needs a display: in a session without one the tab says "the cef engine needs a display (Wayland
-  or X11) and this session has none" and nothing crashes (checked with `sig --tui` in tmux).
+- **`--dump` and text mode** refuse the engine (no `semantics`, as designed). The graphical TUI
+  hosts it with no display: `sig --tui --engine cef` with `WAYLAND_DISPLAY` and `DISPLAY` unset
+  answered the terminal probe, sent kitty graphics, and exited 0 with no helper left
+  (2026-10-31).
 - **Zygotes outlive `cef_shutdown`** until the process exits; the helper's other processes end
   with it. `offscreen.sh` checks that nothing remains after the test process exits.
 - The clipboard is not handled by a CEF hook (there is none): the engine takes the chords
@@ -525,7 +522,8 @@ crashes as `ViewFailed` (reload recovers), downloads as `Service::Download`, cli
 Refused: JS dialogs (suppressed), permission prompts and media access (denied), file choosers
 (cancelled), context menus (emptied), HTTP authentication and certificate errors (cancelled),
 `javascript:` addresses from the browser. Not supported: `<select>` popups (`PET_POPUP` is
-ignored), drag and drop, find in page, accessibility, semantics, DMA-BUF frames, site data.
+ignored), drag and drop, find in page, accessibility, semantics, DMA-BUF frames. Site data is
+declared; listing and forgetting it is refused.
 
 **Tests.**
 - `cargo test -p sighurt-engine-cef`: 17 unit tests (navigation, keys, queue, staging).
@@ -562,3 +560,60 @@ example.com then a local input page):
 5. Newer CEF branches (152 and up) do not start here (exit code 28), so the pin stays at 150.
 6. 1.3 GiB for one page; the engine is opt-in for that reason.
 7. Run on louise-pc: not done (the prefix is only on this machine's HDD).
+
+## 9. After the independent review (Astra)
+
+The review's 15 findings were checked against the code; all were right. What changed:
+
+- **Chromium has no display connection** (`--ozone-platform=headless`, software compositing with
+  SwiftShader, which also draws WebGL). The study's finding that CEF needs a display was about
+  the default platform: with headless ozone CEF 150 starts and paints with `WAYLAND_DISPLAY` and
+  `DISPLAY` unset (smoke test: first paint 112 ms with `--disable-gpu`, 261 ms with SwiftShader,
+  warm; cold 5 to 12 s). So Chromium cannot reach the desktop clipboard or any other part of
+  the desktop (P1.3), the terminal frontend can use the engine without a display, and the
+  display refusal is gone. Cost: no GPU rendering. The engine still takes every clipboard key
+  form itself (Ctrl+C/X/V, Ctrl+Insert, Shift+Insert, Shift+Delete, repeats) and asks the
+  services; a cut deletes the selection (`frame.del()`) only after the write was approved.
+- **Adoption is unsafe** (`Ref::adopt`), and `Send`/`Sync` hold only for `CefBrowser` and
+  `CefBrowserHost` (P1.1).
+- **A paste is bound to the document and focused frame that asked**, rechecked on CEF's UI thread
+  before every insertion; long text goes in 1024-unit tasks (P1.2, P2.12). Test: a paste
+  answered after a navigation is not typed.
+- **No lock is held while CEF is called**; a close during creation is posted after
+  `OnAfterCreated`; commands issued before the browser exists are queued in order (4096 at most) and
+  run after it (P1.4, P2.11). Test: a view closed immediately after `open_view`, three times.
+- **Bounds**: page text is converted at most 16 K units (an address 2 M units, over which it is
+  dropped), the selection 1 MiB; the event queue admits 4096 events, 16 MiB and 512 a view, with
+  life-cycle events always admitted (P1.5). `forget` keeps a published `ViewClosed` (P2.9).
+- **Only GET navigations are held**; a POST form goes ahead in Chromium with its body (P1.6).
+  Test: a form posted to a local server arrives whole and is never asked about.
+- **Navigation ids**: a newer request supersedes an older pending one (which fails `Cancelled`);
+  a late `ERR_ABORTED` never takes the current navigation's id; same-document changes are seen
+  whenever no cross-document navigation is under way, also with an unchanged address (P2.8, P2.10).
+- `leaked()` is forwarded by both bindings (P2.7); the engine declares the site data Chromium
+  keeps and refuses listing and forgetting explicitly (P2.13); download URLs and file names are no
+  longer logged (P2.15).
+- **Presentation copies only what a lease buffer lacks** (`present.rs`): the damage CEF reported
+  since that buffer was last written. A buffer is trusted only if probe pixels recorded at its last
+  write are still in it (a target need not keep buffers), else it gets the whole frame. The offscreen
+  test paints every frame into a kept buffer and a fresh one and compares them (P2.14). DMA-BUF
+  stays future work (open problem 1 of section 8).
+- **A cleared windowless page is opaque white.** A zeroed `CefBrowserSettings` leaves
+  `background_color` alpha at 0, and a windowless browser treats that as transparent painting
+  (the 150 headers). A resized page then showed a transparent 800×600 hole padded with white.
+  The settings write opaque white at C offset 248, the same colour as `CefSettings.background_color`.
+- **A new document clears text input.** The offscreen test's second focus check was flaky: a
+  reload can report the field in the same pump as the commit, and a click on a field that already
+  has focus does not report it again. The test looks from the commit, and clicks only after the
+  load has finished when no focus was reported.
+- **Present-copy measurement** (P2.14), debug build, a 24×24 square blinking in a 320×240 page.
+  A full frame is 307,200 bytes. Thirty submitted frames per run after five warmup frames, three
+  runs. The square sits off the probe pixels, so a trusted buffer is asked only for its rectangle.
+
+  | | bytes copied per frame | `present` time |
+  |---|---:|---:|
+  | before, whole frame (that build still required a display, so the runs used a private headless sway) | 307,200, 307,200, 307,200; median 307,200 | 100, 95, 96 µs; median 96 µs |
+  | after, damage only (no display) | 2,304, 2,304, 2,304; median 2,304 | 42, 46, 44 µs; median 44 µs |
+
+  2,304 bytes is the square (24×24×4). In the contract test a keystroke copied 44,352 bytes into
+  the kept buffer of a 1,920,000-byte frame.

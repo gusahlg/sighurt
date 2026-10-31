@@ -18,11 +18,11 @@
 //! not a sandbox for `sig` (CLAUDE.md, "Security").
 //!
 //! Frames come from `OnPaint` as BGRA with dirty rectangles: those are copied into a staging
-//! buffer on CEF's thread (one copy, only what changed) and into the host's lease at `present`
-//! (a second, whole-frame copy). Chromium needs a display connection even windowless, so the
-//! runtime refuses to start without one. The browser owns the clipboard: copy and paste go
-//! through the services, never through Chromium. Dialogs, permission prompts and menus are
-//! refused.
+//! buffer on CEF's thread (only what changed) and, at `present`, into the host's lease (only the
+//! damage that buffer lacks). Chromium runs with headless ozone and SwiftShader, so it opens no
+//! display connection and the runtime starts without one. The browser owns the clipboard: copy
+//! and paste go through the services, never through Chromium. Dialogs, permission prompts and
+//! menus are refused.
 //!
 //! Must not own: browser policy, surfaces or the event loop; like every engine it reports facts
 //! as events, asks for privileged services and presents only with the host's permits.
