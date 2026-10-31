@@ -377,6 +377,60 @@ fn images(bytes: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
+/// Standard base64 with padding, the encoding an OSC 52 clipboard carries.
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        let n = (u32::from(data[index]) << 16)
+            | (u32::from(data[index + 1]) << 8)
+            | u32::from(data[index + 2]);
+        for shift in [18, 12, 6, 0] {
+            out.push(ALPHABET[((n >> shift) & 0x3f) as usize] as char);
+        }
+        index += 3;
+    }
+    let rest = &data[index..];
+    if let [a, b] = rest {
+        let n = (u32::from(*a) << 16) | (u32::from(*b) << 8);
+        for shift in [18, 12, 6] {
+            out.push(ALPHABET[((n >> shift) & 0x3f) as usize] as char);
+        }
+        out.push('=');
+    } else if let [a] = rest {
+        let n = u32::from(*a) << 16;
+        for shift in [18, 12] {
+            out.push(ALPHABET[((n >> shift) & 0x3f) as usize] as char);
+        }
+        out.push_str("==");
+    }
+    out
+}
+
+/// `ESC ] 52 ; c ; <base64 of data> ESC \`.
+fn osc52(data: &[u8]) -> Vec<u8> {
+    let mut out = b"\x1b]52;c;".to_vec();
+    out.extend(base64(data).into_bytes());
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+/// `ESC ] 52 ; c ; ? ESC \`, the clipboard query.
+const OSC52_QUERY: &[u8] = b"\x1b]52;c;?\x1b\\";
+
+/// The top line dropped `INSERT MODE`.
+///
+/// The diff paints only cells that changed, and a space that was already blank is `CSI C`,
+/// which [`shows`] reads as a space. The cursor is placed on the first cell that changed,
+/// so the cleared indicator is one run as long as `INSERT MODE`. A full rewrite of the
+/// line has `[1/1]` and not the indicator.
+fn insert_mode_left(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && !shows(bytes, "INSERT MODE")
+        && (shows(bytes, "[1/1]") || shows(bytes, &" ".repeat("INSERT MODE".len())))
+}
+
 /// The printable text of `bytes`, image payloads left out, for messages.
 fn printable(bytes: &[u8]) -> String {
     let mut out = String::new();
@@ -572,6 +626,172 @@ fn kitty_keys_open_addresses_tabs_and_quit() {
         term.context()
     );
     term.assert_restored();
+}
+
+/// Escape enters INSERT MODE (`q` reaches the page). Escape leaves it, and then `q` quits.
+#[test]
+fn escape_enters_insert_mode_where_q_does_not_quit() {
+    let mut term = Terminal::start_with("insert-mode", &["demo://pattern"], KITTY_REPLIES);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440) && has(got, b"[1/1]")
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("\x1b"));
+    let insert = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "INSERT MODE")
+    });
+    assert!(
+        insert,
+        "Escape did not show INSERT MODE\n{}",
+        term.context()
+    );
+
+    // In INSERT MODE `q` is not a binding: the page takes the letter, and sig stays up.
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("q"));
+    // Spaces the diff left blank are `CSI C`, so the status is read with `shows`.
+    let typed = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "Typed into the page: q") && shows(got, "INSERT MODE")
+    });
+    assert!(
+        typed,
+        "q in INSERT MODE did not reach the page\n{}",
+        term.context()
+    );
+    assert!(
+        term.child.try_wait().unwrap().is_none(),
+        "q quit in INSERT MODE\n{}",
+        term.context()
+    );
+
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("\x1b"));
+    let left = term.wait(since, Duration::from_secs(10), insert_mode_left);
+    assert!(left, "Escape did not leave INSERT MODE\n{}", term.context());
+
+    term.type_bytes(&kitty_keys("q"));
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+}
+
+/// `y y` copies the selected tab's address as OSC 52.
+#[test]
+fn y_y_writes_the_address_with_osc_52() {
+    let mut term = Terminal::start("yank", &["demo://pattern"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440) && has(got, b"demo://pattern")
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    // `Url` keeps `demo://pattern` as given: `demo` is not a special scheme, so no slash is added.
+    let url = "demo://pattern";
+    let since = term.got.len();
+    term.type_bytes(b"yy");
+    let copied = term.wait(since, Duration::from_secs(10), |got| {
+        has(got, &osc52(url.as_bytes()))
+    });
+    assert!(
+        copied,
+        "y y did not write OSC 52 of {url} ({})\n{}",
+        base64(url.as_bytes()),
+        term.context()
+    );
+}
+
+/// Ctrl+V in the address line queries OSC 52 and inserts the terminal's answer.
+#[test]
+fn ctrl_v_in_the_line_pastes_the_terminals_answer() {
+    let mut term = Terminal::start("paste", &["demo://pattern"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+
+    let since = term.got.len();
+    term.type_bytes(b"o");
+    let editing = term.wait(since, Duration::from_secs(10), |got| {
+        has(got, b"\x1b[24H") && has(got, b"demo://pattern")
+    });
+    assert!(
+        editing,
+        "`o` did not open the address line\n{}",
+        term.context()
+    );
+
+    let since = term.got.len();
+    // Ctrl+V, as a legacy terminal sends it.
+    term.type_bytes(b"\x16");
+    let asked = term.wait(since, Duration::from_secs(5), |got| has(got, OSC52_QUERY));
+    assert!(
+        asked,
+        "Ctrl+V did not query the clipboard\n{}",
+        term.context()
+    );
+
+    let pasted = "clip-text";
+    term.type_bytes(&osc52(pasted.as_bytes()));
+    let since = term.got.len();
+    let inserted = term.wait(since, Duration::from_secs(5), |got| shows(got, pasted));
+    assert!(
+        inserted,
+        "the line did not show {pasted:?}\n{}",
+        term.context()
+    );
+    assert!(
+        !shows(&term.got[since..], "demo://patternclip-text"),
+        "the paste was appended to the address\n{}",
+        term.context()
+    );
+}
+
+/// Ctrl+C in the address line copies the line with OSC 52, and does not quit.
+#[test]
+fn ctrl_c_in_the_line_copies_it() {
+    let mut term = Terminal::start("copy-line", &["demo://pattern"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+
+    let since = term.got.len();
+    term.type_bytes(b"o");
+    let editing = term.wait(since, Duration::from_secs(10), |got| {
+        has(got, b"\x1b[24H") && has(got, b"demo://pattern")
+    });
+    assert!(
+        editing,
+        "`o` did not open the address line\n{}",
+        term.context()
+    );
+
+    let text = "copied-line";
+    let since = term.got.len();
+    term.type_bytes(text.as_bytes());
+    let typed = term.wait(since, Duration::from_secs(10), |got| shows(got, text));
+    assert!(typed, "the line did not show {text:?}\n{}", term.context());
+
+    let since = term.got.len();
+    // Ctrl+C, as a legacy terminal sends it. On the page this quits; in the line it copies.
+    term.type_bytes(b"\x03");
+    let copied = term.wait(since, Duration::from_secs(10), |got| {
+        has(got, &osc52(text.as_bytes()))
+    });
+    assert!(copied, "Ctrl+C did not copy the line\n{}", term.context());
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        term.wait(term.got.len(), Duration::from_millis(20), |_| false);
+        assert!(
+            term.child.try_wait().unwrap().is_none(),
+            "Ctrl+C quit from the address line\n{}",
+            term.context()
+        );
+    }
 }
 
 #[test]
