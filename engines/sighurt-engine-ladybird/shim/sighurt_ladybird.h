@@ -46,8 +46,13 @@ enum {
     LB_EV_CLOSED,           /* the view is gone */
     LB_EV_HISTORY,          /* i0 = current index, i1 = count; s0 = entries, one URL per line */
     LB_EV_JS_RESULT,        /* i0 = request id; s0 = result (JSON), or NULL on failure */
-    LB_EV_INPUT_METHOD,     /* i0 = 1 when a text input has focus */
-    LB_EV_FIND_RESULT       /* i0 = current match, i1 = total (-1 unknown) */
+    LB_EV_INPUT_METHOD,     /* i0 = 1 when an editable field has focus; s0 = caret "x,y,w,h" in device pixels */
+    LB_EV_FIND_RESULT,      /* i0 = current match, i1 = total (-1 unknown) */
+    LB_EV_CLIPBOARD_WRITE,  /* s0 = MIME type, data = bytes; i1 = representations still to come */
+    LB_EV_CLIPBOARD_WANT,   /* a paste found nothing: answer with lb_clipboard_grant or _deny */
+    LB_EV_DOWNLOAD,         /* s0 = url, s1 = suggested name, data = the file */
+    LB_EV_PICK_FILES,       /* i0 = 1 for several files; i1 = token for lb_pick_reply */
+    LB_EV_OPEN_EXTERNAL     /* s0 = url; i1 = token for lb_open_external_reply */
 };
 
 typedef struct lb_event {
@@ -57,6 +62,8 @@ typedef struct lb_event {
     int64_t i1;
     const char* s0;
     const char* s1;
+    const void* data; /* binary payload of some events, valid like the strings */
+    size_t len;
 } lb_event;
 
 /* argv: extra Ladybird arguments after the program name; profile: directory of the profile;
@@ -94,6 +101,13 @@ void lb_input_pointer_leave(uint64_t view);
 void lb_input_pointer_button(uint64_t view, int x, int y, int button, int pressed, int click_count, int modifiers);
 void lb_input_scroll(uint64_t view, int x, int y, double dx, double dy, int precise, int modifiers);
 void lb_input_commit_text(uint64_t view, const char* text);
+void lb_input_preedit(uint64_t view, const char* text);
+
+/* Answers to events. */
+void lb_clipboard_grant(uint64_t view, const uint8_t* data, size_t len); /* plain text to paste */
+void lb_clipboard_deny(uint64_t view);
+void lb_pick_reply(int64_t token, const char* paths); /* newline-separated; NULL: cancelled */
+void lb_open_external_reply(int64_t token, int allowed);
 
 typedef struct lb_frame {
     const uint8_t* pixels; /* BGRA8888 premultiplied, valid until the next lb_pump or lb_view_close */

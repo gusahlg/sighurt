@@ -12,6 +12,8 @@ publish = false
 
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
+# Origins of committed pages, for service requests.
+url.workspace = true
 # dlopen and poll.
 libc = "0.2"
 # Warnings through the executable's logger.

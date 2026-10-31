@@ -142,10 +142,14 @@ Rust 1.98.1 for its Rust crates (`libweb_rust`, `libgfx_rust`, ...). Store outpu
   `lb_loop_fd()`, readable when a notifier's descriptor, a wake or a queued event needs a pump.
   Timers have no descriptor: `lb_pump` returns the milliseconds to the next one, which becomes the
   `PumpStatus` deadline. Notifiers on one descriptor are merged into one epoll registration.
-  `SIGCHLD`, `SIGINT` and `SIGTERM` (the only signals Ladybird registers) use `sigaction` with the
-  previous handler chained and the owner's wake descriptor as the self-pipe; pidfds were not
-  needed. `ProcessMonitor`'s handler calls `waitpid(-1)`, which can reap a child of another engine
-  (WPE's bubblewrap) that exits at that moment: a limit of running both (see Risks). The crate's
+  `SIGINT` and `SIGTERM` (registered only in Ladybird's profiling mode) use `sigaction` with the
+  previous handler chained and the owner's wake descriptor as the self-pipe. **`SIGCHLD` is never
+  installed**: `ProcessMonitor`'s handler reaps with `waitpid(-1)`, which would take the exit status
+  of children that are not Ladybird's (WPE's bubblewrap, a program the host started). The loop keeps
+  the handler and never calls it; the shim watches each helper through a pidfd instead (the
+  `ProcessManager`'s `on_process_added`, plus the helpers already started), reaps it by its own pid and
+  does what the monitor would have done (`remove_process`, `save_crash_report`, `on_process_exited`,
+  so a dead RequestServer is still restarted); shutdown reaps the rest by pid. The crate's
   wait thread polls `lb_loop_fd()` and wakes the owner through the `EngineWaker`; it sleeps until
   the owner has pumped, so a readable descriptor cannot make it spin. The idle test: 6 pumps and
   2 loop wakes in 6 s with a static page (Ladybird's own housekeeping timers, no spin).
@@ -399,6 +403,8 @@ Built and checked on this desktop (nixpkgs pin `4975466d`, Ladybird rev `b90af89
 | Crate `sighurt-engine-ladybird`, `impl EngineRuntime` (M2, M3) | done for the scope below | `tests/headless.rs`: events in order, frames with the page's colour, fragment vs document navigation, history back, a click on a link (hover status, a page-started navigation with its own id), resize, hidden, idle (6 pumps, 2 loop wakes in 6 s), close, shutdown; `clippy -D warnings` clean |
 | ABI-skew guard | done | `ffi::check_abi` and its unit test; the build script's flag check |
 | Wiring: feature `engine-ladybird` on `sighurt-browser`, `-runtime`, `-gui`, `-tui` (not in any default) | done | `tools/cargo check -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo` and with `frontend-tui`; clippy `-D warnings` over browser, runtime, gui, tui with the feature; runtime's descriptor test (24 passed); a build without the feature is unchanged |
+| Reaping only Ladybird's own helpers | done | `tests/headless.rs`: a non-Ladybird zombie child (`sleep 0.2`) stays waitable after a SIGKILLed WebContent was reaped by Ladybird |
+| Services and text input | done | `tests/services.rs`; `sig-shot.sh MODE=typing` |
 | `sig` shows https://example.com/ in Ladybird | done | `tests/sig-shot.sh` in `tools/headless-sway`: `--engine ladybird`, `[routing.ladybird] hosts`, and `page.open-in ladybird` from a demo page (a bound key); screenshots show the page, tab label `ladybird`, title "Example Domain"; sig's diagnostics: `frame engine=ladybird ... readback_bytes=0`; sig and every Ladybird helper process exit cleanly |
 
 Registration is what every engine has and nothing more: a feature, a `Runtime` variant, a
@@ -434,6 +440,20 @@ descriptor (`web: true`, `honors: ["storage"]`, shutdown after WPE), `registry::
   Untested beyond compiling; `window.open` scripts that use the returned window object get a window
   that is closed once its URL is known.
 
+### Text input
+
+`text_input` is true. Ladybird's input-method state (`on_input_method_state_change`) becomes
+`TextInputChanged`: `Some` with the caret rectangle (device pixels from Ladybird, converted to the
+target's logical ones) while an editable field has focus, `None` when it does not, so the core's
+typing state works and a keymap's plain-letter bindings do not fire while the user types in a page.
+The text around the caret is not reported (`surrounding: None`, purpose `Normal`): Ladybird does not
+say whether a field is a password, and a password must not reach the input method. The host's
+`commit` is typed (`commit_text_from_input_method`), and `preedit` is marked text. Evidence:
+`tests/services.rs` (focus a field: `Some` with a caret near it; click away: `None`; a committed
+"hello" is typed) and `sig` in a private sway with `"t" = "tab.new"` bound
+(`MODE=typing tests/sig-shot.sh`): the click focuses a Ladybird field and "tttest" is typed into it,
+with no tab opened.
+
 ### What is missing, and why
 
 1. **`NavigationRequested`** (asking the core before a user-clicked link is followed): impossible
@@ -443,14 +463,37 @@ descriptor (`web: true`, `honors: ["storage"]`, shutdown after WPE), `registry::
    handlers. The engine never asks, so links stay in Ladybird; `OpenRequested` (windows) works. A
    patched Ladybird (an override of nixpkgs' derivation with a hook, built on louise-pc, a multi-hour
    build that needs the user's go-ahead) would be the way.
-2. **Clipboard, downloads, dialogs, file pickers, select popups, external URLs through
-   `sighurt_api::services`:** not wired. Defaults are safe rather than useful: the clipboard is
-   Ladybird's in-memory one (nothing reaches or leaves the system clipboard), downloads are refused
-   (`default_path_for_downloaded_file` fails), `alert/confirm/prompt` are answered as dismissed,
-   pickers and dropdowns are not answered, external URLs have no handler (nothing runs `xdg-open`).
+2. **Services (`sighurt_api::services`) as built:** every privileged request of Ladybird's UI half goes
+   to the host, none is performed by Ladybird.
+   - *Copy:* the page's clipboard item becomes `ClipboardWrite` (each text representation; files the
+     user copied on the desktop are never exposed; over 16 MiB is dropped). The primary selection and
+     Ladybird's own menu copies go nowhere.
+   - *Paste:* a paste that finds nothing asks `ClipboardRead` (text/plain, 1 MiB); the granted text
+     stays readable for one second and the shim repeats the paste, as WPE does, so the page sees an empty
+     first paste and then the real one. `navigator.clipboard.read()` gets the empty one.
+   - *Downloads:* Ladybird downloads into a private staging directory of the profile (it names no
+     view or URL in its path callback), the shim polls only while one is staged (a 500 ms timer that
+     exists only then), and the finished file (at most 64 MiB, else dropped) becomes
+     `Download { Data, suggested_name }`; the staged file is deleted. The user's folders are the host's.
+   - *File inputs:* `PickFiles` (one or several; no filters passed yet); the files named in the answer
+     are read (at most 32 MiB each) into the page's file objects.
+   - *External URLs (`mailto:` and so on):* Ladybird's own policy (a user gesture, a scheme not denied)
+     still decides whether to ask; then the request is `OpenExternal` and the host's answer decides.
+     Nothing runs `xdg-open`.
+   - *Attribution:* Ladybird's download and external-URL callbacks do not say which view they are for,
+     so they are attributed to the view the host last gave input, focus or a navigation: with several
+     Ladybird tabs, a request from a background tab can be charged to the wrong view. The core still
+     decides per that view's document and origin.
+   - *Dialogs:* the API has no dialog service, so `alert`, `confirm` and `prompt` are answered as dismissed
+     (a page never hangs on one). Select dropdowns and color pickers are not answered.
+   - Everything else, and every answer that is not `Ok` with the expected reply, is refused.
+   Evidence: `tests/services.rs` plays the core against a page: a copy (`ClipboardWrite` with
+   `text/plain` "hello"), a paste (granted "PASTED" appears in the field), a `data:` download (bytes
+   "hello", name `hello.txt`), a `mailto:` link (`OpenExternal`, denied), a file input (the page reads
+   `picked.txt`).
 3. **Zero-copy presentation and dmabuf** (L6), **frame pacing from the output** (L8).
-4. **Capabilities** beyond history traversal, zoom (wired through `SetZoom`, not tested) and
-   process-per-view: text input (IME), find in page, screenshots, semantics (so no text mode and no
+4. **Text input:** done (below). **Other capabilities** beyond history traversal, zoom (wired through
+   `SetZoom`, not tested), process-per-view and text input: find in page, screenshots, semantics (so no text mode and no
    `sig --dump` in the terminal; the TUI frontend binds the engine and shows its frames as graphics,
    untested), site data.
 5. **Cursor shapes** map only the common `Gfx::StandardCursor`s; image cursors report the arrow.

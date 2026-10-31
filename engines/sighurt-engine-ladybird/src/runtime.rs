@@ -14,13 +14,17 @@ use sighurt_api::engine::{
     PumpStatus, ViewOptions,
 };
 use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
-use sighurt_api::geometry::{Metrics, SurfacePoint};
-use sighurt_api::ids::{DocumentGeneration, NavigationId, ViewId};
+use sighurt_api::geometry::{Metrics, SurfacePoint, SurfaceRect};
+use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, ViewId};
 use sighurt_api::input::{
     ButtonState, FocusEvent, InputKind, KeyEvent, Modifiers, PointerButton, PointerEvent,
-    ScrollDelta,
+    ScrollDelta, TextInputState, TextPurpose,
 };
 use sighurt_api::present::CpuTarget;
+use sighurt_api::services::{
+    ClipboardData, DownloadSource, PickMode, Selection, Service, ServiceError, ServiceReply,
+    ServiceRequest, ServiceResult,
+};
 
 use crate::ffi;
 use crate::waiter::Waiter;
@@ -33,7 +37,7 @@ pub const NAME: &str = "ladybird";
 /// (docs/rewrite/LADYBIRD.md, "What is missing").
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     history_traversal: true,
-    text_input: false,
+    text_input: true,
     accessibility: false,
     screenshots: false,
     find_in_page: false,
@@ -86,7 +90,24 @@ struct View<T: CpuTarget> {
     history: Option<(Vec<String>, usize)>,
     /// The address of the document shown.
     url: String,
+    /// A page's copy, representation by representation, until the last one has come.
+    clipboard: Vec<ClipboardData>,
 }
+
+/// What the shim is waiting to be told about a service request.
+enum Pending {
+    /// A paste: the text to paste goes to the view.
+    ClipboardRead(u64),
+    /// Nothing comes back to Ladybird (a copy, a download): the answer is only recorded.
+    Told,
+    /// A file picker: the shim's token.
+    Pick(i64),
+    /// An external URL: the shim's token.
+    Open(i64),
+}
+
+/// Most bytes of text a paste takes.
+const MAX_PASTE: usize = 1024 * 1024;
 
 /// The Ladybird engine's runtime. One per process, on the owner thread.
 pub struct LadybirdRuntime<T: CpuTarget> {
@@ -94,6 +115,7 @@ pub struct LadybirdRuntime<T: CpuTarget> {
     by_lb: HashMap<u64, ViewId>,
     waiter: Option<Waiter>,
     queue: Vec<EngineEvent>,
+    services: HashMap<RequestId, (ViewId, Pending)>,
     profile: Option<PathBuf>,
     temporary_profile: bool,
     shut_down: bool,
@@ -171,6 +193,7 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
             by_lb: HashMap::new(),
             waiter: Some(waiter),
             queue: Vec::new(),
+            services: HashMap::new(),
             profile: Some(profile),
             temporary_profile,
             shut_down: false,
@@ -324,7 +347,148 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                     }
                 }
             }
+            ffi::EV_INPUT_METHOD => {
+                let state = (event.i0 != 0).then(|| {
+                    let caret = s0.as_deref().map(parse_caret).unwrap_or_default();
+                    let ratio = view.target.metrics().scale().factor();
+                    // Device pixels to the target's logical ones. No text around the caret is
+                    // reported: Ladybird does not say whether the field is a password.
+                    TextInputState {
+                        caret: SurfaceRect {
+                            x: (f64::from(caret[0]) / ratio).floor() as i32,
+                            y: (f64::from(caret[1]) / ratio).floor() as i32,
+                            width: (f64::from(caret[2]) / ratio).ceil() as u32,
+                            height: (f64::from(caret[3]) / ratio).ceil() as u32,
+                        },
+                        surrounding: None,
+                        purpose: TextPurpose::Normal,
+                        multiline: false,
+                    }
+                });
+                self.queue
+                    .push(EngineEvent::TextInputChanged { view: id, state });
+            }
+            ffi::EV_CLIPBOARD_WRITE => {
+                // Binary payloads are in event.data.
+                let bytes = if event.data.is_null() {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(event.data.cast::<u8>(), event.len) }
+                        .to_vec()
+                };
+                view.clipboard.push(ClipboardData {
+                    mime_type: s0.unwrap_or_default(),
+                    data: bytes,
+                });
+                if event.i1 == 0 {
+                    let items = std::mem::take(&mut view.clipboard);
+                    let request = request(
+                        id,
+                        view,
+                        Service::ClipboardWrite {
+                            selection: Selection::Clipboard,
+                            items,
+                        },
+                    );
+                    self.services.insert(request.id, (id, Pending::Told));
+                    self.queue.push(EngineEvent::ServiceRequested(request));
+                }
+            }
+            ffi::EV_CLIPBOARD_WANT => {
+                let request = request(
+                    id,
+                    view,
+                    Service::ClipboardRead {
+                        selection: Selection::Clipboard,
+                        mime_types: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+                        limit: MAX_PASTE,
+                    },
+                );
+                self.services
+                    .insert(request.id, (id, Pending::ClipboardRead(view.lb)));
+                self.queue.push(EngineEvent::ServiceRequested(request));
+            }
+            ffi::EV_DOWNLOAD => {
+                let bytes = if event.data.is_null() {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(event.data.cast::<u8>(), event.len) }
+                        .to_vec()
+                };
+                let request = request(
+                    id,
+                    view,
+                    Service::Download {
+                        source: DownloadSource::Data(bytes),
+                        suggested_name: from_c(event.s1),
+                    },
+                );
+                self.services.insert(request.id, (id, Pending::Told));
+                self.queue.push(EngineEvent::ServiceRequested(request));
+            }
+            ffi::EV_PICK_FILES => {
+                let request = request(
+                    id,
+                    view,
+                    Service::PickFiles {
+                        mode: if event.i0 != 0 {
+                            PickMode::OpenFiles
+                        } else {
+                            PickMode::OpenFile
+                        },
+                        filters: Vec::new(),
+                    },
+                );
+                self.services
+                    .insert(request.id, (id, Pending::Pick(event.i1)));
+                self.queue.push(EngineEvent::ServiceRequested(request));
+            }
+            ffi::EV_OPEN_EXTERNAL => {
+                let request = request(
+                    id,
+                    view,
+                    Service::OpenExternal {
+                        url: s0.unwrap_or_default(),
+                    },
+                );
+                self.services
+                    .insert(request.id, (id, Pending::Open(event.i1)));
+                self.queue.push(EngineEvent::ServiceRequested(request));
+            }
             _ => {}
+        }
+    }
+
+    fn resolve(&mut self, request: RequestId, result: ServiceResult) {
+        let Some((_, pending)) = self.services.remove(&request) else {
+            return;
+        };
+        match pending {
+            Pending::Told => {}
+            Pending::ClipboardRead(lb) => match result {
+                Ok(ServiceReply::Clipboard(data)) if data.data.len() <= MAX_PASTE => unsafe {
+                    ffi::lb_clipboard_grant(lb, data.data.as_ptr(), data.data.len());
+                },
+                _ => unsafe { ffi::lb_clipboard_deny(lb) },
+            },
+            Pending::Pick(token) => match result {
+                Ok(ServiceReply::Files(files)) => {
+                    let joined = files
+                        .iter()
+                        .map(|p| p.to_string_lossy().replace('\n', " "))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let joined = c_string(&joined);
+                    unsafe { ffi::lb_pick_reply(token, joined.as_ptr()) };
+                }
+                _ => unsafe { ffi::lb_pick_reply(token, std::ptr::null()) },
+            },
+            Pending::Open(token) => unsafe {
+                ffi::lb_open_external_reply(
+                    token,
+                    c_int::from(matches!(result, Ok(ServiceReply::Done))),
+                );
+            },
         }
     }
 
@@ -456,6 +620,30 @@ fn is_fragment_navigation(from: &str, to: &str) -> bool {
     !from.is_empty() && to.contains('#') && without(from) == without(to)
 }
 
+/// A service request for `view`'s current document.
+fn request<T: CpuTarget>(id: ViewId, view: &View<T>, service: Service) -> ServiceRequest {
+    let origin = url::Url::parse(&view.url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+        .filter(|origin| origin != "null");
+    ServiceRequest {
+        id: RequestId::next(),
+        view: id,
+        document: view.document,
+        origin,
+        service,
+    }
+}
+
+/// `x,y,width,height` from the shim.
+fn parse_caret(text: &str) -> [i32; 4] {
+    let mut out = [0; 4];
+    for (slot, part) in out.iter_mut().zip(text.split(',')) {
+        *slot = part.parse().unwrap_or(0);
+    }
+    out
+}
+
 fn modifier_mask(modifiers: &Modifiers) -> c_int {
     c_int::from(modifiers.alt)
         | c_int::from(modifiers.control) << 1
@@ -537,6 +725,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 pointer_buttons: 0,
                 history: None,
                 url: String::new(),
+                clipboard: Vec::new(),
             },
         );
         Ok(())
@@ -583,6 +772,10 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 InputKind::Pointer(pointer) => self.input_pointer(id, pointer),
                 InputKind::Key(key) => self.input_key(id, key),
                 InputKind::TextInput(text) => {
+                    if let Some(preedit) = &text.preedit {
+                        let preedit = c_string(&preedit.text);
+                        unsafe { ffi::lb_input_preedit(lb, preedit.as_ptr()) };
+                    }
                     if let Some(commit) = &text.commit {
                         let commit = c_string(commit);
                         unsafe { ffi::lb_input_commit_text(lb, commit.as_ptr()) };
@@ -592,9 +785,11 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                     ffi::lb_set_focus(lb, c_int::from(matches!(focus, FocusEvent::Activated)))
                 },
             },
-            // Nothing asks for a service yet, and the engine never asks about navigations.
-            EngineCommand::ResolveServiceRequest { .. }
-            | EngineCommand::AnswerNavigation { .. } => {}
+            EngineCommand::ResolveServiceRequest { request, result } => {
+                self.resolve(request, result);
+            }
+            // The engine never asks about navigations (docs/rewrite/LADYBIRD.md).
+            EngineCommand::AnswerNavigation { .. } => {}
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"))
             }
@@ -620,6 +815,8 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 i1: 0,
                 s0: std::ptr::null(),
                 s1: std::ptr::null(),
+                data: std::ptr::null(),
+                len: 0,
             };
             if unsafe { ffi::lb_next_event(&mut raw) } == 0 {
                 break;
@@ -698,6 +895,16 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             self.by_lb.remove(&view.lb);
             unsafe { ffi::lb_view_close(view.lb) };
             self.queue.retain(|event| event.view() != Some(id));
+            // What the view was waiting for is refused, so nothing is left holding a token.
+            let waiting: Vec<RequestId> = self
+                .services
+                .iter()
+                .filter(|(_, (v, _))| *v == id)
+                .map(|(request, _)| *request)
+                .collect();
+            for request in waiting {
+                self.resolve(request, Err(ServiceError::Cancelled));
+            }
             self.queue.push(EngineEvent::ViewClosed { view: id });
         }
     }

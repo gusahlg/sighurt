@@ -10329,6 +10329,7 @@ dependencies = [
  "libc",
  "log",
  "sighurt-api",
+ "url",
 ]
 
 [[package]]

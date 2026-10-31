@@ -19,7 +19,23 @@ mkdir -p "$XDG_CONFIG_HOME/sighurt"
 # MODE=engine: Ladybird is the default engine (sig --engine ladybird). MODE=route: the demo engine
 # is, and [routing.ladybird] gives Ladybird the host of the URL.
 host=$(sed -E 's|^[a-z]+://([^/:]+).*|\1|' <<<"$url")
-if [[ ${MODE:-engine} == open-in ]]; then
+if [[ ${MODE:-engine} == typing ]]; then
+  # A plain-letter binding ("t" opens a tab) must not fire while a Ladybird text field has focus.
+  cat > "$home/page.html" <<HTML
+<!doctype html><title>typing</title><body style="margin:0">
+<input id=i style="position:absolute;left:20px;top:20px;width:400px;height:40px;font-size:24px">
+HTML
+  cat > "$XDG_CONFIG_HOME/sighurt/config.toml" <<CONF
+version = 1
+[engines]
+default = "ladybird"
+enabled = ["ladybird", "demo"]
+[keys]
+"t" = "tab.new"
+CONF
+  engine_args=(--engine ladybird)
+  url_to_open=file://$home/page.html
+elif [[ ${MODE:-engine} == open-in ]]; then
   # The demo engine's page first, then a key bound to page.open-in sends the URL to Ladybird.
   cat > "$XDG_CONFIG_HOME/sighurt/config.toml" <<CONF
 version = 1
@@ -57,7 +73,26 @@ check() { if "${@:2}"; then echo "PASS $1"; else echo "FAIL $1"; failures=$((fai
 SIG_DIAG=1 RUST_LOG=info "$sig" --gui "${engine_args[@]}" "${url_to_open:-$url}" > "$out/sig.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 60); do sleep 1; kill -0 "$pid" 2>/dev/null || break; done
-if [[ ${MODE:-engine} == open-in ]]; then
+if [[ ${MODE:-engine} == typing ]]; then
+  wtype -s 3600000 ' ' &
+  keyboard=$!
+  # A virtual pointer that stays plugged in (wlrctl's events are lost on a new device).
+  # Build it with: tools/cargo build -p sighurt-browser --example virtual-pointer
+  pointer=${CARGO_TARGET_DIR:-$repo/target}/debug/examples/virtual-pointer
+  mkfifo "$XDG_RUNTIME_DIR/pointer"
+  "$pointer" < "$XDG_RUNTIME_DIR/pointer" &
+  pointer_pid=$!
+  exec 3> "$XDG_RUNTIME_DIR/pointer"
+  sleep 5
+  # The page area starts below the chrome (84 px); click into the field.
+  echo "move 100 124 1280 800" >&3
+  sleep 0.5
+  echo click >&3
+  sleep 1
+  wtype "tttest"
+  sleep 2
+  kill $keyboard $pointer_pid 2>/dev/null
+elif [[ ${MODE:-engine} == open-in ]]; then
   # wtype plugs in a new keyboard per command, and the first key of a new one is lost.
   wtype -s 3600000 ' ' &
   keyboard=$!

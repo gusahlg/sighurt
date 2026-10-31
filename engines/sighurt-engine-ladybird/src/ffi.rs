@@ -31,6 +31,11 @@ pub const EV_HISTORY: c_int = 13;
 pub const EV_JS_RESULT: c_int = 14;
 pub const EV_INPUT_METHOD: c_int = 15;
 pub const EV_FIND_RESULT: c_int = 16;
+pub const EV_CLIPBOARD_WRITE: c_int = 17;
+pub const EV_CLIPBOARD_WANT: c_int = 18;
+pub const EV_DOWNLOAD: c_int = 19;
+pub const EV_PICK_FILES: c_int = 20;
+pub const EV_OPEN_EXTERNAL: c_int = 21;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -53,6 +58,8 @@ pub struct Event {
     pub i1: i64,
     pub s0: *const c_char,
     pub s1: *const c_char,
+    pub data: *const c_void,
+    pub len: usize,
 }
 
 #[repr(C)]
@@ -149,6 +156,11 @@ functions! {
     pub fn lb_input_pointer_button(view: u64, x: c_int, y: c_int, button: c_int, pressed: c_int, click_count: c_int, modifiers: c_int);
     pub fn lb_input_scroll(view: u64, x: c_int, y: c_int, dx: c_double, dy: c_double, precise: c_int, modifiers: c_int);
     pub fn lb_input_commit_text(view: u64, text: *const c_char);
+    pub fn lb_input_preedit(view: u64, text: *const c_char);
+    pub fn lb_clipboard_grant(view: u64, data: *const u8, len: usize);
+    pub fn lb_clipboard_deny(view: u64);
+    pub fn lb_pick_reply(token: i64, paths: *const c_char);
+    pub fn lb_open_external_reply(token: i64, allowed: c_int);
     pub fn lb_frame_get(view: u64, out: *mut Frame) -> c_int;
     pub fn lb_shutdown();
 }

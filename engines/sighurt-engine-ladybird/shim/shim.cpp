@@ -14,12 +14,21 @@
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/Directory.h>
+#include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
+#include <LibCore/Timer.h>
+#include <LibFileSystem/FileSystem.h>
+#include <LibWeb/Loader/DownloadFilename.h>
+#include <LibWebView/ExternalURLHandler.h>
+#include <LibWebView/FileDownloader.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
 #include <LibURL/Parser.h>
+#include <LibWeb/Clipboard/SystemClipboard.h>
+#include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/Page/InputEvent.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HeadlessWebView.h>
@@ -51,12 +60,14 @@ struct Event {
     std::string s0;
     std::string s1;
     bool has_s0 { false };
+    std::string data;
+    bool has_data { false };
 };
 
 std::deque<Event> g_events;
 Event g_current;
 
-void push(int kind, uint64_t view, int64_t i0 = 0, int64_t i1 = 0, std::string const* s0 = nullptr, std::string const* s1 = nullptr)
+void push(int kind, uint64_t view, int64_t i0 = 0, int64_t i1 = 0, std::string const* s0 = nullptr, std::string const* s1 = nullptr, std::string const* data = nullptr)
 {
     Event event;
     event.kind = kind;
@@ -69,6 +80,10 @@ void push(int kind, uint64_t view, int64_t i0 = 0, int64_t i1 = 0, std::string c
     }
     if (s1)
         event.s1 = *s1;
+    if (data) {
+        event.data = *data;
+        event.has_data = true;
+    }
     g_events.push_back(move(event));
 }
 
@@ -131,6 +146,65 @@ std::string to_std(StringView view) { return std::string(view.characters_without
 std::string to_std(String const& string) { return to_std(string.bytes_as_string_view()); }
 std::string to_std(Utf16String const& string) { return to_std(string.to_utf8()); }
 
+constexpr size_t max_clipboard_bytes = 16 * 1024 * 1024;
+
+i64 now_ns()
+{
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return i64(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+}
+
+// The view the host last gave input, focus or a navigation: Ladybird's download and external-URL
+// callbacks do not say which view they are for, so those requests are attributed to it.
+uint64_t g_active_view = 0;
+// The view whose external-URL confirmation is being answered (the launch follows at once).
+uint64_t g_launch_view = 0;
+int64_t g_next_token = 0;
+HashMap<int64_t, WebView::ExternalURLHandler::LaunchCallback> g_launches;
+HashMap<int64_t, uint64_t> g_pickers;
+ByteString g_profile;
+// Staged downloads: destination path -> the name the page suggested.
+HashMap<ByteString, ByteString> g_staged;
+RefPtr<Core::Timer> g_download_timer;
+// Most a staged download may be when handed to the host (it travels in memory).
+constexpr u64 max_download_bytes = 64ull * 1024 * 1024;
+constexpr u64 max_picked_file_bytes = 32ull * 1024 * 1024;
+
+void poll_downloads();
+
+void ensure_download_timer()
+{
+    if (g_download_timer)
+        return;
+    // Only while a download is staged: no timer otherwise.
+    g_download_timer = Core::Timer::create_repeating(500, [] { poll_downloads(); });
+    g_download_timer->start();
+}
+
+// Everything Ladybird asks the shell for goes to the host, which decides; the defaults of
+// WebView::Application (the system clipboard's neighbours, the user's Downloads folder, xdg-open)
+// are replaced here.
+class HostURLHandler final : public WebView::ExternalURLHandler {
+public:
+    static NonnullRefPtr<HostURLHandler> create() { return adopt_ref(*new HostURLHandler); }
+
+    // The host opens the URL once it has allowed the request; launching is a request to it.
+    virtual void launch(URL::URL const& url, LaunchCallback callback) const override
+    {
+        auto token = ++g_next_token;
+        g_launches.set(token, move(callback));
+        auto text = to_std(url.serialize());
+        push(LB_EV_OPEN_EXTERNAL, g_launch_view ? g_launch_view : g_active_view, 0, token, &text);
+    }
+
+private:
+    HostURLHandler()
+        : ExternalURLHandler("the desktop"_string, false)
+    {
+    }
+};
+
 class SighurtApplication final : public WebView::Application {
     WEB_VIEW_APPLICATION(SighurtApplication)
 
@@ -143,13 +217,70 @@ public:
     // sig owns the process: no coordination with other Ladybird instances, no profile of the user's.
     virtual bool should_coordinate_browser_process() const override { return false; }
 
-    // A download would write into the user's folders; the host decides that (services), and the
-    // shim does not yet ask it. Denied.
-    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const&) const override
+    // A download goes to a private staging directory of the profile, and when it is complete the
+    // host is given the file (a Download service request); the user's folders are the host's.
+    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const& file) const override
     {
-        return Error::from_string_literal("downloads are not supported by this engine yet");
+        auto directory = ByteString::formatted("{}/downloads-staging", g_profile);
+        TRY(Core::Directory::create(directory, Core::Directory::CreateDirectories::Yes));
+        static u64 counter = 0;
+        auto path = LexicalPath::join(directory, ByteString::formatted("{}-{}.download", getpid(), ++counter));
+        g_staged.set(path.string(), Web::sanitize_suggested_download_filename(file));
+        ensure_download_timer();
+        return path;
     }
+
+    // Nothing is opened by Ladybird: the host's handler asks the host.
+    virtual void resolve_external_url_handler(URL::URL const&, WebView::ExternalURLHandlerCallback callback) const override
+    {
+        callback(HostURLHandler::create());
+    }
+
+    // The primary selection and the Copy actions of Ladybird's own menus do not leave it: the page's
+    // copies arrive as a clipboard item of the view, which asks the host.
+    virtual void set_clipboard_text(String, ClipboardType) override { }
+    virtual Utf16String clipboard_text(ClipboardType) const override { return {}; }
 };
+
+void poll_downloads()
+{
+    auto& downloader = WebView::Application::the().file_downloader();
+    Vector<ByteString> finished;
+    for (auto const& download : downloader.downloads()) {
+        auto it = g_staged.find(download.destination.string());
+        if (it == g_staged.end())
+            continue;
+        using Status = WebView::FileDownloader::DownloadStatus;
+        if (download.status == Status::InProgress || download.status == Status::Paused)
+            continue;
+        finished.append(download.destination.string());
+        if (download.status != Status::Completed) {
+            (void)FileSystem::remove(download.destination.string(), FileSystem::RecursionMode::Disallowed);
+            continue;
+        }
+        auto size = FileSystem::size_from_stat(download.destination.string());
+        if (size.is_error() || size.value() > max_download_bytes) {
+            dbgln("sighurt: a download of {} bytes is dropped (limit {})", size.is_error() ? 0 : size.value(), max_download_bytes);
+            (void)FileSystem::remove(download.destination.string(), FileSystem::RecursionMode::Disallowed);
+            continue;
+        }
+        auto file = Core::File::open(download.destination.string(), Core::File::OpenMode::Read);
+        auto contents = file.is_error() ? ErrorOr<ByteBuffer>(file.release_error()) : file.value()->read_until_eof();
+        (void)FileSystem::remove(download.destination.string(), FileSystem::RecursionMode::Disallowed);
+        if (contents.is_error())
+            continue;
+        std::string url = to_std(download.url.serialize());
+        std::string name = to_std(it->value);
+        std::string bytes(reinterpret_cast<char const*>(contents.value().data()), contents.value().size());
+        push(LB_EV_DOWNLOAD, g_active_view, 0, 0, &url, &name, &bytes);
+    }
+    for (auto const& path : finished)
+        g_staged.remove(path);
+    if (g_staged.is_empty() && g_download_timer) {
+        g_download_timer->stop();
+        g_download_timer = nullptr;
+    }
+}
 
 // HTML's "navigate to a fragment": the same address but for a fragment, which `to` has.
 bool is_fragment_navigation(std::string const& from, std::string const& to)
@@ -311,7 +442,15 @@ private:
         on_top_level_navigation_commit = [this] { push_history(); };
         on_browser_history_traversal_complete = [this] { push_history(); };
         on_input_method_state_change = [this, id] {
-            push(LB_EV_INPUT_METHOD, id, input_method_state().is_enabled ? 1 : 0);
+            // The caret of the focused editable field, in device pixels. The text around it is
+            // not reported: Ladybird does not say whether the field is a password.
+            auto const& state = input_method_state();
+            std::string caret = "0,0,0,0";
+            if (state.is_enabled && state.caret_rect.has_value()) {
+                auto const& rect = *state.caret_rect;
+                caret = std::to_string(rect.x().value()) + "," + std::to_string(rect.y().value()) + "," + std::to_string(rect.width().value()) + "," + std::to_string(rect.height().value());
+            }
+            push(LB_EV_INPUT_METHOD, id, state.is_enabled ? 1 : 0, 0, &caret);
         };
         on_find_in_page = [id](size_t current, Optional<size_t> const& total) {
             push(LB_EV_FIND_RESULT, id, int64_t(current), total.has_value() ? int64_t(*total) : -1);
@@ -325,12 +464,71 @@ private:
             return popup->handle();
         };
 
-        // The host has no dialogs yet: they are answered as dismissed, so a page never hangs on one.
+        // The host has no file picker for pages yet that is not a service: ask it.
+        on_request_file_picker = [id](auto const&, auto multiple) {
+            auto token = ++g_next_token;
+            g_pickers.set(token, id);
+            push(LB_EV_PICK_FILES, id, multiple == Web::HTML::AllowMultipleFiles::Yes ? 1 : 0, token);
+        };
+        // A page's link to mailto: and the like: the host decides and opens it (launch, above).
+        on_request_external_url_confirmation = [id](auto const&, auto const&, auto const&, Function<void(bool)> proceed) {
+            g_launch_view = id;
+            proceed(true);
+            g_launch_view = 0;
+        };
+
+        // The API has no dialog service: alert, confirm and prompt are answered as dismissed, so a
+        // page never hangs on one.
         on_request_alert = [this](auto const&) { alert_closed(); };
         on_request_confirm = [this](auto const&) { confirm_closed(false); };
         on_request_prompt = [this](auto const&, auto const&) { prompt_closed({}); };
     }
 
+public:
+    // The page copied: the host decides what becomes of it.
+    virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem item) override
+    {
+        Vector<std::pair<std::string, std::string>> items;
+        size_t total = 0;
+        for (auto const& representation : item.system_clipboard_representations) {
+            auto const* data = representation.data.get_pointer<ByteString>();
+            if (!data)
+                continue; // A file the user copied on the desktop: never exposed.
+            total += data->length();
+            if (total > max_clipboard_bytes)
+                return;
+            items.append({ to_std(representation.name), std::string(data->characters(), data->length()) });
+        }
+        for (size_t i = 0; i < items.size(); ++i)
+            push(LB_EV_CLIPBOARD_WRITE, m_id, 0, int64_t(items.size() - 1 - i), &items[i].first, nullptr, &items[i].second);
+    }
+
+    // A paste reads what the host granted a moment ago (grant_clipboard), and finding nothing asks
+    // for it: the page sees an empty first paste, then the real one.
+    virtual Web::Clipboard::SystemClipboardItem clipboard_item() const override
+    {
+        if (m_grant.has_value() && now_ns() < m_grant_until)
+            return *m_grant;
+        m_grant.clear();
+        if (!m_clipboard_wanted) {
+            m_clipboard_wanted = true;
+            push(LB_EV_CLIPBOARD_WANT, m_id);
+        }
+        return {};
+    }
+
+    void grant_clipboard(std::string const& text)
+    {
+        m_clipboard_wanted = false;
+        m_grant = Web::Clipboard::SystemClipboardItem { { { "text/plain"_string, ByteString(text.data(), text.size()) } } };
+        m_grant_until = now_ns() + 1'000'000'000;
+        paste_from_clipboard();
+    }
+    void deny_clipboard() { m_clipboard_wanted = false; }
+
+    void picked(Vector<Web::HTML::SelectedFile> files) { file_picker_closed(move(files)); }
+
+private:
     LbView* create_popup()
     {
         return create(m_theme, m_viewport_size, m_device_pixel_ratio);
@@ -387,6 +585,9 @@ private:
     uint64_t m_id;
     bool m_initial_done { false };
     std::string m_last_url;
+    mutable Optional<Web::Clipboard::SystemClipboardItem> m_grant;
+    mutable bool m_clipboard_wanted { false };
+    i64 m_grant_until { 0 };
     Optional<URL::URL> m_queued_load;
 };
 
@@ -526,6 +727,7 @@ int lb_init(char const* const* argv, int argc, char const* profile, char const* 
         return 1;
     }
     Sighurt::loop_install();
+    g_profile = profile ? profile : "";
 
     ByteString binary_path = ByteString::formatted("{}/libexec", prefix && *prefix ? prefix : SIGHURT_LADYBIRD_PREFIX);
 
@@ -584,6 +786,8 @@ int lb_next_event(lb_event* out)
     out->i1 = g_current.i1;
     out->s0 = g_current.has_s0 ? g_current.s0.c_str() : nullptr;
     out->s1 = g_current.s1.empty() ? nullptr : g_current.s1.c_str();
+    out->data = g_current.has_data ? g_current.data.data() : nullptr;
+    out->len = g_current.data.size();
     return 1;
 }
 
@@ -609,6 +813,7 @@ void lb_view_close(uint64_t id)
 
 void lb_navigate(uint64_t id, char const* url)
 {
+    g_active_view = id;
     auto* view = LbView::find(id);
     if (!view)
         return;
@@ -648,6 +853,8 @@ void lb_set_visible(uint64_t id, int visible)
 
 void lb_set_focus(uint64_t id, int focused)
 {
+    if (focused)
+        g_active_view = id;
     if (auto* view = LbView::find(id))
         view->set_has_system_focus(focused != 0);
 }
@@ -669,6 +876,7 @@ void lb_run_js(uint64_t id, char const* script, int64_t request)
 
 void lb_input_key(uint64_t id, char const* w3c_code, char const* key, int pressed, int repeat, int modifiers, uint32_t code_point)
 {
+    g_active_view = id;
     auto* view = LbView::find(id);
     if (!view)
         return;
@@ -714,6 +922,7 @@ void lb_input_pointer_leave(uint64_t id)
 
 void lb_input_pointer_button(uint64_t id, int x, int y, int button, int pressed, int click_count, int modifiers)
 {
+    g_active_view = id;
     if (auto* view = LbView::find(id)) {
         view->enqueue_input_event(Web::MouseEvent {
             .type = pressed ? Web::MouseEvent::Type::MouseDown : Web::MouseEvent::Type::MouseUp,
@@ -742,6 +951,56 @@ void lb_input_scroll(uint64_t id, int x, int y, double dx, double dy, int precis
             .browser_data = nullptr,
         });
     }
+}
+
+void lb_input_preedit(uint64_t id, char const* text)
+{
+    if (auto* view = LbView::find(id))
+        view->set_marked_text_from_input_method(Utf16String::from_utf8(StringView { text, strlen(text) }));
+}
+
+void lb_clipboard_grant(uint64_t id, uint8_t const* data, size_t len)
+{
+    if (auto* view = LbView::find(id))
+        view->grant_clipboard(std::string(reinterpret_cast<char const*>(data), len));
+}
+
+void lb_clipboard_deny(uint64_t id)
+{
+    if (auto* view = LbView::find(id))
+        view->deny_clipboard();
+}
+
+void lb_pick_reply(int64_t token, char const* paths)
+{
+    auto entry = g_pickers.take(token);
+    if (!entry.has_value())
+        return;
+    auto* view = LbView::find(*entry);
+    if (!view)
+        return;
+    Vector<Web::HTML::SelectedFile> files;
+    if (paths) {
+        for (auto const& path : ByteString(paths).split('\n')) {
+            auto size = FileSystem::size_from_stat(path);
+            if (size.is_error() || size.value() > max_picked_file_bytes)
+                continue;
+            auto file = Core::File::open(path, Core::File::OpenMode::Read);
+            if (file.is_error())
+                continue;
+            auto contents = file.value()->read_until_eof();
+            if (contents.is_error())
+                continue;
+            files.append(Web::HTML::SelectedFile(Utf16String::from_utf8(LexicalPath::basename(path)), contents.release_value()));
+        }
+    }
+    view->picked(move(files));
+}
+
+void lb_open_external_reply(int64_t token, int allowed)
+{
+    if (auto callback = g_launches.take(token); callback.has_value())
+        (*callback)(allowed != 0);
 }
 
 void lb_input_commit_text(uint64_t id, char const* text)
