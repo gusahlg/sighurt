@@ -107,3 +107,4 @@ debug = false
 [patch.crates-io]
 surfman = { path = "third_party/surfman" }
 servo-net = { path = "third_party/servo-net" }
+servo-script = { path = "third_party/servo-script" }
