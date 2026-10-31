@@ -1,0 +1,138 @@
+--- a/Libraries/LibWebView/ViewImplementation.h	2026-10-31 10:04:01.444742340 +0100
++++ b/Libraries/LibWebView/ViewImplementation.h	2026-10-31 10:04:01.477504272 +0100
+@@ -397,6 +397,11 @@
+     Function<void()> on_ready_to_paint;
+     Function<void(TabPerformanceStats const&)> on_performance_stats;
+     Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, Optional<Web::PageId>)> on_new_web_view;
++    // SIGHURT-PATCH: a navigation the page started in the top-level document is held here before its
++    // unload check, with whether the user started it (a click). `proceed(false)` cancels it, and
++    // `proceed(true)` lets it go on. Unset, navigations go on at once. An answer that comes after the
++    // navigation was replaced, or the page closed, does nothing.
++    Function<void(URL::URL const&, bool user_activated, Function<void(bool)> proceed)> on_navigation_start_requested;
+     Function<void()> on_activate_tab;
+     Function<void()> on_close;
+     Function<void(URL::URL const&)> on_link_hover;
+--- a/Libraries/LibWebView/Application.h	2026-10-31 10:04:01.452458571 +0100
++++ b/Libraries/LibWebView/Application.h	2026-10-31 10:04:01.477635357 +0100
+@@ -239,6 +239,9 @@
+     virtual bool should_capture_web_content_output() const { return false; }
+ 
+     virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const& file) const;
++    // SIGHURT-PATCH: the same, told where the download came from: its URL and the view_id() of the
++    // view of the page that started it, if the page is known.
++    virtual ErrorOr<LexicalPath> default_path_for_download(URL::URL const&, Optional<u64> /* view_id */, ByteString const& file) const { return default_path_for_downloaded_file(file); }
+     ErrorOr<LexicalPath> path_for_downloaded_file(ByteString const& file) const;
+ 
+     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;
+--- a/Libraries/LibWebView/WebContentClient.cpp	2026-10-31 10:04:01.448179880 +0100
++++ b/Libraries/LibWebView/WebContentClient.cpp	2026-10-31 10:04:01.478006559 +0100
+@@ -129,9 +129,9 @@
+     return title_utf8;
+ }
+ 
+-static Optional<LexicalPath> choose_download_destination_or_report_error(URL::URL const& url, ByteString const& suggested_filename)
++static Optional<LexicalPath> choose_download_destination_or_report_error(URL::URL const& url, ByteString const& suggested_filename, Optional<u64> view_id)
+ {
+-    auto destination = Application::the().default_path_for_downloaded_file(suggested_filename);
++    auto destination = Application::the().default_path_for_download(url, view_id, suggested_filename);
+     if (destination.is_error()) {
+         if (!destination.error().is_errno() || destination.error().code() != ECANCELED)
+             Application::the().display_error_dialog(ByteString::formatted("Unable to download {}: {}", url, destination.error()));
+@@ -820,6 +820,8 @@
+         return;
+     }
+ 
++    auto requested_url = url;
++    bool user_activated = start_request->user_involvement == Web::HTML::UserNavigationInvolvement::Activation;
+     target_navigable->set_ongoing_navigation(CanonicalNavigable::OngoingNavigation {
+         .url = move(url),
+         .navigation_id = navigation_id,
+@@ -829,24 +831,53 @@
+     });
+     target_navigable->set_navigation_population_worker(*this, page_id);
+ 
+-    // Navigate, step 21.2: checking if unloading is canceled for navigable's active document's inclusive descendant
+-    // navigables. The pages hosting the documents the requesting page does not run their checks first; the
+-    // requesting page's own, with the navigation's bookkeeping, comes last, told whether a prompt was shown.
+-    Vector<Web::HTML::CrossProcessId> inclusive_descendants;
+-    target_navigable->for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+-        inclusive_descendants.append(navigable.id());
+-        return IterationDecision::Continue;
+-    });
+-    target_navigable->top_level_traversable().check_if_unloading_is_canceled(move(inclusive_descendants), WebContentPage { this, page_id }, Web::HTML::UnloadPromptShown::No,
+-        [self = NonnullRefPtr<WebContentClient>(*this), page_id, navigable_id, navigation_id = move(navigation_id)](Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) {
+-            if (result != Web::HTML::HistoryStepResult::Applied) {
+-                // The navigation parked for its population is not coming; the recorded load ends as a failed one.
+-                self->async_cancel_navigation_params_creation(page_id, navigable_id, navigation_id);
+-                self->did_fail_navigation_population(page_id, navigable_id, navigation_id);
+-                return;
+-            }
+-            self->async_run_navigation_unload_check(page_id, navigable_id, navigation_id, unload_prompt_shown);
++    // SIGHURT-PATCH: the rest of the admission, the unload check, may be held for the view's
++    // on_navigation_start_requested (Sighurt asks its browser first, for user-clicked links). It
++    // revalidates the transaction when it runs, since an answer can come late.
++    auto proceed = [self = NonnullRefPtr<WebContentClient>(*this), page_id, navigable_id, navigation_id](bool allow) {
++        auto navigable = self->population_worker_navigable_for_page(page_id, navigable_id);
++        if (!navigable.has_value())
++            return;
++        auto const& ongoing = navigable->ongoing_navigation();
++        if (!ongoing.has_value()
++            || ongoing->navigation_id != navigation_id
++            || ongoing->phase != CanonicalNavigable::OngoingNavigation::Phase::AwaitingUnloadCheck
++            || !navigable->navigation_owner_matches(*self, page_id)) {
++            return;
++        }
++        if (!allow) {
++            self->async_cancel_navigation_params_creation(page_id, navigable_id, navigation_id);
++            self->did_fail_navigation_population(page_id, navigable_id, navigation_id);
++            return;
++        }
++
++        // Navigate, step 21.2: checking if unloading is canceled for navigable's active document's inclusive descendant
++        // navigables. The pages hosting the documents the requesting page does not run their checks first; the
++        // requesting page's own, with the navigation's bookkeeping, comes last, told whether a prompt was shown.
++        Vector<Web::HTML::CrossProcessId> inclusive_descendants;
++        navigable->for_each_in_inclusive_subtree([&](CanonicalNavigable const& descendant) {
++            inclusive_descendants.append(descendant.id());
++            return IterationDecision::Continue;
+         });
++        navigable->top_level_traversable().check_if_unloading_is_canceled(move(inclusive_descendants), WebContentPage { self.ptr(), page_id }, Web::HTML::UnloadPromptShown::No,
++            [self, page_id, navigable_id, navigation_id](Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) {
++                if (result != Web::HTML::HistoryStepResult::Applied) {
++                    // The navigation parked for its population is not coming; the recorded load ends as a failed one.
++                    self->async_cancel_navigation_params_creation(page_id, navigable_id, navigation_id);
++                    self->did_fail_navigation_population(page_id, navigable_id, navigation_id);
++                    return;
++                }
++                self->async_run_navigation_unload_check(page_id, navigable_id, navigation_id, unload_prompt_shown);
++            });
++    };
++
++    if (target_navigable->is_top_level_traversable()) {
++        if (auto view = view_for_page_id(page_id); view.has_value() && view->on_navigation_start_requested) {
++            view->on_navigation_start_requested(requested_url, user_activated, move(proceed));
++            return;
++        }
++    }
++    proceed(true);
+ }
+ 
+ void WebContentClient::did_complete_navigation_unload_check(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id)
+@@ -1357,7 +1388,7 @@
+ 
+ Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentClient::did_start_download_without_request(Web::PageId page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size)
+ {
+-    auto destination = choose_download_destination_or_report_error(url, suggested_filename);
++    auto destination = choose_download_destination_or_report_error(url, suggested_filename, (view_for_page_id(page_id).has_value() ? Optional<u64> { view_for_page_id(page_id)->view_id() } : Optional<u64> {}));
+     if (!destination.has_value())
+         return { Optional<u64> {} };
+ 
+@@ -1406,7 +1437,7 @@
+     if (!matches_in_flight_navigation)
+         return { Optional<u64> {} };
+ 
+-    auto destination = choose_download_destination_or_report_error(url, suggested_filename);
++    auto destination = choose_download_destination_or_report_error(url, suggested_filename, (view_for_page_id(page_id).has_value() ? Optional<u64> { view_for_page_id(page_id)->view_id() } : Optional<u64> {}));
+     if (!destination.has_value())
+         return { Optional<u64> {} };
+ 
