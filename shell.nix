@@ -12,6 +12,10 @@ let
   # WPE WebKit, once nix/build-wpewebkit.sh has installed it on this machine (docs/rewrite/WPE.md).
   wpe = import ./nix/wpewebkit.nix { inherit pkgs; };
   hasWpe = builtins.pathExists "${wpe.prefix}/lib/pkgconfig/wpe-webkit-2.0.pc";
+  # CEF, once nix/build-cef.sh has installed it (docs/rewrite/CEF.md). The shell
+  # only exports the prefix path. libcef is not on the link line or the loader path.
+  cef = import ./nix/cef.nix { inherit pkgs; };
+  hasCef = builtins.pathExists "${cef.prefix}/dist/libcef.so";
 in
 pkgs.mkShell ({
   nativeBuildInputs = with pkgs; [
@@ -32,4 +36,4 @@ pkgs.mkShell ({
   LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs
     + pkgs.lib.optionalString hasWpe ":${wpe.prefix}/lib";
-} // pkgs.lib.optionalAttrs hasWpe wpe.env)
+} // pkgs.lib.optionalAttrs hasWpe wpe.env // pkgs.lib.optionalAttrs hasCef cef.env)

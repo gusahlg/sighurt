@@ -33,7 +33,7 @@ WPE prefix's "same home directory" constraint.
 | Pin | **CEF 150.0.22+gc1a097e+chromium-150.0.7871.256**, linux64 `minimal` |
 | URL | `https://cef-builds.spotifycdn.com/cef_binary_150.0.22%2Bgc1a097e%2Bchromium-150.0.7871.256_linux64_minimal.tar.bz2` |
 | sha1 (from index.json) | `7e7ca1e73e5d5e6317ca53dc1302fd180a3e1222` (verified) |
-| sha256 (computed here) | compute with `sha256sum` when writing the build script and pin it; the index has only sha1 |
+| sha256 (pinned) | `dd1b5cc3ac6efe659ec7e8e9b0677ba4e43216a2fefcafd5abc9340837e32d96` |
 | Size | 314 890 058 bytes archive; `libcef.so` 1.4 GB (not stripped of debug-less symbols; only 243 `cef_*` symbols exported), 2.8 GB with the runtime directory |
 | Released | 9 October 2026, stable channel |
 | API version | `CEF_API_VERSION 15000` (build with it defined; the headers default to "experimental", whose hash never matches a release) |
@@ -56,8 +56,9 @@ Same scheme as WPE: a plain directory outside the Nix store, same absolute path 
 its libraries from the pinned nixpkgs (`nix/nixpkgs.nix`), a GC root for them.
 
 - **No build.** The binary distribution is fetched and unpacked (`tar -xjf --strip-components=1`,
-  30 s). `nix/build-cef.sh` (to write; step 1 of the plan) does: download if absent, check sha1 and
-  a pinned sha256, unpack, assemble `dist/`, patch, root `runtime`, print the manifest.
+  30 s). `nix/build-cef.sh` downloads if absent, checks sha1 and the pinned sha256, unpacks,
+  assembles `dist/`, patches, roots `runtime`, and prints a manifest. A second run whose stamp
+  matches does nothing.
 - **What libcef needs** (`readelf -d`, 30 `DT_NEEDED`): glib, gobject, gio, nspr4, nss3, nssutil3,
   smime3, atk, atk-bridge, atspi, dbus-1, cups, X11, Xcomposite, Xdamage, Xext, Xfixes, Xrandr, xcb,
   gbm, expat, xkbcommon, cairo, pango, udev, asound, plus libc, libm, libgcc_s. Chromium also
