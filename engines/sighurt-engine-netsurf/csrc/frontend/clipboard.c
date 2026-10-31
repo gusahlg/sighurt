@@ -49,7 +49,9 @@ static void clip_set(const char *buffer, size_t length, nsclipboard_styles style
 	(void)styles;
 	(void)n_styles;
 	replace_shadow(buffer, length);
-	nsh_emit(NSH_EV_CLIPBOARD, 0, (int)shadow_len, 0, 0, 0, 0, shadow);
+	/* Only a copy or cut the user's key press made reaches the browser. */
+	if (nsh_input_view)
+		nsh_emit(NSH_EV_CLIPBOARD, nsh_input_view, (int)shadow_len, 0, 0, 0, 0, shadow);
 }
 
 struct gui_clipboard_table nsh_clipboard_table = {

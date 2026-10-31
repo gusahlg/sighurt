@@ -57,7 +57,9 @@ enum nsh_event_kind {
 	NSH_EV_DOWNLOAD = 12, /* u0 is the id; i0 is 0 created, 1 done, 2 error */
 	NSH_EV_OPEN = 13, /* view_id is the opener; text is the url */
 	NSH_EV_FILE = 14, /* a file input opened; answer with nsh_file_answer */
-	NSH_EV_CONSOLE = 15 /* i0 is how many messages were coalesced; no text */
+	NSH_EV_CONSOLE = 15, /* i0 is how many messages were coalesced; no text */
+	NSH_EV_ASK = 17, /* a user-activated GET form submit wants to navigate: text is the url; answer with nsh_view_follow */
+	NSH_EV_FAILED = 16 /* a load failed: text is "url\nmessage"; i0 is the core's nserror */
 };
 
 /* text is valid until the next nsh_next_event, nsh_poll, nsh_view_close or
@@ -174,6 +176,12 @@ void nsh_view_scroll(nsh_view *view, int x, int y, int dx, int dy);
 /* Returns 1 if the core consumed the key. */
 int nsh_view_key(nsh_view *view, uint32_t key);
 
+/* Navigates to `url` as a navigation the page started, with the current document as referrer.
+ * Returns 1 if the core accepted it. */
+int nsh_view_follow(nsh_view *view, const char *url);
+/* 1 once the event queue has overflowed (65536 events were waiting): events were lost. */
+int nsh_events_overflowed(void);
+
 /* Copies the link url at a buffer position. Returns 1 if there was one. */
 int nsh_view_link_at(nsh_view *view, int x, int y, char *buf, size_t buflen);
 /* 0 none, 1 text field, 2 file input. */
@@ -192,6 +200,7 @@ int nsh_poll(nsh_poll_info *info);
 size_t nsh_next_event(nsh_event *out);
 
 void nsh_clipboard_set_shadow(const char *utf8, size_t len);
+/* accept 0 releases the download: it is aborted if still running, and all it holds is freed. */
 void nsh_download_answer(uint64_t id, int accept);
 /* path NULL or empty cancels. */
 void nsh_file_answer(uint64_t view_id, const char *path);

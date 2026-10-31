@@ -51,6 +51,8 @@ fn main() {
         println!("cargo:rerun-if-env-changed={var}");
     }
     println!("cargo:rerun-if-changed=csrc");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 
     // Record the fonts' store paths: `sig` runs outside the nix-shell too.
     for k in ["SANS", "SANS_BOLD", "SERIF", "MONO"] {
@@ -63,7 +65,7 @@ fn main() {
     let src_tar = env("SIGHURT_NETSURF_SRC");
     let ns_pc = env("SIGHURT_NETSURF_PKG_CONFIG_PATH");
     let out_dir = PathBuf::from(env("OUT_DIR"));
-    let tree = build_tree();
+    let tree = build_tree(&src_tar);
     let source = tree.join("netsurf-3.11");
 
     unpack(&src_tar, &tree, &source);
@@ -76,18 +78,58 @@ fn main() {
     export_resources(&source, &out_dir);
 }
 
-/// The directory the NetSurf tree is unpacked into.
-fn build_tree() -> PathBuf {
+/// The directory the NetSurf tree is unpacked and built in. It is named by the source tarball
+/// (the hash in its nix store name) and by a hash of this crate's C sources and patches, so no
+/// other checkout, worktree or edit shares objects with it: stale objects cannot be linked.
+fn build_tree(tarball: &str) -> PathBuf {
     println!("cargo:rerun-if-env-changed=SIGHURT_NETSURF_BUILD");
-    if let Ok(dir) = std::env::var("SIGHURT_NETSURF_BUILD") {
-        return PathBuf::from(dir);
-    }
-    let hdd = Path::new("/data/sig-builds");
-    if hdd.is_dir() {
-        hdd.join("netsurf")
+    let base = if let Ok(dir) = std::env::var("SIGHURT_NETSURF_BUILD") {
+        PathBuf::from(dir)
+    } else if Path::new("/data/sig-builds").is_dir() {
+        Path::new("/data/sig-builds").join("netsurf")
     } else {
         PathBuf::from(env("OUT_DIR")).join("netsurf-build")
+    };
+    let store_hash: String = Path::new(tarball)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("tarball")
+        .chars()
+        .take(12)
+        .collect();
+    base.join(format!(
+        "{store_hash}-{:012x}",
+        sources_hash() & 0xffff_ffff_ffff
+    ))
+}
+
+/// FNV-1a over this crate's C sources and patches (names and bytes) and over this script.
+fn sources_hash() -> u64 {
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *hash ^= u64::from(b);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
+    fn walk(dir: &Path, hash: &mut u64) {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, hash);
+            } else {
+                feed(hash, path.to_string_lossy().as_bytes());
+                feed(hash, &fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    walk(Path::new("csrc"), &mut hash);
+    feed(&mut hash, &fs::read("build.rs").unwrap());
+    hash
 }
 
 fn unpack(tar: &str, tree: &Path, source: &Path) {
@@ -178,6 +220,57 @@ void user_agent_override(const char *ua)\n\
         "\t\tcore_user_agent_string = NULL;\n\t}\n}",
         "\t\tcore_user_agent_string = NULL;\n\t}\n\t/* SIGHURT PATCH: free-user-agent. */\n\tfree(sighurt_user_agent);\n\tsighurt_user_agent = NULL;\n}",
     );
+    // --- Security (docs/rewrite/NETSURF.md, "Security patches"). NetSurf lets a page, through
+    // its own about:query forms, relax certificate checks and plant credentials; none of that
+    // exists in sig. Verification is never relaxed, credentials never come from a page.
+    let urldb = source.join("content/urldb.c");
+    replace_once(
+        &urldb,
+        "SIGHURT PATCH: no-cert-permissions-set",
+        "void urldb_set_cert_permissions(nsurl *url, bool permit)\n{\n",
+        "void urldb_set_cert_permissions(nsurl *url, bool permit)\n{\n\t/* SIGHURT PATCH: no-cert-permissions-set. Verification is never relaxed. */\n\t(void)url;\n\t(void)permit;\n\treturn;\n",
+    );
+    replace_once(
+        &urldb,
+        "SIGHURT PATCH: no-cert-permissions-get",
+        "bool urldb_get_cert_permissions(nsurl *url)\n{\n",
+        "bool urldb_get_cert_permissions(nsurl *url)\n{\n\t/* SIGHURT PATCH: no-cert-permissions-get. */\n\t(void)url;\n\treturn false;\n",
+    );
+    replace_once(
+        &urldb,
+        "SIGHURT PATCH: no-auth-details",
+        "void urldb_set_auth_details(nsurl *url, const char *realm, const char *auth)\n{\n",
+        "void urldb_set_auth_details(nsurl *url, const char *realm, const char *auth)\n{\n\t/* SIGHURT PATCH: no-auth-details. A page never plants credentials. */\n\t(void)url;\n\t(void)realm;\n\t(void)auth;\n\treturn;\n",
+    );
+    let bw = source.join("desktop/browser_window.c");
+    replace_once(
+        &bw,
+        "SIGHURT PATCH: internal-navigation",
+        "\t\tif (post_multipart == NULL) {\n\t\t\treturn NSERROR_NEED_DATA;\n\t\t}\n\t\t/* It *is* internal, set it as such */",
+        "\t\t/* SIGHURT PATCH: internal-navigation. Only the core navigates to about:query. */\n\t\treturn NSERROR_NEED_DATA;\n\t\t/* It *is* internal, set it as such */",
+    );
+    // Every failed load, a bad certificate and a login request included, is reported to the
+    // frontend and fails; the core shows no error page, query page or login form.
+    replace_once(
+        &bw,
+        "SIGHURT PATCH: failed-load",
+        "\thlcache_handle_release(c);\n\n\tswitch (code) {\n\tcase NSERROR_BAD_AUTH:\n\t\tres = browser_window__handle_login(bw, message, url);\n\t\tbreak;\n\n\tcase NSERROR_BAD_CERTS:\n\t\tres = browser_window__handle_bad_certs(bw, url);\n\t\tbreak;\n\n\tcase NSERROR_TIMEOUT:\n\t\tres = browser_window__handle_timeout(bw, url);\n\t\tbreak;\n\n\tdefault:\n\t\tres = browser_window__handle_fetcherror(bw, message, url);\n\t\tbreak;\n\t}\n",
+        "\t/* SIGHURT PATCH: failed-load. */\n\textern void nsh_load_failed(struct browser_window *, int, const char *, const char *);\n\tnsh_load_failed(bw, (int)code, message, nsurl_access(url));\n\thlcache_handle_release(c);\n\tif (bw->loading_content == NULL)\n\t\tbrowser_window_stop_throbber(bw);\n\tres = NSERROR_OK;\n",
+    );
+    // A GET form the user submits is asked about like a link (NavigationRequested).
+    replace_once(
+        &source.join("content/handlers/html/form.c"),
+        "SIGHURT PATCH: form-get",
+        "\t\t\t\tres = browser_window_navigate(target,\n\t\t\t\t\t\t\t      query_url,\n",
+        "\t\t\t\t/* SIGHURT PATCH: form-get. */\n\t\t\t\textern int nsh_form_get(struct browser_window *, const char *);\n\t\t\t\tif (nsh_form_get(target, nsurl_access(query_url)))\n\t\t\t\t\tres = NSERROR_OK;\n\t\t\t\telse\n\t\t\t\tres = browser_window_navigate(target,\n\t\t\t\t\t\t\t      query_url,\n",
+    );
+    // A page's resources and redirects never reach file: from another scheme.
+    replace_once(
+        &source.join("content/llcache.c"),
+        "SIGHURT PATCH: file-origin",
+        "\tnsurl *hsts_url;\n\tbool hsts_in_use;\n\n\t/* Perform HSTS transform */",
+        "\tnsurl *hsts_url;\n\tbool hsts_in_use;\n\n\t/* SIGHURT PATCH: file-origin. Only a file: page (or the browser itself, with no referrer) fetches file:. */\n\tif (referer != NULL && strncmp(nsurl_access(url), \"file:\", 5) == 0 &&\n\t    strncmp(nsurl_access(referer), \"file:\", 5) != 0)\n\t\treturn NSERROR_NO_FETCH_HANDLER;\n\n\t/* Perform HSTS transform */",
+    );
 }
 
 fn replace_once(path: &Path, marker: &str, from: &str, to: &str) {
@@ -256,7 +349,8 @@ fn archive_objects(source: &Path, out_dir: &Path) -> PathBuf {
         let entry = entry.unwrap();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.ends_with(".o") && !name.contains("main") {
+        // The frontend's stub main only lets NetSurf's makefile finish its link.
+        if name.ends_with(".o") && name != "frontends_sighurt_main.o" {
             objects.push(entry.path());
         }
     }

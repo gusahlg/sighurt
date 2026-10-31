@@ -84,7 +84,12 @@ const HOME: &str = "<!doctype html><title>Smoke Page</title><body style='margin:
 <h1 style='margin:0;height:60px'>Heading</h1>\
 <a href='/second' style='position:absolute;left:0;top:100px;width:300px;height:60px;background:#cfc'>second page</a>\
 <a href='/blank-target' target=_blank style='position:absolute;left:0;top:200px;width:300px;height:60px;background:#ccf'>new window</a>\
-<a href='/file.bin' style='position:absolute;left:0;top:300px;width:300px;height:60px;background:#fcc'>download</a>";
+<a href='/file.bin' style='position:absolute;left:0;top:300px;width:300px;height:60px;background:#fcc'>download</a>\
+<a href='mailto:me@example.org' style='position:absolute;left:0;top:470px;width:300px;height:40px;background:#ffc'>mail</a>\
+<a href='mailto:you@example.org' target=_blank style='position:absolute;left:0;top:520px;width:300px;height:40px;background:#cff'>mail in a new window</a>\
+<form method=post enctype='multipart/form-data' action='about:query/ssl'>\
+<input type=hidden name=siteurl value='https://127.0.0.1:@TLS@/'><input type=hidden name=proceed value=1>\
+<input type=submit value='proceed anyway' style='position:absolute;left:0;top:400px;width:300px;height:60px'></form>";
 
 const FORM: &str = "<!doctype html><meta charset=utf-8><title>Form</title><body style='margin:0'>\
 <form action='/echo' method=get><input type=text name=q style='position:absolute;left:0;top:0;width:300px;height:40px;font:20px sans-serif'></form>";
@@ -104,7 +109,7 @@ struct Server {
 }
 
 impl Server {
-    fn start() -> Self {
+    fn start(tls_port: u16) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -121,13 +126,48 @@ impl Server {
                     log.lock().unwrap().push(path.clone());
                     let (kind, extra, body): (&str, &str, Vec<u8>) =
                         match path.split('?').next().unwrap() {
-                            "/" => ("text/html", "", HOME.into()),
+                            "/" => (
+                                "text/html",
+                                "",
+                                HOME.replace("@TLS@", &tls_port.to_string()).into(),
+                            ),
                             "/second" => (
                                 "text/html",
                                 "",
                                 b"<!doctype html><title>Second</title><p>two".to_vec(),
                             ),
-                            "/form" => ("text/html", "", FORM.into()),
+                            "/filemeta" => (
+                            "text/html",
+                            "",
+                            b"<!doctype html><title>Meta</title><meta http-equiv=refresh content='0;url=file:///etc/hostname'><p>x".to_vec(),
+                        ),
+                        "/hostile" => (
+                            "text/html",
+                            "",
+                            b"<!doctype html><title>Hostile</title><body style='margin:0'>\
+<input type=radio style='width:200000px;height:200000px'>\
+<div style='width:2000000px;border-top:1000px dashed #000'></div>\
+<div style='width:3000px;height:3000px;border:500px dotted red'></div>".to_vec(),
+                        ),
+                        "/framehost" => (
+                            "text/html",
+                            "",
+                            b"<!doctype html><title>Host</title><body style='margin:0'>\
+<iframe src='/frame' style='position:absolute;left:0;top:0;width:400px;height:200px;border:0'></iframe>".to_vec(),
+                        ),
+                        "/frame" => (
+                            "text/html",
+                            "",
+                            b"<!doctype html><meta http-equiv=refresh content=1><body style='margin:0'>\
+<input type=file style='position:absolute;left:0;top:0;width:300px;height:60px'>".to_vec(),
+                        ),
+                        "/fileroot" => (
+                            "text/html",
+                            "",
+                            b"<!doctype html><title>File</title><body style='margin:0'>\
+<input type=file style='position:absolute;left:0;top:0;width:300px;height:60px'>".to_vec(),
+                        ),
+                        "/form" => ("text/html", "", FORM.into()),
                             "/long" => ("text/html", "", long_page().into_bytes()),
                             "/blank-target" => (
                                 "text/html",
@@ -361,13 +401,76 @@ fn non_white(frame: &Picture) -> usize {
     frame.2.iter().filter(|&&p| p != 0xffff_ffff).count()
 }
 
+/// An HTTPS server with a self-signed certificate (`openssl s_server`), killed on drop.
+struct TlsServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl TlsServer {
+    fn start() -> Self {
+        let dir = std::env::temp_dir().join(format!("sighurt-ns-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (key, cert) = (dir.join("key.pem"), dir.join("cert.pem"));
+        let made = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            ])
+            .args([
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .expect("the openssl command (the repository's nix-shell has it)");
+        assert!(made.status.success(), "openssl req: {made:?}");
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = std::process::Command::new("openssl")
+            .args(["s_server", "-www", "-quiet", "-accept", &port.to_string()])
+            .arg("-cert")
+            .arg(&cert)
+            .arg("-key")
+            .arg(&key)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Owned from here on: it is killed and waited for when this drops, even on a panic.
+        let server = Self { child, port };
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return server;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("openssl s_server did not start");
+    }
+}
+
+impl Drop for TlsServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn has(events: &[EngineEvent], f: impl Fn(&EngineEvent) -> bool) -> bool {
     events.iter().any(f)
 }
 
 #[test]
 fn the_runtime_walks_through_every_scenario() {
-    let server = Server::start();
+    let tls = TlsServer::start();
+    let server = Server::start(tls.port);
     let wakes = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&wakes);
     let waker = EngineWaker::new(move || {
@@ -433,6 +536,123 @@ fn the_runtime_walks_through_every_scenario() {
             .unwrap(),
         PresentOutcome::NotReady
     );
+
+    // --- TLS fails closed. A bad certificate is a failed load; a page cannot grant itself an
+    // exception through NetSurf's own about:query form, and the form does nothing.
+    let secure = format!("https://127.0.0.1:{}/", tls.port);
+    let failed = h.navigate(&secure);
+    let events = h.until("the bad certificate", |ev| {
+        has(ev, |e| matches!(e, EngineEvent::NavigationFailed { navigation, .. } if *navigation == failed))
+    });
+    assert!(
+        !has(&events, |e| matches!(
+            e,
+            EngineEvent::NavigationCommitted { .. }
+        )),
+        "{events:#?}"
+    );
+    let _ = h.load(&server.url("/"));
+    h.click(50.0, 430.0);
+    let events = h.idle_for(Duration::from_millis(500));
+    assert!(
+        !has(&events, |e| matches!(
+            e,
+            EngineEvent::NavigationCommitted { .. } | EngineEvent::NavigationStarted { .. }
+        )),
+        "the about:query form did something: {events:#?}"
+    );
+    let again = h.navigate(&secure);
+    let events = h.until("the bad certificate again", |ev| {
+        has(ev, |e| matches!(e, EngineEvent::NavigationFailed { navigation, .. } if *navigation == again))
+    });
+    assert!(
+        !has(&events, |e| matches!(
+            e,
+            EngineEvent::NavigationCommitted { .. }
+        )),
+        "{events:#?}"
+    );
+    let _ = h.load(&server.url("/"));
+
+    // --- a scheme NetSurf cannot fetch is an external URL of the view the click was in (also
+    // from a target=_blank link, whose spawned window must not linger).
+    let _ = h.load(&server.url("/"));
+    for y in [490.0, 540.0] {
+        h.click(50.0, y);
+        let request = h
+            .pump()
+            .iter()
+            .find_map(|e| match e {
+                EngineEvent::NavigationRequested { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("a mailto link asks first");
+        h.command(EngineCommand::AnswerNavigation {
+            request,
+            allow: true,
+        });
+        let events = h.pump();
+        assert!(
+            has(
+                &events,
+                |e| matches!(e, EngineEvent::ServiceRequested(r) if r.view == view && matches!(&r.service, Service::OpenExternal { url } if url.starts_with("mailto:")))
+            ),
+            "{events:#?}"
+        );
+    }
+
+    // --- a web page cannot send the tab to a file: URL (a meta refresh), though the browser can.
+    let _ = h.load(&server.url("/filemeta"));
+    let events = h.idle_for(Duration::from_millis(1500));
+    assert!(
+        !has(
+            &events,
+            |e| matches!(e, EngineEvent::NavigationCommitted { url, .. } if url.starts_with("file:"))
+        ),
+        "{events:#?}"
+    );
+    let _ = h.load("file:///etc/hostname");
+
+    // --- a page cannot make a paint expensive: a huge radio button, a huge dashed border.
+    let _ = h.load(&server.url("/hostile"));
+    let began = Instant::now();
+    let _ = h.frame();
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "the hostile page took {:?} to paint",
+        began.elapsed()
+    );
+    let _ = h.load(&server.url("/"));
+
+    // --- a file input in a frame is refused (its gadget dies with the frame's document); one in
+    // the page asks, and answering after the page went away does nothing.
+    let _ = h.load(&server.url("/framehost"));
+    h.click(50.0, 30.0);
+    let events = h.idle_for(Duration::from_millis(300));
+    assert!(
+        !has(
+            &events,
+            |e| matches!(e, EngineEvent::ServiceRequested(r) if matches!(r.service, Service::PickFiles { .. }))
+        ),
+        "{events:#?}"
+    );
+    let _ = h.load(&server.url("/fileroot"));
+    h.click(50.0, 30.0);
+    let events = h.pump();
+    let pick = events.iter().find_map(|e| match e {
+        EngineEvent::ServiceRequested(r) if matches!(r.service, Service::PickFiles { .. }) => {
+            Some(r.id)
+        }
+        _ => None,
+    });
+    let pick = pick.expect("a file input in the page asks");
+    let _ = h.load(&server.url("/second"));
+    h.command(EngineCommand::ResolveServiceRequest {
+        request: pick,
+        result: Ok(ServiceReply::Files(vec!["/etc/hostname".into()])),
+    });
+    let _ = h.pump();
+    let _ = h.load(&server.url("/"));
 
     // --- idle: nothing ticks. Two seconds of owner loop with no input.
     let pumps_before = h.pumps;
@@ -654,6 +874,25 @@ fn the_runtime_walks_through_every_scenario() {
         })),
     });
     h.key(Key::Named("Enter".into()), Some("\r"), Modifiers::default());
+    // A GET form the user submits is asked about like a link.
+    let events = h.pump();
+    let request = events
+        .iter()
+        .find_map(|e| match e {
+            EngineEvent::NavigationRequested { request, url, .. } if url.contains("/echo") => {
+                Some(*request)
+            }
+            _ => None,
+        })
+        .expect("a form submit asks first");
+    assert!(
+        !server.saw("/echo"),
+        "the form went to the server before the answer"
+    );
+    h.command(EngineCommand::AnswerNavigation {
+        request,
+        allow: true,
+    });
     let events = h.until("the form submit", |ev| {
         has(
             ev,

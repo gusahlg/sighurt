@@ -8,7 +8,8 @@
 
 static void *b_create(int w, int h, enum gui_bitmap_flags flags)
 {
-	if (w < 1 || h < 1)
+	/* A page picks image sizes: refuse more than 64 Mpixel (256 MB) at once. */
+	if (w < 1 || h < 1 || (long long)w * h > (64LL << 20))
 		return NULL;
 	struct bitmap *b = calloc(1, sizeof *b);
 	if (!b)

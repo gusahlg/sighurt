@@ -71,13 +71,13 @@ struct PendingNavigation {
     started: bool,
 }
 
-/// A link click held for `AnswerNavigation`.
-struct HeldClick {
+/// A navigation held for `AnswerNavigation`: a link click (replayed if the same link is still
+/// under the pointer) or a form submit (followed by its URL).
+struct HeldNav {
     request: RequestId,
-    x: i32,
-    y: i32,
-    state: u32,
-    mods: u32,
+    url: String,
+    /// Position and state of the click, for a link.
+    click: Option<(i32, i32, u32, u32)>,
 }
 
 /// What a service request this view made is for.
@@ -108,7 +108,11 @@ struct View<T: CpuTarget> {
     painted: Option<LayoutEpoch>,
     pointer: Pointer,
     caret: bool,
-    held: Vec<HeldClick>,
+    held: Vec<HeldNav>,
+    /// Downloads in flight, with the document that started each.
+    downloads: HashMap<u64, DocumentGeneration>,
+    /// The latest title, applied again after a commit so it belongs to the new document.
+    title: Option<String>,
     asked: HashMap<RequestId, Asked>,
 }
 
@@ -119,8 +123,8 @@ pub struct NetSurfRuntime<T: CpuTarget = TargetLease> {
     ids: HashMap<u64, ViewId>,
     queue: Vec<EngineEvent>,
     watcher: Watcher,
-    /// The view that last had input: external URLs and clipboard writes have no window of their own.
-    active: Option<ViewId>,
+    /// Set once the core's queue overflowed and `RuntimeFailed` was queued.
+    overflow_reported: bool,
     shut_down: bool,
 }
 
@@ -167,7 +171,7 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
             ids: HashMap::new(),
             queue: Vec::new(),
             watcher,
-            active: None,
+            overflow_reported: false,
             shut_down: false,
         })
     }
@@ -180,25 +184,16 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
         }
     }
 
-    /// Moves what the core queued into `self.queue`, in order. Replaceable metadata (title,
-    /// status, cursor, caret, frames) is applied after the ordered events of the batch, so a
-    /// title the core reported just before it replaced the content belongs to the new document.
+    /// Moves what the core queued into `self.queue`, in the order it happened.
     fn collect(&mut self) {
-        let mut later: Vec<ffi::OwnedEvent> = Vec::new();
         while let Some(event) = ffi::next_event() {
-            match event.kind {
-                ffi::EV_LOADING
-                | ffi::EV_TITLE
-                | ffi::EV_STATUS
-                | ffi::EV_POINTER
-                | ffi::EV_CARET
-                | ffi::EV_REMOVE_CARET
-                | ffi::EV_FRAME => later.push(event),
-                _ => self.apply(event),
-            }
-        }
-        for event in later {
             self.apply(event);
+        }
+        if ffi::events_overflowed() && !self.overflow_reported {
+            self.overflow_reported = true;
+            self.queue.push(EngineEvent::RuntimeFailed {
+                message: "NetSurf's event queue overflowed".into(),
+            });
         }
         // A URL change with no new content and no load in flight is a same-document navigation
         // (a fragment): commit it, keeping the document.
@@ -234,15 +229,14 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
         }
     }
 
-    /// The view an event without a window (a clipboard write, an external URL) goes to.
-    fn service_view(&self) -> Option<ViewId> {
-        self.active
-            .filter(|id| self.views.contains_key(id))
-            .or_else(|| self.views.keys().next().copied())
-    }
-
     /// Queues a service request for `id`'s current document.
-    fn request(&mut self, id: ViewId, service: Service, asked: Asked) {
+    fn request(
+        &mut self,
+        id: ViewId,
+        service: Service,
+        asked: Asked,
+        document: Option<DocumentGeneration>,
+    ) {
         let Some(view) = self.views.get_mut(&id) else {
             return;
         };
@@ -253,7 +247,7 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
             .push(EngineEvent::ServiceRequested(ServiceRequest {
                 id: request,
                 view: id,
-                document: view.document,
+                document: document.unwrap_or(view.document),
                 origin,
                 service,
             }));
@@ -261,13 +255,14 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
 
     fn apply(&mut self, event: ffi::OwnedEvent) {
         match event.kind {
+            // Raised while the user's input ran for that view, or dropped by the C side.
             ffi::EV_LAUNCH => {
-                if let (Some(url), Some(view)) = (event.text, self.service_view()) {
-                    self.request(view, Service::OpenExternal { url }, Asked::Other);
+                if let (Some(url), Some(&view)) = (event.text, self.ids.get(&event.view_id)) {
+                    self.request(view, Service::OpenExternal { url }, Asked::Other, None);
                 }
             }
             ffi::EV_CLIPBOARD => {
-                if let (Some(text), Some(view)) = (event.text, self.service_view()) {
+                if let (Some(text), Some(&view)) = (event.text, self.ids.get(&event.view_id)) {
                     let items = vec![ClipboardData {
                         mime_type: "text/plain;charset=utf-8".into(),
                         data: text.into_bytes(),
@@ -279,29 +274,72 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
                             items,
                         },
                         Asked::Other,
+                        None,
                     );
                 }
             }
             ffi::EV_DOWNLOAD => {
-                // 0: created, 1: finished, 2: failed. Only a finished one is handed over.
-                if event.i0 != 1 {
-                    return;
+                // 0: created, 1: finished, 2: failed. The download belongs to the document that
+                // started it, and only a finished one is handed over.
+                let known = self.ids.get(&event.view_id).copied();
+                match (event.i0, known) {
+                    (0, Some(id)) => {
+                        if let Some(view) = self.views.get_mut(&id) {
+                            view.downloads.insert(event.u0, view.document);
+                        }
+                    }
+                    (1, Some(id)) => {
+                        let document = self
+                            .views
+                            .get_mut(&id)
+                            .and_then(|view| view.downloads.remove(&event.u0));
+                        if let Some((_url, name, data)) = ffi::take_download(event.u0) {
+                            self.request(
+                                id,
+                                Service::Download {
+                                    source: DownloadSource::Data(data),
+                                    suggested_name: name,
+                                },
+                                Asked::Other,
+                                document,
+                            );
+                        }
+                    }
+                    (_, known) => {
+                        // Failed, or its view is gone: release what the core holds.
+                        if let Some(view) = known.and_then(|id| self.views.get_mut(&id)) {
+                            view.downloads.remove(&event.u0);
+                        }
+                        ffi::release_download(event.u0);
+                    }
                 }
+            }
+            ffi::EV_ASK => {
                 let Some(&id) = self.ids.get(&event.view_id) else {
-                    // Its view is gone: release the buffered body.
-                    let _ = ffi::take_download(event.u0);
                     return;
                 };
-                if let Some((_url, name, data)) = ffi::take_download(event.u0) {
-                    self.request(
-                        id,
-                        Service::Download {
-                            source: DownloadSource::Data(data),
-                            suggested_name: name,
-                        },
-                        Asked::Other,
-                    );
+                let (Some(url), Some(view)) = (event.text, self.views.get_mut(&id)) else {
+                    return;
+                };
+                // A form submit the user made. Beyond the held limit it goes ahead unasked.
+                if view.held.len() >= MAX_HELD_NAVIGATIONS {
+                    if let Some(handle) = &view.handle {
+                        handle.follow(&url);
+                    }
+                    return;
                 }
+                let request = RequestId::next();
+                view.held.push(HeldNav {
+                    request,
+                    url: url.clone(),
+                    click: None,
+                });
+                self.queue.push(EngineEvent::NavigationRequested {
+                    view: id,
+                    document: view.document,
+                    request,
+                    url,
+                });
             }
             ffi::EV_OPEN => {
                 // `view_id` is the opener's.
@@ -326,6 +364,7 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
                             filters: Vec::new(),
                         },
                         Asked::Files,
+                        None,
                     );
                 }
             }
@@ -343,10 +382,13 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
             return;
         };
         match event.kind {
-            ffi::EV_TITLE => self.queue.push(EngineEvent::TitleChanged {
-                view: id,
-                title: event.text.filter(|t| !t.is_empty()),
-            }),
+            ffi::EV_TITLE => {
+                view.title = event.text.filter(|t| !t.is_empty());
+                self.queue.push(EngineEvent::TitleChanged {
+                    view: id,
+                    title: view.title.clone(),
+                });
+            }
             ffi::EV_STATUS => self.queue.push(EngineEvent::StatusTextChanged {
                 view: id,
                 text: event.text.filter(|t| !t.is_empty()),
@@ -379,6 +421,36 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
                 }
             }
             ffi::EV_NEW_CONTENT => self.commit(id, &mut view),
+            ffi::EV_FAILED => {
+                // The core reports a failed load of the root document and shows nothing for it.
+                // The address the core showed for the failed load is not the document's.
+                view.last_url = view.url.clone();
+                let text = event.text.unwrap_or_default();
+                let (url, message) = text.split_once('\n').unwrap_or(("", &text));
+                let message = if message.is_empty() {
+                    "the address cannot be loaded".to_string()
+                } else {
+                    message.to_string()
+                };
+                let navigation = match view.pending.take() {
+                    Some(pending) => pending.navigation,
+                    None => {
+                        // The page started it (a link, a refresh).
+                        let navigation = NavigationId::next();
+                        self.queue.push(EngineEvent::NavigationStarted {
+                            view: id,
+                            navigation,
+                            url: url.to_string(),
+                        });
+                        navigation
+                    }
+                };
+                self.queue.push(EngineEvent::NavigationFailed {
+                    view: id,
+                    navigation,
+                    error: NavigationError::Load(message),
+                });
+            }
             ffi::EV_FRAME => view.dirty = true,
             ffi::EV_CARET => {
                 let ratio = scale_ratio(&view.metrics);
@@ -450,6 +522,14 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
             document: view.document,
             history: Some(effect),
         });
+        // NetSurf reports the title just before it replaces the content: say it again, for the
+        // document that has just committed.
+        if view.title.is_some() {
+            self.queue.push(EngineEvent::TitleChanged {
+                view: id,
+                title: view.title.clone(),
+            });
+        }
     }
 
     fn send_pointer(view: &View<T>, action: &PointerAction) {
@@ -462,7 +542,6 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
     }
 
     fn input(&mut self, id: ViewId, kind: InputKind) {
-        self.active = Some(id);
         let Some(view) = self.views.get_mut(&id) else {
             return;
         };
@@ -477,16 +556,19 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
                 for action in actions {
                     if let PointerAction::LeftClick { x, y, state, mods } = action {
                         // A plain click on a link is held until the browser says the engine may
-                        // follow it.
-                        let link = view.handle.as_ref().and_then(|h| h.link_at(x, y));
-                        if let Some(url) = link.filter(|_| view.held.len() < MAX_HELD_NAVIGATIONS) {
+                        // follow it. A click with Shift or Ctrl opens a download or a new window,
+                        // which the core already puts through its own policy.
+                        let link = view
+                            .handle
+                            .as_ref()
+                            .and_then(|h| h.link_at(x, y))
+                            .filter(|_| mods == 0 && view.held.len() < MAX_HELD_NAVIGATIONS);
+                        if let Some(url) = link {
                             let request = RequestId::next();
-                            view.held.push(HeldClick {
+                            view.held.push(HeldNav {
                                 request,
-                                x,
-                                y,
-                                state,
-                                mods,
+                                url: url.clone(),
+                                click: Some((x, y, state, mods)),
                             });
                             self.queue.push(EngineEvent::NavigationRequested {
                                 view: id,
@@ -522,6 +604,7 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
                                 limit: MAX_PASTE,
                             },
                             Asked::Paste,
+                            None,
                         );
                     }
                 }
@@ -681,6 +764,8 @@ impl<T: CpuTarget> EngineRuntime for NetSurfRuntime<T> {
                 pointer: Pointer::default(),
                 caret: false,
                 held: Vec::new(),
+                downloads: HashMap::new(),
+                title: None,
                 asked: HashMap::new(),
             },
         );
@@ -739,11 +824,7 @@ impl<T: CpuTarget> EngineRuntime for NetSurfRuntime<T> {
                 }
                 view.dirty |= visible;
             }
-            EngineCommand::SetFocus(focused) => {
-                if focused {
-                    self.active = Some(id);
-                }
-            }
+            EngineCommand::SetFocus(_) => {}
             EngineCommand::SetZoom(zoom) => {
                 let view = self.views.get_mut(&id).expect("checked above");
                 if let Some(handle) = &view.handle {
@@ -761,7 +842,18 @@ impl<T: CpuTarget> EngineRuntime for NetSurfRuntime<T> {
                 if let Some(at) = view.held.iter().position(|h| h.request == request) {
                     let held = view.held.remove(at);
                     if let (true, Some(handle)) = (allow, &view.handle) {
-                        handle.mouse(held.x, held.y, held.state, held.mods);
+                        match held.click {
+                            // The approved link, if it is still where the click was; a page that
+                            // reflowed meanwhile gets nothing.
+                            Some((x, y, state, mods)) => {
+                                if handle.link_at(x, y).as_deref() == Some(held.url.as_str()) {
+                                    handle.mouse(x, y, state, mods);
+                                }
+                            }
+                            None => {
+                                handle.follow(&held.url);
+                            }
+                        }
                     }
                 }
             }
@@ -856,9 +948,6 @@ impl<T: CpuTarget> EngineRuntime for NetSurfRuntime<T> {
         // What the core queued for the view went with its window.
         self.collect();
         self.queue.retain(|event| event.view() != Some(id));
-        if self.active == Some(id) {
-            self.active = None;
-        }
         self.queue.push(EngineEvent::ViewClosed { view: id });
     }
 

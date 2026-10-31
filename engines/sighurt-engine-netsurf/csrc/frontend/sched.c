@@ -113,7 +113,15 @@ int nsh_sched_deadline(int live_views)
 			next = c->at;
 	}
 	if (live_views && housekeeping) {
+		/* Once a minute, and never before the earliest housekeeping callback is due: a wake
+		 * that finds nothing to run would be asked for again at once. */
+		double earliest = -1;
+		for (struct cb *c = cbs; c; c = c->next)
+			if (c->housekeeping && (earliest < 0 || c->at < earliest))
+				earliest = c->at;
 		double at = last_housekeeping + 60000.0;
+		if (at < earliest)
+			at = earliest;
 		if (next < 0 || at < next)
 			next = at;
 	}

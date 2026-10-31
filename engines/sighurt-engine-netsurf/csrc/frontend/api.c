@@ -19,6 +19,8 @@
 #include "desktop/browser_history.h"
 
 int nsh_core_state;
+uint64_t nsh_input_view;
+static int overflowed;
 
 extern void user_agent_override(const char *ua);
 
@@ -27,7 +29,9 @@ static int registered;
 
 /* --- events ----------------------------------------------------------- */
 
-enum { QCAP = 128 };
+/* The queue grows. Only a replaceable event may be dropped to make room, and only past 4096
+ * waiting; past 65536 the queue refuses more and says so (nsh_events_overflowed). */
+enum { SOFT_CAP = 4096, HARD_CAP = 65536 };
 
 struct queued {
 	int kind;
@@ -37,8 +41,8 @@ struct queued {
 	char *text;
 };
 
-static struct queued queue[QCAP];
-static int qn;
+static struct queued *queue;
+static int qn, qcap;
 static char *held_text;
 
 static char *dup_text(const char *text)
@@ -64,6 +68,17 @@ static void drop_at(int i)
 	qn--;
 }
 
+static int replaceable(int kind)
+{
+	return kind == NSH_EV_TITLE || kind == NSH_EV_STATUS || kind == NSH_EV_POINTER
+		|| kind == NSH_EV_FRAME || kind == NSH_EV_LOADING || kind == NSH_EV_CONSOLE;
+}
+
+int nsh_events_overflowed(void)
+{
+	return overflowed;
+}
+
 void nsh_emit(int kind, uint64_t view_id, int i0, int i1, int i2, int i3, uint64_t u0, const char *text)
 {
 	if (nsh_core_state == 2)
@@ -76,9 +91,9 @@ void nsh_emit(int kind, uint64_t view_id, int i0, int i1, int i2, int i3, uint64
 			}
 		}
 	}
-	int replace = kind == NSH_EV_TITLE || kind == NSH_EV_STATUS || kind == NSH_EV_POINTER
-		|| kind == NSH_EV_FRAME || kind == NSH_EV_LOADING;
-	if (replace) {
+	/* A newer replaceable event supersedes the older one of its kind: the older is dropped, the
+	 * newer takes its own place at the end. */
+	if (replaceable(kind)) {
 		for (int i = 0; i < qn;) {
 			int match = queue[i].kind == kind && queue[i].view == view_id
 				&& (kind != NSH_EV_LOADING || queue[i].i0 == i0);
@@ -88,8 +103,28 @@ void nsh_emit(int kind, uint64_t view_id, int i0, int i1, int i2, int i3, uint64
 				i++;
 		}
 	}
-	if (qn == QCAP)
-		drop_at(0);
+	if (qn >= SOFT_CAP) {
+		for (int i = 0; i < qn; i++) {
+			if (replaceable(queue[i].kind)) {
+				drop_at(i);
+				break;
+			}
+		}
+	}
+	if (qn >= HARD_CAP) {
+		overflowed = 1;
+		return;
+	}
+	if (qn == qcap) {
+		int ncap = qcap ? qcap * 2 : 64;
+		struct queued *grown = realloc(queue, (size_t)ncap * sizeof *queue);
+		if (!grown) {
+			overflowed = 1;
+			return;
+		}
+		queue = grown;
+		qcap = ncap;
+	}
 	struct queued *e = &queue[qn++];
 	e->kind = kind;
 	e->view = view_id;
@@ -117,6 +152,9 @@ void nsh_clear_events(void)
 		drop_at(0);
 	free(held_text);
 	held_text = NULL;
+	free(queue);
+	queue = NULL;
+	qcap = 0;
 }
 
 size_t nsh_next_event(nsh_event *out)
@@ -163,7 +201,10 @@ static void gui_quit(void)
 
 static nserror gui_launch(struct nsurl *url)
 {
-	nsh_emit(NSH_EV_LAUNCH, 0, 0, 0, 0, 0, 0, url ? nsurl_access(url) : NULL);
+	/* Attributed to the view the user's input was running for; a launch the core made on its
+	 * own (a meta refresh to steam://) is dropped. */
+	if (nsh_input_view && url)
+		nsh_emit(NSH_EV_LAUNCH, nsh_input_view, 0, 0, 0, 0, 0, nsurl_access(url));
 	return NSERROR_OK;
 }
 
@@ -243,7 +284,26 @@ int nsh_view_navigate(nsh_view *view, const char *url)
 	struct nsurl *u = NULL;
 	if (nsurl_create(url, &u) != NSERROR_OK)
 		return 0;
+	nsh_input_view = view->view_id;
 	nserror err = browser_window_navigate(view->bw, u, NULL, BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
+	nsh_input_view = 0;
+	nsurl_unref(u);
+	return err == NSERROR_OK;
+}
+
+int nsh_view_follow(nsh_view *view, const char *url)
+{
+	if (!live_view(view) || !url)
+		return 0;
+	struct nsurl *u = NULL;
+	if (nsurl_create(url, &u) != NSERROR_OK)
+		return 0;
+	/* The page's own navigation: the current document is the referrer (so a web page cannot
+	 * reach file:), and it goes into the history. */
+	struct nsurl *referrer = browser_window_access_url(view->bw);
+	nsh_input_view = view->view_id;
+	nserror err = browser_window_navigate(view->bw, u, referrer, BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
+	nsh_input_view = 0;
 	nsurl_unref(u);
 	return err == NSERROR_OK;
 }
@@ -292,10 +352,12 @@ void nsh_view_mouse(nsh_view *view, int x, int y, unsigned state, unsigned mods)
 	y += view->sy;
 	unsigned click = NSH_MOUSE_PRESS_1 | NSH_MOUSE_PRESS_2 | NSH_MOUSE_CLICK_1 | NSH_MOUSE_CLICK_2
 		| NSH_MOUSE_DOUBLE_CLICK | NSH_MOUSE_TRIPLE_CLICK | NSH_MOUSE_DRAG_1 | NSH_MOUSE_DRAG_2;
+	nsh_input_view = view->view_id;
 	if (m & click)
 		browser_window_mouse_click(view->bw, (browser_mouse_state)m, x, y);
 	else
 		browser_window_mouse_track(view->bw, (browser_mouse_state)m, x, y);
+	nsh_input_view = 0;
 }
 
 void nsh_view_scroll(nsh_view *view, int x, int y, int dx, int dy)
@@ -308,7 +370,19 @@ void nsh_view_scroll(nsh_view *view, int x, int y, int dx, int dy)
 		nsh_scroll_by(view, dx, dy);
 }
 
+static int key_inner(nsh_view *view, uint32_t key);
+
 int nsh_view_key(nsh_view *view, uint32_t key)
+{
+	if (!live_view(view))
+		return 0;
+	nsh_input_view = view->view_id;
+	int r = key_inner(view, key);
+	nsh_input_view = 0;
+	return r;
+}
+
+static int key_inner(nsh_view *view, uint32_t key)
 {
 	if (!live_view(view))
 		return 0;
@@ -535,5 +609,6 @@ void nsh_shutdown(void)
 	nsh_sched_clear();
 	nsh_clear_events();
 	nsh_clipboard_clear();
+	nsh_windows_free_tombstones();
 	nsh_core_state = 2;
 }
