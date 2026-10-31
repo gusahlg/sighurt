@@ -184,6 +184,92 @@ fn timers_and_events_reach_the_guest() {
     host.until(5 * SECS, ends("#resize"));
 }
 
+/// Draws nothing in `start_app`. Each `on_frame` clears to the typography background and a
+/// square that steps right, so a reused buffer has to repaint where the square was.
+const MOVING_SQUARE: &str = r#"
+(module
+  (import "oxide" "api_canvas_clear" (func $clear (param i32 i32 i32 i32)))
+  (import "oxide" "api_canvas_rect" (func $rect (param f32 f32 f32 f32 i32 i32 i32 i32)))
+  (global $n (mut i32) (i32.const 0))
+  (func (export "start_app"))
+  (func (export "on_frame") (param i32)
+    (call $clear (i32.const 24) (i32.const 24) (i32.const 32) (i32.const 255))
+    (global.set $n (i32.add (global.get $n) (i32.const 1)))
+    (call $rect
+      (f32.convert_i32_u (i32.mul (global.get $n) (i32.const 30)))
+      (f32.const 40)
+      (f32.const 10)
+      (f32.const 10)
+      (i32.const 255) (i32.const 0) (i32.const 0) (i32.const 255))))
+"#;
+
+/// The first `FrameReady` is the guest's first draw, presented with no extra wait, and a buffer
+/// reused three submits later still has the background where that first square was. Before the
+/// fix the first present was the empty load list: pixel (5, 590) was transparent, with no load
+/// on the machine and no sleep in the test.
+#[test]
+fn the_first_frame_is_the_guests_draw_and_a_reused_buffer_keeps_it() {
+    const BG: u32 = 0x181820;
+    let mut host = Host::new();
+    let url = guest(host.dir(), "moving", MOVING_SQUARE);
+    let (view, shown) = host.open(800, 600, 120);
+    host.navigate(view, &url);
+    let mut first_square = 0;
+    for frame in 1..=4 {
+        host.until(5 * SECS, is_frame_ready(view));
+        assert_eq!(host.present(view), PresentOutcome::Submitted);
+        assert_eq!(
+            shown.pixel(5, 590),
+            bgra(BG),
+            "frame {frame} background was never painted"
+        );
+        // Where the square is, not which guest frame this present caught: steps can coalesce.
+        let square = (0..800)
+            .find(|&x| shown.pixel(x, 45) == bgra(0xff0000))
+            .expect("the square");
+        if frame == 1 {
+            first_square = square;
+            assert_eq!(shown.age(), 0, "the first buffer is new");
+            assert!(shown.whole(), "a new buffer is damaged whole");
+        } else if frame == 4 {
+            // Slot 0 was released when frame 3 was submitted. It still shows frame 1, so the
+            // square that frame left there has to be painted back to the background.
+            assert_eq!(
+                shown.age(),
+                3,
+                "the buffer holds the frame from three submits ago"
+            );
+            assert_ne!(square, first_square, "the square did not move");
+            assert_eq!(
+                shown.pixel(first_square, 45),
+                bgra(BG),
+                "the square frame 1 left on this buffer"
+            );
+            assert!(!shown.whole(), "only the square's rects are damaged");
+        } else {
+            assert_eq!(shown.age(), 0, "frame {frame} is a new buffer");
+            assert!(shown.whole(), "frame {frame} damages the whole buffer");
+        }
+    }
+
+    // A resize drops the old buffers. The metrics event arrives before the guest has redrawn,
+    // so that present is not ready; the next draw is age 0 and covers the new buffer.
+    host.command(view, EngineCommand::SetMetrics(metrics(640, 480, 120)));
+    let mut submitted = false;
+    for _ in 0..5 {
+        host.until(5 * SECS, is_frame_ready(view));
+        if host.present(view) == PresentOutcome::Submitted {
+            submitted = true;
+            break;
+        }
+    }
+    assert!(submitted, "the resized frame was never painted");
+    assert_eq!(shown.pixels().0.width, 640);
+    assert_eq!(shown.age(), 0, "a resize is a new buffer");
+    assert!(shown.whole(), "a new buffer is damaged whole");
+    assert_eq!(shown.pixel(5, 470), bgra(BG), "resized background");
+}
+
 #[test]
 fn raf_demo_animates() {
     let mut host = Host::new();

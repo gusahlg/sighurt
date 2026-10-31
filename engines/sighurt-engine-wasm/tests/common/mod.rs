@@ -17,10 +17,18 @@ use sighurt_api::ids::{LayoutEpoch, NavigationId, SeatId, ViewId};
 use sighurt_api::input::{InputEvent, InputKind};
 use sighurt_engine_wasm::{CpuTarget, Frame, SandboxPolicy, WasmConfig, WasmRuntime};
 
-/// The last frame a target was given: its size and ARGB8888 pixels (B, G, R, A in memory), and
-/// how long painting it took.
+/// The last frame a target was given: its size and ARGB8888 pixels (B, G, R, A in memory),
+/// how long painting it took, and the buffer age and damage of that submit.
 #[derive(Clone, Default)]
-pub struct Shown(Arc<Mutex<Option<Painted>>>, Arc<Mutex<Duration>>);
+pub struct Shown {
+    frame: Arc<Mutex<Option<Painted>>>,
+    painting: Arc<Mutex<Duration>>,
+    /// How many submits ago the buffer's pixels were a submitted frame. 0 is a new, abandoned
+    /// or resized buffer.
+    age: Arc<Mutex<u32>>,
+    /// The submit damaged every pixel: age 0, an unknown age, or a diff that is the whole buffer.
+    whole: Arc<Mutex<bool>>,
+}
 
 type Painted = (BufferSize, Vec<u8>);
 
@@ -28,19 +36,29 @@ impl Shown {
     /// How long the runtime took to paint the last frame into the buffer it was lent: the
     /// owner thread's time, without what this in-memory target spends allocating buffers.
     pub fn painting(&self) -> Duration {
-        *self.1.lock().unwrap()
+        *self.painting.lock().unwrap()
+    }
+
+    /// The age the last submit's buffer reported. 0 means the painter had to cover every pixel.
+    pub fn age(&self) -> u32 {
+        *self.age.lock().unwrap()
+    }
+
+    /// Whether the last submit damaged the whole buffer.
+    pub fn whole(&self) -> bool {
+        *self.whole.lock().unwrap()
     }
 
     /// The `[b, g, r, a]` bytes of pixel (`x`, `y`) of the last frame.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
-        let shown = self.0.lock().unwrap();
+        let shown = self.frame.lock().unwrap();
         let (size, pixels) = shown.as_ref().expect("nothing was presented");
         let i = 4 * (y * size.width + x) as usize;
         pixels[i..i + 4].try_into().unwrap()
     }
 
     pub fn pixels(&self) -> Painted {
-        self.0
+        self.frame
             .lock()
             .unwrap()
             .clone()
@@ -70,15 +88,108 @@ impl Shown {
     }
 }
 
-/// A presentation target in memory, standing in for the Wayland host's SHM lease.
+/// One SHM slot. `content` is the swapchain epoch of the frame these pixels show, or `None`
+/// when they are not a submitted frame (new, or abandoned mid-paint).
+struct Slot {
+    pixels: Vec<u8>,
+    content: Option<u64>,
+    /// Attached until a later submit releases it, the way the compositor holds the latest two.
+    submitted: bool,
+}
+
+/// A presentation target in memory. It follows the host swapchain's age rules
+/// ([`sighurt_wayland`]'s `Swapchain`): at most three buffers, a new or abandoned one is age 0
+/// and zeros, a resize starts over, and a reused buffer's age is how many submits ago its
+/// pixels were submitted. The painter is told that age, so a partial repaint is checked against
+/// the pixels the buffer actually still holds. Two submitted buffers stay held; the older one
+/// is released when a third submit arrives, which is age 3 on the way back.
 pub struct TestTarget {
     metrics: Metrics,
     shown: Shown,
+    slots: Vec<Slot>,
+    size: BufferSize,
+    /// Submits at the current size.
+    epoch: u64,
+}
+
+/// How many submits ago `content` was. 0 when the pixels are not a submitted frame.
+fn age_of(epoch: u64, content: Option<u64>) -> u32 {
+    match content {
+        Some(content) => epoch
+            .saturating_sub(content)
+            .saturating_add(1)
+            .min(u32::MAX as u64) as u32,
+        None => 0,
+    }
+}
+
+/// Clears the thread-local paint if a paint panics, so the next test on this thread does not
+/// inherit an age.
+struct EndPaint {
+    done: bool,
+}
+
+impl EndPaint {
+    fn finish(&mut self) -> Option<Vec<sighurt_wayland::DamageRect>> {
+        self.done = true;
+        sighurt_wayland::end_paint()
+    }
+}
+
+impl Drop for EndPaint {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = sighurt_wayland::end_paint();
+        }
+    }
 }
 
 pub struct Permit {
     epoch: LayoutEpoch,
     size: BufferSize,
+}
+
+impl TestTarget {
+    /// A free slot of `size`, newly zeroed when it holds no submitted frame.
+    fn acquire(&mut self, size: BufferSize) -> usize {
+        let len = 4 * (size.width as usize) * (size.height as usize);
+        if let Some(index) = self.slots.iter().position(|slot| !slot.submitted) {
+            let slot = &mut self.slots[index];
+            if slot.pixels.len() != len {
+                slot.pixels.resize(len, 0);
+            }
+            if slot.content.is_none() {
+                slot.pixels.fill(0);
+            }
+            return index;
+        }
+        assert!(self.slots.len() < 3, "every buffer is still submitted");
+        self.slots.push(Slot {
+            pixels: vec![0; len],
+            content: None,
+            submitted: false,
+        });
+        self.slots.len() - 1
+    }
+
+    /// Keeps the two newest submitted buffers. The one released still shows the frame it was
+    /// given, and reports that age the next time it is drawn into.
+    fn release_oldest(&mut self) {
+        let held = self.slots.iter().filter(|slot| slot.submitted).count();
+        if held <= 2 {
+            return;
+        }
+        let oldest = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.submitted)
+            .min_by_key(|(_, slot)| slot.content.unwrap_or(0))
+            .map(|(index, _)| index);
+        if let Some(index) = oldest {
+            self.slots[index].submitted = false;
+        }
+    }
 }
 
 impl CpuTarget for TestTarget {
@@ -97,16 +208,54 @@ impl CpuTarget for TestTarget {
         permit: Permit,
         paint: &mut dyn FnMut(Frame<'_>) -> Result<(), String>,
     ) -> Result<(), String> {
-        let BufferSize { width, height } = permit.size;
-        let mut pixels = vec![0x55; 4 * (width * height) as usize];
+        let size = permit.size;
+        if self.size != size {
+            // A new size has no frames. Ages belong to this size only, as on a resize.
+            self.slots.clear();
+            self.epoch = 0;
+            self.size = size;
+        }
+        let index = self.acquire(size);
+        let age = age_of(self.epoch, self.slots[index].content);
+        sighurt_wayland::begin_paint(age);
+        let mut end = EndPaint { done: false };
         let started = Instant::now();
-        paint(Frame {
-            pixels: &mut pixels,
-            size: permit.size,
-            stride: 4 * width as usize,
-        })?;
-        *self.shown.1.lock().unwrap() = started.elapsed();
-        *self.shown.0.lock().unwrap() = Some((permit.size, pixels));
+        let painted = {
+            let slot = &mut self.slots[index];
+            paint(Frame {
+                pixels: &mut slot.pixels,
+                size,
+                stride: 4 * size.width as usize,
+            })
+        };
+        let damage = end.finish();
+        *self.shown.painting.lock().unwrap() = started.elapsed();
+        if let Err(error) = painted {
+            // Not a frame: the next lend is age 0 and zeros, whatever was half-painted.
+            let slot = &mut self.slots[index];
+            slot.content = None;
+            slot.submitted = false;
+            slot.pixels.fill(0);
+            return Err(error);
+        }
+        let epoch = self.epoch.saturating_add(1);
+        self.slots[index].content = Some(epoch);
+        self.slots[index].submitted = true;
+        self.epoch = epoch;
+        self.release_oldest();
+        // No report, or an empty one, damages the whole buffer. Age 0 must take that path.
+        let whole = match &damage {
+            None => true,
+            Some(rects) => rects.is_empty(),
+        };
+        assert!(
+            age != 0 || whole,
+            "age 0 damages the whole buffer, got {damage:?}"
+        );
+        let pixels = self.slots[index].pixels.clone();
+        *self.shown.frame.lock().unwrap() = Some((size, pixels));
+        *self.shown.age.lock().unwrap() = age;
+        *self.shown.whole.lock().unwrap() = whole;
         Ok(())
     }
 }
@@ -190,6 +339,9 @@ impl Host {
         let target = TestTarget {
             metrics,
             shown: shown.clone(),
+            slots: Vec::new(),
+            size: BufferSize::default(),
+            epoch: 0,
         };
         self.runtime
             .open_view(view, ViewOptions::default(), target)

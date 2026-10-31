@@ -23,9 +23,9 @@ fn paint(name: &str, width: u32, height: u32, scale: u32) -> (Shown, Duration) {
     let mut host = Host::new();
     let (view, shown) = host.open(width, height, scale);
     host.navigate(view, &example(name));
+    // The first FrameReady is the guest's first draw. Waiting a fixed time after an earlier
+    // signal presents the empty load frame whenever that draw is late.
     host.until(Duration::from_secs(20), is_frame_ready(view));
-    // A few frames, so the guest has settled on its layout for this size.
-    host.run_for(Duration::from_millis(100));
     let started = Instant::now();
     assert_eq!(host.present(view), PresentOutcome::Submitted);
     (shown, started.elapsed())
