@@ -149,9 +149,13 @@ Rust 1.98.1 for its Rust crates (`libweb_rust`, `libgfx_rust`, ...). Store outpu
   installed**: `ProcessMonitor`'s handler reaps with `waitpid(-1)`, which would take the exit status
   of children that are not Ladybird's (WPE's bubblewrap, a program the host started). The loop keeps
   the handler and never calls it; the shim watches each helper through a pidfd instead (the
-  `ProcessManager`'s `on_process_added`, plus the helpers already started), reaps it by its own pid and
-  does what the monitor would have done (`remove_process`, `save_crash_report`, `on_process_exited`,
-  so a dead RequestServer is still restarted); shutdown reaps the rest by pid. The crate's
+  `ProcessManager`'s `on_process_added`, plus the helpers already started), reaps it with
+  `waitid(P_PIDFD)` (a pid number that was reused can never be another process's; `ECHILD`, someone
+  else having reaped it, counts as exited) and does what the monitor would have done (`remove_process`,
+  `on_process_exited`, so a dead RequestServer is still restarted; crash reports are off: they would
+  go to the user's own Ladybird directory). The entry leaves the table before anything else happens.
+  Shutdown signals every helper (`pidfd_send_signal`), reaps them against one 2 s deadline, then
+  kills what is left. The crate's
   wait thread polls `lb_loop_fd()` and wakes the owner through the `EngineWaker`; it sleeps until
   the owner has pumped, so a readable descriptor cannot make it spin. The idle test: 6 pumps and
   2 loop wakes in 6 s with a static page (Ladybird's own housekeeping timers, no spin).
@@ -417,30 +421,45 @@ descriptor (`web: true`, `honors: ["storage"]`, shutdown after WPE), `registry::
 
 ### What Ladybird does, as found (differs from the first design)
 
-- **Navigation is announced backwards.** The loading state turning on is the start of a navigation;
-  `on_url_change` is the commit and comes *before* `on_load_start` (which therefore means nothing
-  here); `on_loading_state_change(false)` then `on_load_finish` end it. A page's own hash change
-  commits with no loading at all. So the crate takes `LoadingChanged(true)` as `NavigationStarted`
-  (the browser's pending id, else its own), a commit with a navigation active as a new document, and
-  a commit with none as a same-document change.
+- **Navigation is announced in an odd order, and the address is optimistic.** The loading state
+  turning on is the start of a navigation. `on_url_change` is `ViewImplementation::set_url`: the
+  browser's `load()` calls it at once (before anything is fetched, and also when the load is then
+  refused or fails), and the page's own fragment and `pushState` changes call it too. What marks a new
+  document is `on_load_start` and `on_top_level_navigation_commit` (the shim's `LB_EV_COMMIT`), which
+  come *after* the address change and only for cross-document commits; `on_loading_state_change(false)`
+  and `on_load_finish` end the load. So the crate holds an address change until it knows what it is:
+  followed by a load start or a commit it is a new document (it takes the navigation in flight, bumps
+  the `DocumentGeneration` and denies what was held); with nothing loading, or as HTML's "navigate to a
+  fragment", it is the page's own change after a 50 ms settle (credited to the browser's request only if
+  that request was for this very address, never to one it merely overlaps); while a navigation to
+  another document is in flight it says nothing, and if loading then ends without a commit, it is
+  dropped and the navigation fails (`NavigationFailed`), so a refused or failed load is never reported as
+  committed.
 - **A fragment navigation made by `load()` reports loading and never reports it over**, and the next
   real navigation then reports no start. The shim ends the state itself (`set_loading_state(false)`)
-  when a commit differs from the previous URL only by a fragment (HTML's "navigate to a fragment");
-  the crate uses the same rule to keep the document.
+  when a commit differs from the previous URL only by a fragment.
 - **A navigation started before the view's own about:blank has loaded is dropped.** The shim holds the
-  first `lb_navigate` until then and reports `ViewReady` at that moment.
-- **History** comes from `session_history()` of the view (entries and current index) after each
-  commit and load end; commits carry `history: None` (the core then treats a new document as a new
-  navigation). `HistoryChanged` is only sent when it changed.
+  first `lb_navigate` until then and reports `ViewReady` at that moment. A view that takes over a
+  *spare* WebContent process (Ladybird keeps one ready) is never told of that blank page's load, since
+  it happened before the view existed: such a view is ready as soon as it has its initial history entry.
+  (Without that, the second Ladybird view of a session stayed on `sig://home` for good: found by the
+  all-engine coexistence test, covered by `tests/views.rs` with a 4 s wait before the second view.) A
+  hidden page gets no rendering opportunities, so views start visible and are hidden once ready.
+- **History** comes from `session_history()` of the view (entries and current index), computed once per
+  pump for the views that changed, after each commit and load end; commits carry `history: None` (the
+  core then treats a new document as a new navigation). `HistoryChanged` is only sent when it changed.
 - **Frames:** the Compositor fell back to memfd bitmaps here ("no supported DRM format modifiers"), and
   the crate copies the valid area (`last_painted_size`, not the 1056x856 allocation) into the host's
   target, one copy per frame (`present_ms` about 1 ms at 1280x696). Zero-copy `wl_shm`/dmabuf import is
   not done; it is the next step (L6).
 - **A link that opens a window** (`target=_blank`, `window.open`) makes Ladybird ask for a new view
-  with an opener. The shim gives it an internal view the host never sees, and once that has a URL it
-  reports `OpenRequested { NewView }` and closes it: the core opens the URL as it does for any engine.
-  Untested beyond compiling; `window.open` scripts that use the returned window object get a window
-  that is closed once its URL is known.
+  with an opener. The shim gives it a view the host never sees, and its first navigation is *not
+  performed*: the patched hook denies it, the opener's browser gets `OpenRequested { NewView }` for the
+  address, and the popup closes (the core opens the URL as it does for any engine: no double fetch, no
+  POST replayed as a GET). A popup that never asks for an address (`window.open()` written into by a
+  script) is closed after 10 s. A popup's downloads and service requests are charged to its opener.
+  Evidence: `tests/robust.rs`. A script that uses the returned window object gets a window that is
+  closed.
 
 ### The terminal frontend
 
@@ -504,9 +523,9 @@ with no tab opened.
    `sig --dump` in the terminal; the TUI frontend binds the engine and shows its frames as graphics,
    untested), site data.
 5. **Cursor shapes** map only the common `Gfx::StandardCursor`s; image cursors report the arrow.
-6. **Coexistence with Servo, WPE and Wasmtime in one process (M5)** is untested: `sig` was built with
-   Ladybird and the demo engine only. `ProcessMonitor`'s `waitpid(-1)` and Ladybird's `sigaction`
-   for `SIGCHLD` are the known conflicts with WPE's GLib.
+6. **Coexistence with Servo, WPE, CEF and Wasmtime in one process** is tested by
+   `apps/sighurt-browser/tests/coexist.sh` (on `config-ext`). Ladybird installs no `SIGCHLD` handler and
+   reaps only its own helpers (see L4), so it no longer disturbs the others' children.
 7. **Environment:** the helpers print "Fontconfig error: Cannot load default config file" unless
    `FONTCONFIG_FILE` is set (the nix store config path is not populated); text still renders. The
    engine does not set it (no environment writes after startup, decision 102); the scripts set it to
@@ -550,7 +569,7 @@ that is not a popup proxy and is not a fragment navigation of the document shown
 (`LB_EV_NAVIGATION_REQUESTED`, answered by `lb_navigation_answer`); the crate turns it into
 `NavigationRequested { document, request, url }` and `AnswerNavigation` into the answer. A held
 navigation is denied when its view's document is replaced (a new-document commit), when the view
-closes, and at shutdown; at most 16 are held per view, the 17th is denied at once; an answer for a
+closes, and at shutdown; at most 16 are held per view, and the 17th goes ahead without asking (the API's rule); an answer for a
 request no longer held does nothing. The browser's own loads (`BrowserUI` involvement) and the page's
 scripts without a gesture are never asked about. Evidence: `tests/navigation.rs` (a click is held and
 nothing is performed; denied, it never is, and a second answer does nothing; allowed, it commits; a
@@ -560,6 +579,64 @@ requests held), `tests/headless.rs` and `tests/services.rs` (their clicks now go
 request), and `sig` in a private sway (`MODE=links tests/sig-shot.sh`): a click on a link in a Ladybird
 page to `demo://pattern`, an address `[routing.demo]` claims, opens the demo engine's page (the tab is
 labelled `demo`), because the core answered the request with the other engine.
+
+### Review of 31 October 2026, second round (an independent read of the code), finding by finding
+
+1. *A page frozen after a resize (verified):* `frame_reported` was cleared only on `Submitted`, so a
+   `NotReady`/`Unchanged` present left it set and later frames raised no `FrameReady`. Now every frame
+   Ladybird presents is a `FrameReady`, coalesced per pump (the field is gone). `tests/robust.rs`: a
+   resize is followed by a `FrameReady`.
+2. *Replaceable events, queue bounds (verified):* the shim's queue replaces an undelivered event of the
+   same kind and view (title, loading, cursor, hover, frame, history, input method); history is built once
+   per pump for the views that changed, not per callback; the crate coalesces per pump and delivers a
+   view's title, status, cursor, history and text input at most once every 50 ms (the latest one waits).
+   `tests/robust.rs`: a loop of 200000 title changes arrives at no more than one event per 40 ms.
+3. *Abort at exit with a download staged (verified by reading):* `lb_shutdown` now stops and drops the
+   download timer, deletes the staging directory (the downloader keeps partial files beside the
+   destinations), clears every table (tokens, pickers, held navigations), and the event-loop manager is
+   never destroyed (it is leaked on purpose: timers unregister at process exit). Test: shutdown in the
+   middle of a download leaves nothing staged and does not abort.
+4. *Downloads fill the disk (verified):* the limit (64 MiB) is checked every 250 ms while the download
+   runs and over `total_size`, and the download is cancelled and its file removed; a finished one is
+   handed over with one copy fewer (the bytes are moved, not copied, into the event). Test: a 200 MiB
+   download is stopped and nothing is handed over.
+5. *Popups (verified):* see "A link that opens a window" above. An `about:blank` popup is closed after
+   10 s; a popup's service requests and downloads are the opener's.
+6. *New-document test was a guess (verified, and worse: the address change is optimistic):* see "What
+   Ladybird does". It uses Ladybird's own load-start and commit signals, and no longer reports a refused
+   navigation as committed.
+7. *The 17th held navigation (verified against `events.rs`):* it now goes ahead without asking.
+8. *Reaping (verified):* done as the finding says: the entry leaves the table synchronously, `waitid(P_PIDFD)`
+   and `pidfd_send_signal`, `ECHILD` is exited (the pidfd is released, no spin), shutdown signals all
+   then reaps against one deadline. Test: a helper reaped by the test process itself is reported as
+   crashed and the loop stays quiet.
+9. *Token events for unknown views (verified):* each is answered with a refusal.
+10. *Temporary profile (verified):* `mkdtemp` (mode 0700, random name, fails if it exists).
+11. *Partial `lb_init` failure (verified):* the half-started Application and its helpers are torn down
+    before the error returns (a second `lb_init` in the process is refused: Ladybird's event-loop manager
+    can be installed once). Not covered by a test (a failure there is hard to cause).
+12. *Same-document change taking the browser's pending id (verified):* same-document changes get their own
+    id unless they are that navigation (see "What Ladybird does").
+13. *Crash reports and `about:` pages (verified; reachable):* crash reports are off (nothing is written
+    outside the profile). `about:settings` has a `showCrashReports` action that spawns `xdg-open`, and
+    Ladybird loads `about:` pages from `load()` (the URL scheme list names `about`). Every top-level
+    navigation to an `about:` page other than `about:blank`/`about:srcdoc`, or to `resource:`, is now denied
+    in the patched hook, whoever asks. Test: `Navigate about:settings` is never committed.
+14. *Password fields (verified; Ladybird does not say what a field is):* every field is reported with
+    `TextPurpose::Password`, so the input method gets the sensitive and hidden hints (fail closed): a
+    price paid in completion quality. The text around the caret is not sent either.
+15. *Iframe lookup in the patch (verified by reading `view_for_page_id` / `owning_view_for_page_id`):*
+    the hook now uses `owning_view_for_page_id`, which also finds the view of an embedded page. That is
+    a change of the patch: **it needs the package rebuilt on louise-pc, which was not possible** (its heavy
+    lock has been held for hours by another job); the rebuild is queued
+    (`nix/build-ladybird-patched.sh`). Until it is built and pulled, the deployed package has the earlier
+    patch, and a `target=_top` click inside a cross-process iframe is not asked about.
+16. *`SA_SIGINFO` chaining:* the handler is installed with `SA_SIGINFO`, chains a previous
+    `sa_sigaction` or `sa_handler`, and puts the old action back only if its own is still installed.
+
+And the second Ladybird view of a session never loading (found by `coexist.sh`): see "A navigation started
+before the view's own about:blank has loaded". After the last Ladybird tab closes, one WebContent stays
+alive until quit: it is Ladybird's spare process (it keeps one ready for the next view), by design.
 
 ### Run it
 

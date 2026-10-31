@@ -168,7 +168,7 @@ std::atomic<unsigned> g_pending[NSIG];
 std::atomic<int> g_signal_wake_fd { -1 };
 int g_next_signal_id = 0;
 
-void on_signal(int number)
+void on_signal(int number, siginfo_t* info, void* context)
 {
     auto saved = errno;
     g_pending[number].fetch_add(1);
@@ -177,13 +177,13 @@ void on_signal(int number)
         uint64_t one = 1;
         (void)!write(fd, &one, sizeof(one));
     }
+    // The handler that was there before (the host's, a signal-hook one) keeps running.
     auto& previous = g_signals[number].previous;
-    if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler) {
-        if (previous.sa_flags & SA_SIGINFO) {
-            // Not chained: nothing here installs a SA_SIGINFO handler before Ladybird.
-        } else {
-            previous.sa_handler(number);
-        }
+    if (previous.sa_flags & SA_SIGINFO) {
+        if (previous.sa_sigaction)
+            previous.sa_sigaction(number, info, context);
+    } else if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler) {
+        previous.sa_handler(number);
     }
     errno = saved;
 }
@@ -424,9 +424,9 @@ public:
         auto& state = g_signals[number];
         if (!state.installed) {
             struct sigaction action {};
-            action.sa_handler = on_signal;
+            action.sa_sigaction = on_signal;
             sigemptyset(&action.sa_mask);
-            action.sa_flags = SA_RESTART;
+            action.sa_flags = SA_RESTART | SA_SIGINFO;
             sigaction(number, &action, &state.previous);
             state.installed = true;
         }
@@ -444,7 +444,12 @@ public:
                     continue;
                 state.handlers.erase(state.handlers.begin() + i);
                 if (state.handlers.empty() && state.installed) {
-                    sigaction(number, &state.previous, nullptr);
+                    // Put the old handler back only if ours is still the one installed: another
+                    // component may have taken the signal since.
+                    struct sigaction current {};
+                    sigaction(number, nullptr, &current);
+                    if ((current.sa_flags & SA_SIGINFO) && current.sa_sigaction == on_signal)
+                        sigaction(number, &state.previous, nullptr);
                     state.installed = false;
                 }
                 return;
@@ -457,7 +462,8 @@ public:
 
 void loop_install()
 {
-    static Manager manager;
+    // Never destroyed: timers and notifiers unregister at process exit, after statics are gone.
+    static Manager& manager = *new Manager;
     Core::EventLoopManager::install(manager); // VERIFYs that none is installed yet.
     g_owner = &this_thread();
 }

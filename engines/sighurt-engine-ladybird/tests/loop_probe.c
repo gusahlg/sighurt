@@ -27,6 +27,7 @@ typedef void (*lb_navigate_t)(uint64_t, const char*);
 typedef int (*lb_frame_get_t)(uint64_t, lb_frame*);
 typedef void (*lb_shutdown_t)(void);
 typedef void (*lb_run_js_t)(uint64_t, const char*, int64_t);
+typedef void (*lb_set_visible_t)(uint64_t, int);
 typedef void (*lb_abi_describe_t)(lb_abi*);
 
 int main(int argc, char** argv)
@@ -35,7 +36,7 @@ int main(int argc, char** argv)
     void* lib = dlopen(path ? path : "libsighurt-ladybird-shim.so", RTLD_NOW | RTLD_LOCAL);
     if (!lib) { fprintf(stderr, "FAIL dlopen: %s\n", dlerror()); return 1; }
     SYM(lb_init) SYM(lb_loop_fd) SYM(lb_pump) SYM(lb_next_event) SYM(lb_wake_count) SYM(lb_view_open)
-    SYM(lb_navigate) SYM(lb_run_js) SYM(lb_frame_get) SYM(lb_shutdown) SYM(lb_abi_describe)
+    SYM(lb_navigate) SYM(lb_run_js) SYM(lb_set_visible) SYM(lb_frame_get) SYM(lb_shutdown) SYM(lb_abi_describe)
     lb_abi abi; lb_abi_describe(&abi);
     printf("abi version=%u probe=%u dmabuf=%u\n", abi.version, abi.probe_shared_image_buffer, abi.vulkan_dmabuf);
     if (!abi.probe_shared_image_buffer) { fprintf(stderr, "FAIL ABI probe\n"); return 1; }
@@ -68,6 +69,25 @@ int main(int argc, char** argv)
     lb_frame f;
     int have = lb_frame_get(view, &f);
     printf("loops=%d title=%d commit=%d finish=%d frame=%d buffer=%d %dx%d\n", loops, title, commit, finish, frame, have, have ? f.width : 0, have ? f.height : 0);
+    if (getenv("HIDE1")) lb_set_visible(view, 0);
+    if (getenv("DELAY")) {
+        double t0 = now();
+        while (now() - t0 < atof(getenv("DELAY"))) {
+            int more = 0; lb_pump(&more); lb_event e;
+            while (lb_next_event(&e)) {}
+            struct pollfd p = { fd, POLLIN, 0 }; poll(&p, 1, 100);
+        }
+    }
+    if (getenv("VIEW2")) {
+        uint64_t v2 = lb_view_open(800, 600, 1.0, 1, 1.0);
+        lb_navigate(v2, getenv("VIEW2"));
+        double t0 = now();
+        while (now() - t0 < 12) {
+            int more = 0; lb_pump(&more); lb_event e;
+            while (lb_next_event(&e)) printf("  v2-ev %d view=%llu s0=%s\n", e.kind, (unsigned long long)e.view, e.s0 ? e.s0 : "(null)");
+            struct pollfd p = { fd, POLLIN, 0 }; poll(&p, 1, 100);
+        }
+    }
     if (getenv("NAV2")) {
         lb_navigate(view, getenv("NAV2"));
         double t0 = now();

@@ -76,13 +76,14 @@ struct View<T: CpuTarget> {
     visible: bool,
     document: DocumentGeneration,
     /// The browser's navigation that Ladybird has not started yet.
-    pending: Option<NavigationId>,
+    pending: Option<(NavigationId, Pend)>,
+    /// An address change Ladybird reported whose kind is not known yet: a new document says so with
+    /// its load start or commit right after; a page's own change (a fragment, pushState) says nothing.
+    deferred: Option<(String, Instant)>,
     /// A navigation Ladybird started that has not committed.
     active: Option<NavigationId>,
     /// Whether the browser stopped the active navigation.
     stopped: bool,
-    /// A frame is ready and `FrameReady` was reported for it.
-    frame_reported: bool,
     /// A frame arrived since the last submission.
     frame_dirty: bool,
     last_click: Option<(Instant, i32, i32, PointerButton, i32)>,
@@ -93,6 +94,17 @@ struct View<T: CpuTarget> {
     /// A page's copy, representation by representation, until the last one has come.
     clipboard: Vec<ClipboardData>,
 }
+
+/// What the browser asked of a view that has not started yet.
+enum Pend {
+    Url(String),
+    Reload,
+    Traverse,
+}
+
+/// How long a changed address waits to learn whether it is a new document (the next callbacks come
+/// in the same burst of messages, so this is generous).
+const COMMIT_SETTLE: Duration = Duration::from_millis(50);
 
 /// What the shim is waiting to be told about a service request.
 enum Pending {
@@ -121,10 +133,35 @@ pub struct LadybirdRuntime<T: CpuTarget> {
     services: HashMap<RequestId, (ViewId, Pending)>,
     /// Navigations Ladybird holds for the browser: its request id, the view, the shim's token.
     held: HashMap<RequestId, (ViewId, i64)>,
+    /// When each throttled kind of event last went to the browser, and the latest one it is waiting
+    /// to send.
+    last_sent: HashMap<(u8, ViewId), Instant>,
+    waiting: HashMap<(u8, ViewId), EngineEvent>,
     profile: Option<PathBuf>,
     temporary_profile: bool,
     shut_down: bool,
     _not_send: std::marker::PhantomData<*const ()>,
+}
+
+/// A new directory under `base` that only this user can enter, with a name nobody can guess
+/// (`mkdtemp`: it fails rather than use one that exists).
+fn private_temporary_directory(base: &std::path::Path) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let template = base.join("sighurt-ladybird-XXXXXX");
+    let mut bytes = CString::new(template.as_os_str().as_bytes())
+        .map_err(|_| "the temporary directory's path has a NUL".to_string())?
+        .into_bytes_with_nul();
+    // SAFETY: a NUL-terminated, writable template, as mkdtemp wants.
+    let made = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+    if made.is_null() {
+        return Err(format!(
+            "cannot make a private directory in {}: {}",
+            base.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    bytes.pop();
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
 
 fn c_string(text: &str) -> CString {
@@ -140,6 +177,47 @@ fn from_c(pointer: *const c_char) -> Option<String> {
 }
 
 impl<T: CpuTarget> LadybirdRuntime<T> {
+    /// Passes the batch through the throttle: a throttled event sent less than [`THROTTLE`] after the
+    /// last of its kind waits (the latest one) and goes out when the time is up. Returns what to send
+    /// now, and when the next waiting one is due.
+    fn throttle(
+        &mut self,
+        batch: Vec<EngineEvent>,
+        now: Instant,
+    ) -> (Vec<EngineEvent>, Option<Instant>) {
+        let mut out = Vec::new();
+        for event in batch {
+            let Some(key) = throttled(&event) else {
+                out.push(event);
+                continue;
+            };
+            let due = self
+                .last_sent
+                .get(&key)
+                .is_none_or(|at| now.duration_since(*at) >= THROTTLE);
+            if due && !self.waiting.contains_key(&key) {
+                self.last_sent.insert(key, now);
+                out.push(event);
+            } else {
+                self.waiting.insert(key, event);
+            }
+        }
+        let mut next: Option<Instant> = None;
+        let keys: Vec<_> = self.waiting.keys().copied().collect();
+        for key in keys {
+            let at = self.last_sent.get(&key).copied().unwrap_or(now) + THROTTLE;
+            if now >= at {
+                if let Some(event) = self.waiting.remove(&key) {
+                    self.last_sent.insert(key, now);
+                    out.push(event);
+                }
+            } else {
+                next = Some(next.map_or(at, |n| n.min(at)));
+            }
+        }
+        (out, next)
+    }
+
     /// Loads the shim, starts Ladybird's UI process half on this thread, and the wait thread that
     /// wakes the owner loop through `waker`.
     pub fn new(config: LadybirdConfig, waker: EngineWaker) -> Result<Self, String> {
@@ -158,10 +236,7 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                 let base = std::env::var_os("XDG_RUNTIME_DIR")
                     .map(PathBuf::from)
                     .unwrap_or_else(std::env::temp_dir);
-                let path = base.join(format!("sighurt-ladybird-{}", std::process::id()));
-                std::fs::create_dir_all(&path)
-                    .map_err(|e| format!("cannot make {}: {e}", path.display()))?;
-                (path, true)
+                (private_temporary_directory(&base)?, true)
             }
         };
         let arguments: Vec<CString> = config.arguments.iter().map(|a| c_string(a)).collect();
@@ -200,6 +275,8 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
             queue: Vec::new(),
             services: HashMap::new(),
             held: HashMap::new(),
+            last_sent: HashMap::new(),
+            waiting: HashMap::new(),
             profile: Some(profile),
             temporary_profile,
             shut_down: false,
@@ -222,10 +299,18 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
     }
 
     fn translate(&mut self, event: &ffi::Event) {
-        let Some(&id) = self.by_lb.get(&event.view) else {
-            return;
-        };
-        let Some(view) = self.views.get_mut(&id) else {
+        let known = self.by_lb.get(&event.view).copied();
+        let Some((id, view)) = known.and_then(|id| self.views.get_mut(&id).map(|view| (id, view)))
+        else {
+            // A view that is gone (or a popup the browser never sees) asked for something that waits
+            // for an answer: refused, so nothing is left holding a token.
+            match event.kind {
+                ffi::EV_NAVIGATION_REQUESTED => unsafe { ffi::lb_navigation_answer(event.i1, 0) },
+                ffi::EV_OPEN_EXTERNAL => unsafe { ffi::lb_open_external_reply(event.i1, 0) },
+                ffi::EV_PICK_FILES => unsafe { ffi::lb_pick_reply(event.i1, std::ptr::null()) },
+                ffi::EV_CLIPBOARD_WANT => unsafe { ffi::lb_clipboard_deny(event.view) },
+                _ => {}
+            }
             return;
         };
         let s0 = from_c(event.s0);
@@ -238,12 +323,31 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
             }
             // Ladybird reports a load's start after the document committed: the start of a
             // navigation is the loading state turning on.
-            ffi::EV_LOAD_START | ffi::EV_LOAD_FINISH => {}
+            // A document's load starts, and Ladybird's top-level commit: the address change that
+            // came just before was a new document.
+            ffi::EV_LOAD_START | ffi::EV_COMMIT => {
+                settle_commit(
+                    id,
+                    view,
+                    &mut self.queue,
+                    &mut self.held,
+                    Settle::NewDocument,
+                );
+            }
+            ffi::EV_LOAD_FINISH => {
+                settle_commit(id, view, &mut self.queue, &mut self.held, Settle::Ended)
+            }
             ffi::EV_LOADING => {
                 let loading = event.i0 != 0;
+                // Whatever address change came before is settled first (a fragment navigation never
+                // gets a load start).
+                settle_commit(id, view, &mut self.queue, &mut self.held, Settle::Ended);
                 if loading {
                     if view.active.is_none() {
-                        let navigation = view.pending.take().unwrap_or_else(NavigationId::next);
+                        let navigation = view
+                            .pending
+                            .take()
+                            .map_or_else(NavigationId::next, |(navigation, _)| navigation);
                         view.active = Some(navigation);
                         view.stopped = false;
                         // The URL is not known until it commits; the browser has it for its own.
@@ -270,34 +374,8 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                     .push(EngineEvent::LoadingChanged { view: id, loading });
             }
             ffi::EV_URL_CHANGED => {
-                let url = s0.unwrap_or_default();
-                // A commit while a navigation is active is a new document; one with nothing
-                // loading is the page changing its own address (a fragment, pushState).
-                // The exception is a navigation to a fragment of the document shown (HTML's
-                // "navigate to a fragment"): Ladybird reports it as loading, but it replaces
-                // nothing (the shim ends the loading state it leaves on).
-                let (navigation, new_document) = match view.active.take() {
-                    Some(navigation) if is_fragment_navigation(&view.url, &url) => {
-                        (navigation, false)
-                    }
-                    Some(navigation) => (navigation, true),
-                    None => (
-                        view.pending.take().unwrap_or_else(NavigationId::next),
-                        false,
-                    ),
-                };
-                if new_document {
-                    view.document = DocumentGeneration::next();
-                    deny_held(&mut self.held, id);
-                }
-                view.url.clone_from(&url);
-                self.queue.push(EngineEvent::NavigationCommitted {
-                    view: id,
-                    navigation,
-                    url,
-                    document: view.document,
-                    history: None,
-                });
+                settle_commit(id, view, &mut self.queue, &mut self.held, Settle::Ended);
+                view.deferred = Some((s0.unwrap_or_default(), Instant::now()));
             }
             ffi::EV_TITLE => self.queue.push(EngineEvent::TitleChanged {
                 view: id,
@@ -322,10 +400,7 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
             }
             ffi::EV_FRAME => {
                 view.frame_dirty = true;
-                if !view.frame_reported {
-                    view.frame_reported = true;
-                    self.queue.push(EngineEvent::FrameReady { view: id });
-                }
+                self.queue.push(EngineEvent::FrameReady { view: id });
             }
             ffi::EV_CRASHED => self.queue.push(EngineEvent::ViewFailed {
                 view: id,
@@ -368,7 +443,9 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                             height: (f64::from(caret[3]) / ratio).ceil() as u32,
                         },
                         surrounding: None,
-                        purpose: TextPurpose::Normal,
+                        // Ladybird does not say whether a field is a password, so every field is
+                        // treated as one: the input method gets the sensitive and hidden hints.
+                        purpose: TextPurpose::Password,
                         multiline: false,
                     }
                 });
@@ -453,8 +530,9 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
             ffi::EV_NAVIGATION_REQUESTED => {
                 let held = self.held.values().filter(|(v, _)| *v == id).count();
                 if held >= MAX_HELD {
-                    // Too many at once: this one is denied without asking.
-                    unsafe { ffi::lb_navigation_answer(event.i1, 0) };
+                    // Too many held at once: the contract lets the page's navigations beyond the
+                    // limit go ahead without asking.
+                    unsafe { ffi::lb_navigation_answer(event.i1, 1) };
                 } else if let Some(url) = s0 {
                     let request = RequestId::next();
                     self.held.insert(request, (id, event.i1));
@@ -669,6 +747,115 @@ fn parse_caret(text: &str) -> [i32; 4] {
     out
 }
 
+/// What settles an address change that is waiting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// A load start or Ladybird's commit: a new document.
+    NewDocument,
+    /// Time passed with nothing following.
+    Timeout,
+    /// Something else happened (loading ended, another change): no new document is coming for it.
+    Ended,
+}
+
+/// Settles the address change `view` reported last: as a new document (its load start or commit
+/// came) or as the page's own change. A new document takes the navigation in flight, supersedes
+/// what was held, and gets a new generation; a page's own change keeps the document, and is only
+/// credited to a navigation of the browser's when it is that navigation (HTML's fragment navigation, or the
+/// browser's own address), never to one it merely overlaps.
+fn settle_commit<T: CpuTarget>(
+    id: ViewId,
+    view: &mut View<T>,
+    queue: &mut Vec<EngineEvent>,
+    held: &mut HashMap<RequestId, (ViewId, i64)>,
+    how: Settle,
+) {
+    let Some((url, _)) = view.deferred.as_ref() else {
+        return;
+    };
+    // Ladybird shows the address of a navigation the browser asked for as soon as it asked (before
+    // anything is loaded, and also when the load is then refused or fails), so an address change
+    // while a navigation to another document is in flight says nothing until that document
+    // commits. It is the page's own change only when nothing is loading, or when it is a navigation
+    // to a fragment of the document shown.
+    let own_change = view.active.is_none() || is_fragment_navigation(&view.url, url);
+    match how {
+        Settle::Timeout if !own_change => return,
+        Settle::Ended if !own_change => {
+            view.deferred = None;
+            return;
+        }
+        _ => {}
+    }
+    let (url, _) = view.deferred.take().expect("checked");
+    let new_document = how == Settle::NewDocument;
+    let navigation = if new_document {
+        view.document = DocumentGeneration::next();
+        deny_held(held, id);
+        view.active
+            .take()
+            .or_else(|| view.pending.take().map(|(navigation, _)| navigation))
+            .unwrap_or_else(NavigationId::next)
+    } else if view.active.is_some() && is_fragment_navigation(&view.url, &url) {
+        view.active.take().expect("checked")
+    } else if view.pending.as_ref().is_some_and(|(_, pend)| match pend {
+        Pend::Url(asked) => {
+            *asked == url
+                || (is_fragment_navigation(&view.url, &url)
+                    && is_fragment_navigation(&view.url, asked))
+        }
+        Pend::Traverse => true,
+        Pend::Reload => false,
+    }) {
+        view.pending.take().expect("checked").0
+    } else {
+        NavigationId::next()
+    };
+    view.url.clone_from(&url);
+    queue.push(EngineEvent::NavigationCommitted {
+        view: id,
+        navigation,
+        url,
+        document: view.document,
+        history: None,
+    });
+}
+
+/// The replaceable events of the contract: only the latest of each kind per view matters.
+fn replaceable(event: &EngineEvent) -> Option<(u8, ViewId)> {
+    Some(match event {
+        EngineEvent::TitleChanged { view, .. } => (0, *view),
+        EngineEvent::StatusTextChanged { view, .. } => (1, *view),
+        EngineEvent::CursorChanged { view, .. } => (2, *view),
+        EngineEvent::LoadingChanged { view, .. } => (3, *view),
+        EngineEvent::HistoryChanged { view, .. } => (4, *view),
+        EngineEvent::TextInputChanged { view, .. } => (5, *view),
+        EngineEvent::FrameReady { view } => (6, *view),
+        _ => return None,
+    })
+}
+
+/// The most often a view's title, status, cursor, history or text input reaches the browser: a page
+/// changing one in a loop costs it a bounded number of events a second.
+const THROTTLE: Duration = Duration::from_millis(50);
+
+/// Whether `event` is throttled, and its key.
+fn throttled(event: &EngineEvent) -> Option<(u8, ViewId)> {
+    replaceable(event).filter(|(kind, _)| !matches!(kind, 3 | 6))
+}
+
+/// Keeps the last of each replaceable event per view, in its own place; the others stay in order.
+fn coalesce(queue: Vec<EngineEvent>) -> Vec<EngineEvent> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<EngineEvent> = queue
+        .into_iter()
+        .rev()
+        .filter(|event| replaceable(event).is_none_or(|key| seen.insert(key)))
+        .collect();
+    kept.reverse();
+    kept
+}
+
 /// Denies every navigation held for `view`: its document is replaced or it is closing.
 fn deny_held(held: &mut HashMap<RequestId, (ViewId, i64)>, view: ViewId) {
     held.retain(|_, (owner, token)| {
@@ -734,6 +921,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             });
         }
         let metrics = target.metrics();
+        log::debug!("ladybird: open {view:?} {options:?} {:?}", metrics.buffer());
         let size = metrics.buffer();
         let lb = unsafe {
             ffi::lb_view_open(
@@ -754,9 +942,9 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 visible: options.visible,
                 document: DocumentGeneration::next(),
                 pending: None,
+                deferred: None,
                 active: None,
                 stopped: false,
-                frame_reported: false,
                 frame_dirty: false,
                 last_click: None,
                 pointer_buttons: 0,
@@ -770,6 +958,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
 
     fn command(&mut self, id: ViewId, command: EngineCommand) -> Result<(), EngineError> {
         self.running()?;
+        log::debug!("ladybird: {id:?} <- {command:?}");
         let view = self
             .views
             .get_mut(&id)
@@ -777,13 +966,13 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
         let lb = view.lb;
         match command {
             EngineCommand::Navigate { navigation, url } => {
-                view.pending = Some(navigation);
+                view.pending = Some((navigation, Pend::Url(url.clone())));
                 view.stopped = false;
                 let url = c_string(&url);
                 unsafe { ffi::lb_navigate(lb, url.as_ptr()) };
             }
             EngineCommand::Reload { navigation } => {
-                view.pending = Some(navigation);
+                view.pending = Some((navigation, Pend::Reload));
                 view.stopped = false;
                 unsafe { ffi::lb_reload(lb) };
             }
@@ -792,7 +981,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 unsafe { ffi::lb_stop(lb) };
             }
             EngineCommand::Traverse { navigation, delta } => {
-                view.pending = Some(navigation);
+                view.pending = Some((navigation, Pend::Traverse));
                 view.stopped = false;
                 unsafe { ffi::lb_traverse(lb, delta) };
             }
@@ -869,13 +1058,35 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 break;
             }
         }
-        events.append(&mut self.queue);
+        // An address change that was not followed by a load start within the settle time is the page's own.
+        let now = Instant::now();
+        let mut settle_at: Option<Instant> = None;
+        for (id, view) in &mut self.views {
+            if let Some((_, since)) = &view.deferred {
+                if now.duration_since(*since) >= COMMIT_SETTLE {
+                    settle_commit(*id, view, &mut self.queue, &mut self.held, Settle::Timeout);
+                } else {
+                    let due = *since + COMMIT_SETTLE;
+                    settle_at = Some(settle_at.map_or(due, |at| at.min(due)));
+                }
+            }
+        }
+        let batch = coalesce(std::mem::take(&mut self.queue));
+        let (sent, release_at) = self.throttle(batch, now);
+        events.extend(sent);
+        let settle_at = match (settle_at, release_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let timer = (next_ms >= 0).then(|| Instant::now() + Duration::from_millis(next_ms as u64));
+        let deadline = match (timer, settle_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         if more != 0 {
             PumpStatus::Pending { deadline: None }
-        } else if next_ms >= 0 {
-            PumpStatus::Pending {
-                deadline: Some(Instant::now() + Duration::from_millis(next_ms as u64)),
-            }
+        } else if deadline.is_some() {
+            PumpStatus::Pending { deadline }
         } else {
             PumpStatus::Idle
         }
@@ -927,7 +1138,6 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             return Ok(PresentOutcome::NotReady);
         }
         view.frame_dirty = false;
-        view.frame_reported = false;
         Ok(PresentOutcome::Submitted)
     }
 
