@@ -276,13 +276,22 @@ pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Lo
     if let Err(e) = engine.start(&mut store, |store| start_app.call(store, ())) {
         anyhow::bail!(guest_error("start_app", &e));
     }
-    let list = {
+    let mut list = {
         let canvas = host_state.canvas.lock().unwrap();
         draw::display_list(&canvas, None).map(Arc::new)
     };
     let Ok(on_frame_fn) = instance.get_typed_func::<u32, ()>(&mut store, "on_frame") else {
         return Ok(Loaded { guest: None, list });
     };
+    // start_app drew nothing. This guest paints from on_frame, so the empty list is not a
+    // frame yet: publishing it makes FrameReady fire before the first draw, and a present in
+    // that window fills the buffer with transparent pixels. The next step's on_frame is the
+    // first frame, including one that deliberately draws nothing (`drawn` stays `None`, so an
+    // empty canvas still differs from "no frame"). A start_app that did draw is a real frame
+    // and is published now.
+    if list.as_ref().is_some_and(|list| list.ops.is_empty()) {
+        list = None;
+    }
     let on_timer_fn = instance
         .get_typed_func::<u32, ()>(&mut store, "on_timer")
         .ok();

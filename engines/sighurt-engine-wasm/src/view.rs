@@ -544,7 +544,11 @@ impl View {
                 self.prompt_shown = false;
                 self.report_history(Some(navigation), out);
                 self.report_title(out);
-                self.invalidate(out);
+                // No list yet: an on_frame guest that has not drawn. The first step publishes
+                // the frame. FrameReady now would present a buffer nothing has painted.
+                if self.list.is_some() {
+                    self.invalidate(out);
+                }
                 self.after_run(out);
             }
         }
@@ -748,9 +752,10 @@ impl View {
     /// Paints the view's frame into `frame`, which has the size of its metrics.
     ///
     /// Inside a host paint ([`sighurt_wayland::buffer_age`]), only the pixels that differ from
-    /// the frame that buffer still holds are painted and reported. Outside one (the terminal,
-    /// tests, a target that does not track age) the whole buffer is painted and nothing is
-    /// reported, so the host damages all of it.
+    /// the frame that buffer still holds are painted and reported. Age 0 (a new, abandoned or
+    /// resized buffer) and an unknown age (the terminal, a target that does not track age)
+    /// paint every pixel and damage the whole buffer. So does a diff that cannot be bounded,
+    /// or a buffer older than the diffs still remembered.
     pub fn paint(&mut self, frame: Frame<'_>) -> Result<(), String> {
         let (rect, buffer) = (self.metrics.rect(), self.metrics.buffer());
         let bx = buffer.width as f32 / rect.width as f32;
