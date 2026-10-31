@@ -36,6 +36,7 @@ pub const EV_CLIPBOARD_WANT: c_int = 18;
 pub const EV_DOWNLOAD: c_int = 19;
 pub const EV_PICK_FILES: c_int = 20;
 pub const EV_OPEN_EXTERNAL: c_int = 21;
+pub const EV_NAVIGATION_REQUESTED: c_int = 22;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -161,6 +162,7 @@ functions! {
     pub fn lb_clipboard_deny(view: u64);
     pub fn lb_pick_reply(token: i64, paths: *const c_char);
     pub fn lb_open_external_reply(token: i64, allowed: c_int);
+    pub fn lb_navigation_answer(token: i64, allow: c_int);
     pub fn lb_frame_get(view: u64, out: *mut Frame) -> c_int;
     pub fn lb_shutdown();
 }

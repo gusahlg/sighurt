@@ -22,12 +22,20 @@ elif [[ -d /data/sig-builds ]]; then prefix=/data/sig-builds/ladybird
 else prefix=$HOME/.cache/sighurt/ladybird; fi
 prefix=$(realpath -m "$prefix")
 mkdir -p "$prefix/lib"
+# The shim is built against the patched Ladybird (nix/ladybird.nix, NavigationRequested), which
+# nix/pull-ladybird-patched.sh puts at PREFIX/patched.
+if [[ ! -d $prefix/patched/include/LibWebView ]]; then
+  echo "build-ladybird-shim: no patched Ladybird at $prefix/patched: build it on louise-pc" >&2
+  echo "  (nix/build-ladybird-patched.sh) and run nix/pull-ladybird-patched.sh" >&2
+  exit 1
+fi
 if [[ -z ${LADYBIRD:-} ]]; then
-  exec nix-shell "$repo/experiments/ladybird-smoke/shell.nix" --run "$(printf '%q ' "$0" "$prefix")"
+  exec nix-shell "$repo/experiments/ladybird-smoke/shell.nix" --argstr patchedPrefix "$(readlink -f "$prefix/patched")" \
+    --run "$(printf '%q ' "$0" "$prefix")"
 fi
 cache=$prefix/cache
 mkdir -p "$cache"
-# Keep the Ladybird package (its libraries and helper processes) from being collected.
+# Keep the Ladybird package's inputs (the same as the patched one's) from being collected.
 nix-build --no-out-link -o "$prefix/ladybird-root" -E "(import $repo/nix/nixpkgs.nix {}).ladybird" > /dev/null
 [[ -f $cache/rust/LibURL/RustFFI.h ]] || "$repo/experiments/ladybird-smoke/gen-rust-headers.sh" "$cache/rust" > /dev/null
 [[ -f $cache/build/Libraries/LibWeb/CSS/Units.h ]] || "$repo/experiments/ladybird-smoke/gen-generated-headers.sh" "$cache"

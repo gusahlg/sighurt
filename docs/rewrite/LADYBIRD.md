@@ -116,8 +116,10 @@ Rust 1.98.1 for its Rust crates (`libweb_rust`, `libgfx_rust`, ...). Store outpu
 
 ## Decisions
 
-- **L1. Use the nixpkgs build as it is; compile only a shim.** No Ladybird build on this
-  desktop (nor needed on louise-pc). If the header regeneration ever proves too fragile, the
+- **L1. Use nixpkgs' Ladybird (with one small patch, see "The patched Ladybird") and compile only a
+  shim.** The patched package is built once on louise-pc (31 minutes); never on this desktop.
+  Originally the stock package was used as it is (the first milestones), and the text below that
+  speaks of the unpatched package describes that. If the header regeneration ever proves too fragile, the
   fallback is `pkgs.ladybird.overrideAttrs` with a `postInstall` that copies the generated headers
   out of the build tree: a full Ladybird build (hours, ask the user first, louise-pc, 13 GB).
 - **L2. C++ shim library `libsighurt-ladybird-shim.so`, built by `nix/build-ladybird-shim.sh`**
@@ -467,13 +469,6 @@ with no tab opened.
 
 ### What is missing, and why
 
-1. **`NavigationRequested`** (asking the core before a user-clicked link is followed): impossible
-   without patching Ladybird. Navigations are admitted inside `WebContentClient::did_request_navigation_start`,
-   a class `Application` instantiates itself; LibWebView offers no hook to hold or veto one, and
-   WebContent has already started it. Intercepting the click instead would hide it from the page's own
-   handlers. The engine never asks, so links stay in Ladybird; `OpenRequested` (windows) works. A
-   patched Ladybird (an override of nixpkgs' derivation with a hook, built on louise-pc, a multi-hour
-   build that needs the user's go-ahead) would be the way.
 2. **Services (`sighurt_api::services`) as built:** every privileged request of Ladybird's UI half goes
    to the host, none is performed by Ladybird.
    - *Copy:* the page's clipboard item becomes `ClipboardWrite` (each text representation; files the
@@ -491,10 +486,11 @@ with no tab opened.
    - *External URLs (`mailto:` and so on):* Ladybird's own policy (a user gesture, a scheme not denied)
      still decides whether to ask; then the request is `OpenExternal` and the host's answer decides.
      Nothing runs `xdg-open`.
-   - *Attribution:* Ladybird's download and external-URL callbacks do not say which view they are for,
-     so they are attributed to the view the host last gave input, focus or a navigation: with several
-     Ladybird tabs, a request from a background tab can be charged to the wrong view. The core still
-     decides per that view's document and origin.
+   - *Attribution:* downloads are charged to the view that started them (the patch below tells the
+     application's path callback). External-URL launches that need no confirmation still do not say
+     which view they are for and are attributed to the view the host last gave input, focus or a
+     navigation: with several Ladybird tabs a request from a background tab can be charged to the
+     wrong view. The core still decides per that view's document and origin.
    - *Dialogs:* the API has no dialog service, so `alert`, `confirm` and `prompt` are answered as dismissed
      (a page never hangs on one). Select dropdowns and color pickers are not answered.
    - Everything else, and every answer that is not `Ok` with the expected reply, is refused.
@@ -518,13 +514,63 @@ with no tab opened.
 8. **Ladybird's idle** is not zero: about 1 to 2 wakes a second (its own timers: TabPerformanceMonitor,
    cookie and HSTS synchronisation, session flush), no spin.
 
+### The patched Ladybird, and `NavigationRequested`
+
+Ladybird admits a navigation its page starts in `WebContentClient::did_request_navigation_start`, with
+no hook. `nix/ladybird/0001-navigation-hold-and-download-view.patch` (about 100 lines, three files of
+LibWebView) adds the smallest seam:
+
+- `ViewImplementation::on_navigation_start_requested(url, user_activated, proceed)`: the unload check
+  that follows admission is wrapped in `proceed(bool)`; a top-level navigation is handed to the hook
+  first (`user_activated` is `UserNavigationInvolvement::Activation`: a click), and `proceed(false)` ends
+  it as the code already ends a failed unload check (`cancel_navigation_params_creation` and
+  `did_fail_navigation_population`). `proceed` revalidates the transaction when it runs (same navigation
+  id, still awaiting the unload check, same owner), so a late answer for a replaced navigation does
+  nothing. With no hook set, behavior is unchanged.
+- `Application::default_path_for_download(url, view_id, name)`, defaulting to the old callback, so a
+  download names its view.
+
+`nix/ladybird.nix` is `pkgs.ladybird.overrideAttrs` adding the patch and nothing else (same inputs,
+flags and version). It was built on louise-pc with `nix/build-ladybird-patched.sh` (`nix-build --cores 8
+--max-jobs 1`, under that machine's heavy lock, no embargo): **31 minutes**, 2972 build steps, memory
+within the 15 GB. The result is `/nix/store/446qfwl3...-ladybird-0-unstable-2026-09-18` on louise.
+
+**Getting it to the desktop without root.** `nix copy --from ssh://louise-pc` refuses an unsigned path
+unless the user is trusted (here: root only, no sudo), so `nix/pull-ladybird-patched.sh` copies the
+package as files and relocates it: every occurrence of its store path (RUNPATHs, the wrappers of the
+helper processes, CMake files) is replaced by a directory path of exactly the same length
+(`/data/sig-builds/ladybird/pxxx...`, symlinked as `.../patched`), which keeps ELF files valid; its
+dependencies are the unpatched package's, already in the store and rooted by `ladybird-root`.
+`nix/build-ladybird-shim.sh` now builds the shim against `patched/` (its headers carry the hook) and
+refuses to run without it. If a trusted user later imports the store path, the relocation is only a
+detour. The shim loads the relocated libraries; the helpers run from `patched/libexec`.
+
+Shim and crate: `on_navigation_start_requested` asks only for a user-activated navigation in a view
+that is not a popup proxy and is not a fragment navigation of the document shown, and holds it by token
+(`LB_EV_NAVIGATION_REQUESTED`, answered by `lb_navigation_answer`); the crate turns it into
+`NavigationRequested { document, request, url }` and `AnswerNavigation` into the answer. A held
+navigation is denied when its view's document is replaced (a new-document commit), when the view
+closes, and at shutdown; at most 16 are held per view, the 17th is denied at once; an answer for a
+request no longer held does nothing. The browser's own loads (`BrowserUI` involvement) and the page's
+scripts without a gesture are never asked about. Evidence: `tests/navigation.rs` (a click is held and
+nothing is performed; denied, it never is, and a second answer does nothing; allowed, it commits; a
+fragment link and the browser's own navigations are not asked about; a request left open while the
+document is replaced does nothing when answered late; 24 clicks hold at most 16; close and shutdown with
+requests held), `tests/headless.rs` and `tests/services.rs` (their clicks now go through the
+request), and `sig` in a private sway (`MODE=links tests/sig-shot.sh`): a click on a link in a Ladybird
+page to `demo://pattern`, an address `[routing.demo]` claims, opens the demo engine's page (the tab is
+labelled `demo`), because the core answered the request with the other engine.
+
 ### Run it
 
 ```sh
-tools/heavy nix/build-ladybird-shim.sh                 # once: the shim (nixpkgs' Ladybird, no build of it)
+# once: the patched Ladybird, on louise-pc (31 min), brought here without root, then the shim
+SIG_REMOTE_DEST=repos/sighurt-wt-ladybird tools/remote tools/heavy nix/build-ladybird-patched.sh
+nix/pull-ladybird-patched.sh
+tools/heavy nix/build-ladybird-shim.sh
 tools/cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
 tools/heavy tools/headless-sway -- engines/sighurt-engine-ladybird/tests/sig-shot.sh OUT [URL]
-#   MODE=route | MODE=open-in selects [routing.ladybird] or page.open-in; screenshots in OUT
+#   MODE=route | open-in | typing | links selects [routing.ladybird] or page.open-in; screenshots in OUT
 tools/heavy cargo test -p sighurt-engine-ladybird --test headless -- --nocapture
 ```
 

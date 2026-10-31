@@ -335,6 +335,26 @@ fn services_and_text_input() {
 
     // 7. A mailto: link is a request to open an external URL; denied, nothing opens.
     d.click(20.0, 125.0);
+    // The click is a navigation the user started: the engine asks the browser first.
+    let asked = d.next(
+        Duration::from_secs(10),
+        "a navigation request for the mailto: link",
+        |e| match e {
+            EngineEvent::NavigationRequested { request, url, .. } if url.starts_with("mailto:") => {
+                Some(*request)
+            }
+            _ => None,
+        },
+    );
+    d.runtime
+        .command(
+            d.view,
+            EngineCommand::AnswerNavigation {
+                request: asked,
+                allow: true,
+            },
+        )
+        .unwrap();
     let open = d.service("an external URL", |s| {
         matches!(s, Service::OpenExternal { .. })
     });

@@ -52,7 +52,8 @@ enum {
     LB_EV_CLIPBOARD_WANT,   /* a paste found nothing: answer with lb_clipboard_grant or _deny */
     LB_EV_DOWNLOAD,         /* s0 = url, s1 = suggested name, data = the file */
     LB_EV_PICK_FILES,       /* i0 = 1 for several files; i1 = token for lb_pick_reply */
-    LB_EV_OPEN_EXTERNAL     /* s0 = url; i1 = token for lb_open_external_reply */
+    LB_EV_OPEN_EXTERNAL,    /* s0 = url; i1 = token for lb_open_external_reply */
+    LB_EV_NAVIGATION_REQUESTED /* s0 = url: a page-started navigation is held; i1 = token for lb_navigation_answer */
 };
 
 typedef struct lb_event {
@@ -108,6 +109,8 @@ void lb_clipboard_grant(uint64_t view, const uint8_t* data, size_t len); /* plai
 void lb_clipboard_deny(uint64_t view);
 void lb_pick_reply(int64_t token, const char* paths); /* newline-separated; NULL: cancelled */
 void lb_open_external_reply(int64_t token, int allowed);
+/* Lets a held navigation go on (allow) or cancels it. Needs the patched Ladybird (nix/ladybird.nix). */
+void lb_navigation_answer(int64_t token, int allow);
 
 typedef struct lb_frame {
     const uint8_t* pixels; /* BGRA8888 premultiplied, valid until the next lb_pump or lb_view_close */
