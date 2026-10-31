@@ -25,7 +25,12 @@
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Utilities.h>
 
+#include <LibWebView/ProcessManager.h>
+
 #include <deque>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <map>
 #include <memory>
 #include <string>
@@ -65,6 +70,61 @@ void push(int kind, uint64_t view, int64_t i0 = 0, int64_t i1 = 0, std::string c
     if (s1)
         event.s1 = *s1;
     g_events.push_back(move(event));
+}
+
+// Ladybird's helper processes (WebContent, RequestServer, ...) are children of this process. Its own
+// monitor reaps with waitpid(-1) from a SIGCHLD handler, which would also reap the children of other
+// engines and of the host, so loop.cpp never installs that handler. Each helper is watched through a
+// pidfd instead and reaped by its own pid, and what ProcessMonitor would have done is done here.
+struct Child {
+    int pidfd { -1 };
+    RefPtr<Core::Notifier> notifier;
+};
+
+HashMap<pid_t, Child>& children()
+{
+    static auto* map = new HashMap<pid_t, Child>;
+    return *map;
+}
+
+void reap_child(pid_t pid)
+{
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) != pid)
+        return;
+    // The notifier is destroyed after this callback returns.
+    Core::deferred_invoke([pid] {
+        if (auto child = children().take(pid); child.has_value()) {
+            child->notifier = nullptr;
+            close(child->pidfd);
+        }
+    });
+    auto& manager = WebView::Application::process_manager();
+    if (auto process = manager.remove_process(pid); process.has_value()) {
+        process->save_crash_report(status);
+        manager.on_process_exited(process.release_value(), status);
+    }
+}
+
+void watch_child(pid_t pid)
+{
+    if (pid == getpid() || children().contains(pid))
+        return;
+    int pidfd = int(syscall(SYS_pidfd_open, pid, 0));
+    if (pidfd < 0) {
+        dbgln("sighurt: pidfd_open({}) failed: {}", pid, strerror(errno));
+        return;
+    }
+    auto notifier = Core::Notifier::construct(pidfd, Core::NotificationType::Read);
+    notifier->on_activation = [pid] { reap_child(pid); };
+    children().set(pid, { pidfd, move(notifier) });
+}
+
+void watch_children()
+{
+    auto& manager = WebView::Application::process_manager();
+    manager.on_process_added = [](WebView::Process& process) { watch_child(process.pid()); };
+    manager.for_each_process([](WebView::Process& process) { watch_child(process.pid()); });
 }
 
 std::string to_std(StringView view) { return std::string(view.characters_without_null_termination(), view.length()); }
@@ -490,6 +550,7 @@ int lb_init(char const* const* argv, int argc, char const* profile, char const* 
         return 2;
     }
     g_app = app.release_value();
+    watch_children();
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
     auto theme = Gfx::load_system_theme(theme_path.string());
@@ -715,6 +776,30 @@ void lb_shutdown(void)
         entry.value->close_now();
     LbView::views().clear();
     g_app = nullptr;
+    // The helpers are stopping: reap them by pid, and make sure they do stop.
+    Vector<pid_t> pids;
+    for (auto& entry : children())
+        pids.append(entry.key);
+    for (auto pid : pids) {
+        bool reaped = false;
+        for (int i = 0; i < 300 && !reaped; ++i) {
+            int status = 0;
+            auto result = waitpid(pid, &status, WNOHANG);
+            reaped = result == pid || (result < 0 && errno != EINTR);
+            if (!reaped)
+                usleep(10'000);
+        }
+        if (!reaped) {
+            kill(pid, SIGKILL);
+            int status = 0;
+            waitpid(pid, &status, 0);
+        }
+    }
+    for (auto& entry : children()) {
+        entry.value.notifier = nullptr;
+        close(entry.value.pidfd);
+    }
+    children().clear();
 }
 
 }

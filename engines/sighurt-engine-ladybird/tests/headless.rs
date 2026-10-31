@@ -165,6 +165,20 @@ fn page(dir: &Path, name: &str, body: &str) -> String {
     format!("file://{}", path.display())
 }
 
+/// The direct children of this process.
+fn child_pids() -> Vec<i32> {
+    let mut pids = Vec::new();
+    for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+        if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+            pids.extend(
+                text.split_whitespace()
+                    .filter_map(|p| p.parse::<i32>().ok()),
+            );
+        }
+    }
+    pids
+}
+
 fn pixel(shot: &Shot, x: usize, y: usize) -> [u8; 4] {
     let size = shot.size.expect("a frame");
     let i = 4 * (y * size.width as usize + x);
@@ -198,6 +212,13 @@ fn pages_load_render_navigate_and_idle() {
              <a id=b href='{second}' style='display:block;height:100px'>second</a><div id=frag>x</div>"
         ),
     );
+
+    // A child of this process that is not Ladybird's. It exits at once and stays a zombie until
+    // we wait for it: Ladybird's monitor, which reaps with waitpid(-1), would take its status.
+    let mut bystander = std::process::Command::new("sleep")
+        .arg("0.2")
+        .spawn()
+        .unwrap();
 
     let (wake_tx, wakes) = mpsc::channel();
     let waker = EngineWaker::new(move || {
@@ -527,7 +548,39 @@ fn pages_load_render_navigate_and_idle() {
     assert!(pumps <= 40, "{pumps} pumps in 6 s of idle");
     assert!(woken <= 40, "{woken} wakes in 6 s of idle");
 
-    // 9. Closing reports ViewClosed, and shutdown leaves no helper processes of ours behind.
+    // 9. A helper that dies is reaped by Ladybird (by its pid), and nothing else is: the process
+    // killed here is gone from the process table, the bystander is still ours to wait for.
+    let web_content = child_pids()
+        .into_iter()
+        .find(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains("WebContent"))
+        })
+        .expect("a WebContent process");
+    let marker = d.seen.len();
+    unsafe { libc::kill(web_content, libc::SIGKILL) };
+    assert!(
+        d.until(Duration::from_secs(10), |e| e[marker..]
+            .iter()
+            .any(|e| matches!(e, EngineEvent::ViewFailed { .. }))),
+        "the crash is reported"
+    );
+    let mut reaped = false;
+    for _ in 0..50 {
+        d.pump();
+        if !Path::new(&format!("/proc/{web_content}")).exists() {
+            reaped = true;
+            break;
+        }
+        let _ = d.wakes.recv_timeout(Duration::from_millis(100));
+    }
+    assert!(reaped, "Ladybird reaps the helper that died");
+    assert!(
+        matches!(bystander.try_wait(), Ok(Some(status)) if status.success()),
+        "a child that is not Ladybird's is still ours to wait for"
+    );
+
+    // 10. Closing reports ViewClosed, and shutdown leaves no helper processes of ours behind.
     d.runtime.close_view(view);
     d.pump();
     assert!(d

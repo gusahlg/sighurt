@@ -407,6 +407,15 @@ public:
     int register_signal(int number, AK::Function<void(int)> handler) override
     {
         VERIFY(number > 0 && number < NSIG);
+        // SIGCHLD is never installed. Ladybird's handler for it (ProcessMonitor) reaps with
+        // waitpid(-1), which would take the exit status of children that are not Ladybird's (WPE's
+        // bubblewrap, a program the host started). The shim reaps Ladybird's helpers itself, one
+        // pidfd each (shim.cpp, watch_child), and the handler is kept and never called.
+        if (number == SIGCHLD) {
+            int id = ++g_next_signal_id;
+            g_signals[number].handlers.push_back({ id, move(handler) });
+            return id;
+        }
         auto& data = this_thread();
         if (g_signal_wake_fd.load() < 0) {
             data.signal_target = true;
