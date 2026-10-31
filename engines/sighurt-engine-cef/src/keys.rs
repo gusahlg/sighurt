@@ -4,7 +4,7 @@
 //! Must not own: any CEF object or state. Pure tables, unit-tested.
 
 use sighurt_api::events::Cursor;
-use sighurt_api::input::{KeyCode, Modifiers};
+use sighurt_api::input::{Key, KeyCode, Modifiers};
 
 /// `EVENTFLAG_*` of `cef_event_flags_t`.
 pub mod flag {
@@ -55,6 +55,20 @@ pub fn modifiers(m: &Modifiers) -> u32 {
         }
     }
     flags
+}
+
+/// The Windows virtual-key code of a key press: the layout's letter or digit when the key makes
+/// one (VK codes follow the layout, so AZERTY's `a` is VK_A), else the physical key's.
+pub fn virtual_key_of(code: KeyCode, key: &Key) -> i32 {
+    if let Key::Character(text) = key {
+        let mut chars = text.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c.is_ascii_alphanumeric() {
+                return i32::from(c.to_ascii_uppercase() as u8);
+            }
+        }
+    }
+    virtual_key(code)
 }
 
 /// The Windows virtual-key code of the physical key `code` (what `windows_key_code` wants),
@@ -182,6 +196,27 @@ mod tests {
         assert_eq!(virtual_key(KeyCode(28)), 0x0D); // Enter
         assert_eq!(virtual_key(KeyCode(51)), 0xBC); // Comma
         assert_eq!(virtual_key(KeyCode(9999)), 0);
+    }
+
+    #[test]
+    fn the_layouts_letter_wins_over_the_physical_key() {
+        // Code 1 is Escape, but the layout says this key makes "v".
+        assert_eq!(
+            virtual_key_of(KeyCode(1), &Key::Character("v".into())),
+            0x56
+        );
+        assert_eq!(
+            virtual_key_of(KeyCode(1), &Key::Character("7".into())),
+            0x37
+        );
+        assert_eq!(
+            virtual_key_of(KeyCode(30), &Key::Character("ä".into())),
+            0x41
+        );
+        assert_eq!(
+            virtual_key_of(KeyCode(28), &Key::Named("Enter".into())),
+            0x0D
+        );
     }
 
     #[test]

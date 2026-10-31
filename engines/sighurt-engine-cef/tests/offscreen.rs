@@ -536,6 +536,46 @@ fn chromium_in_the_engine_contract() {
         "{open:?}"
     );
 
+    // An attachment is a download request for the browser's service, not a page.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let body = "downloaded";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Disposition: attachment; filename=\"a.txt\"\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let from = h.log.len();
+    h.send(EngineCommand::Navigate {
+        navigation: NavigationId::next(),
+        url: format!("http://127.0.0.1:{port}/a.txt"),
+    });
+    let download = h
+        .wait(from, |e| match e {
+            EngineEvent::ServiceRequested(r) => match &r.service {
+                Service::Download {
+                    source,
+                    suggested_name,
+                } => Some((source.clone(), suggested_name.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("an attachment is a Download service request");
+    assert!(
+        matches!(&download.0, sighurt_api::services::DownloadSource::Url(u) if u.ends_with("/a.txt")),
+        "{download:?}"
+    );
+
     // 5. Resizing.
     let big = metrics(1000, 700);
     h.metrics = big;

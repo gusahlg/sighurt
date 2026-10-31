@@ -97,7 +97,9 @@ pub fn make_client(view: &View) -> *mut CefClient {
     request.on_before_browse = Some(on_before_browse);
     request.on_render_process_terminated = Some(on_render_process_terminated);
     let mut download: CefDownloadHandler = zeroed();
+    download.can_download = Some(can_download);
     download.on_before_download = Some(on_before_download);
+    download.on_download_updated = Some(on_download_updated);
     let mut jsdialog: CefJsdialogHandler = zeroed();
     jsdialog.on_jsdialog = Some(on_jsdialog);
     jsdialog.on_before_unload_dialog = Some(on_before_unload_dialog);
@@ -736,6 +738,27 @@ pub(crate) fn origin(view: &ViewShared) -> Option<String> {
     origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
+unsafe extern "C" fn can_download(
+    _this: *mut CefDownloadHandler,
+    browser: *mut CefBrowser,
+    url: *const CefStringUtf16,
+    _method: *const CefStringUtf16,
+) -> i32 {
+    own!(browser);
+    log::debug!("cef: can_download {}", unsafe { read(url) });
+    1
+}
+
+unsafe extern "C" fn on_download_updated(
+    _this: *mut CefDownloadHandler,
+    browser: *mut CefBrowser,
+    item: *mut CefDownloadItem,
+    callback: *mut CefDownloadItemCallback,
+) {
+    own!(browser, item, callback);
+    log::debug!("cef: download updated");
+}
+
 unsafe extern "C" fn on_before_download(
     this: *mut CefDownloadHandler,
     browser: *mut CefBrowser,
@@ -753,6 +776,7 @@ unsafe extern "C" fn on_before_download(
         let view = unsafe { view(this) };
         let url = unsafe { take(call!(item.as_ptr(), get_url)) };
         let suggested = unsafe { read(suggested) };
+        log::debug!("cef: download of {url} ({suggested})");
         let document = lock(&view.nav).document();
         if let Some(document) = document {
             view.shared

@@ -723,7 +723,7 @@ impl<T> View<T> {
 
     fn key(&mut self, key: &KeyEvent, queue: &Arc<Shared>) {
         let code = key.code.0;
-        let virtual_key = keys::virtual_key(key.code);
+        let virtual_key = keys::virtual_key_of(key.code, &key.key);
         let mut modifiers = keys::modifiers(&key.modifiers);
         if key.repeat {
             modifiers |= keys::flag::IS_REPEAT;
@@ -809,7 +809,7 @@ impl<T> View<T> {
             self.pastes.insert(request);
             Service::ClipboardRead {
                 selection: Selection::Clipboard,
-                mime_types: vec!["text/plain".into()],
+                mime_types: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
                 limit: MAX_PASTE,
             }
         } else {
@@ -828,6 +828,7 @@ impl<T> View<T> {
                 }],
             }
         };
+        log::debug!("cef: asking the browser for the clipboard ({virtual_key:#x})");
         queue.push(EngineEvent::ServiceRequested(ServiceRequest {
             id: request,
             view: self.shared.id,
@@ -842,6 +843,14 @@ impl<T> View<T> {
         if !self.pastes.remove(&request) {
             return; // a copy or a download: nothing more to do
         }
+        log::debug!(
+            "cef: clipboard answer: {:?}",
+            result.as_ref().map(|reply| match reply {
+                ServiceReply::Clipboard(data) =>
+                    format!("{} bytes of {}", data.data.len(), data.mime_type),
+                other => format!("{other:?}"),
+            })
+        );
         match result {
             Ok(ServiceReply::Clipboard(data)) => {
                 let mut text = String::from_utf8_lossy(&data.data).into_owned();

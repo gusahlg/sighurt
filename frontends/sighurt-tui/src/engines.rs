@@ -66,10 +66,18 @@ pub fn build() -> Registry<TermTarget, TermPermit> {
 }
 
 /// One engine's runtime, bound to [`TermTarget`].
-#[cfg(any(feature = "engine-wasm", feature = "engine-demo", feature = "engine-cef"))]
+#[cfg(any(
+    feature = "engine-wasm",
+    feature = "engine-demo",
+    feature = "engine-cef"
+))]
 struct Bound<R>(R);
 
-#[cfg(any(feature = "engine-wasm", feature = "engine-demo", feature = "engine-cef"))]
+#[cfg(any(
+    feature = "engine-wasm",
+    feature = "engine-demo",
+    feature = "engine-cef"
+))]
 impl<R> EngineRuntime for Bound<R>
 where
     R: EngineRuntime<Target = TermTarget, FramePermit = TermPermit>,

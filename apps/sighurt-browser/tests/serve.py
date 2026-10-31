@@ -7,6 +7,7 @@ Writes the port it listens on to PORT_FILE and one line per request to LOG (the 
 and the path), so the tests can count loads. Besides the files in PAGES:
 
     /guests/NAME       the file NAME in GUESTS (Wasm apps)
+    /attachment/NAME   the same file as an attachment (a download)
     /count.html        a page whose title is "load N", N counting the requests for it
     /ua.html           a page that puts the User-Agent header of its request and what its script
                        sees as navigator.userAgent in its address: #["header","script"]
@@ -73,6 +74,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "application/wasm")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif url.path.startswith("/attachment/"):
+            # A file every engine must save rather than show (the files of GUESTS).
+            name = url.path.removeprefix("/attachment/")
+            try:
+                data = open(f"{guests}/{name}", "rb").read() if "/" not in name else None
+            except OSError:
+                data = None
+            if data is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)

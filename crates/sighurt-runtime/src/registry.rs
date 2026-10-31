@@ -194,7 +194,10 @@ pub const KEYMAPS: &[KeymapKind] = &[
 
 /// What a runtime is started with.
 // Only the Wasm engine needs a scratch directory, and the demo engine reads nothing.
-#[cfg_attr(not(any(feature = "engine-wasm", feature = "engine-cef")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "engine-wasm", feature = "engine-cef")),
+    allow(dead_code)
+)]
 pub struct Launch<'a> {
     /// `[engines.<name>]` of the configuration the process started with.
     pub settings: &'a EngineSettings,
@@ -202,7 +205,10 @@ pub struct Launch<'a> {
     name: &'static str,
 }
 
-#[cfg_attr(not(any(feature = "engine-wasm", feature = "engine-cef")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "engine-wasm", feature = "engine-cef")),
+    allow(dead_code)
+)]
 impl Launch<'_> {
     /// A directory of the engine's own for what it keeps only while the process runs, made
     /// now: under `$XDG_RUNTIME_DIR` (or the temporary directory), readable by the user alone,
@@ -697,7 +703,11 @@ pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoCon
 
 /// Mode 0700 on `profile` and on the Sighurt directory above it. A failure is logged: the
 /// engine then keeps nothing if it cannot use the directory.
-#[cfg(any(feature = "engine-wpe", feature = "engine-servo", feature = "engine-cef"))]
+#[cfg(any(
+    feature = "engine-wpe",
+    feature = "engine-servo",
+    feature = "engine-cef"
+))]
 fn secure_profile(profile: &std::path::Path) {
     if let Some(root) = profile.parent() {
         if let Err(error) = crate::persistence::secure_private_dir(root) {
