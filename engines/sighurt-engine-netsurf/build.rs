@@ -278,30 +278,38 @@ fn archive_objects(source: &Path, out_dir: &Path) -> PathBuf {
     archive
 }
 
+/// Tells cargo what to link. `cargo:rustc-link-arg` would apply to this crate's own tests only, so
+/// everything goes through `rustc-link-lib`, which reaches every binary that depends on the
+/// crate. The core and the static libraries are merged into one archive: the linker rescans one
+/// archive until nothing more resolves, so their order does not matter.
 fn link(archive: &Path, pkg_config_path: &str, out_dir: &Path) {
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    // Full paths, in order: rustc does not interleave link-arg and link-lib.
-    println!("cargo:rustc-link-arg=-Wl,--whole-archive");
-    println!("cargo:rustc-link-arg={}", archive.display());
-    println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
-    println!("cargo:rustc-link-arg=-Wl,--start-group");
-    let mut rpath = Vec::new();
+    let merged = out_dir.join("libnsall.a");
+    let _ = fs::remove_file(&merged);
+    let mut script = format!(
+        "create {}\naddlib {}\n",
+        merged.display(),
+        archive.display()
+    );
     for package in STATIC_LIBS {
-        let archive = static_archive(package, pkg_config_path);
-        println!("cargo:rustc-link-arg={}", archive.display());
+        let lib = static_archive(package, pkg_config_path);
+        script.push_str(&format!("addlib {}\n", lib.display()));
     }
-    println!("cargo:rustc-link-arg=-Wl,--end-group");
+    script.push_str("save\nend\n");
+    let mut child = Command::new("ar")
+        .arg("-M")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("ar: {e}"));
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), script.as_bytes()).unwrap();
+    if !child.wait().unwrap().success() {
+        panic!("merging the static libraries failed");
+    }
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=nsall");
     for package in SHARED_LIBS {
         let (libname, libdir) = shared_lib(package, pkg_config_path);
-        if !rpath.contains(&libdir) {
-            println!("cargo:rustc-link-arg=-L{libdir}");
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
-            rpath.push(libdir);
-        }
-        println!("cargo:rustc-link-arg=-l{libname}");
-    }
-    for lib in ["m", "pthread", "dl", "c"] {
-        println!("cargo:rustc-link-arg=-l{lib}");
+        println!("cargo:rustc-link-search=native={libdir}");
+        println!("cargo:rustc-link-lib=dylib={libname}");
     }
 }
 

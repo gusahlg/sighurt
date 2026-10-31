@@ -8,6 +8,60 @@ what was verified by a smoke test (`experiments/netsurf-smoke/`), the design of 
 build recipe, and a plan a worker with no context can follow. Nothing in the workspace changed:
 no crate, no `Cargo.toml`, no `shell.nix` line.
 
+## Status: implemented (steps 1 to 6, 8, 9 and 10's wiring)
+
+`sighurt-engine-netsurf` exists and `sig` opens pages in it, in the window and in the terminal's
+graphics mode. The user chose license option 1 below: in process, `engine-netsurf` in **no**
+default feature set, the crate `GPL-2.0-only` with a README that says a `sig` built with it is
+for personal use and must not be distributed. What is built, and the evidence:
+
+| Step | State | Evidence |
+|---|---|---|
+| 1 smoke test | done | `experiments/netsurf-smoke/` |
+| 2 crate, `build.rs`, link | done | `tools/cargo test -p sighurt-engine-netsurf` (`tests/lifecycle.rs`: one init per process); `sig` links |
+| 3 C frontend headless | done | the same C files serve the engine tests |
+| 4 `NetSurfRuntime` | done | `tests/engine.rs`: events in the contract's order, a second navigation cancels the first, `present` on an unseen epoch is `NotReady`, close and shutdown |
+| 5 scale, resize, zoom, hidden | done | `tests/engine.rs`: the heading is twice as tall at scale 240, 500x400 and 800x600 frames, an empty rectangle keeps the size, a hidden view presents nothing, zoom 2 enlarges the page |
+| 6 input | done | `tests/engine.rs`: link click, typing "héllo" reaches a server as UTF-8 through a form, copy, paste, End, the wheel scrolls; `src/input.rs` unit tests |
+| 7 fetching: watcher, CA, cookies | partly | the descriptor watcher thread and its test (a ready fd wakes the owner once, an idle set sleeps), HTTPS CA bundle from `SSL_CERT_FILE` or `/etc/ssl/certs`, `misc.login` refuses; **not done**: certificate-error policy test against a self-signed server, a disk cache, cookie persistence, `site_data`, the `dlopen` question |
+| 8 new windows, link handover | done | `tests/engine.rs`: a link click is `NavigationRequested`, deny drops it, allow follows it; `target=_blank` is `OpenRequested { NewView }`; history stays the core's (`history_traversal: false`) |
+| 9 services | done except two | clipboard read (held paste key) and write (copy), downloads (`Service::Download` with the body and the proposed name), file input and external URLs are wired; the last two have no test |
+| 10 `sig` end to end | done | `tests/headless.sh` in a private sway: PASS for page render, link click both ways, typing with accents, a configured plain-letter binding not firing while typing in a field (`TextInputChanged`), scale 2, an idle chrome with no repaints, and `sig --tui` in kitty drawing the page as an image |
+| 11 quality passes | not started | glyph cache and fontconfig families, SVG paths and Béziers, shaping, semantics, find, JavaScript feature |
+
+What differs from the design below:
+
+- **Root-page scrolling is the frontend's.** NetSurf scrolls only boxes and frames inside a
+  page; for the page itself every frontend keeps a scroll offset, adds it to the positions it
+  gives the core (`mouse_click`, `get_features`, `scroll_at_point`), subtracts it when it
+  draws (`browser_window_redraw(bw, -sx, -sy, ...)`) and scrolls itself when the core did not
+  take a wheel or key. The C frontend does that (`nsh_scroll_by`, `nsh_clamp_scroll`) and
+  clamps the offset to the content's extent at every resize and extent change.
+- **Housekeeping.** The rule "`p == NULL` and a delay of 5 s or more" misses the image cache's
+  cleaner (it passes its cache as `p`; idle wakeups were every 10 s). `nsh_sched_mark_housekeeping`
+  now also records every `(fn, p)` the core scheduled while it started, and any later
+  `schedule` of the same pair is housekeeping. Measured in `tests/engine.rs`: two idle seconds
+  pump fewer than 8 times, and the engine's idle deadline is the once-a-minute housekeeping
+  wake.
+- **Linking.** `cargo:rustc-link-arg` from a library's build script reaches only that
+  crate's own tests, not `sig`. `build.rs` merges the core and the twelve static libraries
+  into one archive (`ar -M`: the linker rescans one archive until nothing more resolves, so
+  order does not matter) and links it with `rustc-link-lib`; the shared libraries (curl,
+  OpenSSL, FreeType, libpng, libjpeg, libwebp, expat, zlib) come from pkg-config the same
+  way. The build tree is `$SIGHURT_NETSURF_BUILD`, else `/data/sig-builds/netsurf` when
+  `/data/sig-builds` exists, else cargo's `OUT_DIR`.
+- **Fonts** are the nix store paths of DejaVu, recorded by `build.rs` at build time (the
+  environment overrides them), so `sig` finds them outside the nix-shell too.
+- **Frames** are painted whole into the lent buffer (the host's buffers rotate, so a dirty
+  rectangle would not be enough); the measured cost (1 to 5 ms at 1024x768) allows it.
+- **Title order.** NetSurf reports the title just before it replaces the content; the runtime
+  applies title, status, cursor, caret and loading after the ordered events of a batch, so the
+  contract's order holds (`started`, `loading`, `committed`, `title`, `loaded`).
+- **Cancelled navigations.** A stop that arrives before the load's own start is the previous
+  load being replaced; only a stop after the start cancels a pending navigation.
+- **A failed load** still shows NetSurf's own error page and commits it; there is no
+  `NavigationFailed` for it yet (risk 4 stands).
+
 ## Verdict
 
 **Feasible, and cheap to build, with one blocker that is the user's decision: the license.**
@@ -36,7 +90,7 @@ no crate, no `Cargo.toml`, no `shell.nix` line.
      aggregation" in GPL's terms, and it reintroduces the IPC decision 22 removed.
   3. Ask the NetSurf authors for a relicensing exception (unlikely: dozens of contributors).
   4. Drop it.
-  The rest of this file designs option 1; nothing in the design prevents option 2 later, since
+  **The user chose option 1.** The rest of this file designs it; nothing in the design prevents option 2 later, since
   the C frontend and the adapter only meet through the `EngineRuntime` trait and the owner
   loop.
 
@@ -140,15 +194,15 @@ JavaScript the `nsgenbind`-generated Duktape bindings, 225 more objects), condit
    `env CFLAGS="-fcommon -Wno-error" make TARGET=sighurt` with `-j` from `NUM_JOBS`.
    `-fcommon` is required (the tarball defines globals in headers; nixpkgs does the same).
    gcc and clang warn a lot on this code; `-Wno-error` and no `-Werror`.
-3. The frontend's `Makefile` lists the production sources (`S_FRONTEND`) and, for the
-   throw-away link, the same stub `main`; build.rs then takes the objects:
-   `ar rcs libnscore.a build/Linux-sighurt/*.o` (the 132 objects, frontend included) and tells
-   cargo `cargo:rustc-link-lib=static=nscore`, plus the static libraries by
-   `cargo:rustc-link-search` from `SIGHURT_NETSURF_PKG_CONFIG_PATH`'s `libdir`s
+3. The frontend's `Makefile` lists the production sources (`S_FRONTEND`, ending in a stub
+   `main.c` that only lets NetSurf's makefile finish its link); `build.rs` then archives the
+   objects (`ar rcs libnscore.a`, `main` left out), merges the twelve static libraries
    (`libcss.a libdom.a libhubbub.a libparserutils.a libwapcaplet.a libnsgif.a libnsbmp.a
-   libsvgtiny.a libnsutils.a libnspsl.a libnslog.a libutf8proc.a`, in dependency order, inside
-   `--start-group`), and the shared `curl`, `freetype2`, `png16`, `jpeg`, `webp`, `expat`, `z`
-   from pkg-config. (`sig` is linked with `--exclude-libs,ALL`, decision 65, which only affects
+   libsvgtiny.a libnsutils.a libnspsl.a libnslog.a libutf8proc.a`, from
+   `SIGHURT_NETSURF_PKG_CONFIG_PATH`'s `libdir`s) into one `libnsall.a` with `ar -M`, and tells
+   cargo `rustc-link-lib=static=nsall` and, for the shared `curl`, `ssl`, `crypto`,
+   `freetype2`, `png16`, `jpeg`, `webp`, `expat`, `z`, `rustc-link-search` and
+   `rustc-link-lib=dylib` from pkg-config (not `rustc-link-arg`: that stays in the crate). (`sig` is linked with `--exclude-libs,ALL`, decision 65, which only affects
    what the archive's symbols export, not what they bind to: check once that libcurl's
    OpenSSL is the same libssl the other engines load.)
 4. The feature `engine-netsurf` in `sighurt-browser`, `sighurt-runtime` and `sighurt-gui` (and
@@ -470,6 +524,12 @@ architecture; the order is not negotiable (each step rests on the one before). B
 
 ## Files
 
+- The engine: `engines/sighurt-engine-netsurf/` (`build.rs`, `csrc/frontend/` the C frontend,
+  `csrc/patches/`, `src/{lib,ffi,runtime,input,watcher}.rs`, `tests/engine.rs`,
+  `tests/lifecycle.rs`, `tests/headless.sh`, `tests/pages/`, `README.md`, `LICENSE`).
+  Run `engines/sighurt-engine-netsurf/tests/headless.sh OUT` for the end-to-end checks
+  (screenshots in OUT; it keeps every sig directory under OUT, never the user's).
+  `CARGO_TARGET_DIR=/data/sig-builds/targets/netsurf` keeps builds off the SSD.
 - `experiments/netsurf-smoke/shell.nix`, `build.sh`, `run.sh`, `.gitignore`, `frontend/`
   (`Makefile`, `Makefile.defaults`, `Makefile.tools`, `smoke.c`): the smoke test. Run it as in
   step 1; `NS_TRACE=1` prints events, schedule calls and loop iterations, `NS_IDLE=N` probes
