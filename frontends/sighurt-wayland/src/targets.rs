@@ -170,6 +170,15 @@ impl Target {
             role.destroy();
             self.synced = false;
             self.clock.unmapped();
+            if let Some(buffers) = self.shm.as_mut() {
+                if !self.want_shown {
+                    // A hidden surface shows nothing: attaching no buffer lets the compositor
+                    // release the last one, whose release then frees it (`Swapchain::trim`).
+                    self.surface.attach(None, 0, 0);
+                    self.surface.commit();
+                }
+                buffers.trim();
+            }
         }
     }
 
