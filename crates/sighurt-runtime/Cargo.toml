@@ -21,6 +21,9 @@ engine-wasm = ["dep:sighurt-engine-wasm"]
 engine-wpe = ["dep:sighurt-engine-wpe"]
 engine-ladybird = ["dep:sighurt-engine-ladybird"]
 engine-demo = []
+# NetSurf. Off unless a frontend asks. The descriptor is the only NetSurf-specific
+# code in this crate (docs/rewrite/NETSURF.md).
+engine-netsurf = ["dep:sighurt-engine-netsurf"]
 # Chromes are the frontend's. The feature exists so one `--features` list can name every
 # crate of the `sig` split; it changes nothing here.
 chrome-line = []
@@ -32,6 +35,7 @@ sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional =
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
 sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = true }
 sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird", optional = true }
+sighurt-engine-netsurf = { path = "../../engines/sighurt-engine-netsurf", optional = true }
 # The example configuration, the built-in keymap of every build (docs/rewrite/config-extension.md).
 sighurt-config-example = { path = "../../extensions/sighurt-config-example" }
 # The configuration watch (inotify) and CLOCK_MONOTONIC for the diagnostics lines.

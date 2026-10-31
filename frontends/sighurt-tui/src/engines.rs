@@ -13,7 +13,8 @@
     feature = "engine-wasm",
     feature = "engine-wpe",
     feature = "engine-ladybird",
-    feature = "engine-demo"
+    feature = "engine-demo",
+    feature = "engine-netsurf"
 ))]
 use sighurt_api::engine::EngineRuntime;
 #[cfg(any(
@@ -21,7 +22,8 @@ use sighurt_api::engine::EngineRuntime;
     feature = "engine-wasm",
     feature = "engine-wpe",
     feature = "engine-ladybird",
-    feature = "engine-demo"
+    feature = "engine-demo",
+    feature = "engine-netsurf"
 ))]
 use sighurt_api::ids::ViewId;
 use sighurt_runtime::registry::{Binding, Registry};
@@ -61,6 +63,12 @@ pub fn build() -> Registry<TermTarget, TermPermit> {
             renderer: "cpu, kitty graphics",
             start: demo,
         },
+        #[cfg(feature = "engine-netsurf")]
+        Binding {
+            name: "netsurf",
+            renderer: "cpu (NetSurf), kitty graphics",
+            start: netsurf,
+        },
     ];
     Registry::bind(bindings)
 }
@@ -69,14 +77,16 @@ pub fn build() -> Registry<TermTarget, TermPermit> {
 #[cfg(any(
     feature = "engine-wasm",
     feature = "engine-ladybird",
-    feature = "engine-demo"
+    feature = "engine-demo",
+    feature = "engine-netsurf"
 ))]
 struct Bound<R>(R);
 
 #[cfg(any(
     feature = "engine-wasm",
     feature = "engine-ladybird",
-    feature = "engine-demo"
+    feature = "engine-demo",
+    feature = "engine-netsurf"
 ))]
 impl<R> EngineRuntime for Bound<R>
 where
@@ -405,5 +415,24 @@ fn demo(
 #[cfg(feature = "engine-demo")]
 impl sighurt_runtime::registry::Running<TermTarget, TermPermit>
     for Bound<sighurt_engine_demo::DemoRuntime<TermTarget>>
+{
+}
+
+#[cfg(feature = "engine-netsurf")]
+fn netsurf(
+    waker: sighurt_api::engine::EngineWaker,
+    launch: sighurt_runtime::registry::Launch<'_>,
+) -> Result<sighurt_runtime::registry::Runtime<TermTarget, TermPermit>, String> {
+    use sighurt_engine_netsurf::NetSurfRuntime;
+    use sighurt_runtime::registry::{self, Runtime};
+
+    NetSurfRuntime::<TermTarget>::new(registry::netsurf_config(launch.settings), waker)
+        .map(|runtime| Runtime::Netsurf(Box::new(Bound(runtime))))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "engine-netsurf")]
+impl sighurt_runtime::registry::Running<TermTarget, TermPermit>
+    for Bound<sighurt_engine_netsurf::NetSurfRuntime<TermTarget>>
 {
 }

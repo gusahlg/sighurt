@@ -1,7 +1,8 @@
 //! The engines compiled into this build, and their runtimes.
 //!
-//! Cargo features decide which engines exist (`engine-servo`, `engine-wasm`, `engine-wpe`, `engine-ladybird`,
-//! `engine-demo`); runtime configuration decides which of them may open new views (the core
+//! Cargo features decide which engines exist (`engine-servo`, `engine-wasm`, `engine-wpe`,
+//! `engine-ladybird`, `engine-demo`; `engine-netsurf` too, but it is never a default feature);
+//! runtime configuration decides which of them may open new views (the core
 //! checks it). A runtime is created on first use, one per engine kind, with the [`EngineWaker`]
 //! it needs. Its `Target` and `FramePermit` are the frontend's: the registry holds
 //! `Box<dyn Running<T, P>>`, and the frontend supplies the value when it starts the engine.
@@ -95,6 +96,9 @@ pub enum Runtime<T: 'static, P: 'static> {
     Ladybird(Box<dyn Running<T, P>>),
     #[cfg(feature = "engine-demo")]
     Demo(Box<dyn Running<T, P>>),
+    /// NetSurf (GPL-2.0-only; never a default feature).
+    #[cfg(feature = "engine-netsurf")]
+    Netsurf(Box<dyn Running<T, P>>),
     /// Present only when no engine is compiled in, so the type still names `T` and `P`.
     /// Never constructed.
     #[cfg(not(any(
@@ -102,7 +106,8 @@ pub enum Runtime<T: 'static, P: 'static> {
         feature = "engine-wasm",
         feature = "engine-wpe",
         feature = "engine-ladybird",
-        feature = "engine-demo"
+        feature = "engine-demo",
+        feature = "engine-netsurf"
     )))]
     #[allow(dead_code)]
     None(std::marker::PhantomData<fn(T, P)>),
@@ -121,12 +126,15 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
             Self::Ladybird(engine) => engine.as_ref(),
             #[cfg(feature = "engine-demo")]
             Self::Demo(engine) => engine.as_ref(),
+            #[cfg(feature = "engine-netsurf")]
+            Self::Netsurf(engine) => engine.as_ref(),
             #[cfg(not(any(
                 feature = "engine-servo",
                 feature = "engine-wasm",
                 feature = "engine-wpe",
                 feature = "engine-ladybird",
-                feature = "engine-demo"
+                feature = "engine-demo",
+                feature = "engine-netsurf"
             )))]
             Self::None(_) => unreachable!("no engine is compiled in"),
         }
@@ -144,12 +152,15 @@ impl<T: 'static, P: 'static> Runtime<T, P> {
             Self::Ladybird(engine) => engine.as_mut(),
             #[cfg(feature = "engine-demo")]
             Self::Demo(engine) => engine.as_mut(),
+            #[cfg(feature = "engine-netsurf")]
+            Self::Netsurf(engine) => engine.as_mut(),
             #[cfg(not(any(
                 feature = "engine-servo",
                 feature = "engine-wasm",
                 feature = "engine-wpe",
                 feature = "engine-ladybird",
-                feature = "engine-demo"
+                feature = "engine-demo",
+                feature = "engine-netsurf"
             )))]
             Self::None(_) => unreachable!("no engine is compiled in"),
         }
@@ -270,7 +281,8 @@ pub enum State<T: 'static, P: 'static> {
             feature = "engine-wasm",
             feature = "engine-wpe",
             feature = "engine-ladybird",
-            feature = "engine-demo"
+            feature = "engine-demo",
+            feature = "engine-netsurf"
         )),
         allow(dead_code)
     )]
@@ -291,7 +303,8 @@ impl<T: 'static, P: 'static> Engine<T, P> {
             feature = "engine-wasm",
             feature = "engine-wpe",
             feature = "engine-ladybird",
-            feature = "engine-demo"
+            feature = "engine-demo",
+            feature = "engine-netsurf"
         )),
         allow(dead_code)
     )]
@@ -645,6 +658,15 @@ pub fn ladybird_config(settings: &EngineSettings) -> sighurt_engine_ladybird::La
     sighurt_engine_ladybird::LadybirdConfig {
         profile,
         ..Default::default()
+    }
+}
+
+/// NetSurf's configuration: the user agent, if one is set. It keeps no profile yet.
+#[cfg(feature = "engine-netsurf")]
+pub fn netsurf_config(settings: &EngineSettings) -> sighurt_engine_netsurf::NetSurfConfig {
+    sighurt_engine_netsurf::NetSurfConfig {
+        user_agent: settings.user_agent.clone(),
+        profile_dir: None,
     }
 }
 

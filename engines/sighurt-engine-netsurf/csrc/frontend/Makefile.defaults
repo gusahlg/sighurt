@@ -1,0 +1,9 @@
+# Sighurt-specific options. JavaScript stays compiled out (no duktape).
+NETSURF_SIGHURT_RESOURCES := $(PREFIX)/share/netsurf/
+NETSURF_USE_RSVG := NO
+NETSURF_USE_NSSVG := AUTO
+NETSURF_USE_ROSPRITE := NO
+NETSURF_USE_HARU_PDF := NO
+NETSURF_FS_BACKING_STORE := NO
+NETSURF_USE_DUKTAPE := NO
+CFLAGS += -O2

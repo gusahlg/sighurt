@@ -6,8 +6,8 @@
 //! starts on its target, how its views present and the renderer label. The core's
 //! [`Environment`](sighurt_core::Environment) is built from these descriptors.
 //!
-//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, Ladybird, the demo engine. The
-//! web engines, those that open http(s) pages, are the ones `page.switch-engine` cycles, in
+//! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, Ladybird, the demo engine,
+//! NetSurf. The web engines, those that open http(s) pages, are the ones `page.switch-engine` cycles, in
 //! that same order.
 //!
 //! Must not own: how a runtime is constructed or how it presents. Those name the frontend's
@@ -86,6 +86,13 @@ pub fn descriptors() -> Vec<Descriptor> {
             },
             honors: &[],
         },
+        #[cfg(feature = "engine-netsurf")]
+        Descriptor {
+            name: "netsurf",
+            web: true,
+            capabilities: sighurt_engine_netsurf::CAPABILITIES,
+            honors: &["user-agent"],
+        },
     ]
 }
 
@@ -159,10 +166,13 @@ mod tests {
         assert_eq!(env.engine_settings["wpe"], ["user-agent", "storage"]);
         #[cfg(feature = "engine-ladybird")]
         assert_eq!(env.engine_settings["ladybird"], ["storage"]);
+        #[cfg(feature = "engine-netsurf")]
+        assert_eq!(env.engine_settings["netsurf"], ["user-agent"]);
         #[cfg(feature = "engine-demo")]
         assert!(env.engine_settings["demo"].is_empty());
         // Web engines are a property of the descriptors, in their order, whatever this build
-        // compiled in. Servo, WPE and Ladybird open http(s) pages; Wasm and the demo engine do not.
+        // compiled in. Servo, WPE, Ladybird and NetSurf open http(s) pages; Wasm and the demo
+        // engine do not.
         let web: Vec<String> = descriptors()
             .iter()
             .filter(|desc| desc.web)
@@ -172,7 +182,7 @@ mod tests {
         for desc in descriptors() {
             assert_eq!(
                 desc.web,
-                matches!(desc.name, "servo" | "wpe" | "ladybird"),
+                matches!(desc.name, "servo" | "wpe" | "ladybird" | "netsurf"),
                 "{}",
                 desc.name
             );

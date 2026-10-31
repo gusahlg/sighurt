@@ -32,6 +32,9 @@ engine-wpe = ["sighurt-gui/engine-wpe", "sighurt-tui?/engine-wpe"]
 # at run time, and nothing at build time.
 engine-ladybird = ["sighurt-gui/engine-ladybird", "sighurt-tui?/engine-ladybird"]
 engine-demo = ["sighurt-gui/engine-demo", "sighurt-tui?/engine-demo"]
+# NetSurf (docs/rewrite/NETSURF.md). GPL-2.0-only: never a default feature, and a sig
+# built with it is for personal use and must not be distributed.
+engine-netsurf = ["sighurt-gui/engine-netsurf", "sighurt-tui?/engine-netsurf"]
 # Chromes besides sighurt-ui's `standard`, chosen by `[ui] chrome`.
 chrome-line = ["sighurt-gui/chrome-line"]
 

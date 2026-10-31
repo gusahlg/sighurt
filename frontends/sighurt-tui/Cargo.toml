@@ -17,6 +17,7 @@ engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
 engine-ladybird = ["sighurt-runtime/engine-ladybird", "dep:sighurt-engine-ladybird"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
+engine-netsurf = ["sighurt-runtime/engine-netsurf", "dep:sighurt-engine-netsurf"]
 
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
@@ -27,6 +28,7 @@ sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = tru
 sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
 sighurt-engine-demo = { path = "../../engines/sighurt-engine-demo", optional = true }
+sighurt-engine-netsurf = { path = "../../engines/sighurt-engine-netsurf", optional = true }
 base64 = "0.22"
 calloop.workspace = true
 dirs = "5"
