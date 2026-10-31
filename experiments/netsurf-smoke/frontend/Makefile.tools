@@ -1,0 +1,3 @@
+# -*- mode: makefile-gmake -*-
+# sighurt frontend tool setup: the stock one, as for the monkey frontend.
+PKG_CONFIG := pkg-config
