@@ -303,7 +303,7 @@ only queue events"); `lb_pump` returns after the loop iteration and the crate dr
    and set (M3); until then run with `--disable-content-blocker --disable-sql-database` and verify
    with `strace -f -e connect` that the only network traffic is the user's navigation.
 8. **Build cost and fragility of header regeneration.** 2.5 minutes and 340 MB now; breaks
-   if nixpkgs changes the source layout. Cache in `/data/storage/sighurt/` (the HDD) when it
+   if nixpkgs changes the source layout. Cache in `/data/sig-builds/ladybird/` (the HDD) when it
    exists, else `~/.cache/sighurt/` (the smoke script honours `LADYBIRD_SMOKE_CACHE`). Fallback:
    L1's override build on louise-pc, with the user's approval first.
 9. **Licensing.** Ladybird is BSD-2-Clause; the shim is AGPL like the rest of `sig`; keep Ladybird's
@@ -316,7 +316,7 @@ only queue events"); `lb_pump` returns after the loop iteration and the crate dr
 
 Each step is for a worker with no context: read this file, CLAUDE.md, `crates/sighurt-api/src/engine.rs`,
 `docs/rewrite/WPE.md`, and `engines/sighurt-engine-wpe/` as the model. Machine rules apply
-(`tools/cargo`, `tools/heavy`, no Wayland on the desktop, caches under `/data/storage/sighurt` when
+(`tools/cargo`, `tools/heavy`, no Wayland on the desktop, caches under `/data/sig-builds/ladybird` when
 it exists).
 
 - **M0. Smoke test (done).** `tools/heavy experiments/ladybird-smoke/smoke.sh OUT.png` prints
