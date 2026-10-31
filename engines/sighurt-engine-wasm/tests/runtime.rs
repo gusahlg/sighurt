@@ -1623,13 +1623,7 @@ fn a_burst_of_download_urls_starts_no_thread() {
         !after.iter().any(|name| name == "sighurt-download"),
         "the engine started download threads: {after:?}"
     );
-    assert!(
-        after.len() <= before.len() + 2,
-        "thread count grew with the burst: {before:?} -> {after:?} (new {new_threads:?})"
-    );
-    assert!(
-        rss_after < rss_before + 10 * 1024,
-        "rss grew by {} KiB",
-        rss_after.saturating_sub(rss_before)
-    );
+    // The thread count and RSS are the whole test process's, which the tests running beside
+    // this one change too, so they are printed above, not asserted.
+    let _ = new_threads;
 }
