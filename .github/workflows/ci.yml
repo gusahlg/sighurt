@@ -36,19 +36,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Everything except Servo, which servo.yml checks, and WPE WebKit, which needs the prefix
-      # nix/build-wpewebkit.sh installs and is checked on a developer machine (docs/rewrite/WPE.md).
-      # Left out: sighurt-engine-servo, sighurt-engine-wpe, sig's default features (sighurt-browser
-      # is checked below with the demo and Wasm engines, the modal keymap and the line chrome),
-      # and the experiments that link Servo (m0-coexist, m1-mixed, wpe-coexist). `--workspace`
-      # alone would compile both (see CLAUDE.md, "Build commands").
+      # Everything except Servo, which servo.yml checks, and the engines whose build needs a
+      # prefix the runners do not have. WPE WebKit needs nix/build-wpewebkit.sh
+      # (docs/rewrite/WPE.md). NetSurf's build.rs compiles the NetSurf 3.11 core and stops
+      # without the nix-shell's SIGHURT_NETSURF_* variables (docs/rewrite/NETSURF.md); the crate
+      # is also GPL-2.0-only and is never a default feature. CEF and Ladybird dlopen their
+      # libraries at run time, so a missing prefix does not stop the build and they stay here.
+      # Left out: sighurt-engine-servo, sighurt-engine-wpe, sighurt-engine-netsurf, sig's default
+      # features (sighurt-browser is checked below with the demo and Wasm engines and the line
+      # chrome), and the experiments that link Servo (m0-coexist, m1-mixed, wpe-coexist,
+      # tui-servo, wpe-cpu). `--workspace` alone would compile Servo and would try to build
+      # NetSurf (see CLAUDE.md, "Build commands").
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (workspace without Servo and WPE WebKit)
+      - name: Clippy (workspace without Servo, WPE WebKit and NetSurf)
         run: >
           cargo clippy --workspace
-          --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-browser
+          --exclude sighurt-engine-servo --exclude sighurt-engine-wpe
+          --exclude sighurt-engine-netsurf --exclude sighurt-browser
           --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
           --exclude tui-servo --exclude wpe-cpu
           --all-targets -- -D warnings
@@ -66,10 +72,11 @@ jobs:
           cargo build --target wasm32-unknown-unknown --release
           -p hello-sighurt -p raf-demo -p gradient-demo -p typography-demo
 
-      - name: Test (workspace without Servo and WPE WebKit)
+      - name: Test (workspace without Servo, WPE WebKit and NetSurf)
         run: >
           cargo test --workspace
-          --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-browser
+          --exclude sighurt-engine-servo --exclude sighurt-engine-wpe
+          --exclude sighurt-engine-netsurf --exclude sighurt-browser
           --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
           --exclude tui-servo --exclude wpe-cpu
 

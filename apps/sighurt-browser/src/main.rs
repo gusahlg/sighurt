@@ -41,7 +41,7 @@ Options:
       --default-config     Print the built-in configuration and exit
       --dump URL           Print URL's page as reflowed text with numbered links on stdout and
                            exit, with no terminal or window (needs an engine that gives page
-                           text: Servo or WPE WebKit); exit code 2 on a timeout
+                           text: Servo, WPE WebKit or the demo engine); exit code 2 on a timeout
       --width N            With --dump, wrap to N columns (default 80)
       --timeout SECS       With --dump, give up after SECS seconds (default 30)
       --diagnostics FILE   Write the diagnostics to FILE as JSON at exit and on SIGUSR1

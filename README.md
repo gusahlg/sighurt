@@ -4,16 +4,20 @@ Sighurt (`sig`) is a small, configurable browser for Linux. It is one binary wit
 a window on Wayland, and the terminal it is started in, where it shows pages as kitty graphics or
 as reflowed text. Its content engines are compiled into `sig` and run in its process (there is
 no IPC); the browser chrome around them is drawn separately, on the CPU. Three engines come with
-it:
+a default build:
 
-- **Servo** renders the web: HTML, CSS and JavaScript with [Servo](https://servo.org) 0.5. It is
+- **Servo** renders the web: HTML, CSS and JavaScript with [Servo](https://servo.org) 0.7. It is
   the default engine, and the long-term one.
 - **WPE WebKit** ([wpewebkit.org](https://wpewebkit.org)) is there for compatibility in the short
   term: it opens only the sites your configuration gives it and the pages you open in it yourself.
 - **The Wasm engine** runs `.wasm` apps (Rust compiled to `wasm32-unknown-unknown`) under
   Wasmtime, with no WASI. It speaks Oxide's app ABI, so Oxide apps run unchanged.
 
-A fourth, the demo engine, exists to test the host and the chrome without a real engine.
+The demo engine exists to test the host and the chrome without a real engine. Three more are
+compiled in only when you ask ([below](#choosing-what-is-compiled-in)): **CEF** (Chromium, through
+the Chromium Embedded Framework 150.0.22), **Ladybird** (LibWeb) and **NetSurf** 3.11. NetSurf's
+crate is GPL-2.0-only, so a `sig` you build with it is for your own use and must not be
+distributed.
 
 ```text
  sig (sighurt-browser): arguments, process-wide setup, the choice of frontend
@@ -24,14 +28,18 @@ A fourth, the demo engine, exists to test the host and the chrome without a real
   │                     kitty graphics or reflowed text, `sig --dump`
   ├── sighurt-runtime   configuration and session files, the engine registry, effects, services
   ├── sighurt-core      tabs, commands, keymaps, routing, history across engines, permissions
-  └── engines           servo · wpe · wasm · demo, each one a library behind sighurt-api
+  └── engines           servo · wpe · wasm · demo, and cef · ladybird · netsurf when enabled
 
  In the GUI, one Wayland window: the chrome's surfaces and one page surface per engine view, which the
  desktop compositor puts together. Servo presents with OpenGL straight into its page surface,
- WPE WebKit attaches its DMA-BUFs to it, the Wasm engine paints into shared memory. No page is
- read back to the CPU to be shown (WPE copies once a frame only where the compositor has no
- DMA-BUF support, and says so). In the terminal the engines paint into CPU frames instead,
- which the frontend encodes as kitty graphics, or it shows the page's text.
+ WPE WebKit attaches its DMA-BUFs to it, the Wasm engine paints into shared memory. Servo, WPE
+ and Wasm show a page without a routine CPU readback (WPE copies once a frame only where the
+ compositor has no DMA-BUF support, and says so). CEF paints Chromium's windowless OnPaint frames
+ on the CPU and needs a Wayland or X11 display to do it. Ladybird copies one frame into shared
+ memory. NetSurf paints on the CPU into the same shared memory. In the terminal the engines paint
+ into CPU frames, which the frontend encodes as kitty graphics, or it shows the page's text.
+ Text mode and `sig --dump` need an engine that gives the page's text; CEF, Ladybird and NetSurf
+ do not.
 ```
 
 The core is ordinary Rust (`update(state, event) -> effects`) with no I/O; engines report facts as
@@ -71,7 +79,7 @@ Options:
       --default-config     Print the built-in configuration and exit
       --dump URL           Print URL's page as reflowed text with numbered links on stdout and
                            exit, with no terminal or window (needs an engine that gives page
-                           text: WPE WebKit); exit code 2 on a timeout
+                           text: Servo or WPE WebKit); exit code 2 on a timeout
       --width N            With --dump, wrap to N columns (default 80)
       --timeout SECS       With --dump, give up after SECS seconds (default 30)
       --diagnostics FILE   Write the diagnostics to FILE as JSON at exit and on SIGUSR1
@@ -108,13 +116,23 @@ configuration decides which of them are used.
 | `engine-wasm` | yes | the Wasm engine, `wasm` |
 | `engine-wpe` | yes | WPE WebKit, `wpe` (needs the WPE prefix below) |
 | `engine-demo` | no | the demo engine, `demo` |
+| `engine-cef` | no | Chromium through CEF 150.0.22, the engine `cef` (needs the CEF prefix below, and a display to run) |
+| `engine-ladybird` | no | Ladybird (LibWeb), the engine `ladybird` (needs the shim below) |
+| `engine-netsurf` | no | NetSurf 3.11, the engine `netsurf` (GPL-2.0-only; your own use; never a default) |
 | `chrome-line` | no | the line chrome, `[ui] chrome = "line"` |
 
 ```bash
-cargo build -p sighurt-browser --features chrome-line                     # everything
+cargo build -p sighurt-browser --features chrome-line                     # the default engines, plus the line chrome
 cargo build -p sighurt-browser --no-default-features --features engine-servo,engine-wasm   # no WPE
 cargo build -p sighurt-browser --no-default-features --features engine-demo                # no Servo
+cargo build -p sighurt-browser --no-default-features --features engine-cef,engine-demo
+cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
+cargo build -p sighurt-browser --no-default-features --features engine-netsurf,engine-demo,frontend-tui
 ```
+
+`engine-cef`, `engine-ladybird` and `engine-netsurf` are in no default feature set. A table for
+one of them in a build that lacks it is a notice, and `sig` goes on. None of the three has the
+`semantics` capability, so text mode and `sig --dump` do not use them.
 
 The `example` and `bindings` keymaps and the `standard` chrome are in every build. A build without
 `frontend-tui` has no terminal frontend: `--tui` and `--dump` are errors there.
@@ -133,8 +151,10 @@ top; status and notices below) and the page between them in one of two modes:
   graphics: inside tmux 3.4 or later, foot, xterm with sixel.
 - **Text**: the page's content reflowed into terminal lines, with links and controls you can
   move to and activate. It works in any terminal, and is the mode `auto` picks where the
-  terminal can't show images. It needs an engine that gives the page's text: Servo and WPE
-  WebKit do (and the demo engine); the Wasm engine shows a message saying so. `m` switches
+  terminal can't show images. It needs an engine with the `semantics` capability: Servo, WPE
+  WebKit and the demo engine have it. The Wasm engine, CEF, Ladybird and NetSurf show a message
+  saying they have no page text. CEF's graphics in the terminal also need a Wayland or X11
+  display; without one the tab says the engine needs a display and nothing crashes. `m` switches
   mode.
 
 `[tui] mode = "auto"` (the default), `"text"` or `"graphics"` chooses the start; the `[tui]`
@@ -161,7 +181,8 @@ match.
 `sig --dump URL` prints a page as text and exits, with no terminal or window: the reflowed
 page, then its links numbered. `--width N` wraps at N columns, `--timeout SECS` gives up (exit
 code 2); a page that fails to load exits 1. The engine is `--engine`, else the one the routing
-names (Servo by default), as in the terminal.
+names (Servo by default), as in the terminal. CEF, Ladybird and NetSurf have no page text, so
+`--dump` does not use them.
 
 ```bash
 target/debug/sig --dump --width 100 https://example.com/ | less
@@ -180,6 +201,69 @@ nix/build-wpewebkit.sh --pull HOST      # copy it from a machine that has it
 
 Run `sig` inside `nix-shell`: it sets the library path and WebKit's `GIO_EXTRA_MODULES` (TLS for
 `https:`) and `GST_PLUGIN_SYSTEM_PATH_1_0` (media); `sig` warns when the last two are missing.
+
+### CEF (Chromium)
+
+CEF 150.0.22 is Chromium, opt-in, the engine name `cef`. `libcef.so` is opened with `dlopen`
+from the prefix [`nix/build-cef.sh`](nix/build-cef.sh) installs at
+`/data/sig-builds/deps/cef-150.0.22` (`SIGHURT_CEF_PREFIX`, [`nix/cef.nix`](nix/cef.nix)).
+Chromium's renderer, GPU and network processes are the helper `sig-cef-helper`. CEF's own UI
+thread runs the browser-process loop (`multi_threaded_message_loop`); frames are Chromium's
+windowless OnPaint buffers, copied on the CPU. Chromium needs a Wayland or X11 display even
+then, including in the terminal. It has no page text, so text mode and `sig --dump` do not use
+it. It also has no find-in-page, accessibility tree or site-data controls, and the build has no
+proprietary codecs.
+
+```bash
+nix/build-cef.sh
+cargo build -p sighurt-browser --no-default-features --features engine-cef,engine-demo
+```
+
+The crate is `AGPL-3.0-or-later`. CEF and Chromium are BSD; the notices are in
+[`engines/sighurt-engine-cef/README.md`](engines/sighurt-engine-cef/README.md). Details:
+[`docs/rewrite/CEF.md`](docs/rewrite/CEF.md).
+
+### Ladybird
+
+Ladybird is the pinned nixpkgs LibWeb, with one patch to LibWebView, opt-in, the engine name
+`ladybird`. A C++ shim ([`nix/build-ladybird-shim.sh`](nix/build-ladybird-shim.sh)) is opened
+with `dlopen` when the first Ladybird page opens. The patched package
+([`nix/ladybird.nix`](nix/ladybird.nix), [`nix/ladybird/`](nix/ladybird/)) is built on louise-pc
+and copied here; the shim is built against that copy and refuses to build without it. Ladybird's
+pages run in its own helper processes, and each frame is copied once into the host's buffer. It
+has no page text, so text mode and `sig --dump` do not use it.
+
+```bash
+# once: the patched Ladybird on louise-pc, then on this machine the copy and the shim
+tools/remote tools/heavy nix/build-ladybird-patched.sh
+nix/pull-ladybird-patched.sh
+nix/build-ladybird-shim.sh
+cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
+```
+
+The crate and the shim are `AGPL-3.0-or-later`. Ladybird itself is BSD-2-Clause and is loaded at
+run time. Details: [`docs/rewrite/LADYBIRD.md`](docs/rewrite/LADYBIRD.md).
+
+### NetSurf
+
+NetSurf 3.11 is a small in-process engine, the name `netsurf`, for pages that fit its CSS 2.1
+and for text. `engine-netsurf` is never a default feature. The crate is **GPL-2.0-only**.
+Sighurt is AGPL-3.0-or-later, and those two licenses cannot both cover one program that you give
+to someone else. **A `sig` built with `engine-netsurf` is for your own use and must not be
+distributed.** Building it yourself and running it is the choice recorded for this engine
+([`docs/rewrite/NETSURF.md`](docs/rewrite/NETSURF.md)). The crate's
+[README](engines/sighurt-engine-netsurf/README.md) says the same.
+
+It paints whole frames on the CPU. It has no page text, so text mode and `sig --dump` do not use
+it. JavaScript (Duktape) is off by default, and it has no flexbox, grid or gradients. It honors
+`[engines.netsurf] user-agent` and keeps no profile directory yet.
+
+```bash
+cargo build -p sighurt-browser --no-default-features --features engine-netsurf,engine-demo,frontend-tui
+```
+
+On NixOS that build belongs inside `nix-shell` (or `tools/cargo`): the crate's build script
+compiles NetSurf's core from the sources the shell provides.
 
 ### Wasm apps
 
@@ -227,6 +311,9 @@ w = "https://en.wikipedia.org/w/index.php?search={}"   # "w rust" searches Wikip
 [routing.wpe]
 hosts = ["*.example.com", "example.com"]               # these sites open in WPE WebKit
 
+[routing.cef]
+hosts = ["app.example.com"]                            # these sites open in Chromium (engine-cef)
+
 [engines.servo]
 storage = "ephemeral"                                  # keep no cookies or site data
 
@@ -236,6 +323,7 @@ storage = "ephemeral"                                  # keep no cookies or site
 "ctrl-l" = "location.focus"
 "alt-left" = "page.back"
 "ctrl-alt-w" = "page.open-in wpe"                      # this page, again in WPE WebKit
+"ctrl-alt-l" = "page.open-in ladybird"                 # this page, again in Ladybird
 
 [ui]
 font-size = 16
@@ -257,13 +345,13 @@ tabs = "left"
 | `[keywords]` | `name = "template"`: the first word typed, if it is a name, picks the template; the rest goes where its `{}` is | none |
 | `[engines] default` | the engine of the web, and of everything no rule below claims | `"servo"` |
 | `[engines] enabled` | the engines that may open new pages | all in the build |
-| `[engines.<engine>] user-agent` | the user agent the engine sends and its pages see (Servo, WPE) | the engine's own |
-| `[engines.<engine>] storage` | `"profile"` keeps logins (persistent cookies), site data and caches across runs, in private (0700) directories; `"ephemeral"` keeps nothing (Servo, WPE, Wasm) | `"profile"` |
+| `[engines.<engine>] user-agent` | the user agent the engine sends and its pages see (Servo, WPE, CEF, NetSurf) | the engine's own |
+| `[engines.<engine>] storage` | `"profile"` keeps logins (persistent cookies), site data and caches across runs, in private (0700) directories; `"ephemeral"` keeps nothing (Servo, WPE, Wasm, Ladybird, CEF) | `"profile"` |
 | `[routing.<engine>] schemes` | URL schemes the engine opens (not http, https, file or sig) | Servo: `data`, `about` |
 | `[routing.<engine>] extensions` | file extensions it opens from `file:` URLs, and from `origins` | Wasm: `wasm` |
 | `[routing.<engine>] origins` | web servers (`scheme://host[:port]`) whose files with those extensions it opens | none |
 | `[routing.<engine>] hosts` | hosts it opens: `"docs.example.com"`, an IP address, or `"*.example.com"` (hosts under it, not itself) | none |
-| `[input] keymap` | the keymap: `bindings` (reads `[keys]`), or one compiled in | `"bindings"` |
+| `[input] keymap` | the keymap: `example` (the example configuration's keys, in both frontends), `bindings` (reads `[keys]`), or one compiled in | `"example"` |
 | `[input] scroll-speed` | how far a wheel notch or a swipe scrolls a page, 0.1 to 10 | `1.0` |
 | `[input.buttons]` | `back`, `forward`: the mouse's side buttons, a command or `""` | `page.back`, `page.forward` |
 | `[keys]`, `[keys.page]`, `[keys.location]` | the `bindings` keymap: everywhere, while the page has the keyboard, while the address line has it | none |
@@ -276,9 +364,9 @@ tabs = "left"
 | `[downloads] directory` | where downloads go: an absolute path or `~/…` | the desktop's download folder, else `~/Downloads` |
 | `[session] restore` | open the tabs of the last run, and save them as they change | `true` |
 
-The session is `~/.local/state/sighurt/session.toml`; Servo's profile is
-`~/.local/share/sighurt/servo`, WPE WebKit's `~/.local/share/sighurt/wpe` and the Wasm apps' stores
-`~/.local/share/sighurt/wasm`.
+The session is `~/.local/state/sighurt/session.toml`. Profiles, each private (0700), are
+`~/.local/share/sighurt/servo`, `wpe`, `cef`, `ladybird` and `wasm`. NetSurf keeps no profile
+directory yet.
 
 ### Which engine opens a page
 
@@ -301,17 +389,19 @@ The choice stays for the whole run, including when the configuration is read aga
 the engine `--dump` uses (without it, the one the routing names).
 
 `page.switch-engine` reopens the page shown in the next web engine among those compiled in and
-enabled, in the build's order, wrapping around. It chooses that engine the way `page.open-in`
+enabled, in the build's order, wrapping around. That order is `servo`, `wpe`, then `ladybird`,
+`cef` and `netsurf` when those features are on and `[engines] enabled` allows them. The Wasm
+engine and the demo engine are not in the cycle. It chooses the engine the way `page.open-in`
 does. With fewer than two such engines, or a page that isn't http, https or a file, it shows a
 notice and the page stays. Clicking the engine's name at the right end of the address field, or
-at the end of the line chrome, runs it. The terminal binds it to `e`; the GUI binds nothing
-until you do.
+at the end of the line chrome, runs it. The example configuration binds it to `e` in both
+frontends; with `keymap = "bindings"` nothing is bound until you bind it.
 
 Links follow the routing too. When you click a link to an address the routing gives another
 engine, the tab opens it there and back returns to the page. Everything else a page does (a
 script's redirect, a frame loading, a link opened with the keyboard, a form) stays in its engine,
 even right after your click, and so do the links of a page you opened with `page.open-in`, until
-you type an address. Only the address goes along. Neither Servo 0.5 nor WebKit says which frame a
+you type an address. Only the address goes along. Servo 0.7 and WebKit do not say which frame a
 link is in, so a click on a link inside a frame that goes elsewhere moves the whole tab.
 
 ### Commands
@@ -326,7 +416,7 @@ command, typed into the address line) all run them.
 | `tab.next`, `tab.previous`, `tab.last`, `tab.select <n>` | switch tabs |
 | `page.open <url>` | open an address or a search in the active tab |
 | `page.open-in <engine> [url]` | open the address, or the page shown, in the engine named, whatever the routing says |
-| `page.switch-engine` | reopen the page shown in the next web engine |
+| `page.switch-engine` | reopen the page shown in the next enabled web engine (`servo`, `wpe`, `ladybird`, `cef`, `netsurf`, among those this build has) |
 | `page.reload`, `page.stop`, `page.back`, `page.forward` | the page's own |
 | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` | page zoom |
 | `page.send-key <key>` | press and release a named key in the page, as if typed: `down`, `pageup`, `end`, `space`, `enter`, `f5`, `shift-space`, … |
@@ -413,7 +503,7 @@ the status over the page only while there is something to say, drops the buttons
 compact. The line chrome (feature `chrome-line`, `[ui] chrome = "line"`) is one line at the top or
 the bottom of the window: the tab's place (`[2/5]`), the keymap's mode, the address and the status;
 tabs are reached by keys and commands. Both name the engine a page runs in (`servo`, `wpe`,
-`wasm`), small and muted: the standard chrome in each tab and at the address bar's right end, the
+`wasm`, `cef`, `ladybird`, `netsurf`), small and muted: the standard chrome in each tab and at the address bar's right end, the
 line chrome at the line's end; `sig:` pages have none, and `engine-label = false` turns it off.
 Every chrome shows what pages say (titles, status text, addresses) contained to one line, and
 `sig`'s own notices whenever there are any.
@@ -587,3 +677,8 @@ available under Apache-2.0 from Oxide. The guest SDK (`sighurt-sdk`) and the exa
 Apache-2.0, so Wasm apps built with them may use any license. `sighurt-engine-servo` is
 `AGPL-3.0-or-later AND MPL-2.0`; `sig` built with Servo links Servo, which is MPL-2.0, and `sig`
 built with WPE WebKit loads WPE WebKit's libraries (LGPL and BSD licenses) dynamically.
+`sighurt-engine-cef` is `AGPL-3.0-or-later`; the CEF and Chromium BSD notices are in
+[that crate's README](engines/sighurt-engine-cef/README.md). Ladybird is BSD-2-Clause and is
+loaded at run time; the shim and `sighurt-engine-ladybird` are `AGPL-3.0-or-later`.
+`sighurt-engine-netsurf` is **GPL-2.0-only**. Do not distribute a `sig` binary built with
+`engine-netsurf`; building and running it yourself is personal use.

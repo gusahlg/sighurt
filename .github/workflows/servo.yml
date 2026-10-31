@@ -1,6 +1,8 @@
 # Checks the Servo engine (sighurt-engine-servo) and `sig` with Servo, which ci.yml leaves out.
-# `sig`'s default features also have WPE WebKit, which needs a prefix the runners don't have
-# (docs/rewrite/WPE.md), so `sig` is checked here with every feature but `engine-wpe`.
+# This job's feature set is Servo, Wasm, the demo engine and the line chrome. It leaves out
+# WPE WebKit and NetSurf, which need prefixes the runners do not have, and it does not enable
+# engine-cef or engine-ladybird: ci.yml's workspace commands compile those crates (they need
+# nothing at build time).
 #
 # HEAVY: this compiles a large part of Servo (the first run takes a long time and a lot of
 # disk space; later runs rely on the cache). It therefore only runs when the engine, the crates

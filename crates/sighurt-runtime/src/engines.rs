@@ -7,9 +7,8 @@
 //! [`Environment`](sighurt_core::Environment) is built from these descriptors.
 //!
 //! The order is the order runtimes shut down: Servo, Wasm, WPE WebKit, Ladybird, CEF, the demo
-//! engine, NetSurf. The web engines, those that open http(s) pages, are the ones
-//! `page.switch-engine` cycles, in
-//! that same order.
+//! engine, NetSurf. The web engines, those that open http(s) pages (Servo, WPE WebKit, Ladybird,
+//! CEF and NetSurf), are the ones `page.switch-engine` cycles, in that same order.
 //!
 //! Must not own: how a runtime is constructed or how it presents. Those name the frontend's
 //! target and permit types.
@@ -181,7 +180,7 @@ mod tests {
         #[cfg(feature = "engine-demo")]
         assert!(env.engine_settings["demo"].is_empty());
         // Web engines are a property of the descriptors, in their order, whatever this build
-        // compiled in. Servo, WPE, Ladybird and NetSurf open http(s) pages; Wasm and the demo
+        // compiled in. Servo, WPE, Ladybird, CEF and NetSurf open http(s) pages; Wasm and the demo
         // engine do not.
         let web: Vec<String> = descriptors()
             .iter()

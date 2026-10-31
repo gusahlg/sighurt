@@ -23,6 +23,10 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   decisions, and River and a second compositor family are still to be measured.
 - **WPE WebKit** is a default engine of `sig` (decision 78); **the configuration and the extension
   API** are built to the design's 18 steps (decisions 67, 68 and 74–77).
+- **CEF, Ladybird and NetSurf** are opt-in engines, in no default feature set (decisions 117–119,
+  31 October 2026). CEF is Chromium through CEF 150.0.22. Ladybird is the pinned nixpkgs LibWeb
+  with one LibWebView patch. NetSurf 3.11 runs in-process; its crate is GPL-2.0-only, and a
+  `sig` built with it is for personal use.
 - **Verified last** (the section "Final verification and documentation", at the end of the
   milestones): every end-to-end suite, unit tests and clippy on every feature set, a configuration
   showcase, and a short live run of `sig` with all three engines on River. README, DOCS, SECURITY,
@@ -3691,3 +3695,102 @@ Newest last. Each entry says what was decided and why.
     `ui/sighurt-ui/tests/headless.sh` 35 PASS, 0 FAIL. Not yet run: `engines.sh showcase`
     (rewritten for the example; needs Servo, so louise-pc) and the terminal's end-to-end tests
     and real-terminal checks (the terminal clipboard lands separately).
+117. **CEF 150.0.22 is an opt-in Chromium engine** (31 October 2026; design and the as-built
+    record in `docs/rewrite/CEF.md`). `sighurt-engine-cef` is `AGPL-3.0-or-later` (the CEF and
+    Chromium BSD notices are in the crate README) and implements `CefRuntime<T: CpuTarget>`:
+    `capi`, `ffi`, `handlers`, `shared`, `nav`, `actions`, `keys`, `runtime`. `libcef.so` is
+    `dlopen`ed from the prefix `nix/build-cef.sh` installs at
+    `/data/sig-builds/deps/cef-150.0.22` (`SIGHURT_CEF_PREFIX`, `nix/cef.nix`). A missing prefix
+    does not stop the build; the runtime then refuses to start. Chromium's renderer, GPU and
+    network processes are `sig-cef-helper`. CEF's UI thread runs `multi_threaded_message_loop`;
+    callbacks only queue events and wake the owner. Frames are `OnPaint` CPU buffers: dirty
+    rectangles into a staging buffer, then the whole frame into the host's lease. The runtime
+    refuses to start unless the session has `WAYLAND_DISPLAY` or `DISPLAY`, so the terminal
+    runs it only with a display; with neither, the tab says the engine needs a display.
+    `semantics` is false, so text mode and `sig --dump` do not use it. `engine-cef` is on
+    `sighurt-browser`, `sighurt-runtime`, `sighurt-gui` and `sighurt-tui`, in no default set.
+    The descriptor `cef` is a web engine (`page.switch-engine` cycles it) and honors
+    `user-agent` and `storage` (profile `{data_dir}/sighurt/cef`, or ephemeral). *Why:* a
+    Chromium engine beside Servo and WPE, opt-in because the prefix is 2.8 GB and one page is
+    about 1.3 GiB, and because CEF 152 and newer did not start here (exit code 28). *Built:*
+    navigation, history by delta, reload, stop, held user-clicked links
+    (`NavigationRequested`, at most 16), popups and middle clicks as `OpenRequested`,
+    `window.close()` as `CloseRequested`, zoom, resize, hidden views, pointer, wheel, keys,
+    focus, cursor, title, status, crashes as `ViewFailed`, downloads and clipboard through the
+    services. Refused: JS dialogs, permission prompts, media, file choosers, context menus,
+    HTTP authentication and certificate errors, `javascript:` addresses, `<select>` popups,
+    drag and drop, find, accessibility, semantics, DMA-BUF frames, site data. *Evidence*
+    (CEF.md §8; desktop RTX 3070, headless sway with pixman, 31 October 2026, debug `sig`):
+    `cargo test -p sighurt-engine-cef`, 17 unit tests (navigation, keys, queue, staging);
+    `engines/sighurt-engine-cef/tests/offscreen.sh` (ARGB pixels, started/committed order, a
+    held link, traversal, text-input state, typing, Ctrl+V, an input-method commit, a popup,
+    an attachment download, a resize, 0 engine wakes in 3 s, `ViewClosed`, no helper after
+    shutdown); `apps/sighurt-browser/tests/cef.sh`, 11 checks (`page.open-in cef
+    https://example.com/`, tab label `cef`, typed letters that do not fire a bound plain
+    letter, Wayland clipboard, an attachment saved whole, no Chromium process left at exit).
+    Runtime start 60–150 ms warm (4.5–8 s cold); 11 processes, 1.28–1.34 GiB resident; idle
+    CPU 0.3–0.7% of one core; `sig`'s idle wakes 1–2 in 10 s.
+118. **Ladybird is an opt-in engine, on a patched LibWebView** (31 October 2026; the user
+    approved the LibWebView patch that day; design in `docs/rewrite/LADYBIRD.md`). The package
+    is nixpkgs' Ladybird `0-unstable-2026-09-18` (source rev `b90af890`, nixpkgs pin
+    `4975466d`) plus `nix/ladybird/0001-navigation-hold-and-download-view.patch`, applied by
+    `nix/ladybird.nix` and nothing else. The patch adds
+    `ViewImplementation::on_navigation_start_requested` (a user-activated top-level navigation
+    is held until `proceed`; with no hook, behavior is unchanged) and
+    `Application::default_path_for_download` (a download names its view). It was built on
+    louise-pc with `nix/build-ladybird-patched.sh` (31 minutes, 2972 steps, within 15 GB) and
+    copied here without root by `nix/pull-ladybird-patched.sh` into `/data/sig-builds/ladybird`
+    (`patched/`). `nix/build-ladybird-shim.sh` builds `libsighurt-ladybird-shim.so` against that
+    tree and refuses to run without it. `sighurt-engine-ladybird` (`ffi`, `runtime`, `waiter`)
+    `dlopen`s the shim when the first page opens; a missing shim does not stop the build. Each
+    frame is one copy of the valid area into the host's CPU target. Ladybird's pages run in its
+    own helper processes; the shim reaps those by pidfd and does not install `SIGCHLD`.
+    `engine-ladybird` is on browser, runtime, gui and tui, in no default set. The descriptor
+    `ladybird` is a web engine and honors `storage` (profile
+    `{data_dir}/sighurt/ladybird`). `semantics` is false. *Why:* a LibWeb engine, loaded lazily
+    like WPE, with the smallest seam that lets a clicked link follow Sighurt's routing.
+    *Evidence* (LADYBIRD.md, "Implementation status"; this desktop, 31 October 2026):
+    `nix/build-ladybird-shim.sh` (the shim, the flag guard, `ladybird-root`); `tests/loop_probe.c`
+    (title, commit, finish, a frame, the ABI probe, 0 wakeups in 1 s idle);
+    `tests/headless.rs` (events in order, frames in the page's colour, fragment versus document
+    navigation, history back, a click, resize, hidden, idle of 6 pumps and 2 loop wakes in 6 s,
+    close, shutdown, and a non-Ladybird zombie left waitable); `ffi::check_abi`;
+    `tools/cargo check -p sighurt-browser --no-default-features --features
+    engine-ladybird,engine-demo` and with `frontend-tui`; clippy `-D warnings` on browser,
+    runtime, gui and tui with the feature; `tests/services.rs` and `tests/navigation.rs` (a
+    click is held, deny drops it, allow commits it, a fragment and the browser's own loads are
+    not asked about, at most 16 held, a late answer does nothing); `tests/sig-shot.sh` in a
+    private sway (`--engine ladybird`, `[routing.ladybird] hosts`, `page.open-in ladybird`,
+    `MODE=typing`, `MODE=links` opening `demo://pattern` in the demo engine);
+    `apps/sighurt-browser/tests/tui.rs` `a_ladybird_page_is_an_image_in_the_page_rows`. The
+    design's open item is coexistence with Servo, WPE and Wasmtime in one process;
+    `apps/sighurt-browser/tests/coexist.sh` is the check written for every engine together.
+119. **NetSurf 3.11 is in-process, never a default, and GPL-2.0-only** (31 October 2026; the
+    user chose license option 1 in `docs/rewrite/NETSURF.md`). NetSurf's core is GPL-2.0-only
+    ("version 2 of the License", no later version). Sighurt is AGPL-3.0-or-later (decision 88).
+    Those two cannot both cover one program that is conveyed. The user chose personal use: build
+    it and do not distribute a binary that contains both. `engine-netsurf` is in no default
+    feature set. The crate `sighurt-engine-netsurf` is `GPL-2.0-only`, and its README says a
+    `sig` built with it must not be distributed. The C frontend under `csrc/` and the patches
+    under `csrc/patches/` are GPL-2.0-only; NetSurf's libraries (libcss, libdom, libhubbub and
+    the rest) are MIT. `build.rs` compiles the core and the frontend and links one static
+    archive; it needs `SIGHURT_NETSURF_SRC`, `SIGHURT_NETSURF_PKG_CONFIG_PATH` and the font and
+    tool variables from the nix-shell, and stops without them, so CI excludes the crate.
+    `NetSurfRuntime` paints whole frames on the CPU into the host's shared-memory target.
+    Modules: `ffi`, `input`, `runtime`, `watcher`. The descriptor `netsurf` is a web engine and
+    honors `user-agent` only (`profile_dir` is still none). `semantics` is false, so text mode
+    and `sig --dump` do not use it; the terminal shows its frames as graphics.
+    `history_traversal` is false (the core keeps the history). JavaScript (Duktape) stays off
+    unless the build asks. *Evidence* (NETSURF.md, "Status: implemented", steps 1–6, 8, 9 and
+    10's wiring; this desktop, 31 October 2026): `experiments/netsurf-smoke/`; `tools/cargo test
+    -p sighurt-engine-netsurf` (`tests/lifecycle.rs`, one init per process; `tests/engine.rs`
+    for event order, a cancelled navigation, scale 240, resize, an empty rectangle, a hidden
+    view, zoom 2, a link click, typing "héllo", copy, paste, End, the wheel, `NavigationRequested`
+    denied and allowed, `target=_blank` as `OpenRequested { NewView }`); `src/input.rs` unit
+    tests; the descriptor-watcher test; `engines/sighurt-engine-netsurf/tests/headless.sh` in a
+    private sway (page render, link clicks both ways, typing with accents, a configured
+    plain-letter binding that does not fire while a field is focused, scale 2, an idle chrome
+    with no repaints, `sig --tui` in kitty drawing the page as an image). Not done, as that
+    status records: a certificate-error policy test, a disk cache, cookie persistence,
+    `site_data`, the `dlopen` question, and the quality pass (glyph cache, SVG paths, shaping,
+    semantics, find, JavaScript as a feature).

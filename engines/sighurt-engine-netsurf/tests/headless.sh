@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # `sig` with the NetSurf engine, end to end, in a private headless sway (never the desktop: it
 # types and clicks). Builds sig (--no-default-features --features engine-netsurf,engine-demo,
-# keymap-modal,frontend-tui) and the virtual-pointer helper into $CARGO_TARGET_DIR (default
+# frontend-tui) and the virtual-pointer helper into $CARGO_TARGET_DIR (default
 # /data/sig-builds/targets/netsurf), then runs the checks and prints PASS or FAIL for each. The
 # configuration, session and profile directories are all under OUT: nothing touches the
 # user's own sig files. Screenshots and the log go to OUT; look at them too.
@@ -26,7 +26,7 @@ if [[ ${1:-} != --inside ]]; then
   mkdir -p "$out/bin"
   if [[ $build == 1 ]]; then
     SIG_WHAT="netsurf e2e build" tools/cargo build -p sighurt-browser --no-default-features \
-      --features engine-netsurf,engine-demo,keymap-modal,frontend-tui --bins --example virtual-pointer || exit 1
+      --features engine-netsurf,engine-demo,frontend-tui --bins --example virtual-pointer || exit 1
   fi
   cp "$CARGO_TARGET_DIR/debug/sig" "$CARGO_TARGET_DIR/debug/examples/virtual-pointer" "$out/bin/"
   SIG_WHAT="netsurf e2e" tools/heavy tools/headless-sway --size 1000x700 --renderer auto -- "$0" --inside "$out"
