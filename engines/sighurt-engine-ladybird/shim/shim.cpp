@@ -14,6 +14,7 @@
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <LibCore/EventLoop.h>
+#include <AK/HashTable.h>
 #include <LibCore/Directory.h>
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
@@ -36,7 +37,8 @@
 
 #include <LibWebView/ProcessManager.h>
 
-#include <deque>
+#include <list>
+#include <map>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -64,8 +66,55 @@ struct Event {
     bool has_data { false };
 };
 
-std::deque<Event> g_events;
+// A page can make Ladybird call back as often as it likes (a title or a cursor changing in a loop,
+// pushState): events that only state the latest value of something replace an undelivered earlier
+// one of the same kind for the same view, so the queue stays bounded by views times kinds.
+std::list<Event> g_events;
+std::map<std::pair<int, uint64_t>, std::list<Event>::iterator> g_replaceable;
 Event g_current;
+
+bool is_replaceable(int kind)
+{
+    switch (kind) {
+    case LB_EV_TITLE:
+    case LB_EV_LOADING:
+    case LB_EV_CURSOR:
+    case LB_EV_HOVER:
+    case LB_EV_FRAME:
+    case LB_EV_HISTORY:
+    case LB_EV_INPUT_METHOD:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The view a request for a service is charged to: a popup's requests are its opener's (defined
+// after LbView).
+uint64_t shim_service_view(uint64_t);
+
+bool is_service_event(int kind)
+{
+    return kind == LB_EV_CLIPBOARD_WRITE || kind == LB_EV_CLIPBOARD_WANT || kind == LB_EV_DOWNLOAD
+        || kind == LB_EV_PICK_FILES || kind == LB_EV_OPEN_EXTERNAL;
+}
+
+void push_event(Event&& event)
+{
+    if (is_service_event(event.kind))
+        event.view = shim_service_view(event.view);
+    auto key = std::make_pair(event.kind, event.view);
+    bool replace = is_replaceable(event.kind);
+    if (replace) {
+        if (auto it = g_replaceable.find(key); it != g_replaceable.end()) {
+            g_events.erase(it->second);
+            g_replaceable.erase(it);
+        }
+    }
+    g_events.push_back(move(event));
+    if (replace)
+        g_replaceable[key] = std::prev(g_events.end());
+}
 
 void push(int kind, uint64_t view, int64_t i0 = 0, int64_t i1 = 0, std::string const* s0 = nullptr, std::string const* s1 = nullptr, std::string const* data = nullptr)
 {
@@ -84,7 +133,21 @@ void push(int kind, uint64_t view, int64_t i0 = 0, int64_t i1 = 0, std::string c
         event.data = *data;
         event.has_data = true;
     }
-    g_events.push_back(move(event));
+    push_event(move(event));
+}
+
+// Same, moving the payload instead of copying it (a download's bytes).
+void push_moved(int kind, uint64_t view, std::string const& s0, std::string const& s1, std::string&& data)
+{
+    Event event;
+    event.kind = kind;
+    event.view = view;
+    event.s0 = s0;
+    event.has_s0 = true;
+    event.s1 = s1;
+    event.data = move(data);
+    event.has_data = true;
+    push_event(move(event));
 }
 
 // Ladybird's helper processes (WebContent, RequestServer, ...) are children of this process. Its own
@@ -102,21 +165,53 @@ HashMap<pid_t, Child>& children()
     return *map;
 }
 
+// A wait status the way waitpid reports it, from what waitid says.
+int wait_status_from(siginfo_t const& info)
+{
+    if (info.si_code == CLD_EXITED)
+        return (info.si_status & 0xff) << 8;
+    return (info.si_status & 0x7f) | (info.si_code == CLD_DUMPED ? 0x80 : 0);
+}
+
+// Whether the helper has exited (and reaps it, by its pidfd: the pid cannot be another process's, even
+// if the number was reused). Sets `status`; an error that means someone else reaped it counts as exited.
+bool reap_exited(int pidfd, Optional<int>& status)
+{
+    siginfo_t info {};
+    int rc;
+    do {
+        rc = waitid(P_PIDFD, pidfd, &info, WEXITED | WNOHANG);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        if (errno == ECHILD)
+            return true; // Reaped elsewhere (SIGCHLD ignored, another component's waitpid(-1)).
+        return false;
+    }
+    if (info.si_pid == 0)
+        return false; // Not yet.
+    status = wait_status_from(info);
+    return true;
+}
+
 void reap_child(pid_t pid)
 {
-    int status = 0;
-    if (waitpid(pid, &status, WNOHANG) != pid)
+    // Out of the table at once (a reused pid is a new helper), the notifier destroyed after this callback.
+    auto child = children().take(pid);
+    if (!child.has_value())
         return;
-    // The notifier is destroyed after this callback returns.
-    Core::deferred_invoke([pid] {
-        if (auto child = children().take(pid); child.has_value()) {
-            child->notifier = nullptr;
-            close(child->pidfd);
-        }
+    Optional<int> status;
+    if (!reap_exited(child->pidfd, status)) {
+        children().set(pid, move(*child)); // Spurious wake-up.
+        return;
+    }
+    Core::deferred_invoke([notifier = move(child->notifier), pidfd = child->pidfd]() mutable {
+        notifier = nullptr;
+        close(pidfd);
     });
     auto& manager = WebView::Application::process_manager();
     if (auto process = manager.remove_process(pid); process.has_value()) {
-        process->save_crash_report(status);
+        // Crash reports would go to the user's own Ladybird directory: off.
+        process->save_crash_report({});
         manager.on_process_exited(process.release_value(), status);
     }
 }
@@ -178,6 +273,8 @@ RefPtr<Core::Timer> g_download_timer;
 constexpr u64 max_download_bytes = 64ull * 1024 * 1024;
 constexpr u64 max_picked_file_bytes = 32ull * 1024 * 1024;
 
+HashTable<uint64_t> g_history_dirty;
+
 void poll_downloads();
 // The shim's id of the view with Ladybird's id, or 0 (defined after LbView).
 uint64_t shim_view_for_ladybird_id(u64);
@@ -187,7 +284,7 @@ void ensure_download_timer()
     if (g_download_timer)
         return;
     // Only while a download is staged: no timer otherwise.
-    g_download_timer = Core::Timer::create_repeating(500, [] { poll_downloads(); });
+    g_download_timer = Core::Timer::create_repeating(250, [] { poll_downloads(); });
     g_download_timer->start();
 }
 
@@ -266,13 +363,18 @@ void poll_downloads()
 {
     auto& downloader = WebView::Application::the().file_downloader();
     Vector<ByteString> finished;
+    Vector<u64> too_big;
     for (auto const& download : downloader.downloads()) {
         auto it = g_staged.find(download.destination.string());
         if (it == g_staged.end())
             continue;
         using Status = WebView::FileDownloader::DownloadStatus;
-        if (download.status == Status::InProgress || download.status == Status::Paused)
+        if (download.status == Status::InProgress || download.status == Status::Paused) {
+            // A download larger than the host takes is stopped while it runs, not after it filled the disk.
+            if (download.downloaded_size > max_download_bytes || (download.total_size.has_value() && *download.total_size > max_download_bytes))
+                too_big.append(download.id);
             continue;
+        }
         finished.append(download.destination.string());
         if (download.status != Status::Completed) {
             (void)FileSystem::remove(download.destination.string(), FileSystem::RecursionMode::Disallowed);
@@ -293,7 +395,17 @@ void poll_downloads()
         std::string name = to_std(it->value.name);
         auto view = it->value.view != 0 ? it->value.view : g_active_view;
         std::string bytes(reinterpret_cast<char const*>(contents.value().data()), contents.value().size());
-        push(LB_EV_DOWNLOAD, view, 0, 0, &url, &name, &bytes);
+        contents = ByteBuffer {}; // One copy of the file, not two.
+        push_moved(LB_EV_DOWNLOAD, view, url, name, move(bytes));
+    }
+    for (auto id : too_big) {
+        auto destination = downloader.download(id).map([](auto const& download) { return download.destination.string(); });
+        downloader.cancel_download(id);
+        if (destination.has_value()) {
+            dbgln("sighurt: a download over {} bytes is cancelled", max_download_bytes);
+            (void)FileSystem::remove(*destination, FileSystem::RecursionMode::Disallowed);
+            g_staged.remove(*destination);
+        }
     }
     for (auto const& path : finished)
         g_staged.remove(path);
@@ -301,6 +413,17 @@ void poll_downloads()
         g_download_timer->stop();
         g_download_timer = nullptr;
     }
+}
+
+bool is_internal_page(URL::URL const& url)
+{
+    auto scheme = url.scheme();
+    if (scheme == "resource"sv)
+        return true;
+    if (scheme != "about"sv)
+        return false;
+    auto serialized = url.serialize();
+    return serialized != "about:blank"sv && serialized != "about:srcdoc"sv;
 }
 
 // HTML's "navigate to a fragment": the same address but for a fragment, which `to` has.
@@ -318,6 +441,10 @@ public:
         view->initialize_client(CreateNewClient::Yes);
         auto* raw = view.ptr();
         views().set(raw->m_id, move(view));
+        // A spare WebContent process loaded its blank page before the view took it over, and then
+        // no load of it is ever reported to the view.
+        if (raw->has_initial_entry())
+            raw->become_ready();
         return raw;
     }
 
@@ -376,6 +503,35 @@ public:
     }
     bool initial_done() const { return m_initial_done; }
 
+    // The view takes navigations: its blank page is loaded (by its own load, or already, when it took
+    // over a spare WebContent process that had loaded it before the view existed).
+    void become_ready()
+    {
+        if (m_initial_done)
+            return;
+        m_initial_done = true;
+        if (!m_wanted_visible)
+            set_system_visibility_state(Web::HTML::VisibilityState::Hidden);
+        if (!is_popup)
+            push(LB_EV_VIEW_READY, m_id);
+        if (m_queued_load.has_value()) {
+            auto url = m_queued_load.release_value();
+            m_queued_load.clear();
+            load(url);
+        }
+    }
+
+    // A view that took over a spare process has its initial history entry at once.
+    bool has_initial_entry() { return !traversable().session_history().is_empty(); }
+
+    // What the host wants: applied at once once the view is ready, and then when it is.
+    void set_wanted_visibility(bool visible)
+    {
+        m_wanted_visible = visible;
+        if (m_initial_done)
+            set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+    }
+
 private:
     LbView(Core::AnonymousBuffer theme, Web::DevicePixelSize size, double scale)
         : HeadlessWebView(move(theme), size)
@@ -420,14 +576,7 @@ private:
             if (!m_initial_done) {
                 // The view's own about:blank is loaded. A navigation started before this is
                 // dropped by Ladybird, so the host's first one waits here.
-                m_initial_done = true;
-                if (!is_popup)
-                    push(LB_EV_VIEW_READY, id);
-                if (m_queued_load.has_value()) {
-                    auto url = m_queued_load.release_value();
-                    m_queued_load.clear();
-                    load(url);
-                }
+                become_ready();
                 return;
             }
             if (is_popup)
@@ -460,7 +609,11 @@ private:
             push(LB_EV_CRASHED, id, int64_t(reason), 0, &text);
         };
         on_close = [id] { push(LB_EV_CLOSED, id); };
-        on_top_level_navigation_commit = [this] { push_history(); };
+        on_top_level_navigation_commit = [this, id] {
+            if (m_initial_done && !is_popup)
+                push(LB_EV_COMMIT, id);
+            push_history();
+        };
         on_browser_history_traversal_complete = [this] { push_history(); };
         on_input_method_state_change = [this, id] {
             // The caret of the focused editable field, in device pixels. The text around it is
@@ -482,6 +635,7 @@ private:
             auto* popup = page_index.has_value() ? create_child_popup(*page_index) : create_popup();
             popup->is_popup = true;
             popup->popup_opener = id;
+            popup->arm_popup_timer();
             return popup->handle();
         };
 
@@ -489,6 +643,23 @@ private:
         // another engine, so it is held until the host answers (patched LibWebView, nix/ladybird.nix).
         on_navigation_start_requested = [this, id](URL::URL const& url, bool user_activated, Function<void(bool)> proceed) {
             auto text = to_std(url.serialize());
+            // Ladybird's own pages (about:settings and the like, which can open files and programs
+            // outside the profile) are never shown; about:blank is the page's own business.
+            if (is_internal_page(url)) {
+                proceed(false);
+                return;
+            }
+            // A window the page opened: its first navigation is not performed. The opener's browser
+            // is asked to open the address in a view of its own, and this one closes.
+            if (is_popup) {
+                if (text == "about:blank" || text == "about:srcdoc") {
+                    proceed(true);
+                    return;
+                }
+                proceed(false);
+                finish_popup(text);
+                return;
+            }
             // Only what the user started, and not the page's own fragments or the host's own loads.
             if (!user_activated || is_popup || !m_initial_done || is_fragment_navigation(m_last_url, text)) {
                 proceed(true);
@@ -582,8 +753,15 @@ private:
 
     void finish_popup(std::string const& url)
     {
-        is_popup = false; // Once only.
+        if (!is_popup)
+            return; // Once only.
+        is_popup = false;
         push(LB_EV_OPEN_REQUESTED, popup_opener, 0, 0, &url);
+        close_popup_later();
+    }
+
+    void close_popup_later()
+    {
         auto id = m_id;
         Core::deferred_invoke([id] {
             if (auto* view = LbView::find(id)) {
@@ -593,7 +771,28 @@ private:
         });
     }
 
-    void push_history()
+public:
+    // A popup that has not asked for an address within a bound (an about:blank one a script writes
+    // into) is closed.
+    void arm_popup_timer()
+    {
+        auto id = m_id;
+        m_popup_timer = Core::Timer::create_single_shot(10'000, [id] {
+            if (auto* view = LbView::find(id); view && view->is_popup) {
+                view->is_popup = false;
+                view->close_popup_later();
+            }
+        });
+        m_popup_timer->start();
+    }
+
+private:
+
+    void push_history() { g_history_dirty.set(m_id); }
+
+public:
+    // Called after a pump: the history of a view that changed, once however often it changed.
+    void flush_history()
     {
         auto snapshot = traversable().session_history();
         auto entries = snapshot.entries();
@@ -616,14 +815,18 @@ private:
         push(LB_EV_HISTORY, m_id, index, count, &urls);
     }
 
+private:
+
     static inline uint64_t s_next_id { 0 };
     uint64_t m_id;
     bool m_initial_done { false };
+    bool m_wanted_visible { true };
     std::string m_last_url;
     mutable Optional<Web::Clipboard::SystemClipboardItem> m_grant;
     mutable bool m_clipboard_wanted { false };
     i64 m_grant_until { 0 };
     Optional<URL::URL> m_queued_load;
+    RefPtr<Core::Timer> m_popup_timer;
 };
 
 OwnPtr<SighurtApplication> g_app;
@@ -636,6 +839,13 @@ void set_error(char* err, size_t len, std::string const& message)
 {
     if (err && len)
         snprintf(err, len, "%s", message.c_str());
+}
+
+uint64_t shim_service_view(uint64_t id)
+{
+    if (auto* view = LbView::find(id); view && view->is_popup && view->popup_opener != 0)
+        return view->popup_opener;
+    return id;
 }
 
 uint64_t shim_view_for_ladybird_id(u64 ladybird_id)
@@ -744,6 +954,68 @@ Web::DevicePixelPoint point(int x, int y) { return { x, y }; }
 
 }
 
+// Stops Ladybird: views, the application (which asks its helpers to go), then every helper still
+// running is signalled and reaped through its pidfd, all against one deadline. Also the way out of a
+// failed lb_init. Nothing is left that could run after the library's globals are destroyed.
+void teardown()
+{
+    for (auto& entry : LbView::views())
+        entry.value->close_now();
+    g_held_navigations.clear();
+    g_launches.clear();
+    g_pickers.clear();
+    g_history_dirty.clear();
+    LbView::views().clear();
+    g_app = nullptr;
+    // The download timer and the files it was watching.
+    if (g_download_timer) {
+        g_download_timer->stop();
+        g_download_timer = nullptr;
+    }
+    for (auto& entry : g_staged)
+        (void)FileSystem::remove(entry.key, FileSystem::RecursionMode::Disallowed);
+    g_staged.clear();
+    // The downloader keeps partial files beside the destinations: the whole staging directory goes.
+    (void)FileSystem::remove(ByteString::formatted("{}/downloads-staging", g_profile), FileSystem::RecursionMode::Allowed);
+    // Helpers: ask them all, then wait for them all, then force what is left.
+    for (auto& entry : children())
+        syscall(SYS_pidfd_send_signal, entry.value.pidfd, SIGTERM, nullptr, 0);
+    auto deadline = now_ns() + 2'000'000'000;
+    bool forced = false;
+    for (;;) {
+        Vector<pid_t> pids;
+        for (auto& entry : children())
+            pids.append(entry.key);
+        for (auto pid : pids) {
+            auto& child = *children().get(pid);
+            Optional<int> status;
+            if (reap_exited(child.pidfd, status)) {
+                child.notifier = nullptr;
+                close(child.pidfd);
+                children().remove(pid);
+            }
+        }
+        if (children().is_empty())
+            break;
+        if (now_ns() > deadline) {
+            if (forced)
+                break; // Nothing more can be done for a helper that survives SIGKILL.
+            for (auto& entry : children())
+                syscall(SYS_pidfd_send_signal, entry.value.pidfd, SIGKILL, nullptr, 0);
+            forced = true;
+            deadline = now_ns() + 1'000'000'000;
+        }
+        usleep(5'000);
+    }
+    for (auto& entry : children()) {
+        entry.value.notifier = nullptr;
+        close(entry.value.pidfd);
+    }
+    children().clear();
+}
+
+bool g_init_failed = false;
+
 extern "C" {
 
 void lb_abi_describe(lb_abi* out)
@@ -765,10 +1037,11 @@ void lb_abi_describe(lb_abi* out)
 
 int lb_init(char const* const* argv, int argc, char const* profile, char const* prefix, char* err, size_t err_len)
 {
-    if (g_app) {
-        set_error(err, err_len, "lb_init was called twice");
+    if (g_app || g_init_failed) {
+        set_error(err, err_len, g_init_failed ? "Ladybird failed to start before; the process cannot start it again" : "lb_init was called twice");
         return 1;
     }
+    g_init_failed = true; // Until it has succeeded: the loop's manager can be installed once.
     Sighurt::loop_install();
     g_profile = profile ? profile : "";
 
@@ -796,14 +1069,18 @@ int lb_init(char const* const* argv, int argc, char const* profile, char const* 
     }
     g_app = app.release_value();
     watch_children();
+    // What an earlier run left in the staging directory is not a download of this one.
+    (void)FileSystem::remove(ByteString::formatted("{}/downloads-staging", g_profile), FileSystem::RecursionMode::Allowed);
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
     auto theme = Gfx::load_system_theme(theme_path.string());
     if (theme.is_error()) {
         set_error(err, err_len, "cannot load Ladybird's theme from " + to_std(theme_path.string()));
+        teardown(); // Not a half-started Ladybird with its helpers and nobody to pump them.
         return 3;
     }
     g_theme = theme.release_value();
+    g_init_failed = false;
     return 0;
 }
 
@@ -812,6 +1089,14 @@ int lb_loop_fd(void) { return Sighurt::loop_fd(); }
 int64_t lb_pump(int* more)
 {
     auto result = Sighurt::loop_pump();
+    {
+        auto dirty = move(g_history_dirty);
+        g_history_dirty = {};
+        for (auto id : dirty) {
+            if (auto* view = LbView::find(id))
+                view->flush_history();
+        }
+    }
     if (more)
         *more = (result.more_queued || result.dispatched > 0 || !g_events.empty()) ? 1 : 0;
     return result.next_timer_ms;
@@ -821,6 +1106,11 @@ int lb_next_event(lb_event* out)
 {
     if (g_events.empty())
         return 0;
+    if (is_replaceable(g_events.front().kind)) {
+        auto it = g_replaceable.find({ g_events.front().kind, g_events.front().view });
+        if (it != g_replaceable.end() && it->second == g_events.begin())
+            g_replaceable.erase(it);
+    }
     g_current = move(g_events.front());
     g_events.pop_front();
     out->kind = g_current.kind;
@@ -839,8 +1129,10 @@ uint64_t lb_wake_count(void) { return Sighurt::loop_wake_count(); }
 uint64_t lb_view_open(int width, int height, double scale, int visible, double zoom)
 {
     auto* view = LbView::create(g_theme, { width, height }, scale);
-    if (!visible)
-        view->set_system_visibility_state(Web::HTML::VisibilityState::Hidden);
+    // A hidden page gets no rendering opportunities, and without them its own blank page never
+    // finishes loading, so the view could not take a navigation (nor report ViewReady) before it is
+    // shown, and the host shows it only after ViewReady. It starts visible and is hidden once ready.
+    view->set_wanted_visibility(visible != 0);
     if (zoom != 1.0)
         view->set_zoom(zoom);
     return view->id();
@@ -891,7 +1183,7 @@ void lb_set_viewport(uint64_t id, int width, int height, double scale)
 void lb_set_visible(uint64_t id, int visible)
 {
     if (auto* view = LbView::find(id))
-        view->set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+        view->set_wanted_visibility(visible != 0);
 }
 
 void lb_set_focus(uint64_t id, int focused)
@@ -1078,37 +1370,7 @@ int lb_frame_get(uint64_t id, lb_frame* out)
 
 void lb_shutdown(void)
 {
-    // Views first, then the application (it stops the helper processes). The event loop is not
-    // pumped again: closing is forced, not waited for.
-    for (auto& entry : LbView::views())
-        entry.value->close_now();
-    g_held_navigations.clear();
-    LbView::views().clear();
-    g_app = nullptr;
-    // The helpers are stopping: reap them by pid, and make sure they do stop.
-    Vector<pid_t> pids;
-    for (auto& entry : children())
-        pids.append(entry.key);
-    for (auto pid : pids) {
-        bool reaped = false;
-        for (int i = 0; i < 300 && !reaped; ++i) {
-            int status = 0;
-            auto result = waitpid(pid, &status, WNOHANG);
-            reaped = result == pid || (result < 0 && errno != EINTR);
-            if (!reaped)
-                usleep(10'000);
-        }
-        if (!reaped) {
-            kill(pid, SIGKILL);
-            int status = 0;
-            waitpid(pid, &status, 0);
-        }
-    }
-    for (auto& entry : children()) {
-        entry.value.notifier = nullptr;
-        close(entry.value.pidfd);
-    }
-    children().clear();
+    teardown();
 }
 
 }

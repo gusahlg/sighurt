@@ -19,7 +19,27 @@ mkdir -p "$XDG_CONFIG_HOME/sighurt"
 # MODE=engine: Ladybird is the default engine (sig --engine ladybird). MODE=route: the demo engine
 # is, and [routing.ladybird] gives Ladybird the host of the URL.
 host=$(sed -E 's|^[a-z]+://([^/:]+).*|\1|' <<<"$url")
-if [[ ${MODE:-engine} == links ]]; then
+if [[ ${MODE:-engine} == second ]]; then
+  # A second Ladybird view: a page from the command line, a new tab (sig://home), then
+  # page.open-in ladybird into that tab.
+  cat > "$home/one.html" <<HTML
+<!doctype html><title>first</title><body style="background:#cfe">first
+HTML
+  cat > "$home/two.html" <<HTML
+<!doctype html><title>second</title><body style="background:#fec">second
+HTML
+  cat > "$XDG_CONFIG_HOME/sighurt/config.toml" <<CONF
+version = 1
+[engines]
+default = "ladybird"
+enabled = ["ladybird", "demo"]
+[keys]
+"ctrl-t" = "tab.new"
+"ctrl-o" = "page.open-in ladybird file://$home/two.html"
+CONF
+  engine_args=(--engine ladybird)
+  url_to_open=file://$home/one.html
+elif [[ ${MODE:-engine} == links ]]; then
   # A click on a link in a Ladybird page to an address the routing gives the demo engine: the
   # engine asks the browser (NavigationRequested), which opens it in the demo engine.
   cat > "$home/page.html" <<HTML
@@ -87,10 +107,20 @@ CONF
 fi
 failures=0
 check() { if "${@:2}"; then echo "PASS $1"; else echo "FAIL $1"; failures=$((failures + 1)); fi }
-SIG_DIAG=1 RUST_LOG=info "$sig" --gui "${engine_args[@]}" "${url_to_open:-$url}" > "$out/sig.log" 2>&1 &
+SIG_DIAG=1 RUST_LOG=${RUST_LOG:-info} "$sig" --gui "${engine_args[@]}" "${url_to_open:-$url}" > "$out/sig.log" 2>&1 &
 pid=$!
-for _ in $(seq 1 60); do sleep 1; kill -0 "$pid" 2>/dev/null || break; done
-if [[ ${MODE:-engine} == links ]]; then
+for _ in $(seq 1 ${SIG_SETTLE:-15}); do sleep 1; kill -0 "$pid" 2>/dev/null || break; done
+if [[ ${MODE:-engine} == second ]]; then
+  wtype -s 3600000 ' ' &
+  keyboard=$!
+  sleep 6
+  grim "$out/first.png"
+  wtype -M ctrl -k t -m ctrl
+  sleep 2
+  wtype -M ctrl -k o -m ctrl
+  sleep 12
+  kill $keyboard 2>/dev/null
+elif [[ ${MODE:-engine} == links ]]; then
   pointer=${CARGO_TARGET_DIR:-$repo/target}/debug/examples/virtual-pointer
   mkfifo "$XDG_RUNTIME_DIR/pointer"
   "$pointer" < "$XDG_RUNTIME_DIR/pointer" &

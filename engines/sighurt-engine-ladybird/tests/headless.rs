@@ -179,6 +179,16 @@ fn child_pids() -> Vec<i32> {
     pids
 }
 
+/// The last history report among `events`.
+fn last_history(events: &[EngineEvent]) -> Option<(Vec<String>, usize)> {
+    events.iter().rev().find_map(|e| match e {
+        EngineEvent::HistoryChanged {
+            entries, current, ..
+        } => Some((entries.clone(), *current)),
+        _ => None,
+    })
+}
+
 fn pixel(shot: &Shot, x: usize, y: usize) -> [u8; 4] {
     let size = shot.size.expect("a frame");
     let i = 4 * (y * size.width as usize + x);
@@ -388,17 +398,15 @@ fn pages_load_render_navigate_and_idle() {
         })
         .expect("commit of the second page");
     assert_ne!(new_document, documents_before, "a new document");
-    let history = d
-        .seen
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            EngineEvent::HistoryChanged {
-                entries, current, ..
-            } => Some((entries.clone(), *current)),
-            _ => None,
-        })
-        .expect("HistoryChanged");
+    // History reports are throttled (50 ms): wait for the one that says it all.
+    assert!(
+        d.until(
+            Duration::from_secs(10),
+            |e| matches!(last_history(e), Some((ref entries, 2)) if entries.len() == 3)
+        ),
+        "history of three entries"
+    );
+    let history = last_history(&d.seen).expect("HistoryChanged");
     assert_eq!(history.0.len(), 3, "{history:?}");
     assert_eq!(history.1, 2);
 
@@ -434,17 +442,14 @@ fn pages_load_render_navigate_and_idle() {
     assert!(d.until(Duration::from_secs(20), |e| e[marker..].iter().any(
         |e| matches!(e, EngineEvent::TitleChanged { title: Some(t), .. } if t == "First")
     )));
-    let history = d
-        .seen
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            EngineEvent::HistoryChanged {
-                entries, current, ..
-            } => Some((entries.clone(), *current)),
-            _ => None,
-        })
-        .unwrap();
+    assert!(
+        d.until(Duration::from_secs(10), |e| matches!(
+            last_history(e),
+            Some((_, 0))
+        )),
+        "history back at the start"
+    );
+    let history = last_history(&d.seen).unwrap();
     assert_eq!(history.1, 0, "{history:?}");
 
     // 5b. A click on a link: the page starts its own navigation, with an id of the engine's own.
