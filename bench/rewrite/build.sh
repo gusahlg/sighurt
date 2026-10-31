@@ -39,11 +39,26 @@ if [[ ${1:-} == --on-host ]]; then
   fi
   mkdir -p "$dest.tmp"
   cd "$src"
+  # Every revision has its own source directory but they share target-rewrite, and git archive
+  # stamps files with the commit's time, so a revision built after a later one would look older
+  # than its artifacts and cargo would keep them. Files that differ from the tree target-rewrite
+  # last built are stamped now; identical ones keep their time. With no record, every file is.
+  last=$(cat ~/$root/target-rewrite.last-src 2>/dev/null || true)
+  if [[ -n $last && -d $last && $last != "$src" ]]; then
+    find . -type f -print0 | while IFS= read -r -d '' f; do
+      cmp -s "$f" "$last/$f" || touch "$f"
+    done
+  elif [[ $last != "$src" ]]; then
+    find . -type f -exec touch {} +
+  fi
   # Rust from the revision's pinned nixpkgs, which revisions before shell.nix brought it lack;
   # the machine's own may be older than the workspace's rust-version.
   if [[ -f nix/nixpkgs.nix ]] && ! grep -q 'rustc cargo' shell.nix; then
     PATH=$(nix-build nix/nixpkgs.nix -A rustc -A cargo --no-out-link | sed 's|$|/bin|' | paste -sd:):$PATH
   fi
+  # Recorded before building: a build that fails half way has already put this tree's artifacts
+  # there.
+  echo "$src" > ~/$root/target-rewrite.last-src
   CARGO_TARGET_DIR=~/$root/target-rewrite SIG_MEM=${SIG_MEM:-11G} SIG_WHAT="bench: rewrite sig $name" \
     tools/heavy cargo build "${flags[@]}" 2>&1 | tee "$dest.tmp/build.log"
   cp ~/$root/target-rewrite/release/sig "$dest.tmp/sig"
