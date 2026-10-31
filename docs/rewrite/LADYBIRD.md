@@ -549,7 +549,7 @@ LibWebView) adds the smallest seam:
 - `Application::default_path_for_download(url, view_id, name)`, defaulting to the old callback, so a
   download names its view.
 
-`nix/ladybird.nix` is `pkgs.ladybird.overrideAttrs` adding the patch and nothing else (same inputs,
+`nix/ladybird.nix` is `pkgs.ladybird.overrideAttrs` adding the patches (0001, and 0002 below) and a wrapper default (see "Fontconfig"), nothing else (same inputs,
 flags and version). It was built on louise-pc with `nix/build-ladybird-patched.sh` (`nix-build --cores 8
 --max-jobs 1`, under that machine's heavy lock, no embargo): **31 minutes**, 2972 build steps, memory
 within the 15 GB. The result is `/nix/store/446qfwl3...-ladybird-0-unstable-2026-09-18` on louise.
@@ -626,17 +626,48 @@ labelled `demo`), because the core answered the request with the other engine.
     `TextPurpose::Password`, so the input method gets the sensitive and hidden hints (fail closed): a
     price paid in completion quality. The text around the caret is not sent either.
 15. *Iframe lookup in the patch (verified by reading `view_for_page_id` / `owning_view_for_page_id`):*
-    the hook now uses `owning_view_for_page_id`, which also finds the view of an embedded page. That is
-    a change of the patch: **it needs the package rebuilt on louise-pc, which was not possible** (its heavy
-    lock has been held for hours by another job); the rebuild is queued
-    (`nix/build-ladybird-patched.sh`). Until it is built and pulled, the deployed package has the earlier
-    patch, and a `target=_top` click inside a cross-process iframe is not asked about.
+    the hook now uses `owning_view_for_page_id`, which also finds the view of an embedded page, so a
+    `target=_top` click inside a cross-process iframe is asked about too. The package was rebuilt on
+    louise-pc (30 minutes) with it and pulled; not covered by a test (the test pages have no cross-process
+    iframe, which needs two sites).
 16. *`SA_SIGINFO` chaining:* the handler is installed with `SA_SIGINFO`, chains a previous
     `sa_sigaction` or `sa_handler`, and puts the old action back only if its own is still installed.
 
 And the second Ladybird view of a session never loading (found by `coexist.sh`): see "A navigation started
 before the view's own about:blank has loaded". After the last Ladybird tab closes, one WebContent stays
 alive until quit: it is Ladybird's spare process (it keeps one ready for the next view), by design.
+
+### Cancelling a download aborted the page: patch 0002 (found by the workspace test run)
+
+Cancelling a running download (the engine does it for one over the limit) printed `VERIFICATION FAILED:
+m_running_execution_context at Libraries/LibJS/Runtime/VM.h:270` and WebContent died, from
+`readable_stream_cancel` → `resolve_promise` → a JavaScript call. Cause (upstream, in
+`WebContent::PageClient::cancel_download`): the UI process's `async_cancel_download` arrives while no
+script runs in WebContent, and cancelling the download's stream resolves a promise, which needs an
+execution context. A cancellation path that avoids it was looked for:
+`FileDownloader::cancel_download` and `fail_download` both call the cancel callback that tells
+WebContent (it is what stops the renderer-owned fetch), and clearing the callback first would leave the
+page's fetch running to the end of the file (the whole transfer through IPC, to be dropped), so that is no
+fix. Patch `nix/ladybird/0002-webcontent-download-cancel-context.patch` (the one function) runs the
+cancellation in a `TemporaryExecutionContext` of a document of the page. (A first version took the realm
+from the reader's `closed_promise_realm()`, which is not exported from LibWeb: the link failed, 30 minutes
+lost; the realm now comes from `relevant_realm` of the page's active document.) The package was rebuilt (30
+minutes) and pulled, and `tests/robust.rs` checks that cancelling an oversized download raises no
+`ViewFailed` and stops the transfer. Without the patch, or on any other WebContent abort, the engine
+reports `ViewFailed` (the page can be reloaded; `tests/robust.rs` kills a WebContent process and the view
+fails and recovers its helpers). This is an upstream Ladybird bug at the pinned revision, worth reporting
+with the stack above.
+
+### The "Fontconfig error" lines
+
+Helpers print `Fontconfig error: Cannot load default config file: Unable to open /nix/store/...-fontconfig-2.18.3/etc/fonts/fonts.conf`.
+It is cosmetic (text renders) and it is not about the environment: it is gone with `--disable-sandbox`
+and stays with `FONTCONFIG_FILE` set to a valid file (checked with `tests/loop_probe.c` and
+`LB_ARG=--disable-sandbox`), because the helpers apply a Landlock sandbox that does not allow reading
+that store path when fontconfig initialises lazily. The helpers' wrappers (patched package, `nix/ladybird.nix`)
+now set `FONTCONFIG_FILE` to `/etc/fonts/fonts.conf` when it is unset, which is harmless and needs no
+environment write in `sig`, but does not silence the message. Left as it is: disabling the sandbox for it
+would be a bad trade.
 
 ### Run it
 
