@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{
     EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, PresentOutcome,
-    PumpStatus, SiteDataKinds, ViewOptions,
+    PumpStatus, SiteDataKinds, SiteDataRequest, ViewOptions,
 };
 use sighurt_api::events::{EngineEvent, NavigationError};
 use sighurt_api::geometry::{Metrics, SurfaceRect};
@@ -54,7 +54,14 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     native_popups: false,
     process_per_view: false,
     semantics: false,
-    site_data: SiteDataKinds::NONE,
+    // Chromium keeps all of these in its profile; forgetting them is not implemented, and
+    // `site_data` says so instead of pretending.
+    site_data: SiteDataKinds {
+        cookies: true,
+        storage: true,
+        caches: true,
+        hsts: true,
+    },
 };
 
 /// The most events one `pump` hands over.
@@ -150,6 +157,7 @@ pub struct CefRuntime<T: CpuTarget> {
     shared: Arc<Shared>,
     views: HashMap<ViewId, View<T>>,
     shut_down: bool,
+    leaked: bool,
     presented_bytes: u64,
 }
 
@@ -231,6 +239,7 @@ impl<T: CpuTarget> CefRuntime<T> {
             shared: Shared::new(waker),
             views: HashMap::new(),
             shut_down: false,
+            leaked: false,
             presented_bytes: 0,
         })
     }
@@ -248,6 +257,11 @@ impl<T: CpuTarget> CefRuntime<T> {
             d.staged_bytes += staged.copied;
         }
         d
+    }
+
+    /// Whether `shutdown` had to leave Chromium running (a browser never closed).
+    pub fn leaked(&self) -> bool {
+        self.leaked
     }
 
     fn running(&self) -> Result<(), EngineError> {
@@ -432,18 +446,23 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
                     });
                     return Ok(());
                 }
-                lock(&shared.nav).request_navigate(navigation);
+                let superseded = lock(&shared.nav).request_navigate(navigation);
+                self.shared.push_all(superseded);
                 shared.run(Action::Load(url));
             }
             EngineCommand::Reload { navigation } => {
-                lock(&shared.nav).request_reload(navigation);
+                let superseded = lock(&shared.nav).request_reload(navigation);
+                self.shared.push_all(superseded);
                 shared.run(Action::Reload);
             }
             EngineCommand::Stop => shared.run(Action::Stop),
             EngineCommand::Traverse { navigation, delta } => {
                 let steps = lock(&shared.nav).request_traverse(navigation, delta);
                 match steps {
-                    Ok(steps) => shared.run(Action::History(steps)),
+                    Ok((steps, superseded)) => {
+                        self.shared.push_all(superseded);
+                        shared.run(Action::History(steps));
+                    }
                     Err(event) => self.shared.push(event),
                 }
             }
@@ -479,6 +498,13 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
             }
         }
         Ok(())
+    }
+
+    fn site_data(&mut self, _request: SiteDataRequest) -> Result<(), EngineError> {
+        // Declared (Chromium stores them), not implemented: refused, so the user is told.
+        Err(EngineError::Unsupported(
+            "listing or forgetting Chromium's site data",
+        ))
     }
 
     fn pump(&mut self, events: &mut Vec<EngineEvent>) -> PumpStatus {
@@ -567,6 +593,7 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
         }
         if self.shared.live.load(std::sync::atomic::Ordering::Acquire) > 0 {
             log::warn!("cef: browsers still open at shutdown; leaving Chromium running");
+            self.leaked = true;
         } else {
             // SAFETY: after every browser closed, on the thread that initialized CEF.
             unsafe { (ffi::api().shutdown)() };

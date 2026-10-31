@@ -284,6 +284,12 @@ impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
     fn readbacks(&self) -> u64 {
         self.0.diagnostics().staged_bytes
     }
+
+    /// Chromium is still running when a browser never closed in time: the registry then ends
+    /// the process the way it does for any engine that could not shut down.
+    fn leaked(&self) -> bool {
+        self.0.leaked()
+    }
 }
 
 #[cfg(feature = "engine-demo")]

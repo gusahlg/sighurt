@@ -371,8 +371,7 @@ impl sighurt_runtime::registry::Running<TermTarget, TermPermit> for WpeBound {
     }
 }
 
-/// Chromium needs a display connection even windowless; a terminal session without one gets
-/// the runtime's own refusal ("the cef engine needs a display"), which the tab shows.
+/// Chromium runs headless (SwiftShader), so a terminal session needs no display.
 #[cfg(feature = "engine-cef")]
 fn cef(
     waker: sighurt_api::engine::EngineWaker,
@@ -391,6 +390,11 @@ impl sighurt_runtime::registry::Running<TermTarget, TermPermit>
 {
     fn readbacks(&self) -> u64 {
         self.0.diagnostics().staged_bytes
+    }
+
+    /// Chromium is still running when a browser never closed in time.
+    fn leaked(&self) -> bool {
+        self.0.leaked()
     }
 }
 
