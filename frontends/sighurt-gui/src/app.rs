@@ -1161,6 +1161,8 @@ fn report(gui: &Gui, session: &mut Session<Gui>, at_exit: bool) {
     let counters = session.diagnostics().counters.clone();
     let peaks = session.diagnostics().peaks.clone();
     let last_error = session.diagnostics().last_error();
+    let indicator = session.core().keymap_indicator().map(str::to_owned);
+    session.diagnostics_mut().keymap_indicator = indicator;
     let report = Report {
         counters,
         peaks,

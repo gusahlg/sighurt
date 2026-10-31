@@ -50,7 +50,7 @@ frontend-neutral crate carved out of today's `sighurt-browser`:
 | **`sighurt-runtime`** (new; name pending, §8) | the engine registry and runtime lifecycle, effect execution that isn't frontend-specific, services and downloads, config and session persistence and watch, diagnostics, per-view bookkeeping, the snapshot builder, a frontend-neutral `Session<P: Platform>` driving `update()` | windows, terminals, pixels, key routing policy | api, core, engines (optional features), `sighurt-wayland` only under feature `wayland` |
 | **`sighurt-gui`** (new; today's `app.rs`, chrome targets and placement, Wayland clipboard glue) | the calloop owner loop over `Host`, the Wayland `Platform` | policy, engine internals | api, core, runtime, wayland, ui |
 | **`sighurt-tui`** (new) | terminal I/O, capability detection, cell grid and diff writer, terminal chrome, graphics encoders (kitty, sixel), the text renderer (semantic → cells), input mapping, dump mode | policy, engines, Wayland | api, core, runtime (never sighurt-ui or sighurt-wayland) |
-| `sighurt-wayland`, `sighurt-ui`, `sighurt-chrome-line`, `sighurt-keymap-modal` | unchanged | | |
+| `sighurt-wayland`, `sighurt-ui`, `sighurt-chrome-line`, `sighurt-config-example` (was `sighurt-keymap-modal`; decision 116) | unchanged | | |
 | `sighurt-browser` (`sig`) | `main.rs`: CLI, frontend choice, process-wide setup | | gui/tui optional |
 | `sighurt-semantic` (new, small) | the DOM extraction script and the bounded JSON → `SemanticSnapshot` parser shared by the Servo and WPE adapters | engine specifics | api, serde_json |
 
@@ -399,7 +399,7 @@ Where it differs from the sketches in §2–§3:
 - **Semantics.** `App::sync_semantics` asks (`Session::set_semantics`) for exactly the shown view
   in text mode whose engine declares `semantics`, and stops asking, and drops the view's page,
   when it is hidden or the mode changes. An engine without them gets the page-rows message "No
-  page text from this engine …" (the keys in it are the built-in `[tui.keys]` ones).
+  page text from this engine …" (the keys in it are the example configuration's, decision 116).
 - **Keys.** The keymap runs first. What it leaves for the page, including `page.send-key
   ArrowDown` from the built-in `j`, reaches `Frontend::page_input` (new in `sighurt-runtime`:
   called for each `EngineCommand::Input` before the engine, `true` keeps it from the engine), and

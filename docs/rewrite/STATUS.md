@@ -3647,3 +3647,47 @@ Newest last. Each entry says what was decided and why.
     7/7 in kitty, and a live check in Rio running the user's tmux configuration: sixel with
     Servo, Servo text mode, `e`, `o` with an address opening chatgpt.com, and `q` quitting in
     1 s with chatgpt.com open. `sighurt-sdk` keeps 0.7.0 (the guest ABI didn't change).
+116. **The configuration extension: the keymap reads the browser, runs sequences, and is the
+    example configuration by default** (31 October 2026; design in
+    `docs/rewrite/config-extension.md`; amends 68, 74 (5), 91, 99's wording and 111; CLAUDE.md's
+    "no default bindings" rule is rewritten). (1) `sighurt_api::keymap` gains `Browser` (a
+    borrowed, read-only view: the frontend, the key context, the tabs as `TabInfo` and which is
+    selected), `Frontend` (moved from the core, which re-exports it) and `KeyAction::RunAll`;
+    `Keymap::press` takes the browser. The core builds the view from its own fields for one call
+    and runs a `RunAll` whole, in order, in that update. The chrome API is unchanged; the
+    indicator is still the one thing a keymap shows, and both chromes show it. (2)
+    `sighurt-keymap-modal` is replaced by `sighurt-config-example` (`example`), always compiled in
+    and the built-in `[input] keymap`; the `keymap-modal` features are gone. Its bindings are
+    Rust (`table.rs`; a `Binding`'s frontend field is named `frontend`): the terminal's 0.9.0
+    keys in both frontends (`ctrl-c`, `m` and `ctrl-l` in the terminal only; `ctrl-c` only while
+    the page has the keyboard), Escape toggling NORMAL and INSERT (INSERT passes every key but
+    Escape to whatever has the keyboard, the address line included, and shows `INSERT MODE`;
+    NORMAL shows nothing), `y y` copying the address and `c o` closing the other tabs, both
+    computed from the browser view. `[keymap.example]` takes no keys. The built-in file's keymap
+    falls back to `bindings` in a build that lacks it (as 82 (3) does for the default engine).
+    (3) The built-in `[tui.keys]` table is gone and `[tui] default-keys` does nothing (a notice
+    when set); `bindings` binds nothing in either frontend until `[keys]` does, and a user's
+    `[tui.keys]` still applies in the terminal over `[keys]`. Version 1 stands. (4)
+    `clipboard.copy <text>` is a command (`Effect::ClipboardWrite`, carried out by the runtime
+    through the frontend's `Clipboard`; too much text is refused with a notice). (5) The terminal
+    has a clipboard: OSC 52 writes, OSC 52 reads one at a time with a 1 s deadline, bracketed
+    paste as before; its address line copies, cuts and pastes with Ctrl+C/X/V and selects all
+    with Ctrl+A. Page copy and paste in both frontends are the engines' own keys through the
+    service path of 68. The diagnostics file gained `keymap_indicator` (the window's; the
+    terminal's report leaves it null). *Why:* the user's request (31 October 2026): one
+    configuration for both frontends, the terminal's keys in the window, Escape as an
+    insert-mode switch shown in the UI, a Rust layer that reads and changes browser state, copy
+    and paste; plan §28's first question (what a key does has one owner, in both frontends) and
+    §26 (no copies, no ticks: the view is borrowed, the indicator redraws on change). *Evidence:*
+    `tools/cargo test -p sighurt-core -p sighurt-runtime -p sighurt-config-example` passes
+    (sighurt-core's `a_keymap_reads_the_tabs_it_decides_with`, `run_all_runs_in_order_in_one_update`,
+    `clipboard_copy_is_an_effect`; the example's `the_table_is_valid_in_both_frontends`,
+    `escape_toggles_insert_and_the_indicator`, `terminal_bindings_exist_only_in_the_terminal`,
+    `y_y_copies_the_address`, `c_o_closes_the_others_highest_first`); clippy `-D warnings` on
+    sighurt-runtime is clean; `apps/sighurt-browser/tests/headless.sh` (built with
+    `engine-demo` alone, the new `example` scenario: `t` gives 2 tabs, Escape then `t` leaves 2
+    with the indicator `INSERT MODE`, Escape then `x` gives 1, `q` quits; the screenshot shows
+    `INSERT MODE` at the right of the address line) 78 PASS, 0 FAIL, and
+    `ui/sighurt-ui/tests/headless.sh` 35 PASS, 0 FAIL. Not yet run: `engines.sh showcase`
+    (rewritten for the example; needs Servo, so louise-pc) and the terminal's end-to-end tests
+    and real-terminal checks (the terminal clipboard lands separately).

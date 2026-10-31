@@ -45,7 +45,7 @@ The tests that need a compositor run in a private headless sway (`tools/headless
 
 | Script | What it runs |
 |---|---|
-| `apps/sighurt-browser/tests/headless.sh OUT` | `sig` with the demo engine: tabs, typing, coordinates, scaling, buffers, idle, the configuration, the modal keymap, settings |
+| `apps/sighurt-browser/tests/headless.sh OUT` | `sig` with the demo engine: tabs, typing, coordinates, scaling, buffers, idle, the configuration, the example keymap, settings |
 | `apps/sighurt-browser/tests/engines.sh OUT` | `sig` with Servo, WPE WebKit and Wasm on the GPU: pages, input, history, links between engines, settings, a configuration showcase |
 | `ui/sighurt-ui/tests/headless.sh OUT` | the chromes in `sig`: the line chrome, the status overlay, tabs on the left, fonts |
 | `frontends/sighurt-wayland/tests/headless.sh` | the Wayland host against sway |
@@ -57,7 +57,7 @@ They print `PASS` or `FAIL` for each check and leave screenshots to look at in `
 
 - **Engines stay out of the browser's state.** Engines implement `sighurt_api::engine::EngineRuntime`, report what happens as events and never change browser state; the core decides (`update(state, event) -> effects`, no I/O), and `sig` carries the effects out. Read the trait's documentation before you change an engine.
 - **The core has no platform.** `sighurt-core` builds and tests without Wayland, Servo, WebKit, Wasmtime or a graphics driver.
-- **Keys live in the user's configuration.** No default bindings and no key handlers in code: everything goes through commands and the keymap.
+- **Keys live in the configuration.** The default keys are the example configuration's (Rust, in `extensions/sighurt-config-example`) and no key handlers are in code elsewhere: everything goes through commands and the keymap.
 - **No copies, no ticks.** Nothing reads a page back to the CPU to show it, the chrome repaints only what changed, and an idle browser sleeps. The end-to-end tests check all three.
 - **Treat what pages and guests say as untrusted.** Keep the core's bounds, validate every guest `(ptr, len)`, never link WASI.
 - Small, focused commits and PRs. Test real behavior, not the implementation's own assumptions. Every public SDK function has a doc comment, and every module says what it owns and what it must not.

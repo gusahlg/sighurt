@@ -72,6 +72,8 @@ $1
 default = "demo"
 [routing.demo]
 schemes = ["demo"]
+[input]
+keymap = "bindings"
 [keys]
 "ctrl-t" = "tab.new"
 "ctrl-l" = "location.focus"

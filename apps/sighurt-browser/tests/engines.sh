@@ -2,8 +2,8 @@
 # End-to-end tests of `sig` with its default engines, Servo, Wasm and WPE WebKit, in a private
 # headless sway with the GLES2 renderer (the GPU), on a D-Bus session of their own
 # (engines/sighurt-engine-wpe/tests/private-bus): never on the desktop, since they type and click. Builds
-# `sig` (default features, with the modal keymap and the line chrome compiled in too, which only
-# `showcase` selects), the virtual-pointer helper and the example guests with tools/cargo,
+# `sig` (default features, with the line chrome compiled in too, which only `showcase`
+# selects; the example configuration is the keymap of `showcase`, the others select `bindings`), the virtual-pointer helper and the example guests with tools/cargo,
 # then runs the scenarios below inside `tools/headless-sway --renderer gles2`, printing PASS or
 # FAIL for each check. A local web server (`serve.py`) serves `tests/pages` and the guests;
 # the test guests in `tests/guests` are WAT, which Wasmtime compiles as it does binaries. Only
@@ -54,11 +54,11 @@
 #           the routing, and a script's navigation staying in WPE; WebKit's web processes killed
 #           and a reload; closing every WPE tab ends WebKit's web processes; the profile WebKit
 #           keeps
-#   showcase  a configuration that changes much: the modal keymap (a sequence, typing in insert
-#           mode, keys swallowed in normal mode, a command line), the standard chrome's tab list
+#   showcase  a configuration that changes much: the example keymap (J and K, Escape and the
+#           INSERT MODE indicator, typing in a page field, a command line), the standard chrome's tab list
 #           on the left and chrome.toggle-tabs, [ui] font-size, a [routing.wpe] hosts rule, a
-#           [keywords] template; a binding and a color added while sig runs apply at once, and a
-#           new [ui] chrome gets a notice; started again, the line chrome with the same keymap
+#           [keywords] template; a color added while sig runs applies at once and the keymap goes on working, and a
+#           new [ui] chrome gets a notice; started again, the line chrome with the same keymap, showing INSERT MODE
 #   labels  the engine labels: a Servo page, a page [routing.wpe] hosts gives WPE and sig://home
 #           are labelled servo, wpe and nothing, in their tabs and the address bar; engine-label =
 #           false turns them off while sig runs; the line chrome names the page's engine too
@@ -131,6 +131,8 @@ version = 1
 directory = "$out/downloads"
 [routing.wasm]
 origins = ["$base"]
+[input]
+keymap = "bindings"
 [keys]
 "ctrl-t" = "tab.new"
 "ctrl-w" = "tab.close"
@@ -1011,8 +1013,8 @@ CONF
 showcase)
   lh=http://localhost:$(cat "$out/port")
   config=$out/config/sighurt/config.toml
-  # The modal keymap instead of [keys], the standard chrome with its tabs on the left at 16 px, a
-  # site for WPE and a search keyword.
+  # The example keymap (the default: no [keys], no [input]), the standard chrome with its tabs on
+  # the left at 16 px, a site for WPE and a search keyword.
   cat > "$config" <<CONF
 version = 1
 [downloads]
@@ -1021,23 +1023,6 @@ directory = "$out/downloads"
 hosts = ["localhost"]
 [keywords]
 t = "$base/count.html?q={}"
-[input]
-keymap = "modal"
-[keymap.modal]
-start = "normal"
-typing = "insert"
-pass = ["insert"]
-[keymap.modal.always]
-"ctrl-q" = "browser.quit"
-[keymap.modal.normal]
-"g t" = "tab.next"
-"g T" = "tab.previous"
-"o" = "location.focus"
-":" = { run = "location.focus", pass = true }
-"i" = "mode insert"
-"b" = "chrome.toggle-tabs"
-[keymap.modal.insert]
-"escape" = "mode normal"
 [ui]
 chrome = "standard"
 font-size = 16
@@ -1060,22 +1045,22 @@ CONF
   point 1000 700
   shot 01-left-tabs-16px-normal 1
 
-  step "the modal keymap: g t, then g T"
-  key g
-  key t
-  check "g t shows the next tab" "$(shows_tab 2 servo)"
-  key g
-  key -M shift t -m shift
-  check "g T shows the one before" "$(shows_tab 1 wpe)"
-  step "a click on the WPE page's field enters insert mode: åäö; Escape, then z in normal mode"
+  # run_command COMMAND: ":COMMAND" typed into the address line, as the example binds ":" to open it.
+  run_command() { key :; key "$1"; key -k Return; }
+  step "the example keymap: J, then K"
+  key J
+  check "J shows the next tab" "$(shows_tab 2 servo)"
+  key K
+  check "K shows the one before" "$(shows_tab 1 wpe)"
+  step "a click on the WPE page's field: åäö typed there; Escape is insert mode, Escape again normal mode"
   click $((list + 100)) $((toolbar + 215))
   key 'åäö'
-  check "insert mode: what is typed reaches WebKit's field" "$(sess 8 "url(1).endswith('#field åäö'), url(1).split('#')[1]")"
+  check "what is typed reaches WebKit's field" "$(sess 8 "url(1).endswith('#field åäö'), url(1).split('#')[1]")"
+  key -k Escape
+  check "Escape: the keymap's indicator reads INSERT MODE" "$(dg 3 "d['keymap_indicator']=='INSERT MODE', d['keymap_indicator']")"
   shot 02-insert-mode 0.3
   key -k Escape
-  key z
-  sleep 0.5
-  check "normal mode: an unbound letter is swallowed" "$(sess 2 "url(1).endswith('#field åäö'), url(1).split('#')[1]")"
+  check "Escape again: normal mode shows no indicator" "$(dg 3 "d['keymap_indicator'] is None, d['keymap_indicator']")"
   shot 03-normal-mode 0.3
 
   step "o (location.focus), a keyword search: t åäö"
@@ -1098,41 +1083,38 @@ CONF
   key -k Return
   check "a command line opened with :" "$(shows_tab 2 servo)"
 
-  step "b: chrome.toggle-tabs, twice"
-  key b
+  step ":chrome.toggle-tabs, twice"
+  run_command chrome.toggle-tabs
   check "chrome.toggle-tabs hides the tab list, and the page takes its room" \
     "$(dg 5 "not surface('tabs')['mapped'] and shown and shown['width']==1280, ($surfaces, shown and shown['width'])")"
-  key b
+  run_command chrome.toggle-tabs
   check "and shows it again" "$(dg 5 "surface('tabs')['mapped'] and shown and shown['width']==1280 - $list, ($surfaces, shown and shown['width'])")"
 
-  step "a binding and a color added while sig runs"
+  step "a color added while sig runs"
   point 1000 700
-  key n
-  check "n is bound to nothing yet" "$(dg 3 "len(tabs)==2, len(tabs)")"
   purple() {
     grim -t ppm "$out/$1.ppm"
     python3 "$probe" png "$out/$1.ppm" "$out/$1.png"
     python3 "$probe" count "$out/$1.ppm" 0 "$toolbar" "$list" $((800 - strip)) 124 58 237
   }
   before=$(purple 04-before-reload)
-  sed -i 's|^"b" = "chrome.toggle-tabs"$|&\n"n" = "tab.new"|; s|^\[ui\]$|[ui.colors]\ntab = "#7c3aed"\n&|' "$config"
+  sed -i 's|^\[ui\]$|[ui.colors]\ntab = "#7c3aed"\n&|' "$config"
   sleep 0.7
   check "the new file is valid: no notice" "$(dg 3 "d['status'] is None, d['status']")"
   after=$(purple 05-after-reload)
   check "the new tab color applies at once: the active row of the list" \
     "$(answer "$([[ $before == 0 && $after -gt 2000 ]]; echo $?)" "pixels of #7c3aed in the tab list: $before before, $after after")"
-  key n
-  check "the new binding applies at once: n opens a tab" "$(dg 5 "len(tabs)==3 and d['active_tab']==3, (len(tabs), d['active_tab'])")"
-  shot 06-new-tab-by-new-binding
-  key -k Escape
+  key t
+  check "the keymap goes on working after the reload: t opens a tab" "$(dg 5 "len(tabs)==3 and d['active_tab']==3, (len(tabs), d['active_tab'])")"
+  shot 06-new-tab-after-reload
 
   step "[ui] chrome = \"line\" while sig runs: a notice, since a chrome changes at the next start"
-  sed -i 's|^chrome = "standard"$|chrome = "line"|; /^"b" = "chrome.toggle-tabs"$/d' "$config"
+  sed -i 's|^chrome = "standard"$|chrome = "line"|' "$config"
   check "a new chrome gets a notice that it applies at restart" "$(dg 5 "d['status']=='notice', d['status']")"
   check "the standard chrome stays meanwhile" "$(dg 3 "surface('tabs')['mapped'] and surface('line') is None, $surfaces")"
-  key -M ctrl q -m ctrl
+  run_command browser.quit
   wait "$sig_pid"; code=$?
-  check "ctrl-q, bound in always, exits cleanly" "$(answer "$code" "exit code $code")"
+  check ":browser.quit exits cleanly" "$(answer "$code" "exit code $code")"
   check "the session holds the three tabs" \
     "$(python3 "$probe" session "$session" "len(s['tabs'])==3 and [seg(i).get('engine') for i in (1, 2)]==['wpe', 'servo'], [(seg(i).get('engine'), url(i)) for i in range(1, len(s['tabs']) + 1)]")"
 
@@ -1143,13 +1125,17 @@ CONF
   check "the configuration is valid: no notice" "$(dg 3 "d['status'] is None, d['status']")"
   check "the line chrome: one line at the top, 32 px at font-size 16" \
     "$(dg 5 "[x['role'] for x in t if x['role'] not in ('view', 'retiring', 'page')]==['line'] and (surface('line')['width'], surface('line')['height'])==(1280, $line), $surfaces")"
-  step "g T: from the home page in the third tab to the second"
-  key g
-  key -M shift t -m shift
-  check "the modal keymap drives it: g T" "$(shows_tab 2 servo)"
+  step "K: from the home page in the third tab to the second"
+  key K
+  check "the example keymap drives it: K" "$(shows_tab 2 servo)"
   check "and the page has the window but the line" "$(dg 5 "(shown['width'], shown['height'])==(1280, 800 - $line), (shown['width'], shown['height'])")"
   point 1000 700
   shot 07-line-chrome 1
+  step "Escape: the line chrome shows INSERT MODE"
+  key -k Escape
+  check "the line chrome's keymap indicator reads INSERT MODE" "$(dg 3 "d['keymap_indicator']=='INSERT MODE', d['keymap_indicator']")"
+  shot 07b-line-chrome-insert-mode 0.3
+  key -k Escape
   step "o, an address on localhost typed into the line"
   key o
   key "$lh/input.html"
@@ -1163,9 +1149,9 @@ CONF
   key 'tab.select 1'
   key -k Return
   check "a command line in the line chrome" "$(shows_tab 1 wpe)"
-  key -M ctrl q -m ctrl
+  run_command browser.quit
   wait "$sig_pid"; code=$?
-  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+  check ":browser.quit exits cleanly" "$(answer "$code" "exit code $code")"
   ;;
 
 labels)

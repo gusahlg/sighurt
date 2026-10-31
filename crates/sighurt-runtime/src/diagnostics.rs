@@ -226,6 +226,8 @@ pub struct Diagnostics {
     pub counters: Counters,
     pub peaks: Peaks,
     last_error: Option<String>,
+    /// The keymap's indicator at the last report (the frontend sets it; the terminal doesn't).
+    pub keymap_indicator: Option<String>,
     /// Each engine's readback count already accounted for.
     readbacks_seen: BTreeMap<String, u64>,
     /// The engines whose renderer line was printed.
@@ -240,6 +242,7 @@ impl Diagnostics {
             counters: Counters::default(),
             peaks: Peaks::default(),
             last_error: None,
+            keymap_indicator: None,
             readbacks_seen: BTreeMap::new(),
             renderers: BTreeSet::new(),
         }
@@ -407,6 +410,7 @@ impl Diagnostics {
                 "tabs": report.tabs,
                 "active_tab": report.active_tab,
                 "status": report.status,
+                "keymap_indicator": self.keymap_indicator,
                 "capabilities": report.capabilities,
                 "pending_host_events": report.pending_host_events,
                 "last_error": report.last_error,

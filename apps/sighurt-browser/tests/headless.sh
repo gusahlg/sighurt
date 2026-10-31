@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end tests of `sig` with the demo engine, in a private headless sway: never on the
 # desktop, since they type and click. Builds `sig` (--no-default-features --features
-# engine-demo,keymap-modal) and the virtual-pointer helper with tools/cargo, then runs the checks
+# engine-demo) and the virtual-pointer helper with tools/cargo, then runs the checks
 # below inside
 # tools/headless-sway, and prints PASS or FAIL for each. The checks read `sig`'s diagnostics
 # (which tab and view are shown, what the status strip shows, counters and peaks), its session
@@ -21,10 +21,11 @@
 #               color keeps the configuration in use and says why, before the page's status
 #   close       the compositor's close request (swaymsg kill) quits and saves the session
 #   disconnect  the compositor going away: sig saves the session and exits with 1
-#   modal       the modal keymap in place of [keys]: a key sequence, insert mode typing into
-#               the page while normal mode swallows letters, a command line opened with ":"
-#               (where letters type), a chrome command the chrome lacks, the mouse's side
-#               buttons over the chrome and the page, a quit from `always`
+#   example     the default keymap, the example configuration: t opens a tab, Escape switches
+#               to insert mode (the indicator reads INSERT MODE, keys pass to the page), Escape
+#               again and x closes a tab; a command line opened with ":" (where letters type),
+#               a chrome command the chrome lacks, the mouse's side buttons over the chrome
+#               and the page, q quits
 #   settings    `zoom` for new tabs and page.zoom-reset, kept by open tabs across a reload;
 #               page.open-in, and its errors (an engine the build lacks, a sig: page, the
 #               latter in the status strip over the home page); an engine setting
@@ -42,7 +43,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect modal settings)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (with other features); this link keeps the binary these
   # runs use. It is made under the same hold of the machine's lock as the build, so no other
@@ -50,7 +51,7 @@ if [[ ${1:-} != --inside ]]; then
   link='ln -f target/debug/sig target/debug/sig-headless-e2e'
   if [[ $build == 1 ]]; then
     SIG_WHAT="build sig (demo engine) for headless tests" tools/heavy bash -c \
-      "cargo build -p sighurt-browser --no-default-features --features engine-demo,keymap-modal \
+      "cargo build -p sighurt-browser --no-default-features --features engine-demo \
        --bins --example virtual-pointer && $link" || exit 1
   else
     $link || exit 1
@@ -80,6 +81,8 @@ version = 1
 default = "demo"
 [routing.demo]
 schemes = ["demo"]
+[input]
+keymap = "bindings"
 [keys]
 "ctrl-t" = "tab.new"
 "ctrl-w" = "tab.close"
@@ -402,95 +405,79 @@ config)
   wait "$sig_pid"
   ;;
 
-modal)
-  # The modal keymap (sighurt-keymap-modal) reads [keymap.modal]; [keys] is gone.
+example)
+  # The default keymap, the example configuration (sighurt-config-example): no [keys], no [input].
   cat > "$out/config/sighurt/config.toml" <<'CONF'
 version = 1
 [engines]
 default = "demo"
 [routing.demo]
 schemes = ["demo"]
-[input]
-keymap = "modal"
-[keymap.modal]
-start = "normal"
-typing = "insert"
-pass = ["insert"]
-[keymap.modal.always]
-"ctrl-q" = "browser.quit"
-[keymap.modal.normal]
-"g t" = "tab.next"
-"g T" = "tab.previous"
-"j" = "page.send-key down"
-"t" = "tab.new"
-"x" = "tab.close"
-":" = { run = "location.focus", pass = true }
-"i" = "mode insert"
-[keymap.modal.insert]
-"escape" = "mode normal"
 CONF
-  start_sig demo://pattern demo://resize demo://animation
-  tab_count="sum(1 for x in t if x['role']=='view')"
-  check "the configuration is valid: no notice" "$(diag "0 if d['status'] is None else 1")" "$(diag "d['status']")"
-  step "g: the start of a sequence, nothing yet; then t: g t is tab.next"
-  key g
-  check "g alone waits" "$(shows_tab 1)" "$(tabs_now)"
+  start_sig demo://resize
+  tab_count="len(d['tabs'])"
+  indicator="d['keymap_indicator']"
+  check "the configuration is valid: no notice" "$(diag "0 if d['status']!='notice' else 1")" "$(diag "d['status']")"
+  step "t opens a tab"
   key t
-  shot 01-g-t-tab-2
-  check "g t shows the second tab" "$(shows_tab 2)" "$(tabs_now)"
-  step "normal mode: z (unbound) and j (page.send-key down) type nothing; i, hej, Escape"
-  key z
-  key j
-  key i
-  key hej
-  shot 02-insert-hej
+  check "t is tab.new" "$(diag "0 if $tab_count==2 and d['active_tab']==2 else 1")" "$(diag "$tab_count, d['active_tab']") (views, active tab)"
+  step "alt-1: the first tab (Always bindings work in the address line the new tab has); Escape, then t: insert mode passes t to the page"
+  key -M alt 1 -m alt
+  check "alt-1 shows the first tab" "$(shows_tab 1)" "$(tabs_now)"
   key -k Escape
-  key z
-  step "g t to the third tab; x closes it"
-  key g
   key t
-  check "g t again shows the third tab" "$(shows_tab 3)" "$(tabs_now)"
-  key x
-  check "x closed it, and the tab before it shows" "$(diag "0 if $tab_count==2 and d['active_tab']==2 else 1")" \
-    "$(diag "$tab_count, d['active_tab']") (views, active tab)"
-  step ": opens the command line with a colon in it; letters bound in normal mode type there"
+  check "after Escape, t opens no tab" "$(diag "0 if $tab_count==2 else 1")" "$(diag "$tab_count") views"
+  check "the indicator reads INSERT MODE" "$(diag "0 if $indicator=='INSERT MODE' else 1")" "$(diag "$indicator")"
+  shot 01-insert-mode-indicator
+  step "hej in insert mode reaches the page; Escape returns to normal mode"
+  key hej
+  key -k Escape
+  check "the indicator is gone in normal mode" "$(diag "0 if $indicator is None else 1")" "$(diag "$indicator")"
+  step "alt-2: the second tab; : opens the command line with a colon in it; t, bound in normal mode, types there"
+  key -M alt 2 -m alt
+  check "alt-2 shows the second tab" "$(diag "0 if d['active_tab']==2 else 1")" "$(tabs_now)"
   key :
-  key 'tab.select 1'
-  shot 03-command-line-typed
+  key 'page.open demo://pattern'
+  shot 02-command-line-typed
   key -k Return
-  check ":tab.select 1, typed after the colon the key put there" "$(shows_tab 1)" "$(tabs_now)"
-  check "t, bound to tab.new in normal mode, typed into the line" "$(diag "0 if $tab_count==2 else 1")" \
-    "$(diag "$tab_count") views"
+  check "t typed into the line opened no tab" "$(diag "0 if $tab_count==2 else 1")" "$(diag "$tab_count") views"
   step ":chrome.nope: the chrome has no such command"
   key :
   key 'chrome.nope'
   key -k Return
-  shot 04-chrome-lacks-the-command
+  shot 03-chrome-lacks-the-command
   check "a chrome command the chrome lacks gets a notice" "$(diag "0 if d['status']=='notice' else 1")" "$(diag "d['status']")"
   step "the side buttons: back over the tab strip, forward over the page ([input.buttons]' defaults)"
   key :
   key 'page.open demo://resize'
   key -k Return
   sleep 0.5
-  history="d['tabs'][0]['can_go_back'], d['tabs'][0]['can_go_forward']"
-  check "a second page in the first tab" "$(diag "0 if ($history)==(True, False) else 1")" "$(diag "$history") (back, forward)"
+  history="d['tabs'][1]['can_go_back'], d['tabs'][1]['can_go_forward']"
+  check "a second page in the second tab" "$(diag "0 if ($history)==(True, False) else 1")" "$(diag "$history") (back, forward)"
   point 1000 20
   echo click side >&3
   sleep 0.5
-  check "the back button over the chrome goes back" "$(diag "0 if ($history)==(False, True) else 1")" \
+  check "the back button over the chrome goes back" "$(diag "0 if ($history)==(True, True) else 1")" \
     "$(diag "$history") (back, forward)"
   point 640 400
   echo click extra >&3
   sleep 0.5
   check "the forward button over the page goes forward" "$(diag "0 if ($history)==(True, False) else 1")" \
     "$(diag "$history") (back, forward)"
-  step "ctrl-q, bound in always, quits"
-  key -M ctrl q -m ctrl
+  step "Escape, then x: insert mode passes x on; Escape again, then x closes the tab"
+  key -k Escape
+  key x
+  check "in insert mode x closes nothing" "$(diag "0 if $tab_count==2 else 1")" "$(diag "$tab_count") views"
+  key -k Escape
+  key x
+  check "x closes the second tab" "$(diag "0 if $tab_count==1 and d['active_tab']==1 else 1")" "$(diag "$tab_count, d['active_tab']") (views, active tab)"
+  step "q quits"
+  key q
   wait "$sig_pid"; code=$?
-  check "ctrl-q exits cleanly" "$code" "exit code $code"
+  check "q exits cleanly" "$code" "exit code $code"
   session=$out/state/sighurt/session.toml
-  check "only what insert mode passed reached the page" \
-    "$(grep -q 'title = "Demo: resize · hej"$' "$session"; echo $?)" "$(grep -o 'title = .*' "$session" | tr '\n' ' ')"
+  check "only what insert mode passed (t, hej) reached the page" \
+    "$(grep -q 'title = "Demo: resize · thej"$' "$session"; echo $?)" "$(grep -o 'title = .*' "$session" | tr '\n' ' ')"
   ;;
 
 settings)

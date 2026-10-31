@@ -36,7 +36,7 @@ The user's machines are shared with another Claude session. Breaking these rules
 | Terminal frontend | `sighurt-tui` | The terminal owner loop, terminal I/O, the cell grid and the terminal chrome, the page's CPU target and its kitty and sixel encodings, text mode (reflowing a semantic snapshot), `--dump`, binding engines to the CPU target | Browser policy, engine internals, anything of Wayland or sighurt-ui |
 | Executable | `sighurt-browser` (`sig`) | Arguments, process-wide setup, choosing the frontend | Everything else |
 
-- **Engines are compiled in and run in-process; there is no IPC.** Cargo features on `sighurt-browser` (`engine-servo`, `engine-wasm`, `engine-wpe`, `engine-demo`) decide which engines exist: the `default = [...]` line in `apps/sighurt-browser/Cargo.toml` is the list of engines compiled into `sig` (Servo, Wasm and WPE WebKit). Runtime configuration decides which of them may open pages: Servo is the default engine, WPE WebKit opens what `[routing.wpe]` and `page.open-in wpe` give it. One runtime per engine kind serves all of its views. Keymaps and chromes are compiled in the same way (`keymap-modal`, `chrome-line`).
+- **Engines are compiled in and run in-process; there is no IPC.** Cargo features on `sighurt-browser` (`engine-servo`, `engine-wasm`, `engine-wpe`, `engine-demo`) decide which engines exist: the `default = [...]` line in `apps/sighurt-browser/Cargo.toml` is the list of engines compiled into `sig` (Servo, Wasm and WPE WebKit). Runtime configuration decides which of them may open pages: Servo is the default engine, WPE WebKit opens what `[routing.wpe]` and `page.open-in wpe` give it. One runtime per engine kind serves all of its views. Keymaps and chromes are compiled in the same way (`chrome-line`).
 - **The host creates every surface**: the root `xdg_toplevel` (an opaque fallback), a subsurface for each surface the chrome names (at most 8), one page subsurface per live view (mapped only while selected), and overlays. The chrome and the engines present into host-managed targets through a target lease and a per-layout frame permit; the desktop compositor combines the surfaces.
 - **The chrome is drawn on the CPU** with cosmic-text and tiny-skia into shared-memory buffers. GPUI is gone.
 - **Servo presents GL straight into its subsurface** (`WindowRenderingContext` on surfman). The normal display path never reads page pixels back to the CPU.
@@ -55,7 +55,7 @@ sighurt/
 ├── ui/            sighurt-ui
 ├── engines/       sighurt-engine-servo, sighurt-engine-wpe, sighurt-engine-wasm,
 │                  sighurt-engine-demo, sighurt-semantic
-├── extensions/    sighurt-chrome-line, sighurt-keymap-modal
+├── extensions/    sighurt-chrome-line, sighurt-config-example
 ├── sdk/           sighurt-sdk
 ├── apps/          sighurt-browser (`sig`)
 ├── examples/      Wasm guests
@@ -70,7 +70,7 @@ sighurt/
 | `sighurt-wayland` | `connection`, `window`, `targets`, `placement`, `scale`, `input`, `text_input`, `clipboard`, `scheduler`, `shm` | api |
 | `sighurt-ui` | `state`, `layout`, `hit_test`, `text_edit`, `text`, `chrome`, `canvas`, `paint_cpu`, `accessibility`, `extension` (the chrome API), `standard` (the standard chrome through it) | api (it paints into memory the host lends it) |
 | `sighurt-chrome-line` | `lib` (the line chrome, through the chrome API alone) | api, ui |
-| `sighurt-keymap-modal` | `lib` (the modal keymap: modes and key sequences) | api |
+| `sighurt-config-example` | `lib` (the example configuration, the default keymap `example`: modes and key sequences), `table` (its bindings, in Rust), `actions` (what it computes from the browser view) | api |
 | `sighurt-engine-servo` | `runtime`, `view`, `delegate`, `presentation`, `offscreen` (the terminal's GL context), `input`, `navigation`, `semantic` (page text) | api, wayland, semantic; Servo 0.7 |
 | `sighurt-engine-wpe` | `runtime`, `view`, `navigation`, `platform` (its `WPEDisplay` and `WPEView`), `present`, `input`, `ime`, `clipboard`, `glib_loop` (WebKit's GLib context in the owner loop), `ffi` | api, wayland; WPE WebKit 2.52 |
 | `sighurt-engine-wasm` | `adapter` (`WasmRuntime`), `view`, `navigation`, `engine` (Wasmtime, limits), `live` and `pool` (guest threads), `capabilities` (host functions), `draw` and `raster` (CPU drawing), `wayland` (its `CpuTarget` for the host's SHM lease), and a module per guest subsystem | api, wayland |
@@ -95,7 +95,7 @@ sighurt/
 
 ```bash
 # Crates that need neither Servo, WPE WebKit nor Wasmtime
-tools/cargo check -p sighurt-api -p sighurt-core -p sighurt-wayland -p sighurt-ui -p sighurt-engine-demo -p sighurt-chrome-line -p sighurt-keymap-modal
+tools/cargo check -p sighurt-api -p sighurt-core -p sighurt-wayland -p sighurt-ui -p sighurt-engine-demo -p sighurt-chrome-line -p sighurt-config-example
 tools/cargo check -p sighurt-browser --no-default-features
 tools/cargo test -p sighurt-api -p sighurt-core
 tools/cargo clippy -p <crate> --all-targets -- -D warnings
@@ -106,7 +106,7 @@ tools/cargo fmt -p <crate>
 tools/cargo build -p sighurt-browser --no-default-features --features engine-demo
 tools/heavy tools/headless-sway -- target/debug/sig
 # sig's unit tests, and its end-to-end tests in a private headless sway (builds sig with the
-# demo engine and the modal keymap; prints PASS or FAIL per check, screenshots and logs in OUT);
+# demo engine; prints PASS or FAIL per check, screenshots and logs in OUT);
 # the chromes' end-to-end tests (the line chrome, the standard chrome's options)
 tools/cargo test -p sighurt-browser -p sighurt-engine-demo --no-default-features --features engine-demo
 apps/sighurt-browser/tests/headless.sh OUT
@@ -131,7 +131,7 @@ SIG_WHAT="servo build" tools/remote tools/cargo build -p sighurt-browser
 # sig with Servo, WPE WebKit and Wasm on the GPU, in a private compositor on a D-Bus session of
 # its own (with SIG_DIAG=1 it prints each engine's renderer and a line per frame), and its
 # end-to-end tests (Servo, Wasm, WPE WebKit, links across engines, settings, a configuration
-# showcase with the modal keymap and the line chrome)
+# showcase with the example keymap and the line chrome)
 tools/heavy tools/headless-sway --renderer gles2 -- engines/sighurt-engine-wpe/tests/private-bus target/debug/sig https://example.com/
 apps/sighurt-browser/tests/engines.sh OUT
 
@@ -161,11 +161,11 @@ SIG_WHAT="servo build" tools/cargo test -p sighurt-browser -p sighurt-runtime -p
 
 ## Commands, keys and configuration
 
-- Everything the browser does is a named command, `<area>.<action>` with kebab-case actions and an optional argument after whitespace: `tab.new`, `tab.close [n]`, `tab.next`, `tab.previous`, `tab.select <n>`, `tab.last`, `page.open <url>`, `page.open-in <engine> [url]`, `page.reload`, `page.stop`, `page.back`, `page.forward`, `page.zoom-in`, `page.zoom-out`, `page.zoom-reset`, `page.send-key <key>`, `location.focus`, `browser.home`, `browser.quit`, and a chrome's own `chrome.<action>` (no argument; the core hands it to the chrome). Users write these names in their configuration, so keep them.
+- Everything the browser does is a named command, `<area>.<action>` with kebab-case actions and an optional argument after whitespace: `tab.new`, `tab.close [n]`, `tab.next`, `tab.previous`, `tab.select <n>`, `tab.last`, `page.open <url>`, `page.open-in <engine> [url]`, `page.reload`, `page.stop`, `page.back`, `page.forward`, `page.zoom-in`, `page.zoom-out`, `page.zoom-reset`, `page.send-key <key>`, `clipboard.copy <text>`, `location.focus`, `browser.home`, `browser.quit`, and a chrome's own `chrome.<action>` (no argument; the core hands it to the chrome). Users write these names in their configuration, so keep them.
 - A command string is parsed once into `sighurt_api::commands::Command`; unknown names and bad arguments are errors when the configuration loads. `Display` gives the canonical string back. The core carries commands out, except `location.focus`, which the chrome handles. Keys and buttons use the same path; don't add a second one.
 - To add a command: a variant in `Command` (and `NAMES`, `name`, parsing, `Display`), its handling in `sighurt-core`, the command list in `crates/sighurt-core/src/default-config.toml`, and the README's command table.
-- **Keys live only in the user's configuration**: no key handlers in code, no default bindings. Bindings match the layout's key value by default and the physical key when a binding asks for it; AltGr is never Ctrl+Alt. A consumed key press also consumes its release.
-- Keymaps and chromes are compiled in and chosen like engines (`docs/rewrite/extension-api.md`): a keymap implements `sighurt_api::keymap::Keymap` and is chosen by `[input] keymap` (the core's `bindings`, which reads `[keys]`, by default); a chrome implements `sighurt_ui::extension::Chrome` and is chosen by `[ui] chrome` at startup (`standard` by default). Keymaps are listed in `sighurt-runtime`'s `registry` (`KEYMAPS`), chromes in `sighurt-gui`'s `chrome` (`CHROMES`); the defaults go through the same traits.
+- **Keys live only in the configuration**: the example configuration crate (the default, in Rust) or the `bindings` keymap's `[keys]` tables. The core, the frontends and the chromes bind no keys; a frontend's chrome handles only its own editing keys (Enter, Escape, arrows, Ctrl+A/C/X/V in the address line). A keymap reads the browser through the read-only `sighurt_api::keymap::Browser` view and may return several commands (`KeyAction::RunAll`); it changes nothing itself. Bindings match the layout's key value by default and the physical key when a binding asks for it; AltGr is never Ctrl+Alt. A consumed key press also consumes its release.
+- Keymaps and chromes are compiled in and chosen like engines (`docs/rewrite/extension-api.md`): a keymap implements `sighurt_api::keymap::Keymap` and is chosen by `[input] keymap` (`example`, the example configuration, by default; the core's `bindings` reads `[keys]`); a chrome implements `sighurt_ui::extension::Chrome` and is chosen by `[ui] chrome` at startup (`standard` by default). Keymaps are listed in `sighurt-runtime`'s `registry` (`KEYMAPS`), chromes in `sighurt-gui`'s `chrome` (`CHROMES`); the defaults go through the same traits.
 - Configuration is TOML: `{config_dir}/sighurt/config.toml` over built-in defaults (`crates/sighurt-core/src/default-config.toml`, which documents every setting), with a schema version, still 1. The core parses and validates it against the build (its engines, keymaps and chromes); the executable reads the file. Unknown keys are errors; a table for something the build lacks gets a notice. An invalid reload keeps the previous configuration and reports the problem. Everything applies live except `[ui] chrome` and the engines' own settings (`[engines.<name>]`), which need a restart.
 
 ## The engine contract

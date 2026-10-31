@@ -108,16 +108,15 @@ configuration decides which of them are used.
 | `engine-wasm` | yes | the Wasm engine, `wasm` |
 | `engine-wpe` | yes | WPE WebKit, `wpe` (needs the WPE prefix below) |
 | `engine-demo` | no | the demo engine, `demo` |
-| `keymap-modal` | no | the modal keymap, `[input] keymap = "modal"` |
 | `chrome-line` | no | the line chrome, `[ui] chrome = "line"` |
 
 ```bash
-cargo build -p sighurt-browser --features keymap-modal,chrome-line        # everything
+cargo build -p sighurt-browser --features chrome-line                     # everything
 cargo build -p sighurt-browser --no-default-features --features engine-servo,engine-wasm   # no WPE
 cargo build -p sighurt-browser --no-default-features --features engine-demo                # no Servo
 ```
 
-The `bindings` keymap and the `standard` chrome are in every build. A build without
+The `example` and `bindings` keymaps and the `standard` chrome are in every build. A build without
 `frontend-tui` has no terminal frontend: `--tui` and `--dump` are errors there.
 
 ### In the terminal
@@ -140,32 +139,16 @@ top; status and notices below) and the page between them in one of two modes:
 
 `[tui] mode = "auto"` (the default), `"text"` or `"graphics"` chooses the start; the `[tui]`
 table of the [built-in configuration](crates/sighurt-core/src/default-config.toml) also has
-`graphics` (`auto`, `kitty`, `sixel`, `none`), `fps`, `mouse` and `default-keys`. The mouse
+`graphics` (`auto`, `kitty`, `sixel`, `none`), `fps`, `mouse` and `default-keys` (which does
+nothing since 0.10: the terminal's default keys are the example configuration's). The mouse
 clicks and scrolls the page (in text mode the wheel scrolls three lines and a click activates
 the link or control under it). Logs, and anything else written to stderr, go to
 `$XDG_STATE_HOME/sighurt/tui.log` (`~/.local/state/sighurt/tui.log`). The terminal is restored
 on every way out.
 
-A terminal has no key bindings of its own to start from, so it ships a small table, `[tui.keys]`,
-under your `[keys]` (a binding of yours for the same keystroke wins; `default-keys = false` drops
-the whole table):
-
-| Key | Command |
-|---|---|
-| `q`, `ctrl-c` | `browser.quit` |
-| `o`, `:`, `ctrl-o` | `location.focus` (the address line; `:` then a command runs it) |
-| `t`, `x` | `tab.new`, `tab.close` |
-| `J`, `K` | `tab.next`, `tab.previous` |
-| `alt-1` to `alt-9` | `tab.select 1` to `9` |
-| `H`, `L` | `page.back`, `page.forward` |
-| `r`, `ctrl-r` | `page.reload` |
-| `e` | `page.switch-engine` |
-| `j`, `k` | scroll down, up (`page.send-key ArrowDown`, `ArrowUp`) |
-| `ctrl-d`, `ctrl-u` | page down, up |
-| `g`, `G` | top, bottom of the page |
-| `+`, `-`, `=` | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` |
-| `m` | `chrome.toggle-mode` (text or graphics) |
-| `ctrl-l` | `chrome.refresh` (draw the page again) |
+The terminal's keys are the [default keys](#keys), the same as the window's, with three more of
+its own: `ctrl-c` quits (only while the page has the keyboard; in the address line it copies),
+`m` switches between text and graphics, and `ctrl-l` draws the page again.
 
 In text mode `Tab` and `Shift-Tab` move between links and controls and `Enter` activates one
 (a text field opens a one-line editor, a list a chooser; `Escape` cancels). `Enter` in the
@@ -348,6 +331,7 @@ command, typed into the address line) all run them.
 | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` | page zoom |
 | `page.send-key <key>` | press and release a named key in the page, as if typed: `down`, `pageup`, `end`, `space`, `enter`, `f5`, `shift-space`, … |
 | `location.focus` | focus the address line with its text selected |
+| `clipboard.copy <text>` | put the text on the clipboard |
 | `browser.home` | open the home page in the active tab |
 | `browser.quit` | quit, saving the tabs |
 | `site.forget [host]` | forget that site's cookies and stored data in every engine that keeps them (no argument: the page shown); no wildcards |
@@ -355,9 +339,36 @@ command, typed into the address line) all run them.
 
 ### Keys
 
-The window has no default key bindings: nothing is bound until you bind it (the terminal's small
-default table is [above](#in-the-terminal)). The tab strip, the toolbar
-and the address line work without any. With the `bindings` keymap:
+The default keys are the example configuration's (`extensions/sighurt-config-example`, the
+default `[input] keymap = "example"`), the same in the window and the terminal. They apply while
+the page has the keyboard; a key that types a character does not fire while you type into the
+address line or a page's text field, and the keys no row names pass to the page.
+
+| Key | Command |
+|---|---|
+| `q` | `browser.quit` |
+| `o`, `:`, `ctrl-o` | `location.focus` (the address line; `:` then a command runs it) |
+| `t`, `x` | `tab.new`, `tab.close` |
+| `J`, `K` | `tab.next`, `tab.previous` |
+| `alt-1` to `alt-9` | `tab.select 1` to `9` |
+| `H`, `L` | `page.back`, `page.forward` |
+| `r`, `ctrl-r` | `page.reload` |
+| `e` | `page.switch-engine` |
+| `j`, `k` | scroll down, up (`page.send-key down`, `up`) |
+| `ctrl-d`, `ctrl-u` | page down, up |
+| `g`, `G` | top, bottom of the page |
+| `+`, `-`, `=` | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` |
+| `Escape` | insert mode: every key but `Escape` passes to the page or the line, and the chrome shows `INSERT MODE`; `Escape` again returns |
+| `y y` | copy the address of the tab shown (`clipboard.copy`) |
+| `c o` | close every tab but the one shown |
+| terminal only: `ctrl-c` | `browser.quit` (only while the page has the keyboard) |
+| terminal only: `m` | `chrome.toggle-mode` (text or graphics) |
+| terminal only: `ctrl-l` | `chrome.refresh` (draw the page again) |
+
+`y y` and `c o` are written in Rust in the example, against the keymap API's read-only view of the
+tabs. With `[input] keymap = "bindings"` nothing is bound until you bind it in `[keys]` (and
+`[tui.keys]`, over it, in the terminal). The tab strip, the toolbar and the address line work
+without any keys. With the `bindings` keymap:
 
 ```toml
 [keys]                        # everywhere
@@ -380,34 +391,19 @@ or `code:` and a W3C key code for a physical key. AltGr is never Ctrl+Alt. While
 address line or a page's text field, a keystroke that types a character types it instead of
 running its command. A key the browser takes never reaches the page, release included.
 
-The modal keymap (feature `keymap-modal`) has modes and key sequences, vim-style:
+`[keys]` while `example` is selected gets a notice, and so does `[keymap.example]` with any key in
+it: the example takes no settings. To change the keys, copy
+[`sighurt-config-example`](extensions/sighurt-config-example/) (its bindings are one table in
+`table.rs`) and put your copy in `KEYMAPS`, as below.
 
-```toml
-[input]
-keymap = "modal"
+### Copy and paste
 
-[keymap.modal]
-start = "normal"        # the mode it starts in
-typing = "insert"       # the mode a text field of the page puts it in
-pass = ["insert"]       # modes in which unbound keys reach the page
-
-[keymap.modal.always]   # in every mode, and the only bindings while the address line is focused
-"ctrl-q" = "browser.quit"
-
-[keymap.modal.normal]
-"j" = "page.send-key down"
-"g g" = "page.send-key home"
-"g t" = "tab.next"
-"o" = "location.focus"
-":" = { run = "location.focus", pass = true }   # opens the command line with ":"
-"i" = "mode insert"
-
-[keymap.modal.insert]
-"escape" = "mode normal"
-```
-
-The chrome shows the mode and an unfinished sequence ("NORMAL g"). Sequences never wait for a
-timeout: no binding may be the start of another.
+Pages copy and paste with their own keys (Ctrl+C and Ctrl+V in the window: nothing binds them, so
+they reach Servo and WPE WebKit, which use the browser's clipboard). The address line has Ctrl+A,
+Ctrl+C, Ctrl+X and Ctrl+V. In the terminal, copies go through OSC 52 to the terminal's clipboard,
+and pastes arrive through the terminal's own paste key (bracketed paste) or, where the terminal
+answers OSC 52 reads, from its clipboard. `clipboard.copy <text>` copies text from a binding or
+the command line.
 
 ### Chromes
 
@@ -497,15 +493,14 @@ sighurt-keymap-one = { path = "../sighurt-keymap-one", optional = true }
 
 ```rust
 pub const KEYMAPS: &[KeymapKind] = &[
-    #[cfg(feature = "keymap-modal")]
-    sighurt_keymap_modal::KIND,
+    sighurt_config_example::KIND,
     #[cfg(feature = "keymap-one")]
     sighurt_keymap_one::KIND,
 ];
 ```
 
 Then `[input] keymap = "one"` with `[keymap.one] key = "ctrl-n"` and `run = "tab.next"`. The
-worked examples are [`sighurt-keymap-modal`](extensions/sighurt-keymap-modal/) and
+worked examples are [`sighurt-config-example`](extensions/sighurt-config-example/) and
 [`sighurt-chrome-line`](extensions/sighurt-chrome-line/); `crates/sighurt-api/tests/keymap.rs` and
 `ui/sighurt-ui/tests/extension.rs` implement both traits from outside their crates.
 
@@ -523,7 +518,7 @@ worked examples are [`sighurt-keymap-modal`](extensions/sighurt-keymap-modal/) a
 | [`sighurt-wayland`](frontends/sighurt-wayland/) | the Wayland host: window, surfaces, targets, scaling, input, clipboard, shared-memory buffers, frame scheduling |
 | [`sighurt-ui`](ui/sighurt-ui/) | the standard chrome, the chrome API and its helpers |
 | [`sighurt-chrome-line`](extensions/sighurt-chrome-line/) | the line chrome |
-| [`sighurt-keymap-modal`](extensions/sighurt-keymap-modal/) | the modal keymap |
+| [`sighurt-config-example`](extensions/sighurt-config-example/) | the example configuration: the default keymap, in Rust |
 | [`sighurt-engine-servo`](engines/sighurt-engine-servo/) | the Servo engine |
 | [`sighurt-engine-wpe`](engines/sighurt-engine-wpe/) | the WPE WebKit engine |
 | [`sighurt-engine-wasm`](engines/sighurt-engine-wasm/) | the Wasm engine |

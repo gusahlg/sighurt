@@ -1783,3 +1783,12 @@ finding was checked against the plan and the code before it was acted on.
   row's name. Also added: `TabSnapshot::engine_label` (the name, for an engine page only),
   `Fonts::baseline` (to put text of two sizes on one baseline) and `LayoutOptions::engine_label`.
   A chrome that builds `TabSnapshot` values itself must name the new field.
+- **The configuration extension** (31 October 2026, STATUS decision 116; design in
+  `docs/rewrite/config-extension.md`): `sighurt_api::keymap` gains `Browser` (a borrowed,
+  read-only view of the frontend, the key context and the tabs), `TabInfo`, `Frontend` (moved from
+  the core, which re-exports it) and `KeyAction::RunAll`; `Keymap::press` takes `&dyn Browser`
+  as its third argument. `sighurt-keymap-modal` is replaced by `sighurt-config-example` (config
+  name `example`, always compiled in, the built-in `[input] keymap`): the `keymap-modal` feature
+  and `[keymap.modal]`'s TOML modes are gone (§2.5 and the examples above describe the old
+  crate), and the example's bindings are Rust. `[tui.keys]`' built-in table is gone. New command
+  `clipboard.copy <text>`. The chrome API is unchanged.
