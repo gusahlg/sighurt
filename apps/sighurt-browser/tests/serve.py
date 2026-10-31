@@ -13,10 +13,16 @@ and the path), so the tests can count loads. Besides the files in PAGES:
                        sees as navigator.userAgent in its address: #["header","script"]
     /slow.html?s=N     a page that answers after N seconds
     /hold.png          an image held for a minute, or until the client gives up
+    /coexist.html      coexist.sh's page: its title, background and link depend on the Host
+                       header (127.0.0.N); a script reports what is typed into its field as
+                       GET /typed/HOST/VALUE
+
+SERVE_BIND (default 127.0.0.1) and SERVE_PORT (default: any) choose the address.
 """
 
 import http.server
 import json
+import os
 import sys
 import threading
 import time
@@ -59,6 +65,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.page("<!DOCTYPE html><meta charset=utf-8><title>user agent</title><script>"
                       f"history.replaceState(null, '', '#' + JSON.stringify([{header}, "
                       "navigator.userAgent]));</script>")
+        elif url.path == "/coexist.html":
+            host = self.headers.get("Host", "?").split(":")[0]
+            colour = {"127.0.0.1": "#d9ecff", "127.0.0.2": "#d9ffd9", "127.0.0.3": "#fff2c2",
+                      "127.0.0.4": "#f0d9ff", "127.0.0.5": "#ffe0c2"}.get(host, "#ffffff")
+            port = self.headers.get("Host", "").partition(":")[2]
+            self.page(f"""<!DOCTYPE html><meta charset=utf-8><title>coexist@{host}</title>
+<body style="margin:0;background:{colour};font:24px sans-serif">
+<input id=field autocomplete=off style="position:absolute;left:20px;top:20px;width:300px;height:30px;font-size:20px">
+<a href="http://127.0.0.2:{port}/coexist.html?from={host}" style="position:absolute;left:20px;top:100px;width:500px;height:60px;display:block;background:#c33;color:#fff">link to 127.0.0.2</a>
+<p style="position:absolute;left:20px;top:200px">page of {host}</p>
+<script>document.getElementById('field').addEventListener('input', e => fetch('/typed/' + location.hostname + '/' + encodeURIComponent(e.target.value)));</script>""")
         elif url.path == "/slow.html":
             time.sleep(float(query.get("s", ["3"])[0]))
             self.page("<!DOCTYPE html><meta charset=utf-8><title>slow</title>"
@@ -106,7 +123,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             super().do_GET()
 
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+server = http.server.ThreadingHTTPServer(
+    (os.environ.get("SERVE_BIND", "127.0.0.1"), int(os.environ.get("SERVE_PORT", "0"))), Handler)
 server.daemon_threads = True
 with open(port_file, "w") as f:
     f.write(str(server.server_address[1]))
