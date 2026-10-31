@@ -3,7 +3,7 @@
 //! The runtime lists each engine's name, capabilities and settings. This module supplies what
 //! is the Wayland frontend's: how to start the runtime on the host's target lease and frame
 //! permit, the present mode its targets are created with, and the renderer label. Shutdown
-//! order is the runtime's descriptor order (Servo, then Wasm, then WPE, then the demo).
+//! order is the runtime's descriptor order (Servo, then Wasm, then WPE, then the demo, then NetSurf).
 //!
 //! Must not own: when a runtime starts (the registry, on first use, except Servo at launch) or
 //! what it is asked to do.
@@ -59,6 +59,15 @@ pub fn build() -> (
             },
             mode: PresentMode::Shm,
         },
+        #[cfg(feature = "engine-netsurf")]
+        WaylandEngine {
+            binding: Binding {
+                name: "netsurf",
+                renderer: "cpu (NetSurf), wl_shm",
+                start: netsurf,
+            },
+            mode: PresentMode::Shm,
+        },
     ];
     let modes = engines
         .iter()
@@ -74,7 +83,8 @@ pub fn build() -> (
     feature = "engine-servo",
     feature = "engine-wasm",
     feature = "engine-wpe",
-    feature = "engine-demo"
+    feature = "engine-demo",
+    feature = "engine-netsurf"
 ))]
 struct Bound<R>(R);
 
@@ -82,7 +92,8 @@ struct Bound<R>(R);
     feature = "engine-servo",
     feature = "engine-wasm",
     feature = "engine-wpe",
-    feature = "engine-demo"
+    feature = "engine-demo",
+    feature = "engine-netsurf"
 ))]
 impl<R> sighurt_api::engine::EngineRuntime for Bound<R>
 where
@@ -264,5 +275,24 @@ fn demo(
 #[cfg(feature = "engine-demo")]
 impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
     for Bound<sighurt_engine_demo::DemoRuntime<TargetLease>>
+{
+}
+
+#[cfg(feature = "engine-netsurf")]
+fn netsurf(
+    waker: sighurt_api::engine::EngineWaker,
+    launch: sighurt_runtime::registry::Launch<'_>,
+) -> Result<sighurt_runtime::registry::Runtime<TargetLease, FramePermit>, String> {
+    use sighurt_engine_netsurf::NetSurfRuntime;
+    use sighurt_runtime::registry::{self, Runtime};
+
+    NetSurfRuntime::<TargetLease>::new(registry::netsurf_config(launch.settings), waker)
+        .map(|runtime| Runtime::Netsurf(Box::new(Bound(runtime))))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "engine-netsurf")]
+impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
+    for Bound<sighurt_engine_netsurf::NetSurfRuntime<TargetLease>>
 {
 }
