@@ -51,6 +51,8 @@ members = [
     "experiments/tui-servo",
     "experiments/wpe-cpu",
     "experiments/tty-io",
+    # wgpu 30 on Vulkan presenting into a host GL-mode subsurface (docs/rewrite/RENDER.md §14).
+    "experiments/wgpu-subsurface",
 ]
 # Resolver 3 picks dependency versions that support `rust-version` below: the Rust of the nixpkgs
 # pin in nix/nixpkgs.nix, which both machines build with.
