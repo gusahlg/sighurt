@@ -19,7 +19,7 @@ use sighurt_api::services::{
 };
 use sighurt_core::config::{Config, ConfigError};
 use sighurt_core::navigation::RETAINED_VIEWS;
-use sighurt_core::session::Session;
+use sighurt_core::session::{Session, MAX_TABS};
 use sighurt_core::tabs::{Content, TabSummary, ViewState, MAX_URL};
 use sighurt_core::{
     update, BrowserEvent, BrowserState, ChromeChecks, Effect, Environment, OpenRequest,
@@ -2312,6 +2312,45 @@ fn a_damaged_session_is_refused() {
 }
 
 #[test]
+fn no_more_tabs_open_than_a_session_holds() {
+    let mut b = Harness::start("", &[]);
+    for _ in 1..MAX_TABS {
+        b.update(command("tab.new"));
+    }
+    assert_eq!(b.state.tabs().len(), MAX_TABS);
+    let refused = "sig holds at most 1000 tabs: close one to open another.";
+    let effects = b.update(command("tab.new"));
+    assert_eq!(notices(&effects), [refused]);
+    let effects = b.update(BrowserEvent::Open(open("https://a.test/")));
+    assert_eq!(notices(&effects), [refused]);
+    assert!(opened(&effects).is_empty());
+    assert_eq!(b.state.tabs().len(), MAX_TABS);
+    assert_eq!(b.state.active(), MAX_TABS - 1);
+    // What is saved is read back whole.
+    let session = Session::parse(&b.state.session().to_text()).unwrap();
+    assert_eq!((session.tabs.len(), session.notices.len()), (MAX_TABS, 0));
+}
+
+#[test]
+fn what_reading_the_session_left_out_is_told() {
+    let session = Harness::start("", &["https://a.test/"]).state.session();
+    let text = format!(
+        "{}\n[[tabs]]\ncurrent = 0\nzoom = \"big\"\n",
+        session.to_text()
+    );
+    let mut b = Harness::new("");
+    let effects = b.apply(BrowserEvent::Start {
+        session: Some(Session::parse(&text).unwrap()),
+        open: Vec::new(),
+    });
+    assert_eq!(
+        notices(&effects),
+        ["A saved tab was damaged and is left out."]
+    );
+    assert_eq!(b.state.tabs().len(), 1);
+}
+
+#[test]
 fn a_tab_still_loading_its_first_page_is_saved_with_it() {
     let mut b = Harness::new("");
     b.update(BrowserEvent::Start {
@@ -3760,4 +3799,25 @@ fn only_a_captured_buttons_release_reaches_a_view_that_is_no_longer_shown() {
     // The ordinary path still drops a release for a view not shown.
     let effects = b.click(view, PointerButton::Left, ButtonState::Released);
     assert!(!pointed(&effects, view), "{effects:?}");
+}
+
+#[test]
+fn a_view_being_closed_gets_no_release() {
+    let mut b = Harness::start("", &["https://a.test/", "https://b.test/"]);
+    let view = b.shown();
+    // Closed, and its engine has not said it is gone yet.
+    let effects = b.update(command("tab.close"));
+    assert_eq!(closed(&effects), [view]);
+    let event = InputEvent {
+        seat: b.seat,
+        kind: InputKind::Pointer(PointerEvent::Button {
+            button: PointerButton::Left,
+            state: ButtonState::Released,
+            position: SurfacePoint { x: 5.0, y: 5.0 },
+            modifiers: Modifiers::default(),
+        }),
+    };
+    let at = b.now;
+    let effects = b.update(BrowserEvent::PointerRelease { view, event, at });
+    assert!(effects.is_empty(), "{effects:?}");
 }

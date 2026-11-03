@@ -22,7 +22,8 @@
 //!   answers every navigation a view it knows asks about (`NavigationRequested`): a link the
 //!   user clicked goes where routing sends its address, perhaps to another engine.
 //!   `SiteDataDone` finishes a pending `site.forget`: a notice, and a reload of the tabs in
-//!   that engine whose host matches. `SitesListed` is ignored until a command lists sites.
+//!   that engine whose host matches. `RuntimeFailed` finishes the ones that engine was asked,
+//!   as failed, and a failed engine is asked nothing more. `SitesListed` is ignored until a command lists sites.
 //!   `FrameReady` is the executable's to schedule presentation from, and `SemanticsChanged`
 //!   page content for a frontend that shows text; the core ignores both;
 //! - what its own calls and services produced: [`BrowserEvent::OpenFailed`],
@@ -156,7 +157,8 @@ pub enum BrowserEvent {
     /// The browser starts: restore `session`, then open each of `open` in a new tab and select
     /// the first; open a home tab if that leaves no tab.
     Start {
-        /// The saved session, if it could be read. A damaged one is refused with a notice.
+        /// The saved session, if it could be read; what reading it left out
+        /// ([`Session::notices`]) is told the user. A damaged one is refused with a notice.
         session: Option<Session>,
         /// What the command line asked for.
         open: Vec<OpenRequest>,
@@ -169,7 +171,8 @@ pub enum BrowserEvent {
     /// The chrome closes this tab (its close button), as `tab.close` would. A tab that is gone
     /// is not closed.
     CloseTab(TabId),
-    /// Open something in a new tab and select it.
+    /// Open something in a new tab and select it; with [`session::MAX_TABS`] tabs open, say so
+    /// instead.
     Open(OpenRequest),
     /// Keyboard input for the window: a key, input-method text, or window activation.
     Keyboard {
@@ -455,9 +458,10 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             state.tab_command(tab, |n| Command::TabClose(Some(n)), &mut fx)
         }
         BrowserEvent::Open(request) => {
-            let tab = state.open_tab(request, false, &mut fx);
-            state.active = tab;
-            state.move_focus(KeyboardFocus::Page, &mut fx);
+            if let Some(tab) = state.open_tab(request, false, &mut fx) {
+                state.active = tab;
+                state.move_focus(KeyboardFocus::Page, &mut fx);
+            }
         }
         BrowserEvent::Keyboard { event, at } => state.keyboard(event, at, &mut fx),
         BrowserEvent::Pointer { view, event, at } => state.pointer(view, event, at, &mut fx),
@@ -471,7 +475,9 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
                     ..
                 })
             );
-            if release && state.views.contains_key(&view) {
+            // A view being closed is sent nothing after its `CloseView`.
+            let open = state.views.get(&view).is_some_and(|v| !v.closing);
+            if release && open {
                 fx.push(Effect::Engine {
                     view,
                     command: EngineCommand::Input(event),
@@ -868,6 +874,7 @@ impl BrowserState {
             version: session::VERSION,
             active: self.active,
             tabs: self.tabs.iter().map(tab).collect(),
+            notices: Vec::new(),
         }
     }
 
@@ -927,6 +934,7 @@ impl BrowserState {
             }
         });
         if let Some(session) = session {
+            notify(session.notices, fx);
             let first = self.tabs.len();
             for saved in session.tabs {
                 self.tabs.push(restored(saved));
@@ -940,14 +948,15 @@ impl BrowserState {
         }
         let mut opened = None;
         for request in open {
-            let tab = self.open_tab(request, false, fx);
-            opened.get_or_insert(tab);
+            if let Some(tab) = self.open_tab(request, false, fx) {
+                opened.get_or_insert(tab);
+            }
         }
         if let Some(tab) = opened {
             self.active = tab;
         }
         if self.tabs.is_empty() {
-            self.new_tab(false);
+            self.new_tab(false, fx);
             self.open_home(0, fx);
         }
         notify(self.config.notices().to_vec(), fx);
@@ -982,19 +991,36 @@ impl BrowserState {
         fx.chrome = true;
     }
 
-    /// Adds a tab at the end that opens `request`, and returns its index.
-    fn open_tab(&mut self, request: OpenRequest, opened_by_page: bool, fx: &mut Fx) -> usize {
-        let tab = self.new_tab(opened_by_page);
+    /// Adds a tab at the end that opens `request`, and returns its index; `None` when there
+    /// are [`session::MAX_TABS`] already.
+    fn open_tab(
+        &mut self,
+        request: OpenRequest,
+        opened_by_page: bool,
+        fx: &mut Fx,
+    ) -> Option<usize> {
+        let tab = self.new_tab(opened_by_page, fx)?;
         let url = self.fixup(&request.input);
         self.navigate(tab, url, By::User(request.engine.as_deref()), fx);
-        tab
+        Some(tab)
     }
 
     /// Adds an empty tab at the end, at the configured zoom, and returns its index. The active
-    /// tab doesn't change.
-    pub(crate) fn new_tab(&mut self, opened_by_page: bool) -> usize {
+    /// tab doesn't change. With [`session::MAX_TABS`] open already, it says so and adds none:
+    /// the session saves every tab, and can read back only so many.
+    pub(crate) fn new_tab(&mut self, opened_by_page: bool, fx: &mut Fx) -> Option<usize> {
+        if self.tabs.len() >= session::MAX_TABS {
+            notice(
+                format!(
+                    "sig holds at most {} tabs: close one to open another.",
+                    session::MAX_TABS
+                ),
+                fx,
+            );
+            return None;
+        }
         self.tabs.push(Tab::new(opened_by_page, self.config.zoom()));
-        self.tabs.len() - 1
+        Some(self.tabs.len() - 1)
     }
 
     /// Closes tab `index`, unless it is the last one.
@@ -1534,6 +1560,17 @@ impl BrowserState {
             }
             self.view_gone(view, Some(clamp(reason.clone())), fx);
         }
+        // It will answer no `site.forget` it was asked: each fails for it now.
+        let asked: Vec<RequestId> = self
+            .site_requests
+            .iter()
+            .filter(|(_, pending)| pending.waiting.contains(engine))
+            .map(|(&request, _)| request)
+            .collect();
+        for request in asked {
+            let why = "it stopped working".to_owned();
+            self.site_answered(engine, request, Err(why), fx);
+        }
         fx.push(Effect::Notice {
             tab: None,
             message: clamp(format!("{reason}. Restart sig to use it again.")),
@@ -1593,16 +1630,29 @@ impl BrowserState {
                 },
             },
         };
-        let waiting: BTreeSet<String> = self
+        let keepers: Vec<&String> = self
             .env
             .engines
             .iter()
             .filter(|(_, capabilities)| capabilities.site_data.any())
-            .map(|(name, _)| name.clone())
+            .map(|(name, _)| name)
+            .collect();
+        if keepers.is_empty() {
+            return notice(
+                "No engine in this build can forget site data yet, so nothing was forgotten."
+                    .into(),
+                fx,
+            );
+        }
+        // A failed engine answers nothing.
+        let waiting: BTreeSet<String> = keepers
+            .into_iter()
+            .filter(|name| !self.failed.contains_key(*name))
+            .cloned()
             .collect();
         if waiting.is_empty() {
             return notice(
-                "No engine in this build can forget site data yet, so nothing was forgotten."
+                "The engines that keep site data stopped working: restart sig to forget a site."
                     .into(),
                 fx,
             );
@@ -1940,8 +1990,9 @@ impl BrowserState {
             OpenDisposition::NewView => {
                 let view = self.views.get_mut(&id).expect("checked by the caller");
                 if permissions::take_activation(&mut view.activation, at) {
-                    let tab = self.new_tab(true);
-                    self.navigate(tab, url, By::Page, fx);
+                    if let Some(tab) = self.new_tab(true, fx) {
+                        self.navigate(tab, url, By::Page, fx);
+                    }
                 } else {
                     fx.push(Effect::Notice {
                         tab: tab_id,

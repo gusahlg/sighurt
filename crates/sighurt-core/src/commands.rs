@@ -3,7 +3,7 @@
 //!
 //! - Tabs count from 1 in tab-strip order; a number without a tab does nothing.
 //! - `tab.new` opens the home page in a new tab at the end, selects it and focuses the address
-//!   bar. The last tab can't be closed; closing the active tab selects the one after it, or the
+//!   bar; with `session::MAX_TABS` tabs open it says so instead. The last tab can't be closed; closing the active tab selects the one after it, or the
 //!   one before if it was the last.
 //! - `tab.next` and `tab.previous` wrap around.
 //! - Page zoom walks [`ZOOM_STEPS`] and stops at its ends; each tab keeps its own, across
@@ -72,12 +72,14 @@ impl BrowserState {
         let (active, count) = (self.active, self.tabs.len());
         let tab_number = |n: NonZeroUsize| (n.get() <= count).then(|| n.get() - 1);
         let focus = match command {
-            Command::TabNew => {
-                let tab = self.new_tab(false);
-                self.active = tab;
-                self.open_home(tab, fx);
-                Some(KeyboardFocus::Chrome)
-            }
+            Command::TabNew => match self.new_tab(false, fx) {
+                Some(tab) => {
+                    self.active = tab;
+                    self.open_home(tab, fx);
+                    Some(KeyboardFocus::Chrome)
+                }
+                None => None,
+            },
             Command::TabClose(n) => {
                 if let Some(index) = n.map_or(Some(active), tab_number) {
                     self.close_tab(index, fx);

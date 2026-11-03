@@ -289,8 +289,12 @@ key is optional.
   `[input]`, `[input.buttons]`, `[downloads]` and `[session]` key by key, and `[keywords]`,
   `[engines.*]`, `[keys]`, `[keymap.*]`, `[ui]` and `[chrome.*]` are yours alone.
 - The whole file is checked at once and every problem is reported together. A file with a
-  problem is not used: at startup `sig` runs with the built-in configuration, and a file saved
-  while `sig` runs leaves the configuration in use as it was. The status line says so.
+  problem is not used. At startup `sig` doesn't start: it prints the file and the problems and
+  exits, since the built-in configuration in its place would drop what the file sets (an
+  engine's ephemeral storage, `[session] restore = false`). A file saved while `sig` runs
+  leaves the configuration in use as it was, and the status line says so. Without a file `sig`
+  starts with the built-in configuration; a file deleted or moved away while it runs leaves the
+  configuration in use as it is until the file is back.
 - A table for an engine, keymap or chrome that this build doesn't have is not a problem: `sig`
   says so and goes on, so one file serves several builds. The routing rules of an engine the
   build lacks are left out, so what they claim opens in the default engine. `[engines] default`
@@ -364,7 +368,11 @@ tabs = "left"
 | `[downloads] directory` | where downloads go: an absolute path or `~/…` | the desktop's download folder, else `~/Downloads` |
 | `[session] restore` | open the tabs of the last run, and save them as they change | `true` |
 
-The session is `~/.local/state/sighurt/session.toml`. Profiles, each private (0700), are
+The session is `~/.local/state/sighurt/session.toml`. One `sig` at a time saves it (it holds
+`session.lock` beside it); another started meanwhile restores the same tabs but doesn't save its
+own, and says so. A session file that can't be read is kept as `session.toml.broken-<seconds>`
+instead of being written over, and a damaged tab in it is left out with a notice. `sig` holds
+at most 1000 tabs. Profiles, each private (0700), are
 `~/.local/share/sighurt/servo`, `wpe`, `cef`, `ladybird` and `wasm`. NetSurf keeps no profile
 directory yet.
 

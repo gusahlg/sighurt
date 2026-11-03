@@ -332,6 +332,7 @@ fn a_sig_page_and_a_tab_with_no_page_are_notices() {
                 title: None,
             }],
         }],
+        notices: Vec::new(),
     };
     let mut harness = Harness::new(environment(&["servo"], &[]));
     harness.apply(BrowserEvent::Start {
@@ -520,6 +521,33 @@ fn sixteen_unfinished_forgets_is_the_limit() {
         host_of(&requests(&effects)[0]),
         &SiteKey::Host("extra.example".into())
     );
+}
+
+#[test]
+fn a_failed_engine_fails_the_forgets_it_was_asked() {
+    let mut harness = Harness::servo(&["https://example.com/"]);
+    for i in 0..16 {
+        harness.apply(command(&format!("site.forget host{i}.example")));
+    }
+    let effects = harness.apply(BrowserEvent::Engine {
+        engine: "servo".into(),
+        event: EngineEvent::RuntimeFailed {
+            message: "gone".into(),
+        },
+        at: harness.now,
+    });
+    let failed = notices(&effects)
+        .into_iter()
+        .filter(|notice| notice.ends_with("nothing on disk changed in servo (it stopped working)"))
+        .count();
+    assert_eq!(failed, 16, "{:?}", notices(&effects));
+    // None is left waiting, and the failed engine is asked nothing more.
+    let effects = harness.apply(command("site.forget extra.example"));
+    assert_eq!(
+        notices(&effects),
+        ["The engines that keep site data stopped working: restart sig to forget a site."]
+    );
+    assert!(requests(&effects).is_empty());
 }
 
 #[test]

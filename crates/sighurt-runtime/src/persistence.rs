@@ -9,14 +9,22 @@
 //!
 //! The core parses and validates the configuration, against what the build has (its engines,
 //! keymaps and chromes, and the chrome's color names: `sighurt_core::Environment`). A file with
-//! any problem is not used: at startup `sig` runs with the built-in configuration and says why,
-//! and a reload that fails keeps the configuration in use.
+//! any problem is not used. At startup that stops `sig` ([`startup_config`]): running with the
+//! built-in configuration instead would drop what the file sets, such as an engine's ephemeral
+//! storage or `[session] restore = false`. Only a missing file means the built-in
+//! configuration. A reload that fails, or finds the file missing, keeps the configuration in
+//! use ([`load_config`]).
 //! The configuration's directory is watched with inotify, so a saved file (written in place or
 //! renamed over the old one) or a deleted one is read again; nothing polls.
 //!
 //! Sessions are written atomically (a temporary file in the same directory, synced, then renamed
 //! over the old one) by a thread of their own, which writes only the latest snapshot it has been
-//! given; at quit the last one is written before `sig` goes on.
+//! given; at quit the last one is written before `sig` goes on. Only one `sig` writes a session
+//! file: the writer holds an advisory lock (`session.lock` beside it) until its last write, and
+//! the OS releases it if `sig` dies. Another `sig` still restores the session, says once that it
+//! won't save it, and never writes it. The owner removes temporary files a crash left behind. A
+//! session file that can't be read is kept aside as `session.toml.broken-<seconds>` before
+//! anything is saved over it.
 //!
 //! Must not own: parsing or validating the configuration's contents (the core), or deciding what
 //! a reload changes.
@@ -29,7 +37,9 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::inotify;
 use sighurt_core::config::{Config, ConfigError};
@@ -134,19 +144,49 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-/// Reads and checks the configuration at `path` (none: the built-in one) for a build with
-/// what `env` lists.
-pub fn load_config(path: Option<&Path>, env: &Environment) -> Result<Config, LoadError> {
-    let text = match path.map(fs::read_to_string) {
-        None => None,
-        Some(Ok(text)) => Some(text),
-        Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => None,
-        Some(Err(error)) => {
-            let path = path.expect("read from a path").display();
-            return Err(LoadError::Other(format!("cannot read {path}: {error}")));
-        }
+/// The configuration `sig` starts with, for a build with what `env` lists: the file at `path`,
+/// or the built-in one when there is no file (or no configuration directory). A file that
+/// can't be used is fatal: the built-in configuration in its place would drop what it sets (an
+/// engine's ephemeral storage, `[session] restore = false`). `Err` names the file and every
+/// problem, for the frontend to stop with before it starts anything.
+pub fn startup_config(path: Option<&Path>, env: &Environment) -> Result<Config, String> {
+    let text = match read_config(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot read {}: {error}", shown(path))),
     };
+    Config::parse(text.as_deref(), env).map_err(|error| {
+        format!(
+            "{}: {error}\nsig did not start. Fix the file, or move it away to start with the \
+             built-in configuration.",
+            shown(path)
+        )
+    })
+}
+
+/// Reads and checks the configuration at `path` again, for a reload (none: the built-in one),
+/// for a build with what `env` lists. A missing file is an error too, so the configuration in
+/// use stays: an editor that moves the old file away before it writes the new one would
+/// otherwise reset everything for a moment.
+pub fn load_config(path: Option<&Path>, env: &Environment) -> Result<Config, LoadError> {
+    let text = read_config(path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => LoadError::Other(format!("{} is missing.", shown(path))),
+        _ => LoadError::Other(format!("cannot read {}: {error}", shown(path))),
+    })?;
     Config::parse(text.as_deref(), env).map_err(LoadError::Config)
+}
+
+/// The text of the file at `path`; none without a path.
+fn read_config(path: Option<&Path>) -> io::Result<Option<String>> {
+    path.map(fs::read_to_string).transpose()
+}
+
+/// `path` for the user.
+fn shown(path: Option<&Path>) -> String {
+    path.map_or_else(
+        || "the built-in configuration".into(),
+        |path| path.display().to_string(),
+    )
 }
 
 /// Watches the configuration file's directory for the file being written, replaced or deleted.
@@ -195,14 +235,135 @@ impl AsFd for ConfigWatch {
     }
 }
 
-/// Reads the saved session: `Ok(None)` when there is none, `Err` when it can't be read.
+/// Session files whose lock another `sig` held when [`SessionWriter::new`] asked for it. This
+/// process restores them but never writes them.
+static OWNED_ELSEWHERE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// What a `sig` that doesn't own the session says about it, once.
+const NOT_SAVED: &str = "Another sig owns the saved tabs; this one won't save its tabs.";
+
+/// Reads the saved session: `Ok(None)` when there is none, `Err` when it can't be read. What
+/// reading it left out is in its notices. A file that can't be read is kept aside as
+/// `<file>.broken-<seconds>`, unless another `sig` owns it, so the next save doesn't replace it.
+/// In a `sig` that doesn't own the session, the session says so in its notices.
 pub fn load_session(path: &Path) -> Result<Option<Session>, String> {
-    match fs::read_to_string(path) {
-        Ok(text) => Session::parse(&text)
-            .map(Some)
-            .map_err(|e| format!("{}: {e}", path.display())),
+    let elsewhere = OWNED_ELSEWHERE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|owned| owned == path);
+    let read = match fs::read_to_string(path) {
+        Ok(text) => Session::parse(&text).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("{}: {error}", path.display())),
+        Err(error) => Err(error.to_string()),
+    };
+    match read {
+        Ok(session) if elsewhere => {
+            let mut session = session.unwrap_or_else(|| Session {
+                version: sighurt_core::session::VERSION,
+                active: 0,
+                tabs: Vec::new(),
+                notices: Vec::new(),
+            });
+            session.notices.push(NOT_SAVED.into());
+            Ok(Some(session))
+        }
+        Ok(session) => Ok(session),
+        Err(error) if elsewhere => Err(format!("{}: {error}", path.display())),
+        Err(error) => Err(match keep_aside(path) {
+            Ok(kept) => format!(
+                "{}: {error}\nIt is kept as {}.",
+                path.display(),
+                kept.display()
+            ),
+            Err(failed) => format!(
+                "{}: {error}\nIt can't be kept aside ({failed}), and saving will replace it.",
+                path.display()
+            ),
+        }),
+    }
+}
+
+/// Renames the session file at `path` to `<path>.broken-<seconds since 1970>`, never over
+/// another file, and returns the new path.
+fn keep_aside(path: &Path) -> io::Result<PathBuf> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    for n in 0..100 {
+        let mut kept = path.as_os_str().to_owned();
+        kept.push(format!(".broken-{seconds}"));
+        if n > 0 {
+            kept.push(format!("-{n}"));
+        }
+        let kept = PathBuf::from(kept);
+        // Only the owner of the session renames it, so nothing races this check.
+        if fs::symlink_metadata(&kept).is_err() {
+            fs::rename(path, &kept)?;
+            return Ok(kept);
+        }
+    }
+    Err(io::Error::other("too many kept session files"))
+}
+
+/// The lock file of the session at `path`: `session.lock` beside `session.toml`.
+fn lock_path(path: &Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{stem}.lock"))
+}
+
+/// Takes the session at `path` for this process: the lock, held as long as the file returned
+/// stays open, and released by the OS when the process ends however it ends. When another
+/// `sig` holds it, records that and fails.
+fn lock_session(path: &Path) -> io::Result<fs::File> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("no directory"))?;
+    secure_private_dir(dir)?;
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path(path))?;
+    let mut elsewhere = OWNED_ELSEWHERE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    elsewhere.retain(|owned| owned != path);
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => {
+            elsewhere.push(path.to_owned());
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another sig owns the session, so this one won't save it",
+            ))
+        }
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Removes the temporary files [`write_atomically`] left beside `path` when a `sig` died
+/// before renaming one: they hold URLs and titles. Called with the session's lock held, when
+/// no other `sig` writes there.
+fn remove_temporaries(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let pid = file
+            .to_str()
+            .and_then(|file| file.strip_prefix(&prefix)?.strip_suffix(".tmp"));
+        if pid.is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())) {
+            if let Err(error) = fs::remove_file(entry.path()) {
+                log::warn!("cannot remove {}: {error}", entry.path().display());
+            }
+        }
     }
 }
 
@@ -239,19 +400,27 @@ pub fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
     result
 }
 
-/// Writes session snapshots on a thread of its own, the latest one only.
+/// Writes session snapshots on a thread of its own, the latest one only. It owns the session:
+/// its thread holds the session's lock until it has written the last snapshot.
 pub struct SessionWriter {
     sender: Option<Sender<String>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl SessionWriter {
-    /// A writer to `path`.
+    /// A writer to `path`, which takes the session's lock and removes the temporary files a
+    /// crash left. Fails when another `sig` owns the session: this `sig` then restores it
+    /// ([`load_session`] says it won't save it) and saves nothing.
     pub fn new(path: PathBuf) -> io::Result<Self> {
+        let lock = lock_session(&path)?;
+        remove_temporaries(&path);
         let (sender, receiver) = mpsc::channel::<String>();
         let thread = std::thread::Builder::new()
             .name("sighurt-session".into())
-            .spawn(move || write_latest(&path, receiver))?;
+            .spawn(move || {
+                write_latest(&path, receiver);
+                drop(lock);
+            })?;
         Ok(Self {
             sender: Some(sender),
             thread: Some(thread),
@@ -290,11 +459,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_missing_file_is_the_built_in_configuration() {
+    fn a_missing_file_is_the_built_in_configuration_at_startup_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let config = load_config(Some(&path), &Environment::default()).ok();
-        assert_eq!(config, Some(Config::default()));
+        let env = Environment::default();
+        assert_eq!(startup_config(Some(&path), &env), Ok(Config::default()));
+        assert_eq!(startup_config(None, &env), Ok(Config::default()));
+        // Reloaded, it keeps the configuration in use: the file may be on its way back.
+        let reloaded = load_config(Some(&path), &env);
+        assert!(matches!(reloaded, Err(LoadError::Other(m)) if m.ends_with("is missing.")));
+    }
+
+    #[test]
+    fn a_file_that_cant_be_used_stops_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let env = Environment::default();
+        fs::write(&path, "version = 1\nbogus = 1\n").unwrap();
+        let error = startup_config(Some(&path), &env).unwrap_err();
+        assert!(
+            error.starts_with(&format!("{}: ", path.display())),
+            "{error}"
+        );
+        assert!(
+            error.contains("bogus") && error.contains("sig did not start"),
+            "{error}"
+        );
+        assert!(matches!(
+            load_config(Some(&path), &env),
+            Err(LoadError::Config(_))
+        ));
+        fs::write(&path, "version = 1\n").unwrap();
+        assert_eq!(startup_config(Some(&path), &env), Ok(Config::default()));
     }
 
     #[test]
@@ -323,6 +519,7 @@ mod tests {
                 version: sighurt_core::session::VERSION,
                 active: 0,
                 tabs: Vec::new(),
+                notices: Vec::new(),
             }
             .to_text()
                 + &"#\n".repeat(n)
@@ -333,11 +530,92 @@ mod tests {
         writer.finish();
         assert_eq!(fs::read_to_string(&path).unwrap(), text(49));
         assert_eq!(load_session(&path).unwrap().unwrap().tabs.len(), 0);
-        // Only the session is left in the directory: no temporary file.
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
-        fs::write(&path, "version = 7\n").unwrap();
-        assert!(load_session(&path).is_err());
+        // Only the session and its lock are left in the directory: no temporary file.
+        assert_eq!(
+            names(path.parent().unwrap()),
+            ["session.lock", "session.toml"]
+        );
         assert_eq!(load_session(&dir.path().join("none")), Ok(None));
+    }
+
+    #[test]
+    fn a_session_that_cant_be_read_is_kept_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        for text in ["version = 7\n", "not toml ["] {
+            fs::write(&path, text).unwrap();
+            let error = load_session(&path).unwrap_err();
+            assert!(error.contains("It is kept as"), "{error}");
+            assert!(!path.exists());
+        }
+        let kept = names(dir.path());
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept
+            .iter()
+            .all(|name| name.starts_with("session.toml.broken-")));
+        let contents: Vec<_> = kept
+            .iter()
+            .map(|name| fs::read_to_string(dir.path().join(name)).unwrap())
+            .collect();
+        assert!(
+            contents.contains(&"version = 7\n".to_owned()),
+            "{contents:?}"
+        );
+        // A damaged tab doesn't make the file unreadable.
+        fs::write(&path, "version = 1\nactive = 0\n[[tabs]]\nzoom = \"x\"\n").unwrap();
+        let session = load_session(&path).unwrap().unwrap();
+        assert_eq!((session.tabs.len(), session.notices.len()), (0, 1));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn one_sig_owns_the_session_and_the_other_only_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        // What a sig that crashed while writing left.
+        fs::write(dir.path().join("session.toml.4242.tmp"), "tabs").unwrap();
+        fs::write(dir.path().join("session.toml.x.tmp"), "not ours").unwrap();
+        let owner = SessionWriter::new(path.clone()).unwrap();
+        assert_eq!(
+            names(dir.path()),
+            ["session.lock", "session.toml.x.tmp"],
+            "the temporary file is gone"
+        );
+        owner.save(empty_session());
+        // The lock is per open file, so a second writer in this process stands for another sig.
+        let error = SessionWriter::new(path.clone()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        owner.finish();
+        let session = load_session(&path).unwrap().unwrap();
+        assert_eq!(session.notices, [NOT_SAVED]);
+        // Broken or not, the file is the owner's: it stays.
+        fs::write(&path, "not toml [").unwrap();
+        assert!(load_session(&path).is_err());
+        assert!(path.exists());
+        // The owner let go when it finished: now this one owns the session.
+        SessionWriter::new(path.clone()).unwrap().finish();
+        let error = load_session(&path).unwrap_err();
+        assert!(error.contains("It is kept as"), "{error}");
+    }
+
+    fn empty_session() -> String {
+        Session {
+            version: sighurt_core::session::VERSION,
+            active: 0,
+            tabs: Vec::new(),
+            notices: Vec::new(),
+        }
+        .to_text()
+    }
+
+    /// The names in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]

@@ -3851,3 +3851,21 @@ Newest last. Each entry says what was decided and why.
     `sighurt-sdk` keeps 0.7.0 (the guest ABI didn't change). Work: Claude Opus 5.5
     (orchestration, integration, review), Claude Sonnet 5.5 and Grok 4.7 (implementation),
     GPT-6 Astra and Claude Opus 5.5 (reviews), Claude Fable 5.1 (the configuration design).
+121. **Sixel frames show in Rio and under tmux 3.8** (3 November 2026, commit 36e043a; the user:
+    "sixel graphics doesn't work at all for the TUI mode, no graphics show up, make it work in
+    tmux"). Two causes, found by replaying what tmux sends the outer terminal: (1) tmux
+    re-encodes every sixel and defines every colour register up to the highest one used, so a
+    register the frame never defined comes out as `#n;0;0;0;0`, and Rio 0.5.28 drops an image
+    that contains one — this blanked Rio under tmux 3.7c as well, so decision 120's "sixel with
+    Servo" live check was wrong: it only read the diagnostics, and its own screenshot
+    (`test-out/release/live2/1-sixel.png`) is blank; (2) tmux 3.8 holds a synchronized pane's
+    lines until the update ends and then redraws them over an image it wrote through at once,
+    erasing it. `sixel.rs` now defines all 252 registers in every frame (about 3 KiB), and
+    `app.rs` blanks the page rows in a synchronized update of its own and writes the image after
+    it. *Evidence*: `frontends/sighurt-tui` tests (147) and the pty suite (`tests/tui.rs`: no
+    sixel inside a synchronized update, the palette present); headless Rio + a private tmux
+    (3.7c and 3.8) and foot showing `demo://pattern` and `demo://animation`
+    (`/data/sig-builds/test-out/sixel-fix2-*/`), the 0.10.0 release blank beside them
+    (`sixel-old-38/`). Not yet verified: Servo frames with the fix (same encoder path), the
+    user's GPU Rio, and a possible flash between frames at 5 fps. Work: Claude Opus 5.5
+    (diagnosis and fix), Claude Fable 5.1 (orchestration).

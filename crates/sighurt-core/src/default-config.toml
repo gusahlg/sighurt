@@ -9,8 +9,11 @@
 # applies only in the terminal when the keymap is bindings.
 #
 # The problems in the file are reported together. A file with any problem is not used: at
-# startup sig runs with these defaults, and when the file is loaded again the configuration in
-# use stays. A table for an engine, keymap or chrome that this build of sig doesn't have is not
+# startup sig doesn't start, and says which file and what is wrong (these defaults in its place
+# would drop what it sets, such as an engine's ephemeral storage or restore = false); when the
+# file is loaded again while sig runs, the configuration in use stays. No file at all means
+# these defaults at startup; a file deleted or moved away while sig runs leaves the
+# configuration in use as it is until the file is back. A table for an engine, keymap or chrome that this build of sig doesn't have is not
 # a problem, so one file can serve several builds: sig says so, names what it has, and goes on
 # (an absent engine's routing rules are left out, so what they claim opens in the default engine).
 # Key bindings, the keymap, the mouse's buttons, scrolling, colors, fonts, the chrome's
@@ -336,8 +339,8 @@ default-keys = true
 #
 # Downloads go to the desktop's download folder (XDG_DOWNLOAD_DIR in ~/.config/user-dirs.dirs),
 # or ~/Downloads if there is none, unless `directory` names another: an absolute path, or one
-# starting with ~/. Web pages and Wasm apps alike save there, at most one file a second per tab.
-# A folder that doesn't exist yet is made at the first download.
+# starting with ~/. Web pages and Wasm apps alike save there, at most one file a second per tab
+# and 8 at once in all. A folder that doesn't exist yet is made at the first download.
 #
 #   [downloads]
 #   directory = "~/Downloads"
@@ -346,5 +349,8 @@ default-keys = true
 # Whether sig opens the tabs it had when it last quit, and saves them as they change, in
 # ~/.local/state/sighurt/session.toml. With false it starts with the home page and doesn't
 # write the session file, which it leaves as it is. With storage = "ephemeral" for each engine
-# too, nothing of a session is kept.
+# too, nothing of a session is kept. One sig saves the session: another started while it runs
+# restores the same tabs but doesn't save its own, and says so. A session file sig can't read is
+# kept as session.toml.broken-<seconds>, never written over; a damaged tab in it is left out.
+# sig holds at most 1000 tabs.
 restore = true

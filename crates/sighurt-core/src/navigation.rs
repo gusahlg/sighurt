@@ -7,7 +7,8 @@
 //! failed or cancelled; after its commit, loading completes when the view stops loading. The
 //! view's current document stays until a navigation commits, and the requested URL is kept
 //! apart from the committed one, so an unfinished navigation never shows as the address. A
-//! commit, or a newer navigation starting, supersedes the view's earlier pending navigations. A
+//! commit, or a newer navigation starting, supersedes the view's earlier pending navigations,
+//! and the core's own superseded requests are remembered for when they commit after all. A
 //! failed load is not a failed engine.
 //!
 //! # History
@@ -157,7 +158,9 @@ impl Navigations {
         }
     }
 
-    /// `id` committed: returns what it was, dropping it and everything before it.
+    /// `id` committed: returns what it was and drops it. It supersedes every navigation that
+    /// was pending before it; the core's own are remembered, as [`Navigations::request`] does,
+    /// since the engine may still carry them out.
     pub(crate) fn committed(&mut self, id: NavigationId) -> NavigationKind {
         let pending = self.pending.iter().find(|n| n.id == id).map(|n| n.kind);
         let superseded = || {
@@ -165,8 +168,9 @@ impl Navigations {
             old.map(|&(_, kind)| kind)
         };
         let kind = pending.or_else(superseded);
-        self.pending.retain(|n| n.id > id);
-        self.superseded.retain(|&(old, _)| old > id);
+        self.pending.retain(|n| n.id != id);
+        self.superseded.retain(|&(old, _)| old != id);
+        self.supersede(|n| n.id < id);
         kind.unwrap_or(NavigationKind::Page)
     }
 
@@ -422,6 +426,27 @@ mod tests {
         }
         assert_eq!(navigations.committed(ids[0]), NavigationKind::Page);
         assert_eq!(navigations.committed(ids[1]), NavigationKind::Reload);
+    }
+
+    #[test]
+    fn a_request_a_page_commit_supersedes_is_known_when_it_commits() {
+        let mut navigations = Navigations::default();
+        let reload = NavigationId::next();
+        navigations.request(reload, NavigationKind::Reload, None);
+        let page = NavigationId::next();
+        // The page's own navigation commits without having started: the reload is superseded,
+        // not forgotten.
+        assert_eq!(navigations.committed(page), NavigationKind::Page);
+        assert_eq!(navigations.latest(), None);
+        assert_eq!(navigations.committed(reload), NavigationKind::Reload);
+        // Committed once: a second commit with its id is not the core's.
+        assert_eq!(navigations.committed(reload), NavigationKind::Page);
+        let traverse = NavigationId::next();
+        navigations.request(traverse, NavigationKind::Traverse, None);
+        navigations.started(traverse, None);
+        let page = NavigationId::next();
+        assert_eq!(navigations.committed(page), NavigationKind::Page);
+        assert_eq!(navigations.committed(traverse), NavigationKind::Traverse);
     }
 
     #[test]

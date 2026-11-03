@@ -11,7 +11,9 @@
 //!
 //! - The clipboard, file pickers and handing a URL to the desktop need a click or key press in
 //!   the page within the last [`ACTIVATION`] (user activation); reading the clipboard, picking
-//!   files and opening a URL elsewhere use it up.
+//!   files and opening a URL elsewhere use it up. A URL whose scheme makes the desktop mount a
+//!   share or connect to a remote machine (`smb:`, `sftp:`, `ssh:`, `vnc:` and the like), maybe
+//!   with credentials it keeps, is never handed to it.
 //! - A new tab needs activation too, and uses it up, so one click opens one tab. A page never
 //!   opens Sighurt's `sig:` pages, and opens `file:` URLs only if it is a `file:` page itself.
 //! - Camera, microphone, location and screen capture need the user's answer to a prompt.
@@ -92,8 +94,42 @@ pub(crate) fn requirement(service: &Service) -> Requirement {
     }
 }
 
+/// Schemes the desktop's handlers mount a file share with, browse files through or connect to
+/// a remote machine with, perhaps with credentials they keep: a page never hands them over.
+const NEVER_EXTERNAL: [&str; 29] = [
+    "smb",
+    "cifs",
+    "nfs",
+    "afp",
+    "sftp",
+    "ftp",
+    "ftps",
+    "fish",
+    "dav",
+    "davs",
+    "webdav",
+    "webdavs",
+    "ssh",
+    "telnet",
+    "vnc",
+    "rdp",
+    "spice",
+    "x11",
+    "admin",
+    "network",
+    "computer",
+    "trash",
+    "recent",
+    "burn",
+    "archive",
+    "mtp",
+    "afc",
+    "gphoto2",
+    "google-drive",
+];
+
 /// Whether `url` is one to hand to the desktop (`mailto:`, a custom scheme) rather than one the
-/// browser opens itself or that runs code.
+/// browser opens itself, that runs code, or that reaches files or machines ([`NEVER_EXTERNAL`]).
 fn is_external(url: &str) -> bool {
     const OURS: [&str; 10] = [
         "http",
@@ -107,7 +143,10 @@ fn is_external(url: &str) -> bool {
         "ws",
         "wss",
     ];
-    url.len() <= MAX_URL && url::Url::parse(url).is_ok_and(|url| !OURS.contains(&url.scheme()))
+    url.len() <= MAX_URL
+        && url::Url::parse(url).is_ok_and(|url| {
+            !OURS.contains(&url.scheme()) && !NEVER_EXTERNAL.contains(&url.scheme())
+        })
 }
 
 /// A request the browser has not answered yet.
@@ -205,6 +244,13 @@ mod tests {
             "javascript:alert(1)",
             "sig://home",
             "not a url",
+            "smb://server/share",
+            "SFTP://me@host/",
+            "ssh://host",
+            "davs://host/dav",
+            "vnc://host:5900",
+            "rdp://host",
+            "admin:///etc/shadow",
         ] {
             assert_eq!(external(url), Requirement::Refused, "{url}");
         }

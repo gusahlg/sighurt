@@ -6,13 +6,15 @@
 //! This module decides nothing about selections; it asks the frontend to read, write and
 //! cancel, and reports the answer to the core.
 //!
-//! Work that takes time runs off the owner thread (downloads on threads of their own; clipboard
-//! reads however the frontend carries them out) and reports back with its `RequestId` through a
-//! channel that wakes the loop. Downloads report progress as short status lines for the status
-//! strip, as the old browser did: saved as `name`, `name (1)`, ... in the download folder
+//! Work that takes time runs off the owner thread (downloads on threads of their own, at most
+//! [`MAX_DOWNLOADS`] at once, past which a download fails with a notice; clipboard reads however
+//! the frontend carries them out) and reports back with its `RequestId` through a channel that
+//! wakes the loop. Downloads report progress as short status lines for the status strip, all of
+//! them together at most one per [`PROGRESS_EVERY`], as the old browser did: saved as `name`,
+//! `name (1)`, ... in the download folder
 //! (`[downloads] directory`, else the desktop's, else `~/Downloads`; made by the download that
-//! first needs it), a name that never leads out of the folder and is never a dot file or hides
-//! characters, and no file left behind by
+//! first needs it), a name that never leads out of the folder, is never a dot file, hides no
+//! characters and fits a file system's 255 bytes, and no file left behind by
 //! a failed or cancelled download: at quit, the file of a download still waiting on its server
 //! is deleted by the owner. File pickers and permissions have no implementation yet and fail
 //! closed with `ServiceError::Unsupported`, as does anything else.
@@ -60,8 +62,12 @@ pub trait Clipboard {
     fn cancel(&mut self, request: RequestId);
 }
 
-/// How often a running download reports its progress.
+/// How often the running downloads, all of them together, report their progress.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+/// The most downloads running at once.
+pub const MAX_DOWNLOADS: usize = 8;
+/// The most bytes of a download's name, before ` (n)` is added to make it unique.
+const MAX_NAME: usize = 200;
 /// The most clipboard bytes `sig` reads for anyone.
 pub const MAX_CLIPBOARD: usize = 16 * 1024 * 1024;
 /// How long a download may take, all of it.
@@ -106,6 +112,8 @@ pub struct Services {
     clipboard_reads: HashSet<RequestId>,
     downloads: HashMap<u64, Download>,
     next: u64,
+    /// When a download last reported its progress, shared by all of them.
+    progress: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Services {
@@ -119,6 +127,7 @@ impl Services {
             clipboard_reads: HashSet::new(),
             downloads: HashMap::new(),
             next: 0,
+            progress: Arc::default(),
         }
     }
 
@@ -196,13 +205,20 @@ impl Services {
     }
 
     /// Starts saving `source` in `dir`: the browser has taken the download over when this
-    /// returns `Ok`.
+    /// returns `Ok`. With [`MAX_DOWNLOADS`] running, it fails and says so.
     fn download(
         &mut self,
         source: DownloadSource,
         suggested: Option<String>,
         dir: PathBuf,
     ) -> ServiceResult {
+        if self.downloads.len() >= MAX_DOWNLOADS {
+            let message = format!(
+                "A page's download was refused: {MAX_DOWNLOADS} downloads are running already."
+            );
+            self.reporter().send(Completion::Status(message.clone()));
+            return Err(ServiceError::Failed(message));
+        }
         let name = match (&source, suggested) {
             (_, Some(name)) => sanitize(&name),
             (DownloadSource::Url(url), None) => filename_from_url(url),
@@ -229,10 +245,7 @@ impl Services {
         let id = self.next;
         self.next += 1;
         let cancel = Arc::new(AtomicBool::new(false));
-        let report = Reporter {
-            sender: self.sender.clone(),
-            wake: Arc::clone(&self.wake),
-        };
+        let report = self.reporter();
         let stop = Arc::clone(&cancel);
         let partial = Partial::default();
         let file = Arc::clone(&partial);
@@ -256,6 +269,15 @@ impl Services {
             },
         );
         Ok(ServiceReply::Done)
+    }
+
+    /// A reporter for a service thread.
+    fn reporter(&self) -> Reporter {
+        Reporter {
+            sender: self.sender.clone(),
+            wake: Arc::clone(&self.wake),
+            progress: Arc::clone(&self.progress),
+        }
     }
 
     /// Cancels every download: each stops at its next read and deletes its file. The first
@@ -288,6 +310,8 @@ impl Services {
 struct Reporter {
     sender: Sender<Completion>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    /// When a download last reported its progress, shared by all of them.
+    progress: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Reporter {
@@ -295,6 +319,18 @@ impl Reporter {
         if self.sender.send(completion).is_ok() {
             (self.wake)();
         }
+    }
+
+    /// Whether a download may report its progress now: no download has in the last
+    /// [`PROGRESS_EVERY`]. If so, it counts as having reported.
+    fn progress_due(&self) -> bool {
+        let mut last = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if last.is_some_and(|last| now.saturating_duration_since(last) < PROGRESS_EVERY) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 }
 
@@ -365,7 +401,7 @@ fn save(
     let copy = || -> io::Result<()> {
         let mut writer = BufWriter::new(file);
         let mut buf = vec![0; 64 * 1024];
-        let (mut received, mut reported) = (0, Instant::now());
+        let (mut received, started) = (0, Instant::now());
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::other("cancelled"));
@@ -376,8 +412,7 @@ fn save(
             }
             writer.write_all(&buf[..n])?;
             received += n as u64;
-            if reported.elapsed() >= PROGRESS_EVERY {
-                reported = Instant::now();
+            if started.elapsed() >= PROGRESS_EVERY && report.progress_due() {
                 let received = format_bytes(received);
                 report.send(Completion::Status(match &total {
                     Some(total) => format!("Downloading {name}: {received} of {total}"),
@@ -400,7 +435,9 @@ fn save(
 /// A file name from untrusted text: its last path component, without control or invisible
 /// formatting characters (Unicode's format characters: bidi controls, zero-width ones) and
 /// without dots or whitespace at either end, so it is never hidden or a dot file; or
-/// `"download"`. As Firefox and Chromium clean the names they save.
+/// `"download"`. As Firefox and Chromium clean the names they save. At most [`MAX_NAME`] bytes,
+/// cut at a character and keeping a short extension, so ` (n)` still fits in a file system's
+/// 255.
 fn sanitize(name: &str) -> String {
     let name: String = name
         .chars()
@@ -409,8 +446,25 @@ fn sanitize(name: &str) -> String {
     let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
     match last.trim_matches(|c: char| c == '.' || c.is_whitespace()) {
         "" => "download".to_string(),
-        name => name.chars().take(200).collect(),
+        name if name.len() <= MAX_NAME => name.to_string(),
+        name => {
+            let ext = match name.rfind('.') {
+                Some(dot) if dot > 0 && name.len() - dot <= 16 => &name[dot..],
+                _ => "",
+            };
+            let stem = &name[..name.len() - ext.len()];
+            format!("{}{ext}", cut(stem, MAX_NAME - ext.len()))
+        }
     }
+}
+
+/// The longest start of `text` of at most `max` bytes that ends at a character.
+fn cut(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Whether `c` is a Unicode format character (general category Cf, Unicode 16).
@@ -439,8 +493,10 @@ fn filename_from_url(url: &str) -> String {
     sanitize(&decoded)
 }
 
-/// Creates `dir/name`, or `name (1)`, `name (2)`, ... if it exists. Creating and checking are
-/// one step, so downloads running side by side never share a file.
+/// Creates `dir/name`, or `name (1)`, `name (2)`, ... if it exists: the first free one when
+/// the names in use run without gaps. Creating and checking are one step, so downloads running
+/// side by side never share a file. Finding the number takes a logarithmic number of looks,
+/// not one for each name in use.
 fn create_unique(dir: &Path, name: &str) -> io::Result<(PathBuf, File)> {
     let stem = Path::new(name)
         .file_stem()
@@ -450,18 +506,46 @@ fn create_unique(dir: &Path, name: &str) -> io::Result<(PathBuf, File)> {
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
-    for i in 0u32.. {
-        let path = match i {
-            0 => dir.join(name),
-            i => dir.join(format!("{stem} ({i}){ext}")),
+    let path = |i: u32| match i {
+        0 => dir.join(name),
+        i => dir.join(format!("{stem} ({i}){ext}")),
+    };
+    let taken = |i: u32| std::fs::symlink_metadata(path(i)).is_ok();
+    // The highest number known to be in use.
+    let mut used = None::<u32>;
+    loop {
+        let free = match used {
+            None => 0,
+            Some(used) => {
+                // Doubling steps past the names in use, then halving back to the first free one.
+                let (mut low, mut step) = (used, 1u32);
+                while taken(low.saturating_add(step)) {
+                    low = low.saturating_add(step);
+                    step = step.saturating_mul(2);
+                }
+                let mut high = low.saturating_add(step);
+                while high - low > 1 {
+                    let middle = low + (high - low) / 2;
+                    match taken(middle) {
+                        true => low = middle,
+                        false => high = middle,
+                    }
+                }
+                high
+            }
         };
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path(free))
+        {
+            Ok(file) => return Ok((path(free), file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && free < u32::MAX => {
+                used = Some(free);
+            }
             Err(e) => return Err(e),
         }
     }
-    unreachable!("some name is free")
 }
 
 /// Formats a byte count for display: "1.2 MB", "340 KB", etc.
@@ -553,6 +637,83 @@ mod tests {
     }
 
     #[test]
+    fn long_names_are_cut_to_bytes_at_a_character_keeping_the_extension() {
+        let cjk = "漢".repeat(150);
+        let name = sanitize(&format!("{cjk}.pdf"));
+        assert!(name.len() <= MAX_NAME && name.ends_with(".pdf"), "{name}");
+        assert_eq!(name, format!("{}.pdf", "漢".repeat(65)));
+        assert_eq!(sanitize(&"é".repeat(150)), "é".repeat(100));
+        // A long "extension" is part of the name.
+        let dotted = format!("a.{}", "b".repeat(300));
+        assert_eq!(sanitize(&dotted), dotted[..MAX_NAME]);
+        // The numbered copies of the longest name still fit a file system's 255 bytes.
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..3 {
+            let (path, _) = create_unique(dir.path(), &name).unwrap();
+            assert!(path.file_name().unwrap().len() <= 255);
+        }
+    }
+
+    #[test]
+    fn names_skip_a_long_run_of_copies_in_few_looks() {
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..40 {
+            create_unique(dir.path(), "a.txt").unwrap();
+        }
+        let (path, _) = create_unique(dir.path(), "a.txt").unwrap();
+        assert_eq!(path, dir.path().join("a (40).txt"));
+        // A gap the steps pass over stays a gap: any free name will do.
+        std::fs::remove_file(dir.path().join("a (32).txt")).unwrap();
+        let (path, _) = create_unique(dir.path(), "a.txt").unwrap();
+        assert_eq!(path, dir.path().join("a (41).txt"));
+        std::fs::remove_file(dir.path().join("a (1).txt")).unwrap();
+        let (path, _) = create_unique(dir.path(), "a.txt").unwrap();
+        assert_eq!(path, dir.path().join("a (1).txt"));
+    }
+
+    #[test]
+    fn at_most_max_downloads_run_at_once() {
+        // Accepts connections and never answers.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/x.bin", listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let mut services = Services::new(|| {});
+        let mut start =
+            || services.download(DownloadSource::Url(url.clone()), None, dir.path().into());
+        for _ in 0..MAX_DOWNLOADS {
+            assert!(start().is_ok());
+        }
+        assert!(matches!(start(), Err(ServiceError::Failed(m)) if m.contains("refused")));
+        let lines: Vec<String> = services
+            .completions(16)
+            .into_iter()
+            .filter_map(|completion| match completion {
+                Completion::Status(line) => Some(line),
+                Completion::Finished(_) => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        services.shutdown();
+    }
+
+    #[test]
+    fn progress_is_reported_at_most_every_250_ms_by_all_downloads_together() {
+        let (sender, _receiver) = mpsc::channel();
+        let shared = Arc::default();
+        let reporter = || Reporter {
+            sender: sender.clone(),
+            wake: Arc::new(|| {}),
+            progress: Arc::clone(&shared),
+        };
+        let (a, b) = (reporter(), reporter());
+        assert!(a.progress_due());
+        assert!(!b.progress_due() && !a.progress_due());
+        std::thread::sleep(PROGRESS_EVERY);
+        assert!(b.progress_due());
+        assert!(!a.progress_due());
+    }
+
+    #[test]
     fn format_bytes_display() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
@@ -587,6 +748,7 @@ mod tests {
         let report = Reporter {
             sender,
             wake: Arc::new(|| {}),
+            progress: Arc::default(),
         };
         let partial = Mutex::default();
         let last = match save(
@@ -700,6 +862,7 @@ mod tests {
         let report = Reporter {
             sender,
             wake: Arc::new(|| {}),
+            progress: Arc::default(),
         };
         let result = save(
             DownloadSource::Data(vec![0; 1024]),
