@@ -168,6 +168,9 @@ pub struct Session {
     held_at: usize,
     /// [`Self::read_input`] stopped with more input already available.
     more_input: bool,
+    /// What the user typed (keys, mouse, pastes, focus) while [`Self::probe`] waited, at
+    /// most [`INPUT_EVENT_CAP`]. [`Self::read_input`] returns it first.
+    early: Vec<Input>,
     /// Read end of the self-pipe the `SIGWINCH` handler writes to.
     winch_read: OwnedFd,
     winch_write: OwnedFd,
@@ -231,6 +234,7 @@ impl Session {
             held: Vec::new(),
             held_at: 0,
             more_input: false,
+            early: Vec::new(),
             winch_read,
             winch_write,
             guard: Some(guard),
@@ -428,13 +432,18 @@ impl Session {
     /// a timeout chosen earlier would let `poll` run past the deadline.
     /// `O_NONBLOCK` is put back first: a panic used to clear it and turn the
     /// follow-up `read` into a blocking canonical read. A terminal that never
-    /// answers cannot stall this past the deadline.
+    /// answers cannot stall this past the deadline. Input that is not a reply (keys typed
+    /// before the terminal answered) is kept for [`Self::read_input`], and the `SIGWINCH`
+    /// pipe is poked so the owner reads it, once DA1 has answered: without DA1 the terminal
+    /// may have sent replies the parser does not know, which could read as keys
+    /// (`ESC _` that is not kitty's `G` is Alt+_), so nothing it sent is kept.
     pub fn probe(&mut self, deadline: Duration) -> io::Result<Caps> {
         let queries = startup_queries(std::env::var_os("TERM").as_deref());
         self.write_frame(queries)?;
         let start = std::time::Instant::now();
         let mut caps = Caps::default();
         let mut saw_da1 = false;
+        let mut early = Vec::new();
         loop {
             if !self.prepare_read()? {
                 break;
@@ -459,20 +468,27 @@ impl Session {
             for input in self.parser.feed(&bytes) {
                 if probe::absorb(&mut caps, &input) {
                     saw_da1 = true;
+                } else if !matches!(input, Input::Reply(_)) && early.len() < INPUT_EVENT_CAP {
+                    push_coalesced(&mut early, input);
                 }
             }
+        }
+        if saw_da1 && !early.is_empty() {
+            self.early = early;
+            self.poke_winch();
         }
         Ok(caps)
     }
 
     /// Read what is already buffered, up to [`INPUT_BYTE_BUDGET`] and
-    /// [`INPUT_EVENT_CAP`], and parse it with the probe's parser.
+    /// [`INPUT_EVENT_CAP`], and parse it with the probe's parser. Input the probe kept
+    /// comes first.
     ///
     /// Consecutive mouse-motion reports collapse to the latest one. When the
     /// budget stops the call early, [`Self::input_pending`] is set and
     /// [`Self::poll_timeout`] is zero so the owner comes back without sleeping.
     pub fn read_input(&mut self) -> io::Result<Vec<Input>> {
-        let mut inputs = Vec::new();
+        let mut inputs = std::mem::take(&mut self.early);
         let mut parsed = 0usize;
         let mut hit_budget = false;
         while inputs.len() < INPUT_EVENT_CAP && parsed < INPUT_BYTE_BUDGET {
@@ -1431,5 +1447,32 @@ fn read_some<Fd: AsFd>(fd: Fd) -> io::Result<Vec<u8>> {
             Err(Errno::AGAIN) => return Ok(Vec::new()),
             Err(err) => return Err(io::Error::from(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key typed before the terminal answered the probe is delivered after it.
+    #[test]
+    fn keys_typed_during_the_probe_are_kept() {
+        let (master, slave) = open_pty().expect("openpty");
+        let mut session = Session::enter(slave).expect("enter");
+        rustix::io::write(&master, b"a\x1b[?62;4c").expect("write");
+        let caps = session.probe(Duration::from_secs(2)).expect("probe");
+        assert_eq!(caps.da1, Some(vec![62, 4]));
+        assert!(!session.early.is_empty());
+        let inputs = session.read_input().expect("read");
+        let keys: Vec<_> = inputs
+            .iter()
+            .filter_map(|input| match input {
+                Input::Key(key) if key.text.as_deref() == Some("a") => Some(()),
+                _ => None,
+            })
+            .collect();
+        assert!(!keys.is_empty(), "{inputs:?}");
+        assert!(inputs.iter().all(|input| !matches!(input, Input::Reply(_))));
+        session.restore().expect("restore");
     }
 }

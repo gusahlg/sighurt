@@ -36,6 +36,8 @@ const REPLIES: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
 const KITTY_REPLIES: &[u8] = b"\x1b[?31u\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
 /// Cells of 10×20 pixels and DA1 with sixel, and no kitty graphics reply.
 const SIXEL_REPLIES: &[u8] = b"\x1b[6;20;10t\x1b[?62;4c";
+/// [`REPLIES`] after a `q` the user typed while the terminal had not answered yet.
+const Q_THEN_REPLIES: &[u8] = b"q\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
 
 /// `sig --tui` on the slave side of a pty, and the fake terminal on the master side.
 struct Terminal {
@@ -849,6 +851,68 @@ fn ctrl_v_in_the_line_pastes_the_terminals_answer() {
     );
 }
 
+/// A terminal that ignores an OSC 52 read (tmux with `set-clipboard off`, Alacritty) does not
+/// stop the next Ctrl+V from asking again, and tmux's reply, which names no selection, answers it.
+#[test]
+fn ctrl_v_asks_again_after_an_unanswered_read() {
+    let mut term = Terminal::start("paste-again", &["demo://pattern"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"o");
+    let editing = term.wait(since, Duration::from_secs(10), |got| {
+        has(got, b"\x1b[24H") && has(got, b"demo://pattern")
+    });
+    assert!(
+        editing,
+        "`o` did not open the address line\n{}",
+        term.context()
+    );
+
+    let since = term.got.len();
+    term.type_bytes(b"\x16");
+    let asked = term.wait(since, Duration::from_secs(5), |got| has(got, OSC52_QUERY));
+    assert!(
+        asked,
+        "Ctrl+V did not query the clipboard\n{}",
+        term.context()
+    );
+    // No answer. After the read's second, Ctrl+V asks again.
+    term.wait(term.got.len(), Duration::from_millis(1500), |_| false);
+    let since = term.got.len();
+    term.type_bytes(b"\x16");
+    let again = term.wait(since, Duration::from_secs(5), |got| has(got, OSC52_QUERY));
+    assert!(again, "the second Ctrl+V did not ask\n{}", term.context());
+
+    let pasted = "tmux-text";
+    let mut reply = b"\x1b]52;;".to_vec();
+    reply.extend(base64(pasted.as_bytes()).into_bytes());
+    reply.extend_from_slice(b"\x1b\\");
+    let since = term.got.len();
+    term.type_bytes(&reply);
+    let inserted = term.wait(since, Duration::from_secs(5), |got| shows(got, pasted));
+    assert!(
+        inserted,
+        "the line did not show {pasted:?}\n{}",
+        term.context()
+    );
+}
+
+/// A key typed before the terminal answered the startup probe is not lost: `q` quits.
+#[test]
+fn a_key_typed_during_the_probe_is_kept() {
+    let mut term = Terminal::start_with("early-key", &["demo://pattern"], Q_THEN_REPLIES);
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+}
+
 /// Ctrl+C in the address line copies the line with OSC 52, and does not quit.
 #[test]
 fn ctrl_c_in_the_line_copies_it() {
@@ -1201,6 +1265,12 @@ fn a_drag_that_leaves_the_page_still_reaches_the_page() {
     assert!(shown, "no image\n{}", term.context());
     // Press at cell (5, 5) of the screen, then move onto the top line of the chrome with the
     // button held: the page gets the position above its top edge (one row of 20 pixels).
+    // Presses, and motion while a button is held (1002), in SGR form.
+    assert!(
+        has(&term.got, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h"),
+        "button-event mouse tracking was not asked for\n{}",
+        term.context()
+    );
     let since = term.got.len();
     term.type_bytes(b"\x1b[<0;6;6M\x1b[<32;6;1M");
     let moved = term.wait(since, Duration::from_secs(10), |got| {

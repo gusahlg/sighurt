@@ -664,25 +664,17 @@ fn probe_ignores_malformed_replies_and_later_keys_stay_keys() {
     let _deadline = arm_deadline();
     let (master, slave) = open_pty().expect("openpty");
     set_nonblock(&master);
-    let master_for_reply = master.try_clone().expect("dup master");
     let mut session = enter_session(slave);
-    // Same as the batch helper: the query does not exist until `probe`, so
-    // the wait to see it starts here, after the session lock.
-    let reply = reply_after(
-        master_for_reply,
-        Duration::ZERO,
+    // Written before the probe, so they are in the pty when it reads: an
+    // `ESC _` not followed by `G` that lands after the probe is Alt+_ and
+    // keys, by design (the parser's reply starts), so timing would decide
+    // the outcome otherwise.
+    write_all(
+        &master,
         b"\x1b[?62;4x\x1b_Nope\x1b\\\x1b]99;nope\x07",
     );
     let caps = session.probe(Duration::from_millis(40)).expect("probe");
     assert_eq!(caps, &Capabilities::default());
-    // Under load the helper's write lands after the 40 ms probe. It has
-    // landed once the helper returns, and it is still not a key.
-    reply.join().expect("reply thread");
-    let late = session.read_events().expect("read");
-    assert!(
-        late.iter().all(|event| !matches!(event, TermEvent::Key(_))),
-        "malformed replies became keys: {late:?}"
-    );
     write_all(&master, b"q");
     let inputs = session.read_events().expect("read");
     assert!(

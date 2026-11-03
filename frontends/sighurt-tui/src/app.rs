@@ -11,15 +11,21 @@
 //! said it changed (or the terminal was resized or resumed), and at most one page frame. Passes
 //! repeat until one does nothing, at most [`MAX_PASSES`] times; then the loop sleeps until an
 //! event or a real deadline: an engine pump, the session save, a notice giving way, a partial
-//! escape sequence, a clipboard read, or the next frame's time while a frame is waiting. Nothing
-//! ticks.
+//! escape sequence, a clipboard read, a held pointer motion (at most one per
+//! [`MOTION_INTERVAL`] reaches the core), or the next frame's time while a frame is waiting.
+//! Nothing ticks.
 //!
 //! The clipboard is the terminal's OSC 52. One unsent write is kept, and a newer write
 //! replaces it. A write over [`MAX_CLIPBOARD`], or whose sequence does not fit the output
 //! cap, is refused before any of it is queued; a write that was queued is not dropped or
 //! cut short by a later frame. One read at a time waits up to a second. A read that is
-//! cancelled or times out stays outstanding until its reply arrives, and that reply is
-//! dropped; a new read fails until then. A reply for the address line belongs to that
+//! cancelled or times out is given up, and the next read is sent at once: a terminal that
+//! ignores OSC 52 reads (tmux with `set-clipboard off` or no paste buffer, Alacritty) fails
+//! each read after its second and never blocks the next. OSC 52 replies carry no id, so a
+//! reply goes to the read waiting when it arrives, if that read named its selection, and is
+//! dropped when none waits. A late reply (kitty answers after its permission prompt) is the
+//! same clipboard, which the waiting read was allowed to have. A reply that names no
+//! selection (tmux) answers the waiting read. A reply for the address line belongs to that
 //! line and is dropped when the line closes or is replaced.
 //!
 //! Text mode (TUI.md §4, [`crate::text`]): `[tui] mode`, or `chrome.toggle-mode` for the run,
@@ -116,6 +122,9 @@ const OUTPUT_CAP: usize = 16 * 1024 * 1024;
 const TEXT_FPS: u32 = 2;
 /// An empty last chunk. Ends a kitty image upload a resize cut after its `m=1`.
 const KITTY_UPLOAD_END: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
+/// The least time between two pointer motions handed to the core. Terminals report motion
+/// per cell; a motion inside the interval waits, and a newer one replaces it.
+const MOTION_INTERVAL: Duration = Duration::from_millis(16);
 /// The most pasted text the address line or a page's field takes.
 const MAX_PASTE: usize = 1024 * 1024;
 /// How long an OSC 52 read waits for the terminal.
@@ -229,16 +238,10 @@ struct PendingRead {
     limit: usize,
 }
 
-/// The one clipboard read the terminal still owes a reply for.
-///
-/// OSC 52 replies carry no id. After a cancel or a timeout the read stays as
-/// [`Outstanding::Discard`] so the late reply is dropped, and a new read fails
-/// until that reply (or the parser's discarded OSC 52) arrives.
-enum Outstanding {
-    /// The reply is delivered to this read.
-    Live(PendingRead),
-    /// The read was cancelled or timed out. The next matching reply is dropped.
-    Discard { selection: Selection },
+/// Whether a reply that named `named` answers a read of `asked`. A reply that names no
+/// selection (tmux leaves the field empty) answers whatever was asked.
+fn answers(named: Option<Selection>, asked: Selection) -> bool {
+    named.is_none_or(|named| named == asked)
 }
 
 /// One view's target as the loop sees it.
@@ -306,8 +309,8 @@ struct Tui {
     page_text: bool,
     /// The earliest time the next page frame may be presented.
     next_frame: Option<Instant>,
-    /// The OSC 52 read the terminal has not answered, if there is one.
-    outstanding: Option<Outstanding>,
+    /// The OSC 52 read waiting for the terminal's answer, if there is one.
+    outstanding: Option<PendingRead>,
     /// Reads that failed before a query was sent. The next pass answers them.
     failed_reads: Vec<(RequestId, ServiceError)>,
     /// One OSC 52 write not yet accepted by the terminal. A newer write replaces it.
@@ -336,6 +339,11 @@ struct App {
     signals: Vec<u8>,
     /// The terminal's write source, enabled only while bytes are waiting.
     writable: Option<RegistrationToken>,
+    /// The latest pointer motion not yet handled, held until `motion_due`.
+    motion: Option<MouseEvent>,
+    /// The earliest time the next pointer motion is handled: at most one per
+    /// [`MOTION_INTERVAL`].
+    motion_due: Option<Instant>,
 }
 
 /// Runs the terminal frontend until it quits.
@@ -513,17 +521,8 @@ impl App {
         let mut registry = crate::engines::build();
         let mut env = registry.environment(chrome_checks(), COLOR_NAMES);
         env.frontend = FrontendKind::Terminal;
-        let mut notice = None;
-        let config = match persistence::load_config(paths.config.as_deref(), &env) {
-            Ok(config) => config,
-            Err(error) => {
-                log::warn!("the configuration can't be used: {error}");
-                notice = Some(format!(
-                    "{error} sig runs with the built-in configuration until the file is fixed."
-                ));
-                persistence::load_config(None, &env).map_err(|e| e.to_string())?
-            }
-        };
+        // A configuration file that can't be used stops sig before anything starts.
+        let config = persistence::startup_config(paths.config.as_deref(), &env)?;
         let servo_wake = ping.clone();
         registry.start_at_launch(&config, || EngineWaker::new(move || servo_wake.ping()));
         // Servo's logger, if it started; otherwise env_logger. Either writes to the log file.
@@ -598,9 +597,6 @@ impl App {
             left: false,
         };
         tui.adopt(settings);
-        if let Some(notice) = notice {
-            tui.show_notice(notice);
-        }
         Ok(Self {
             tui,
             session,
@@ -609,6 +605,8 @@ impl App {
             config_changed: false,
             signals: Vec::new(),
             writable: None,
+            motion: None,
+            motion_due: None,
         })
     }
 
@@ -747,6 +745,7 @@ impl App {
             self.session.session_due(),
             self.tui.notice_first,
             self.tui.clipboard_deadline(),
+            self.motion_due.filter(|_| self.motion.is_some()),
             frame,
             escape,
         ]
@@ -822,6 +821,12 @@ impl App {
         if self.input.is_empty() {
             self.input.extend(self.tui.terminal.expire_if_due());
         }
+        let now = Instant::now();
+        let motion_due = self.motion.is_some() && self.motion_due.is_none_or(|due| due <= now);
+        if motion_due {
+            self.flush_motion(now);
+            self.run_core();
+        }
         let peaks = &mut self.session.diagnostics_mut().peaks;
         peaks.max_host_queue = peaks.max_host_queue.max(self.input.len() as u64);
         let count = self.input.len().min(MAX_EVENTS);
@@ -832,10 +837,39 @@ impl App {
         // Read again next pass, in case the terminal had more than one read took.
         self.readable |= count > 0;
         self.flush_releases();
-        count > 0
+        count > 0 || motion_due
     }
 
+    /// Hands one terminal event on. Pointer motion is paced: one per [`MOTION_INTERVAL`], the
+    /// latest kept meanwhile. Any other event first hands on the motion held before it, so the
+    /// order is kept (a drag's last motion before its release).
     fn event(&mut self, event: TermEvent) {
+        let now = Instant::now();
+        if let TermEvent::Mouse(mouse) = &event {
+            if mouse.motion && mouse.wheel.is_none() {
+                if self.motion_due.is_some_and(|due| due > now) {
+                    self.motion = Some(mouse.clone());
+                    return;
+                }
+                self.motion = None;
+                self.motion_due = Some(now + MOTION_INTERVAL);
+                self.handle(event);
+                return;
+            }
+        }
+        self.flush_motion(now);
+        self.handle(event);
+    }
+
+    /// Hands on the held pointer motion, if there is one, as of `now`.
+    fn flush_motion(&mut self, now: Instant) {
+        if let Some(mouse) = self.motion.take() {
+            self.motion_due = Some(now + MOTION_INTERVAL);
+            self.handle(TermEvent::Mouse(mouse));
+        }
+    }
+
+    fn handle(&mut self, event: TermEvent) {
         let at = Instant::now();
         let seat = self.tui.seat;
         let keyboard = |kind| BrowserEvent::Keyboard {
@@ -1364,20 +1398,38 @@ impl App {
     }
 
     /// The chrome's lines, from the same facts the window's snapshot has. Contained by the
-    /// caller.
+    /// caller. The top line draws only the active tab, so only its title, address and engine
+    /// are copied, and only as many characters as the line could show (an address may be
+    /// 2 MiB); the other tabs are counted.
     fn chrome_state(&self) -> ChromeState {
         let core = self.session.core();
+        let active = core.active();
+        let room = usize::from(self.tui.terminal.size().cols).saturating_mul(4);
         let tabs = core
             .tabs()
-            .map(|tab| TabLine {
-                engine: tab_engine(core, &tab).map(str::to_owned),
-                title: tab.title.into_owned(),
-                // What it is loading until something commits: a new tab's first page.
-                url: tab.url.or(tab.requested).unwrap_or_default().to_owned(),
-                loading: tab.loading,
+            .enumerate()
+            .map(|(index, tab)| match index == active {
+                true => TabLine {
+                    engine: tab_engine(core, &tab).map(str::to_owned),
+                    title: tab.title.chars().take(room).collect(),
+                    // What it is loading until something commits: a new tab's first page.
+                    url: tab
+                        .url
+                        .or(tab.requested)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(room)
+                        .collect(),
+                    loading: tab.loading,
+                },
+                false => TabLine {
+                    title: String::new(),
+                    url: String::new(),
+                    loading: tab.loading,
+                    engine: None,
+                },
             })
             .collect();
-        let active = core.active();
         let error_text = core
             .tabs()
             .nth(active)
@@ -1584,8 +1636,9 @@ impl Tui {
     fn adopt(&mut self, settings: TuiConfig) {
         if settings.mouse != self.mouse_on {
             self.control.extend_from_slice(match settings.mouse {
-                true => b"\x1b[?1000h\x1b[?1006h",
-                false => b"\x1b[?1006l\x1b[?1000l",
+                // As in the terminal's enter and leave sequences (`term::modes`).
+                true => b"\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+                false => b"\x1b[?1006l\x1b[?1002l\x1b[?1000l",
             });
             self.mouse_on = settings.mouse;
             if !settings.mouse {
@@ -1869,104 +1922,80 @@ impl Tui {
     }
 
     /// Ask the terminal for the clipboard and insert the answer into the line. A read that is
-    /// already waiting, or one whose reply has not arrived yet, is left alone: one query at a time.
+    /// already waiting is left alone: one query at a time.
     fn paste_line(&mut self) {
         self.editing_fresh = false;
         if self.outstanding.is_some() {
             return;
         }
         self.control.extend(clipboard::query(Selection::Clipboard));
-        self.outstanding = Some(Outstanding::Live(PendingRead {
+        self.outstanding = Some(PendingRead {
             request: RequestId::next(),
             deadline: Instant::now() + CLIPBOARD_WAIT,
             for_line: true,
             line_gen: self.line_gen,
             selection: Selection::Clipboard,
             limit: MAX_PASTE,
-        }));
+        });
     }
 
-    /// The terminal answered the waiting read.
+    /// The terminal answered the waiting read, or one given up on (see the module's
+    /// documentation): either way the reply is the terminal's clipboard now.
     ///
-    /// A reply for another selection is left waiting. A truncated reply is a failure, not a
-    /// prefix. A page's answer goes back to the session. The line's is inserted only when
-    /// `line_gen` is still the line that asked. A discard-only read drops the reply.
+    /// A reply with nothing waiting is dropped. A reply for another selection leaves the
+    /// waiting read waiting. A truncated reply is a failure, not a prefix. A page's answer goes
+    /// back to the session. The line's is inserted only when `line_gen` is still the line that
+    /// asked.
     fn clipboard_reply(
         &mut self,
         reply: ClipboardReply,
     ) -> Option<(RequestId, Result<ClipboardData, ServiceError>)> {
-        let outstanding = self.outstanding.take()?;
-        let wanted = match &outstanding {
-            Outstanding::Live(pending) => pending.selection,
-            Outstanding::Discard { selection } => *selection,
-        };
-        if reply.selection != Some(wanted) {
-            self.outstanding = Some(outstanding);
-            return None;
-        }
-        match outstanding {
-            Outstanding::Discard { .. } => None,
-            Outstanding::Live(pending) => {
-                if reply.truncated {
-                    if pending.for_line {
-                        return None;
-                    }
-                    return Some((
-                        pending.request,
-                        Err(ServiceError::Failed(
-                            "the clipboard reply was cut short".into(),
-                        )),
-                    ));
-                }
-                if pending.for_line {
-                    if pending.line_gen == self.line_gen {
-                        self.insert_clipboard(reply.data, pending.limit);
-                    }
-                    None
-                } else {
-                    Some((pending.request, clipboard_result(reply.data, pending.limit)))
-                }
+        let pending = self
+            .outstanding
+            .take_if(|pending| answers(reply.selection, pending.selection))?;
+        if reply.truncated {
+            if pending.for_line {
+                return None;
             }
+            return Some((
+                pending.request,
+                Err(ServiceError::Failed(
+                    "the clipboard reply was cut short".into(),
+                )),
+            ));
+        }
+        if pending.for_line {
+            if pending.line_gen == self.line_gen {
+                self.insert_clipboard(reply.data, pending.limit);
+            }
+            None
+        } else {
+            Some((pending.request, clipboard_result(reply.data, pending.limit)))
         }
     }
 
     /// `now` is past the waiting read. A page's fails; the line's is dropped, with no notice
-    /// (the open line would hide one). Either way the read stays outstanding, discard-only,
-    /// until the reply arrives.
+    /// (the open line would hide one). Either way the read is given up, and the next one may
+    /// be sent at once.
     fn expire_clipboard(
         &mut self,
         now: Instant,
     ) -> Option<(RequestId, Result<ClipboardData, ServiceError>)> {
-        let due = matches!(
-            &self.outstanding,
-            Some(Outstanding::Live(pending)) if pending.deadline <= now
-        );
-        if !due {
-            return None;
-        }
-        let Some(Outstanding::Live(pending)) = self.outstanding.take() else {
-            return None;
-        };
-        let selection = pending.selection;
-        let for_line = pending.for_line;
-        let request = pending.request;
-        self.outstanding = Some(Outstanding::Discard { selection });
-        if for_line {
+        let pending = self
+            .outstanding
+            .take_if(|pending| pending.deadline <= now)?;
+        if pending.for_line {
             return None;
         }
         Some((
-            request,
+            pending.request,
             Err(ServiceError::Failed("the terminal didn't answer".into())),
         ))
     }
 
-    /// When the waiting read must be finished. `None` when nothing is waiting on a timer.
-    /// A discard-only read has no deadline: it ends when the reply arrives.
+    /// When the waiting read must be finished. `None` when nothing is waiting.
     fn clipboard_deadline(&self) -> Option<Instant> {
-        match &self.outstanding {
-            Some(Outstanding::Live(pending)) => Some(pending.deadline),
-            _ => None,
-        }
+        self.outstanding.as_ref().map(|pending| pending.deadline)
     }
 
     /// Queue one OSC 52 write, or refuse it before any byte is queued.
@@ -2072,8 +2101,8 @@ fn clipboard_result(data: Option<Vec<u8>>, limit: usize) -> Result<ClipboardData
 }
 
 impl Clipboard for Tui {
-    /// One OSC 52 query at a time. A second read fails at once, and so does a read started
-    /// while a cancelled or timed-out read is still waiting for its reply. A read that asks
+    /// One OSC 52 query at a time. A second read fails at once while the first waits; one
+    /// started after a cancel or a timeout is sent at once. A read that asks
     /// for no `text/*` type is unsupported. The answer comes later, as [`Tui::clipboard_reply`]
     /// or [`Tui::expire_clipboard`].
     fn read(
@@ -2087,32 +2116,22 @@ impl Clipboard for Tui {
             self.failed_reads.push((request, ServiceError::Unsupported));
             return;
         }
-        match &self.outstanding {
-            Some(Outstanding::Discard { .. }) => {
-                self.failed_reads.push((
-                    request,
-                    ServiceError::Failed("the previous clipboard read was not answered".into()),
-                ));
-                return;
-            }
-            Some(Outstanding::Live(_)) => {
-                self.failed_reads.push((
-                    request,
-                    ServiceError::Failed("another clipboard read is waiting".into()),
-                ));
-                return;
-            }
-            None => {}
+        if self.outstanding.is_some() {
+            self.failed_reads.push((
+                request,
+                ServiceError::Failed("another clipboard read is waiting".into()),
+            ));
+            return;
         }
         self.control.extend(clipboard::query(selection));
-        self.outstanding = Some(Outstanding::Live(PendingRead {
+        self.outstanding = Some(PendingRead {
             request,
             deadline: Instant::now() + CLIPBOARD_WAIT,
             for_line: false,
             line_gen: self.line_gen,
             selection,
             limit,
-        }));
+        });
     }
 
     /// The first `text/*` item, as one OSC 52. Anything else is unsupported. A payload over
@@ -2132,19 +2151,11 @@ impl Clipboard for Tui {
         self.queue_clipboard(selection, &item.data)
     }
 
-    /// A read that is still waiting for `request` becomes discard-only: its reply is dropped,
-    /// and nothing is reported for it. A failure not yet delivered is dropped too.
+    /// A read that is still waiting for `request` is given up: nothing is reported for it,
+    /// and the next read is sent at once. A failure not yet delivered is dropped too.
     fn cancel(&mut self, request: RequestId) {
-        if matches!(
-            &self.outstanding,
-            Some(Outstanding::Live(pending)) if pending.request == request
-        ) {
-            let selection = match self.outstanding.take() {
-                Some(Outstanding::Live(pending)) => pending.selection,
-                _ => return,
-            };
-            self.outstanding = Some(Outstanding::Discard { selection });
-        }
+        self.outstanding
+            .take_if(|pending| pending.request == request);
         self.failed_reads.retain(|(id, _)| *id != request);
     }
 }
@@ -2949,13 +2960,10 @@ mod tests {
             )]
         );
         assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
-        let Outstanding::Live(pending) = tui
+        let pending = tui
             .outstanding
             .as_ref()
-            .expect("the first read still waits")
-        else {
-            panic!("the first read is not live");
-        };
+            .expect("the first read still waits");
         assert_eq!(pending.request, first);
         assert!(!pending.for_line);
         assert_eq!(pending.selection, Selection::Clipboard);
@@ -2966,7 +2974,7 @@ mod tests {
         assert_eq!(tui.failed_reads[1], (image, ServiceError::Unsupported));
         assert!(matches!(
             &tui.outstanding,
-            Some(Outstanding::Live(read)) if read.request == first
+            Some(read) if read.request == first
         ));
         // A reply for another selection does not satisfy this read.
         assert!(tui
@@ -2978,7 +2986,7 @@ mod tests {
             .is_none());
         assert!(matches!(
             &tui.outstanding,
-            Some(Outstanding::Live(read)) if read.request == first
+            Some(read) if read.request == first
         ));
     }
 
@@ -2996,44 +3004,26 @@ mod tests {
             result,
             Err(ServiceError::Failed("the terminal didn't answer".into()))
         );
-        assert!(matches!(
-            tui.outstanding,
-            Some(Outstanding::Discard {
-                selection: Selection::Clipboard
-            })
-        ));
+        assert!(tui.outstanding.is_none());
         assert!(tui
             .expire_clipboard(Instant::now() + Duration::from_secs(2))
             .is_none());
-
-        let blocked = RequestId::next();
-        let query = tui.control.clone();
-        tui.read(blocked, Selection::Clipboard, &["text/plain".into()], 8);
-        assert_eq!(
-            tui.failed_reads.last(),
-            Some(&(
-                blocked,
-                ServiceError::Failed("the previous clipboard read was not answered".into())
-            ))
-        );
-        assert_eq!(tui.control, query);
+        // A late reply with nothing waiting is dropped.
         assert!(tui
             .clipboard_reply(clip_reply(Some(b"late".to_vec())))
             .is_none());
-        assert!(tui.outstanding.is_none());
-        tui.failed_reads.clear();
 
-        tui.read(
-            RequestId::next(),
-            Selection::Clipboard,
-            &["text/plain".into()],
-            2,
-        );
+        // The next read is sent at once, and takes the next reply.
+        let next = RequestId::next();
+        tui.control.clear();
+        tui.read(next, Selection::Clipboard, &["text/plain".into()], 2);
+        assert!(tui.failed_reads.is_empty());
+        assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
         let (id, result) = tui
             .clipboard_reply(clip_reply(Some(b"hej".to_vec())))
             .expect("over the limit");
+        assert_eq!(id, next);
         assert_eq!(result, Err(ServiceError::TooLarge));
-        assert_ne!(id, request);
         tui.read(
             RequestId::next(),
             Selection::Clipboard,
@@ -3051,41 +3041,89 @@ mod tests {
         let waiting = RequestId::next();
         tui.read(waiting, Selection::Clipboard, &["text/plain".into()], 8);
         tui.cancel(waiting);
-        assert!(matches!(
-            tui.outstanding,
-            Some(Outstanding::Discard {
-                selection: Selection::Clipboard
-            })
-        ));
+        assert!(tui.outstanding.is_none());
         assert!(tui
             .clipboard_reply(clip_reply(Some(b"hej".to_vec())))
             .is_none());
+    }
+
+    /// A terminal that ignores OSC 52 reads (tmux with `set-clipboard off` or no paste
+    /// buffer, Alacritty) fails each read after its wait, and never blocks the next one.
+    #[test]
+    fn a_terminal_that_never_answers_fails_each_read_and_keeps_asking() {
+        let (_master, mut tui) = on_pty();
+        let mut at = Instant::now();
+        for _ in 0..12 {
+            let request = RequestId::next();
+            tui.control.clear();
+            tui.read(request, Selection::Clipboard, &["text/plain".into()], 64);
+            assert!(tui.failed_reads.is_empty());
+            assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
+            at += Duration::from_secs(2);
+            let (id, result) = tui.expire_clipboard(at).expect("due");
+            assert_eq!(id, request);
+            assert_eq!(
+                result,
+                Err(ServiceError::Failed("the terminal didn't answer".into()))
+            );
+        }
+        // The terminal starts answering (tmux has a paste buffer now): the read that asked
+        // gets it.
+        let request = RequestId::next();
+        tui.read(request, Selection::Clipboard, &["text/plain".into()], 64);
+        let (id, result) = tui
+            .clipboard_reply(clip_reply(Some(b"ok".to_vec())))
+            .expect("answered");
+        assert_eq!(id, request);
+        assert_eq!(
+            result,
+            Ok(ClipboardData {
+                mime_type: CLIPBOARD_TYPE.into(),
+                data: b"ok".to_vec(),
+            })
+        );
+    }
+
+    /// tmux answers with an empty selection field, which names no selection: it answers the
+    /// read that is waiting.
+    #[test]
+    fn a_reply_naming_no_selection_answers_the_read() {
+        let (_master, mut tui) = on_pty();
+        let request = RequestId::next();
+        tui.read(request, Selection::Clipboard, &["text/plain".into()], 64);
+        let (id, result) = tui
+            .clipboard_reply(ClipboardReply {
+                selection: None,
+                data: Some(b"tmux".to_vec()),
+                truncated: false,
+            })
+            .expect("answered");
+        assert_eq!(id, request);
+        assert_eq!(
+            result,
+            Ok(ClipboardData {
+                mime_type: CLIPBOARD_TYPE.into(),
+                data: b"tmux".to_vec(),
+            })
+        );
         assert!(tui.outstanding.is_none());
     }
 
+    /// A reply with no id: after a cancel, the next read is sent at once and takes the next
+    /// reply of its selection, which is the terminal's clipboard whichever query it answers.
     #[test]
-    fn a_late_reply_after_cancel_is_discarded_and_the_next_read_fails_closed() {
+    fn after_a_cancel_the_next_read_is_sent_and_answered() {
         let (_master, mut tui) = on_pty();
         let first = RequestId::next();
         tui.read(first, Selection::Clipboard, &["text/plain".into()], 64);
         tui.cancel(first);
-        assert!(matches!(
-            tui.outstanding,
-            Some(Outstanding::Discard {
-                selection: Selection::Clipboard
-            })
-        ));
+        assert!(tui.outstanding.is_none());
         let second = RequestId::next();
-        let query = tui.control.clone();
+        tui.control.clear();
         tui.read(second, Selection::Clipboard, &["text/plain".into()], 64);
-        assert_eq!(
-            tui.failed_reads,
-            vec![(
-                second,
-                ServiceError::Failed("the previous clipboard read was not answered".into())
-            )]
-        );
-        assert_eq!(tui.control, query);
+        assert!(tui.failed_reads.is_empty());
+        assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
+        // Another selection's reply answers neither.
         assert!(tui
             .clipboard_reply(ClipboardReply {
                 selection: Some(Selection::Primary),
@@ -3093,23 +3131,11 @@ mod tests {
                 truncated: false,
             })
             .is_none());
-        assert!(matches!(
-            tui.outstanding,
-            Some(Outstanding::Discard {
-                selection: Selection::Clipboard
-            })
-        ));
-        assert!(tui
-            .clipboard_reply(clip_reply(Some(b"late".to_vec())))
-            .is_none());
-        assert!(tui.outstanding.is_none());
-
-        let third = RequestId::next();
-        tui.read(third, Selection::Clipboard, &["text/plain".into()], 64);
+        assert!(matches!(&tui.outstanding, Some(read) if read.request == second));
         let (id, result) = tui
             .clipboard_reply(clip_reply(Some(b"ok".to_vec())))
             .expect("the new read");
-        assert_eq!(id, third);
+        assert_eq!(id, second);
         assert_eq!(
             result,
             Ok(ClipboardData {
@@ -3195,9 +3221,7 @@ mod tests {
         tui.editing = Some(LineEditor::from_text("ab"));
         let mut queue = VecDeque::new();
         tui.edit_key(&ctrl("v"), &mut queue);
-        let Outstanding::Live(pending) = tui.outstanding.as_ref().expect("waiting") else {
-            panic!("the line read is not live");
-        };
+        let pending = tui.outstanding.as_ref().expect("waiting");
         assert!(pending.for_line);
         assert_eq!(pending.line_gen, tui.line_gen);
         assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
@@ -3218,20 +3242,21 @@ mod tests {
         let due = Instant::now() + Duration::from_secs(2);
         tui.edit_key(&ctrl("v"), &mut queue);
         assert!(tui.expire_clipboard(due).is_none());
-        assert!(matches!(
-            tui.outstanding,
-            Some(Outstanding::Discard {
-                selection: Selection::Clipboard
-            })
-        ));
-        let query = tui.control.clone();
+        assert!(tui.outstanding.is_none());
+        // A paste after the timeout asks again, and the reply is pasted.
+        tui.control.clear();
         tui.edit_key(&ctrl("v"), &mut queue);
-        assert_eq!(tui.control, query);
+        assert_eq!(tui.control, clipboard::query(Selection::Clipboard));
+        assert!(tui
+            .clipboard_reply(clip_reply(Some(b"yes".to_vec())))
+            .is_none());
+        assert!(tui.outstanding.is_none());
+        // The line was selected, so the paste replaces it. A second reply has no read.
+        assert_eq!(tui.editing.as_ref().unwrap().text(), "yes");
         assert!(tui
             .clipboard_reply(clip_reply(Some(b"nope".to_vec())))
             .is_none());
-        assert_eq!(tui.editing.as_ref().unwrap().text(), "ab");
-        assert!(tui.outstanding.is_none());
+        assert_eq!(tui.editing.as_ref().unwrap().text(), "yes");
     }
 
     #[test]
@@ -3244,7 +3269,7 @@ mod tests {
         tui.edit_key(&ctrl("v"), &mut queue);
         assert!(matches!(
             &tui.outstanding,
-            Some(Outstanding::Live(pending)) if pending.for_line && pending.line_gen == asked
+            Some(pending) if pending.for_line && pending.line_gen == asked
         ));
         tui.close_address();
         tui.active_url = "https://two.test".into();
@@ -3316,6 +3341,8 @@ schemes = [\"demo\"]
                 config_changed: false,
                 signals: Vec::new(),
                 writable: None,
+                motion: None,
+                motion_due: None,
             },
         }
     }
@@ -3446,10 +3473,7 @@ schemes = [\"demo\"]
         );
         app.run_core();
         press_page(app, "z");
-        // The timed-out read stays outstanding until its reply arrives. That
-        // reply is dropped, and only then can the page ask again.
-        app.event(TermEvent::Clipboard(clip_reply(Some(b"late".to_vec()))));
-        assert!(app.tui.outstanding.is_none());
+        // The timed-out read is given up, so the page may ask again at once.
         let request = request_clipboard(app, document);
         assert_eq!(app.tui.control, clipboard::query(Selection::Clipboard));
         app.event(TermEvent::Clipboard(clip_reply(Some(b"hej".to_vec()))));
@@ -3462,6 +3486,47 @@ schemes = [\"demo\"]
                 }
             )))
         );
+    }
+
+    /// One pointer motion per [`MOTION_INTERVAL`]: the latest waits, and goes before the next
+    /// event of another kind, or once its time has come.
+    #[cfg(feature = "engine-demo")]
+    #[test]
+    fn pointer_motion_is_paced_and_keeps_its_order() {
+        let mut held = demo_app();
+        let app = &mut held.app;
+        let mouse = |column, motion, state| MouseEvent {
+            column,
+            row: 5,
+            button: Some(PointerButton::Left),
+            state,
+            modifiers: Modifiers::default(),
+            motion,
+            wheel: None,
+        };
+        app.event(TermEvent::Mouse(mouse(1, false, ButtonState::Pressed)));
+        assert!(app.motion.is_none() && app.motion_due.is_none());
+        app.event(TermEvent::Mouse(mouse(1, true, ButtonState::Pressed)));
+        assert!(app.motion.is_none());
+        let due = app.motion_due.expect("paced");
+        assert!(due <= Instant::now() + MOTION_INTERVAL);
+        // Far enough ahead that a slow machine does not reach it during the test.
+        let due = Instant::now() + Duration::from_secs(60);
+        app.motion_due = Some(due);
+        app.event(TermEvent::Mouse(mouse(2, true, ButtonState::Pressed)));
+        app.event(TermEvent::Mouse(mouse(3, true, ButtonState::Pressed)));
+        assert_eq!(app.motion, Some(mouse(3, true, ButtonState::Pressed)));
+        assert_eq!(app.motion_due, Some(due));
+        // The release hands the held motion on first.
+        app.event(TermEvent::Mouse(mouse(3, false, ButtonState::Released)));
+        assert!(app.motion.is_none());
+        // A held motion goes once its time has come, with no other event.
+        app.motion_due = Some(due);
+        app.event(TermEvent::Mouse(mouse(4, true, ButtonState::Pressed)));
+        assert!(app.motion.is_some());
+        app.motion_due = Some(Instant::now());
+        assert!(app.drain_input());
+        assert!(app.motion.is_none());
     }
 
     #[cfg(feature = "engine-demo")]

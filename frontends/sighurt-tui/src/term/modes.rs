@@ -7,15 +7,26 @@
 //! Synchronized output brackets one frame; it is not left on. The startup
 //! batch's kitty graphics query is omitted inside tmux: tmux's APC sets the
 //! pane title, and tmux does not pass kitty graphics without passthrough.
+//!
+//! Mouse reporting is 1000 (presses and releases), then 1002 (button-event
+//! tracking: motion while a button is held), in SGR form (1006). A terminal
+//! without 1002 keeps 1000. 1002 is what a drag in graphics mode needs (the
+//! pointer capture in `App::mouse`). 1003 (any motion) is not asked for: it
+//! reports every cell the pointer crosses with no button held, which tmux with
+//! `mouse on` passes on for the whole pane, and only graphics-mode hover (CSS
+//! `:hover`, a link's address in the status line) would use it; text mode
+//! ignores motion. Resetting any of 1000, 1002 or 1003 turns tracking off in
+//! xterm and tmux, so [`LEAVE`] resets them all the same way. `App::adopt`
+//! writes the same bytes when `[tui] mouse` changes.
 
 /// Disambiguate, event types, alternate keys, all keys as escapes, associated text.
 pub const KITTY_KEYBOARD_FLAGS: u32 = 1 | 2 | 4 | 8 | 16;
 
 /// Alternate screen, hidden cursor, bracketed paste, kitty keyboard push,
-/// SGR mouse, focus events, numeric keypad (DECKPNM, `ESC >`), cursor home,
-/// clear screen.
+/// SGR mouse with button-event tracking, focus events, numeric keypad
+/// (DECKPNM, `ESC >`), cursor home, clear screen.
 pub const ENTER: &[u8] =
-    b"\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>31u\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b>\x1b[H\x1b[2J";
+    b"\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[>31u\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b>\x1b[H\x1b[2J";
 
 /// Synchronized output off, then focus off, mouse off, kitty keyboard pop,
 /// bracketed paste off, cursor shown, leave the alternate screen. The reverse
@@ -23,7 +34,7 @@ pub const ENTER: &[u8] =
 /// is left as it is. `CSI ? 2026 l` is first so a frame that
 /// was cut off cannot leave the terminal inside a synchronized update.
 pub const LEAVE: &[u8] =
-    b"\x1b[?2026l\x1b[?1004l\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?2004l\x1b[?25h\x1b[?1049l";
+    b"\x1b[?2026l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[<u\x1b[?2004l\x1b[?25h\x1b[?1049l";
 
 /// Begin a synchronized frame (`CSI ? 2026 h`).
 pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
@@ -77,6 +88,12 @@ mod tests {
         assert!(LEAVE.starts_with(SYNC_END));
         assert!(ENTER.windows(b"[?1004h".len()).any(|w| w == b"[?1004h"));
         assert!(LEAVE.windows(b"[?1004l".len()).any(|w| w == b"[?1004l"));
+        // Mouse: presses, then drags, in SGR form; no any-motion tracking.
+        let mouse_on = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+        let mouse_off = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+        assert!(ENTER.windows(mouse_on.len()).any(|w| w == mouse_on));
+        assert!(LEAVE.windows(mouse_off.len()).any(|w| w == mouse_off));
+        assert!(ENTER.windows(b"1003".len()).all(|w| w != b"1003"));
         // DECKPNM. A program that left DECKPAM on would make the numpad `ESC O`.
         assert!(ENTER.windows(2).any(|window| window == b"\x1b>"));
         assert!(LEAVE.windows(2).all(|window| window != b"\x1b>"));

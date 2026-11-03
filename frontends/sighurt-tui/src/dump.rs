@@ -3,8 +3,10 @@
 //! Owns: the headless [`Frontend`] (it shows nothing and keeps the latest page snapshot), the
 //! loop that opens the page, waits for it to be complete and prints [`textmode::dump`], and
 //! which engine is used. A page is complete when the core says its load ended, and then the
-//! first snapshot the engine sends after being asked again has gone 300 ms without a newer one
-//! (TUI.md §8.12); it fails on the first navigation error, or after the timeout. Shutdown after
+//! snapshots the engine sends after being asked again have gone 300 ms without a newer one, or
+//! 3 s have passed since the first of them (a page that keeps changing, such as a ticker, is
+//! re-extracted about every 250 ms and is never quiet); the latest is printed (TUI.md §8.12).
+//! It fails on the first navigation error, or after the timeout. Shutdown after
 //! that is bounded ([`SHUTDOWN_BOUND`]): Servo's `Drop` sleeps until its script threads exit,
 //! and a page that keeps one busy would otherwise never let `--dump` end. The session is
 //! ephemeral: no session file is read or written, and no terminal, Wayland connection or
@@ -45,6 +47,11 @@ use crate::textmode;
 /// How long the page's text must stay unchanged after the load ended: an extraction that was
 /// already running when the load ended may still deliver an earlier state.
 const SETTLE: Duration = Duration::from_millis(300);
+
+/// The longest the snapshots are awaited to go quiet, from the first one after the engine was
+/// asked again. Servo re-extracts a changing page about every 250 ms
+/// (`sighurt_engine_servo::semantic::DEBOUNCE`), sooner than [`SETTLE`].
+const MAX_SETTLE: Duration = Duration::from_secs(3);
 
 /// A page that builds itself with scripts after its load ended (most of today's sites) is
 /// given this long, from the end of the load, before a snapshot may be taken for it.
@@ -272,13 +279,9 @@ fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
     let mut registry = crate::engines::build();
     let mut env = registry.environment(chrome_checks(), COLOR_NAMES);
     env.frontend = FrontendKind::Terminal;
-    let config = match persistence::load_config(paths.config.as_deref(), &env) {
-        Ok(config) => config,
-        Err(error) => {
-            log::warn!("the configuration can't be used: {error}");
-            persistence::load_config(None, &env).map_err(|e| e.to_string())?
-        }
-    };
+    // A configuration file that can't be used stops the dump; its lines become one.
+    let config = persistence::startup_config(paths.config.as_deref(), &env)
+        .map_err(|error| error.replace('\n', " "))?;
     // Routing, not "WPE first": a demo: URL configured for the demo engine must not be handed
     // to WPE. TUI.md still asks for WPE when the page is an ordinary http(s) or file URL whose
     // only claim is the default engine and that engine gives no page text.
@@ -553,6 +556,8 @@ fn is_quit(byte: u8) -> bool {
 #[derive(Default)]
 struct Settle {
     asked: Option<(DocumentGeneration, u64)>,
+    /// When the first snapshot after asking was seen.
+    first: Option<Instant>,
 }
 
 /// What [`Settle::step`] wants done.
@@ -581,12 +586,14 @@ impl Settle {
     ) -> Step {
         let Some(document) = loaded else {
             self.asked = None;
+            self.first = None;
             return Step::Wait;
         };
         match self.asked {
             Some((asked, _)) if asked == document => {}
             _ => {
                 self.asked = Some((document, count));
+                self.first = None;
                 return Step::Ask;
             }
         }
@@ -601,6 +608,17 @@ impl Settle {
     /// A snapshot arrived after the engine was asked, so only quiet is awaited.
     fn settling(&self, count: u64) -> bool {
         self.asked.is_some_and(|(_, seen)| count > seen)
+    }
+
+    /// When the snapshots will count as quiet: [`SETTLE`] after the latest (`last`), or
+    /// [`MAX_SETTLE`] after the first one after asking, whichever is sooner. `None` until such
+    /// a snapshot has arrived; the first time one has, `now` is taken as its arrival.
+    fn quiet_at(&mut self, count: u64, last: Instant, now: Instant) -> Option<Instant> {
+        if !self.settling(count) {
+            return None;
+        }
+        let first = *self.first.get_or_insert(now);
+        Some((last + SETTLE).min(first + MAX_SETTLE))
     }
 }
 
@@ -701,7 +719,10 @@ fn wait(
             .and_then(|view| view.document())
             .filter(|_| loaded);
         let latest = headless.snapshot.as_ref().map(|(_, s)| s.document);
-        let quiet = headless.last.elapsed() >= SETTLE;
+        let checked = Instant::now();
+        let quiet = settle
+            .quiet_at(headless.count, headless.last, checked)
+            .is_some_and(|at| at <= checked);
         if document.is_none() {
             loaded_at = None;
         }
@@ -730,9 +751,7 @@ fn wait(
         if now >= deadline {
             return Ok(None);
         }
-        let quiet_at = settle
-            .settling(headless.count)
-            .then_some(headless.last + SETTLE);
+        let quiet_at = settle.quiet_at(headless.count, headless.last, now);
         let grace_from = loaded_at.filter(|_| document.is_some());
         let Some(pause) = sleep_for(
             now,
@@ -770,6 +789,48 @@ mod tests {
         // Quiet is not enough before the page has had its grace time.
         assert_eq!(settle.step(Some(b), 3, true, false, Some(b)), Step::Wait);
         assert_eq!(settle.step(Some(b), 3, true, true, Some(b)), Step::Done);
+    }
+
+    /// A page whose snapshots never stop (a ticker, re-extracted every 250 ms) still settles:
+    /// [`MAX_SETTLE`] after the first snapshot that followed the question.
+    #[test]
+    fn snapshots_that_never_go_quiet_settle_after_the_cap() {
+        let a = DocumentGeneration::next();
+        let mut settle = Settle::default();
+        let start = Instant::now();
+        assert_eq!(settle.step(Some(a), 1, false, true, Some(a)), Step::Ask);
+        assert_eq!(settle.quiet_at(1, start, start), None);
+        // Snapshots every 250 ms from the first: SETTLE after the latest is never reached.
+        let mut count = 1;
+        let mut now = start;
+        let mut done_at = None;
+        while now < start + Duration::from_secs(10) {
+            count += 1;
+            let last = now;
+            let quiet = settle
+                .quiet_at(count, last, now)
+                .is_some_and(|at| at <= now);
+            if settle.step(Some(a), count, quiet, true, Some(a)) == Step::Done {
+                done_at = Some(now);
+                break;
+            }
+            now += Duration::from_millis(250);
+        }
+        let done_at = done_at.expect("never settled");
+        assert_eq!(done_at - start, MAX_SETTLE);
+        // A page that goes quiet settles SETTLE after its latest snapshot, before the cap.
+        let mut settle = Settle::default();
+        assert_eq!(settle.step(Some(a), 1, false, true, Some(a)), Step::Ask);
+        let first = start;
+        assert_eq!(settle.quiet_at(2, first, first), Some(first + SETTLE));
+        let last = first + Duration::from_millis(200);
+        assert_eq!(settle.quiet_at(3, last, last), Some(last + SETTLE));
+        // A new document starts over.
+        let b = DocumentGeneration::next();
+        assert_eq!(settle.step(Some(b), 3, false, true, Some(b)), Step::Ask);
+        let later = start + Duration::from_secs(5);
+        assert_eq!(settle.quiet_at(3, later, later), None);
+        assert_eq!(settle.quiet_at(4, later, later), Some(later + SETTLE));
     }
 
     #[test]

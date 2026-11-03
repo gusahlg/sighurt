@@ -416,13 +416,17 @@ Where it differs from the sketches in §2–§3:
   the link or control under it; other buttons and motion are ignored. In graphics mode a button
   pressed over the page captures the pointer (`input::PointerCapture`): its motion and its release
   go to that view with positions relative to the page's top-left, negative above and left of it,
-  until released or the view closes (review finding 8).
+  until released or the view closes (review finding 8). The terminal is asked for modes 1000,
+  1002 and 1006: motion arrives only while a button is held (1003, any motion, would flood
+  through tmux and only hover would use it), and at most one motion every 16 ms reaches the
+  page, the newest kept and handed on before any later event so a release never overtakes it.
 - **`sig --dump URL [--width N] [--timeout SECS]`** (`sighurt_tui::dump`; no terminal, no Wayland,
   no sighurt-ui, no session file written). The engine is `--engine`, else WPE WebKit, else the
   first compiled-in engine with `semantics`, else an error. Only that engine's runtime starts
   (Servo does not, `Registry::configure`). The page is complete when the core's tab is loaded; then
   the engine is asked for a snapshot again, and the first one that arrives, once 300 ms pass
-  without a newer one (an extraction already running when the load ended may deliver an earlier
+  without a newer one, or 3 s after the first since the ask on a page whose text never settles
+  (Servo re-extracts every 250 ms while the DOM changes; the latest snapshot is printed then) (an extraction already running when the load ended may deliver an earlier
   state), is printed. A navigation error exits 1 with one line on stderr; the timeout (default 30
   s) exits 2. If stderr is a terminal, logging goes to the log file. The demo engine now has
   semantics (a heading, a paragraph, two links, a field, a checkbox, a select and a button), so
