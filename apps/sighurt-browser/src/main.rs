@@ -355,10 +355,19 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(code) => code,
-        Err(error) => {
-            eprintln!("sig: {error}");
-            ExitCode::FAILURE
-        }
+        Err(error) => failed(&error),
+    }
+}
+
+/// Prints a failure to start or run and gives the exit status: 2 when the configuration file
+/// stopped the start (`sighurt_runtime::persistence::DID_NOT_START`, a usage error like bad
+/// arguments), 1 otherwise.
+fn failed(error: &str) -> ExitCode {
+    eprintln!("sig: {error}");
+    if error.ends_with(sighurt_runtime::persistence::DID_NOT_START) {
+        ExitCode::from(2)
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -376,10 +385,7 @@ fn run_dump(dump: Dump, engine: Option<String>, signals: OwnedFd) -> ExitCode {
     };
     match sighurt_tui::dump(options, &signals) {
         Ok(code) => code,
-        Err(error) => {
-            eprintln!("sig: {error}");
-            ExitCode::FAILURE
-        }
+        Err(error) => failed(&error),
     }
 }
 

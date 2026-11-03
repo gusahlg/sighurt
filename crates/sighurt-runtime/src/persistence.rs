@@ -153,16 +153,21 @@ pub fn startup_config(path: Option<&Path>, env: &Environment) -> Result<Config, 
     let text = match read_config(path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("cannot read {}: {error}", shown(path))),
+        Err(error) => {
+            return Err(format!(
+                "cannot read {}: {error}\n{DID_NOT_START}",
+                shown(path)
+            ))
+        }
     };
-    Config::parse(text.as_deref(), env).map_err(|error| {
-        format!(
-            "{}: {error}\nsig did not start. Fix the file, or move it away to start with the \
-             built-in configuration.",
-            shown(path)
-        )
-    })
+    Config::parse(text.as_deref(), env)
+        .map_err(|error| format!("{}: {error}\n{DID_NOT_START}", shown(path)))
 }
+
+/// The last line of a [`startup_config`] error. The executable exits with status 2 (a usage
+/// error, as for bad arguments) when a start fails with this line, and 1 for any other failure.
+pub const DID_NOT_START: &str =
+    "sig did not start. Fix the file, or move it away to start with the built-in configuration.";
 
 /// Reads and checks the configuration at `path` again, for a reload (none: the built-in one),
 /// for a build with what `env` lists. A missing file is an error too, so the configuration in

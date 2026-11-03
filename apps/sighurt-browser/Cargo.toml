@@ -42,6 +42,8 @@ chrome-line = ["sighurt-gui/chrome-line"]
 
 [dependencies]
 sighurt-core = { path = "../../crates/sighurt-core" }
+# The frontends share it; main names its startup-configuration error for the exit status.
+sighurt-runtime = { path = "../../crates/sighurt-runtime" }
 # The Wayland frontend. Not optional: see `frontend-gui` above.
 sighurt-gui = { path = "../../frontends/sighurt-gui" }
 # The terminal frontend. Optional: the headless GUI builds leave `frontend-tui` off.

@@ -10287,6 +10287,7 @@ dependencies = [
  "sighurt-engine-ladybird",
  "sighurt-engine-servo",
  "sighurt-gui",
+ "sighurt-runtime",
  "sighurt-tui",
  "signal-hook-registry",
  "smithay-client-toolkit",
