@@ -351,7 +351,8 @@ impl<F: Frontend> Session<F> {
             Effect::RedrawChrome => frontend.redraw(),
             Effect::SaveSession => self.session_changed(),
             Effect::Quit => {
-                self.save_session();
+                // `shutdown` writes the session, once and whole; a save due now is that one.
+                self.session_due = None;
                 self.quit.get_or_insert(ExitCode::SUCCESS);
             }
         }
@@ -658,8 +659,12 @@ impl<F: Frontend> Session<F> {
         }
     }
 
-    /// The core changed what the session holds: save it soon.
+    /// The core changed what the session holds: save it soon. After quitting, `shutdown` saves
+    /// it.
     pub fn session_changed(&mut self) {
+        if self.quit.is_some() {
+            return;
+        }
         self.session_due
             .get_or_insert_with(|| Instant::now() + SESSION_DELAY);
     }
@@ -798,11 +803,12 @@ impl<F: Frontend> Session<F> {
     }
 
     /// Shuts down the part of plan §20 that is not the frontend tearing itself down, and returns
-    /// the exit code. The order is fixed: cancel downloads, write the session and finish the
-    /// writer, forget and close every view, `report` (the final diagnostics, while the runtimes
-    /// can still say how they render), shut the runtimes down, shut services down, delete scratch
-    /// directories. If a runtime had to be left running (decision 54), the frontend is asked to
-    /// clean up and the process ends with [`exit_now`]; destructors do not run. Otherwise the
+    /// the exit code. The order is fixed: cancel downloads, write the session (the only write
+    /// at quit) and finish the writer, `report` (the final diagnostics, while every view is
+    /// still there and the runtimes can still say how they render), forget and close every view,
+    /// shut the runtimes down, shut services down, delete scratch directories. If a runtime had
+    /// to be left running (decision 54), the frontend is asked to clean up and the process ends
+    /// with [`exit_now`]; destructors do not run. Otherwise the
     /// caller tears the frontend down after this returns: the session stays alive until the
     /// caller drops it, so those destructors still run after the frontend's own.
     ///
@@ -819,10 +825,8 @@ impl<F: Frontend> Session<F> {
     ) -> ExitCode {
         let code = self.quit.take().unwrap_or(ExitCode::SUCCESS);
         self.services().cancel_downloads();
+        self.save_session();
         if let Some(writer) = self.session.take() {
-            if self.core.config().restore_session() {
-                writer.save(self.core.session().to_text());
-            }
             writer.finish();
         }
         // The session file is written. From here a script thread that will not exit must
@@ -831,6 +835,7 @@ impl<F: Frontend> Session<F> {
         let _bound = self
             .shutdown_bound
             .map(|bound| arm_shutdown_bound(bound, process_status(&code)));
+        report(self, frontend);
         let views: Vec<(ViewId, String)> = self
             .views
             .iter()
@@ -842,7 +847,6 @@ impl<F: Frontend> Session<F> {
                 runtime.close_view(view);
             }
         }
-        report(self, frontend);
         #[cfg(test)]
         stall_shutdown_for_tests();
         self.registry.shutdown();
@@ -1247,6 +1251,77 @@ mod tests {
         _: crate::registry::Launch<'_>,
     ) -> Result<Runtime<(), ()>, String> {
         Ok(Runtime::Demo(Box::new(scripted("plain", false, None))))
+    }
+
+    #[test]
+    fn quitting_writes_the_session_once_and_the_exit_report_sees_every_view() {
+        let dir = std::env::temp_dir().join(format!("sighurt-quit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        let path = dir.join("session.toml");
+        let registry = Registry::new(vec![Engine::new(
+            "idle",
+            site_caps(true),
+            "cpu",
+            &[],
+            start_idle,
+        )]);
+        let env = registry.environment(Vec::new(), &[]);
+        let text = "version = 1\n[engines]\ndefault = \"idle\"\nenabled = [\"idle\"]";
+        let config = Config::parse(Some(text), &env).expect("config");
+        let writer = crate::persistence::SessionWriter::new(path.clone()).expect("a writer");
+        let mut session = Session::<Recording>::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            Services::new(|| {}),
+            Paths {
+                config: None,
+                session: Some(path.clone()),
+            },
+            Some(writer),
+            Diagnostics::new(None),
+            Arc::new(|| {}),
+        );
+        let mut frontend = Recording::default();
+        session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: vec![OpenRequest {
+                input: "https://example.com/".into(),
+                engine: None,
+            }],
+        });
+        session.run_core(&mut frontend);
+        session.pump(&mut frontend);
+        session.queue_mut().push_back(BrowserEvent::Command(
+            "browser.quit".parse::<Command>().unwrap(),
+        ));
+        session.run_core(&mut frontend);
+        assert!(session.has_quit());
+        assert_eq!(
+            session.diag.counters.session_saves, 0,
+            "quit leaves it to shutdown"
+        );
+        assert_eq!(
+            session.session_due(),
+            None,
+            "and the loop does not save it either"
+        );
+
+        let mut seen = None;
+        session.shutdown(&mut frontend, |session, _| {
+            seen = Some(session.views().len());
+        });
+
+        assert_eq!(
+            seen,
+            Some(1),
+            "the exit report is built before the views close"
+        );
+        assert!(session.views().is_empty());
+        assert_eq!(session.diag.counters.session_saves, 1, "written once");
+        let saved = std::fs::read_to_string(&path).expect("the session file");
+        assert!(saved.contains("https://example.com/"), "{saved}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

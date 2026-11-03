@@ -36,6 +36,11 @@
 //! through `sighurt_ui::extension::Chrome`: its surfaces are SHM targets by name
 //! ([`ChromeTargets`](crate::chrome::ChromeTargets)), created when it first lists them.
 //!
+//! A view's target outlives the view while its engine still holds the lease (Servo keeps a
+//! closing view until its GL context is free, and every lease after a crash). The host refuses
+//! a placement that leaves out a live target, so such a target is placed hidden until its lease
+//! drops (`place_retiring`).
+//!
 //! Shutdown (plan §20): stop taking input, cancel downloads, write the session (at once, whole),
 //! close every view and shut every runtime down (each releases its target leases), wait a moment
 //! for the downloads (deleting the files of those still waiting on a server), delete what
@@ -140,6 +145,8 @@ struct Gui {
     keyboard_target: Option<TargetId>,
     /// The target whose text field the input method has.
     page_text_target: Option<TargetId>,
+    /// Targets of forgotten views whose leases their engines still hold, placed hidden.
+    retiring: Vec<TargetId>,
 }
 
 /// The owner loop's state: the window and the session, and what the loop's sources report.
@@ -298,6 +305,8 @@ impl Frontend for Gui {
     }
 
     fn forget_target(&mut self, target: TargetId) {
+        // Listed, hidden, until the engine drops the lease.
+        self.retiring.push(target);
         if self.page_text_target == Some(target) {
             self.host.set_text_input(self.window, target, None);
             self.page_text_target = None;
@@ -452,8 +461,8 @@ impl Gui {
     }
 
     /// The window's layout for the host: every view (only the shown one visible) at the page
-    /// rectangle, the chrome's surfaces above them in its order. A surface name the chrome
-    /// hasn't used before gets a target here.
+    /// rectangle, the targets of forgotten views still leased (hidden), the chrome's surfaces
+    /// above them in its order. A surface name the chrome hasn't used before gets a target here.
     /// Fills `placement_buf` from `views` and the chrome. `None` until the window has a size.
     fn fill_placement(
         &mut self,
@@ -481,6 +490,13 @@ impl Gui {
                 input: InputRegion::Whole,
             });
         }
+        let host = &self.host;
+        place_retiring(
+            &mut self.retiring,
+            |target| host.is_live(target),
+            page,
+            &mut self.placement_buf.targets,
+        );
         let surfaces = self.placing_buf.surfaces.len();
         let mut created = false;
         for index in 0..surfaces {
@@ -567,17 +583,8 @@ impl App {
         let paths = Paths::from_env();
         let (mut registry, modes) = engines::build();
         let env = registry.environment(chrome::checks_all(), &Colors::NAMES);
-        let mut notice = None;
-        let config = match persistence::load_config(paths.config.as_deref(), &env) {
-            Ok(config) => config,
-            Err(error) => {
-                log::warn!("the configuration can't be used: {error}");
-                notice = Some(format!(
-                    "{error}\nsig runs with the built-in configuration until the file is fixed."
-                ));
-                persistence::load_config(None, &env).map_err(|e| e.to_string())?
-            }
-        };
+        // A configuration file that can't be used stops sig before anything starts.
+        let config = persistence::startup_config(paths.config.as_deref(), &env)?;
         let servo_wake = ping.clone();
         registry.start_at_launch(&config, || EngineWaker::new(move || servo_wake.ping()));
         // Servo's logger, if it started; otherwise env_logger. The ping's clones, in the
@@ -647,15 +654,13 @@ impl App {
             paste: None,
             keyboard_target: None,
             page_text_target: None,
+            retiring: Vec::new(),
         };
         gui.chrome_actions(session.queue_mut(), configured);
         session.queue_mut().push_back(BrowserEvent::Start {
             session: None,
             open: options.open,
         });
-        if let Some(notice) = notice {
-            gui.show_notice(notice);
-        }
         Ok(Self {
             gui,
             session,
@@ -1084,7 +1089,7 @@ impl App {
     }
 
     /// Shuts down in the order of plan §20 and returns the exit code. [`Session::shutdown`]
-    /// cancels downloads, writes the session, closes the views, writes the final report, shuts
+    /// cancels downloads, writes the session, writes the final report, closes the views, shuts
     /// the engines and services down and deletes scratch. If an engine could not shut down
     /// (decision 54), that ends the process with `_exit` after this window is asked to clean
     /// up, and the rest of this function does not run: dropping the window would release
@@ -1104,6 +1109,26 @@ impl App {
         drop(self.gui.host);
         code
     }
+}
+
+/// Lists the `retiring` targets that are still `live` in `out`, hidden at the page rectangle,
+/// and forgets the others. A view's target can outlive the view: Servo keeps a closing view's
+/// lease until its GL context is free, and leaks every lease after a crash. The host refuses a
+/// placement without a live target, so each stays listed, hidden (unmapped, never waited
+/// for), until its lease drops; leaving it out would refuse every placement until then.
+fn place_retiring(
+    retiring: &mut Vec<TargetId>,
+    live: impl Fn(TargetId) -> bool,
+    page: WindowRect,
+    out: &mut Vec<TargetPlacement>,
+) {
+    retiring.retain(|&target| live(target));
+    out.extend(retiring.iter().map(|&target| TargetPlacement {
+        target,
+        rect: page,
+        visible: false,
+        input: InputRegion::Whole,
+    }));
 }
 
 /// The diagnostics report. Called on SIGUSR1 and, from [`Session::shutdown`], at exit, while
@@ -1331,6 +1356,35 @@ mod tests {
             .filter(|&replaced| replaced)
             .count();
         (batch, dropped)
+    }
+
+    #[test]
+    fn a_forgotten_views_target_stays_placed_hidden_until_its_lease_drops() {
+        let (closing, dropped) = (TargetId::next(), TargetId::next());
+        let page = WindowRect {
+            x: 0,
+            y: 40,
+            width: 800,
+            height: 560,
+        };
+        let mut retiring = vec![closing, dropped];
+        let mut out = Vec::new();
+        // Servo parked `closing` with its lease; the other engine dropped its lease at once.
+        place_retiring(&mut retiring, |t| t == closing, page, &mut out);
+        assert_eq!(retiring, vec![closing]);
+        assert_eq!(
+            out,
+            vec![TargetPlacement {
+                target: closing,
+                rect: page,
+                visible: false,
+                input: InputRegion::Whole,
+            }]
+        );
+        // Its lease dropped: it leaves the placement.
+        out.clear();
+        place_retiring(&mut retiring, |_| false, page, &mut out);
+        assert!(retiring.is_empty() && out.is_empty());
     }
 
     #[test]

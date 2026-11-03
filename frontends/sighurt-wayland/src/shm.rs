@@ -4,13 +4,16 @@
 //! being drawn, or submitted; submitted storage is reused only after the compositor releases it
 //! (`wl_buffer.release`), and with no free buffer the invalidation waits instead of overwriting
 //! memory in use. A resize starts a new pool generation: the old generation's free buffers are
-//! destroyed at once and its submitted ones retire, kept alive until released. At most
-//! two generations retire at a time; beyond that a new size waits for a release,
+//! destroyed at once and its submitted ones retire, kept alive until released. So does a new
+//! layout epoch at the same buffer size (a logical size change offset by a scale change): the
+//! old buffers hold pixels laid out for another scale, no base for the new layout's frames. At
+//! most two generations retire at a time; beyond that a new layout waits for a release,
 //! which always comes because every retiring generation but the newest has been superseded by a
-//! later commit. So a resize storm holds at most nine buffers: three sizes of three.
+//! later commit. So a resize storm holds at most nine buffers: three layouts of three.
 //!
-//! A hidden (unmapped) surface frees its buffers once the compositor has released them
-//! ([`Swapchain::trim`]); showing it again allocates afresh.
+//! A surface the placement hid frees its buffers once it is unmapped and the compositor has
+//! released them ([`Swapchain::trim`]); showing it again allocates afresh. One unmapped only for
+//! lacking a frame at the end of a layout's grace period keeps them: its frame is coming.
 //!
 //! A submission damages the rectangles the painter reported ([`crate::damage`]), or the whole
 //! buffer when it reported none. A reused buffer holds an older frame; the swapchain remembers
@@ -31,7 +34,7 @@ use std::io;
 
 use sighurt_api::engine::PresentOutcome;
 use sighurt_api::geometry::{BufferSize, Metrics};
-use sighurt_api::ids::{TargetId, WindowId};
+use sighurt_api::ids::{LayoutEpoch, TargetId, WindowId};
 use smithay_client_toolkit::error::GlobalError;
 use smithay_client_toolkit::globals::ProvidesBoundGlobal;
 use smithay_client_toolkit::shm::raw::RawPool;
@@ -101,6 +104,8 @@ struct Slot<B> {
 struct Generation<B> {
     id: u64,
     size: BufferSize,
+    /// The layout its buffers are drawn for, if the owner has layouts (the root has none).
+    epoch: Option<LayoutEpoch>,
     // Indexed by `BufferKey::index`; a retired slot becomes `None` so the indices of the others,
     // baked into their `wl_buffer`s, stay valid.
     slots: Vec<Option<Slot<B>>>,
@@ -140,6 +145,7 @@ impl<B> Swapchain<B> {
             current: Generation {
                 id: 0,
                 size: BufferSize::default(),
+                epoch: None,
                 slots: Vec::new(),
             },
             retiring: Vec::new(),
@@ -148,19 +154,22 @@ impl<B> Swapchain<B> {
         }
     }
 
-    /// A free buffer of `size` to draw into, lent out with its storage and its age: its slot is
-    /// `Drawing` until [`submit`](Self::submit) or [`abandon`](Self::abandon) gives the storage
-    /// back. The age is 0 when the pixels are not a frame this swapchain submitted, and otherwise
-    /// how many submits ago that frame was (1 is the previous frame). `alloc` makes a new one of
-    /// `bytes` bytes when the current generation has room for one more.
+    /// A free buffer of `size`, for layout `epoch`, to draw into, lent out with its storage and
+    /// its age: its slot is `Drawing` until [`submit`](Self::submit) or
+    /// [`abandon`](Self::abandon) gives the storage back. The age is 0 when the pixels are not a
+    /// frame this swapchain submitted, and otherwise how many submits ago that frame was (1 is
+    /// the previous frame). Another size or epoch than the current generation's starts a new
+    /// one. `alloc` makes a new one of `bytes` bytes when the current generation has room for
+    /// one more.
     pub fn acquire(
         &mut self,
         size: BufferSize,
+        epoch: Option<LayoutEpoch>,
         bytes: usize,
         alloc: impl FnOnce(BufferKey) -> io::Result<B>,
     ) -> Result<(BufferKey, B, u32), AcquireError> {
-        if size != self.current.size {
-            self.start_generation(size)?;
+        if !self.is_current(size, epoch) {
+            self.start_generation(size, epoch)?;
         }
         let generation = self.current.id;
         let epoch = self.epoch;
@@ -192,9 +201,14 @@ impl<B> Swapchain<B> {
         Ok((key, buffer, 0))
     }
 
-    /// Whether [`acquire`](Self::acquire) would lend a buffer of `size` now.
-    pub fn can_acquire(&self, size: BufferSize) -> bool {
-        if size != self.current.size {
+    /// Whether the current generation is for `size` and `epoch`.
+    fn is_current(&self, size: BufferSize, epoch: Option<LayoutEpoch>) -> bool {
+        self.current.size == size && self.current.epoch == epoch
+    }
+
+    /// Whether [`acquire`](Self::acquire) would lend a buffer of `size`, for `epoch`, now.
+    pub fn can_acquire(&self, size: BufferSize, epoch: Option<LayoutEpoch>) -> bool {
+        if !self.is_current(size, epoch) {
             let holds_any = self.current.held().any(|s| s.state != BufferState::Free);
             return !holds_any || self.retiring.len() < MAX_RETIRING;
         }
@@ -202,7 +216,11 @@ impl<B> Swapchain<B> {
             || self.current.held().any(|s| s.state == BufferState::Free)
     }
 
-    fn start_generation(&mut self, size: BufferSize) -> Result<(), AcquireError> {
+    fn start_generation(
+        &mut self,
+        size: BufferSize,
+        epoch: Option<LayoutEpoch>,
+    ) -> Result<(), AcquireError> {
         let holds_any = self.current.held().any(|s| s.state != BufferState::Free);
         if holds_any && self.retiring.len() >= MAX_RETIRING {
             return Err(AcquireError::Retiring);
@@ -214,6 +232,7 @@ impl<B> Swapchain<B> {
             Generation {
                 id,
                 size,
+                epoch,
                 slots: Vec::new(),
             },
         );
@@ -226,7 +245,7 @@ impl<B> Swapchain<B> {
         if old.held().next().is_some() {
             self.retiring.push(old);
         }
-        // The new size has no frames yet. Ages belong to this generation only.
+        // The new layout has no frames yet. Ages belong to this generation only.
         self.epoch = 0;
         Ok(())
     }
@@ -249,6 +268,7 @@ impl<B> Swapchain<B> {
         self.current = Generation {
             id,
             size: BufferSize::default(),
+            epoch: None,
             slots: Vec::new(),
         };
         true
@@ -453,7 +473,8 @@ impl Dispatch<WlBuffer, BufferData> for Host {
                 if let Some(target) = host.targets.get(&id) {
                     let mut target = target.borrow_mut();
                     target.stats.releases += 1;
-                    let hidden = target.role.is_none();
+                    // Hidden by the placement, not just unmapped until its late frame comes.
+                    let hidden = target.role.is_none() && !target.want_shown;
                     if let Some(buffers) = target.shm.as_mut() {
                         buffers.release(data.key);
                         if hidden {
@@ -594,9 +615,17 @@ mod tests {
         }
 
         fn acquire_aged(&mut self, width: u32) -> Result<(BufferKey, Tracked, u32), AcquireError> {
+            self.acquire_for(width, None)
+        }
+
+        fn acquire_for(
+            &mut self,
+            width: u32,
+            epoch: Option<LayoutEpoch>,
+        ) -> Result<(BufferKey, Tracked, u32), AcquireError> {
             let alive = Rc::clone(&self.alive);
             let size = BufferSize { width, height: 10 };
-            self.chain.acquire(size, width as usize * 40, |_| {
+            self.chain.acquire(size, epoch, width as usize * 40, |_| {
                 alive.set(alive.get() + 1);
                 Ok(Tracked(alive))
             })
@@ -752,6 +781,40 @@ mod tests {
         let (immediate, _, age) = c.acquire_aged(100).unwrap();
         assert_eq!(immediate, b);
         assert_eq!(age, 1);
+    }
+
+    #[test]
+    fn a_new_layout_at_the_same_buffer_size_starts_a_generation() {
+        let mut c = Chain::new();
+        let (first, second) = (LayoutEpoch::next(), LayoutEpoch::next());
+        let (shown, buffer, _) = c.acquire_for(100, Some(first)).unwrap();
+        c.chain.submit(shown, buffer);
+        let (spare, buffer, _) = c.acquire_for(100, Some(first)).unwrap();
+        c.chain.submit(spare, buffer);
+        c.chain.release(spare);
+        assert_eq!(c.acquire_for(100, Some(first)).unwrap().2, 1, "same layout");
+        let mut c = Chain::new();
+        let (shown, buffer, _) = c.acquire_for(100, Some(first)).unwrap();
+        c.chain.submit(shown, buffer);
+        let (spare, buffer, _) = c.acquire_for(100, Some(first)).unwrap();
+        c.chain.submit(spare, buffer);
+        c.chain.release(spare);
+        // Another scale and logical size that round to the same buffer: pixels laid out for
+        // the old scale are not lent as a frame of the new layout.
+        let (key, _, age) = c.acquire_for(100, Some(second)).unwrap();
+        assert_eq!(age, 0);
+        assert_ne!(key.generation, spare.generation);
+        assert_eq!(
+            c.chain.state(spare),
+            None,
+            "the free old buffer is destroyed"
+        );
+        assert_eq!(
+            c.chain.state(shown),
+            Some(BufferState::Submitted),
+            "it retires"
+        );
+        assert_eq!(c.chain.stats().retiring_generations, 1);
     }
 
     #[test]

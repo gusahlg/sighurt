@@ -151,11 +151,19 @@ fn is_new_field(sent: &TextInputState, state: &TextInputState) -> bool {
 
 /// `caret`, reported by a target placed at `target` (window coordinates), in the coordinates of
 /// the surface placed at `focus` that has text-input focus: translated once, through the window.
+/// The engine's numbers are not trusted: the result is clamped to what `set_cursor_rectangle`'s
+/// `int`s can carry, never wrapped.
 fn caret_on(caret: SurfaceRect, target: WindowRect, focus: WindowRect) -> SurfaceRect {
+    let shift = |at: i32, from: i32, to: i32| {
+        let moved = i64::from(at) + i64::from(from) - i64::from(to);
+        moved.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    };
+    let length = |l: u32| l.min(i32::MAX as u32);
     SurfaceRect {
-        x: caret.x + target.x - focus.x,
-        y: caret.y + target.y - focus.y,
-        ..caret
+        x: shift(caret.x, target.x, focus.x),
+        y: shift(caret.y, target.y, focus.y),
+        width: length(caret.width),
+        height: length(caret.height),
     }
 }
 
@@ -395,6 +403,26 @@ mod tests {
             height: 64,
         };
         assert_eq!(caret_on(caret, page, chrome).y, 84);
+        // A page reporting nonsense is clamped, not wrapped into a caret elsewhere.
+        let wild = SurfaceRect {
+            x: i32::MAX,
+            y: i32::MIN,
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        let below = WindowRect {
+            x: 10,
+            y: 64,
+            ..page
+        };
+        let shifted = caret_on(wild, below, chrome);
+        assert_eq!((shifted.x, shifted.y), (i32::MAX, i32::MIN + 64));
+        assert_eq!(
+            (shifted.width, shifted.height),
+            (i32::MAX as u32, i32::MAX as u32)
+        );
+        let back = caret_on(wild, root, below);
+        assert_eq!((back.x, back.y), (i32::MAX - 10, i32::MIN));
     }
 
     fn field(purpose: TextPurpose, multiline: bool) -> TextInputState {

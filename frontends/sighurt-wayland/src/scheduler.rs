@@ -17,7 +17,8 @@
 //!
 //! On an SHM target the host requests the callback in the commit it makes. On a GL target it
 //! requests it when issuing the permit, as pending surface state that the presenter's swap
-//! commits; at most one such request is pending at a time.
+//! commits; at most one such request is pending at a time, and its presentation feedback counts
+//! from the swap that commits it (reported with `Submitted`), not from the permit.
 //!
 //! There is no fixed tick: an idle browser sleeps, the chrome never repaints because a page
 //! animated, and a page is never pumped because the caret blinked. Submissions and
@@ -26,6 +27,8 @@
 //!
 //! Must not own: rendering, or engine pumping (the application loop does).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sighurt_api::engine::PresentOutcome;
@@ -192,17 +195,20 @@ impl Dispatch<WlCallback, FrameData> for Host {
 }
 
 /// A presentation feedback's target and when its frame was submitted, in nanoseconds of
-/// `CLOCK_MONOTONIC`.
-#[derive(Clone, Copy, Debug)]
+/// `CLOCK_MONOTONIC`: 0 until the commit that carries it is made (a GL target's request waits
+/// for the presenter's swap, which may come with a later permit).
+#[derive(Clone, Debug)]
 pub(crate) struct FeedbackData {
     pub target: TargetId,
-    pub submitted_ns: u128,
+    pub submitted_ns: Arc<AtomicU64>,
 }
 
 /// Now on `CLOCK_MONOTONIC`, in nanoseconds: the clock `wp_presentation` usually reports in.
-pub(crate) fn monotonic_ns() -> u128 {
+pub(crate) fn monotonic_ns() -> u64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    now.tv_sec as u128 * 1_000_000_000 + now.tv_nsec as u128
+    (now.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(now.tv_nsec as u64)
 }
 
 /// `CLOCK_MONOTONIC`'s id in `wp_presentation.clock_id`.
@@ -244,10 +250,11 @@ impl Dispatch<WpPresentationFeedback, FeedbackData> for Host {
                 ..
             } => {
                 target.stats.presented += 1;
-                if host.presentation_clock == Some(CLOCK_MONOTONIC) {
+                let submitted = u128::from(data.submitted_ns.load(Ordering::Relaxed));
+                if host.presentation_clock == Some(CLOCK_MONOTONIC) && submitted > 0 {
                     let secs = (u128::from(tv_sec_hi) << 32) | u128::from(tv_sec_lo);
                     let shown = secs * 1_000_000_000 + u128::from(tv_nsec);
-                    let latency = shown.saturating_sub(data.submitted_ns);
+                    let latency = shown.saturating_sub(submitted);
                     target.stats.last_latency =
                         Some(Duration::from_nanos(latency.min(u64::MAX as u128) as u64));
                 }

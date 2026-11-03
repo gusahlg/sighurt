@@ -639,7 +639,9 @@ impl Host {
     /// `window` is gone: no seat's input goes to it any more.
     pub(crate) fn window_closed(&mut self, window: WindowId) {
         for index in 0..self.seats.len() {
-            self.seats[index].forget_window(window);
+            if let Some(timer) = self.seats[index].forget_window(window) {
+                self.loop_ops.remove(timer);
+            }
             self.sync_text_input(index);
         }
     }

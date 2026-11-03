@@ -81,10 +81,14 @@ impl Keyboard {
 }
 
 impl Seat {
-    /// Drops every reference to `window`, which closed.
-    pub fn forget_window(&mut self, window: WindowId) {
+    /// Drops every reference to `window`, which closed. A key repeating into it stops; its
+    /// timer is handed back for the caller to remove.
+    #[must_use]
+    pub fn forget_window(&mut self, window: WindowId) -> Option<RegistrationToken> {
+        let mut repeat_timer = None;
         if let Some(keyboard) = self.keyboard.as_mut().filter(|k| k.window == Some(window)) {
             keyboard.window = None;
+            repeat_timer = keyboard.take_repeat_timer();
         }
         if let Some(pointer) = self.pointer.as_mut() {
             if pointer
@@ -98,6 +102,7 @@ impl Seat {
         if let Some(ti) = self.text_input.as_mut() {
             ti.forget_window(window);
         }
+        repeat_timer
     }
 
     pub fn new(wl: WlSeat) -> Self {
@@ -663,6 +668,21 @@ impl<K: Copy + PartialEq> PointerRouter<K> {
         }
     }
 
+    /// The device went away: ends a drag (its recipient gets the releases and the leave), or
+    /// else the surface under the pointer gets its leave. Each surface that had the pointer
+    /// gets one leave; one hovered during a drag never got an enter, so it gets none.
+    pub fn drop_device(&mut self, out: &mut Vec<Routed<K>>) {
+        match self.grab {
+            Some(_) => self.cancel(out),
+            None => {
+                if let Some((surface, _)) = self.hover {
+                    out.push(Routed::Leave(surface));
+                }
+            }
+        }
+        self.hover = None;
+    }
+
     /// Ends a drag without its releases: the device went away, or its target did.
     pub fn cancel(&mut self, out: &mut Vec<Routed<K>>) {
         if let Some((grab, last)) = self.grab.take() {
@@ -923,10 +943,7 @@ impl Host {
     fn drop_pointer(&mut self, index: usize) {
         if let Some(mut pointer) = self.seats[index].pointer.take() {
             let mut routed = Vec::new();
-            pointer.router.cancel(&mut routed);
-            if let Some((surface, _)) = pointer.router.hover {
-                routed.push(Routed::Leave(surface));
-            }
+            pointer.router.drop_device(&mut routed);
             self.deliver_pointer(index, routed, None);
             // ThemedPointer's drop releases the wl_pointer and destroys the cursor surface.
         }
@@ -1485,6 +1502,46 @@ mod tests {
                 Routed::Leave(S::Chrome),
             ]
         );
+        assert_eq!(router.target(), None);
+    }
+
+    #[test]
+    fn a_pointer_that_goes_away_leaves_each_surface_once() {
+        // Mid-drag over the surface that got the press.
+        let mut router = PointerRouter::default();
+        let mut out = Vec::new();
+        router.enter(S::Page, at(5.0, 5.0), &Layout, &mut out);
+        router.button(LEFT, ButtonState::Pressed, &Layout, &mut out);
+        out.clear();
+        router.drop_device(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                Routed::Button(S::Page, LEFT, ButtonState::Released, at(5.0, 5.0)),
+                Routed::Leave(S::Page),
+            ]
+        );
+        // Mid-drag over another surface, which never got an enter.
+        let mut router = PointerRouter::default();
+        router.enter(S::Page, at(5.0, 5.0), &Layout, &mut out);
+        router.button(LEFT, ButtonState::Pressed, &Layout, &mut out);
+        router.leave(S::Page, &mut out);
+        router.enter(S::Chrome, at(5.0, 30.0), &Layout, &mut out);
+        out.clear();
+        router.drop_device(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                Routed::Button(S::Page, LEFT, ButtonState::Released, at(5.0, -10.0)),
+                Routed::Leave(S::Page),
+            ]
+        );
+        // No buttons: the surface under the pointer.
+        let mut router = PointerRouter::default();
+        router.enter(S::Chrome, at(5.0, 5.0), &Layout, &mut out);
+        out.clear();
+        router.drop_device(&mut out);
+        assert_eq!(out, vec![Routed::Leave(S::Chrome)]);
         assert_eq!(router.target(), None);
     }
 

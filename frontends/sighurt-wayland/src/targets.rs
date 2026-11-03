@@ -43,6 +43,8 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
@@ -101,8 +103,12 @@ pub(crate) struct Target {
     /// Whether the latest placement shows it (visible, with room).
     pub want_shown: bool,
     pub input: InputRegion,
-    /// The epoch of the last frame submitted.
+    /// The epoch of the last frame submitted since the target was last mapped: unmapping
+    /// clears it, so a target shown again waits for a new frame before it counts as having one.
     pub presented: Option<LayoutEpoch>,
+    /// On a GL target, when the frame that commits the requested presentation feedback was
+    /// submitted: set when the presenter reports the swap, not when the permit is issued.
+    pub gl_feedback: Option<Arc<AtomicU64>>,
     pub clock: FrameClock,
     pub stats: PresentStats,
     pub shm: Option<Swapchain<ShmBuffer>>,
@@ -136,6 +142,7 @@ impl Target {
             want_shown: false,
             input: InputRegion::Whole,
             presented: None,
+            gl_feedback: None,
             clock: FrameClock::new(),
             stats: PresentStats::default(),
             shm: (mode == PresentMode::Shm).then(Swapchain::new),
@@ -152,7 +159,7 @@ impl Target {
     /// Whether an SHM buffer of the current size could be lent now.
     fn buffer_available(&self) -> bool {
         match &self.shm {
-            Some(buffers) => buffers.can_acquire(self.metrics.buffer()),
+            Some(buffers) => buffers.can_acquire(self.metrics.buffer(), Some(self.metrics.epoch())),
             None => true,
         }
     }
@@ -163,21 +170,25 @@ impl Target {
     }
 
     /// Unmaps the target at once by destroying its subsurface role (`wl_subsurface.destroy`
-    /// unmaps immediately). Neither the buffer nor any commit of the leaf is touched, so this
-    /// is safe on a GL leaf too; mapping again creates a new role.
+    /// unmaps immediately). On a GL leaf neither the buffer nor any commit is touched; mapping
+    /// again creates a new role. The frame it showed no longer counts as current: shown again,
+    /// it waits for a new one, since a GL leaf would show its stale buffer and the presenter may
+    /// have nothing to give its first permit.
     pub fn unmap(&mut self) {
         if let Some(role) = self.role.take() {
             role.destroy();
             self.synced = false;
+            self.presented = None;
             self.clock.unmapped();
             if let Some(buffers) = self.shm.as_mut() {
                 if !self.want_shown {
                     // A hidden surface shows nothing: attaching no buffer lets the compositor
                     // release the last one, whose release then frees it (`Swapchain::trim`).
+                    // One only waiting for its late frame keeps its buffers.
                     self.surface.attach(None, 0, 0);
                     self.surface.commit();
+                    buffers.trim();
                 }
-                buffers.trim();
             }
         }
     }
@@ -410,7 +421,8 @@ impl FramePermit {
             return Err(PresentError::WrongMode);
         };
         let bytes = crate::shm::layout(size).map_or(0, |(.., bytes)| bytes);
-        let acquired = buffers.acquire(size, bytes, |key| {
+        let epoch = Some(self.metrics.epoch());
+        let acquired = buffers.acquire(size, epoch, bytes, |key| {
             let data = BufferData {
                 owner: BufferOwner::Target(id),
                 key,
@@ -497,7 +509,7 @@ impl FramePermit {
                 &target.env.qh,
                 FeedbackData {
                     target: target.id,
-                    submitted_ns: crate::scheduler::monotonic_ns(),
+                    submitted_ns: Arc::new(AtomicU64::new(crate::scheduler::monotonic_ns())),
                 },
             );
         }
@@ -547,6 +559,11 @@ impl Drop for FramePermit {
         if outcome == PresentOutcome::Submitted {
             target.stats.submissions += 1;
             target.presented = Some(self.metrics.epoch());
+            // This swap committed the feedback requested with an earlier permit, perhaps one
+            // that came back unused: its frame was submitted now.
+            if let Some(submitted) = target.gl_feedback.take() {
+                submitted.store(crate::scheduler::monotonic_ns(), Ordering::Relaxed);
+            }
         }
     }
 }
@@ -652,9 +669,12 @@ impl Host {
                 if let Some(seq) = t.clock.request_callback() {
                     t.surface.frame(&self.qh, FrameData { target: id, seq });
                     if let Some(presentation) = &self.globals.presentation {
+                        // Timed when a permit reports the swap that commits it.
+                        let submitted = Arc::new(AtomicU64::new(0));
+                        t.gl_feedback = Some(Arc::clone(&submitted));
                         let feedback = FeedbackData {
                             target: id,
-                            submitted_ns: crate::scheduler::monotonic_ns(),
+                            submitted_ns: submitted,
                         };
                         presentation.feedback(&t.surface, &self.qh, feedback);
                     }
@@ -670,6 +690,12 @@ impl Host {
                 outcome: None,
             });
         }
+    }
+
+    /// Whether `target` is still leased: every placement of its window must list it, even once
+    /// the application has forgotten the view it was made for.
+    pub fn is_live(&self, target: TargetId) -> bool {
+        self.targets.get(&target).is_some_and(|t| t.borrow().leased)
     }
 
     /// Forgets targets whose leases are gone. Their native objects are destroyed when the last
@@ -703,5 +729,93 @@ impl Host {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+
+    use sighurt_api::geometry::Scale;
+    use wayland_client::EventQueue;
+
+    use super::*;
+
+    /// A target on inert proxies: its bookkeeping, with nothing sent to any compositor. The
+    /// connection and queue keep the queue handle valid.
+    fn target(mode: PresentMode) -> (Rc<RefCell<Target>>, Connection, EventQueue<Host>) {
+        let (ours, _theirs) = UnixStream::pair().expect("a socket pair");
+        let conn = Connection::from_socket(ours).expect("a connection");
+        let queue = conn.new_event_queue::<Host>();
+        let weak = conn.backend().downgrade();
+        let env = Rc::new(Env {
+            qh: queue.handle(),
+            shm: WlShm::inert(weak.clone()),
+            presentation: None,
+        });
+        let rect = WindowRect {
+            x: 0,
+            y: 40,
+            width: 800,
+            height: 560,
+        };
+        let metrics = Metrics::new(LayoutEpoch::next(), rect, Scale::ONE);
+        let surface = WlSurface::inert(weak.clone());
+        let mut t = Target::new(WindowId::next(), None, mode, env, surface, None, metrics);
+        t.placed = true;
+        t.want_shown = true;
+        t.role = Some(WlSubsurface::inert(weak));
+        (Rc::new(RefCell::new(t)), conn, queue)
+    }
+
+    fn permit(target: &Rc<RefCell<Target>>, outcome: PresentOutcome) -> FramePermit {
+        let (id, metrics) = {
+            let t = target.borrow();
+            (t.id, t.metrics)
+        };
+        FramePermit {
+            target: Rc::clone(target),
+            id,
+            view: None,
+            metrics,
+            outcome: Some(outcome),
+        }
+    }
+
+    #[test]
+    fn unmapping_clears_the_current_frame() {
+        for mode in [PresentMode::Gl, PresentMode::Shm] {
+            let (target, _conn, _queue) = target(mode);
+            drop(permit(&target, PresentOutcome::Submitted));
+            assert!(target.borrow().has_current_frame());
+            // Hidden (a background tab), then shown again at the same layout.
+            target.borrow_mut().want_shown = false;
+            target.borrow_mut().unmap();
+            target.borrow_mut().want_shown = true;
+            let t = target.borrow();
+            assert!(t.role.is_none());
+            assert!(
+                !t.has_current_frame(),
+                "{mode:?}: shown again, it waits for a new frame"
+            );
+        }
+    }
+
+    #[test]
+    fn gl_presentation_latency_counts_from_the_swap() {
+        let (target, _conn, _queue) = target(PresentMode::Gl);
+        let submitted = Arc::new(AtomicU64::new(0));
+        target.borrow_mut().gl_feedback = Some(Arc::clone(&submitted));
+        // The permit that requested the feedback came back without a swap.
+        drop(permit(&target, PresentOutcome::NotReady));
+        drop(permit(&target, PresentOutcome::Unchanged));
+        assert_eq!(submitted.load(Ordering::Relaxed), 0);
+        let before = crate::scheduler::monotonic_ns();
+        drop(permit(&target, PresentOutcome::Submitted));
+        assert!(submitted.load(Ordering::Relaxed) >= before);
+        assert!(
+            target.borrow().gl_feedback.is_none(),
+            "that swap carried it"
+        );
     }
 }

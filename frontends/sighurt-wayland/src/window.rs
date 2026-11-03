@@ -180,7 +180,7 @@ impl Window {
                     return;
                 };
                 let owner = BufferOwner::Root(self.id);
-                let acquired = buffers.acquire(buffer_size, bytes, |key| {
+                let acquired = buffers.acquire(buffer_size, None, bytes, |key| {
                     ShmBuffer::new(&env.shm, &env.qh, buffer_size, BufferData { owner, key })
                 });
                 // Without a free buffer the old one stays until the next resize.
