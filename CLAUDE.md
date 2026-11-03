@@ -28,7 +28,8 @@ The user's machines are shared with another Claude session. Breaking these rules
 | Layer | Crate | Owns | Does not own |
 |---|---|---|---|
 | Browser core | `sighurt-core` | Tabs, engine selection, commands, navigation coordination, permission decisions, session state | Windows, surfaces, glyphs, GPU contexts, any I/O |
-| Chrome | `sighurt-ui` (the standard chrome and the chrome API), `sighurt-chrome-line` | Address/command editing, chrome layout, hit testing, CPU painting | Web layout, engine internals, guest permissions, what a key does (the keymap's) |
+| Chrome | `sighurt-ui` (the standard chrome and the chrome API), `sighurt-chrome-line` | Address/command editing, chrome layout, hit testing, drawing scenes | Web layout, engine internals, guest permissions, what a key does (the keymap's), pixels |
+| Render | `sighurt-render` (`docs/rewrite/RENDER.md`) | Scenes and the pen chromes draw with, text shaping and glyph rasterization, the `Backend` trait, the CPU backend | Host targets and Wayland objects, what is drawn, browser state |
 | Wayland host | `sighurt-wayland` | Connection, surface roles, target lifetime, placement, scaling, input normalization, SHM presentation, frame scheduling | DOM layout, guest execution, engine rendering |
 | Engines | `sighurt-engine-*` | Interpreting, running and rendering content; engine-local state and history | Tab policy, the chrome, global commands |
 | Runtime | `sighurt-runtime` | Frontend-neutral: config and session files, the engine registry and descriptors, carrying out effects, OS services, diagnostics, shutdown; the `Frontend` trait | Browser policy, windows, terminals, pixels |
@@ -38,7 +39,7 @@ The user's machines are shared with another Claude session. Breaking these rules
 
 - **Engines are compiled in and run in-process; there is no IPC.** Cargo features on `sighurt-browser` (`engine-servo`, `engine-wasm`, `engine-wpe`, `engine-demo`, `engine-cef`, `engine-ladybird`, `engine-netsurf`) decide which engines exist. The `default = [...]` line in `apps/sighurt-browser/Cargo.toml` is what a default `sig` contains (Servo, Wasm and WPE WebKit). `engine-cef`, `engine-ladybird` and `engine-netsurf` are in no default set. Runtime configuration decides which compiled engines may open pages: Servo is the default engine; the others open what `[routing.<name>]` and `page.open-in <name>` give them. `page.switch-engine` cycles the enabled web engines in descriptor order: servo, wpe, ladybird, cef, netsurf. One runtime per engine kind serves all of its views. Keymaps and chromes are compiled in the same way (`chrome-line`).
 - **The host creates every surface**: the root `xdg_toplevel` (an opaque fallback), a subsurface for each surface the chrome names (at most 8), one page subsurface per live view (mapped only while selected), and overlays. The chrome and the engines present into host-managed targets through a target lease and a per-layout frame permit; the desktop compositor combines the surfaces.
-- **The chrome is drawn on the CPU** with cosmic-text and tiny-skia into shared-memory buffers. GPUI is gone.
+- **The chrome draws scenes; a renderer renders them.** A chrome records each surface with sighurt-render's `Pen` (window-logical, no pixels); the backend `[ui] renderer` names (`auto`, `cpu`, `wgpu`, `vulkan`; this build has `cpu`, which `auto` picks) renders it. The CPU backend draws with tiny-skia and cosmic-text into shared-memory buffers, and commits nothing when a surface's scene and metrics are those of its last frame. One font system, loaded once, is shared by the chrome and the backend. GPUI is gone.
 - **Servo presents GL straight into its subsurface** (`WindowRenderingContext` on surfman). The normal display path never reads page pixels back to the CPU.
 - **WPE WebKit attaches its DMA-BUFs to its subsurface** (the WPE Platform API; WebKit's UI-process half runs on the owner thread, its pages in WebKit's own web processes). Where the compositor has no DMA-BUF, it falls back to shared memory with one copy per frame, counted and reported as the fallback.
 - **CEF presents CPU frames from Chromium's `OnPaint`** (dirty rectangles into a staging buffer, then the whole frame into the host's lease). `libcef.so` is `dlopen`ed when the runtime first starts, from the prefix `nix/build-cef.sh` installs (`SIGHURT_CEF_PREFIX`, `nix/cef.nix`, `/data/sig-builds/deps/cef-150.0.22`). Chromium's renderer, GPU and network processes are `sig-cef-helper`. CEF's UI thread runs its multi-threaded message loop; callbacks only queue events and wake the owner. Chromium needs a Wayland or X11 display even windowless, so the runtime refuses to start when the session has neither `WAYLAND_DISPLAY` nor `DISPLAY` (in the terminal, only with a display). No `semantics`, so no text mode and no `--dump`.
@@ -56,6 +57,7 @@ sighurt/
 ├── crates/        sighurt-api, sighurt-core, sighurt-runtime
 ├── frontends/     sighurt-gui, sighurt-tui, sighurt-wayland
 ├── ui/            sighurt-ui
+├── render/        sighurt-render
 ├── engines/       sighurt-engine-servo, sighurt-engine-wpe, sighurt-engine-wasm,
 │                  sighurt-engine-demo, sighurt-engine-cef, sighurt-engine-ladybird,
 │                  sighurt-engine-netsurf, sighurt-semantic
@@ -72,7 +74,8 @@ sighurt/
 | `sighurt-api` | `ids`, `geometry`, `input`, `engine`, `events`, `services`, `commands`, `settings`, `keymap` | None, and no third-party crates |
 | `sighurt-core` | `state`, `tabs`, `navigation`, `router`, `commands`, `keys`, `permissions`, `config`, `session` | api |
 | `sighurt-wayland` | `connection`, `window`, `targets`, `placement`, `scale`, `input`, `text_input`, `clipboard`, `scheduler`, `shm` | api |
-| `sighurt-ui` | `state`, `layout`, `hit_test`, `text_edit`, `text`, `chrome`, `canvas`, `paint_cpu`, `accessibility`, `extension` (the chrome API), `standard` (the standard chrome through it) | api (it paints into memory the host lends it) |
+| `sighurt-ui` | `state`, `layout`, `hit_test`, `text_edit`, `text` (sighurt-render's, re-exported), `chrome`, `paint` (the standard chrome's scenes), `accessibility`, `extension` (the chrome API), `standard` (the standard chrome through it) | api, render (it draws scenes, never pixels) |
+| `sighurt-render` | `color` (`Rgba`), `scene` (items, clips, the shared snapping and glyph placement), `pen` (the scene builder), `text` (`Fonts`, `ShapedText`, `TextStyle`, the shared `FontSystemHandle`), `glyph` (rasterizing one glyph), `backend` (the `Backend` trait, `Output`, `Rendered`, `RenderError`), `cpu` (`CpuBackend`) | api; the only crate that names cosmic-text or tiny-skia |
 | `sighurt-chrome-line` | `lib` (the line chrome, through the chrome API alone) | api, ui |
 | `sighurt-config-example` | `lib` (the example configuration, the default keymap `example`: modes and key sequences), `table` (its bindings, in Rust), `actions` (what it computes from the browser view) | api |
 | `sighurt-engine-servo` | `runtime`, `view`, `delegate`, `presentation`, `offscreen` (the terminal's GL context), `input`, `navigation`, `semantic` (page text) | api, wayland, semantic; Servo 0.7 |
@@ -85,13 +88,14 @@ sighurt/
 | `sighurt-semantic` | `extract` (the DOM extraction script), `parse` (its bounded JSON parser), `action` (action scripts), `world` | api; shared by the Servo and WPE adapters |
 | `sighurt-tui` | `app` (the owner loop and its `Frontend`), `term` (terminal I/O, parser, capability probe), `grid`, `chrome` (the terminal chrome), `input`, `kitty` and `sixel` (graphics encoders), `target` (the page's CPU target), `engines` (compiled-in engines bound to it), `text` and `textmode` (reflowing a semantic snapshot), `sanitize`, `dump` (`sig --dump`); binary `sighurt-tui-worker` | api, core, runtime; engines optional (never wayland or ui) |
 | `sighurt-runtime` | `session` (the core, effects, pumps, presenting, shutdown), `frontend`, `registry`, `engines` (descriptors), `view`, `services`, `persistence`, `diagnostics` | api, core; engines optional (never wayland or ui types in its own code) |
-| `sighurt-gui` | `app` (the owner loop), `chrome`, `engines` (engines bound to Wayland targets) | api, core, runtime, wayland, ui; engines optional |
+| `sighurt-gui` | `app` (the owner loop), `chrome`, `render` (the renderers, `RENDERERS`, and `[ui] renderer`), `engines` (engines bound to Wayland targets) | api, core, runtime, wayland, ui, render; engines optional |
 | `sighurt-browser` | `main` | runtime, gui; engines optional |
 | `sighurt-sdk` | The guest-side Wasm API | None: independent of every native crate |
 
 - `sighurt-core` compiles and tests without GPUI, Wayland, Servo, Wasmtime or a graphics driver.
 - `sighurt-api` holds no `gpui::Entity`, `wl_surface`, `Rc<Servo>`, graphics-API type or `Any` escape hatch. It is an internal contract rebuilt with the workspace, not a plugin ABI.
-- Only the executable chooses which engines, keymaps and chromes are installed.
+- Only the executable chooses which engines, keymaps, chromes and renderers are installed.
+- `sighurt-render` never depends on sighurt-wayland (a native backend gets raw-window-handle handles) and is the only crate naming tiny-skia or cosmic-text; `sighurt-runtime` and `sighurt-tui` never depend on it. The GPU backends are their own crates (`render/sighurt-render-wgpu`, `render/sighurt-render-vulkan`) behind the features `render-wgpu` and `render-vulkan` on `sighurt-browser` and `sighurt-gui` (RENDER.md lanes 2 and 3; not built yet).
 - Engines talk outward through typed events and service requests, never through a reference to the browser.
 - Rendering choices never change tab or navigation state types.
 - Network and filesystem effects live in the executable; the core may parse and validate.
@@ -104,7 +108,7 @@ sighurt/
 # Crates that need neither Servo, WPE WebKit nor Wasmtime. CEF and Ladybird compile without
 # their prefixes (they are dlopen'd at run time). NetSurf's build.rs compiles its C core and
 # needs the nix-shell's SIGHURT_NETSURF_* variables, so it is not in this list.
-tools/cargo check -p sighurt-api -p sighurt-core -p sighurt-wayland -p sighurt-ui -p sighurt-engine-demo -p sighurt-chrome-line -p sighurt-config-example -p sighurt-engine-cef -p sighurt-engine-ladybird
+tools/cargo check -p sighurt-api -p sighurt-core -p sighurt-wayland -p sighurt-ui -p sighurt-render -p sighurt-engine-demo -p sighurt-chrome-line -p sighurt-config-example -p sighurt-engine-cef -p sighurt-engine-ladybird
 tools/cargo check -p sighurt-browser --no-default-features
 tools/cargo test -p sighurt-api -p sighurt-core
 tools/cargo clippy -p <crate> --all-targets -- -D warnings
@@ -211,8 +215,9 @@ SIG_WHAT="servo build" tools/cargo test -p sighurt-browser -p sighurt-runtime -p
 - A command string is parsed once into `sighurt_api::commands::Command`; unknown names and bad arguments are errors when the configuration loads. `Display` gives the canonical string back. The core carries commands out, except `location.focus`, which the chrome handles. Keys and buttons use the same path; don't add a second one.
 - To add a command: a variant in `Command` (and `NAMES`, `name`, parsing, `Display`), its handling in `sighurt-core`, the command list in `crates/sighurt-core/src/default-config.toml`, and the README's command table.
 - **Keys live only in the configuration**: the example configuration crate (the default, in Rust) or the `bindings` keymap's `[keys]` tables. The core, the frontends and the chromes bind no keys; a frontend's chrome handles only its own editing keys (Enter, Escape, arrows, Ctrl+A/C/X/V in the address line). A keymap reads the browser through the read-only `sighurt_api::keymap::Browser` view and may return several commands (`KeyAction::RunAll`); it changes nothing itself. Bindings match the layout's key value by default and the physical key when a binding asks for it; AltGr is never Ctrl+Alt. A consumed key press also consumes its release.
+- Renderers are compiled in too and chosen by `[ui] renderer` at startup (`auto` by default); they are listed in `sighurt-gui`'s `render` (`RENDERERS`). The core accepts every project renderer name (`sighurt_core::config::RENDERERS`, in `Environment::renderers` for both frontends and `--dump`); a window built without the one named says so and uses `auto`.
 - Keymaps and chromes are compiled in and chosen like engines (`docs/rewrite/extension-api.md`): a keymap implements `sighurt_api::keymap::Keymap` and is chosen by `[input] keymap` (`example`, the example configuration, by default; the core's `bindings` reads `[keys]`); a chrome implements `sighurt_ui::extension::Chrome` and is chosen by `[ui] chrome` at startup (`standard` by default). Keymaps are listed in `sighurt-runtime`'s `registry` (`KEYMAPS`), chromes in `sighurt-gui`'s `chrome` (`CHROMES`); the defaults go through the same traits.
-- Configuration is TOML: `{config_dir}/sighurt/config.toml` over built-in defaults (`crates/sighurt-core/src/default-config.toml`, which documents every setting), with a schema version, still 1. The core parses and validates it against the build (its engines, keymaps and chromes); the executable reads the file. Unknown keys are errors; a table for something the build lacks gets a notice. An invalid reload keeps the previous configuration and reports the problem. Everything applies live except `[ui] chrome` and the engines' own settings (`[engines.<name>]`), which need a restart.
+- Configuration is TOML: `{config_dir}/sighurt/config.toml` over built-in defaults (`crates/sighurt-core/src/default-config.toml`, which documents every setting), with a schema version, still 1. The core parses and validates it against the build (its engines, keymaps and chromes); the executable reads the file. Unknown keys are errors; a table for something the build lacks gets a notice. An invalid reload keeps the previous configuration and reports the problem. Everything applies live except `[ui] chrome`, `[ui] renderer` and the engines' own settings (`[engines.<name>]`), which need a restart.
 
 ## The engine contract
 
@@ -378,7 +383,7 @@ The engine has no widget kit: guests draw their own UI with the canvas API and p
 - Every changed line should trace directly to the request.
 
 **Verify your work.**
-- `sighurt-api`, `-core`, `-wayland`, `-ui`, `-engine-demo`: `tools/cargo check`, `test` and `clippy -- -D warnings` on the crate.
+- `sighurt-api`, `-core`, `-wayland`, `-ui`, `-render`, `-engine-demo`: `tools/cargo check`, `test` and `clippy -- -D warnings` on the crate. A change to the CPU backend or a chrome's drawing must keep the golden images (`ui/sighurt-ui/tests/golden`, `extensions/sighurt-chrome-line/tests/golden`) pixel for pixel, or say why.
 - `sighurt-browser`, `sighurt-runtime`, `sighurt-gui`: `tools/cargo check -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features`, plus `--features engine-demo`, plus the feature sets your change touches (`--all-features` covers them all). `sighurt-runtime`'s own code never names a `sighurt_wayland` or `sighurt_ui` type.
 - `sighurt-engine-servo`, `sighurt-engine-wpe`, or anything built with them: `SIG_WHAT="servo build" tools/cargo check -p <crate>` (and `-p sighurt-browser` with its default features), on louise-pc when the desktop is busy.
 - `sighurt-engine-cef`, `sighurt-engine-ladybird`: `tools/cargo check -p <crate>` compiles with no prefix. Running them needs the prefix or the shim, and for CEF a display, under `tools/headless-sway`.
