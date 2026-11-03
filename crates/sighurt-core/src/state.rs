@@ -104,6 +104,10 @@ pub struct Environment {
     pub chromes: Vec<ChromeChecks>,
     /// The color names `[ui.colors]` takes: the chrome's (`sighurt_ui::Colors::NAMES`).
     pub color_names: &'static [&'static str],
+    /// The names `[ui] renderer` takes: every renderer of the project
+    /// ([`crate::config::RENDERERS`]), the same in both frontends and `--dump`, so one file
+    /// serves every build. A window built without the one named uses `auto` and says so.
+    pub renderers: &'static [&'static str],
     /// Which frontend is running. [`Frontend::Gui`] when left out, which keeps the window's
     /// chrome checks.
     pub frontend: Frontend,
@@ -428,6 +432,8 @@ pub struct BrowserState {
     indicator: Option<String>,
     /// The chrome `sig` runs: the configuration's when it started.
     chrome: String,
+    /// `[ui] renderer` when `sig` started: what the window chose its renderer by.
+    renderer: String,
     /// The settings each engine of the build starts with: the configuration's when `sig`
     /// started.
     launched: BTreeMap<String, EngineSettings>,
@@ -777,6 +783,7 @@ impl BrowserState {
             seat: SeatId::next(),
             indicator: None,
             chrome: config.chrome().to_owned(),
+            renderer: config.renderer().to_owned(),
             launched: env
                 .engines
                 .keys()
@@ -967,6 +974,14 @@ impl BrowserState {
                  then.",
                 config.chrome(),
                 self.chrome
+            ));
+        }
+        if config.renderer() != self.renderer && self.env.frontend == Frontend::Gui {
+            notices.push(format!(
+                "[ui] renderer = {:?} applies when sig starts again; the chrome is drawn as \
+                 [ui] renderer = {:?} says until then.",
+                config.renderer(),
+                self.renderer
             ));
         }
         for (engine, settings) in &self.launched {

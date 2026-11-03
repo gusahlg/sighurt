@@ -1,5 +1,5 @@
 //! What the integration tests share: a chrome with the bundled test font, snapshots, and
-//! painting into a wl_shm-style buffer.
+//! rendering its scenes with the CPU backend into a wl_shm-style buffer.
 
 #![allow(dead_code)]
 
@@ -7,22 +7,42 @@ use std::path::PathBuf;
 
 use sighurt_api::geometry::{LogicalSize, Metrics, Scale, WindowRect};
 use sighurt_api::ids::{LayoutEpoch, TabId};
+use sighurt_render::{
+    Backend, CpuBackend, Output, PixelBuffer, RenderError, Rendered, Scene, SurfaceKey,
+};
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::extension::SurfaceName;
 use sighurt_ui::{
-    Colors, CpuPainter, EngineRow, Fonts, HomeInfo, LayoutOptions, Model, PixelBuffer, Snapshot,
+    Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, LayoutOptions, Model, Pen, Snapshot,
     TabContent, TabSnapshot,
 };
 use tiny_skia::{IntSize, Pixmap};
 
-/// The bundled test font (see tests/fonts/README.md).
-pub const FONT: &[u8] = include_bytes!("../fonts/Cantarell-Regular.ttf");
+/// The bundled test font (see render/sighurt-render/tests/fonts/README.md).
+pub const FONT: &[u8] =
+    include_bytes!("../../../../render/sighurt-render/tests/fonts/Cantarell-Regular.ttf");
+
+thread_local! {
+    /// The test font's font system, shared by this thread's chromes and backends as `sig`
+    /// shares its own.
+    static FONT_SYSTEM: FontSystemHandle = Fonts::from_data([FONT.to_vec()]).handle();
+}
+
+/// The shared font system with the test font.
+pub fn font_system() -> FontSystemHandle {
+    FONT_SYSTEM.with(FontSystemHandle::clone)
+}
 
 /// The scales the tests cover, as numerators over 120: 100 %, 125 %, 150 % and 200 %.
 pub const SCALES: [u32; 4] = [120, 150, 180, 240];
 
 pub fn fonts() -> Fonts {
-    Fonts::from_data([FONT.to_vec()])
+    Fonts::new(font_system())
+}
+
+/// A CPU backend rasterizing from the shared font system.
+pub fn backend() -> CpuBackend {
+    CpuBackend::new(font_system())
 }
 
 /// A chrome for a window of `width` × `height` showing `snapshot`.
@@ -167,25 +187,49 @@ pub fn metrics(rect: WindowRect, scale: u32) -> Metrics {
     )
 }
 
-/// Paints `chrome`'s `surface` at `scale` (over 120) and reads the buffer back.
-pub fn paint(chrome: &mut Model, surface: SurfaceName, scale: u32) -> Image {
-    let metrics = metrics(rect_of(chrome, surface), scale);
+/// The scene of `chrome`'s `surface` placed for `metrics`.
+pub fn scene(chrome: &mut Model, surface: SurfaceName, metrics: &Metrics) -> Scene {
+    let mut pen = Pen::new(metrics.rect());
+    sighurt_ui::paint::draw(&mut pen, chrome, surface);
+    pen.finish()
+}
+
+/// Renders `scene` for `metrics` with `backend` into `data`, rows `stride` bytes apart.
+pub fn render_into(
+    backend: &mut CpuBackend,
+    scene: &Scene,
+    metrics: &Metrics,
+    data: &mut [u8],
+    (width, height, stride): (u32, u32, usize),
+) -> Result<Rendered, RenderError> {
+    let buffer = PixelBuffer {
+        data,
+        width,
+        height,
+        stride,
+    };
+    backend.render(SurfaceKey(1), metrics, scene, Output::Pixels(buffer))
+}
+
+/// Renders `scene` for `metrics` with a new CPU backend and reads the buffer back.
+pub fn render(scene: &Scene, metrics: &Metrics) -> Image {
     let size = metrics.buffer();
     let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
-    let buffer = PixelBuffer {
-        data: &mut data,
-        width: size.width,
-        height: size.height,
-        stride: size.width as usize * 4,
-    };
-    CpuPainter::new()
-        .paint(chrome, surface, &metrics, buffer)
-        .unwrap();
+    let layout = (size.width, size.height, size.width as usize * 4);
+    let rendered = render_into(&mut backend(), scene, metrics, &mut data, layout);
+    assert_eq!(rendered, Ok(Rendered::Submitted));
     Image {
         width: size.width,
         height: size.height,
         rgba: argb_to_rgba(&data),
     }
+}
+
+/// Draws `chrome`'s `surface` at `scale` (over 120), renders it with the CPU backend and reads
+/// the buffer back.
+pub fn paint(chrome: &mut Model, surface: SurfaceName, scale: u32) -> Image {
+    let metrics = metrics(rect_of(chrome, surface), scale);
+    render(&scene(chrome, surface, &metrics), &metrics)
 }
 
 /// wl_shm ARGB8888 (little-endian: B, G, R, A) to R, G, B, A.

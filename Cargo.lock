@@ -10299,6 +10299,7 @@ name = "sighurt-chrome-line"
 version = "0.10.0"
 dependencies = [
  "sighurt-api",
+ "sighurt-render",
  "sighurt-ui",
  "tiny-skia 0.11.4",
 ]
@@ -10463,9 +10464,22 @@ dependencies = [
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",
+ "sighurt-render",
  "sighurt-runtime",
  "sighurt-ui",
  "sighurt-wayland",
+]
+
+[[package]]
+name = "sighurt-render"
+version = "0.10.0"
+dependencies = [
+ "cosmic-text",
+ "log",
+ "raw-window-handle",
+ "sighurt-api",
+ "tiny-skia 0.11.4",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -10535,9 +10549,8 @@ dependencies = [
 name = "sighurt-ui"
 version = "0.10.0"
 dependencies = [
- "cosmic-text",
- "log",
  "sighurt-api",
+ "sighurt-render",
  "tiny-skia 0.11.4",
  "unicode-segmentation",
  "url",

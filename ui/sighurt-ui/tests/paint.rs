@@ -1,5 +1,6 @@
-//! The CPU painter: golden images of chrome states at 100 %, 125 %, 150 % and 200 %, and the
-//! buffer rules (whole repaints, strides with padding, sizes).
+//! The standard chrome's drawing, rendered by the CPU backend: golden images of chrome states at
+//! 100 %, 125 %, 150 % and 200 %, and the buffer rules (whole repaints, strides with padding,
+//! sizes, an unchanged scene).
 //!
 //! Golden images are in tests/golden/. They use the bundled test font, so they don't depend on
 //! the machine's fonts. After an intended change of the look, regenerate them with
@@ -15,9 +16,10 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerButton,
     PointerEvent, Preedit, TextInputEvent,
 };
+use sighurt_render::{Backend, RenderError, Rendered};
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::layout::{Status, Tabs};
-use sighurt_ui::{Colors, CpuPainter, LayoutOptions, Model, PaintError, PixelBuffer, TabContent};
+use sighurt_ui::{Colors, LayoutOptions, Model, TabContent};
 use tiny_skia::{IntSize, Pixmap};
 
 fn key(key: Key, text: Option<&str>) -> KeyEvent {
@@ -351,16 +353,26 @@ fn paints_cover_the_whole_buffer() {
     let mut data: Vec<u8> = (0..size.width * size.height * 4)
         .map(|i| (i * 7) as u8)
         .collect();
-    let buffer = PixelBuffer {
-        data: &mut data,
-        width: size.width,
-        height: size.height,
-        stride: size.width as usize * 4,
-    };
-    CpuPainter::new()
-        .paint(&mut chrome, CHROME, &metrics, buffer)
-        .unwrap();
+    let scene = scene(&mut chrome, CHROME, &metrics);
+    let layout = (size.width, size.height, size.width as usize * 4);
+    let mut backend = backend();
+    let rendered = render_into(&mut backend, &scene, &metrics, &mut data, layout);
+    assert_eq!(rendered, Ok(Rendered::Submitted));
     assert!(argb_to_rgba(&data) == fresh.rgba, "garbage showed through");
+    // The same scene for the same metrics again is the frame the surface shows: nothing is
+    // rendered, and the buffer lent is untouched.
+    let mut other = vec![0x5a; data.len()];
+    let rendered = render_into(&mut backend, &scene, &metrics, &mut other, layout);
+    assert_eq!(rendered, Ok(Rendered::Unchanged));
+    assert!(other.iter().all(|&b| b == 0x5a));
+    // New metrics (another layout epoch), or a surface the backend forgot, render again.
+    let moved = self::metrics(rect, 150);
+    let rendered = render_into(&mut backend, &scene, &moved, &mut other, layout);
+    assert_eq!(rendered, Ok(Rendered::Submitted));
+    backend.unbind(sighurt_render::SurfaceKey(1));
+    let rendered = render_into(&mut backend, &scene, &moved, &mut other, layout);
+    assert_eq!(rendered, Ok(Rendered::Submitted));
+    assert!(argb_to_rgba(&other) == fresh.rgba);
 }
 
 /// Rows with padding get the same pixels, and the padding is left alone.
@@ -376,16 +388,10 @@ fn padded_strides() {
         let stride = row + 12;
         // The last row needs no padding after it.
         let mut data = vec![0xab; stride * (size.height as usize - 1) + row];
-        let buffer = PixelBuffer {
-            data: &mut data,
-            width: size.width,
-            height: size.height,
-            stride,
-        };
-        let mut painter = CpuPainter::new();
-        painter
-            .paint(&mut chrome, CHROME, &metrics, buffer)
-            .unwrap();
+        let scene = scene(&mut chrome, CHROME, &metrics);
+        let layout = (size.width, size.height, stride);
+        let rendered = render_into(&mut backend(), &scene, &metrics, &mut data, layout);
+        assert_eq!(rendered, Ok(Rendered::Submitted));
         for (y, line) in data.chunks(stride).enumerate() {
             let expected = &packed.rgba[y * row..(y + 1) * row];
             assert!(
@@ -403,44 +409,22 @@ fn bad_buffers_are_refused() {
     let metrics = metrics(chrome.layout().chrome, 150);
     let size = metrics.buffer();
     let mut data = vec![0; size.width as usize * size.height as usize * 4];
-    let mut painter = CpuPainter::new();
-    let wrong_size = PixelBuffer {
-        data: &mut data,
-        width: size.width - 1,
-        height: size.height,
-        stride: size.width as usize * 4,
+    let scene = scene(&mut chrome, CHROME, &metrics);
+    let mut backend = backend();
+    let (width, height, row) = (size.width, size.height, size.width as usize * 4);
+    let refused = |result: Result<Rendered, RenderError>| {
+        assert!(matches!(result, Err(RenderError::Output(_))), "{result:?}");
     };
-    let result = painter.paint(&mut chrome, CHROME, &metrics, wrong_size);
-    assert!(
-        matches!(result, Err(PaintError::WrongSize { .. })),
-        "{result:?}"
-    );
-    let short_stride = PixelBuffer {
-        data: &mut data,
-        width: size.width,
-        height: size.height,
-        stride: 4,
-    };
-    let result = painter.paint(&mut chrome, CHROME, &metrics, short_stride);
-    assert_eq!(result, Err(PaintError::WrongLayout));
+    let mut render =
+        |data: &mut [u8], layout| render_into(&mut backend, &scene, &metrics, data, layout);
+    refused(render(&mut data, (width - 1, height, row)));
+    refused(render(&mut data, (width, height, 4)));
     let len = data.len();
-    let short_memory = PixelBuffer {
-        data: &mut data[..len - 1],
-        width: size.width,
-        height: size.height,
-        stride: size.width as usize * 4,
-    };
-    let result = painter.paint(&mut chrome, CHROME, &metrics, short_memory);
-    assert_eq!(result, Err(PaintError::WrongLayout));
-    // An empty target paints nothing, successfully.
+    refused(render(&mut data[..len - 1], (width, height, row)));
+    // An empty target renders nothing, successfully.
     let empty = self::metrics(WindowRect::default(), 150);
-    let nothing = PixelBuffer {
-        data: &mut [],
-        width: 0,
-        height: 0,
-        stride: 0,
-    };
-    assert_eq!(painter.paint(&mut chrome, CHROME, &empty, nothing), Ok(()));
+    let rendered = render_into(&mut backend, &scene, &empty, &mut [], (0, 0, 0));
+    assert_eq!(rendered, Ok(Rendered::Submitted));
 }
 
 /// Odd window sizes paint at every scale without trouble, and the chrome is opaque.
@@ -528,6 +512,7 @@ fn measure_with_system_fonts() {
 
     let start = Instant::now();
     let fonts = Fonts::system();
+    let handle = fonts.handle();
     println!(
         "Fonts::system: {:?}, family {:?}",
         start.elapsed(),
@@ -543,20 +528,17 @@ fn measure_with_system_fonts() {
     chrome.set_snapshot(snapshot.clone());
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     for scale in SCALES {
-        let mut painter = CpuPainter::new();
+        let mut backend = sighurt_render::CpuBackend::new(handle.clone());
         let rect = chrome.layout().chrome;
-        let metrics = metrics(rect, scale);
-        let size = metrics.buffer();
+        let size = metrics(rect, scale).buffer();
         let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
         let mut time = |chrome: &mut Model, data: &mut Vec<u8>| {
+            // A new layout epoch each time, so the scene is rendered, not found unchanged.
+            let metrics = metrics(rect, scale);
             let start = Instant::now();
-            let buffer = PixelBuffer {
-                data,
-                width: size.width,
-                height: size.height,
-                stride: size.width as usize * 4,
-            };
-            painter.paint(chrome, CHROME, &metrics, buffer).unwrap();
+            let scene = scene(chrome, CHROME, &metrics);
+            let layout = (size.width, size.height, size.width as usize * 4);
+            render_into(&mut backend, &scene, &metrics, data, layout).unwrap();
             start.elapsed()
         };
         let cold = time(&mut chrome, &mut data);
@@ -578,7 +560,18 @@ fn measure_with_system_fonts() {
     home.tabs[2].active = true;
     chrome.set_snapshot(home);
     let start = Instant::now();
-    let image = paint(&mut chrome, PAGE, 240);
+    let metrics = metrics(chrome.layout().page, 240);
+    let scene = scene(&mut chrome, PAGE, &metrics);
+    let size = metrics.buffer();
+    let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
+    let layout = (size.width, size.height, size.width as usize * 4);
+    let mut backend = sighurt_render::CpuBackend::new(handle);
+    render_into(&mut backend, &scene, &metrics, &mut data, layout).unwrap();
+    let image = Image {
+        width: size.width,
+        height: size.height,
+        rgba: argb_to_rgba(&data),
+    };
     println!(
         "home page at 200 % ({}×{}): {:?}",
         image.width,

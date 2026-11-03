@@ -6,24 +6,26 @@
 //! (`sighurt_ui::extension`): one target for each name the chrome has used, at most
 //! `MAX_SURFACES`; a listed surface at its rectangle clipped to the window, taking input on its
 //! input area clipped to it; a name no longer listed hidden at its last rectangle. It is plain
-//! bookkeeping: the owner loop creates a target for each name it hasn't seen and hands the
-//! placement to the host, which validates it. [`ChromeTargets::place_into`] writes that
+//! bookkeeping: the owner loop creates a target for each name it hasn't seen, presenting the
+//! way the renderer does ([`ChromeTargets::mode`]), and hands the placement to the host, which
+//! validates it. [`ChromeTargets::place_into`] writes that
 //! placement into a caller-owned [`Placing`] and reuses the caller's lists. The chromes of the
 //! build are listed here
 //! ([`CHROMES`]), compiled in and chosen by `[ui] chrome` at startup.
 //!
-//! Must not own: the chrome's layout and painting (the chrome), browser state (the core), or
-//! targets' lifetimes (the owner loop and the host).
+//! Must not own: the chrome's layout and drawing (the chrome), rendering (the renderer), browser
+//! state (the core), or targets' lifetimes (the owner loop and the host).
 
 use sighurt_api::geometry::{LogicalSize, SurfaceRect, WindowRect};
 use sighurt_core::config::Config;
 use sighurt_core::tabs::{Content, TabSummary};
 use sighurt_core::{BrowserState, ChromeChecks};
+use sighurt_render::Presents;
 use sighurt_ui::extension::{
     ChromeEvent, ChromeKind, ChromeLayout, InputArea, SurfaceName, Theme, MAX_SURFACES,
 };
 use sighurt_ui::{HomeInfo, Snapshot, TabContent, TabSnapshot};
-use sighurt_wayland::InputRegion;
+use sighurt_wayland::{InputRegion, PresentMode};
 
 /// The chromes compiled into this build: the standard one always, then those of features.
 pub const CHROMES: &[ChromeKind] = &[
@@ -143,9 +145,12 @@ pub fn snapshot(
     snapshot
 }
 
-/// The chrome's surfaces as targets: which names it has used, and where each went last.
-#[derive(Debug, Default)]
+/// The chrome's surfaces as targets: which names it has used, where each went last, and how
+/// their targets present.
+#[derive(Debug)]
 pub struct ChromeTargets {
+    /// How every chrome target presents: as the renderer does.
+    mode: PresentMode,
     /// Every name the chrome has used, in the order it first did, with where it was last
     /// listed.
     known: Vec<(SurfaceName, WindowRect, InputRegion)>,
@@ -180,7 +185,33 @@ pub struct Placing {
     pub refused: Vec<SurfaceName>,
 }
 
+impl Default for ChromeTargets {
+    /// Targets for the CPU renderer.
+    fn default() -> Self {
+        Self::new(Presents::Pixels)
+    }
+}
+
 impl ChromeTargets {
+    /// No surfaces yet, for a renderer that presents as `presents` says.
+    pub fn new(presents: Presents) -> Self {
+        Self {
+            mode: match presents {
+                Presents::Pixels => PresentMode::Shm,
+                Presents::Native => PresentMode::Native,
+            },
+            known: Vec::new(),
+            refused: Vec::new(),
+            listed: Vec::new(),
+        }
+    }
+
+    /// How the chrome's targets present: shared memory for a renderer that fills pixels, the
+    /// native path for one that presents itself.
+    pub fn mode(&self) -> PresentMode {
+        self.mode
+    }
+
     /// Where the surfaces of `layout` go in a window of `window` size. A name listed twice is
     /// placed once. Allocates; the owner loop uses [`ChromeTargets::place_into`].
     #[cfg(test)]
@@ -339,6 +370,19 @@ mod tests {
         entries
             .map(|placed| (placed.name, placed.visible))
             .collect()
+    }
+
+    #[test]
+    fn targets_present_as_the_renderer_does() {
+        assert_eq!(ChromeTargets::default().mode(), PresentMode::Shm);
+        assert_eq!(
+            ChromeTargets::new(Presents::Pixels).mode(),
+            PresentMode::Shm
+        );
+        assert_eq!(
+            ChromeTargets::new(Presents::Native).mode(),
+            PresentMode::Native
+        );
     }
 
     #[test]

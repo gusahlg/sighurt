@@ -20,9 +20,10 @@
 //! 5. Rebuild the chrome's snapshot only when the core said the chrome changed; invalidate only
 //!    the chrome surfaces it asks to repaint; apply a placement only when it differs from the
 //!    last (or answers a configure).
-//! 6. Present whatever the host has permits for: the chrome paints its surfaces, engines present
-//!    their views. Presenting is a call, so the runtimes are pumped again; steps 1–6 repeat until
-//!    a pass does nothing, at most [`MAX_PASSES`] times.
+//! 6. Present whatever the host has permits for: the chrome draws a surface's scene and the
+//!    renderer renders it (a scene equal to the surface's last frame commits nothing), engines
+//!    present their views. Presenting is a call, so the runtimes are pumped again; steps 1–6
+//!    repeat until a pass does nothing, at most [`MAX_PASSES`] times.
 //! 7. Flush, and sleep until an event or a real deadline. With work left over, the next
 //!    iteration starts without sleeping.
 //!
@@ -33,17 +34,21 @@
 //! service or a signal wakes it. Downloads and session writes run on threads of their own.
 //!
 //! The chrome is the one `[ui] chrome` names when `sig` starts ([`chrome::CHROMES`]), driven
-//! through `sighurt_ui::extension::Chrome`: its surfaces are SHM targets by name
-//! ([`ChromeTargets`](crate::chrome::ChromeTargets)), created when it first lists them.
+//! through `sighurt_ui::extension::Chrome`: its surfaces are targets by name
+//! ([`ChromeTargets`](crate::chrome::ChromeTargets)), created when it first lists them and
+//! presenting as the renderer does. The renderer is the one `[ui] renderer` names when `sig`
+//! starts ([`crate::render`]); the fonts are loaded once and shared by the chrome (which shapes)
+//! and the renderer (which rasterizes). A surface the placement hides is unbound from the
+//! renderer, which forgets its last frame: the host detaches a hidden surface's buffer.
 //!
 //! Shutdown (plan §20): stop taking input, cancel downloads, write the session (at once, whole),
 //! close every view and shut every runtime down (each releases its target leases), wait a moment
 //! for the downloads (deleting the files of those still waiting on a server), delete what
-//! engines kept only for this run (`storage = "ephemeral"`), retire the chrome's leases, close
-//! the window, and only then drop the host. If a runtime could not shut down (Servo after a
-//! crash, decision 54), the frontend is asked to clean up and the process ends with `_exit`,
-//! releasing nothing that runtime may still use. With `[session] restore` off, the session is
-//! neither read nor written.
+//! engines kept only for this run (`storage = "ephemeral"`), unbind every chrome surface from the
+//! renderer and drop it, retire the chrome's leases, close the window, and only then drop the
+//! host. If a runtime could not shut down (Servo after a crash, decision 54), the frontend is
+//! asked to clean up and the process ends with `_exit`, releasing nothing that runtime may still
+//! use. With `[session] restore` off, the session is neither read nor written.
 //!
 //! Must not own: browser policy (the core) or which effect runs (the session). Drawing belongs
 //! to the chrome and the engines.
@@ -65,7 +70,8 @@ use sighurt_api::input::{InputEvent, InputKind, KeyboardFocus, PointerButton, Po
 use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_core::tabs::{Content, TabSummary};
 use sighurt_core::{BrowserEvent, BrowserState, OpenRequest};
-use sighurt_runtime::diagnostics::{Diagnostics, Report, TabReport, TargetReport};
+use sighurt_render::{Backend, Output, Pen, PixelBuffer, Presents, Rendered, SurfaceKey};
+use sighurt_runtime::diagnostics::{Diagnostics, RendererReport, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
 use sighurt_runtime::registry::State;
@@ -75,14 +81,14 @@ use sighurt_runtime::view::ViewEntry;
 use sighurt_ui::extension::{
     Chrome, ChromeAction, ChromeEvent, SurfaceName, TextField, MAX_SURFACES,
 };
-use sighurt_ui::{Colors, EngineRow, HomeInfo, PixelBuffer, Snapshot};
+use sighurt_ui::{Colors, EngineRow, Fonts, HomeInfo, Snapshot};
 use sighurt_wayland::{
     FramePermit, Host, HostEvent, InputRegion, Placement, PresentMode, TargetLease,
     TargetPlacement, WindowOptions,
 };
 
 use crate::chrome::{self, ChromeTargets, Placing};
-use crate::engines;
+use crate::{engines, render};
 
 /// Most host events handled in one pass.
 pub const MAX_HOST_EVENTS: usize = 256;
@@ -111,6 +117,8 @@ struct Gui {
     chrome: Box<dyn Chrome>,
     /// The chrome's name: the configuration's `[ui] chrome` when `sig` started.
     chrome_name: &'static str,
+    /// What renders the chrome's scenes: `[ui] renderer` when `sig` started.
+    backend: Box<dyn Backend>,
     /// The chrome's surfaces as targets, and their leases by name.
     chrome_targets: ChromeTargets,
     leases: BTreeMap<SurfaceName, TargetLease>,
@@ -490,7 +498,10 @@ impl Gui {
             let input = self.placing_buf.surfaces[index].input.clone();
             let target = match self.leases.get(name) {
                 Some(lease) => lease.id(),
-                None => match self.host.create_target(self.window, PresentMode::Shm, None) {
+                None => match self
+                    .host
+                    .create_target(self.window, self.chrome_targets.mode(), None)
+                {
                     Ok(lease) => {
                         let target = lease.id();
                         self.host.set_cursor(target, self.chrome_cursor);
@@ -506,6 +517,10 @@ impl Gui {
                     }
                 },
             };
+            if !visible || rect.size().is_empty() {
+                // The host detaches a hidden surface's buffer: its next frame is drawn anew.
+                self.backend.unbind(surface_key(target));
+            }
             self.placement_buf.targets.push(TargetPlacement {
                 target,
                 rect,
@@ -584,7 +599,12 @@ impl App {
         // wakers below, are what keep it alive.
         sighurt_runtime::registry::install_logger();
         let kind = chrome::chrome(config.chrome());
-        let mut chrome = (kind.new)();
+        let fonts = Fonts::system();
+        let (backend, renderer_notice) = render::start(config.renderer(), &fonts.handle());
+        if let Some(why) = &renderer_notice {
+            log::warn!("{why}");
+        }
+        let mut chrome = (kind.new)(fonts);
         let window = WindowId::next();
         let bg = chrome::theme(&config).colors.bg;
         host.create_window(
@@ -611,6 +631,7 @@ impl App {
         let services = Services::new(move || services_wake.ping());
         let wake = std::sync::Arc::new(move || ping.ping());
         let diag = Diagnostics::new(options.diagnostics);
+        diag.chrome_renderer(backend.name(), &backend.describe());
         let mut session = Session::new(
             BrowserState::new(config, env.clone()),
             env,
@@ -626,7 +647,8 @@ impl App {
             window,
             chrome,
             chrome_name: kind.name,
-            chrome_targets: ChromeTargets::default(),
+            chrome_targets: ChromeTargets::new(backend.presents()),
+            backend,
             leases: BTreeMap::new(),
             chrome_text: None,
             chrome_text_target: None,
@@ -653,6 +675,8 @@ impl App {
             session: None,
             open: options.open,
         });
+        let notices = [notice, renderer_notice].into_iter().flatten();
+        let notice = notices.reduce(|first, second| format!("{first}\n{second}"));
         if let Some(notice) = notice {
             gui.show_notice(notice);
         }
@@ -1009,8 +1033,19 @@ impl App {
             .buffers(self.buffer_scratch.iter().copied(), bytes);
     }
 
+    /// Draws the chrome's `surface` and has the renderer render it for `permit`.
     fn paint_chrome(&mut self, surface: SurfaceName, permit: FramePermit) {
         let metrics = permit.metrics();
+        let key = surface_key(permit.target());
+        if self.gui.backend.presents() == Presents::Native {
+            // The chrome's targets present as the renderer does, and every renderer of this
+            // build fills pixels; dropping the permit presents nothing.
+            let name = self.gui.backend.name();
+            self.session.diagnostics_mut().error(format!(
+                "the {name} renderer presents natively, which this build can't drive"
+            ));
+            return;
+        }
         let mut frame = match permit.shm_frame() {
             Ok(frame) => frame,
             Err(error) => {
@@ -1020,26 +1055,38 @@ impl App {
                 return;
             }
         };
-        let (size, stride) = (frame.size(), frame.stride());
         let started = Instant::now();
+        let mut pen = Pen::new(metrics.rect());
+        self.gui.chrome.draw(surface, &mut pen);
+        let scene = pen.finish();
+        let drawn = started.elapsed();
+        let (size, stride) = (frame.size(), frame.stride());
         let buffer = PixelBuffer {
             data: frame.pixels(),
             width: size.width,
             height: size.height,
             stride,
         };
-        match self.gui.chrome.paint(surface, &metrics, buffer) {
-            Ok(()) => {
+        let rendering = Instant::now();
+        let rendered = self
+            .gui
+            .backend
+            .render(key, &metrics, &scene, Output::Pixels(buffer));
+        let diag = self.session.diagnostics_mut();
+        match rendered {
+            Ok(Rendered::Submitted) => {
                 frame.submit();
-                self.session
-                    .diagnostics_mut()
-                    .chrome(surface, started.elapsed());
+                diag.chrome(surface, drawn, rendering.elapsed());
             }
-            // The buffer goes back unsubmitted.
-            Err(error) => self
-                .session
-                .diagnostics_mut()
-                .error(format!("painting the chrome's {surface} failed: {error}")),
+            Ok(Rendered::Unchanged) => {
+                frame.unchanged();
+                diag.chrome_unchanged(drawn);
+            }
+            // The buffer goes back unsubmitted. A pixel renderer has nothing to wait for.
+            Ok(Rendered::Deferred) => diag.error(format!(
+                "the renderer put off the chrome's {surface}, which it never should"
+            )),
+            Err(error) => diag.error(format!("rendering the chrome's {surface} failed: {error}")),
         }
     }
 
@@ -1096,12 +1143,22 @@ impl App {
         let code = self
             .session
             .shutdown(&mut self.gui, |session, gui| report(gui, session, true));
-        let leases = std::mem::take(&mut self.gui.leases);
+        let Gui {
+            mut host,
+            window,
+            leases,
+            mut backend,
+            ..
+        } = self.gui;
+        // What the renderer made from the targets dies before the targets do.
+        for lease in leases.values() {
+            backend.unbind(surface_key(lease.id()));
+        }
+        drop(backend);
         drop(leases);
-        let window = self.gui.window;
-        self.gui.host.close_window(window);
-        self.gui.host.flush();
-        drop(self.gui.host);
+        host.close_window(window);
+        host.flush();
+        drop(host);
         code
     }
 }
@@ -1159,6 +1216,17 @@ fn report(gui: &Gui, session: &mut Session<Gui>, at_exit: bool) {
         })
         .collect();
     let engines = session.engine_reports();
+    let stats = gui.backend.stats();
+    let renderer = Some(RendererReport {
+        name: gui.backend.name(),
+        describe: gui.backend.describe(),
+        frames: stats.frames,
+        unchanged: stats.unchanged,
+        deferred: stats.deferred,
+        max_render_us: stats.max_render_us,
+        glyphs: stats.glyphs,
+        glyph_resets: stats.glyph_resets,
+    });
     let tabs = {
         let core = session.core();
         core.tabs()
@@ -1200,6 +1268,7 @@ fn report(gui: &Gui, session: &mut Session<Gui>, at_exit: bool) {
         peaks,
         targets,
         engines,
+        renderer,
         tabs,
         active_tab,
         status,
@@ -1208,6 +1277,11 @@ fn report(gui: &Gui, session: &mut Session<Gui>, at_exit: bool) {
         last_error,
     };
     session.diagnostics_mut().report(&report, at_exit);
+}
+
+/// The renderer's key for the chrome surface on `target`.
+fn surface_key(target: TargetId) -> SurfaceKey {
+    SurfaceKey(target.serial())
 }
 
 /// What the status strip shows, and where it comes from: a notice of `sig`'s own while it is

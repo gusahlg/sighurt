@@ -26,6 +26,8 @@ sighurt-api = { path = "../../crates/sighurt-api" }
 sighurt-core = { path = "../../crates/sighurt-core" }
 sighurt-wayland = { path = "../sighurt-wayland" }
 sighurt-ui = { path = "../../ui/sighurt-ui" }
+# The chrome's renderers (`[ui] renderer`): the CPU one in every build.
+sighurt-render = { path = "../../render/sighurt-render" }
 sighurt-runtime = { path = "../../crates/sighurt-runtime" }
 sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }

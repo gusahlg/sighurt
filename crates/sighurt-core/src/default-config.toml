@@ -299,8 +299,14 @@ default-keys = true
 # which take no argument: the standard chrome's is chrome.toggle-tabs, which hides and shows
 # its tabs.
 #
+# `renderer` is what draws the chrome: "cpu" (in every build), "wgpu" or "vulkan" (the
+# GPU, in a sig built with them), or "auto", which chooses (the CPU for now). One this sig
+# lacks or that can't start gives a notice and auto is used. It changes when sig starts
+# again.
+#
 #   [ui]
 #   chrome = "standard"
+#   renderer = "auto"
 #   font = "DejaVu Sans"    # the chrome's text; one that isn't installed falls back
 #   font-size = 14          # 9 to 32 logical pixels; the chrome's heights follow it
 #

@@ -426,6 +426,7 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             keymaps: KEYMAPS.to_vec(),
             chromes,
             color_names,
+            renderers: sighurt_core::config::RENDERERS,
             frontend: Frontend::Gui,
             starting_engine: None,
         }

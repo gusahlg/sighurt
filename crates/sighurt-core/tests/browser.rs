@@ -85,6 +85,7 @@ fn environment() -> Environment {
         engine_settings: settings.map(|(e, s)| (e.to_owned(), s)).into(),
         keymaps: vec![script::KIND],
         chromes: vec![chrome("standard", &["toggle-tabs"]), chrome("line", &[])],
+        renderers: sighurt_core::config::RENDERERS,
         ..Environment::default()
     }
 }
@@ -2873,6 +2874,46 @@ fn a_reload_that_changes_the_chrome_says_it_applies_at_restart() {
     // Back to the chrome it runs: nothing to say.
     let back = Config::parse(Some("version = 1"), &environment());
     assert_eq!(notices(&b.update(config_reloaded(back))), [] as [&str; 0]);
+}
+
+#[test]
+fn a_reload_that_changes_the_renderer_says_it_applies_at_restart() {
+    let mut b = Harness::start("", &["sig://home"]);
+    let cpu = Config::parse(
+        Some(
+            "version = 1
+[ui]
+renderer = \"cpu\"",
+        ),
+        &environment(),
+    );
+    let effects = b.update(config_reloaded(cpu));
+    assert_eq!(
+        notices(&effects),
+        [
+            "[ui] renderer = \"cpu\" applies when sig starts again; the chrome is drawn as [ui] \
+          renderer = \"auto\" says until then."
+        ]
+    );
+    let back = Config::parse(Some("version = 1"), &environment());
+    assert_eq!(notices(&b.update(config_reloaded(back))), [] as [&str; 0]);
+    // The terminal draws no chrome with it: nothing to say there.
+    let env = Environment {
+        frontend: sighurt_core::Frontend::Terminal,
+        ..environment()
+    };
+    let config = Config::parse(Some("version = 1"), &env).unwrap();
+    let mut state = BrowserState::new(config, env.clone());
+    let vulkan = Config::parse(
+        Some(
+            "version = 1
+[ui]
+renderer = \"vulkan\"",
+        ),
+        &env,
+    );
+    let effects = update(&mut state, config_reloaded(vulkan));
+    assert_eq!(notices(&effects), [] as [&str; 0]);
 }
 
 // ── Chrome commands, sent keys, side buttons and scrolling ─────────────────────────────────
