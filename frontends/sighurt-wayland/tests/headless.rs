@@ -502,6 +502,10 @@ fn pointer_positions_are_local_to_the_surface_under_the_pointer() {
     let (chrome, page) = (h.app.chrome.id(), h.app.page.id());
     let mut pointer = driver::Pointer::new((1280, 800));
     h.pump_for(Duration::from_millis(300));
+    // The compositor's cursor is wherever sway or the previous test left it (alone, a fresh sway
+    // had it at window (100, 140)), so the window maps under it and the page gets an enter
+    // there. Only what the moves below produce is checked.
+    h.app.events.clear();
     pointer.move_to(100, 20);
     h.wait("the chrome", |app| {
         app.pointer().iter().any(|(t, _)| *t == Some(chrome))
