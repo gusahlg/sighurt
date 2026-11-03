@@ -1,10 +1,22 @@
 //! What the terminal sends: keys, mouse, paste, capability replies and OSC 52 clipboard replies.
 //!
-//! `feed` never sleeps. A lone Escape arms a 25 ms timer; any longer partial
-//! sequence arms a 1 s timer. The owner loop sleeps for [`Parser::poll_timeout`]
-//! and then calls [`Parser::expire`]. Calling `expire` means that timer has
-//! fired. An unfinished CSI is not abandoned on the Escape timer, so a reply
-//! that arrives in pieces is still a reply.
+//! `feed` never sleeps. A lone Escape, a bare introducer (`ESC [`, `ESC O`,
+//! `ESC ]`, `ESC P`, `ESC _`) and a string whose start is not yet a reply's
+//! arm a 25 ms timer; any longer partial sequence arms a 1 s timer. The owner
+//! loop sleeps for [`Parser::poll_timeout`] and then calls [`Parser::expire`].
+//! Calling `expire` means that timer has fired. An unfinished CSI is not
+//! abandoned on the Escape timer, so a reply that arrives in pieces is still a
+//! reply. A bare introducer that expires is the Alt chord of its byte (in
+//! legacy key mode Alt+`[`, Alt+Shift+O, Alt+`]`, Alt+Shift+P and Alt+`_` are
+//! those very bytes). `ESC X` and `ESC ^` (SOS, PM) are Alt+X and Alt+`^` at
+//! once: no terminal answers anything `sig` asks with them.
+//!
+//! An OSC, DCS or APC string is a reply only once its start says so: OSC
+//! digits and `;`, a DCS header with parameters or intermediates and its
+//! final byte, APC `G` and one more byte. Until then it is on the Escape
+//! timer, and a byte that cannot continue such a start, or that timer, makes
+//! the opener its Alt chord and every byte after it keys. Replies come in one
+//! write, so the start of one is never 25 ms apart; typed keys always are.
 //!
 //! Bracketed paste is collected until `CSI 201 ~` and is not parsed as keys.
 //! Payloads are capped (64 KiB for APC/OSC/DCS, 1 MiB for paste). Bytes past
@@ -13,10 +25,12 @@
 //! data. That payload is capped with the other OSC payloads; once the cap is
 //! hit the reply is a failure (`truncated`), never a decoded prefix.
 //!
-//! When an OSC, DCS or APC string times out, the bytes still to come are
-//! discarded until its terminator (`ESC \` or, for OSC, BEL) and are not
-//! parsed as keys. A clipboard read's own deadline is separate. A timed-out
-//! OSC 52 is reported as a truncated reply when that terminator arrives.
+//! When a reply string times out, the bytes still to come are discarded until
+//! its terminator (`ESC \` or, for OSC, BEL) and are not parsed as keys, for
+//! at most 1 s more: then bytes are keys again, terminator or not, so a reply
+//! that never ends cannot take the keyboard. A clipboard read's own deadline
+//! is separate. A timed-out OSC 52 is reported as a truncated reply when that
+//! terminator arrives or the discarding ends.
 //!
 //! Releases: once the terminal's reply to `CSI ? u` says it reports event
 //! types (flag 2), a key in an escape sequence (`CSI … u`, `CSI … ~`, the
@@ -46,6 +60,8 @@ const MAX_PASTE: usize = 1024 * 1024;
 const PASTE_END: &[u8] = b"\x1b[201~";
 const MAX_PARAMS: usize = 16;
 const MAX_SUBS: usize = 8;
+/// Most bytes of a string's start before it is a reply; longer, it was typed.
+const MAX_START: usize = 16;
 /// Most keys held at once; the oldest is forgotten past this.
 const MAX_HELD: usize = 16;
 /// Kitty's "report event types" flag.
@@ -276,6 +292,8 @@ impl Csi {
 #[derive(Debug)]
 struct Dcs {
     csi: Csi,
+    /// The header's bytes, to be keys again if they turn out not to be a reply.
+    header: Vec<u8>,
     data: Buf,
     in_data: bool,
     final_byte: u8,
@@ -285,6 +303,7 @@ impl Dcs {
     fn new() -> Self {
         Self {
             csi: Csi::new(),
+            header: Vec::new(),
             data: Buf::new(),
             in_data: false,
             final_byte: 0,
@@ -324,15 +343,15 @@ enum State {
     },
     Csi(Csi),
     Ss3,
+    /// The OSC, DCS and APC strings. Their `…Esc` states (a possible ST) follow only a
+    /// start that is a reply's; before that, `ESC` means the string was typed.
     Osc(Buf),
     OscEsc(Buf),
     Dcs(Dcs),
     DcsEsc(Dcs),
     Apc(Buf),
     ApcEsc(Buf),
-    Ignore,
-    IgnoreEsc,
-    /// A string timed out. Bytes are ignored until ST or, for OSC, BEL.
+    /// A string timed out. Bytes are ignored until ST or, for OSC, BEL, or the timer.
     Discard {
         kind: DiscardKind,
     },
@@ -437,15 +456,13 @@ impl Parser {
     }
 
     /// The armed timer fired. A lone Escape becomes a key. A bare introducer
-    /// becomes Alt plus that byte. Anything with parameters is dropped, not
-    /// reported as keys. An OSC, DCS or APC string that has started is
-    /// discarded until its terminator, so the rest is not keys. Paste, and a
-    /// string already being discarded, are left alone.
+    /// becomes Alt plus that byte, and a string whose start is not a reply's
+    /// becomes that and its bytes as keys. A CSI with parameters is dropped,
+    /// not reported as keys. A reply string is discarded until its
+    /// terminator, so the rest is not keys, and a string being discarded is
+    /// given up: what follows is keys. Paste is left alone.
     pub fn expire(&mut self) -> Vec<Input> {
-        if matches!(
-            self.state,
-            State::Paste { .. } | State::Ground | State::Discard { .. } | State::DiscardEsc { .. }
-        ) {
+        if matches!(self.state, State::Paste { .. } | State::Ground) {
             return Vec::new();
         }
         let state = std::mem::replace(&mut self.state, State::Ground);
@@ -466,52 +483,32 @@ impl Parser {
             State::Ss3 => self.alt_char(b'O', &mut out),
             State::Csi(csi) if !csi.started => self.alt_char(b'[', &mut out),
             State::Osc(buf) => {
-                if buf.data.is_empty() && !buf.truncated {
-                    self.alt_char(b']', &mut out);
+                if osc_is_reply(&buf.data) {
+                    self.start_discard(false, osc_discard_kind(&buf));
                 } else {
-                    self.prefix_alt = false;
-                    self.state = State::Discard {
-                        kind: osc_discard_kind(&buf),
-                    };
+                    self.not_a_reply(b']', &buf.data, None, &mut out);
                 }
             }
-            State::OscEsc(buf) => {
-                self.prefix_alt = false;
-                self.state = State::DiscardEsc {
-                    kind: osc_discard_kind(&buf),
-                };
-            }
+            State::OscEsc(buf) => self.start_discard(true, osc_discard_kind(&buf)),
             State::Apc(buf) => {
-                if buf.data.is_empty() && !buf.truncated {
-                    self.alt_char(b'_', &mut out);
+                if apc_is_reply(&buf.data) {
+                    self.start_discard(false, DiscardKind::String { bell: false });
                 } else {
-                    self.prefix_alt = false;
-                    self.state = State::Discard {
-                        kind: DiscardKind::String { bell: false },
-                    };
+                    self.not_a_reply(b'_', &buf.data, None, &mut out);
                 }
             }
-            State::ApcEsc(_) => {
-                self.prefix_alt = false;
-                self.state = State::DiscardEsc {
-                    kind: DiscardKind::String { bell: false },
-                };
+            State::ApcEsc(_) | State::DcsEsc(_) => {
+                self.start_discard(true, DiscardKind::String { bell: false });
             }
             State::Dcs(dcs) => {
-                if !dcs.csi.started && !dcs.in_data {
-                    self.alt_char(b'P', &mut out);
+                if dcs.in_data {
+                    self.start_discard(false, DiscardKind::String { bell: false });
                 } else {
-                    self.prefix_alt = false;
-                    self.state = State::Discard {
-                        kind: DiscardKind::String { bell: false },
-                    };
+                    self.not_a_reply(b'P', &dcs.header, None, &mut out);
                 }
             }
-            State::DcsEsc(_) => {
-                self.prefix_alt = false;
-                self.state = State::DiscardEsc {
-                    kind: DiscardKind::String { bell: false },
-                };
+            State::Discard { kind } | State::DiscardEsc { kind } => {
+                self.finish_discard(kind, &mut out);
             }
             _ => {
                 self.prefix_alt = false;
@@ -540,6 +537,28 @@ impl Parser {
             out,
             legacy_press(Key::Character(ch.to_string()), modifiers, false, None),
         );
+    }
+
+    /// A string's opener and start were typed, not a reply: the opener is its
+    /// Alt chord, and `start` and then `next` are parsed again as input.
+    fn not_a_reply(&mut self, opener: u8, start: &[u8], next: Option<u8>, out: &mut Vec<Input>) {
+        self.disarm();
+        self.alt_char(opener, out);
+        for &byte in start.iter().chain(next.as_ref()) {
+            self.byte(byte, out);
+        }
+    }
+
+    /// A reply string timed out: what is still to come of it is discarded until its
+    /// terminator, for one more [`SEQ_TIMEOUT`] at most. Bytes do not extend that.
+    fn start_discard(&mut self, after_esc: bool, kind: DiscardKind) {
+        self.prefix_alt = false;
+        self.state = if after_esc {
+            State::DiscardEsc { kind }
+        } else {
+            State::Discard { kind }
+        };
+        self.arm(false);
     }
 
     fn arm(&mut self, esc_only: bool) {
@@ -578,14 +597,6 @@ impl Parser {
             }
             State::Apc(mut buf) => self.apc(byte, &mut buf, out),
             State::ApcEsc(buf) => self.string_esc(byte, buf, false, out),
-            State::Ignore => self.ignore(byte),
-            State::IgnoreEsc => {
-                if byte == b'\\' {
-                    self.disarm();
-                } else {
-                    self.escape(byte, 1, out);
-                }
-            }
             State::Discard { kind } => self.discard(byte, kind, out),
             State::DiscardEsc { kind } => self.discard_esc(byte, kind, out),
             State::Paste { data, matched } => self.paste(byte, data, matched, out),
@@ -666,36 +677,32 @@ impl Parser {
             return;
         }
         let prefixed = count >= 2;
+        // A bare introducer waits only as long as a lone Escape: it is also an Alt chord.
         match byte {
             b'[' => {
                 self.prefix_alt = prefixed;
                 self.state = State::Csi(Csi::new());
-                self.arm(false);
+                self.arm(true);
             }
             b']' => {
                 self.prefix_alt = prefixed;
                 self.state = State::Osc(Buf::new());
-                self.arm(false);
+                self.arm(true);
             }
             b'P' => {
                 self.prefix_alt = prefixed;
                 self.state = State::Dcs(Dcs::new());
-                self.arm(false);
+                self.arm(true);
             }
             b'_' => {
                 self.prefix_alt = prefixed;
                 self.state = State::Apc(Buf::new());
-                self.arm(false);
-            }
-            b'X' | b'^' => {
-                self.prefix_alt = false;
-                self.state = State::Ignore;
-                self.arm(false);
+                self.arm(true);
             }
             b'O' => {
                 self.prefix_alt = prefixed;
                 self.state = State::Ss3;
-                self.arm(false);
+                self.arm(true);
             }
             0x80..=0xff => {
                 self.prefix_alt = prefixed;
@@ -988,6 +995,19 @@ impl Parser {
     }
 
     fn osc(&mut self, byte: u8, buf: &mut Buf, out: &mut Vec<Input>) {
+        if !osc_is_reply(&buf.data) {
+            // Only digits and then `;` start a reply (`10;`, `11;`, `52;`).
+            let digits = buf.data.len() < MAX_START;
+            if (byte.is_ascii_digit() && digits) || (byte == b';' && !buf.data.is_empty()) {
+                buf.push(byte);
+                let reply = osc_is_reply(&buf.data);
+                self.state = State::Osc(take_buf(buf));
+                self.arm(!reply);
+            } else {
+                self.not_a_reply(b']', &buf.data, Some(byte), out);
+            }
+            return;
+        }
         match byte {
             0x07 => {
                 self.disarm();
@@ -1010,7 +1030,24 @@ impl Parser {
         }
     }
 
-    fn apc(&mut self, byte: u8, buf: &mut Buf, _out: &mut Vec<Input>) {
+    fn apc(&mut self, byte: u8, buf: &mut Buf, out: &mut Vec<Input>) {
+        if !apc_is_reply(&buf.data) {
+            // Only kitty's graphics replies are asked for: `G` and its keys.
+            let fits = if buf.data.is_empty() {
+                byte == b'G'
+            } else {
+                (0x20..=0x7e).contains(&byte)
+            };
+            if fits {
+                buf.push(byte);
+                let reply = apc_is_reply(&buf.data);
+                self.state = State::Apc(take_buf(buf));
+                self.arm(!reply);
+            } else {
+                self.not_a_reply(b'_', &buf.data, Some(byte), out);
+            }
+            return;
+        }
         match byte {
             0x18 | 0x1a => {
                 self.prefix_alt = false;
@@ -1043,7 +1080,7 @@ impl Parser {
         }
     }
 
-    fn dcs(&mut self, byte: u8, dcs: &mut Dcs, _out: &mut Vec<Input>) {
+    fn dcs(&mut self, byte: u8, dcs: &mut Dcs, out: &mut Vec<Input>) {
         if dcs.in_data {
             match byte {
                 0x18 | 0x1a => {
@@ -1062,54 +1099,41 @@ impl Parser {
             }
             return;
         }
+        // The header is a reply's (`1 + r`) only with parameters or intermediates before its
+        // final byte. Until then it is on the Escape timer, and anything else was typed.
+        if dcs.header.len() >= MAX_START {
+            self.not_a_reply(b'P', &dcs.header, Some(byte), out);
+            return;
+        }
         match byte {
-            0x18 | 0x1a => {
-                self.prefix_alt = false;
-                self.disarm();
-            }
-            0x1b => {
-                self.prefix_alt = false;
-                self.state = State::Esc { count: 1 };
-                self.arm(true);
-            }
-            b'0'..=b'9' => {
-                dcs.csi.push_digit(byte - b'0');
-                self.state = State::Dcs(take_dcs(dcs));
-                self.arm(false);
-            }
-            b':' => {
-                dcs.csi.separate(true);
-                self.state = State::Dcs(take_dcs(dcs));
-                self.arm(false);
-            }
-            b';' => {
-                dcs.csi.separate(false);
-                self.state = State::Dcs(take_dcs(dcs));
-                self.arm(false);
-            }
+            b'0'..=b'9' => dcs.csi.push_digit(byte - b'0'),
+            b':' => dcs.csi.separate(true),
+            b';' => dcs.csi.separate(false),
             0x20..=0x2f => {
                 if dcs.csi.intermediates.len() < 2 {
                     dcs.csi.intermediates.push(byte);
                 }
                 dcs.csi.started = true;
-                self.state = State::Dcs(take_dcs(dcs));
-                self.arm(false);
             }
-            0x40..=0x7e => {
+            0x40..=0x7e if dcs.csi.started => {
                 dcs.csi.finish();
                 dcs.final_byte = byte;
                 dcs.in_data = true;
                 self.state = State::Dcs(take_dcs(dcs));
                 self.arm(false);
+                return;
             }
             _ => {
-                self.prefix_alt = false;
-                self.disarm();
+                self.not_a_reply(b'P', &dcs.header, Some(byte), out);
+                return;
             }
         }
+        dcs.header.push(byte);
+        self.state = State::Dcs(take_dcs(dcs));
+        self.arm(true);
     }
 
-    /// Drop bytes of a string that timed out, until ST or (for OSC) BEL.
+    /// Drop bytes of a string that timed out, until ST, (for OSC) BEL or the timer.
     /// Nothing here is a key. CAN and SUB end the string, as they do in ground.
     fn discard(&mut self, byte: u8, kind: DiscardKind, out: &mut Vec<Input>) {
         match byte {
@@ -1142,20 +1166,6 @@ impl Parser {
                 data: None,
                 truncated: true,
             }));
-        }
-    }
-
-    fn ignore(&mut self, byte: u8) {
-        match byte {
-            0x18 | 0x1a => self.disarm(),
-            0x1b => {
-                self.state = State::IgnoreEsc;
-                self.arm(false);
-            }
-            _ => {
-                self.state = State::Ignore;
-                self.arm(false);
-            }
         }
     }
 
@@ -1394,14 +1404,16 @@ fn legacy_final(final_byte: u8, csi: &Csi) -> Option<&'static str> {
     })
 }
 
+/// `CSI number ~`. Home and End are 1 and 4 in tmux, screen and the Linux console
+/// (`khome=\E[1~`, `kend=\E[4~` in `tmux-256color`), 7 and 8 in rxvt.
 fn tilde_key(number: u32) -> Option<&'static str> {
     Some(match number {
+        1 | 7 => "Home",
         2 => "Insert",
         3 => "Delete",
+        4 | 8 => "End",
         5 => "PageUp",
         6 => "PageDown",
-        7 => "Home",
-        8 => "End",
         11 => "F1",
         12 => "F2",
         13 => "F3",
@@ -1518,6 +1530,18 @@ fn osc_discard_kind(buf: &Buf) -> DiscardKind {
         },
         _ => DiscardKind::String { bell: true },
     }
+}
+
+/// Whether an OSC payload starts as a reply does: digits, then `;`.
+fn osc_is_reply(data: &[u8]) -> bool {
+    data.iter()
+        .position(|&byte| byte == b';')
+        .is_some_and(|at| at > 0 && data[..at].iter().all(u8::is_ascii_digit))
+}
+
+/// Whether an APC payload starts as kitty's graphics reply does: `G` and one more byte.
+fn apc_is_reply(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == b'G'
 }
 
 /// OSC 52's data field: base64, or nothing when it is `?`, empty or not base64.
@@ -2307,5 +2331,253 @@ mod tests {
         assert_eq!(typed, "ogoogle.com");
         assert_eq!(keys.len(), 24);
         assert_eq!(keys[22].key, Key::Named("Enter".into()));
+    }
+
+    /// The presses among `inputs`, as `(key, alt)`.
+    fn presses(inputs: &[Input]) -> Vec<(String, bool)> {
+        inputs
+            .iter()
+            .filter_map(|input| match input {
+                Input::Key(key) if key.state == ButtonState::Pressed => {
+                    let name = match &key.key {
+                        Key::Character(text) | Key::Named(text) => text.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    Some((name, key.modifiers.alt))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn press(name: &str, alt: bool) -> (String, bool) {
+        (name.to_string(), alt)
+    }
+
+    /// In legacy key mode Alt+`]`, Alt+Shift+P and Alt+`_` are `ESC ]`, `ESC P` and `ESC _`,
+    /// the openers of OSC, DCS and APC. Typing after them is typing, and never locks the keys.
+    #[test]
+    fn typing_after_a_string_opener_is_keys() {
+        for (opener, name) in [(b']', "]"), (b'P', "P"), (b'_', "_")] {
+            // The opener alone waits only the Escape timer, then is its Alt chord.
+            let mut parser = Parser::new();
+            assert!(parser.feed(&[0x1b, opener]).is_empty());
+            assert!(parser.poll_timeout().unwrap() <= ESC_TIMEOUT, "{name}");
+            assert_eq!(presses(&parser.expire()), [press(name, true)]);
+            // What is typed after the timer is keys, Escape and the arrows included.
+            let typed = parser.feed(b"abc\x1b[A\r");
+            assert_eq!(
+                presses(&typed),
+                [
+                    press("a", false),
+                    press("b", false),
+                    press("c", false),
+                    press("ArrowUp", false),
+                    press("Enter", false),
+                ],
+                "{name}"
+            );
+            assert!(parser.poll_timeout().is_none(), "{name}");
+
+            // Text in the same read as the opener, which no reply starts with, is keys at
+            // once (`a` cannot start a reply's OSC, DCS or APC).
+            let mut bytes = vec![0x1b, opener];
+            bytes.extend_from_slice(b"abc");
+            let mut parser = Parser::new();
+            assert_eq!(
+                presses(&parser.feed(&bytes)),
+                [
+                    press(name, true),
+                    press("a", false),
+                    press("b", false),
+                    press("c", false)
+                ],
+                "{name}"
+            );
+            assert!(parser.poll_timeout().is_none(), "{name}");
+
+            // Escape right after the opener is Escape (here the start of an arrow).
+            let mut bytes = vec![0x1b, opener];
+            bytes.extend_from_slice(b"\x1b[B");
+            assert_eq!(
+                presses(&Parser::new().feed(&bytes)),
+                [press(name, true), press("ArrowDown", false)],
+                "{name}"
+            );
+        }
+
+        // A start that could be a reply's but stops is keys on the Escape timer.
+        for (bytes, opener, rest) in [
+            (&b"\x1b]1"[..], "]", &["1"][..]),
+            (b"\x1bP1+", "P", &["1", "+"]),
+            (b"\x1b_G", "_", &["G"]),
+        ] {
+            let mut parser = Parser::new();
+            assert!(parser.feed(bytes).is_empty());
+            assert!(parser.poll_timeout().unwrap() <= ESC_TIMEOUT, "{bytes:?}");
+            let mut want = vec![press(opener, true)];
+            want.extend(rest.iter().map(|key| press(key, false)));
+            assert_eq!(presses(&parser.expire()), want, "{bytes:?}");
+        }
+        // Ctrl+X (CAN) after Alt+] is Ctrl+X, not the end of a string.
+        assert_eq!(
+            presses(&Parser::new().feed(b"\x1b]\x18")),
+            [press("]", true), press("x", false)]
+        );
+    }
+
+    /// A reply string that stops is discarded until its terminator, and only for one more
+    /// [`SEQ_TIMEOUT`]: then bytes are keys again, terminator or not.
+    #[test]
+    fn a_discarded_string_gives_the_keyboard_back() {
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b]52;c;").is_empty());
+        assert!(
+            parser.poll_timeout().unwrap() > ESC_TIMEOUT,
+            "a reply's start"
+        );
+        assert!(parser.expire().is_empty());
+        let since = parser.partial_at;
+        assert!(since.is_some(), "discarding is timed");
+        assert!(parser.feed(b"YWJj\x1b[A").is_empty());
+        assert_eq!(
+            parser.partial_at, since,
+            "bytes do not extend the discarding"
+        );
+        match parser.expire().as_slice() {
+            [Input::Reply(Reply::Clipboard {
+                selection: Some(b'c'),
+                data: None,
+                truncated: true,
+            })] => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(parser.poll_timeout().is_none());
+        assert_eq!(presses(&parser.feed(b"q")), [press("q", false)]);
+
+        // The same after an ESC that was not ST, and for DCS and APC.
+        for start in [
+            &b"\x1b]10;rgb:\x1b"[..],
+            b"\x1bP1+r52",
+            b"\x1bP1+r52\x1b",
+            b"\x1b_Gi=31",
+        ] {
+            let mut parser = Parser::new();
+            assert!(parser.feed(start).is_empty(), "{start:?}");
+            assert!(parser.expire().is_empty(), "{start:?}");
+            assert!(parser.feed(b"zz").is_empty(), "{start:?}");
+            assert!(parser.expire().is_empty(), "{start:?}");
+            assert_eq!(
+                presses(&parser.feed(b"q\x1b[A")),
+                [press("q", false), press("ArrowUp", false)],
+                "{start:?}"
+            );
+        }
+    }
+
+    /// Replies in the same read as keys are still replies, and the keys still keys.
+    #[test]
+    fn keys_in_the_read_of_a_reply_stay_keys() {
+        let inputs = Parser::new()
+            .feed(b"x\x1b]11;rgb:0000/0000/0000\x1b\\q\x1bP1+r524742=3234\x1b\\j\x1b_Gi=31;OK\x1b\\k\x1b[?62;4cl");
+        let replies = inputs
+            .iter()
+            .filter(|input| matches!(input, Input::Reply(_)))
+            .count();
+        assert_eq!(replies, 4, "{inputs:?}");
+        assert!(matches!(
+            inputs
+                .iter()
+                .find(|input| matches!(input, Input::Reply(Reply::XtGetTcap { .. }))),
+            Some(Input::Reply(Reply::XtGetTcap { found: true, .. }))
+        ));
+        assert_eq!(
+            presses(&inputs),
+            [
+                press("x", false),
+                press("q", false),
+                press("j", false),
+                press("k", false),
+                press("l", false)
+            ]
+        );
+    }
+
+    /// tmux, screen and the Linux console send Home and End as `CSI 1 ~` and `CSI 4 ~`
+    /// (`khome`/`kend` in `tmux-256color`; recorded from tmux 3.8), with modifiers as
+    /// `CSI 1 ; m H` and `CSI 1 ; m F`. rxvt sends `CSI 7 ~` and `CSI 8 ~`; xterm `CSI H`,
+    /// `CSI F` and, in application cursor mode, `SS3 H` and `SS3 F`.
+    #[test]
+    fn home_and_end_in_every_form() {
+        for (bytes, name) in [
+            (&b"\x1b[1~"[..], "Home"),
+            (b"\x1b[4~", "End"),
+            (b"\x1b[7~", "Home"),
+            (b"\x1b[8~", "End"),
+            (b"\x1b[H", "Home"),
+            (b"\x1b[F", "End"),
+            (b"\x1bOH", "Home"),
+            (b"\x1bOF", "End"),
+        ] {
+            let keys = keys_of(bytes);
+            assert_eq!(keys.len(), 2, "{bytes:?}");
+            assert_eq!(keys[0].key, Key::Named(name.into()), "{bytes:?}");
+            assert_eq!(keys[1].state, ButtonState::Released, "{bytes:?}");
+        }
+        let ctrl_home = keys_of(b"\x1b[1;5H");
+        assert_eq!(ctrl_home[0].key, Key::Named("Home".into()));
+        assert!(ctrl_home[0].modifiers.control);
+        let shift_end = keys_of(b"\x1b[1;2F");
+        assert_eq!(shift_end[0].key, Key::Named("End".into()));
+        assert!(shift_end[0].modifiers.shift);
+    }
+
+    /// Alt+`[` and Alt+Shift+O (`ESC [`, `ESC O`) wait only the Escape timer and do not take
+    /// the next key into a sequence; Alt+Shift+X and Alt+`^` (`ESC X`, `ESC ^`) are keys.
+    #[test]
+    fn alt_introducers_are_alt_chords() {
+        for (opener, name) in [(b'[', "["), (b'O', "O")] {
+            let mut parser = Parser::new();
+            assert!(parser.feed(&[0x1b, opener]).is_empty());
+            assert!(parser.poll_timeout().unwrap() <= ESC_TIMEOUT, "{name}");
+            assert_eq!(presses(&parser.expire()), [press(name, true)]);
+            // `A` after the timer is `A`, not ArrowUp.
+            assert_eq!(presses(&parser.feed(b"A")), [press("A", false)], "{name}");
+        }
+        assert_eq!(presses(&Parser::new().feed(b"\x1bX")), [press("X", true)]);
+        assert_eq!(presses(&Parser::new().feed(b"\x1b^")), [press("^", true)]);
+        assert_eq!(
+            presses(&Parser::new().feed(b"\x1bXq\x1b^q")),
+            [
+                press("X", true),
+                press("q", false),
+                press("^", true),
+                press("q", false)
+            ]
+        );
+        // A parameter makes `ESC [` a sequence, which waits the long timer.
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b[1").is_empty());
+        assert!(parser.poll_timeout().unwrap() > ESC_TIMEOUT);
+    }
+
+    /// Escape before a byte that starts no sequence is Alt on that key, and a bare Escape (as
+    /// tmux sends it with `escape-time 0`) is Escape on the Escape timer.
+    #[test]
+    fn escape_alone_and_before_other_bytes() {
+        let mut parser = Parser::new();
+        assert!(parser.feed(b"\x1b").is_empty());
+        assert!(parser.poll_timeout().unwrap() <= ESC_TIMEOUT);
+        assert_eq!(presses(&parser.expire()), [press("Escape", false)]);
+        assert_eq!(presses(&parser.feed(b"j")), [press("j", false)]);
+        assert_eq!(
+            presses(&Parser::new().feed(b"\x1bj\x1b\x7f\x1b\r\x1b1")),
+            [
+                press("j", true),
+                press("Backspace", true),
+                press("Enter", true),
+                press("1", true)
+            ]
+        );
     }
 }
