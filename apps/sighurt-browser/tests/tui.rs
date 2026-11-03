@@ -1130,6 +1130,28 @@ fn sixel_is_sent_when_the_terminal_has_sixel_and_no_kitty_graphics() {
         "a kitty image was sent\n{}",
         term.context()
     );
+    // tmux 3.8 writes a sixel through at once but redraws a synchronized pane's lines when
+    // the update ends, over the image. No sixel starts inside a synchronized update.
+    let mut synced = false;
+    for (at, window) in term.got.windows(8).enumerate() {
+        if window == b"\x1b[?2026h" {
+            synced = true;
+        } else if window == b"\x1b[?2026l" {
+            synced = false;
+        } else if window.starts_with(b"\x1bP0;2q") {
+            assert!(
+                !synced,
+                "a sixel at byte {at} is inside a synchronized update"
+            );
+        }
+    }
+    // Every register is defined: tmux re-encodes an undefined one as `#n;0;0;0;0`, and Rio
+    // drops an image that has one.
+    assert!(
+        has(&term.got, b"#0;2;0;0;0#1;2;0;0;20#"),
+        "{}",
+        term.context()
+    );
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
     let json = fs::read_to_string(term.dir.join("diag.json")).unwrap_or_default();

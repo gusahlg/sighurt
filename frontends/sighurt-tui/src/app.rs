@@ -1471,22 +1471,17 @@ impl App {
             columns: page.cols,
             rows: page.rows,
         };
-        // The blank and the synchronized-output brackets sit outside the encoder, so the
-        // image itself still has to fit in what remains of the output cap.
+        // The blank and its synchronized update sit outside the encoder, so the image
+        // itself still has to fit in what remains of the output cap.
         let mut prefix = Vec::new();
         if protocol == Protocol::Sixel {
             prefix.extend_from_slice(SYNC_BEGIN);
             blank_page(&mut prefix, page);
+            prefix.extend_from_slice(SYNC_END);
         }
-        let suffix = if protocol == Protocol::Sixel {
-            SYNC_END.len()
-        } else {
-            0
-        };
         let max = OUTPUT_CAP
             .saturating_sub(out.len())
-            .saturating_sub(prefix.len())
-            .saturating_sub(suffix);
+            .saturating_sub(prefix.len());
         let image = pixels.image;
         let Some(encoded) = pixels
             .handle
@@ -1507,13 +1502,14 @@ impl App {
             Ok(bytes) => {
                 diag.counters.encoded_bytes += bytes.len() as u64;
                 if protocol == Protocol::Sixel {
-                    // Spaces update tmux's grid, which drops the previous sixel, and the
-                    // synchronized update keeps those spaces off the outer terminal. The
-                    // sixel itself is written through. The cursor save inside the sixel
-                    // restores the position after the spaces, not the grid's cursor.
+                    // Spaces update tmux's grid, which drops the previous sixel. The image
+                    // comes after the synchronized update that holds them: tmux 3.8 writes
+                    // a sixel through at once but holds a synchronized pane's lines until
+                    // the update ends, and then redraws them over the image, which erases
+                    // it in the outer terminal. The cursor save inside the sixel restores
+                    // the position after the spaces, not the grid's cursor.
                     out.extend_from_slice(&prefix);
                     out.extend(bytes);
-                    out.extend_from_slice(SYNC_END);
                     self.tui.grid.forget_cursor();
                     self.tui.grid.forget_pen();
                 } else {

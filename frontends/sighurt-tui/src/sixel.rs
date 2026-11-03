@@ -14,6 +14,14 @@
 //! (`"1;1;W;H`) carry the size. The height is clipped to the rectangle and
 //! rounded down to a multiple of 6, so the image fits the page rows.
 //!
+//! Every frame defines all 252 registers, in order, right after the raster
+//! attributes (about 3 KiB). tmux decodes a sixel and re-encodes it for the
+//! outer terminal with one definition for every register from 0 to the highest
+//! one used, and writes a register the image never defined as `#n;0;0;0;0`
+//! (colour space 0). Rio drops a whole image that contains one of those, so a
+//! frame that defined only its own colours never showed in Rio under tmux
+//! (3.7 and 3.8).
+//!
 //! The introducer is `ESC P 0 ; 2 q`. Parameter 2 is 2, so colour 0 is an
 //! opaque register; `ESC P 2 q` sets parameter 1 instead, and tmux then treats
 //! register 0 as transparent.
@@ -273,7 +281,6 @@ impl Encoder {
         if out.over {
             return out.finish();
         }
-        let mut defined = [false; COLORS];
         let bands = height / 6;
         for band in 0..bands {
             if band > 0 {
@@ -294,7 +301,7 @@ impl Encoder {
                 }
                 first = false;
                 let index = u8::try_from(color).unwrap_or(0);
-                emit_color(&mut out, index, &mut defined);
+                emit_select(&mut out, index);
                 if scan {
                     emit_sixels_scan(&mut out, &self.indices[..width * 6], width, index);
                 } else {
@@ -372,27 +379,28 @@ fn emit_preamble(out: &mut Out, place: CellRect, width: usize, height: usize) {
     at += 1;
     at += write_dec(&mut buf[at..], u32::try_from(height).unwrap_or(u32::MAX));
     out.push(&buf[..at]);
+    for (index, [red, green, blue]) in PALETTE.iter().enumerate() {
+        let mut buf = [0u8; 24];
+        buf[0] = b'#';
+        let mut at = 1 + write_dec(&mut buf[1..], u32::try_from(index).unwrap_or(0));
+        buf[at..at + 3].copy_from_slice(b";2;");
+        at += 3;
+        at += write_dec(&mut buf[at..], u32::from(*red));
+        buf[at] = b';';
+        at += 1;
+        at += write_dec(&mut buf[at..], u32::from(*green));
+        buf[at] = b';';
+        at += 1;
+        at += write_dec(&mut buf[at..], u32::from(*blue));
+        out.push(&buf[..at]);
+    }
 }
 
-fn emit_color(out: &mut Out, index: u8, defined: &mut [bool; COLORS]) {
-    let mut buf = [0u8; 24];
+/// Selects register `index` (`#n`). Every register is defined in the preamble.
+fn emit_select(out: &mut Out, index: u8) {
+    let mut buf = [0u8; 4];
     buf[0] = b'#';
-    let mut at = 1 + write_dec(&mut buf[1..], u32::from(index));
-    if !defined[usize::from(index)] {
-        defined[usize::from(index)] = true;
-        let [red, green, blue] = PALETTE[usize::from(index)];
-        buf[at] = b';';
-        buf[at + 1] = b'2';
-        buf[at + 2] = b';';
-        at += 3;
-        at += write_dec(&mut buf[at..], u32::from(red));
-        buf[at] = b';';
-        at += 1;
-        at += write_dec(&mut buf[at..], u32::from(green));
-        buf[at] = b';';
-        at += 1;
-        at += write_dec(&mut buf[at..], u32::from(blue));
-    }
+    let at = 1 + write_dec(&mut buf[1..], u32::from(index));
     out.push(&buf[..at]);
 }
 
@@ -560,6 +568,26 @@ mod tests {
         }
     }
 
+    /// The preamble's register definitions, built independently of the encoder.
+    fn definitions() -> String {
+        (0..COLORS)
+            .map(|index| {
+                let [red, green, blue] = PALETTE[index];
+                format!("#{index};2;{red};{green};{blue}")
+            })
+            .collect()
+    }
+
+    /// `ESC [ s`, `cursor`, the introducer and raster attributes, every definition, `body`,
+    /// `ST`, `ESC [ u`.
+    fn expected(cursor: &str, size: &str, body: &str) -> Vec<u8> {
+        format!(
+            "\x1b[s{cursor}\x1bP0;2q\"1;1;{size}{}{body}\x1b\\\x1b[u",
+            definitions()
+        )
+        .into_bytes()
+    }
+
     fn raster(bytes: &[u8]) -> (u32, u32) {
         let marker = b"\"1;1;";
         let at = bytes
@@ -579,18 +607,12 @@ mod tests {
     #[test]
     fn a_known_frame_encodes_header_palette_rle_and_bands() {
         let mut red = [0u8, 0, 255, 255].repeat(4 * 6);
-        let bytes = encode_pixels(&mut red, 4, 6, full(4, 1), 1, 6, 1024).unwrap();
-        assert_eq!(
-            bytes,
-            b"\x1b[s\x1b[H\x1bP0;2q\"1;1;4;6#210;2;100;0;0!4~\x1b\\\x1b[u"
-        );
+        let bytes = encode_pixels(&mut red, 4, 6, full(4, 1), 1, 6, 16 * 1024).unwrap();
+        assert_eq!(bytes, expected("\x1b[H", "4;6", "#210!4~"));
 
         let mut tall = [0u8, 0, 255, 255].repeat(12);
-        let bytes = encode_pixels(&mut tall, 1, 12, full(1, 2), 1, 6, 1024).unwrap();
-        assert_eq!(
-            bytes,
-            b"\x1b[s\x1b[H\x1bP0;2q\"1;1;1;12#210;2;100;0;0~-#210~\x1b\\\x1b[u"
-        );
+        let bytes = encode_pixels(&mut tall, 1, 12, full(1, 2), 1, 6, 16 * 1024).unwrap();
+        assert_eq!(bytes, expected("\x1b[H", "1;12", "#210~-#210~"));
         assert_eq!(bytes.iter().filter(|byte| **byte == b'-').count(), 1);
 
         let mut mixed = Vec::new();
@@ -603,10 +625,39 @@ mod tests {
             columns: 2,
             rows: 1,
         };
-        let bytes = encode_pixels(&mut mixed, 2, 6, place, 1, 6, 1024).unwrap();
-        assert_eq!(
-            bytes,
-            b"\x1b[s\x1b[3;2H\x1bP0;2q\"1;1;2;6#5;2;0;0;100?~$#210;2;100;0;0~\x1b\\\x1b[u"
+        let bytes = encode_pixels(&mut mixed, 2, 6, place, 1, 6, 16 * 1024).unwrap();
+        assert_eq!(bytes, expected("\x1b[3;2H", "2;6", "#5?~$#210~"));
+    }
+
+    /// tmux re-encodes a sixel with a definition for every register up to the
+    /// highest used, and an undefined one comes out as `#n;0;0;0;0`, which makes
+    /// Rio drop the image. A frame of one colour, high in the palette, defines
+    /// every register below it, in colour space 2, once, before the first sixel.
+    #[test]
+    fn every_register_is_defined_before_the_first_sixel() {
+        let mut white = [255u8, 255, 255, 255].repeat(3 * 12);
+        let bytes = encode_pixels(&mut white, 3, 12, full(3, 2), 1, 6, 16 * 1024).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let (_, after) = text.split_once("\"1;1;3;12").unwrap();
+        let (palette, body) = after.split_at(definitions().len());
+        assert_eq!(palette, definitions());
+        assert_eq!(body, "#251!3~-#251!3~\x1b\\\x1b[u");
+        let mut seen = Vec::new();
+        for definition in palette.split('#').skip(1) {
+            let fields: Vec<u32> = definition.split(';').map(|f| f.parse().unwrap()).collect();
+            assert_eq!(fields.len(), 5, "{definition}");
+            assert_eq!(fields[1], 2, "colour space of {definition}");
+            assert!(
+                fields[2..].iter().all(|percent| *percent <= 100),
+                "{definition}"
+            );
+            seen.push(fields[0]);
+        }
+        assert_eq!(seen, (0..252).collect::<Vec<u32>>());
+        assert!(
+            palette.len() < 4 * 1024,
+            "{} bytes of palette",
+            palette.len()
         );
     }
 
@@ -615,19 +666,14 @@ mod tests {
         // Half of opaque red, premultiplied. Un-premultiplying and forgetting
         // to composite would emit full red (register 210).
         let mut half = [0u8, 0, 128, 128].repeat(6);
-        let bytes = encode_pixels(&mut half, 1, 6, full(1, 1), 1, 6, 1024).unwrap();
-        assert_eq!(
-            bytes,
-            b"\x1b[s\x1b[H\x1bP0;2q\"1;1;1;6#126;2;60;0;0~\x1b\\\x1b[u"
-        );
+        let bytes = encode_pixels(&mut half, 1, 6, full(1, 1), 1, 6, 16 * 1024).unwrap();
+        assert_eq!(bytes, expected("\x1b[H", "1;6", "#126~"));
+        assert!(definitions().contains("#126;2;60;0;0#"));
 
         // Alpha 0 is black, whatever channel was stored.
         let mut clear = [0u8, 0, 255, 0].repeat(6);
-        let bytes = encode_pixels(&mut clear, 1, 6, full(1, 1), 1, 6, 1024).unwrap();
-        assert_eq!(
-            bytes,
-            b"\x1b[s\x1b[H\x1bP0;2q\"1;1;1;6#0;2;0;0;0~\x1b\\\x1b[u"
-        );
+        let bytes = encode_pixels(&mut clear, 1, 6, full(1, 1), 1, 6, 16 * 1024).unwrap();
+        assert_eq!(bytes, expected("\x1b[H", "1;6", "#0~"));
     }
 
     #[test]
@@ -657,7 +703,7 @@ mod tests {
     #[test]
     fn a_frame_over_the_cap_is_an_error_and_not_a_partial_image() {
         let mut pixels = [0u8, 0, 255, 255].repeat(4 * 6);
-        let bytes = encode_pixels(&mut pixels, 4, 6, full(4, 1), 1, 6, 1024).unwrap();
+        let bytes = encode_pixels(&mut pixels, 4, 6, full(4, 1), 1, 6, 16 * 1024).unwrap();
         assert!(encode_pixels(&mut pixels, 4, 6, full(4, 1), 1, 6, bytes.len()).is_ok());
         match encode_pixels(&mut pixels, 4, 6, full(4, 1), 1, 6, bytes.len() - 1) {
             Err(Error::TooLarge { bytes: got, max }) => assert!(got > max),
@@ -683,13 +729,13 @@ mod tests {
     #[test]
     fn a_short_buffer_is_a_bad_frame_and_an_empty_rectangle_is_empty() {
         let mut pixels = [0u8; 4];
-        let error = encode_pixels(&mut pixels, 2, 6, full(2, 1), 1, 6, 1024);
+        let error = encode_pixels(&mut pixels, 2, 6, full(2, 1), 1, 6, 16 * 1024);
         assert!(matches!(error, Err(Error::BadFrame(_))));
         let mut pixels = [0u8, 0, 255, 255].repeat(6);
-        let error = encode_pixels(&mut pixels, 1, 6, full(0, 1), 1, 6, 1024);
+        let error = encode_pixels(&mut pixels, 1, 6, full(0, 1), 1, 6, 16 * 1024);
         assert_eq!(error, Err(Error::Empty));
         // One pixel is shorter than a sixel band.
-        let error = encode_pixels(&mut pixels, 1, 6, full(1, 1), 1, 1, 1024);
+        let error = encode_pixels(&mut pixels, 1, 6, full(1, 1), 1, 1, 16 * 1024);
         assert_eq!(error, Err(Error::Empty));
     }
 
