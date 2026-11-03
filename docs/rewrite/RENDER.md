@@ -578,3 +578,48 @@ layering and on these corrections. They override the body above.
     timeout, device loss (`SIG_RENDER_FAIL=device`), closing one of two windows, atlas overflow
     while another surface is in flight; measured owner-loop stalls and retiring memory, not only
     render time.
+
+## 15. Measured: wgpu 30 on Vulkan as a chrome presenter (3 November 2026)
+
+`experiments/wgpu-subsurface` (branch `wgpu-exp`, commit d205209; Claude Opus 5.5) binds wgpu
+30 (Vulkan only, validation on) to a GL-mode chrome target of the host and presents on each
+permit, in `tools/headless-sway --renderer gles2` on this desktop (RTX 3070, NVIDIA 595.104.02,
+sway with explicit sync). Logs and screenshots: `/data/sig-builds/test-out/wgpuexp/`.
+
+| Question | Result |
+|---|---|
+| Does `queue.present` commit the host's pending frame request? | Yes, synchronously: the `WAYLAND_DEBUG` trace shows the host's `wl_surface.frame` and presentation feedback at permit issue, then inside present the syncobj acquire/release points, attach, damage and commit. 59–63 permits, callbacks and presented frames a second over 17 s; no stall. |
+| Per-frame cost (debug build, validation on) | acquire 0.15–0.24 ms (0.5 max; 2.2 after a configure), submit 0.7–1.0 ms (3.4 max), present 0.27–0.5 ms (3.4 max). |
+| Present modes, formats, alpha | `[Mailbox, Fifo, Immediate]`; `Bgra8Unorm` present; `[Opaque, PreMultiplied]`. wgpu asks for `desired_maximum_frame_latency + 1` images: 3 images by default (min 2, max 8). |
+| Hide and show | Keeping the `Surface` across an unmap costs nothing and errs nowhere (presents on the unmapped surface 8–12 ms for 10; re-show at the same size needs no reconfigure; a new size configures in 1.7–3.6 ms). Dropping and recreating costs 20–35 ms of owner-thread time per re-show (drop waits for the device 8–12 ms, bind 1.4–5.4 ms with NVIDIA's registry roundtrips, first configure 10–17 ms). After every map NVIDIA returns `Suboptimal` on each acquire until one reconfigure (3–4 ms). |
+| Acquire when every image is held | `FRAME_TIMEOUT_MS = 1000` is fixed in `wgpu-core/src/present.rs`. On a desynchronized or unmapped surface, 10 back-to-back presents never block. **In a synchronized subsurface before the root commits, the third present blocks 1 s and returns `Timeout`, each time, until the root commits** (8 in a row stalled the loop 8.2 s). |
+| Drop order | Surface, then device and queue, then adapter and instance, then the lease and host: clean. A present after the lease is gone is a fatal protocol error for the whole connection (`wp_linux_drm_syncobj_surface_v1: The surface has been destroyed`), and the dispatch thread then spins printing the error. |
+| Memory and start | RSS 6 MB → **123–157 MB after the device (+117 MB)**; instance 85–120 ms, device 66–117 ms, first bind 141–241 ms in all. Unmeasured: how much is shared with Servo's NVIDIA GL driver inside `sig`. |
+| 0×0 configure | A validation error (`ZeroArea`); a panic without an error scope or uncaptured-error handler. Lazy configure at the first permit: 1.5–4.5 ms. |
+| Pixman compositor | Refused: the adapter does not present to the surface (no `zwp_linux_dmabuf_v1`, no syncobj). lavapipe does not load in the nix-shell (needs a newer glibc), so the software-adapter rule is untested. |
+| `Cargo.lock` | With `default-features = false` wgpu adds crates only (ash, gpu-allocator, naga, spirv, wgpu*); the wasm-bindgen family is unchanged (§14.15 overstated it); `bit-set`/`bit-vec` entries gain a version suffix because a second version joins. |
+
+Rules that follow (they amend §14):
+
+- **A native chrome target renders only on a permit, once per permit, never on its own
+  clock.** The host issues the next permit for a synchronized target only after the
+  transaction's root commit and the frame callback, which is what keeps acquire from
+  blocking. So a `Deferred` outcome is retried by *invalidating* the target (a new permit),
+  never by presenting again; nothing presents outside `render`. The host's existing pacing
+  already provides this; the frontend must not add a second path.
+- **`Suboptimal` after a map:** render that frame, then reconfigure once before the next.
+- **Hide keeps the `Surface`** (amends §14.2): `unbind` happens on retire, fallback and
+  shutdown only. Mesa is untested; the rule is reconsidered if Mesa misbehaves.
+- **The RSS cost is real** (+117 MB for a device next to a Servo that already owns the GPU):
+  §14.5 stands, `auto` stays on the CPU backend, and lane 2 measures the cost *inside `sig`*
+  with Servo running before anything is promoted.
+- **wgpu 30 API facts for lane 2:** `Instance::new(InstanceDescriptor { backends: VULKAN,
+  ..new_without_display_handle() })`; the surface from
+  `SurfaceTargetUnsafe::from_display_and_window(&handles, &handles)` (`from_window` leaves the
+  display out and fails with `MissingDisplayHandle`); `request_adapter` returns a `Result`
+  and `request_device(&desc)` takes one argument, both futures (a no-op waker `block_on`);
+  `get_current_texture()` returns the `CurrentSurfaceTexture` enum; present is
+  `queue.present(texture)`; `SurfaceConfiguration` has `color_space`; error scopes are
+  guards whose `pop()` is a future; always install `on_uncaptured_error`; image counts are
+  only visible through `wgpu::hal` (`maximum_frame_latency` = image count − 1). Debug builds
+  turn validation on and load the user's implicit layers (MangoHud here).
