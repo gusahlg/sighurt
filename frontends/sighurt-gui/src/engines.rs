@@ -31,7 +31,7 @@ pub fn build() -> (
                 renderer: "gl, straight into the page's subsurface",
                 start: servo,
             },
-            mode: PresentMode::Gl,
+            mode: PresentMode::Native,
         },
         #[cfg(feature = "engine-wasm")]
         WaylandEngine {
@@ -49,7 +49,7 @@ pub fn build() -> (
                 renderer: "WebKit: its DMA-BUFs straight into the page's subsurface",
                 start: wpe,
             },
-            mode: PresentMode::Gl,
+            mode: PresentMode::Native,
         },
         #[cfg(feature = "engine-ladybird")]
         WaylandEngine {

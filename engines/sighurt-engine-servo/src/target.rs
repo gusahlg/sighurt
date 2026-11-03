@@ -183,7 +183,7 @@ impl ServoTarget for TargetLease {
 
     fn unsupported(&self) -> Option<&'static str> {
         match self.mode() {
-            PresentMode::Gl => None,
+            PresentMode::Native => None,
             PresentMode::Shm => Some("presenting into a shared-memory target"),
         }
     }

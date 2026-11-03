@@ -513,7 +513,7 @@ host's frame callback and buffer release); measured, not yet optimized.
 
 ## 4. Presentation on a host-owned subsurface
 
-**The path.** The host leases each WPE view a native target (`PresentMode::Gl`, whose contract is
+**The path.** The host leases each WPE view a native target (`PresentMode::Native`, whose contract is
 that the presenter, not the host, attaches and commits the leaf; the name says GL, the presenter
 here attaches DMA-BUFs). The presenter (`present.rs`) joins the host's `wl_display` with a second
 event queue of its own (`Backend::from_foreign_display`), wraps the target's `wl_surface`, and binds
@@ -612,7 +612,7 @@ table.
 3. **Implicit synchronization only**: WebKit waits for each rendering fence in the UI process.
    Explicit synchronization (`linux-drm-syncobj-v1` in the host, `use_explicit_sync`) would save a
    wakeup per frame. The loop's 5–6 iterations per frame are measured, not optimized.
-4. **The host's names**: the presenter uses `PresentMode::Gl` targets and `TargetLease::gl_handles`
+4. **The host's names**: the presenter uses `PresentMode::Native` targets and `TargetLease::gl_handles`
    for a non-GL native presenter. A `Native` mode, or a documented accessor for the display and
    surface, would say what it is (a `sighurt-wayland` change, not made here).
 5. **Releases are seen when the engine is pumped or presents**: the host reads the socket, and the
@@ -834,7 +834,7 @@ WebKit opens what `[routing.wpe] hosts` gives it and what `page.open-in wpe` ask
 78). What the integration is:
 
 - **The registry entry `wpe`** (`apps/sighurt-browser/src/registry.rs`): `CAPABILITIES`, native
-  (`PresentMode::Gl`) targets, the settings it honors (`user-agent`, `storage`), and
+  (`PresentMode::Native`) targets, the settings it honors (`user-agent`, `storage`), and
   `WpeRuntime::new` on first use with `WpeConfig { profile, user_agent }`: the profile is
   `{data_dir}/sighurt/wpe` with `storage = "profile"` and none (an ephemeral session) with
   `"ephemeral"`. The diagnostics' renderer line is `mode=hardware gl="WebKit, DMA-BUF on
@@ -943,8 +943,8 @@ whole of `engines.sh`, 217 checks, passes with them):
    frame message and its rendering fence); before, 3.25 were the watch thread's, half of them
    WebKit waking its own context while it dispatched. Explicit synchronization (the proof's
    limitation 3) would save the fence's.
-8. **The host**: `PresentMode::Gl` names a native target that isn't GL (the proof's limitation
-   4); its text input could re-enable a session when surrounding text first appears (the
+8. **The host**: `PresentMode::Gl` named a native target that isn't GL (the proof's limitation
+   4; renamed `PresentMode::Native` with the render framework, RENDER.md §14.16); its text input could re-enable a session when surrounding text first appears (the
    engine works around it).
 9. **Not run**: on louise-pc (its benchmark runs held it, then it didn't answer; `shell.nix`
    now brings the pin's Rust, decision 86), a `RuntimeFailed` (it needs the compositor

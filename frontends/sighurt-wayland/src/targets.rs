@@ -3,7 +3,7 @@
 //! A target ([`TargetId`]) is a `wl_surface` the host created and places as a subsurface of its
 //! window's root. A [`TargetLease`] keeps its native backing alive and gives a trusted presenter
 //! the target id, the current [`Metrics`], the presentation mode chosen when it was created
-//! ([`PresentMode::Shm`], or [`PresentMode::Gl`] for a native GL path), and, for GL, the raw
+//! ([`PresentMode::Shm`], or [`PresentMode::Native`] for a native GL path), and, for it, the raw
 //! display and window handles through one unsafe accessor ([`TargetLease::gl_handles`]) whose
 //! lifetime rules are documented there and nowhere else. A [`FramePermit`] allows one
 //! presentation for one target at one layout epoch: it is consumed by use, not `Clone`, and
@@ -71,9 +71,10 @@ use crate::shm::{
 pub enum PresentMode {
     /// The host's shared-memory buffers, painted on the CPU: [`FramePermit::shm_frame`].
     Shm,
-    /// A native GL presenter (EGL on the target's `wl_surface`) that commits the leaf with its
-    /// own swaps: [`TargetLease::gl_handles`] and [`FramePermit::finish`].
-    Gl,
+    /// A native presenter (EGL on the target's `wl_surface`, WPE WebKit's DMA-BUFs, a GPU
+    /// swapchain) that commits the leaf with its own swaps: [`TargetLease::gl_handles`] and
+    /// [`FramePermit::finish`].
+    Native,
 }
 
 /// What the host's objects need to present on a target without the host at hand.
@@ -280,7 +281,7 @@ impl TargetLease {
     /// keeps the surface and the connection alive until then.
     pub unsafe fn gl_handles(&self) -> Option<GlHandles<'_>> {
         let target = self.target.borrow();
-        if target.mode != PresentMode::Gl {
+        if target.mode != PresentMode::Native {
             return None;
         }
         let display = NonNull::new(self.connection.backend().display_ptr().cast::<c_void>())?;
@@ -437,7 +438,8 @@ impl FramePermit {
     /// [`ShmFrame::submit`] instead.
     pub fn finish(mut self, outcome: PresentOutcome) {
         debug_assert!(
-            outcome != PresentOutcome::Submitted || self.target.borrow().mode == PresentMode::Gl,
+            outcome != PresentOutcome::Submitted
+                || self.target.borrow().mode == PresentMode::Native,
             "an SHM frame is submitted through ShmFrame::submit"
         );
         self.outcome = Some(outcome);
@@ -647,7 +649,7 @@ impl Host {
             let mut t = target.borrow_mut();
             t.clock.issue();
             t.stats.permits += 1;
-            if t.mode == PresentMode::Gl {
+            if t.mode == PresentMode::Native {
                 // Pending state the presenter's swap commits.
                 if let Some(seq) = t.clock.request_callback() {
                     t.surface.frame(&self.qh, FrameData { target: id, seq });

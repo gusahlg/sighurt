@@ -311,7 +311,7 @@ impl State {
         let view = ViewId::next();
         let mode = match kind {
             Kind::Wasm => PresentMode::Shm,
-            Kind::Servo | Kind::Wpe => PresentMode::Gl,
+            Kind::Servo | Kind::Wpe => PresentMode::Native,
         };
         let lease = self
             .host

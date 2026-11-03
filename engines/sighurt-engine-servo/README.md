@@ -18,7 +18,7 @@ returns early for `should_panic_hook_suppress_termination()` and hands other pan
 `log::error!`), installs rustls's aws-lc-rs provider, builds the one `ServoRuntime` at startup
 with a `ServoConfig` (the profile directory, `{data_dir}/sighurt/servo`) and an `EngineWaker`,
 and calls `setup_logging()`. The runtime implements `EngineRuntime` with
-`sighurt_wayland::TargetLease` (a `PresentMode::Gl` target per view) and `FramePermit`; see
+`sighurt_wayland::TargetLease` (a `PresentMode::Native` target per view) and `FramePermit`; see
 `tests/common/mod.rs` for an owner loop that does all of this, and `examples/servo-window.rs`
 for a window built on it:
 

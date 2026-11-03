@@ -319,7 +319,7 @@ impl State {
         let view = ViewId::next();
         let lease = self
             .host
-            .create_target(self.window, PresentMode::Gl, Some(view))
+            .create_target(self.window, PresentMode::Native, Some(view))
             .expect("the window exists");
         let target = lease.id();
         let options = ViewOptions {
