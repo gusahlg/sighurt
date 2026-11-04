@@ -92,3 +92,27 @@ Mesa's Vulkan WSI (another machine), a real output instead of the headless one, 
 Servo running beside the chrome's device (how much of the +129 MiB the NVIDIA GL driver Servo
 already loads shares), debug builds (validation on: render ~10 ms for a first frame, about the
 same steady).
+
+## After the CPU backend's optimizations (4 November 2026, branch `opt2`)
+
+H-CPU1 (painting in the buffer's byte order) and H-CPU2 (glyph rows), bench/HYPOTHESES.md.
+Same machine and method as above, release builds of a89465c (`base`) and of `opt2` (`final`),
+`bench/render/chrome.sh` with `CHROME_BUILDS`, both builds and all three renderers interleaved,
+three runs each, in one gles2 sway; the workload now has a third tab (`demo://resize`) and a
+10 s hover phase (pointer motion every 10 ms: a status-line change per motion). Logs:
+`/data/sig-builds/test-out/opt2/chrome-final/`.
+
+| renderer | build | churn CPU | hover CPU | RSS | chrome render | page render | status render |
+|---|---|---|---|---|---|---|---|
+| cpu | base | 3.7 % | 11.4 % | 15.1 MiB | 0.197 ms | 1.987 ms | 0.208 ms |
+| cpu | final | 3.4 % | 11.0 % | 15.3 MiB | 0.168 ms | 1.488 ms | 0.160 ms |
+| wgpu | base | 4.0 % | 14.7 % | 142.6 MiB | 0.358 ms | 0.593 ms | 0.727 ms |
+| wgpu | final | 3.7 % | 14.8 % | 142.7 MiB | 0.352 ms | 0.323 ms | 0.727 ms |
+| vulkan | base | 3.9 % | 12.6 % | 138.5 MiB | 0.561 ms | 2.769 ms | 0.392 ms |
+| vulkan | final | 3.9 % | 12.4 % | 139.2 MiB | 0.784 ms | 2.550 ms | 0.390 ms |
+
+The GPU renderers' code did not change; their rows show this session's run-to-run spread
+(Vulkan's chrome median moved 0.56 → 0.78 ms with the same code). The CPU renderer's per-surface
+medians fell 15–25 %, and it is now the fastest of the three on every surface but the
+page surface under wgpu (whose native surface keeps its frame across a hide, so most of its
+page renders find nothing new to draw). Idle: 0 wakeups and 0 chrome paints for every build.

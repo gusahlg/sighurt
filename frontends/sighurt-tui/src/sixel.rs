@@ -10,7 +10,10 @@
 //! 6×7×6 palette (252 registers). There is no per-frame palette search and no
 //! dither. Every frame is a full image. One pass per 6-row band emits only the
 //! colours present in that band, run-length encoded (`!n`, split at 10000 so a
-//! repeat stays inside the limit tmux accepts). Raster attributes
+//! repeat stays inside the limit tmux accepts). A run of equal pixels in a row
+//! is quantized once, and each colour's sixels are built and scanned only
+//! between the first and last column it has in the band (bench/HYPOTHESES.md
+//! H-TUI1). Raster attributes
 //! (`"1;1;W;H`) carry the size. The height is clipped to the rectangle and
 //! rounded down to a multiple of 6, so the image fits the page rows.
 //!
@@ -241,23 +244,49 @@ fn pixel_index(pixel: &[u8]) -> u8 {
     )
 }
 
+/// The columns a colour has in one band: from `start` up to, not including,
+/// `end`. Empty while `start >= end`.
+#[derive(Clone, Copy)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+
+impl Span {
+    const EMPTY: Span = Span {
+        start: usize::MAX,
+        end: 0,
+    };
+
+    fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+
+    fn add(&mut self, start: usize, end: usize) {
+        self.start = self.start.min(start);
+        self.end = self.end.max(end);
+    }
+}
+
 /// Reused buffers for [`encode`]. One encoder per thread.
 #[derive(Default)]
 struct Encoder {
-    /// Palette index of each pixel in the current 6-row band, row-major.
+    /// Palette index of each pixel in the current 6-row band, row-major. Only
+    /// when the band is scanned.
     indices: Vec<u8>,
     /// Six-bit mask of each colour across the band, colour-major. Empty when
-    /// the band is scanned instead.
+    /// the band is scanned instead. All zero between bands: each colour's span
+    /// is cleared once it is written.
     masks: Vec<u8>,
 }
 
 impl Encoder {
     fn prepare(&mut self, width: usize, scan: bool) {
-        let indices = width.saturating_mul(6);
-        if self.indices.len() < indices {
-            self.indices.resize(indices, 0);
-        }
         if scan {
+            let indices = width.saturating_mul(6);
+            if self.indices.len() < indices {
+                self.indices.resize(indices, 0);
+            }
             return;
         }
         let masks = COLORS.saturating_mul(width);
@@ -286,14 +315,11 @@ impl Encoder {
             if band > 0 {
                 out.byte(b'-');
             }
-            let mut present = [false; COLORS];
-            self.paint_band(frame, band, width, &mut present);
-            if !scan {
-                self.stamp_masks(width, &present);
-            }
+            let mut spans = [Span::EMPTY; COLORS];
+            self.paint_band(frame, band, width, &mut spans, scan);
             let mut first = true;
-            for (color, on) in present.iter().enumerate() {
-                if !*on {
+            for (color, span) in spans.iter().enumerate() {
+                if span.is_empty() {
                     continue;
                 }
                 if !first {
@@ -305,8 +331,9 @@ impl Encoder {
                 if scan {
                     emit_sixels_scan(&mut out, &self.indices[..width * 6], width, index);
                 } else {
-                    let start = color * width;
-                    emit_sixels(&mut out, &self.masks[start..start + width]);
+                    let masks = &mut self.masks[color * width..(color + 1) * width];
+                    emit_sixels(&mut out, masks, *span);
+                    masks[span.start..span.end].fill(0);
                 }
             }
             if out.over {
@@ -317,38 +344,38 @@ impl Encoder {
         out.finish()
     }
 
+    /// Quantizes band `band`, one run of equal pixels at a time, into the
+    /// colours' masks (or, when `scan`, into `indices`), and widens each
+    /// colour's span to the columns it has.
     fn paint_band(
         &mut self,
         frame: &Frame<'_>,
         band: usize,
         width: usize,
-        present: &mut [bool; COLORS],
+        spans: &mut [Span; COLORS],
+        scan: bool,
     ) {
-        let stride = frame.stride;
         for row in 0..6 {
-            let src = (band * 6 + row) * stride;
-            let dst = row * width;
-            for x in 0..width {
-                let pixel = src + x * 4;
-                let index = pixel_index(&frame.pixels[pixel..pixel + 4]);
-                self.indices[dst + x] = index;
-                present[usize::from(index)] = true;
-            }
-        }
-    }
-
-    fn stamp_masks(&mut self, width: usize, present: &[bool; COLORS]) {
-        for (color, on) in present.iter().enumerate() {
-            if *on {
-                self.masks[color * width..(color + 1) * width].fill(0);
-            }
-        }
-        for row in 0..6 {
-            let bit = 1u8 << row;
-            let src = row * width;
-            for x in 0..width {
-                let color = usize::from(self.indices[src + x]);
-                self.masks[color * width + x] |= bit;
+            let start = (band * 6 + row) * frame.stride;
+            let pixels = frame.pixels[start..start + width * 4].as_chunks::<4>().0;
+            let mut x = 0;
+            while x < width {
+                let pixel = pixels[x];
+                let index = pixel_index(&pixel);
+                let mut end = x + 1;
+                while end < width && pixels[end] == pixel {
+                    end += 1;
+                }
+                spans[usize::from(index)].add(x, end);
+                if scan {
+                    self.indices[row * width + x..row * width + end].fill(index);
+                } else {
+                    let masks = &mut self.masks[usize::from(index) * width..];
+                    for mask in &mut masks[x..end] {
+                        *mask |= 1 << row;
+                    }
+                }
+                x = end;
             }
         }
     }
@@ -404,13 +431,16 @@ fn emit_select(out: &mut Out, index: u8) {
     out.push(&buf[..at]);
 }
 
-/// Sixel bytes for one colour of a band. Trailing zero sixels are omitted.
-fn emit_sixels(out: &mut Out, masks: &[u8]) {
-    let end = masks
-        .iter()
-        .rposition(|&bits| bits != 0)
-        .map_or(0, |at| at + 1);
+/// Sixel bytes for one colour of a band, whose columns are `span`: the empty
+/// sixels before it as runs, then its own. Trailing zero sixels are omitted.
+fn emit_sixels(out: &mut Out, masks: &[u8], span: Span) {
     let mut x = 0;
+    while x < span.start {
+        let count = (span.start - x).min(REPEAT_MAX);
+        emit_run(out, 0, count);
+        x += count;
+    }
+    let end = span.end;
     while x < end {
         let value = masks[x];
         let mut count = 1;
