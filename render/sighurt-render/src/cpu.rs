@@ -13,8 +13,11 @@
 //!
 //! The buffer is Wayland's `WL_SHM_FORMAT_ARGB8888`: 32-bit pixels `0xAARRGGBB`, stored
 //! little-endian, so the bytes of each pixel are B, G, R, A, with premultiplied alpha. tiny-skia
-//! paints premultiplied R, G, B, A bytes; the backend swaps red and blue once, after drawing, in
-//! place when rows are packed and through a reused scratch pixmap when the stride has padding.
+//! paints premultiplied R, G, B, A bytes, so the backend hands it, and its own text blending,
+//! every color with red and blue exchanged ([`bgra`]): source-over treats the color channels
+//! alike, so what is painted is already B, G, R, A, and no pass over the buffer swaps them. It
+//! paints in place when rows are packed and through a reused scratch pixmap, copied row by row,
+//! when the stride has padding.
 //!
 //! Must not own: buffers or their lifetime (the host's SHM presenter), what is drawn (the
 //! chrome), page pixels, or a native surface (it binds none).
@@ -157,7 +160,6 @@ impl Backend for CpuBackend {
             let bytes = &mut data[..row * height as usize];
             let pixmap = PixmapMut::from_bytes(bytes, width, height).expect("size checked");
             draw(pixmap, &mapping, scene, &fonts, glyphs);
-            swap_red_blue(bytes);
         } else {
             let pixmap = match scratch.take() {
                 Some(pixmap) if (pixmap.width(), pixmap.height()) == (width, height) => pixmap,
@@ -167,7 +169,6 @@ impl Backend for CpuBackend {
             draw(pixmap.as_mut(), &mapping, scene, &fonts, glyphs);
             for (source, target) in pixmap.data().chunks_exact(row).zip(data.chunks_mut(stride)) {
                 target[..row].copy_from_slice(source);
-                swap_red_blue(&mut target[..row]);
             }
         }
         self.scratch = scratch;
@@ -197,7 +198,7 @@ fn draw(
     fonts: &FontSystemHandle,
     glyphs: &mut GlyphCache,
 ) {
-    let Rgba { r, g, b, a } = scene.clear;
+    let Rgba { r, g, b, a } = bgra(scene.clear);
     pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, a));
     let transform = shape::transform(mapping);
     for item in &scene.items {
@@ -209,7 +210,16 @@ fn draw(
                 }
             };
             if let Some(clip) = clip {
-                text(&mut pixmap, mapping, scene, run, color, clip, fonts, glyphs);
+                text(
+                    &mut pixmap,
+                    mapping,
+                    scene,
+                    run,
+                    bgra(color),
+                    clip,
+                    fonts,
+                    glyphs,
+                );
             }
             continue;
         }
@@ -225,7 +235,7 @@ fn draw(
         match item.kind {
             Kind::Rect { rect, color } => {
                 if let Some(rect) = mapping.snap(rect).and_then(skia_rect) {
-                    pixmap.fill_rect(rect, &paint(color), Transform::identity(), mask);
+                    pixmap.fill_rect(rect, &paint(bgra(color)), Transform::identity(), mask);
                 }
             }
             Kind::RoundedRect {
@@ -234,7 +244,8 @@ fn draw(
                 color,
             } => {
                 if let Some(rect) = mapping.snap(rect).and_then(skia_rect) {
-                    fill_rounded(&mut pixmap, rect, radius * mapping.scale(), color, mask);
+                    let radius = radius * mapping.scale();
+                    fill_rounded(&mut pixmap, rect, radius, bgra(color), mask);
                 }
             }
             Kind::Bordered {
@@ -247,11 +258,12 @@ fn draw(
                     continue;
                 };
                 if let Some(outer) = skia_rect(bordered.outer) {
-                    fill_rounded(&mut pixmap, outer, bordered.outer_radius, border, mask);
+                    let radius = bordered.outer_radius;
+                    fill_rounded(&mut pixmap, outer, radius, bgra(border), mask);
                 }
                 if let Some((inner, radius)) = bordered.inner {
                     if let Some(inner) = skia_rect(inner) {
-                        fill_rounded(&mut pixmap, inner, radius, fill, mask);
+                        fill_rounded(&mut pixmap, inner, radius, bgra(fill), mask);
                     }
                 }
             }
@@ -261,6 +273,7 @@ fn draw(
                 stroke,
             } => {
                 if let Some(path) = shape::skia_path(scene.path(path)) {
+                    let color = bgra(color);
                     shape::paint_path(&mut pixmap, &path, color, stroke, transform, mask);
                 }
             }
@@ -269,7 +282,8 @@ fn draw(
     }
 }
 
-/// Draws glyph run `run` of `scene` in `color`, cut to `clip` and the buffer.
+/// Draws glyph run `run` of `scene` in `color` (red and blue exchanged, as the buffer holds
+/// them), cut to `clip` and the buffer.
 #[allow(clippy::too_many_arguments)]
 fn text(
     pixmap: &mut PixmapMut<'_>,
@@ -309,7 +323,7 @@ fn text(
                         let [r, g, b, a] = image.data[source * 4..source * 4 + 4] else {
                             continue;
                         };
-                        blend(pixel, Rgba { r, g, b, a }, 255);
+                        blend(pixel, bgra(Rgba { r, g, b, a }), 255);
                     }
                     SwashContent::SubpixelMask => {}
                 }
@@ -330,10 +344,13 @@ fn skia_rect(rect: PixelRect) -> Option<Rect> {
     Rect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom)
 }
 
-/// Turns premultiplied RGBA bytes into premultiplied BGRA (ARGB8888 little-endian), in place.
-fn swap_red_blue(pixels: &mut [u8]) {
-    for pixel in pixels.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
+/// `color` with red and blue exchanged: painted in R, G, B, A order, it gives the B, G, R, A
+/// bytes of ARGB8888 little-endian.
+fn bgra(color: Rgba) -> Rgba {
+    Rgba {
+        r: color.b,
+        b: color.r,
+        ..color
     }
 }
 
@@ -428,13 +445,17 @@ mod tests {
     }
 
     #[test]
-    fn rgba_becomes_argb8888_little_endian() {
-        // tiny-skia's premultiplied RGBA bytes...
-        let mut pixels = [0x11, 0x22, 0x33, 0xff, 0x80, 0x00, 0x00, 0x80];
-        swap_red_blue(&mut pixels);
-        // ...read back as the 32-bit ARGB values wl_shm expects.
-        let first = u32::from_le_bytes(pixels[..4].try_into().unwrap());
-        let second = u32::from_le_bytes(pixels[4..].try_into().unwrap());
+    fn colors_are_painted_as_argb8888_little_endian() {
+        // A color exchanged, painted in R, G, B, A order...
+        let mut pixmap = Pixmap::new(2, 1).unwrap();
+        let Rgba { r, g, b, a } = bgra(Rgba::rgb(0x112233));
+        pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, a));
+        let mut pixel = [0, 0, 0, 0];
+        blend(&mut pixel, bgra(Rgba::rgb_alpha(0xff000080)), 255);
+        pixmap.data_mut()[4..].copy_from_slice(&pixel);
+        // ...reads back as the 32-bit ARGB values wl_shm expects.
+        let first = u32::from_le_bytes(pixmap.data()[..4].try_into().unwrap());
+        let second = u32::from_le_bytes(pixmap.data()[4..].try_into().unwrap());
         assert_eq!(first, 0xff11_2233);
         assert_eq!(second, 0x8080_0000, "half-transparent red, premultiplied");
     }

@@ -444,6 +444,103 @@ engine starts no download thread, and thread count and RSS do not grow with N pa
 4. Nothing to change. The burst test stays, so a later path that spawns a thread per call fails
 it.
 
+### Optimization session (4 November 2026): method
+
+Written on 4 November 2026 on tensor-ash (Intel Core i5-12400F, RTX 3070, NVIDIA 595.104.02,
+Linux 6.18.57), branch `opt2` off a89465c. Every `sig` measured is a **release** build
+(`tools/cargo build --release -p sighurt-browser --no-default-features --features
+engine-demo,render-wgpu,render-vulkan`), the build before a change and the build after it copied
+side by side and run interleaved in one private compositor (`tools/heavy tools/headless-sway
+[--renderer gles2] --`), 1280×800 at scale 1, every run with fresh XDG directories. `perf` cannot
+open events in this session's sandbox, so where a profile would have said where time goes,
+temporary timing lines (never committed) did.
+
+**A finding before any hypothesis:** H-UI2's `max_chrome_paint_us` of about 35 ms is a debug
+build's. In a release build the whole startup is about 7 ms (`bench/startup/startup.sh`, probe
+of 3 runs: exec to the first chrome surface 5.0 ms, to `sig://home`'s page surface 7.0 ms; the
+first paint of that 1280×696 surface 2.3 ms, of which 0.4 ms is the scene and the cold shaping);
+the debug build takes 57 ms to the same page surface, 38 ms of it in that one render
+(`/data/sig-builds/test-out/opt2/start-probe-home`). A timeline of temporary probes (three runs,
+`start-probe2`) splits the release startup into: exec to `main` 1.1 ms (the exec, page faults
+and Rust's start; the dynamic loader is 0.05 ms by `LD_DEBUG=statistics`), the Wayland
+connection 0.2 ms, the configuration 0.2 ms, **the font scan 2.3 ms** (`FontSystem::new`: fontdb
+reading the metadata of 125 faces; 2.4–3.1 ms in a release test of the scan alone), the
+renderer, the chrome and the window 0.05 ms, then 0.4 ms waiting for the first configure, and
+the first paints.
+
+### H-START1: The font scan overlaps the connection and the first configure
+
+- **Change:** the GUI starts the font scan on a thread of its own as `run` begins, before it
+  connects to the compositor, and creates the window (whose first commit asks the compositor
+  for a configure) before it waits for the scan. The connection, the configuration, the engine
+  registry and the configure's round trip then happen while the fonts are read, instead of
+  after. Nothing else changes: the same `FontSystem`, made by the same call, is handed to the
+  chrome and the renderer.
+- **Prediction:** on `demo://pattern` and on `sig://home`, the time from exec to the first
+  chrome line falls by 0.5 to 0.9 ms (the connection, configuration and configure wait measured
+  above), and the time to the page surface of `sig://home` by as much. Ten runs per build,
+  interleaved, a change counts when the medians differ by more than the larger IQR.
+- **Guards:** the same paints (`chrome_paints` 3 on `sig://home`, 2 on `demo://pattern`), the
+  chrome screenshots of headless.sh unchanged (78/78), no thread left running after startup (the
+  scan's thread ends when the scan does).
+- **Outcome:** not supported; reverted. `startup.sh`, ten runs a build, interleaved
+  (`/data/sig-builds/test-out/opt2/start1-pattern`, `start1-home`), medians (min–max):
+  `demo://pattern` exec to the first chrome surface 5.00 (4.70–6.40) → 5.10 (4.30–6.70) ms, to
+  the page's first frame 6.00 (5.40–6.50) → 6.20 (5.50–6.50) ms; `sig://home` first chrome
+  surface 4.85 (4.40–7.00) → 5.80 (4.50–7.20) ms, its page surface 6.85 (6.70–7.10) →
+  7.15 (6.50–7.50) ms. Nothing moved beyond the spread, and the medians moved the wrong way. The
+  configure that follows the window's first commit is sizeless (H-UI2), so the round trip that
+  matters starts only when the loop answers it, after the fonts; and the scan on a second thread
+  ran no faster than on the first. What is left of startup is the scan itself (2.3 ms of about
+  7), which only a cache of the fonts' metadata kept between runs would remove: not done, an
+  open item at that size.
+
+### H-CPU1: The CPU backend paints in the buffer's byte order
+
+- **Seen:** the CPU backend paints with tiny-skia in R, G, B, A byte order, then walks the whole
+  buffer again to swap red and blue (`swap_red_blue`), because wl_shm's ARGB8888 is B, G, R, A
+  in memory. On `sig://home` that is a second pass over 3.5 MB (1280×696) per frame. The
+  release measurement `frame_cost` (ui/sighurt-ui/tests/paint.rs, bundled font, 200 frames
+  after 20 warm-up frames, each a new layout so none is unchanged) gives render medians:
+  chrome surface 1280×84 108 µs, status 1280×20 16 µs, home page 1280×696 426 µs; at 200 %
+  311, 51 and 1730 µs. The standard chrome's scenes have no clipped shapes (only clipped text),
+  so the whole-buffer `Mask` of `clip_mask` is never made for them and is not a candidate.
+- **Change:** hand tiny-skia and the text blender every color with red and blue exchanged
+  (the clear color, shapes, paths, glyph colors, and the bytes of color glyphs), so what they
+  paint is already B, G, R, A, and drop the swap pass (a padded stride still copies row by
+  row, without the swap). Source-over with premultiplied alpha treats the three color channels
+  alike, so exchanging two of them before painting is the same as exchanging them after: the
+  same bytes.
+- **Prediction:** `frame_cost` render medians fall, most on the large surfaces: home page by at
+  least 15 % at 100 % and 200 %, the chrome surface by at least 5 %. Five runs of the test per
+  build, interleaved; a change counts when the medians of the five medians differ by more than
+  the larger spread.
+- **Guards:** every golden image byte for byte (`tools/cargo test -p sighurt-ui --test paint`,
+  `-p sighurt-chrome-line`), the CPU backend's unit tests, `sighurt-render --all-features`
+  (the GPU preparation's reference comparison with the CPU backend); in `sig`, `chrome.sh` cpu
+  render medians do not rise.
+- **Outcome:** supported, kept. `frame_cost`, five runs per build interleaved
+  (`/data/sig-builds/test-out/opt2/framecost-cpu1.txt`), median of the run medians (min–max)
+  in µs, before → after: home page 1280×696 427.0 (426.0–428.6) → 180.9 (180.0–197.1), −58 %;
+  at 200 % 1768.7 (1735.4–1798.7) → 687.1 (686.7–697.2), −61 %; chrome surface 1280×84 102.9
+  (98.7–103.2) → 73.8 (70.3–77.2), −28 %; at 200 % 313.7 → 202.6, −35 %; status 1280×20 15.4 →
+  9.0, at 200 % 50.8 → 25.1. The swap pass was most of the large surfaces' render. Every golden
+  image is byte for byte the same: regenerating all of them with `SIGHURT_BLESS=1` (sighurt-ui
+  `paint`, sighurt-chrome-line) left `git status` clean; `sighurt-render --all-features` (the
+  GPU preparation against the CPU backend) passes. In `sig` (`chrome.sh`, cpu renderer, five
+  runs per build interleaved in one gles2 sway, `chrome-cpu1/`): render medians chrome 0.200 →
+  0.166 ms, page 1.780 → 1.180 ms, status 0.205 → 0.167 ms; churn CPU 3.4 → 3.1 %, hover CPU
+  11.3 → 11.0 %, RSS 15.1 → 14.9 MiB (those three inside the spread). `sig`'s page render
+  (1.2 ms) stays well above the test's (0.18 ms): each show of `sig://home` paints into a new
+  shared-memory buffer (H-UI1 frees a hidden surface's), whose first writes fault its pages in.
+- **Seen while measuring (not a change):** on `chrome.sh`'s new hover phase the status
+  surface's `scene_ms` is about 0.5 ms a frame, almost all of it shaping the new status line
+  (`Fonts::fitted`, 0.53 ms in a probe inside `sig`). The same 75-character line shapes in
+  71 µs in a tight loop and in 421 µs when the loop sleeps 10 ms between lines (DejaVu Sans;
+  Cantarell 37 → 193 µs): it is cold caches and clocks after the idle gap, not the shaper's own
+  work, and a page's status text changes once per link hovered, not per motion as on
+  `demo://resize`. Left alone.
+
 ## Predictions for the IPC-removal session (gpui-baseline against 3c510fe)
 
 Written on 2 October 2026, before the session's first run. The session measures the baseline

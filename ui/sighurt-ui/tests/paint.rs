@@ -583,3 +583,58 @@ fn measure_with_system_fonts() {
     pixmap.save_png(out.join("system-home-240.png")).unwrap();
     println!("images in {}", out.display());
 }
+
+/// The cost of a chrome frame on the CPU, in a release build, with the bundled font: the scene
+/// and the render of the standard chrome's surfaces in a 1280×800 window, each frame a new
+/// layout so none is found unchanged (bench/HYPOTHESES.md H-CPU*):
+/// `cargo test -p sighurt-ui --release --test paint -- --ignored --nocapture frame_cost`.
+#[test]
+#[ignore = "a timing, run by hand"]
+fn frame_cost() {
+    use std::time::{Duration, Instant};
+
+    let median = |mut times: Vec<Duration>| {
+        times.sort_unstable();
+        times[times.len() / 2].as_secs_f64() * 1e6
+    };
+    let mut home = three_tabs();
+    home.tabs[0].active = false;
+    home.tabs[2].active = true;
+    home.status = Some("https://example.com/a/link/being/hovered".into());
+    for (name, surface, snapshot) in [
+        ("chrome", CHROME, three_tabs()),
+        ("status", STATUS, home.clone()),
+        ("home", PAGE, home),
+    ] {
+        for scale in [120, 240] {
+            let mut chrome = chrome(1280, 800, snapshot.clone());
+            let mut backend = backend();
+            let rect = rect_of(&chrome, surface);
+            let size = metrics(rect, scale).buffer();
+            let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
+            let layout = (size.width, size.height, size.width as usize * 4);
+            let (mut scenes, mut renders) = (Vec::new(), Vec::new());
+            for round in 0..220 {
+                let metrics = metrics(rect, scale);
+                let start = Instant::now();
+                let scene = scene(&mut chrome, surface, &metrics);
+                let drawn = start.elapsed();
+                let start = Instant::now();
+                let rendered = render_into(&mut backend, &scene, &metrics, &mut data, layout);
+                let took = start.elapsed();
+                assert_eq!(rendered, Ok(RenderOutcome::Submitted));
+                if round >= 20 {
+                    scenes.push(drawn);
+                    renders.push(took);
+                }
+            }
+            println!(
+                "frame_cost {name} {}x{} at {scale}/120: scene {:.1} us, render {:.1} us",
+                size.width,
+                size.height,
+                median(scenes),
+                median(renders)
+            );
+        }
+    }
+}
