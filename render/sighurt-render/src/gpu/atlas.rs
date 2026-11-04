@@ -425,8 +425,9 @@ impl Atlas {
     }
 
     /// Makes room in `kind` after it was full: doubles it while it may grow, else starts it
-    /// over once a frame. Either way the page is new (and so are this frame's icons, when it is
-    /// the mask page). `Err` when it already started over this frame.
+    /// over once a frame. Either way the page is new (and so are this frame's icons). `Err`
+    /// when it already started over this frame; the whole atlas then starts over, since none
+    /// of the frame's placements will be uploaded.
     pub(crate) fn make_room(&mut self, kind: PageKind) -> Result<(), AtlasFull> {
         let (size, reset) = {
             let page = self.page(kind);
@@ -440,6 +441,15 @@ impl Atlas {
             size
         } else {
             self.stats.overflows += 1;
+            // Nothing of this frame is uploaded: forget everything placed, so no later frame
+            // finds a tile whose texels never reached the texture.
+            for kind in [PageKind::Mask, PageKind::Color] {
+                let size = self.page(kind).size;
+                *self.page_mut(kind) = Page::new(kind, size);
+            }
+            self.glyphs.clear();
+            self.pending.clear();
+            self.icons = ring_slot(&self.mask, self.slot);
             return Err(AtlasFull { page: kind, size });
         };
         let mut page = Page::new(kind, new_size);

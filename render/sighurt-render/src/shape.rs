@@ -85,8 +85,8 @@ pub(crate) fn paint_path(
 }
 
 /// The buffer pixels `path` (filled, or stroked `stroke` wide) can touch under `mapping`,
-/// conservatively: its control points' hull (curves stay inside it), widened by half the
-/// stroke in the larger ratio and one pixel of antialiasing. `None` for an empty or non-finite
+/// conservatively: its control points' hull (curves stay inside it), widened by the farthest a
+/// miter join of the stroke reaches in the larger ratio, and one pixel of antialiasing. `None` for an empty or non-finite
 /// path.
 pub fn ink_bounds(path: &Path, stroke: Option<f32>, mapping: &Mapping) -> Option<PixelBounds> {
     let [sx, _, _, sy, tx, ty] = mapping.path_transform();
@@ -113,7 +113,10 @@ pub fn ink_bounds(path: &Path, stroke: Option<f32>, mapping: &Mapping) -> Option
             PathCommand::Close => {}
         }
     }
-    let pad = stroke.map_or(0.0, |width| width * sx.max(sy) / 2.0) + 1.0;
+    // A stroke reaches half its width beyond the path, and a miter join up to the miter limit
+    // times that (tiny-skia's default joins: miter, limit 4).
+    let reach = |width: f32| width * sx.max(sy) / 2.0 * Stroke::default().miter_limit;
+    let pad = stroke.map_or(0.0, reach) + 1.0;
     let (left, top) = ((left - pad).floor(), (top - pad).floor());
     let (right, bottom) = ((right + pad).ceil(), (bottom + pad).ceil());
     let fits = |v: f32| v.is_finite() && v.abs() < 1e7;
@@ -174,6 +177,15 @@ mod tests {
         Mapping::new(&Metrics::new(LayoutEpoch::next(), rect, scale))
     }
 
+    /// An acute join, whose miter reaches far beyond half the stroke.
+    fn acute() -> Path {
+        let mut path = ScenePath::new();
+        path.move_to(10.0, 38.0);
+        path.line_to(15.0, 20.0);
+        path.line_to(20.0, 38.0);
+        path.finish()
+    }
+
     fn icon() -> Path {
         let mut path = ScenePath::new();
         path.move_to(10.0, 10.0);
@@ -188,8 +200,7 @@ mod tests {
     fn coverage_is_the_targets_painting_moved() {
         for scale in [120, 150, 180, 240] {
             let map = mapping(scale);
-            for stroke in [None, Some(1.5)] {
-                let path = icon();
+            for (path, stroke) in [(icon(), None), (icon(), Some(1.5)), (acute(), Some(5.0))] {
                 let bounds = ink_bounds(&path, stroke, &map).unwrap();
                 let mask = coverage(&path, stroke, &map, bounds).unwrap();
                 let mut whole = Pixmap::new(200, 120).unwrap();

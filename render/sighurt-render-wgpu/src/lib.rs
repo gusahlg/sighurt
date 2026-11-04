@@ -107,11 +107,6 @@ impl WgpuBackend {
         })
     }
 
-    /// What it has to tell the user since the last call (a software adapter in use).
-    pub fn take_notices(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.notices)
-    }
-
     /// The adapter and device, made for `surface` on the first bind.
     fn start(&mut self, surface: &wgpu::Surface<'_>) -> Result<(), RenderError> {
         let instance = self.instance.as_ref().expect("made before");
@@ -176,11 +171,29 @@ impl WgpuBackend {
         Ok(())
     }
 
-    /// Configures `bound`'s swapchain at `size`.
-    fn configure(gpu: &Gpu, bound: &mut Bound, size: (u32, u32), stats: &mut BackendStats) {
+    /// Configures `bound`'s swapchain at `size`. A size beyond the device's limit or a
+    /// configuration the device refuses is a [`RenderError::Surface`], and the swapchain stays
+    /// unconfigured (acquiring from it would panic), so the next render configures again.
+    fn configure(
+        gpu: &Gpu,
+        bound: &mut Bound,
+        size: (u32, u32),
+        stats: &mut BackendStats,
+    ) -> Result<(), RenderError> {
+        bound.configured = None;
+        let limit = gpu.device.device.limits().max_texture_dimension_2d;
+        if size.0 > limit || size.1 > limit {
+            return Err(RenderError::Surface(format!(
+                "{}×{} is beyond the device's {limit}-pixel limit",
+                size.0, size.1
+            )));
+        }
         let started = Instant::now();
+        let device = &gpu.device.device;
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         bound.surface.configure(
-            &gpu.device.device,
+            device,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: FORMAT,
@@ -193,11 +206,18 @@ impl WgpuBackend {
                 view_formats: vec![],
             },
         );
-        bound.configured = Some(size);
-        bound.reconfigure = false;
+        let refused = block_on(validation.pop()).or(block_on(memory.pop()));
         stats.configures += 1;
         let took = micros(started.elapsed());
         stats.max_configure_us = Some(stats.max_configure_us.unwrap_or(0).max(took));
+        if let Some(error) = refused {
+            return Err(RenderError::Surface(format!(
+                "configuring the swapchain: {error}"
+            )));
+        }
+        bound.configured = Some(size);
+        bound.reconfigure = false;
+        Ok(())
     }
 
     /// Drops the device, the adapter and the instance, and the atlas planned for them.
@@ -355,10 +375,8 @@ impl Backend for WgpuBackend {
             return Ok(RenderOutcome::Unchanged);
         }
         let gpu = self.gpu.as_mut().expect("bound surfaces have a device");
-        let prepared = gpu::prepare(scene, metrics, &mut self.atlas, &self.fonts)
-            .map_err(|full| RenderError::Device(full.to_string()))?;
         if bound.configured != Some(size) || bound.reconfigure {
-            Self::configure(gpu, bound, size, &mut self.stats);
+            Self::configure(gpu, bound, size, &mut self.stats)?;
         }
         let mut retried = false;
         let texture = loop {
@@ -383,7 +401,7 @@ impl Backend for WgpuBackend {
                     if !retried =>
                 {
                     retried = true;
-                    Self::configure(gpu, bound, size, &mut self.stats);
+                    Self::configure(gpu, bound, size, &mut self.stats)?;
                 }
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                     bound.last = None;
@@ -399,6 +417,10 @@ impl Backend for WgpuBackend {
                 }
             }
         };
+        // Only now that the frame will be drawn: the atlas's uploads must reach the texture
+        // with this frame, so a put-off frame must not have planned any.
+        let prepared = gpu::prepare(scene, metrics, &mut self.atlas, &self.fonts)
+            .map_err(|full| RenderError::Device(full.to_string()))?;
         let view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -412,6 +434,10 @@ impl Backend for WgpuBackend {
         self.stats.max_render_us = self.stats.max_render_us.max(took);
         self.stats.last_render_us = took;
         Ok(RenderOutcome::Submitted)
+    }
+
+    fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
     }
 
     fn stats(&self) -> BackendStats {

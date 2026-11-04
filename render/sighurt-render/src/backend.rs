@@ -222,4 +222,10 @@ pub trait Backend {
 
     /// What it counted.
     fn stats(&self) -> BackendStats;
+
+    /// What it has to tell the user since the last call (say, that a software adapter draws
+    /// the chrome), for the frontend's notices.
+    fn take_notices(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }

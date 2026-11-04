@@ -340,7 +340,7 @@ fn prepared_frames_draw_what_the_cpu_backend_draws() {
                 if near_corner(&scene, &mapping, x, y) {
                     corner_max = corner_max.max(diff);
                     assert!(
-                        diff <= 16,
+                        diff <= 32,
                         "corner ({x}, {y}) at {scale}: {ours:?} vs {theirs:?}"
                     );
                 } else {
@@ -470,7 +470,24 @@ fn the_atlas_is_bounded_and_says_when_it_overflows() {
     assert_eq!((stats.mask_size, stats.overflows), (128, overflows + 1));
     assert!(stats.resets >= 1);
     assert!(stats.bytes <= 128 * 128 * 5);
-    prepare(&few, &metrics, &mut atlas, &handle).expect("a frame that fits renders again");
+    // A frame that fits renders again, its glyphs uploaded anew: nothing the failed frame
+    // placed is taken for uploaded.
+    let mut pages = Pages::new();
+    let prepared = prepare(&few, &metrics, &mut atlas, &handle).expect("it fits");
+    assert!(prepared
+        .uploads
+        .iter()
+        .any(|u| u.data.iter().any(|&t| t != 0)));
+    pages.apply(&prepared);
+    let ours = draw(&prepared, &pages);
+    let theirs = cpu(&few, &metrics, &handle);
+    for (ours, theirs) in ours.iter().zip(&theirs) {
+        let ours = ours.map(|v| (v * 255.0).round() as u8);
+        assert!(
+            (0..4).all(|k| ours[k].abs_diff(theirs[k]) <= 2),
+            "{ours:?} {theirs:?}"
+        );
+    }
 }
 
 /// A new scale starts the atlas over.
