@@ -24,8 +24,8 @@
 //!
 //! Every buffer is `wl_shm` ARGB8888 with premultiplied alpha: each pixel is a little-endian
 //! `u32` `0xAARRGGBB`, so its bytes in memory are **B, G, R, A**. Rows are `width × 4` bytes
-//! with no padding. tiny-skia's pixmaps are premultiplied **R, G, B, A** bytes, so a painter
-//! using one swaps red and blue once, with [`rgba_to_argb8888`], before submitting.
+//! with no padding. A painter writes that byte order directly (the CPU render backend and the
+//! Wasm engine's rasterizer do), so nothing is converted after drawing.
 //!
 //! Must not own: page pixels. A page-sized CPU copy per frame is exactly what the rewrite
 //! removes.
@@ -53,14 +53,6 @@ pub(crate) const MAX_BUFFERS: usize = 3;
 
 /// Superseded generations that may still hold submitted buffers.
 pub(crate) const MAX_RETIRING: usize = 2;
-
-/// Converts premultiplied RGBA bytes, tiny-skia's layout, into the buffers' ARGB8888 (B, G, R,
-/// A bytes), in place. Alpha and premultiplication are unchanged.
-pub fn rgba_to_argb8888(pixels: &mut [u8]) {
-    for pixel in pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
-        pixel.swap(0, 2);
-    }
-}
 
 /// Identifies one buffer of one surface: its generation and its slot in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -869,17 +861,6 @@ mod tests {
         assert_eq!(c.chain.stats().retiring_generations, 0);
         assert_eq!(c.alive.get(), 1);
         assert_eq!(c.chain.state(resized), Some(BufferState::Submitted));
-    }
-
-    #[test]
-    fn rgba_becomes_bgra() {
-        // Premultiplied half-transparent red, then opaque blue.
-        let mut pixels = [128, 0, 0, 128, 0, 0, 255, 255];
-        rgba_to_argb8888(&mut pixels);
-        assert_eq!(pixels, [0, 0, 128, 128, 255, 0, 0, 255]);
-        // As little-endian u32s: 0xAARRGGBB.
-        let first = u32::from_le_bytes(pixels[..4].try_into().unwrap());
-        assert_eq!(first, 0x8080_0000);
     }
 
     #[test]
