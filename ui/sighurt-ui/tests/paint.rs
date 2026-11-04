@@ -18,6 +18,7 @@ use sighurt_api::input::{
 };
 use sighurt_render::{Backend, RenderError, RenderOutcome};
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
+use sighurt_ui::extension::{ChromeAction, Completion};
 use sighurt_ui::layout::{Status, Tabs};
 use sighurt_ui::{Colors, LayoutOptions, Model, TabContent};
 use tiny_skia::{IntSize, Pixmap};
@@ -78,6 +79,25 @@ fn golden_tabs() {
 fn golden_selected_address() {
     let mut chrome = focused(700);
     golden("selected-125", &paint(&mut chrome, CHROME, 150));
+}
+
+/// Typing an address the visited pages complete: the rest of it after the caret, muted.
+#[test]
+fn golden_completion() {
+    let mut chrome = focused(700);
+    let mut asked = None;
+    for c in "exa".chars() {
+        let c = c.to_string();
+        for action in chrome.key(&key(Key::Character(c.clone()), Some(&c))) {
+            if let ChromeAction::Complete { request, .. } = action {
+                asked = Some(request);
+            }
+        }
+    }
+    let url = "https://www.example.com/page".to_owned();
+    let matches = [Completion::new(url, "Example".into())];
+    chrome.completions(asked.expect("typing asks"), &matches);
+    golden("completion-150", &paint(&mut chrome, CHROME, 180));
 }
 
 /// Typing: Swedish letters, the caret after them, then an input method's preedit.

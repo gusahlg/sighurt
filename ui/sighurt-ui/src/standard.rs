@@ -154,6 +154,9 @@ impl Chrome for Standard {
             ChromeEvent::TextInput(event) => self.model.text_input(&event),
             ChromeEvent::Pasted { request, text } => self.model.paste(request, &text),
             ChromeEvent::Command(action) => self.model.command(&action),
+            ChromeEvent::Completions { request, matches } => {
+                self.model.completions(request, &matches)
+            }
         };
         self.layout = layout_of(&self.model);
         // A surface that isn't listed shows nothing; when it is listed again, what lists it

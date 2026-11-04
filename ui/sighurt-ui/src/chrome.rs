@@ -14,7 +14,11 @@
 //! [`ChromeAction::Focus`], for the executable to tell the core.
 //!
 //! The address line doubles as the command line: a line starting with `:` runs the command
-//! after it, such as `:tab.close 2`, so every command can be reached without a key binding. Its
+//! after it, such as `:tab.close 2`, so every command can be reached without a key binding.
+//! Typing an address completes it from the visited pages
+//! ([`InlineCompletion`](crate::extension::InlineCompletion)): the rest of
+//! the address shows after the caret in the muted text color, and Right or Tab at the end of
+//! the line takes it. Its
 //! right end shows the keymap's indicator, if the keymap has one ("NORMAL"), and before it the
 //! engine of the active tab's page while the line isn't focused, drawn as a button, as each
 //! engine page's tab names its engine (`[chrome.standard] engine-label`). A click on that
@@ -45,7 +49,7 @@ use sighurt_api::input::{
     ScrollDelta, TextInputEvent, TextInputState, TextPurpose,
 };
 
-use crate::extension::{contained, readable_url, ChromeAction, SurfaceName, TextField};
+use crate::extension::{contained, readable_url, ChromeAction, Completion, SurfaceName, TextField};
 use crate::hit_test::{hit_test, Target};
 use crate::layout::{Layout, LayoutOptions, Tabs};
 use crate::state::{
@@ -277,6 +281,8 @@ pub(crate) struct AddressView {
     pub caret: Option<f32>,
     pub selection: Option<(f32, f32)>,
     pub preedit: Option<(f32, f32)>,
+    /// The rest of a completed address after the text, and where it starts.
+    pub ghost: Option<(Rc<ShapedText>, f32)>,
     /// The keymap's indicator at the field's right end, and where it starts.
     pub indicator: Option<(Rc<ShapedText>, f32)>,
     /// The active tab's engine button before the indicator.
@@ -584,6 +590,17 @@ impl Model {
         self.finish(Vec::new())
     }
 
+    /// What the visited pages complete the line's text to, for the latest
+    /// [`ChromeAction::Complete`] (`request`). An answer to an older request, or for text the
+    /// line no longer has, is ignored.
+    pub fn completions(&mut self, request: RequestId, matches: &[Completion]) -> Vec<ChromeAction> {
+        let state = &mut self.state;
+        if state.completion.answer(request, matches, &state.address) {
+            self.damage.chrome = true;
+        }
+        self.finish(Vec::new())
+    }
+
     /// The options as configured, with the tabs hidden or shown by `chrome.toggle-tabs`.
     fn shown_options(&self) -> LayoutOptions {
         let mut options = self.options;
@@ -666,6 +683,7 @@ impl Model {
         self.state.address_tab = tab;
         if switched {
             self.state.paste = None;
+            self.damage.chrome |= self.state.completion.clear();
         }
         let opened = self.state.opened.as_deref();
         let settled = opened.is_some_and(|from| switched || !loading || from != url);
@@ -755,6 +773,13 @@ impl Model {
         let word = event.modifiers.control && !event.consumed.control;
         // Alt the same way: a shortcut the core didn't bind types nothing, as in the old URL bar.
         let alt = event.modifiers.alt && !event.consumed.alt;
+        // Right or Tab at the end of the line takes the completion shown.
+        let plain = !select && !word && !alt;
+        let takes = matches!(&event.key, Key::Named(name) if name == "ArrowRight" || name == "Tab");
+        let state = &mut self.state;
+        if plain && takes && state.completion.accept(&mut state.address) {
+            return;
+        }
         let editor = &mut self.state.address;
         match &event.key {
             Key::Named(name) => match name.as_str() {
@@ -973,8 +998,11 @@ impl Model {
         shaped.offset_at(x - left + self.state.address.scroll())
     }
 
-    /// Scrolls the address line to its caret and reports what the host needs to know.
+    /// Scrolls the address line to its caret, asks for completions of what was typed, and
+    /// reports what the host needs to know.
     fn finish(&mut self, mut actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
+        let state = &mut self.state;
+        actions.extend(state.completion.update(&state.address, state.focused));
         let before = self.state.address.scroll();
         if self.state.focused {
             let view = self.address_view();
@@ -1091,10 +1119,17 @@ impl Model {
             let (a, b) = (shaped.x_at(range.start), shaped.x_at(range.end));
             (x + a.min(b), x + a.max(b))
         };
+        let ghost = self
+            .state
+            .completion
+            .ghost(editor)
+            .filter(|_| self.state.focused);
+        let ghost = ghost.map(|rest| (self.fonts.line(rest, style), x + shaped.width));
         AddressView {
             caret: display.caret.map(|offset| x + shaped.x_at(offset)),
             selection: (!display.selection.is_empty()).then(|| span(&display.selection)),
             preedit: display.preedit.as_ref().map(span),
+            ghost,
             shaped,
             x,
             y,

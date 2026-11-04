@@ -6,16 +6,19 @@
 mod common;
 
 use common::*;
+use sighurt_api::commands::Command;
 use sighurt_api::geometry::{LogicalSize, SurfacePoint, SurfaceRect, WindowRect};
+use sighurt_api::ids::RequestId;
 use sighurt_api::input::{
-    ButtonState, KeyboardFocus, Modifiers, PointerButton, PointerEvent, ScrollDelta,
-    TextInputState, TextPurpose,
+    ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerButton,
+    PointerEvent, ScrollDelta, TextInputState, TextPurpose,
 };
 use sighurt_api::settings::{Table, Value};
 use sighurt_ui::extension::{
-    contained, Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout, ChromeSurface,
-    InputArea, SurfaceName, TextField, Theme,
+    completion_suffix, contained, Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout,
+    ChromeSurface, Completion, InputArea, SurfaceName, TextField, Theme,
 };
+use sighurt_ui::chrome::CHROME;
 use sighurt_ui::standard::{self, Standard};
 use sighurt_ui::{Fonts, Pen, Snapshot, TabContent};
 
@@ -654,4 +657,117 @@ fn a_new_engine_repaints_its_label() {
         ["chrome", "tabs"]
     );
     assert!(repaints(&chrome.handle(ChromeEvent::Snapshot(switching))).is_empty());
+}
+
+fn press(chrome: &mut dyn Chrome, key: Key, text: Option<&str>) -> Vec<ChromeAction> {
+    chrome.handle(ChromeEvent::Key(KeyEvent {
+        code: KeyCode(30),
+        key,
+        state: ButtonState::Pressed,
+        repeat: false,
+        modifiers: Modifiers::default(),
+        consumed: Modifiers::default(),
+        text: text.map(Into::into),
+    }))
+}
+
+fn named(chrome: &mut dyn Chrome, name: &str) -> Vec<ChromeAction> {
+    press(chrome, Key::Named(name.into()), None)
+}
+
+/// Types `text` a character at a time, and returns the completions each key asked for.
+fn type_asking(chrome: &mut dyn Chrome, text: &str) -> Vec<(RequestId, String)> {
+    let mut asked = Vec::new();
+    for c in text.chars() {
+        let c = c.to_string();
+        for action in press(chrome, Key::Character(c.clone()), Some(&c)) {
+            if let ChromeAction::Complete { request, prefix } = action {
+                asked.push((request, prefix));
+            }
+        }
+    }
+    asked
+}
+
+fn answer(chrome: &mut dyn Chrome, request: RequestId, urls: &[&str]) -> Vec<ChromeAction> {
+    let matches = urls
+        .iter()
+        .map(|url| Completion::new((*url).into(), "A page".into()))
+        .collect();
+    chrome.handle(ChromeEvent::Completions { request, matches })
+}
+
+fn opened(actions: &[ChromeAction]) -> Vec<String> {
+    let open = |action: &ChromeAction| match action {
+        ChromeAction::Command(Command::PageOpen(url)) => Some(url.clone()),
+        _ => None,
+    };
+    actions.iter().filter_map(open).collect()
+}
+
+#[test]
+fn the_completion_suffix_skips_the_scheme_and_www() {
+    let url = "https://www.example.com/a";
+    assert_eq!(completion_suffix("exa", url), Some("mple.com/a"));
+    assert_eq!(completion_suffix("WWW.Ex", url), Some("ample.com/a"));
+    assert_eq!(completion_suffix("https://www.e", url), Some("xample.com/a"));
+    assert_eq!(completion_suffix("http://www.e", url), None);
+    assert_eq!(completion_suffix("https://exa", url), None);
+    assert_eq!(completion_suffix("ample", url), None);
+}
+
+/// The standard chrome completes what is typed through the API: it asks, shows only the latest
+/// answer for the text still typed, takes the exact address with Right or Tab, and drops the
+/// completion as the line changes or loses its tab or the keyboard.
+#[test]
+fn the_standard_chrome_completes_from_the_visited_pages() {
+    const URL: &str = "https://www.example.com/page";
+    let mut chrome = standard(900, 600);
+    chrome.handle(ChromeEvent::Snapshot(three_tabs()));
+    chrome.handle(ChromeEvent::WindowFocus(FocusEvent::Activated));
+    let actions = chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    assert!(!actions.iter().any(|a| matches!(a, ChromeAction::Complete { .. })));
+    let asked = type_asking(&mut *chrome, "exa");
+    let texts: Vec<&str> = asked.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(texts, ["e", "ex", "exa"]);
+    let plain = paint_surface(&mut *chrome, CHROME, 120);
+    assert!(repaints(&answer(&mut *chrome, asked[1].0, &[URL])).is_empty(), "stale");
+    assert_eq!(repaints(&answer(&mut *chrome, asked[2].0, &[URL])), [CHROME]);
+    let shown = paint_surface(&mut *chrome, CHROME, 120);
+    assert_ne!(plain.rgba, shown.rgba, "the rest shows after the caret");
+    // Answered again with nothing, as after history.clear: it goes.
+    assert_eq!(repaints(&answer(&mut *chrome, asked[2].0, &[])), [CHROME]);
+    assert_eq!(plain.rgba, paint_surface(&mut *chrome, CHROME, 120).rgba);
+    answer(&mut *chrome, asked[2].0, &[URL]);
+    named(&mut *chrome, "ArrowRight");
+    assert_eq!(opened(&named(&mut *chrome, "Enter")), [URL]);
+
+    // With the caret off the end there is none: Tab takes nothing.
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    let (request, _) = type_asking(&mut *chrome, "exa").pop().unwrap();
+    named(&mut *chrome, "ArrowLeft");
+    answer(&mut *chrome, request, &[URL]);
+    named(&mut *chrome, "Tab");
+    assert_eq!(opened(&named(&mut *chrome, "Enter")), ["exa"]);
+
+    // A command line asks nothing; an answer after the line lost the keyboard shows nothing.
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    assert!(type_asking(&mut *chrome, ":tab.n").is_empty());
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Page));
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    let (request, _) = type_asking(&mut *chrome, "exa").pop().unwrap();
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Page));
+    assert!(repaints(&answer(&mut *chrome, request, &[URL])).is_empty());
+
+    // Another tab drops it.
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    let (request, _) = type_asking(&mut *chrome, "exa").pop().unwrap();
+    answer(&mut *chrome, request, &[URL]);
+    let mut other = three_tabs();
+    other.tabs[0].active = false;
+    other.tabs[1].active = true;
+    chrome.handle(ChromeEvent::Snapshot(other));
+    named(&mut *chrome, "End");
+    named(&mut *chrome, "Tab");
+    assert_eq!(opened(&named(&mut *chrome, "Enter")), ["https://recept.example/sylt"]);
 }
