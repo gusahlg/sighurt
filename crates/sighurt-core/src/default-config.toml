@@ -299,10 +299,11 @@ default-keys = true
 # which take no argument: the standard chrome's is chrome.toggle-tabs, which hides and shows
 # its tabs.
 #
-# `renderer` is what draws the chrome: "cpu" (in every build), "wgpu" or "vulkan" (the
-# GPU, in a sig built with them), or "auto", which chooses (the CPU for now). One this sig
-# lacks or that can't start gives a notice and auto is used. It changes when sig starts
-# again.
+# `renderer` is what draws the chrome: "cpu" (in every build), "wgpu" (the GPU through
+# Vulkan, in a default sig), "vulkan" (not built yet), or "auto", which chooses (the CPU until
+# wgpu is measured at least as good). One this sig lacks or that can't start gives a notice
+# and auto is used; a GPU that can't present the chrome's surfaces, or fails later, gives the
+# chrome back to the CPU. It changes when sig starts again.
 #
 #   [ui]
 #   chrome = "standard"
