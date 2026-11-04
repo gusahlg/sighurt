@@ -313,12 +313,15 @@ const KEY_NAMES: [(&str, &str); 16] = [
     ("menu", "ContextMenu"),
 ];
 
-/// The lower-case form of `text` if it is one letter that has upper and lower case.
+/// The lower-case form of `text` if it is one letter that has upper and lower case, and whose
+/// lower case is one character too ("İ" lowercases to "i" and a combining dot, which no key
+/// types, so it is not a letter here and a keystroke naming it stays as written).
 fn letter(text: &str) -> Option<String> {
     let mut chars = text.chars();
     let c = chars.next()?;
     let cased = chars.next().is_none() && c.to_lowercase().ne(c.to_uppercase());
-    cased.then(|| c.to_lowercase().collect())
+    let lower: String = c.to_lowercase().collect();
+    (cased && lower.chars().count() == 1).then_some(lower)
 }
 
 impl Chord {
