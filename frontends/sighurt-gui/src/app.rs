@@ -408,6 +408,10 @@ impl Frontend for Gui {
         self.chrome_event(queue, ChromeEvent::Focus(focus));
     }
 
+    fn line_text(&mut self, text: String, queue: &mut VecDeque<BrowserEvent>) {
+        self.chrome_event(queue, ChromeEvent::LineText(text));
+    }
+
     fn chrome_input(&mut self, event: InputEvent, queue: &mut VecDeque<BrowserEvent>) {
         let event = match event.kind {
             InputKind::Key(key) => ChromeEvent::Key(key),

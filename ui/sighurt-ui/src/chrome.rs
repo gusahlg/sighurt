@@ -479,6 +479,19 @@ impl Model {
         self.finish(Vec::new())
     }
 
+    /// The focused address line holds `text` instead, as if typed over its selected address,
+    /// the caret at its end (`location.focus <text>`). Cut to what the editor holds. Ignored
+    /// while the line doesn't have the keyboard.
+    pub fn line_text(&mut self, text: &str) -> Vec<ChromeAction> {
+        if self.state.focused {
+            let before = self.state.address.clone();
+            self.state.address.select_all();
+            self.state.address.insert(text);
+            self.edited(&before);
+        }
+        self.finish(Vec::new())
+    }
+
     /// The window gained or lost keyboard focus.
     pub fn window_focus(&mut self, event: FocusEvent) -> Vec<ChromeAction> {
         self.state.window_active = event == FocusEvent::Activated;

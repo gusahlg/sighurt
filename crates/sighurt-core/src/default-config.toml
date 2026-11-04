@@ -169,14 +169,16 @@ forward = "page.forward"
 # work without any.
 #
 # While the page has the keyboard, in both frontends: q quits, o focuses the address line,
-# : focuses it and types itself, ctrl-o focuses it from anywhere, t opens a tab, x closes
-# the tab, J and K move to the next and previous tab, H and L go back and forward, r and
-# ctrl-r reload (ctrl-r from anywhere), e reopens the page in the next web engine, j and k
-# scroll, ctrl-d and ctrl-u scroll a page, g and G go to the top and the bottom, and + - =
-# zoom. alt-1 to alt-9 select those tabs from anywhere. Escape enters INSERT MODE, which
-# shows INSERT MODE and passes every other key until Escape leaves it. y y copies the
-# page's address and c o closes the other tabs, highest number first. Those two are key
-# sequences of the example configuration, not of [keys].
+# : opens it as the command line (location.focus :), / as the find line (location.focus /),
+# ctrl-o focuses it from anywhere, t opens a tab, x closes the tab, u reopens the tab closed
+# last, J and K move to the next and previous tab, H and L go back and forward, r and ctrl-r
+# reload (ctrl-r from anywhere), e reopens the page in the next web engine, j and k scroll,
+# ctrl-d and ctrl-u scroll a page, g and G go to the top and the bottom, and + - = zoom.
+# alt-1 to alt-9 select those tabs from anywhere. Escape enters INSERT MODE, which shows
+# INSERT MODE and passes every other key until Escape leaves it. y y copies the page's
+# address, y f the link the pointer is over, and c o closes the other tabs, highest number
+# first. Those three are key sequences of the example configuration, not of [keys]. The
+# other tab commands are typed after ":": tab.move left, tab.duplicate, tab.new <address>.
 #
 # In the terminal only: ctrl-c quits and m switches between text and graphics, both while
 # the page has the keyboard, and ctrl-l redraws the page wherever the keyboard is. A
@@ -211,8 +213,8 @@ forward = "page.forward"
 # layouts, while a letter keeps its shift: "ctrl-shift-t" and "ctrl-T" are both Ctrl+Shift+T.
 # AltGr is never Ctrl+Alt. While you type, in the address bar or a text field of a page, a
 # keystroke that types a character (no modifier but shift) types it instead of running its
-# command. [keys] has no key sequences such as "g g". The example configuration's y y and
-# c o are sequences in its own table.
+# command. [keys] has no key sequences such as "g g". The example configuration's y y, y f
+# and c o are sequences in its own table.
 #
 # Commands: tab.new [address], tab.duplicate, tab.move left|right|<n>, tab.reopen,
 # tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last, page.open <url>,

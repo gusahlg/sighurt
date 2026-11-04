@@ -4,7 +4,7 @@
 use sighurt_api::commands::Command;
 use sighurt_api::keymap::Browser;
 
-use crate::actions::{close_other_tabs, copy_address};
+use crate::actions::{close_other_tabs, copy_address, copy_link};
 
 /// Where a binding applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +72,7 @@ const fn bind(keys: &'static str, action: Action, scope: Scope, frontend: Where)
     }
 }
 
-use Action::{Custom, Mode as To, Run, RunThenPass};
+use Action::{Custom, Mode as To, Run};
 use Scope::{Always, Page};
 use Where::{Both, Terminal};
 
@@ -80,11 +80,13 @@ use Where::{Both, Terminal};
 pub const NORMAL: &[Binding] = &[
     bind("q", Run("browser.quit"), Page, Both),
     bind("o", Run("location.focus"), Page, Both),
-    // The line opens with ":" typed into it.
-    bind(":", RunThenPass("location.focus"), Page, Both),
+    // The command line: the line opens holding ":"; "/" opens it holding "/", to find in page.
+    bind(":", Run("location.focus :"), Page, Both),
+    bind("/", Run("location.focus /"), Page, Both),
     bind("ctrl-o", Run("location.focus"), Always, Both),
     bind("t", Run("tab.new"), Page, Both),
     bind("x", Run("tab.close"), Page, Both),
+    bind("u", Run("tab.reopen"), Page, Both),
     bind("J", Run("tab.next"), Page, Both),
     bind("K", Run("tab.previous"), Page, Both),
     bind("H", Run("page.back"), Page, Both),
@@ -118,6 +120,7 @@ pub const NORMAL: &[Binding] = &[
     bind("escape", To(Mode::Insert), Page, Both),
     // Defined by this configuration against the state API.
     bind("y y", Custom(copy_address), Page, Both),
+    bind("y f", Custom(copy_link), Page, Both),
     bind("c o", Custom(close_other_tabs), Page, Both),
 ];
 

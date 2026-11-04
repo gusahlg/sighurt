@@ -34,7 +34,8 @@
 //! - `clipboard.copy <text>` puts that text on the clipboard ([`Effect::ClipboardWrite`]).
 //!   The runtime refuses text over its own limit and says so; the core does not cut it.
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
-//!   `Effect::Focus`. Commands that change what the page area shows give the page the keyboard.
+//!   `Effect::Focus`; `location.focus <text>` then hands the line its text with
+//!   `Effect::LineText`. Commands that change what the page area shows give the page the keyboard.
 //! - `page.find`, `page.find-next`, `page.find-previous` and `page.find-stop`: no engine finds
 //!   in page yet, so `page.find` says the page's engine can't, and the others that there is no
 //!   search. A `page.find` over [`MAX_FIND`] bytes, which only a chrome can make, is refused.
@@ -179,7 +180,13 @@ impl BrowserState {
                 self.send_key(&key, fx);
                 None
             }
-            Command::LocationFocus(_) => Some(KeyboardFocus::Chrome),
+            Command::LocationFocus(text) => {
+                self.move_focus(KeyboardFocus::Chrome, fx);
+                if let Some(text) = text {
+                    fx.push(Effect::LineText(text));
+                }
+                None
+            }
             Command::PageFind(_)
             | Command::PageFindNext
             | Command::PageFindPrevious

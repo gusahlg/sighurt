@@ -291,6 +291,7 @@ impl<F: Frontend> Session<F> {
                 }
             }
             Effect::Focus(focus) => frontend.focus(focus, &mut self.queue),
+            Effect::LineText(text) => frontend.line_text(text, &mut self.queue),
             Effect::ChromeInput(event) => frontend.chrome_input(event, &mut self.queue),
             Effect::ChromeCommand(action) => frontend.chrome_command(action, &mut self.queue),
             Effect::PageCursor(cursor) => {

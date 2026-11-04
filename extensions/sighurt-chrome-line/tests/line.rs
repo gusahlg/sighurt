@@ -460,6 +460,24 @@ fn typing_opens_addresses_and_runs_commands() {
 /// Ctrl+V asks for the clipboard; only the latest answer is pasted, once, without line breaks,
 /// and not after the line lost the keyboard.
 #[test]
+fn location_focus_with_text_opens_the_command_line() {
+    let mut chrome = line(Table::new(), 800, 600);
+    let tabs = five_tabs();
+    chrome.handle(ChromeEvent::Snapshot(tabs.clone()));
+    // Ignored while the line doesn't have the keyboard.
+    chrome.handle(ChromeEvent::LineText(":".into()));
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    let actions = chrome.handle(ChromeEvent::LineText(":".into()));
+    assert!(repaints(&actions).contains(&LINE), "{actions:?}");
+    // An edit: a snapshot of the same tab keeps it, and what is typed follows the ":".
+    let mut loading = tabs;
+    loading.status = None;
+    chrome.handle(ChromeEvent::Snapshot(loading));
+    type_text(&mut *chrome, "tab.next");
+    assert_eq!(commands(&named(&mut *chrome, "Enter")), [Command::TabNext]);
+}
+
+#[test]
 fn a_paste() {
     let mut chrome = line(Table::new(), 800, 600);
     chrome.handle(ChromeEvent::Snapshot(five_tabs()));

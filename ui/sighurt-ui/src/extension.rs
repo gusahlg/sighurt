@@ -119,6 +119,10 @@ pub enum ChromeEvent {
     /// The core moved the keyboard. `Chrome`: focus the line with its text selected. `Page`:
     /// leave the line and drop an edit.
     Focus(KeyboardFocus),
+    /// Right after `Focus(Chrome)` (`location.focus <text>`): the line holds this text instead
+    /// of the address, as if typed over it, the caret at its end. A line keeps no more of it
+    /// than it would of typing. A chrome whose line does not have the keyboard ignores it.
+    LineText(String),
     /// The window gained or lost the keyboard.
     WindowFocus(FocusEvent),
     /// Pointer input on one of the chrome's surfaces, in its coordinates. The mouse's side

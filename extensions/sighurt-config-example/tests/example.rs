@@ -35,6 +35,8 @@ struct Fake {
     frontend: Frontend,
     urls: Vec<Option<&'static str>>,
     active: usize,
+    /// Every tab's status text: the link the pointer is over.
+    status: Option<&'static str>,
 }
 
 impl Fake {
@@ -43,6 +45,7 @@ impl Fake {
             frontend,
             urls: vec![Some("https://example.com/")],
             active: 0,
+            status: None,
         }
     }
     fn tabs(urls: usize, active: usize) -> Self {
@@ -50,6 +53,7 @@ impl Fake {
             frontend: Frontend::Gui,
             urls: vec![None; urls],
             active,
+            status: None,
         }
     }
 }
@@ -78,7 +82,7 @@ impl Browser for Fake {
             1.0,
             false,
             false,
-            None,
+            self.status,
         ))
     }
 }
@@ -311,6 +315,9 @@ fn the_shared_table_in_normal_mode() {
         (ctrl('o'), "location.focus"),
         (typed('t'), "tab.new"),
         (typed('x'), "tab.close"),
+        (typed('u'), "tab.reopen"),
+        (typed(':'), "location.focus :"),
+        (typed('/'), "location.focus /"),
         (typed('J'), "tab.next"),
         (typed('K'), "tab.previous"),
         (typed('H'), "page.back"),
@@ -329,10 +336,6 @@ fn the_shared_table_in_normal_mode() {
     ] {
         assert_eq!(keymap.press(&key, PAGE, &b), run(command), "{command}");
     }
-    assert_eq!(
-        keymap.press(&typed(':'), PAGE, &b),
-        KeyAction::RunThenPass(Command::LocationFocus(None))
-    );
     // Unbound keys pass; nothing is swallowed.
     assert_eq!(keymap.press(&typed('z'), PAGE, &b), KeyAction::Pass);
     assert_eq!(
@@ -358,6 +361,40 @@ fn y_y_copies_the_address() {
         press(&mut keymap, "yy", PAGE, &blank),
         [KeyAction::Take, KeyAction::RunAll(vec![])]
     );
+}
+
+#[test]
+fn y_f_copies_the_hovered_link() {
+    let mut b = Fake::new(Frontend::Gui);
+    let mut keymap = example();
+    // No link under the pointer: taken, nothing runs.
+    assert_eq!(
+        press(&mut keymap, "yf", PAGE, &b),
+        [KeyAction::Take, KeyAction::RunAll(vec![])]
+    );
+    b.status = Some("https://example.com/a?b#c");
+    assert_eq!(
+        press(&mut keymap, "yf", PAGE, &b)[1],
+        KeyAction::RunAll(vec![Command::ClipboardCopy(
+            "https://example.com/a?b#c".into()
+        )])
+    );
+    b.status = Some("mailto:someone@example.com");
+    assert_eq!(
+        press(&mut keymap, "yf", PAGE, &b)[1],
+        KeyAction::RunAll(vec![Command::ClipboardCopy(
+            "mailto:someone@example.com".into()
+        )])
+    );
+    // Status text that is not a link is not copied.
+    for status in ["Loading page…", "Done: 3 items", ":nothing", "https:"] {
+        b.status = Some(status);
+        assert_eq!(
+            press(&mut keymap, "yf", PAGE, &b)[1],
+            KeyAction::RunAll(vec![]),
+            "{status}"
+        );
+    }
 }
 
 #[test]

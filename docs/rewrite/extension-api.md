@@ -1836,4 +1836,9 @@ finding was checked against the plan and the code before it was acted on.
   `EngineCommand::Find(FindCommand)`, `EngineCommand::ExitFullscreen`,
   `EngineEvent::FindResult` (replaceable per view), `EngineEvent::FullscreenChanged` (ordered)
   and `EngineCapabilities::fullscreen`; no engine sets `find_in_page` or `fullscreen` yet, and
-  every adapter refuses both commands as unsupported.
+  every adapter refuses both commands as unsupported. The chrome API gains
+  `ChromeEvent::LineText(String)`: right after `Focus(Chrome)`, `location.focus <text>` puts
+  the text in the line as if typed over the selected address, the caret at its end (the core's
+  `Effect::LineText`, the runtime's `Frontend::line_text`). The example configuration binds `:`
+  to `location.focus :` instead of `RunThenPass(location.focus)`, `/` to `location.focus /`,
+  `u` to `tab.reopen` and `y f` to copying the hovered link.

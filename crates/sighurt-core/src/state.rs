@@ -318,6 +318,9 @@ pub enum Effect {
     /// The keyboard focus moves. `Chrome`: the chrome focuses its address line and selects its
     /// text. `Page`: the chrome leaves the address line, discarding an edit.
     Focus(KeyboardFocus),
+    /// The address line, just focused (`Focus(Chrome)` comes first), holds this text instead of
+    /// the address, the caret at its end, as if it had been typed: `location.focus <text>`.
+    LineText(String),
     /// Keyboard input for the chrome: the address bar has focus, or the page area shows no
     /// engine view.
     ChromeInput(InputEvent),

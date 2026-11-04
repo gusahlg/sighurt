@@ -731,6 +731,24 @@ fn tab_reopen_skips_a_tab_that_had_no_page() {
 }
 
 #[test]
+fn location_focus_with_text_hands_the_line_its_text_after_the_focus() {
+    let mut b = Harness::start("", &["https://a.test/"]);
+    let effects = b.apply(command("location.focus :"));
+    let focus = effects
+        .iter()
+        .position(|e| *e == Effect::Focus(KeyboardFocus::Chrome));
+    let text = effects
+        .iter()
+        .position(|e| *e == Effect::LineText(":".into()));
+    assert!(focus.is_some() && focus < text, "{effects:?}");
+    assert_eq!(b.state.focus(), KeyboardFocus::Chrome);
+    // Without text, only the focus.
+    let effects = b.apply(command("location.focus"));
+    assert!(effects.contains(&Effect::Focus(KeyboardFocus::Chrome)));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::LineText(_))));
+}
+
+#[test]
 fn find_history_and_fullscreen_say_what_is_missing() {
     use sighurt_api::commands::{Command, MAX_FIND};
     let mut b = Harness::start("", &["https://a.test/"]);

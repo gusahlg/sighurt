@@ -457,8 +457,10 @@ address line or a page's text field, and the keys no row names pass to the page.
 | Key | Command |
 |---|---|
 | `q` | `browser.quit` |
-| `o`, `:`, `ctrl-o` | `location.focus` (the address line; `:` then a command runs it) |
-| `t`, `x` | `tab.new`, `tab.close` |
+| `o`, `ctrl-o` | `location.focus` (the address line) |
+| `:` | `location.focus :`: the command line, where a command typed after `:` runs (`:tab.move left`, `:tab.duplicate`, `:tab.new <address>`) |
+| `/` | `location.focus /`: the find line, where the text typed after `/` is found in the page |
+| `t`, `x`, `u` | `tab.new`, `tab.close`, `tab.reopen` |
 | `J`, `K` | `tab.next`, `tab.previous` |
 | `alt-1` to `alt-9` | `tab.select 1` to `9` |
 | `H`, `L` | `page.back`, `page.forward` |
@@ -470,12 +472,13 @@ address line or a page's text field, and the keys no row names pass to the page.
 | `+`, `-`, `=` | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` |
 | `Escape` | insert mode: every key but `Escape` passes to the page or the line, and the chrome shows `INSERT MODE`; `Escape` again returns |
 | `y y` | copy the address of the tab shown (`clipboard.copy`) |
+| `y f` | copy the link the pointer is over |
 | `c o` | close every tab but the one shown |
 | terminal only: `ctrl-c` | `browser.quit` (only while the page has the keyboard) |
 | terminal only: `m` | `chrome.toggle-mode` (text or graphics) |
 | terminal only: `ctrl-l` | `chrome.refresh` (draw the page again) |
 
-`y y` and `c o` are written in Rust in the example, against the keymap API's read-only view of the
+`y y`, `y f` and `c o` are written in Rust in the example, against the keymap API's read-only view of the
 tabs. With `[input] keymap = "bindings"` nothing is bound until you bind it in `[keys]` (and
 `[tui.keys]`, over it, in the terminal). The tab strip, the toolbar and the address line work
 without any keys. With the `bindings` keymap:

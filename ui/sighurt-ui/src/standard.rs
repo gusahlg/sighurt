@@ -144,6 +144,7 @@ impl Chrome for Standard {
             ChromeEvent::Resize(size) => self.model.resize(size),
             ChromeEvent::Snapshot(snapshot) => self.model.set_snapshot(snapshot),
             ChromeEvent::Focus(focus) => self.model.set_focus(focus),
+            ChromeEvent::LineText(text) => self.model.line_text(&text),
             ChromeEvent::WindowFocus(event) => self.model.window_focus(event),
             ChromeEvent::Pointer { surface, event } => match self.rect(surface) {
                 Some(rect) => self.model.pointer(rect, &event),

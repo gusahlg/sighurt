@@ -25,7 +25,8 @@
 #               to insert mode (the indicator reads INSERT MODE, keys pass to the page), Escape
 #               again and x closes a tab; a command line opened with ":" (where letters type),
 #               a chrome command the chrome lacks, the mouse's side buttons over the chrome
-#               and the page, q quits
+#               and the page; :tab.new with an address, :tab.move left, u (tab.reopen) after
+#               x; q quits, and the session has the moved tab first
 #   settings    `zoom` for new tabs and page.zoom-reset, kept by open tabs across a reload;
 #               page.open-in, and its errors (an engine the build lacks, a sig: page, the
 #               latter in the status strip over the home page); an engine setting
@@ -482,6 +483,30 @@ CONF
   key -k Escape
   key x
   check "x closes the second tab" "$(diag "0 if $tab_count==1 and d['active_tab']==1 else 1")" "$(diag "$tab_count, d['active_tab']") (views, active tab)"
+  step ":tab.new demo://pattern opens a tab on that page; :tab.move left puts it first"
+  key :
+  key 'tab.new demo://pattern'
+  key -k Return
+  sleep 0.5
+  check ":tab.new with an address opens it in a new tab" \
+    "$(diag "0 if $tab_count==2 and d['active_tab']==2 and d['tabs'][1]['engine']=='demo' else 1")" \
+    "$(diag "$tab_count, d['active_tab'], d['tabs'][1]['engine']") (tabs, active tab, its engine)"
+  key :
+  key 'tab.move left'
+  key -k Return
+  check ":tab.move left moves the selected tab, which stays selected" \
+    "$(diag "0 if $tab_count==2 and d['active_tab']==1 else 1")" "$(diag "$tab_count, d['active_tab']") (tabs, active tab)"
+  step "x closes the pattern tab, u reopens it at the end, :tab.move left puts it first again"
+  key x
+  check "x closes the pattern tab" "$(diag "0 if $tab_count==1 else 1")" "$(diag "$tab_count") tabs"
+  key u
+  sleep 0.5
+  check "u (tab.reopen) brings it back, selected, at the end" \
+    "$(diag "0 if $tab_count==2 and d['active_tab']==2 and d['tabs'][1]['engine']=='demo' else 1")" \
+    "$(diag "$tab_count, d['active_tab'], d['tabs'][1]['engine']") (tabs, active tab, its engine)"
+  key :
+  key 'tab.move left'
+  key -k Return
   step "q quits"
   key q
   wait "$sig_pid"; code=$?
@@ -489,6 +514,9 @@ CONF
   session=$out/state/sighurt/session.toml
   check "only what insert mode passed (t, hej) reached the page" \
     "$(grep -q 'title = "Demo: resize · thej"$' "$session"; echo $?)" "$(grep -o 'title = .*' "$session" | tr '\n' ' ')"
+  entries=$(grep -o 'entries = .*' "$session" | tr '\n' ' ')
+  check "the session saves the reopened, moved tab first" \
+    "$([[ $entries == 'entries = ["demo://pattern"] entries = ["demo://resize"] ' ]]; echo $?)" "$entries"
   ;;
 
 settings)

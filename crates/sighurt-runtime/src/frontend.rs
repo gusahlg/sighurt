@@ -55,6 +55,12 @@ pub trait Frontend: Clipboard {
     /// The keyboard focus moved. Queue whatever the chrome asks for.
     fn focus(&mut self, focus: KeyboardFocus, queue: &mut VecDeque<BrowserEvent>);
 
+    /// The address line, just focused, holds `text` instead of the address, the caret at its
+    /// end, as if typed (`location.focus <text>`). A frontend with no address line ignores it.
+    fn line_text(&mut self, text: String, queue: &mut VecDeque<BrowserEvent>) {
+        let _ = (text, queue);
+    }
+
     /// Keyboard input for the chrome. Pointer and window-focus input are not chrome input;
     /// ignore them.
     fn chrome_input(&mut self, event: InputEvent, queue: &mut VecDeque<BrowserEvent>);

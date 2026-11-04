@@ -1,5 +1,5 @@
 //! `example`: the example configuration. A NORMAL and an INSERT mode with the terminal's keys in
-//! both frontends (`table`), and two actions computed from the browser's state (`actions`),
+//! both frontends (`table`), and three actions computed from the browser's state (`actions`),
 //! written in Rust against `sighurt_api::keymap` (docs/rewrite/config-extension.md, §3). Select it
 //! with `[input] keymap = "example"`; copy the crate and edit the tables to make your own.
 //!
