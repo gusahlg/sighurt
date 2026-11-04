@@ -104,13 +104,14 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     text_input: true,
     accessibility: false,
     screenshots: false,
-    find_in_page: false,
+    find_in_page: false, // lane B: true once find in page is wired
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
     process_per_view: true,
     semantics: true,
     site_data: sighurt_api::engine::SiteDataKinds::NONE,
+    fullscreen: false, // lane D: true once element fullscreen is wired
 };
 
 /// The `log` target of the timing lines: `RUST_LOG=sighurt_engine_wpe::timing=debug`.
@@ -2028,6 +2029,8 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                     then = Then::Act(sighurt_semantic::action_script(&action));
                 }
             }
+            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         match then {
             Then::Nothing => {}

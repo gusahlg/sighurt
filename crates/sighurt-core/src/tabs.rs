@@ -28,6 +28,9 @@ pub const MAX_TEXT: usize = 16 * 1024;
 /// The longest URL accepted from a page, in bytes (Chrome's limit). Longer ones are dropped.
 pub const MAX_URL: usize = 2 * 1024 * 1024;
 
+/// The most closed tabs `tab.reopen` can bring back. The oldest goes first.
+pub const MAX_CLOSED: usize = 10;
+
 /// `text` cut to at most [`MAX_TEXT`] bytes at a character boundary.
 pub(crate) fn clamp(mut text: String) -> String {
     if text.len() > MAX_TEXT {

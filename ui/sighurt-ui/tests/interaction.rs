@@ -485,7 +485,7 @@ fn a_new_tab_focuses_its_address_selected() {
     chrome.window_focus(FocusEvent::Activated);
     let new_tab = center(chrome.layout().new_tab);
     let actions = click(&mut chrome, new_tab);
-    assert_eq!(commands(&actions), [Command::TabNew]);
+    assert_eq!(commands(&actions), [Command::TabNew(None)]);
     // The core opens a fourth tab, active, at home.
     let mut snapshot = chrome.snapshot().clone();
     snapshot.tabs[0].active = false;

@@ -910,7 +910,7 @@ impl Model {
         let action = match target {
             Some(Target::Tab(id)) => ChromeAction::SelectTab(id),
             Some(Target::CloseTab(id)) => ChromeAction::CloseTab(id),
-            Some(Target::NewTab) => ChromeAction::Command(Command::TabNew),
+            Some(Target::NewTab) => ChromeAction::Command(Command::TabNew(None)),
             Some(Target::Back) => ChromeAction::Command(Command::PageBack),
             Some(Target::Forward) => ChromeAction::Command(Command::PageForward),
             Some(Target::ReloadOrStop) => match self.snapshot.active().is_some_and(|t| t.loading) {

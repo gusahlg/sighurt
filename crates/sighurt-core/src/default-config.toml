@@ -214,11 +214,31 @@ forward = "page.forward"
 # command. [keys] has no key sequences such as "g g". The example configuration's y y and
 # c o are sequences in its own table.
 #
-# Commands: tab.new, tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last,
-# page.open <url>, page.open-in <engine> [url], page.switch-engine, page.reload, page.stop,
-# page.back, page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
-# clipboard.copy <text>, location.focus, browser.home, browser.quit, site.forget [host],
-# and the chrome's own, chrome.<action>. Tabs count from 1.
+# Commands: tab.new [address], tab.duplicate, tab.move left|right|<n>, tab.reopen,
+# tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last, page.open <url>,
+# page.open-in <engine> [url], page.switch-engine, page.reload, page.stop, page.back,
+# page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
+# page.find <text>, page.find-next, page.find-previous, page.find-stop,
+# clipboard.copy <text>, location.focus [text], history.clear, browser.home,
+# browser.fullscreen, browser.quit, site.forget [host], and the chrome's own,
+# chrome.<action>. Tabs count from 1.
+#
+# tab.new opens the home page in a new tab and puts you in the address line; with an address
+# it opens that as page.open would (keywords, searches and routing included) and gives the
+# page the keyboard. tab.duplicate opens the address shown in a new tab right after it,
+# without its history. tab.move left and right move the tab shown one place, wrapping
+# around; tab.move <n> moves it to position n. tab.reopen brings back the tab closed last,
+# at the end: its pages load again from their addresses, so what they held (a form you
+# filled in, a scroll position) is gone. sig keeps the last 10 tabs closed since it started.
+#
+# location.focus puts you in the address line with the address selected; with text, the line
+# holds that text instead, the cursor at its end: "location.focus :" opens the command line.
+#
+# page.find finds the text in the page shown, wrapping around, and is case-sensitive only
+# when the text has a capital letter; page.find-next and page.find-previous move between the
+# matches and page.find-stop ends the search. A page whose engine can't find in it says so.
+# history.clear forgets the pages you visited. browser.fullscreen puts the window in
+# fullscreen, or takes it out.
 #
 # clipboard.copy <text> puts the text on the clipboard. The runtime refuses text over its
 # limit and says so, rather than cutting it.

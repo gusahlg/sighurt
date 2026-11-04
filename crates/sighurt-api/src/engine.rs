@@ -95,10 +95,12 @@ pub trait EngineRuntime {
     /// [`LoadingChanged`](EngineEvent::LoadingChanged),
     /// [`HistoryChanged`](EngineEvent::HistoryChanged),
     /// [`TextInputChanged`](EngineEvent::TextInputChanged),
-    /// [`SemanticsChanged`](EngineEvent::SemanticsChanged) and
+    /// [`SemanticsChanged`](EngineEvent::SemanticsChanged),
+    /// [`FindResult`](EngineEvent::FindResult) and
     /// [`FrameReady`](EngineEvent::FrameReady) per view until it is delivered, so a page
     /// changing its title in a loop adds one event, not millions. Every other event, including
-    /// a site-data report, is ordered and delivered, none dropped.
+    /// a site-data report and [`FullscreenChanged`](EngineEvent::FullscreenChanged) (entering
+    /// and leaving both matter), is ordered and delivered, none dropped.
     fn pump(&mut self, events: &mut Vec<EngineEvent>) -> PumpStatus;
 
     /// Paints and submits `view`'s latest frame, if it has one for the permit's layout epoch.
@@ -138,7 +140,7 @@ pub struct EngineCapabilities {
     pub accessibility: bool,
     /// Screenshots of a view's content.
     pub screenshots: bool,
-    /// Find in page.
+    /// Find in page ([`EngineCommand::Find`]).
     pub find_in_page: bool,
     /// Page zoom ([`EngineCommand::SetZoom`]).
     pub page_zoom: bool,
@@ -158,6 +160,9 @@ pub struct EngineCapabilities {
     /// ([`EngineRuntime::site_data`]). All false means it keeps none, and the core does not
     /// ask it.
     pub site_data: SiteDataKinds,
+    /// A document can show an element fullscreen inside the view, reported as
+    /// [`EngineEvent::FullscreenChanged`] and left with [`EngineCommand::ExitFullscreen`].
+    pub fullscreen: bool,
 }
 
 /// Which kinds of site data an engine keeps, and can list or forget.
@@ -337,6 +342,36 @@ pub enum EngineCommand {
         /// Whether the engine may perform the navigation.
         allow: bool,
     },
+    /// Find in the view's document ([`EngineCapabilities::find_in_page`]). One search per
+    /// view: a new [`FindCommand::Search`] replaces the last, and its highlights. Results
+    /// arrive as [`EngineEvent::FindResult`]. An engine without the capability refuses it, and
+    /// the core never sends it one.
+    Find(FindCommand),
+    /// Leave element fullscreen ([`EngineCapabilities::fullscreen`]);
+    /// [`EngineEvent::FullscreenChanged`] with `fullscreen: false` follows. An engine without
+    /// the capability refuses it.
+    ExitFullscreen,
+}
+
+/// What [`EngineCommand::Find`] does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FindCommand {
+    /// Start a search, or replace the view's search: select the first match from the view's
+    /// current position.
+    Search {
+        /// Identifies this search in its [`EngineEvent::FindResult`]s.
+        search: RequestId,
+        /// What to find: not empty, at most [`MAX_FIND`](crate::commands::MAX_FIND) bytes.
+        text: String,
+        /// Whether case matters.
+        case_sensitive: bool,
+    },
+    /// Move to the next match, wrapping around.
+    Next,
+    /// Move to the previous match, wrapping around.
+    Previous,
+    /// End the search and clear its highlights.
+    Stop,
 }
 
 /// Whether a runtime has more work after [`EngineRuntime::pump`].

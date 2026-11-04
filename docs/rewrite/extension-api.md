@@ -1823,3 +1823,17 @@ finding was checked against the plan and the code before it was acted on.
   `FontSystemHandle` are sighurt-render's, re-exported from sighurt-ui at their old paths;
   `ShapedText::lines` is new; `paint_cpu` is `paint` (`paint::draw`). The standard chrome's and
   the line chrome's golden images are unchanged, pixel for pixel.
+- **Tabs, find, history and fullscreen: the API** (4 November 2026, STATUS decisions 126–129).
+  `Command` gains `TabDuplicate`, `TabMove`
+  (with `commands::TabMove`: `Left`, `Right`, `To(n)`), `TabReopen`, `PageFind(String)` (cut
+  to `commands::MAX_FIND`, 1024 bytes, at a character boundary), `PageFindNext`,
+  `PageFindPrevious`, `PageFindStop`, `HistoryClear` and `BrowserFullscreen`; `TabNew` and
+  `LocationFocus` take an optional argument (`tab.new [address]`, `location.focus [text]`), so a
+  keymap or chrome that names them writes `Command::TabNew(None)` and
+  `Command::LocationFocus(None)`. `CommandError::InvalidTabMove` is new. `keymap::TabInfo` gains
+  `status` (the page's status text: the hovered link, page data like the title), and
+  `TabInfo::new` takes it as its last argument. The engine contract gains
+  `EngineCommand::Find(FindCommand)`, `EngineCommand::ExitFullscreen`,
+  `EngineEvent::FindResult` (replaceable per view), `EngineEvent::FullscreenChanged` (ordered)
+  and `EngineCapabilities::fullscreen`; no engine sets `find_in_page` or `fullscreen` yet, and
+  every adapter refuses both commands as unsupported.

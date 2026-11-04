@@ -37,11 +37,12 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     text_input: false,
     accessibility: false,
     screenshots: false,
-    find_in_page: false,
+    find_in_page: false, // lane B: true once find in page is wired
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
     process_per_view: false,
     semantics: false,
     site_data: SiteDataKinds::NONE,
+    fullscreen: false,
 };

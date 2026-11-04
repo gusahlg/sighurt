@@ -213,6 +213,7 @@ impl Browser for Tabs {
             1.0,
             false,
             false,
+            None,
         ))
     }
 }

@@ -425,7 +425,10 @@ command, typed into the address line) all run them.
 
 | Command | What it does |
 |---|---|
-| `tab.new` | a new tab on the home page |
+| `tab.new [address]` | a new tab on the home page, with the address line ready; or on the address, as `page.open` opens it |
+| `tab.duplicate` | the page shown again, in a new tab right after it (without its history) |
+| `tab.move left`, `tab.move right`, `tab.move <n>` | move the active tab one place (wrapping around), or to position `n` |
+| `tab.reopen` | bring back the tab closed last; its pages load again from their addresses (the last 10 closed since `sig` started) |
 | `tab.close [n]` | close the active tab, or tab `n` (tabs count from 1) |
 | `tab.next`, `tab.previous`, `tab.last`, `tab.select <n>` | switch tabs |
 | `page.open <url>` | open an address or a search in the active tab |
@@ -434,7 +437,10 @@ command, typed into the address line) all run them.
 | `page.reload`, `page.stop`, `page.back`, `page.forward` | the page's own |
 | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` | page zoom |
 | `page.send-key <key>` | press and release a named key in the page, as if typed: `down`, `pageup`, `end`, `space`, `enter`, `f5`, `shift-space`, … |
-| `location.focus` | focus the address line with its text selected |
+| `page.find <text>`, `page.find-next`, `page.find-previous`, `page.find-stop` | find text in the page shown, wrapping around (case-sensitive only when the text has a capital letter), move between the matches, end the search; a page whose engine can't find says so |
+| `location.focus [text]` | focus the address line with its text selected; with text, the line holds that text instead (`location.focus :` opens the command line) |
+| `history.clear` | forget the pages you visited |
+| `browser.fullscreen` | put the window in fullscreen, or take it out |
 | `clipboard.copy <text>` | put the text on the clipboard |
 | `browser.home` | open the home page in the active tab |
 | `browser.quit` | quit, saving the tabs |

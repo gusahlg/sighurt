@@ -78,6 +78,7 @@ impl Browser for Fake {
             1.0,
             false,
             false,
+            None,
         ))
     }
 }
@@ -330,7 +331,7 @@ fn the_shared_table_in_normal_mode() {
     }
     assert_eq!(
         keymap.press(&typed(':'), PAGE, &b),
-        KeyAction::RunThenPass(Command::LocationFocus)
+        KeyAction::RunThenPass(Command::LocationFocus(None))
     );
     // Unbound keys pass; nothing is swallowed.
     assert_eq!(keymap.press(&typed('z'), PAGE, &b), KeyAction::Pass);

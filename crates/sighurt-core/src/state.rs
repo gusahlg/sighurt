@@ -38,7 +38,7 @@
 //! Must not own: I/O, timers, threads, surface metrics or anything the chrome draws. It is not a
 //! framework: no event bus, no generic UI tree, no plugin registry.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -72,7 +72,8 @@ use crate::permissions::{self, Pending, Requests, Requirement, MAX_PENDING_REQUE
 use crate::router::{self, Route};
 use crate::session::{self, Session, SessionSegment, SessionTab};
 use crate::tabs::{
-    bounded, clamp, display_title, Content, LoadError, Tab, TabSummary, View, MAX_TEXT, MAX_URL,
+    bounded, clamp, display_title, Content, LoadError, Tab, TabSummary, View, MAX_CLOSED, MAX_TEXT,
+    MAX_URL,
 };
 
 /// Which frontend is running. The same enum a keymap sees
@@ -451,6 +452,9 @@ pub struct BrowserState {
     text_input: Option<TextInputState>,
     /// [`BrowserEvent::PageTyping`].
     page_typing: bool,
+    /// The tabs closed since the browser started, the latest last, as the session saves them:
+    /// what `tab.reopen` restores. At most [`MAX_CLOSED`]; never saved.
+    pub(crate) closed: VecDeque<SessionTab>,
 }
 
 /// Applies `event` to `state` and returns what the executable should do.
@@ -782,6 +786,7 @@ impl Browser for CoreBrowser<'_> {
             tab.zoom,
             shown.can_go_back,
             shown.can_go_forward,
+            shown.view.and_then(|view| view.status.as_deref()),
         ))
     }
 }
@@ -813,6 +818,7 @@ impl BrowserState {
             cursor: Cursor::Default,
             text_input: None,
             page_typing: true,
+            closed: VecDeque::new(),
         }
     }
 
@@ -854,6 +860,16 @@ impl BrowserState {
 
     /// A snapshot of the tabs and their history, to save.
     pub fn session(&self) -> Session {
+        Session {
+            version: session::VERSION,
+            active: self.active,
+            tabs: self.tabs.iter().map(|tab| self.saved_tab(tab)).collect(),
+            notices: Vec::new(),
+        }
+    }
+
+    /// What is saved of `tab`: its segments, as records, and its zoom.
+    fn saved_tab(&self, tab: &Tab) -> SessionTab {
         let segment = |segment: &Segment| match segment {
             Segment::Internal(url) => SessionSegment {
                 engine: None,
@@ -864,30 +880,22 @@ impl BrowserState {
             Segment::View(view) => saved(self.views[view].record()),
             Segment::Record(record) => saved(record.clone()),
         };
-        let tab = |tab: &Tab| {
-            let mut segments: Vec<_> = tab.segments.iter().map(segment).collect();
-            // A tab still loading its first page keeps the address it is loading.
-            let loading = tab.switch.map(|switch| &self.views[&switch.view]);
-            if let (true, Some(view)) = (segments.is_empty(), loading) {
-                let url = view.navigations.latest().and_then(|n| n.url.clone());
-                segments.extend(url.map(|url| SessionSegment {
-                    engine: Some(view.engine.clone()),
-                    entries: vec![url],
-                    current: 0,
-                    title: None,
-                }));
-            }
-            SessionTab {
-                current: tab.current,
-                zoom: tab.zoom,
-                segments,
-            }
-        };
-        Session {
-            version: session::VERSION,
-            active: self.active,
-            tabs: self.tabs.iter().map(tab).collect(),
-            notices: Vec::new(),
+        let mut segments: Vec<_> = tab.segments.iter().map(segment).collect();
+        // A tab still loading its first page keeps the address it is loading.
+        let loading = tab.switch.map(|switch| &self.views[&switch.view]);
+        if let (true, Some(view)) = (segments.is_empty(), loading) {
+            let url = view.navigations.latest().and_then(|n| n.url.clone());
+            segments.extend(url.map(|url| SessionSegment {
+                engine: Some(view.engine.clone()),
+                entries: vec![url],
+                current: 0,
+                title: None,
+            }));
+        }
+        SessionTab {
+            current: tab.current,
+            zoom: tab.zoom,
+            segments,
         }
     }
 
@@ -1044,10 +1052,19 @@ impl BrowserState {
         Some(self.tabs.len() - 1)
     }
 
-    /// Closes tab `index`, unless it is the last one.
+    /// Closes tab `index`, unless it is the last one. A tab with a page to show again is kept
+    /// for `tab.reopen`, as the session would save it, dropping the oldest beyond
+    /// [`MAX_CLOSED`].
     pub(crate) fn close_tab(&mut self, index: usize, fx: &mut Fx) {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return;
+        }
+        let saved = self.saved_tab(&self.tabs[index]);
+        if !saved.segments.is_empty() {
+            if self.closed.len() == MAX_CLOSED {
+                self.closed.pop_front();
+            }
+            self.closed.push_back(saved);
         }
         let tab = self.tabs.remove(index);
         for view in tab.views() {
@@ -1848,6 +1865,10 @@ impl BrowserState {
                 })
             }
             EngineEvent::FrameReady { .. } | EngineEvent::SemanticsChanged { .. } => {}
+            // The core starts no search yet, so every result is stale (lane B).
+            EngineEvent::FindResult { .. } => {}
+            // No engine declares element fullscreen yet (lane D).
+            EngineEvent::FullscreenChanged { .. } => {}
             EngineEvent::ServiceRequested(request) => self.service_requested(request, at, fx),
             EngineEvent::ServiceCancelled { request, .. } => {
                 if self.requests.get(request).is_some_and(|p| p.view == id) {
@@ -2586,7 +2607,7 @@ fn notify(notices: Vec<String>, fx: &mut Fx) {
 }
 
 /// A saved tab, restored with a new id, its own zoom and its engine segments as records.
-fn restored(saved: SessionTab) -> Tab {
+pub(crate) fn restored(saved: SessionTab) -> Tab {
     let mut tab = Tab::new(false, crate::commands::clamp_zoom(saved.zoom));
     tab.segments = saved
         .segments

@@ -401,6 +401,8 @@ impl View {
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"))
             }
+            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         Ok(())
     }
