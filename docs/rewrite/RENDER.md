@@ -453,6 +453,12 @@ Lanes, each in its own worktree with its own `CARGO_TARGET_DIR` under
    lane 2). Measured (`bench/results/RENDER.md`): wgpu is slower per render, costs +129 MiB
    RSS and some idle CPU in a driver thread, so `auto` stays `cpu` (§14.5). Unverified:
    Mesa's WSI, a real output, `sig` with Servo beside the chrome's device.
+   *Merged into config-ext* (4 November 2026, aa25a3b) with two seams fixed where the day's
+   bug fixes met the framework: `Gui::fall_back` invalidates the cached keyboard focus, and,
+   since an unmapped target now waits for a new frame (6c02b9c), the frontend calls the new
+   `Backend::forget_frame(surface)` when a native renderer's surface is hidden, so the next
+   show renders instead of answering `Unchanged` (the binding and the swapchain stay, per §15);
+   a pixel renderer's surface is still unbound. Approved as a small addition to §4's trait.
 3. **`render-vulkan`** (Opus or Sonnet, after 2's `gpu` module): `sighurt-render-vulkan` with
    `build.rs` on naga; the same tests.
 4. **Docs and measurements** (Sonnet): `extension-api.md` amendments, CLAUDE.md's crate table
