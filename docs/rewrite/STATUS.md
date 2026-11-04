@@ -3971,5 +3971,22 @@ Newest last. Each entry says what was decided and why.
     (1017), the all-features clippy and tests with Servo and WPE, and a default sig with
     Servo's GL page and the chrome on wgpu in one process under the GPU compositor
     (`test-out/coexist-wgpu`: no fallback, clean exit). Deferred by design: images, native
-    damage, the Wasm canvas on the scene, Metal. The pure Vulkan backend (`sighurt-render-vulkan`
-    on ash, opt-in, never default) is lane 3, recorded when it lands.
+    damage, the Wasm canvas on the scene, Metal. **Lane 3, the pure Vulkan backend**
+    (`render/sighurt-render-vulkan` on ash 0.38, merged 0dbb28a): the loader opened at run
+    time, VK_KHR_wayland_surface, a device with a graphics queue that presents to the first
+    bound surface (integrated first; a CPU device only when named), MAILBOX required, lazy
+    swapchains with the driver's actual image count reported (3 on NVIDIA), one frame in flight
+    per backend with a render-finished semaphore per image and the fence reset only before a
+    submission, zero-timeout acquire → `Deferred`, one recreation after SUBOPTIMAL or
+    OUT_OF_DATE then a `Surface` error, atlas updates by staging copies with barriers, the
+    shared WGSL compiled to SPIR-V by naga in `build.rs` with a test reading the interface
+    back; `render-vulkan` is in no default set and `auto` never picks it. Astra's review of
+    the lane fixed seven synchronization and lifetime slips before it landed. Measured beside
+    the others (release, same method): render median 0.21 ms, idle 0.70 % CPU, RSS 138.7 MiB,
+    so it is a little faster and lighter than wgpu and still not `auto`. Not closed: a retired
+    swapchain is destroyed after `vkDeviceWaitIdle`, which does not prove the presentation
+    engine is done with it (wgpu-hal has the same gap; `VK_EXT_swapchain_maintenance1` present
+    fences would close it). Vulkan validation and wgpu's debug layers are on only with
+    `SIG_VULKAN_VALIDATION=1`. headless.sh 140/140 (`renderers`: cpu, wgpu, vulkan, surface
+    rebind and device fallback for each GPU backend). Unverified: Mesa's drivers, a real output,
+    the ash backend beside Servo (wgpu beside Servo was checked).
