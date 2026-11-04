@@ -38,6 +38,11 @@ struct gui_window {
 	 * hidden or before the first paint. Only the dirty part is painted into it again. */
 	uint32_t *stage;
 	int stage_w, stage_h;
+	/* Find in page (window.c): the search's text (NULL: none), its case, and what the core said
+	 * of it last: a current match, and whether one follows and one precedes it. */
+	char *find_text;
+	bool find_case;
+	bool find_found, find_next, find_prev;
 };
 
 /* The image buffer is R,G,B,A, not premultiplied. The plotter reads these fields. */
@@ -96,6 +101,7 @@ extern struct gui_download_table nsh_download_table;
 extern struct gui_clipboard_table nsh_clipboard_table;
 extern struct gui_fetch_table nsh_fetch_table;
 extern struct gui_misc_table nsh_misc_table;
+extern struct gui_search_table nsh_search_table;
 
 struct gui_window *nsh_windows(void);
 /* Keeps the scroll offset inside the content. Returns 1 if it moved. Offsets are in buffer

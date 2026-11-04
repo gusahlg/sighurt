@@ -585,6 +585,7 @@ int nsh_init(const nsh_config *cfg)
 		.fetch = &nsh_fetch_table,
 		.bitmap = &nsh_bitmap_table,
 		.layout = &nsh_layout_table,
+		.search = &nsh_search_table,
 		.llcache = null_llcache_table,
 	};
 	if (netsurf_register(&core_table) != NSERROR_OK) {

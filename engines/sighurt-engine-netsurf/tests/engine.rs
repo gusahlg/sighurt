@@ -1,5 +1,6 @@
 //! The runtime against a local HTTP server and a fake CPU target. NetSurf is one runtime per
-//! process, so this binary has one test that walks through every scenario in order.
+//! process, so this binary has one test that walks through every scenario in order (find in
+//! page among them).
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -8,11 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{
-    EngineCommand, EngineRuntime, EngineWaker, PresentOutcome, PumpStatus, ViewOptions,
+    EngineCommand, EngineRuntime, EngineWaker, FindCommand, PresentOutcome, PumpStatus, ViewOptions,
 };
 use sighurt_api::events::{EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{Metrics, Scale, SurfacePoint, WindowRect};
-use sighurt_api::ids::{LayoutEpoch, NavigationId, SeatId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, RequestId, SeatId, ViewId};
 use sighurt_api::input::{
     ButtonState, InputEvent, InputKind, Key, KeyCode, KeyEvent, Modifiers, PointerButton,
     PointerEvent, ScrollDelta, TextPurpose,
@@ -153,6 +154,13 @@ impl Server {
                                 "text/html",
                                 "",
                                 b"<!doctype html><title>Second</title><p>two".to_vec(),
+                            ),
+                            "/find" => (
+                                "text/html",
+                                "",
+                                b"<!doctype html><title>Find</title><p>apple one<p>Apple two\
+                                  <p>apple three<p style='margin-top: 1500px'>apple four"
+                                    .to_vec(),
                             ),
                             "/filemeta" => (
                             "text/html",
@@ -1040,6 +1048,97 @@ fn the_runtime_walks_through_every_scenario() {
     assert!(
         again >= 5,
         "the animation resumed with {again} wakes in a second"
+    );
+
+    // --- find in page: NetSurf says whether there is a match, synchronously; moves wrap; case
+    // is as asked; moves and stops of a search the view no longer has, and a search of a gone
+    // document, do nothing; a new document ends the search.
+    let events = h.load(&server.url("/find"));
+    let document = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            EngineEvent::NavigationCommitted { document, .. } => Some(*document),
+            _ => None,
+        })
+        .expect("committed");
+    let find = |h: &mut Harness, command: FindCommand| -> Vec<(RequestId, bool)> {
+        h.command(EngineCommand::Find(command));
+        let results = h.pump().into_iter().filter_map(|e| match e {
+            EngineEvent::FindResult {
+                view: v,
+                document: d,
+                search,
+                found,
+                current: None,
+                total: None,
+            } if v == view && d == document => Some((search, found)),
+            EngineEvent::FindResult { .. } => panic!("{e:?}"),
+            _ => None,
+        });
+        results.collect()
+    };
+    let search = |text: &str, case_sensitive: bool| {
+        let search = RequestId::next();
+        let command = FindCommand::Search {
+            search,
+            document,
+            text: text.into(),
+            case_sensitive,
+        };
+        (search, command)
+    };
+    let (apple, command) = search("apple", false);
+    assert_eq!(find(&mut h, command), [(apple, true)]);
+    // Forwards through all four and around; backwards from the first to the last.
+    for _ in 0..4 {
+        assert_eq!(
+            find(&mut h, FindCommand::Next { search: apple }),
+            [(apple, true)]
+        );
+    }
+    for _ in 0..2 {
+        let previous = FindCommand::Previous { search: apple };
+        assert_eq!(find(&mut h, previous), [(apple, true)]);
+    }
+    let (sensitive, command) = search("APPLE", true);
+    assert_eq!(find(&mut h, command), [(sensitive, false)], "case as asked");
+    let (insensitive, command) = search("APPLE", false);
+    assert_eq!(find(&mut h, command), [(insensitive, true)]);
+    let (pear, command) = search("pear", false);
+    assert_eq!(find(&mut h, command), [(pear, false)]);
+    assert_eq!(
+        find(&mut h, FindCommand::Next { search: pear }),
+        [(pear, false)]
+    );
+    let gone = FindCommand::Search {
+        search: RequestId::next(),
+        document: DocumentGeneration::next(),
+        text: "apple".into(),
+        case_sensitive: false,
+    };
+    for command in [
+        FindCommand::Next { search: apple },
+        FindCommand::Stop { search: apple },
+        gone,
+    ] {
+        assert_eq!(find(&mut h, command), [], "nothing answered");
+    }
+    let (again, command) = search("apple", false);
+    assert_eq!(find(&mut h, command), [(again, true)]);
+    assert_eq!(find(&mut h, FindCommand::Stop { search: again }), []);
+    assert_eq!(
+        find(&mut h, FindCommand::Next { search: again }),
+        [],
+        "stopped"
+    );
+    let (last, command) = search("apple", false);
+    assert_eq!(find(&mut h, command), [(last, true)]);
+    h.load(&server.url("/second"));
+    assert_eq!(
+        find(&mut h, FindCommand::Next { search: last }),
+        [],
+        "the search ended with its document"
     );
 
     // --- close and shut down.

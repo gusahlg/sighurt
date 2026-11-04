@@ -29,15 +29,16 @@ pub use sighurt_wayland::TargetLease;
 /// The engine's name in the configuration and the registry.
 pub const NAME: &str = "netsurf";
 
-/// What the engine supports: page zoom. `text_input` is IME composition, which it does not do (a
-/// focused field is reported through `TextInputChanged`). No history of its own (the core gives
-/// each page a view), no semantics, no find, no site data yet.
+/// What the engine supports: page zoom and find in page (whether there is a match: NetSurf counts
+/// nothing). `text_input` is IME composition, which it does not do (a focused field is reported
+/// through `TextInputChanged`). No history of its own (the core gives each page a view), no
+/// semantics, no site data yet.
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     history_traversal: false,
     text_input: false,
     accessibility: false,
     screenshots: false,
-    find_in_page: false, // lane B: true once find in page is wired
+    find_in_page: true,
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,

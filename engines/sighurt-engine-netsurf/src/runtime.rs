@@ -23,6 +23,9 @@
 //!   frontend reads the field's type from the core) or a textarea. A field in a frame or an
 //!   iframe cannot be told apart and is reported as a password, so the input method never learns
 //!   what is typed there.
+//! - **Find in page.** NetSurf searches synchronously, so each find command's result is known
+//!   when the call returns: `FindResult` with `found` only (NetSurf counts nothing), for the
+//!   search and document the command named. A new document ends the search.
 //! - **Bounds.** URLs are passed on whole, never shortened; a link over `MAX_URL` (the core's
 //!   bound) is not followed. Titles and status text arrive cut to 16 KiB, as the core cuts them.
 //!
@@ -35,8 +38,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{
-    EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, PresentOutcome,
-    PumpStatus, ViewOptions,
+    EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, FindCommand,
+    PresentOutcome, PumpStatus, ViewOptions,
 };
 use sighurt_api::events::{EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{Metrics, SurfacePoint, SurfaceRect};
@@ -126,6 +129,8 @@ struct View<T: CpuTarget> {
     /// The latest title, applied again after a commit so it belongs to the new document.
     title: Option<String>,
     asked: HashMap<RequestId, Asked>,
+    /// The search moves and stops name, and the document it searches.
+    find: Option<(RequestId, DocumentGeneration)>,
 }
 
 /// NetSurf as an engine runtime.
@@ -527,6 +532,7 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
         // What the old document held is dead with it.
         view.held.clear();
         view.asked.retain(|_, asked| matches!(asked, Asked::Other));
+        view.find = None;
         if std::mem::take(&mut view.caret) {
             self.queue.push(EngineEvent::TextInputChanged {
                 view: id,
@@ -796,6 +802,7 @@ impl<T: CpuTarget> EngineRuntime for NetSurfRuntime<T> {
                 downloads: HashMap::new(),
                 title: None,
                 asked: HashMap::new(),
+                find: None,
             },
         );
         self.queue.push(EngineEvent::ViewReady { view: id });
@@ -889,7 +896,49 @@ impl<T: CpuTarget> EngineRuntime for NetSurfRuntime<T> {
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"))
             }
-            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::Find(find) => {
+                let view = self.views.get_mut(&id).expect("checked above");
+                let Some(handle) = &view.handle else {
+                    return Ok(());
+                };
+                let found = match find {
+                    FindCommand::Search {
+                        search,
+                        document,
+                        text,
+                        case_sensitive,
+                    } => {
+                        // A search of a document that is gone is dropped.
+                        (document == view.document).then(|| {
+                            view.find = Some((search, document));
+                            handle.find(&text, case_sensitive)
+                        })
+                    }
+                    // Moves and stops of a search the view no longer has do nothing.
+                    FindCommand::Next { search } | FindCommand::Previous { search } => {
+                        let forwards = matches!(find, FindCommand::Next { .. });
+                        let current = view.find.is_some_and(|(s, _)| s == search);
+                        current.then(|| handle.find_move(forwards))
+                    }
+                    FindCommand::Stop { search } => {
+                        if view.find.is_some_and(|(s, _)| s == search) {
+                            view.find = None;
+                            handle.find_stop();
+                        }
+                        None
+                    }
+                };
+                if let (Some(found), Some((search, document))) = (found, view.find) {
+                    self.queue.push(EngineEvent::FindResult {
+                        view: id,
+                        document,
+                        search,
+                        found,
+                        current: None,
+                        total: None,
+                    });
+                }
+            }
             EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         self.collect();
@@ -1020,6 +1069,7 @@ fn coalesce(events: &mut Vec<EngineEvent>) {
                 | EngineEvent::TextInputChanged { .. }
                 | EngineEvent::FrameReady { .. }
                 | EngineEvent::SemanticsChanged { .. }
+                | EngineEvent::FindResult { .. }
         )
     }
     let mut seen: HashSet<(Discriminant<EngineEvent>, Option<ViewId>)> = HashSet::new();

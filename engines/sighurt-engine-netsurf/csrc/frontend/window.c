@@ -2,6 +2,7 @@
  * opens itself (target=_blank, existing != NULL) stays pending until its first
  * set_url, then is destroyed on the next poll, after the core call has returned.
  * A hidden window records what is invalidated but queues no frame for it.
+ * Find in page is here too: the core's search is synchronous, and this wraps it.
  * GPL-2.0-only. */
 #include "internal.h"
 
@@ -10,6 +11,8 @@
 
 #include "netsurf/window.h"
 #include "netsurf/console.h"
+#include "netsurf/search.h"
+#include "desktop/search.h"
 #include "netsurf/content.h"
 #include "content/hlcache.h"
 #include "desktop/browser_private.h"
@@ -130,6 +133,8 @@ static void gw_destroy(struct gui_window *g)
 	g->gadget_content = NULL;
 	free(g->stage);
 	g->stage = NULL;
+	free(g->find_text);
+	g->find_text = NULL;
 	g->next = graveyard;
 	graveyard = g;
 }
@@ -238,6 +243,10 @@ static nserror gw_event(struct gui_window *g, enum gui_window_event event)
 	case GW_EVENT_NEW_CONTENT:
 		g->gadget = NULL;
 		g->sx = g->sy = 0;
+		/* The search ended with the content that held it. */
+		free(g->find_text);
+		g->find_text = NULL;
+		g->find_found = g->find_next = g->find_prev = false;
 		nsh_emit(NSH_EV_NEW_CONTENT, g->view_id, 0, 0, 0, 0, 0, NULL);
 		break;
 	case GW_EVENT_UPDATE_EXTENT:
@@ -393,6 +402,128 @@ struct gui_window_table nsh_window_table = {
 	.file_gadget_open = gw_file_open,
 	.console_log = gw_console,
 };
+
+/* ---- Find in page ----
+ * The core searches synchronously: browser_window_search runs the search and calls the search
+ * table, with the window as its context, before it returns. So each call has its own answer, and
+ * nothing of a search arrives later. NetSurf 3.11 does not wrap: the frontend does. */
+
+/* The most steps a move backwards from the first match takes to reach the last. Each step walks
+ * the matches once, so a page with more matches wraps only this far. */
+#define NSH_MAX_FIND_STEPS 4096
+
+/* What the core said during the search call in progress, for the window that made it. */
+static struct {
+	const struct gui_window *g;
+	bool found, next, prev;
+} searching;
+
+static void search_status(bool found, void *p)
+{
+	if (p == searching.g)
+		searching.found = found;
+}
+
+static void search_hourglass(bool active, void *p)
+{
+	(void)active;
+	(void)p;
+}
+
+static void search_add_recent(const char *string, void *p)
+{
+	(void)string;
+	(void)p;
+}
+
+static void search_forward_state(bool active, void *p)
+{
+	if (p == searching.g)
+		searching.next = active;
+}
+
+static void search_back_state(bool active, void *p)
+{
+	if (p == searching.g)
+		searching.prev = active;
+}
+
+struct gui_search_table nsh_search_table = {
+	.status = search_status,
+	.hourglass = search_hourglass,
+	.add_recent = search_add_recent,
+	.forward_state = search_forward_state,
+	.back_state = search_back_state,
+};
+
+static search_flags_t search_flags(const struct gui_window *g, bool forwards)
+{
+	return (g->find_case ? SEARCH_FLAG_CASE_SENSITIVE : SEARCH_FLAG_NONE)
+		| (forwards ? SEARCH_FLAG_FORWARDS : SEARCH_FLAG_BACKWARDS);
+}
+
+/* One step of the window's search (the first match of a new one); whether there is a match. */
+static int search_step(struct gui_window *g, bool forwards)
+{
+	searching.g = g;
+	searching.found = searching.next = searching.prev = false;
+	browser_window_search(g->bw, g, search_flags(g, forwards), g->find_text);
+	searching.g = NULL;
+	g->find_found = searching.found;
+	g->find_next = searching.next;
+	g->find_prev = searching.prev;
+	return g->find_found;
+}
+
+/* Ends the core's search of the window's content, and its highlight. */
+static void search_clear(struct gui_window *g)
+{
+	browser_window_search(g->bw, g, SEARCH_FLAG_NONE, NULL);
+}
+
+int nsh_view_find(nsh_view *view, const char *text, int case_sensitive)
+{
+	if (!view || !view->bw || view->dead || !text || !*text)
+		return 0;
+	char *copy = strdup(text);
+	if (!copy)
+		return 0;
+	/* A new search even for the same text, which the core would continue. */
+	search_clear(view);
+	free(view->find_text);
+	view->find_text = copy;
+	view->find_case = case_sensitive != 0;
+	return search_step(view, true);
+}
+
+int nsh_view_find_move(nsh_view *view, int forwards)
+{
+	if (!view || !view->bw || view->dead || !view->find_text || !view->find_found)
+		return 0;
+	if (forwards && !view->find_next) {
+		/* The last match: a new search selects the first. */
+		search_clear(view);
+		return search_step(view, true);
+	}
+	if (!forwards && !view->find_prev) {
+		/* The first match: the core can't go to the last, so it steps there. */
+		for (int i = 0; i < NSH_MAX_FIND_STEPS && view->find_found && view->find_next; i++)
+			search_step(view, true);
+		return view->find_found;
+	}
+	return search_step(view, forwards != 0);
+}
+
+void nsh_view_find_stop(nsh_view *view)
+{
+	if (!view || !view->find_text)
+		return;
+	if (view->bw && !view->dead)
+		search_clear(view);
+	free(view->find_text);
+	view->find_text = NULL;
+	view->find_found = view->find_next = view->find_prev = false;
+}
 
 void nsh_reap_doomed(void)
 {
