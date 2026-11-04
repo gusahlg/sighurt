@@ -370,6 +370,14 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
+    fn forget_frame(&mut self, surface: SurfaceKey) {
+        // The binding and the swapchain stay (RENDER.md §15); only the frame the surface last
+        // showed is forgotten, so the next render after a hide is not found unchanged.
+        if let Some(target) = self.targets.get_mut(&surface) {
+            target.last = None;
+        }
+    }
+
     fn unbind(&mut self, surface: SurfaceKey) {
         let Some(target) = self.targets.remove(&surface) else {
             return;
