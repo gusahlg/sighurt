@@ -41,6 +41,44 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   WebKit is opened on first use and its processes end with the last WPE page, retained views are
   bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
 
+### Paused on 4 November 2026 (evening): the second run, two feature lanes in flight
+
+The user asked for a second run after decision 125: "optimize the renderer and the browser in
+general as much as possible. Do more reliability testing and add in obvious features that are
+missing in a way that goes with the philosophy and design." Landed on `config-ext` (decisions
+126–129 and the lane commits after them): seeded random-input tests for every parser with 8
+fixes (126), the soak and fault suites with 5 fixes (127), the second measured optimization pass
+(128: CPU backend page render −58 %, sixel encode −52 %), the tab commands, the keymap's hovered
+link and `location.focus <text>` with the find and fullscreen API stubbed honestly in every
+engine (129), find in page in the WPE, CEF, Ladybird (shim ABI 3) and NetSurf adapters
+(874dcb0…6fd6335, each with a direct engine test; Servo 0.7 has no find API), and window
+fullscreen in the host (`Host::set_fullscreen`, `WindowConfigured { fullscreen }`, 20/20
+compositor tests). The feature set and its API shapes are
+[features-2026-11-04.md](features-2026-11-04.md) (the deep-design agent's design with the
+orchestrator's amendments after [reviews-features-astra.md](reviews-features-astra.md)).
+
+**In flight, on branches, not merged:** `find` (worktree `../sighurt-wt-find`: lane B1, find in
+the core, both windowed chromes and the terminal's text mode, with the demo engine as the test
+path) and `hist` (worktree `../sighurt-wt-hist`: lane C, visited history, `history.toml`,
+`[history] remember`, acknowledged deletion, inline address completion). Each branch's last
+commit says what is done; a "WIP:" subject means the lane was stopped by the end of the day.
+Their worktrees build into /data/sig-builds/targets/gwasm and /data/sig-builds/targets/merge.
+
+**To resume, in order:** (1) finish and merge `find`, then `hist` (both touch
+`crates/sighurt-core/src/state.rs` and `ui/sighurt-ui/src/chrome.rs`: expect small conflicts);
+write decisions 130 (find) and 131 (history). (2) Lane D, fullscreen, per the design's "Lane D"
+amendments: the core's three states (wanted, observed, page-owned), `browser.fullscreen` through
+`Host::set_fullscreen`, the chrome listing its surfaces only when needed, page-requested
+fullscreen as a fact gated by activation with `page.exit-fullscreen` and the core's Escape
+safety override, Servo (`notify_fullscreen_state_changed`, `WebView::exit_fullscreen`) and CEF
+first, WPE after its exit path is verified in 2.52's sources; decision 132. (3) The full
+pre-commit list with Servo and WPE (the non-Servo part and the `--all-features` clippy/tests ran
+on the merged tree at the pause: see the log named in the session memory), `engines.sh`,
+`real-terminals.sh`, `coexist.sh`. (4) Rebuild `/data/sig-builds/try/sig` with every engine: the
+one there was built before shim ABI 3 and refuses the rebuilt Ladybird shim (a rebuild was
+started at the pause; `REVISION` there says which commit it is). Still owed from before: the
+0.9.0-vs-0.10.0 benchmark on louise-pc (offline all day).
+
 ### Paused on 23 October 2026: the terminal in tmux, Servo text, persistent logins
 
 The user's report ("basically all keybindings in the TUI malfunction") was tmux: sig ran inside
