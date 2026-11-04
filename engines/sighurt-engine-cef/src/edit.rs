@@ -1,10 +1,14 @@
-//! Editing the page on the browser's behalf: typing a paste, deleting what a cut took.
+//! Editing the page on the browser's behalf: inserting a paste, deleting what a cut took.
 //!
 //! The text of a paste belongs to the document and frame that asked for it. Both are recorded
 //! when the key goes down ([`Binding`]) and checked again on CEF's UI thread immediately before
 //! every insertion: commits and the checks run on that one thread, so a page that navigated
 //! after asking can never receive the clipboard. A long paste goes in a thousand units at a time,
-//! each a task of its own, so neither the owner nor CEF's queue holds the whole of it.
+//! each a task of its own, so neither the owner nor CEF's queue holds the whole of it. Text goes
+//! in as typed characters (Chromium ignores an input method's calls from the browser side
+//! here). A line break is typed as Enter only into a multi-line field (a text area or an
+//! editable element), where it is a new line; into any other field it is a space, as Chromium
+//! makes it of a paste, so a multi-line paste never submits a form.
 //!
 //! Must not own: the clipboard (the browser's services do) or the decision to paste.
 
@@ -18,6 +22,13 @@ use crate::shared::{lock, ViewShared};
 
 /// Units of text sent per task.
 const CHUNK: usize = 1024;
+/// A line break, once [`line_breaks`] made every kind of them this one.
+const LF: u16 = b'\n' as u16;
+
+/// `text` with each CR LF and lone CR as LF.
+fn line_breaks(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
 
 /// The document and frame an edit was asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,9 +54,9 @@ impl ViewShared {
             && self.focused_frame() == binding.frame
     }
 
-    /// Types `text` into the page as characters, if `binding` still holds at each step.
+    /// Types `text` into the page, if `binding` still holds at each step.
     pub fn insert_text(self: &Arc<Self>, text: &str, binding: Binding) {
-        let units: Arc<Vec<u16>> = Arc::new(text.replace('\n', "\r").encode_utf16().collect());
+        let units: Arc<Vec<u16>> = Arc::new(line_breaks(text).encode_utf16().collect());
         if !units.is_empty() {
             self.insert_from(units, 0, binding);
         }
@@ -65,9 +76,18 @@ impl ViewShared {
             if end < units.len() && (0xD800..0xDC00).contains(&units[end - 1]) {
                 end += 1;
             }
-            for unit in &units[from..end] {
+            // The field that has the focus now decides what a line break is.
+            let multiline = lock(&view.text_input)
+                .as_ref()
+                .is_some_and(|state| state.multiline);
+            for &unit in &units[from..end] {
+                let unit = match unit {
+                    LF if multiline => u16::from(b'\r'),
+                    LF => u16::from(b' '),
+                    unit => unit,
+                };
                 // SAFETY: a live host reference, on the UI thread.
-                unsafe { send_char(host.as_ptr(), *unit) };
+                unsafe { send_char(host.as_ptr(), unit) };
             }
             if end < units.len() {
                 view.insert_from(units, end, binding);
@@ -93,5 +113,16 @@ impl ViewShared {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_kind_of_line_break_is_one() {
+        assert_eq!(line_breaks("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        assert_eq!(line_breaks("\r\n\r\n"), "\n\n");
     }
 }

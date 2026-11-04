@@ -4,8 +4,9 @@
 //! `tests/offscreen.sh` runs it with no display connection (ozone headless). It checks the
 //! pages' pixels (ARGB top-down), navigation events in order with
 //! history, a link the user clicks being held and answered, a popup becoming `OpenRequested`,
-//! typing, the text-input state, a paste through the clipboard service, resizing, idling
-//! without wakeups, and a clean shutdown.
+//! typing, the text-input state, a paste through the clipboard service (a multi-line one as
+//! text, never Enter), a popup nobody clicked for refused, a page closing itself (asked, then
+//! failed and closed), resizing, idling without wakeups, and a clean shutdown.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -647,10 +648,15 @@ fn chromium_in_the_engine_contract() {
             data: b"PASTED".to_vec(),
         })),
     });
-    assert!(
-        h.title(from, "typed:hiPASTED"),
-        "the pasted text reaches the field"
-    );
+    let ok = h.title(from, "typed:hiPASTED");
+    let titles: Vec<_> = h.log[from..]
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::TitleChanged { title: Some(t), .. } => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(ok, "the pasted text reaches the field: {titles:?}");
     // An input method's commit reaches the field too.
     let from = h.log.len();
     h.input(InputKind::TextInput(sighurt_api::input::TextInputEvent {
@@ -660,6 +666,47 @@ fn chromium_in_the_engine_contract() {
     assert!(
         h.title(from, "typed:hiPASTED!"),
         "committed text reaches the field"
+    );
+    // A multi-line paste never presses Enter in a one-line field: its line break is a space
+    // there (as Chromium makes it of a paste), where a typed '\r' would submit a form.
+    let from = h.log.len();
+    h.type_key(
+        47,
+        "v",
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        },
+    );
+    let id = h
+        .wait(from, |e| match e {
+            EngineEvent::ServiceRequested(r)
+                if matches!(r.service, Service::ClipboardRead { .. }) =>
+            {
+                Some(r.id)
+            }
+            _ => None,
+        })
+        .expect("the multi-line paste is asked for");
+    h.send(EngineCommand::ResolveServiceRequest {
+        request: id,
+        result: Ok(ServiceReply::Clipboard(ClipboardData {
+            mime_type: "text/plain".into(),
+            data: b"A\nB".to_vec(),
+        })),
+    });
+    let ok = h.title(from, "typed:hiPASTED!A B");
+    let titles: Vec<_> = h.log[from..]
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::TitleChanged { title: Some(t), .. } => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(ok, "a multi-line paste is inserted as text: {titles:?}");
+    assert!(
+        !titles.iter().any(|t| t.starts_with("enter:")),
+        "a multi-line paste pressed Enter: {titles:?}"
     );
     let from = h.log.len();
     h.click(30.0, 110.0);
@@ -674,6 +721,21 @@ fn chromium_in_the_engine_contract() {
     assert!(
         open.0.ends_with("second.html") && open.1 == OpenDisposition::NewView,
         "{open:?}"
+    );
+    // A popup the page opens on its own, with no click behind it, is refused.
+    let from = h.log.len();
+    h.navigate(&page("popup.html"));
+    assert!(h.title(from, "opened"), "the popup page ran");
+    let settle = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < settle {
+        h.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !h.log[from..]
+            .iter()
+            .any(|e| matches!(e, EngineEvent::OpenRequested { .. })),
+        "a popup without a user gesture became an OpenRequested"
     );
 
     // A paste belongs to the document that asked: answered after a navigation, it goes nowhere.
@@ -854,6 +916,49 @@ fn chromium_in_the_engine_contract() {
         [0xff, 0xff, 0xff, 0xff],
         "white page, opaque"
     );
+
+    // A page alone in its history that closes itself: the browser is asked, and the view, whose
+    // document is gone, fails and closes on its own.
+    let closer = ViewId::next();
+    h.rt.open_view(
+        closer,
+        ViewOptions::default(),
+        Mem {
+            metrics: size,
+            frames: Arc::new(Mutex::new(Vec::new())),
+            persistent: Vec::new(),
+        },
+    )
+    .expect("open_view");
+    let from = h.log.len();
+    h.rt.command(
+        closer,
+        EngineCommand::Navigate {
+            navigation: NavigationId::next(),
+            url: page("close.html"),
+        },
+    )
+    .expect("command accepted");
+    h.wait(from, |e| {
+        matches!(e, EngineEvent::ViewClosed { view } if *view == closer).then_some(())
+    })
+    .expect("a page that closed itself closes its view");
+    let ends: Vec<&str> = h.log[from..]
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::CloseRequested { view, .. } if *view == closer => Some("asked"),
+            EngineEvent::ViewFailed { view, .. } if *view == closer => Some("failed"),
+            EngineEvent::ViewClosed { view } if *view == closer => Some("closed"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        ["asked", "failed", "closed"],
+        "window.close() in order"
+    );
+    // The browser closing it afterwards, as when its rule allows the request, is harmless.
+    h.rt.close_view(closer);
 
     // 6. Idle: nothing wakes the owner, and nothing is queued.
     h.frame_where(|_| true);

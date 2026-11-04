@@ -1,8 +1,10 @@
 //! `LadybirdRuntime`: the `EngineRuntime` over the shim.
 //!
 //! Owns: the runtime's views, the translation of Ladybird's callbacks (as the shim reports them) into
-//! the contract's events, and presenting frames into the host's CPU target. Must not own: how
-//! Ladybird's loop works (the shim) or when the host pumps (it gets a deadline and a waker).
+//! the contract's events (throttled per view without reordering them), the keys and buttons each
+//! view's content holds, and presenting frames into the host's CPU target (one counted copy per
+//! frame). Must not own: how Ladybird's loop works (the shim) or when the host pumps (it gets a
+//! deadline and a waker).
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CStr, CString};
@@ -87,7 +89,11 @@ struct View<T: CpuTarget> {
     /// A frame arrived since the last submission.
     frame_dirty: bool,
     last_click: Option<(Instant, i32, i32, PointerButton, i32)>,
+    /// The buttons held, as the shim's mask: every pointer event says them.
     pointer_buttons: i32,
+    /// The keys the content got pressed and not released, released for it when the view loses
+    /// focus.
+    keys: Vec<KeyEvent>,
     history: Option<(Vec<String>, usize)>,
     /// The address of the document shown.
     url: String,
@@ -124,6 +130,17 @@ const MAX_HELD: usize = 16;
 /// Most bytes of text a paste takes.
 const MAX_PASTE: usize = 1024 * 1024;
 
+/// Most bytes of a download handed to the host (the shim stops larger ones while they run).
+const MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
+
+/// What the runtime counted, for diagnostics.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LadybirdDiagnostics {
+    /// Frames copied from Ladybird's backing stores into the host's buffers: every frame
+    /// presented is one whole-frame copy.
+    pub frames_copied: u64,
+}
+
 /// The Ladybird engine's runtime. One per process, on the owner thread.
 pub struct LadybirdRuntime<T: CpuTarget> {
     views: HashMap<ViewId, View<T>>,
@@ -133,10 +150,8 @@ pub struct LadybirdRuntime<T: CpuTarget> {
     services: HashMap<RequestId, (ViewId, Pending)>,
     /// Navigations Ladybird holds for the browser: its request id, the view, the shim's token.
     held: HashMap<RequestId, (ViewId, i64)>,
-    /// When each throttled kind of event last went to the browser, and the latest one it is waiting
-    /// to send.
-    last_sent: HashMap<(u8, ViewId), Instant>,
-    waiting: HashMap<(u8, ViewId), EngineEvent>,
+    throttle: Throttle,
+    diagnostics: LadybirdDiagnostics,
     profile: Option<PathBuf>,
     temporary_profile: bool,
     shut_down: bool,
@@ -176,11 +191,22 @@ fn from_c(pointer: *const c_char) -> Option<String> {
     })
 }
 
-impl<T: CpuTarget> LadybirdRuntime<T> {
-    /// Passes the batch through the throttle: a throttled event sent less than [`THROTTLE`] after the
-    /// last of its kind waits (the latest one) and goes out when the time is up. Returns what to send
-    /// now, and when the next waiting one is due.
-    fn throttle(
+/// The throttle of each view's title, status, cursor, history and text input ([`THROTTLE`]).
+#[derive(Default)]
+struct Throttle {
+    /// When each throttled kind of event last went to the browser.
+    last_sent: HashMap<(u8, ViewId), Instant>,
+    /// The latest one of each kind waiting to be sent, in the order they came.
+    waiting: Vec<((u8, ViewId), EngineEvent)>,
+}
+
+impl Throttle {
+    /// Passes the batch through: a throttled event sent less than [`THROTTLE`] after the last of its
+    /// kind waits (the latest one) and goes out when the time is up. An event that is not replaceable
+    /// (a commit, a failure, a request, the view's closing) goes out after what waits for its view, so
+    /// a view's events keep their order: a field's text input never arrives after the commit of the
+    /// next document. Returns what to send now, and when the next waiting one is due.
+    fn pass(
         &mut self,
         batch: Vec<EngineEvent>,
         now: Instant,
@@ -188,36 +214,78 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
         let mut out = Vec::new();
         for event in batch {
             let Some(key) = throttled(&event) else {
+                let barrier = replaceable(&event)
+                    .is_none()
+                    .then(|| event.view())
+                    .flatten();
+                if let Some(view) = barrier {
+                    self.release_view(view, now, &mut out);
+                }
+                let closed = match &event {
+                    EngineEvent::ViewClosed { view } => Some(*view),
+                    _ => None,
+                };
                 out.push(event);
+                if let Some(view) = closed {
+                    self.last_sent.retain(|(_, v), _| *v != view);
+                }
                 continue;
             };
-            let due = self
-                .last_sent
-                .get(&key)
-                .is_none_or(|at| now.duration_since(*at) >= THROTTLE);
-            if due && !self.waiting.contains_key(&key) {
+            let held = self.waiting.iter().position(|(k, _)| *k == key);
+            let due = held.is_none()
+                && self
+                    .last_sent
+                    .get(&key)
+                    .is_none_or(|at| now.duration_since(*at) >= THROTTLE);
+            if due {
                 self.last_sent.insert(key, now);
                 out.push(event);
             } else {
-                self.waiting.insert(key, event);
+                if let Some(i) = held {
+                    self.waiting.remove(i);
+                }
+                self.waiting.push((key, event));
             }
         }
         let mut next: Option<Instant> = None;
-        let keys: Vec<_> = self.waiting.keys().copied().collect();
-        for key in keys {
-            let at = self.last_sent.get(&key).copied().unwrap_or(now) + THROTTLE;
+        let mut i = 0;
+        while i < self.waiting.len() {
+            let key = self.waiting[i].0;
+            let at = self.last_sent.get(&key).map_or(now, |at| *at + THROTTLE);
             if now >= at {
-                if let Some(event) = self.waiting.remove(&key) {
-                    self.last_sent.insert(key, now);
-                    out.push(event);
-                }
+                let (_, event) = self.waiting.remove(i);
+                self.last_sent.insert(key, now);
+                out.push(event);
             } else {
                 next = Some(next.map_or(at, |n| n.min(at)));
+                i += 1;
             }
         }
         (out, next)
     }
 
+    /// Sends what waits for `view` now, in the order it came.
+    fn release_view(&mut self, view: ViewId, now: Instant, out: &mut Vec<EngineEvent>) {
+        let mut i = 0;
+        while i < self.waiting.len() {
+            if self.waiting[i].0 .1 == view {
+                let (key, event) = self.waiting.remove(i);
+                self.last_sent.insert(key, now);
+                out.push(event);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Drops everything of `view`'s: the browser closed it.
+    fn forget(&mut self, view: ViewId) {
+        self.waiting.retain(|((_, v), _)| *v != view);
+        self.last_sent.retain(|(_, v), _| *v != view);
+    }
+}
+
+impl<T: CpuTarget> LadybirdRuntime<T> {
     /// Loads the shim, starts Ladybird's UI process half on this thread, and the wait thread that
     /// wakes the owner loop through `waker`.
     pub fn new(config: LadybirdConfig, waker: EngineWaker) -> Result<Self, String> {
@@ -267,7 +335,17 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
             ));
         }
         let fd = unsafe { ffi::lb_loop_fd() };
-        let waiter = Waiter::start(fd, waker)?;
+        let waiter = match Waiter::start(fd, waker) {
+            Ok(waiter) => waiter,
+            Err(error) => {
+                // Not a started Ladybird nobody pumps: its helpers and the temporary profile go.
+                unsafe { ffi::lb_shutdown() };
+                if temporary_profile {
+                    let _ = std::fs::remove_dir_all(&profile);
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             views: HashMap::new(),
             by_lb: HashMap::new(),
@@ -275,8 +353,8 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
             queue: Vec::new(),
             services: HashMap::new(),
             held: HashMap::new(),
-            last_sent: HashMap::new(),
-            waiting: HashMap::new(),
+            throttle: Throttle::default(),
+            diagnostics: LadybirdDiagnostics::default(),
             profile: Some(profile),
             temporary_profile,
             shut_down: false,
@@ -287,6 +365,34 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
     /// How many times the owner loop's wake descriptor fired (for the idle test).
     pub fn wake_count(&self) -> u64 {
         unsafe { ffi::lb_wake_count() }
+    }
+
+    /// What the runtime counted.
+    pub fn diagnostics(&self) -> LadybirdDiagnostics {
+        self.diagnostics
+    }
+
+    /// Reads and removes the file a download was staged in (the event's `data` is its path in the
+    /// profile's staging directory): `None` when it is not there or is over [`MAX_DOWNLOAD`].
+    fn take_staged(&self, event: &ffi::Event) -> Option<Vec<u8>> {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        if event.data.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(event.data.cast::<u8>(), event.len) };
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(bytes));
+        let staging = self.profile.as_ref()?.join("downloads-staging");
+        if path.parent() != Some(staging.as_path()) {
+            return None;
+        }
+        let read = std::fs::File::open(path).and_then(|file| {
+            let mut data = Vec::new();
+            file.take(MAX_DOWNLOAD + 1).read_to_end(&mut data)?;
+            Ok(data)
+        });
+        let _ = std::fs::remove_file(path);
+        read.ok().filter(|data| data.len() as u64 <= MAX_DOWNLOAD)
     }
 
     fn running(&self) -> Result<(), EngineError> {
@@ -309,6 +415,7 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                 ffi::EV_OPEN_EXTERNAL => unsafe { ffi::lb_open_external_reply(event.i1, 0) },
                 ffi::EV_PICK_FILES => unsafe { ffi::lb_pick_reply(event.i1, std::ptr::null()) },
                 ffi::EV_CLIPBOARD_WANT => unsafe { ffi::lb_clipboard_deny(event.view) },
+                ffi::EV_DOWNLOAD => drop(self.take_staged(event)),
                 _ => {}
             }
             return;
@@ -406,6 +513,20 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                 view: id,
                 message: s0.unwrap_or_else(|| "the page crashed".into()),
             }),
+            // The page closed its own view (window.close() of a script-closable one): Ladybird has
+            // already dropped the page, so the view cannot continue. The browser hears the request
+            // (and closes a tab the page opened), then that the view failed and is closed.
+            ffi::EV_CLOSED => {
+                let document = view.document;
+                self.queue
+                    .push(EngineEvent::CloseRequested { view: id, document });
+                self.queue.push(EngineEvent::ViewFailed {
+                    view: id,
+                    message: "the page closed its window".into(),
+                });
+                self.remove_view(id);
+                self.queue.push(EngineEvent::ViewClosed { view: id });
+            }
             ffi::EV_HISTORY => {
                 let entries: Vec<String> = s0
                     .unwrap_or_default()
@@ -493,12 +614,10 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                 self.queue.push(EngineEvent::ServiceRequested(request));
             }
             ffi::EV_DOWNLOAD => {
-                let bytes = if event.data.is_null() {
-                    Vec::new()
-                } else {
-                    unsafe { std::slice::from_raw_parts(event.data.cast::<u8>(), event.len) }
-                        .to_vec()
+                let Some(bytes) = self.take_staged(event) else {
+                    return;
                 };
+                let view = &self.views[&id];
                 let request = request(
                     id,
                     view,
@@ -608,7 +727,7 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
         match event {
             PointerEvent::Enter { position } => {
                 let (x, y) = device(*position);
-                unsafe { ffi::lb_input_pointer_move(lb, x, y, 0) };
+                unsafe { ffi::lb_input_pointer_move(lb, x, y, view.pointer_buttons, 0) };
             }
             PointerEvent::Leave => unsafe { ffi::lb_input_pointer_leave(lb) },
             PointerEvent::Motion {
@@ -616,7 +735,15 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                 modifiers,
             } => {
                 let (x, y) = device(*position);
-                unsafe { ffi::lb_input_pointer_move(lb, x, y, modifier_mask(modifiers)) };
+                unsafe {
+                    ffi::lb_input_pointer_move(
+                        lb,
+                        x,
+                        y,
+                        view.pointer_buttons,
+                        modifier_mask(modifiers),
+                    )
+                };
             }
             PointerEvent::Button {
                 button,
@@ -658,6 +785,7 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                         x,
                         y,
                         code,
+                        view.pointer_buttons,
                         c_int::from(pressed),
                         clicks,
                         modifier_mask(modifiers),
@@ -686,9 +814,16 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
     }
 
     fn input_key(&mut self, id: ViewId, event: &KeyEvent) {
-        let Some(view) = self.views.get(&id) else {
+        let Some(view) = self.views.get_mut(&id) else {
             return;
         };
+        match event.state {
+            ButtonState::Pressed if !view.keys.iter().any(|k| k.code == event.code) => {
+                view.keys.push(event.clone())
+            }
+            ButtonState::Released => view.keys.retain(|k| k.code != event.code),
+            ButtonState::Pressed => {}
+        }
         let code = c_string(event.code.w3c_code().unwrap_or(""));
         let key = c_string(match &event.key {
             sighurt_api::input::Key::Character(text) | sighurt_api::input::Key::Named(text) => text,
@@ -968,6 +1103,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 frame_dirty: false,
                 last_click: None,
                 pointer_buttons: 0,
+                keys: Vec::new(),
                 history: None,
                 url: String::new(),
                 clipboard: Vec::new(),
@@ -1010,26 +1146,25 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 view.visible = visible;
                 unsafe { ffi::lb_set_visible(lb, c_int::from(visible)) };
             }
-            EngineCommand::SetFocus(focused) => unsafe {
-                ffi::lb_set_focus(lb, c_int::from(focused))
-            },
+            EngineCommand::SetFocus(focused) => self.set_focus(id, focused),
             EngineCommand::SetZoom(zoom) => unsafe { ffi::lb_set_zoom(lb, zoom) },
             EngineCommand::Input(event) => match &event.kind {
                 InputKind::Pointer(pointer) => self.input_pointer(id, pointer),
                 InputKind::Key(key) => self.input_key(id, key),
                 InputKind::TextInput(text) => {
-                    if let Some(preedit) = &text.preedit {
-                        let preedit = c_string(&preedit.text);
-                        unsafe { ffi::lb_input_preedit(lb, preedit.as_ptr()) };
-                    }
+                    // The commit replaces the composition and ends it; then the new composition,
+                    // where none (or an empty one) clears what is shown: Ladybird ends a composition
+                    // on empty marked text, and ignores it when none is going on.
                     if let Some(commit) = &text.commit {
                         let commit = c_string(commit);
                         unsafe { ffi::lb_input_commit_text(lb, commit.as_ptr()) };
                     }
+                    let preedit = c_string(text.preedit.as_ref().map_or("", |p| &p.text));
+                    unsafe { ffi::lb_input_preedit(lb, preedit.as_ptr()) };
                 }
-                InputKind::Focus(focus) => unsafe {
-                    ffi::lb_set_focus(lb, c_int::from(matches!(focus, FocusEvent::Activated)))
-                },
+                InputKind::Focus(focus) => {
+                    self.set_focus(id, matches!(focus, FocusEvent::Activated))
+                }
             },
             EngineCommand::ResolveServiceRequest { request, result } => {
                 self.resolve(request, result);
@@ -1092,7 +1227,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             }
         }
         let batch = coalesce(std::mem::take(&mut self.queue));
-        let (sent, release_at) = self.throttle(batch, now);
+        let (sent, release_at) = self.throttle.pass(batch, now);
         events.extend(sent);
         let settle_at = match (settle_at, release_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1158,25 +1293,15 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             return Ok(PresentOutcome::NotReady);
         }
         view.frame_dirty = false;
+        self.diagnostics.frames_copied += 1;
         Ok(PresentOutcome::Submitted)
     }
 
     fn close_view(&mut self, id: ViewId) {
-        if let Some(view) = self.views.remove(&id) {
-            self.by_lb.remove(&view.lb);
-            unsafe { ffi::lb_view_close(view.lb) };
+        if self.remove_view(id) {
+            // The browser closed it: what it had not been told is dropped.
             self.queue.retain(|event| event.view() != Some(id));
-            // What the view was waiting for is refused, so nothing is left holding a token.
-            let waiting: Vec<RequestId> = self
-                .services
-                .iter()
-                .filter(|(_, (v, _))| *v == id)
-                .map(|(request, _)| *request)
-                .collect();
-            for request in waiting {
-                self.resolve(request, Err(ServiceError::Cancelled));
-            }
-            deny_held(&mut self.held, id);
+            self.throttle.forget(id);
             self.queue.push(EngineEvent::ViewClosed { view: id });
         }
     }
@@ -1196,6 +1321,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
         self.views.clear();
         self.by_lb.clear();
         self.queue.clear();
+        self.throttle = Throttle::default();
         unsafe { ffi::lb_shutdown() };
         if self.temporary_profile {
             if let Some(profile) = self.profile.take() {
@@ -1206,6 +1332,50 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
 }
 
 impl<T: CpuTarget> LadybirdRuntime<T> {
+    /// Closes the view in Ladybird and forgets it; what it was waiting for is refused, so nothing
+    /// is left holding a token. Whether it was open.
+    fn remove_view(&mut self, id: ViewId) -> bool {
+        let Some(view) = self.views.remove(&id) else {
+            return false;
+        };
+        self.by_lb.remove(&view.lb);
+        unsafe { ffi::lb_view_close(view.lb) };
+        let waiting: Vec<RequestId> = self
+            .services
+            .iter()
+            .filter(|(_, (v, _))| *v == id)
+            .map(|(request, _)| *request)
+            .collect();
+        for request in waiting {
+            self.resolve(request, Err(ServiceError::Cancelled));
+        }
+        deny_held(&mut self.held, id);
+        true
+    }
+
+    /// Gives or takes the view's focus. Losing it first releases every key its content holds as
+    /// pressed, last pressed first, while the content still has the focus to receive the key-ups
+    /// (the contract's `SetFocus(false)` and `FocusEvent::Deactivated`). Buttons stay held.
+    fn set_focus(&mut self, id: ViewId, focused: bool) {
+        let Some(view) = self.views.get_mut(&id) else {
+            return;
+        };
+        let lb = view.lb;
+        if !focused {
+            for key in std::mem::take(&mut view.keys).into_iter().rev() {
+                let release = KeyEvent {
+                    state: ButtonState::Released,
+                    repeat: false,
+                    modifiers: Modifiers::default(),
+                    text: None,
+                    ..key
+                };
+                self.input_key(id, &release);
+            }
+        }
+        unsafe { ffi::lb_set_focus(lb, c_int::from(focused)) };
+    }
+
     fn set_metrics(&mut self, id: ViewId, metrics: &Metrics) {
         let Some(view) = self.views.get_mut(&id) else {
             return;
@@ -1233,5 +1403,108 @@ impl<T: CpuTarget> Drop for LadybirdRuntime<T> {
         if !self.shut_down {
             self.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn title(view: ViewId, text: &str) -> EngineEvent {
+        EngineEvent::TitleChanged {
+            view,
+            title: Some(text.into()),
+        }
+    }
+
+    fn text_input(view: ViewId) -> EngineEvent {
+        EngineEvent::TextInputChanged { view, state: None }
+    }
+
+    fn commit(view: ViewId) -> EngineEvent {
+        EngineEvent::NavigationCommitted {
+            view,
+            navigation: NavigationId::next(),
+            url: "https://example.org/".into(),
+            document: DocumentGeneration::next(),
+            history: None,
+        }
+    }
+
+    fn kinds(events: &[EngineEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|e| match e {
+                EngineEvent::TitleChanged { .. } => "title",
+                EngineEvent::TextInputChanged { .. } => "text-input",
+                EngineEvent::NavigationCommitted { .. } => "commit",
+                EngineEvent::FrameReady { .. } => "frame",
+                EngineEvent::ViewClosed { .. } => "closed",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_burst_is_throttled_to_its_latest() {
+        let mut throttle = Throttle::default();
+        let view = ViewId::next();
+        let now = Instant::now();
+        let (sent, next) = throttle.pass(vec![title(view, "a")], now);
+        assert_eq!(kinds(&sent), ["title"]);
+        assert_eq!(next, None);
+        let (sent, next) = throttle.pass(vec![title(view, "b"), title(view, "c")], now);
+        assert!(sent.is_empty());
+        assert_eq!(next, Some(now + THROTTLE));
+        let (sent, next) = throttle.pass(Vec::new(), now + THROTTLE);
+        assert!(
+            matches!(&sent[..], [EngineEvent::TitleChanged { title: Some(t), .. }] if t == "c")
+        );
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn what_waits_goes_before_the_next_commit() {
+        let mut throttle = Throttle::default();
+        let view = ViewId::next();
+        let other = ViewId::next();
+        let now = Instant::now();
+        throttle.pass(vec![text_input(view), title(other, "a")], now);
+        // Held: the second text input and the other view's title.
+        let (sent, _) = throttle.pass(vec![text_input(view), title(other, "b")], now);
+        assert!(sent.is_empty());
+        // A frame is not a barrier; the commit is, for its own view only.
+        let (sent, next) = throttle.pass(
+            vec![EngineEvent::FrameReady { view }, commit(view)],
+            now + THROTTLE / 2,
+        );
+        assert_eq!(kinds(&sent), ["frame", "text-input", "commit"]);
+        assert_eq!(next, Some(now + THROTTLE));
+        // The text input after the commit is throttled again, from the flush.
+        let (sent, _) = throttle.pass(vec![text_input(view)], now + THROTTLE / 2);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn nothing_of_a_closed_view_comes_after_its_closing() {
+        let view = ViewId::next();
+        let now = Instant::now();
+        // Closed by its page: what waits goes first.
+        let mut throttle = Throttle::default();
+        throttle.pass(vec![title(view, "a")], now);
+        throttle.pass(vec![title(view, "b")], now);
+        let (sent, next) = throttle.pass(vec![EngineEvent::ViewClosed { view }], now);
+        assert_eq!(kinds(&sent), ["title", "closed"]);
+        assert_eq!(next, None);
+        assert!(throttle.last_sent.is_empty() && throttle.waiting.is_empty());
+        // Closed by the browser: what waits is dropped.
+        let mut throttle = Throttle::default();
+        throttle.pass(vec![title(view, "a")], now);
+        throttle.pass(vec![title(view, "b")], now);
+        throttle.forget(view);
+        let (sent, next) = throttle.pass(Vec::new(), now + THROTTLE);
+        assert!(sent.is_empty());
+        assert_eq!(next, None);
+        assert!(throttle.last_sent.is_empty());
     }
 }

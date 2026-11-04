@@ -309,6 +309,10 @@ fn ladybird(
 impl sighurt_runtime::registry::Running<TermTarget, TermPermit>
     for Bound<sighurt_engine_ladybird::LadybirdRuntime<TermTarget>>
 {
+    /// Every presented frame is one copy of Ladybird's backing store into the page's buffer.
+    fn readbacks(&self) -> u64 {
+        self.0.diagnostics().frames_copied
+    }
 }
 
 /// WebKit's runtime wants `Offscreen<TermTarget>` as its target. The session's target is

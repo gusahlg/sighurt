@@ -136,20 +136,6 @@ void push(int kind, uint64_t view, int64_t i0 = 0, int64_t i1 = 0, std::string c
     push_event(move(event));
 }
 
-// Same, moving the payload instead of copying it (a download's bytes).
-void push_moved(int kind, uint64_t view, std::string const& s0, std::string const& s1, std::string&& data)
-{
-    Event event;
-    event.kind = kind;
-    event.view = view;
-    event.s0 = s0;
-    event.has_s0 = true;
-    event.s1 = s1;
-    event.data = move(data);
-    event.has_data = true;
-    push_event(move(event));
-}
-
 // Ladybird's helper processes (WebContent, RequestServer, ...) are children of this process. Its own
 // monitor reaps with waitpid(-1) from a SIGCHLD handler, which would also reap the children of other
 // engines and of the host, so loop.cpp never installs that handler. Each helper is watched through a
@@ -250,10 +236,9 @@ i64 now_ns()
     return i64(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
 }
 
-// The view the host last gave input, focus or a navigation: Ladybird's download and external-URL
-// callbacks do not say which view they are for, so those requests are attributed to it.
-uint64_t g_active_view = 0;
 // The view whose external-URL confirmation is being answered (the launch follows at once).
+// Ladybird's launch does not say which view it is for: without this, it is the one view whose
+// external-URL request is being resolved (shim_view_launching), or nobody's, and then refused.
 uint64_t g_launch_view = 0;
 int64_t g_next_token = 0;
 HashMap<int64_t, WebView::ExternalURLHandler::LaunchCallback> g_launches;
@@ -262,7 +247,7 @@ HashMap<int64_t, uint64_t> g_pickers;
 HashMap<int64_t, Function<void(bool)>> g_held_navigations;
 ByteString g_profile;
 // Staged downloads: destination path -> the name the page suggested and the view it came from
-// (0: not known).
+// (never 0: a download whose view is not known is refused).
 struct Staged {
     ByteString name;
     uint64_t view { 0 };
@@ -278,6 +263,8 @@ HashTable<uint64_t> g_history_dirty;
 void poll_downloads();
 // The shim's id of the view with Ladybird's id, or 0 (defined after LbView).
 uint64_t shim_view_for_ladybird_id(u64);
+// The one view whose external-URL request is being resolved, or 0 (defined after LbView).
+uint64_t shim_view_launching();
 
 void ensure_download_timer()
 {
@@ -298,10 +285,16 @@ public:
     // The host opens the URL once it has allowed the request; launching is a request to it.
     virtual void launch(URL::URL const& url, LaunchCallback callback) const override
     {
+        auto view = g_launch_view ? g_launch_view : shim_view_launching();
+        if (view == 0) {
+            // Not charged to a view that did not ask.
+            callback(false);
+            return;
+        }
         auto token = ++g_next_token;
         g_launches.set(token, move(callback));
         auto text = to_std(url.serialize());
-        push(LB_EV_OPEN_EXTERNAL, g_launch_view ? g_launch_view : g_active_view, 0, token, &text);
+        push(LB_EV_OPEN_EXTERNAL, view, 0, token, &text);
     }
 
 private:
@@ -331,13 +324,18 @@ public:
         return stage_download(file, ladybird_view_id.has_value() ? shim_view_for_ladybird_id(*ladybird_view_id) : 0);
     }
 
-    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const& file) const override
+    // Only Ladybird's own interface asks without a view (its context menus, screenshots, the
+    // bookmarks export), none of which sig shows: refused (ECANCELED reports no error).
+    virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const&) const override
     {
-        return stage_download(file, 0);
+        return Error::from_errno(ECANCELED);
     }
 
+    // A download of a view the shim does not know is refused, never charged to another view.
     ErrorOr<LexicalPath> stage_download(ByteString const& file, uint64_t view) const
     {
+        if (view == 0)
+            return Error::from_errno(ECANCELED);
         auto directory = ByteString::formatted("{}/downloads-staging", g_profile);
         TRY(Core::Directory::create(directory, Core::Directory::CreateDirectories::Yes));
         static u64 counter = 0;
@@ -386,17 +384,12 @@ void poll_downloads()
             (void)FileSystem::remove(download.destination.string(), FileSystem::RecursionMode::Disallowed);
             continue;
         }
-        auto file = Core::File::open(download.destination.string(), Core::File::OpenMode::Read);
-        auto contents = file.is_error() ? ErrorOr<ByteBuffer>(file.release_error()) : file.value()->read_until_eof();
-        (void)FileSystem::remove(download.destination.string(), FileSystem::RecursionMode::Disallowed);
-        if (contents.is_error())
-            continue;
+        // The receiver reads the file straight into the memory it hands the host, and removes
+        // it; what is never received goes with the staging directory at shutdown.
         std::string url = to_std(download.url.serialize());
         std::string name = to_std(it->value.name);
-        auto view = it->value.view != 0 ? it->value.view : g_active_view;
-        std::string bytes(reinterpret_cast<char const*>(contents.value().data()), contents.value().size());
-        contents = ByteBuffer {}; // One copy of the file, not two.
-        push_moved(LB_EV_DOWNLOAD, view, url, name, move(bytes));
+        std::string path = to_std(download.destination.string().view());
+        push(LB_EV_DOWNLOAD, it->value.view, 0, 0, &url, &name, &path);
     }
     for (auto id : too_big) {
         auto destination = downloader.download(id).map([](auto const& download) { return download.destination.string(); });
@@ -454,11 +447,27 @@ public:
         return *map;
     }
 
+    // The view with this id, if its page has not closed it (a closed view takes no calls: its
+    // client is gone).
     static LbView* find(uint64_t id)
     {
         auto it = views().find(id);
-        return it == views().end() ? nullptr : it->value.ptr();
+        return it == views().end() || it->value->m_closed ? nullptr : it->value.ptr();
     }
+
+    // Closes the view, unless its page did, and destroys it.
+    static void remove(uint64_t id)
+    {
+        auto it = views().find(id);
+        if (it == views().end())
+            return;
+        if (!it->value->m_closed)
+            it->value->close_now();
+        views().remove(id);
+    }
+
+    // Whether Ladybird is resolving an external URL this view asked for.
+    bool launching_external_url() const { return m_external_url_confirmation_pending; }
 
     uint64_t id() const { return m_id; }
 
@@ -608,7 +617,16 @@ private:
             std::string text = "the web content process crashed";
             push(LB_EV_CRASHED, id, int64_t(reason), 0, &text);
         };
-        on_close = [id] { push(LB_EV_CLOSED, id); };
+        // The page closed its view (a script-closable one, after window.close()): Ladybird has
+        // dropped its client, so nothing may call into it again. A popup goes at once; a view the
+        // host knows waits for lb_view_close.
+        on_close = [this, id] {
+            m_closed = true;
+            if (is_popup)
+                close_popup_later();
+            else
+                push(LB_EV_CLOSED, id);
+        };
         on_top_level_navigation_commit = [this, id] {
             if (m_initial_done && !is_popup)
                 push(LB_EV_COMMIT, id);
@@ -763,12 +781,7 @@ private:
     void close_popup_later()
     {
         auto id = m_id;
-        Core::deferred_invoke([id] {
-            if (auto* view = LbView::find(id)) {
-                view->close_now();
-                views().remove(id);
-            }
-        });
+        Core::deferred_invoke([id] { LbView::remove(id); });
     }
 
 public:
@@ -819,6 +832,7 @@ private:
 
     static inline uint64_t s_next_id { 0 };
     uint64_t m_id;
+    bool m_closed { false };
     bool m_initial_done { false };
     bool m_wanted_visible { true };
     std::string m_last_url;
@@ -854,6 +868,21 @@ uint64_t shim_view_for_ladybird_id(u64 ladybird_id)
         if (entry.value->view_id() == ladybird_id)
             return entry.key;
     return 0;
+}
+
+// Ladybird resolves an external URL and launches it synchronously (the handler and the
+// confirmation are the shim's, and answer at once), so at a launch at most one view is resolving.
+uint64_t shim_view_launching()
+{
+    uint64_t found = 0;
+    for (auto& entry : LbView::views()) {
+        if (entry.value->launching_external_url()) {
+            if (found != 0)
+                return 0;
+            found = entry.key;
+        }
+    }
+    return found;
 }
 
 using namespace Web::UIEvents;
@@ -950,6 +979,9 @@ MouseButton button_from(int button)
     }
 }
 
+// The held buttons: the ABI's mask is UIEvents::MouseButton's (1, 2, 4, 8, 16).
+MouseButton buttons_from(int buttons) { return MouseButton(buttons & 0x1f); }
+
 Web::DevicePixelPoint point(int x, int y) { return { x, y }; }
 
 }
@@ -960,7 +992,8 @@ Web::DevicePixelPoint point(int x, int y) { return { x, y }; }
 void teardown()
 {
     for (auto& entry : LbView::views())
-        entry.value->close_now();
+        if (LbView::find(entry.key))
+            entry.value->close_now();
     g_held_navigations.clear();
     g_launches.clear();
     g_pickers.clear();
@@ -1014,7 +1047,9 @@ void teardown()
     children().clear();
 }
 
-bool g_init_failed = false;
+// lb_init ran once in this process: Ladybird's application and the loop's manager are installed
+// once, so it never starts again (after a failure or a shutdown).
+bool g_init_tried = false;
 
 extern "C" {
 
@@ -1037,11 +1072,11 @@ void lb_abi_describe(lb_abi* out)
 
 int lb_init(char const* const* argv, int argc, char const* profile, char const* prefix, char* err, size_t err_len)
 {
-    if (g_app || g_init_failed) {
-        set_error(err, err_len, g_init_failed ? "Ladybird failed to start before; the process cannot start it again" : "lb_init was called twice");
+    if (g_init_tried) {
+        set_error(err, err_len, g_app ? "lb_init was called twice" : "Ladybird started (or failed to start) before; the process cannot start it again");
         return 1;
     }
-    g_init_failed = true; // Until it has succeeded: the loop's manager can be installed once.
+    g_init_tried = true; // The loop's manager can be installed once.
     Sighurt::loop_install();
     g_profile = profile ? profile : "";
 
@@ -1080,7 +1115,6 @@ int lb_init(char const* const* argv, int argc, char const* profile, char const* 
         return 3;
     }
     g_theme = theme.release_value();
-    g_init_failed = false;
     return 0;
 }
 
@@ -1140,15 +1174,11 @@ uint64_t lb_view_open(int width, int height, double scale, int visible, double z
 
 void lb_view_close(uint64_t id)
 {
-    if (auto* view = LbView::find(id)) {
-        view->close_now();
-        LbView::views().remove(id);
-    }
+    LbView::remove(id);
 }
 
 void lb_navigate(uint64_t id, char const* url)
 {
-    g_active_view = id;
     auto* view = LbView::find(id);
     if (!view)
         return;
@@ -1188,8 +1218,6 @@ void lb_set_visible(uint64_t id, int visible)
 
 void lb_set_focus(uint64_t id, int focused)
 {
-    if (focused)
-        g_active_view = id;
     if (auto* view = LbView::find(id))
         view->set_has_system_focus(focused != 0);
 }
@@ -1211,7 +1239,6 @@ void lb_run_js(uint64_t id, char const* script, int64_t request)
 
 void lb_input_key(uint64_t id, char const* w3c_code, char const* key, int pressed, int repeat, int modifiers, uint32_t code_point)
 {
-    g_active_view = id;
     auto* view = LbView::find(id);
     if (!view)
         return;
@@ -1230,13 +1257,14 @@ void lb_input_key(uint64_t id, char const* w3c_code, char const* key, int presse
     view->enqueue_input_event(move(event));
 }
 
-void lb_input_pointer_move(uint64_t id, int x, int y, int modifiers)
+void lb_input_pointer_move(uint64_t id, int x, int y, int buttons, int modifiers)
 {
     if (auto* view = LbView::find(id)) {
         view->enqueue_input_event(Web::MouseEvent {
             .type = Web::MouseEvent::Type::MouseMove,
             .position = point(x, y),
             .screen_position = point(x, y),
+            .buttons = buttons_from(buttons),
             .modifiers = modifiers_from(modifiers),
             .browser_data = nullptr,
         });
@@ -1255,16 +1283,15 @@ void lb_input_pointer_leave(uint64_t id)
     }
 }
 
-void lb_input_pointer_button(uint64_t id, int x, int y, int button, int pressed, int click_count, int modifiers)
+void lb_input_pointer_button(uint64_t id, int x, int y, int button, int buttons, int pressed, int click_count, int modifiers)
 {
-    g_active_view = id;
     if (auto* view = LbView::find(id)) {
         view->enqueue_input_event(Web::MouseEvent {
             .type = pressed ? Web::MouseEvent::Type::MouseDown : Web::MouseEvent::Type::MouseUp,
             .position = point(x, y),
             .screen_position = point(x, y),
             .button = button_from(button),
-            .buttons = pressed ? button_from(button) : MouseButton::None,
+            .buttons = buttons_from(buttons),
             .modifiers = modifiers_from(modifiers),
             .click_count = click_count,
             .browser_data = nullptr,

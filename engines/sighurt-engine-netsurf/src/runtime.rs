@@ -15,8 +15,16 @@
 //!   releases the button on one (`NavigationRequested`) and sends the click on `allow`.
 //! - **Services.** The clipboard, downloads, external URLs and file inputs are service requests;
 //!   a paste key waits for the clipboard before the core sees it.
-//! - **Painting.** On the CPU, a whole frame at a time into the lent buffer (the host's buffers
-//!   rotate, so a dirty rectangle would not be enough); it is cheap (1 to 5 ms at 1024x768).
+//! - **Painting.** On the CPU. The C frontend keeps each visible view's picture, paints into it
+//!   only what the core invalidated, and copies the whole of it into the lent buffer (the host's
+//!   buffers rotate, so each needs the whole frame). A hidden view keeps no picture and queues no
+//!   frame; an animation only it shows stops waking the owner until a view is shown.
+//! - **Text fields.** `TextInputChanged` says whether the focused field is a password (the
+//!   frontend reads the field's type from the core) or a textarea. A field in a frame or an
+//!   iframe cannot be told apart and is reported as a password, so the input method never learns
+//!   what is typed there.
+//! - **Bounds.** URLs are passed on whole, never shortened; a link over `MAX_URL` (the core's
+//!   bound) is not followed. Titles and status text arrive cut to 16 KiB, as the core cuts them.
 //!
 //! Owns: the mapping between the contract and the C API. Must not own: tab policy, the clipboard
 //! or any file access of its own, a timer.
@@ -41,7 +49,7 @@ use sighurt_api::services::{
 };
 use sighurt_wayland::TargetLease;
 
-use crate::ffi::{self, Handle};
+use crate::ffi::{self, Handle, LinkAt};
 use crate::input::{self, KeyAction, Pointer, PointerAction};
 use crate::watcher::Watcher;
 use crate::CAPABILITIES;
@@ -52,6 +60,10 @@ const MAX_EVENTS_PER_PUMP: usize = 256;
 const MAX_HELD_NAVIGATIONS: usize = 16;
 /// The most clipboard text a paste reads.
 const MAX_PASTE: usize = 1 << 20;
+/// The longest URL the browser accepts (`sighurt-core`'s `MAX_URL`): a link to a longer one is
+/// neither asked about nor followed, since the browser would drop it and a shortened URL points
+/// elsewhere.
+const MAX_URL: usize = 2 * 1024 * 1024;
 
 /// What `[engines.netsurf]` and the profile give the runtime.
 #[derive(Clone, Debug, Default)]
@@ -455,6 +467,12 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
             ffi::EV_CARET => {
                 let ratio = scale_ratio(&view.metrics);
                 let at = |n: i32| (f64::from(n) / ratio).round() as i32;
+                // A password, or a field the frontend could not classify (fail closed).
+                let purpose = if event.i3 & ffi::FIELD_SENSITIVE != 0 {
+                    TextPurpose::Password
+                } else {
+                    TextPurpose::Normal
+                };
                 view.caret = true;
                 self.queue.push(EngineEvent::TextInputChanged {
                     view: id,
@@ -466,8 +484,8 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
                             height: at(event.i2).max(1) as u32,
                         },
                         surrounding: None,
-                        purpose: TextPurpose::Normal,
-                        multiline: false,
+                        purpose,
+                        multiline: event.i3 & ffi::FIELD_MULTILINE != 0,
                     }),
                 });
             }
@@ -557,12 +575,23 @@ impl<T: CpuTarget> NetSurfRuntime<T> {
                     if let PointerAction::LeftClick { x, y, state, mods } = action {
                         // A plain click on a link is held until the browser says the engine may
                         // follow it. A click with Shift or Ctrl opens a download or a new window,
-                        // which the core already puts through its own policy.
+                        // which the core already puts through its own policy. A link over the
+                        // browser's bound is dropped whatever the modifiers.
                         let link = view
                             .handle
                             .as_ref()
-                            .and_then(|h| h.link_at(x, y))
-                            .filter(|_| mods == 0 && view.held.len() < MAX_HELD_NAVIGATIONS);
+                            .map_or(LinkAt::None, |h| h.link_at(x, y, MAX_URL));
+                        if link == LinkAt::TooLong {
+                            continue;
+                        }
+                        let link = match link {
+                            LinkAt::Url(url)
+                                if mods == 0 && view.held.len() < MAX_HELD_NAVIGATIONS =>
+                            {
+                                Some(url)
+                            }
+                            _ => None,
+                        };
                         if let Some(url) = link {
                             let request = RequestId::next();
                             view.held.push(HeldNav {
@@ -846,7 +875,7 @@ impl<T: CpuTarget> EngineRuntime for NetSurfRuntime<T> {
                             // The approved link, if it is still where the click was; a page that
                             // reflowed meanwhile gets nothing.
                             Some((x, y, state, mods)) => {
-                                if handle.link_at(x, y).as_deref() == Some(held.url.as_str()) {
+                                if handle.link_at(x, y, MAX_URL) == LinkAt::Url(held.url) {
                                     handle.mouse(x, y, state, mods);
                                 }
                             }

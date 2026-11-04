@@ -1,6 +1,7 @@
 //! What a hostile or sloppy page and a busy host must not be able to break: a flood of title changes,
-//! a window.open, a huge download, a helper reaped by someone else, a resize that races a frame, and
-//! quitting in the middle of a download. One process, one Ladybird (see tests/headless.rs).
+//! a window.open, a huge download, a page closing its own window, keys held when the focus goes, a
+//! drag, a helper reaped by someone else, a resize that races a frame, and quitting in the middle of
+//! a download. One process, one Ladybird (see tests/headless.rs).
 //!
 //!   tools/heavy cargo test -p sighurt-engine-ladybird --test robust -- --nocapture
 
@@ -19,7 +20,8 @@ use sighurt_api::events::{EngineEvent, OpenDisposition};
 use sighurt_api::geometry::{Metrics, Scale, SurfacePoint, WindowRect};
 use sighurt_api::ids::{LayoutEpoch, NavigationId, SeatId, ViewId};
 use sighurt_api::input::{
-    ButtonState, InputEvent, InputKind, Modifiers, PointerButton, PointerEvent,
+    ButtonState, InputEvent, InputKind, Key, KeyCode, KeyEvent, Modifiers, PointerButton,
+    PointerEvent,
 };
 use sighurt_api::present::{CpuTarget, Frame};
 use sighurt_api::services::Service;
@@ -436,6 +438,103 @@ fn hostile_pages_and_a_busy_host() {
         "about:settings was shown: {:#?}",
         &d.seen[marker..]
     );
+
+    // A second view, loaded once (so its page may close it). Keys its page holds are released when
+    // it loses the focus, a drag shows the held button, and window.close() ends the view: the
+    // browser hears the request, then that it failed and closed, and nothing of it after that.
+    let closer = dir.join("closer.html");
+    std::fs::write(
+        &closer,
+        "<!doctype html><title>closer</title>\
+         <body style='margin:0;height:300px' onkeyup='document.title=\"up:\"+event.code'>\
+         <div style='position:absolute;left:0;top:0;width:200px;height:30px' onclick='window.close()'>close</div>\
+         <div style='position:absolute;left:0;top:100px;width:300px;height:100px' \
+              onmousemove='if (event.buttons) document.title=\"buttons:\"+event.buttons'>drag</div>",
+    )
+    .unwrap();
+    let main_view = d.view;
+    let second = ViewId::next();
+    d.runtime
+        .open_view(second, ViewOptions::default(), Mem(Rc::clone(&metrics)))
+        .unwrap();
+    d.view = second;
+    d.runtime
+        .command(
+            second,
+            EngineCommand::Navigate {
+                navigation: NavigationId::next(),
+                url: format!("file://{}", closer.display()),
+            },
+        )
+        .unwrap();
+    d.title("closer");
+    d.runtime
+        .command(second, EngineCommand::SetFocus(true))
+        .unwrap();
+    d.click(250.0, 250.0);
+    d.input(InputKind::Key(KeyEvent {
+        code: KeyCode(30),
+        key: Key::Character("a".into()),
+        state: ButtonState::Pressed,
+        repeat: false,
+        modifiers: Modifiers::default(),
+        consumed: Modifiers::default(),
+        text: Some("a".into()),
+    }));
+    d.runtime
+        .command(second, EngineCommand::SetFocus(false))
+        .unwrap();
+    d.title("up:KeyA");
+    let modifiers = Modifiers::default();
+    let at = |x| SurfacePoint { x, y: 150.0 };
+    d.input(InputKind::Pointer(PointerEvent::Motion {
+        position: at(20.0),
+        modifiers,
+    }));
+    d.input(InputKind::Pointer(PointerEvent::Button {
+        button: PointerButton::Left,
+        state: ButtonState::Pressed,
+        position: at(20.0),
+        modifiers,
+    }));
+    d.input(InputKind::Pointer(PointerEvent::Motion {
+        position: at(60.0),
+        modifiers,
+    }));
+    d.title("buttons:1");
+    d.input(InputKind::Pointer(PointerEvent::Button {
+        button: PointerButton::Left,
+        state: ButtonState::Released,
+        position: at(60.0),
+        modifiers,
+    }));
+    d.click(20.0, 15.0);
+    d.next(Duration::from_secs(15), "CloseRequested", |e| match e {
+        EngineEvent::CloseRequested { view, .. } if *view == second => Some(()),
+        _ => None,
+    });
+    d.next(Duration::from_secs(1), "ViewFailed", |e| match e {
+        EngineEvent::ViewFailed { view, .. } if *view == second => Some(()),
+        _ => None,
+    });
+    d.next(Duration::from_secs(1), "ViewClosed", |e| match e {
+        EngineEvent::ViewClosed { view } if *view == second => Some(()),
+        _ => None,
+    });
+    let after = d.seen.len();
+    d.idle(Duration::from_secs(1));
+    assert!(
+        !d.seen[after..].iter().any(|e| e.view() == Some(second)),
+        "events of a closed view: {:#?}",
+        &d.seen[after..]
+    );
+    // The browser's own close of it afterwards does nothing; Ladybird goes on.
+    d.runtime.close_view(second);
+    assert!(d
+        .runtime
+        .command(second, EngineCommand::SetFocus(true))
+        .is_err());
+    d.view = main_view;
 
     // A helper reaped by someone else (here: this process) is treated as exited and the loop does not
     // spin on its pidfd afterwards.

@@ -144,8 +144,9 @@ Rust 1.98.1 for its Rust crates (`libweb_rust`, `libgfx_rust`, ...). Store outpu
   `lb_loop_fd()`, readable when a notifier's descriptor, a wake or a queued event needs a pump.
   Timers have no descriptor: `lb_pump` returns the milliseconds to the next one, which becomes the
   `PumpStatus` deadline. Notifiers on one descriptor are merged into one epoll registration.
-  `SIGINT` and `SIGTERM` (registered only in Ladybird's profiling mode) use `sigaction` with the
-  previous handler chained and the owner's wake descriptor as the self-pipe. **`SIGCHLD` is never
+  The shim installs no signal handler: the handlers Ladybird registers (`SIGINT` and `SIGTERM`
+  only in its profiling mode, for an event loop `sig` never runs) are recorded so they can be
+  unregistered, and never run; `sig` keeps its own handling. **`SIGCHLD` is never
   installed**: `ProcessMonitor`'s handler reaps with `waitpid(-1)`, which would take the exit status
   of children that are not Ladybird's (WPE's bubblewrap, a program the host started). The loop keeps
   the handler and never calls it; the shim watches each helper through a pidfd instead (the

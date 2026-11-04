@@ -7,8 +7,8 @@
 //!
 //! Must not own: CEF objects other than the thread-safe browser handle, or any policy.
 
-use std::collections::VecDeque;
-use std::mem::discriminant;
+use std::collections::{HashMap, VecDeque};
+use std::mem::{discriminant, Discriminant};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -16,6 +16,7 @@ use sighurt_api::engine::EngineWaker;
 use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::SurfaceRect;
 use sighurt_api::ids::ViewId;
+use sighurt_api::input::TextInputState;
 
 use crate::actions::Action;
 use crate::capi::{CefBrowser, CefBrowserHost, CefRect};
@@ -36,13 +37,170 @@ pub const MAX_QUEUED: usize = 4096;
 pub const MAX_QUEUED_BYTES: usize = 16 << 20;
 /// The most of them from one view: a flooding page cannot starve the others.
 pub const MAX_QUEUED_PER_VIEW: usize = 512;
+/// The most navigation events (started, committed, failed, requested) held for one view. They
+/// have a budget of their own, which nothing else a page does can use up: a dropped commit would
+/// leave the browser on the previous document. Chromium throttles a page's same-document
+/// navigations and [`crate::nav::MAX_HELD`] bounds the held ones, so only an owner that stopped
+/// pumping reaches it.
+pub const MAX_NAV_QUEUED_PER_VIEW: usize = 256;
 /// The most commands held for a browser that is not created yet.
 pub const MAX_PENDING: usize = 4096;
+/// Superseded replaceable events are skipped when drained; past this many (and more than the
+/// live ones) they are swept out at once.
+const MAX_STALE: usize = 1024;
 
+/// How an event is admitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Begins or ends a view's life, or fails the engine: never refused.
+    Life,
+    /// Supersedes an undelivered earlier one of its kind for the same view.
+    Replaceable,
+    /// A navigation event: within [`MAX_NAV_QUEUED_PER_VIEW`].
+    Navigation,
+    /// Anything else a page can cause: within [`MAX_QUEUED`], [`MAX_QUEUED_BYTES`] and
+    /// [`MAX_QUEUED_PER_VIEW`].
+    Page,
+}
+
+type Key = (Option<ViewId>, Discriminant<EngineEvent>);
+
+/// One view's queued events, by budget.
+#[derive(Default)]
+struct Counts {
+    page: usize,
+    navigation: usize,
+}
+
+#[derive(Default)]
 struct Queue {
-    events: VecDeque<EngineEvent>,
+    /// Each event with its sequence number.
+    events: VecDeque<(u64, EngineEvent)>,
+    next: u64,
+    /// The sequence number of the live event of each replaceable kind and view: an earlier
+    /// one still in `events` is superseded and skipped.
+    latest: HashMap<Key, u64>,
+    /// Superseded events still in `events`.
+    stale: usize,
+    /// Per view, what its events use of their budgets.
+    counts: HashMap<Option<ViewId>, Counts>,
+    /// Page events queued, and their weight.
+    page: usize,
+    page_bytes: usize,
     /// Events refused for want of room, for the diagnostics.
     dropped: u64,
+}
+
+impl Queue {
+    /// Whether the queued `(seq, event)` was superseded.
+    fn is_stale(&self, seq: u64, event: &EngineEvent) -> bool {
+        class(event) == Class::Replaceable
+            && self.latest.get(&(event.view(), discriminant(event))) != Some(&seq)
+    }
+
+    /// Takes the next live event, skipping superseded ones, and gives back its budget.
+    fn pop(&mut self) -> Option<EngineEvent> {
+        while let Some((seq, event)) = self.events.pop_front() {
+            if self.is_stale(seq, &event) {
+                self.stale -= 1;
+                continue;
+            }
+            self.release(&event);
+            return Some(event);
+        }
+        None
+    }
+
+    /// Gives back what `event` used, as it leaves the queue.
+    fn release(&mut self, event: &EngineEvent) {
+        let view = event.view();
+        match class(event) {
+            Class::Life => {}
+            Class::Replaceable => {
+                self.latest.remove(&(view, discriminant(event)));
+            }
+            Class::Navigation | Class::Page => {
+                let counts = self.counts.entry(view).or_default();
+                if class(event) == Class::Page {
+                    counts.page -= 1;
+                    self.page -= 1;
+                    self.page_bytes -= weight(event);
+                } else {
+                    counts.navigation -= 1;
+                }
+                if counts.page == 0 && counts.navigation == 0 {
+                    self.counts.remove(&view);
+                }
+            }
+        }
+    }
+
+    /// Drops the superseded events at the front.
+    fn skip_stale(&mut self) {
+        while let Some((seq, event)) = self.events.front() {
+            if !self.is_stale(*seq, event) {
+                break;
+            }
+            self.events.pop_front();
+            self.stale -= 1;
+        }
+    }
+
+    /// Rebuilds the bookkeeping from the events, keeping only the live ones and those `keep`
+    /// accepts.
+    fn rebuild(&mut self, keep: impl Fn(&EngineEvent) -> bool) {
+        let events = std::mem::take(&mut self.events);
+        let live: Vec<_> = events
+            .into_iter()
+            .filter(|(seq, event)| !self.is_stale(*seq, event) && keep(event))
+            .collect();
+        self.latest.clear();
+        self.counts.clear();
+        self.stale = 0;
+        self.page = 0;
+        self.page_bytes = 0;
+        for (seq, event) in live {
+            self.admit(seq, &event);
+            self.events.push_back((seq, event));
+        }
+    }
+
+    /// Records what `event`, numbered `seq`, uses.
+    fn admit(&mut self, seq: u64, event: &EngineEvent) {
+        let view = event.view();
+        match class(event) {
+            Class::Life => {}
+            Class::Replaceable => {
+                if self
+                    .latest
+                    .insert((view, discriminant(event)), seq)
+                    .is_some()
+                {
+                    self.stale += 1;
+                }
+            }
+            Class::Navigation => self.counts.entry(view).or_default().navigation += 1,
+            Class::Page => {
+                self.counts.entry(view).or_default().page += 1;
+                self.page += 1;
+                self.page_bytes += weight(event);
+            }
+        }
+    }
+
+    /// Whether `event` fits its budget.
+    fn fits(&self, event: &EngineEvent) -> bool {
+        let counts = self.counts.get(&event.view());
+        match class(event) {
+            Class::Life | Class::Replaceable => true,
+            Class::Navigation => counts.map_or(0, |c| c.navigation) < MAX_NAV_QUEUED_PER_VIEW,
+            Class::Page => {
+                self.page < MAX_QUEUED
+                    && self.page_bytes + weight(event) <= MAX_QUEUED_BYTES
+                    && counts.map_or(0, |c| c.page) < MAX_QUEUED_PER_VIEW
+            }
+        }
+    }
 }
 
 /// The runtime's event queue.
@@ -57,48 +215,39 @@ impl Shared {
     /// An empty queue that wakes `waker` when something arrives.
     pub fn new(waker: EngineWaker) -> Arc<Self> {
         Arc::new(Self {
-            queue: Mutex::new(Queue {
-                events: VecDeque::new(),
-                dropped: 0,
-            }),
+            queue: Mutex::new(Queue::default()),
             waker,
             live: AtomicUsize::new(0),
         })
     }
 
     /// Queues `events`. A replaceable event supersedes an undelivered earlier one of its kind
-    /// for the same view (the later keeps its own place), so those are bounded by kind. Every
-    /// other event a page can cause is admitted only within [`MAX_QUEUED`],
+    /// for the same view (the later keeps its own place), so those are bounded by kind.
+    /// Navigation events are admitted within their own budget, [`MAX_NAV_QUEUED_PER_VIEW`].
+    /// Every other event a page can cause is admitted only within [`MAX_QUEUED`],
     /// [`MAX_QUEUED_BYTES`] and [`MAX_QUEUED_PER_VIEW`]; what does not fit is dropped and
     /// counted (a page that floods popups or downloads loses the excess, not the browser's
-    /// memory). Life-cycle events are always admitted. Wakes the owner loop.
+    /// memory, and never its navigations). Life-cycle events are always admitted. The cost of
+    /// each event is constant: nothing scans the queue. Wakes the owner loop.
     pub fn push_all(&self, events: impl IntoIterator<Item = EngineEvent>) {
         let mut queue = lock(&self.queue);
         let mut any = false;
         for event in events {
-            if replaceable(&event) {
-                let kind = discriminant(&event);
-                let view = event.view();
-                queue
-                    .events
-                    .retain(|queued| discriminant(queued) != kind || queued.view() != view);
-            } else if !always_admitted(&event) {
-                let view = event.view();
-                let from_view = queue.events.iter().filter(|q| q.view() == view).count();
-                let bytes: usize = queue.events.iter().map(weight).sum::<usize>() + weight(&event);
-                if queue.events.len() >= MAX_QUEUED
-                    || bytes > MAX_QUEUED_BYTES
-                    || from_view >= MAX_QUEUED_PER_VIEW
-                {
-                    if queue.dropped == 0 {
-                        log::warn!("cef: the event queue is full; page events are being dropped");
-                    }
-                    queue.dropped += 1;
-                    continue;
+            if !queue.fits(&event) {
+                if queue.dropped == 0 {
+                    log::warn!("cef: the event queue is full; page events are being dropped");
                 }
+                queue.dropped += 1;
+                continue;
             }
-            queue.events.push_back(event);
+            let seq = queue.next;
+            queue.next += 1;
+            queue.admit(seq, &event);
+            queue.events.push_back((seq, event));
             any = true;
+        }
+        if queue.stale > MAX_STALE && queue.stale > queue.events.len() / 2 {
+            queue.rebuild(|_| true);
         }
         drop(queue);
         if any {
@@ -114,8 +263,13 @@ impl Shared {
     /// Takes up to `max` events; whether more are left.
     pub fn drain(&self, max: usize, out: &mut Vec<EngineEvent>) -> bool {
         let mut queue = lock(&self.queue);
-        let count = queue.events.len().min(max);
-        out.extend(queue.events.drain(..count));
+        for _ in 0..max {
+            let Some(event) = queue.pop() else {
+                break;
+            };
+            out.push(event);
+        }
+        queue.skip_stale();
         !queue.events.is_empty()
     }
 
@@ -123,8 +277,7 @@ impl Shared {
     /// there: that one is the core's only way to forget the view.
     pub fn forget(&self, view: ViewId) {
         lock(&self.queue)
-            .events
-            .retain(|e| e.view() != Some(view) || matches!(e, EngineEvent::ViewClosed { .. }));
+            .rebuild(|e| e.view() != Some(view) || matches!(e, EngineEvent::ViewClosed { .. }));
     }
 
     /// Events refused for want of room so far.
@@ -133,15 +286,27 @@ impl Shared {
     }
 }
 
-/// Events that end or begin a view's life, or fail the engine: never refused.
-fn always_admitted(event: &EngineEvent) -> bool {
-    matches!(
-        event,
+/// How `event` is admitted.
+fn class(event: &EngineEvent) -> Class {
+    match event {
         EngineEvent::ViewReady { .. }
-            | EngineEvent::ViewClosed { .. }
-            | EngineEvent::ViewFailed { .. }
-            | EngineEvent::RuntimeFailed { .. }
-    )
+        | EngineEvent::ViewClosed { .. }
+        | EngineEvent::ViewFailed { .. }
+        | EngineEvent::RuntimeFailed { .. } => Class::Life,
+        EngineEvent::NavigationStarted { .. }
+        | EngineEvent::NavigationCommitted { .. }
+        | EngineEvent::NavigationFailed { .. }
+        | EngineEvent::NavigationRequested { .. } => Class::Navigation,
+        EngineEvent::TitleChanged { .. }
+        | EngineEvent::StatusTextChanged { .. }
+        | EngineEvent::CursorChanged { .. }
+        | EngineEvent::LoadingChanged { .. }
+        | EngineEvent::HistoryChanged { .. }
+        | EngineEvent::TextInputChanged { .. }
+        | EngineEvent::SemanticsChanged { .. }
+        | EngineEvent::FrameReady { .. } => Class::Replaceable,
+        _ => Class::Page,
+    }
 }
 
 /// What an event costs while queued: its own size and its strings.
@@ -174,20 +339,6 @@ fn weight(event: &EngineEvent) -> usize {
         _ => 0,
     };
     std::mem::size_of::<EngineEvent>() + strings
-}
-
-fn replaceable(event: &EngineEvent) -> bool {
-    matches!(
-        event,
-        EngineEvent::TitleChanged { .. }
-            | EngineEvent::StatusTextChanged { .. }
-            | EngineEvent::CursorChanged { .. }
-            | EngineEvent::LoadingChanged { .. }
-            | EngineEvent::HistoryChanged { .. }
-            | EngineEvent::TextInputChanged { .. }
-            | EngineEvent::SemanticsChanged { .. }
-            | EngineEvent::FrameReady { .. }
-    )
 }
 
 /// The size and scale CEF is told the view has.
@@ -355,8 +506,12 @@ pub struct ViewShared {
     pub nav: Mutex<Nav>,
     /// The page's selected text, for a copy.
     pub selection: Mutex<String>,
-    /// Where the text caret is, as far as known (the last click), for the input method.
+    /// Where the text caret is, as far as known (the last click, then the composition's last
+    /// character), surface-local, for the input method.
     pub caret: Mutex<SurfaceRect>,
+    /// The focused field's text-input state as last reported, so a moved caret can be
+    /// reported again with it.
+    pub text_input: Mutex<Option<TextInputState>>,
     /// `close_view` ran: `DoClose` lets the browser close.
     pub closing: AtomicBool,
 }
@@ -373,6 +528,7 @@ impl ViewShared {
             nav: Mutex::new(Nav::new(id)),
             selection: Mutex::new(String::new()),
             caret: Mutex::new(SurfaceRect::default()),
+            text_input: Mutex::new(None),
             closing: AtomicBool::new(false),
         })
     }
@@ -490,6 +646,124 @@ mod tests {
         );
         assert!(out.iter().any(|e| e.view() == Some(other)));
         assert!(shared.dropped() >= 10_000 - MAX_QUEUED_PER_VIEW as u64);
+    }
+
+    #[test]
+    fn a_popup_flood_never_costs_a_view_its_navigations() {
+        use sighurt_api::events::{HistoryEffect, OpenDisposition};
+        use sighurt_api::ids::{DocumentGeneration, NavigationId};
+        let shared = shared();
+        let view = ViewId::next();
+        let document = DocumentGeneration::next();
+        // Every slot a page has, and the whole queue's, taken by popups (of many views).
+        for n in 0..MAX_QUEUED * 2 {
+            shared.push(EngineEvent::OpenRequested {
+                view: if n % 2 == 0 { view } else { ViewId::next() },
+                document,
+                url: format!("https://x/{n}"),
+                disposition: OpenDisposition::NewView,
+            });
+        }
+        let navigation = NavigationId::next();
+        let committed = DocumentGeneration::next();
+        shared.push_all([
+            EngineEvent::NavigationStarted {
+                view,
+                navigation,
+                url: "https://a/".into(),
+            },
+            EngineEvent::NavigationCommitted {
+                view,
+                navigation,
+                url: "https://a/".into(),
+                document: committed,
+                history: Some(HistoryEffect::Push),
+            },
+        ]);
+        let mut out = Vec::new();
+        shared.drain(usize::MAX, &mut out);
+        let nav: Vec<_> = out
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    EngineEvent::NavigationStarted { .. } | EngineEvent::NavigationCommitted { .. }
+                )
+            })
+            .collect();
+        assert_eq!(nav.len(), 2, "the navigation got through the flood");
+        assert!(matches!(
+            out.last(),
+            Some(EngineEvent::NavigationCommitted { document, .. }) if *document == committed
+        ));
+    }
+
+    #[test]
+    fn navigations_have_a_budget_of_their_own() {
+        use sighurt_api::events::NavigationError;
+        use sighurt_api::ids::NavigationId;
+        let shared = shared();
+        let (view, other) = (ViewId::next(), ViewId::next());
+        let failed = |view| EngineEvent::NavigationFailed {
+            view,
+            navigation: NavigationId::next(),
+            error: NavigationError::Cancelled,
+        };
+        for _ in 0..MAX_NAV_QUEUED_PER_VIEW + 10 {
+            shared.push(failed(view));
+        }
+        shared.push(failed(other));
+        let mut out = Vec::new();
+        shared.drain(usize::MAX, &mut out);
+        assert_eq!(
+            out.iter().filter(|e| e.view() == Some(view)).count(),
+            MAX_NAV_QUEUED_PER_VIEW
+        );
+        assert_eq!(out.iter().filter(|e| e.view() == Some(other)).count(), 1);
+        // Drained, the budget is back.
+        shared.push(failed(view));
+        out.clear();
+        shared.drain(usize::MAX, &mut out);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn a_flood_of_replaceable_events_keeps_only_the_latest_and_stays_small() {
+        let shared = shared();
+        let view = ViewId::next();
+        for n in 0..100_000 {
+            shared.push(EngineEvent::TitleChanged {
+                view,
+                title: Some(n.to_string()),
+            });
+        }
+        assert!(lock(&shared.queue).events.len() <= 2 * MAX_STALE + 2);
+        let mut out = Vec::new();
+        assert!(!shared.drain(usize::MAX, &mut out));
+        assert!(
+            matches!(out.as_slice(), [EngineEvent::TitleChanged { title: Some(t), .. }] if t == "99999")
+        );
+    }
+
+    #[test]
+    fn a_bounded_drain_counts_only_live_events() {
+        let shared = shared();
+        let view = ViewId::next();
+        shared.push(EngineEvent::TitleChanged {
+            view,
+            title: Some("a".into()),
+        });
+        shared.push(EngineEvent::ViewReady { view });
+        shared.push(EngineEvent::TitleChanged {
+            view,
+            title: Some("b".into()),
+        });
+        let mut out = Vec::new();
+        // The superseded title is skipped, not delivered nor counted.
+        assert!(shared.drain(1, &mut out));
+        assert!(matches!(out.as_slice(), [EngineEvent::ViewReady { .. }]));
+        assert!(!shared.drain(1, &mut out));
+        assert!(matches!(&out[1], EngineEvent::TitleChanged { title: Some(t), .. } if t == "b"));
     }
 
     #[test]

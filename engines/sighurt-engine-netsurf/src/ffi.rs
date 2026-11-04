@@ -233,7 +233,7 @@ mod raw {
             y: c_int,
             buf: *mut c_char,
             buflen: usize,
-        ) -> c_int;
+        ) -> usize;
         pub fn nsh_view_form_at(view: *mut View, x: c_int, y: c_int) -> c_int;
         pub fn nsh_view_selection(view: *mut View, buf: *mut c_char, buflen: usize) -> c_int;
         pub fn nsh_view_paint(
@@ -242,7 +242,6 @@ mod raw {
             w: c_int,
             h: c_int,
             stride: usize,
-            clip: *const Rect,
         ) -> c_int;
         pub fn nsh_view_dirty_rect(view: *const View, out: *mut Rect) -> c_int;
         pub fn nsh_poll(info: *mut PollInfo) -> c_int;
@@ -280,6 +279,11 @@ mod raw {
     pub const EV_CONSOLE: u32 = 15;
     pub const EV_FAILED: u32 = 16;
     pub const EV_ASK: u32 = 17;
+
+    /// `EV_CARET`'s `i3`: a password, or a field the frontend cannot classify.
+    pub const FIELD_SENSITIVE: i32 = 1;
+    /// `EV_CARET`'s `i3`: a textarea.
+    pub const FIELD_MULTILINE: i32 = 2;
 
     pub const MOUSE_HOVER: c_uint = 0;
     pub const MOUSE_PRESS_1: c_uint = 1 << 0;
@@ -416,22 +420,32 @@ impl Handle {
         unsafe { raw::nsh_view_key(self.0.as_ptr(), key) != 0 }
     }
 
-    /// The link under a buffer position, if any.
-    pub fn link_at(&self, x: i32, y: i32) -> Option<String> {
+    /// The link under a buffer position. Its URL is whole, never cut: one longer than `max`
+    /// bytes is [`LinkAt::TooLong`].
+    pub fn link_at(&self, x: i32, y: i32, max: usize) -> LinkAt {
         let mut buf = vec![0u8; 4096];
-        // SAFETY: live handle; the C side writes at most `buf.len()` bytes with a NUL.
-        let found = unsafe {
-            raw::nsh_view_link_at(self.0.as_ptr(), x, y, buf.as_mut_ptr().cast(), buf.len())
-        };
-        if found == 0 {
-            return None;
+        loop {
+            // SAFETY: live handle; the C side writes a NUL-terminated URL only if it fits in
+            // `buf.len()` bytes, and returns its length plus one (0 for no link).
+            let needed = unsafe {
+                raw::nsh_view_link_at(self.0.as_ptr(), x, y, buf.as_mut_ptr().cast(), buf.len())
+            };
+            if needed == 0 {
+                return LinkAt::None;
+            }
+            if needed - 1 > max {
+                return LinkAt::TooLong;
+            }
+            if needed <= buf.len() {
+                return LinkAt::Url(String::from_utf8_lossy(&buf[..needed - 1]).into_owned());
+            }
+            buf.resize(needed, 0);
         }
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
     }
 
-    /// Paints the whole view into `pixels` (ARGB8888, premultiplied: opaque), `stride` bytes per
-    /// row. Errs if the memory is not four-byte aligned or too small.
+    /// Paints what changed into the view's own picture and copies all of it into `pixels`
+    /// (ARGB8888, premultiplied: opaque), `stride` bytes per row. Errs if the memory is not
+    /// four-byte aligned or too small.
     pub fn paint(&self, pixels: &mut [u8], w: u32, h: u32, stride: usize) -> Result<bool, String> {
         if !(pixels.as_ptr() as usize).is_multiple_of(4) || !stride.is_multiple_of(4) {
             return Err("the frame is not aligned to four bytes".into());
@@ -448,11 +462,21 @@ impl Handle {
                 w as c_int,
                 h as c_int,
                 stride,
-                std::ptr::null(),
             )
         };
         Ok(drew != 0)
     }
+}
+
+/// What is under a position, for a click.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkAt {
+    /// No link.
+    None,
+    /// A link, with its whole URL.
+    Url(String),
+    /// A link whose URL is over the bound it was asked with.
+    TooLong,
 }
 
 /// What the core wants from the owner loop after [`poll`].

@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>popup</title>
+<body style="margin:0;background:#fff">
+<script>
+  // Popups nobody clicked for: refused by the engine, never an OpenRequested.
+  window.open('second.html');
+  setTimeout(() => { window.open('second.html'); document.title = 'opened'; }, 200);
+</script>

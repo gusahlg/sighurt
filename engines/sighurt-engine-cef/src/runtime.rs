@@ -533,7 +533,15 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
             return PumpStatus::Idle;
         }
         // Nothing here waits for CEF: its thread wakes the owner loop through the waker.
-        if self.shared.drain(MAX_PER_PUMP, events) {
+        let from = events.len();
+        let more = self.shared.drain(MAX_PER_PUMP, events);
+        // A page that closed itself (`window.close()`): its target goes with the view.
+        for event in &events[from..] {
+            if let EngineEvent::ViewClosed { view } = event {
+                self.views.remove(view);
+            }
+        }
+        if more {
             PumpStatus::Pending { deadline: None }
         } else {
             PumpStatus::Idle
@@ -939,7 +947,7 @@ impl<T> View<T> {
         }
         if let Some(text) = event.commit {
             // Chromium takes a commit only inside a composition it knows of; text with none
-            // is typed, as characters, into what is the page now.
+            // is inserted as one of its own into what is the page now.
             if std::mem::take(&mut self.composing) {
                 self.shared.run(Action::ImeCommit(text));
             } else if let Some(binding) = self.shared.binding() {

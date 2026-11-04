@@ -298,6 +298,10 @@ fn ladybird(
 impl sighurt_runtime::registry::Running<TargetLease, FramePermit>
     for Bound<sighurt_engine_ladybird::LadybirdRuntime<TargetLease>>
 {
+    /// Every presented frame is one copy of Ladybird's backing store into the host's buffer.
+    fn readbacks(&self) -> u64 {
+        self.0.diagnostics().frames_copied
+    }
 }
 
 #[cfg(feature = "engine-cef")]

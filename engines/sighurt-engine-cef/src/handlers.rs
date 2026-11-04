@@ -8,8 +8,9 @@
 //! the callback ends; a handler CEF asks for is returned with a reference added.
 //!
 //! Anything the engine does not support is refused: dialogs are suppressed, permissions denied,
-//! menus emptied, authentication and certificate errors cancelled, popups handed to the browser
-//! as `OpenRequested`.
+//! menus emptied, authentication and certificate errors cancelled, popups the user's gesture
+//! opened handed to the browser as `OpenRequested` (the others refused), and a page's
+//! `window.close()` reported as `CloseRequested` before the view fails and closes.
 //!
 //! Must not own: policy beyond refusing, or any state of its own.
 
@@ -300,23 +301,40 @@ unsafe extern "C" fn on_ime_composition_range_changed(
         if count == 0 || bounds.is_null() {
             return;
         }
-        // SAFETY: `bounds` is `count` rectangles; the last is the caret's character.
+        // SAFETY: `bounds` is `count` rectangles; the last is the caret's character. They are
+        // in view coordinates, the DIPs `GetViewRect` gives CEF: the surface's own.
         let last = unsafe { *bounds.add(count - 1) };
         let view = unsafe { view(this) };
-        *lock(&view.caret) = SurfaceRect {
+        let caret = SurfaceRect {
             x: last.x,
             y: last.y,
             width: u32::try_from(last.width.max(1)).unwrap_or(1),
             height: u32::try_from(last.height.max(1)).unwrap_or(1),
         };
+        *lock(&view.caret) = caret;
+        // The input method follows the composition when a field is focused.
+        let state = {
+            let mut input = lock(&view.text_input);
+            let Some(state) = input.as_mut().filter(|state| state.caret != caret) else {
+                return;
+            };
+            state.caret = caret;
+            state.clone()
+        };
+        view.shared.push(EngineEvent::TextInputChanged {
+            view: view.id,
+            state: Some(state),
+        });
     });
 }
 
 // ---- the renderer's focus message ----
 
 /// The input purpose of a `cef_dom_form_control_type_t`, and whether the field takes lines.
+/// 0 is an editable node that is not a form control (`contenteditable`): it takes lines.
 fn purpose(control: i32) -> (TextPurpose, bool) {
     match control {
+        0 => (TextPurpose::Normal, true),
         9 => (TextPurpose::Date, false),
         10 => (TextPurpose::DateTime, false),
         11 => (TextPurpose::Email, false),
@@ -331,7 +349,9 @@ fn purpose(control: i32) -> (TextPurpose, bool) {
 }
 
 /// `sig.focus` from `sig-cef-helper`: which DOM node holds the focus, as text-input state. No
-/// surrounding text is ever sent (a password field's content stays in the page).
+/// surrounding text is ever sent (a password field's content stays in the page). The node's
+/// bounds are in device pixels (`cef_domnode_t::get_element_bounds`): the caret is them divided
+/// by the scale CEF was given, or, for a node with no bounds, where the user last clicked.
 unsafe extern "C" fn on_process_message_received(
     this: *mut CefClient,
     browser: *mut CefBrowser,
@@ -356,23 +376,45 @@ unsafe extern "C" fn on_process_message_received(
         let int = |index: usize| unsafe { call!(args.as_ptr(), get_int, index) };
         let state = (int(0) != 0).then(|| {
             let (purpose, multiline) = purpose(int(1));
+            let scale = lock(&view.geometry).scale;
+            let caret = device_to_surface([int(2), int(3), int(4), int(5)], scale)
+                .unwrap_or_else(|| *lock(&view.caret));
             TextInputState {
-                caret: SurfaceRect {
-                    x: int(2),
-                    y: int(3),
-                    width: u32::try_from(int(4).max(1)).unwrap_or(1),
-                    height: u32::try_from(int(5).max(1)).unwrap_or(1),
-                },
+                caret,
                 surrounding: None,
                 purpose,
                 multiline,
             }
         });
+        lock(&view.text_input).clone_from(&state);
         view.shared.push(EngineEvent::TextInputChanged {
             view: view.id,
             state,
         });
         1
+    })
+}
+
+/// A rectangle `[x, y, width, height]` in device pixels as surface-local DIPs (`None`: empty).
+fn device_to_surface(rect: [i32; 4], scale: f32) -> Option<SurfaceRect> {
+    let [x, y, width, height] = rect;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let scale = if scale.is_finite() && scale > 0.0 {
+        f64::from(scale)
+    } else {
+        1.0
+    };
+    let x0 = (f64::from(x) / scale).floor();
+    let y0 = (f64::from(y) / scale).floor();
+    let x1 = (f64::from(x.saturating_add(width)) / scale).ceil();
+    let y1 = (f64::from(y.saturating_add(height)) / scale).ceil();
+    Some(SurfaceRect {
+        x: x0 as i32,
+        y: y0 as i32,
+        width: ((x1 - x0) as u32).max(1),
+        height: ((y1 - y0) as u32).max(1),
     })
 }
 
@@ -386,7 +428,7 @@ unsafe extern "C" fn on_before_popup(
     target_url: *const CefStringUtf16,
     _target_frame_name: *const CefStringUtf16,
     _disposition: i32,
-    _user_gesture: i32,
+    user_gesture: i32,
     _features: *const c_void,
     _window_info: *mut c_void,
     _client: *mut *mut CefClient,
@@ -397,7 +439,15 @@ unsafe extern "C" fn on_before_popup(
     own!(browser, frame);
     guard(|| {
         // SAFETY: as above. The popup is never created: the browser decides where the URL goes.
+        // One the page opened on its own, with no click or key press of the user's behind it
+        // (Chromium's transient activation, consumed by the popup it allows), is refused here,
+        // as Chromium's own blocker would: a `window.open` loop then queues nothing. What the
+        // user did open still meets the browser's own rule (a click in the view within 5 s).
         let view = unsafe { view(this) };
+        if user_gesture == 0 {
+            log::debug!("cef: a popup without a user gesture was refused");
+            return 1;
+        }
         let url = unsafe { read_url(target_url) };
         let document = lock(&view.nav).document();
         if let (Some(document), Some(url)) = (document, url) {
@@ -461,18 +511,29 @@ unsafe extern "C" fn on_after_created(this: *mut CefLifeSpanHandler, browser: *m
 unsafe extern "C" fn do_close(this: *mut CefLifeSpanHandler, browser: *mut CefBrowser) -> i32 {
     own!(browser);
     guard(|| {
-        // SAFETY: as above. The page's `window.close()` is a request; our own close goes ahead.
+        // SAFETY: as above. Our own close goes ahead. Otherwise the page called
+        // `window.close()` and Chromium allowed it: its unload handlers have run, so the
+        // document cannot continue, and a windowless browser that answers 1 is left half
+        // closed (CEF's `do_close`). It closes now (0: CEF destroys it, `OnBeforeClose`
+        // reports `ViewClosed`). The browser hears the request first, and closes the tab when
+        // its rule allows; otherwise the tab keeps the page as history it can reload.
         let view = unsafe { view(this) };
         if view.is_closing() {
             return 0;
         }
+        let mut events = Vec::with_capacity(2);
         if let Some(document) = lock(&view.nav).document() {
-            view.shared.push(EngineEvent::CloseRequested {
+            events.push(EngineEvent::CloseRequested {
                 view: view.id,
                 document,
             });
         }
-        1
+        events.push(EngineEvent::ViewFailed {
+            view: view.id,
+            message: "The page closed itself.".into(),
+        });
+        view.shared.push_all(events);
+        0
     })
 }
 
@@ -492,7 +553,11 @@ unsafe extern "C" fn on_before_close(this: *mut CefLifeSpanHandler, browser: *mu
         view.shared
             .live
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        view.shared.forget(view.id);
+        // The browser closed this view: what is queued for it is late. A page that closed
+        // itself keeps its request and its failure, in order, before the `ViewClosed`.
+        if view.is_closing() {
+            view.shared.forget(view.id);
+        }
         view.shared.push(EngineEvent::ViewClosed { view: view.id });
     });
 }
@@ -516,10 +581,12 @@ unsafe extern "C" fn on_loading_state_change(
     });
 }
 
-/// The navigation entries' addresses and the current index, read on the UI thread (CEF calls
-/// the visitor before `get_navigation_entries` returns there).
-fn entries(browser: *mut CefBrowser) -> (Vec<String>, usize) {
-    type Found = Arc<Mutex<(Vec<String>, usize)>>;
+/// The navigation entries' addresses, the current index, and whether every address fit, read
+/// on the UI thread (CEF calls the visitor before `get_navigation_entries` returns there). An
+/// address over the bound is never shortened: its entry is kept empty (for the indices) and
+/// the list is not complete, so it is not reported (the core drops such a list too).
+fn entries(browser: *mut CefBrowser) -> (Vec<String>, usize, bool) {
+    type Found = Arc<Mutex<(Vec<String>, usize, bool)>>;
     unsafe extern "C" fn visit(
         this: *mut CefNavigationEntryVisitor,
         entry: *mut CefNavigationEntry,
@@ -533,16 +600,17 @@ fn entries(browser: *mut CefBrowser) -> (Vec<String>, usize) {
                 return 1;
             };
             let found = ffi::data::<CefNavigationEntryVisitor, Found>(this);
-            let url = take(call!(entry.as_ptr(), get_url));
+            let url = take_url(call!(entry.as_ptr(), get_url));
             let mut found = lock(found);
-            found.0.push(url);
+            found.2 &= url.is_some();
+            found.0.push(url.unwrap_or_default());
             if current != 0 {
                 found.1 = usize::try_from(index).unwrap_or(0);
             }
         }
         1
     }
-    let found: Found = Arc::default();
+    let found: Found = Arc::new(Mutex::new((Vec::new(), 0, true)));
     let mut visitor: CefNavigationEntryVisitor = zeroed();
     visitor.visit = Some(visit);
     let visitor = new_object(visitor, Arc::clone(&found));
@@ -556,7 +624,14 @@ fn entries(browser: *mut CefBrowser) -> (Vec<String>, usize) {
         }
     }
     let found = lock(&found);
-    (found.0.clone(), found.1)
+    (found.0.clone(), found.1, found.2)
+}
+
+/// Leaves out the history report of a list with an address over the bound.
+fn keep_history(events: &mut Vec<EngineEvent>, complete: bool) {
+    if !complete {
+        events.retain(|event| !matches!(event, EngineEvent::HistoryChanged { .. }));
+    }
 }
 
 unsafe extern "C" fn on_load_start(
@@ -576,7 +651,7 @@ unsafe extern "C" fn on_load_start(
         }
         let view = unsafe { view(this) };
         let url = unsafe { take_url(call!(frame.as_ptr(), get_url)) };
-        let (list, current) = entries(browser);
+        let (list, current, complete) = entries(browser);
         let mut events = Vec::new();
         // A new document does not keep the previous field: its text-input state ends here.
         // The renderer reports the new one, if any, when a node actually gains focus.
@@ -585,7 +660,9 @@ unsafe extern "C" fn on_load_start(
             Some(url) => lock(&view.nav).commit(&url, transition, list, current, &mut events),
             None => lock(&view.nav).failed(0, "the address is too long", &mut events),
         }
+        keep_history(&mut events, complete);
         if lock(&view.nav).document() != before {
+            *lock(&view.text_input) = None;
             events.push(EngineEvent::TextInputChanged {
                 view: view.id,
                 state: None,
@@ -641,9 +718,10 @@ unsafe extern "C" fn on_address_change(
         let Some(url) = (unsafe { read_url(url) }) else {
             return;
         };
-        let (list, current) = entries(browser);
+        let (list, current, complete) = entries(browser);
         let mut events = Vec::new();
         lock(&view.nav).address_changed(&url, list, current, &mut events);
+        keep_history(&mut events, complete);
         view.shared.push_all(events);
     });
 }
@@ -939,4 +1017,37 @@ unsafe extern "C" fn on_before_context_menu(
             unsafe { call!(model.as_ptr(), clear) };
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_nodes_device_pixels_become_the_surfaces_own() {
+        // At scale 2 a node at (40, 60), 200 by 30 device pixels, is at (20, 30), 100 by 15.
+        assert_eq!(
+            device_to_surface([40, 60, 200, 30], 2.0),
+            Some(SurfaceRect {
+                x: 20,
+                y: 30,
+                width: 100,
+                height: 15
+            })
+        );
+        // A fractional scale covers the node: never smaller than it.
+        let r = device_to_surface([3, 3, 3, 3], 1.5).expect("not empty");
+        assert_eq!((r.x, r.y, r.width, r.height), (2, 2, 2, 2));
+        assert_eq!(
+            device_to_surface([5, 5, 7, 9], 1.0),
+            Some(SurfaceRect {
+                x: 5,
+                y: 5,
+                width: 7,
+                height: 9
+            })
+        );
+        // No bounds: the caller falls back to the last click.
+        assert_eq!(device_to_surface([5, 5, 0, 9], 1.0), None);
+    }
 }

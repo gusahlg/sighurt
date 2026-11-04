@@ -13,7 +13,7 @@ extern "C" {
 #endif
 #pragma GCC visibility push(default)
 
-#define LB_ABI_VERSION 1
+#define LB_ABI_VERSION 2
 
 /* Sizes of the Ladybird types this library was compiled against, to be compared with what the
  * libraries at run time were built with (the ABI-skew guard). */
@@ -43,14 +43,15 @@ enum {
     LB_EV_OPEN_REQUESTED,   /* s0 = url: the page wants a new window/tab */
     LB_EV_FRAME,            /* a new frame is ready */
     LB_EV_CRASHED,          /* i0 = reason; s0 = text */
-    LB_EV_CLOSED,           /* the view is gone */
+    LB_EV_CLOSED,           /* the page closed its view (window.close()): it takes no more calls; lb_view_close removes it */
     LB_EV_HISTORY,          /* i0 = current index, i1 = count; s0 = entries, one URL per line */
     LB_EV_JS_RESULT,        /* i0 = request id; s0 = result (JSON), or NULL on failure */
     LB_EV_INPUT_METHOD,     /* i0 = 1 when an editable field has focus; s0 = caret "x,y,w,h" in device pixels */
     LB_EV_FIND_RESULT,      /* i0 = current match, i1 = total (-1 unknown) */
     LB_EV_CLIPBOARD_WRITE,  /* s0 = MIME type, data = bytes; i1 = representations still to come */
     LB_EV_CLIPBOARD_WANT,   /* a paste found nothing: answer with lb_clipboard_grant or _deny */
-    LB_EV_DOWNLOAD,         /* s0 = url, s1 = suggested name, data = the file */
+    LB_EV_DOWNLOAD,         /* s0 = url, s1 = suggested name, data = the path of the staged file (at most
+                             * 64 MiB), which the receiver reads and removes */
     LB_EV_PICK_FILES,       /* i0 = 1 for several files; i1 = token for lb_pick_reply */
     LB_EV_OPEN_EXTERNAL,    /* s0 = url; i1 = token for lb_open_external_reply */
     LB_EV_COMMIT,           /* Ladybird's top-level navigation commit: a new document is shown (i0 = 1 if history-entry activation) */
@@ -97,10 +98,11 @@ void lb_run_js(uint64_t view, const char* script, int64_t request);
 
 /* Input. Positions are in device pixels of the view. modifiers: 1 alt, 2 ctrl, 4 shift, 8 super. */
 void lb_input_key(uint64_t view, const char* w3c_code, const char* key, int pressed, int repeat, int modifiers, uint32_t code_point);
-void lb_input_pointer_move(uint64_t view, int x, int y, int modifiers);
+/* buttons: the buttons held, a mask of the button values below. */
+void lb_input_pointer_move(uint64_t view, int x, int y, int buttons, int modifiers);
 void lb_input_pointer_leave(uint64_t view);
-/* button: 1 primary, 2 secondary, 4 middle, 8 back, 16 forward */
-void lb_input_pointer_button(uint64_t view, int x, int y, int button, int pressed, int click_count, int modifiers);
+/* button: 1 primary, 2 secondary, 4 middle, 8 back, 16 forward; buttons: those held after this change */
+void lb_input_pointer_button(uint64_t view, int x, int y, int button, int buttons, int pressed, int click_count, int modifiers);
 void lb_input_scroll(uint64_t view, int x, int y, double dx, double dy, int precise, int modifiers);
 void lb_input_commit_text(uint64_t view, const char* text);
 void lb_input_preedit(uint64_t view, const char* text);

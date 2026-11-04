@@ -1,15 +1,21 @@
 /* One gui window per view. Callbacks only queue events. A window the core
  * opens itself (target=_blank, existing != NULL) stays pending until its first
  * set_url, then is destroyed on the next poll, after the core call has returned.
+ * A hidden window records what is invalidated but queues no frame for it.
  * GPL-2.0-only. */
 #include "internal.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "netsurf/window.h"
 #include "netsurf/console.h"
+#include "netsurf/content.h"
+#include "content/hlcache.h"
+#include "desktop/browser_private.h"
+#include "content/handlers/html/private.h"
+#include "content/handlers/html/box.h"
+#include "content/handlers/html/form_internal.h"
 
 static struct gui_window *windows;
 /* Closed windows. The core can still hold a pointer to a gui_window after it destroyed it (a
@@ -122,6 +128,8 @@ static void gw_destroy(struct gui_window *g)
 	g->bw = NULL;
 	g->gadget = NULL;
 	g->gadget_content = NULL;
+	free(g->stage);
+	g->stage = NULL;
 	g->next = graveyard;
 	graveyard = g;
 }
@@ -140,6 +148,14 @@ static nserror gw_invalidate(struct gui_window *g, const struct rect *rect)
 	if (quiet(g))
 		return NSERROR_OK;
 	add_dirty(g, rect);
+	/* A hidden window has nothing to show: it is painted from what add_dirty kept when it is
+	 * shown again. Counting it lets the scheduler park an animation that only it shows. */
+	if (g->hidden) {
+		nsh_run_effects.hidden_frames++;
+		return NSERROR_OK;
+	}
+	nsh_run_effects.visible_frames++;
+	nsh_sched_unpark();
 	nsh_emit(NSH_EV_FRAME, g->view_id, 0, 0, 0, 0, 0, NULL);
 	return NSERROR_OK;
 }
@@ -278,13 +294,40 @@ static void gw_set_pointer(struct gui_window *g, enum gui_pointer_shape shape)
 	nsh_emit(NSH_EV_POINTER, g->view_id, (int)shape, 0, 0, 0, 0, NULL);
 }
 
+/* NSH_FIELD_* bits for the field that is placing the caret. The core's textarea sets the html
+ * content's focus to its box before the caret reaches the frontend, so the root document's focus
+ * owner is that field, and its gadget says whether it is a password. A caret from a frame or an
+ * iframe belongs to another document, which the frontend cannot tell apart here: a root window
+ * with frames or iframes, or anything else it cannot classify, is reported sensitive. */
+static int focused_field(const struct gui_window *g)
+{
+	struct browser_window *bw = g->bw;
+	if (!bw || bw->children || bw->iframe_count > 0)
+		return NSH_FIELD_SENSITIVE;
+	struct hlcache_handle *h = browser_window_get_content(bw);
+	if (!h || content_get_type(h) != CONTENT_HTML)
+		return NSH_FIELD_SENSITIVE;
+	html_content *html = (html_content *)hlcache_handle_get_content(h);
+	if (!html || html->focus_type != HTML_FOCUS_TEXTAREA || !html->focus_owner.textarea
+	    || !html->focus_owner.textarea->gadget)
+		return NSH_FIELD_SENSITIVE;
+	switch (html->focus_owner.textarea->gadget->type) {
+	case GADGET_TEXTBOX:
+		return 0;
+	case GADGET_TEXTAREA:
+		return NSH_FIELD_MULTILINE;
+	default:
+		return NSH_FIELD_SENSITIVE;
+	}
+}
+
 static void gw_place_caret(struct gui_window *g, int x, int y, int height, const struct rect *clip)
 {
 	(void)clip;
 	if (quiet(g))
 		return;
 	/* The core places the caret in content space; the browser wants it in the view. */
-	nsh_emit(NSH_EV_CARET, g->view_id, x - g->sx, y - g->sy, height, 0, 0, NULL);
+	nsh_emit(NSH_EV_CARET, g->view_id, x - g->sx, y - g->sy, height, focused_field(g), 0, NULL);
 }
 
 static bool gw_drag_start(struct gui_window *g, gui_drag_type type, const struct rect *rect)
@@ -460,6 +503,14 @@ void nsh_view_set_hidden(nsh_view *view, int hidden)
 	if (!view)
 		return;
 	view->hidden = hidden != 0;
+	if (view->hidden) {
+		/* Its picture is painted whole when it is shown again. */
+		free(view->stage);
+		view->stage = NULL;
+		view->stage_w = view->stage_h = 0;
+	} else {
+		nsh_sched_unpark();
+	}
 }
 
 int nsh_view_hidden(const nsh_view *view)
@@ -486,15 +537,26 @@ int nsh_view_dirty_rect(const nsh_view *view, nsh_rect *out)
 {
 	if (!view || !view->dirty)
 		return 0;
-	if (view->dirty_all || !view->has_dirty)
-		return 2;
-	if (out) {
-		out->x0 = view->dirty_r.x0;
-		out->y0 = view->dirty_r.y0;
-		out->x1 = view->dirty_r.x1;
-		out->y1 = view->dirty_r.y1;
+	int w = view->stage ? view->stage_w : view->w, h = view->stage ? view->stage_h : view->h;
+	nsh_rect r = { 0, 0, w, h };
+	int kind = 2;
+	if (!view->dirty_all && view->has_dirty) {
+		/* The core invalidates in scaled content pixels, which the scroll offset moves into
+		 * the view. Its scaling truncates, so a pixel of margin keeps an edge from being
+		 * left behind. Long arithmetic: a page's rectangle can be anywhere. */
+		long x0 = (long)view->dirty_r.x0 - view->sx - 1, y0 = (long)view->dirty_r.y0 - view->sy - 1;
+		long x1 = (long)view->dirty_r.x1 - view->sx + 2, y1 = (long)view->dirty_r.y1 - view->sy + 2;
+		r.x0 = x0 < 0 ? 0 : x0 > w ? w : (int)x0;
+		r.y0 = y0 < 0 ? 0 : y0 > h ? h : (int)y0;
+		r.x1 = x1 < 0 ? 0 : x1 > w ? w : (int)x1;
+		r.y1 = y1 < 0 ? 0 : y1 > h ? h : (int)y1;
+		if (r.x1 <= r.x0 || r.y1 <= r.y0)
+			return 0;
+		kind = 1;
 	}
-	return 1;
+	if (out)
+		*out = r;
+	return kind;
 }
 
 void nsh_file_answer(uint64_t view_id, const char *path)
@@ -517,9 +579,19 @@ void nsh_load_failed(struct browser_window *bw, int code, const char *message, c
 	for (struct gui_window *g = windows; g; g = g->next) {
 		if (g->bw != bw || quiet(g))
 			continue;
-		char text[4096];
-		snprintf(text, sizeof text, "%s\n%s", url ? url : "", message ? message : "");
+		/* The url whole (never shortened), the message cut as the browser cuts text. Without
+		 * memory the failure is still reported, with no text. */
+		size_t ul = url ? strlen(url) : 0;
+		size_t ml = message ? nsh_utf8_cut(message, strlen(message), NSH_MAX_TEXT) : 0;
+		char *text = malloc(ul + ml + 2);
+		if (text) {
+			memcpy(text, url ? url : "", ul);
+			text[ul] = '\n';
+			memcpy(text + ul + 1, message ? message : "", ml);
+			text[ul + 1 + ml] = '\0';
+		}
 		nsh_emit(NSH_EV_FAILED, g->view_id, code, 0, 0, 0, 0, text);
+		free(text);
 		return;
 	}
 }

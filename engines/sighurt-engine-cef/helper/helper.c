@@ -8,7 +8,8 @@
 // engine's `TextInputChanged` (docs/rewrite/CEF.md). Message "sig.focus", arguments:
 //   0 int  1 when the node is editable (an input, a textarea, contenteditable), else 0
 //   1 int  cef_dom_form_control_type_t of the node
-//   2..5   int  x, y, width, height of the node's bounds in the page's DIPs
+//   2..5   int  x, y, width, height of the node's bounds in device pixels (get_element_bounds;
+//               the engine divides them by the scale it gave CEF)
 #ifndef CEF_API_VERSION
 #define CEF_API_VERSION 15000
 #endif

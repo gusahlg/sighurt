@@ -44,14 +44,30 @@ struct queued {
 static struct queued *queue;
 static int qn, qcap;
 static char *held_text;
+struct nsh_run_effects nsh_run_effects;
 
-static char *dup_text(const char *text)
+size_t nsh_utf8_cut(const char *s, size_t len, size_t max)
+{
+	if (len <= max)
+		return len;
+	size_t n = max;
+	/* Back off continuation bytes so the cut never splits a character. */
+	while (n > 0 && ((unsigned char)s[n] & 0xc0) == 0x80)
+		n--;
+	return n;
+}
+
+/* Titles and status text are cut to NSH_MAX_TEXT, as the browser cuts them. Everything else is
+ * copied whole: a URL (the url, a launch, an open, a form, a failed load's) is never shortened,
+ * since a shortened URL points elsewhere; the browser drops one over its bound. A failed load's
+ * message is cut where its text is built (window.c), clipboard text where it is shadowed. */
+static char *dup_text(int kind, const char *text)
 {
 	if (!text)
 		return NULL;
 	size_t n = strlen(text);
-	if (n > 1024u * 1024u)
-		n = 1024u * 1024u;
+	if (kind == NSH_EV_TITLE || kind == NSH_EV_STATUS)
+		n = nsh_utf8_cut(text, n, NSH_MAX_TEXT);
 	char *d = malloc(n + 1);
 	if (!d)
 		return NULL;
@@ -83,6 +99,8 @@ void nsh_emit(int kind, uint64_t view_id, int i0, int i1, int i2, int i3, uint64
 {
 	if (nsh_core_state == 2)
 		return;
+	if (kind != NSH_EV_FRAME)
+		nsh_run_effects.other_events++;
 	if (kind == NSH_EV_CONSOLE) {
 		for (int i = 0; i < qn; i++) {
 			if (queue[i].kind == NSH_EV_CONSOLE && queue[i].view == view_id) {
@@ -133,7 +151,7 @@ void nsh_emit(int kind, uint64_t view_id, int i0, int i1, int i2, int i3, uint64
 	e->i2 = i2;
 	e->i3 = i3;
 	e->u0 = u0;
-	e->text = dup_text(text);
+	e->text = dup_text(kind, text);
 }
 
 void nsh_drop_events(uint64_t view_id)
@@ -405,11 +423,12 @@ static int key_inner(nsh_view *view, uint32_t key)
 	}
 }
 
-int nsh_view_link_at(nsh_view *view, int x, int y, char *buf, size_t buflen)
+size_t nsh_view_link_at(nsh_view *view, int x, int y, char *buf, size_t buflen)
 {
-	if (!live_view(view) || !buf || buflen == 0)
+	if (buf && buflen > 0)
+		buf[0] = '\0';
+	if (!live_view(view))
 		return 0;
-	buf[0] = '\0';
 	struct browser_window_features features;
 	memset(&features, 0, sizeof features);
 	if (browser_window_get_features(view->bw, x + view->sx, y + view->sy, &features) != NSERROR_OK || !features.link)
@@ -418,11 +437,12 @@ int nsh_view_link_at(nsh_view *view, int x, int y, char *buf, size_t buflen)
 	if (!s)
 		return 0;
 	size_t n = strlen(s);
-	if (n >= buflen)
-		n = buflen - 1;
-	memcpy(buf, s, n);
-	buf[n] = '\0';
-	return 1;
+	/* Whole or not at all: the caller asks again with a buffer of the size returned. */
+	if (buf && n < buflen) {
+		memcpy(buf, s, n);
+		buf[n] = '\0';
+	}
+	return n + 1;
 }
 
 int nsh_view_form_at(nsh_view *view, int x, int y)
@@ -458,38 +478,24 @@ int nsh_view_selection(nsh_view *view, char *buf, size_t buflen)
 	return ret;
 }
 
-int nsh_view_paint(nsh_view *view, uint32_t *bgra, int w, int h, size_t stride, const nsh_rect *clip)
+/* Paints `clip` of the view into its stage. */
+static bool redraw_stage(nsh_view *view, const nsh_rect *clip)
 {
-	if (!live_view(view) || !bgra || w < 1 || h < 1)
-		return 0;
-	if (view->hidden)
-		return 0;
-	if (stride < (size_t)w * 4 || (stride % 4) != 0)
-		return 0;
 	struct nsh_canvas cv = {
-		.px = bgra,
-		.w = w,
-		.h = h,
-		.stride = (int)(stride / 4),
+		.px = view->stage,
+		.w = view->stage_w,
+		.h = view->stage_h,
+		.stride = view->stage_w,
+		.clip = { clip->x0, clip->y0, clip->x1, clip->y1 },
 	};
-	if (clip) {
-		cv.clip.x0 = clip->x0 < 0 ? 0 : clip->x0;
-		cv.clip.y0 = clip->y0 < 0 ? 0 : clip->y0;
-		cv.clip.x1 = clip->x1 > w ? w : clip->x1;
-		cv.clip.y1 = clip->y1 > h ? h : clip->y1;
-	} else {
-		cv.clip.x0 = 0;
-		cv.clip.y0 = 0;
-		cv.clip.x1 = w;
-		cv.clip.y1 = h;
-	}
-	if (cv.clip.x1 < cv.clip.x0)
-		cv.clip.x1 = cv.clip.x0;
-	if (cv.clip.y1 < cv.clip.y0)
-		cv.clip.y1 = cv.clip.y0;
-	for (int y = cv.clip.y0; y < cv.clip.y1; y++)
-		for (int x = cv.clip.x0; x < cv.clip.x1; x++)
-			cv.px[(size_t)y * (size_t)cv.stride + (size_t)x] = 0xffffffffu;
+	/* White first, one row filled and copied down: the core fills its own background, but a
+	 * failed or partial redraw must not show the previous picture through. */
+	int cw = cv.clip.x1 - cv.clip.x0;
+	uint32_t *first = cv.px + (size_t)cv.clip.y0 * (size_t)cv.stride + (size_t)cv.clip.x0;
+	for (int x = 0; x < cw; x++)
+		first[x] = 0xffffffffu;
+	for (int y = cv.clip.y0 + 1; y < cv.clip.y1; y++)
+		memcpy(cv.px + (size_t)y * (size_t)cv.stride + (size_t)cv.clip.x0, first, (size_t)cw * 4);
 	struct redraw_context ctx = {
 		.interactive = true,
 		.background_images = true,
@@ -497,11 +503,44 @@ int nsh_view_paint(nsh_view *view, uint32_t *bgra, int w, int h, size_t stride, 
 		.priv = &cv,
 	};
 	struct rect core_clip = cv.clip;
-	bool ok = browser_window_redraw(view->bw, -view->sx, -view->sy, &core_clip, &ctx);
-	view->dirty = false;
-	view->dirty_all = false;
+	return browser_window_redraw(view->bw, -view->sx, -view->sy, &core_clip, &ctx);
+}
+
+int nsh_view_paint(nsh_view *view, uint32_t *bgra, int w, int h, size_t stride)
+{
+	if (!live_view(view) || !bgra || w < 1 || h < 1)
+		return 0;
+	if (view->hidden)
+		return 0;
+	if (stride < (size_t)w * 4 || (stride % 4) != 0)
+		return 0;
+	if (!view->stage || view->stage_w != w || view->stage_h != h) {
+		free(view->stage);
+		view->stage = malloc((size_t)w * (size_t)h * 4);
+		view->stage_w = view->stage ? w : 0;
+		view->stage_h = view->stage ? h : 0;
+		if (!view->stage)
+			return 0;
+		view->dirty = true;
+		view->dirty_all = true;
+	}
+	nsh_rect clip = { 0, 0, w, h };
+	bool ok = true;
+	if (nsh_view_dirty_rect(view, &clip) != 0)
+		ok = redraw_stage(view, &clip);
+	/* A failed redraw paints everything again next time. */
+	view->dirty = !ok;
+	view->dirty_all = !ok;
 	view->has_dirty = false;
-	return ok ? 1 : 0;
+	if (!ok)
+		return 0;
+	if (stride == (size_t)w * 4) {
+		memcpy(bgra, view->stage, (size_t)w * (size_t)h * 4);
+	} else {
+		for (int y = 0; y < h; y++)
+			memcpy((uint8_t *)bgra + (size_t)y * stride, view->stage + (size_t)y * (size_t)w, (size_t)w * 4);
+	}
+	return 1;
 }
 
 /* --- lifetime --------------------------------------------------------- */

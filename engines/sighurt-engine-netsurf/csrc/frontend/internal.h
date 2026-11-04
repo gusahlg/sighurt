@@ -34,6 +34,10 @@ struct gui_window {
 	bool hidden;
 	int pointer;
 	struct form_control *gadget;
+	/* The view's picture as last painted (stage_w x stage_h, stride stage_w); NULL while
+	 * hidden or before the first paint. Only the dirty part is painted into it again. */
+	uint32_t *stage;
+	int stage_w, stage_h;
 };
 
 /* The image buffer is R,G,B,A, not premultiplied. The plotter reads these fields. */
@@ -61,6 +65,20 @@ int nsh_sched_run(int limit);
 int nsh_sched_deadline(int live_views);
 void nsh_sched_clear(void);
 void nsh_sched_mark_housekeeping(void);
+/* Makes every parked callback count for the deadline again (a view became visible, or a visible
+ * one was invalidated). See sched.c. */
+void nsh_sched_unpark(void);
+
+/* What the callback the scheduler is running did: frames of hidden and of visible views, and any
+ * other event. A callback that only invalidated hidden views and rescheduled itself (an
+ * animation in a background tab) is parked: it stops waking the owner. */
+struct nsh_run_effects {
+	unsigned hidden_frames, visible_frames, other_events;
+};
+extern struct nsh_run_effects nsh_run_effects;
+
+/* The length of `s` (`len` bytes) cut to at most `max` bytes at a UTF-8 boundary. */
+size_t nsh_utf8_cut(const char *s, size_t len, size_t max);
 
 int nsh_fonts_init(const nsh_config *cfg);
 void nsh_fonts_fini(void);

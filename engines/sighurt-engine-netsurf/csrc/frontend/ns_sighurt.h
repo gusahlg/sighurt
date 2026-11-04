@@ -49,7 +49,7 @@ enum nsh_event_kind {
 	NSH_EV_POINTER = 4,
 	NSH_EV_LOADING = 5, /* i0 is 1 while loading, 0 when it stopped */
 	NSH_EV_FRAME = 6,
-	NSH_EV_CARET = 7, /* i0, i1, i2: x, y, height */
+	NSH_EV_CARET = 7, /* i0, i1, i2: x, y, height; i3: NSH_FIELD_* bits */
 	NSH_EV_REMOVE_CARET = 8,
 	NSH_EV_NEW_CONTENT = 9,
 	NSH_EV_LAUNCH = 10, /* text is the url */
@@ -61,6 +61,16 @@ enum nsh_event_kind {
 	NSH_EV_ASK = 17, /* a user-activated GET form submit wants to navigate: text is the url; answer with nsh_view_follow */
 	NSH_EV_FAILED = 16 /* a load failed: text is "url\nmessage"; i0 is the core's nserror */
 };
+
+/* What NSH_EV_CARET's i3 says about the focused field. A password is sensitive, and so is a field
+ * the frontend cannot classify (one in a frame or an iframe): the input method then gets no hint
+ * that it may learn or show the text. */
+#define NSH_FIELD_SENSITIVE 1
+#define NSH_FIELD_MULTILINE 2
+
+/* The longest title, status or error message an event carries, in bytes (cut at a UTF-8 boundary,
+ * as the browser cuts them). URLs are never cut: the browser drops one that is too long. */
+#define NSH_MAX_TEXT 16384
 
 /* text is valid until the next nsh_next_event, nsh_poll, nsh_view_close or
  * nsh_shutdown. Copy it before then. */
@@ -182,16 +192,20 @@ int nsh_view_follow(nsh_view *view, const char *url);
 /* 1 once the event queue has overflowed (65536 events were waiting): events were lost. */
 int nsh_events_overflowed(void);
 
-/* Copies the link url at a buffer position. Returns 1 if there was one. */
-int nsh_view_link_at(nsh_view *view, int x, int y, char *buf, size_t buflen);
+/* The link url at a buffer position. Returns 0 if there is none, else the url's length plus one;
+ * the url is copied (NUL-terminated) only if that fits in buflen. It is never cut. */
+size_t nsh_view_link_at(nsh_view *view, int x, int y, char *buf, size_t buflen);
 /* 0 none, 1 text field, 2 file input. */
 int nsh_view_form_at(nsh_view *view, int x, int y);
 /* Copies the core's selection. Returns the byte length, or -1. */
 int nsh_view_selection(nsh_view *view, char *buf, size_t buflen);
 
-/* stride is bytes per row. clip NULL paints the whole buffer. Returns 1 if it drew. */
-int nsh_view_paint(nsh_view *view, uint32_t *bgra, int w, int h, size_t stride, const nsh_rect *clip);
-/* 0 clean, 1 a rectangle (written to out), 2 the whole view. */
+/* stride is bytes per row. Paints what changed since the last paint into the view's own copy of
+ * its picture, then copies the whole picture into bgra (the host's buffers rotate, so each needs
+ * the whole frame). Returns 1 if it drew. A hidden view paints nothing and drops its copy. */
+int nsh_view_paint(nsh_view *view, uint32_t *bgra, int w, int h, size_t stride);
+/* What needs painting again, in view (buffer) pixels: 0 nothing visible, 1 a rectangle (written
+ * to out, clipped to the view), 2 the whole view. */
 int nsh_view_dirty_rect(const nsh_view *view, nsh_rect *out);
 
 /* Runs due callbacks, then polls fetchers. Fills info. Returns 0. */

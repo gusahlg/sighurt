@@ -1,6 +1,6 @@
 // See loop.h. Ported from Core::EventLoopManagerUnix (LibCore/EventLoopImplementationUnix.cpp), with
-// epoll instead of poll, timers kept in the thread's own table and no process-wide signal pipe
-// for anything but SIGCHLD-style handlers.
+// epoll instead of poll, timers kept in the thread's own table, and no signal handling at all:
+// Ladybird's signal handlers are kept and never installed, since signals are the process's (sig's).
 
 #include "loop.h"
 
@@ -65,17 +65,14 @@ struct ThreadData {
     }
     ~ThreadData()
     {
-        // The wake descriptor stays open when a signal handler may still write to it.
         close(epoll_fd);
-        if (!signal_target)
-            close(wake_fd);
+        close(wake_fd);
     }
 
     std::recursive_mutex mutex;
     int epoll_fd { -1 };
     int wake_fd { -1 };
     pthread_t thread_id {};
-    bool signal_target { false };
     std::vector<Timer*> timers;
     std::map<int, FdEntry> fds;
 };
@@ -151,63 +148,19 @@ void recompute_mask(FdEntry& entry)
         entry.mask |= epoll_events_for(notifier->type());
 }
 
-// Signals: one handler list per signal, process-wide, delivered on the owner thread through its
-// wake descriptor. Only SIGCHLD, SIGINT and SIGTERM are ever registered by Ladybird. The previous
-// handler is chained so that another component's handler keeps working.
-struct SignalState {
-    struct Handler {
-        int id;
-        AK::Function<void(int)> function;
-    };
-    std::vector<Handler> handlers;
-    struct sigaction previous {};
-    bool installed { false };
-};
-SignalState g_signals[NSIG];
-std::atomic<unsigned> g_pending[NSIG];
-std::atomic<int> g_signal_wake_fd { -1 };
+// Signals: Ladybird registers SIGCHLD (ProcessMonitor) always, and SIGINT and SIGTERM (quitting its
+// own event loop, which sig never runs) only in its profiling mode. None is installed: a handler of
+// Ladybird's would be process-wide, setup that belongs to sig's main. SIGCHLD's would reap with
+// waitpid(-1), which takes the exit status of children that are not Ladybird's (WPE's bubblewrap, a
+// program the host started): the shim reaps Ladybird's helpers itself, one pidfd each (shim.cpp,
+// watch_child). SIGINT and SIGTERM stay sig's to handle (it shuts the runtime down). The handlers are
+// kept, by id, so unregistering works, and never called. Never destroyed, like the manager.
+std::vector<std::pair<int, AK::Function<void(int)>>>& signal_handlers()
+{
+    static auto* handlers = new std::vector<std::pair<int, AK::Function<void(int)>>>;
+    return *handlers;
+}
 int g_next_signal_id = 0;
-
-void on_signal(int number, siginfo_t* info, void* context)
-{
-    auto saved = errno;
-    g_pending[number].fetch_add(1);
-    int fd = g_signal_wake_fd.load();
-    if (fd >= 0) {
-        uint64_t one = 1;
-        (void)!write(fd, &one, sizeof(one));
-    }
-    // The handler that was there before (the host's, a signal-hook one) keeps running.
-    auto& previous = g_signals[number].previous;
-    if (previous.sa_flags & SA_SIGINFO) {
-        if (previous.sa_sigaction)
-            previous.sa_sigaction(number, info, context);
-    } else if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler) {
-        previous.sa_handler(number);
-    }
-    errno = saved;
-}
-
-void dispatch_signals()
-{
-    for (int number = 1; number < NSIG; ++number) {
-        auto count = g_pending[number].exchange(0);
-        for (unsigned i = 0; i < count; ++i) {
-            // Copy ids: a handler may unregister itself.
-            std::vector<int> ids;
-            for (auto& handler : g_signals[number].handlers)
-                ids.push_back(handler.id);
-            for (auto id : ids) {
-                for (auto& handler : g_signals[number].handlers) {
-                    if (handler.id == id) {
-                        handler.function(number);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
 
 std::atomic<uint64_t> g_pumps { 0 };
 
@@ -276,8 +229,6 @@ private:
                 uint64_t value;
                 (void)!read(data.wake_fd, &value, sizeof(value));
                 g_wakes.fetch_add(1);
-                if (data.signal_target)
-                    dispatch_signals();
                 continue;
             }
             auto it = data.fds.find(fd);
@@ -404,54 +355,21 @@ public:
         (void)!write(this_thread().wake_fd, &one, sizeof(one));
     }
 
+    // Kept, never installed (see signal_handlers).
     int register_signal(int number, AK::Function<void(int)> handler) override
     {
         VERIFY(number > 0 && number < NSIG);
-        // SIGCHLD is never installed. Ladybird's handler for it (ProcessMonitor) reaps with
-        // waitpid(-1), which would take the exit status of children that are not Ladybird's (WPE's
-        // bubblewrap, a program the host started). The shim reaps Ladybird's helpers itself, one
-        // pidfd each (shim.cpp, watch_child), and the handler is kept and never called.
-        if (number == SIGCHLD) {
-            int id = ++g_next_signal_id;
-            g_signals[number].handlers.push_back({ id, move(handler) });
-            return id;
-        }
-        auto& data = this_thread();
-        if (g_signal_wake_fd.load() < 0) {
-            data.signal_target = true;
-            g_signal_wake_fd.store(data.wake_fd);
-        }
-        auto& state = g_signals[number];
-        if (!state.installed) {
-            struct sigaction action {};
-            action.sa_sigaction = on_signal;
-            sigemptyset(&action.sa_mask);
-            action.sa_flags = SA_RESTART | SA_SIGINFO;
-            sigaction(number, &action, &state.previous);
-            state.installed = true;
-        }
         int id = ++g_next_signal_id;
-        state.handlers.push_back({ id, move(handler) });
+        signal_handlers().emplace_back(id, move(handler));
         return id;
     }
 
     void unregister_signal(int id) override
     {
-        for (int number = 1; number < NSIG; ++number) {
-            auto& state = g_signals[number];
-            for (size_t i = 0; i < state.handlers.size(); ++i) {
-                if (state.handlers[i].id != id)
-                    continue;
-                state.handlers.erase(state.handlers.begin() + i);
-                if (state.handlers.empty() && state.installed) {
-                    // Put the old handler back only if ours is still the one installed: another
-                    // component may have taken the signal since.
-                    struct sigaction current {};
-                    sigaction(number, nullptr, &current);
-                    if ((current.sa_flags & SA_SIGINFO) && current.sa_sigaction == on_signal)
-                        sigaction(number, &state.previous, nullptr);
-                    state.installed = false;
-                }
+        auto& handlers = signal_handlers();
+        for (size_t i = 0; i < handlers.size(); ++i) {
+            if (handlers[i].first == id) {
+                handlers.erase(handlers.begin() + i);
                 return;
             }
         }

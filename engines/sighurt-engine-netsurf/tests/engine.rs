@@ -15,7 +15,7 @@ use sighurt_api::geometry::{Metrics, Scale, SurfacePoint, WindowRect};
 use sighurt_api::ids::{LayoutEpoch, NavigationId, SeatId, ViewId};
 use sighurt_api::input::{
     ButtonState, InputEvent, InputKind, Key, KeyCode, KeyEvent, Modifiers, PointerButton,
-    PointerEvent, ScrollDelta,
+    PointerEvent, ScrollDelta, TextPurpose,
 };
 use sighurt_api::present::{CpuTarget, Frame};
 use sighurt_api::services::{ClipboardData, Service, ServiceReply};
@@ -94,6 +94,24 @@ const HOME: &str = "<!doctype html><title>Smoke Page</title><body style='margin:
 const FORM: &str = "<!doctype html><meta charset=utf-8><title>Form</title><body style='margin:0'>\
 <form action='/echo' method=get><input type=text name=q style='position:absolute;left:0;top:0;width:300px;height:40px;font:20px sans-serif'></form>";
 
+const FIELDS: &str =
+    "<!doctype html><meta charset=utf-8><title>Fields</title><body style='margin:0'>\
+<input type=password name=p style='position:absolute;left:0;top:0;width:300px;height:40px'>\
+<textarea name=t style='position:absolute;left:0;top:100px;width:300px;height:60px'></textarea>\
+<input type=text name=q style='position:absolute;left:0;top:200px;width:300px;height:40px'>";
+
+/// A 1x1 GIF of two frames, black then white, 100 ms each, looping.
+const ANIM_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\
+\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00\
+\x21\xf9\x04\x00\x0a\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\
+\x21\xf9\x04\x00\x0a\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x4c\x01\x00\
+\x3b";
+
+/// A link longer than the 4 KiB the frontend's first buffer holds.
+fn long_link_path() -> String {
+    format!("/second?{}", "x".repeat(6000))
+}
+
 fn long_page() -> String {
     let mut page =
         String::from("<!doctype html><title>Long</title><body style='font:20px sans-serif'>");
@@ -168,6 +186,24 @@ impl Server {
 <input type=file style='position:absolute;left:0;top:0;width:300px;height:60px'>".to_vec(),
                         ),
                         "/form" => ("text/html", "", FORM.into()),
+                        "/fields" => ("text/html", "", FIELDS.into()),
+                        "/anim" => (
+                            "text/html",
+                            "",
+                            b"<!doctype html><title>Anim</title><body style='margin:0'>\
+<img src='/anim.gif' style='width:100px;height:100px'>".to_vec(),
+                        ),
+                        "/anim.gif" => ("image/gif", "", ANIM_GIF.to_vec()),
+                        "/longlink" => (
+                            "text/html",
+                            "",
+                            format!(
+                                "<!doctype html><title>Long link</title><body style='margin:0'>\
+<a href='{}' style='position:absolute;left:0;top:0;width:300px;height:60px;background:#cfc'>long</a>",
+                                long_link_path()
+                            )
+                            .into_bytes(),
+                        ),
                             "/long" => ("text/html", "", long_page().into_bytes()),
                             "/blank-target" => (
                                 "text/html",
@@ -835,6 +871,16 @@ fn the_runtime_walks_through_every_scenario() {
         non_white(&typed) > non_white(&before),
         "the typed text drew"
     );
+    // Typing repainted only the field's rectangle: the picture is what a whole repaint makes
+    // (hiding drops the frontend's picture, so showing paints all of it).
+    h.command(EngineCommand::SetVisibility(false));
+    let _ = h.pump();
+    h.command(EngineCommand::SetVisibility(true));
+    let whole = h.frame();
+    assert!(
+        typed.2 == whole.2,
+        "a partial repaint differs from a whole one"
+    );
     // Copy writes the clipboard through the service.
     let ctrl = Modifiers {
         control: true,
@@ -926,6 +972,75 @@ fn the_runtime_walks_through_every_scenario() {
     eprintln!("after scroll: {ev:?}");
     let scrolled = h.frame();
     assert_ne!(top.2, scrolled.2, "scrolling changed the frame");
+
+    // --- text fields: a password is sensitive for the input method, a textarea is multiline,
+    // a text field is neither.
+    let _ = h.load(&server.url("/fields"));
+    for (y, purpose, multiline) in [
+        (20.0, TextPurpose::Password, false),
+        (130.0, TextPurpose::Normal, true),
+        (220.0, TextPurpose::Normal, false),
+    ] {
+        h.click(50.0, y);
+        let events = h.pump();
+        let state = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                EngineEvent::TextInputChanged {
+                    state: Some(state), ..
+                } => Some(state.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no field reported at y {y}: {events:#?}"));
+        assert_eq!(
+            (state.purpose, state.multiline),
+            (purpose, multiline),
+            "the field at y {y}"
+        );
+    }
+
+    // --- a link longer than the first buffer is asked about whole, never shortened.
+    let _ = h.load(&server.url("/longlink"));
+    h.click(50.0, 30.0);
+    let url = h
+        .pump()
+        .iter()
+        .find_map(|e| match e {
+            EngineEvent::NavigationRequested { url, .. } => Some(url.clone()),
+            _ => None,
+        })
+        .expect("a click on the long link asks first");
+    assert_eq!(url, server.url(&long_link_path()));
+
+    // --- an animated image wakes the owner while its view is shown, and not while it is hidden.
+    let _ = h.load(&server.url("/anim"));
+    let _ = h.frame();
+    let pumps_before = h.pumps;
+    let _ = h.idle_for(Duration::from_secs(1));
+    let shown = h.pumps - pumps_before;
+    assert!(
+        shown >= 5,
+        "the animation woke the owner {shown} times in a second"
+    );
+    h.command(EngineCommand::SetVisibility(false));
+    let _ = h.idle_for(Duration::from_millis(300));
+    let pumps_before = h.pumps;
+    let _ = h.idle_for(Duration::from_secs(2));
+    let hidden = h.pumps - pumps_before;
+    assert!(
+        hidden < 4,
+        "a hidden animation woke the owner {hidden} times in two seconds"
+    );
+    h.command(EngineCommand::SetVisibility(true));
+    let _ = h.frame();
+    let pumps_before = h.pumps;
+    let _ = h.idle_for(Duration::from_secs(1));
+    let again = h.pumps - pumps_before;
+    assert!(
+        again >= 5,
+        "the animation resumed with {again} wakes in a second"
+    );
 
     // --- close and shut down.
     h.runtime.close_view(view);

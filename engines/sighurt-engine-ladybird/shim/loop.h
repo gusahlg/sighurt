@@ -6,7 +6,8 @@
 // thread) the epoll descriptor is exported (`sighurt_loop_fd`): it is readable exactly when a
 // `pump` has work (a notifier's descriptor, a wake, a queued event), so the host waits on one
 // descriptor and calls `pump` when it fires. Timers have no descriptor: `pump` returns when the
-// next one is due and the host sleeps until then. Nothing in here ticks.
+// next one is due and the host sleeps until then. Nothing in here ticks, and no signal handler is
+// installed (signals are the process's).
 //
 // Must not own: anything of the browser (views, pages, frames).
 #pragma once
