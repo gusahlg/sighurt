@@ -77,9 +77,26 @@ impl Rng {
             0..=3 => (b' ' + (self.byte() % 95)) as char,
             4 => char::from(self.byte() % 32),
             5 => *self.pick(&[
-                '\u{7f}', '\u{85}', '\u{a0}', '\u{ad}', '\u{200b}', '\u{200d}', '\u{200e}',
-                '\u{202e}', '\u{2028}', '\u{2029}', '\u{2066}', '\u{2069}', '\u{feff}', '\u{fffd}',
-                '\u{ffff}', '\u{10ffff}', '\u{e000}', '\u{d7ff}', '\u{301}', '\u{0}',
+                '\u{7f}',
+                '\u{85}',
+                '\u{a0}',
+                '\u{ad}',
+                '\u{200b}',
+                '\u{200d}',
+                '\u{200e}',
+                '\u{202e}',
+                '\u{2028}',
+                '\u{2029}',
+                '\u{2066}',
+                '\u{2069}',
+                '\u{feff}',
+                '\u{fffd}',
+                '\u{ffff}',
+                '\u{10ffff}',
+                '\u{e000}',
+                '\u{d7ff}',
+                '\u{301}',
+                '\u{0}',
             ]),
             6 => char::from_u32(0xC0 + self.below(0x300) as u32).unwrap_or('?'),
             7 => char::from_u32(0x4E00 + self.below(0x5000) as u32).unwrap_or('?'),
@@ -224,11 +241,15 @@ pub fn run(name: &str, cases: usize, limit: Duration, mut body: impl FnMut(&mut 
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| {
-            name.bytes()
-                .fold(0xCBF2_9CE4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01B3))
+            name.bytes().fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
+                (h ^ b as u64).wrapping_mul(0x100_0000_01B3)
+            })
         });
-    let only: Option<usize> = std::env::var("SIG_FUZZ_CASE").ok().and_then(|v| v.parse().ok());
+    let only: Option<usize> = std::env::var("SIG_FUZZ_CASE")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let note = Arc::new(Mutex::new(String::new()));
+    let began = Instant::now();
     let started = Arc::new(AtomicU64::new(u64::MAX));
     let done = Arc::new(AtomicBool::new(false));
     let epoch = Instant::now();
@@ -241,7 +262,9 @@ pub fn run(name: &str, cases: usize, limit: Duration, mut body: impl FnMut(&mut 
             while !done.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(25));
                 let since = started.load(Ordering::Relaxed);
-                if since != u64::MAX && epoch.elapsed().as_millis() as u64 > since + limit.as_millis() as u64 {
+                if since != u64::MAX
+                    && epoch.elapsed().as_millis() as u64 > since + limit.as_millis() as u64
+                {
                     let note = note.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     let message = format!(
                         "\nFUZZ HANG in {name}: a case ran over {limit:?}\n  replay: SIG_FUZZ_SEED={base} SIG_FUZZ_CASE={}\n  input: {note}\n",
@@ -278,4 +301,5 @@ pub fn run(name: &str, cases: usize, limit: Duration, mut body: impl FnMut(&mut 
     }
     done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
+    eprintln!("{name}: {cases} cases in {:?}", began.elapsed());
 }

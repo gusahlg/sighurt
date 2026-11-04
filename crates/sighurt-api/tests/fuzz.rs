@@ -16,11 +16,58 @@ use sighurt_api::keymap::Chord;
 const LIMIT: Duration = Duration::from_secs(2);
 
 const KEY_WORDS: &[&str] = &[
-    "ctrl", "alt", "shift", "super", "altgr", "secondary", "-", "--", "code:", "KeyQ", "KeyA",
-    "Enter", "enter", "escape", "esc", "space", "tab", "f1", "f5", "f24", "f25", "f0", "F5", "left",
-    "down", "pageup", "menu", "BrowserBack", "AudioVolumeUp", "a", "A", "z", "Z", "1", "+", "=",
-    "ä", "Ä", "ß", "İ", "ǅ", " ", "\u{a0}", "\t", "", "code:Digit1", "code:Nope", "ctrl-shift-t",
-    "ctrl--", "ctrl-+", "Ctrl", "SHIFT",
+    "ctrl",
+    "alt",
+    "shift",
+    "super",
+    "altgr",
+    "secondary",
+    "-",
+    "--",
+    "code:",
+    "KeyQ",
+    "KeyA",
+    "Enter",
+    "enter",
+    "escape",
+    "esc",
+    "space",
+    "tab",
+    "f1",
+    "f5",
+    "f24",
+    "f25",
+    "f0",
+    "F5",
+    "left",
+    "down",
+    "pageup",
+    "menu",
+    "BrowserBack",
+    "AudioVolumeUp",
+    "a",
+    "A",
+    "z",
+    "Z",
+    "1",
+    "+",
+    "=",
+    "ä",
+    "Ä",
+    "ß",
+    "İ",
+    "ǅ",
+    " ",
+    "\u{a0}",
+    "\t",
+    "",
+    "code:Digit1",
+    "code:Nope",
+    "ctrl-shift-t",
+    "ctrl--",
+    "ctrl-+",
+    "Ctrl",
+    "SHIFT",
 ];
 
 fn keystroke(rng: &mut Rng) -> String {
@@ -39,14 +86,30 @@ fn keystroke(rng: &mut Rng) -> String {
 
 fn argument(rng: &mut Rng) -> String {
     match rng.below(10) {
-        0 => rng.pick(&["0", "1", "2", "99", "-1", "+3", "1_0", "0x10", "٣", " 4 ", "1e3"]).to_string(),
+        0 => rng
+            .pick(&[
+                "0", "1", "2", "99", "-1", "+3", "1_0", "0x10", "٣", " 4 ", "1e3",
+            ])
+            .to_string(),
         1 => rng.next_u64().to_string(),
         2 => format!("{}{}", rng.next_u64(), rng.next_u64()),
         3 => keystroke(rng),
         4 => rng
-            .pick(&["servo", "wpe", "cef", "Servo", "1servo", "net-surf", "x y", "servo https://a.b/c d"])
+            .pick(&[
+                "servo",
+                "wpe",
+                "cef",
+                "Servo",
+                "1servo",
+                "net-surf",
+                "x y",
+                "servo https://a.b/c d",
+            ])
             .to_string(),
-        5 => rng.string_from(&["example.com", "/", "?", "#", "%", " ", "\t", "\u{a0}", "a"], 12),
+        5 => rng.string_from(
+            &["example.com", "/", "?", "#", "%", " ", "\t", "\u{a0}", "a"],
+            12,
+        ),
         6 => format!("https://{}", rng.string(30)),
         7 => String::new(),
         _ => rng.string(24),
@@ -56,7 +119,10 @@ fn argument(rng: &mut Rng) -> String {
 fn command_text(rng: &mut Rng) -> String {
     let mut text = match rng.below(6) {
         0 => rng.string(30),
-        1 => format!("chrome.{}", rng.string_from(&["a", "b", "-", "1", "toggle", "Z", "é"], 12)),
+        1 => format!(
+            "chrome.{}",
+            rng.string_from(&["a", "b", "-", "1", "toggle", "Z", "é"], 12)
+        ),
         _ => {
             let name = *rng.pick(&Command::NAMES);
             let separator = *rng.pick(&[" ", "  ", "\t", "\n", "\u{a0}", "\u{2003}", ""]);
@@ -67,7 +133,11 @@ fn command_text(rng: &mut Rng) -> String {
         text = rng.mutate(&text);
     }
     if rng.one_in(8) {
-        text = format!("{}{text}{}", rng.pick(&[" ", "\n", "\u{a0}", "\t"]), rng.pick(&[" ", "\r\n", ""]));
+        text = format!(
+            "{}{text}{}",
+            rng.pick(&[" ", "\n", "\u{a0}", "\t"]),
+            rng.pick(&[" ", "\r\n", ""])
+        );
     }
     text
 }
@@ -77,11 +147,21 @@ fn fuzz_commands_parse_and_round_trip() {
     run("fuzz_commands", iterations(100) * 5, LIMIT, |case| {
         let text = command_text(&mut case.rng);
         case.note(|| format!("{text:?}"));
-        let Ok(command) = text.parse::<Command>() else { return };
+        let Ok(command) = text.parse::<Command>() else {
+            return;
+        };
         let shown = command.to_string();
         case.note(|| format!("{text:?} parsed to {command:?}, shown as {shown:?}"));
-        assert_eq!(shown.parse::<Command>().as_ref(), Ok(&command), "round trip");
-        assert_eq!(shown.parse::<Command>().unwrap().to_string(), shown, "canonical");
+        assert_eq!(
+            shown.parse::<Command>().as_ref(),
+            Ok(&command),
+            "round trip"
+        );
+        assert_eq!(
+            shown.parse::<Command>().unwrap().to_string(),
+            shown,
+            "canonical"
+        );
         assert_eq!(CommandSet::ANY.parse(&text), Ok(command));
     });
 }
@@ -104,7 +184,9 @@ fn fuzz_chords_parse_and_round_trip() {
             text = case.rng.mutate(&text);
         }
         case.note(|| format!("{text:?}"));
-        let Ok(chord) = text.parse::<Chord>() else { return };
+        let Ok(chord) = text.parse::<Chord>() else {
+            return;
+        };
         let shown = chord.to_string();
         case.note(|| format!("{text:?} parsed to {chord:?}, shown as {shown:?}"));
         assert_eq!(shown.parse::<Chord>().as_ref(), Ok(&chord), "round trip");
@@ -136,7 +218,9 @@ fn fuzz_sent_keys_round_trip() {
     run("fuzz_sent_keys", iterations(100) * 3, LIMIT, |case| {
         let text = keystroke(&mut case.rng);
         case.note(|| format!("{text:?}"));
-        let Ok(key) = text.parse::<SentKey>() else { return };
+        let Ok(key) = text.parse::<SentKey>() else {
+            return;
+        };
         let shown = key.to_string();
         case.note(|| format!("{text:?} parsed to {key:?}, shown as {shown:?}"));
         assert_eq!(shown.parse::<SentKey>().as_ref(), Ok(&key), "round trip");
@@ -149,10 +233,22 @@ fn fuzz_sent_keys_round_trip() {
 #[test]
 fn every_name_round_trips_with_arguments() {
     for name in Command::NAMES {
-        for argument in ["", "1", "servo", "servo https://a.example/ b", "down", "shift-space", "toggle"] {
+        for argument in [
+            "",
+            "1",
+            "servo",
+            "servo https://a.example/ b",
+            "down",
+            "shift-space",
+            "toggle",
+        ] {
             let text = format!("{name} {argument}");
             if let Ok(command) = text.parse::<Command>() {
-                assert_eq!(command.to_string().parse::<Command>(), Ok(command), "{text:?}");
+                assert_eq!(
+                    command.to_string().parse::<Command>(),
+                    Ok(command),
+                    "{text:?}"
+                );
             }
         }
     }
