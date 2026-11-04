@@ -42,6 +42,9 @@ chrome-line = ["sighurt-gui/chrome-line"]
 # The chrome's wgpu renderer (Vulkan), chosen by `[ui] renderer = "wgpu"`; `auto` stays on the
 # CPU renderer until measured (docs/rewrite/RENDER.md §14.5).
 render-wgpu = ["sighurt-gui/render-wgpu"]
+# The chrome's Vulkan renderer on ash, `[ui] renderer = "vulkan"`: in no default set, never
+# chosen by `auto` (RENDER.md §14.13).
+render-vulkan = ["sighurt-gui/render-vulkan"]
 
 [dependencies]
 sighurt-core = { path = "../../crates/sighurt-core" }

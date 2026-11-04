@@ -1,0 +1,33 @@
+[package]
+name = "sighurt-render-vulkan"
+description = "Sighurt's Vulkan chrome renderer on ash: swapchains on the host's native targets, the shared WGSL program as SPIR-V"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# `VulkanBackend::headless` and `render_to_image`, for the comparison with the CPU backend.
+testing = []
+
+# No sighurt-wayland: the backend binds raw-window-handle handles (RENDER.md §2).
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }
+sighurt-render = { path = "../sighurt-render", features = ["gpu"] }
+raw-window-handle.workspace = true
+# The Vulkan loader is opened at run time (`Entry::load`): the crate builds and `sig` starts
+# without one. The version wgpu-hal already locks.
+ash = "0.38"
+log = "0.4"
+
+[build-dependencies]
+# The shared WGSL program (sighurt-render's gpu/shaders.wgsl) compiled to SPIR-V at build
+# time; wgpu's naga, so the lock gains nothing.
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+
+[dev-dependencies]
+sighurt-render-vulkan = { path = ".", features = ["testing"] }
+# The standard chrome's fixtures (sighurt-ui's tests/common), for the comparison test.
+sighurt-ui = { path = "../../ui/sighurt-ui" }
+tiny-skia.workspace = true

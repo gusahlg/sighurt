@@ -22,6 +22,8 @@ engine-netsurf = ["sighurt-runtime/engine-netsurf", "dep:sighurt-engine-netsurf"
 chrome-line = ["dep:sighurt-chrome-line"]
 # The chrome's GPU renderer, chosen by `[ui] renderer = "wgpu"` (docs/rewrite/RENDER.md).
 render-wgpu = ["dep:sighurt-render-wgpu"]
+# The chrome's Vulkan renderer on ash, chosen by `[ui] renderer = "vulkan"`; opt-in.
+render-vulkan = ["dep:sighurt-render-vulkan"]
 
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
@@ -31,6 +33,7 @@ sighurt-ui = { path = "../../ui/sighurt-ui" }
 # The chrome's renderers (`[ui] renderer`): the CPU one in every build.
 sighurt-render = { path = "../../render/sighurt-render" }
 sighurt-render-wgpu = { path = "../../render/sighurt-render-wgpu", optional = true }
+sighurt-render-vulkan = { path = "../../render/sighurt-render-vulkan", optional = true }
 sighurt-runtime = { path = "../../crates/sighurt-runtime" }
 sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }

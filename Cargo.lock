@@ -10578,6 +10578,7 @@ dependencies = [
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",
  "sighurt-render",
+ "sighurt-render-vulkan",
  "sighurt-render-wgpu",
  "sighurt-runtime",
  "sighurt-ui",
@@ -10596,6 +10597,21 @@ dependencies = [
  "sighurt-api",
  "tiny-skia 0.11.4",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "sighurt-render-vulkan"
+version = "0.10.0"
+dependencies = [
+ "ash",
+ "log",
+ "naga",
+ "raw-window-handle",
+ "sighurt-api",
+ "sighurt-render",
+ "sighurt-render-vulkan",
+ "sighurt-ui",
+ "tiny-skia 0.11.4",
 ]
 
 [[package]]

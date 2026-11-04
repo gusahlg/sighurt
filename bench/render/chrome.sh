@@ -9,12 +9,13 @@
 #          (the chrome's tab strip and its page surface repaint; the page surface is shown and
 #          hidden): CPU time, wakeups, chrome paints;
 # and the chrome's render time per surface over the whole run, from SIG_DIAG's `chrome` lines
-# (render_ms: the renderer's render call, presenting included for wgpu; scene_ms: the chrome
+# (render_ms: the renderer's render call, presenting included for wgpu and vulkan; scene_ms: the chrome
 # drawing the scene). Prints a table; logs and diagnostics in OUT.
 #
 #   tools/heavy tools/headless-sway --renderer gles2 -- bench/render/chrome.sh SIG OUT [REPS]
 #
-# SIG is a `sig` built with `--features engine-demo,render-wgpu` (state whether release).
+# SIG is a `sig` built with `--features engine-demo,render-wgpu,render-vulkan` (state whether
+# release).
 set -u
 sig=$(realpath "${1:?usage: chrome.sh SIG OUT [REPS]}")
 out=$(realpath -m "${2:?usage: chrome.sh SIG OUT [REPS]}")
@@ -40,7 +41,7 @@ diag() { # diag PID FILE EXPR
 }
 
 for rep in $(seq "$reps"); do
-  for renderer in cpu wgpu; do
+  for renderer in cpu wgpu vulkan; do
     run=$out/$renderer-$rep
     rm -rf "$run" && mkdir -p "$run/config/sighurt" "$run/state" "$run/downloads"
     cat > "$run/config/sighurt/config.toml" <<CONF
