@@ -38,8 +38,8 @@
 //! ([`ChromeTargets`](crate::chrome::ChromeTargets)), created when it first lists them and
 //! presenting as the renderer does. The renderer is the one `[ui] renderer` names when `sig`
 //! starts ([`crate::render`]); the fonts are loaded once and shared by the chrome (which shapes)
-//! and the renderer (which rasterizes). A surface the placement hides is unbound from the
-//! renderer, which forgets its last frame: the host detaches a hidden surface's buffer.
+//! and the renderer (which rasterizes). A surface the placement hides is unbound from a pixel
+//! renderer, which forgets its last frame: the host detaches a hidden SHM surface's buffer.
 //!
 //! Shutdown (plan §20): stop taking input, cancel downloads, write the session (at once, whole),
 //! close every view and shut every runtime down (each releases its target leases), wait a moment
@@ -70,7 +70,7 @@ use sighurt_api::input::{InputEvent, InputKind, KeyboardFocus, PointerButton, Po
 use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_core::tabs::{Content, TabSummary};
 use sighurt_core::{BrowserEvent, BrowserState, OpenRequest};
-use sighurt_render::{Backend, Output, Pen, PixelBuffer, Presents, Rendered, SurfaceKey};
+use sighurt_render::{Backend, Output, Pen, PixelBuffer, Presents, RenderOutcome, SurfaceKey};
 use sighurt_runtime::diagnostics::{Diagnostics, RendererReport, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
@@ -517,8 +517,10 @@ impl Gui {
                     }
                 },
             };
-            if !visible || rect.size().is_empty() {
-                // The host detaches a hidden surface's buffer: its next frame is drawn anew.
+            let pixels = self.backend.presents() == Presents::Pixels;
+            if pixels && (!visible || rect.size().is_empty()) {
+                // The host detaches a hidden SHM surface's buffer: its next frame is drawn
+                // anew. A native binding stays across a hide (RENDER.md §15).
                 self.backend.unbind(surface_key(target));
             }
             self.placement_buf.targets.push(TargetPlacement {
@@ -1074,16 +1076,16 @@ impl App {
             .render(key, &metrics, &scene, Output::Pixels(buffer));
         let diag = self.session.diagnostics_mut();
         match rendered {
-            Ok(Rendered::Submitted) => {
+            Ok(RenderOutcome::Submitted) => {
                 frame.submit();
                 diag.chrome(surface, drawn, rendering.elapsed());
             }
-            Ok(Rendered::Unchanged) => {
+            Ok(RenderOutcome::Unchanged) => {
                 frame.unchanged();
                 diag.chrome_unchanged(drawn);
             }
             // The buffer goes back unsubmitted. A pixel renderer has nothing to wait for.
-            Ok(Rendered::Deferred) => diag.error(format!(
+            Ok(RenderOutcome::Deferred) => diag.error(format!(
                 "the renderer put off the chrome's {surface}, which it never should"
             )),
             Err(error) => diag.error(format!("rendering the chrome's {surface} failed: {error}")),

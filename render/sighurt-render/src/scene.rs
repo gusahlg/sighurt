@@ -9,9 +9,10 @@
 //! A backend maps it onto its target with a [`Mapping`], made from the target's `Metrics`:
 //! the surface's window-logical origin, the buffer pixels per logical pixel from the actual
 //! buffer size (scale is a rational; the rounded buffer decides), and the nominal scale for
-//! text, radii and strokes. Every backend snaps with the same functions here, so a control has
-//! the same pixels under each, and the hit test, which uses the logical rectangles, stays on
-//! what is drawn:
+//! text, radii and the one-pixel border. Paths, their strokes' widths included, map with the
+//! actual ratio ([`Mapping::path_transform`], rasterized by `crate::shape`). Every backend
+//! snaps with the same functions here, so a control has the same pixels under each, and the hit
+//! test, which uses the logical rectangles, stays on what is drawn:
 //!
 //! - [`Mapping::snap`]: each edge to the first pixel whose centre is at or after it, so a
 //!   rectangle covers exactly the pixels whose centres lie inside it;
@@ -27,6 +28,7 @@ use cosmic_text::{fontdb, CacheKey, CacheKeyFlags};
 use sighurt_api::geometry::Metrics;
 
 use crate::color::Rgba;
+use crate::text::FontSystemId;
 
 /// The drawing of one surface for one frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -39,6 +41,20 @@ pub struct Scene {
     pub(crate) runs: Vec<GlyphRun>,
     /// Paths, referenced by [`Kind::Path`].
     pub(crate) paths: Vec<Path>,
+    /// The font system its text was shaped with.
+    pub(crate) fonts: Provenance,
+}
+
+/// Which font system a scene's glyphs belong to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Provenance {
+    /// It has no text.
+    #[default]
+    None,
+    /// All of its text was shaped with this system.
+    One(FontSystemId),
+    /// Its text came from more than one system: no backend can render it.
+    Mixed,
 }
 
 impl Default for Scene {
@@ -49,6 +65,7 @@ impl Default for Scene {
             items: Vec::new(),
             runs: Vec::new(),
             paths: Vec::new(),
+            fonts: Provenance::None,
         }
     }
 }
@@ -62,6 +79,17 @@ impl Scene {
     /// The path `id` names.
     pub fn path(&self, id: PathId) -> &Path {
         &self.paths[id.0]
+    }
+
+    /// Whether its glyphs can be rasterized from the font system `fonts`: it has no text, or
+    /// all of it was shaped there. A glyph's font is an id in one system's database, so a
+    /// backend refuses a scene shaped with another.
+    pub fn shaped_with(&self, fonts: FontSystemId) -> bool {
+        match self.fonts {
+            Provenance::None => true,
+            Provenance::One(id) => id == fonts,
+            Provenance::Mixed => false,
+        }
     }
 }
 
@@ -137,6 +165,22 @@ pub struct Rect {
     pub width: f32,
     /// Height.
     pub height: f32,
+}
+
+impl Rect {
+    /// The part of `self` inside `other`: empty (zero width or height) where they don't meet.
+    pub fn intersect(self, other: Rect) -> Rect {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        Rect {
+            x: left,
+            y: top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        }
+    }
 }
 
 impl From<[f32; 4]> for Rect {
@@ -333,7 +377,7 @@ pub struct Mapping {
     origin: (f32, f32),
     /// Buffer pixels per logical pixel, from the actual buffer size.
     ratio: (f32, f32),
-    /// The nominal scale, for text, radii and stroke sizes.
+    /// The nominal scale, for text, radii and borders (paths use `ratio`).
     scale: f32,
 }
 
@@ -517,6 +561,61 @@ mod tests {
         let map = mapping(RECT, 240);
         let thin = map.bordered([10.0, 40.0, 1.0, 20.0].into(), 2.0).unwrap();
         assert_eq!(thin.inner, None);
+    }
+
+    /// `glyph_physical` places every glyph and keys its image as cosmic-text's own
+    /// `LayoutGlyph::physical` does, for the run's origin in buffer pixels: combining marks
+    /// (shaping offsets), negative bearings, fallback fonts and emoji, at fractional scales and
+    /// odd buffer sizes. Uses the system's fonts; what they can't show is shaped by fallback
+    /// or `.notdef` and compared all the same.
+    #[test]
+    fn glyphs_are_placed_as_cosmic_text_places_them() {
+        let mut fonts = crate::Fonts::system();
+        let texts = [
+            "e\u{301}a\u{308}o\u{328}\u{302}",
+            "fjord ƒ yj",
+            "Blåbär 中文 Ωμέγα",
+            "smile 😀 ok",
+        ];
+        let rect = WindowRect {
+            x: 7,
+            y: 3,
+            width: 333,
+            height: 41,
+        };
+        let mut glyphs = 0;
+        for scale in [120, 150, 180, 240, 140] {
+            let map = mapping(rect, scale);
+            for text in texts {
+                let shaped = fonts.line(text, crate::TextStyle::SM);
+                let mut pen = crate::Pen::new(rect);
+                let origin = (19.3, 8.0);
+                pen.text(
+                    &shaped,
+                    origin,
+                    Rgba::rgb(0xffffff),
+                    [0.0, 0.0, 400.0, 60.0],
+                );
+                let scene = pen.finish();
+                for (layout, item) in shaped.runs().zip(&scene.items) {
+                    let Kind::Text { run, .. } = item.kind else {
+                        panic!("{item:?}")
+                    };
+                    let run = scene.run(run);
+                    let left = (origin.0 - map.origin.0) * map.ratio.0;
+                    let top = (origin.1 - map.origin.1) * map.ratio.1;
+                    let baseline = (top + layout.line_y * map.scale).round() as i32;
+                    for (ours, theirs) in run.glyphs.iter().zip(layout.glyphs) {
+                        let expected = theirs.physical((left, 0.0), map.scale);
+                        let (x, y, key) = glyph_physical(&map, run, ours);
+                        assert_eq!(key, expected.cache_key, "{text:?} at {scale}");
+                        assert_eq!((x, y), (expected.x, baseline + expected.y), "{text:?}");
+                        glyphs += 1;
+                    }
+                }
+            }
+        }
+        assert!(glyphs > 100, "{glyphs}");
     }
 
     #[test]

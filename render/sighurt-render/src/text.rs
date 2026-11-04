@@ -23,8 +23,55 @@ use cosmic_text::{fontdb, Attrs, Buffer, Family, FontSystem, LayoutGlyph, Shapin
 use unicode_segmentation::GraphemeCursor;
 
 /// The font system a frontend loads once and shares between its chrome ([`Fonts::new`]) and its
-/// backend (which rasterizes from it). Not `Send`: it stays on the owner thread.
-pub type FontSystemHandle = Rc<RefCell<FontSystem>>;
+/// backend (which rasterizes from it). Cheap to clone; every clone is the same system, with the
+/// same [`FontSystemId`]. Not `Send`: it stays on the owner thread.
+///
+/// The system itself is borrowed only inside this crate and only for one call (shaping a line,
+/// rasterizing a glyph), so no borrow is held across a chrome's `draw` or a backend's `render`.
+#[derive(Clone)]
+pub struct FontSystemHandle {
+    id: FontSystemId,
+    system: Rc<RefCell<FontSystem>>,
+}
+
+/// Which font system text was shaped with. A glyph's font ([`crate::scene::FontRef`]) is an id
+/// in one system's database, meaningless in another's, so a scene records the system its text
+/// came from and a backend renders it only with that system
+/// ([`crate::Scene::shaped_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FontSystemId(u64);
+
+impl FontSystemHandle {
+    /// The system's fonts, found through fontconfig's configuration. This reads every installed
+    /// font's metadata, so do it once.
+    pub fn system() -> Self {
+        Self::new(FontSystem::new())
+    }
+
+    fn new(system: FontSystem) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: FontSystemId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            system: Rc::new(RefCell::new(system)),
+        }
+    }
+
+    /// Which system this is.
+    pub fn id(&self) -> FontSystemId {
+        self.id
+    }
+
+    /// Borrows the system for `f`, and only for it.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut FontSystem) -> R) -> R {
+        f(&mut self.system.borrow_mut())
+    }
+}
+
+impl std::fmt::Debug for FontSystemHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("FontSystemHandle").field(&self.id).finish()
+    }
+}
 
 /// Shaped lines kept before the cache starts over.
 const MAX_SHAPED: usize = 256;
@@ -81,12 +128,14 @@ impl TextStyle {
     }
 
     /// The same style with another weight.
+    #[must_use]
     pub const fn weight(self, weight: u16) -> Self {
         Self { weight, ..self }
     }
 
     /// The style at `[ui] font-size` `font_size`: its size and line height (given at
     /// [`DEFAULT_FONT_SIZE`]) times `font_size / 14`, rounded to whole pixels.
+    #[must_use]
     pub fn at(self, font_size: u16) -> Self {
         let scale = |px: u16| at_size(px.into(), font_size).try_into().unwrap_or(u16::MAX);
         Self {
@@ -123,7 +172,7 @@ impl Fonts {
     pub fn new(system: FontSystemHandle) -> Self {
         let family = PREFERRED_FAMILIES
             .into_iter()
-            .find(|family| has_family(system.borrow().db(), family))
+            .find(|family| system.with(|system| has_family(system.db(), family)))
             .map(str::to_owned);
         Self::with_family(system, family)
     }
@@ -134,7 +183,7 @@ impl Fonts {
     /// This reads every installed font's metadata, so do it once: it took 3 ms with the fonts
     /// of the machine it was written on, and grows with the number of fonts installed.
     pub fn system() -> Self {
-        Self::new(Rc::new(RefCell::new(FontSystem::new())))
+        Self::new(FontSystemHandle::system())
     }
 
     /// Only the given font files, with the first font's family as the chrome's font and a fixed
@@ -150,13 +199,12 @@ impl Fonts {
             .and_then(|face| face.families.first())
             .map(|(name, _)| name.clone());
         let system = FontSystem::new_with_locale_and_db("en-US".into(), db);
-        Self::with_family(Rc::new(RefCell::new(system)), family)
+        Self::with_family(FontSystemHandle::new(system), family)
     }
 
     fn with_family(system: FontSystemHandle, family: Option<String>) -> Self {
         if let Some(family) = &family {
-            let mut fonts = system.borrow_mut();
-            fonts.db_mut().set_sans_serif_family(family.clone());
+            system.with(|fonts| fonts.db_mut().set_sans_serif_family(family.clone()));
         }
         Self {
             system,
@@ -170,7 +218,7 @@ impl Fonts {
     /// The font system, shared: for a backend to rasterize this text's glyphs, or another
     /// `Fonts` over the same fonts.
     pub fn handle(&self) -> FontSystemHandle {
-        Rc::clone(&self.system)
+        self.system.clone()
     }
 
     /// The chrome's font family, if one of the preferred ones (or the given fonts, or
@@ -184,7 +232,10 @@ impl Fonts {
     /// since one configuration serves several machines: the text stays in the family it was
     /// made with, and the log says so. A new family drops the shaped text.
     pub fn set_family(&mut self, family: Option<&str>) {
-        let installed = family.and_then(|name| installed_family(self.system.borrow().db(), name));
+        let installed = family.and_then(|name| {
+            self.system
+                .with(|system| installed_family(system.db(), name))
+        });
         if let (Some(wanted), None) = (family, &installed) {
             let used = self.default.as_deref().unwrap_or("the default sans-serif");
             log::warn!("the font {wanted:?} is not installed; the chrome's text is in {used}");
@@ -244,24 +295,24 @@ impl Fonts {
             return shaped.clone();
         }
         let metrics = cosmic_text::Metrics::new(style.size.into(), style.line_height.into());
-        let mut guard = self.system.borrow_mut();
-        let system = &mut *guard;
-        let mut buffer = Buffer::new(system, metrics);
-        let lines = match wrap {
-            Some(_) => Wrap::WordOrGlyph,
-            None => Wrap::None,
-        };
-        buffer.set_wrap(system, lines);
-        buffer.set_size(system, wrap, None);
-        let family = match &self.family {
-            Some(name) => Family::Name(name),
-            None => Family::SansSerif,
-        };
-        let attrs = Attrs::new().family(family).weight(Weight(style.weight));
-        // Shapes and lays out every line, since the height is unbounded.
-        buffer.set_text(system, text, &attrs, Shaping::Advanced);
-        drop(guard);
-        let shaped = Rc::new(ShapedText::new(buffer, style));
+        let buffer = self.system.with(|system| {
+            let mut buffer = Buffer::new(system, metrics);
+            let lines = match wrap {
+                Some(_) => Wrap::WordOrGlyph,
+                None => Wrap::None,
+            };
+            buffer.set_wrap(system, lines);
+            buffer.set_size(system, wrap, None);
+            let family = match &self.family {
+                Some(name) => Family::Name(name),
+                None => Family::SansSerif,
+            };
+            let attrs = Attrs::new().family(family).weight(Weight(style.weight));
+            // Shapes and lays out every line, since the height is unbounded.
+            buffer.set_text(system, text, &attrs, Shaping::Advanced);
+            buffer
+        });
+        let shaped = Rc::new(ShapedText::new(buffer, style, self.system.id()));
 
         // Text too big for the budget isn't kept at all.
         if text.len() <= MAX_SHAPED_BYTES {
@@ -308,6 +359,8 @@ fn installed_family(db: &fontdb::Database, family: &str) -> Option<String> {
 /// Text laid out in logical pixels, with its top-left corner at the origin.
 pub struct ShapedText {
     buffer: Buffer,
+    /// The font system it was shaped with.
+    fonts: FontSystemId,
     /// The widest line's width.
     pub width: f32,
     /// The height of all lines.
@@ -315,7 +368,7 @@ pub struct ShapedText {
 }
 
 impl ShapedText {
-    fn new(buffer: Buffer, style: TextStyle) -> Self {
+    fn new(buffer: Buffer, style: TextStyle, fonts: FontSystemId) -> Self {
         let (mut width, mut lines) = (0.0f32, 0);
         for run in buffer.layout_runs() {
             width = width.max(run.line_w);
@@ -323,9 +376,15 @@ impl ShapedText {
         }
         Self {
             buffer,
+            fonts,
             width,
             height: f32::from(style.line_height) * lines.max(1) as f32,
         }
+    }
+
+    /// The font system it was shaped with.
+    pub fn font_system(&self) -> FontSystemId {
+        self.fonts
     }
 
     /// The laid-out lines.

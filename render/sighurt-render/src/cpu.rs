@@ -4,7 +4,7 @@
 //!
 //! Every frame paints the whole buffer, which may hold an older frame. A render whose scene and
 //! metrics are those of the surface's last frame paints nothing and says
-//! [`Rendered::Unchanged`]: the surface still shows that frame, so the frontend commits
+//! [`RenderOutcome::Unchanged`]: the surface still shows that frame, so the frontend commits
 //! nothing. [`Backend::unbind`] forgets the last frame, for a surface the host hid (its buffer
 //! is detached then) or retired. Glyph images are cached across frames and surfaces up to a
 //! budget, and the cache starts over when the scale changes.
@@ -23,26 +23,22 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use sighurt_api::geometry::{Metrics, Scale};
-use tiny_skia::{
-    FillRule, LineCap, Mask, Paint, PathBuilder, Pixmap, PixmapMut, Rect, Stroke, Transform,
-};
+use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pixmap, PixmapMut, Rect, Transform};
 
 use crate::backend::{
-    Backend, BackendStats, NativeWindow, Output, PixelBuffer, Presents, RenderError, Rendered,
+    Backend, BackendStats, NativeWindow, Output, PixelBuffer, Presents, RenderError, RenderOutcome,
     SurfaceKey,
 };
 use crate::color::Rgba;
-use crate::glyph::{rasterize, SwashCache, SwashContent};
-use crate::scene::{glyph_physical, Kind, Mapping, PathCommand, PixelRect, Scene};
+use crate::glyph::{GlyphCache, SwashContent};
+use crate::scene::{glyph_physical, Kind, Mapping, PixelRect, Scene};
+use crate::shape;
 use crate::text::FontSystemHandle;
-
-/// Rasterized glyphs kept before the cache starts over. Chrome text uses a few hundred.
-const MAX_GLYPHS: usize = 2048;
 
 /// The CPU backend. One serves every surface of a window.
 pub struct CpuBackend {
     fonts: FontSystemHandle,
-    glyphs: Option<SwashCache>,
+    glyphs: GlyphCache,
     /// The scale the cached glyphs were rasterized at.
     scale: Option<Scale>,
     /// Where to draw when the target's rows aren't packed.
@@ -57,7 +53,7 @@ impl CpuBackend {
     pub fn new(fonts: FontSystemHandle) -> Self {
         Self {
             fonts,
-            glyphs: None,
+            glyphs: GlyphCache::new(),
             scale: None,
             scratch: None,
             last: BTreeMap::new(),
@@ -65,21 +61,14 @@ impl CpuBackend {
         }
     }
 
-    /// The glyph cache for `scale`: kept from earlier frames at the same scale, within its
-    /// budget.
-    fn glyph_cache(&mut self, scale: Scale) -> &mut SwashCache {
+    /// The glyph cache for `scale`: kept from earlier frames at the same scale, and bounded
+    /// by its own admission rule ([`GlyphCache`]).
+    fn glyph_cache(&mut self, scale: Scale) -> &mut GlyphCache {
         if self.scale != Some(scale) {
             self.scale = Some(scale);
-            if self.glyphs.take().is_some() {
-                self.stats.glyph_resets += 1;
-            }
+            self.glyphs.clear();
         }
-        let glyphs = self.glyphs.get_or_insert_with(SwashCache::new);
-        if glyphs.image_cache.len() > MAX_GLYPHS {
-            glyphs.image_cache.clear();
-            self.stats.glyph_resets += 1;
-        }
-        glyphs
+        &mut self.glyphs
     }
 }
 
@@ -113,7 +102,7 @@ impl Backend for CpuBackend {
         metrics: &Metrics,
         scene: &Scene,
         output: Output<'_>,
-    ) -> Result<Rendered, RenderError> {
+    ) -> Result<RenderOutcome, RenderError> {
         let Output::Pixels(buffer) = output else {
             return Err(RenderError::Output(
                 "the CPU backend renders into pixel memory".into(),
@@ -134,7 +123,7 @@ impl Backend for CpuBackend {
             )));
         }
         if metrics.is_empty() || width == 0 || height == 0 {
-            return Ok(Rendered::Submitted);
+            return Ok(RenderOutcome::Submitted);
         }
         let row = width as usize * 4;
         let needed = stride
@@ -145,10 +134,15 @@ impl Backend for CpuBackend {
                 "buffer stride or length too small for its size".into(),
             ));
         }
+        if !scene.shaped_with(self.fonts.id()) {
+            return Err(RenderError::Output(
+                "the scene's text was shaped with another font system".into(),
+            ));
+        }
         let unchanged = self.last.get(&surface);
         if unchanged.is_some_and(|(last, drawn)| last == metrics && drawn == scene) {
             self.stats.unchanged += 1;
-            return Ok(Rendered::Unchanged);
+            return Ok(RenderOutcome::Unchanged);
         }
 
         let mapping = Mapping::new(metrics);
@@ -177,13 +171,15 @@ impl Backend for CpuBackend {
         let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.stats.frames += 1;
         self.stats.max_render_us = self.stats.max_render_us.max(took);
-        Ok(Rendered::Submitted)
+        self.stats.last_render_us = took;
+        Ok(RenderOutcome::Submitted)
     }
 
     fn stats(&self) -> BackendStats {
-        let glyphs = self.glyphs.as_ref().map_or(0, |g| g.image_cache.len());
         BackendStats {
-            glyphs: glyphs as u64,
+            glyphs: self.glyphs.len() as u64,
+            glyph_bytes: self.glyphs.bytes() as u64,
+            glyph_resets: self.glyphs.resets(),
             ..self.stats
         }
     }
@@ -195,14 +191,11 @@ fn draw(
     mapping: &Mapping,
     scene: &Scene,
     fonts: &FontSystemHandle,
-    glyphs: &mut SwashCache,
+    glyphs: &mut GlyphCache,
 ) {
     let Rgba { r, g, b, a } = scene.clear;
     pixmap.fill(tiny_skia::Color::from_rgba8(r, g, b, a));
-    let transform = {
-        let [sx, ky, kx, sy, tx, ty] = mapping.path_transform();
-        Transform::from_row(sx, ky, kx, sy, tx, ty)
-    };
+    let transform = shape::transform(mapping);
     for item in &scene.items {
         if let Kind::Text { run, color } = item.kind {
             let clip = match item.clip {
@@ -263,34 +256,8 @@ fn draw(
                 color,
                 stroke,
             } => {
-                let mut builder = PathBuilder::new();
-                for command in &scene.path(path).commands {
-                    match *command {
-                        PathCommand::MoveTo(x, y) => builder.move_to(x, y),
-                        PathCommand::LineTo(x, y) => builder.line_to(x, y),
-                        PathCommand::QuadTo(x1, y1, x, y) => builder.quad_to(x1, y1, x, y),
-                        PathCommand::CubicTo(x1, y1, x2, y2, x, y) => {
-                            builder.cubic_to(x1, y1, x2, y2, x, y)
-                        }
-                        PathCommand::Close => builder.close(),
-                    }
-                }
-                let Some(path) = builder.finish() else {
-                    continue;
-                };
-                match stroke {
-                    Some(width) => {
-                        let stroke = Stroke {
-                            width,
-                            line_cap: LineCap::Round,
-                            ..Stroke::default()
-                        };
-                        pixmap.stroke_path(&path, &paint(color), &stroke, transform, mask);
-                    }
-                    None => {
-                        let winding = FillRule::Winding;
-                        pixmap.fill_path(&path, &paint(color), winding, transform, mask);
-                    }
+                if let Some(path) = shape::skia_path(scene.path(path)) {
+                    shape::paint_path(&mut pixmap, &path, color, stroke, transform, mask);
                 }
             }
             Kind::Text { .. } => {}
@@ -308,7 +275,7 @@ fn text(
     color: Rgba,
     clip: PixelRect,
     fonts: &FontSystemHandle,
-    glyphs: &mut SwashCache,
+    glyphs: &mut GlyphCache,
 ) {
     let (width, height) = (pixmap.width() as i32, pixmap.height() as i32);
     let clip = (
@@ -321,7 +288,7 @@ fn text(
     let data = pixmap.data_mut();
     for glyph in &run.glyphs {
         let (x, y, key) = glyph_physical(mapping, run, glyph);
-        let Some(image) = rasterize(fonts, glyphs, key) else {
+        let Some(image) = glyphs.image(fonts, key) else {
             continue;
         };
         let (w, h) = (image.placement.width as i32, image.placement.height as i32);

@@ -12,8 +12,10 @@
 //!
 //! The modules: [`color`] has [`Rgba`]; [`scene`] the scene, its items, and the snapping every
 //! backend shares; [`pen`] the scene builder a chrome draws with; [`text`] fonts, shaping and
-//! shaped text; [`glyph`] rasterizing one glyph; [`backend`] the [`Backend`] trait and what
-//! crosses it; [`cpu`] the CPU backend, in every build.
+//! shaped text; [`glyph`] rasterizing one glyph and a bounded glyph cache; [`shape`] how paths
+//! are rasterized, for every backend; [`backend`] the [`Backend`] trait and what crosses it;
+//! [`cpu`] the CPU backend, in every build; `gpu` (feature `gpu`) what every GPU backend
+//! prepares the same way: meshes, the atlas, the shaders.
 //!
 //! This is the only crate that names tiny-skia or cosmic-text: a chrome names neither. It knows
 //! nothing of Wayland (a native backend gets raw-window-handle handles) or of browser state.
@@ -30,14 +32,15 @@ pub mod cpu;
 pub mod glyph;
 pub mod pen;
 pub mod scene;
+pub mod shape;
 pub mod text;
 
 pub use backend::{
-    Backend, BackendStats, NativeWindow, Output, PixelBuffer, Presents, RenderError, Rendered,
-    SurfaceKey,
+    AtlasStats, Backend, BackendStats, NativeWindow, Output, PixelBuffer, Presents, RenderError,
+    RenderOutcome, SurfaceKey,
 };
 pub use color::Rgba;
 pub use cpu::CpuBackend;
 pub use pen::Pen;
 pub use scene::{PathBuilder, Scene};
-pub use text::{FontSystemHandle, Fonts, ShapedText, TextStyle};
+pub use text::{FontSystemHandle, FontSystemId, Fonts, ShapedText, TextStyle};

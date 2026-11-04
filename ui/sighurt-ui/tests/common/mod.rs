@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use sighurt_api::geometry::{LogicalSize, Metrics, Scale, WindowRect};
 use sighurt_api::ids::{LayoutEpoch, TabId};
 use sighurt_render::{
-    Backend, CpuBackend, Output, PixelBuffer, RenderError, Rendered, Scene, SurfaceKey,
+    Backend, CpuBackend, Output, PixelBuffer, RenderError, RenderOutcome, Scene, SurfaceKey,
 };
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::extension::SurfaceName;
@@ -201,7 +201,7 @@ pub fn render_into(
     metrics: &Metrics,
     data: &mut [u8],
     (width, height, stride): (u32, u32, usize),
-) -> Result<Rendered, RenderError> {
+) -> Result<RenderOutcome, RenderError> {
     let buffer = PixelBuffer {
         data,
         width,
@@ -217,7 +217,7 @@ pub fn render(scene: &Scene, metrics: &Metrics) -> Image {
     let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
     let layout = (size.width, size.height, size.width as usize * 4);
     let rendered = render_into(&mut backend(), scene, metrics, &mut data, layout);
-    assert_eq!(rendered, Ok(Rendered::Submitted));
+    assert_eq!(rendered, Ok(RenderOutcome::Submitted));
     Image {
         width: size.width,
         height: size.height,

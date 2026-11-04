@@ -16,7 +16,7 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerButton,
     PointerEvent, Preedit, TextInputEvent,
 };
-use sighurt_render::{Backend, RenderError, Rendered};
+use sighurt_render::{Backend, RenderError, RenderOutcome};
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::layout::{Status, Tabs};
 use sighurt_ui::{Colors, LayoutOptions, Model, TabContent};
@@ -357,21 +357,21 @@ fn paints_cover_the_whole_buffer() {
     let layout = (size.width, size.height, size.width as usize * 4);
     let mut backend = backend();
     let rendered = render_into(&mut backend, &scene, &metrics, &mut data, layout);
-    assert_eq!(rendered, Ok(Rendered::Submitted));
+    assert_eq!(rendered, Ok(RenderOutcome::Submitted));
     assert!(argb_to_rgba(&data) == fresh.rgba, "garbage showed through");
     // The same scene for the same metrics again is the frame the surface shows: nothing is
     // rendered, and the buffer lent is untouched.
     let mut other = vec![0x5a; data.len()];
     let rendered = render_into(&mut backend, &scene, &metrics, &mut other, layout);
-    assert_eq!(rendered, Ok(Rendered::Unchanged));
+    assert_eq!(rendered, Ok(RenderOutcome::Unchanged));
     assert!(other.iter().all(|&b| b == 0x5a));
     // New metrics (another layout epoch), or a surface the backend forgot, render again.
     let moved = self::metrics(rect, 150);
     let rendered = render_into(&mut backend, &scene, &moved, &mut other, layout);
-    assert_eq!(rendered, Ok(Rendered::Submitted));
+    assert_eq!(rendered, Ok(RenderOutcome::Submitted));
     backend.unbind(sighurt_render::SurfaceKey(1));
     let rendered = render_into(&mut backend, &scene, &moved, &mut other, layout);
-    assert_eq!(rendered, Ok(Rendered::Submitted));
+    assert_eq!(rendered, Ok(RenderOutcome::Submitted));
     assert!(argb_to_rgba(&other) == fresh.rgba);
 }
 
@@ -391,7 +391,7 @@ fn padded_strides() {
         let scene = scene(&mut chrome, CHROME, &metrics);
         let layout = (size.width, size.height, stride);
         let rendered = render_into(&mut backend(), &scene, &metrics, &mut data, layout);
-        assert_eq!(rendered, Ok(Rendered::Submitted));
+        assert_eq!(rendered, Ok(RenderOutcome::Submitted));
         for (y, line) in data.chunks(stride).enumerate() {
             let expected = &packed.rgba[y * row..(y + 1) * row];
             assert!(
@@ -412,7 +412,7 @@ fn bad_buffers_are_refused() {
     let scene = scene(&mut chrome, CHROME, &metrics);
     let mut backend = backend();
     let (width, height, row) = (size.width, size.height, size.width as usize * 4);
-    let refused = |result: Result<Rendered, RenderError>| {
+    let refused = |result: Result<RenderOutcome, RenderError>| {
         assert!(matches!(result, Err(RenderError::Output(_))), "{result:?}");
     };
     let mut render =
@@ -424,7 +424,7 @@ fn bad_buffers_are_refused() {
     // An empty target renders nothing, successfully.
     let empty = self::metrics(WindowRect::default(), 150);
     let rendered = render_into(&mut backend, &scene, &empty, &mut [], (0, 0, 0));
-    assert_eq!(rendered, Ok(Rendered::Submitted));
+    assert_eq!(rendered, Ok(RenderOutcome::Submitted));
 }
 
 /// Odd window sizes paint at every scale without trouble, and the chrome is opaque.
@@ -538,7 +538,7 @@ fn measure_with_system_fonts() {
             let start = Instant::now();
             let scene = scene(chrome, CHROME, &metrics);
             let layout = (size.width, size.height, size.width as usize * 4);
-            render_into(&mut backend, &scene, &metrics, data, layout).unwrap();
+            let _ = render_into(&mut backend, &scene, &metrics, data, layout).unwrap();
             start.elapsed()
         };
         let cold = time(&mut chrome, &mut data);
@@ -566,7 +566,7 @@ fn measure_with_system_fonts() {
     let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
     let layout = (size.width, size.height, size.width as usize * 4);
     let mut backend = sighurt_render::CpuBackend::new(handle);
-    render_into(&mut backend, &scene, &metrics, &mut data, layout).unwrap();
+    let _ = render_into(&mut backend, &scene, &metrics, &mut data, layout).unwrap();
     let image = Image {
         width: size.width,
         height: size.height,

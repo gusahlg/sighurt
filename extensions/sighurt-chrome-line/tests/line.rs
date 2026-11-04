@@ -19,7 +19,7 @@ use sighurt_api::input::{
 };
 use sighurt_api::settings::{Table, Value};
 use sighurt_chrome_line::{Line, KIND, LINE, PAGE};
-use sighurt_render::{Backend, CpuBackend, Output, PixelBuffer, Rendered, SurfaceKey};
+use sighurt_render::{Backend, CpuBackend, Output, PixelBuffer, RenderOutcome, SurfaceKey};
 use sighurt_ui::extension::{Chrome, ChromeAction, ChromeEvent, SurfaceName, Theme};
 use sighurt_ui::{
     Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, Pen, Snapshot, TabContent, TabSnapshot,
@@ -223,7 +223,7 @@ fn paint(chrome: &mut dyn Chrome, surface: SurfaceName, scale: u32) -> Image {
         &pen.finish(),
         Output::Pixels(buffer),
     );
-    assert_eq!(rendered, Ok(Rendered::Submitted));
+    assert_eq!(rendered, Ok(RenderOutcome::Submitted));
     // ARGB8888 little-endian (B, G, R, A) to R, G, B, A.
     let rgba = data
         .as_chunks::<4>()

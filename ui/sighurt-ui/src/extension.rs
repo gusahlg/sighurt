@@ -21,7 +21,8 @@
 //!   colour first), in window-logical coordinates; it names no pixel format, buffer or
 //!   rasterizer. The fonts are shared: `sig` loads them once and hands the chrome a [`Fonts`]
 //!   ([`ChromeKind::new`]) and the backend the same font system. A scene equal to the surface's
-//!   last one is not rendered again.
+//!   last frame, at the same metrics and layout epoch, is not rendered again, provided that
+//!   frame was submitted and the surface still shows it (`RenderOutcome::Unchanged`).
 //! - **Memory is bounded by the host:** at most 3 buffers per surface at its latest size, plus
 //!   ones the compositor has yet to release; a hidden surface keeps its buffers. A surface as
 //!   big as the page holds about 30 MB a buffer at 1920 × 1000 and 200 %. A native backend's

@@ -14,7 +14,8 @@ use sighurt_api::geometry::WindowRect;
 
 use crate::color::Rgba;
 use crate::scene::{
-    FontRef, Glyph, GlyphFlags, GlyphRun, Item, Kind, PathBuilder, PathId, Rect, RunId, Scene,
+    FontRef, Glyph, GlyphFlags, GlyphRun, Item, Kind, PathBuilder, PathId, Provenance, Rect, RunId,
+    Scene,
 };
 use crate::text::ShapedText;
 
@@ -24,6 +25,8 @@ use crate::text::ShapedText;
 pub struct Pen {
     rect: WindowRect,
     scene: Scene,
+    /// What [`Pen::clip`] cuts everything to now.
+    clip: Option<Rect>,
 }
 
 impl Pen {
@@ -32,6 +35,7 @@ impl Pen {
         Self {
             rect,
             scene: Scene::default(),
+            clip: None,
         }
     }
 
@@ -41,6 +45,7 @@ impl Pen {
     }
 
     /// The scene drawn.
+    #[must_use]
     pub fn finish(self) -> Scene {
         self.scene
     }
@@ -85,6 +90,16 @@ impl Pen {
         self.push(kind, None);
     }
 
+    /// Draws what `draw` draws cut to `rect` (`[x, y, width, height]`, snapped like
+    /// [`Pen::fill`]), within any clip already in force: clips nest by intersecting.
+    pub fn clip(&mut self, rect: [f32; 4], draw: impl FnOnce(&mut Pen)) {
+        let outer = self.clip;
+        let rect = Rect::from(rect);
+        self.clip = Some(outer.map_or(rect, |outer| outer.intersect(rect)));
+        draw(self);
+        self.clip = outer;
+    }
+
     /// Strokes the lines `build` makes (in window-logical coordinates) `width` logical pixels
     /// wide, with round caps.
     pub fn stroke(&mut self, width: f32, color: Rgba, build: impl FnOnce(&mut PathBuilder)) {
@@ -112,6 +127,11 @@ impl Pen {
     /// whole buffer pixels, so text stays sharp vertically; horizontally, glyphs keep their
     /// subpixel positions.
     pub fn text(&mut self, text: &ShapedText, (x, y): (f32, f32), color: Rgba, clip: [f32; 4]) {
+        self.scene.fonts = match self.scene.fonts {
+            Provenance::None => Provenance::One(text.font_system()),
+            Provenance::One(id) if id == text.font_system() => Provenance::One(id),
+            _ => Provenance::Mixed,
+        };
         for line in text.runs() {
             if line.glyphs.is_empty() {
                 continue;
@@ -144,6 +164,10 @@ impl Pen {
     }
 
     fn push(&mut self, kind: Kind, clip: Option<Rect>) {
+        let clip = match (self.clip, clip) {
+            (Some(outer), Some(clip)) => Some(outer.intersect(clip)),
+            (outer, clip) => outer.or(clip),
+        };
         self.scene.items.push(Item { kind, clip });
     }
 }
@@ -163,6 +187,48 @@ mod tests {
         let scene = pen.finish();
         assert_eq!(scene.clear, Rgba::rgb(0x112233));
         assert_eq!(scene.items.len(), 1);
+    }
+
+    #[test]
+    fn clips_nest_by_intersecting_and_end_with_their_scope() {
+        let mut pen = Pen::new(WindowRect::default());
+        pen.clip([0.0, 0.0, 10.0, 10.0], |pen| {
+            pen.fill([1.0, 1.0, 2.0, 2.0], Rgba::rgb(0xff0000));
+            pen.clip([5.0, 5.0, 10.0, 10.0], |pen| {
+                pen.fill([1.0, 1.0, 2.0, 2.0], Rgba::rgb(0xff0000));
+            });
+        });
+        pen.fill([1.0, 1.0, 2.0, 2.0], Rgba::rgb(0xff0000));
+        let clips: Vec<_> = pen.finish().items.iter().map(|item| item.clip).collect();
+        assert_eq!(
+            clips,
+            [
+                Some([0.0, 0.0, 10.0, 10.0].into()),
+                Some([5.0, 5.0, 5.0, 5.0].into()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn a_scene_knows_its_font_system() {
+        let mut ours = fonts();
+        let theirs = fonts();
+        let mut pen = Pen::new(WindowRect::default());
+        assert!(
+            pen.scene.shaped_with(theirs.handle().id()),
+            "no text: any system"
+        );
+        let line = ours.line("Hej", TextStyle::SM);
+        pen.text(
+            &line,
+            (0.0, 0.0),
+            Rgba::rgb(0xffffff),
+            [0.0, 0.0, 50.0, 20.0],
+        );
+        let scene = pen.finish();
+        assert!(scene.shaped_with(ours.handle().id()));
+        assert!(!scene.shaped_with(theirs.handle().id()));
     }
 
     #[test]
