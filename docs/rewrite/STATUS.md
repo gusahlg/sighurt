@@ -57,12 +57,17 @@ compositor tests). The feature set and its API shapes are
 [features-2026-11-04.md](features-2026-11-04.md) (the deep-design agent's design with the
 orchestrator's amendments after [reviews-features-astra.md](reviews-features-astra.md)).
 
-**In flight, on branches, not merged:** `find` (worktree `../sighurt-wt-find`: lane B1, find in
-the core, both windowed chromes and the terminal's text mode, with the demo engine as the test
-path) and `hist` (worktree `../sighurt-wt-hist`: lane C, visited history, `history.toml`,
-`[history] remember`, acknowledged deletion, inline address completion). Each branch's last
-commit says what is done; a "WIP:" subject means the lane was stopped by the end of the day.
-Their worktrees build into /data/sig-builds/targets/gwasm and /data/sig-builds/targets/merge.
+**On branches, pushed, not merged:** `find` (worktree `../sighurt-wt-find`: lane B1, complete —
+find in the core, the runtime's one result path, both windowed chromes, the terminal's find
+field and text mode's own search, the demo engine as the test path; verified on the non-Servo
+set with headless.sh 152/152; the Servo and `--all-features` builds and ui/headless.sh not run)
+and `hist` (worktree `../sighurt-wt-hist`: lane C, stopped by the end of the day — core, runtime
+store and writer, and both windowed chromes done and tested; the GUI's answering of completion
+queries and the terminal's ghost text committed as "WIP:" without tests; README and
+extension-api.md not yet written). Resume notes with the exact shapes and merge hazards are in
+`~/.local/share/sighurt-handoff/2026-11-04/lane-B1-find-resume.md` and `lane-C-history-resume.md`
+(the lanes' reports). Their worktrees build into /data/sig-builds/targets/gwasm and
+/data/sig-builds/targets/merge.
 
 **To resume, in order:** (1) finish and merge `find`, then `hist` (both touch
 `crates/sighurt-core/src/state.rs` and `ui/sighurt-ui/src/chrome.rs`: expect small conflicts);
