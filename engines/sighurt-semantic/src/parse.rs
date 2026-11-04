@@ -9,7 +9,9 @@
 //! [`MAX_TOTAL_BYTES`] and a nesting depth without building a `serde_json::Value` tree. Input
 //! longer than [`max_input_bytes`] is refused before the scan. [`MAX_TOTAL_BYTES`] is the text
 //! budget, which is smaller than the JSON that carries it, so the raw-byte ceiling stays
-//! [`max_input_bytes`].
+//! [`max_input_bytes`]. A `\u` escape of a surrogate with no partner reads as U+FFFD, since a
+//! page's string may hold one (cut inside an emoji, or broken) and `JSON.stringify` writes it
+//! so; the snapshot is not refused for it.
 
 use std::fmt;
 
@@ -234,10 +236,15 @@ impl<'a> Cur<'a> {
         })
     }
 
+    /// One `\u` escape, after the `\u`. A surrogate pair is one character. A surrogate on its
+    /// own is U+FFFD, as JavaScript's `JSON.stringify` writes one: a page string cut inside
+    /// an emoji, or a page that holds a broken pair, is still a snapshot. The escape after a
+    /// lone high surrogate is read on its own.
     fn unicode_escape(&mut self) -> Result<char, ParseError> {
         let unit = self.hex4()?;
         if (0xD800..=0xDBFF).contains(&unit) {
             if self.rest().starts_with("\\u") {
+                let after_high = self.i;
                 self.i += 2;
                 let low = self.hex4()?;
                 if (0xDC00..=0xDFFF).contains(&low) {
@@ -245,11 +252,12 @@ impl<'a> Cur<'a> {
                         0x1_0000 + (((u32::from(unit) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
                     return char::from_u32(cp).ok_or_else(|| syntax("bad unicode escape"));
                 }
+                self.i = after_high;
             }
-            return Err(syntax("lone surrogate"));
+            return Ok(char::REPLACEMENT_CHARACTER);
         }
         if (0xDC00..=0xDFFF).contains(&unit) {
-            return Err(syntax("lone surrogate"));
+            return Ok(char::REPLACEMENT_CHARACTER);
         }
         char::from_u32(u32::from(unit)).ok_or_else(|| syntax("bad unicode escape"))
     }
