@@ -138,7 +138,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     text_input: true,
     accessibility: false,
     screenshots: false,
-    find_in_page: false,
+    find_in_page: false, // Servo 0.7 has no find API
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
