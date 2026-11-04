@@ -50,6 +50,10 @@ if [[ $flags != "$want" ]]; then
   echo "  update engines/sighurt-engine-ladybird/shim/CMakeLists.txt (and the ABI doc) first." >&2
   exit 1
 fi
+# A cache configured from another checkout (a worktree) refuses this source directory; start it over.
+if [[ -f $cache/shim/CMakeCache.txt ]] && ! grep -q "CMAKE_HOME_DIRECTORY:INTERNAL=$repo/engines/sighurt-engine-ladybird/shim$" "$cache/shim/CMakeCache.txt"; then
+  rm -rf "$cache/shim"
+fi
 cmake -S "$repo/engines/sighurt-engine-ladybird/shim" -B "$cache/shim" -G Ninja -DCMAKE_BUILD_TYPE=Release > /dev/null
 cmake --build "$cache/shim" -j"${SIG_JOBS:-2}"
 install -m 755 "$cache/shim/libsighurt-ladybird-shim.so" "$prefix/lib/"
