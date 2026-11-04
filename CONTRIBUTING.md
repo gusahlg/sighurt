@@ -56,6 +56,8 @@ The tests that need a compositor run in a private headless sway (`tools/headless
 | Script | What it runs |
 |---|---|
 | `apps/sighurt-browser/tests/headless.sh OUT` | `sig` with the demo engine: tabs, typing, coordinates, scaling, buffers, idle, the configuration, the example keymap, settings |
+| `apps/sighurt-browser/tests/soak.sh OUT [MINUTES]` | `sig` with the demo and Wasm engines for MINUTES (10): tab churn, history, zoom, sizes and scales, hiding, configuration reloads, the clipboard; RSS, descriptors, threads and counters sampled and held to bounds |
+| `apps/sighurt-browser/tests/faults.sh OUT [SCENARIO ...]` | `sig` under faults: unusable directories, a held or stale session lock, failing writes, broken and huge sessions, invalid configurations, the compositor killed, signals, a crashing page, floods of tabs and resizes |
 | `apps/sighurt-browser/tests/engines.sh OUT` | `sig` with Servo, WPE WebKit and Wasm on the GPU: pages, input, history, links between engines, settings, a configuration showcase |
 | `ui/sighurt-ui/tests/headless.sh OUT` | the chromes in `sig`: the line chrome, the status overlay, tabs on the left, fonts |
 | `frontends/sighurt-wayland/tests/headless.sh` | the Wayland host against sway |

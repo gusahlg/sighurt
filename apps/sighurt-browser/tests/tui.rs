@@ -1426,3 +1426,325 @@ addEventListener("load", function () {
         started.elapsed()
     );
 }
+
+// ── Faults: what a terminal or its user can throw at `sig` ────────────────────────────────
+
+impl Terminal {
+    /// Types `bytes` in chunks, reading what `sig` writes between them, so neither side of the
+    /// pty fills up while the other waits.
+    fn flood(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(4096) {
+            let mut rest = chunk;
+            while !rest.is_empty() {
+                match rustix::io::write(&self.master, rest) {
+                    Ok(n) => rest = &rest[n..],
+                    Err(Errno::AGAIN) | Err(Errno::INTR) => {
+                        self.wait(self.got.len(), Duration::from_millis(1), |_| false);
+                    }
+                    Err(error) => panic!("writing to the pty: {error}"),
+                }
+            }
+            self.wait(self.got.len(), Duration::ZERO, |_| false);
+        }
+    }
+
+    /// Whether `sig` is still running.
+    fn running(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+}
+
+/// A small xorshift generator: the tests' random bytes are the same on every run.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// About `size` bytes of what a terminal sends, at random: printable text, UTF-8, controls,
+/// CSI, SS3, SGR mouse reports, bracketed pastes, OSC and DCS strings, cut-off sequences and
+/// stray bytes. Never Ctrl+C in any encoding (0x03, `CSI 99;5u`, `CSI 27;5;99~`) and never `q`.
+fn random_input(seed: u64, size: usize) -> Vec<u8> {
+    let mut random = Random(seed);
+    let mut out = Vec::with_capacity(size + 64);
+    while out.len() < size {
+        match random.below(10) {
+            0..=2 => {
+                for _ in 0..random.below(12) {
+                    let byte = 0x20 + random.below(0x5f) as u8;
+                    out.push(if byte == b'q' { b'p' } else { byte });
+                }
+            }
+            3 => out.extend_from_slice(
+                ["å", "ä", "ö", "→", "😀", "\u{202e}"][random.below(6) as usize].as_bytes(),
+            ),
+            4 => {
+                let control = random.below(32) as u8;
+                out.push(if control == 0x03 { 0x04 } else { control });
+            }
+            5 => {
+                let params: Vec<String> = (0..random.below(4))
+                    .map(|_| random.below(300).to_string())
+                    .collect();
+                let mut params = params.join(";");
+                let finals = b"ABCDEFGHJKPQRSZ~mnhlu";
+                let fin = finals[random.below(finals.len() as u64) as usize];
+                if matches!(fin, b'u' | b'~')
+                    && (params.starts_with("99") || params.starts_with("27"))
+                {
+                    params.insert(0, '1');
+                }
+                out.extend_from_slice(format!("\x1b[{params}").as_bytes());
+                out.push(fin);
+            }
+            6 => out.extend_from_slice(
+                format!(
+                    "\x1b[<{};{};{}{}",
+                    random.below(70),
+                    random.below(120),
+                    random.below(40),
+                    if random.below(2) == 0 { 'M' } else { 'm' }
+                )
+                .as_bytes(),
+            ),
+            7 => out.extend_from_slice(
+                [
+                    "\x1bOP",
+                    "\x1bOA",
+                    "\x1b",
+                    "\x1b[",
+                    "\x1b[<",
+                    "\x1b]52;c;",
+                    "\x1bP",
+                ][random.below(7) as usize]
+                    .as_bytes(),
+            ),
+            8 => {
+                let body: Vec<u8> = (0..random.below(64))
+                    .map(|_| 0x20 + random.below(0x5f) as u8)
+                    .collect();
+                let (start, end): (&[u8], &[u8]) = match random.below(4) {
+                    0 => (b"\x1b]0;", b"\x07"),
+                    1 => (b"\x1bP1+r", b"\x1b\\"),
+                    2 => (b"\x1b[200~", b"\x1b[201~"),
+                    _ => (b"\x1b_G", b"\x1b\\"),
+                };
+                out.extend_from_slice(start);
+                out.extend_from_slice(&body);
+                out.extend_from_slice(end);
+            }
+            _ => out.push(0x80 + random.below(0x80) as u8),
+        }
+    }
+    out
+}
+
+/// 200 resizes in about a second: `sig` keeps up, ends at the last size, and still quits.
+#[test]
+fn a_flood_of_resizes_ends_at_the_last_size() {
+    let started = Instant::now();
+    let mut term = Terminal::start("winch-flood", &["demo://resize"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    let flood = Instant::now();
+    for i in 0..200u16 {
+        term.resize(60 + i % 41, 16 + i % 17);
+        thread::sleep(Duration::from_millis(4));
+        term.wait(term.got.len(), Duration::ZERO, |_| false);
+    }
+    let flooded = flood.elapsed();
+    let since = term.got.len();
+    term.resize(100, 30);
+    let resized = term.wait(since, Duration::from_secs(10), |got| {
+        image(got, 100, 28, 1000, 560)
+    });
+    assert!(
+        resized,
+        "no image of the last size after {flooded:?} of resizes\n{}",
+        term.context()
+    );
+    assert_eq!(term.tabs(), (1, 1), "{}", term.context());
+    term.type_bytes(b"q");
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+    let frames = term.counter("page_frames_presented");
+    let seconds = started.elapsed().as_secs() + 1;
+    assert!(
+        frames <= FPS * seconds,
+        "{frames} frames in {seconds} s, above {FPS} a second"
+    );
+}
+
+/// A terminal that never answers the probe: `sig` gives up on it after its deadline and runs.
+#[test]
+fn a_terminal_that_never_answers_the_probe_still_gets_the_browser() {
+    let mut term = Terminal::start_with("silent", &["demo://pattern"], b"");
+    let shown = term.wait(0, Duration::from_secs(15), |got| has(got, b"[1/1]"));
+    assert!(shown, "no tab line\n{}", term.context());
+    term.type_bytes(b"q");
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+}
+
+/// Malformed answers to the probe: overlong and empty parameters, unknown and cut-off
+/// sequences, strings that aren't UTF-8, an interrupted CSI. `sig` starts, keeps the
+/// terminal's graphics off, and stays responsive.
+const GARBAGE_REPLIES: &[u8] =
+    b"\x1b[?;;;;99999999999999999999999u\x1b_G\x1b\\\x1b_Gi=;\xff\xfe\x1b\\\
+\x1bP1+r\x1b\\\x1bP0+r4142\x1b\\\x1b]11;rgb:zzzz/\x07\x1b]10;\x1b\\\x1b[6;0;0t\x1b[6;-5;99999t\
+\x1b[4;0;0t\x1b[4;99999999999;99999999999t\x1b[?62;\x1b[?\x1b[c";
+
+#[test]
+fn garbage_answers_to_the_probe_are_survived() {
+    let mut term = Terminal::start_with("garbage", &["demo://pattern"], GARBAGE_REPLIES);
+    let shown = term.wait(0, Duration::from_secs(15), |got| has(got, b"[1/1]"));
+    assert!(shown, "no tab line\n{}", term.context());
+    assert_eq!(term.tabs(), (1, 1), "{}", term.context());
+    term.type_bytes(b"q");
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+}
+
+/// A megabyte of random terminal input as the answer to the probe: `sig` starts, answers its
+/// diagnostics signal, and SIGTERM still quits it and restores the terminal.
+#[test]
+fn a_megabyte_of_garbage_as_the_probes_answer_is_survived() {
+    let replies: &'static [u8] = Box::leak(random_input(0x5eed, 1 << 20).into_boxed_slice());
+    let mut term = Terminal::start_with("garbage-1mb", &["demo://pattern"], replies);
+    let shown = term.wait(0, Duration::from_secs(20), |got| has(got, b"[1/"));
+    assert!(shown, "no tab line\n{}", term.context());
+    let (_, tabs) = term.tabs();
+    assert!(tabs >= 1, "{}", term.context());
+    assert!(term.running(), "sig quit\n{}", term.context());
+    // SAFETY: kill(2) on the child.
+    unsafe { libc::kill(term.child.id() as i32, libc::SIGTERM) };
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+}
+
+/// A megabyte of random input while `sig` runs, with a keymap whose one binding is Ctrl+C:
+/// none of it is Ctrl+C, so nothing quits; the browser still answers, and Ctrl+C then quits.
+#[test]
+fn a_megabyte_of_random_input_runs_no_command_the_keymap_did_not_bind() {
+    let keys = "[input]\nkeymap = \"bindings\"\n[keys]\n\"ctrl-c\" = \"browser.quit\"";
+    let mut term = Terminal::start_in("stdin-flood", &["demo://pattern"], REPLIES, keys);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    let input = random_input(0xf100d, 1 << 20);
+    let flood = Instant::now();
+    term.flood(&input);
+    let flooded = flood.elapsed();
+    // The report comes once the loop has read up to it.
+    let answered = Instant::now();
+    let _ = term.tabs();
+    let answered = answered.elapsed();
+    assert!(
+        term.running(),
+        "random input without Ctrl+C quit sig\n{}",
+        term.context()
+    );
+    // An Escape closes an address line a click may have opened; Ctrl+C then quits.
+    term.type_bytes(b"\x1b");
+    thread::sleep(Duration::from_millis(100));
+    term.type_bytes(b"\x03");
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?} (flood {flooded:?}, report after {answered:?})\n{}",
+        term.context()
+    );
+    term.assert_restored();
+}
+
+/// The terminal goes away (its master side closed) while `sig` runs: `sig` exits with a
+/// failure, saving the session, instead of spinning on a dead terminal.
+#[test]
+fn closing_the_terminal_ends_sig_with_a_failure() {
+    let mut term = Terminal::start("hangup", &["demo://animation"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    // Close the master but keep its descriptor number: /dev/null takes its place.
+    let null = fs::File::open("/dev/null").unwrap();
+    // SAFETY: dup2(2) onto a descriptor this test owns.
+    assert!(
+        unsafe {
+            libc::dup2(
+                std::os::fd::AsRawFd::as_raw_fd(&null),
+                std::os::fd::AsRawFd::as_raw_fd(&term.master),
+            )
+        } >= 0
+    );
+    let closed = Instant::now();
+    let status = loop {
+        if let Some(status) = term.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            closed.elapsed() < Duration::from_secs(10),
+            "sig still runs 10 s after its terminal went away\n{}",
+            term.context()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        !status.success(),
+        "sig exited with {status:?} after {:?}\n{}",
+        closed.elapsed(),
+        term.context()
+    );
+    let session = fs::read_to_string(term.dir.join("state/sighurt/session.toml"));
+    assert!(
+        session
+            .as_deref()
+            .is_ok_and(|s| s.contains("demo://animation")),
+        "the session was not saved: {session:?}\n{}",
+        term.context()
+    );
+}
+
+/// `--dump` of the slow page: done within the settle cap (3 s after its first snapshot) and the
+/// thin page's grace (6 s after the load), not the 30 s timeout.
+#[test]
+fn dump_of_the_slow_page_ends_within_its_caps() {
+    let started = Instant::now();
+    let (status, out, err) = dump("slow", &["demo://slow"]);
+    let took = started.elapsed();
+    assert!(status.success(), "{status:?}\n{err}");
+    assert!(out.starts_with("Demo: slow"), "{out}");
+    assert!(took < Duration::from_secs(12), "{took:?}");
+}
