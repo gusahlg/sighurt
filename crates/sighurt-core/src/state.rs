@@ -1537,6 +1537,8 @@ impl BrowserState {
         let url = v.navigations.latest().and_then(|n| n.url.clone());
         v.failure = Some(message.clone());
         v.document = None;
+        // The status text was the document's: it must not hide why the view failed.
+        v.status = None;
         v.answers.clear();
         v.loading = false;
         v.navigations.clear();

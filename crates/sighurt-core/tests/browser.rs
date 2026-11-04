@@ -837,15 +837,21 @@ fn failed_loads_are_not_failed_engines() {
     assert_eq!(opened(&effects)[0].1, "wasm");
     assert!(b.active().error.is_none());
 
-    // The shown page's document crashes: the view stays, and reloading recovers it.
+    // The shown page's document crashes: the view stays, and reloading recovers it. The
+    // document's status text goes with it, so the status strip says why.
     let mut b = Harness::start("", &["https://a.test/"]);
     let view = b.shown();
+    b.engine(EngineEvent::StatusTextChanged {
+        view,
+        text: Some("typed".into()),
+    });
     b.engine(EngineEvent::ViewFailed {
         view,
         message: "script crashed".into(),
     });
     assert_eq!(b.state.view(view).unwrap().state(), ViewState::Failed);
     assert_eq!(b.active().error.unwrap().url, None);
+    assert_eq!(b.active().status, None);
     let effects = b.apply(command("page.reload"));
     assert!(matches!(
         commands(&effects, view)[0],
