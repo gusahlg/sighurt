@@ -19,7 +19,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::sanitize::sanitize;
 
-use super::{CellRange, Item, ItemKind, Span, Style, TextDocument, TextLine};
+use super::{CellRange, Item, ItemKind, Joined, Span, Style, TextDocument, TextLine};
 
 /// Least columns of a text field's brackets, filled with underscores.
 const FIELD_MIN: usize = 10;
@@ -43,6 +43,7 @@ pub fn layout(snapshot: &SemanticSnapshot, width: u16) -> TextDocument {
         depth: 0,
         no_blank: false,
         lists: 0,
+        join: Joined::No,
     };
     b.block(snapshot.root);
     if snapshot.truncated {
@@ -413,6 +414,8 @@ struct Builder<'a> {
     no_blank: bool,
     /// How many lists enclose the node being laid out.
     lists: usize,
+    /// How the next line continues the last one: set by [`Self::wrap`] when it breaks a run.
+    join: Joined,
 }
 
 impl<'a> Builder<'a> {
@@ -439,6 +442,8 @@ impl<'a> Builder<'a> {
             self.lines.push(TextLine {
                 spans: Vec::new(),
                 node: None,
+                joined: Joined::No,
+                prefixed: false,
             });
         }
     }
@@ -449,7 +454,8 @@ impl<'a> Builder<'a> {
         let line = self.lines.len();
         let mut all = Vec::with_capacity(spans.len() + 1);
         let mut col = w(&self.prefix);
-        if !self.prefix.is_empty() {
+        let prefixed = !self.prefix.is_empty();
+        if prefixed {
             all.push(span(self.prefix.clone(), Style::default(), None));
         }
         for s in spans {
@@ -465,7 +471,13 @@ impl<'a> Builder<'a> {
             col += sw;
             all.push(s);
         }
-        self.lines.push(TextLine { spans: all, node });
+        let joined = std::mem::take(&mut self.join);
+        self.lines.push(TextLine {
+            spans: all,
+            node,
+            joined,
+            prefixed,
+        });
     }
 
     fn wrap(&mut self, tokens: Vec<Tok>, node: Option<NodeId>) {
@@ -490,6 +502,10 @@ impl<'a> Builder<'a> {
             let gw = usize::from(gap.is_some());
             if cur_w > 0 && cur_w + gw + uw > room {
                 self.push_line(std::mem::take(&mut cur), node);
+                self.join = match gap {
+                    Some(_) => Joined::Space,
+                    None => Joined::Directly,
+                };
                 cur_w = 0;
                 gap = None;
             }
@@ -500,6 +516,7 @@ impl<'a> Builder<'a> {
                         let gw = w(g);
                         if cur_w > 0 && cur_w + gw > room {
                             self.push_line(std::mem::take(&mut cur), node);
+                            self.join = Joined::Directly;
                             cur_w = 0;
                         }
                         push_merged(&mut cur, g.to_string(), *style, *item);
@@ -521,6 +538,7 @@ impl<'a> Builder<'a> {
         if !cur.is_empty() {
             self.push_line(cur, node);
         }
+        self.join = Joined::No;
     }
 
     /// One line, in order. The caller has checked that the tokens fit in [`Self::room`].

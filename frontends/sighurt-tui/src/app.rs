@@ -29,6 +29,15 @@
 //! selection (tmux) answers the waiting read. A reply for the address line belongs to that
 //! line and is dropped when the line closes or is replaced.
 //!
+//! Find in page (TUI.md §4): `page.find` without text opens the find field on the bottom line
+//! (the address line's editor behind a `/`); each edit runs `page.find <text>`, an empty one
+//! `page.find-stop`; Enter keeps the search and gives the page the keyboard, Escape ends it, and
+//! the core moving the focus closes it and keeps the search. In text mode every search of the
+//! shown view is the frontend's ([`Frontend::find`]): it searches the page's text and answers
+//! the core with `BrowserEvent::FindResult`, as an engine would; in graphics mode the engine
+//! searches. Changing the mode ends the shown page's search, with a notice. What the search
+//! found, from the core, is right-aligned on the bottom line.
+//!
 //! Text mode (TUI.md §4, [`crate::text`]): `[tui] mode`, or `chrome.toggle-mode` for the run,
 //! decides whether the page rows show pixels or the page's text. In text mode the shown view's
 //! engine is asked for snapshots ([`Session::set_semantics`]), the others' are not, and the
@@ -68,8 +77,8 @@ use std::time::{Duration, Instant};
 use calloop::generic::Generic;
 use calloop::ping::make_ping;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
-use sighurt_api::commands::Command;
-use sighurt_api::engine::{EngineCommand, EngineWaker, PresentOutcome};
+use sighurt_api::commands::{Command, MAX_FIND};
+use sighurt_api::engine::{EngineCommand, EngineWaker, FindCommand, PresentOutcome};
 use sighurt_api::events::Cursor;
 use sighurt_api::geometry::{Metrics, Scale, SurfacePoint, WindowRect};
 use sighurt_api::ids::{LayoutEpoch, RequestId, SeatId, TargetId, ViewId};
@@ -81,11 +90,11 @@ use sighurt_api::semantic::SemanticSnapshot;
 use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_api::settings::Table;
 use sighurt_core::config::{GraphicsProtocol, TuiConfig, TuiMode, TERMINAL_CHROME_COMMANDS};
-use sighurt_core::tabs::{Content, LoadError, TabSummary};
+use sighurt_core::tabs::{Content, Find, LoadError, TabSummary};
 use sighurt_core::{
     BrowserEvent, BrowserState, ChromeChecks, Frontend as FrontendKind, OpenRequest,
 };
-use sighurt_runtime::diagnostics::{Diagnostics, Report, TabReport, TargetReport};
+use sighurt_runtime::diagnostics::{Diagnostics, FindReport, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
 use sighurt_runtime::services::{Clipboard, Services, MAX_CLIPBOARD};
@@ -106,7 +115,7 @@ use crate::term::{
     clipboard, ClipboardReply, MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE,
     SYNC_BEGIN, SYNC_END,
 };
-use crate::text::{Act, TextPages};
+use crate::text::{Act, Count, Query, Step, TextPages};
 use crate::textmode::Area;
 
 /// Most terminal events handled in one pass; the rest wait for the next.
@@ -306,8 +315,20 @@ struct Tui {
     /// Each view's target, for the core's show and hide.
     views: HashMap<ViewId, TargetId>,
     next_image: u32,
-    /// The address line, while `location.focus` has it.
+    /// The address line, while `location.focus` has it, or the find field.
     editing: Option<LineEditor>,
+    /// [`Self::editing`] is the find field (`page.find` without text).
+    finding: bool,
+    /// The find field's text as last searched for, trimmed: an edit that leaves it searches
+    /// nothing again.
+    find_sent: String,
+    /// Each view's search, as the core last started it ([`Frontend::find`] sees every one).
+    searches: HashMap<ViewId, Query>,
+    /// Events for the core from outside an effect: what the find field typed, a search that
+    /// found anew in a new snapshot, the stop a mode change makes. [`App::run_core`] sends them.
+    find_events: Vec<BrowserEvent>,
+    /// The view the core shows, as [`Frontend::show`] last said.
+    shown_view: Option<ViewId>,
     /// Bumped when the address line opens or closes. A paste in flight names the line it
     /// asked, and a reply for another line is dropped.
     line_gen: u64,
@@ -583,6 +604,11 @@ impl App {
             views: HashMap::new(),
             next_image: 1,
             editing: None,
+            finding: false,
+            find_sent: String::new(),
+            searches: HashMap::new(),
+            find_events: Vec::new(),
+            shown_view: None,
             line_gen: 0,
             editing_fresh: false,
             active_url: String::new(),
@@ -645,7 +671,12 @@ impl App {
     /// tab's address as they left it, unless something was typed into it meanwhile.
     fn run_core(&mut self) {
         self.tui.active_url = active_url(self.session.core());
+        self.flush_find();
         self.session.run_core(&mut self.tui);
+        // A mode the core changed (`m`) ended a search: the stop goes in this turn.
+        while self.flush_find() {
+            self.session.run_core(&mut self.tui);
+        }
         if std::mem::take(&mut self.tui.editing_fresh) {
             let url = active_url(self.session.core());
             if url != self.tui.active_url {
@@ -658,6 +689,16 @@ impl App {
         if !self.tui.releases.is_empty() {
             self.flush_releases();
         }
+    }
+
+    /// Queues for the core what the find field typed and what [`Tui::find_events`] holds.
+    /// Returns whether there was anything.
+    fn flush_find(&mut self) -> bool {
+        let mut events = std::mem::take(&mut self.tui.find_events);
+        events.extend(self.tui.find_query().map(BrowserEvent::Command));
+        let any = !events.is_empty();
+        self.session.queue_mut().extend(events);
+        any
     }
 
     /// One iteration of the loop, after it woke. Returns whether work is left that shouldn't
@@ -694,6 +735,11 @@ impl App {
             // After the pump, which may have opened a view: nothing is drawn for it before the
             // engine is asked for its text.
             worked |= self.sync_semantics();
+            // A snapshot that found the search anew, a mode change that ended it.
+            if !self.tui.find_events.is_empty() {
+                self.run_core();
+                worked = true;
+            }
             // Startup in text mode, a resize that loses images, a reload of `[tui] mode`.
             // `chrome_command` already told the core when `m` changed the mode.
             let mut typing = VecDeque::new();
@@ -1450,10 +1496,17 @@ impl App {
             Some(("notice", text)) => (Some(text.to_owned()), None),
             other => (None, other.map(|(_, text)| text.to_owned())),
         };
+        let find = core.tabs().nth(active).and_then(|tab| {
+            let engine = tab_engine(core, &tab);
+            tab.find
+                .and_then(|find| find_indicator(find, engine, self.tui.finding))
+        });
         ChromeState {
             tabs,
             active,
             address_editing: self.tui.editing.clone(),
+            finding: self.tui.finding,
+            find,
             mode_label: match self.tui.text_mode {
                 true => MODE_TEXT,
                 false => MODE_GRAPHICS,
@@ -1768,6 +1821,18 @@ impl Tui {
             (0, 0)
         };
         if graphics != self.graphics || text != self.text_mode {
+            // The search was the other mode's finder's: it ends, and says so.
+            let shown_search = self
+                .shown_view
+                .is_some_and(|view| self.searches.contains_key(&view));
+            if text != self.text_mode && shown_search {
+                self.find_events
+                    .push(BrowserEvent::Command(Command::PageFindStop));
+                let now = if text { "as text" } else { "as graphics" };
+                self.show_notice(format!(
+                    "The search in the page ended: the page is shown {now} now."
+                ));
+            }
             self.graphics = graphics;
             self.text_mode = text;
             self.clear = true;
@@ -1820,6 +1885,7 @@ impl Tui {
 
     /// `location.focus`: opens the address line on the active tab's address, selected.
     fn open_address(&mut self) {
+        self.finding = false;
         self.line_gen = self.line_gen.wrapping_add(1);
         let mut editor = LineEditor::from_text(self.active_url.as_str());
         editor.select_all();
@@ -1830,6 +1896,7 @@ impl Tui {
 
     fn close_address(&mut self) {
         self.editing_fresh = false;
+        self.finding = false;
         if self.editing.take().is_some() {
             self.line_gen = self.line_gen.wrapping_add(1);
             self.chrome_dirty = true;
@@ -1854,6 +1921,16 @@ impl Tui {
         let alt = event.modifiers.alt && !event.consumed.alt;
         match &event.key {
             Key::Named(name) => match name.as_str() {
+                // The find field: Escape ends the search, Enter keeps it for the page.
+                "Escape" | "Enter" if self.finding => {
+                    let stop = name == "Escape";
+                    self.close_address();
+                    queue.push_back(BrowserEvent::Focus(KeyboardFocus::Page));
+                    if stop {
+                        queue.push_back(BrowserEvent::Command(Command::PageFindStop));
+                    }
+                    return;
+                }
                 "Escape" => {
                     self.close_address();
                     queue.push_back(BrowserEvent::Focus(KeyboardFocus::Page));
@@ -1881,6 +1958,26 @@ impl Tui {
             },
         }
         self.chrome_dirty = true;
+    }
+
+    /// What the find field's text asks of the core since it last asked: `page.find <text>`, or
+    /// `page.find-stop` for text that is empty or only whitespace. `None` when the field is
+    /// closed or its text, trimmed, is what was last searched for.
+    fn find_query(&mut self) -> Option<Command> {
+        if !self.finding {
+            return None;
+        }
+        let mut text = self.editing.as_ref()?.text().trim().to_owned();
+        cut(&mut text, MAX_FIND);
+        let text = text.trim_end().to_owned();
+        if text == self.find_sent {
+            return None;
+        }
+        self.find_sent.clone_from(&text);
+        Some(match text.is_empty() {
+            true => Command::PageFindStop,
+            false => Command::PageFind(Some(text)),
+        })
     }
 
     /// Ctrl+C copies the line, Ctrl+X copies it and clears it, Ctrl+V asks the terminal.
@@ -2210,6 +2307,8 @@ impl Frontend for Tui {
             .map(|(&view, _)| view)
             .collect();
         for view in gone {
+            self.searches.remove(&view);
+            self.shown_view.take_if(|shown| *shown == view);
             self.text.forget(view);
             self.semantic_on.remove(&view);
             self.capture.forget(view);
@@ -2256,6 +2355,71 @@ impl Frontend for Tui {
             }
             _ => {}
         }
+        // An edit of the find field searches before the next key is handled.
+        queue.extend(self.find_query().map(BrowserEvent::Command));
+    }
+
+    /// `page.find` without text: the address line, just opened, becomes the find field holding
+    /// `text`, selected, so typing replaces it.
+    fn find_field(&mut self, text: String, _queue: &mut VecDeque<BrowserEvent>) {
+        let mut editor = LineEditor::from_text(text);
+        editor.select_all();
+        self.find_sent = editor.text().trim().to_owned();
+        self.editing = Some(editor);
+        self.finding = true;
+        self.editing_fresh = false;
+        self.chrome_dirty = true;
+    }
+
+    /// In text mode the shown page's searches are the frontend's: it searches the page's text
+    /// and answers as an engine would. In graphics mode the engine searches. A stop also goes
+    /// to the engine, which ignores one for a search it does not have.
+    fn find(
+        &mut self,
+        view: ViewId,
+        command: &FindCommand,
+        queue: &mut VecDeque<BrowserEvent>,
+    ) -> bool {
+        let (search, step) = match command {
+            FindCommand::Search {
+                search,
+                text,
+                case_sensitive,
+                ..
+            } => {
+                let query = Query {
+                    search: *search,
+                    text: text.clone(),
+                    case_sensitive: *case_sensitive,
+                };
+                self.searches.insert(view, query);
+                (*search, Step::Start)
+            }
+            FindCommand::Next { search } => (*search, Step::Next),
+            FindCommand::Previous { search } => (*search, Step::Previous),
+            FindCommand::Stop { search } => {
+                if self
+                    .searches
+                    .get(&view)
+                    .is_some_and(|q| q.search == *search)
+                {
+                    self.searches.remove(&view);
+                    self.text.stop_find(view);
+                    self.chrome_dirty = true;
+                }
+                return false;
+            }
+        };
+        if !self.text_mode || !self.semantic_on.contains(&view) {
+            return false;
+        }
+        // A move in a search that is not the view's does nothing, as in an engine.
+        if let Some(query) = self.searches.get(&view).filter(|q| q.search == search) {
+            let count = self.text.find(view, query, step);
+            queue.push_back(find_result(view, count));
+            self.chrome_dirty = true;
+        }
+        true
     }
 
     fn chrome_command(&mut self, action: String, queue: &mut VecDeque<BrowserEvent>) {
@@ -2293,8 +2457,11 @@ impl Frontend for Tui {
     /// A shown view's last frame is sent again if it is still the layout's, or its next one
     /// is; a hidden view's image is deleted.
     fn show(&mut self, view: ViewId, visible: bool) {
-        if !visible {
+        if visible {
+            self.shown_view = Some(view);
+        } else {
             self.release_pointer(Some(view));
+            self.shown_view.take_if(|shown| *shown == view);
         }
         let Some(&target) = self.views.get(&view) else {
             return;
@@ -2355,7 +2522,10 @@ impl Frontend for Tui {
 
     fn semantics_changed(&mut self, view: ViewId, snapshot: Box<SemanticSnapshot>) {
         if self.semantic_on.contains(&view) {
-            self.text.snapshot(view, snapshot);
+            // The same document found anew: the core hears the new count.
+            if let Some(count) = self.text.snapshot(view, snapshot) {
+                self.find_events.push(find_result(view, count));
+            }
             self.chrome_dirty = true;
         }
     }
@@ -2371,6 +2541,50 @@ fn page_area(size: TermSize) -> PageArea {
         cols: size.cols,
         cursor: None,
     }
+}
+
+/// The core's event for what a search in a page's text found.
+fn find_result(view: ViewId, count: Count) -> BrowserEvent {
+    BrowserEvent::FindResult {
+        view,
+        search: count.search,
+        found: count.total > 0,
+        current: count.current,
+        total: Some(count.total),
+        supported: true,
+    }
+}
+
+/// The most characters of a search's text the bottom line shows beside what it found.
+const FIND_TEXT: usize = 16;
+
+/// What the bottom line says of a search: "3 of 12", "12 matches", "no matches", or that the
+/// page's engine can't find, after the search's text (cut) when the find field is closed.
+/// Nothing while a search waits for its first result with the field open.
+fn find_indicator(find: &Find, engine: Option<&str>, field_open: bool) -> Option<String> {
+    let result = match (find.supported, find.found, find.current, find.total) {
+        (false, ..) => Some(format!(
+            "not supported by {}",
+            engine.unwrap_or("this page")
+        )),
+        (true, None, ..) => None,
+        (true, Some(false), ..) => Some("no matches".to_owned()),
+        (true, Some(true), Some(current), Some(total)) => Some(format!("{current} of {total}")),
+        (true, Some(true), _, Some(1)) => Some("1 match".to_owned()),
+        (true, Some(true), _, Some(total)) => Some(format!("{total} matches")),
+        (true, Some(true), ..) => Some("found".to_owned()),
+    };
+    if field_open {
+        return result;
+    }
+    let mut text: String = find.text.chars().take(FIND_TEXT).collect();
+    if find.text.chars().nth(FIND_TEXT).is_some() {
+        text.push('…');
+    }
+    Some(match result {
+        Some(result) => format!("/{text} {result}"),
+        None => format!("/{text}"),
+    })
 }
 
 /// The core's event for an action the user chose in the page's text.
@@ -2594,6 +2808,7 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
             reloads: tab.reloads,
             error: tab.error.is_some(),
             engine: tab_engine(core, &tab).map(str::to_owned),
+            find: tab.find.map(FindReport::from),
         })
         .collect();
     let active_tab = core.active() + 1;
@@ -2828,6 +3043,11 @@ mod tests {
             views: HashMap::new(),
             next_image: 1,
             editing: None,
+            finding: false,
+            find_sent: String::new(),
+            searches: HashMap::new(),
+            find_events: Vec::new(),
+            shown_view: None,
             line_gen: 0,
             editing_fresh: false,
             active_url: String::new(),
@@ -3579,5 +3799,175 @@ schemes = [\"demo\"]
                 } if *id == request => Some(result.clone()),
                 _ => None,
             })
+    }
+
+    fn typed(text: &str) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode(0),
+            key: Key::Character(text.into()),
+            state: ButtonState::Pressed,
+            repeat: false,
+            modifiers: Modifiers::default(),
+            consumed: Modifiers::default(),
+            text: Some(text.into()),
+        }
+    }
+
+    fn named(name: &str) -> KeyEvent {
+        KeyEvent {
+            key: Key::Named(name.into()),
+            text: None,
+            ..typed("x")
+        }
+    }
+
+    fn commands(queue: &VecDeque<BrowserEvent>) -> Vec<String> {
+        queue
+            .iter()
+            .filter_map(|event| match event {
+                BrowserEvent::Command(command) => Some(command.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_find_field_searches_as_it_is_typed_and_enter_and_escape_close_it() {
+        let (_master, mut tui) = on_pty();
+        let mut queue = VecDeque::new();
+        tui.focus(KeyboardFocus::Chrome, &mut queue);
+        tui.find_field("old".into(), &mut queue);
+        assert!(tui.finding);
+        let editor = tui.editing.as_ref().unwrap();
+        assert_eq!((editor.text(), editor.selected()), ("old", true));
+        assert!(queue.is_empty(), "opening searches nothing");
+        let key = |tui: &mut Tui, key: KeyEvent, queue: &mut VecDeque<BrowserEvent>| {
+            let event = InputEvent {
+                seat: tui.seat,
+                kind: InputKind::Key(key),
+            };
+            tui.chrome_input(event, queue);
+        };
+        // Typing replaces the selected text and searches each edit.
+        key(&mut tui, typed("p"), &mut queue);
+        key(&mut tui, typed("a"), &mut queue);
+        assert_eq!(commands(&queue), ["page.find p", "page.find pa"]);
+        queue.clear();
+        // A space at the end searches nothing new; motion neither.
+        key(&mut tui, typed(" "), &mut queue);
+        key(&mut tui, named("ArrowLeft"), &mut queue);
+        assert!(queue.is_empty(), "{queue:?}");
+        // Emptied: the search stops.
+        for _ in 0..3 {
+            key(&mut tui, named("Backspace"), &mut queue);
+        }
+        assert_eq!(commands(&queue), ["page.find p", "page.find-stop"]);
+        queue.clear();
+        // Enter keeps the search and gives the page the keyboard.
+        key(&mut tui, typed("q"), &mut queue);
+        key(&mut tui, named("Enter"), &mut queue);
+        assert_eq!(commands(&queue), ["page.find q"]);
+        assert!(queue.contains(&BrowserEvent::Focus(KeyboardFocus::Page)));
+        assert!(tui.editing.is_none() && !tui.finding);
+        queue.clear();
+        // Escape ends it.
+        tui.focus(KeyboardFocus::Chrome, &mut queue);
+        tui.find_field("q".into(), &mut queue);
+        key(&mut tui, named("Escape"), &mut queue);
+        assert_eq!(
+            queue.iter().collect::<Vec<_>>(),
+            [
+                &BrowserEvent::Focus(KeyboardFocus::Page),
+                &BrowserEvent::Command(Command::PageFindStop)
+            ]
+        );
+        assert!(tui.editing.is_none() && !tui.finding);
+        queue.clear();
+        // The core moving the focus closes it and keeps the search; location.focus is the
+        // address line again.
+        tui.focus(KeyboardFocus::Chrome, &mut queue);
+        tui.find_field("q".into(), &mut queue);
+        tui.focus(KeyboardFocus::Page, &mut queue);
+        assert!(tui.editing.is_none() && !tui.finding && queue.is_empty());
+        tui.focus(KeyboardFocus::Chrome, &mut queue);
+        tui.find_field("q".into(), &mut queue);
+        tui.focus(KeyboardFocus::Chrome, &mut queue);
+        assert!(tui.editing.is_some() && !tui.finding);
+        assert!(queue.is_empty());
+    }
+
+    #[cfg(feature = "engine-demo")]
+    #[test]
+    fn text_mode_finds_in_the_pages_text_and_a_mode_change_ends_the_search() {
+        let mut held = demo_app();
+        let app = &mut held.app;
+        app.tui.relayout();
+        assert!(app.tui.text_mode, "a pty without pixels is text");
+        app.session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: vec![OpenRequest {
+                input: "demo://pattern".into(),
+                engine: Some("demo".into()),
+            }],
+        });
+        settle_document(app);
+        let view = app.session.shown_view().expect("shown").0;
+        for _ in 0..8 {
+            app.sync_semantics();
+            let _ = app.session.pump(&mut app.tui);
+            app.run_core();
+            if app.tui.text.has(view) {
+                break;
+            }
+        }
+        assert!(app.tui.text.has(view), "{}", page_debug(app));
+        let find = |app: &mut App, command: &str| {
+            let command = command.parse::<Command>().unwrap();
+            app.session
+                .queue_mut()
+                .push_back(BrowserEvent::Command(command));
+            app.run_core();
+            let core = app.session.core();
+            let tab = core.tabs().nth(core.active()).unwrap();
+            let engine = tab_engine(core, &tab);
+            tab.find.and_then(|find| find_indicator(find, engine, true))
+        };
+        // "page": the paragraph and the two links' labels.
+        assert_eq!(find(app, "page.find page").as_deref(), Some("1 of 3"));
+        assert_eq!(find(app, "page.find-next").as_deref(), Some("2 of 3"));
+        assert_eq!(find(app, "page.find-previous").as_deref(), Some("1 of 3"));
+        assert_eq!(find(app, "page.find-previous").as_deref(), Some("3 of 3"));
+        assert_eq!(find(app, "page.find Page").as_deref(), Some("no matches"));
+        assert_eq!(find(app, "page.find PAGE").as_deref(), Some("no matches"));
+        assert_eq!(find(app, "page.find pAge").as_deref(), Some("no matches"));
+        assert_eq!(find(app, "page.find text").as_deref(), Some("1 of 1"));
+        // The match is drawn: the bottom line and the highlight.
+        let mut out = Vec::new();
+        app.draw_chrome(&mut out);
+        let rows = app.tui.grid.rows();
+        let bottom: String = (0..app.tui.grid.cols())
+            .filter_map(|col| app.tui.grid.cell(col, rows - 1))
+            .map(|cell| cell.grapheme.clone())
+            .collect();
+        assert!(bottom.trim_end().ends_with("/text 1 of 1"), "{bottom}");
+        let reversed: String = (0..rows)
+            .flat_map(|row| (0..app.tui.grid.cols()).map(move |col| (col, row)))
+            .filter_map(|(col, row)| app.tui.grid.cell(col, row))
+            .filter(|cell| cell.attrs.reverse)
+            .map(|cell| cell.grapheme.clone())
+            .collect();
+        assert_eq!(reversed, "text");
+        // Leaving text mode ends the search and says so.
+        app.tui.mode_override = Some(false);
+        app.tui.relayout();
+        assert!(!app.tui.text_mode);
+        assert!(app
+            .tui
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("search in the page ended")));
+        app.run_core();
+        let core = app.session.core();
+        assert!(core.tabs().nth(core.active()).unwrap().find.is_none());
     }
 }

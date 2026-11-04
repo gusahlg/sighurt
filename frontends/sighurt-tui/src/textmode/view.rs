@@ -1,15 +1,16 @@
 //! The viewport over a [`TextDocument`]: scrolling, which item has focus, and what activating it
 //! means.
 //!
-//! Owns: the scroll offset, the focused item, their rules (wrap-around, scroll into view,
-//! anchoring across a new snapshot), and the [`Intent`] an activation produces. Must not own:
+//! Owns: the scroll offset, the focused item, the current match of a search (drawn, not found:
+//! [`super::find`] finds), their rules (wrap-around, scroll into view, anchoring across a new
+//! snapshot), and the [`Intent`] an activation produces. Must not own:
 //! which keys do these (the app maps them), the terminal, the line editor or the engine; the app
 //! turns an [`Intent`] into a `Semantic` command.
 
 use sighurt_api::ids::DocumentGeneration;
 use sighurt_api::semantic::{NodeId, SemanticAction};
 
-use super::{ItemKind, TextDocument};
+use super::{CellRange, ItemKind, TextDocument};
 
 /// What activating the focused item asks of the app.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +44,8 @@ pub struct TextView {
     pub focused_item: Option<usize>,
     /// The width the document was laid out to.
     pub width: u16,
+    /// The cells of the current match of a search, drawn in reverse video. Empty with none.
+    pub found: Vec<CellRange>,
     document: Option<DocumentGeneration>,
 }
 

@@ -9,6 +9,12 @@
 //! app sends the core as `BrowserEvent::Semantic`), the layout itself
 //! ([`crate::textmode`]) or when text mode is on (the app).
 //!
+//! Find in page (`page.find` in text mode, TUI.md §4) searches the page's logical lines
+//! ([`textmode::find`]): the first match from the top row shown, then `Next` and `Previous`
+//! around them, wrapping. The current match is scrolled into view and drawn in reverse video.
+//! A new snapshot of the same document, or a new width, finds again and keeps the current match
+//! by its number; another document ends the search.
+//!
 //! Enter in the field editor sends `SetValue` when the text changed and `Submit` where HTML
 //! submits implicitly: a single-line field in a form with a button or with no other text
 //! field, never a text area. A value too long to be whole in the snapshot is not edited. A value with a newline is not edited here:
@@ -16,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use sighurt_api::ids::{DocumentGeneration, ViewId};
+use sighurt_api::ids::{DocumentGeneration, RequestId, ViewId};
 use sighurt_api::input::{ButtonState, Key, KeyEvent};
 use sighurt_api::semantic::{
     Landmark, NodeId, NodeKind, SemanticAction, SemanticSnapshot, MAX_STRING_BYTES,
@@ -27,7 +33,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::chrome::LineEditor;
 use crate::grid::{Attrs, Color, Grid};
 use crate::sanitize::sanitize;
-use crate::textmode::{self, Area, Intent, TextDocument, TextView};
+use crate::textmode::{self, Area, CellRange, Intent, TextDocument, TextView};
 
 /// The most option rows the chooser shows at once.
 const CHOOSER_ROWS: u16 = 8;
@@ -271,6 +277,85 @@ struct Page {
     snapshot: Box<SemanticSnapshot>,
     doc: TextDocument,
     view: TextView,
+    found: Option<Found>,
+}
+
+/// A search in a page and its matches.
+struct Found {
+    query: Query,
+    matches: Vec<Vec<CellRange>>,
+    /// Index into `matches`; 0 with none.
+    current: usize,
+}
+
+/// What a search looks for: its id, its text and whether case matters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Query {
+    /// The search, as the core named it.
+    pub search: RequestId,
+    /// The text.
+    pub text: String,
+    /// Whether case matters.
+    pub case_sensitive: bool,
+}
+
+/// A step of a search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// The search starts: the first match from the top row shown.
+    Start,
+    /// The next match, wrapping.
+    Next,
+    /// The previous match, wrapping.
+    Previous,
+}
+
+/// What a search found: which match is current (from 1) and how many there are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Count {
+    /// The search.
+    pub search: RequestId,
+    /// The current match, from 1; `None` with none.
+    pub current: Option<u32>,
+    /// How many matches there are.
+    pub total: u32,
+}
+
+impl Page {
+    /// What its search found, if it has one.
+    fn count(&self) -> Option<Count> {
+        let found = self.found.as_ref()?;
+        let total = u32::try_from(found.matches.len()).unwrap_or(u32::MAX);
+        Some(Count {
+            search: found.query.search,
+            current: (total > 0).then(|| u32::try_from(found.current + 1).unwrap_or(u32::MAX)),
+            total,
+        })
+    }
+
+    /// Finds its search again in the document as laid out now, keeping the current match by
+    /// its number, and shows it.
+    fn refind(&mut self, rows: u16) {
+        let Some(found) = &mut self.found else {
+            return;
+        };
+        let query = &found.query;
+        found.matches = textmode::find(&self.doc, &query.text, query.case_sensitive);
+        found.current = found.current.min(found.matches.len().saturating_sub(1));
+        self.show_match(rows);
+    }
+
+    /// Draws the current match and scrolls it into view; with none, draws none.
+    fn show_match(&mut self, rows: u16) {
+        let current = self
+            .found
+            .as_ref()
+            .and_then(|found| found.matches.get(found.current));
+        self.view.found = current.cloned().unwrap_or_default();
+        if let Some(line) = self.view.found.first().map(|range| range.line) {
+            self.view.show_line(&self.doc, rows, line);
+        }
+    }
 }
 
 /// Every view's page in text mode, and the prompt over the shown one.
@@ -311,23 +396,31 @@ impl TextPages {
         }
         for page in self.pages.values_mut() {
             page.view.scroll_lines(&page.doc, rows, 0);
+            page.refind(rows);
         }
     }
 
-    /// `view` has a new snapshot. The same document keeps its place and focus; another one
-    /// starts at the top and drops a prompt that was open on the old one.
-    pub fn snapshot(&mut self, view: ViewId, snapshot: Box<SemanticSnapshot>) {
+    /// `view` has a new snapshot. The same document keeps its place and focus, and its search
+    /// finds again; another one starts at the top and drops a prompt that was open on the old
+    /// one, and the search. Returns what the search finds now if that changed.
+    pub fn snapshot(&mut self, view: ViewId, snapshot: Box<SemanticSnapshot>) -> Option<Count> {
         let doc = textmode::layout(&snapshot, self.cols.max(1));
         match self.pages.get_mut(&view) {
             Some(page) => {
-                if page.doc.document != doc.document
-                    && self.prompt.as_ref().is_some_and(|(v, _)| *v == view)
-                {
-                    self.prompt = None;
+                if page.doc.document != doc.document {
+                    if self.prompt.as_ref().is_some_and(|(v, _)| *v == view) {
+                        self.prompt = None;
+                    }
+                    page.found = None;
+                    page.view.found.clear();
                 }
                 page.view.retarget(&page.doc, &doc);
                 page.doc = doc;
                 page.snapshot = snapshot;
+                let before = page.count();
+                page.refind(self.rows);
+                let after = page.count();
+                (after != before).then_some(after).flatten()
             }
             None => {
                 let mut text = TextView::new(doc.width);
@@ -338,9 +431,59 @@ impl TextPages {
                         snapshot,
                         doc,
                         view: text,
+                        found: None,
                     },
                 );
+                None
             }
+        }
+    }
+
+    /// A step of `query` in `view`'s page: a new search (or one this page has not seen) finds
+    /// its matches first. Returns what it found; a view with no page yet has none.
+    pub fn find(&mut self, view: ViewId, query: &Query, step: Step) -> Count {
+        let rows = self.rows;
+        let Some(page) = self.pages.get_mut(&view) else {
+            return Count {
+                search: query.search,
+                current: None,
+                total: 0,
+            };
+        };
+        let fresh = step == Step::Start
+            || page
+                .found
+                .as_ref()
+                .is_none_or(|found| found.query != *query);
+        if fresh {
+            let matches = textmode::find(&page.doc, &query.text, query.case_sensitive);
+            let top = page.view.scroll;
+            let current = matches
+                .iter()
+                .position(|cells| cells.first().is_some_and(|range| range.line >= top))
+                .unwrap_or(0);
+            page.found = Some(Found {
+                query: query.clone(),
+                matches,
+                current,
+            });
+        } else if let Some(found) = &mut page.found {
+            let n = found.matches.len().max(1);
+            found.current = match step {
+                Step::Next => (found.current + 1) % n,
+                Step::Previous => (found.current + n - 1) % n,
+                Step::Start => found.current,
+            };
+        }
+        page.show_match(rows);
+        page.count().expect("a search was just set")
+    }
+
+    /// Ends `view`'s search and its highlight.
+    pub fn stop_find(&mut self, view: ViewId) {
+        if let Some(page) = self.pages.get_mut(&view) {
+            page.found = None;
+            page.view.found.clear();
         }
     }
 
@@ -910,6 +1053,77 @@ mod tests {
         let cursor = pages.draw(view, &mut grid, area);
         assert!(row_text(&grid, 9).starts_with("Edit: ab"));
         assert_eq!(cursor, Some((8, 9)));
+    }
+
+    fn reversed(pages: &TextPages, view: ViewId) -> Vec<String> {
+        let mut grid = Grid::new(40, 10);
+        let area = Area {
+            col: 0,
+            row: 0,
+            cols: 40,
+            rows: 10,
+        };
+        pages.draw(view, &mut grid, area);
+        (0..10)
+            .map(|row| {
+                (0..40)
+                    .filter_map(|col| grid.cell(col, row))
+                    .filter(|cell| cell.attrs.reverse)
+                    .map(|cell| cell.grapheme.clone())
+                    .collect::<String>()
+            })
+            .filter(|text| !text.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn find_walks_the_matches_around_and_shows_the_current_one() {
+        let (mut pages, view, document) = pages();
+        let query = Query {
+            search: RequestId::next(),
+            text: "Paragraph 2".into(),
+            case_sensitive: false,
+        };
+        // "paragraph 2" and "paragraph 20" to "paragraph 29".
+        let count = pages.find(view, &query, Step::Start);
+        assert_eq!((count.current, count.total), (Some(1), 11));
+        assert_eq!(reversed(&pages, view), ["paragraph 2"]);
+        let count = pages.find(view, &query, Step::Previous);
+        assert_eq!(count.current, Some(11), "wraps back");
+        // Scrolled to it: paragraph 29 is drawn, and is the match.
+        assert_eq!(reversed(&pages, view), ["paragraph 2"]);
+        assert!(pages.place(view).unwrap().0 > 0);
+        let count = pages.find(view, &query, Step::Next);
+        assert_eq!(count.current, Some(1), "wraps on");
+        assert_eq!(pages.place(view).unwrap().0, 4, "back up to its line");
+        // Case sensitive: none.
+        let exact = Query {
+            case_sensitive: true,
+            ..query.clone()
+        };
+        let count = pages.find(view, &exact, Step::Start);
+        assert_eq!((count.current, count.total), (None, 0));
+        assert!(reversed(&pages, view).is_empty());
+        // A new snapshot of the document finds again and reports a changed count.
+        pages.find(view, &query, Step::Start);
+        assert_eq!(pages.snapshot(view, snapshot(document)), None, "the same");
+        let mut fewer = snapshot(document);
+        fewer.nodes.retain(|node| node.id != NodeId(120));
+        fewer.nodes[0].children.retain(|id| *id != NodeId(120));
+        let count = pages.snapshot(view, fewer).expect("a new count");
+        assert_eq!((count.current, count.total), (Some(1), 10));
+        // Stop clears it; a new document drops it.
+        pages.stop_find(view);
+        assert!(reversed(&pages, view).is_empty());
+        pages.find(view, &query, Step::Start);
+        assert_eq!(
+            pages.snapshot(view, snapshot(DocumentGeneration::next())),
+            None
+        );
+        assert!(reversed(&pages, view).is_empty());
+        // A page that is not there finds nothing.
+        let count = pages.find(ViewId::next(), &query, Step::Next);
+        assert_eq!((count.current, count.total), (None, 0));
     }
 
     #[test]
