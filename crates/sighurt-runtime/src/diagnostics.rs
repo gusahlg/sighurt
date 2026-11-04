@@ -2,7 +2,8 @@
 //!
 //! Counts loop wakeups and iterations, input events, core events and effects, engine pumps and
 //! their events, frame-ready notifications, page frames presented (and not ready), chrome
-//! paints per surface, placements, and the deepest queues seen; times the longest pump,
+//! paints per surface, placements, and the deepest queues seen; counts and times the placements
+//! and chrome snapshots a frontend builds; times the longest pump,
 //! present and chrome paint; keeps the most SHM buffers any target, and any of the chrome's
 //! targets, held, sampled after every presentation (where buffers are allocated). The host adds, per target, its metrics and its
 //! permits, submissions, frame callbacks, buffer releases and presentation feedback, kept
@@ -97,6 +98,14 @@ pub struct Counters {
     pub placements: u64,
     /// Placements the host refused.
     pub placement_errors: u64,
+    /// Placements a frontend built to compare with the one applied last (applied or not).
+    pub placement_builds: u64,
+    /// Nanoseconds spent building and comparing them, all together.
+    pub placement_ns: u64,
+    /// Snapshots of the core built for the chrome.
+    pub snapshots: u64,
+    /// Nanoseconds spent building them (containing every string included), all together.
+    pub snapshot_ns: u64,
     /// Configuration reloads, valid or not.
     pub config_reloads: u64,
     /// Session snapshots handed to the writer.
@@ -172,8 +181,8 @@ pub struct EngineReport {
     /// For a GL engine once it has a context: "hardware" or "software", and the GL renderer.
     pub gl: Option<String>,
     /// Page readbacks to the CPU the engine counted (Servo's `read_to_image`, and its GL reads
-    /// when auditing); 0 on the display path and for the CPU engines, which paint into the
-    /// host's buffers.
+    /// when auditing); 0 on the display path. The CPU engines count their copies here: CEF's
+    /// staged bytes, WPE's shared-memory fallback copies, Ladybird's frames copied.
     pub readbacks: u64,
     /// The `glReadPixels`/`glGetTexImage` calls among them, when the engine audits its GL calls
     /// (Servo with `SIG_AUDIT_GL=1`); `None` otherwise.
@@ -382,6 +391,18 @@ impl Diagnostics {
         }
     }
 
+    /// A frontend built a placement to compare with the last one, which took `took`.
+    pub fn placement_built(&mut self, took: Duration) {
+        self.counters.placement_builds += 1;
+        self.counters.placement_ns = self.counters.placement_ns.saturating_add(nanos(took));
+    }
+
+    /// A frontend built a snapshot of the core for its chrome, which took `took`.
+    pub fn snapshot_built(&mut self, took: Duration) {
+        self.counters.snapshots += 1;
+        self.counters.snapshot_ns = self.counters.snapshot_ns.saturating_add(nanos(took));
+    }
+
     /// An engine pump took `took` and reported `events`.
     pub fn pump(&mut self, events: usize, took: Duration) {
         self.counters.pumps += 1;
@@ -436,6 +457,10 @@ impl Diagnostics {
 
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// An object's fields as `key=value` pairs, strings quoted when they need it, booleans 0 or 1.

@@ -61,7 +61,9 @@ pub trait Running<T, P>: EngineRuntime<Target = T, FramePermit = P> {
         Some(("cpu", None))
     }
 
-    /// Page readbacks to the CPU the engine made. 0 for the CPU engines.
+    /// Page readbacks to the CPU the engine made. A CPU engine whose frame reaches the host as a
+    /// copy of a buffer of its own counts those copies here, one per frame copied whole (Ladybird's
+    /// `LadybirdDiagnostics::frames_copied`); one that paints into the host's buffers counts 0.
     fn readbacks(&self) -> u64 {
         0
     }

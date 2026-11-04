@@ -26,8 +26,12 @@
 //! 7. Flush, and sleep until an event or a real deadline. With work left over, the next
 //!    iteration starts without sleeping.
 //!
-//! The permit list, the placement built each refresh and the buffer-peak sample are reused
-//! across passes, so a steady frame does not allocate them.
+//! The host-event and permit lists, the placement and the buffer-peak sample are reused across
+//! passes, so a steady frame does not allocate them. The placement is built only when a view,
+//! the window's size or the chrome's layout changed (and while a retiring target is listed), and
+//! the keyboard focus worked out only when the core's focus, the shown view or the chrome
+//! changed; the last placement applied is still compared before applying one. A snapshot reuses
+//! the contained strings of tabs that did not change ([`SnapshotCache`]).
 //!
 //! Nothing ticks at a fixed rate: an idle browser sleeps until the compositor, an engine, a
 //! service or a signal wakes it. Downloads and session writes run on threads of their own.
@@ -86,7 +90,7 @@ use sighurt_wayland::{
     TargetPlacement, WindowOptions,
 };
 
-use crate::chrome::{self, ChromeTargets, Placing};
+use crate::chrome::{self, ChromeTargets, Placing, SnapshotCache};
 use crate::engines;
 
 /// Most host events handled in one pass.
@@ -130,11 +134,19 @@ struct Gui {
     size: Option<LogicalSize>,
     /// The placement last applied, and whether the next must be applied even if equal.
     placed: Option<Placement>,
-    /// Built every refresh and compared with `placed`. Cloned only when a placement is applied.
+    /// Built when `place_dirty` and compared with `placed`. Cloned only when a placement is
+    /// applied.
     placement_buf: Placement,
     /// The chrome half of `placement_buf`, reused each refresh.
     placing_buf: Placing,
     place_now: bool,
+    /// What the placement is built from changed: a view was opened, shown, hidden or forgotten,
+    /// or the chrome handled an event (its layout is read after each). The placement is built
+    /// only then, and while a retiring target is listed (its lease drops unannounced).
+    place_dirty: bool,
+    /// The core's focus, the shown view's target and the chrome's text target the keyboard
+    /// focus was last given from. `None` when it must be worked out again.
+    focus_from: Option<(KeyboardFocus, Option<TargetId>, Option<TargetId>)>,
     snapshot_dirty: bool,
     /// The latest notice or download status, for the status strip.
     notice: Option<String>,
@@ -157,8 +169,12 @@ struct App {
     signals: Vec<u8>,
     /// Permits for this pass. Reused so a steady frame does not allocate the list.
     permits: Vec<FramePermit>,
+    /// Host events for this pass. Reused, like the permits.
+    host_events: Vec<HostEvent>,
     /// Buffer peaks sampled after a presentation. Reused.
     buffer_scratch: Vec<(usize, usize, bool)>,
+    /// The tabs of the last snapshot, contained, for the next.
+    snapshot_cache: SnapshotCache,
 }
 
 /// Runs the Wayland frontend until it quits.
@@ -277,14 +293,23 @@ impl Frontend for Gui {
             .create_target(self.window, mode, Some(view))
             .map_err(|e| e.to_string())?;
         let id = lease.id();
+        self.layout_changed();
         Ok((id, lease))
     }
 
     fn place(&mut self, views: &BTreeMap<ViewId, ViewEntry>, diag: &mut Diagnostics) -> bool {
-        if self.fill_placement(views, diag).is_none() {
+        if !(self.place_dirty || self.place_now || !self.retiring.is_empty()) {
             return false;
         }
-        if !self.place_now && self.placed.as_ref() == Some(&self.placement_buf) {
+        self.place_dirty = false;
+        let started = Instant::now();
+        if self.fill_placement(views, diag).is_none() {
+            self.place_dirty = true;
+            return false;
+        }
+        let same = self.placed.as_ref() == Some(&self.placement_buf);
+        diag.placement_built(started.elapsed());
+        if !self.place_now && same {
             return false;
         }
         let placement = self.placement_buf.clone();
@@ -297,6 +322,8 @@ impl Frontend for Gui {
             }
             Err(error) => {
                 // A stale size means a newer configure is queued; it brings its own placement.
+                // Until then it is tried again each pass, as it is built again.
+                self.place_dirty = true;
                 diag.counters.placement_errors += 1;
                 diag.error(format!("placement refused: {error}"));
                 false
@@ -307,6 +334,7 @@ impl Frontend for Gui {
     fn forget_target(&mut self, target: TargetId) {
         // Listed, hidden, until the engine drops the lease.
         self.retiring.push(target);
+        self.layout_changed();
         if self.page_text_target == Some(target) {
             self.host.set_text_input(self.window, target, None);
             self.page_text_target = None;
@@ -318,8 +346,7 @@ impl Frontend for Gui {
     }
 
     fn focus(&mut self, focus: KeyboardFocus, queue: &mut VecDeque<BrowserEvent>) {
-        let actions = self.chrome.handle(ChromeEvent::Focus(focus));
-        self.chrome_actions(queue, actions);
+        self.chrome_event(queue, ChromeEvent::Focus(focus));
     }
 
     fn chrome_input(&mut self, event: InputEvent, queue: &mut VecDeque<BrowserEvent>) {
@@ -329,16 +356,12 @@ impl Frontend for Gui {
             // Window focus reached the chrome already, whoever has the keyboard.
             InputKind::Focus(_) | InputKind::Pointer(_) => return,
         };
-        let actions = self.chrome.handle(event);
-        self.chrome_actions(queue, actions);
+        self.chrome_event(queue, event);
     }
 
     fn chrome_command(&mut self, action: String, queue: &mut VecDeque<BrowserEvent>) {
         match chrome::command(&chrome::chrome(self.chrome_name), action) {
-            Ok(event) => {
-                let actions = self.chrome.handle(event);
-                self.chrome_actions(queue, actions);
-            }
+            Ok(event) => self.chrome_event(queue, event),
             Err(notice) => self.show_notice(notice),
         }
     }
@@ -375,6 +398,7 @@ impl Frontend for Gui {
     fn show(&mut self, _view: ViewId, _visible: bool) {
         // `ViewEntry::visible` is already updated. The next `place` maps or unmaps the target,
         // which is when the core's show and hide took effect before.
+        self.layout_changed();
     }
 
     fn frame_ready(&mut self, target: TargetId) {
@@ -396,6 +420,20 @@ impl Gui {
         self.notice = Some(message);
         self.notice_first = Some(Instant::now() + NOTICE_FIRST);
         self.snapshot_dirty = true;
+    }
+
+    /// Hands `event` to the chrome and carries out what it asks for. Its layout is read after
+    /// every event, so the placement is built again.
+    fn chrome_event(&mut self, queue: &mut VecDeque<BrowserEvent>, event: ChromeEvent) {
+        let actions = self.chrome.handle(event);
+        self.layout_changed();
+        self.chrome_actions(queue, actions);
+    }
+
+    /// What the placement and the keyboard focus are worked out from changed.
+    fn layout_changed(&mut self) {
+        self.place_dirty = true;
+        self.focus_from = None;
     }
 
     /// Carries out what the chrome asks for.
@@ -518,6 +556,8 @@ impl Gui {
                     }
                     Err(error) => {
                         diag.error(format!("no target for the chrome's {name}: {error}"));
+                        // Tried again next time, as before.
+                        self.place_dirty = true;
                         continue;
                     }
                 },
@@ -540,6 +580,11 @@ impl Gui {
     /// chrome's surface at the page's rectangle while it draws the page.
     fn sync_keyboard_focus(&mut self, focus: KeyboardFocus, shown: Option<TargetId>) {
         let chrome_text = self.chrome_text_target;
+        let from = Some((focus, shown, chrome_text));
+        if self.focus_from == from {
+            return;
+        }
+        self.focus_from = from;
         let wanted = {
             let layout = self.chrome.layout();
             let leases = &self.leases;
@@ -562,6 +607,21 @@ impl Gui {
             self.keyboard_target = wanted;
             self.host.set_keyboard_focus(self.window, wanted);
         }
+    }
+
+    /// What the status strip shows for `tab`, and where it comes from. A tab's error is shown
+    /// there unless the page area shows it (a tab with nothing else to show).
+    fn status<'a>(&'a self, tab: &TabSummary<'a>) -> Option<(&'static str, &'a str)> {
+        let error = tab
+            .error
+            .filter(|_| !matches!(tab.content, Content::Blank))
+            .map(|e| e.message.as_str());
+        status_line(
+            self.notice.as_deref(),
+            self.notice_first.is_some(),
+            tab.status,
+            error,
+        )
     }
 
     /// The chrome's surface that `target` is.
@@ -648,6 +708,8 @@ impl App {
             },
             placing_buf: Placing::default(),
             place_now: false,
+            place_dirty: true,
+            focus_from: None,
             snapshot_dirty: true,
             notice: None,
             notice_first: None,
@@ -667,7 +729,9 @@ impl App {
             config_changed: false,
             signals: Vec::new(),
             permits: Vec::new(),
+            host_events: Vec::new(),
             buffer_scratch: Vec::new(),
+            snapshot_cache: SnapshotCache::default(),
         })
     }
 
@@ -774,7 +838,7 @@ impl App {
 
     /// Handles the host's events, at most [`MAX_HOST_EVENTS`]. Returns whether there were any.
     fn drain_host_events(&mut self) -> bool {
-        let mut batch: Vec<HostEvent> = Vec::new();
+        let mut batch = std::mem::take(&mut self.host_events);
         while batch.len() < MAX_HOST_EVENTS {
             let Some(event) = self.gui.host.next_event() else {
                 break;
@@ -786,10 +850,11 @@ impl App {
         let peaks = &mut self.session.diagnostics_mut().peaks;
         peaks.max_host_queue = peaks.max_host_queue.max(batch.len() as u64);
         let worked = !batch.is_empty();
-        for event in batch {
+        for event in batch.drain(..) {
             self.host_event(event);
             self.session.run_core(&mut self.gui);
         }
+        self.host_events = batch;
         worked
     }
 
@@ -798,8 +863,8 @@ impl App {
         match event {
             HostEvent::WindowConfigured { size, .. } => {
                 self.gui.size = Some(size);
-                let actions = self.gui.chrome.handle(ChromeEvent::Resize(size));
-                self.gui.chrome_actions(self.session.queue_mut(), actions);
+                let queue = self.session.queue_mut();
+                self.gui.chrome_event(queue, ChromeEvent::Resize(size));
                 self.gui.place_now = true;
             }
             HostEvent::CloseRequested { .. } => self.session.queue_mut().push_back(
@@ -820,11 +885,9 @@ impl App {
                     self.gui.paste = None;
                     if let Ok(data) = result {
                         let text = String::from_utf8_lossy(&data.data).into_owned();
-                        let actions = self
-                            .gui
-                            .chrome
-                            .handle(ChromeEvent::Pasted { request, text });
-                        self.gui.chrome_actions(self.session.queue_mut(), actions);
+                        let queue = self.session.queue_mut();
+                        self.gui
+                            .chrome_event(queue, ChromeEvent::Pasted { request, text });
                     }
                 } else {
                     self.session.clipboard_done(request, result);
@@ -857,11 +920,9 @@ impl App {
                         .push_back(BrowserEvent::Button { view, event, at });
                 } else if let Some(surface) = target.and_then(|t| self.gui.surface_of(t)) {
                     let event = pointer.clone();
-                    let actions = self
-                        .gui
-                        .chrome
-                        .handle(ChromeEvent::Pointer { surface, event });
-                    self.gui.chrome_actions(self.session.queue_mut(), actions);
+                    let queue = self.session.queue_mut();
+                    self.gui
+                        .chrome_event(queue, ChromeEvent::Pointer { surface, event });
                 } else if let Some(view) = target.and_then(|t| self.session.view_of(t)) {
                     self.session
                         .queue_mut()
@@ -869,8 +930,9 @@ impl App {
                 }
             }
             InputKind::Focus(focus) => {
-                let actions = self.gui.chrome.handle(ChromeEvent::WindowFocus(*focus));
-                self.gui.chrome_actions(self.session.queue_mut(), actions);
+                let queue = self.session.queue_mut();
+                self.gui
+                    .chrome_event(queue, ChromeEvent::WindowFocus(*focus));
                 self.session
                     .queue_mut()
                     .push_back(BrowserEvent::Keyboard { event, at });
@@ -891,9 +953,13 @@ impl App {
             if !std::mem::take(&mut self.gui.snapshot_dirty) {
                 break;
             }
+            let started = Instant::now();
             let snapshot = self.snapshot();
-            let actions = self.gui.chrome.handle(ChromeEvent::Snapshot(snapshot));
-            self.gui.chrome_actions(self.session.queue_mut(), actions);
+            let built = started.elapsed();
+            self.session.diagnostics_mut().snapshot_built(built);
+            let queue = self.session.queue_mut();
+            self.gui
+                .chrome_event(queue, ChromeEvent::Snapshot(snapshot));
             self.session.run_core(&mut self.gui);
             worked = true;
             // A navigation whose tab the user left is no longer waited for.
@@ -907,9 +973,12 @@ impl App {
     }
 
     /// What the chrome shows: the core's tabs, the status line and the home page, contained.
-    fn snapshot(&self) -> Snapshot {
-        let status = |tab: &TabSummary<'_>| self.status(tab).map(|(_, text)| text.to_owned());
-        chrome::snapshot(self.session.core(), self.home_info(), status)
+    fn snapshot(&mut self) -> Snapshot {
+        let home = self.home_info();
+        let gui = &self.gui;
+        let status = |tab: &TabSummary<'_>| gui.status(tab).map(|(_, text)| text.to_owned());
+        let cache = &mut self.snapshot_cache;
+        chrome::snapshot(self.session.core(), home, status, cache)
     }
 
     /// What `sig://home` says: the configuration file and the engines of this build.
@@ -958,21 +1027,6 @@ impl App {
             config_path,
             engines,
         }
-    }
-
-    /// What the status strip shows for `tab`, and where it comes from. A tab's error is shown
-    /// there unless the page area shows it (a tab with nothing else to show).
-    fn status<'a>(&'a self, tab: &TabSummary<'a>) -> Option<(&'static str, &'a str)> {
-        let error = tab
-            .error
-            .filter(|_| !matches!(tab.content, Content::Blank))
-            .map(|e| e.message.as_str());
-        status_line(
-            self.gui.notice.as_deref(),
-            self.gui.notice_first.is_some(),
-            tab.status,
-            error,
-        )
     }
 
     /// Hands each permit the host issues to its presenter. Returns whether there were any.
@@ -1059,11 +1113,9 @@ impl App {
                 if config.restore_session() && !self.session.core().config().restore_session() {
                     self.session.session_changed();
                 }
-                let actions = self
-                    .gui
-                    .chrome
-                    .handle(chrome::configure(&config, self.gui.chrome_name));
-                self.gui.chrome_actions(self.session.queue_mut(), actions);
+                let configure = chrome::configure(&config, self.gui.chrome_name);
+                let queue = self.session.queue_mut();
+                self.gui.chrome_event(queue, configure);
                 self.session
                     .queue_mut()
                     .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));

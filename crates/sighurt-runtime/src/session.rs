@@ -86,6 +86,9 @@ pub struct Session<F: Frontend> {
     registry: Registry<F::Target, F::Permit>,
     /// Live engine views.
     views: BTreeMap<ViewId, ViewEntry>,
+    /// Each live view by its target, for [`Session::view_of`] on every permit and pointer
+    /// event. Kept in step with `views`.
+    by_target: BTreeMap<TargetId, ViewId>,
     /// Downloads and the page's clipboard bookkeeping. `None` once shutdown has taken it.
     services: Option<Services>,
     /// Counters and the diagnostics file.
@@ -133,6 +136,7 @@ impl<F: Frontend> Session<F> {
             queue: VecDeque::new(),
             registry,
             views: BTreeMap::new(),
+            by_target: BTreeMap::new(),
             services: Some(services),
             diag,
             paths,
@@ -387,6 +391,7 @@ impl<F: Frontend> Session<F> {
                 navigated: None,
             },
         );
+        self.by_target.insert(target_id, view);
         frontend.place(&self.views, &mut self.diag);
         let runtime = self.registry.running(engine).expect("started above");
         let opened = runtime.open_view(view, options, target);
@@ -434,6 +439,7 @@ impl<F: Frontend> Session<F> {
         let Some(entry) = self.views.remove(&view) else {
             return;
         };
+        self.by_target.remove(&entry.target);
         frontend.forget_target(entry.target);
     }
 
@@ -635,10 +641,7 @@ impl<F: Frontend> Session<F> {
 
     /// The view whose target is `target`.
     pub fn view_of(&self, target: TargetId) -> Option<ViewId> {
-        self.views
-            .iter()
-            .find(|(_, entry)| entry.target == target)
-            .map(|(&view, _)| view)
+        self.by_target.get(&target).copied()
     }
 
     /// Whether `view` belongs to the active tab.
@@ -1097,6 +1100,7 @@ mod tests {
         assert_eq!(frontend.forgotten.len(), 1, "forget_target once");
         assert!(frontend.targets.is_empty(), "no target record is left");
         assert!(session.views.is_empty(), "no view entry is left");
+        assert!(session.by_target.is_empty(), "nor its target");
         // A second forget finds nothing to forget.
         session.forget_view(&mut frontend, view);
         assert_eq!(frontend.forgotten.len(), 1);
@@ -1292,6 +1296,13 @@ mod tests {
         });
         session.run_core(&mut frontend);
         session.pump(&mut frontend);
+        let (&view, entry) = session.views().iter().next().expect("the page's view");
+        assert_eq!(
+            session.view_of(entry.target),
+            Some(view),
+            "found by its target"
+        );
+        let target = entry.target;
         session.queue_mut().push_back(BrowserEvent::Command(
             "browser.quit".parse::<Command>().unwrap(),
         ));
@@ -1318,6 +1329,11 @@ mod tests {
             "the exit report is built before the views close"
         );
         assert!(session.views().is_empty());
+        assert_eq!(
+            session.view_of(target),
+            None,
+            "a closed view's target finds nothing"
+        );
         assert_eq!(session.diag.counters.session_saves, 1, "written once");
         let saved = std::fs::read_to_string(&path).expect("the session file");
         assert!(saved.contains("https://example.com/"), "{saved}");

@@ -129,6 +129,169 @@ causes (README, "Known limits"). H10 and H11 are new, for the two workloads adde
 - **Outcome:** supported: median 2038 us to 763-806 us (3 runs), kept (written together with its
   baseline, not before it).
 
+### Owner-loop review (3 November 2026): method
+
+Five hypotheses from an independent review of the GUI owner loop (`frontends/sighurt-gui/src/app.rs`,
+`chrome.rs`, `crates/sighurt-runtime/src/session.rs`), written on 3 November 2026 after a
+probe (one 5 s run of each workload, flat `perf record` profiles of the main thread) and before
+the measured runs. Every number is from the debug `sig` the build commands make
+(`--no-default-features --features engine-demo,engine-wasm,chrome-line`: dependencies at
+opt-level 3, the workspace's own crates unoptimized), so owner-loop code costs more here than in
+a release build; the ratios between workloads and the direction are what carry over.
+
+- **Workloads**, 1280×800 at scale 1, in `tools/headless-sway` (pixman), isolated XDG
+  directories, `RUST_LOG=error`, `SIG_DIAG` unset: `raf` (the Wasm raf-demo alone); `anim50`
+  (49 `demo://pattern/N/<16 000-character path>` tabs and `demo://animation/<same>` last,
+  selected with `tab.last`, so its view is the last in the session's map); `idle50` (50 such
+  pattern tabs, nothing moving); `hover50` (`demo://resize/<long>` first and active, 49 pattern
+  tabs; the pointer moves over the page every 10 ms, and each motion is a status-text change, as
+  hovering links is); `chrome50` (50 pattern tabs, the pointer moves along the tab strip every
+  10 ms).
+- **Method:** start `sig`, wait 4 s (6 s for `anim50`), start the pointer if any, wait 2 s, then
+  10 s of `perf stat -e task-clock,instructions:u` on the main thread (`-t`, the owner thread) and
+  on the process, diagnostics (`--diagnostics`, SIGUSR1) and an allocation count
+  (an `LD_PRELOAD` counter of malloc, calloc, realloc and the aligned family, per process and on
+  the main thread, read with SIGUSR2; heaptrack and valgrind are not installed) at both ends.
+  Three runs per build, the builds interleaved. The diagnostics gained four counters for this:
+  `placement_builds` and `placement_ns` (placements built and compared, applied or not) and
+  `snapshots` and `snapshot_ns` (snapshots built for the chrome).
+- **Builds compared:** `base` is HEAD plus only those four counters; `after` adds H-OWN2,
+  H-SNAP2 and H-OWN4. Both were built one after the other from the same tree (other agents were
+  editing engines meanwhile), so they differ only in `app.rs` and `chrome.rs`. H-OWN3 was
+  measured afterwards the same way, `session.rs` as at HEAD (`nomap`) against the map (`map`).
+  Results and logs: `/data/sig-builds/test-out/opt-gui-bench/` (`ab1` all workloads, `ab2`–`ab4`
+  `anim50`, `map1` H-OWN3, `ab3/prof-after-*` the profiles after). On `anim50`, `tab.last` sent
+  by a freshly plugged-in wtype keyboard was sometimes missed by both builds alike (`sig` had not
+  bound the new device yet); such runs show no animation and are left out, and the later runs
+  keep a keyboard plugged in, as headless.sh does. Seven `base` and six `after` runs counted.
+
+### H-OWN2: The placement is built only when what feeds it changed
+
+- **Seen:** every pass of every iteration builds the whole placement (every view, the retiring
+  targets and the chrome's surfaces) and compares it with the one applied last: about 4 builds
+  per animation frame (raf 1269 builds for 305 frames), 10 µs each with one view and 25 µs with
+  50 (`placement_ns`), about 7 % of the owner thread's CPU on `anim50`. Keyboard focus is also
+  recomputed from the chrome's layout every pass.
+- **Change:** the GUI keeps a dirty flag, set when a view is opened, shown or hidden, or
+  forgotten, when the window is configured, when the chrome handles any event (its layout is
+  read after every `handle`) and while a retiring target is listed (its lease can drop without an
+  event). A placement is built only then; the comparison with the last applied placement stays as
+  the safety net. A refused placement leaves the flag set, so it is retried as before. Keyboard
+  focus is recomputed only when the core's focus, the shown view, the chrome's text field or the
+  chrome's layout changed.
+- **Prediction:** on `raf` and `anim50`, `placement_builds` per presented frame falls from about
+  4 to under 0.1, `placement_ns` by at least 90 %, and the owner thread's instructions per
+  presented frame by at least 3 % on `anim50` (by roughly the placement's share).
+- **Guards:** `placements` and `placement_errors` unchanged, no chrome paint during the
+  animations, frames presented per second not lower, headless.sh 78/78 (its resize, scale,
+  tab-switch and focus checks exercise every path that sets the flag).
+- **Outcome:** supported. `placement_builds` per 10 s: `raf` 2482, 2458, 2462 → 0, 0, 0;
+  `anim50` about 2330 → 0 (`placement_ns` 63.7 ms → 0); `chrome50` 2633–2668 → 806–811 (once
+  per chrome event; `placement_ns` 21.2 → 10.1 ms median); `idle50` 1 → 0. Owner-thread
+  instructions per presented frame on `anim50`: median 1.2200 M (7 runs, 1.2163–1.2218) →
+  1.0706 M (6 runs, 1.0662–1.0719), −12.2 %, more than the placement's measured share (the focus
+  sync and the walks inside the placement went with it); task-clock per frame 1.537 → 1.431 ms
+  median, inside the spread (1.435–1.604 against 1.183–1.521). `raf`: 7.548 → 7.522 M
+  instructions per frame (−0.35 %, outside both spreads of 0.17 % and 0.13 %); task-clock 1679
+  → 1576 ms median, inside the spread. On `chrome50` the instructions moved −0.7 %, inside the
+  spread (the chrome's own painting dominates). Guards: `placements` and `placement_errors`
+  0 → 0 in every window, chrome paints 0 during `raf` and `anim50`, frames presented the same
+  (`raf` 605–607, `anim50` 579–592 per 10 s), main-thread allocations the same (`raf` 264.3–264.7 k,
+  `anim50` 29.5–29.7 k), headless.sh 78/78. Kept.
+
+### H-OWN3: Lookups by target are not worth a map
+
+- **Seen:** `Gui::surface_of` (at most 8 leases) and `Session::view_of` (every view) are linear
+  scans, on every permit and every pointer event; `record_buffers` scans the leases for each
+  target after every presenting pass.
+- **Prediction (to decide whether to change anything):** with 50 views and the animated view
+  last in the map, these scans together cost under 2 % of the owner thread's samples on `anim50`
+  and `hover50`. If so, a map kept in step with the views costs more code (and a second place to
+  keep right) than it saves, and nothing changes. Above 2 %, a `TargetId → ViewId` map in the
+  session.
+- **Measured:** above 2 %, so the prediction does not hold. After H-OWN2, the flat profile of
+  the owner thread on `anim50` (animated view last; about 505 samples in each of the two PMU
+  groups perf reports) puts the walks of the session's view map (`view_of` per permit and
+  `shown_view` per pass) at 5.9 % and 2.3 % (about 4 %), `record_buffers` and `for_each_buffer`
+  at about 2 % (mostly the host's per-target buffer statistics, which this change does not
+  touch), and `surface_of` at 0 %. On `hover50` (active view first) the walks are 0.8 %.
+- **Change (by the rule above):** `Session::view_of` reads a `TargetId → ViewId` map kept in step
+  with the views where a view is recorded (`open_view`) and forgotten (`forget_view`), the only
+  two places; `shown_view` and `record_buffers` stay as they are.
+- **Outcome:** supported, small. `anim50` instructions per frame 1.0717 M median (1.0663–1.0856)
+  → 1.0497 M (1.0472–1.0521), −2.1 %, every run with the map below every run without; task-clock
+  inside the spread. `hover50` 44.79 → 44.63 M per frame (−0.4 %, inside the spread). In a
+  release build the walk of 50 entries is well under a microsecond a frame; kept because it is
+  a few lines, tested (`a_refused_open_forgets_the_frontends_target`,
+  `quitting_writes_the_session_once_and_the_exit_report_sees_every_view`) and removes the one
+  per-event scan that grows with the tab count.
+
+### H-SNAP2: A snapshot reuses the contained strings of unchanged tabs
+
+- **Seen:** on `hover50` the owner thread is saturated (100 % of a CPU): each status change
+  rebuilds the snapshot, and building it, mostly the containment scan of 50 unchanged 16 000-byte
+  addresses (`is_contained` in `Snapshot::contain`), takes 10.4 ms (`snapshot_ns`: 4.25 s of the
+  5 s window, 409 snapshots). H-SNAP1 made the scan cheaper; it is still linear in the bytes of
+  every tab.
+- **Change:** the GUI keeps, per tab, the core's strings it last contained and the contained
+  tab. A tab whose title, address, engine, switching engine and error are byte-equal to last time
+  (compared with `memcmp`, not scanned per character) reuses its contained tab; only the others
+  go through `Snapshot::contain` (a snapshot of just them, so the bounds stay the UI crate's).
+  `HomeInfo` is left as it is unless the profile after the change shows it.
+- **Prediction:** on `hover50` `snapshot_ns` per snapshot falls by at least 80 %, the owner
+  thread is no longer saturated (task-clock under 80 % of the window) and the page and status
+  repaint more often (status paints per second up). Allocations per snapshot do not rise.
+- **Guards:** the chrome sees the same snapshot (a unit test compares the reused snapshot with a
+  freshly contained one through title, address and error changes, and with strings that need
+  containing); `the_snapshot_contains_what_pages_say`; headless.sh 78/78.
+- **Outcome:** supported. `hover50`, three runs each: `snapshot_ns` per snapshot 10.21, 10.35,
+  10.67 ms → 0.354, 0.356, 0.368 ms (−96.6 % median). The owner thread is no longer saturated:
+  task-clock 10 002 ms of the 10 s window in every base run → 4581, 4666, 4674 ms; instructions
+  137.3, 135.8, 132.4 G → 26.88, 26.80, 26.73 G (−80 %). Status and page repaints per 10 s
+  358, 354, 330 → 601, 601, 598. Main-thread allocations per snapshot 3586 → 3738 (+4 %): the
+  snapshot itself copies the same strings as before (one copy per tab string, from the cache
+  instead of the core), and the rise is the repaints that now follow (0.83 paints per snapshot
+  against 0.44; solving for both gives about 3400 allocations per snapshot and 390 per
+  status-and-page repaint, so not a rise in the snapshot's own). After the change `home_info`
+  is 0.08 % of the owner thread's samples on `hover50`, so `HomeInfo` is not cached: an
+  invalidation key (engine states, configuration) would cost more than the dozen small
+  allocations it saves. Guards: `a_reused_tab_is_what_containing_it_again_gives` (the reused
+  snapshot equals a freshly contained one after start, commits with a 40 000-character
+  address cut to its bound, a bidi-and-newline title set and reset, a failed first navigation
+  shown as an error tab, and a closed tab that moves the rest; and it counts the tabs
+  contained each step: 4, 0, 2, 0, 1, 1, 1, 1, 0, 0), `the_snapshot_contains_what_pages_say`,
+  headless.sh 78/78. The cache holds a second copy only of tabs whose strings containing
+  changed. Kept. Still linear in the tabs: a byte comparison and a copy of each tab's strings
+  per snapshot (`memcmp`/`memcpy`, fast in any build), and the chrome compares the whole
+  snapshot again.
+
+### H-OWN4: Draining host events reuses its list
+
+- **Seen:** `drain_host_events` makes a new `Vec` each pass, which allocates whenever there is an
+  event (pointer motion: about once per pass on `hover50` and `chrome50`).
+- **Change:** a list kept in the app and reused, as the permits are.
+- **Prediction:** main-thread allocations per input event fall by about one on `chrome50`
+  (where nothing else here changes allocations). Wasted work removed; kept unless it costs
+  something.
+- **Outcome:** not resolvable, kept. `chrome50` main-thread allocations per input event 377.8
+  median (373.7–379.5) → 373.9 (370.3–377.4): the expected one allocation per pass with events
+  (about 810 of about 305 000 in a window) is inside the run-to-run spread, which the chrome's
+  painting sets. The change is three lines with no cost, like the permit list's.
+
+### H-OWN5: An engine command is not cloned for a refusal that rarely comes
+
+- **Seen:** `Session::engine_command` clones every command so that a refusal can carry it back
+  to the core (`BrowserEvent::CommandFailed`).
+- **Prediction (to decide whether to change anything):** the clone is free for pointer input
+  (no heap data: a pointer event is plain values) and two small strings for a key, and the large
+  payloads (a URL, a service result) come once per navigation or request; so on `hover50` it
+  is not in the profile. The core reads the command of a refusal (a refused navigation fails
+  that navigation), and `EngineRuntime::command` takes it by value, so it cannot be cloned only on
+  the error path without changing the API. If the profile agrees, nothing changes.
+- **Outcome:** as predicted; nothing changed. On `hover50` after H-SNAP2 the clone and
+  `engine_command` are 0.03 % of the owner thread's samples. `EngineCommand::Input` of a pointer
+  event clones no heap data.
+
 Candidates from the IPC-removal session (`results/IPC-REMOVAL.md`, "Surprises and regressions"),
 each seen there but not predicted, so each still to be tested:
 

@@ -2,6 +2,9 @@
 //! `[chrome.<name>]`, a snapshot of the core with every string contained, and its own commands),
 //! and its named surfaces as the host's targets.
 //!
+//! [`snapshot`] contains again only the tabs whose strings changed since the last snapshot: the
+//! others' contained copies are kept in a [`SnapshotCache`].
+//!
 //! [`ChromeTargets`] keeps the surface part of the chrome API's contract
 //! (`sighurt_ui::extension`): one target for each name the chrome has used, at most
 //! `MAX_SURFACES`; a listed surface at its rectangle clipped to the window, taking input on its
@@ -103,10 +106,15 @@ pub fn engine<'a>(core: &'a BrowserState, tab: &TabSummary<'_>) -> Option<&'a st
 
 /// What the chrome shows of `core`: its tabs, `status` (the active tab's status line) and
 /// `home`, with every string contained to the bound its field states.
+///
+/// A tab whose strings are what `cache` holds from the previous snapshot reuses its contained
+/// copy (byte comparisons, no containing again); the others, and everything outside the tabs,
+/// go through `Snapshot::contain`, so the rules and bounds stay the UI crate's.
 pub fn snapshot(
     core: &BrowserState,
     home: HomeInfo,
     status: impl Fn(&TabSummary<'_>) -> Option<String>,
+    cache: &mut SnapshotCache,
 ) -> Snapshot {
     let active = core.active();
     let mut snapshot = Snapshot {
@@ -114,33 +122,115 @@ pub fn snapshot(
         keymap: core.keymap_indicator().map(str::to_owned),
         ..Snapshot::default()
     };
+    let count = cache.tabs.len();
+    let mut previous = std::mem::replace(&mut cache.tabs, Vec::with_capacity(count));
+    cache.contained = 0;
+    snapshot.tabs.reserve(count);
     for (index, tab) in core.tabs().enumerate() {
-        let content = match (tab.content, tab.error) {
-            (Content::View(_), _) => TabContent::Engine,
-            (Content::Internal(_), _) => TabContent::Internal,
-            (Content::Blank, Some(error)) => TabContent::Error(error.message.clone()),
-            (Content::Blank, None) => TabContent::Blank,
-        };
-        let engine = engine(core, &tab).map(str::to_owned);
-        let switching_to = tab.switching_to.map(str::to_owned);
+        let engine = engine(core, &tab);
         if index == active {
             snapshot.can_go_back = tab.can_go_back;
             snapshot.can_go_forward = tab.can_go_forward;
             snapshot.status = status(&tab);
         }
-        snapshot.tabs.push(TabSnapshot {
-            id: tab.id,
-            title: tab.title.into_owned(),
-            url: tab.url.unwrap_or_default().to_owned(),
-            loading: tab.loading,
-            active: index == active,
-            engine,
-            switching_to,
-            content,
-        });
+        let matches = |cached: &Option<CachedTab>| {
+            cached
+                .as_ref()
+                .is_some_and(|cached| cached.matches(&tab, engine))
+        };
+        // Usually at the same place as last time.
+        let found = match previous.get(index) {
+            Some(cached) if matches(cached) => Some(index),
+            _ => previous.iter().position(matches),
+        };
+        let loading = tab.loading;
+        let mut cached = match found.and_then(|at| previous[at].take()) {
+            Some(cached) => cached,
+            None => {
+                cache.contained += 1;
+                CachedTab::contain(tab_snapshot(tab, engine))
+            }
+        };
+        cached.contained.loading = loading;
+        cached.contained.active = index == active;
+        snapshot.tabs.push(cached.contained.clone());
+        cache.tabs.push(Some(cached));
     }
+    // The strings outside the tabs; the tabs are contained already.
+    let tabs = std::mem::take(&mut snapshot.tabs);
     snapshot.contain();
+    snapshot.tabs = tabs;
     snapshot
+}
+
+/// `tab` as the core has it, before containing.
+fn tab_snapshot(tab: TabSummary<'_>, engine: Option<&str>) -> TabSnapshot {
+    let content = match (tab.content, tab.error) {
+        (Content::View(_), _) => TabContent::Engine,
+        (Content::Internal(_), _) => TabContent::Internal,
+        (Content::Blank, Some(error)) => TabContent::Error(error.message.clone()),
+        (Content::Blank, None) => TabContent::Blank,
+    };
+    TabSnapshot {
+        id: tab.id,
+        title: tab.title.into_owned(),
+        url: tab.url.unwrap_or_default().to_owned(),
+        loading: tab.loading,
+        active: false,
+        engine: engine.map(str::to_owned),
+        switching_to: tab.switching_to.map(str::to_owned),
+        content,
+    }
+}
+
+/// The tabs [`snapshot`] contained last time, in its order, so an unchanged tab is not
+/// contained again.
+#[derive(Debug, Default)]
+pub struct SnapshotCache {
+    tabs: Vec<Option<CachedTab>>,
+    /// How many tabs the last snapshot contained, not reusing them.
+    contained: usize,
+}
+
+/// One tab as the core had it and as it was contained.
+#[derive(Debug)]
+struct CachedTab {
+    contained: TabSnapshot,
+    /// The core's strings, when containing changed any; `None` when they are `contained`'s.
+    raw: Option<TabSnapshot>,
+}
+
+impl CachedTab {
+    /// `raw` contained by `Snapshot::contain`.
+    fn contain(raw: TabSnapshot) -> Self {
+        let mut one = Snapshot {
+            tabs: vec![raw.clone()],
+            ..Snapshot::default()
+        };
+        one.contain();
+        let contained = one.tabs.pop().expect("one tab");
+        let raw = (contained != raw).then_some(raw);
+        Self { contained, raw }
+    }
+
+    /// Whether `tab`, whose page runs in `engine`, has the strings this was contained from.
+    /// `loading` and `active` are not strings: they are set on the copy each time.
+    fn matches(&self, tab: &TabSummary<'_>, engine: Option<&str>) -> bool {
+        let raw = self.raw.as_ref().unwrap_or(&self.contained);
+        let content = match (&raw.content, tab.content, tab.error) {
+            (TabContent::Engine, Content::View(_), _) => true,
+            (TabContent::Internal, Content::Internal(_), _) => true,
+            (TabContent::Error(message), Content::Blank, Some(error)) => *message == error.message,
+            (TabContent::Blank, Content::Blank, None) => true,
+            _ => false,
+        };
+        raw.id == tab.id
+            && content
+            && raw.title == *tab.title
+            && raw.url == tab.url.unwrap_or_default()
+            && raw.engine.as_deref() == engine
+            && raw.switching_to.as_deref() == tab.switching_to
+    }
 }
 
 /// The chrome's surfaces as targets: which names it has used, and where each went last.
@@ -525,7 +615,8 @@ mod tests {
             .expect("the page is opened");
         // Neither a tab whose page hasn't committed yet nor sig://home names an engine.
         let engines = |core: &BrowserState| {
-            let snapshot = snapshot(core, HomeInfo::default(), |_| None);
+            let cache = &mut SnapshotCache::default();
+            let snapshot = snapshot(core, HomeInfo::default(), |_| None, cache);
             let tabs = snapshot.tabs.into_iter();
             tabs.map(|tab| (tab.content, tab.engine))
                 .collect::<Vec<_>>()
@@ -555,7 +646,12 @@ mod tests {
             update(&mut core, BrowserEvent::Engine { engine, event, at });
         }
         let status = |_: &TabSummary<'_>| Some("\u{2066}hover\r\n".to_owned());
-        let snapshot = snapshot(&core, HomeInfo::default(), status);
+        let snapshot = snapshot(
+            &core,
+            HomeInfo::default(),
+            status,
+            &mut SnapshotCache::default(),
+        );
         let tab = &snapshot.tabs[0];
         assert_eq!(tab.content, TabContent::Engine);
         assert!(tab.title.starts_with("agpj.exe b"), "{:?}", tab.title);
@@ -564,6 +660,115 @@ mod tests {
         // The engine page names its engine, by its configured name.
         assert_eq!(tab.engine.as_deref(), Some("demo"));
         assert_eq!(snapshot.tabs[1].engine, None);
+    }
+
+    #[test]
+    fn a_reused_tab_is_what_containing_it_again_gives() {
+        let engines = [("demo".to_owned(), EngineCapabilities::default())].into();
+        let env = Environment {
+            engines,
+            ..Environment::default()
+        };
+        let config = "version = 1\n[routing.demo]\nschemes = [\"demo\"]";
+        let config = Config::parse(Some(config), &env).unwrap();
+        let mut core = BrowserState::new(config, env);
+        let open = ["demo://a", "sig://home", "demo://b", "demo://c"].map(|input| OpenRequest {
+            input: input.into(),
+            engine: None,
+        });
+        let start = BrowserEvent::Start {
+            session: None,
+            open: open.into(),
+        };
+        let navigations: Vec<_> = update(&mut core, start)
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Engine {
+                    view,
+                    command: EngineCommand::Navigate { navigation, .. },
+                } => Some((view, navigation)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(navigations.len(), 3);
+        let mut cache = SnapshotCache::default();
+        // Each step: the snapshot, and how many tabs it contained rather than reused.
+        let mut step = |core: &BrowserState, what: &str| {
+            let status = |_: &TabSummary<'_>| Some(format!("{what}\u{202e}"));
+            let reused = snapshot(core, HomeInfo::default(), status, &mut cache);
+            let fresh = snapshot(
+                core,
+                HomeInfo::default(),
+                status,
+                &mut SnapshotCache::default(),
+            );
+            assert_eq!(reused, fresh, "{what}");
+            (reused, cache.contained)
+        };
+        let engine = |core: &mut BrowserState, event| {
+            let at = Instant::now();
+            update(
+                core,
+                BrowserEvent::Engine {
+                    engine: "demo".into(),
+                    event,
+                    at,
+                },
+            );
+        };
+        assert_eq!(step(&core, "started").1, 4);
+        assert_eq!(step(&core, "again").1, 0);
+        let long = format!("demo://a/{}", "x".repeat(40_000));
+        // The last one never commits: it fails below, and its tab shows the error.
+        for (i, &(view, navigation)) in navigations.iter().enumerate().take(2) {
+            engine(&mut core, EngineEvent::ViewReady { view });
+            let document = sighurt_api::ids::DocumentGeneration::next();
+            let url = if i == 0 {
+                long.clone()
+            } else {
+                format!("demo://{i}")
+            };
+            engine(
+                &mut core,
+                EngineEvent::NavigationCommitted {
+                    view,
+                    navigation,
+                    url,
+                    document,
+                    history: None,
+                },
+            );
+        }
+        let (snap, contained) = step(&core, "committed");
+        assert_eq!(contained, 2);
+        // Cut to the bound: the core's address was longer.
+        assert!(snap.tabs[0].url.len() < long.len());
+        assert_eq!(step(&core, "committed again").1, 0);
+        let (first, _) = navigations[0];
+        for title in ["a\u{202e}gpj.exe\nb", "plain", "a\u{202e}gpj.exe\nb"] {
+            let title = Some(title.into());
+            engine(&mut core, EngineEvent::TitleChanged { view: first, title });
+            assert_eq!(step(&core, "title").1, 1);
+        }
+        let (last, navigation) = navigations[2];
+        let error = sighurt_api::events::NavigationError::Load("gone\u{2066}".into());
+        engine(
+            &mut core,
+            EngineEvent::NavigationFailed {
+                view: last,
+                navigation,
+                error,
+            },
+        );
+        let (failed, contained) = step(&core, "failed");
+        assert_eq!(contained, 1);
+        assert!(matches!(&failed.tabs[3].content, TabContent::Error(m) if m.starts_with("gone")));
+        // A tab closed: the others move up and are found where they went.
+        let id = snap.tabs[0].id;
+        update(&mut core, BrowserEvent::CloseTab(id));
+        let (after, contained) = step(&core, "closed");
+        assert_eq!((after.tabs.len(), contained), (3, 0));
+        assert_eq!(step(&core, "closed again").1, 0);
     }
 
     /// Time of `snapshot` plus the chrome's equality check per hovered link, with 50 tabs whose
@@ -617,12 +822,13 @@ mod tests {
             }
         }
         let mut times = Vec::new();
-        let mut previous = snapshot(&core, HomeInfo::default(), |_| None);
+        let mut cache = SnapshotCache::default();
+        let mut previous = snapshot(&core, HomeInfo::default(), |_| None, &mut cache);
         assert_eq!(previous.tabs.len(), 50);
         for round in 0..21 {
             let status = move |_: &TabSummary<'_>| Some(format!("hover {round}"));
             let start = Instant::now();
-            let next = snapshot(&core, HomeInfo::default(), status);
+            let next = snapshot(&core, HomeInfo::default(), status, &mut cache);
             let changed = next != previous;
             times.push(start.elapsed().as_micros());
             assert!(changed);
