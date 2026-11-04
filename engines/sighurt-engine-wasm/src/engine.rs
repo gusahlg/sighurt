@@ -10,18 +10,31 @@
 //! waited longer than [`SandboxPolicy::max_wait`] for the network and other modules within it;
 //! or as soon as its document is closed or replaced. A guest that exceeds its fuel traps too.
 //!
-//! Default [`SandboxPolicy`]: 256 MiB of linear memory, 500M instructions for `start_app`, 50M
-//! for each later callback, 10 s for `start_app` and 1 s for each callback, and 30 s of waiting
-//! for the network in each.
+//! Default [`SandboxPolicy`]: 256 MiB of linear memory per store, 500M instructions for
+//! `start_app`, 50M for each later callback, 10 s for `start_app` and 1 s for each callback, and
+//! 30 s of waiting for the network in each.
+//!
+//! Memory is bounded by a [`ResourceLimiter`] on every store ([`Limits`]), whoever creates the
+//! memory: the host's `oxide.memory`, a module's own, or both together are at most
+//! [`SandboxPolicy::max_memory_pages`] per store, tables at most [`MAX_TABLE_ELEMENTS`]
+//! elements, and the memories of all stores of a runtime (pages, workers, the modules they
+//! load) at most [`SandboxPolicy::max_runtime_memory`] together. Multi-memory is off, so a
+//! module has at most one memory of its own.
+//!
+//! Wasm runs on the native stack of the thread that calls it, [`WASM_STACK`] at most per store;
+//! a module loaded with `api_load_module` runs in a store of its own on the same thread, so
+//! the threads that run guests have [`GUEST_THREAD_STACK`], enough for
+//! [`MAX_MODULE_DEPTH`] nested loads.
 //!
 //! Owns: the Wasmtime [`Engine`], the epoch ticker, the compiled-module cache, the location of
-//! the persistent key-value store and the count of worker threads. Must not own: any guest's
-//! state, or process-wide choices such as where those directories are (the executable passes
-//! them in [`WasmConfig`]).
+//! the persistent key-value store and its quota, the count of worker threads, the runtime's
+//! memory total and its shared network resources ([`crate::net::Net`]). Must not own: any
+//! guest's state, or process-wide choices such as where those directories are (the executable
+//! passes them in [`WasmConfig`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,8 +43,32 @@ use sha2::{Digest, Sha256};
 use wasmtime::*;
 
 use crate::capabilities::HostState;
+use crate::kv::KvQuota;
+use crate::net::{Counter, Net, MAX_RUNTIME_BYTES};
 
 const MAX_MEMORY_PAGES: u32 = 4096; // 4096 * 64KB = 256MB
+/// Most bytes of linear memory all stores of a runtime may hold together (default of
+/// [`SandboxPolicy::max_runtime_memory`]): eight guests at their limit. Past it, `memory.grow`
+/// fails and modules that need more memory don't instantiate.
+const MAX_RUNTIME_MEMORY: usize = 2 * 1024 * 1024 * 1024;
+/// Most table elements one store may hold (a pointer or two each).
+pub const MAX_TABLE_ELEMENTS: usize = 1 << 20;
+/// Most memories and tables one store may create: the host's `oxide.memory` and the module's
+/// own memory; a handful of tables.
+const MAX_MEMORIES: usize = 2;
+const MAX_TABLES: usize = 16;
+/// Most native stack one store's Wasm may use (Wasmtime's default, set explicitly).
+pub const WASM_STACK: usize = 512 * 1024;
+/// Native stack the host functions and compiler of one level of nesting may need beyond it.
+const HOST_STACK: usize = 1024 * 1024;
+/// How deep `api_load_module` may nest: a page's module may load modules that load modules,
+/// no deeper.
+pub const MAX_MODULE_DEPTH: u32 = 2;
+/// The stack of the threads that run guests (the runtime's pools and workers): room for a
+/// page and [`MAX_MODULE_DEPTH`] nested modules, each with its Wasm and host stack.
+pub const GUEST_THREAD_STACK: usize = 8 * 1024 * 1024;
+const _: () =
+    assert!((MAX_MODULE_DEPTH as usize + 1) * (WASM_STACK + HOST_STACK) <= GUEST_THREAD_STACK);
 const FUEL_LIMIT: u64 = 500_000_000; // ~500M instructions before forced halt
 /// Fuel for each callback after `start_app`: `on_frame`, `on_timer`, `on_event`, `on_message`.
 pub const FRAME_FUEL_LIMIT: u64 = 50_000_000;
@@ -40,13 +77,17 @@ pub const FRAME_FUEL_LIMIT: u64 = 50_000_000;
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 
 /// Bump when [`Config`] changes in a way that would invalidate cached artifacts.
-const AOT_CACHE_FORMAT: &str = "v2";
+const AOT_CACHE_FORMAT: &str = "v3";
 
 /// The hard limits applied to a guest at runtime.
 #[derive(Clone, Debug)]
 pub struct SandboxPolicy {
-    /// Maximum number of 64 KiB Wasm memory pages the guest may grow to (default: 4096 → 256 MiB).
+    /// Maximum number of 64 KiB Wasm memory pages one store's memories may hold together
+    /// (default: 4096 → 256 MiB).
     pub max_memory_pages: u32,
+    /// Most bytes of linear memory all stores of the runtime may hold together (default:
+    /// 2 GiB).
+    pub max_runtime_memory: usize,
     /// Wasm "fuel" (instruction budget) for `start_app`, and for a new [`Store`].
     pub fuel_limit: u64,
     /// Fuel for each later callback.
@@ -65,6 +106,7 @@ impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
             max_memory_pages: MAX_MEMORY_PAGES,
+            max_runtime_memory: MAX_RUNTIME_MEMORY,
             fuel_limit: FUEL_LIMIT,
             frame_fuel: FRAME_FUEL_LIMIT,
             start_time_limit: Duration::from_secs(10),
@@ -99,6 +141,14 @@ pub struct WasmEngine {
     ticker: Arc<TickerHandle>,
     /// Guest worker threads alive in this runtime (see [`crate::worker`]).
     worker_threads: Arc<AtomicUsize>,
+    /// Bytes of linear memory all stores of this runtime hold.
+    memory: Arc<AtomicUsize>,
+    /// The network resources guests share, made on first use (`None` if they can't be).
+    net: Arc<OnceLock<Option<Arc<Net>>>>,
+    /// Bytes all documents' connections hold for their guests.
+    net_bytes: Arc<Counter>,
+    /// What the key-value store holds, per origin and in all.
+    kv: Arc<KvQuota>,
 }
 
 impl WasmEngine {
@@ -109,6 +159,8 @@ impl WasmEngine {
         wasmtime.consume_fuel(true);
         wasmtime.epoch_interruption(true);
         wasmtime.cranelift_opt_level(OptLevel::Speed);
+        wasmtime.wasm_multi_memory(false);
+        wasmtime.max_wasm_stack(WASM_STACK);
         let engine = Engine::new(&wasmtime).context("failed to create wasmtime engine")?;
         let ticker = Arc::new(Ticker::default());
         let weak = engine.weak();
@@ -120,10 +172,14 @@ impl WasmEngine {
         Ok(Self {
             engine,
             policy: config.policy,
+            kv: Arc::new(KvQuota::new(&config.kv_root)),
             kv_root: config.kv_root.into(),
             aot_cache: config.aot_cache.map(Into::into),
             ticker: Arc::new(TickerHandle(ticker)),
             worker_threads: Arc::default(),
+            memory: Arc::default(),
+            net: Arc::default(),
+            net_bytes: Arc::new(Counter::new(MAX_RUNTIME_BYTES)),
         })
     }
 
@@ -142,11 +198,40 @@ impl WasmEngine {
         &self.kv_root
     }
 
+    /// The quota of the persistent key-value store.
+    pub(crate) fn kv(&self) -> &Arc<KvQuota> {
+        &self.kv
+    }
+
+    /// The network resources guests share, started on first use; `None` when they can't be.
+    pub(crate) fn net(&self) -> Option<Arc<Net>> {
+        let net = self.net.get_or_init(|| match Net::new() {
+            Ok(net) => Some(Arc::new(net)),
+            Err(e) => {
+                tracing::warn!("the Wasm engine's network runtime failed to start: {e}");
+                None
+            }
+        });
+        net.clone()
+    }
+
+    /// The budget of bytes all documents' connections may hold.
+    pub(crate) fn net_bytes(&self) -> Arc<Counter> {
+        self.net_bytes.clone()
+    }
+
     /// Creates a new [`Store`] with `state` as host state and a full tank of fuel, whose calls
-    /// are checked against `state`'s [`Budget`] on every epoch tick. Guest code that runs
-    /// outside [`call`](Self::call) and [`start`](Self::start) halts at the first tick.
-    pub fn create_store(&self, state: HostState) -> Result<Store<HostState>> {
+    /// are checked against `state`'s [`Budget`] on every epoch tick, and whose memories and
+    /// tables are bounded by [`Limits`]. Guest code that runs outside [`call`](Self::call) and
+    /// [`start`](Self::start) halts at the first tick.
+    pub fn create_store(&self, mut state: HostState) -> Result<Store<HostState>> {
+        state.limits = Limits::counted(
+            self.policy.max_memory_pages as usize * WASM_PAGE,
+            self.memory.clone(),
+            self.policy.max_runtime_memory,
+        );
         let mut store = Store::new(&self.engine, state);
+        store.limiter(|state| &mut state.limits);
         store
             .set_fuel(self.policy.fuel_limit)
             .context("failed to set fuel limit")?;
@@ -218,6 +303,131 @@ impl WasmEngine {
     }
 }
 
+/// Bytes in a Wasm page.
+const WASM_PAGE: usize = 64 * 1024;
+
+/// The [`ResourceLimiter`] of a store: its memories together within the store's limit and the
+/// runtime's, its tables within [`MAX_TABLE_ELEMENTS`]. The memory a store holds is counted in
+/// the runtime's total until the store, and with it these limits, is dropped.
+///
+/// Only the copy [`WasmEngine::create_store`] puts in a store counts anything: a clone of a
+/// [`HostState`] (the view's own, a child's before its store exists) holds an uncounted one.
+#[derive(Debug, Default)]
+pub struct Limits(Option<Counted>);
+
+#[derive(Debug)]
+struct Counted {
+    store_limit: usize,
+    runtime: Arc<AtomicUsize>,
+    runtime_limit: usize,
+    /// Bytes of memory this store holds, counted in `runtime`.
+    memory: usize,
+    table_elements: usize,
+    /// The growth last allowed, given back if it fails.
+    pending_memory: usize,
+    pending_table: usize,
+}
+
+impl Clone for Limits {
+    /// An uncounted copy: what a store holds is counted once.
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl Limits {
+    fn counted(store_limit: usize, runtime: Arc<AtomicUsize>, runtime_limit: usize) -> Self {
+        Self(Some(Counted {
+            store_limit,
+            runtime,
+            runtime_limit,
+            memory: 0,
+            table_elements: 0,
+            pending_memory: 0,
+            pending_table: 0,
+        }))
+    }
+}
+
+impl ResourceLimiter for Limits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
+        let Some(counted) = &mut self.0 else {
+            return Ok(false);
+        };
+        let grow = desired.saturating_sub(current);
+        if counted.memory.saturating_add(grow) > counted.store_limit {
+            return Ok(false);
+        }
+        let limit = counted.runtime_limit;
+        let reserved = counted
+            .runtime
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                total.checked_add(grow).filter(|&total| total <= limit)
+            });
+        if reserved.is_err() {
+            return Ok(false);
+        }
+        counted.memory += grow;
+        counted.pending_memory = grow;
+        Ok(true)
+    }
+
+    fn memory_grow_failed(&mut self, _error: anyhow::Error) -> Result<()> {
+        if let Some(counted) = &mut self.0 {
+            let failed = std::mem::take(&mut counted.pending_memory);
+            counted.memory -= failed;
+            counted.runtime.fetch_sub(failed, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
+        let Some(counted) = &mut self.0 else {
+            return Ok(false);
+        };
+        let grow = desired.saturating_sub(current);
+        if counted.table_elements.saturating_add(grow) > MAX_TABLE_ELEMENTS {
+            return Ok(false);
+        }
+        counted.table_elements += grow;
+        counted.pending_table = grow;
+        Ok(true)
+    }
+
+    fn table_grow_failed(&mut self, _error: anyhow::Error) -> Result<()> {
+        if let Some(counted) = &mut self.0 {
+            counted.table_elements -= std::mem::take(&mut counted.pending_table);
+        }
+        Ok(())
+    }
+
+    fn tables(&self) -> usize {
+        MAX_TABLES
+    }
+
+    fn memories(&self) -> usize {
+        MAX_MEMORIES
+    }
+}
+
+impl Drop for Limits {
+    fn drop(&mut self) {
+        if let Some(counted) = &self.0 {
+            counted.runtime.fetch_sub(counted.memory, Ordering::AcqRel);
+        }
+    }
+}
+
 /// One counted thread; dropping it counts the thread as ended.
 pub(crate) struct ThreadCount(Arc<AtomicUsize>);
 
@@ -275,6 +485,9 @@ struct BudgetState {
     /// This store's cancellation flag, then those of the stores it was started from (the page
     /// of a worker or of a module it loaded), any of which cancels it.
     cancelled: Vec<Arc<AtomicBool>>,
+    /// The budget of the call this store runs within (a module's `api_load_module` caller): its
+    /// time limit and waits apply to this store's calls too.
+    within: Option<Budget>,
 }
 
 struct Call {
@@ -301,18 +514,32 @@ impl Default for Budget {
         Self(Arc::new(BudgetState {
             call: Mutex::default(),
             cancelled: vec![Arc::default()],
+            within: None,
         }))
     }
 }
 
 impl Budget {
-    /// A budget for a store started from this one's: cancelling this one cancels it too.
+    /// A budget for a store started from this one's that runs on its own (a worker):
+    /// cancelling this one cancels it too.
     pub fn child(&self) -> Self {
+        self.derived(None)
+    }
+
+    /// A budget for a store that runs within this one's call on the same thread (a module the
+    /// call loads): cancelling this one cancels it, and the call's time limit and its limit on
+    /// waiting go on counting while it runs, so they bound it too.
+    pub fn nested(&self) -> Self {
+        self.derived(Some(self.clone()))
+    }
+
+    fn derived(&self, within: Option<Budget>) -> Self {
         let mut cancelled = vec![Arc::default()];
         cancelled.extend(self.0.cancelled.iter().cloned());
         Self(Arc::new(BudgetState {
             call: Mutex::default(),
             cancelled,
+            within,
         }))
     }
 
@@ -340,11 +567,16 @@ impl Budget {
         let started = Instant::now();
         let result = crate::pool::blocking(f);
         let took = started.elapsed();
-        if let Some(call) = self.lock().as_mut() {
-            call.waited += took;
-            if what == Wait::Host {
-                call.counted += took;
+        // The calls this one runs within waited as long.
+        let mut budget = Some(self);
+        while let Some(this) = budget {
+            if let Some(call) = this.lock().as_mut() {
+                call.waited += took;
+                if what == Wait::Host {
+                    call.counted += took;
+                }
             }
+            budget = this.0.within.as_ref();
         }
         Some(result)
     }
@@ -372,14 +604,28 @@ impl Budget {
         if self.is_cancelled() {
             return Err(Halt::Cancelled);
         }
-        let call = self.lock();
-        let Some(call) = call.as_ref() else {
-            return Err(Halt::Time);
-        };
-        if call.counted > call.max_wait {
+        match self.lock().as_ref() {
+            Some(call) => call.within_limits()?,
+            None => return Err(Halt::Time),
+        }
+        self.0.within.as_ref().map_or(Ok(()), Budget::check_within)
+    }
+
+    /// Whether the calls a nested store runs within may go on.
+    fn check_within(&self) -> Result<(), Halt> {
+        if let Some(call) = self.lock().as_ref() {
+            call.within_limits()?;
+        }
+        self.0.within.as_ref().map_or(Ok(()), Budget::check_within)
+    }
+}
+
+impl Call {
+    fn within_limits(&self) -> Result<(), Halt> {
+        if self.counted > self.max_wait {
             return Err(Halt::Waited);
         }
-        if call.started.elapsed().saturating_sub(call.waited) > call.limit {
+        if self.started.elapsed().saturating_sub(self.waited) > self.limit {
             return Err(Halt::Time);
         }
         Ok(())
@@ -756,6 +1002,97 @@ pub(crate) mod tests {
         assert_eq!(mem.ty(&store).minimum(), 1);
         assert_eq!(mem.ty(&store).maximum(), Some(4));
         assert!(mem.grow(&mut store, 8).is_err());
+    }
+
+    fn compile(engine: &WasmEngine, wat: &str) -> Module {
+        compile_cached_in(engine.engine(), &wat::parse_str(wat).unwrap(), None).unwrap()
+    }
+
+    /// A module's own memory, which `oxide.memory` doesn't bound, counts against the store's
+    /// limit together with the host's.
+    #[test]
+    fn a_stores_memories_share_its_limit() {
+        let engine = engine_with(SandboxPolicy {
+            max_memory_pages: 4,
+            ..SandboxPolicy::default()
+        });
+        let mut store = engine.create_store(HostState::default()).unwrap();
+        engine.create_bounded_memory(&mut store).unwrap();
+        let module = compile(
+            &engine,
+            r#"(module (memory (export "memory") 3)
+                 (func (export "grow") (result i32) (memory.grow (i32.const 1))))"#,
+        );
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let grow = instance
+            .get_typed_func::<(), i32>(&mut store, "grow")
+            .unwrap();
+        assert_eq!(engine.call(&mut store, |s| grow.call(s, ())).unwrap(), -1);
+        // One that starts bigger than the limit doesn't instantiate.
+        let mut store = engine.create_store(HostState::default()).unwrap();
+        let big = compile(&engine, r#"(module (memory 5))"#);
+        assert!(Instance::new(&mut store, &big, &[]).is_err());
+    }
+
+    #[test]
+    fn the_stores_of_a_runtime_share_a_memory_total() {
+        let page = 64 * 1024;
+        let engine = engine_with(SandboxPolicy {
+            max_memory_pages: 4,
+            max_runtime_memory: 8 * page,
+            ..SandboxPolicy::default()
+        });
+        let module = compile(&engine, r#"(module (memory 4))"#);
+        let instantiate = || {
+            let mut store = engine.create_store(HostState::default()).unwrap();
+            Instance::new(&mut store, &module, &[]).map(|_| store)
+        };
+        let first = instantiate().unwrap();
+        let _second = instantiate().unwrap();
+        assert!(instantiate().is_err());
+        assert_eq!(engine.memory.load(Ordering::Acquire), 8 * page);
+        // A store gives its memory back when it goes.
+        drop(first);
+        assert_eq!(engine.memory.load(Ordering::Acquire), 4 * page);
+        let _third = instantiate().unwrap();
+    }
+
+    #[test]
+    fn modules_have_one_memory_and_bounded_tables() {
+        let engine = engine_with(SandboxPolicy::default());
+        let two = wat::parse_str(r#"(module (memory 1) (memory 1))"#).unwrap();
+        assert!(compile_cached_in(engine.engine(), &two, None).is_err());
+        let mut store = engine.create_store(HostState::default()).unwrap();
+        let table = compile(
+            &engine,
+            &format!("(module (table {} funcref))", MAX_TABLE_ELEMENTS + 1),
+        );
+        assert!(Instance::new(&mut store, &table, &[]).is_err());
+    }
+
+    /// A budget nested in a call goes on counting that call's time, so it halts once the call
+    /// it runs within is out of time, whatever its own limit.
+    #[test]
+    fn a_nested_budget_is_bounded_by_the_call_it_runs_within() {
+        let parent = Budget::default();
+        parent.begin(Duration::from_millis(50), Duration::from_secs(30));
+        let nested = parent.nested();
+        nested.begin(Duration::from_secs(10), Duration::from_secs(30));
+        assert_eq!(nested.check(), Ok(()));
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(nested.check(), Err(Halt::Time));
+        // Its waits are the parent's waits too.
+        let parent = Budget::default();
+        parent.begin(Duration::from_millis(50), Duration::from_millis(60));
+        let nested = parent.nested();
+        nested.begin(Duration::from_secs(10), Duration::from_secs(30));
+        nested.wait(Wait::Host, || thread::sleep(Duration::from_millis(80)));
+        assert_eq!(nested.check(), Err(Halt::Waited));
+        assert_eq!(parent.check(), Err(Halt::Waited));
+        // A worker's budget isn't bounded by its page's calls.
+        let worker = Budget::default().child();
+        worker.begin(Duration::from_secs(10), Duration::from_secs(30));
+        assert_eq!(worker.check(), Ok(()));
     }
 
     #[test]

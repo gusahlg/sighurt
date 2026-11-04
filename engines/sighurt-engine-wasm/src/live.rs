@@ -6,7 +6,7 @@
 //! the view is visible and one a second while it is hidden. The owner thread hands over input,
 //! changes the visibility and ends the guest, and hears of a step only when the step changed
 //! something the browser shows: a new frame, the history, the permission prompt, a navigation
-//! request or a failure. A guest that draws the same frame every frame wakes nobody.
+//! or download request or a failure. A guest that draws the same frame every frame wakes nobody.
 //!
 //! Owns: a live guest's scheduling state. Must not own: running steps (the adapter) or page
 //! logic (the view).
@@ -173,7 +173,7 @@ impl LiveGuest {
     }
 
     /// A step finished: puts `guest` back, or ends the guest when the step failed (`None`).
-    /// `changed` says whether it drew a new frame, asked for a navigation or failed; `seen` is
+    /// `changed` says whether it drew a new frame, asked for a navigation or a download, or failed; `seen` is
     /// what the guest's state shows now.
     pub fn finish(&self, guest: Option<Box<Guest>>, seen: Seen, changed: bool) -> After {
         let mut state = self.lock();

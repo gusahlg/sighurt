@@ -1,7 +1,21 @@
 //! FFmpeg-backed video for guests (`api_video_*`, `api_subtitle_*`): decode, playback clock,
 //! HLS variant metadata, and subtitle cues.
+//!
+//! FFmpeg opens what it is given with any protocol it has (`file:`, `pipe:`, `concat:`,
+//! `tcp://`...), so nothing a guest names reaches it unchecked. A URL must be an absolute
+//! `http`/`https` URL the document's [`NetPolicy`](crate::net::NetPolicy) allows, its host's
+//! every address included; FFmpeg then opens it with only the protocols HTTP(S) needs
+//! ([`NETWORK_PROTOCOLS`], which also binds the segments of an HLS playlist) and a read timeout.
+//! FFmpeg resolves the name again and follows HTTP redirects itself, which the policy doesn't
+//! see. Bytes a guest passes are opened as a local file with only the `file` protocol and the
+//! container demuxers of [`LOCAL_FORMATS`], so they can't name other files or URLs (as an HLS
+//! playlist or a concat list would). Streams whose frames are over [`MAX_VIDEO_SIDE`] or
+//! [`MAX_VIDEO_PIXELS`] are refused before anything is allocated for them.
+//!
+//! Opening a URL waits for the network as a wait of the guest's call
+//! ([`Budget::wait`](crate::engine::Budget::wait)), without holding the video state's lock.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -20,9 +34,27 @@ use url::Url;
 
 use crate::capabilities::{
     guest_bytes, guest_str, write_prefix, ConsoleLevel, DecodedImage, DrawCommand, HostState,
+    MAX_IMAGE_SIDE, MAX_URL,
 };
+use crate::engine::Wait;
+use crate::net::{NetPolicy, HTTP};
 use crate::subtitle::{self, SubtitleCue};
 use crate::video_format;
+
+/// The protocols FFmpeg may use for a video URL, and for what an HLS playlist names.
+pub const NETWORK_PROTOCOLS: &str = "http,https,tcp,tls";
+/// The demuxers FFmpeg may use for bytes a guest passes: containers that name no other file.
+pub const LOCAL_FORMATS: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,flv,mpegts,ogg,mpeg";
+/// Longest FFmpeg waits for the network on one read, in microseconds (its `rw_timeout`).
+const READ_TIMEOUT_US: &str = "30000000";
+/// Longest side of a video frame, and most pixels in one: decoded frames are images.
+pub const MAX_VIDEO_SIDE: u32 = MAX_IMAGE_SIDE;
+pub const MAX_VIDEO_PIXELS: u32 = 4096 * 4096;
+/// Largest HLS master playlist read, and most variants kept from it.
+const MAX_PLAYLIST_BYTES: u64 = 1024 * 1024;
+const MAX_HLS_VARIANTS: usize = 256;
+/// How long the `HEAD` and playlist requests of `api_video_load_url` may take.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 static FFMPEG_INIT: OnceLock<Result<(), ffmpeg::Error>> = OnceLock::new();
 
@@ -127,6 +159,15 @@ impl VideoPlayer {
         let duration_ms = Self::probe_duration_ms(&input, &stream);
 
         let (width, height) = (decoder.width(), decoder.height());
+        let side = 1..=MAX_VIDEO_SIDE;
+        if !side.contains(&width)
+            || !side.contains(&height)
+            || width.saturating_mul(height) > MAX_VIDEO_PIXELS
+        {
+            return Err(format!(
+                "{width}x{height} frames are over the limit of {MAX_VIDEO_PIXELS} pixels"
+            ));
+        }
         let scaler = ScalerContext::get(
             decoder.format(),
             width,
@@ -150,13 +191,24 @@ impl VideoPlayer {
         })
     }
 
+    /// Opens a local file of guest bytes: the `file` protocol and [`LOCAL_FORMATS`] only.
     pub fn open_path(path: &Path) -> Result<Self, String> {
-        let input = format::input(path).map_err(|e| e.to_string())?;
+        ensure_ffmpeg().map_err(|e| e.to_string())?;
+        let mut options = ffmpeg::Dictionary::new();
+        options.set("protocol_whitelist", "file");
+        options.set("format_whitelist", LOCAL_FORMATS);
+        let input = format::input_with_dictionary(path, options).map_err(|e| e.to_string())?;
         Self::open_input(input)
     }
 
-    pub fn open_url(url: &str) -> Result<Self, String> {
-        let input = format::input(url).map_err(|e| e.to_string())?;
+    /// Opens `url`, which [`checked_url`] allowed: [`NETWORK_PROTOCOLS`] only, with a read
+    /// timeout.
+    fn open_url(url: &str) -> Result<Self, String> {
+        ensure_ffmpeg().map_err(|e| e.to_string())?;
+        let mut options = ffmpeg::Dictionary::new();
+        options.set("protocol_whitelist", NETWORK_PROTOCOLS);
+        options.set("rw_timeout", READ_TIMEOUT_US);
+        let input = format::input_with_dictionary(url, options).map_err(|e| e.to_string())?;
         Self::open_input(input)
     }
 
@@ -376,19 +428,31 @@ impl VideoPlaybackState {
     }
 }
 
-/// Parse `#EXT-X-STREAM-INF` master playlist variant URIs (best-effort).
+/// Parse `#EXT-X-STREAM-INF` master playlist variant URIs (best-effort), at most
+/// [`MAX_HLS_VARIANTS`] of at most [`MAX_URL`] bytes.
 pub fn parse_hls_master_variants(body: &str) -> Vec<String> {
     let lines: Vec<&str> = body.lines().collect();
     let mut out = Vec::new();
     for i in 0..lines.len() {
         if lines[i].starts_with("#EXT-X-STREAM-INF") && i + 1 < lines.len() {
             let u = lines[i + 1].trim();
-            if !u.starts_with('#') && !u.is_empty() {
+            if !u.starts_with('#') && !u.is_empty() && u.len() <= MAX_URL {
                 out.push(u.to_string());
             }
         }
+        if out.len() == MAX_HLS_VARIANTS {
+            break;
+        }
     }
     out
+}
+
+/// `url` if FFmpeg may open it for `policy`: an absolute `http`/`https` URL whose host and its
+/// every address the policy allows. Blocks while it resolves the host.
+pub fn checked_url(url: &str, policy: &NetPolicy) -> Result<String, String> {
+    let parsed = policy.check(url, HTTP)?;
+    policy.check_resolved(&parsed)?;
+    Ok(parsed.into())
 }
 
 pub fn resolve_against_base(base: &str, relative: &str) -> Option<String> {
@@ -428,18 +492,25 @@ fn render_at(state: &HostState, x: f32, y: f32, w: f32, h: f32) -> Result<(), St
     Ok(())
 }
 
-/// `api_video_load_url`: opens `url` for playback, reading the variants of an HLS master
-/// playlist. Returns the guest's result code.
-fn load_url(state: &HostState, url: &str) -> i32 {
-    state.log(ConsoleLevel::Log, format!("[VIDEO] Opening {url}"));
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(90))
-        .build()
-    else {
-        return -3;
+/// What `api_video_load_url` found at a URL.
+struct Opened {
+    content_type: String,
+    variants: Vec<String>,
+    player: Result<VideoPlayer, String>,
+}
+
+/// Opens `url`, which [`checked_url`] allowed for `policy`, reading the variants of an HLS
+/// master playlist. Waits for the network.
+fn open_url(url: &str, policy: &NetPolicy) -> Result<Opened, String> {
+    let client = crate::net::blocking_client(policy)?;
+    let request = |method| {
+        let request = client.request(method, url).timeout(REQUEST_TIMEOUT);
+        match policy.origin() {
+            Some(origin) => request.header("Origin", origin),
+            None => request,
+        }
     };
-    let content_type = client
-        .head(url)
+    let content_type = request(reqwest::Method::HEAD)
         .send()
         .ok()
         .and_then(|r| {
@@ -452,37 +523,91 @@ fn load_url(state: &HostState, url: &str) -> i32 {
         || content_type.to_ascii_lowercase().contains("m3u8");
     let playlist = is_playlist
         .then(|| {
-            client
-                .get(url)
+            let response = request(reqwest::Method::GET)
                 .header("Accept", video_format::VIDEO_HTTP_ACCEPT)
-                .timeout(Duration::from_secs(60))
                 .send()
                 .ok()
-                .filter(|r| r.status().is_success())?
-                .text()
-                .ok()
+                .filter(|r| r.status().is_success())?;
+            let mut body = Vec::new();
+            response
+                .take(MAX_PLAYLIST_BYTES)
+                .read_to_end(&mut body)
+                .ok()?;
+            String::from_utf8(body).ok()
         })
         .flatten();
+    Ok(Opened {
+        content_type,
+        variants: playlist
+            .map(|body| parse_hls_master_variants(&body))
+            .unwrap_or_default(),
+        player: VideoPlayer::open_url(url),
+    })
+}
+
+/// `api_video_load_url`: opens `url` for playback, reading the variants of an HLS master
+/// playlist. Returns the guest's result code: -2 when the URL is refused or can't be opened,
+/// -1 when the document was cancelled meanwhile.
+fn load_url(state: &HostState, url: &str) -> i32 {
+    state.log(ConsoleLevel::Log, format!("[VIDEO] Opening {url}"));
+    let policy = state.net_policy();
+    let opened = state.budget.wait(Wait::Host, || {
+        checked_url(url, &policy).and_then(|url| open_url(&url, &policy))
+    });
+    let Some(opened) = opened else {
+        return -1;
+    };
+    let Opened {
+        content_type,
+        variants,
+        player,
+    } = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            state.log(ConsoleLevel::Error, format!("[VIDEO] Refused: {e}"));
+            return -2;
+        }
+    };
 
     let mut video = state.video.lock().unwrap();
     video.stop();
     video.last_url_content_type.clone_from(&content_type);
     video.hls_base_url = url.to_string();
-    video.hls_variants = playlist
-        .map(|body| parse_hls_master_variants(&body))
-        .unwrap_or_default();
-    match VideoPlayer::open_url(url) {
+    video.hls_variants = variants;
+    match player {
         Ok(player) => {
             video.player = Some(player);
+            drop(video);
             let message = format!("[VIDEO] Opened URL (Content-Type: {content_type})");
             state.log(ConsoleLevel::Log, message);
             0
         }
         Err(e) => {
+            drop(video);
             state.log(ConsoleLevel::Error, format!("[VIDEO] Open failed: {e}"));
             -2
         }
     }
+}
+
+/// `api_video_hls_open_variant`: opens variant `index` of the playlist loaded last, under the
+/// same checks as a URL the guest gives. `None` when there is no such variant.
+fn open_variant(state: &HostState, index: u32) -> Option<Result<(), String>> {
+    let url = state.video.lock().unwrap().variant_url(index)?;
+    let policy = state.net_policy();
+    let player = state.budget.wait(Wait::Host, || {
+        checked_url(&url, &policy).and_then(|url| VideoPlayer::open_url(&url))
+    });
+    let Some(player) = player else {
+        return Some(Err("cancelled".into()));
+    };
+    let mut video = state.video.lock().unwrap();
+    video.hls_base_url.clone_from(&url);
+    video.hls_variants.clear();
+    Some(player.map(|player| {
+        video.player = Some(player);
+        video.reset_playback_clock();
+    }))
 }
 
 /// Register all `api_video_*` and `api_subtitle_*` host functions.
@@ -529,7 +654,7 @@ pub fn register_video_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "api_video_load_url",
         |caller: Caller<'_, HostState>, url_ptr: u32, url_len: u32| -> i32 {
             let url = guest_str(&caller, url_ptr, url_len).unwrap_or_default();
-            if url.is_empty() {
+            if url.is_empty() || url.len() > MAX_URL {
                 return -1;
             }
             load_url(caller.data(), &url)
@@ -564,16 +689,7 @@ pub fn register_video_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "oxide",
         "api_video_hls_open_variant",
         |caller: Caller<'_, HostState>, index: u32| -> i32 {
-            let result = video(&caller, |v| {
-                let url = v.variant_url(index)?;
-                v.hls_base_url.clone_from(&url);
-                v.hls_variants.clear();
-                Some(VideoPlayer::open_url(&url).map(|player| {
-                    v.player = Some(player);
-                    v.reset_playback_clock();
-                }))
-            });
-            match result {
+            match open_variant(caller.data(), index) {
                 None => -1,
                 Some(Ok(())) => {
                     let message = format!("[VIDEO] Opened HLS variant {index}");
@@ -683,4 +799,45 @@ pub fn register_video_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing a guest names reaches FFmpeg unless it is an HTTP(S) URL the policy allows.
+    #[test]
+    fn only_allowed_http_urls_reach_ffmpeg() {
+        let policy = NetPolicy::for_page("https://a.test/app.wasm", Some([1, 1, 1, 1].into()));
+        for refused in [
+            "file:///etc/passwd",
+            "/proc/self/fd/0",
+            "pipe:0",
+            "concat:https://a.test/1.ts|https://a.test/2.ts",
+            "subfile,,start,0,end,0,,:https://a.test/x",
+            "tcp://127.0.0.1:22",
+            "http://127.0.0.1:8080/video.mp4",
+            "https://localhost/video.mp4",
+            "crypto+https://a.test/x",
+        ] {
+            assert!(checked_url(refused, &policy).is_err(), "{refused}");
+        }
+    }
+
+    /// Bytes that are an HLS playlist naming a local file are not opened: only containers are.
+    #[test]
+    fn guest_bytes_cannot_name_other_files() {
+        let mut state = VideoPlaybackState::default();
+        let playlist =
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nfile:///etc/hostname\n#EXT-X-ENDLIST\n";
+        assert!(state.open_bytes(playlist, 0).is_err());
+        let concat = b"ffconcat version 1.0\nfile /etc/hostname\n";
+        assert!(state.open_bytes(concat, 0).is_err());
+    }
+
+    #[test]
+    fn playlists_keep_a_bounded_number_of_variants() {
+        let body = "#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n".repeat(MAX_HLS_VARIANTS * 2);
+        assert_eq!(parse_hls_master_variants(&body).len(), MAX_HLS_VARIANTS);
+    }
 }

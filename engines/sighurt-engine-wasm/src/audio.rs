@@ -111,8 +111,14 @@ const MAX_AUDIO_BYTES: u64 = 256 * 1024 * 1024;
 /// Fetches the sound at `url` and plays it on channel 0. Returns the guest's result code.
 fn play_url(state: &HostState, url: &str) -> i32 {
     state.log(ConsoleLevel::Log, format!("[AUDIO] Fetching {url}"));
-    let fetched = http_get(url, audio_format::AUDIO_HTTP_ACCEPT, MAX_AUDIO_BYTES);
-    let (data, content_type) = match fetched {
+    let policy = state.net_policy();
+    let fetched = http_get(
+        url,
+        audio_format::AUDIO_HTTP_ACCEPT,
+        MAX_AUDIO_BYTES,
+        &policy,
+    );
+    let (data, content_type, _) = match fetched {
         Ok(response) => response,
         Err(e) => {
             state.log(ConsoleLevel::Error, format!("[AUDIO] Fetch error: {e}"));

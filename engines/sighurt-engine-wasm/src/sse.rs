@@ -5,9 +5,16 @@
 //! wire format, and queues events for `api_sse_recv`. The stream reconnects
 //! automatically with `Last-Event-ID`, matching the web `EventSource` contract.
 //!
+//! Streams follow the document's [`NetPolicy`] (refused URLs fail `api_sse_open`), carry its
+//! `Origin`, and run on the runtime's shared network runtime ([`crate::net::Net`]). A
+//! connection that sends nothing, not even a comment, for [`IDLE_TIMEOUT`] is dropped and
+//! reconnected. Removing a stream, or dropping the document, stops its task.
+//!
 //! What a guest can make the host keep is bounded: at most [`MAX_STREAMS`] streams (until it
-//! removes them), [`MAX_QUEUE`] events per stream (the oldest go first), and events and lines of
-//! at most [`MAX_EVENT_BYTES`]; longer ones are dropped as they arrive.
+//! removes them), [`MAX_QUEUE`] events per stream (the oldest go first) within the document's
+//! budget of buffered bytes ([`NetBytes`]; past it the stream stops reading until the guest
+//! catches up), and events and lines of at most [`MAX_EVENT_BYTES`]; longer ones are dropped as
+//! they arrive.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -16,11 +23,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::StreamExt;
+use tokio::task::JoinHandle;
 use wasmtime::{Caller, Linker};
 
 use crate::capabilities::{
-    guest_str, next_handle, with, with_started, write_guest, ConsoleLevel, HostState, Runtime,
+    guest_str, next_handle, with, with_started, write_guest, ConsoleLevel, HostState,
 };
+use crate::net::{Held, Net, NetBytes, NetPolicy, HTTP, ROOM_POLL};
 
 /// Connection is being established (or reconnecting).
 pub const SSE_CONNECTING: u32 = 0;
@@ -42,6 +51,9 @@ pub const MAX_STREAMS: usize = 256;
 pub const MAX_QUEUE: usize = 128;
 /// Largest event, and longest line, kept.
 pub const MAX_EVENT_BYTES: usize = 256 * 1024;
+/// Longest a stream may go without receiving anything before it is dropped and reconnected.
+/// Servers send comments as keep-alives far more often.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_RETRY_MS: u64 = 3_000;
 const MIN_RETRY_MS: u64 = 500;
 const MAX_RETRY_MS: u64 = 60_000;
@@ -54,11 +66,15 @@ pub struct SseEvent {
     pub data: String,
 }
 
-/// Incremental SSE parser (WHATWG HTML Living Standard, event stream).
+/// Incremental SSE parser (WHATWG HTML Living Standard, event stream). Each byte is looked at
+/// once: the line in progress is kept, at most [`MAX_EVENT_BYTES`] of it.
 pub struct SseParser {
+    /// The line in progress.
     buf: Vec<u8>,
     /// The rest of the line in progress is dropped: it is too long.
     skip_line: bool,
+    /// The last chunk ended in a CR: a LF that starts the next one ends no other line.
+    after_cr: bool,
     name: String,
     id: String,
     data_lines: Vec<String>,
@@ -81,6 +97,7 @@ impl SseParser {
         Self {
             buf: Vec::new(),
             skip_line: false,
+            after_cr: false,
             name: String::new(),
             id: String::new(),
             data_lines: Vec::new(),
@@ -91,23 +108,53 @@ impl SseParser {
     }
 
     /// Feed bytes and return every complete event dispatched.
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
-        self.buf.extend_from_slice(bytes);
+    pub fn push(&mut self, mut bytes: &[u8]) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        while let Some(line) = self.take_line() {
-            if std::mem::take(&mut self.skip_line) {
+        if self.after_cr && !bytes.is_empty() {
+            self.after_cr = false;
+            bytes = bytes.strip_prefix(b"\n").unwrap_or(bytes);
+        }
+        while let Some(end) = bytes.iter().position(|&b| b == b'\n' || b == b'\r') {
+            let (part, rest) = bytes.split_at(end);
+            let crlf = rest.starts_with(b"\r\n");
+            bytes = &rest[1 + usize::from(crlf)..];
+            self.after_cr = rest[0] == b'\r' && !crlf && bytes.is_empty();
+            let too_long = self.buf.len() + part.len() > MAX_EVENT_BYTES;
+            if std::mem::take(&mut self.skip_line) || too_long {
+                self.buf.clear();
                 continue;
             }
+            self.buf.extend_from_slice(part);
+            let line = std::mem::take(&mut self.buf);
+            if let Ok(line) = String::from_utf8(line) {
+                self.line(&line, &mut events);
+            }
+        }
+        // A line that doesn't end within the limit is dropped, up to its end.
+        if !self.skip_line {
+            if self.buf.len() + bytes.len() > MAX_EVENT_BYTES {
+                self.buf.clear();
+                self.skip_line = true;
+            } else {
+                self.buf.extend_from_slice(bytes);
+            }
+        }
+        events
+    }
+
+    /// Handles one whole line.
+    fn line(&mut self, line: &str, events: &mut Vec<SseEvent>) {
+        {
             if line.is_empty() {
                 if let Some(ev) = self.dispatch() {
                     events.push(ev);
                 }
-                continue;
+                return;
             }
             if line.starts_with(':') {
-                continue;
+                return;
             }
-            let (field, value) = split_field(&line);
+            let (field, value) = split_field(line);
             match field {
                 "event" => self.name = value.to_string(),
                 "data" if !self.oversized => {
@@ -128,26 +175,6 @@ impl SseParser {
                 _ => {}
             }
         }
-        // A line that doesn't end within the limit is dropped, up to its end.
-        if self.buf.len() > MAX_EVENT_BYTES {
-            self.buf.clear();
-            self.skip_line = true;
-        }
-        events
-    }
-
-    fn take_line(&mut self) -> Option<String> {
-        let pos = self.buf.iter().position(|&b| b == b'\n' || b == b'\r')?;
-        let line = self.buf.drain(..pos).collect::<Vec<u8>>();
-        if self.buf.first() == Some(&b'\r') {
-            self.buf.drain(..1);
-            if self.buf.first() == Some(&b'\n') {
-                self.buf.drain(..1);
-            }
-        } else if self.buf.first() == Some(&b'\n') {
-            self.buf.drain(..1);
-        }
-        String::from_utf8(line).ok()
     }
 
     fn dispatch(&mut self) -> Option<SseEvent> {
@@ -207,37 +234,79 @@ pub fn encode_event(ev: &SseEvent) -> Vec<u8> {
 struct SseInner {
     state: AtomicU32,
     aborted: AtomicBool,
-    events: Mutex<VecDeque<SseEvent>>,
+    events: Mutex<Events>,
     error: Mutex<Option<String>>,
     last_id: Mutex<String>,
     retry_ms: AtomicU64,
 }
 
+/// Events the guest hasn't read, and the bytes they hold of the document's budget.
+struct Events {
+    queue: VecDeque<SseEvent>,
+    held: Held,
+}
+
+impl Events {
+    fn pop(&mut self) -> Option<SseEvent> {
+        let event = self.queue.pop_front()?;
+        self.held.remove(event_bytes(&event));
+        Some(event)
+    }
+}
+
+/// The bytes an event holds.
+fn event_bytes(event: &SseEvent) -> usize {
+    event.name.len() + event.id.len() + event.data.len()
+}
+
 impl SseInner {
-    fn new() -> Self {
+    fn new(bytes: NetBytes) -> Self {
         Self {
             state: AtomicU32::new(SSE_CONNECTING),
             aborted: AtomicBool::new(false),
-            events: Mutex::new(VecDeque::new()),
+            events: Mutex::new(Events {
+                queue: VecDeque::new(),
+                held: Held::new(bytes),
+            }),
             error: Mutex::new(None),
             last_id: Mutex::new(String::new()),
             retry_ms: AtomicU64::new(DEFAULT_RETRY_MS),
         }
     }
 
-    fn push_events(&self, events: Vec<SseEvent>) {
-        if events.is_empty() {
-            return;
-        }
+    /// Queues `events`, the oldest of the queue going first past [`MAX_QUEUE`], while the
+    /// document's budget has room; returns those it had none for, in order.
+    fn push_events(&self, mut events: VecDeque<SseEvent>) -> VecDeque<SseEvent> {
         let mut q = self.events.lock().unwrap();
-        for ev in events {
+        while let Some(ev) = events.pop_front() {
+            if q.queue.len() >= MAX_QUEUE {
+                q.pop();
+            }
+            if !q.held.try_add(event_bytes(&ev)) {
+                events.push_front(ev);
+                break;
+            }
             if !ev.id.is_empty() {
                 *self.last_id.lock().unwrap() = ev.id.clone();
             }
-            if q.len() >= MAX_QUEUE {
-                q.pop_front();
+            q.queue.push_back(ev);
+        }
+        events
+    }
+
+    /// Queues `events`, waiting for room in the document's budget as long as it takes. False
+    /// if the guest closed the stream first.
+    async fn deliver(&self, events: Vec<SseEvent>) -> bool {
+        let mut events = VecDeque::from(events);
+        loop {
+            events = self.push_events(events);
+            if events.is_empty() {
+                return true;
             }
-            q.push_back(ev);
+            if self.aborted.load(Ordering::SeqCst) {
+                return false;
+            }
+            tokio::time::sleep(ROOM_POLL).await;
         }
     }
 
@@ -247,59 +316,88 @@ impl SseInner {
     }
 }
 
+/// A stream and the task that drives it.
+struct Stream {
+    inner: Arc<SseInner>,
+    task: JoinHandle<()>,
+}
+
 /// All SSE streams for a tab. Lazily initialised on the first `api_sse_*` call.
 pub struct SseState {
-    runtime: Runtime,
-    streams: HashMap<u32, Arc<SseInner>>,
+    net: Arc<Net>,
+    policy: NetPolicy,
+    bytes: NetBytes,
+    streams: HashMap<u32, Stream>,
     last_id: u32,
 }
 
 impl SseState {
-    pub fn new() -> Option<Self> {
-        let runtime = Runtime::new()?;
-        Some(Self {
-            runtime,
+    pub fn new(net: Arc<Net>, policy: NetPolicy, bytes: NetBytes) -> Self {
+        Self {
+            net,
+            policy,
+            bytes,
             streams: HashMap::new(),
             last_id: 0,
-        })
+        }
     }
 
-    /// Opens a stream; returns its handle, or `0` when the guest has [`MAX_STREAMS`].
-    fn open(&mut self, url: String) -> u32 {
+    /// The state of `host`'s document; `None` when the network can't be used.
+    pub fn of(host: &HostState) -> Option<Self> {
+        Some(Self::new(
+            host.shared_net()?,
+            host.net_policy(),
+            host.net_bytes(),
+        ))
+    }
+
+    /// Opens a stream; returns its handle, or why it was refused: the guest has
+    /// [`MAX_STREAMS`], or the policy refuses `url`.
+    fn open(&mut self, url: String) -> Result<u32, String> {
         if self.streams.len() >= MAX_STREAMS {
-            return 0;
+            return Err(format!("{MAX_STREAMS} streams open"));
+        }
+        let url = self.policy.check(&url, HTTP)?;
+        let mut request = self
+            .net
+            .client(&self.policy)
+            .get(url)
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache");
+        if let Some(origin) = self.policy.origin() {
+            request = request.header("Origin", origin);
         }
         let id = next_handle(&mut self.last_id);
-        let inner = Arc::new(SseInner::new());
-        let driver = inner.clone();
-        self.runtime.spawn(async move {
-            drive_stream(driver, url).await;
-        });
-        self.streams.insert(id, inner);
-        id
+        let inner = Arc::new(SseInner::new(self.bytes.clone()));
+        let task = self
+            .net
+            .runtime()
+            .spawn(drive_stream(inner.clone(), request));
+        self.streams.insert(id, Stream { inner, task });
+        Ok(id)
+    }
+
+    fn inner(&self, id: u32) -> Option<&SseInner> {
+        self.streams.get(&id).map(|stream| &*stream.inner)
     }
 
     fn state(&self, id: u32) -> u32 {
-        self.streams
-            .get(&id)
+        self.inner(id)
             .map(|s| s.state.load(Ordering::SeqCst))
             .unwrap_or(SSE_CLOSED)
     }
 
     fn pop(&self, id: u32) -> Option<SseEvent> {
-        self.streams
-            .get(&id)
-            .and_then(|s| s.events.lock().unwrap().pop_front())
+        self.inner(id).and_then(|s| s.events.lock().unwrap().pop())
     }
 
     fn peek_front(&self, id: u32) -> Option<SseEvent> {
-        self.streams
-            .get(&id)
-            .and_then(|s| s.events.lock().unwrap().front().cloned())
+        self.inner(id)
+            .and_then(|s| s.events.lock().unwrap().queue.front().cloned())
     }
 
     fn empty_recv_code(&self, id: u32) -> i64 {
-        let Some(inner) = self.streams.get(&id) else {
+        let Some(inner) = self.inner(id) else {
             return RECV_UNKNOWN;
         };
         match inner.state.load(Ordering::SeqCst) {
@@ -309,41 +407,40 @@ impl SseState {
         }
     }
 
+    /// Closes the stream: its task stops, and its events stay for the guest to read.
     fn close(&self, id: u32) -> bool {
-        let Some(inner) = self.streams.get(&id) else {
+        let Some(stream) = self.streams.get(&id) else {
             return false;
         };
-        inner.aborted.store(true, Ordering::SeqCst);
-        inner.state.store(SSE_CLOSED, Ordering::SeqCst);
+        stream.inner.aborted.store(true, Ordering::SeqCst);
+        stream.inner.state.store(SSE_CLOSED, Ordering::SeqCst);
+        stream.task.abort();
         true
     }
 
+    /// Forgets stream `id`, stopping its task wherever it is.
     fn remove(&mut self, id: u32) {
-        if let Some(inner) = self.streams.remove(&id) {
-            inner.aborted.store(true, Ordering::SeqCst);
+        if let Some(stream) = self.streams.remove(&id) {
+            stream.inner.aborted.store(true, Ordering::SeqCst);
+            stream.task.abort();
         }
     }
 
     fn error(&self, id: u32) -> Option<String> {
-        self.streams
-            .get(&id)
-            .and_then(|s| s.error.lock().unwrap().clone())
+        self.inner(id).and_then(|s| s.error.lock().unwrap().clone())
     }
 }
 
-async fn drive_stream(inner: Arc<SseInner>, url: String) {
-    let client = match reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(0)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            inner.set_error(format!("client build failed: {e}"));
-            return;
+impl Drop for SseState {
+    /// The document is gone: its streams stop.
+    fn drop(&mut self) {
+        for stream in self.streams.values() {
+            stream.task.abort();
         }
-    };
+    }
+}
 
+async fn drive_stream(inner: Arc<SseInner>, request: reqwest::RequestBuilder) {
     loop {
         if inner.aborted.load(Ordering::SeqCst) {
             inner.state.store(SSE_CLOSED, Ordering::SeqCst);
@@ -352,17 +449,22 @@ async fn drive_stream(inner: Arc<SseInner>, url: String) {
 
         inner.state.store(SSE_CONNECTING, Ordering::SeqCst);
         let last_id = inner.last_id.lock().unwrap().clone();
-        let mut req = client
-            .get(&url)
-            .header("Accept", "text/event-stream")
-            .header("Cache-Control", "no-cache");
+        let Some(mut req) = request.try_clone() else {
+            inner.set_error("the request can't be repeated");
+            return;
+        };
         if !last_id.is_empty() {
             req = req.header("Last-Event-ID", &last_id);
         }
 
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
+        let resp = match tokio::time::timeout(IDLE_TIMEOUT, req.send()).await {
+            Err(_) => {
+                inner.set_error("no response");
+                sleep_retry(&inner).await;
+                continue;
+            }
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 if inner.aborted.load(Ordering::SeqCst) {
                     inner.state.store(SSE_CLOSED, Ordering::SeqCst);
                     return;
@@ -391,7 +493,14 @@ async fn drive_stream(inner: Arc<SseInner>, url: String) {
         inner.state.store(SSE_OPEN, Ordering::SeqCst);
         let mut parser = SseParser::new();
         let mut stream = resp.bytes_stream();
-        while let Some(next) = stream.next().await {
+        loop {
+            let Ok(next) = tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await else {
+                inner.set_error(format!("nothing received for {} s", IDLE_TIMEOUT.as_secs()));
+                break;
+            };
+            let Some(next) = next else {
+                break;
+            };
             if inner.aborted.load(Ordering::SeqCst) {
                 inner.state.store(SSE_CLOSED, Ordering::SeqCst);
                 return;
@@ -402,7 +511,10 @@ async fn drive_stream(inner: Arc<SseInner>, url: String) {
                     if let Some(ms) = parser.retry_ms.take() {
                         inner.retry_ms.store(ms, Ordering::SeqCst);
                     }
-                    inner.push_events(events);
+                    if !inner.deliver(events).await {
+                        inner.state.store(SSE_CLOSED, Ordering::SeqCst);
+                        return;
+                    }
                 }
                 Err(e) => {
                     if inner.aborted.load(Ordering::SeqCst) {
@@ -440,13 +552,16 @@ pub fn register_sse_functions(linker: &mut Linker<HostState>) -> Result<()> {
                 return 0;
             }
             let state = caller.data();
-            match with_started(&state.sse, SseState::new, |sse| sse.open(url.clone())) {
-                Some(0) => {
-                    let message = format!("[SSE] Refused: {MAX_STREAMS} streams open");
-                    state.log(ConsoleLevel::Error, message);
+            match with_started(
+                &state.sse,
+                || SseState::of(state),
+                |sse| sse.open(url.clone()),
+            ) {
+                Some(Err(e)) => {
+                    state.log(ConsoleLevel::Error, format!("[SSE] Refused: {e}"));
                     0
                 }
-                Some(id) => {
+                Some(Ok(id)) => {
                     state.log(ConsoleLevel::Log, format!("[SSE] Opening {url} (id={id})"));
                     id
                 }
@@ -614,6 +729,50 @@ mod tests {
         let mut p = SseParser::new();
         let ev = p.push(b"data: crlf\r\n\r\n");
         assert_eq!(ev[0].data, "crlf");
+        // A CRLF split between two chunks is one line end, not two.
+        assert!(p.push(b"data: split\r").is_empty());
+        assert!(p.push(b"\ndata: more\r").is_empty());
+        let ev = p.push(b"\n\r\n");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].data, "split\nmore");
+    }
+
+    /// A chunk of many lines is parsed in time proportional to its size.
+    #[test]
+    fn many_lines_in_one_chunk_are_parsed_in_linear_time() {
+        let chunk = ": keep-alive\n".repeat(400_000) + "data: last\n\n";
+        let mut p = SseParser::new();
+        let started = std::time::Instant::now();
+        let ev = p.push(chunk.as_bytes());
+        assert_eq!(ev.len(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_page_from_the_web_cannot_open_local_streams() {
+        let policy = NetPolicy::for_page("https://a.test/app.wasm", Some([1, 1, 1, 1].into()));
+        let net = Arc::new(Net::new().unwrap());
+        let mut sse = SseState::new(net, policy, NetBytes::with_limit(1024));
+        assert!(sse.open("http://127.0.0.1:1/".into()).is_err());
+        assert!(sse.open("file:///etc/passwd".into()).is_err());
+    }
+
+    #[test]
+    fn events_wait_for_room_in_the_documents_budget() {
+        let inner = SseInner::new(NetBytes::with_limit(9));
+        let event = |data: &str| SseEvent {
+            name: String::new(),
+            id: String::new(),
+            data: data.into(),
+        };
+        let left = inner.push_events(VecDeque::from([event("12345"), event("678"), event("90")]));
+        assert_eq!(left, [event("90")]);
+        inner.events.lock().unwrap().pop();
+        assert!(inner.push_events(left).is_empty());
     }
 
     #[test]

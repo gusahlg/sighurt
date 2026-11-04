@@ -5,9 +5,18 @@
 //! [`PERMISSION_PENDING`] while the in-browser prompt is showing, and the guest retries on a
 //! later frame. Native OS prompts (camera / microphone / screen recording) may appear in
 //! addition once the in-browser grant is given.
+//!
+//! The camera runs on a thread of its own ([`CameraThread`]) that takes a frame when asked: a
+//! guest waits at most [`CAMERA_FRAME_TIMEOUT`] for one, as a wait of its call
+//! ([`Budget::wait`](crate::engine::Budget::wait)), without holding the capture state's lock,
+//! so a camera that stops delivering holds its own thread, not the guest's. Opening the camera
+//! waits the same way.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -21,14 +30,78 @@ use crate::capabilities::{
     console_log, pack, permission_gate, write_guest, write_prefix, ConsoleEntry, ConsoleLevel,
     HostState,
 };
+use crate::engine::Wait;
 use crate::permissions::PermissionKind;
 
 const MIC_RING_CAP: usize = 96_000;
+/// Longest a guest waits for a camera frame; past it the call returns nothing and the frame
+/// asked for is the next call's.
+pub const CAMERA_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A frame: its width, height and RGBA pixels.
+type CameraFrame = (u32, u32, Vec<u8>);
+
+/// An open camera on a thread of its own, which takes one frame each time it is asked. Dropping
+/// this ends the thread once the frame in progress, if any, is taken, and stops the stream.
+pub struct CameraThread {
+    ask: SyncSender<()>,
+    frames: Mutex<Receiver<Result<CameraFrame, String>>>,
+    /// A frame was asked for and not received yet.
+    asked: AtomicBool,
+}
+
+impl CameraThread {
+    fn start(mut camera: Camera) -> std::io::Result<Self> {
+        let (ask, asked) = mpsc::sync_channel::<()>(1);
+        let (send, frames) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("sighurt-camera".into())
+            .spawn(move || {
+                while asked.recv().is_ok() {
+                    let frame = camera
+                        .frame()
+                        .and_then(|buffer| buffer.decode_image::<RgbFormat>())
+                        .map(|image| {
+                            let (w, h) = (image.width(), image.height());
+                            let rgba = image.pixels().flat_map(|p| [p[0], p[1], p[2], 255]);
+                            (w, h, rgba.collect())
+                        })
+                        .map_err(|e| e.to_string());
+                    if send.send(frame).is_err() {
+                        break;
+                    }
+                }
+                let _ = camera.stop_stream();
+            })?;
+        Ok(Self {
+            ask,
+            frames: Mutex::new(frames),
+            asked: AtomicBool::new(false),
+        })
+    }
+
+    /// The next frame, waiting at most `timeout` for it; `None` when none came in time.
+    fn frame(&self, timeout: Duration) -> Option<Result<CameraFrame, String>> {
+        let frames = self.frames.lock().unwrap();
+        if !self.asked.swap(true, Ordering::AcqRel) && self.ask.try_send(()).is_err() {
+            self.asked.store(false, Ordering::Release);
+            return Some(Err("the camera stopped".into()));
+        }
+        match frames.recv_timeout(timeout) {
+            Ok(frame) => {
+                self.asked.store(false, Ordering::Release);
+                Some(frame)
+            }
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => Some(Err("the camera stopped".into())),
+        }
+    }
+}
 
 /// Shared capture state for a tab (camera stream, mic ring buffer, counters for pipeline stats).
 #[derive(Default)]
 pub struct MediaCaptureState {
-    camera: Option<Camera>,
+    camera: Option<Arc<CameraThread>>,
     last_frame_w: u32,
     last_frame_h: u32,
     camera_frames: u64,
@@ -43,9 +116,7 @@ impl MediaCaptureState {
     /// Called when the tab navigates to a different origin so a new app can never
     /// read frames or samples from devices the previous origin opened.
     pub fn reset(&mut self) {
-        if let Some(mut cam) = self.camera.take() {
-            let _ = cam.stop_stream();
-        }
+        // The camera's thread stops its stream.
         *self = Self::default();
     }
 }
@@ -174,23 +245,21 @@ fn open_camera(console: &Mutex<Vec<ConsoleEntry>>) -> Result<Camera, i32> {
     Ok(camera)
 }
 
-/// The next camera frame as RGBA, or `None` (logged) when there is none.
+/// The next camera frame as RGBA, or `None` (logged) when there is none, waiting at most
+/// [`CAMERA_FRAME_TIMEOUT`] for it.
 fn camera_frame(state: &HostState) -> Option<Vec<u8>> {
-    let mut capture = state.media_capture.lock().unwrap();
-    let frame = capture.camera.as_mut()?.frame();
-    let image = frame
-        .and_then(|buffer| buffer.decode_image::<RgbFormat>())
+    let camera = state.media_capture.lock().unwrap().camera.clone()?;
+    let frame = state
+        .budget
+        .wait(Wait::Host, || camera.frame(CAMERA_FRAME_TIMEOUT))??;
+    let (width, height, rgba) = frame
         .map_err(|e| state.log(ConsoleLevel::Warn, format!("[CAMERA] Frame: {e}")))
         .ok()?;
-    capture.last_frame_w = image.width();
-    capture.last_frame_h = image.height();
+    let mut capture = state.media_capture.lock().unwrap();
+    capture.last_frame_w = width;
+    capture.last_frame_h = height;
     capture.camera_frames = capture.camera_frames.saturating_add(1);
-    Some(
-        image
-            .pixels()
-            .flat_map(|p| [p[0], p[1], p[2], 255])
-            .collect(),
-    )
+    Some(rgba)
 }
 
 /// A screenshot of the first display as RGBA, or the guest's error code (logged).
@@ -234,16 +303,21 @@ pub fn register_media_capture_functions(linker: &mut Linker<HostState>) -> Resul
             if let Some(code) = permission_gate(caller.data(), PermissionKind::Camera) {
                 return code;
             }
-            let mut capture = caller.data().media_capture.lock().unwrap();
-            if let Some(mut camera) = capture.camera.take() {
-                let _ = camera.stop_stream();
-            }
-            match open_camera(&caller.data().console) {
-                Ok(camera) => {
-                    capture.camera = Some(camera);
+            let state = caller.data();
+            // The camera open before stops; its thread stops its stream.
+            drop(capture(&caller, |c| c.camera.take()));
+            let opened = state.budget.wait(Wait::Host, || {
+                let camera = open_camera(&state.console)?;
+                CameraThread::start(camera)
+                    .map_err(|e| log_err(&state.console, -3, format!("[CAMERA] Thread: {e}")))
+            });
+            match opened {
+                Some(Ok(camera)) => {
+                    capture(&caller, |c| c.camera = Some(Arc::new(camera)));
                     0
                 }
-                Err(code) => code,
+                Some(Err(code)) => code,
+                None => -3,
             }
         },
     )?;
@@ -252,9 +326,8 @@ pub fn register_media_capture_functions(linker: &mut Linker<HostState>) -> Resul
         "oxide",
         "api_camera_close",
         |caller: Caller<'_, HostState>| {
-            if let Some(mut camera) = capture(&caller, |c| c.camera.take()) {
-                let _ = camera.stop_stream();
-            }
+            // Its thread stops the stream.
+            drop(capture(&caller, |c| c.camera.take()));
         },
     )?;
 

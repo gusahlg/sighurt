@@ -1220,6 +1220,10 @@ fn the_permission_prompt_cannot_be_hidden_or_answered_unseen() {
     // However much the page paints, the prompt is painted over it.
     assert_eq!(host.present(view), PresentOutcome::Submitted);
     assert_eq!(shown.pixel(20, 60), bgra(0x18181b), "the prompt's card");
+    // Just shown, it can't be allowed yet: an Enter meant for the page is dropped.
+    host.input(view, enter());
+    assert!(!host.run_for(SECS / 5).iter().any(granted));
+    host.run_for(SECS / 2);
     host.input(view, enter());
     host.until(5 * SECS, granted);
 }
@@ -1712,4 +1716,88 @@ fn a_burst_of_download_urls_starts_no_thread() {
     // The thread count and RSS are the whole test process's, which the tests running beside
     // this one change too, so they are printed above, not asserted.
     let _ = new_threads;
+}
+
+/// A module whose `start_app` loads `next` with `api_load_module` and, when that returns
+/// `code`, sets its URL's fragment to `fragment` (`api_push_state` is the page's: modules share
+/// the document).
+fn loads(next: &str, code: i32, fragment: &str) -> String {
+    format!(
+        r#"(module
+  (import "oxide" "api_load_module" (func $load (param i32 i32) (result i32)))
+  (import "oxide" "api_push_state" (func $push (param i32 i32 i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{fragment}")
+  (data (i32.const 256) "{next}")
+  (func (export "start_app")
+    (if (i32.eq (call $load (i32.const 256) (i32.const {len})) (i32.const {code}))
+      (then (call $push (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)
+                        (i32.const 0) (i32.const {fragment_len}))))))
+"#,
+        len = next.len(),
+        fragment_len = fragment.len(),
+    )
+}
+
+/// `api_load_module` nests at most two deep: the third load fails, and the module it names
+/// never runs.
+#[test]
+fn modules_nest_a_bounded_depth() {
+    let mut host = Host::new();
+    let never = guest(
+        host.dir(),
+        "level3",
+        &loads("file:///nonexistent.wasm", -999, "#too-deep"),
+    );
+    let level2 = guest(host.dir(), "level2", &loads(&never, -1, "#bounded"));
+    let level1 = guest(host.dir(), "level1", &loads(&level2, 0, "#level1"));
+    let page = guest(host.dir(), "page", &loads(&level1, 0, "#page"));
+    let (view, _) = host.open(800, 600, 120);
+    host.navigate(view, &page);
+    let events = host.until(
+        10 * SECS,
+        |e| matches!(e, EngineEvent::LoadingChanged { view: v, loading: false, .. } if *v == view),
+    );
+    let urls: Vec<_> = events.iter().filter_map(committed_url).collect();
+    assert!(urls.iter().any(|url| url.ends_with("#page")), "{urls:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::HistoryChanged { entries, .. }
+            if entries.iter().any(|url| url.ends_with("#bounded")))),
+        "{events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::HistoryChanged { entries, .. }
+            if entries.iter().any(|url| url.ends_with("#too-deep")))),
+        "the fourth module ran"
+    );
+}
+
+/// Asks for a download from its fifth frame on, once, and never draws anything new.
+const DOWNLOADS_LATER: &str = r##"
+(module
+  (import "oxide" "api_download_url" (func $url (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (global $frames (mut i32) (i32.const 0))
+  (data (i32.const 0) "https://a.test/later.bin")
+  (func (export "start_app"))
+  (func (export "on_frame") (param i32)
+    (global.set $frames (i32.add (global.get $frames) (i32.const 1)))
+    (if (i32.eq (global.get $frames) (i32.const 5))
+      (then (drop (call $url (i32.const 0) (i32.const 24)))))))
+"##;
+
+/// A download asked for in a frame that drew nothing new reaches the browser all the same.
+#[test]
+fn a_download_from_an_unchanged_frame_reaches_the_browser() {
+    let mut host = Host::new();
+    let url = guest(host.dir(), "later", DOWNLOADS_LATER);
+    let (view, _) = load(&mut host, &url);
+    host.until(
+        5 * SECS,
+        |e| matches!(e, EngineEvent::ServiceRequested(request) if request.view == view),
+    );
 }

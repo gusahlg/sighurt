@@ -135,11 +135,10 @@ pub fn fetch_manifest(wasm_url: &AppUrl) -> Result<Option<AppManifest>, String> 
         return Ok(None);
     };
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-    let response = match client.get(&url).send() {
+    // The page's own sibling: the user asked for the page, wherever it is.
+    let client = crate::net::blocking_client(&crate::net::NetPolicy::top_level())?;
+    let request = client.get(&url).timeout(std::time::Duration::from_secs(10));
+    let response = match request.send() {
         Ok(r) if r.status().is_success() => r,
         // Missing, or a network failure fetching an *optional* file: treat as absent.
         _ => return Ok(None),

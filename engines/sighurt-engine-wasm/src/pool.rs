@@ -12,6 +12,9 @@
 //! their threads until their own timeouts. A spare ends once the pool has its `n` running
 //! threads again.
 //!
+//! Its threads have [`GUEST_THREAD_STACK`](crate::engine::GUEST_THREAD_STACK) of stack: guests
+//! run on them, Wasm on the native stack.
+//!
 //! Owns: its threads, and the jobs queued on it: when the pool is dropped, its threads drop the
 //! jobs still queued (and what they hold) rather than the thread that drops the pool. Must not
 //! own: what the jobs do, or their results (jobs send those to the owner loop themselves).
@@ -160,6 +163,7 @@ impl Shared {
         let shared = self.clone();
         thread::Builder::new()
             .name(self.name.clone())
+            .stack_size(crate::engine::GUEST_THREAD_STACK)
             .spawn(move || {
                 POOL.with(|pool| *pool.borrow_mut() = Arc::downgrade(&shared));
                 shared.work()

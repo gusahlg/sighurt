@@ -24,7 +24,9 @@
 //! most [`MAX_QUEUED_MESSAGES`] undelivered messages of [`MAX_QUEUED_BYTES`] together, and
 //! posting to a full queue fails. Each call into a worker has the same fuel and time limits as a
 //! page's, and stops at the next epoch tick once the worker is terminated or its page's document
-//! is closed or replaced.
+//! is closed or replaced. A worker's memory counts in the runtime's total
+//! ([`crate::engine::Limits`]), and its connections follow its page's network policy within its
+//! page's budget of buffered bytes ([`crate::net`]). A worker opens no file dialog.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -108,8 +110,9 @@ impl WorkerState {
     ///
     /// Returns a handle (`> 0`) or `0` if there is no engine to run it on, the guest already
     /// has [`MAX_WORKERS`] worker threads alive or the runtime [`MAX_WORKER_THREADS`], or no
-    /// thread can be started. The worker shares only the console and the persistent KV store of
-    /// the parent's origin; canvas, input, timers, and memory are its own.
+    /// thread can be started. The worker shares only the console, the persistent KV store of the
+    /// parent's origin, and its network policy and byte budget; canvas, input, timers, and
+    /// memory are its own.
     fn spawn(&mut self, url: String, parent: &HostState) -> u32 {
         let Some(engine) = parent.engine.clone() else {
             return 0;
@@ -130,6 +133,8 @@ impl WorkerState {
             console: parent.console.clone(),
             current_url: Arc::new(Mutex::new(url.clone())),
             module_origin: Arc::new(Mutex::new(parent.module_origin.lock().unwrap().clone())),
+            // The page's network policy, and its budget of buffered bytes.
+            net: parent.net.clone(),
             worker_outbox: Some(outbox.clone()),
             ..Default::default()
         };
@@ -137,6 +142,7 @@ impl WorkerState {
         let bytes = inbox_bytes.clone();
         let started = std::thread::Builder::new()
             .name("sighurt-wasm-worker".into())
+            .stack_size(crate::engine::GUEST_THREAD_STACK)
             .spawn(move || {
                 let _counted = (mine, all);
                 let inbox = (inbox_rx, bytes);
@@ -201,7 +207,7 @@ fn worker_main(
     (inbox_rx, inbox_bytes): (Receiver<Inbox>, Arc<AtomicUsize>),
 ) -> Result<(), String> {
     let budget = host_state.budget.clone();
-    let wasm_bytes = crate::runtime::fetch_module(url, page_url)
+    let (wasm_bytes, _) = crate::runtime::fetch_module(url, page_url, &host_state.net_policy())
         .map_err(|e| format!("fetch failed for {url}: {e:#}"))?;
     let module = engine
         .compile_module(&wasm_bytes)

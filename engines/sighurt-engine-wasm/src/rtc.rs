@@ -8,12 +8,24 @@
 //! What a guest, or a remote peer, can make the host keep is bounded: at most [`MAX_PEERS`]
 //! peers, and per peer [`MAX_CHANNELS`] data channels, [`MAX_PENDING`] tracks and ICE
 //! candidates waiting for the guest, and [`MAX_QUEUED_MESSAGES`] received messages of
-//! [`MAX_QUEUED_BYTES`] together. Past these, a remote peer's channels are closed and its
-//! messages and tracks dropped.
+//! [`MAX_QUEUED_BYTES`] together, within the document's budget of buffered bytes
+//! ([`NetBytes`]). Past these, a remote peer's channels are closed and its messages and tracks
+//! dropped.
+//!
+//! Every call that waits for WebRTC (creating a peer, SDP, ICE, sending, opening a channel or
+//! a track) is bounded by [`RTC_TIMEOUT`] and counts as a wait of the guest's call (see
+//! [`Budget::wait`](crate::engine::Budget::wait)); signaling requests follow the document's
+//! [`NetPolicy`], carry its `Origin`, and are bounded by [`SIGNAL_TIMEOUT`] and
+//! [`MAX_SIGNAL_BYTES`]. Peer connections run on the runtime's shared network runtime
+//! ([`crate::net::Net`]) and are closed with the document. The ICE servers and candidates a
+//! guest names are WebRTC's to reach, outside this policy.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::io::Read;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use wasmtime::{Caller, Linker};
@@ -36,8 +48,9 @@ use webrtc::track::track_local::TrackLocal;
 
 use crate::capabilities::{
     guest_bytes, guest_str, next_handle, with, with_started, write_prefix, ConsoleLevel, HostState,
-    Runtime,
 };
+use crate::engine::Wait;
+use crate::net::{Held, Net, NetBytes, NetPolicy, HTTP};
 
 /// Most peers a guest may have.
 pub const MAX_PEERS: usize = 64;
@@ -48,6 +61,12 @@ pub const MAX_PENDING: usize = 256;
 /// Most received messages of one peer waiting for the guest, and most bytes of them.
 pub const MAX_QUEUED_MESSAGES: usize = 4096;
 pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+/// Longest one call into WebRTC may wait.
+pub const RTC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest one signaling request may take.
+pub const SIGNAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest signaling message received.
+pub const MAX_SIGNAL_BYTES: u64 = 1024 * 1024;
 
 /// Incoming message queued by a data channel's on_message callback.
 struct IncomingMessage {
@@ -82,11 +101,10 @@ struct PeerState {
     next_channel_id: Arc<AtomicU32>,
 }
 
-/// Received messages the guest hasn't read.
-#[derive(Default)]
+/// Received messages the guest hasn't read, and the bytes they hold of the document's budget.
 struct Incoming {
     messages: VecDeque<IncomingMessage>,
-    bytes: usize,
+    held: Held,
 }
 
 /// Queues `item` unless `queue` holds [`MAX_PENDING`] already.
@@ -101,12 +119,13 @@ fn push_pending<T>(queue: &Mutex<VecDeque<T>>, item: T) {
 struct SignalingSession {
     base_url: String,
     room: String,
-    client: reqwest::blocking::Client,
 }
 
 /// All RTC state for a tab. Lazily initialised on first `api_rtc_*` call.
 pub struct RtcState {
-    runtime: Runtime,
+    net: Arc<Net>,
+    policy: NetPolicy,
+    bytes: NetBytes,
     peers: HashMap<u32, PeerState>,
     last_peer_id: u32,
     signaling: Option<SignalingSession>,
@@ -137,9 +156,11 @@ fn map_connection_state(s: RTCPeerConnectionState) -> u32 {
 fn deliver_messages(dc: &RTCDataChannel, channel_id: u32, queue: Arc<Mutex<Incoming>>) {
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let mut queue = queue.lock().unwrap();
-        let bytes = queue.bytes + msg.data.len();
-        if queue.messages.len() < MAX_QUEUED_MESSAGES && bytes <= MAX_QUEUED_BYTES {
-            queue.bytes = bytes;
+        let bytes = queue.held.get() + msg.data.len();
+        if queue.messages.len() < MAX_QUEUED_MESSAGES
+            && bytes <= MAX_QUEUED_BYTES
+            && queue.held.try_add(msg.data.len())
+        {
             queue.messages.push_back(IncomingMessage {
                 channel_id,
                 is_binary: !msg.is_string,
@@ -151,14 +172,37 @@ fn deliver_messages(dc: &RTCDataChannel, channel_id: u32, queue: Arc<Mutex<Incom
 }
 
 impl RtcState {
-    pub fn new() -> Option<Self> {
-        let runtime = Runtime::new()?;
-        Some(Self {
-            runtime,
+    pub fn new(net: Arc<Net>, policy: NetPolicy, bytes: NetBytes) -> Self {
+        Self {
+            net,
+            policy,
+            bytes,
             peers: HashMap::new(),
             last_peer_id: 0,
             signaling: None,
-        })
+        }
+    }
+
+    /// The state of `host`'s document; `None` when the network can't be used.
+    pub fn of(host: &HostState) -> Option<Self> {
+        Some(Self::new(
+            host.shared_net()?,
+            host.net_policy(),
+            host.net_bytes(),
+        ))
+    }
+
+    /// Runs `f` on the network runtime, for at most [`RTC_TIMEOUT`].
+    fn block_on<T, E: Into<anyhow::Error>>(
+        &self,
+        f: impl Future<Output = Result<T, E>>,
+    ) -> Result<T> {
+        self.net
+            .runtime()
+            // The timer is made inside the runtime, which drives it.
+            .block_on(async { tokio::time::timeout(RTC_TIMEOUT, f).await })
+            .map_err(|_| anyhow::anyhow!("no answer within {} s", RTC_TIMEOUT.as_secs()))?
+            .map_err(Into::into)
     }
 
     fn peer(&self, peer_id: u32) -> Result<&PeerState> {
@@ -182,7 +226,7 @@ impl RtcState {
             ..Default::default()
         };
 
-        let conn = Arc::new(self.runtime.block_on(async {
+        let conn = Arc::new(self.block_on(async {
             let mut me = MediaEngine::default();
             me.register_default_codecs()?;
             let registry = register_default_interceptors(Registry::new(), &mut me)?;
@@ -195,7 +239,10 @@ impl RtcState {
         let peer = PeerState {
             conn: conn.clone(),
             data_channels: Default::default(),
-            incoming_messages: Default::default(),
+            incoming_messages: Arc::new(Mutex::new(Incoming {
+                messages: VecDeque::new(),
+                held: Held::new(self.bytes.clone()),
+            })),
             pending_channels: Default::default(),
             pending_tracks: Default::default(),
             ice_candidates: Default::default(),
@@ -267,22 +314,21 @@ impl RtcState {
         let Some(peer) = self.peers.remove(&peer_id) else {
             return false;
         };
-        let _ = self.runtime.block_on(peer.conn.close());
+        let _ = self.block_on(peer.conn.close());
         true
     }
 
     /// Creates an offer, or an answer, and makes it the local description.
     fn create_sdp(&self, peer_id: u32, answer: bool) -> Result<String> {
         let conn = &self.peer(peer_id)?.conn;
-        let sdp = self.runtime.block_on(async {
+        let sdp = self.block_on(async {
             if answer {
                 conn.create_answer(None).await
             } else {
                 conn.create_offer(None).await
             }
         })?;
-        self.runtime
-            .block_on(conn.set_local_description(sdp.clone()))?;
+        self.block_on(conn.set_local_description(sdp.clone()))?;
         Ok(sdp.sdp)
     }
 
@@ -294,9 +340,9 @@ impl RtcState {
             RTCSessionDescription::answer(sdp.to_string())?
         };
         if remote {
-            self.runtime.block_on(conn.set_remote_description(desc))?;
+            self.block_on(conn.set_remote_description(desc))?;
         } else {
-            self.runtime.block_on(conn.set_local_description(desc))?;
+            self.block_on(conn.set_local_description(desc))?;
         }
         Ok(())
     }
@@ -304,7 +350,7 @@ impl RtcState {
     fn add_ice_candidate(&self, peer_id: u32, candidate_json: &str) -> Result<()> {
         let conn = &self.peer(peer_id)?.conn;
         let init: RTCIceCandidateInit = serde_json::from_str(candidate_json)?;
-        self.runtime.block_on(conn.add_ice_candidate(init))?;
+        self.block_on(conn.add_ice_candidate(init))?;
         Ok(())
     }
 
@@ -328,9 +374,7 @@ impl RtcState {
             ordered: Some(false),
             ..Default::default()
         });
-        let dc = self
-            .runtime
-            .block_on(peer.conn.create_data_channel(label, options))?;
+        let dc = self.block_on(peer.conn.create_data_channel(label, options))?;
         let channel_id = peer.next_channel_id.fetch_add(1, Ordering::Relaxed);
         deliver_messages(&dc, channel_id, peer.incoming_messages.clone());
         peer.data_channels.lock().unwrap().insert(channel_id, dc);
@@ -347,11 +391,10 @@ impl RtcState {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown channel"))?;
         if is_binary {
-            self.runtime
-                .block_on(dc.send(&bytes::Bytes::copy_from_slice(data)))?;
+            self.block_on(dc.send(&bytes::Bytes::copy_from_slice(data)))?;
         } else {
             let text = String::from_utf8_lossy(data).to_string();
-            self.runtime.block_on(dc.send_text(text))?;
+            self.block_on(dc.send_text(text))?;
         }
         Ok(())
     }
@@ -365,7 +408,7 @@ impl RtcState {
             .iter()
             .position(|m| channel_id == 0 || m.channel_id == channel_id)?;
         let message = queue.messages.remove(pos)?;
-        queue.bytes -= message.data.len();
+        queue.held.remove(message.data.len());
         Some(message)
     }
 
@@ -395,7 +438,7 @@ impl RtcState {
             format!("track-{kind}-{handle}"),
             format!("sighurt-{name}"),
         ));
-        self.runtime.block_on(
+        self.block_on(
             peer.conn
                 .add_track(track as Arc<dyn TrackLocal + Send + Sync>),
         )?;
@@ -404,41 +447,60 @@ impl RtcState {
 
     // ── Signaling helpers ───────────────────────────────────────────
 
-    fn signal_connect(&mut self, url: &str) {
+    /// Uses the signaling server at `url`, if the policy allows it.
+    fn signal_connect(&mut self, url: &str) -> Result<(), String> {
+        let base = self.policy.check(url.trim_end_matches('/'), HTTP)?;
         self.signaling = Some(SignalingSession {
-            base_url: url.trim_end_matches('/').to_string(),
+            base_url: base.as_str().trim_end_matches('/').to_string(),
             room: String::new(),
-            client: reqwest::blocking::Client::new(),
         });
+        Ok(())
+    }
+
+    /// A signaling request to `url` (checked again: a room name is part of it).
+    fn signal_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+    ) -> Option<reqwest::blocking::RequestBuilder> {
+        let url = self.policy.check(url, HTTP).ok()?;
+        let client = crate::net::blocking_client(&self.policy).ok()?;
+        let mut request = client.request(method, url).timeout(SIGNAL_TIMEOUT);
+        if let Some(origin) = self.policy.origin() {
+            request = request.header("Origin", origin);
+        }
+        Some(request)
     }
 
     fn signal_join_room(&mut self, room: &str) -> bool {
         let Some(sig) = &mut self.signaling else {
             return false;
         };
-        sig.room = room.to_string();
-        let _ = sig
-            .client
-            .post(format!("{}/rooms/{room}/join", sig.base_url))
-            .send();
+        sig.room = percent_encoding::utf8_percent_encode(room, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
+        let url = format!("{}/rooms/{}/join", sig.base_url, sig.room);
+        if let Some(request) = self.signal_request(reqwest::Method::POST, &url) {
+            let _ = request.send();
+        }
         true
     }
 
-    /// The signaling session and the URL to exchange messages at.
-    fn signal_endpoint(&self) -> Option<(&SignalingSession, String)> {
+    /// The URL to exchange signaling messages at.
+    fn signal_endpoint(&self) -> Option<String> {
         let sig = self.signaling.as_ref()?;
-        let url = if sig.room.is_empty() {
+        Some(if sig.room.is_empty() {
             format!("{}/signal", sig.base_url)
         } else {
             format!("{}/rooms/{}/signal", sig.base_url, sig.room)
-        };
-        Some((sig, url))
+        })
     }
 
     fn signal_send(&self, data: &[u8]) -> bool {
-        self.signal_endpoint().is_some_and(|(sig, url)| {
-            sig.client
-                .post(url)
+        let request = self
+            .signal_endpoint()
+            .and_then(|url| self.signal_request(reqwest::Method::POST, &url));
+        request.is_some_and(|request| {
+            request
                 .header("Content-Type", "application/json")
                 .body(data.to_vec())
                 .send()
@@ -446,14 +508,41 @@ impl RtcState {
         })
     }
 
+    /// The next signaling message, at most [`MAX_SIGNAL_BYTES`] of it.
     fn signal_recv(&self) -> Option<Vec<u8>> {
-        let (sig, url) = self.signal_endpoint()?;
-        let resp = sig.client.get(url).send().ok()?;
+        let url = self.signal_endpoint()?;
+        let resp = self
+            .signal_request(reqwest::Method::GET, &url)?
+            .send()
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        resp.bytes().ok().map(|b| b.to_vec())
+        let mut body = Vec::new();
+        resp.take(MAX_SIGNAL_BYTES).read_to_end(&mut body).ok()?;
+        Some(body)
     }
+}
+
+impl Drop for RtcState {
+    /// The document is gone: its peers close, on the network runtime, without waiting here.
+    fn drop(&mut self) {
+        for (_, peer) in self.peers.drain() {
+            self.net.runtime().spawn(async move {
+                let _ = peer.conn.close().await;
+            });
+        }
+    }
+}
+
+/// Runs `f` on the started RTC state, as a wait for the network (see
+/// [`Budget::wait`](crate::engine::Budget::wait)); `None` before any peer was created, or once
+/// the document is cancelled.
+fn waiting<R>(state: &HostState, f: impl FnOnce(&mut RtcState) -> R) -> Option<R> {
+    state
+        .budget
+        .wait(Wait::Host, || with(&state.rtc, f))
+        .flatten()
 }
 
 /// The guest's code for an RTC call without a result: 0 on success, -1 before any peer was
@@ -513,7 +602,14 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
                 .filter(|_| !stun.is_empty())
                 .collect();
             let state = caller.data();
-            match with_started(&state.rtc, RtcState::new, |r| r.create_peer(stun_urls)) {
+            let created = state.budget.wait(Wait::Host, || {
+                with_started(
+                    &state.rtc,
+                    || RtcState::of(state),
+                    |r| r.create_peer(stun_urls),
+                )
+            });
+            match created.flatten() {
                 Some(Ok(id)) => {
                     state.log(ConsoleLevel::Log, format!("[RTC] Peer {id} created"));
                     id
@@ -534,7 +630,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "oxide",
         "api_rtc_close_peer",
         |caller: Caller<'_, HostState>, peer_id: u32| -> u32 {
-            u32::from(with(&caller.data().rtc, |r| r.close_peer(peer_id)) == Some(true))
+            u32::from(waiting(caller.data(), |r| r.close_peer(peer_id)) == Some(true))
         },
     )?;
 
@@ -552,7 +648,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
                   out_ptr: u32,
                   out_cap: u32|
                   -> i32 {
-                let sdp = with(&caller.data().rtc, |r| r.create_sdp(peer_id, answer));
+                let sdp = waiting(caller.data(), |r| r.create_sdp(peer_id, answer));
                 match sdp {
                     Some(Ok(sdp)) => {
                         write_polled(&mut caller, out_ptr, out_cap, Some(Some(sdp.into_bytes())))
@@ -585,7 +681,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
                   is_offer: u32|
                   -> i32 {
                 let sdp = guest_str(&caller, sdp_ptr, sdp_len).unwrap_or_default();
-                let result = with(&caller.data().rtc, |r| {
+                let result = waiting(caller.data(), |r| {
                     r.set_description(peer_id, &sdp, is_offer != 0, remote)
                 });
                 status(caller.data(), what, result)
@@ -600,9 +696,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "api_rtc_add_ice_candidate",
         |caller: Caller<'_, HostState>, peer_id: u32, cand_ptr: u32, cand_len: u32| -> i32 {
             let candidate = guest_str(&caller, cand_ptr, cand_len).unwrap_or_default();
-            let result = with(&caller.data().rtc, |r| {
-                r.add_ice_candidate(peer_id, &candidate)
-            });
+            let result = waiting(caller.data(), |r| r.add_ice_candidate(peer_id, &candidate));
             status(caller.data(), "Add ICE candidate", result)
         },
     )?;
@@ -638,7 +732,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
          ordered: u32|
          -> u32 {
             let label = guest_str(&caller, label_ptr, label_len).unwrap_or_default();
-            let result = with(&caller.data().rtc, |r| {
+            let result = waiting(caller.data(), |r| {
                 r.create_data_channel(peer_id, &label, ordered != 0)
             });
             handle(caller.data(), "Create data channel", result)
@@ -656,7 +750,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
          is_binary: u32|
          -> i32 {
             let data = guest_bytes(&caller, data_ptr, data_len).unwrap_or_default();
-            let result = with(&caller.data().rtc, |r| {
+            let result = waiting(caller.data(), |r| {
                 r.send_data(peer_id, channel_id, &data, is_binary != 0)
             });
             match status(caller.data(), "Send", result) {
@@ -712,7 +806,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "oxide",
         "api_rtc_add_track",
         |caller: Caller<'_, HostState>, peer_id: u32, kind: u32| -> u32 {
-            let result = with(&caller.data().rtc, |r| r.add_track(peer_id, kind));
+            let result = waiting(caller.data(), |r| r.add_track(peer_id, kind));
             handle(caller.data(), "Add track", result)
         },
     )?;
@@ -737,9 +831,20 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
         |caller: Caller<'_, HostState>, url_ptr: u32, url_len: u32| -> u32 {
             let url = guest_str(&caller, url_ptr, url_len).unwrap_or_default();
             let state = caller.data();
-            if with_started(&state.rtc, RtcState::new, |r| r.signal_connect(&url)).is_none() {
-                state.log(ConsoleLevel::Error, "[RTC] Init failed");
-                return 0;
+            match with_started(
+                &state.rtc,
+                || RtcState::of(state),
+                |r| r.signal_connect(&url),
+            ) {
+                None => {
+                    state.log(ConsoleLevel::Error, "[RTC] Init failed");
+                    return 0;
+                }
+                Some(Err(e)) => {
+                    state.log(ConsoleLevel::Error, format!("[RTC] Signaling refused: {e}"));
+                    return 0;
+                }
+                Some(Ok(())) => {}
             }
             let message = format!("[RTC] Signaling connected to {url}");
             state.log(ConsoleLevel::Log, message);
@@ -752,7 +857,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "api_rtc_signal_join_room",
         |caller: Caller<'_, HostState>, room_ptr: u32, room_len: u32| -> i32 {
             let room = guest_str(&caller, room_ptr, room_len).unwrap_or_default();
-            match with(&caller.data().rtc, |r| r.signal_join_room(&room)) {
+            match waiting(caller.data(), |r| r.signal_join_room(&room)) {
                 Some(true) => 0,
                 Some(false) => -2,
                 None => -1,
@@ -765,7 +870,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "api_rtc_signal_send",
         |caller: Caller<'_, HostState>, data_ptr: u32, data_len: u32| -> i32 {
             let data = guest_bytes(&caller, data_ptr, data_len).unwrap_or_default();
-            match with(&caller.data().rtc, |r| r.signal_send(&data)) {
+            match waiting(caller.data(), |r| r.signal_send(&data)) {
                 Some(true) => 0,
                 Some(false) => -2,
                 None => -1,
@@ -777,7 +882,7 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "oxide",
         "api_rtc_signal_recv",
         |mut caller: Caller<'_, HostState>, out_ptr: u32, out_cap: u32| -> i32 {
-            let data = with(&caller.data().rtc, |r| r.signal_recv());
+            let data = waiting(caller.data(), |r| r.signal_recv());
             write_polled(&mut caller, out_ptr, out_cap, data)
         },
     )?;
@@ -789,9 +894,15 @@ pub fn register_rtc_functions(linker: &mut Linker<HostState>) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn local() -> RtcState {
+        let policy = NetPolicy::for_page("file:///app.wasm", None);
+        let bytes = NetBytes::with_limit(crate::net::MAX_DOCUMENT_BYTES);
+        RtcState::new(Arc::new(Net::new().unwrap()), policy, bytes)
+    }
+
     #[test]
     fn a_guest_has_a_bounded_number_of_peers() {
-        let mut rtc = RtcState::new().unwrap();
+        let mut rtc = local();
         // Peers that are never connected: creating one touches no network.
         let stun = || vec!["stun:127.0.0.1:1".to_string()];
         for _ in 0..MAX_PEERS {
@@ -809,5 +920,43 @@ mod tests {
             push_pending(&queue, i);
         }
         assert_eq!(queue.lock().unwrap().len(), MAX_PENDING);
+    }
+
+    #[test]
+    fn signaling_follows_the_pages_policy() {
+        let policy = NetPolicy::for_page("https://a.test/app.wasm", Some([1, 1, 1, 1].into()));
+        let bytes = NetBytes::with_limit(1024);
+        let mut rtc = RtcState::new(Arc::new(Net::new().unwrap()), policy, bytes);
+        assert!(rtc.signal_connect("http://127.0.0.1:1/").is_err());
+        assert!(rtc.signal_connect("file:///tmp/").is_err());
+        assert!(rtc.signal_connect("https://signal.test/").is_ok());
+        // A room name stays a path segment of that server.
+        assert!(rtc.signal_join_room("../@127.0.0.1:1/x?y#z"));
+        let url = rtc.signal_endpoint().unwrap();
+        assert!(url.starts_with("https://signal.test/rooms/"), "{url}");
+        assert_eq!(
+            url::Url::parse(&url).unwrap().host_str(),
+            Some("signal.test")
+        );
+    }
+
+    /// A signaling server that sends more than [`MAX_SIGNAL_BYTES`] has the rest cut.
+    #[test]
+    fn signaling_messages_are_bounded() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = std::io::Read::read(&mut socket, &mut request);
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            let chunk = vec![b'x'; 64 * 1024];
+            while socket.write_all(&chunk).is_ok() {}
+        });
+        let mut rtc = local();
+        rtc.signal_connect(&format!("http://{address}")).unwrap();
+        let message = rtc.signal_recv().unwrap();
+        assert_eq!(message.len() as u64, MAX_SIGNAL_BYTES);
     }
 }

@@ -14,12 +14,16 @@
 //! * `api_fetch_abort` cancels an in-flight request.
 //! * `api_fetch_remove` frees host-side resources once the guest is done.
 //!
-//! A background tokio task per request drives `reqwest`'s `bytes_stream()`,
-//! pushing chunks into a `VecDeque<Vec<u8>>` drained by the guest.
+//! A background tokio task per request, on the runtime's shared network runtime
+//! ([`crate::net::Net`]), drives `reqwest`'s `bytes_stream()`, pushing chunks into a
+//! `VecDeque<Vec<u8>>` drained by the guest. Requests follow the document's
+//! [`NetPolicy`](crate::net::NetPolicy); a refused URL or method fails `api_fetch_begin`.
 //!
 //! What a guest can make the host keep is bounded: at most [`MAX_REQUESTS`] handles, and per
-//! request at most [`MAX_QUEUED_BYTES`] of body the guest hasn't read (and one chunk more);
-//! past that the task stops reading from the network until the guest catches up.
+//! request at most [`MAX_QUEUED_BYTES`] of body the guest hasn't read (and one chunk more),
+//! within the document's budget of buffered bytes ([`NetBytes`]); past either the task stops
+//! reading from the network until the guest catches up. Removing a handle, or dropping the
+//! document, stops its task at once.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -28,17 +32,21 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::StreamExt;
+use tokio::task::JoinHandle;
 use wasmtime::{Caller, Linker};
 
 use crate::capabilities::{
-    guest_bytes, guest_str, next_handle, with, with_started, write_guest, write_prefix,
-    ConsoleLevel, HostState, Runtime,
+    guest_bytes, guest_str, next_handle, request_method, with, with_started, write_guest,
+    write_prefix, ConsoleLevel, HostState,
 };
+use crate::net::{Held, Net, NetBytes, NetPolicy, HTTP, ROOM_POLL};
 
 /// Most requests a guest may have (until it removes them).
 pub const MAX_REQUESTS: usize = 256;
 /// Most bytes of unread body the host holds for one request before it stops reading.
 pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+/// How long one request may take, reading its body included.
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Ready-state constants (mirrored in sighurt-sdk) ────────────────────────
 
@@ -78,12 +86,15 @@ struct FetchInner {
 }
 
 impl FetchInner {
-    fn new() -> Self {
+    fn new(bytes: NetBytes) -> Self {
         Self {
             state: AtomicU32::new(FETCH_PENDING),
             status: AtomicU32::new(0),
             aborted: AtomicBool::new(false),
-            body: Mutex::default(),
+            body: Mutex::new(Body {
+                chunks: VecDeque::new(),
+                held: Held::new(bytes),
+            }),
             drained: tokio::sync::Notify::new(),
             error: Mutex::new(None),
         }
@@ -100,67 +111,103 @@ impl FetchInner {
     }
 }
 
-/// Body chunks the guest hasn't read.
-#[derive(Default)]
+/// Body chunks the guest hasn't read, and the bytes they hold of the document's budget.
 struct Body {
     chunks: VecDeque<Vec<u8>>,
-    bytes: usize,
+    held: Held,
+}
+
+/// A request and the task that drives it.
+struct Request {
+    inner: Arc<FetchInner>,
+    task: JoinHandle<()>,
 }
 
 /// All streaming-fetch state for a host. Lazily initialised on the first
 /// `api_fetch_begin` call.
 pub struct FetchState {
-    runtime: Runtime,
-    handles: HashMap<u32, Arc<FetchInner>>,
+    net: Arc<Net>,
+    policy: NetPolicy,
+    bytes: NetBytes,
+    handles: HashMap<u32, Request>,
     last_id: u32,
 }
 
 impl FetchState {
-    pub fn new() -> Option<Self> {
-        let runtime = Runtime::new()?;
-        Some(Self {
-            runtime,
+    pub fn new(net: Arc<Net>, policy: NetPolicy, bytes: NetBytes) -> Self {
+        Self {
+            net,
+            policy,
+            bytes,
             handles: HashMap::new(),
             last_id: 0,
-        })
+        }
     }
 
-    /// Dispatch a new request. Returns a handle (`> 0`), or `0` when the guest already has
-    /// [`MAX_REQUESTS`].
-    fn begin(&mut self, method: String, url: String, content_type: String, body: Vec<u8>) -> u32 {
+    /// The state of `host`'s document; `None` when the network can't be used.
+    pub fn of(host: &HostState) -> Option<Self> {
+        Some(Self::new(
+            host.shared_net()?,
+            host.net_policy(),
+            host.net_bytes(),
+        ))
+    }
+
+    /// Dispatch a new request. Returns a handle (`> 0`), or why it was refused: the guest
+    /// already has [`MAX_REQUESTS`], or the policy refuses its URL or method.
+    fn begin(
+        &mut self,
+        method: String,
+        url: String,
+        content_type: String,
+        body: Vec<u8>,
+    ) -> Result<u32, String> {
         if self.handles.len() >= MAX_REQUESTS {
-            return 0;
+            return Err(format!("{MAX_REQUESTS} requests open"));
+        }
+        let url = self.policy.check(&url, HTTP)?;
+        let mut request = self
+            .net
+            .client(&self.policy)
+            .request(request_method(&method)?, url)
+            .timeout(TIMEOUT);
+        if let Some(origin) = self.policy.origin() {
+            request = request.header("Origin", origin);
+        }
+        if !content_type.is_empty() {
+            request = request.header("Content-Type", content_type);
+        }
+        if !body.is_empty() {
+            request = request.body(body);
         }
         let id = next_handle(&mut self.last_id);
-        let inner = Arc::new(FetchInner::new());
-        let driver_inner = inner.clone();
+        let inner = Arc::new(FetchInner::new(self.bytes.clone()));
+        let task = self
+            .net
+            .runtime()
+            .spawn(drive_request(inner.clone(), request));
+        self.handles.insert(id, Request { inner, task });
+        Ok(id)
+    }
 
-        self.runtime.spawn(async move {
-            drive_request(driver_inner, method, url, content_type, body).await;
-        });
-
-        self.handles.insert(id, inner);
-        id
+    fn inner(&self, id: u32) -> Option<&FetchInner> {
+        self.handles.get(&id).map(|request| &*request.inner)
     }
 
     fn state(&self, id: u32) -> u32 {
-        self.handles
-            .get(&id)
+        self.inner(id)
             .map(|h| h.state.load(Ordering::SeqCst))
             .unwrap_or(FETCH_ERROR)
     }
 
     fn status(&self, id: u32) -> u32 {
-        self.handles
-            .get(&id)
+        self.inner(id)
             .map(|h| h.status.load(Ordering::SeqCst))
             .unwrap_or(0)
     }
 
     fn error(&self, id: u32) -> Option<String> {
-        self.handles
-            .get(&id)
-            .and_then(|h| h.error.lock().unwrap().clone())
+        self.inner(id).and_then(|h| h.error.lock().unwrap().clone())
     }
 
     /// Pop up to `cap` bytes from the head of the body queue.
@@ -170,7 +217,7 @@ impl FetchState {
     /// are re-queued at the front so the next call returns them — no data is
     /// dropped.
     fn recv(&self, id: u32, cap: usize) -> RecvResult {
-        let Some(inner) = self.handles.get(&id) else {
+        let Some(inner) = self.inner(id) else {
             return RecvResult::Sentinel(RECV_UNKNOWN);
         };
 
@@ -180,7 +227,7 @@ impl FetchState {
                 let remainder = chunk.split_off(cap);
                 body.chunks.push_front(remainder);
             }
-            body.bytes -= chunk.len();
+            body.held.remove(chunk.len());
             inner.drained.notify_one();
             return RecvResult::Data(chunk);
         }
@@ -194,7 +241,7 @@ impl FetchState {
     }
 
     fn abort(&self, id: u32) -> bool {
-        if let Some(inner) = self.handles.get(&id) {
+        if let Some(inner) = self.inner(id) {
             inner.stop();
             // Flip state immediately so `state()` reports the intent even
             // before the driver task observes the flag.
@@ -216,9 +263,20 @@ impl FetchState {
         }
     }
 
+    /// Forgets request `id`, stopping its task wherever it is (connecting, sending, reading).
     fn remove(&mut self, id: u32) {
-        if let Some(inner) = self.handles.remove(&id) {
-            inner.stop();
+        if let Some(request) = self.handles.remove(&id) {
+            request.inner.stop();
+            request.task.abort();
+        }
+    }
+}
+
+impl Drop for FetchState {
+    /// The document is gone: its requests stop.
+    fn drop(&mut self) {
+        for request in self.handles.values() {
+            request.task.abort();
         }
     }
 }
@@ -229,39 +287,13 @@ enum RecvResult {
 }
 
 /// Background task body: run the request and feed chunks into `inner`.
-async fn drive_request(
-    inner: Arc<FetchInner>,
-    method: String,
-    url: String,
-    content_type: String,
-    body: Vec<u8>,
-) {
+async fn drive_request(inner: Arc<FetchInner>, request: reqwest::RequestBuilder) {
     if inner.aborted.load(Ordering::SeqCst) {
         inner.state.store(FETCH_ABORTED, Ordering::SeqCst);
         return;
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            inner.set_error(format!("client build failed: {e}"));
-            return;
-        }
-    };
-
-    let parsed_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
-    let mut req = client.request(parsed_method, &url);
-    if !content_type.is_empty() {
-        req = req.header("Content-Type", &content_type);
-    }
-    if !body.is_empty() {
-        req = req.body(body);
-    }
-
-    let resp = match req.send().await {
+    let resp = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             inner.set_error(e.to_string());
@@ -287,16 +319,9 @@ async fn drive_request(
         }
         match next {
             Ok(chunk) => {
-                if !chunk.is_empty() {
-                    let mut body = inner.body.lock().unwrap();
-                    body.bytes += chunk.len();
-                    body.chunks.push_back(chunk.to_vec());
-                }
-                // Read no further until the guest has caught up.
-                while inner.body.lock().unwrap().bytes > MAX_QUEUED_BYTES
-                    && !inner.aborted.load(Ordering::SeqCst)
-                {
-                    inner.drained.notified().await;
+                if !chunk.is_empty() && !queue(&inner, chunk.to_vec()).await {
+                    inner.state.store(FETCH_ABORTED, Ordering::SeqCst);
+                    return;
                 }
             }
             Err(e) => {
@@ -313,6 +338,37 @@ async fn drive_request(
         Ordering::SeqCst,
         Ordering::SeqCst,
     );
+}
+
+/// Queues `chunk` for the guest once there is room for it, reading no further meanwhile: room
+/// in the request's queue ([`MAX_QUEUED_BYTES`], and one chunk more) and in the document's
+/// budget. False if the guest stopped the request first.
+async fn queue(inner: &FetchInner, chunk: Vec<u8>) -> bool {
+    let mut chunk = Some(chunk);
+    loop {
+        if inner.aborted.load(Ordering::SeqCst) {
+            return false;
+        }
+        let queue_full = {
+            let mut body = inner.body.lock().unwrap();
+            let queue_full = body.held.get() > MAX_QUEUED_BYTES;
+            let len = chunk.as_ref().map_or(0, Vec::len);
+            if !queue_full && body.held.try_add(len) {
+                body.chunks.extend(chunk.take());
+                return true;
+            }
+            queue_full
+        };
+        if queue_full {
+            inner.drained.notified().await;
+        } else {
+            // The document's budget is full: another connection's reader frees it.
+            tokio::select! {
+                _ = inner.drained.notified() => {}
+                _ = tokio::time::sleep(ROOM_POLL) => {}
+            }
+        }
+    }
 }
 
 /// Register all `api_fetch_*` streaming host functions on the given linker.
@@ -339,15 +395,16 @@ pub fn register_fetch_functions(linker: &mut Linker<HostState>) -> Result<()> {
             let body = guest_bytes(&caller, body_ptr, body_len).unwrap_or_default();
             let state = caller.data();
             let line = format!("[FETCH] {method} {url}");
-            match with_started(&state.fetch, FetchState::new, |f| {
-                f.begin(method, url, content_type, body)
-            }) {
-                Some(0) => {
-                    let message = format!("[FETCH] Refused: {MAX_REQUESTS} requests open");
-                    state.log(ConsoleLevel::Error, message);
+            match with_started(
+                &state.fetch,
+                || FetchState::of(state),
+                |f| f.begin(method, url, content_type, body),
+            ) {
+                Some(Err(e)) => {
+                    state.log(ConsoleLevel::Error, format!("[FETCH] Refused: {e}"));
                     0
                 }
-                Some(id) => {
+                Some(Ok(id)) => {
                     state.log(ConsoleLevel::Log, format!("{line} (id={id})"));
                     id
                 }
@@ -467,12 +524,29 @@ mod tests {
         format!("http://{address}/")
     }
 
+    /// A fetch state of a local page, with a budget of `limit` bytes.
+    fn local(limit: usize) -> FetchState {
+        let policy = NetPolicy::for_page("file:///app.wasm", None);
+        let net = Arc::new(Net::new().unwrap());
+        FetchState::new(net, policy, NetBytes::with_limit(limit))
+    }
+
+    fn get(fetch: &mut FetchState, url: String) -> u32 {
+        fetch
+            .begin("GET".into(), url, String::new(), Vec::new())
+            .unwrap()
+    }
+
+    fn queued(fetch: &FetchState, id: u32) -> usize {
+        fetch.handles[&id].inner.body.lock().unwrap().held.get()
+    }
+
     #[test]
     fn a_body_nobody_reads_is_held_back_not_kept() {
         let total = 64 * MIB;
-        let mut fetch = FetchState::new().unwrap();
-        let id = fetch.begin("GET".into(), serve(total), String::new(), Vec::new());
-        let queued = || fetch.handles[&id].body.lock().unwrap().bytes;
+        let mut fetch = local(crate::net::MAX_DOCUMENT_BYTES);
+        let id = get(&mut fetch, serve(total));
+        let queued = || queued(&fetch, id);
         let started = Instant::now();
         while queued() < MAX_QUEUED_BYTES && started.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(10));
@@ -499,23 +573,81 @@ mod tests {
 
     #[test]
     fn a_guest_has_a_bounded_number_of_requests() {
-        let mut fetch = FetchState::new().unwrap();
+        let mut fetch = local(crate::net::MAX_DOCUMENT_BYTES);
         // Nothing listens there: each request fails at once.
         let url = || "http://127.0.0.1:1/".to_string();
         for _ in 0..MAX_REQUESTS {
-            assert_ne!(
-                fetch.begin("GET".into(), url(), String::new(), Vec::new()),
-                0
-            );
+            get(&mut fetch, url());
         }
-        assert_eq!(
-            fetch.begin("GET".into(), url(), String::new(), Vec::new()),
-            0
-        );
+        let refused = fetch.begin("GET".into(), url(), String::new(), Vec::new());
+        assert!(refused.is_err());
         fetch.remove(1);
-        assert_ne!(
-            fetch.begin("GET".into(), url(), String::new(), Vec::new()),
-            0
-        );
+        get(&mut fetch, url());
+    }
+
+    /// Several requests together hold no more than the document's budget.
+    #[test]
+    fn requests_share_the_documents_budget() {
+        let budget = 6 * MIB;
+        let mut fetch = local(budget);
+        let ids: Vec<u32> = (0..3).map(|_| get(&mut fetch, serve(16 * MIB))).collect();
+        let total = |fetch: &FetchState| ids.iter().map(|&id| queued(fetch, id)).sum::<usize>();
+        let started = Instant::now();
+        while total(&fetch) + MIB < budget && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let held = total(&fetch);
+        assert!((budget - MIB..=budget).contains(&held), "{held}");
+        // Removing one gives its share back to the others.
+        fetch.remove(ids[0]);
+        let rest = |fetch: &FetchState| ids[1..].iter().map(|&id| queued(fetch, id)).sum::<usize>();
+        let started = Instant::now();
+        while rest(&fetch) + MIB < budget && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let rest = rest(&fetch);
+        assert!((budget - MIB..=budget).contains(&rest), "{rest}");
+    }
+
+    #[test]
+    fn a_page_from_the_web_cannot_fetch_local_addresses() {
+        let net = Arc::new(Net::new().unwrap());
+        let policy = NetPolicy::for_page("https://a.test/app.wasm", Some([1, 1, 1, 1].into()));
+        let mut fetch = FetchState::new(net, policy, NetBytes::with_limit(MIB));
+        for url in ["http://127.0.0.1:1/", "file:///etc/passwd", "http://[::1]/"] {
+            let refused = fetch.begin("GET".into(), url.into(), String::new(), Vec::new());
+            assert!(refused.is_err(), "{url}");
+        }
+        assert!(fetch
+            .begin(
+                "TRACE".into(),
+                "https://a.test/".into(),
+                String::new(),
+                Vec::new()
+            )
+            .is_err());
+    }
+
+    /// A removed request's task ends: the server sees its connection close.
+    #[test]
+    fn removing_a_request_stops_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request);
+            // Never answer; tell when the client hangs up.
+            let _ = socket.read(&mut request);
+            let _ = tx.send(());
+        });
+        let mut fetch = local(MIB);
+        let id = get(&mut fetch, format!("http://{address}/"));
+        std::thread::sleep(Duration::from_millis(200));
+        fetch.remove(id);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the request was not stopped");
     }
 }

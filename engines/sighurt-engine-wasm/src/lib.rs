@@ -37,6 +37,7 @@ pub mod manifest;
 pub mod media_capture;
 pub mod midi;
 pub mod navigation;
+pub mod net;
 pub mod permissions;
 mod pool;
 mod raster;

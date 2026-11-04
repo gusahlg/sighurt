@@ -341,11 +341,16 @@ fn step(live: Arc<LiveGuest>, serial: u64, report: Report, guests: Spawner) {
         Err(error) => (None, None, Some(error)),
     };
     let seen = guest.as_deref().map(Seen::of).unwrap_or_default();
-    let navigates = guest.as_deref().is_some_and(|guest| {
-        let requested = guest.host_state().pending_navigation.lock();
-        requested.unwrap_or_else(PoisonError::into_inner).is_some()
+    // A navigation or a download the guest asked for is the browser's to hear of, even when
+    // the frame stayed the same.
+    let asks = guest.as_deref().is_some_and(|guest| {
+        let state = guest.host_state();
+        let navigates = state.pending_navigation.lock();
+        let downloads = state.downloads.lock();
+        navigates.unwrap_or_else(PoisonError::into_inner).is_some()
+            || !downloads.unwrap_or_else(PoisonError::into_inner).is_empty()
     });
-    let changed = list.is_some() || error.is_some() || navigates;
+    let changed = list.is_some() || error.is_some() || asks;
     let after = live.finish(guest, seen, changed);
     if after.notify {
         report.send(Done::Stepped {

@@ -5,6 +5,11 @@
 //! guest that redraws the same picture every frame asks for no new presentation. Coordinates
 //! stay in canvas pixels: zoom and the display scale are the rasterizer's business.
 //!
+//! The conversion runs after the guest's callback, outside its time limit, so it is bounded
+//! itself: it stops at [`MAX_OPS`] operations or before [`MAX_POINTS`] path points, before it
+//! computes the points that would cross the limit, so however many curves a frame holds, one
+//! conversion computes and keeps at most that many.
+//!
 //! [`convert`] bakes the translation and opacity into coordinates and colors, turns clips into
 //! [`DrawOp::PushClip`] / [`DrawOp::PopClip`] pairs, and builds the shapes the list has no op
 //! for from the ones it has. [`bound`] applies the limits the pre-rewrite browser applied to
@@ -161,7 +166,9 @@ impl State {
 /// Appends the draw ops for `commands` to `ops`. `image_id` maps canvas image indices to the
 /// list's image ids.
 ///
-/// Transforms apply only their translation, and clips stay axis-aligned rectangles.
+/// Transforms apply only their translation, and clips stay axis-aligned rectangles. Stops
+/// converting once `ops` has [`MAX_OPS`] operations, or at a path that would take its points
+/// past [`MAX_POINTS`] (closing the clips still open), which is where [`bound`] would cut it.
 pub fn convert(
     commands: &[DrawCommand],
     image_id: impl Fn(usize) -> Option<u32>,
@@ -174,7 +181,23 @@ pub fn convert(
         clips: 0,
     };
     let mut saved = Vec::new();
+    // Path points in `ops`, counted as in `bound`.
+    let mut points = ops
+        .iter()
+        .map(|op| match op {
+            DrawOp::Path { points, .. } => points.len(),
+            _ => 0,
+        })
+        .sum::<usize>();
+    // Whether a path of `n` more points still fits.
+    let mut room = |n: usize| {
+        points += n;
+        points <= MAX_POINTS
+    };
     for command in commands {
+        if ops.len() >= MAX_OPS {
+            break;
+        }
         match *command {
             DrawCommand::Save => saved.push(state),
             DrawCommand::Restore => {
@@ -252,11 +275,16 @@ pub fn convert(
                 y2,
                 color,
                 thickness,
-            } => ops.push(DrawOp::Path {
-                points: vec![state.point(x1, y1), state.point(x2, y2)],
-                width: thickness,
-                color: state.color(color),
-            }),
+            } => {
+                if !room(2) {
+                    break;
+                }
+                ops.push(DrawOp::Path {
+                    points: vec![state.point(x1, y1), state.point(x2, y2)],
+                    width: thickness,
+                    color: state.color(color),
+                })
+            }
             DrawCommand::Arc {
                 cx,
                 cy,
@@ -270,6 +298,9 @@ pub fn convert(
                 let sweep = end_angle - start_angle;
                 // A chord spanning angle θ strays r·θ²/8 from its arc.
                 let n = segments(sweep.abs() * (radius.abs() / (8.0 * TOLERANCE)).sqrt());
+                if !room(n + 1) {
+                    break;
+                }
                 let points = (0..=n)
                     .map(|i| {
                         let t = start_angle + sweep * i as f32 / n as f32;
@@ -306,6 +337,9 @@ pub fn convert(
                 };
                 let m = bend(p[0], p[1], p[2]).max(bend(p[1], p[2], p[3]));
                 let n = segments((0.75 * m / TOLERANCE).sqrt());
+                if !room(n + 1) {
+                    break;
+                }
                 let points = (0..=n)
                     .map(|i| {
                         let t = i as f32 / n as f32;
@@ -400,7 +434,19 @@ pub fn convert(
                 if kind == 1 {
                     radial_gradient(ops, rect, from, by.abs(), color);
                 } else {
+                    let before = ops.len();
                     linear_gradient(ops, rect, from, state.point(bx, by), color);
+                    let added = ops[before..]
+                        .iter()
+                        .map(|op| match op {
+                            DrawOp::Path { points, .. } => points.len(),
+                            _ => 0,
+                        })
+                        .sum();
+                    // At most 48 strips of a few points: the limit is crossed by little.
+                    if !room(added) {
+                        break;
+                    }
                 }
             }
         }
@@ -631,6 +677,39 @@ fn in_range(op: &DrawOp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame of the most arcs a canvas keeps, each of the most segments, is converted only up
+    /// to the point limit: no more points are computed or kept than a list may hold.
+    #[test]
+    fn converting_stops_at_the_point_limit() {
+        let arc = DrawCommand::Arc {
+            cx: 100.0,
+            cy: 100.0,
+            radius: 1e5,
+            start_angle: 0.0,
+            end_angle: 6.0,
+            color: [0, 0, 0, 255],
+            thickness: 1.0,
+        };
+        let commands = vec![arc; crate::capabilities::MAX_COMMANDS];
+        let started = std::time::Instant::now();
+        let mut ops = Vec::new();
+        convert(&commands, |_| None, &mut ops);
+        let took = started.elapsed();
+        let points: usize = ops
+            .iter()
+            .map(|op| match op {
+                DrawOp::Path { points, .. } => points.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(points <= MAX_POINTS, "{points}");
+        assert_eq!(ops.len(), MAX_POINTS / 257, "every arc has 257 points");
+        let before = ops.clone();
+        bound(&mut ops, &[]);
+        assert_eq!(ops, before, "nothing left for bound to cut");
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
 
     fn ops(commands: &[DrawCommand]) -> Vec<DrawOp> {
         let mut ops = Vec::new();

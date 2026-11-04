@@ -12,19 +12,27 @@
 //!
 //! Guests run inside the browser process, so everything a guest can make the host keep is
 //! bounded, not only its linear memory: console lines, draw commands and their text, decoded
-//! images, timers, hyperlinks, session storage and history entries.
+//! images, timers, hyperlinks, session storage and history entries. Data a host function reads
+//! for the guest (a response, a file) goes into the guest's buffer a chunk at a time, once the
+//! buffer is known to be inside guest memory ([`read_into_guest`]), so a guest can't make the
+//! host hold more than a chunk of it. Network access follows [`crate::net`]'s policy. Native
+//! file dialogs open only within [`USER_ACTIVATION`] of a click or key press in the page, one per
+//! activation, and never for a worker.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{self, Read};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use wasmtime::*;
 
-use crate::engine::{Budget, Wait, WasmEngine};
+use crate::engine::{Budget, Limits, Wait, WasmEngine, MAX_MODULE_DEPTH};
 use crate::kv::KvStore;
 use crate::navigation::{HistoryEntry, NavigationStack};
+use crate::net::{DocNet, Net, NetBytes, NetPolicy, HTTP};
 use crate::permissions::{PermissionKind, PermissionStatus, PERMISSION_PENDING};
 use crate::url::{self as app_url, AppUrl};
 
@@ -128,6 +136,19 @@ pub struct HostState {
     pub worker_current_msg: Arc<Mutex<Option<Vec<u8>>>>,
     /// Whether the page was told it has no GPU, which it is only once.
     pub gpu_warned: Arc<AtomicBool>,
+    /// What this store's memories and tables may take (see [`Limits`]); counted only in the
+    /// store's own copy.
+    pub limits: Limits,
+    /// The document's network policy and its budget of buffered bytes, shared with its workers
+    /// and the modules it loads.
+    pub net: Arc<DocNet>,
+    /// How deep in `api_load_module` calls this store runs: 0 for a page or a worker.
+    pub module_depth: u32,
+    /// Modules the document has loaded with `api_load_module`, nested ones included.
+    pub modules_loaded: Arc<AtomicUsize>,
+    /// The page's last user activation (a click or key press in the view), which a file dialog
+    /// needs. Page-level: it carries over to every document of the view.
+    pub activation: Arc<UserActivation>,
 }
 
 impl HostState {
@@ -135,6 +156,70 @@ impl HostState {
     pub fn log(&self, level: ConsoleLevel, message: impl Into<String>) {
         console_log(&self.console, level, message.into());
     }
+
+    /// What the document's guest may connect to.
+    pub fn net_policy(&self) -> NetPolicy {
+        self.net.policy()
+    }
+
+    /// The budget of bytes the document's connections may hold.
+    pub fn net_bytes(&self) -> NetBytes {
+        self.net
+            .bytes(self.engine.as_ref().map(WasmEngine::net_bytes))
+    }
+
+    /// The runtime's shared network resources; `None` without an engine, or when they can't be
+    /// started.
+    pub fn shared_net(&self) -> Option<Arc<Net>> {
+        self.engine.as_ref()?.net()
+    }
+
+    /// Whether this state is a worker's.
+    pub fn is_worker(&self) -> bool {
+        self.worker_outbox.is_some()
+    }
+}
+
+/// How long after a click or key press in the page it may open a native dialog.
+pub const USER_ACTIVATION: Duration = Duration::from_secs(5);
+
+/// When the user last clicked or pressed a key in the page, until a dialog uses it.
+#[derive(Debug, Default)]
+pub struct UserActivation(Mutex<Option<Instant>>);
+
+impl UserActivation {
+    /// The user clicked or pressed a key in the page.
+    pub fn activate(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// Takes an activation of the last [`USER_ACTIVATION`], if there is one: each activation
+    /// opens at most one dialog.
+    pub fn consume(&self) -> bool {
+        let mut last = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        last.take()
+            .is_some_and(|at| at.elapsed() <= USER_ACTIVATION)
+    }
+}
+
+/// Whether `state` may open a native file dialog now: not from a worker, and only within
+/// [`USER_ACTIVATION`] of the user's click or key press, which it takes. Logs a refusal as `what`.
+pub(crate) fn dialog_allowed(state: &HostState, what: &str) -> bool {
+    let refusal = if state.is_worker() {
+        "workers can't open dialogs"
+    } else if !state.activation.consume() {
+        "a dialog needs a click or key press in the page first"
+    } else {
+        return true;
+    };
+    state.log(ConsoleLevel::Error, format!("[{what}] Refused: {refusal}"));
+    false
 }
 
 /// A single console log line: severity and message text.
@@ -262,6 +347,8 @@ pub struct CanvasState {
     decoded_bytes: usize,
     /// [`CanvasState::decoded`] of the generation before.
     decoded_before: Vec<(Vec<u8>, Arc<DecodedImage>)>,
+    /// Commands or images changed since [`CanvasState::take_changed`] last looked.
+    changed: bool,
 }
 
 impl Default for CanvasState {
@@ -279,6 +366,7 @@ impl Default for CanvasState {
             decoded: Vec::new(),
             decoded_bytes: 0,
             decoded_before: Vec::new(),
+            changed: false,
         }
     }
 }
@@ -306,6 +394,7 @@ impl CanvasState {
             return false;
         }
         self.bytes += bytes;
+        self.changed = true;
         self.transformed |= matches!(
             command,
             DrawCommand::Transform { .. } | DrawCommand::Clip { .. } | DrawCommand::Opacity { .. }
@@ -316,6 +405,7 @@ impl CanvasState {
 
     /// Drops everything drawn so far.
     pub fn clear(&mut self) {
+        self.changed = true;
         self.commands.clear();
         self.images.clear();
         self.generation += 1;
@@ -332,6 +422,12 @@ impl CanvasState {
         self.dropped
     }
 
+    /// Whether commands or images changed since the last call: a canvas that didn't needs no
+    /// new display list at the same size.
+    pub fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
     /// Draws `image` into a rectangle, unless the frame already holds [`MAX_IMAGES`] images or
     /// [`MAX_IMAGE_BYTES`] of them; returns whether it was kept.
     pub fn push_image(&mut self, image: Arc<DecodedImage>, x: f32, y: f32, w: f32, h: f32) -> bool {
@@ -344,6 +440,7 @@ impl CanvasState {
                     return false;
                 }
                 self.image_bytes += bytes;
+                self.changed = true;
                 self.images.push(image);
                 self.images.len() - 1
             }
@@ -816,6 +913,44 @@ pub(crate) fn write_prefix(
     write_guest(caller, ptr, &bytes[..len]).then_some(len as u32)
 }
 
+/// Whether the `len` bytes at `ptr` are inside guest memory.
+pub(crate) fn guest_range(caller: &Caller<'_, HostState>, ptr: u32, len: u32) -> bool {
+    let memory = caller.data().memory.expect("memory not set");
+    (ptr as usize)
+        .checked_add(len as usize)
+        .is_some_and(|end| end <= memory.data_size(caller))
+}
+
+/// Bytes a host function reads at a time when it streams data into guest memory.
+pub const IO_CHUNK: usize = 64 * 1024;
+
+/// Reads from `reader` into the `cap`-byte guest buffer at `ptr`, [`IO_CHUNK`] at a time, until
+/// the buffer is full or `reader` ends; returns the bytes written. Check the buffer with
+/// [`guest_range`] first: the host holds a chunk at a time, never the guest's whole `cap`.
+pub(crate) fn read_into_guest(
+    caller: &mut Caller<'_, HostState>,
+    ptr: u32,
+    cap: u32,
+    reader: &mut impl Read,
+) -> io::Result<u32> {
+    let mut chunk = vec![0; IO_CHUNK.min(cap as usize)];
+    let mut written = 0;
+    while written < cap {
+        let want = ((cap - written) as usize).min(chunk.len());
+        let n = match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if !write_guest(caller, ptr + written, &chunk[..n]) {
+            return Err(io::Error::other("the buffer is outside guest memory"));
+        }
+        written += n as u32;
+    }
+    Ok(written)
+}
+
 /// Runs `f` on a subsystem that is started on first use, if it has been.
 pub(crate) fn with<T, R>(slot: &Mutex<Option<T>>, f: impl FnOnce(&mut T) -> R) -> Option<R> {
     slot.lock().unwrap().as_mut().map(f)
@@ -859,19 +994,29 @@ pub(crate) fn permission_gate(state: &HostState, kind: PermissionKind) -> Option
     }
 }
 
-/// A blocking HTTP GET with the 30 s timeout guest fetches use. Returns the body and its
-/// `Content-Type`. A body of more than `max` bytes is an error.
+/// How long a blocking request of a guest (`api_fetch`, a module, a sound) may take.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A response body, its `Content-Type`, and the address it came from.
+pub(crate) type Fetched = (Vec<u8>, Option<String>, Option<IpAddr>);
+
+/// A blocking HTTP GET of `url` under `policy`, with [`REQUEST_TIMEOUT`]. A body of more than
+/// `max` bytes is an error.
 pub(crate) fn http_get(
     url: &str,
     accept: &str,
     max: u64,
-) -> Result<(Vec<u8>, Option<String>), String> {
-    use std::io::Read;
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .and_then(|client| client.get(url).header("Accept", accept).send())
-        .map_err(|e| e.to_string())?;
+    policy: &NetPolicy,
+) -> Result<Fetched, String> {
+    let url = policy.check(url, HTTP)?;
+    let mut request = crate::net::blocking_client(policy)?
+        .get(url)
+        .header("Accept", accept)
+        .timeout(REQUEST_TIMEOUT);
+    if let Some(origin) = policy.origin() {
+        request = request.header("Origin", origin);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
@@ -880,6 +1025,7 @@ pub(crate) fn http_get(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let served_from = response.remote_addr().map(|addr| addr.ip());
     let too_large = || format!("response larger than {max} bytes");
     if response.content_length().is_some_and(|len| len > max) {
         return Err(too_large());
@@ -893,7 +1039,7 @@ pub(crate) fn http_get(
     if body.len() as u64 > max {
         return Err(too_large());
     }
-    Ok((body, content_type))
+    Ok((body, content_type, served_from))
 }
 
 /// Resolves `raw` against the document URL, or returns it as is when either doesn't parse.
@@ -916,35 +1062,6 @@ fn resolve_url(state: &HostState, raw: &str) -> String {
         urls.insert(raw.to_string(), url.clone());
     }
     url
-}
-
-/// A Tokio runtime for a subsystem's network tasks (fetch, WebSocket, SSE, RTC) that doesn't
-/// wait for them when it is dropped: Tokio's own waits for blocking tasks such as a DNS lookup,
-/// which would hold up the thread that drops the page.
-pub(crate) struct Runtime(Option<tokio::runtime::Runtime>);
-
-impl Runtime {
-    pub(crate) fn new() -> Option<Self> {
-        tokio::runtime::Runtime::new()
-            .ok()
-            .map(|runtime| Self(Some(runtime)))
-    }
-}
-
-impl std::ops::Deref for Runtime {
-    type Target = tokio::runtime::Runtime;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("present until dropped")
-    }
-}
-
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        if let Some(runtime) = self.0.take() {
-            runtime.shutdown_background();
-        }
-    }
 }
 
 /// The guest handle after `last`: handles count up from 1 and skip 0, which guests read as
@@ -1042,6 +1159,9 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     // ── File Picker ──────────────────────────────────────────────────
+    // Returns the name's and the data's lengths packed, the data cut to `data_cap`; 0 when the
+    // user cancelled, a buffer is outside guest memory, or no dialog may open (see
+    // `dialog_allowed`).
     linker.func_wrap(
         "oxide",
         "api_upload_file",
@@ -1051,6 +1171,14 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          data_ptr: u32,
          data_cap: u32|
          -> u64 {
+            if !guest_range(&caller, name_ptr, name_cap)
+                || !guest_range(&caller, data_ptr, data_cap)
+            {
+                return 0;
+            }
+            if !dialog_allowed(caller.data(), "UPLOAD") {
+                return 0;
+            }
             let picked = caller.data().budget.wait(Wait::User, || {
                 rfd::FileDialog::new()
                     .set_title("Sighurt: Select a file to upload")
@@ -1063,9 +1191,9 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let data = std::fs::read(&path).unwrap_or_default();
             let name_len = write_prefix(&mut caller, name_ptr, name_cap, name.as_bytes());
-            let data_len = write_prefix(&mut caller, data_ptr, data_cap, &data);
+            let data_len = std::fs::File::open(&path)
+                .and_then(|mut file| read_into_guest(&mut caller, data_ptr, data_cap, &mut file));
             pack(name_len.unwrap_or(0), data_len.unwrap_or(0))
         },
     )?;
@@ -1660,7 +1788,9 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
 
     // ── HTTP Fetch ───────────────────────────────────────────────────
     // Blocks the guest until the response is in, for at most 30 s; `api_fetch_begin` streams
-    // instead. Only as much of the body as fits the guest's buffer is read.
+    // instead. Only as much of the body as fits the guest's buffer is read, straight into it.
+    // Returns `status << 32 | length`, or -1 when the URL or method is refused, the buffer is
+    // outside guest memory or the request failed.
     linker.func_wrap(
         "oxide",
         "api_fetch",
@@ -1683,33 +1813,37 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
             caller
                 .data()
                 .log(ConsoleLevel::Log, format!("[FETCH] {method} {url}"));
-            let result = caller.data().budget.wait(Wait::Host, || {
-                use std::io::Read;
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()?;
-                let method = method.parse().unwrap_or(reqwest::Method::GET);
-                let mut request = client.request(method, &url);
+            if !guest_range(&caller, out_ptr, out_cap) {
+                return -1;
+            }
+            let policy = caller.data().net_policy();
+            let request = policy.check(&url, HTTP).and_then(|url| {
+                let method = request_method(&method)?;
+                let client = crate::net::blocking_client(&policy)?;
+                let mut request = client.request(method, url).timeout(REQUEST_TIMEOUT);
+                if let Some(origin) = policy.origin() {
+                    request = request.header("Origin", origin);
+                }
                 if !content_type.is_empty() {
                     request = request.header("Content-Type", &content_type);
                 }
                 if !body.is_empty() {
                     request = request.body(body);
                 }
-                let response = request.send()?;
-                let status = response.status().as_u16();
-                let mut body = Vec::new();
-                response.take(u64::from(out_cap)).read_to_end(&mut body)?;
-                Ok::<_, anyhow::Error>((status, body))
+                Ok(request)
             });
-            let Some(result) = result else {
-                return -1;
-            };
+            let budget = caller.data().budget.clone();
+            let result = request.map_err(anyhow::Error::msg).and_then(|request| {
+                let result = budget.wait(Wait::Host, || {
+                    let mut response = request.send()?;
+                    let status = response.status().as_u16();
+                    let len = read_into_guest(&mut caller, out_ptr, out_cap, &mut response)?;
+                    Ok::<_, anyhow::Error>((status, len))
+                });
+                result.unwrap_or_else(|| Err(anyhow::anyhow!("cancelled")))
+            });
             match result {
-                Ok((status, response)) => {
-                    let len = write_prefix(&mut caller, out_ptr, out_cap, &response);
-                    (i64::from(status) << 32) | i64::from(len.unwrap_or(0))
-                }
+                Ok((status, len)) => (i64::from(status) << 32) | i64::from(len),
                 Err(e) => {
                     let message = format!("[FETCH ERROR] {e}");
                     caller.data().log(ConsoleLevel::Error, message);
@@ -1721,7 +1855,8 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
 
     // ── Dynamic Module Loading ───────────────────────────────────────
     // Fetches another .wasm module and runs its `start_app` against the same canvas,
-    // console, and storage — like a <script> tag loading code into the same page.
+    // console, and storage — like a <script> tag loading code into the same page. At most
+    // `MAX_MODULE_DEPTH` deep and `MAX_MODULE_LOADS` per document; -1 past either.
     linker.func_wrap(
         "oxide",
         "api_load_module",
@@ -1731,11 +1866,20 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
             let Some(engine) = state.engine.clone() else {
                 return -1;
             };
+            if state.module_depth >= MAX_MODULE_DEPTH {
+                let message = format!("[LOAD ERROR] Modules nest at most {MAX_MODULE_DEPTH} deep");
+                state.log(ConsoleLevel::Error, message);
+                return -1;
+            }
+            let loads = state.modules_loaded.fetch_add(1, Ordering::AcqRel);
+            if loads >= MAX_MODULE_LOADS {
+                let message =
+                    format!("[LOAD ERROR] A document loads at most {MAX_MODULE_LOADS} modules");
+                state.log(ConsoleLevel::Error, message);
+                return -1;
+            }
             state.log(ConsoleLevel::Log, format!("[LOAD] Fetching module: {url}"));
-            let loaded = state
-                .budget
-                .wait(Wait::Host, || load_module(&engine, state, &url));
-            let Some((code, message)) = loaded else {
+            let Some((code, message)) = load_module(&engine, state, &url) else {
                 return -1;
             };
             let level = if code == 0 {
@@ -2276,10 +2420,23 @@ fn kv_store(state: &HostState) -> std::io::Result<KvStore> {
         std::io::Error::new(std::io::ErrorKind::Unsupported, "no key-value store")
     })?;
     Ok(KvStore::new(
-        engine.kv_root(),
+        engine.kv(),
         &state.module_origin.lock().unwrap(),
     ))
 }
+
+/// The method of a guest's request: any HTTP method but those browsers forbid (`CONNECT`,
+/// `TRACE`, `TRACK`); an unparsable one is `GET`, as it always was.
+pub(crate) fn request_method(method: &str) -> Result<reqwest::Method, String> {
+    let parsed = method.parse().unwrap_or(reqwest::Method::GET);
+    if ["CONNECT", "TRACE", "TRACK"].contains(&parsed.as_str().to_ascii_uppercase().as_str()) {
+        return Err(format!("{parsed} requests are not allowed"));
+    }
+    Ok(parsed)
+}
+
+/// Most modules one document may load with `api_load_module`, nested ones included.
+pub const MAX_MODULE_LOADS: usize = 256;
 
 /// Moves one same-document history entry back or forward. Returns false at either end.
 pub fn traverse(state: &HostState, forward: bool) -> bool {
@@ -2297,40 +2454,51 @@ pub fn traverse(state: &HostState, forward: bool) -> bool {
 }
 
 /// `api_load_module`: runs the module at `url` in a child store that shares `parent`'s canvas,
-/// console, storage and the rest of its state. Returns the guest's result code and a line for
-/// the console.
-fn load_module(engine: &WasmEngine, parent: &HostState, url: &str) -> (i32, String) {
+/// console, storage and the rest of its state, one level deeper. Returns the guest's result
+/// code and a line for the console, or `None` when the parent was cancelled.
+///
+/// Fetching it is a wait of the parent's call. Compiling and running it are not: the parent's
+/// time limit goes on counting, and bounds the child's calls too ([`Budget::nested`]), as does
+/// the child's own budget of `start_app`.
+fn load_module(engine: &WasmEngine, parent: &HostState, url: &str) -> Option<(i32, String)> {
     let page_url = parent.current_url.lock().unwrap().clone();
-    let bytes = match crate::runtime::fetch_module(url, &page_url) {
-        Ok(bytes) => bytes,
-        Err(e) => return (-1, format!("[LOAD ERROR] {e:#}")),
+    let policy = parent.net_policy();
+    let fetched = parent.budget.wait(Wait::Host, || {
+        crate::runtime::fetch_module(url, &page_url, &policy)
+    })?;
+    let bytes = match fetched {
+        Ok((bytes, _)) => bytes,
+        Err(e) => return Some((-1, format!("[LOAD ERROR] {e:#}"))),
     };
     let module = match engine.compile_module(&bytes) {
         Ok(module) => module,
-        Err(e) => return (-2, format!("[LOAD ERROR] Compile: {e}")),
+        Err(e) => return Some((-2, format!("[LOAD ERROR] Compile: {e}"))),
     };
     let child = HostState {
         memory: None,
-        budget: parent.budget.child(),
+        budget: parent.budget.nested(),
+        module_depth: parent.module_depth + 1,
         ..parent.clone()
     };
     let (mut store, instance) = match crate::runtime::instantiate(engine, child, &module) {
         Ok(instance) => instance,
-        Err(e) => return (-6, format!("[LOAD ERROR] Instantiate: {e:#}")),
+        Err(e) => return Some((-6, format!("[LOAD ERROR] Instantiate: {e:#}"))),
     };
     let Ok(start_app) = instance.get_typed_func::<(), ()>(&mut store, "start_app") else {
-        return (-7, "[LOAD ERROR] Module missing start_app".into());
+        return Some((-7, "[LOAD ERROR] Module missing start_app".into()));
     };
-    match engine.start(&mut store, |store| start_app.call(store, ())) {
-        Ok(()) => (0, format!("[LOAD] Module {url} executed successfully")),
-        Err(e) => (
-            -8,
-            format!(
-                "[LOAD ERROR] {}",
-                crate::runtime::guest_error("start_app", &e)
+    Some(
+        match engine.start(&mut store, |store| start_app.call(store, ())) {
+            Ok(()) => (0, format!("[LOAD] Module {url} executed successfully")),
+            Err(e) => (
+                -8,
+                format!(
+                    "[LOAD ERROR] {}",
+                    crate::runtime::guest_error("start_app", &e)
+                ),
             ),
-        ),
-    }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2642,12 +2810,39 @@ mod tests {
     }
 
     #[test]
-    fn a_subsystem_runtime_does_not_wait_for_its_tasks() {
-        let runtime = Runtime::new().unwrap();
+    fn the_network_runtime_does_not_wait_for_its_tasks() {
+        let net = Net::new().unwrap();
         // Like a DNS lookup that takes its time.
-        runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(5)));
+        net.runtime()
+            .spawn_blocking(|| std::thread::sleep(Duration::from_secs(5)));
         let started = Instant::now();
-        drop(runtime);
+        drop(net);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_dialog_needs_a_recent_activation_and_uses_it() {
+        let state = HostState::default();
+        assert!(!dialog_allowed(&state, "TEST"));
+        state.activation.activate();
+        assert!(dialog_allowed(&state, "TEST"));
+        assert!(!dialog_allowed(&state, "TEST"), "one dialog per activation");
+        *state.activation.0.lock().unwrap() = Some(Instant::now() - USER_ACTIVATION * 2);
+        assert!(!dialog_allowed(&state, "TEST"), "too long ago");
+        let worker = HostState {
+            worker_outbox: Some(Arc::default()),
+            ..HostState::default()
+        };
+        worker.activation.activate();
+        assert!(!dialog_allowed(&worker, "TEST"));
+    }
+
+    #[test]
+    fn browsers_forbidden_methods_are_refused() {
+        assert_eq!(request_method("POST").unwrap(), reqwest::Method::POST);
+        assert_eq!(request_method("").unwrap(), reqwest::Method::GET);
+        for method in ["CONNECT", "TRACE", "TRACK"] {
+            assert!(request_method(method).is_err(), "{method}");
+        }
     }
 }

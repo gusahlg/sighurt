@@ -41,7 +41,16 @@
 //!
 //! The engine draws the prompt over the page, with a paint budget of its own, and it answers
 //! Enter, Escape and clicks only once a frame with it was painted, and only when the view is
-//! big enough to show all of it: a page can't hide it and still have it answered.
+//! big enough to show all of it: a page can't hide it and still have it answered. Allowing
+//! (Enter, or a click on Allow) takes effect only [`PROMPT_DELAY`] after the prompt was first
+//! shown, as in browsers, so a key or click meant for the page just before it appeared doesn't
+//! answer it; blocking takes effect at once.
+//!
+//! ## User activation
+//!
+//! A click or key press in the view is a user activation of the page
+//! ([`UserActivation`](crate::capabilities::UserActivation)), which the guest needs to open a
+//! file dialog.
 //!
 //! Owns: a view's page state (document, history, pointer, prompt, what the browser was told).
 //! Must not own: guest execution (workers do it) or painting (the rasterizer). When the host
@@ -82,6 +91,8 @@ const MAX_FRAME_KEYS: usize = 256;
 const MAX_FRAME_TEXT: usize = 4096;
 /// The page zoom a view accepts; others are clamped to it.
 const ZOOM: std::ops::RangeInclusive<f64> = 0.1..=10.0;
+/// How long the permission prompt must have been shown before it can be allowed.
+pub const PROMPT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Locks `mutex` even if a panicking guest call poisoned it: the owner thread must not panic.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -208,6 +219,8 @@ pub struct View {
     prompt: Option<PendingPermission>,
     /// The prompt was painted, whole, in the last frame presented: only then does it answer.
     prompt_shown: bool,
+    /// When a frame first showed the prompt whole: it can be allowed [`PROMPT_DELAY`] later.
+    prompt_shown_at: Option<Instant>,
     /// The version of the history the browser was last told about.
     history_version: u64,
     shown: Shown,
@@ -285,6 +298,7 @@ impl View {
             prompt_grab: false,
             prompt: None,
             prompt_shown: false,
+            prompt_shown_at: None,
             history_version: 0,
             shown: Shown::default(),
             painted: None,
@@ -542,6 +556,7 @@ impl View {
                 self.list = loaded.list;
                 self.prompt = None;
                 self.prompt_shown = false;
+                self.prompt_shown_at = None;
                 self.report_history(Some(navigation), out);
                 self.report_title(out);
                 // No list yet: an on_frame guest that has not drawn. The first step publishes
@@ -628,6 +643,7 @@ impl View {
         if changed {
             self.prompt = prompt;
             self.prompt_shown = false;
+            self.prompt_shown_at = None;
             self.invalidate(out);
         }
         self.update_hover(out);
@@ -803,6 +819,11 @@ impl View {
         let [x, y, w, h] = PROMPT;
         let fits = rect.width as f32 >= x + w + x && rect.height as f32 >= y + h + y;
         self.prompt_shown = self.prompt.is_some() && fits;
+        if !self.prompt_shown {
+            self.prompt_shown_at = None;
+        } else if self.prompt_shown_at.is_none() {
+            self.prompt_shown_at = Some(Instant::now());
+        }
         Ok(())
     }
 
@@ -924,7 +945,8 @@ impl View {
             && (self.prompt_grab || (down && self.prompt_at_pointer(PROMPT)))
         {
             self.prompt_grab = down;
-            if let Some(allow) = self.prompt_button_at_pointer().filter(|_| !down) {
+            let answer = self.prompt_button_at_pointer().filter(|_| !down);
+            if let Some(allow) = answer.filter(|&allow| !allow || self.prompt_allows()) {
                 self.answer_prompt(allow, out);
             }
             return;
@@ -936,7 +958,9 @@ impl View {
             _ => return,
         };
         lock(&self.page.input_state).mouse_buttons_down[index] = down;
-        if !down {
+        if down {
+            self.page.activation.activate();
+        } else {
             self.frame_input(|frame| frame.clicked[index] = true);
         }
         // Clicking a link opens it; with the middle button, in a new tab.
@@ -992,16 +1016,23 @@ impl View {
                 input.modifiers_alt,
             ) = keys::guest_modifiers(event.modifiers);
         }
-        // Enter / Escape answer the permission prompt; the guest never sees them.
+        // Enter / Escape answer the permission prompt; the guest never sees them. Enter
+        // before the prompt can be allowed is dropped.
         if down && keys::plain(event.modifiers) && self.prompt_answers() {
             let allow = match &event.key {
                 Key::Named(name) if name == "Enter" => Some(true),
                 Key::Named(name) if name == "Escape" => Some(false),
                 _ => None,
             };
-            if let Some(allow) = allow {
-                return self.answer_prompt(allow, out);
+            match allow {
+                Some(true) if !self.prompt_allows() => return,
+                Some(allow) => return self.answer_prompt(allow, out),
+                None => {}
             }
+        }
+        // Escape is how the user gets away from a page, not a gesture to it.
+        if down && event.key != Key::Named("Escape".into()) {
+            self.page.activation.activate();
         }
         let code = keys::key_code(&event.key, event.code);
         let mut input = lock(&self.page.input_state);
@@ -1043,6 +1074,7 @@ impl View {
         permissions::resolve_pending(&self.page.permissions, allow);
         self.prompt = None;
         self.prompt_shown = false;
+        self.prompt_shown_at = None;
         self.prompt_grab = false;
         self.invalidate(out);
         self.update_hover(out);
@@ -1051,6 +1083,14 @@ impl View {
     /// Whether the prompt is up and was shown to the user, so it may be answered.
     fn prompt_answers(&self) -> bool {
         self.prompt.is_some() && self.prompt_shown
+    }
+
+    /// Whether the prompt may be answered with Allow: it has been shown for [`PROMPT_DELAY`].
+    fn prompt_allows(&self) -> bool {
+        self.prompt_answers()
+            && self
+                .prompt_shown_at
+                .is_some_and(|at| at.elapsed() >= PROMPT_DELAY)
     }
 
     /// Whether the prompt is showing and the pointer is in `rect` of it.
@@ -1201,8 +1241,9 @@ fn go_to(state: &HostState, index: usize) {
 /// Guest state for a new document loaded from `url`, with `history`, derived from the page's
 /// current one. Everything the previous document's module could start (timers, event
 /// listeners, connections, audio, workers, canvas, console, scroll) begins empty, so none of it
-/// outlives that document. The page-level parts carry over: the engine, input, canvas size,
-/// focus and permission decisions, plus the session storage when `url` has the same origin. A
+/// outlives that document, and its network policy and byte budget are its own. The page-level
+/// parts carry over: the engine, input, canvas size, focus, the last user activation and
+/// permission decisions, plus the session storage when `url` has the same origin. A
 /// part whose lock a panicking host function poisoned starts over instead, so one engine bug
 /// doesn't break every later document. The guest reads its current entry's URL back.
 pub fn document_state(page: &HostState, url: &str, history: NavigationStack) -> HostState {
@@ -1217,6 +1258,7 @@ pub fn document_state(page: &HostState, url: &str, history: NavigationStack) -> 
         permissions: carry(&page.permissions),
         input_state: carry(&page.input_state),
         focused: page.focused.clone(),
+        activation: page.activation.clone(),
         ..Default::default()
     };
     {

@@ -8,6 +8,12 @@
 //! `api_folder_entries` lists a picked directory as JSON, pre-allocating
 //! sub-handles for each child so the guest can read files without ever
 //! seeing the underlying path.
+//!
+//! A dialog opens only within [`USER_ACTIVATION`](crate::capabilities::USER_ACTIVATION) of a
+//! click or key press in the page, one per activation, and never for a worker
+//! ([`dialog_allowed`]). A path has one handle however often it is listed, and a document has
+//! at most [`MAX_HANDLES`]; a listing names at most [`MAX_FOLDER_ENTRIES`] entries. Reads go
+//! into the guest's buffer a chunk at a time once the buffer is known to be in guest memory.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,8 +22,15 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 use wasmtime::{Caller, Linker};
 
-use crate::capabilities::{guest_str, next_handle, write_guest, HostState};
+use crate::capabilities::{
+    dialog_allowed, guest_range, guest_str, next_handle, read_into_guest, write_guest, HostState,
+};
 use crate::engine::Wait;
+
+/// Most handles a document may hold: picked files and folders and the entries listed in them.
+pub const MAX_HANDLES: usize = 65_536;
+/// Most entries one `api_folder_entries` call lists.
+pub const MAX_FOLDER_ENTRIES: usize = 10_000;
 
 /// One picked file or folder, keyed by an opaque handle the guest holds.
 pub struct PickedEntry {
@@ -25,18 +38,29 @@ pub struct PickedEntry {
     pub is_dir: bool,
 }
 
-/// All picker state for a tab. Handles are never reused within a session.
+/// All picker state for a tab. A path keeps the handle it was first given.
 #[derive(Default)]
 pub struct FilePickerState {
     entries: HashMap<u32, PickedEntry>,
+    /// The handle of each path in `entries`.
+    handles: HashMap<PathBuf, u32>,
     last_id: u32,
 }
 
 impl FilePickerState {
-    fn alloc(&mut self, path: PathBuf, is_dir: bool) -> u32 {
+    /// The handle of `path`: the one it has, or a new one; `None` once there are
+    /// [`MAX_HANDLES`].
+    fn alloc(&mut self, path: PathBuf, is_dir: bool) -> Option<u32> {
+        if let Some(&id) = self.handles.get(&path) {
+            return Some(id);
+        }
+        if self.entries.len() >= MAX_HANDLES {
+            return None;
+        }
         let id = next_handle(&mut self.last_id);
+        self.handles.insert(path.clone(), id);
         self.entries.insert(id, PickedEntry { path, is_dir });
-        id
+        Some(id)
     }
 
     fn get(&self, handle: u32) -> Option<&PickedEntry> {
@@ -153,6 +177,9 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
          out_ptr: u32,
          out_cap: u32|
          -> i32 {
+            if !guest_range(&caller, out_ptr, out_cap) || !dialog_allowed(caller.data(), "FILE") {
+                return -1;
+            }
             let title = guest_str(&caller, title_ptr, title_len)
                 .unwrap_or_else(|| "Sighurt: Select a file".to_string());
             let filters = guest_str(&caller, filters_ptr, filters_len).unwrap_or_default();
@@ -183,7 +210,8 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
                 paths
                     .into_iter()
                     .take((out_cap / 4) as usize)
-                    .flat_map(|path| state.alloc(path, false).to_le_bytes())
+                    .map_while(|path| state.alloc(path, false))
+                    .flat_map(u32::to_le_bytes)
                     .collect()
             };
             if !write_guest(&mut caller, out_ptr, &handles) {
@@ -199,15 +227,19 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
         "oxide",
         "api_folder_pick",
         |caller: Caller<'_, HostState>, title_ptr: u32, title_len: u32| -> u32 {
+            if !dialog_allowed(caller.data(), "FOLDER") {
+                return 0;
+            }
             let title = guest_str(&caller, title_ptr, title_len)
                 .unwrap_or_else(|| "Sighurt: Select a folder".to_string());
             let picked = caller.data().budget.wait(Wait::User, || {
                 rfd::FileDialog::new().set_title(&title).pick_folder()
             });
-            match picked.flatten() {
-                Some(path) => caller.data().file_picker.lock().unwrap().alloc(path, true),
-                None => 0,
-            }
+            let mut state = caller.data().file_picker.lock().unwrap();
+            picked
+                .flatten()
+                .and_then(|path| state.alloc(path, true))
+                .unwrap_or(0)
         },
     )?;
 
@@ -215,8 +247,9 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
     //   Writes JSON array of entries:
     //     [{"name":"a.txt","size":123,"is_dir":false,"handle":42}, ...]
     //   Sub-handles are allocated on the fly so guests can read children
-    //   without learning any host path. Returns bytes written, -1 on bad
-    //   handle, -2 on io error, or negative of required size if truncated.
+    //   without learning any host path; listing again gives the same ones. At most
+    //   `MAX_FOLDER_ENTRIES` entries, and only those that get a handle. Returns bytes written,
+    //   -1 on bad handle, -2 on io error, or negative of required size if truncated.
     linker.func_wrap(
         "oxide",
         "api_folder_entries",
@@ -229,6 +262,7 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
             };
             let children: Vec<(PathBuf, bool, u64)> = read_dir
                 .flatten()
+                .take(MAX_FOLDER_ENTRIES)
                 .filter_map(|entry| {
                     let meta = entry.metadata().ok()?;
                     Some((entry.path(), meta.is_dir(), meta.len()))
@@ -237,13 +271,16 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
 
             let mut json = String::from("[");
             let mut state = caller.data().file_picker.lock().unwrap();
-            for (i, (path, is_dir, size)) in children.into_iter().enumerate() {
-                if i > 0 {
+            for (path, is_dir, size) in children {
+                let name = file_name_of(&path);
+                let Some(id) = state.alloc(path, is_dir) else {
+                    break;
+                };
+                if json.len() > 1 {
                     json.push(',');
                 }
                 json.push_str("{\"name\":");
-                json_escape(&file_name_of(&path), &mut json);
-                let id = state.alloc(path, is_dir);
+                json_escape(&name, &mut json);
                 json.push_str(&format!(
                     ",\"size\":{size},\"is_dir\":{is_dir},\"handle\":{id}}}"
                 ));
@@ -256,7 +293,8 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
 
     // api_file_read(handle, out_ptr, out_cap) -> i64
     //   Reads the full file. Returns bytes written, -1 invalid handle,
-    //   -2 io error, or -(required size) if the buffer is too small.
+    //   -2 io error or a buffer outside guest memory, or -(required size) if the buffer is
+    //   too small. The file goes into the buffer a chunk at a time.
     linker.func_wrap(
         "oxide",
         "api_file_read",
@@ -264,8 +302,20 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
             let Some(file) = picked(&caller, handle, Some(false)) else {
                 return -1;
             };
-            match std::fs::read(&file.path) {
-                Ok(data) => write_or_size(&mut caller, out_ptr, out_cap, &data),
+            let Ok(mut opened) = std::fs::File::open(&file.path) else {
+                return -2;
+            };
+            let Ok(size) = opened.metadata().map(|meta| meta.len()) else {
+                return -2;
+            };
+            if size > u64::from(out_cap) {
+                return -(size.min(i64::MAX as u64) as i64);
+            }
+            if !guest_range(&caller, out_ptr, out_cap) {
+                return -2;
+            }
+            match read_into_guest(&mut caller, out_ptr, size as u32, &mut opened) {
+                Ok(n) => i64::from(n),
                 Err(_) => -2,
             }
         },
@@ -290,14 +340,17 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
             let Some(file) = picked(&caller, handle, Some(false)) else {
                 return -1;
             };
+            let len = len.min(out_cap);
+            if !guest_range(&caller, out_ptr, len) {
+                return -2;
+            }
             let offset = (u64::from(offset_hi) << 32) | u64::from(offset_lo);
-            let mut buf = vec![0u8; len.min(out_cap) as usize];
             let read = std::fs::File::open(&file.path).and_then(|mut f| {
                 f.seek(SeekFrom::Start(offset))?;
-                f.read(&mut buf)
+                read_into_guest(&mut caller, out_ptr, len, &mut f.take(u64::from(len)))
             });
             match read {
-                Ok(n) if write_guest(&mut caller, out_ptr, &buf[..n]) => n as i64,
+                Ok(n) => i64::from(n),
                 _ => -2,
             }
         },
@@ -338,4 +391,21 @@ pub fn register_file_picker_functions(linker: &mut Linker<HostState>) -> Result<
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_keeps_its_handle_and_handles_are_bounded() {
+        let mut state = FilePickerState::default();
+        let a = state.alloc("/a".into(), false).unwrap();
+        assert_eq!(state.alloc("/a".into(), false), Some(a));
+        for i in 1..MAX_HANDLES {
+            state.alloc(format!("/{i}").into(), false).unwrap();
+        }
+        assert_eq!(state.alloc("/new".into(), false), None);
+        assert_eq!(state.alloc("/a".into(), false), Some(a));
+    }
 }

@@ -42,8 +42,10 @@ SIG_WHAT="build the Wasm engine's headless checks" tools/cargo build --target wa
   --release -p raf-demo -p gradient-demo
 tools/cargo build -p sighurt-engine-wasm --example wasm-view
 bin=$(tools/cargo test -p sighurt-engine-wasm --test wayland --no-run 2>&1 | tee /dev/stderr |
-  grep -oE '/[^[:space:]()]*debug/deps/wayland-[0-9a-f]+' | tail -1)
+  grep -oE '[^[:space:]()]*debug/deps/wayland-[0-9a-f]+' | tail -1)
 [[ -n $bin ]] || { echo "headless.sh: no test binary" >&2; exit 1; }
+# Cargo prints it relative to the workspace or absolute.
+bin=$(realpath "$bin")
 
 tools/heavy tools/headless-sway -- env SIGHURT_HEADLESS=1 "$bin" --include-ignored --test-threads 1
 

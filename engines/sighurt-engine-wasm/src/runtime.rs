@@ -32,6 +32,7 @@ use crate::capabilities::{
 use crate::draw::{self, DisplayList};
 use crate::engine::{Halt, WasmEngine};
 use crate::events::{drain_pending_events, set_current_event};
+use crate::net::NetPolicy;
 use crate::url::AppUrl;
 
 /// How long a step keeps delivering events and timers before it leaves the rest for the next
@@ -173,10 +174,16 @@ impl Guest {
         }
     }
 
-    /// The canvas as a new display list, if it changed since the last one.
+    /// The canvas as a new display list, if it changed since the last one. A canvas the guest
+    /// didn't touch, at the size of the last list, isn't converted again.
     fn redrawn(&mut self) -> Option<Arc<DisplayList>> {
         let list = {
-            let canvas = self.store.data().canvas.lock().unwrap();
+            let mut canvas = self.store.data().canvas.lock().unwrap();
+            let size = (canvas.width, canvas.height);
+            let touched = canvas.take_changed();
+            if !touched && self.drawn.as_ref().is_some_and(|drawn| drawn.size == size) {
+                return None;
+            }
             draw::display_list(&canvas, self.drawn.as_deref())?
         };
         let list = Arc::new(list);
@@ -249,8 +256,13 @@ pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Lo
     };
     let parsed = AppUrl::parse(url).map_err(|e| anyhow::anyhow!("{e}"))?;
     check()?;
-    // Fetching waits on the network: other loads go on meanwhile.
-    let wasm_bytes = crate::pool::blocking(|| fetch_module(url, url))?;
+    // Fetching waits on the network: other loads go on meanwhile. The user asked for this
+    // page: it may be on any host. What the page may reach depends on where it came from.
+    let (wasm_bytes, served_from) =
+        crate::pool::blocking(|| fetch_module(url, url, &NetPolicy::top_level()))?;
+    host_state
+        .net
+        .set_policy(NetPolicy::for_page(url, served_from));
 
     // Optional sibling manifest: metadata + declared permissions.
     match crate::pool::blocking(|| crate::manifest::fetch_manifest(&parsed)) {
@@ -316,19 +328,28 @@ pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Lo
 /// Largest `.wasm` module that is fetched or read.
 const MAX_WASM_MODULE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
 
-/// Fetches the `.wasm` module at `url` for the page at `page_url`: the page itself, a module it
-/// loads with `api_load_module`, or a worker. `http(s)` modules must come with a wasm (or
-/// untyped) `Content-Type`. `file://` modules are read only for pages that are local files
-/// themselves, so pages from the web can't read the disk. Either way, modules are at most
-/// [`MAX_WASM_MODULE_SIZE`] bytes.
-pub fn fetch_module(url: &str, page_url: &str) -> Result<Vec<u8>> {
+/// Fetches the `.wasm` module at `url` for the page at `page_url`, under `policy`: the page
+/// itself ([`NetPolicy::top_level`]), a module it loads with `api_load_module`, or a worker
+/// (the page's policy). `http(s)` modules must come with a wasm (or untyped) `Content-Type`.
+/// `file://` modules are read only for pages that are local files themselves, so pages from
+/// the web can't read the disk. Either way, modules are at most [`MAX_WASM_MODULE_SIZE`] bytes.
+/// Returns the module and the address it was served from (`None` for a file).
+pub fn fetch_module(
+    url: &str,
+    page_url: &str,
+    policy: &NetPolicy,
+) -> Result<(Vec<u8>, Option<std::net::IpAddr>)> {
     use std::io::Read;
     let parsed = AppUrl::parse(url).map_err(|e| anyhow::anyhow!("{e}"))?;
     let page_is_local = AppUrl::parse(page_url).is_ok_and(|page| page.is_local_file());
-    let bytes = if parsed.is_fetchable() {
-        let (bytes, content_type) =
-            http_get(parsed.as_str(), "application/wasm", MAX_WASM_MODULE_SIZE)
-                .map_err(anyhow::Error::msg)?;
+    let fetched = if parsed.is_fetchable() {
+        let (bytes, content_type, served_from) = http_get(
+            parsed.as_str(),
+            "application/wasm",
+            MAX_WASM_MODULE_SIZE,
+            policy,
+        )
+        .map_err(anyhow::Error::msg)?;
         let content_type = content_type.unwrap_or_default();
         anyhow::ensure!(
             content_type.is_empty()
@@ -336,7 +357,7 @@ pub fn fetch_module(url: &str, page_url: &str) -> Result<Vec<u8>> {
                 || content_type.contains("application/octet-stream"),
             "unexpected Content-Type for .wasm module: {content_type}"
         );
-        bytes
+        (bytes, served_from)
     } else if parsed.is_local_file() && page_is_local {
         let path = parsed
             .to_file_path()
@@ -349,7 +370,7 @@ pub fn fetch_module(url: &str, page_url: &str) -> Result<Vec<u8>> {
             (bytes.len() as u64) <= MAX_WASM_MODULE_SIZE,
             "module exceeds size limit ({MAX_WASM_MODULE_SIZE} bytes)"
         );
-        bytes
+        (bytes, None)
     } else if parsed.is_local_file() {
         anyhow::bail!("only local pages can load local modules: {url}");
     } else if parsed.is_internal() {
@@ -357,7 +378,7 @@ pub fn fetch_module(url: &str, page_url: &str) -> Result<Vec<u8>> {
     } else {
         anyhow::bail!("unsupported URL scheme: {}", parsed.scheme());
     };
-    Ok(bytes)
+    Ok(fetched)
 }
 
 #[cfg(test)]
@@ -371,10 +392,16 @@ mod tests {
         std::fs::write(&path, b"\0asm").unwrap();
         let module = url::Url::from_file_path(&path).unwrap().to_string();
         let page = url::Url::from_file_path(dir.path().join("app.wasm")).unwrap();
-        assert_eq!(fetch_module(&module, page.as_str()).unwrap(), b"\0asm");
-        assert_eq!(fetch_module(&module, &module).unwrap(), b"\0asm");
-        let err = fetch_module(&module, "https://example.com/app.wasm").unwrap_err();
+        let policy = NetPolicy::default();
+        let fetch =
+            |url: &str, page: &str| fetch_module(url, page, &policy).map(|(bytes, _)| bytes);
+        assert_eq!(fetch(&module, page.as_str()).unwrap(), b"\0asm");
+        assert_eq!(fetch(&module, &module).unwrap(), b"\0asm");
+        let err = fetch(&module, "https://example.com/app.wasm").unwrap_err();
         assert!(err.to_string().contains("only local pages"), "{err}");
-        assert!(fetch_module("sig://home", page.as_str()).is_err());
+        assert!(fetch("sig://home", page.as_str()).is_err());
+        // A page from the web can't load a module from a local address.
+        let err = fetch("http://127.0.0.1:1/a.wasm", "https://example.com/app.wasm").unwrap_err();
+        assert!(err.to_string().contains("local or private"), "{err}");
     }
 }
