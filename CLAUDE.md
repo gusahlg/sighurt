@@ -161,6 +161,16 @@ SIG_WHAT="servo build" tools/remote tools/cargo build -p sighurt-browser
 tools/heavy tools/headless-sway --renderer gles2 -- engines/sighurt-engine-wpe/tests/private-bus target/debug/sig https://example.com/
 apps/sighurt-browser/tests/engines.sh OUT
 
+# Seeded random-input tests ("fuzz-lite", tools/fuzz/mod.rs) of every parser and decoder that
+# takes untrusted or user-written input, in ordinary `cargo test`: commands and keystrokes, the
+# configuration, addresses and routing, sessions and the files that hold them, the semantic
+# snapshot, the terminal's input, the chrome's contained text and readable URLs, the sixel and
+# kitty encoders and the grid, download names, the external-link denylist, the Wasm network
+# policy. N = 2000 cases by default; a failure prints the seed and case to replay.
+tools/cargo test -p sighurt-api -p sighurt-core -p sighurt-runtime -p sighurt-semantic -p sighurt-ui -p sighurt-tui -p sighurt-engine-wasm -- fuzz
+SIG_FUZZ_ITERATIONS=100000 tools/cargo test -p sighurt-core -- fuzz     # more cases
+SIG_FUZZ_SEED=<seed> SIG_FUZZ_CASE=<case> tools/cargo test -p <crate> -- <test>   # replay one
+
 # Wasm guests (always release); the Wasm engine's tests run the first four
 tools/cargo build --target wasm32-unknown-unknown --release -p hello-sighurt -p raf-demo -p gradient-demo -p typography-demo
 tools/cargo build -p sighurt-sdk --target wasm32-unknown-unknown

@@ -3990,3 +3990,31 @@ Newest last. Each entry says what was decided and why.
     `SIG_VULKAN_VALIDATION=1`. headless.sh 140/140 (`renderers`: cpu, wgpu, vulkan, surface
     rebind and device fallback for each GPU backend). Unverified: Mesa's drivers, a real output,
     the ash backend beside Servo (wgpu beside Servo was checked).
+126. **Seeded random-input tests for every parser, and what they found** (4 November 2026,
+    branch `fuzz-tests`; `tools/fuzz/mod.rs`, a 150-line xorshift64 generator, an iteration
+    loop with a seed per case and `SIG_FUZZ_ITERATIONS`, `SIG_FUZZ_SEED` and `SIG_FUZZ_CASE`
+    to replay, and a watchdog that ends the test binary when one case takes over its limit; no
+    new crate, no nightly, no cargo-fuzz). Targets, each with structured inputs, mutated valid
+    inputs and bytes: commands and keystrokes (parse, display, parse again); the configuration
+    (the default file's examples, a rich file, random files in the schema's shape, mutations,
+    100 000-deep nesting, 50 000 keys); addresses and routing; sessions and
+    `session.toml.broken-*`; the state machine driven with random commands, keys and
+    reloads; the semantic snapshot parser (100 000 nested arrays, 10 MB strings, floods);
+    the terminal parser (chunking changes nothing, buffers within their bounds, the timers
+    return it to ground, 1 MB shapes); `contained` and `readable_url`; the address editor;
+    the sixel encoder (decoded again, all 252 registers, pixels within the palette's error)
+    and kitty's (chunks, zlib, pixels); the grid (its diff replayed on a model terminal);
+    text-mode layout; download names; the external-link denylist; the Wasm network policy
+    (every spelling of an address). Found and fixed, each with its regression test: a
+    keystroke naming "İ" did not round trip (its lower case is two characters); a surrogate
+    escape with no partner in the snapshot JSON (a page string cut inside an emoji, which
+    `JSON.stringify` writes) refused the whole snapshot, now U+FFFD; `contained` kept U+2028
+    and U+2029, which a text shaper breaks a line at; the "(truncated)" note of text mode did
+    not wrap; a grid cluster of marks with no base was joined to the cell before it by the
+    terminal; a long download name cut after a dot or a space ended in it; `64:ff9b:1::/48`
+    and the IPv4-translated `::ffff:0:a.b.c.d` were public addresses to the Wasm network
+    policy. Open, by design: a Prepend character at the end of one drawn string joins the
+    next string's first character on the terminal (two cells the grid draws independently);
+    Teredo (`2001::/32`) is public to the Wasm policy; a bracketed paste with no end swallows
+    the keyboard until its `CSI 201 ~`; below 8 columns text mode can put a list bullet and a
+    wide character on one line wider than the page.
