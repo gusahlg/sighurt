@@ -170,7 +170,8 @@ impl NetPolicy {
 
 /// Whether `ip` is a public unicast address: not loopback, unspecified, private (RFC 1918,
 /// unique local), link-local, shared (CGNAT), multicast, broadcast, reserved or documentation,
-/// and not an IPv6 address that embeds one of those (IPv4-mapped, -compatible, NAT64, 6to4).
+/// and not an IPv6 address that embeds one of those (IPv4-mapped, -translated, -compatible,
+/// NAT64, 6to4) or is in the local-use translation prefix `64:ff9b:1::/48`.
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => public_v4(ip),
@@ -184,8 +185,17 @@ pub fn is_public(ip: IpAddr) -> bool {
                 // `::`, `::1` and the deprecated IPv4-compatible `::a.b.c.d`.
                 return !ip.is_unspecified() && !ip.is_loopback() && public_v4(embedded);
             }
+            if s[..4] == [0; 4] && s[4] == 0xffff && s[5] == 0 {
+                // The IPv4-translated `::ffff:0:a.b.c.d` (RFC 2765).
+                return public_v4(embedded);
+            }
             if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
                 return public_v4(embedded);
+            }
+            if s[..3] == [0x64, 0xff9b, 1] {
+                // The local-use translation prefix `64:ff9b:1::/48` (RFC 8215) reaches any IPv4
+                // address a site's translator is set up for.
+                return false;
             }
             if s[0] == 0x2002 {
                 return public_v4(Ipv4Addr::from((u32::from(s[1]) << 16) | u32::from(s[2])));
