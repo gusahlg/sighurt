@@ -1898,3 +1898,162 @@ fn the_engine_button_hits_its_drawn_rect() {
         }
     );
 }
+
+/// A chrome with the find field open, as the core opens it for `page.find`: the line focused,
+/// then the field holding `text`.
+fn finding(text: &str) -> Model {
+    let mut chrome = chrome(800, 600, labelled(three_tabs(), &["servo", "wasm", ""]));
+    chrome.window_focus(FocusEvent::Activated);
+    chrome.set_focus(KeyboardFocus::Chrome);
+    let actions = chrome.find_field(text);
+    assert!(commands(&actions).is_empty(), "opening searches nothing");
+    assert!(chrome.state().find.is_some());
+    chrome
+}
+
+#[test]
+fn the_find_field_searches_as_it_is_edited() {
+    let mut chrome = finding("");
+    let address = chrome
+        .state()
+        .find
+        .as_ref()
+        .unwrap()
+        .address
+        .text()
+        .to_owned();
+    assert!(address.contains("sighurt"), "{address}");
+    let mut sent = Vec::new();
+    for c in ["b", "l", "å"] {
+        sent.extend(commands(&chrome.key(&typed(c))));
+    }
+    let find = |text: &str| Command::PageFind(Some(text.into()));
+    assert_eq!(sent, [find("b"), find("bl"), find("blå")]);
+    // Back to nothing ends the search; spaces search nothing and send nothing more.
+    let backspace = named("Backspace", Modifiers::default());
+    let mut sent = Vec::new();
+    for _ in 0..3 {
+        sent.extend(commands(&chrome.key(&backspace)));
+    }
+    assert_eq!(sent, [find("bl"), find("b"), Command::PageFindStop]);
+    assert!(commands(&chrome.key(&typed(" "))).is_empty());
+    assert_eq!(commands(&chrome.key(&typed("x"))), [find("x")]);
+    // The input method is told it is not an address.
+    let field = chrome
+        .key(&typed("y"))
+        .into_iter()
+        .find_map(|action| match action {
+            ChromeAction::TextInput(Some(field)) => Some(field),
+            _ => None,
+        });
+    let purpose = field.map(|field| field.state.purpose);
+    assert_eq!(purpose, Some(sighurt_api::input::TextPurpose::Normal));
+}
+
+#[test]
+fn the_find_field_opens_with_the_search_selected_and_typing_replaces_it() {
+    let mut chrome = finding("räksmörgås");
+    assert_eq!(chrome.state().address.text(), "räksmörgås");
+    assert_eq!(chrome.state().address.selected_text(), Some("räksmörgås"));
+    // The same text again searches nothing; typing over it searches the new text.
+    assert_eq!(
+        commands(&chrome.key(&typed("q"))),
+        [Command::PageFind(Some("q".into()))]
+    );
+    // Ignored while the line doesn't have the keyboard.
+    let mut unfocused = common::chrome(800, 600, three_tabs());
+    unfocused.find_field("x");
+    assert!(unfocused.state().find.is_none());
+}
+
+#[test]
+fn enter_keeps_the_search_and_escape_ends_it() {
+    let mut chrome = finding("");
+    let address = chrome
+        .state()
+        .find
+        .as_ref()
+        .unwrap()
+        .address
+        .text()
+        .to_owned();
+    chrome.key(&typed("a"));
+    let actions = chrome.key(&named("Enter", Modifiers::default()));
+    assert!(commands(&actions).is_empty(), "{actions:?}");
+    assert!(actions.contains(&ChromeAction::Focus(KeyboardFocus::Page)));
+    assert!(chrome.state().find.is_none());
+    assert!(!chrome.state().focused);
+    assert_eq!(
+        chrome.state().address.text(),
+        address,
+        "the address is back"
+    );
+
+    let mut chrome = finding("");
+    chrome.key(&typed("a"));
+    let actions = chrome.key(&named("Escape", Modifiers::default()));
+    assert_eq!(commands(&actions), [Command::PageFindStop]);
+    assert!(actions.contains(&ChromeAction::Focus(KeyboardFocus::Page)));
+    assert!(chrome.state().find.is_none());
+    assert_eq!(chrome.state().address.text(), address);
+}
+
+#[test]
+fn the_core_moving_the_keyboard_or_another_tab_closes_the_field_and_keeps_the_search() {
+    for focus in [KeyboardFocus::Page, KeyboardFocus::Chrome] {
+        let mut chrome = finding("");
+        chrome.key(&typed("a"));
+        let actions = chrome.set_focus(focus);
+        assert!(commands(&actions).is_empty(), "{actions:?}");
+        assert!(chrome.state().find.is_none());
+        assert_eq!(chrome.state().focused, focus == KeyboardFocus::Chrome);
+        // The address line is the address line again.
+        assert!(chrome.state().address.text().contains("sighurt"));
+    }
+    let mut chrome = finding("");
+    chrome.key(&typed("a"));
+    let snapshot = switched(chrome.snapshot(), 2);
+    let actions = chrome.set_snapshot(snapshot);
+    assert!(commands(&actions).is_empty(), "{actions:?}");
+    assert!(chrome.state().find.is_none());
+    // A snapshot of the same tab leaves it open, and its text alone.
+    let mut chrome = finding("");
+    chrome.key(&typed("a"));
+    let mut snapshot = chrome.snapshot().clone();
+    snapshot.tabs[0].loading = true;
+    chrome.set_snapshot(snapshot);
+    assert_eq!(chrome.state().address.text(), "a");
+}
+
+#[test]
+fn the_find_field_sends_at_most_what_page_find_takes() {
+    use sighurt_api::commands::MAX_FIND;
+    let mut chrome = finding("");
+    let request = paste_request(&chrome.key(&ctrl("v", 47)));
+    let actions = chrome.paste(request, &"é".repeat(MAX_FIND));
+    let [Command::PageFind(Some(text))] = &commands(&actions)[..] else {
+        panic!("{actions:?}")
+    };
+    assert_eq!(text.len(), MAX_FIND);
+    assert_eq!(text.chars().count(), MAX_FIND / 2);
+}
+
+#[test]
+fn the_find_field_is_named_and_says_what_was_found() {
+    let mut chrome = finding("");
+    let mut snapshot = chrome.snapshot().clone();
+    snapshot.find = Some(sighurt_ui::FindSnapshot {
+        text: "a".into(),
+        found: Some(true),
+        current: Some(3),
+        total: Some(12),
+        supported: true,
+    });
+    chrome.take_damage();
+    chrome.set_snapshot(snapshot);
+    assert!(chrome.take_damage().chrome);
+    let tree = chrome.accessibility();
+    let field = tree.node(NodeId::Address).unwrap();
+    assert_eq!(field.name, "Find in page");
+    assert_eq!(field.description.as_deref(), Some("3 of 12"));
+}

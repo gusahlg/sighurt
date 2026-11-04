@@ -13,7 +13,7 @@ use sighurt_api::ids::TabId;
 use sighurt_api::input::{DeleteSurrounding, Preedit, TextInputEvent};
 use sighurt_ui::extension::{contained, readable_url};
 use sighurt_ui::text_edit::{TextEditor, MAX_TEXT};
-use sighurt_ui::{EngineRow, HomeInfo, Snapshot, TabContent, TabSnapshot};
+use sighurt_ui::{EngineRow, FindSnapshot, HomeInfo, Snapshot, TabContent, TabSnapshot};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Characters a one-line text must not hold: controls, the bidi embeddings, overrides and
@@ -72,6 +72,10 @@ fn fuzz_snapshot_contain() {
                 can_go_forward: rng.one_in(2),
                 status: rng.one_in(2).then(|| text(rng)),
                 keymap: rng.one_in(2).then(|| text(rng)),
+                find: rng.one_in(2).then(|| FindSnapshot {
+                    text: text(rng),
+                    ..FindSnapshot::default()
+                }),
                 home: HomeInfo {
                     config_path: text(rng),
                     engines: (0..rng.below(3))
@@ -108,6 +112,9 @@ fn fuzz_snapshot_contain() {
             }
             if let Some(keymap) = &snapshot.keymap {
                 check("keymap", keymap, 64);
+            }
+            if let Some(find) = &snapshot.find {
+                check("find", &find.text, 1024);
             }
             check("config path", &snapshot.home.config_path, 1000);
             for row in &snapshot.home.engines {

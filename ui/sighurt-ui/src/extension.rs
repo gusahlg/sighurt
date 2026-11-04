@@ -47,6 +47,9 @@
 //! - **Tabs by identity:** a click on a tab is [`ChromeAction::SelectTab`] or
 //!   [`ChromeAction::CloseTab`], never a position, so a tab list that changed since the snapshot
 //!   can't make it act on another tab.
+//! - **The find field is the chrome's** ([`ChromeEvent::FindField`]): it searches as it is
+//!   edited, with `page.find` commands, and shows [`Snapshot::find`] beside it. The core
+//!   carries the search out and keeps its state.
 //! - **Chrome commands:** a chrome offers actions ([`ChromeKind::commands`]) that keys and
 //!   `:commands` run as `chrome.<action>`; `sig` hands each to the chrome as
 //!   [`ChromeEvent::Command`]. They take no argument and carry no identity: like keys, they act
@@ -123,6 +126,14 @@ pub enum ChromeEvent {
     /// of the address, as if typed over it, the caret at its end. A line keeps no more of it
     /// than it would of typing. A chrome whose line does not have the keyboard ignores it.
     LineText(String),
+    /// Right after `Focus(Chrome)` (`page.find` without text): open the find field, holding
+    /// this text (the search under way, or nothing), ready to type over. Each edit there runs
+    /// `page.find <text>`, an edit that leaves only whitespace `page.find-stop`; Enter closes
+    /// the field and gives the page the keyboard ([`ChromeAction::Focus`]), keeping the search;
+    /// Escape closes it the same way and runs `page.find-stop`. A `Focus` from the core, or
+    /// another tab, closes it and keeps the search. A chrome with no find field, or whose line
+    /// does not have the keyboard, ignores it. [`Snapshot::find`] says what the search found.
+    FindField(String),
     /// The window gained or lost the keyboard.
     WindowFocus(FocusEvent),
     /// Pointer input on one of the chrome's surfaces, in its coordinates. The mouse's side
