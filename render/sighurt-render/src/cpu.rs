@@ -312,21 +312,29 @@ fn text(
         let (w, h) = (image.placement.width as i32, image.placement.height as i32);
         let x0 = x + image.placement.left;
         let y0 = y - image.placement.top;
+        let (left, right) = (x0.max(clip.0), (x0 + w).min(clip.2));
+        if left >= right {
+            continue;
+        }
+        let columns = (right - left) as usize;
         for row in (y0.max(clip.1))..((y0 + h).min(clip.3)) {
-            for column in (x0.max(clip.0))..((x0 + w).min(clip.2)) {
-                let source = ((row - y0) * w + (column - x0)) as usize;
-                let target = ((row * width + column) * 4) as usize;
-                let pixel = &mut data[target..target + 4];
-                match image.content {
-                    SwashContent::Mask => blend(pixel, color, image.data[source]),
-                    SwashContent::Color => {
-                        let [r, g, b, a] = image.data[source * 4..source * 4 + 4] else {
-                            continue;
-                        };
+            let source = ((row - y0) * w + (left - x0)) as usize;
+            let target = ((row * width + left) * 4) as usize;
+            let pixels = data[target..target + columns * 4].as_chunks_mut::<4>().0;
+            match image.content {
+                SwashContent::Mask => {
+                    let coverage = &image.data[source..source + columns];
+                    for (pixel, &coverage) in pixels.iter_mut().zip(coverage) {
+                        blend(pixel, color, coverage);
+                    }
+                }
+                SwashContent::Color => {
+                    let colors = &image.data[source * 4..(source + columns) * 4];
+                    for (pixel, &[r, g, b, a]) in pixels.iter_mut().zip(colors.as_chunks().0) {
                         blend(pixel, bgra(Rgba { r, g, b, a }), 255);
                     }
-                    SwashContent::SubpixelMask => {}
                 }
+                SwashContent::SubpixelMask => {}
             }
         }
     }
@@ -398,7 +406,7 @@ fn rounded_rect(rect: Rect, radius: f32) -> Option<tiny_skia::Path> {
 }
 
 /// Blends `color` at `coverage` over a premultiplied RGBA pixel.
-fn blend(pixel: &mut [u8], color: Rgba, coverage: u8) {
+fn blend(pixel: &mut [u8; 4], color: Rgba, coverage: u8) {
     let alpha = mul(color.a, coverage);
     if alpha == 0 {
         return;

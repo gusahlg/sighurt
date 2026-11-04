@@ -614,6 +614,28 @@ Written after its measurement, which was a probe: recorded because it was reject
   8.5 KB. The shaped-text, glyph and snapshot caches are bounded by construction (above), so a
   longer run cannot grow them either.
 
+### H-CPU2: Glyphs are blended a row slice at a time
+
+- **Seen:** after H-CPU1, text is about a quarter of the CPU backend's render on the large
+  surface (a probe rendering `frame_cost`'s scenes with only some kinds of item: home page,
+  nothing but the clear 91 µs, the text alone 138 µs, everything 187 µs; chrome surface 7, 22,
+  73 µs). Each glyph pixel recomputes its source and target index and slices the buffer with
+  bounds checks before blending.
+- **Change:** per glyph row, slice the coverage (or the color glyph's bytes) and the target
+  row once and blend along them; the blend itself is unchanged.
+- **Prediction:** `frame_cost` render medians fall by at least 10 % on the home page and 5 % on
+  the chrome surface; five runs a build, interleaved.
+- **Guards:** golden images byte for byte (`SIGHURT_BLESS=1` leaves `git status` clean), the
+  backend's unit tests, `sighurt-render --all-features`.
+- **Outcome:** supported in part, below the predicted size; kept. `frame_cost`, five runs a
+  build interleaved (`/data/sig-builds/test-out/opt2/framecost-cpu2.txt`), render medians
+  (min–max) in µs: at 200 %, beyond the spread: home 694.6 (691.1–734.9) → 647.9
+  (634.2–660.9), −6.7 %; chrome 202.6 (194.2–206.0) → 175.6 (165.8–183.4), −13 %; status
+  25.2 → 21.6. At 100 %, inside the spread: home 180.1 (179.4–189.6) → 174.1 (172.5–181.9),
+  −3.3 %; chrome 73.9 (70.6–77.6) → 69.2 (68.2–71.2), −6 %. Kept because it moved beyond
+  noise where glyphs are larger and regressed nothing; the golden images are byte for byte
+  the same.
+
 ## Predictions for the IPC-removal session (gpui-baseline against 3c510fe)
 
 Written on 2 October 2026, before the session's first run. The session measures the baseline
