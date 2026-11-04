@@ -3904,8 +3904,11 @@ Newest last. Each entry says what was decided and why.
     example keymap had been ignoring — cef.sh's failing check since c4211d6 was that, not the
     browser). Engine suites: Servo 3/3, WPE gles2 and pixman, cef.sh 12/12, Ladybird sig-shot
     16/16 and robust, NetSurf 11/11, Wasm headless, headless.sh 78/78, ui headless 35/35, the
-    pty suite. engines.sh was 270/280 with the re-shown WPE page of 6c02b9c's unmap rule still
-    open (amended below when fixed). Reports: the session's scratchpad `findings/`.
+    pty suite. engines.sh was 270/280 until f47c573: 6c02b9c's rule that an unmapped target
+    waits for a new frame left a static WPE page shown again unmapped (WebKit renders only on
+    change and WPE 2.52 cannot be asked for a frame), so the adapter keeps each view's shown
+    frame and re-attaches it on the next permit; CEF and Ladybird already repaint on show and
+    their suites gained tab-switch checks. engines.sh 280/280. Reports: the session's scratchpad `findings/`.
 123. **Wasm guests get one network policy, and the engine's limits are real** (4 November 2026,
     0a51c23; from the Wasm review). Guests from the web reach only public http(s) and ws(s)
     hosts: loopback, private, link-local, CGNAT, multicast and reserved addresses are refused at
