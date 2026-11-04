@@ -41,6 +41,14 @@ pub const RENDERERS: &[RendererKind] = &[
             Ok(Box::new(backend))
         },
     },
+    #[cfg(feature = "render-vulkan")]
+    RendererKind {
+        name: "vulkan",
+        start: |fonts, explicit| {
+            let backend = sighurt_render_vulkan::VulkanBackend::new(fonts, explicit)?;
+            Ok(Box::new(backend))
+        },
+    },
 ];
 
 /// What `auto` tries, in order: the first that starts.
@@ -95,6 +103,12 @@ mod tests {
         for name in sighurt_core::config::RENDERERS {
             let (backend, notice) = start(name, &fonts);
             let compiled = RENDERERS.iter().any(|kind| kind.name == *name);
+            if compiled && !["auto", "cpu"].contains(name) && backend.name() == "cpu" {
+                // Compiled in, but it can't start here (no Vulkan loader): said so.
+                let said = notice.as_ref().is_some_and(|n| n.contains("can't start"));
+                assert!(said, "{name}: {notice:?}");
+                continue;
+            }
             let expected = if compiled && *name != "auto" {
                 *name
             } else {
@@ -107,16 +121,6 @@ mod tests {
                 "{name}: {notice:?}"
             );
         }
-        let (_, notice) = start("vulkan", &fonts);
-        let has: Vec<_> = RENDERERS.iter().map(|kind| kind.name).collect();
-        assert_eq!(
-            notice,
-            Some(format!(
-                "[ui] renderer = \"vulkan\" is not in this build (it has: {}); the chrome is \
-                 drawn as \"auto\" says.",
-                has.join(", ")
-            ))
-        );
         let (auto, _) = start("auto", &fonts);
         assert_eq!(
             auto.name(),

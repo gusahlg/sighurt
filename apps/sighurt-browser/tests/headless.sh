@@ -35,7 +35,8 @@
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
 #               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
 #               "wgpu", "wgpu" with SIG_RENDER_FAIL=surface (bound again, stays on wgpu) and
-#               SIG_RENDER_FAIL=device (ends on cpu); every screenshot compared with cpu's
+#               SIG_RENDER_FAIL=device (ends on cpu), then "vulkan" the same three ways; every
+#               screenshot compared with cpu's
 #
 # Exits with the number of failed checks.
 set -u
@@ -57,7 +58,7 @@ if [[ ${1:-} != --inside ]]; then
   link="ln -f $tdir/debug/sig $tdir/debug/sig-headless-e2e"
   if [[ $build == 1 ]]; then
     SIG_WHAT="build sig (demo engine) for headless tests" tools/heavy bash -c \
-      "cargo build -p sighurt-browser --no-default-features --features engine-demo,render-wgpu \
+      "cargo build -p sighurt-browser --no-default-features --features engine-demo,render-wgpu,render-vulkan \
        --bins --example virtual-pointer && $link" || exit 1
   else
     $link || exit 1
@@ -658,8 +659,26 @@ renderers)
   run_renderer fallback wgpu device
   check "fallback: a failed device ends on the CPU renderer" \
     "$(python3 -c "r=$report; print(0 if r[0]=='cpu' and r[3]==1 else 1)")" "$report; $(grep -o 'chrome-renderer-fallback.*' "$out/fallback.log" | head -1)"
+  # The Khronos validation layer on for the Vulkan runs (it logs to sig's output).
+  export SIG_VULKAN_VALIDATION=1
+  run_renderer vulkan vulkan
+  check "vulkan: the validation layer is on and reports nothing" \
+    "$(grep -q 'describe="Vulkan.*validation layer on' "$out/vulkan.log" && ! grep -qi 'validation error' "$out/vulkan.log"; echo $?)" \
+    "$(grep -ci 'validation error' "$out/vulkan.log") validation errors in vulkan.log"
+  check "vulkan: Vulkan draws, no fallback" "$(python3 -c "r=$report; print(0 if r[0]=='vulkan' and r[1]>0 and r[3]==0 else 1)")" "$report"
+  check "vulkan: the device is named after the first bind" \
+    "$(grep -q 'chrome-renderer renderer=vulkan describe="Vulkan [0-9]' "$out/vulkan.log"; echo $?)" \
+    "$(grep -o 'chrome-renderer renderer=vulkan describe="[^"]*"' "$out/vulkan.log" | tail -1)"
+  check "vulkan: no chrome render failed" "$(grep -q "rendering the chrome's" "$out/vulkan.log"; [[ $? == 1 ]]; echo $?)" \
+    "$(grep -c "rendering the chrome's" "$out/vulkan.log") failures in vulkan.log"
+  run_renderer vulkan-surface vulkan surface
+  check "vulkan-surface: a lost surface is bound again and vulkan stays" \
+    "$(python3 -c "r=$report; print(0 if r[0]=='vulkan' and r[3]==0 else 1)")" "$report; $(grep -o "lost its surface.*" "$out/vulkan-surface.log" | head -1)"
+  run_renderer vulkan-fallback vulkan device
+  check "vulkan-fallback: a failed device ends on the CPU renderer" \
+    "$(python3 -c "r=$report; print(0 if r[0]=='cpu' and r[3]==1 else 1)")" "$report; $(grep -o 'chrome-renderer-fallback.*' "$out/vulkan-fallback.log" | head -1)"
   # Every screenshot of every run against cpu's: the same pixels but near rounded corners.
-  for run in wgpu surface fallback; do
+  for run in wgpu surface fallback vulkan vulkan-surface vulkan-fallback; do
     for shot in 01-start 02-home 03-after-churn 03b-home-again 04-restored 05-home-150; do
       found=$(python3 - "$out/cpu-$shot.png" "$out/$run-$shot.png" <<'PY'
 import struct, sys, zlib

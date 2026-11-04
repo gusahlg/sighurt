@@ -4,6 +4,7 @@
 //!
 //! - **Vulkan only**, never wgpu's GL backend: that would open the EGL display of the
 //!   `wl_display`, which is Servo's (§14.1). The GPU-selection environment is never written.
+//!   Validation only with `SIG_VULKAN_VALIDATION=1`, whatever the build profile.
 //! - **Construction is provisional**: [`WgpuBackend::new`] makes the instance and nothing else.
 //!   The first [`Backend::bind`] picks an adapter that can present to that surface (low power
 //!   first; a software adapter only when `[ui] renderer = "wgpu"` was named, with a notice),
@@ -462,11 +463,20 @@ impl Drop for WgpuBackend {
     }
 }
 
-/// The instance: Vulkan only, its flags from the build (validation in debug builds) and
-/// wgpu's environment variables, never one that names another backend.
+/// The instance: Vulkan only, never a backend wgpu's environment names. Validation and debug
+/// labels only with `SIG_VULKAN_VALIDATION=1`, in debug and release builds alike: wgpu's own
+/// default turns them on in every debug build, where the Vulkan loader's messages (ICDs that
+/// fail to load, say) are then logged as errors at every start. wgpu's `WGPU_*` flag
+/// variables still apply on top.
 fn instance() -> wgpu::Instance {
-    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = wgpu::Backends::VULKAN;
+    let validation = std::env::var_os("SIG_VULKAN_VALIDATION").is_some_and(|v| v == "1");
+    desc.flags = match validation {
+        true => wgpu::InstanceFlags::debugging(),
+        false => wgpu::InstanceFlags::empty(),
+    }
+    .with_env();
     wgpu::Instance::new(desc)
 }
 
