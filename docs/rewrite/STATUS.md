@@ -4046,3 +4046,60 @@ Newest last. Each entry says what was decided and why.
     text is cleared, so the strip says why it failed. *Open*: the terminal's SIGHUP restores
     the terminal and re-raises without the last session write (at most 1 s of changes lost);
     under `ulimit -f` the SHM buffers (memfd) can't be sized either, so pages don't present.
+128. **A second measured optimization pass: the CPU backend and the sixel encoder** (4 November
+    2026, branch `opt2`, merged dbcb533; bench/HYPOTHESES.md H-START1, H-CPU1, H-CPU2, H-TUI1,
+    H-SHM1, H-MEM1, each written before it was measured; release builds, this desktop, headless
+    sway 1280×800, interleaved runs with fresh XDG directories). *Kept*: the CPU backend paints
+    straight into the buffers' B, G, R, A byte order instead of swapping red and blue over the
+    whole buffer after drawing (H-CPU1: the home page surface 427 → 181 µs a frame in the
+    microbenchmark, 1769 → 687 µs at 200 %; in sig, chrome.sh with the cpu renderer, page
+    1.78 → 1.18 ms, chrome 0.200 → 0.166 ms, status 0.205 → 0.167 ms), glyphs blended a row
+    slice at a time (H-CPU2, beyond the spread only at 200 %: home 695 → 648 µs), and the sixel
+    encoder quantizing each run of equal pixels once and visiting each colour only over the
+    columns it spans (H-TUI1: example.com 2527 → 1206 µs a frame, byte-identical output; all 252
+    registers still defined, decision 121). Every golden image stayed byte-identical. *Not
+    supported, reverted*: the font scan on its own thread with the window created first
+    (H-START1: exec → first chrome frame 5.00 → 5.10 ms; release startup is about 7 ms in all,
+    the font scan 2.3 ms of it — the 35 ms first paint of H-UI2 was a debug-build figure).
+    *Rejected*: pre-faulting new SHM buffers with MADV_POPULATE_WRITE (H-SHM1: a page-surface
+    show 1.16 → 1.59 ms). *Measured, nothing to fix*: 20 cycles of tab churn with the demo and
+    Wasm engines keep RSS within −4.0 … +0.7 MiB from cycle 5, the SHM bytes and the glyph cache
+    identical at every cycle's end (H-MEM1, `bench/memory/churn.sh`); the shaped-text, glyph and
+    snapshot caches are bounded by construction. New harness pieces: `bench/startup/startup.sh`,
+    a hover phase and `CHROME_BUILDS`/`CHROME_RENDERERS` in `bench/render/chrome.sh`, the ignored
+    timing tests `frame_cost` (sighurt-ui) and `encode_cost` (sighurt-tui). *Open*: the kitty
+    encoder spends 11–12 ms a page frame in zlib level 6 (a faster deflate backend would change
+    flate2's features for Servo's graph too); the owner loop was not re-profiled (`perf` is not
+    available in the sandbox); a text-mode layout of a 20 000-node snapshot takes 7 ms, once per
+    snapshot. The host's `rgba_to_argb8888` lost its last caller and is gone.
+129. **Tab commands, the keymap's hovered link, and `location.focus <text>`** (4 November 2026,
+    branch `features`, merged c6f8fb4; the user: "add in obvious features that are missing in a
+    way that goes with the philosophy and design"; the feature set was chosen by the deep-design
+    agent and amended after GPT-6 Astra's review — the design and both reviews are in the
+    session's records, the amendments summarized here). `tab.new [url]` opens the address
+    through the same path as `page.open`; `tab.duplicate` makes a tab right after the selected
+    one at its committed address, zoom and chosen engine; `tab.move left|right|<n>` wraps for
+    left and right and clamps `n`; `tab.reopen` reopens the most recently closed tab from a
+    bounded list of ten `ClosedTab { url, title, engine, zoom }` records (an address, never the
+    history; recorded only by a close that removed a tab, the page's own `window.close()`
+    included; `MAX_TABS` checked first). `location.focus <text>` focuses the line with that text
+    (`Effect::Focus(Chrome)` then `Effect::LineText`; `ChromeEvent::LineText` in the chrome API;
+    the terminal's line does the same), which is how `:` types itself now. The keymap's
+    `TabInfo` gains `link` — the hovered link as a document-scoped URL the router would open
+    (http, https, file; at most 8 KiB, dropped rather than shortened; cleared at a new document
+    and on `ViewFailed`), never the raw status text, so the example keymap's `y f` copies a link
+    and nothing reinterprets page text as command syntax — and `fullscreen` (for decision 132).
+    The example keymap binds `u` to `tab.reopen`, `/` to `page.find` and `:` to
+    `location.focus :`. With the same commit the API for find in page and fullscreen landed with
+    honest stubs: every adapter answers `EngineCommand::Find` and `ExitFullscreen` with
+    `Unsupported` and reports `find_in_page: false` and `fullscreen: false` until its lane lands
+    (decisions 130–132); `page.find [text]` refuses text over 1024 bytes at parse time, and the
+    `FindCommand` variants each name their search (and `Search` its document) so a late result
+    is recognisably stale. *Verified*: core tests for every command and bound (reopen after 11
+    closes, the last-tab guard, `MAX_TABS`, a chosen engine; the link's schemes, size and
+    clearing), API parse round trips, chrome and terminal `line_text` tests, the example
+    keymap's tests, headless.sh 145/145 (`:tab.new demo://pattern`, `:tab.move left`, `x` then
+    `u`, the saved order), ui 35/35, the workspace tests, the Servo, WPE and NetSurf crates
+    checked. *Left out, with reasons*: bookmarks (a `[keywords]` entry without `{}` already is
+    one, and sig never rewrites the user's file); per-site zoom memory (decision 29);
+    `sig://history` and a downloads page (after completion exists).
