@@ -24,7 +24,8 @@ distributed.
   ├── sighurt-gui       the Wayland frontend: the event loop, the chrome's surfaces
   │    ├── sighurt-ui        the chrome: tabs, address and command line, drawn as scenes
   │    ├── sighurt-render    scenes, text, and the renderers that draw them: the CPU's,
-  │    │                     and wgpu's on Vulkan (sighurt-render-wgpu)
+  │    │                     wgpu's on Vulkan (sighurt-render-wgpu), and ash's
+  │    │                     (sighurt-render-vulkan, opt-in)
   │    └── sighurt-wayland   the window and its surfaces, input, scaling, frame scheduling
   ├── sighurt-tui       the terminal frontend: terminal I/O, the chrome as text, pages as
   │                     kitty graphics or reflowed text, `sig --dump`
@@ -123,6 +124,7 @@ configuration decides which of them are used.
 | `engine-netsurf` | no | NetSurf 3.11, the engine `netsurf` (GPL-2.0-only; your own use; never a default) |
 | `chrome-line` | no | the line chrome, `[ui] chrome = "line"` |
 | `render-wgpu` | yes | the chrome drawn on the GPU by wgpu (Vulkan), `[ui] renderer = "wgpu"` |
+| `render-vulkan` | no | the chrome drawn on the GPU by Vulkan directly (ash), `[ui] renderer = "vulkan"` |
 
 ```bash
 cargo build -p sighurt-browser --features chrome-line                     # the default engines, plus the line chrome
@@ -360,7 +362,7 @@ tabs = "left"
 | `[keys]`, `[keys.page]`, `[keys.location]` | the `bindings` keymap: everywhere, while the page has the keyboard, while the address line has it | none |
 | `[keymap.<name>]` | another keymap's own table | — |
 | `[ui] chrome` | the chrome that draws the window (at the next start) | `"standard"` |
-| `[ui] renderer` | what renders the chrome (at the next start): `"auto"`, `"cpu"`, `"wgpu"` (the GPU through Vulkan; a surface it can't present on, or a GPU that fails, gives the chrome back to the CPU) or `"vulkan"` (not built yet); one this build lacks gives a notice and `"auto"` is used, which is the CPU until wgpu is measured at least as good | `"auto"` |
+| `[ui] renderer` | what renders the chrome (at the next start): `"auto"`, `"cpu"`, `"wgpu"` (the GPU through Vulkan; a surface it can't present on, or a GPU that fails, gives the chrome back to the CPU) or `"vulkan"` (Vulkan directly, in a `sig` built with `render-vulkan`); one this build lacks gives a notice and `"auto"` is used, which is the CPU until wgpu is measured at least as good | `"auto"` |
 | `[ui] font`, `font-size` | the chrome's font family, and its size in logical pixels (9 to 32) | an installed sans-serif, 14 |
 | `[ui.colors]` | `bg`, `surface`, `hover`, `tab`, `border`, `focus`, `text`, `text_muted`, `text_dim`, `selection`, `error`: `"#rrggbb"` or `"#rrggbbaa"` | a dark theme |
 | `[chrome.standard]` | `tabs` (`"top"`, `"left"`, `"hidden"`), `status` (`"strip"`, `"overlay"`), `buttons`, `compact`, `engine-label` (the engine a page runs in, in its tab and the address bar) | top, strip, true, false, true |

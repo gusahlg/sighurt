@@ -293,6 +293,10 @@ Everything a GPU backend needs that is not an API call lives here, once:
   `render_to_image` under `cfg(test)`/a `testing` feature renders to a texture and maps it,
   for the backend comparison test in §12.)
 - Atlas textures are `R8Unorm` and `Rgba8Unorm` with `write_texture` per changed row.
+- Validation (wgpu's `VALIDATION` and `DEBUG` instance flags) only with `SIG_VULKAN_VALIDATION=1`,
+  in debug and release builds alike (wgpu's default turns it on in every debug build, and the
+  Vulkan loader's messages about ICDs that fail to load were then logged as errors at every
+  start); wgpu's `WGPU_*` variables still apply on top. (Lane 3, 4 November 2026.)
 - `trim` drops the surface's configured textures (`surface.configure` at 1×1 is not needed:
   dropping and re-creating the `Surface` on the next `render` is simpler and bounded).
 
@@ -455,6 +459,23 @@ Lanes, each in its own worktree with its own `CARGO_TARGET_DIR` under
    Mesa's WSI, a real output, `sig` with Servo beside the chrome's device.
 3. **`render-vulkan`** (Opus or Sonnet, after 2's `gpu` module): `sighurt-render-vulkan` with
    `build.rs` on naga; the same tests.
+   *Status (4 November 2026, branch `render`):* done. `sighurt-render-vulkan` (`VulkanBackend`
+   on ash 0.38) behind `render-vulkan`, in no default set and never `auto`'s; `gpu` reused
+   unchanged; `build.rs` compiles the shared WGSL with naga (`wgsl-in`, `spv-out`) and a test
+   holds the SPIR-V's vertex inputs against `VERTEX_ATTRIBUTES`. The comparison test and the
+   `renderers` scenario (with the validation layer on: no errors) pass on this desktop; it
+   reports the driver's actual swapchain image count (3 here) and its own device memory.
+   Deviations: the viewport is the shared program's uniform buffer, not a push constant (the
+   program is shared unchanged); one frame slot (one acquire semaphore and fence), since one
+   frame is in flight per backend; a swapchain is recreated after `vkDeviceWaitIdle`. The lock
+   gained only the crate's own entry (ash 0.38 and naga 30 were locked by wgpu). From Astra's
+   review of lane 3: an acquired image whose frame fails is drained by an empty submission;
+   an out-of-date present is `Deferred`; a present's `SUBOPTIMAL` recreates once, as an
+   acquire's; nothing is destroyed when the device fails to go idle (leaked instead). Known
+   gap, as in wgpu-hal: a retired swapchain is destroyed after `vkDeviceWaitIdle`, which does
+   not cover the presentation engine (`VK_EXT_swapchain_maintenance1` present fences would).
+   Both GPU backends validate only with `SIG_VULKAN_VALIDATION=1`, debug build or not.
+   Unverified: Mesa, a real output, the Vulkan backend beside Servo.
 4. **Docs and measurements** (Sonnet): `extension-api.md` amendments, CLAUDE.md's crate table
    and build commands, README's `[ui] renderer`, default-config.toml, `bench/results/RENDER.md`,
    a STATUS decision with the evidence.
