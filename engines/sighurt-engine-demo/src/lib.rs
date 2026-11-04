@@ -86,6 +86,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
         caches: false,
         hsts: false,
     },
+    fullscreen: false,
 };
 
 /// How long `demo:slow` takes to have a frame for a new layout: longer than the host's resize
@@ -694,6 +695,8 @@ impl<T: CpuTarget> EngineRuntime for DemoRuntime<T> {
                     self.act(id, action)?;
                 }
             }
+            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         Ok(())
     }

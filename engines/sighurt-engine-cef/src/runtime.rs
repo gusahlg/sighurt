@@ -49,7 +49,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     text_input: true,
     accessibility: false,
     screenshots: false,
-    find_in_page: false,
+    find_in_page: false, // lane B: true once find in page is wired
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
@@ -63,6 +63,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
         caches: true,
         hsts: true,
     },
+    fullscreen: false, // lane D: true once element fullscreen is wired
 };
 
 /// The most events one `pump` hands over.
@@ -517,6 +518,8 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"));
             }
+            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         Ok(())
     }

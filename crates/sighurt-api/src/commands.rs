@@ -17,11 +17,24 @@ use std::str::FromStr;
 use crate::input::{ButtonState, Key, KeyCode, KeyEvent, KeyLocation, Modifiers};
 use crate::keymap::{Chord, ChordKey};
 
+/// The most bytes `page.find` searches for. A longer argument is refused when the command is
+/// parsed, never cut, and the core refuses a longer one made otherwise.
+pub const MAX_FIND: usize = 1024;
+
 /// A browser command. Tab numbers count from 1, in tab-strip order.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
-    /// `tab.new`: open a tab on the home page and select it.
-    TabNew,
+    /// `tab.new [address]`: open a tab and select it, on the home page, or on `address` as
+    /// `page.open` takes it (trimmed, never empty).
+    TabNew(Option<String>),
+    /// `tab.duplicate`: open a tab right after the selected one, at its address, and select it.
+    /// Its history is not copied.
+    TabDuplicate,
+    /// `tab.move left|right|<n>`: move the selected tab one place (wrapping around), or to
+    /// position `n`.
+    TabMove(TabMove),
+    /// `tab.reopen`: open the tab closed last again, at the end, and select it.
+    TabReopen,
     /// `tab.close [n]`: close tab `n`, or the selected tab.
     TabClose(Option<NonZeroUsize>),
     /// `tab.next`: select the next tab, wrapping around.
@@ -67,8 +80,26 @@ pub enum Command {
     /// `page.send-key <key>`: press and release a named key in the page, while the page has
     /// the keyboard: `down`, `pageup`, `shift-space`, ...
     PageSendKey(SentKey),
-    /// `location.focus`: focus the address bar.
-    LocationFocus,
+    /// `location.focus [text]`: focus the address line with its address selected; with
+    /// `text`, the line holds `text` instead, the caret at its end (`location.focus :` opens
+    /// the command line). The text is kept as given (trimmed, never empty).
+    LocationFocus(Option<String>),
+    /// `page.find [text]`: find `text` in the page shown, from where it is, wrapping around;
+    /// without text, open the chrome's find field. The text is kept as given (trimmed, never
+    /// empty), at most [`MAX_FIND`] bytes. Upper case in it makes the search case-sensitive.
+    PageFind(Option<String>),
+    /// `page.find-next`: the next match of the search.
+    PageFindNext,
+    /// `page.find-previous`: the previous match of the search.
+    PageFindPrevious,
+    /// `page.find-stop`: end the search and clear its highlights.
+    PageFindStop,
+    /// `page.exit-fullscreen`: leave the element fullscreen of the page shown.
+    PageExitFullscreen,
+    /// `history.clear`: forget every page visited.
+    HistoryClear,
+    /// `browser.fullscreen`: put the window in fullscreen, or take it out.
+    BrowserFullscreen,
     /// `browser.home`: open the home page in the selected tab.
     BrowserHome,
     /// `browser.quit`.
@@ -87,8 +118,11 @@ pub enum Command {
 
 impl Command {
     /// Every command name. The chrome's commands, `chrome.<action>`, depend on the chrome.
-    pub const NAMES: [&'static str; 22] = [
+    pub const NAMES: [&'static str; 32] = [
         "tab.new",
+        "tab.duplicate",
+        "tab.move",
+        "tab.reopen",
         "tab.close",
         "tab.next",
         "tab.previous",
@@ -105,8 +139,15 @@ impl Command {
         "page.zoom-out",
         "page.zoom-reset",
         "page.send-key",
+        "page.find",
+        "page.find-next",
+        "page.find-previous",
+        "page.find-stop",
+        "page.exit-fullscreen",
         "location.focus",
+        "history.clear",
         "browser.home",
+        "browser.fullscreen",
         "browser.quit",
         "site.forget",
         "clipboard.copy",
@@ -115,7 +156,10 @@ impl Command {
     /// The command's name, without its argument; `chrome` for every `chrome.<action>`.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::TabNew => "tab.new",
+            Self::TabNew(_) => "tab.new",
+            Self::TabDuplicate => "tab.duplicate",
+            Self::TabMove(_) => "tab.move",
+            Self::TabReopen => "tab.reopen",
             Self::TabClose(_) => "tab.close",
             Self::TabNext => "tab.next",
             Self::TabPrevious => "tab.previous",
@@ -132,8 +176,15 @@ impl Command {
             Self::PageZoomOut => "page.zoom-out",
             Self::PageZoomReset => "page.zoom-reset",
             Self::PageSendKey(_) => "page.send-key",
-            Self::LocationFocus => "location.focus",
+            Self::PageFind(_) => "page.find",
+            Self::PageFindNext => "page.find-next",
+            Self::PageFindPrevious => "page.find-previous",
+            Self::PageFindStop => "page.find-stop",
+            Self::PageExitFullscreen => "page.exit-fullscreen",
+            Self::LocationFocus(_) => "location.focus",
+            Self::HistoryClear => "history.clear",
             Self::BrowserHome => "browser.home",
+            Self::BrowserFullscreen => "browser.fullscreen",
             Self::BrowserQuit => "browser.quit",
             Self::SiteForget(_) => "site.forget",
             Self::ClipboardCopy(_) => "clipboard.copy",
@@ -174,6 +225,28 @@ impl FromStr for Command {
             "tab.close" => return Ok(Self::TabClose(Some(tab_number()?))),
             "site.forget" if argument.is_empty() => return Ok(Self::SiteForget(None)),
             "site.forget" => return Ok(Self::SiteForget(Some(argument.to_owned()))),
+            "tab.new" if argument.is_empty() => return Ok(Self::TabNew(None)),
+            "tab.new" => return Ok(Self::TabNew(Some(argument.to_owned()))),
+            "location.focus" if argument.is_empty() => return Ok(Self::LocationFocus(None)),
+            "location.focus" => return Ok(Self::LocationFocus(Some(argument.to_owned()))),
+            "tab.move" => {
+                return match required("tab.move")? {
+                    "left" => Ok(Self::TabMove(TabMove::Left)),
+                    "right" => Ok(Self::TabMove(TabMove::Right)),
+                    n => n
+                        .parse()
+                        .map(|n| Self::TabMove(TabMove::To(n)))
+                        .map_err(|_| CommandError::InvalidTabMove(n.to_owned())),
+                };
+            }
+            "page.find" if argument.is_empty() => return Ok(Self::PageFind(None)),
+            "page.find" if argument.len() > MAX_FIND => {
+                return Err(CommandError::TooLong {
+                    command: "page.find",
+                    max: MAX_FIND,
+                })
+            }
+            "page.find" => return Ok(Self::PageFind(Some(argument.to_owned()))),
             "tab.select" => {
                 required("tab.select")?;
                 return Ok(Self::TabSelect(tab_number()?));
@@ -200,7 +273,8 @@ impl FromStr for Command {
                 let key = required("page.send-key")?.parse();
                 return key.map(Self::PageSendKey).map_err(CommandError::InvalidKey);
             }
-            "tab.new" => Self::TabNew,
+            "tab.duplicate" => Self::TabDuplicate,
+            "tab.reopen" => Self::TabReopen,
             "tab.next" => Self::TabNext,
             "tab.previous" => Self::TabPrevious,
             "tab.last" => Self::TabLast,
@@ -212,8 +286,13 @@ impl FromStr for Command {
             "page.zoom-out" => Self::PageZoomOut,
             "page.zoom-reset" => Self::PageZoomReset,
             "page.switch-engine" => Self::PageSwitchEngine,
-            "location.focus" => Self::LocationFocus,
+            "page.find-next" => Self::PageFindNext,
+            "page.find-previous" => Self::PageFindPrevious,
+            "page.find-stop" => Self::PageFindStop,
+            "page.exit-fullscreen" => Self::PageExitFullscreen,
+            "history.clear" => Self::HistoryClear,
             "browser.home" => Self::BrowserHome,
+            "browser.fullscreen" => Self::BrowserFullscreen,
             "browser.quit" => Self::BrowserQuit,
             unknown => return Err(CommandError::Unknown(unknown.to_owned())),
         };
@@ -230,7 +309,12 @@ impl fmt::Display for Command {
         f.write_str(self.name())?;
         match self {
             Self::TabClose(Some(n)) | Self::TabSelect(n) => write!(f, " {n}"),
-            Self::PageOpen(input) | Self::ClipboardCopy(input) => write!(f, " {input}"),
+            Self::PageOpen(input)
+            | Self::ClipboardCopy(input)
+            | Self::PageFind(Some(input))
+            | Self::TabNew(Some(input))
+            | Self::LocationFocus(Some(input)) => write!(f, " {input}"),
+            Self::TabMove(to) => write!(f, " {to}"),
             Self::PageOpenIn { engine, address } => match address {
                 Some(address) => write!(f, " {engine} {address}"),
                 None => write!(f, " {engine}"),
@@ -239,6 +323,27 @@ impl fmt::Display for Command {
             Self::SiteForget(Some(host)) => write!(f, " {host}"),
             Self::Chrome(action) => write!(f, ".{action}"),
             _ => Ok(()),
+        }
+    }
+}
+
+/// Where `tab.move` moves the selected tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TabMove {
+    /// `left`: one place towards the start; the first tab goes to the end.
+    Left,
+    /// `right`: one place towards the end; the last tab goes to the start.
+    Right,
+    /// `<n>`: to position `n`, counting from 1; past the end is the end.
+    To(NonZeroUsize),
+}
+
+impl fmt::Display for TabMove {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Left => f.write_str("left"),
+            Self::Right => f.write_str("right"),
+            Self::To(n) => write!(f, "{n}"),
         }
     }
 }
@@ -256,6 +361,15 @@ pub enum CommandError {
     UnexpectedArgument(&'static str),
     /// The argument should be a tab number (1 or more) but isn't.
     InvalidTabNumber(String),
+    /// `tab.move`'s argument is not `left`, `right` or a tab number.
+    InvalidTabMove(String),
+    /// The argument is longer than the command takes (`page.find`: [`MAX_FIND`] bytes).
+    TooLong {
+        /// The command.
+        command: &'static str,
+        /// The most bytes it takes.
+        max: usize,
+    },
     /// `page.send-key`'s argument is not a key it can press; says why.
     InvalidKey(String),
     /// `page.open-in`'s engine is not an engine's name.
@@ -274,6 +388,13 @@ impl fmt::Display for CommandError {
             Self::UnexpectedArgument(name) => write!(f, "{name} takes no argument"),
             Self::InvalidTabNumber(argument) => {
                 write!(f, "{argument:?} is not a tab number (tabs count from 1)")
+            }
+            Self::InvalidTabMove(argument) => write!(
+                f,
+                "tab.move takes left, right or a tab number (from 1), not {argument:?}"
+            ),
+            Self::TooLong { command, max } => {
+                write!(f, "{command} takes at most {max} bytes of text")
             }
             Self::InvalidKey(why) => f.write_str(why),
             Self::InvalidEngine(name) => write!(
@@ -536,6 +657,23 @@ mod tests {
             "page.send-key shift-space",
             "page.send-key ctrl-alt-F5",
             "location.focus",
+            "location.focus :",
+            "location.focus /",
+            "tab.new demo://pattern",
+            "tab.new rust borrow checker",
+            "tab.duplicate",
+            "tab.move left",
+            "tab.move right",
+            "tab.move 3",
+            "tab.reopen",
+            "page.find",
+            "page.find Hello  world",
+            "page.exit-fullscreen",
+            "page.find-next",
+            "page.find-previous",
+            "page.find-stop",
+            "history.clear",
+            "browser.fullscreen",
             "browser.quit",
             "site.forget",
             "site.forget example.com",
@@ -559,7 +697,11 @@ mod tests {
             parse("appearance.theme dark"),
             Err(Unknown("appearance.theme".into()))
         );
-        assert_eq!(parse("tab.new now"), Err(UnexpectedArgument("tab.new")));
+        assert_eq!(parse("tab.reopen 2"), Err(UnexpectedArgument("tab.reopen")));
+        assert_eq!(
+            parse("history.clear all"),
+            Err(UnexpectedArgument("history.clear"))
+        );
         assert_eq!(
             parse("page.switch-engine wpe"),
             Err(UnexpectedArgument("page.switch-engine"))
@@ -569,6 +711,64 @@ mod tests {
         assert_eq!(parse("tab.select 0"), Err(InvalidTabNumber("0".into())));
         assert_eq!(parse("tab.close -1"), Err(InvalidTabNumber("-1".into())));
         assert_eq!(parse("tab.select two"), Err(InvalidTabNumber("two".into())));
+    }
+
+    #[test]
+    fn tab_commands_take_their_arguments() {
+        assert_eq!(parse("tab.new"), Ok(Command::TabNew(None)));
+        assert_eq!(
+            parse(" tab.new  gh rust "),
+            Ok(Command::TabNew(Some("gh rust".into())))
+        );
+        assert_eq!(parse("tab.move left"), Ok(Command::TabMove(TabMove::Left)));
+        assert_eq!(
+            parse("tab.move  right "),
+            Ok(Command::TabMove(TabMove::Right))
+        );
+        assert_eq!(
+            parse("tab.move 12"),
+            Ok(Command::TabMove(TabMove::To(tab(12))))
+        );
+        assert_eq!(
+            parse("tab.move"),
+            Err(CommandError::MissingArgument("tab.move"))
+        );
+        for bad in ["0", "-1", "up", "Left", "1 2"] {
+            let error = parse(&format!("tab.move {bad}")).unwrap_err();
+            assert_eq!(error, CommandError::InvalidTabMove(bad.into()));
+            assert!(error.to_string().contains("left, right"), "{error}");
+        }
+        assert_eq!(parse("location.focus"), Ok(Command::LocationFocus(None)));
+        assert_eq!(
+            parse("location.focus  :"),
+            Ok(Command::LocationFocus(Some(":".into())))
+        );
+    }
+
+    #[test]
+    fn find_text_over_the_limit_is_refused() {
+        assert_eq!(parse("page.find"), Ok(Command::PageFind(None)));
+        assert_eq!(
+            parse(" page.find  Hello  World "),
+            Ok(Command::PageFind(Some("Hello  World".into())))
+        );
+        let at_limit = "é".repeat(MAX_FIND / 2);
+        assert_eq!(
+            parse(&format!("page.find {at_limit}")),
+            Ok(Command::PageFind(Some(at_limit.clone())))
+        );
+        let error = parse(&format!("page.find {at_limit}a")).unwrap_err();
+        assert_eq!(
+            error,
+            CommandError::TooLong {
+                command: "page.find",
+                max: MAX_FIND
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "page.find takes at most 1024 bytes of text"
+        );
     }
 
     #[test]
@@ -718,7 +918,7 @@ mod tests {
             line.parse("tab.nope"),
             Err("unknown command \"tab.nope\"".into())
         );
-        assert_eq!(CommandSet::ANY.parse("tab.new"), Ok(Command::TabNew));
+        assert_eq!(CommandSet::ANY.parse("tab.new"), Ok(Command::TabNew(None)));
         // The chrome's own command, and any with no chrome to check against; a malformed one
         // is a syntax error whichever chrome runs.
         let toggle = Command::Chrome("toggle-tabs".into());

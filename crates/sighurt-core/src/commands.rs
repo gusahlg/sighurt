@@ -3,8 +3,21 @@
 //!
 //! - Tabs count from 1 in tab-strip order; a number without a tab does nothing.
 //! - `tab.new` opens the home page in a new tab at the end, selects it and focuses the address
-//!   bar; with `session::MAX_TABS` tabs open it says so instead. The last tab can't be closed; closing the active tab selects the one after it, or the
-//!   one before if it was the last.
+//!   bar; `tab.new <address>` opens the address there as `page.open` would (keywords, search,
+//!   routing) and gives the page the keyboard. With `session::MAX_TABS` tabs open, a new tab
+//!   (`tab.new`, `tab.duplicate`, `tab.reopen`) is a notice instead. The last tab can't be
+//!   closed; closing the active tab selects the one after it, or the one before if it was the
+//!   last.
+//! - `tab.duplicate` opens the selected tab's committed address in a new tab right after it, at
+//!   its zoom, in its engine if the user chose that engine, and selects it; its history is not
+//!   copied. A tab with no page duplicates as a home tab.
+//! - `tab.move left|right` moves the selected tab one place, wrapping around; `tab.move <n>`
+//!   moves it to position `n`, or the end. It stays selected and keeps the keyboard where it is.
+//! - `tab.reopen` opens the address of the tab closed last in a new tab at the end, in the
+//!   engine the user chose for it and at its zoom, and selects it: its history and the page's
+//!   state are not restored. Only the last [`MAX_CLOSED`] closed since the browser started are
+//!   kept, a page's own `window.close()` included, and a tab with no address is not. With
+//!   none, it is a notice.
 //! - `tab.next` and `tab.previous` wrap around.
 //! - Page zoom walks [`ZOOM_STEPS`] and stops at its ends; each tab keeps its own, across
 //!   engines. New tabs start at the configured `zoom`, and `page.zoom-reset` returns to it.
@@ -22,7 +35,14 @@
 //! - `clipboard.copy <text>` puts that text on the clipboard ([`Effect::ClipboardWrite`]).
 //!   The runtime refuses text over its own limit and says so; the core does not cut it.
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
-//!   `Effect::Focus`. Commands that change what the page area shows give the page the keyboard.
+//!   `Effect::Focus`; `location.focus <text>` then hands the line its text with
+//!   `Effect::LineText`. Commands that change what the page area shows give the page the keyboard.
+//! - `page.find [text]`, `page.find-next`, `page.find-previous` and `page.find-stop`: no engine
+//!   finds in page yet, so `page.find` says the page's engine can't, and the moves that there is
+//!   no search. A `page.find` over [`MAX_FIND`] bytes, which only a chrome can make, is refused.
+//! - `history.clear`: sig keeps no history of visited pages yet, so it says there is nothing to
+//!   clear. `browser.fullscreen` says the frontend has no fullscreen yet, and
+//!   `page.exit-fullscreen` that the page is not in fullscreen.
 //! - `page.send-key` presses and releases its key in the page only while the page has the
 //!   keyboard; run by a key press, that counts as the user's key press in the page.
 //! - `chrome.<action>` is the chrome's own: the core hands it on (`Effect::ChromeCommand`).
@@ -32,12 +52,13 @@
 
 use std::num::NonZeroUsize;
 
-use sighurt_api::commands::Command;
+use sighurt_api::commands::{Command, TabMove, MAX_FIND};
 use sighurt_api::ids::TabId;
 use sighurt_api::input::KeyboardFocus;
 
 use crate::navigation::Segment;
 use crate::state::{BrowserState, By, Effect, Fx};
+use crate::tabs::MAX_CLOSED;
 
 /// Page zoom levels in percent, as in common browsers.
 pub const ZOOM_STEPS: [u32; 13] = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300];
@@ -72,14 +93,40 @@ impl BrowserState {
         let (active, count) = (self.active, self.tabs.len());
         let tab_number = |n: NonZeroUsize| (n.get() <= count).then(|| n.get() - 1);
         let focus = match command {
-            Command::TabNew => match self.new_tab(false, fx) {
+            Command::TabNew(address) => match self.new_tab(false, fx) {
                 Some(tab) => {
                     self.active = tab;
-                    self.open_home(tab, fx);
-                    Some(KeyboardFocus::Chrome)
+                    let url = address.map(|address| self.fixup(&address));
+                    match url.filter(|url| !url.is_empty()) {
+                        Some(url) => {
+                            self.navigate(tab, url, By::User(None), fx);
+                            Some(KeyboardFocus::Page)
+                        }
+                        None => {
+                            self.open_home(tab, fx);
+                            Some(KeyboardFocus::Chrome)
+                        }
+                    }
                 }
                 None => None,
             },
+            Command::TabDuplicate => self.duplicate(active, fx),
+            Command::TabMove(to) => {
+                let to = match to {
+                    TabMove::Left => (active + count - 1) % count,
+                    TabMove::Right => (active + 1) % count,
+                    TabMove::To(n) => n.get().min(count) - 1,
+                };
+                if to != active {
+                    let tab = self.tabs.remove(active);
+                    self.tabs.insert(to, tab);
+                    self.active = to;
+                    fx.chrome = true;
+                    fx.session = true;
+                }
+                None
+            }
+            Command::TabReopen => self.reopen(fx),
             Command::TabClose(n) => {
                 if let Some(index) = n.map_or(Some(active), tab_number) {
                     self.close_tab(index, fx);
@@ -135,7 +182,40 @@ impl BrowserState {
                 self.send_key(&key, fx);
                 None
             }
-            Command::LocationFocus => Some(KeyboardFocus::Chrome),
+            Command::LocationFocus(text) => {
+                self.move_focus(KeyboardFocus::Chrome, fx);
+                if let Some(text) = text {
+                    fx.push(Effect::LineText(text));
+                }
+                None
+            }
+            Command::PageFind(_)
+            | Command::PageFindNext
+            | Command::PageFindPrevious
+            | Command::PageFindStop => {
+                self.find(active, &command, fx);
+                None
+            }
+            Command::HistoryClear => {
+                self.tab_notice(
+                    active,
+                    "sig keeps no history of the pages you visit, so there is nothing to clear.",
+                    fx,
+                );
+                None
+            }
+            Command::PageExitFullscreen => {
+                self.tab_notice(active, "The page shown is not in fullscreen.", fx);
+                None
+            }
+            Command::BrowserFullscreen => {
+                self.tab_notice(
+                    active,
+                    "browser.fullscreen is not available in this frontend.",
+                    fx,
+                );
+                None
+            }
             Command::BrowserHome => {
                 self.open_home(active, fx);
                 Some(KeyboardFocus::Page)
@@ -162,6 +242,70 @@ impl BrowserState {
         }
     }
 
+    /// Opens tab `tab`'s committed address in a new tab right after it, at its zoom and in the
+    /// engine the user chose for it if they chose one, and selects it. Nothing committed: a home
+    /// tab.
+    fn duplicate(&mut self, tab: usize, fx: &mut Fx) -> Option<KeyboardFocus> {
+        let url = self
+            .tabs()
+            .nth(tab)
+            .and_then(|summary| summary.url.map(str::to_owned));
+        let engine = self.chosen_engine(tab);
+        let zoom = self.tabs[tab].zoom;
+        let new = self.new_tab(false, fx)?;
+        let mut duplicate = self.tabs.remove(new);
+        duplicate.zoom = zoom;
+        self.tabs.insert(tab + 1, duplicate);
+        self.active = tab + 1;
+        match url {
+            Some(url) => self.navigate(tab + 1, url, By::User(engine.as_deref()), fx),
+            None => self.open_home(tab + 1, fx),
+        }
+        fx.chrome = true;
+        fx.session = true;
+        Some(KeyboardFocus::Page)
+    }
+
+    /// Opens the address of the tab closed last in a new tab at the end, in the engine the
+    /// user had chosen for it and at its zoom, and selects it. Its history is not restored.
+    fn reopen(&mut self, fx: &mut Fx) -> Option<KeyboardFocus> {
+        if self.closed.is_empty() {
+            let message = format!(
+                "No closed tab to reopen: tab.reopen brings back the last {MAX_CLOSED} tabs closed \
+                 since sig started."
+            );
+            return self.tab_notice(self.active, &message, fx);
+        }
+        // A full tab strip says so and keeps the closed tab.
+        let tab = self.new_tab(false, fx)?;
+        let closed = self.closed.pop_back().expect("not empty");
+        self.tabs[tab].zoom = closed.zoom;
+        self.active = tab;
+        self.navigate(tab, closed.url, By::User(closed.engine.as_deref()), fx);
+        fx.session = true;
+        Some(KeyboardFocus::Page)
+    }
+
+    /// `page.find` and its moves. No engine finds in page yet: `page.find` names the page's
+    /// engine as unable, and the moves have no search to move in.
+    fn find(&mut self, tab: usize, command: &Command, fx: &mut Fx) {
+        let engine = self
+            .shown_engine(tab)
+            .filter(|_| self.tabs[tab].current_view().is_some());
+        let message = match (command, engine) {
+            (Command::PageFind(Some(text)), _) if text.len() > MAX_FIND => {
+                format!("page.find searches for at most {MAX_FIND} bytes of text.")
+            }
+            (Command::PageFind(_), Some(engine)) => format!("{engine} can't find in page."),
+            (Command::PageFind(_), None) => "This tab shows no page to find in.".to_owned(),
+            (Command::PageFindNext | Command::PageFindPrevious, _) => {
+                "Nothing to find: page.find <text> first.".to_owned()
+            }
+            _ => return,
+        };
+        self.tab_notice(tab, &message, fx);
+    }
+
     /// Reopens the page in the next enabled web engine, in [`Environment::web_engines`] order,
     /// wrapping around. The navigation is `page.open-in` of that engine. Anything else is a
     /// notice, and the page stays. While the tab is already switching, nothing happens.
@@ -174,12 +318,12 @@ impl BrowserState {
         }
         let url = self.address(tab).filter(|url| !url.is_empty());
         let Some(url) = url else {
-            return self.switch_notice(tab, "This tab has no page to open in another engine.", fx);
+            return self.tab_notice(tab, "This tab has no page to open in another engine.", fx);
         };
         let web = url::Url::parse(&url)
             .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https" | "file"));
         if !web {
-            return self.switch_notice(
+            return self.tab_notice(
                 tab,
                 "page.switch-engine opens http, https and file pages. This page stays where it is.",
                 fx,
@@ -199,7 +343,7 @@ impl BrowserState {
                 ),
                 _ => "No web engine is enabled, so this page stays where it is.".to_owned(),
             };
-            return self.switch_notice(tab, &message, fx);
+            return self.tab_notice(tab, &message, fx);
         }
         let next = match self
             .shown_engine(tab)
@@ -229,7 +373,7 @@ impl BrowserState {
     }
 
     /// Says `message` about tab `tab` and leaves the keyboard where it is.
-    fn switch_notice(&mut self, tab: usize, message: &str, fx: &mut Fx) -> Option<KeyboardFocus> {
+    fn tab_notice(&mut self, tab: usize, message: &str, fx: &mut Fx) -> Option<KeyboardFocus> {
         fx.push(Effect::Notice {
             tab: Some(self.tabs[tab].id),
             message: message.to_owned(),

@@ -42,13 +42,14 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     text_input: true,
     accessibility: false,
     screenshots: false,
-    find_in_page: false,
+    find_in_page: false, // lane B: true once find in page is wired
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
     process_per_view: true,
     semantics: false,
     site_data: sighurt_api::engine::SiteDataKinds::NONE,
+    fullscreen: false,
 };
 
 /// Most events one pump hands over.
@@ -1178,6 +1179,8 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"))
             }
+            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         Ok(())
     }

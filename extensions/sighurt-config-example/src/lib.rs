@@ -1,5 +1,5 @@
 //! `example`: the example configuration. A NORMAL and an INSERT mode with the terminal's keys in
-//! both frontends (`table`), and two actions computed from the browser's state (`actions`),
+//! both frontends (`table`), and three actions computed from the browser's state (`actions`),
 //! written in Rust against `sighurt_api::keymap` (docs/rewrite/config-extension.md, §3). Select it
 //! with `[input] keymap = "example"`; copy the crate and edit the tables to make your own.
 //!
@@ -7,6 +7,8 @@
 //!   not fire while a text field (or the line) has it, so forms are typed into without changing
 //!   mode. Unbound keys pass. The indicator is empty, or the keys of an unfinished sequence.
 //! - **INSERT** binds Escape only; every other key passes. The indicator is `INSERT MODE`.
+//! - **Escape** switches mode, except while the page shown holds an element fullscreen (a
+//!   video): then it runs `page.exit-fullscreen` and the mode stays.
 //! - **The address line.** While the chrome has the keyboard only `Always` bindings whose first
 //!   key types nothing apply; Escape and the editing keys are the line's.
 //! - **Sequences** are at most 4 keys, no binding the start of another, and never wait for a
@@ -86,6 +88,7 @@ enum Resolved {
     Run(Command),
     RunThenPass(Command),
     Mode(Mode),
+    ExitFullscreenOr(Mode),
     Custom(fn(&dyn Browser) -> Vec<Command>),
 }
 
@@ -110,6 +113,7 @@ fn parse(table: &[Binding]) -> Vec<Parsed> {
                 Action::Run(text) => Resolved::Run(command(text)),
                 Action::RunThenPass(text) => Resolved::RunThenPass(command(text)),
                 Action::Mode(mode) => Resolved::Mode(mode),
+                Action::ExitFullscreenOr(mode) => Resolved::ExitFullscreenOr(mode),
                 Action::Custom(f) => Resolved::Custom(f),
             },
             scope: binding.scope,
@@ -250,7 +254,14 @@ impl Keymap for Example {
                 KeyAction::Run(command)
             }
             Some(Resolved::RunThenPass(command)) => KeyAction::RunThenPass(command),
-            Some(Resolved::Mode(mode)) => {
+            Some(Resolved::ExitFullscreenOr(_))
+                if browser
+                    .tab(browser.active_tab())
+                    .is_some_and(|tab| tab.fullscreen) =>
+            {
+                KeyAction::Run(Command::PageExitFullscreen)
+            }
+            Some(Resolved::Mode(mode) | Resolved::ExitFullscreenOr(mode)) => {
                 self.set_mode(mode);
                 KeyAction::Take
             }

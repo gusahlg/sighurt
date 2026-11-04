@@ -257,6 +257,37 @@ pub enum EngineEvent {
         /// Whether the engine has more sites than `sites` holds.
         more: bool,
     },
+    /// What the view's search found, after a [`FindCommand`](crate::engine::FindCommand)
+    /// `Search`, `Next` or `Previous`. Replaceable: only the latest counts. `current` and
+    /// `total` are 1-based when the engine knows them: WebKit reports only `total`, NetSurf
+    /// only `found`. Numbers only, so nothing to contain. The core drops it when `search` is
+    /// not the view's current search or `document` is no longer its document.
+    FindResult {
+        /// The view.
+        view: ViewId,
+        /// The document searched.
+        document: DocumentGeneration,
+        /// The search, as its `Search` named it.
+        search: RequestId,
+        /// Whether there is a match.
+        found: bool,
+        /// Which match is selected, from 1, when the engine knows.
+        current: Option<u32>,
+        /// How many matches there are, when the engine knows.
+        total: Option<u32>,
+    },
+    /// The document entered or left element fullscreen inside the view (a video, a game): a
+    /// fact, not a request. The browser answers with its policy: the window's own state, or
+    /// [`ExitFullscreen`](crate::engine::EngineCommand::ExitFullscreen). Ordered, not
+    /// replaceable: entering and leaving both matter.
+    FullscreenChanged {
+        /// The view.
+        view: ViewId,
+        /// The document whose element it is.
+        document: DocumentGeneration,
+        /// Whether an element is fullscreen now.
+        fullscreen: bool,
+    },
     /// [`crate::engine::SiteDataRequest::Forget`] or [`ForgetAll`](crate::engine::SiteDataRequest::ForgetAll)
     /// finished. Not replaceable. [`EngineEvent::check`] drops an empty `removed` name or one
     /// longer than [`MAX_SITE_NAME`] bytes, and cuts an error message to [`MAX_SITE_MESSAGE`].
@@ -291,7 +322,9 @@ impl EngineEvent {
             | Self::OpenRequested { view, .. }
             | Self::CloseRequested { view, .. }
             | Self::ViewClosed { view }
-            | Self::ViewFailed { view, .. } => Some(*view),
+            | Self::ViewFailed { view, .. }
+            | Self::FindResult { view, .. }
+            | Self::FullscreenChanged { view, .. } => Some(*view),
             Self::ServiceRequested(request) => Some(request.view),
             Self::RuntimeFailed { .. } | Self::SitesListed { .. } | Self::SiteDataDone { .. } => {
                 None

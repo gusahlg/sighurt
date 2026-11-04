@@ -1,5 +1,5 @@
 //! The actions this configuration defines itself: commands computed from what the browser shows
-//! (`sighurt_api::keymap::Browser`). Owns those two functions; must not read anything but the
+//! (`sighurt_api::keymap::Browser`). Owns those functions; must not read anything but the
 //! `Browser` it is given, keep state, or do I/O.
 
 use std::num::NonZeroUsize;
@@ -13,6 +13,16 @@ pub fn copy_address(browser: &dyn Browser) -> Vec<Command> {
         .tab(browser.active_tab())
         .and_then(|tab| tab.url)
         .map(|url| vec![Command::ClipboardCopy(url.to_owned())])
+        .unwrap_or_default()
+}
+
+/// `y f`: copy the link the pointer is over in the selected tab. No link: the key is taken and
+/// nothing runs.
+pub fn copy_link(browser: &dyn Browser) -> Vec<Command> {
+    browser
+        .tab(browser.active_tab())
+        .and_then(|tab| tab.link)
+        .map(|link| vec![Command::ClipboardCopy(link.to_owned())])
         .unwrap_or_default()
 }
 

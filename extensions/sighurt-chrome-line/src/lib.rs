@@ -836,6 +836,12 @@ impl Chrome for Line {
                 self.unfocus();
                 Vec::new()
             }
+            // `location.focus <text>`: typed over the address the focus selected.
+            ChromeEvent::LineText(text) if self.focused => {
+                self.editor.select_all();
+                self.editor.insert(&text);
+                Vec::new()
+            }
             ChromeEvent::WindowFocus(event) => {
                 self.window_active = event == FocusEvent::Activated;
                 if !self.window_active {

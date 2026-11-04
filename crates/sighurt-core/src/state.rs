@@ -38,7 +38,7 @@
 //! Must not own: I/O, timers, threads, surface metrics or anything the chrome draws. It is not a
 //! framework: no event bus, no generic UI tree, no plugin registry.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -72,7 +72,8 @@ use crate::permissions::{self, Pending, Requests, Requirement, MAX_PENDING_REQUE
 use crate::router::{self, Route};
 use crate::session::{self, Session, SessionSegment, SessionTab};
 use crate::tabs::{
-    bounded, clamp, display_title, Content, LoadError, Tab, TabSummary, View, MAX_TEXT, MAX_URL,
+    bounded, clamp, display_title, link, ClosedTab, Content, LoadError, Tab, TabSummary, View,
+    MAX_CLOSED, MAX_TEXT, MAX_URL,
 };
 
 /// Which frontend is running. The same enum a keymap sees
@@ -317,6 +318,9 @@ pub enum Effect {
     /// The keyboard focus moves. `Chrome`: the chrome focuses its address line and selects its
     /// text. `Page`: the chrome leaves the address line, discarding an edit.
     Focus(KeyboardFocus),
+    /// The address line, just focused (`Focus(Chrome)` comes first), holds this text instead of
+    /// the address, the caret at its end, as if it had been typed: `location.focus <text>`.
+    LineText(String),
     /// Keyboard input for the chrome: the address bar has focus, or the page area shows no
     /// engine view.
     ChromeInput(InputEvent),
@@ -451,6 +455,9 @@ pub struct BrowserState {
     text_input: Option<TextInputState>,
     /// [`BrowserEvent::PageTyping`].
     page_typing: bool,
+    /// The tabs closed since the browser started, the latest last: what `tab.reopen` restores.
+    /// At most [`MAX_CLOSED`]; never saved.
+    pub(crate) closed: VecDeque<ClosedTab>,
 }
 
 /// Applies `event` to `state` and returns what the executable should do.
@@ -782,6 +789,9 @@ impl Browser for CoreBrowser<'_> {
             tab.zoom,
             shown.can_go_back,
             shown.can_go_forward,
+            shown.view.and_then(|view| view.hovered.as_deref()),
+            // No engine reports element fullscreen yet (lane D).
+            false,
         ))
     }
 }
@@ -813,6 +823,7 @@ impl BrowserState {
             cursor: Cursor::Default,
             text_input: None,
             page_typing: true,
+            closed: VecDeque::new(),
         }
     }
 
@@ -1044,10 +1055,17 @@ impl BrowserState {
         Some(self.tabs.len() - 1)
     }
 
-    /// Closes tab `index`, unless it is the last one.
+    /// Closes tab `index`, unless it is the last one. A tab with an address is kept for
+    /// `tab.reopen`, dropping the oldest beyond [`MAX_CLOSED`].
     pub(crate) fn close_tab(&mut self, index: usize, fx: &mut Fx) {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return;
+        }
+        if let Some(closed) = self.closed_tab(index) {
+            if self.closed.len() == MAX_CLOSED {
+                self.closed.pop_front();
+            }
+            self.closed.push_back(closed);
         }
         let tab = self.tabs.remove(index);
         for view in tab.views() {
@@ -1058,6 +1076,28 @@ impl BrowserState {
         }
         fx.chrome = true;
         fx.session = true;
+    }
+
+    /// What `tab.reopen` keeps of tab `index`: the address it shows, its title, the engine the
+    /// user chose for it and its zoom. `None` when it has no address.
+    fn closed_tab(&self, index: usize) -> Option<ClosedTab> {
+        let tab = &self.tabs[index];
+        let shown = shown(tab, &self.views, &self.env);
+        Some(ClosedTab {
+            url: self.address(index)?,
+            title: shown.title.map(str::to_owned),
+            engine: self.chosen_engine(index),
+            zoom: tab.zoom,
+        })
+    }
+
+    /// The engine the user chose for the page tab `index` shows, if they chose one.
+    pub(crate) fn chosen_engine(&self, index: usize) -> Option<String> {
+        let view = self.tabs[index]
+            .current_view()
+            .and_then(|id| self.views.get(&id));
+        view.filter(|view| view.chosen)
+            .map(|view| view.engine.clone())
     }
 
     pub(crate) fn tab_index(&self, tab: TabId) -> Option<usize> {
@@ -1539,6 +1579,7 @@ impl BrowserState {
         v.document = None;
         // The status text was the document's: it must not hide why the view failed.
         v.status = None;
+        v.hovered = None;
         v.answers.clear();
         v.loading = false;
         v.navigations.clear();
@@ -1838,6 +1879,7 @@ impl BrowserState {
                 fx.chrome = true;
             }
             EngineEvent::StatusTextChanged { text, .. } => {
+                view.hovered = text.as_deref().and_then(link);
                 view.status = text.map(clamp);
                 fx.chrome = true;
             }
@@ -1850,6 +1892,10 @@ impl BrowserState {
                 })
             }
             EngineEvent::FrameReady { .. } | EngineEvent::SemanticsChanged { .. } => {}
+            // The core starts no search yet, so every result is stale (lane B).
+            EngineEvent::FindResult { .. } => {}
+            // No engine declares element fullscreen yet (lane D).
+            EngineEvent::FullscreenChanged { .. } => {}
             EngineEvent::ServiceRequested(request) => self.service_requested(request, at, fx),
             EngineEvent::ServiceCancelled { request, .. } => {
                 if self.requests.get(request).is_some_and(|p| p.view == id) {
@@ -1932,6 +1978,7 @@ impl BrowserState {
             view.answers.clear();
             view.activation = None;
             view.link = None;
+            view.hovered = None;
             self.cancel_requests(id, Some(document), fx);
         }
         let Some(tab) = self.tab_index(tab) else {

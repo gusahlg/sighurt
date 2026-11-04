@@ -461,7 +461,7 @@ mod tests {
         );
         assert_eq!(
             bindings.find(KeyboardFocus::Chrome, true, &ctrl_l),
-            Some(&Command::LocationFocus)
+            Some(&Command::LocationFocus(None))
         );
         let j = press(36, character("j"), NONE, NONE);
         assert_eq!(
@@ -588,8 +588,11 @@ mod tests {
             state: ButtonState::Released,
             ..down.clone()
         };
-        assert_eq!(handle(&down), KeyOutcome::Run(vec![Command::TabNew]));
-        assert_eq!(handle(&repeat), KeyOutcome::Run(vec![Command::TabNew]));
+        assert_eq!(handle(&down), KeyOutcome::Run(vec![Command::TabNew(None)]));
+        assert_eq!(
+            handle(&repeat),
+            KeyOutcome::Run(vec![Command::TabNew(None)])
+        );
         // Ctrl was let go while A repeats: still the browser's.
         let bare_repeat = KeyEvent {
             modifiers: NONE,
@@ -660,7 +663,7 @@ mod tests {
         fn press(&mut self, key: &KeyEvent, _: KeyContext, _: &dyn Browser) -> KeyAction {
             match &key.key {
                 Key::Character(text) if text == "a" => {
-                    KeyAction::RunAll(vec![Command::TabNew, Command::PageReload])
+                    KeyAction::RunAll(vec![Command::TabNew(None), Command::PageReload])
                 }
                 Key::Character(text) if text == "e" => KeyAction::RunAll(Vec::new()),
                 _ => KeyAction::Pass,
@@ -678,7 +681,7 @@ mod tests {
         let mut keys = KeyState::new(kind, &Table::new());
         let seat = SeatId::next();
         let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser);
-        let commands = vec![Command::TabNew, Command::PageReload];
+        let commands = vec![Command::TabNew(None), Command::PageReload];
         let down = press(KEY_A, character("a"), NONE, NONE);
         let repeat = KeyEvent {
             repeat: true,

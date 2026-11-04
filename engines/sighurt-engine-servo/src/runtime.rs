@@ -145,6 +145,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     process_per_view: false,
     semantics: true,
     site_data: sighurt_api::engine::SiteDataKinds::NONE,
+    fullscreen: false, // lane D: true once element fullscreen is wired
 };
 
 /// What the executable decides for the Servo runtime.
@@ -1594,6 +1595,8 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                     }
                 }
             }
+            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         Ok(())
     }

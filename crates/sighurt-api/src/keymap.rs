@@ -32,9 +32,9 @@
 //!
 //! A keymap is the browser's configuration in Rust (docs/rewrite/config-extension.md): it reads
 //! what the browser shows through [`Browser`], defines its own actions as commands computed from
-//! it, and shows its state in both frontends' chromes through [`Keymap::indicator`]. Titles and
-//! addresses are page data: a keymap may compute with them (an address to copy, a tab to close)
-//! and must not put them in its indicator or log them.
+//! it, and shows its state in both frontends' chromes through [`Keymap::indicator`]. Titles,
+//! addresses and links are page data: a keymap may compute with them (an address to copy,
+//! a tab to close) and must not put them in its indicator or log them.
 //!
 //! [`Chord`] is one keystroke of the configuration's syntax, for keymaps to match key events
 //! with.
@@ -112,6 +112,12 @@ pub struct TabInfo<'a> {
     pub can_go_back: bool,
     /// Whether `page.forward` has somewhere to go.
     pub can_go_forward: bool,
+    /// The link the pointer is over in the page shown: an http, https or file URL as the
+    /// browser would open it, at most 8 KiB, gone when the document changes or the pointer
+    /// leaves it. Page data, like the title; never anything else the page's status text says.
+    pub link: Option<&'a str>,
+    /// Whether the page shown holds an element fullscreen (`page.exit-fullscreen` leaves it).
+    pub fullscreen: bool,
 }
 
 impl<'a> TabInfo<'a> {
@@ -126,6 +132,8 @@ impl<'a> TabInfo<'a> {
         zoom: f64,
         can_go_back: bool,
         can_go_forward: bool,
+        link: Option<&'a str>,
+        fullscreen: bool,
     ) -> Self {
         Self {
             id,
@@ -136,6 +144,8 @@ impl<'a> TabInfo<'a> {
             zoom,
             can_go_back,
             can_go_forward,
+            link,
+            fullscreen,
         }
     }
 }

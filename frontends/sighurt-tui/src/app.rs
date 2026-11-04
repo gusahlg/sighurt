@@ -126,8 +126,20 @@ const KITTY_UPLOAD_END: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
 /// The least time between two pointer motions handed to the core. Terminals report motion
 /// per cell; a motion inside the interval waits, and a newer one replaces it.
 const MOTION_INTERVAL: Duration = Duration::from_millis(16);
-/// The most pasted text the address line or a page's field takes.
+/// The most pasted text the address line or a page's field takes, and the most text
+/// `location.focus <text>` puts in the line.
 const MAX_PASTE: usize = 1024 * 1024;
+
+/// Cuts `text` to at most `max` bytes, at a character boundary.
+fn cut(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+}
 /// How long an OSC 52 read waits for the terminal.
 const CLIPBOARD_WAIT: Duration = Duration::from_secs(1);
 /// What a read reports. The terminal's clipboard is text.
@@ -922,13 +934,7 @@ impl App {
     /// A pasted text: the address line's while it is open, the page's if it has a text field,
     /// and otherwise nobody's.
     fn paste(&mut self, mut text: String) -> Option<InputKind> {
-        if text.len() > MAX_PASTE {
-            let mut end = MAX_PASTE;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-        }
+        cut(&mut text, MAX_PASTE);
         if self.tui.text.paste(&text) {
             self.tui.chrome_dirty = true;
             return None;
@@ -2226,6 +2232,16 @@ impl Frontend for Tui {
         }
     }
 
+    fn line_text(&mut self, mut text: String, _queue: &mut VecDeque<BrowserEvent>) {
+        if let Some(editor) = &mut self.editing {
+            cut(&mut text, MAX_PASTE);
+            editor.select_all();
+            editor.insert(&text);
+            self.editing_fresh = false;
+            self.chrome_dirty = true;
+        }
+    }
+
     fn chrome_input(&mut self, event: InputEvent, queue: &mut VecDeque<BrowserEvent>) {
         match event.kind {
             InputKind::Key(key) => self.edit_key(&key, queue),
@@ -3212,6 +3228,26 @@ mod tests {
             Some(clipboard::set(Selection::Clipboard, line.as_bytes()).as_slice())
         );
         assert!(tui.chrome_dirty);
+    }
+
+    #[test]
+    fn location_focus_with_text_types_it_over_the_address() {
+        let (_master, mut tui) = on_pty();
+        let mut queue = VecDeque::new();
+        // No line open: nothing to fill.
+        tui.line_text(":".into(), &mut queue);
+        assert!(tui.editing.is_none());
+        tui.active_url = "https://example.test/a".into();
+        tui.focus(KeyboardFocus::Chrome, &mut queue);
+        tui.chrome_dirty = false;
+        tui.line_text("/".into(), &mut queue);
+        let editor = tui.editing.as_ref().unwrap();
+        assert_eq!((editor.text(), editor.selected()), ("/", false));
+        assert_eq!(editor.before_cursor(), "/");
+        // Typed, so the address of a page the run opened does not replace it.
+        assert!(!tui.editing_fresh);
+        assert!(tui.chrome_dirty);
+        assert!(queue.is_empty());
     }
 
     #[test]

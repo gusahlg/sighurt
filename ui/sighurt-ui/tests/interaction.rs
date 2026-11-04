@@ -452,6 +452,33 @@ fn typed_commands_run_after_a_colon() {
 }
 
 #[test]
+fn location_focus_with_text_types_it_over_the_address() {
+    let tabs = three_tabs();
+    let mut chrome = chrome(800, 600, tabs.clone());
+    chrome.window_focus(FocusEvent::Activated);
+    // Not focused: the line is not the core's to fill.
+    chrome.line_text(":");
+    assert_eq!(address(&chrome), "https://sighurt.example/");
+    // `location.focus :`: the focus, then the text, caret at its end.
+    chrome.set_focus(KeyboardFocus::Chrome);
+    chrome.line_text(":");
+    assert_eq!(address(&chrome), ":");
+    assert_eq!(chrome.state().address.cursor(), 1);
+    assert!(chrome.state().address.selection().is_empty());
+    // It is an edit: a new snapshot of the same tab keeps it, and Enter runs it as a command.
+    let mut loading = tabs;
+    loading.status = None;
+    chrome.set_snapshot(loading);
+    type_text(&mut chrome, "tab.reopen");
+    let actions = chrome.key(&named("Enter", Modifiers::default()));
+    assert_eq!(commands(&actions), [Command::TabReopen]);
+    // Cut to what the line holds.
+    chrome.set_focus(KeyboardFocus::Chrome);
+    chrome.line_text(&"x".repeat(sighurt_ui::text_edit::MAX_TEXT + 10));
+    assert_eq!(address(&chrome).len(), sighurt_ui::text_edit::MAX_TEXT);
+}
+
+#[test]
 fn the_committed_address_is_not_the_typed_one() {
     let mut chrome = editing("");
     chrome.key(&ctrl("a", 30));
@@ -485,7 +512,7 @@ fn a_new_tab_focuses_its_address_selected() {
     chrome.window_focus(FocusEvent::Activated);
     let new_tab = center(chrome.layout().new_tab);
     let actions = click(&mut chrome, new_tab);
-    assert_eq!(commands(&actions), [Command::TabNew]);
+    assert_eq!(commands(&actions), [Command::TabNew(None)]);
     // The core opens a fourth tab, active, at home.
     let mut snapshot = chrome.snapshot().clone();
     snapshot.tabs[0].active = false;

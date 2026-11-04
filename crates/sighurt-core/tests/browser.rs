@@ -507,6 +507,307 @@ fn tabs_keep_their_numbering_and_closing_rules() {
     assert!(effects.contains(&Effect::Focus(KeyboardFocus::Page)));
 }
 
+/// The tabs' committed addresses, in order.
+fn urls(b: &Harness) -> Vec<String> {
+    b.state
+        .tabs()
+        .map(|tab| tab.url.unwrap_or("").to_owned())
+        .collect()
+}
+
+#[test]
+fn tab_new_opens_an_address_as_page_open_does() {
+    let mut b = Harness::start(
+        "[keywords]\nw = \"https://w.test/?q={}\"",
+        &["https://a.test/"],
+    );
+    let effects = b.apply(command("tab.new w rust"));
+    assert_eq!((b.state.active(), b.state.tabs().len()), (1, 2));
+    assert_eq!(b.active().url, Some("https://w.test/?q=rust"));
+    // The page gets the keyboard, not the address line.
+    assert!(effects.contains(&Effect::Focus(KeyboardFocus::Page)));
+    assert!(!effects.contains(&Effect::Focus(KeyboardFocus::Chrome)));
+
+    b.apply(command("tab.new rust servo"));
+    assert_eq!(b.state.active(), 2);
+    assert!(b
+        .active()
+        .url
+        .unwrap()
+        .starts_with("https://duckduckgo.com/html/?q=rust%20servo"));
+
+    // Routing, as for a typed address: a Wasm file goes to the wasm engine.
+    let effects = b.apply(command("tab.new /tmp/app.wasm"));
+    let engines: Vec<_> = opened(&effects).into_iter().map(|(_, e, _)| e).collect();
+    assert_eq!(engines, ["wasm"]);
+    assert_eq!(b.state.tabs().len(), 4);
+
+    // Without an address, the home page and the address line, as before.
+    let effects = b.apply(command("tab.new"));
+    assert_eq!(b.active().content, Content::Internal("sig://home"));
+    assert!(effects.contains(&Effect::Focus(KeyboardFocus::Chrome)));
+}
+
+#[test]
+fn tab_duplicate_opens_the_address_after_the_selected_tab() {
+    let mut b = Harness::start(
+        "",
+        &["https://a.test/", "https://b.test/x", "https://c.test/"],
+    );
+    b.apply(command("tab.select 2"));
+    b.apply(command("page.zoom-in"));
+    let original = b.shown();
+    let effects = b.apply(command("tab.duplicate"));
+    assert_eq!(
+        urls(&b),
+        [
+            "https://a.test/",
+            "https://b.test/x",
+            "https://b.test/x",
+            "https://c.test/"
+        ]
+    );
+    assert_eq!(b.state.active(), 2);
+    assert_ne!(b.shown(), original, "a view of its own");
+    assert_eq!(b.active().zoom, b.tab(1).zoom);
+    assert!(effects.contains(&Effect::Focus(KeyboardFocus::Page)));
+    // Its history is not copied.
+    assert!(!b.active().can_go_back);
+
+    // A page opened in an engine the user chose stays in that engine.
+    let mut b = Harness::start("", &["https://a.test/"]);
+    b.apply(command("page.open-in wasm"));
+    let effects = b.apply(command("tab.duplicate"));
+    let engines: Vec<_> = opened(&effects).into_iter().map(|(_, e, _)| e).collect();
+    assert_eq!(engines, ["wasm"]);
+}
+
+#[test]
+fn tab_duplicate_of_a_tab_with_no_page_is_a_home_tab() {
+    let mut b = Harness::start("", &["https://a.test/"]);
+    // A tab whose first page never committed.
+    b.update(command("tab.new https://slow.test/"));
+    assert_eq!(b.active().url, None);
+    b.apply(command("tab.duplicate"));
+    assert_eq!(b.state.tabs().len(), 3);
+    assert_eq!(b.state.active(), 2);
+    assert_eq!(b.active().content, Content::Internal("sig://home"));
+}
+
+#[test]
+fn tab_move_wraps_and_clamps_and_the_selection_follows() {
+    let mut b = Harness::start(
+        "",
+        &["https://a.test/", "https://b.test/", "https://c.test/"],
+    );
+    let ids: Vec<TabId> = b.state.tabs().map(|t| t.id).collect();
+    let order = |b: &Harness| b.state.tabs().map(|t| t.id).collect::<Vec<_>>();
+    let effects = b.apply(command("tab.move right"));
+    assert_eq!(order(&b), [ids[1], ids[0], ids[2]]);
+    assert_eq!(b.state.active(), 1);
+    assert_eq!(b.active().id, ids[0]);
+    assert!(effects.contains(&Effect::SaveSession));
+    assert!(effects.contains(&Effect::RedrawChrome));
+    // The keyboard stays where it was.
+    assert!(!effects.iter().any(|e| matches!(e, Effect::Focus(_))));
+
+    b.apply(command("tab.move 3"));
+    assert_eq!(order(&b), [ids[1], ids[2], ids[0]]);
+    // The last tab right wraps to the start, the first left to the end.
+    b.apply(command("tab.move right"));
+    assert_eq!(order(&b), [ids[0], ids[1], ids[2]]);
+    assert_eq!(b.state.active(), 0);
+    b.apply(command("tab.move left"));
+    assert_eq!(order(&b), [ids[1], ids[2], ids[0]]);
+    assert_eq!((b.state.active(), b.active().id), (2, ids[0]));
+
+    // Past the end is the end; 0 is not a position.
+    b.apply(command("tab.select 1"));
+    b.apply(command("tab.move 999"));
+    assert_eq!(order(&b), [ids[2], ids[0], ids[1]]);
+    assert_eq!(b.state.active(), 2);
+    assert!("tab.move 0"
+        .parse::<sighurt_api::commands::Command>()
+        .is_err());
+    // Where it already is: nothing changes, nothing is saved.
+    let effects = b.apply(command("tab.move 3"));
+    assert!(!effects.contains(&Effect::SaveSession));
+
+    // The session saves the new order.
+    let saved: Vec<String> = b
+        .state
+        .session()
+        .tabs
+        .iter()
+        .map(|tab| tab.segments[0].entries[0].clone())
+        .collect();
+    assert_eq!(
+        saved,
+        ["https://c.test/", "https://a.test/", "https://b.test/"]
+    );
+
+    // One tab: nothing to move.
+    let mut b = Harness::start("", &["https://a.test/"]);
+    let effects = b.apply(command("tab.move left"));
+    assert_eq!(b.state.tabs().len(), 1);
+    assert!(!effects.contains(&Effect::SaveSession));
+}
+
+#[test]
+fn tab_reopen_opens_the_address_of_the_tab_closed_last() {
+    let mut b = Harness::start("", &["https://a.test/", "https://b.test/"]);
+    let effects = b.apply(command("tab.reopen"));
+    assert_eq!(
+        notices(&effects),
+        [
+            "No closed tab to reopen: tab.reopen brings back the last 10 tabs closed since sig \
+          started."
+        ]
+    );
+    assert_eq!(b.state.tabs().len(), 2);
+
+    // Its address, in a new tab at the end, selected, at its zoom: not its history.
+    b.apply(command("tab.select 1"));
+    b.apply(command("page.open https://a.test/2"));
+    b.apply(command("page.zoom-in"));
+    let zoom = b.active().zoom;
+    b.apply(command("tab.close 1"));
+    assert_eq!(urls(&b), ["https://b.test/"]);
+    let effects = b.apply(command("tab.reopen"));
+    assert_eq!(urls(&b), ["https://b.test/", "https://a.test/2"]);
+    assert_eq!(b.state.active(), 1);
+    assert_eq!(b.active().zoom, zoom);
+    assert!(effects.contains(&Effect::Focus(KeyboardFocus::Page)));
+    assert!(!b.active().can_go_back, "the history is not restored");
+    // Reopened once: there is nothing left.
+    let effects = b.apply(command("tab.reopen"));
+    assert_eq!(notices(&effects).len(), 1);
+
+    // In the engine the user chose for it.
+    b.apply(command("page.open-in wasm https://w.test/app.wasm"));
+    b.apply(command("tab.close"));
+    let effects = b.apply(command("tab.reopen"));
+    let engines: Vec<_> = opened(&effects).into_iter().map(|(_, e, _)| e).collect();
+    assert_eq!(engines, ["wasm"]);
+    assert_eq!(b.active().url, Some("https://w.test/app.wasm"));
+}
+
+#[test]
+fn tab_reopen_keeps_the_last_ten_closed() {
+    let pages: Vec<String> = (0..12).map(|i| format!("https://p{i}.test/")).collect();
+    let mut all: Vec<&str> = pages.iter().map(String::as_str).collect();
+    all.push("https://last.test/");
+    let mut b = Harness::start("", &all);
+    // Close the first 11, oldest first.
+    for _ in 0..11 {
+        b.apply(command("tab.close 1"));
+    }
+    assert_eq!(b.state.tabs().len(), 2);
+    for i in (1..11).rev() {
+        b.apply(command("tab.reopen"));
+        assert_eq!(b.active().url, Some(pages[i].as_str()));
+    }
+    // p0 was the eleventh: dropped.
+    let effects = b.apply(command("tab.reopen"));
+    assert_eq!(notices(&effects).len(), 1);
+    assert_eq!(b.state.tabs().len(), 12);
+}
+
+#[test]
+fn tab_reopen_needs_room_and_a_close_that_closed() {
+    // The last tab stays, so closing it keeps nothing to reopen.
+    let mut b = Harness::start("", &["https://a.test/"]);
+    b.apply(command("tab.close"));
+    assert_eq!(notices(&b.apply(command("tab.reopen"))).len(), 1);
+
+    // With MAX_TABS open, reopening says so and opens nothing.
+    let mut b = Harness::start("", &["sig://home"]);
+    b.apply(command("tab.new https://a.test/"));
+    b.apply(command("tab.close"));
+    while b.state.tabs().len() < MAX_TABS {
+        b.update(command("tab.new"));
+    }
+    let effects = b.update(command("tab.reopen"));
+    assert!(notices(&effects)[0].contains("at most"), "{effects:?}");
+    assert_eq!(b.state.tabs().len(), MAX_TABS);
+    assert!(opened(&effects).is_empty());
+}
+
+#[test]
+fn tab_reopen_opens_what_the_tab_was_loading() {
+    let mut b = Harness::start("", &["https://a.test/"]);
+    // A tab still loading its first page keeps the address it was loading.
+    b.update(command("tab.new https://slow.test/"));
+    assert_eq!(b.active().url, None);
+    b.apply(command("tab.close"));
+    b.apply(command("tab.reopen"));
+    assert_eq!(b.active().url, Some("https://slow.test/"));
+}
+
+#[test]
+fn location_focus_with_text_hands_the_line_its_text_after_the_focus() {
+    let mut b = Harness::start("", &["https://a.test/"]);
+    let effects = b.apply(command("location.focus :"));
+    let focus = effects
+        .iter()
+        .position(|e| *e == Effect::Focus(KeyboardFocus::Chrome));
+    let text = effects
+        .iter()
+        .position(|e| *e == Effect::LineText(":".into()));
+    assert!(focus.is_some() && focus < text, "{effects:?}");
+    assert_eq!(b.state.focus(), KeyboardFocus::Chrome);
+    // Without text, only the focus.
+    let effects = b.apply(command("location.focus"));
+    assert!(effects.contains(&Effect::Focus(KeyboardFocus::Chrome)));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::LineText(_))));
+}
+
+#[test]
+fn find_history_and_fullscreen_say_what_is_missing() {
+    use sighurt_api::commands::{Command, MAX_FIND};
+    let mut b = Harness::start("", &["https://a.test/"]);
+    let view = b.shown();
+    let effects = b.apply(command("page.find hello"));
+    assert_eq!(notices(&effects), ["servo can't find in page."]);
+    assert!(commands(&effects, view).is_empty(), "no engine is asked");
+    for moves in ["page.find-next", "page.find-previous"] {
+        let effects = b.apply(command(moves));
+        assert_eq!(
+            notices(&effects),
+            ["Nothing to find: page.find <text> first."]
+        );
+    }
+    assert!(notices(&b.apply(command("page.find-stop"))).is_empty());
+    // The find field: the page's engine can't find either.
+    assert_eq!(
+        notices(&b.apply(command("page.find"))),
+        ["servo can't find in page."]
+    );
+    // Only a chrome can make a longer one; the core refuses it.
+    let long = BrowserEvent::Command(Command::PageFind(Some("a".repeat(MAX_FIND + 1))));
+    assert_eq!(
+        notices(&b.apply(long)),
+        ["page.find searches for at most 1024 bytes of text."]
+    );
+    b.apply(command("tab.new"));
+    assert_eq!(
+        notices(&b.apply(command("page.find hello"))),
+        ["This tab shows no page to find in."]
+    );
+    assert_eq!(
+        notices(&b.apply(command("history.clear"))),
+        ["sig keeps no history of the pages you visit, so there is nothing to clear."]
+    );
+    assert_eq!(
+        notices(&b.apply(command("browser.fullscreen"))),
+        ["browser.fullscreen is not available in this frontend."]
+    );
+    assert_eq!(
+        notices(&b.apply(command("page.exit-fullscreen"))),
+        ["The page shown is not in fullscreen."]
+    );
+}
+
 #[test]
 fn quitting_saves_the_session_first() {
     let mut b = Harness::start("", &[]);
@@ -1585,6 +1886,9 @@ fn pages_open_tabs_only_after_a_click_or_key() {
         at: b.now,
     });
     assert_eq!(b.state.tabs().len(), 1);
+    // A tab its page closed can be reopened too.
+    b.apply(command("tab.reopen"));
+    assert_eq!(b.active().url, Some("https://popup.test/"));
 }
 
 #[test]
@@ -2442,8 +2746,9 @@ fn a_failed_page_says_so_when_it_is_shown_again() {
 /// `script`, a keymap for these tests. `[keymap.script]` says what a press of a key that types
 /// a character does: `"take"` takes a fresh press and passes its repeats, `"run <command>"`
 /// runs the command, `"then <command>"` runs it and passes the press on, `"all <commands>"`
-/// runs those commands (separated by `;`) in order, and `"close-titled <title>"` closes the
-/// tab whose own title it read. It counts the presses it is asked about, and shows the count
+/// runs those commands (separated by `;`) in order, `"close-titled <title>"` closes the tab
+/// whose own title it read, and `"copy-link"` copies the link the pointer is over in the
+/// selected tab, or takes the key when there is none. It counts the presses it is asked about, and shows the count
 /// as its indicator. What the core tells it goes into a log of the thread, so each test sees
 /// its own.
 mod script {
@@ -2480,6 +2785,7 @@ mod script {
         Then(Command),
         All(Vec<Command>),
         CloseTitled(String),
+        CopyLink,
     }
 
     fn rule(text: &str, commands: &CommandSet<'_>) -> Result<Rule, String> {
@@ -2502,10 +2808,11 @@ mod script {
         }
         match text.split_once(' ') {
             None if text == "take" => Ok(Rule::Take),
+            None if text == "copy-link" => Ok(Rule::CopyLink),
             Some(("run", command)) => commands.parse(command).map(Rule::Run),
             Some(("then", command)) => commands.parse(command).map(Rule::Then),
             _ => Err(format!(
-                "{text:?}: expected take, run, then, all or close-titled"
+                "{text:?}: expected take, run, then, all, close-titled or copy-link"
             )),
         }
     }
@@ -2569,6 +2876,13 @@ mod script {
                 Some((_, Rule::Then(command))) => KeyAction::RunThenPass(command.clone()),
                 Some((_, Rule::All(commands))) => KeyAction::RunAll(commands.clone()),
                 Some((_, Rule::CloseTitled(title))) => close_titled(browser, title),
+                Some((_, Rule::CopyLink)) => {
+                    let tab = browser.tab(browser.active_tab());
+                    match tab.and_then(|tab| tab.link) {
+                        Some(link) => KeyAction::Run(Command::ClipboardCopy(link.into())),
+                        None => KeyAction::Take,
+                    }
+                }
                 _ => KeyAction::Pass,
             }
         }
@@ -2705,6 +3019,51 @@ fn a_keymap_reads_the_tabs_it_decides_with() {
     assert_eq!(b.state.tabs().len(), 2);
     assert_eq!(b.tab(0).title, "Keep");
     assert_eq!(b.tab(1).title, "Stay");
+}
+
+#[test]
+fn a_keymap_reads_the_hovered_link() {
+    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\"y\" = \"copy-link\"";
+    let mut b = Harness::start(config, &["https://a.test/"]);
+    let view = b.shown();
+    let copied = |effects: &[Effect]| {
+        effects.iter().find_map(|e| match e {
+            Effect::ClipboardWrite(text) => Some(text.clone()),
+            _ => None,
+        })
+    };
+    assert_eq!(copied(&b.key(typed("y"))), None);
+    let status = |b: &mut Harness, text: &str| {
+        b.engine(EngineEvent::StatusTextChanged {
+            view,
+            text: Some(text.into()),
+        });
+    };
+    // A link, as opening it would load it.
+    status(&mut b, "HTTPS://A.test/link?x");
+    assert_eq!(
+        copied(&b.key(typed("y"))).as_deref(),
+        Some("https://a.test/link?x")
+    );
+    // Status text that is not an http, https or file URL is no link, nor is a longer one.
+    for text in [
+        "Loading…",
+        "javascript:alert(1)",
+        "tab.close",
+        "mailto:a@b.test",
+        &format!("https://a.test/{}", "x".repeat(8 * 1024)),
+    ] {
+        status(&mut b, text);
+        assert_eq!(copied(&b.key(typed("y"))), None, "{text}");
+    }
+    status(&mut b, "file:///tmp/a%20b.html");
+    assert_eq!(
+        copied(&b.key(typed("y"))).as_deref(),
+        Some("file:///tmp/a%20b.html")
+    );
+    // A new document has no hovered link until the page says so.
+    b.apply(command("page.open https://b.test/"));
+    assert_eq!(copied(&b.key(typed("y"))), None);
 }
 
 #[test]

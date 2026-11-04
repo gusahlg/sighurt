@@ -169,14 +169,16 @@ forward = "page.forward"
 # work without any.
 #
 # While the page has the keyboard, in both frontends: q quits, o focuses the address line,
-# : focuses it and types itself, ctrl-o focuses it from anywhere, t opens a tab, x closes
-# the tab, J and K move to the next and previous tab, H and L go back and forward, r and
-# ctrl-r reload (ctrl-r from anywhere), e reopens the page in the next web engine, j and k
-# scroll, ctrl-d and ctrl-u scroll a page, g and G go to the top and the bottom, and + - =
-# zoom. alt-1 to alt-9 select those tabs from anywhere. Escape enters INSERT MODE, which
-# shows INSERT MODE and passes every other key until Escape leaves it. y y copies the
-# page's address and c o closes the other tabs, highest number first. Those two are key
-# sequences of the example configuration, not of [keys].
+# : opens it as the command line (location.focus :), / opens the find field (page.find),
+# ctrl-o focuses it from anywhere, t opens a tab, x closes the tab, u reopens the tab closed
+# last, J and K move to the next and previous tab, H and L go back and forward, r and ctrl-r
+# reload (ctrl-r from anywhere), e reopens the page in the next web engine, j and k scroll,
+# ctrl-d and ctrl-u scroll a page, g and G go to the top and the bottom, and + - = zoom.
+# alt-1 to alt-9 select those tabs from anywhere. Escape enters INSERT MODE, which shows
+# INSERT MODE and passes every other key until Escape leaves it. y y copies the page's
+# address, y f the link the pointer is over, and c o closes the other tabs, highest number
+# first. Those three are key sequences of the example configuration, not of [keys]. The
+# other tab commands are typed after ":": tab.move left, tab.duplicate, tab.new <address>.
 #
 # In the terminal only: ctrl-c quits and m switches between text and graphics, both while
 # the page has the keyboard, and ctrl-l redraws the page wherever the keyboard is. A
@@ -211,14 +213,37 @@ forward = "page.forward"
 # layouts, while a letter keeps its shift: "ctrl-shift-t" and "ctrl-T" are both Ctrl+Shift+T.
 # AltGr is never Ctrl+Alt. While you type, in the address bar or a text field of a page, a
 # keystroke that types a character (no modifier but shift) types it instead of running its
-# command. [keys] has no key sequences such as "g g". The example configuration's y y and
-# c o are sequences in its own table.
+# command. [keys] has no key sequences such as "g g". The example configuration's y y, y f
+# and c o are sequences in its own table.
 #
-# Commands: tab.new, tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last,
-# page.open <url>, page.open-in <engine> [url], page.switch-engine, page.reload, page.stop,
-# page.back, page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
-# clipboard.copy <text>, location.focus, browser.home, browser.quit, site.forget [host],
-# and the chrome's own, chrome.<action>. Tabs count from 1.
+# Commands: tab.new [address], tab.duplicate, tab.move left|right|<n>, tab.reopen,
+# tab.close [n], tab.next, tab.previous, tab.select <n>, tab.last, page.open <url>,
+# page.open-in <engine> [url], page.switch-engine, page.reload, page.stop, page.back,
+# page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
+# page.find [text], page.find-next, page.find-previous, page.find-stop,
+# page.exit-fullscreen, clipboard.copy <text>, location.focus [text], history.clear,
+# browser.home, browser.fullscreen, browser.quit, site.forget [host], and the chrome's own,
+# chrome.<action>. Tabs count from 1.
+#
+# tab.new opens the home page in a new tab and puts you in the address line; with an address
+# it opens that as page.open would (keywords, searches and routing included) and gives the
+# page the keyboard. tab.duplicate opens the address shown in a new tab right after it,
+# without its history. tab.move left and right move the tab shown one place, wrapping
+# around; tab.move <n> moves it to position n. tab.reopen opens the address of the tab
+# closed last again, in a new tab at the end, in the engine you chose for it and at its
+# zoom; its history and what the page held (a form you filled in, a scroll position) are
+# gone. sig keeps the last 10 tabs closed since it started.
+#
+# location.focus puts you in the address line with the address selected; with text, the line
+# holds that text instead, the cursor at its end: "location.focus :" opens the command line.
+#
+# page.find <text> finds the text (at most 1024 bytes) in the page shown, wrapping around,
+# and is case-sensitive only when the text has a capital letter; page.find alone opens the
+# chrome's find field. page.find-next and page.find-previous move between the matches and
+# page.find-stop ends the search. A page whose engine can't find in it says so.
+# history.clear forgets the pages you visited. browser.fullscreen puts the window in
+# fullscreen, or takes it out; page.exit-fullscreen leaves the fullscreen a page put one of
+# its elements in (a video, a game).
 #
 # clipboard.copy <text> puts the text on the clipboard. The runtime refuses text over its
 # limit and says so, rather than cutting it.

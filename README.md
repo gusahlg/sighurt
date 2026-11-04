@@ -426,7 +426,10 @@ command, typed into the address line) all run them.
 
 | Command | What it does |
 |---|---|
-| `tab.new` | a new tab on the home page |
+| `tab.new [address]` | a new tab on the home page, with the address line ready; or on the address, as `page.open` opens it |
+| `tab.duplicate` | the page shown again, in a new tab right after it (without its history) |
+| `tab.move left`, `tab.move right`, `tab.move <n>` | move the active tab one place (wrapping around), or to position `n` |
+| `tab.reopen` | open the address of the tab closed last again, in the engine you chose for it and at its zoom, without its history (the last 10 closed since `sig` started) |
 | `tab.close [n]` | close the active tab, or tab `n` (tabs count from 1) |
 | `tab.next`, `tab.previous`, `tab.last`, `tab.select <n>` | switch tabs |
 | `page.open <url>` | open an address or a search in the active tab |
@@ -435,7 +438,11 @@ command, typed into the address line) all run them.
 | `page.reload`, `page.stop`, `page.back`, `page.forward` | the page's own |
 | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` | page zoom |
 | `page.send-key <key>` | press and release a named key in the page, as if typed: `down`, `pageup`, `end`, `space`, `enter`, `f5`, `shift-space`, … |
-| `location.focus` | focus the address line with its text selected |
+| `page.find [text]`, `page.find-next`, `page.find-previous`, `page.find-stop` | find text (at most 1024 bytes) in the page shown, wrapping around (case-sensitive only when the text has a capital letter), or with no text open the chrome's find field; move between the matches; end the search. A page whose engine can't find says so |
+| `page.exit-fullscreen` | leave the fullscreen a page put one of its elements in (a video, a game) |
+| `location.focus [text]` | focus the address line with its text selected; with text, the line holds that text instead (`location.focus :` opens the command line) |
+| `history.clear` | forget the pages you visited |
+| `browser.fullscreen` | put the window in fullscreen, or take it out |
 | `clipboard.copy <text>` | put the text on the clipboard |
 | `browser.home` | open the home page in the active tab |
 | `browser.quit` | quit, saving the tabs |
@@ -452,8 +459,10 @@ address line or a page's text field, and the keys no row names pass to the page.
 | Key | Command |
 |---|---|
 | `q` | `browser.quit` |
-| `o`, `:`, `ctrl-o` | `location.focus` (the address line; `:` then a command runs it) |
-| `t`, `x` | `tab.new`, `tab.close` |
+| `o`, `ctrl-o` | `location.focus` (the address line) |
+| `:` | `location.focus :`: the command line, where a command typed after `:` runs (`:tab.move left`, `:tab.duplicate`, `:tab.new <address>`) |
+| `/` | `page.find`: the find field |
+| `t`, `x`, `u` | `tab.new`, `tab.close`, `tab.reopen` |
 | `J`, `K` | `tab.next`, `tab.previous` |
 | `alt-1` to `alt-9` | `tab.select 1` to `9` |
 | `H`, `L` | `page.back`, `page.forward` |
@@ -463,14 +472,15 @@ address line or a page's text field, and the keys no row names pass to the page.
 | `ctrl-d`, `ctrl-u` | page down, up |
 | `g`, `G` | top, bottom of the page |
 | `+`, `-`, `=` | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` |
-| `Escape` | insert mode: every key but `Escape` passes to the page or the line, and the chrome shows `INSERT MODE`; `Escape` again returns |
+| `Escape` | `page.exit-fullscreen` while the page shown has an element in fullscreen; otherwise insert mode: every key but `Escape` passes to the page or the line, and the chrome shows `INSERT MODE`; `Escape` again returns |
 | `y y` | copy the address of the tab shown (`clipboard.copy`) |
+| `y f` | copy the link the pointer is over |
 | `c o` | close every tab but the one shown |
 | terminal only: `ctrl-c` | `browser.quit` (only while the page has the keyboard) |
 | terminal only: `m` | `chrome.toggle-mode` (text or graphics) |
 | terminal only: `ctrl-l` | `chrome.refresh` (draw the page again) |
 
-`y y` and `c o` are written in Rust in the example, against the keymap API's read-only view of the
+`y y`, `y f` and `c o` are written in Rust in the example, against the keymap API's read-only view of the
 tabs. With `[input] keymap = "bindings"` nothing is bound until you bind it in `[keys]` (and
 `[tui.keys]`, over it, in the terminal). The tab strip, the toolbar and the address line work
 without any keys. With the `bindings` keymap:
