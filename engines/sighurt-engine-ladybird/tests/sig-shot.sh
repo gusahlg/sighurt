@@ -21,7 +21,7 @@ mkdir -p "$XDG_CONFIG_HOME/sighurt"
 host=$(sed -E 's|^[a-z]+://([^/:]+).*|\1|' <<<"$url")
 if [[ ${MODE:-engine} == second ]]; then
   # A second Ladybird view: a page from the command line, a new tab (sig://home), then
-  # page.open-in ladybird into that tab.
+  # page.open-in ladybird into that tab; then back to the first tab, whose page must show again.
   cat > "$home/one.html" <<HTML
 <!doctype html><title>first</title><body style="background:#cfe">first
 HTML
@@ -38,6 +38,7 @@ enabled = ["ladybird", "demo"]
 keymap = "bindings"
 [keys]
 "ctrl-t" = "tab.new"
+"alt-1" = "tab.select 1"
 "ctrl-o" = "page.open-in ladybird file://$home/two.html"
 CONF
   engine_args=(--engine ladybird)
@@ -128,7 +129,15 @@ if [[ ${MODE:-engine} == second ]]; then
   sleep 2
   wtype -M ctrl -k o -m ctrl
   sleep 12
+  grim "$out/second.png"
+  # Back to the first tab: its Ladybird view, hidden meanwhile, presents again although the
+  # page paints nothing new, so the host maps it (a target shown again waits for a frame).
+  wtype -M alt 1 -m alt
+  sleep 3
+  grim -t ppm "$out/back.ppm"
   kill $keyboard 2>/dev/null
+  check "back on the first tab, its page shows again (#cfe)" \
+    test "$(python3 "$repo/apps/sighurt-browser/tests/probe.py" pixel "$out/back.ppm" 640 500)" == "204 255 238"
 elif [[ ${MODE:-engine} == links ]]; then
   pointer=${CARGO_TARGET_DIR:-$repo/target}/debug/examples/virtual-pointer
   mkfifo "$XDG_RUNTIME_DIR/pointer"

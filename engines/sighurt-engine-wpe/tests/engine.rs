@@ -665,9 +665,17 @@ fn wpe_views_navigate_present_ask_and_fail_distinctly() {
         "a hidden view stops presenting"
     );
 
+    // Shown again, a view presents even when WebKit renders nothing new (a static page): the
+    // host waits for a frame before it maps a target shown again.
+    let hidden_frames = d.state.submitted(a);
+    d.state.set_visible(a, true);
+    assert!(
+        d.run_until(WAIT, |s| s.submitted(a) > hidden_frames),
+        "a view shown again presents"
+    );
+
     // A crashed web process fails its view's document, not the view or the others; a reload
     // brings it back with a new document.
-    d.state.set_visible(a, true);
     d.state.layout = Layout::Split;
     d.state.place();
     d.state.runtime.terminate_web_process(b).unwrap();

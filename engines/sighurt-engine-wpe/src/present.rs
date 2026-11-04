@@ -329,6 +329,17 @@ impl ShmBuffers {
         Ok(Some((target.wl_buffer.clone(), target.key)))
     }
 
+    /// Our buffer `key`, still of `size`, to attach again: it holds the last frame copied into
+    /// it, since a copy picks a buffer only to attach it. `None` once a new size dropped it.
+    pub fn again(&mut self, key: BufferKey, size: (u32, u32)) -> Option<WlBuffer> {
+        let buffer = self
+            .buffers
+            .iter_mut()
+            .find(|b| b.key == key && b.size == size)?;
+        buffer.busy = true;
+        Some(buffer.wl_buffer.clone())
+    }
+
     /// Marks our buffer `key` free again; false if it isn't one of ours.
     pub fn release(&mut self, key: BufferKey) -> bool {
         match self.buffers.iter_mut().find(|b| b.key == key) {

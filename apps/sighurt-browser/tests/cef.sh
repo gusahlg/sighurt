@@ -2,7 +2,8 @@
 # sig with the CEF engine, end to end, in a private headless sway on a private D-Bus session:
 # example.com and a local input page open in Chromium (`page.open-in cef`), the page is
 # shown, typing reaches a field and not the keymap, a paste goes through the clipboard service,
-# and an idle page costs nothing. Screenshots and logs in OUT. Builds sig with the cef and
+# the page shows again after another tab was shown, and an idle page costs nothing.
+# Screenshots and logs in OUT. Builds sig with the cef and
 # demo engines (no Servo, no WPE). Never touches the desktop or the user's configuration: every
 # XDG directory is under OUT.
 #
@@ -49,6 +50,7 @@ directory = "$out/downloads"
 keymap = "bindings"
 [keys]
 "ctrl-t" = "tab.new"
+"alt-1" = "tab.select 1"
 "ctrl-l" = "location.focus"
 "ctrl-q" = "browser.quit"
 "h" = "tab.new"
@@ -149,6 +151,14 @@ check "an attachment goes to the browser's download service, whole" \
 check "Ctrl+L took the keyboard from the page's field: none of the command reached it" \
   "$([[ $(served '/typed/%3A.*') == 0 ]]; echo "$? the page reported $(served '/typed/%3A.*') typed command prefix(es)")"
 info "screenshot $out/02-typed.png"
+# Another tab, then back: the CEF view, hidden meanwhile, presents again although its page
+# paints nothing new, and the host maps it (a target shown again waits for a frame).
+key -M ctrl t -m ctrl
+check "a new tab hides the CEF view" "$(dg 10 "len(tabs)==2 and (shown is None or shown['engine']!='cef'), shown and shown['engine']")"
+key -M alt 1 -m alt
+check "back on the first tab, the CEF view is shown and mapped" \
+  "$(dg 10 "shown is not None and shown['engine']=='cef' and shown['mapped'], shown and (shown['engine'], shown['mapped'])")"
+shot 04-shown-again 0.5
 # Idle: after load, nothing wakes sig and Chromium's tree does not burn CPU.
 sleep 3
 before=$(tree)

@@ -174,6 +174,21 @@ pub enum Answer {
     Withdraw(Vec<RequestId>),
 }
 
+/// The frame a view submitted last, which it can submit again. At most one per view, dropped
+/// with it.
+pub enum Shown {
+    /// WebKit's DMA-BUF, attached to the surface. WebKit gets it back (`released`) once a newer
+    /// frame replaced it and the compositor released it, not before: until then its pixels are
+    /// the page's.
+    Dmabuf(Buffer),
+    /// Our `wl_shm` buffer, of this size, holding the last frame copied (the shared-memory
+    /// fallback). WebKit's own buffer went back at once.
+    Shm(crate::present::BufferKey, (u32, u32)),
+    /// WebKit's shared-memory frame last copied into a CPU target. Rendered, and released once
+    /// a newer frame replaced it.
+    Cpu(Buffer),
+}
+
 /// One view. `close` drops WebKit's objects first and the target last; the field order is not
 /// that sequence.
 pub struct Page<T: WpeTarget> {
@@ -185,6 +200,11 @@ pub struct Page<T: WpeTarget> {
     pub pending: Option<(Buffer, Vec<ffi::WPERectangle>)>,
     /// The epoch of the frame last submitted.
     pub presented: Option<LayoutEpoch>,
+    /// The frame last submitted, kept to submit again when the view is shown again: WebKit
+    /// renders a static page once, and a target shown again waits for a frame.
+    pub(crate) shown: Option<Shown>,
+    /// Shown again with nothing new pending: the next permit submits [`shown`](Self::shown).
+    pub(crate) reshow: bool,
     pub navigator: Navigator<glib::Object>,
     pub loading: bool,
     pub requests: Vec<Request>,

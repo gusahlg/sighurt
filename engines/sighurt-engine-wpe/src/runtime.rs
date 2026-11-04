@@ -96,7 +96,7 @@ use crate::platform::{Buffer, Call, Display, View};
 use crate::present::{self, BufferKey, PresentStats, Wayland};
 use crate::semantic::{self, Tag};
 use crate::target::WpeTarget;
-use crate::view::{self, Answer, Note, Page, RequestKind, Shared, TextInput};
+use crate::view::{self, Answer, Note, Page, RequestKind, Shared, Shown, TextInput};
 
 /// What the WPE engine supports, for the executable's registry before the runtime exists.
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
@@ -948,7 +948,10 @@ impl<T: WpeTarget> WpeRuntime<T> {
         for key in released {
             self.stats.releases += 1;
             if let Some((view, buffer)) = self.in_flight.remove(&key) {
-                if let Some(page) = self.pages.get(&view) {
+                // The frame the view shows last stays ours, to submit again when the view is
+                // shown again; it goes back when a newer one replaces it (`replace_shown`).
+                let shown = |page: &Page<T>| matches!(&page.shown, Some(Shown::Dmabuf(b)) if b.as_ptr() == buffer.as_ptr());
+                if let Some(page) = self.pages.get(&view).filter(|page| !shown(page)) {
                     unsafe { ffi::wpe_view_buffer_released(page.wpe(), buffer.as_ptr()) };
                 }
             } else if let Some((&view, page)) = self.pages.iter_mut().find_map(|(view, page)| {
@@ -1093,11 +1096,15 @@ impl<T: WpeTarget> WpeRuntime<T> {
             requests,
             held,
             navigator,
+            shown,
             ..
         } = page;
         drop(held);
         drop(requests);
         drop(navigator);
+        // The frame kept to submit again: WebKit's buffer (and our `wl_buffer` on it) before
+        // WebKit's view, which takes the rest of its buffers.
+        drop(shown);
         drop(wpe_view);
         drop(web_view);
         if let Some(slot) = slot {
@@ -1222,13 +1229,16 @@ impl<T: WpeTarget> WpeRuntime<T> {
         present::damage(surface, if copied { &[] } else { &damage }, size);
         surface.commit();
         page.presented = Some(epoch);
+        page.reshow = false;
         unsafe { ffi::wpe_view_buffer_rendered(page.wpe(), frame.as_ptr()) };
         if copied {
             self.stats.shm_copies += 1;
             self.stats.shm_bytes += u64::from(size.0) * u64::from(size.1) * 4;
             unsafe { ffi::wpe_view_buffer_released(page.wpe(), frame.as_ptr()) };
+            replace_shown(page, &self.in_flight, Shown::Shm(key, size));
         } else {
             self.stats.dmabuf_frames += 1;
+            replace_shown(page, &self.in_flight, Shown::Dmabuf(frame.clone()));
             self.in_flight.insert(key, (view, frame));
         }
         T::dismiss(permit, PresentOutcome::Submitted);
@@ -1274,10 +1284,10 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 self.stats.shm_copies += 1;
                 self.stats.shm_bytes += u64::from(width) * u64::from(height) * 4;
                 page.presented = Some(epoch);
-                unsafe {
-                    ffi::wpe_view_buffer_rendered(page.wpe(), frame.as_ptr());
-                    ffi::wpe_view_buffer_released(page.wpe(), frame.as_ptr());
-                }
+                page.reshow = false;
+                // Released once a newer frame replaces it: shown again, it is copied again.
+                unsafe { ffi::wpe_view_buffer_rendered(page.wpe(), frame.as_ptr()) };
+                replace_shown(page, &self.in_flight, Shown::Cpu(frame));
                 self.account_present(start);
                 Ok(PresentOutcome::Submitted)
             }
@@ -1289,6 +1299,69 @@ impl<T: WpeTarget> WpeRuntime<T> {
         }
     }
 
+    /// Submits the view's last frame again, for a target shown again ([`Page::reshow`]): our
+    /// `wl_buffer` attached again (no copy, no WebKit), or the CPU frame copied again (that copy
+    /// is the frame). A frame of another size than the permit's is not shown: WebKit renders the
+    /// new size.
+    fn present_again(
+        &mut self,
+        view: ViewId,
+        permit: T::Permit,
+        epoch: LayoutEpoch,
+        unchanged: PresentOutcome,
+        start: Instant,
+    ) -> Result<PresentOutcome, EngineError> {
+        let page = self.pages.get_mut(&view).expect("present checked the view");
+        page.reshow = false;
+        let buffer = T::permit_buffer(&permit, page.buffer);
+        let size = (buffer.width, buffer.height);
+        let near = |(w, h): (u32, u32)| w.abs_diff(size.0) <= 1 && h.abs_diff(size.1) <= 1;
+        let wayland = self.platform.as_mut().and_then(|p| p.wayland.as_mut());
+        let attach = match (&page.shown, page.slot.as_mut(), wayland) {
+            (Some(Shown::Dmabuf(frame)), Some(_), Some(wayland)) if near(frame.size()) => {
+                // Imported already: the `wl_buffer` is kept on WebKit's buffer.
+                match wayland.dmabuf_buffer(frame) {
+                    Ok((wl_buffer, key)) => {
+                        self.in_flight.insert(key, (view, frame.clone()));
+                        Some((wl_buffer, frame.size()))
+                    }
+                    Err(_) => None,
+                }
+            }
+            (Some(Shown::Shm(key, shm_size)), Some(slot), Some(_)) if near(*shm_size) => {
+                slot.shm.again(*key, *shm_size).map(|b| (b, *shm_size))
+            }
+            (Some(Shown::Cpu(frame)), None, None) if frame.size() == size => {
+                let frame = frame.clone();
+                return match page.target.copy_shm(permit, &frame) {
+                    Ok(took) => {
+                        self.max_copy = self.max_copy.max(took);
+                        self.total_copy += took;
+                        self.stats.shm_copies += 1;
+                        self.stats.shm_bytes += u64::from(size.0) * u64::from(size.1) * 4;
+                        page.presented = Some(epoch);
+                        self.account_present(start);
+                        Ok(PresentOutcome::Submitted)
+                    }
+                    Err(message) => Err(EngineError::View { view, message }),
+                };
+            }
+            _ => None,
+        };
+        let Some((wl_buffer, size)) = attach else {
+            T::dismiss(permit, unchanged);
+            return Ok(unchanged);
+        };
+        let surface = &page.slot.as_ref().expect("a Wayland view").surface;
+        surface.attach(Some(&wl_buffer), 0, 0);
+        present::damage(surface, &[], size);
+        surface.commit();
+        page.presented = Some(epoch);
+        T::dismiss(permit, PresentOutcome::Submitted);
+        self.account_present(start);
+        Ok(PresentOutcome::Submitted)
+    }
+
     fn account_present(&mut self, start: Instant) {
         let took = start.elapsed();
         self.max_present = self.max_present.max(took);
@@ -1298,6 +1371,29 @@ impl<T: WpeTarget> WpeRuntime<T> {
         if !self.events.is_empty() {
             self.waker.wake();
         }
+    }
+}
+
+/// Makes `shown` the view's last frame. The one it replaces goes back to WebKit when it is
+/// WebKit's and the compositor no longer holds it (a DMA-BUF it still holds goes back on its
+/// release, in `release_buffers`).
+fn replace_shown<T: WpeTarget>(
+    page: &mut Page<T>,
+    in_flight: &HashMap<BufferKey, (ViewId, Buffer)>,
+    shown: Shown,
+) {
+    let old = match page.shown.replace(shown) {
+        Some(Shown::Dmabuf(old)) => old,
+        Some(Shown::Cpu(old)) => old,
+        _ => return,
+    };
+    let same = |b: &Buffer| b.as_ptr() == old.as_ptr();
+    let still = match &page.shown {
+        Some(Shown::Dmabuf(new) | Shown::Cpu(new)) if same(new) => true,
+        _ => in_flight.values().any(|(_, b)| same(b)),
+    };
+    if !still {
+        unsafe { ffi::wpe_view_buffer_released(page.wpe(), old.as_ptr()) };
     }
 }
 
@@ -1770,6 +1866,8 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                 input: Input::default(),
                 pending: None,
                 presented: None,
+                shown: None,
+                reshow: false,
                 navigator: Default::default(),
                 loading: false,
                 requests: Vec::new(),
@@ -1856,7 +1954,10 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                         false => ffi::wpe_view_unmap(page.wpe()),
                     }
                 }
-                if visible && page.pending.is_some() {
+                // A target shown again waits for a frame, and a static page renders none: the
+                // last one is submitted again unless a newer one waits.
+                page.reshow = visible && page.pending.is_none() && page.shown.is_some();
+                if visible && (page.pending.is_some() || page.reshow) {
                     self.push(EngineEvent::FrameReady { view });
                 }
             }
@@ -2013,6 +2114,9 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
         // submitted. A CPU permit names one layout; one for a layout the view has left is
         // not ready, even when that layout was shown.
         let current = T::permit_is_current(&permit, page.epoch);
+        if current && page.pending.is_none() && page.reshow {
+            return self.present_again(view, permit, epoch, unchanged, start);
+        }
         if !current || page.pending.is_none() {
             let outcome = if current || page.slot.is_some() {
                 unchanged
