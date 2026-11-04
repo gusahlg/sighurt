@@ -3933,3 +3933,43 @@ Newest last. Each entry says what was decided and why.
     (snapshot 10.4 → 0.36 ms with 50 long-URL tabs; hovering links 10.0 → 4.6 s of owner CPU
     in 10 s, −80 % instructions); views found by a target map (−2 %); the host-event list
     reused. H-OWN5 (cloning each engine command for a rare refusal) is 0.03 % and stays.
+125. **The render framework: chromes draw scenes, backends render them** (3–4 November 2026;
+    the user: "make a framework to replace the current UI/drawing library … many different kinds
+    of backends … mixed without modifying browser code … a substantial wgpu backend as the
+    primary one but … also a pure vulkan one and maybe a metal one"). Design
+    `docs/rewrite/RENDER.md` (Claude Fable 5.1), critiqued before a line was written by the
+    deep-design agent and GPT-6 Astra (§14: wgpu is Vulkan-only, since wgpu's GL path would
+    share and terminate Servo's EGL display; `bind` is `unsafe` with the lease's contract and
+    the swapchain is configured lazily from the permit; MAILBOX required, never FIFO; outcomes
+    `Submitted | Unchanged | Deferred` and errors `Surface | Device` with fallback at backend
+    granularity; `auto` selects the CPU backend until measured at worst equal; incremental CPU
+    painting cut; one shared glyph-placement function; the `FontSystem` shared by handle), then
+    measured by an experiment before lane 2 (§15, `experiments/wgpu-subsurface`: on this NVIDIA
+    desktop `queue.present` commits the host's frame request synchronously at 60 permits/s;
+    MAILBOX offered; a second present inside an open synchronized transaction stalls 1 s in
+    wgpu-core's fixed acquire timeout, hence "one render per permit, retry by invalidation";
+    hide keeps the Surface; +117 MB RSS for the device). Built on branch `render` (Claude Opus
+    5.5) and merged (aa25a3b, 8f5dc9a): `render/sighurt-render` (scene, pen, text, glyph, shape,
+    backend, cpu; `gpu` behind a feature: `prepare`, `Atlas`, the vertex layout, `shaders.wgsl`
+    validated by naga in `cargo test`) and `render/sighurt-render-wgpu` (`render-wgpu`, in the
+    default set, chosen by `[ui] renderer = "wgpu"`). The chrome API draws with `Pen` into a
+    scene (`Chrome::draw`; `ChromeKind::new(Fonts)`; no pixel type in it any more; decision 10
+    becomes "sighurt-ui depends on api and render"); the CPU backend reproduces the old pixels
+    byte for byte (every golden at 1, 1.25, 1.5 and 2 unchanged) and commits nothing for an
+    unchanged scene; the GUI binds native chrome targets when they are made, keeps them across
+    hides (`Backend::forget_frame` at the merge), retries a `Deferred` frame 16 ms later, rebinds
+    a lost surface once and otherwise replaces the backend with the CPU one for the whole
+    window (`SIG_RENDER_FAIL=device|surface`); the Astra review of lane 1's API was applied in
+    lane 2 (font-system provenance, bounded glyph admission, shared path rasterization,
+    `RenderOutcome`, `BackendStats`, `Pen::clip`). `PresentMode::Gl` is `Native`. *Measured*
+    (`bench/results/RENDER.md`, release sig, demo engine, gles2 sway, 3 interleaved runs):
+    chrome render median cpu 0.19 ms vs wgpu 0.33 ms; idle 0.00 % vs 0.60 % CPU; RSS 14.6 vs
+    143.9 MiB — so `auto` is `cpu` (§14.5) and wgpu is a choice. *Verified*: sighurt-render 29+5
+    tests, the wgpu comparison on the GPU (worst pixel difference 4, at corners), headless.sh
+    110/110 with its `renderers` scenario (cpu, wgpu, surface rebind, device fallback;
+    screenshots within 2 levels of cpu), ui 35/35, the host suite 16/16, the workspace tests
+    (1017), the all-features clippy and tests with Servo and WPE, and a default sig with
+    Servo's GL page and the chrome on wgpu in one process under the GPU compositor
+    (`test-out/coexist-wgpu`: no fallback, clean exit). Deferred by design: images, native
+    damage, the Wasm canvas on the scene, Metal. The pure Vulkan backend (`sighurt-render-vulkan`
+    on ash, opt-in, never default) is lane 3, recorded when it lands.
