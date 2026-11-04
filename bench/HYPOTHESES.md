@@ -323,6 +323,9 @@ each seen there but not predicted, so each still to be tested:
 - **Prediction:** `steady.compositor_cpu_pct` on `wasm-raf` ≤ 15 % and `steady.gpu_util_pct`
   ≤ 13 %.
 - **Guards:** `wasm-raf` `steady.cpu_pct`, frames presented.
+- **Done as H19** (below): the Wasm engine damages the rectangles its draw list changed
+  (`engines/sighurt-engine-wasm/src/damage.rs`), measured on this desktop on 31 October 2026.
+  The louise-pc bench numbers of this entry were not repeated.
 
 ### H15: A flooding guest doesn't hold the owner thread
 
@@ -635,6 +638,20 @@ Written after its measurement, which was a probe: recorded because it was reject
   −3.3 %; chrome 73.9 (70.6–77.6) → 69.2 (68.2–71.2), −6 %. Kept because it moved beyond
   noise where glyphs are larger and regressed nothing; the golden images are byte for byte
   the same.
+
+### Optimization session (4 November 2026): measured and left alone
+
+- **Text mode's layout** (`frontends/sighurt-tui/src/textmode/layout.rs`): the existing test
+  `a_truncated_document_says_so_and_a_big_one_is_fast`, release, lays out a 20 000-node
+  snapshot with 4999 links at 80 columns in 6.8, 7.2 and 14.7 ms (three runs). It runs once per
+  snapshot or resize, not per frame; nothing changed.
+- **The owner loop** after decision 124 was not profiled again: `perf` cannot open events in
+  this session's sandbox. On `chrome.sh`'s hover phase (a status change and a `demo://resize`
+  repaint every 10 ms) `sig` uses 11 % of a core, which is the demo page's full repaint per
+  motion and the status line's shaping (H-CPU1's note), not the loop.
+- **The GPU renderers** (wgpu, Vulkan) were not changed: their per-frame cost is the driver's
+  acquire, submit and present (bench/results/RENDER.md), `auto` does not choose them, and the
+  CPU renderer is now the faster one per frame by more than before.
 
 ## Predictions for the IPC-removal session (gpui-baseline against 3c510fe)
 
