@@ -99,7 +99,8 @@ Environment:
   SIG_AUDIT_GL=1  Count Servo's GL reads of page pixels too (times every GL call; for tests)
   RUST_LOG        Log filter, such as RUST_LOG=debug
 
-Signals: SIGUSR1 prints the diagnostics on stderr; SIGTERM and SIGINT quit, saving the tabs.
+Signals: SIGUSR1 prints the diagnostics on stderr; SIGTERM, SIGINT and SIGHUP quit, saving the
+tabs.
 ```
 
 An argument that names an existing file becomes a `file:` URL; anything else is read as the

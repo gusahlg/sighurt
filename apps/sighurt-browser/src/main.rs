@@ -3,8 +3,11 @@
 //! Process-wide setup and the choice of frontend. Setup follows decision 26, before any engine
 //! starts: the panic hook logs and never exits; rustls gets the aws-lc-rs provider; the one
 //! `log` logger is Servo's when Servo is compiled in and enabled, `env_logger` otherwise (the
-//! frontend's launch does that). SIGUSR1 prints the diagnostics, SIGTERM and SIGINT quit cleanly
-//! (the session is saved); their handlers only write to a pipe the loop reads. With WPE WebKit
+//! frontend's launch does that). SIGUSR1 prints the diagnostics, SIGTERM, SIGINT and SIGHUP quit
+//! cleanly (the session is saved; the terminal frontend replaces SIGHUP's handler with its own);
+//! their handlers only write to a pipe the loop reads. SIGXFSZ is caught and does nothing, so a
+//! write over the file size limit (`ulimit -f`) fails with EFBIG, as one to a full disk does,
+//! instead of killing `sig`; children get the default back at exec. With WPE WebKit
 //! compiled in, its JavaScriptCore suspends threads with SIGUSR2 instead of SIGUSR1
 //! (`keep_webkit_off_sigusr1`). The one forced exit is the runtime's, after an engine that could
 //! not shut down (decision 54), and the frontend is asked to clean up first.
@@ -58,7 +61,8 @@ Environment:
   SIG_AUDIT_GL=1  Count Servo's GL reads of page pixels too (times every GL call; for tests)
   RUST_LOG        Log filter, such as RUST_LOG=debug
 
-Signals: SIGUSR1 prints the diagnostics on stderr; SIGTERM and SIGINT quit, saving the tabs.
+Signals: SIGUSR1 prints the diagnostics on stderr; SIGTERM, SIGINT and SIGHUP quit, saving the
+tabs.
 ";
 
 /// What the command line asks for.
@@ -270,12 +274,15 @@ fn webkit_environment() {
     }
 }
 
-/// The signals `sig` handles, and the pipe their handlers write the signal number to.
+/// The signals `sig` handles, and the pipe their handlers write the signal number to. SIGXFSZ
+/// gets a handler that does nothing: the write that went over the limit then fails with EFBIG.
 fn install_signal_handlers() -> std::io::Result<OwnedFd> {
     use rustix::pipe::{pipe_with, PipeFlags};
+    // SAFETY: the action does nothing.
+    unsafe { signal_hook_registry::register(libc::SIGXFSZ, || {})? };
     let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
     let write = Arc::new(write);
-    for signal in [libc::SIGUSR1, libc::SIGTERM, libc::SIGINT] {
+    for signal in [libc::SIGUSR1, libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         let write = Arc::clone(&write);
         // SAFETY: the action only calls write(2) on a non-blocking pipe, which is
         // async-signal-safe; it allocates nothing and takes no lock. A full pipe loses the

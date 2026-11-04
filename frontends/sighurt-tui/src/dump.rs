@@ -191,8 +191,8 @@ impl Frontend for Headless {
 
 /// Opens `options.open`, waits for the page and prints it to stdout. Returns the exit code: 0
 /// printed, 2 timed out. A page that fails to load, or a build with no engine that gives page
-/// text, is an error for the caller to print. `signals` is `sig`'s signal pipe: SIGTERM and
-/// SIGINT end the dump.
+/// text, is an error for the caller to print. `signals` is `sig`'s signal pipe: SIGTERM, SIGINT
+/// and SIGHUP end the dump.
 pub fn run(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
     // Library and engine logging goes to the log file when stderr is a terminal.
     let saved = match std::io::stderr().is_terminal() {
@@ -426,7 +426,7 @@ fn stats(snapshot: &SemanticSnapshot) -> String {
 }
 
 /// Writes `bytes` to stdout without ever blocking on it. Gives up at `deadline`
-/// (`Ok(false)`) or on SIGTERM and SIGINT. `deadline` is the dump's one timeout, not a
+/// (`Ok(false)`) or on SIGTERM, SIGINT and SIGHUP. `deadline` is the dump's one timeout, not a
 /// fresh one for the write.
 fn write_out(bytes: &[u8], signals: &OwnedFd, deadline: Instant) -> Result<bool, String> {
     let stdout = std::io::stdout();
@@ -547,7 +547,7 @@ fn write_nonblocking(
 
 /// Whether the byte `sig`'s signal pipe carries is a request to quit.
 fn is_quit(byte: u8) -> bool {
-    [libc::SIGTERM as u8, libc::SIGINT as u8].contains(&byte)
+    [libc::SIGTERM as u8, libc::SIGINT as u8, libc::SIGHUP as u8].contains(&byte)
 }
 
 /// Where a document is on its way to being printed: which one the snapshot count was taken at

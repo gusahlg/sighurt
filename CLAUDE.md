@@ -128,6 +128,13 @@ tools/heavy tools/headless-sway -- target/debug/sig
 tools/cargo test -p sighurt-browser -p sighurt-engine-demo --no-default-features --features engine-demo
 apps/sighurt-browser/tests/headless.sh OUT
 ui/sighurt-ui/tests/headless.sh OUT
+# Reliability: a soak of the demo and Wasm engines (default 10 minutes; RSS, fds, threads and
+# counters held to bounds) and fault injection (directories, locks, failing writes, sessions,
+# configurations, the compositor killed, signals, crashes, floods), each in private sways;
+# the terminal's faults (resize and input floods, a silent or garbage probe answer, the
+# terminal closed) are in apps/sighurt-browser/tests/tui.rs
+apps/sighurt-browser/tests/soak.sh OUT [MINUTES]
+apps/sighurt-browser/tests/faults.sh OUT [SCENARIO ...]
 
 # The chrome's renderers: sighurt-render with its GPU preparation (naga validates the WGSL; a
 # reference rasterizer compares prepared frames with the CPU backend), and the wgpu backend

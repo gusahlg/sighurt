@@ -3,7 +3,8 @@
 //! Its sources are the terminal (readable for input; writable only while bytes wait in the
 //! bounded output), the `SIGWINCH` pipe (resize, and the wake after `SIGCONT`), one ping that
 //! engine wakers and service threads share, the signal pipe from `sig` (SIGUSR1 diagnostics,
-//! SIGTERM and SIGINT quit) and the configuration watch.
+//! SIGTERM and SIGINT quit, and SIGHUP until the terminal's handler takes it over) and the
+//! configuration watch.
 //!
 //! One iteration, after the loop wakes, as in the Wayland loop: terminal input (at most
 //! [`MAX_EVENTS`] events a pass, each handed to the core), service completions, the layout's
@@ -86,7 +87,7 @@ use sighurt_core::{
 };
 use sighurt_runtime::diagnostics::{Diagnostics, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
-use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
+use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
 use sighurt_runtime::services::{Clipboard, Services, MAX_CLIPBOARD};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
 use sighurt_runtime::view::ViewEntry;
@@ -527,16 +528,9 @@ impl App {
         registry.start_at_launch(&config, || EngineWaker::new(move || servo_wake.ping()));
         // Servo's logger, if it started; otherwise env_logger. Either writes to the log file.
         sighurt_runtime::registry::install_logger();
-        let session_writer = match &paths.session {
-            Some(path) => match SessionWriter::new(path.clone()) {
-                Ok(writer) => Some(writer),
-                Err(error) => {
-                    log::warn!("cannot save the session: {error}");
-                    None
-                }
-            },
-            None => None,
-        };
+        let writer_wake = ping.clone();
+        let (session_writer, writer_notice) =
+            persistence::session_writer(paths.session.as_deref(), move || writer_wake.ping());
         let services_wake = ping.clone();
         let services = Services::new(move || services_wake.ping());
         let wake = std::sync::Arc::new(move || ping.ping());
@@ -597,6 +591,9 @@ impl App {
             left: false,
         };
         tui.adopt(settings);
+        if let Some(notice) = writer_notice {
+            tui.show_notice(notice);
+        }
         Ok(Self {
             tui,
             session,
@@ -781,7 +778,8 @@ impl App {
         for signal in std::mem::take(&mut self.signals) {
             match i32::from(signal) {
                 libc::SIGUSR1 => report(&self.tui, &mut self.session, false),
-                libc::SIGTERM | libc::SIGINT => {
+                // SIGHUP only before the terminal's own handler is installed.
+                libc::SIGTERM | libc::SIGINT | libc::SIGHUP => {
                     self.session
                         .queue_mut()
                         .push_back(BrowserEvent::Command(Command::BrowserQuit));

@@ -4024,3 +4024,25 @@ Newest last. Each entry says what was decided and why.
     the semantic parser, 1.5 s each); `SIG_FUZZ_ITERATIONS=100000` takes 143 s. Verified: the
     workspace tests (1076), the two clippy lines, fmt, the terminal frontend's tests with
     the demo and Wasm engines (198), sighurt-render with all features.
+127. **Reliability suites, and what they found** (4 November 2026, branch `reliability`; the
+    user asked for more reliability testing). Three suites stay in the tree:
+    `apps/sighurt-browser/tests/soak.sh OUT [MINUTES]` (demo and Wasm engines, pixman sway:
+    20-tab churn, history, zoom, 16 sizes over scales 1–2, hiding, configuration reloads with
+    an invalid file every third cycle, the clipboard both ways; RSS, VmHWM, descriptors,
+    threads, targets, views, buffer bytes and the glyph cache sampled at each cycle's end and
+    held to bounds; quit within 5 s; the session restored), `faults.sh OUT` (directories,
+    session locks, failing writes, broken and huge sessions, invalid configurations, the
+    compositor killed, signals, a crashing page, 200 `tab.new` and 1000 resizes) and seven
+    terminal tests in `tests/tui.rs` (200 SIGWINCH, a silent or garbage probe answer, 1 MB of
+    random input, the terminal closed, `--dump` of the slow page). *Measured* (debug sig, this
+    desktop): 19 cycles in 617 s with RSS 96.5–98.0 MiB from cycle 2 on (no climb), 18 fds, 22
+    threads, 9 targets and 4.6 MB of buffers at every cycle's end, no placement error; soak
+    143/143, faults 93/93. *Fixed*: SIGHUP quits saving the tabs (it killed the window and
+    `--dump` unsaved; the terminal keeps its own handler); SIGXFSZ has a no-op handler, so a
+    write over `ulimit -f` fails with EFBIG instead of killing sig with a core dump; a SIG_DIAG
+    line that can't be written no longer panics (stderr a closed pipe ended sig with 101); a
+    session that can't be saved, at startup or on a failed write, is a notice, not only a log
+    line (once until a write works; the previous file stays whole); a failed view's status
+    text is cleared, so the strip says why it failed. *Open*: the terminal's SIGHUP restores
+    the terminal and re-raises without the last session write (at most 1 s of changes lost);
+    under `ulimit -f` the SHM buffers (memfd) can't be sized either, so pages don't present.
