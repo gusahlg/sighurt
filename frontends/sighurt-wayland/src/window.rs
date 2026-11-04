@@ -2,13 +2,18 @@
 //!
 //! smithay-client-toolkit acknowledges each configure as it arrives. A configure that names a
 //! size is recorded, the window geometry is set to the whole root surface, and
-//! [`HostEvent::WindowConfigured`] is reported when that size or the scale changed. A configure
+//! [`HostEvent::WindowConfigured`] is reported when that size, the scale or the fullscreen state
+//! changed. A configure
 //! that leaves both axes to the client is not a size: the root is committed at the client's
 //! default so the window can map, and nothing is placed until a later configure names a size.
+//! Fullscreen is a request ([`Host::set_fullscreen`]) the compositor answers, or overrides, with
+//! a configure: the state the window reports is the one in the latest configure
+//! (`xdg_toplevel.state`), never the one asked for, so a compositor that refuses or ends
+//! fullscreen on its own is reported as it is.
 //! If none does within [`CLIENT_SIZE_GRACE`], the client default is reported, so a floating
 //! window still appears. The application answers with a placement, whose layout transaction
-//! commits the root with the new state. A configure that changes neither size nor scale
-//! (activation, say) is committed at once, or by the transaction already under way.
+//! commits the root with the new state. A configure that changes neither size, scale nor
+//! fullscreen state (activation, say) is committed at once, or by the transaction already under way.
 //!
 //! The root is a stable anchor that stays mapped while the window exists, and shows an opaque
 //! background wherever no target covers it: a single-pixel buffer scaled with `wp_viewporter`
@@ -130,8 +135,10 @@ pub(crate) struct Window {
     /// Until then a scale change is stored and reported with the first size, and nothing is placed.
     layout_ready: bool,
     pub scale: WindowScale,
-    /// The size and scale last reported as `WindowConfigured`.
-    reported: Option<(LogicalSize, Scale)>,
+    /// The toplevel is fullscreen, as the latest configure's `xdg_toplevel.state` says.
+    fullscreen: bool,
+    /// The size, scale and fullscreen state last reported as `WindowConfigured`.
+    reported: Option<(LogicalSize, Scale, bool)>,
     /// Armed while the first sizeless configure is waiting for a named size.
     fallback_timer: Option<RegistrationToken>,
     pub decorations: DecorationMode,
@@ -155,6 +162,21 @@ impl Window {
     /// The root surface.
     pub fn root(&self) -> &WlSurface {
         self.xdg.wl_surface()
+    }
+
+    /// Whether the compositor has the toplevel fullscreen (the latest configure's state).
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
+    /// Asks the compositor to put the toplevel into fullscreen on the output it is on, or to
+    /// take it out. The answer is a configure; [`Window::is_fullscreen`] changes with it.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        if fullscreen {
+            self.xdg.set_fullscreen(None);
+        } else {
+            self.xdg.unset_fullscreen();
+        }
     }
 
     /// Updates the background for the window's size, as pending root state for the next root
@@ -320,6 +342,7 @@ impl Host {
                 configured: false,
                 layout_ready: false,
                 scale: WindowScale::default(),
+                fullscreen: false,
                 reported: None,
                 fallback_timer: None,
                 decorations: DecorationMode::Client,
@@ -360,7 +383,21 @@ impl Host {
         drop(window);
     }
 
-    /// Reports `window`'s size and scale once a size is known and either has changed; otherwise
+    /// Asks the compositor to put `window` into fullscreen or take it out; nothing happens for
+    /// an unknown window. The change is reported as [`HostEvent::WindowConfigured`] when the
+    /// compositor's configure arrives, with the state it gave.
+    pub fn set_fullscreen(&mut self, window: WindowId, fullscreen: bool) {
+        if let Some(w) = self.windows.get(&window) {
+            w.set_fullscreen(fullscreen);
+        }
+    }
+
+    /// Whether the compositor has `window` fullscreen, as of its latest configure.
+    pub fn is_fullscreen(&self, window: WindowId) -> bool {
+        self.windows.get(&window).is_some_and(Window::is_fullscreen)
+    }
+
+    /// Reports `window`'s size, scale and fullscreen state once a size is known and any has changed; otherwise
     /// makes sure the latest acknowledged configure is committed. A sizeless configure before
     /// the first size is committed by [`Host::map_at_client_size`] and is not reported.
     fn report_configuration(&mut self, id: WindowId) {
@@ -371,7 +408,11 @@ impl Host {
         if !window.configured || !window.layout_ready {
             return;
         }
-        let now = (window.size, window.scale.effective(viewporter));
+        let now = (
+            window.size,
+            window.scale.effective(viewporter),
+            window.fullscreen,
+        );
         if window.reported != Some(now) {
             window.reported = Some(now);
             // Replaceable: a scale event often comes just before the configure with the new
@@ -383,6 +424,7 @@ impl Host {
                 window: id,
                 size: now.0,
                 scale: now.1,
+                fullscreen: now.2,
             });
         } else if window.transaction.is_none() {
             window.root().commit();
@@ -495,6 +537,7 @@ impl WindowHandler for Host {
             };
             let decision = decide_configure(configure.new_size, fallback);
             window.decorations = configure.decoration_mode;
+            window.fullscreen = configure.is_fullscreen();
             window.configured = true;
             match decision {
                 ConfigureDecision::Named(size) => {
