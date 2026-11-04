@@ -237,6 +237,7 @@ impl LineEditor {
         let text = sanitize(text);
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
+        self.settle();
     }
 
     /// Delete the grapheme before the cursor. A selected line is cleared.
@@ -247,6 +248,7 @@ impl LineEditor {
         let previous = prev_boundary(&self.text, self.cursor);
         self.text.replace_range(previous..self.cursor, "");
         self.cursor = previous;
+        self.settle();
     }
 
     /// Delete the grapheme after the cursor. A selected line is cleared.
@@ -256,6 +258,7 @@ impl LineEditor {
         }
         let next = next_boundary(&self.text, self.cursor);
         self.text.replace_range(self.cursor..next, "");
+        self.settle();
     }
 
     /// Move one grapheme left. A selection collapses to the start.
@@ -350,11 +353,26 @@ impl LineEditor {
         let (start, end) = (from.min(self.cursor), from.max(self.cursor));
         self.text.replace_range(start..end, "");
         self.cursor = start;
+        self.settle();
     }
 
     /// Insert `text` at the cursor, same as [`Self::insert`].
     pub fn paste(&mut self, text: &str) {
         self.insert(text);
+    }
+
+    /// Puts the cursor back on a cluster boundary of the whole line: an edit can join the text
+    /// on either side of the cursor into one cluster (a mark typed before a letter, a letter
+    /// deleted between two joiners). It moves on to the end of that cluster.
+    fn settle(&mut self) {
+        let end = self.text.len();
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .chain([end])
+            .find(|&mark| mark >= self.cursor)
+            .unwrap_or(end);
     }
 
     fn resanitize(&mut self) {

@@ -17,6 +17,7 @@ use sighurt_api::ids::{DocumentGeneration, ViewId};
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, Modifiers};
 use sighurt_api::present::Frame;
 use sighurt_api::semantic::{NodeId, NodeKind, SemanticNode, SemanticSnapshot};
+use sighurt_tui::chrome::LineEditor;
 use sighurt_tui::grid::{Attrs, Color, Grid};
 use sighurt_tui::kitty::{self, CellRect, CHUNK_BYTES};
 use sighurt_tui::sanitize::sanitize;
@@ -1209,4 +1210,103 @@ fn a_cluster_with_no_base_is_not_a_cell() {
     assert_eq!(terminal.cells[0].as_ref().unwrap().text, "a");
     assert_eq!(terminal.cells[1].as_ref().unwrap().text, " ");
     assert_eq!(terminal.cells[2].as_ref().unwrap().text, "b");
+}
+
+/// The terminal's line editor, as the address line and a page field use it: the cursor stays on a
+/// grapheme boundary, whatever is typed, pasted, deleted or moved over.
+#[test]
+fn fuzz_line_editor_keeps_its_cursor_on_a_boundary() {
+    run("fuzz_line_editor", iterations(100) / 2, LIMIT, |case| {
+        let pieces = [
+            "a",
+            "é",
+            "e\u{301}",
+            "日本",
+            "😀",
+            "👩\u{200d}👩\u{200d}👧",
+            "🇸🇪",
+            "\u{200d}",
+            "\u{301}",
+            "\u{fe0f}",
+            "\n",
+            "\t",
+            "\0",
+            "\x1b[31m",
+            "x y",
+            "  ",
+            "\u{202e}",
+            "한",
+        ];
+        let mut editor = if case.rng.one_in(2) {
+            LineEditor::new()
+        } else {
+            LineEditor::from_text(case.rng.string_from(&pieces, 4))
+        };
+        for step in 0..case.rng.range(1, 40) {
+            let piece = case.rng.string_from(&pieces, 4);
+            case.note(|| {
+                format!(
+                    "step {step}: {piece:?} on {:?} cursor at column {}",
+                    editor.text(),
+                    editor.cursor_column()
+                )
+            });
+            match case.rng.below(14) {
+                0..=3 => editor.insert(&piece),
+                4 => editor.paste(&piece),
+                5 => editor.backspace(),
+                6 => editor.delete(),
+                7 => editor.left(),
+                8 => editor.right(),
+                9 => editor.home(),
+                10 => editor.end(),
+                11 => editor.word_left(),
+                12 => editor.word_right(),
+                _ => {
+                    if case.rng.one_in(2) {
+                        editor.delete_word(case.rng.one_in(2));
+                    } else {
+                        editor.select_all();
+                    }
+                }
+            }
+            let text = editor.text();
+            let cursor = editor.before_cursor().len();
+            let marks: Vec<usize> = text
+                .grapheme_indices(true)
+                .map(|(i, _)| i)
+                .chain([text.len()])
+                .collect();
+            assert!(
+                marks.contains(&cursor),
+                "cursor {cursor} is inside a cluster of {text:?}"
+            );
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+            let _ = editor.cursor_column();
+        }
+    });
+}
+
+/// Found by `fuzz_line_editor_keeps_its_cursor_on_a_boundary`: an edit that joined the text on
+/// both sides of the cursor into one cluster left the cursor inside it, against the editor's
+/// rule that it sits on a grapheme boundary (typing a variation selector before a ZWJ, or
+/// deleting the letter between a base and its mark).
+#[test]
+fn an_edit_that_joins_the_text_around_the_cursor_moves_the_cursor_past_the_join() {
+    let mut editor = LineEditor::from_text("\u{200d}a");
+    editor.home();
+    editor.insert("\u{fe0f}");
+    assert_eq!(
+        editor.before_cursor(),
+        "\u{fe0f}\u{200d}",
+        "the cursor is after the joined cluster"
+    );
+    // A letter deleted between a joiner and an emoji: the two emoji become one cluster.
+    let mut editor = LineEditor::from_text("\u{1f469}\u{200d}x\u{1f469}");
+    editor.left();
+    editor.backspace();
+    assert_eq!(editor.text(), "\u{1f469}\u{200d}\u{1f469}");
+    assert_eq!(editor.before_cursor(), editor.text());
+    editor.left();
+    assert_eq!(editor.before_cursor(), "");
 }
