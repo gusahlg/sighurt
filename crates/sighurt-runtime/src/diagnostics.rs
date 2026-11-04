@@ -335,8 +335,15 @@ impl Diagnostics {
         self.last_error.clone()
     }
 
+    /// One line on stderr. A line that can't be written (a full disk, a closed pipe, the file
+    /// size limit) is lost: `eprintln!` would panic.
     fn line(&self, kind: &str, fields: std::fmt::Arguments<'_>) {
-        eprintln!("sig-diag t={:.6} {kind} {fields}", monotonic());
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "sig-diag t={:.6} {kind} {fields}",
+            monotonic()
+        );
     }
 
     /// Whether `engine`'s renderer line was printed.
