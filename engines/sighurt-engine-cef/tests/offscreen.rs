@@ -5,18 +5,21 @@
 //! pages' pixels (ARGB top-down), navigation events in order with
 //! history, a link the user clicks being held and answered, a popup becoming `OpenRequested`,
 //! typing, the text-input state, a paste through the clipboard service (a multi-line one as
-//! text, never Enter), a popup nobody clicked for refused, a page closing itself (asked, then
-//! failed and closed), resizing, idling without wakeups, and a clean shutdown.
+//! text, never Enter), a popup nobody clicked for refused, find in page (counts, moves, stops,
+//! no result given to a later search or document), a page closing itself (asked, then failed
+//! and closed), resizing, idling without wakeups, and a clean shutdown.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sighurt_api::engine::{EngineCommand, EngineRuntime, EngineWaker, PresentOutcome, ViewOptions};
+use sighurt_api::engine::{
+    EngineCommand, EngineRuntime, EngineWaker, FindCommand, PresentOutcome, ViewOptions,
+};
 use sighurt_api::events::{EngineEvent, HistoryEffect, OpenDisposition};
 use sighurt_api::geometry::{BufferSize, Metrics, Scale, SurfacePoint, WindowRect};
-use sighurt_api::ids::{LayoutEpoch, NavigationId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, RequestId, ViewId};
 use sighurt_api::input::{
     ButtonState, InputEvent, InputKind, Key, KeyCode, KeyEvent, Modifiers, PointerButton,
     PointerEvent,
@@ -192,6 +195,66 @@ impl Harness {
         });
         assert!(committed.is_some(), "{url} committed with the browser's id");
         navigation
+    }
+
+    /// The find results for `search` since `from`: found, current and total.
+    fn found(&self, from: usize, search: RequestId) -> Vec<(bool, Option<u32>, Option<u32>)> {
+        let results = self.log[from..].iter().filter_map(|e| match e {
+            EngineEvent::FindResult {
+                search: s,
+                found,
+                current,
+                total,
+                ..
+            } if *s == search => Some((*found, *current, *total)),
+            _ => None,
+        });
+        results.collect()
+    }
+
+    /// Pumps until a find result for `search` after `from` satisfies `done`; the last one.
+    fn find_result(
+        &mut self,
+        from: usize,
+        search: RequestId,
+        done: impl Fn(bool, Option<u32>, Option<u32>) -> bool,
+    ) -> Option<(bool, Option<u32>, Option<u32>)> {
+        self.wait(from, |e| match e {
+            EngineEvent::FindResult {
+                search: s,
+                found,
+                current,
+                total,
+                ..
+            } if *s == search && done(*found, *current, *total) => Some((*found, *current, *total)),
+            _ => None,
+        })
+    }
+
+    /// Starts a search of `document`.
+    fn search(
+        &mut self,
+        document: DocumentGeneration,
+        text: &str,
+        case_sensitive: bool,
+    ) -> RequestId {
+        let search = RequestId::next();
+        self.send(EngineCommand::Find(FindCommand::Search {
+            search,
+            document,
+            text: text.into(),
+            case_sensitive,
+        }));
+        search
+    }
+
+    /// Pumps for `time`.
+    fn idle(&mut self, time: Duration) {
+        let end = Instant::now() + time;
+        while Instant::now() < end {
+            self.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn title(&mut self, from: usize, wanted: &str) -> bool {
@@ -894,7 +957,114 @@ fn chromium_in_the_engine_contract() {
         "{download:?}"
     );
 
-    // 5. Resizing.
+    // 5. Find in page: a search counts and selects, moves select the next and previous match
+    // (wrapping), case is as asked, no match is said; a result is never stamped with a later
+    // search; moves and stops of a search the view no longer has and a search of a gone
+    // document do nothing; a new document ends the search.
+    let from = h.log.len();
+    h.navigate(&page("find.html"));
+    let document = h.log[from..]
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            EngineEvent::NavigationCommitted { document, .. } => Some(*document),
+            _ => None,
+        })
+        .expect("committed");
+    let apple = h.search(document, "apple", false);
+    let first = h.find_result(from, apple, |_, current, total| {
+        current.is_some() && total == Some(4)
+    });
+    assert_eq!(
+        first,
+        Some((true, Some(1), Some(4))),
+        "{:?}",
+        h.found(from, apple)
+    );
+    let expect = |h: &mut Harness, command: FindCommand, current: u32| {
+        let from = h.log.len();
+        h.send(EngineCommand::Find(command));
+        let result = h.find_result(from, apple, |_, c, _| c == Some(current));
+        assert_eq!(
+            result,
+            Some((true, Some(current), Some(4))),
+            "{:?}",
+            h.found(from, apple)
+        );
+    };
+    expect(&mut h, FindCommand::Next { search: apple }, 2);
+    expect(&mut h, FindCommand::Previous { search: apple }, 1);
+    expect(&mut h, FindCommand::Previous { search: apple }, 4);
+    let from = h.log.len();
+    let sensitive = h.search(document, "Apple", true);
+    let result = h.find_result(from, sensitive, |_, _, total| total == Some(1));
+    assert_eq!(result, Some((true, Some(1), Some(1))), "case-sensitive");
+    let pear = h.search(document, "pear", false);
+    let result = h.find_result(from, pear, |found, _, _| !found);
+    assert_eq!(result, Some((false, None, Some(0))), "no match");
+    // Two searches at once: the first's results are never stamped with the second.
+    let from = h.log.len();
+    let replaced = h.search(document, "apple", false);
+    let three = h.search(document, "three", false);
+    assert!(h
+        .find_result(from, three, |_, _, total| total == Some(1))
+        .is_some());
+    h.idle(Duration::from_millis(500));
+    assert!(
+        h.found(from, three)
+            .iter()
+            .all(|r| *r == (true, Some(1), Some(1))),
+        "{:?}",
+        h.found(from, three)
+    );
+    assert!(
+        h.found(from, replaced)
+            .iter()
+            .all(|r| r.2.is_none_or(|t| t == 4)),
+        "{:?}",
+        h.found(from, replaced)
+    );
+    let from = h.log.len();
+    let gone = FindCommand::Search {
+        search: RequestId::next(),
+        document: DocumentGeneration::next(),
+        text: "apple".into(),
+        case_sensitive: false,
+    };
+    for command in [
+        FindCommand::Next { search: replaced },
+        FindCommand::Previous { search: replaced },
+        FindCommand::Stop { search: replaced },
+        gone,
+    ] {
+        h.send(EngineCommand::Find(command));
+    }
+    h.idle(Duration::from_millis(500));
+    let results = |h: &Harness, from: usize| {
+        h.log[from..]
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::FindResult { .. }))
+            .count()
+    };
+    assert_eq!(results(&h, from), 0, "nothing answered");
+    // Stopped, the search doesn't move.
+    h.send(EngineCommand::Find(FindCommand::Stop { search: three }));
+    h.send(EngineCommand::Find(FindCommand::Next { search: three }));
+    h.idle(Duration::from_millis(500));
+    assert_eq!(results(&h, from), 0, "a stopped search doesn't move");
+    // A new document ends the search.
+    let again = h.search(document, "apple", false);
+    assert!(h
+        .find_result(from, again, |_, _, total| total == Some(4))
+        .is_some());
+    // (A white page, as the resize below expects.)
+    h.navigate(&page("find.html"));
+    let from = h.log.len();
+    h.send(EngineCommand::Find(FindCommand::Next { search: again }));
+    h.idle(Duration::from_millis(500));
+    assert_eq!(results(&h, from), 0, "the search ended with its document");
+
+    // 6. Resizing.
     let big = metrics(1000, 700);
     h.metrics = big;
     h.send(EngineCommand::SetMetrics(big));
@@ -960,7 +1130,7 @@ fn chromium_in_the_engine_contract() {
     // The browser closing it afterwards, as when its rule allows the request, is harmless.
     h.rt.close_view(closer);
 
-    // 6. Idle: nothing wakes the owner, and nothing is queued.
+    // 7. Idle: nothing wakes the owner, and nothing is queued.
     h.frame_where(|_| true);
     std::thread::sleep(Duration::from_millis(500));
     h.pump();
@@ -974,7 +1144,7 @@ fn chromium_in_the_engine_contract() {
         "an idle page wakes the owner {idle} times in 3 s"
     );
 
-    // 7. Close and shut down; nothing of Chromium is left.
+    // 8. Close and shut down; nothing of Chromium is left.
     h.rt.close_view(view);
     assert!(
         h.wait(0, |e| matches!(e, EngineEvent::ViewClosed { .. })

@@ -21,6 +21,7 @@ use sighurt_api::input::TextInputState;
 use crate::actions::Action;
 use crate::capi::{CefBrowser, CefBrowserHost, CefRect};
 use crate::ffi::Ref;
+use crate::find::FindState;
 use crate::nav::Nav;
 
 /// Locks, ignoring poison: a panic in one callback must not wedge the rest of the engine.
@@ -304,6 +305,7 @@ fn class(event: &EngineEvent) -> Class {
         | EngineEvent::HistoryChanged { .. }
         | EngineEvent::TextInputChanged { .. }
         | EngineEvent::SemanticsChanged { .. }
+        | EngineEvent::FindResult { .. }
         | EngineEvent::FrameReady { .. } => Class::Replaceable,
         _ => Class::Page,
     }
@@ -514,6 +516,8 @@ pub struct ViewShared {
     pub text_input: Mutex<Option<TextInputState>>,
     /// `close_view` ran: `DoClose` lets the browser close.
     pub closing: AtomicBool,
+    /// Find in page, as CEF's UI thread sees it.
+    pub find: Mutex<FindState>,
 }
 
 impl ViewShared {
@@ -530,6 +534,7 @@ impl ViewShared {
             caret: Mutex::new(SurfaceRect::default()),
             text_input: Mutex::new(None),
             closing: AtomicBool::new(false),
+            find: Mutex::new(FindState::default()),
         })
     }
 

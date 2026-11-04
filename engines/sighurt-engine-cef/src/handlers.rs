@@ -1,5 +1,5 @@
 //! The CEF handler objects of one view: the client and the render, life-span, load, display,
-//! request, download, dialog, permission and menu handlers.
+//! request, download, dialog, permission, menu and find handlers.
 //!
 //! Every callback runs on CEF's UI thread. It does the least that tells the owner what happened:
 //! it updates the view's shared state, queues events and wakes the owner loop. It never calls a
@@ -54,6 +54,7 @@ pub struct ClientData {
     permission: *mut CefPermissionHandler,
     dialog: *mut CefDialogHandler,
     menu: *mut CefContextMenuHandler,
+    find: *mut CefFindHandler,
 }
 
 impl Drop for ClientData {
@@ -70,6 +71,7 @@ impl Drop for ClientData {
             release_raw(self.permission);
             release_raw(self.dialog);
             release_raw(self.menu);
+            release_raw(self.find);
         }
     }
 }
@@ -114,6 +116,8 @@ pub fn make_client(view: &View) -> *mut CefClient {
     dialog.on_file_dialog = Some(on_file_dialog);
     let mut menu: CefContextMenuHandler = zeroed();
     menu.on_before_context_menu = Some(on_before_context_menu);
+    let mut find: CefFindHandler = zeroed();
+    find.on_find_result = Some(on_find_result);
 
     let data = ClientData {
         view: v(),
@@ -127,6 +131,7 @@ pub fn make_client(view: &View) -> *mut CefClient {
         permission: new_object(permission, v()),
         dialog: new_object(dialog, v()),
         menu: new_object(menu, v()),
+        find: new_object(find, v()),
     };
     let mut client: CefClient = zeroed();
     client.get_render_handler = Some(get_render_handler);
@@ -139,6 +144,7 @@ pub fn make_client(view: &View) -> *mut CefClient {
     client.get_permission_handler = Some(get_permission_handler);
     client.get_dialog_handler = Some(get_dialog_handler);
     client.get_context_menu_handler = Some(get_context_menu_handler);
+    client.get_find_handler = Some(get_find_handler);
     client.on_process_message_received = Some(on_process_message_received);
     new_object(client, data)
 }
@@ -167,6 +173,7 @@ getters! {
     get_permission_handler, permission, CefPermissionHandler;
     get_dialog_handler, dialog, CefDialogHandler;
     get_context_menu_handler, menu, CefContextMenuHandler;
+    get_find_handler, find, CefFindHandler;
 }
 
 /// The view of a handler object.
@@ -662,6 +669,7 @@ unsafe extern "C" fn on_load_start(
         }
         keep_history(&mut events, complete);
         if lock(&view.nav).document() != before {
+            lock(&view.find).end();
             *lock(&view.text_input) = None;
             events.push(EngineEvent::TextInputChanged {
                 view: view.id,
@@ -835,10 +843,35 @@ unsafe extern "C" fn on_render_process_terminated(
         // SAFETY: as above.
         let view = unsafe { view(this) };
         lock(&view.nav).crashed();
+        lock(&view.find).end();
         view.shared.push(EngineEvent::ViewFailed {
             view: view.id,
             message: format!("the page's content process ended (status {status})"),
         });
+    });
+}
+
+// ---- find ----
+
+unsafe extern "C" fn on_find_result(
+    this: *mut CefFindHandler,
+    browser: *mut CefBrowser,
+    identifier: i32,
+    count: i32,
+    _selection: *const CefRect,
+    active: i32,
+    last: i32,
+) {
+    own!(browser);
+    guard(|| {
+        // SAFETY: as above.
+        let view = unsafe { view(this) };
+        let document = lock(&view.nav).document();
+        let result =
+            lock(&view.find).result(view.id, identifier, count, active, last != 0, document);
+        if let Some(event) = result {
+            view.shared.push(event);
+        }
     });
 }
 

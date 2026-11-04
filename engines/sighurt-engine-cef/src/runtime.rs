@@ -49,7 +49,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     text_input: true,
     accessibility: false,
     screenshots: false,
-    find_in_page: false, // lane B: true once find in page is wired
+    find_in_page: true,
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
@@ -518,7 +518,7 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"));
             }
-            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::Find(find) => shared.find(find),
             EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         Ok(())
