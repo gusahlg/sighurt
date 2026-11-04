@@ -10,6 +10,8 @@ members = [
     "render/sighurt-render",
     # The wgpu backend (Vulkan only).
     "render/sighurt-render-wgpu",
+    # The Vulkan backend on ash (opt-in).
+    "render/sighurt-render-vulkan",
     "apps/sighurt-browser",
     # The terminal frontend (docs/rewrite/TUI.md).
     "frontends/sighurt-tui",
