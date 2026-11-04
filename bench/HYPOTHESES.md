@@ -572,6 +572,48 @@ the first paints.
   deflate backend for flate2 (zlib-ng, zlib-rs) would change flate2's features for the whole
   graph Servo shares, so it is an open item, not done here.
 
+### H-SHM1: A new SHM buffer is faulted in with one call
+
+Written after its measurement, which was a probe: recorded because it was rejected.
+
+- **Seen:** in `sig`, the CPU renderer's render of `sig://home`'s page surface takes 1.16 ms
+  against 0.18 ms in `frame_cost`; the surface is shown afresh on every tab switch (H-UI1 frees
+  a hidden surface's buffers), so its first frame paints into a new 3.5 MB buffer whose pages
+  fault in one by one as they are written.
+- **Change tried:** `madvise(MADV_POPULATE_WRITE)` on a new buffer's mapping (memmap2's
+  `advise`, the version smithay-client-toolkit's pool already uses), so the faults happen in
+  one call before painting.
+- **Measured:** `chrome.sh`, cpu, three runs a build interleaved, with a temporary probe line
+  in both builds timing `shm_frame` (the buffer) and the render (`/data/sig-builds/test-out/
+  opt2/shmprobe`): page surface, medians, buffer + render 0.015 + 1.139 = 1.156 ms → 0.858 +
+  0.291 = 1.589 ms. The render fell by the faults, but populating took longer than the faults
+  it replaced.
+- **Outcome:** rejected; not kept.
+
+### H-MEM1: Tab churn with the demo and Wasm engines levels off
+
+- **Question:** do the frontend's own caches and buffers grow with tabs opened and closed? By
+  construction they are bounded: the shaped-text cache (`Fonts`, 256 lines and 128 KiB of text,
+  then it starts over), the glyph cache (2048 glyphs, 8 MiB), the snapshot cache (one entry per
+  open tab, rebuilt each snapshot), the SHM buffers (three per surface, two retiring
+  generations, freed with their target).
+- **Workload:** `bench/memory/churn.sh`, release `sig` with the demo and Wasm engines, 20
+  cycles of: new tab, `demo://animation`, new tab, raf-demo (Wasm), 1 s, close both. Samples
+  after cycles 0, 1, 5, 10 and 20; three runs.
+- **Prediction:** after cycle 5, VmRSS grows by less than 2 MiB per further 5 cycles (allocator
+  retention aside, H12), the SHM `buffer_bytes` the targets hold after a cycle are the same
+  every cycle (the one remaining tab's), the open targets are the same, and the glyph cache stays
+  under its bound. If something grows linearly, it is a leak to fix.
+- **Outcome:** supported; nothing to fix. Three runs (`/data/sig-builds/test-out/opt2/mem1`,
+  raf-demo presenting 2202 frames a run): VmRSS after cycles 0, 1, 5, 10, 20 (MiB) 43.8, 70.2,
+  71.3, 71.6, 71.7; 43.1, 69.6, 70.3, 71.0, 66.3; 42.9, 69.1, 69.9, 70.4, 70.6. The step at the
+  first cycle is the Wasm engine starting (Wasmtime, its threads) and the first `sig://home`;
+  from cycle 5 to 20 RSS moves −4.0 to +0.7 MiB. After every cycle the targets hold the same
+  4,526,080 bytes of SHM buffers in 4 targets (the remaining tab's view and the chrome's three
+  surfaces, the hidden page surface holding none), and the glyph cache the same 138 glyphs,
+  8.5 KB. The shaped-text, glyph and snapshot caches are bounded by construction (above), so a
+  longer run cannot grow them either.
+
 ## Predictions for the IPC-removal session (gpui-baseline against 3c510fe)
 
 Written on 2 October 2026, before the session's first run. The session measures the baseline
