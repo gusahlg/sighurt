@@ -7,14 +7,16 @@
 //!
 //! A cell holds one grapheme cluster. Width comes from `unicode-width`. A wide
 //! cluster that does not fit before the right edge is stored as a single
-//! space, so it never spills onto the next row. The diff emits only the cells
+//! space, so it never spills onto the next row. Marks at the start of a cluster
+//! that would join the cell before it on the terminal (a combining mark, a
+//! variation selector, a skin tone modifier with no base) are not written. The diff emits only the cells
 //! that changed, with the shortest cursor move and one SGR sequence per style
 //! change, inside synchronized output.
 
 use std::io::Write;
 
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::term::{SYNC_BEGIN, SYNC_END};
 
@@ -102,6 +104,20 @@ impl Default for Pen {
     }
 }
 
+/// Whether `c`, written right after another character, belongs to its grapheme cluster rather
+/// than starting one: a combining mark, a variation selector, a skin tone modifier, a joiner.
+fn joins_the_cell_before(c: char) -> bool {
+    if c.is_ascii() {
+        return false;
+    }
+    if c.width().unwrap_or(0) == 0 {
+        return true;
+    }
+    let mut pair = String::from("a");
+    pair.push(c);
+    pair.graphemes(true).count() == 1
+}
+
 /// The screen the terminal should show, and the screen it was last sent.
 pub struct Grid {
     cols: u16,
@@ -170,6 +186,9 @@ impl Grid {
         bg: Color,
         attrs: Attrs,
     ) -> u16 {
+        // Marks with no base of their own would join the cell before this one on the terminal:
+        // a cluster is placed without them.
+        let cluster = cluster.trim_start_matches(joins_the_cell_before);
         if row >= self.rows || col >= self.cols || cluster.is_empty() {
             return 0;
         }

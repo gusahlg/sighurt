@@ -2581,3 +2581,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "parser_fuzz.rs"]
+mod fuzz_tests;

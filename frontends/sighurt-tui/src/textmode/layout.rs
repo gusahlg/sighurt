@@ -51,7 +51,7 @@ pub fn layout(snapshot: &SemanticSnapshot, width: u16) -> TextDocument {
             dim: true,
             ..Style::default()
         };
-        b.push_line(vec![span("(truncated)".into(), style, None)], None);
+        b.wrap(vec![Tok::Word("(truncated)".into(), style, None)], None);
     }
     TextDocument {
         document: snapshot.document,
