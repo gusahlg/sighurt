@@ -13962,6 +13962,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu-subsurface"
+version = "0.10.0"
+dependencies = [
+ "calloop",
+ "log",
+ "raw-window-handle",
+ "sighurt-api",
+ "sighurt-wayland",
+ "wgpu",
+]
+
+[[package]]
 name = "wgpu-types"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

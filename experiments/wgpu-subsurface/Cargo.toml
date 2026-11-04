@@ -1,0 +1,19 @@
+[package]
+name = "wgpu-subsurface"
+description = "De-risking the GPU chrome renderer: wgpu 30 on Vulkan presenting into a host GL-mode subsurface (docs/rewrite/RENDER.md §14)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }
+sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
+calloop.workspace = true
+raw-window-handle.workspace = true
+# Vulkan only (RENDER.md §14.1: never wgpu's GL backend in sig's process).
+wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
+# wgpu's own diagnostics.
+log = "0.4"

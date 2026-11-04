@@ -45,8 +45,9 @@ jobs:
       # Left out: sighurt-engine-servo, sighurt-engine-wpe, sighurt-engine-netsurf, sig's default
       # features (sighurt-browser is checked below with the demo and Wasm engines and the line
       # chrome), and the experiments that link Servo (m0-coexist, m1-mixed, wpe-coexist,
-      # tui-servo, wpe-cpu). `--workspace` alone would compile Servo and would try to build
-      # NetSurf (see CLAUDE.md, "Build commands").
+      # tui-servo, wpe-cpu), and wgpu-subsurface (an experiment that needs a compositor and a
+      # GPU). `--workspace` alone would compile Servo and would try to build NetSurf (see
+      # CLAUDE.md, "Build commands").
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -56,7 +57,7 @@ jobs:
           --exclude sighurt-engine-servo --exclude sighurt-engine-wpe
           --exclude sighurt-engine-netsurf --exclude sighurt-browser
           --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
-          --exclude tui-servo --exclude wpe-cpu
+          --exclude tui-servo --exclude wpe-cpu --exclude wgpu-subsurface
           --all-targets -- -D warnings
 
       - name: Clippy (sig without Servo and WPE WebKit)
@@ -78,7 +79,7 @@ jobs:
           --exclude sighurt-engine-servo --exclude sighurt-engine-wpe
           --exclude sighurt-engine-netsurf --exclude sighurt-browser
           --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist
-          --exclude tui-servo --exclude wpe-cpu
+          --exclude tui-servo --exclude wpe-cpu --exclude wgpu-subsurface
 
       # Unit tests only: the end-to-end tests (apps/sighurt-browser/tests/headless.sh and engines.sh)
       # need a compositor and run on a developer machine.

@@ -208,9 +208,9 @@ apps/sighurt-browser/tests/coexist.sh [--build] OUT
 # Ladybird crates; running those engines still needs their prefixes, and a sig with NetSurf
 # must not be distributed.
 tools/cargo fmt --all
-tools/cargo clippy --workspace --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-engine-netsurf --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist --exclude tui-servo --exclude wpe-cpu --all-targets -- -D warnings
+tools/cargo clippy --workspace --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-engine-netsurf --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist --exclude tui-servo --exclude wpe-cpu --exclude wgpu-subsurface --all-targets -- -D warnings
 tools/cargo clippy -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features --features engine-demo,engine-wasm,chrome-line,render-wgpu --all-targets -- -D warnings
-tools/cargo test --workspace --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-engine-netsurf --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist --exclude tui-servo --exclude wpe-cpu
+tools/cargo test --workspace --exclude sighurt-engine-servo --exclude sighurt-engine-wpe --exclude sighurt-engine-netsurf --exclude sighurt-browser --exclude m0-coexist --exclude m1-mixed --exclude wpe-coexist --exclude tui-servo --exclude wpe-cpu --exclude wgpu-subsurface
 tools/cargo test -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features --features engine-demo,engine-wasm,chrome-line,render-wgpu
 SIG_WHAT="servo build" tools/cargo clippy -p sighurt-engine-servo -p sighurt-engine-wpe -p sighurt-browser -p m0-coexist -p m1-mixed -p wpe-coexist -p tui-servo -p wpe-cpu --all-targets -- -D warnings
 SIG_WHAT="servo build" tools/cargo clippy -p sighurt-browser -p sighurt-runtime -p sighurt-gui --all-features --all-targets -- -D warnings
