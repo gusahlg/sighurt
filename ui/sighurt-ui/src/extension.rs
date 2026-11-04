@@ -282,8 +282,9 @@ impl fmt::Debug for ChromeKind {
     }
 }
 
-/// Untrusted text made safe to show on one line: control characters become spaces; bidi
-/// embedding, override and isolate controls are dropped, so the text can't reorder what
+/// Untrusted text made safe to show on one line: control characters and the line and
+/// paragraph separators (U+2028, U+2029, which a text shaper breaks a line at) become spaces;
+/// bidi embedding, override and isolate controls are dropped, so the text can't reorder what
 /// follows it; at most `max_chars` characters are kept.
 pub fn contained(text: &str, max_chars: usize) -> String {
     if is_contained(text, max_chars) {
@@ -291,7 +292,13 @@ pub fn contained(text: &str, max_chars: usize) -> String {
     }
     text.chars()
         .filter(|c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .take(max_chars)
         .collect()
 }
