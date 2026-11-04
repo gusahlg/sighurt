@@ -35,8 +35,10 @@ struct Fake {
     frontend: Frontend,
     urls: Vec<Option<&'static str>>,
     active: usize,
-    /// Every tab's status text: the link the pointer is over.
-    status: Option<&'static str>,
+    /// Every tab's hovered link.
+    link: Option<&'static str>,
+    /// Whether every tab's page holds an element fullscreen.
+    fullscreen: bool,
 }
 
 impl Fake {
@@ -45,7 +47,8 @@ impl Fake {
             frontend,
             urls: vec![Some("https://example.com/")],
             active: 0,
-            status: None,
+            link: None,
+            fullscreen: false,
         }
     }
     fn tabs(urls: usize, active: usize) -> Self {
@@ -53,7 +56,8 @@ impl Fake {
             frontend: Frontend::Gui,
             urls: vec![None; urls],
             active,
-            status: None,
+            link: None,
+            fullscreen: false,
         }
     }
 }
@@ -82,7 +86,8 @@ impl Browser for Fake {
             1.0,
             false,
             false,
-            self.status,
+            self.link,
+            self.fullscreen,
         ))
     }
 }
@@ -234,8 +239,24 @@ fn escape_toggles_insert_and_the_indicator() {
     assert_eq!(table::INSERT.len(), 1);
     assert!(matches!(
         table::INSERT[0].action,
-        Action::Mode(Mode::Normal)
+        Action::ExitFullscreenOr(Mode::Normal)
     ));
+}
+
+#[test]
+fn escape_leaves_a_pages_fullscreen_first() {
+    let mut b = Fake::new(Frontend::Gui);
+    b.fullscreen = true;
+    let mut keymap = example();
+    let exit = KeyAction::Run(Command::PageExitFullscreen);
+    assert_eq!(keymap.press(&escape(), PAGE, &b), exit);
+    assert_eq!(keymap.indicator(), None, "still NORMAL");
+    b.fullscreen = false;
+    assert_eq!(keymap.press(&escape(), PAGE, &b), KeyAction::Take);
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+    b.fullscreen = true;
+    assert_eq!(keymap.press(&escape(), PAGE, &b), exit);
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"), "still INSERT");
 }
 
 #[test]
@@ -317,7 +338,7 @@ fn the_shared_table_in_normal_mode() {
         (typed('x'), "tab.close"),
         (typed('u'), "tab.reopen"),
         (typed(':'), "location.focus :"),
-        (typed('/'), "location.focus /"),
+        (typed('/'), "page.find"),
         (typed('J'), "tab.next"),
         (typed('K'), "tab.previous"),
         (typed('H'), "page.back"),
@@ -372,29 +393,13 @@ fn y_f_copies_the_hovered_link() {
         press(&mut keymap, "yf", PAGE, &b),
         [KeyAction::Take, KeyAction::RunAll(vec![])]
     );
-    b.status = Some("https://example.com/a?b#c");
+    b.link = Some("https://example.com/a?b#c");
     assert_eq!(
         press(&mut keymap, "yf", PAGE, &b)[1],
         KeyAction::RunAll(vec![Command::ClipboardCopy(
             "https://example.com/a?b#c".into()
         )])
     );
-    b.status = Some("mailto:someone@example.com");
-    assert_eq!(
-        press(&mut keymap, "yf", PAGE, &b)[1],
-        KeyAction::RunAll(vec![Command::ClipboardCopy(
-            "mailto:someone@example.com".into()
-        )])
-    );
-    // Status text that is not a link is not copied.
-    for status in ["Loading page…", "Done: 3 items", ":nothing", "https:"] {
-        b.status = Some(status);
-        assert_eq!(
-            press(&mut keymap, "yf", PAGE, &b)[1],
-            KeyAction::RunAll(vec![]),
-            "{status}"
-        );
-    }
 }
 
 #[test]

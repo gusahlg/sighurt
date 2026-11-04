@@ -31,6 +31,31 @@ pub const MAX_URL: usize = 2 * 1024 * 1024;
 /// The most closed tabs `tab.reopen` can bring back. The oldest goes first.
 pub const MAX_CLOSED: usize = 10;
 
+/// The longest hovered link a keymap is shown, in bytes. Longer ones are not shown, never
+/// shortened.
+pub const MAX_LINK: usize = 8 * 1024;
+
+/// What `tab.reopen` keeps of a closed tab: its address, not its history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosedTab {
+    /// The address it showed, or was loading.
+    pub url: String,
+    /// The page's own title, if it gave one.
+    pub title: Option<String>,
+    /// The engine the user chose for its page, if they chose one.
+    pub engine: Option<String>,
+    /// Its page zoom.
+    pub zoom: f64,
+}
+
+/// `text`, if it is an http, https or file URL no longer than [`MAX_LINK`]: as the URL parser
+/// writes it, which is what opening it would load.
+pub(crate) fn link(text: &str) -> Option<String> {
+    let url = url::Url::parse(text).ok()?;
+    let link = matches!(url.scheme(), "http" | "https" | "file").then(|| String::from(url))?;
+    (link.len() <= MAX_LINK).then_some(link)
+}
+
 /// `text` cut to at most [`MAX_TEXT`] bytes at a character boundary.
 pub(crate) fn clamp(mut text: String) -> String {
     if text.len() > MAX_TEXT {
@@ -169,6 +194,9 @@ pub struct View {
     /// The link the pointer was over (the page's status text) when that was a click; `None`
     /// after a key press.
     pub(crate) link: Option<String>,
+    /// The link the pointer is over now, when the status text is one ([`link`]); `None` for a
+    /// new document.
+    pub(crate) hovered: Option<String>,
     /// Opened, or last navigated by the user, in an engine the user chose.
     pub(crate) chosen: bool,
     /// The user's answers to `document`'s permission prompts. Dropped with the document.
@@ -198,6 +226,7 @@ impl View {
             navigations: Navigations::default(),
             activation: None,
             link: None,
+            hovered: None,
             chosen: false,
             answers: Vec::new(),
         }

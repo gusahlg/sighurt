@@ -72,8 +72,8 @@ use crate::permissions::{self, Pending, Requests, Requirement, MAX_PENDING_REQUE
 use crate::router::{self, Route};
 use crate::session::{self, Session, SessionSegment, SessionTab};
 use crate::tabs::{
-    bounded, clamp, display_title, Content, LoadError, Tab, TabSummary, View, MAX_CLOSED, MAX_TEXT,
-    MAX_URL,
+    bounded, clamp, display_title, link, ClosedTab, Content, LoadError, Tab, TabSummary, View,
+    MAX_CLOSED, MAX_TEXT, MAX_URL,
 };
 
 /// Which frontend is running. The same enum a keymap sees
@@ -455,9 +455,9 @@ pub struct BrowserState {
     text_input: Option<TextInputState>,
     /// [`BrowserEvent::PageTyping`].
     page_typing: bool,
-    /// The tabs closed since the browser started, the latest last, as the session saves them:
-    /// what `tab.reopen` restores. At most [`MAX_CLOSED`]; never saved.
-    pub(crate) closed: VecDeque<SessionTab>,
+    /// The tabs closed since the browser started, the latest last: what `tab.reopen` restores.
+    /// At most [`MAX_CLOSED`]; never saved.
+    pub(crate) closed: VecDeque<ClosedTab>,
 }
 
 /// Applies `event` to `state` and returns what the executable should do.
@@ -789,7 +789,9 @@ impl Browser for CoreBrowser<'_> {
             tab.zoom,
             shown.can_go_back,
             shown.can_go_forward,
-            shown.view.and_then(|view| view.status.as_deref()),
+            shown.view.and_then(|view| view.hovered.as_deref()),
+            // No engine reports element fullscreen yet (lane D).
+            false,
         ))
     }
 }
@@ -863,16 +865,6 @@ impl BrowserState {
 
     /// A snapshot of the tabs and their history, to save.
     pub fn session(&self) -> Session {
-        Session {
-            version: session::VERSION,
-            active: self.active,
-            tabs: self.tabs.iter().map(|tab| self.saved_tab(tab)).collect(),
-            notices: Vec::new(),
-        }
-    }
-
-    /// What is saved of `tab`: its segments, as records, and its zoom.
-    fn saved_tab(&self, tab: &Tab) -> SessionTab {
         let segment = |segment: &Segment| match segment {
             Segment::Internal(url) => SessionSegment {
                 engine: None,
@@ -883,22 +875,30 @@ impl BrowserState {
             Segment::View(view) => saved(self.views[view].record()),
             Segment::Record(record) => saved(record.clone()),
         };
-        let mut segments: Vec<_> = tab.segments.iter().map(segment).collect();
-        // A tab still loading its first page keeps the address it is loading.
-        let loading = tab.switch.map(|switch| &self.views[&switch.view]);
-        if let (true, Some(view)) = (segments.is_empty(), loading) {
-            let url = view.navigations.latest().and_then(|n| n.url.clone());
-            segments.extend(url.map(|url| SessionSegment {
-                engine: Some(view.engine.clone()),
-                entries: vec![url],
-                current: 0,
-                title: None,
-            }));
-        }
-        SessionTab {
-            current: tab.current,
-            zoom: tab.zoom,
-            segments,
+        let tab = |tab: &Tab| {
+            let mut segments: Vec<_> = tab.segments.iter().map(segment).collect();
+            // A tab still loading its first page keeps the address it is loading.
+            let loading = tab.switch.map(|switch| &self.views[&switch.view]);
+            if let (true, Some(view)) = (segments.is_empty(), loading) {
+                let url = view.navigations.latest().and_then(|n| n.url.clone());
+                segments.extend(url.map(|url| SessionSegment {
+                    engine: Some(view.engine.clone()),
+                    entries: vec![url],
+                    current: 0,
+                    title: None,
+                }));
+            }
+            SessionTab {
+                current: tab.current,
+                zoom: tab.zoom,
+                segments,
+            }
+        };
+        Session {
+            version: session::VERSION,
+            active: self.active,
+            tabs: self.tabs.iter().map(tab).collect(),
+            notices: Vec::new(),
         }
     }
 
@@ -1055,19 +1055,17 @@ impl BrowserState {
         Some(self.tabs.len() - 1)
     }
 
-    /// Closes tab `index`, unless it is the last one. A tab with a page to show again is kept
-    /// for `tab.reopen`, as the session would save it, dropping the oldest beyond
-    /// [`MAX_CLOSED`].
+    /// Closes tab `index`, unless it is the last one. A tab with an address is kept for
+    /// `tab.reopen`, dropping the oldest beyond [`MAX_CLOSED`].
     pub(crate) fn close_tab(&mut self, index: usize, fx: &mut Fx) {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return;
         }
-        let saved = self.saved_tab(&self.tabs[index]);
-        if !saved.segments.is_empty() {
+        if let Some(closed) = self.closed_tab(index) {
             if self.closed.len() == MAX_CLOSED {
                 self.closed.pop_front();
             }
-            self.closed.push_back(saved);
+            self.closed.push_back(closed);
         }
         let tab = self.tabs.remove(index);
         for view in tab.views() {
@@ -1078,6 +1076,28 @@ impl BrowserState {
         }
         fx.chrome = true;
         fx.session = true;
+    }
+
+    /// What `tab.reopen` keeps of tab `index`: the address it shows, its title, the engine the
+    /// user chose for it and its zoom. `None` when it has no address.
+    fn closed_tab(&self, index: usize) -> Option<ClosedTab> {
+        let tab = &self.tabs[index];
+        let shown = shown(tab, &self.views, &self.env);
+        Some(ClosedTab {
+            url: self.address(index)?,
+            title: shown.title.map(str::to_owned),
+            engine: self.chosen_engine(index),
+            zoom: tab.zoom,
+        })
+    }
+
+    /// The engine the user chose for the page tab `index` shows, if they chose one.
+    pub(crate) fn chosen_engine(&self, index: usize) -> Option<String> {
+        let view = self.tabs[index]
+            .current_view()
+            .and_then(|id| self.views.get(&id));
+        view.filter(|view| view.chosen)
+            .map(|view| view.engine.clone())
     }
 
     pub(crate) fn tab_index(&self, tab: TabId) -> Option<usize> {
@@ -1557,6 +1577,7 @@ impl BrowserState {
         let url = v.navigations.latest().and_then(|n| n.url.clone());
         v.failure = Some(message.clone());
         v.document = None;
+        v.hovered = None;
         v.answers.clear();
         v.loading = false;
         v.navigations.clear();
@@ -1856,6 +1877,7 @@ impl BrowserState {
                 fx.chrome = true;
             }
             EngineEvent::StatusTextChanged { text, .. } => {
+                view.hovered = text.as_deref().and_then(link);
                 view.status = text.map(clamp);
                 fx.chrome = true;
             }
@@ -1954,6 +1976,7 @@ impl BrowserState {
             view.answers.clear();
             view.activation = None;
             view.link = None;
+            view.hovered = None;
             self.cancel_requests(id, Some(document), fx);
         }
         let Some(tab) = self.tab_index(tab) else {
@@ -2610,7 +2633,7 @@ fn notify(notices: Vec<String>, fx: &mut Fx) {
 }
 
 /// A saved tab, restored with a new id, its own zoom and its engine segments as records.
-pub(crate) fn restored(saved: SessionTab) -> Tab {
+fn restored(saved: SessionTab) -> Tab {
     let mut tab = Tab::new(false, crate::commands::clamp_zoom(saved.zoom));
     tab.segments = saved
         .segments

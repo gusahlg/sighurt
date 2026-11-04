@@ -13,10 +13,11 @@
 //!   copied. A tab with no page duplicates as a home tab.
 //! - `tab.move left|right` moves the selected tab one place, wrapping around; `tab.move <n>`
 //!   moves it to position `n`, or the end. It stays selected and keeps the keyboard where it is.
-//! - `tab.reopen` restores the tab closed last, at the end, and selects it: as a restored
-//!   session's tab, so its pages load again from their addresses and lose their state. Only
-//!   the last [`MAX_CLOSED`] closed since the browser started are kept, and a tab that had no
-//!   page is not. With none, it is a notice.
+//! - `tab.reopen` opens the address of the tab closed last in a new tab at the end, in the
+//!   engine the user chose for it and at its zoom, and selects it: its history and the page's
+//!   state are not restored. Only the last [`MAX_CLOSED`] closed since the browser started are
+//!   kept, a page's own `window.close()` included, and a tab with no address is not. With
+//!   none, it is a notice.
 //! - `tab.next` and `tab.previous` wrap around.
 //! - Page zoom walks [`ZOOM_STEPS`] and stops at its ends; each tab keeps its own, across
 //!   engines. New tabs start at the configured `zoom`, and `page.zoom-reset` returns to it.
@@ -36,11 +37,12 @@
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
 //!   `Effect::Focus`; `location.focus <text>` then hands the line its text with
 //!   `Effect::LineText`. Commands that change what the page area shows give the page the keyboard.
-//! - `page.find`, `page.find-next`, `page.find-previous` and `page.find-stop`: no engine finds
-//!   in page yet, so `page.find` says the page's engine can't, and the others that there is no
-//!   search. A `page.find` over [`MAX_FIND`] bytes, which only a chrome can make, is refused.
+//! - `page.find [text]`, `page.find-next`, `page.find-previous` and `page.find-stop`: no engine
+//!   finds in page yet, so `page.find` says the page's engine can't, and the moves that there is
+//!   no search. A `page.find` over [`MAX_FIND`] bytes, which only a chrome can make, is refused.
 //! - `history.clear`: sig keeps no history of visited pages yet, so it says there is nothing to
-//!   clear. `browser.fullscreen` says the frontend has no fullscreen yet.
+//!   clear. `browser.fullscreen` says the frontend has no fullscreen yet, and
+//!   `page.exit-fullscreen` that the page is not in fullscreen.
 //! - `page.send-key` presses and releases its key in the page only while the page has the
 //!   keyboard; run by a key press, that counts as the user's key press in the page.
 //! - `chrome.<action>` is the chrome's own: the core hands it on (`Effect::ChromeCommand`).
@@ -55,7 +57,7 @@ use sighurt_api::ids::TabId;
 use sighurt_api::input::KeyboardFocus;
 
 use crate::navigation::Segment;
-use crate::state::{restored, BrowserState, By, Effect, Fx};
+use crate::state::{BrowserState, By, Effect, Fx};
 use crate::tabs::MAX_CLOSED;
 
 /// Page zoom levels in percent, as in common browsers.
@@ -202,6 +204,10 @@ impl BrowserState {
                 );
                 None
             }
+            Command::PageExitFullscreen => {
+                self.tab_notice(active, "The page shown is not in fullscreen.", fx);
+                None
+            }
             Command::BrowserFullscreen => {
                 self.tab_notice(
                     active,
@@ -244,11 +250,7 @@ impl BrowserState {
             .tabs()
             .nth(tab)
             .and_then(|summary| summary.url.map(str::to_owned));
-        let chosen = self.tabs[tab]
-            .current_view()
-            .and_then(|id| self.view(id))
-            .filter(|view| view.chosen())
-            .map(|view| view.engine().to_owned());
+        let engine = self.chosen_engine(tab);
         let zoom = self.tabs[tab].zoom;
         let new = self.new_tab(false, fx)?;
         let mut duplicate = self.tabs.remove(new);
@@ -256,7 +258,7 @@ impl BrowserState {
         self.tabs.insert(tab + 1, duplicate);
         self.active = tab + 1;
         match url {
-            Some(url) => self.navigate(tab + 1, url, By::User(chosen.as_deref()), fx),
+            Some(url) => self.navigate(tab + 1, url, By::User(engine.as_deref()), fx),
             None => self.open_home(tab + 1, fx),
         }
         fx.chrome = true;
@@ -264,7 +266,8 @@ impl BrowserState {
         Some(KeyboardFocus::Page)
     }
 
-    /// Restores the tab closed last at the end and selects it; its record loads when shown.
+    /// Opens the address of the tab closed last in a new tab at the end, in the engine the
+    /// user had chosen for it and at its zoom, and selects it. Its history is not restored.
     fn reopen(&mut self, fx: &mut Fx) -> Option<KeyboardFocus> {
         if self.closed.is_empty() {
             let message = format!(
@@ -273,14 +276,12 @@ impl BrowserState {
             );
             return self.tab_notice(self.active, &message, fx);
         }
+        // A full tab strip says so and keeps the closed tab.
         let tab = self.new_tab(false, fx)?;
-        let saved = self.closed.pop_back().expect("not empty");
-        self.tabs[tab] = restored(saved);
-        if self.tabs[tab].segments.is_empty() {
-            self.open_home(tab, fx);
-        }
+        let closed = self.closed.pop_back().expect("not empty");
+        self.tabs[tab].zoom = closed.zoom;
         self.active = tab;
-        fx.chrome = true;
+        self.navigate(tab, closed.url, By::User(closed.engine.as_deref()), fx);
         fx.session = true;
         Some(KeyboardFocus::Page)
     }
@@ -292,7 +293,7 @@ impl BrowserState {
             .shown_engine(tab)
             .filter(|_| self.tabs[tab].current_view().is_some());
         let message = match (command, engine) {
-            (Command::PageFind(text), _) if text.len() > MAX_FIND => {
+            (Command::PageFind(Some(text)), _) if text.len() > MAX_FIND => {
                 format!("page.find searches for at most {MAX_FIND} bytes of text.")
             }
             (Command::PageFind(_), Some(engine)) => format!("{engine} can't find in page."),

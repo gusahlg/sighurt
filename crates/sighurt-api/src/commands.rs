@@ -17,8 +17,8 @@ use std::str::FromStr;
 use crate::input::{ButtonState, Key, KeyCode, KeyEvent, KeyLocation, Modifiers};
 use crate::keymap::{Chord, ChordKey};
 
-/// The most bytes `page.find` searches for. A longer argument is cut to it, at a character
-/// boundary, when the command is parsed; the core refuses a longer one made otherwise.
+/// The most bytes `page.find` searches for. A longer argument is refused when the command is
+/// parsed, never cut, and the core refuses a longer one made otherwise.
 pub const MAX_FIND: usize = 1024;
 
 /// A browser command. Tab numbers count from 1, in tab-strip order.
@@ -84,16 +84,18 @@ pub enum Command {
     /// `text`, the line holds `text` instead, the caret at its end (`location.focus :` opens
     /// the command line). The text is kept as given (trimmed, never empty).
     LocationFocus(Option<String>),
-    /// `page.find <text>`: find `text` in the page shown, from where it is, wrapping around. The
-    /// text is kept as given (trimmed, never empty), cut to [`MAX_FIND`] bytes. Upper case in
-    /// it makes the search case-sensitive.
-    PageFind(String),
+    /// `page.find [text]`: find `text` in the page shown, from where it is, wrapping around;
+    /// without text, open the chrome's find field. The text is kept as given (trimmed, never
+    /// empty), at most [`MAX_FIND`] bytes. Upper case in it makes the search case-sensitive.
+    PageFind(Option<String>),
     /// `page.find-next`: the next match of the search.
     PageFindNext,
     /// `page.find-previous`: the previous match of the search.
     PageFindPrevious,
     /// `page.find-stop`: end the search and clear its highlights.
     PageFindStop,
+    /// `page.exit-fullscreen`: leave the element fullscreen of the page shown.
+    PageExitFullscreen,
     /// `history.clear`: forget every page visited.
     HistoryClear,
     /// `browser.fullscreen`: put the window in fullscreen, or take it out.
@@ -116,7 +118,7 @@ pub enum Command {
 
 impl Command {
     /// Every command name. The chrome's commands, `chrome.<action>`, depend on the chrome.
-    pub const NAMES: [&'static str; 31] = [
+    pub const NAMES: [&'static str; 32] = [
         "tab.new",
         "tab.duplicate",
         "tab.move",
@@ -141,6 +143,7 @@ impl Command {
         "page.find-next",
         "page.find-previous",
         "page.find-stop",
+        "page.exit-fullscreen",
         "location.focus",
         "history.clear",
         "browser.home",
@@ -177,6 +180,7 @@ impl Command {
             Self::PageFindNext => "page.find-next",
             Self::PageFindPrevious => "page.find-previous",
             Self::PageFindStop => "page.find-stop",
+            Self::PageExitFullscreen => "page.exit-fullscreen",
             Self::LocationFocus(_) => "location.focus",
             Self::HistoryClear => "history.clear",
             Self::BrowserHome => "browser.home",
@@ -235,13 +239,14 @@ impl FromStr for Command {
                         .map_err(|_| CommandError::InvalidTabMove(n.to_owned())),
                 };
             }
-            "page.find" => {
-                let mut end = required("page.find")?.len().min(MAX_FIND);
-                while !argument.is_char_boundary(end) {
-                    end -= 1;
-                }
-                return Ok(Self::PageFind(argument[..end].trim_end().to_owned()));
+            "page.find" if argument.is_empty() => return Ok(Self::PageFind(None)),
+            "page.find" if argument.len() > MAX_FIND => {
+                return Err(CommandError::TooLong {
+                    command: "page.find",
+                    max: MAX_FIND,
+                })
             }
+            "page.find" => return Ok(Self::PageFind(Some(argument.to_owned()))),
             "tab.select" => {
                 required("tab.select")?;
                 return Ok(Self::TabSelect(tab_number()?));
@@ -284,6 +289,7 @@ impl FromStr for Command {
             "page.find-next" => Self::PageFindNext,
             "page.find-previous" => Self::PageFindPrevious,
             "page.find-stop" => Self::PageFindStop,
+            "page.exit-fullscreen" => Self::PageExitFullscreen,
             "history.clear" => Self::HistoryClear,
             "browser.home" => Self::BrowserHome,
             "browser.fullscreen" => Self::BrowserFullscreen,
@@ -305,7 +311,7 @@ impl fmt::Display for Command {
             Self::TabClose(Some(n)) | Self::TabSelect(n) => write!(f, " {n}"),
             Self::PageOpen(input)
             | Self::ClipboardCopy(input)
-            | Self::PageFind(input)
+            | Self::PageFind(Some(input))
             | Self::TabNew(Some(input))
             | Self::LocationFocus(Some(input)) => write!(f, " {input}"),
             Self::TabMove(to) => write!(f, " {to}"),
@@ -357,6 +363,13 @@ pub enum CommandError {
     InvalidTabNumber(String),
     /// `tab.move`'s argument is not `left`, `right` or a tab number.
     InvalidTabMove(String),
+    /// The argument is longer than the command takes (`page.find`: [`MAX_FIND`] bytes).
+    TooLong {
+        /// The command.
+        command: &'static str,
+        /// The most bytes it takes.
+        max: usize,
+    },
     /// `page.send-key`'s argument is not a key it can press; says why.
     InvalidKey(String),
     /// `page.open-in`'s engine is not an engine's name.
@@ -380,6 +393,9 @@ impl fmt::Display for CommandError {
                 f,
                 "tab.move takes left, right or a tab number (from 1), not {argument:?}"
             ),
+            Self::TooLong { command, max } => {
+                write!(f, "{command} takes at most {max} bytes of text")
+            }
             Self::InvalidKey(why) => f.write_str(why),
             Self::InvalidEngine(name) => write!(
                 f,
@@ -650,7 +666,9 @@ mod tests {
             "tab.move right",
             "tab.move 3",
             "tab.reopen",
+            "page.find",
             "page.find Hello  world",
+            "page.exit-fullscreen",
             "page.find-next",
             "page.find-previous",
             "page.find-stop",
@@ -728,37 +746,29 @@ mod tests {
     }
 
     #[test]
-    fn find_text_is_cut_at_a_character_boundary() {
-        assert_eq!(
-            parse("page.find"),
-            Err(CommandError::MissingArgument("page.find"))
-        );
+    fn find_text_over_the_limit_is_refused() {
+        assert_eq!(parse("page.find"), Ok(Command::PageFind(None)));
         assert_eq!(
             parse(" page.find  Hello  World "),
-            Ok(Command::PageFind("Hello  World".into()))
+            Ok(Command::PageFind(Some("Hello  World".into())))
         );
-        let at_limit = "a".repeat(MAX_FIND);
+        let at_limit = "é".repeat(MAX_FIND / 2);
         assert_eq!(
             parse(&format!("page.find {at_limit}")),
-            Ok(Command::PageFind(at_limit.clone()))
+            Ok(Command::PageFind(Some(at_limit.clone())))
+        );
+        let error = parse(&format!("page.find {at_limit}a")).unwrap_err();
+        assert_eq!(
+            error,
+            CommandError::TooLong {
+                command: "page.find",
+                max: MAX_FIND
+            }
         );
         assert_eq!(
-            parse(&format!("page.find {at_limit}b")),
-            Ok(Command::PageFind(at_limit))
+            error.to_string(),
+            "page.find takes at most 1024 bytes of text"
         );
-        // "é" is two bytes: 1023 of them would end mid-character, so 511 are kept.
-        let Ok(Command::PageFind(cut)) = parse(&format!("page.find a{}", "é".repeat(600))) else {
-            panic!("page.find");
-        };
-        assert_eq!(cut.len(), MAX_FIND - 1);
-        assert_eq!(cut, format!("a{}", "é".repeat(511)));
-        // A cut that ends at a space keeps no trailing space.
-        let Ok(Command::PageFind(cut)) =
-            parse(&format!("page.find {} x", "a".repeat(MAX_FIND - 1)))
-        else {
-            panic!("page.find");
-        };
-        assert_eq!(cut, "a".repeat(MAX_FIND - 1));
     }
 
     #[test]

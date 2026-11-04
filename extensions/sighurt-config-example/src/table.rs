@@ -45,6 +45,9 @@ pub enum Action {
     RunThenPass(&'static str),
     /// Switch mode.
     Mode(Mode),
+    /// `page.exit-fullscreen` while the page shown holds an element fullscreen (a video), so
+    /// Escape leaves it as on the web; otherwise switch mode.
+    ExitFullscreenOr(Mode),
     /// What the configuration computes from the browser: the commands to run, or none to take
     /// the key and do nothing.
     Custom(fn(&dyn Browser) -> Vec<Command>),
@@ -72,7 +75,7 @@ const fn bind(keys: &'static str, action: Action, scope: Scope, frontend: Where)
     }
 }
 
-use Action::{Custom, Mode as To, Run};
+use Action::{Custom, ExitFullscreenOr, Run};
 use Scope::{Always, Page};
 use Where::{Both, Terminal};
 
@@ -80,9 +83,9 @@ use Where::{Both, Terminal};
 pub const NORMAL: &[Binding] = &[
     bind("q", Run("browser.quit"), Page, Both),
     bind("o", Run("location.focus"), Page, Both),
-    // The command line: the line opens holding ":"; "/" opens it holding "/", to find in page.
+    // The command line: the line opens holding ":". "/" opens the chrome's find field.
     bind(":", Run("location.focus :"), Page, Both),
-    bind("/", Run("location.focus /"), Page, Both),
+    bind("/", Run("page.find"), Page, Both),
     bind("ctrl-o", Run("location.focus"), Always, Both),
     bind("t", Run("tab.new"), Page, Both),
     bind("x", Run("tab.close"), Page, Both),
@@ -116,8 +119,8 @@ pub const NORMAL: &[Binding] = &[
     bind("ctrl-c", Run("browser.quit"), Page, Terminal),
     bind("m", Run("chrome.toggle-mode"), Page, Terminal),
     bind("ctrl-l", Run("chrome.refresh"), Always, Terminal),
-    // The mode switch.
-    bind("escape", To(Mode::Insert), Page, Both),
+    // The mode switch, unless a page's element is fullscreen: then Escape leaves that.
+    bind("escape", ExitFullscreenOr(Mode::Insert), Page, Both),
     // Defined by this configuration against the state API.
     bind("y y", Custom(copy_address), Page, Both),
     bind("y f", Custom(copy_link), Page, Both),
@@ -125,4 +128,4 @@ pub const NORMAL: &[Binding] = &[
 ];
 
 /// INSERT: only Escape; every other key passes.
-pub const INSERT: &[Binding] = &[bind("escape", To(Mode::Normal), Page, Both)];
+pub const INSERT: &[Binding] = &[bind("escape", ExitFullscreenOr(Mode::Normal), Page, Both)];

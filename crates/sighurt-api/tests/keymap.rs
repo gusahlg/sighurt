@@ -214,6 +214,7 @@ impl Browser for Tabs {
             false,
             false,
             None,
+            false,
         ))
     }
 }

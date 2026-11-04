@@ -1825,20 +1825,26 @@ finding was checked against the plan and the code before it was acted on.
   the line chrome's golden images are unchanged, pixel for pixel.
 - **Tabs, find, history and fullscreen: the API** (4 November 2026, STATUS decisions 126–129).
   `Command` gains `TabDuplicate`, `TabMove`
-  (with `commands::TabMove`: `Left`, `Right`, `To(n)`), `TabReopen`, `PageFind(String)` (cut
-  to `commands::MAX_FIND`, 1024 bytes, at a character boundary), `PageFindNext`,
-  `PageFindPrevious`, `PageFindStop`, `HistoryClear` and `BrowserFullscreen`; `TabNew` and
+  (with `commands::TabMove`: `Left`, `Right`, `To(n)`), `TabReopen`, `PageFind(Option<String>)`
+  (no text opens the chrome's find field; text over `commands::MAX_FIND`, 1024 bytes, is
+  refused with `CommandError::TooLong`), `PageFindNext`,
+  `PageFindPrevious`, `PageFindStop`, `PageExitFullscreen`, `HistoryClear` and
+  `BrowserFullscreen`; `TabNew` and
   `LocationFocus` take an optional argument (`tab.new [address]`, `location.focus [text]`), so a
   keymap or chrome that names them writes `Command::TabNew(None)` and
-  `Command::LocationFocus(None)`. `CommandError::InvalidTabMove` is new. `keymap::TabInfo` gains
-  `status` (the page's status text: the hovered link, page data like the title), and
-  `TabInfo::new` takes it as its last argument. The engine contract gains
-  `EngineCommand::Find(FindCommand)`, `EngineCommand::ExitFullscreen`,
+  `Command::LocationFocus(None)`. `CommandError::InvalidTabMove` and `TooLong` are new.
+  `keymap::TabInfo` gains `link` (the link the pointer is over: an http, https or file URL
+  as opening it would load it, at most 8 KiB, per document; never the raw status text) and
+  `fullscreen` (the page holds an element fullscreen), and `TabInfo::new` takes them as its
+  last two arguments. The engine contract gains
+  `EngineCommand::Find(FindCommand)` (each `FindCommand` names its search, and `Search` its
+  document, so late ones are dropped), `EngineCommand::ExitFullscreen`,
   `EngineEvent::FindResult` (replaceable per view), `EngineEvent::FullscreenChanged` (ordered)
   and `EngineCapabilities::fullscreen`; no engine sets `find_in_page` or `fullscreen` yet, and
   every adapter refuses both commands as unsupported. The chrome API gains
   `ChromeEvent::LineText(String)`: right after `Focus(Chrome)`, `location.focus <text>` puts
   the text in the line as if typed over the selected address, the caret at its end (the core's
   `Effect::LineText`, the runtime's `Frontend::line_text`). The example configuration binds `:`
-  to `location.focus :` instead of `RunThenPass(location.focus)`, `/` to `location.focus /`,
-  `u` to `tab.reopen` and `y f` to copying the hovered link.
+  to `location.focus :` instead of `RunThenPass(location.focus)`, `/` to `page.find`, `u` to
+  `tab.reopen`, `y f` to copying `TabInfo::link`, and Escape to `page.exit-fullscreen` while
+  `TabInfo::fullscreen` holds (its mode switch otherwise).

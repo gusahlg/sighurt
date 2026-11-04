@@ -344,8 +344,9 @@ pub enum EngineCommand {
     },
     /// Find in the view's document ([`EngineCapabilities::find_in_page`]). One search per
     /// view: a new [`FindCommand::Search`] replaces the last, and its highlights. Results
-    /// arrive as [`EngineEvent::FindResult`]. An engine without the capability refuses it, and
-    /// the core never sends it one.
+    /// arrive as [`EngineEvent::FindResult`]. A move or stop for a search that is not the
+    /// view's current one does nothing. An engine without the capability refuses it, and the
+    /// core never sends it one.
     Find(FindCommand),
     /// Leave element fullscreen ([`EngineCapabilities::fullscreen`]);
     /// [`EngineEvent::FullscreenChanged`] with `fullscreen: false` follows. An engine without
@@ -353,25 +354,37 @@ pub enum EngineCommand {
     ExitFullscreen,
 }
 
-/// What [`EngineCommand::Find`] does.
+/// What [`EngineCommand::Find`] does. Each names the search it belongs to, so the engine can
+/// drop one for a search it no longer has.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FindCommand {
     /// Start a search, or replace the view's search: select the first match from the view's
-    /// current position.
+    /// current position. Dropped if `document` is no longer the view's.
     Search {
         /// Identifies this search in its [`EngineEvent::FindResult`]s.
         search: RequestId,
+        /// The document to search.
+        document: DocumentGeneration,
         /// What to find: not empty, at most [`MAX_FIND`](crate::commands::MAX_FIND) bytes.
         text: String,
         /// Whether case matters.
         case_sensitive: bool,
     },
-    /// Move to the next match, wrapping around.
-    Next,
-    /// Move to the previous match, wrapping around.
-    Previous,
-    /// End the search and clear its highlights.
-    Stop,
+    /// Move to the next match of `search`, wrapping around.
+    Next {
+        /// The search.
+        search: RequestId,
+    },
+    /// Move to the previous match of `search`, wrapping around.
+    Previous {
+        /// The search.
+        search: RequestId,
+    },
+    /// End `search` and clear its highlights.
+    Stop {
+        /// The search.
+        search: RequestId,
+    },
 }
 
 /// Whether a runtime has more work after [`EngineRuntime::pump`].
