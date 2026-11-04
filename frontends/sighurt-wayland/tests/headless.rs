@@ -123,7 +123,7 @@ impl App {
     /// Paints `permit`'s target in its color and submits the frame.
     fn present(&mut self, permit: FramePermit) {
         let target = permit.target();
-        if target == self.page.id() && self.page.mode() == PresentMode::Gl {
+        if target == self.page.id() && self.page.mode() == PresentMode::Native {
             let presenter = self
                 .gl
                 .get_or_insert_with(|| gl::Presenter::new(&self.page));
@@ -979,7 +979,7 @@ fn a_new_field_on_the_same_target_is_a_new_input_method_session() {
 #[test]
 #[ignore = "needs tools/headless-sway: run frontends/sighurt-wayland/tests/headless.sh"]
 fn a_gl_presenter_owns_its_leaf_from_first_frame_to_teardown() {
-    let mut h = Harness::with_page(PresentMode::Gl);
+    let mut h = Harness::with_page(PresentMode::Native);
     let page = h.app.page.id();
     assert!(h.app.gl.is_some(), "the page presented through EGL");
     h.pump_for(Duration::from_millis(100));

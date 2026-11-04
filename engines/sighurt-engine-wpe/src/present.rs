@@ -1,7 +1,7 @@
 //! Presenting WebKit's frames on the host's page targets: DMA-BUF buffers attached as they are,
 //! or shared-memory frames copied once into our own `wl_shm` buffers (the diagnosed fallback).
 //!
-//! The host leases each view a native target ([`PresentMode::Gl`]: the presenter, not the
+//! The host leases each view a native target ([`PresentMode::Native`]: the presenter, not the
 //! host, attaches and commits the leaf). This module talks to the compositor on the host's own
 //! `wl_display`, through an event queue of its own, so its buffers' events never reach the
 //! host: it wraps the target's `wl_surface`, binds `zwp_linux_dmabuf_v1` (version 4, for the
@@ -16,7 +16,7 @@
 //! releases them. On a CPU target ([`crate::Offscreen`]) there is no compositor: `copy_argb`
 //! copies the SHM frame into the frame the target lends, row by row, with no conversion.
 //!
-//! [`PresentMode::Gl`]: sighurt_wayland::PresentMode::Gl
+//! [`PresentMode::Native`]: sighurt_wayland::PresentMode::Native
 //!
 //! Must not own: when to present (the host's permits), WebKit's buffers (WebKit allocates and
 //! frees them), or the surface's geometry (the host's viewport and scale are pending state that

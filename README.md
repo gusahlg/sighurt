@@ -22,7 +22,9 @@ distributed.
 ```text
  sig (sighurt-browser): arguments, process-wide setup, the choice of frontend
   ├── sighurt-gui       the Wayland frontend: the event loop, the chrome's surfaces
-  │    ├── sighurt-ui        the chrome: tabs, address and command line, drawn on the CPU
+  │    ├── sighurt-ui        the chrome: tabs, address and command line, drawn as scenes
+  │    ├── sighurt-render    scenes, text, and the renderers that draw them: the CPU's,
+  │    │                     and wgpu's on Vulkan (sighurt-render-wgpu)
   │    └── sighurt-wayland   the window and its surfaces, input, scaling, frame scheduling
   ├── sighurt-tui       the terminal frontend: terminal I/O, the chrome as text, pages as
   │                     kitty graphics or reflowed text, `sig --dump`
@@ -120,6 +122,7 @@ configuration decides which of them are used.
 | `engine-ladybird` | no | Ladybird (LibWeb), the engine `ladybird` (needs the shim below) |
 | `engine-netsurf` | no | NetSurf 3.11, the engine `netsurf` (GPL-2.0-only; your own use; never a default) |
 | `chrome-line` | no | the line chrome, `[ui] chrome = "line"` |
+| `render-wgpu` | yes | the chrome drawn on the GPU by wgpu (Vulkan), `[ui] renderer = "wgpu"` |
 
 ```bash
 cargo build -p sighurt-browser --features chrome-line                     # the default engines, plus the line chrome
@@ -302,7 +305,7 @@ key is optional.
 - `sig` reads the file again whenever it is saved. The keymap and its bindings, the mouse's
   buttons, scrolling, colors, fonts and the chrome's options, the home page, search, keywords,
   zoom, routing and the download folder apply at once; pages already open stay in their engine.
-  `[ui] chrome` and the engines' own settings apply when `sig` starts again.
+  `[ui] chrome`, `[ui] renderer` and the engines' own settings apply when `sig` starts again.
 
 ```toml
 version = 1
@@ -361,6 +364,7 @@ tabs = "left"
 | `[keys]`, `[keys.page]`, `[keys.location]` | the `bindings` keymap: everywhere, while the page has the keyboard, while the address line has it | none |
 | `[keymap.<name>]` | another keymap's own table | — |
 | `[ui] chrome` | the chrome that draws the window (at the next start) | `"standard"` |
+| `[ui] renderer` | what renders the chrome (at the next start): `"auto"`, `"cpu"`, `"wgpu"` (the GPU through Vulkan; a surface it can't present on, or a GPU that fails, gives the chrome back to the CPU) or `"vulkan"` (not built yet); one this build lacks gives a notice and `"auto"` is used, which is the CPU until wgpu is measured at least as good | `"auto"` |
 | `[ui] font`, `font-size` | the chrome's font family, and its size in logical pixels (9 to 32) | an installed sans-serif, 14 |
 | `[ui.colors]` | `bg`, `surface`, `hover`, `tab`, `border`, `focus`, `text`, `text_muted`, `text_dim`, `selection`, `error`: `"#rrggbb"` or `"#rrggbbaa"` | a dark theme |
 | `[chrome.standard]` | `tabs` (`"top"`, `"left"`, `"hidden"`), `status` (`"strip"`, `"overlay"`), `buttons`, `compact`, `engine-label` (the engine a page runs in, in its tab and the address bar) | top, strip, true, false, true |
@@ -574,9 +578,11 @@ window's size, a snapshot of the browser's state whenever something it could sho
 pointer input on its surfaces, keys the keymap passed, pasted text, its own commands), returns
 actions (run a command, select or close a tab by its id, move the keyboard, copy, paste, repaint a
 surface), lays out up to 8 named surfaces with their input areas and the page's rectangle, and
-paints a surface into a buffer the host lends. Its kind checks `[chrome.<name>]` and names its
-`chrome.<action>` commands. sighurt-ui's text, editing and painting helpers (`Fonts`, `TextEditor`,
-`Canvas`) are there to use.
+draws a surface as a scene with a `Pen` (rectangles, rounded and bordered ones, paths, shaped text,
+in window coordinates), which the renderer `[ui] renderer` chose renders. Its kind checks
+`[chrome.<name>]`, names its `chrome.<action>` commands and makes the chrome with the fonts `sig`
+shares with its renderer. sighurt-ui's text, editing and drawing helpers (`Fonts`, `TextEditor`,
+`Pen`) are there to use.
 
 To add either to `sig`: a feature in `apps/sighurt-browser/Cargo.toml` and the kind in the list in
 `crates/sighurt-runtime/src/registry.rs` (`KEYMAPS`) or `frontends/sighurt-gui/src/chrome.rs` (`CHROMES`):

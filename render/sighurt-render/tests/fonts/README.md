@@ -1,7 +1,8 @@
 # Test font
 
-`Cantarell-Regular.ttf` is used only by sighurt-ui's tests, so text shaping and the golden
-images don't depend on the fonts installed on the machine running them. The browser itself uses
+`Cantarell-Regular.ttf` is used only by tests (sighurt-render's, and the chromes' in sighurt-ui
+and sighurt-chrome-line), so text shaping and the golden images don't depend on the fonts
+installed on the machine running them. The browser itself uses
 the system's fonts.
 
 - **Font:** Cantarell Regular, a subset covering Basic Latin, Latin-1 and Latin Extended-A

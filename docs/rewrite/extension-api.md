@@ -578,13 +578,17 @@ already puts there. A keymap crate depends on `sighurt-api` alone.
 
 - The core never calls a chrome; the executable does.
 - Every type a chrome exchanges, besides the shared input, geometry and id types, already lives
-  in sighurt-ui: `Snapshot`, `TabSnapshot`, `TabContent`, `HomeInfo`, `EngineRow`, `Colors`,
-  `PixelBuffer`, `PaintError`. So nothing moves, and `sighurt-api` stays the neutral contract of
-  plan §5, with no CPU pixel buffers or palettes in it (§28, question 4). Decision 10
-  ("sighurt-ui depends on sighurt-api only") is unchanged.
-- A chrome depends on `sighurt-api` and `sighurt-ui`. sighurt-ui brings cosmic-text and
-  tiny-skia, which any CPU chrome needs anyway. Its text, editing and painting helpers are part
-  of the chrome API (§2.8).
+  in sighurt-ui: `Snapshot`, `TabSnapshot`, `TabContent`, `HomeInfo`, `EngineRow`, `Colors`.
+  So nothing moves, and `sighurt-api` stays the neutral contract of plan §5, with no pixel
+  buffers or palettes in it (§28, question 4).
+- A chrome draws with `sighurt-render` (docs/rewrite/RENDER.md): a `Pen` records a scene, which
+  the renderer `sig` chose renders, so a chrome names no pixel buffer, tiny-skia or cosmic-text
+  type. sighurt-ui re-exports what a chrome draws and shapes with (`Pen`, `PathBuilder`, `Rgba`,
+  `Fonts`, `ShapedText`, `TextStyle`, `FontSystemHandle`). Decision 10 ("sighurt-ui depends on
+  sighurt-api only") becomes "on sighurt-api and sighurt-render": the render crate is the
+  chrome's drawing library, as tiny-skia was.
+- A chrome depends on `sighurt-api` and `sighurt-ui`. Its text, editing and drawing helpers are
+  part of the chrome API (§2.8).
 
 **What the core needs from a chrome is only checks:** its name, the check function for its
 table, and its list of commands. The executable copies them into the core's `Environment`
@@ -877,14 +881,14 @@ directory and was not kept (Evidence). Step 7 writes the crate and its tests.
 ```rust
 use sighurt_api::commands::Command;
 use sighurt_api::events::Cursor;
-use sighurt_api::geometry::{LogicalSize, Metrics, SurfaceRect, WindowRect};
+use sighurt_api::geometry::{LogicalSize, SurfaceRect, WindowRect};
 use sighurt_api::ids::{RequestId, TabId};
 use sighurt_api::input::{
     FocusEvent, KeyEvent, KeyboardFocus, PointerEvent, TextInputEvent, TextInputState,
 };
 use sighurt_api::settings::Table;
 
-use crate::{Colors, PaintError, PixelBuffer, Snapshot};
+use crate::{Colors, Fonts, Pen, Snapshot};
 
 /// A chrome's own name for one of its surfaces ("toolbar", "page").
 pub type SurfaceName = &'static str;
@@ -896,10 +900,9 @@ pub trait Chrome {
     fn handle(&mut self, event: ChromeEvent) -> Vec<ChromeAction>;
     /// Where the page goes and where the chrome's surfaces are. Read after every `handle`.
     fn layout(&self) -> &ChromeLayout;
-    /// Paints `surface` for `metrics` into `buffer` (`metrics.buffer()` in size), covering all
-    /// of it: the buffer may hold an older frame.
-    fn paint(&mut self, surface: SurfaceName, metrics: &Metrics, buffer: PixelBuffer<'_>)
-        -> Result<(), PaintError>;
+    /// Draws `surface` with `pen`, whole: the surface's clear colour first (`Pen::clear`), then
+    /// everything it shows. The pen's rectangle is the surface's (`Pen::rect`).
+    fn draw(&mut self, surface: SurfaceName, pen: &mut Pen);
 }
 
 #[non_exhaustive]
@@ -907,7 +910,7 @@ pub trait Chrome {
 pub enum ChromeEvent {
     /// The shared look and `[chrome.<name>]`. Comes first of all, and after every valid reload.
     Configure { theme: Theme, settings: Table },
-    /// The window's size; before the first paint and on every change.
+    /// The window's size; before the first drawing and on every change.
     Resize(LogicalSize),
     /// What the browser shows now, after every change the core made that a chrome could show.
     /// Never sent because a page drew a frame.
@@ -988,7 +991,8 @@ pub struct ChromeKind {
     pub check: fn(&Table) -> Vec<String>,
     /// The actions it takes as `chrome.<action>` commands, which take no argument.
     pub commands: &'static [&'static str],
-    pub new: fn() -> Box<dyn Chrome>,
+    /// A new chrome shaping with `fonts`, the font system `sig` shares with its renderer.
+    pub new: fn(Fonts) -> Box<dyn Chrome>,
 }
 
 /// Untrusted text made safe to show on one line: control characters become spaces; bidi
@@ -1003,16 +1007,28 @@ pub fn readable_url(url: &str) -> Cow<'_, str>;
 
 The existing snapshot types gain one field, `Snapshot::keymap: Option<String>`, the keymap's
 indicator, and one method, `Snapshot::contain`, which the executable runs before a chrome sees a
-snapshot. The other snapshot, color and painting types stay as they are, where they are. Besides
-`Canvas` (with `Pen`), `Fonts`, `TextStyle`, `ShapedText` and `TextEditor`, a chrome may use
+snapshot. The other snapshot and color types stay as they are, where they are. Besides `Pen`
+(with `PathBuilder`), `Fonts`, `TextStyle`, `ShapedText` and `TextEditor`, a chrome may use
 `state::{is_home, NO_SUCH_PAGE}`, which say what the page area shows for `sig:` addresses; the
 line chrome uses all of them.
+
+**Drawing (the painting half, amended by docs/rewrite/RENDER.md).** `Chrome::draw` records the
+surface's scene with a `Pen`, in window-logical coordinates: `clear` (made opaque: chrome surfaces
+are opaque), `fill`, `fill_rounded`, `bordered`, `stroke` and `shape` (with sighurt-render's own
+`PathBuilder`), `text` (a `ShapedText` at a point, cut to a rectangle) and `rect` (the surface's
+rectangle). It names no buffer, pixel format or rasterizer: the renderer `[ui] renderer` chose
+renders the scene, with every edge and baseline snapped by the same shared functions, so the
+chrome's pixels and its hit test agree under any renderer. A scene equal to the surface's last
+one, at the same metrics, is not rendered again and commits nothing. The fonts are shared: `sig`
+loads them once, hands the chrome a `Fonts` (`ChromeKind::new`) and the renderer the same font
+system, so a chrome no longer loads fonts itself.
 
 **The contract between the executable and a chrome:**
 
 - **The chrome lays out; the host validates** (plan §4, §13).
-  - The executable keeps one SHM target for each surface name the chrome has used, never more
-    than `MAX_SURFACES`. A ninth name is refused, with a diagnostic, and not shown.
+  - The executable keeps one target for each surface name the chrome has used, never more than
+    `MAX_SURFACES`, presenting as the renderer does (shared memory for the CPU renderer). A
+    ninth name is refused, with a diagnostic, and not shown.
   - A *listed* surface is placed at its rectangle, clipped to the window. It takes pointer input
     on its `input` area, clipped to the surface, which the executable maps one to one to
     `sighurt_wayland::InputRegion` (placement.rs:79–90).
@@ -1036,6 +1052,8 @@ line chrome uses all of them.
     so.
   - Freeing the free buffers of a hidden SHM target would lower this, for engine views as well.
     That is the host track's call: requested in part 3, not assumed here.
+  - A native renderer's swapchain holds 2 to 4 images of the surface's size, the same order as
+    the SHM bound (RENDER.md §11).
 - **The page area when no engine shows** (home, errors, blank): the chrome draws it on a surface
   of its own at `layout.page`, listed only while it is needed (decision 18).
 - **Damage is the chrome's to report** (`Repaint`).
@@ -1099,10 +1117,10 @@ pub const KIND: ChromeKind = ChromeKind {
     name: "standard",
     check,
     commands: &["toggle-tabs"],
-    new: || Box::new(Standard::new()),
+    new: |fonts| Box::new(Standard::new(fonts)),
 };
 
-pub struct Standard { model: Model, painter: CpuPainter, layout: ChromeLayout }
+pub struct Standard { model: Model, layout: ChromeLayout }
 
 impl Chrome for Standard {
     fn handle(&mut self, event: ChromeEvent) -> Vec<ChromeAction> {
@@ -1134,10 +1152,9 @@ impl Chrome for Standard {
 
     fn layout(&self) -> &ChromeLayout { &self.layout }
 
-    fn paint(&mut self, _: SurfaceName, metrics: &Metrics, buffer: PixelBuffer<'_>)
-        -> Result<(), PaintError> {
-        // CpuPainter already paints whatever the model shows inside metrics.rect().
-        self.painter.paint(&mut self.model, metrics, buffer)
+    fn draw(&mut self, surface: SurfaceName, pen: &mut Pen) {
+        // paint.rs draws whatever the model shows on that surface.
+        crate::paint::draw(pen, &mut self.model, surface);
     }
 }
 ```
@@ -1172,8 +1189,8 @@ From sighurt-ui it uses the extension module and the helpers that are part of th
 - `Fonts`, the cached font system;
 - `TextEditor`, the address editor (grapheme movement, selection, paste, IME preedit, the 32 KiB
   cap);
-- `Canvas`, new: it fills rectangles and draws shaped text into a `PixelBuffer` at a target's
-  scale, with the glyph cache. It is split out of `paint_cpu` in that step.
+- `Pen`, sighurt-render's scene builder (it was `Canvas` and its `Pen`, which painted into a
+  `PixelBuffer` on the CPU, until the render framework, RENDER.md).
 
 **What the proof shows, and what it doesn't.**
 
@@ -1327,8 +1344,8 @@ conditions:
 |---|---|
 | 1. One owner per field? | Mode and unfinished sequence: the keymap. Taken presses, taken buttons and the keyboard focus: the core. Routing, including where a page's navigation goes: the core. What an engine can load: the engine. Layout, editing, painting, and which of its widgets has the keyboard: the chrome. Targets, placement and input regions: the executable and the host. Each setting: §1.3. |
 | 2. Can a delayed event tell what it belongs to? | Pastes carry a `RequestId`. Tab actions carry a `TabId` (new). Text fields name their surface. A navigation request carries its `RequestId` and `DocumentGeneration`, and one from a replaced document is denied. Chrome commands carry no identity: like keys, they act on the chrome's current state. |
-| 3. A page-sized copy or an unconditional tick? | None. Chromes paint into lent buffers, and the API has no clock. A page-sized repaint happens only when the chrome's own page changes (decision 18). The status overlay has a fixed size, so a new hovered URL starts no new buffer generation. |
-| 4. A renderer detail leaking into the core or the guest contract? | The chrome contract and its CPU `PixelBuffer` stay in sighurt-ui. `sighurt-api` gains the neutral keymap and settings modules, plus two engine-contract items (`NavigationRequested`, `AnswerNavigation`) that carry only ids and a URL. The core sees nothing of a chrome but its checks. |
+| 3. A page-sized copy or an unconditional tick? | None. Chromes draw scenes that the renderer renders into lent buffers, and the API has no clock. A page-sized repaint happens only when the chrome's own page changes (decision 18). The status overlay has a fixed size, so a new hovered URL starts no new buffer generation. |
+| 4. A renderer detail leaking into the core or the guest contract? | The chrome contract stays in sighurt-ui, and draws scenes (sighurt-render), not pixels; the core sees only `[ui] renderer`'s name. `sighurt-api` gains the neutral keymap and settings modules, plus two engine-contract items (`NavigationRequested`, `AnswerNavigation`) that carry only ids and a URL. The core sees nothing of a chrome but its checks. |
 | 5. Claims backed? | Evidence lists what was checked: the code facts this design relies on, and the out-of-tree patch recipe. It also lists what wasn't: these signatures have not been compiled since this revision, nor ever on Rust 1.95; WPE; and the hand-off's latency. Every step in part 3 names its test. |
 
 **§26.**
@@ -1792,3 +1809,17 @@ finding was checked against the plan and the code before it was acted on.
   and `[keymap.modal]`'s TOML modes are gone (§2.5 and the examples above describe the old
   crate), and the example's bindings are Rust. `[tui.keys]`' built-in table is gone. New command
   `clipboard.copy <text>`. The chrome API is unchanged.
+- **The render framework, lane 1** (3 November 2026; design in `docs/rewrite/RENDER.md`, §14
+  amending its body): the painting half of the chrome API is replaced by drawing scenes.
+  `Chrome::paint(surface, &Metrics, PixelBuffer) -> Result<(), PaintError>` becomes
+  `Chrome::draw(surface, &mut Pen)`; `ChromeKind::new` takes the shared `Fonts`
+  (`fn(Fonts) -> Box<dyn Chrome>`), so a chrome no longer loads fonts. `Canvas`, `CpuPainter`,
+  `PixelBuffer` and `PaintError` leave the chrome API (`PixelBuffer` is sighurt-render's
+  backend contract now). The `Pen` (sighurt-render's, re-exported) is widened: `fill_rounded`,
+  `bordered`, `stroke` and `shape` are public, `stroke` and `shape` take sighurt-render's
+  `PathBuilder` (tiny-skia's method names: `move_to`, `line_to`, `quad_to`, `cubic_to`,
+  `close`, `push_circle`), `text` loses its `&mut Fonts` argument, `clear` makes its color
+  opaque, and `rect()` is new. `Rgba`, `Fonts`, `ShapedText`, `TextStyle` and
+  `FontSystemHandle` are sighurt-render's, re-exported from sighurt-ui at their old paths;
+  `ShapedText::lines` is new; `paint_cpu` is `paint` (`paint::draw`). The standard chrome's and
+  the line chrome's golden images are unchanged, pixel for pixel.

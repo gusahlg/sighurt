@@ -2604,6 +2604,7 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
         peaks: session.diagnostics().peaks.clone(),
         targets,
         engines: session.engine_reports(),
+        renderer: None,
         tabs,
         active_tab,
         status,

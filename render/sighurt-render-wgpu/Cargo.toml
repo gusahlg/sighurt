@@ -1,0 +1,27 @@
+[package]
+name = "sighurt-render-wgpu"
+description = "Sighurt's wgpu chrome renderer: wgpu 30 on Vulkan, presenting into the host's native targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# `WgpuBackend::render_to_image`, for the comparison with the CPU backend.
+testing = []
+
+# No sighurt-wayland: the backend binds raw-window-handle handles (RENDER.md §2).
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }
+sighurt-render = { path = "../sighurt-render", features = ["gpu"] }
+raw-window-handle.workspace = true
+# Vulkan only, never wgpu's GL backend in sig's process (RENDER.md §14.1).
+wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
+log = "0.4"
+
+[dev-dependencies]
+sighurt-render-wgpu = { path = ".", features = ["testing"] }
+# The standard chrome's fixtures (sighurt-ui's tests/common), for the comparison test.
+sighurt-ui = { path = "../../ui/sighurt-ui" }
+tiny-skia.workspace = true

@@ -13,5 +13,7 @@ sighurt-api = { path = "../../crates/sighurt-api" }
 sighurt-ui = { path = "../../ui/sighurt-ui" }
 
 [dev-dependencies]
+# Renders its scenes for the golden images, as `sig`'s CPU backend does.
+sighurt-render = { path = "../../render/sighurt-render" }
 # Reads and writes the golden images.
 tiny-skia.workspace = true

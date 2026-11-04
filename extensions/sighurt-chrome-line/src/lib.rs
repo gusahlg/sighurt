@@ -1,8 +1,8 @@
 //! The line chrome, `[ui] chrome = "line"`: the whole chrome is one line, at the top of the
 //! window or, with `[chrome.line] position = "bottom"`, at the bottom. It proves that the chrome
 //! API (`sighurt_ui::extension`) is enough for a chrome whose surfaces, layout, editing and
-//! painting are its own: it uses sighurt-ui's helpers ([`Fonts`], [`TextEditor`], [`Canvas`])
-//! and nothing of the core, the host or an engine.
+//! drawing are its own: it uses sighurt-ui's helpers ([`Fonts`], [`TextEditor`], [`Pen`])
+//! and nothing of the core, the host, a renderer or an engine.
 //!
 //! Unfocused, the line shows the active tab's place (`[2/5]`), the keymap's indicator, the
 //! committed address (decoded where that is safe), a mark while the page loads, and on the right
@@ -32,7 +32,7 @@ use std::rc::Rc;
 
 use sighurt_api::commands::Command;
 use sighurt_api::events::Cursor;
-use sighurt_api::geometry::{LogicalSize, Metrics, SurfacePoint, SurfaceRect, WindowRect};
+use sighurt_api::geometry::{LogicalSize, SurfacePoint, SurfaceRect, WindowRect};
 use sighurt_api::ids::RequestId;
 use sighurt_api::input::{
     ButtonState, FocusEvent, Key, KeyEvent, KeyboardFocus, PointerButton, PointerEvent,
@@ -45,9 +45,7 @@ use sighurt_ui::extension::{
 };
 use sighurt_ui::state::{is_home, NO_SUCH_PAGE};
 use sighurt_ui::text_edit::TextEditor;
-use sighurt_ui::{
-    Canvas, Fonts, PaintError, Pen, PixelBuffer, Rgba, ShapedText, Snapshot, TabContent, TextStyle,
-};
+use sighurt_ui::{Fonts, Pen, Rgba, ShapedText, Snapshot, TabContent, TextStyle};
 
 /// The line.
 pub const LINE: SurfaceName = "line";
@@ -71,7 +69,7 @@ pub const KIND: ChromeKind = ChromeKind {
     name: "line",
     check,
     commands: &[],
-    new: || Box::new(Line::new(Fonts::system())),
+    new: |fonts| Box::new(Line::new(fonts)),
 };
 
 /// Everything wrong with `[chrome.line]`.
@@ -100,7 +98,6 @@ fn check(settings: &Table) -> Vec<String> {
 /// The line chrome.
 pub struct Line {
     fonts: Fonts,
-    canvas: Canvas,
     theme: Theme,
     /// `[chrome.line] position = "bottom"`.
     bottom: bool,
@@ -158,7 +155,6 @@ impl Line {
     pub fn new(fonts: Fonts) -> Self {
         let mut line = Self {
             fonts,
-            canvas: Canvas::new(),
             theme: Theme::default(),
             bottom: false,
             engine_label: true,
@@ -619,13 +615,7 @@ impl Line {
         let gap = self.scaled(GAP);
         let text_height = f32::from(self.style().line_height);
         let all = [x, y, width, height];
-        pen.text(
-            &mut self.fonts,
-            &view.prefix,
-            (x + gap, view.top),
-            colors.text_muted,
-            all,
-        );
+        pen.text(&view.prefix, (x + gap, view.top), colors.text_muted, all);
         let (from, to) = view.field;
         let field = [from, y, to - from, height];
         if self.focused {
@@ -648,7 +638,7 @@ impl Line {
             pen.fill(selection, colors.selection);
         }
         let at = (view.text_x, view.top);
-        pen.text(&mut self.fonts, &view.text, at, colors.text, field);
+        pen.text(&view.text, at, colors.text, field);
         if let Some(preedit) = view.preedit.and_then(clipped) {
             let underline = view.top + text_height - self.scaled(2.0);
             pen.fill([preedit[0], underline, preedit[2], 1.0], colors.text);
@@ -669,7 +659,7 @@ impl Line {
             } else {
                 colors.text_muted
             };
-            pen.text(&mut self.fonts, status, (*at, view.top), color, all);
+            pen.text(status, (*at, view.top), color, all);
         }
         if let Some((engine, x, top, busy)) = &view.engine {
             // Muted at rest, bright and underlined under the pointer, reversed while held, and
@@ -692,7 +682,7 @@ impl Line {
             if let Some(back) = back {
                 pen.fill(bounds, back);
             }
-            pen.text(&mut self.fonts, engine, (*x, *top), color, all);
+            pen.text(engine, (*x, *top), color, all);
             if over && !held {
                 let under = *top + engine.height - 1.0;
                 pen.fill([*x, under, engine.width, 1.0], color);
@@ -763,13 +753,7 @@ impl Line {
             let shaped = self
                 .fonts
                 .wrapped(&text, style, (width - 2.0 * gap).max(1.0));
-            pen.text(
-                &mut self.fonts,
-                &shaped,
-                (x + gap, top),
-                color,
-                [x, y, width, height],
-            );
+            pen.text(&shaped, (x + gap, top), color, [x, y, width, height]);
             top += shaped.height + self.scaled(GAP) / 2.0;
         }
     }
@@ -894,22 +878,14 @@ impl Chrome for Line {
         &self.layout
     }
 
-    fn paint(
-        &mut self,
-        surface: SurfaceName,
-        metrics: &Metrics,
-        buffer: PixelBuffer<'_>,
-    ) -> Result<(), PaintError> {
-        let mut canvas = std::mem::take(&mut self.canvas);
-        let painted = canvas.paint(metrics, buffer, |pen| match surface {
+    fn draw(&mut self, surface: SurfaceName, pen: &mut Pen) {
+        match surface {
             LINE => self.paint_line(pen),
             PAGE => self.paint_page(pen),
             _ => pen.clear(Rgba {
                 a: 255,
                 ..self.theme.colors.bg
             }),
-        });
-        self.canvas = canvas;
-        painted
+        }
     }
 }

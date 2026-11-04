@@ -300,6 +300,15 @@ impl<B> Swapchain<B> {
         self.make_free(key);
     }
 
+    /// The painter gives `key` back untouched, without submitting it: free again with the frame
+    /// it held, or destroyed if its generation retired meanwhile.
+    pub fn unused(&mut self, key: BufferKey, buffer: B) {
+        if let Some(slot) = self.slot_mut(key) {
+            slot.buffer = Some(buffer);
+        }
+        self.make_free(key);
+    }
+
     /// The compositor released `key`: it may be drawn into again, or, if its generation
     /// retired, it is destroyed.
     pub fn release(&mut self, key: BufferKey) {
@@ -566,6 +575,17 @@ impl ShmFrame {
         let (key, buffer) = self.lent.take().expect("a frame has its buffer");
         self.permit.submit_shm(key, buffer, damage);
     }
+
+    /// Gives the buffer back untouched and commits nothing: the surface already shows what this
+    /// frame would (a renderer found its scene unchanged). The permit's outcome is
+    /// [`PresentOutcome::Unchanged`].
+    pub fn unchanged(mut self) {
+        let (key, buffer) = self.lent.take().expect("a frame has its buffer");
+        if let Some(buffers) = self.permit.target_mut().shm.as_mut() {
+            buffers.unused(key, buffer);
+        }
+        self.permit.set_outcome(PresentOutcome::Unchanged);
+    }
 }
 
 impl Drop for ShmFrame {
@@ -815,6 +835,19 @@ mod tests {
             "it retires"
         );
         assert_eq!(c.chain.stats().retiring_generations, 1);
+    }
+
+    #[test]
+    fn an_unused_buffer_keeps_its_frame() {
+        let mut c = Chain::new();
+        let (a, buffer) = c.acquire(100).unwrap();
+        c.chain.submit(a, buffer);
+        c.chain.release(a);
+        let (again, buffer, age) = c.acquire_aged(100).unwrap();
+        assert_eq!((again, age), (a, 1));
+        c.chain.unused(again, buffer);
+        let (same, _, age) = c.acquire_aged(100).unwrap();
+        assert_eq!((same, age), (a, 1), "nothing was drawn into it");
     }
 
     #[test]

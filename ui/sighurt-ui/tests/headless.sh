@@ -41,7 +41,8 @@ if [[ ${1:-} != --inside ]]; then
     SIG_WHAT="build sig (demo engine, line chrome) for the chrome tests" tools/cargo build \
       -p sighurt-browser --no-default-features --features engine-demo,chrome-line \
       --bins --example virtual-pointer || exit 1
-    cp target/debug/sig target/debug/examples/virtual-pointer "$out/bin/"
+    tdir=${CARGO_TARGET_DIR:-target}
+    cp "$tdir/debug/sig" "$tdir/debug/examples/virtual-pointer" "$out/bin/"
   fi
   failed=0
   for scenario in "${scenarios[@]}"; do

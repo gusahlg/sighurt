@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use sighurt_api::geometry::{LogicalSize, Metrics, SurfacePoint, SurfaceRect, WindowRect};
+use sighurt_api::geometry::{LogicalSize, SurfacePoint, SurfaceRect, WindowRect};
 use sighurt_api::input::{
     ButtonState, KeyboardFocus, Modifiers, PointerButton, PointerEvent, ScrollDelta,
     TextInputState, TextPurpose,
@@ -17,7 +17,7 @@ use sighurt_ui::extension::{
     InputArea, SurfaceName, TextField, Theme,
 };
 use sighurt_ui::standard::{self, Standard};
-use sighurt_ui::{PaintError, PixelBuffer, Snapshot, TabContent};
+use sighurt_ui::{Fonts, Pen, Snapshot, TabContent};
 
 fn configured(mut chrome: Box<dyn Chrome>, width: u32, height: u32) -> Box<dyn Chrome> {
     chrome.handle(ChromeEvent::Configure {
@@ -62,24 +62,13 @@ fn click(chrome: &mut dyn Chrome, surface: SurfaceName, (x, y): (f64, f64)) -> V
     actions
 }
 
-/// Paints `surface` at `scale` (over 120) through the trait.
+/// Draws `surface` through the trait and renders it at `scale` (over 120) with the CPU backend.
 fn paint_surface(chrome: &mut dyn Chrome, surface: SurfaceName, scale: u32) -> Image {
     let rect = chrome.layout().surfaces.iter().find(|s| s.name == surface);
     let metrics = metrics(rect.expect("listed").rect, scale);
-    let size = metrics.buffer();
-    let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
-    let buffer = PixelBuffer {
-        data: &mut data,
-        width: size.width,
-        height: size.height,
-        stride: size.width as usize * 4,
-    };
-    chrome.paint(surface, &metrics, buffer).unwrap();
-    Image {
-        width: size.width,
-        height: size.height,
-        rgba: argb_to_rgba(&data),
-    }
+    let mut pen = Pen::new(metrics.rect());
+    chrome.draw(surface, &mut pen);
+    render(&pen.finish(), &metrics)
 }
 
 #[test]
@@ -464,27 +453,8 @@ impl Chrome for Bar {
         &self.layout
     }
 
-    fn paint(
-        &mut self,
-        _surface: SurfaceName,
-        metrics: &Metrics,
-        buffer: PixelBuffer<'_>,
-    ) -> Result<(), PaintError> {
-        let expected = metrics.buffer();
-        if (buffer.width, buffer.height) != (expected.width, expected.height) {
-            return Err(PaintError::WrongSize {
-                expected,
-                width: buffer.width,
-                height: buffer.height,
-            });
-        }
-        let bg = self.theme.colors.bg;
-        for row in buffer.data.chunks_mut(buffer.stride) {
-            for pixel in row[..buffer.width as usize * 4].as_chunks_mut::<4>().0 {
-                *pixel = [bg.b, bg.g, bg.r, 0xff];
-            }
-        }
-        Ok(())
+    fn draw(&mut self, _surface: SurfaceName, pen: &mut Pen) {
+        pen.clear(self.theme.colors.bg);
     }
 }
 
@@ -502,7 +472,7 @@ const BAR: ChromeKind = ChromeKind {
         settings.iter().filter_map(bad).collect()
     },
     commands: &[],
-    new: || Box::<Bar>::default(),
+    new: |_: Fonts| Box::<Bar>::default(),
 };
 
 #[test]
@@ -521,7 +491,7 @@ fn a_chrome_from_outside_the_crate() {
         ]
     );
 
-    let mut chrome = (BAR.new)();
+    let mut chrome = (BAR.new)(fonts());
     let mut theme = Theme::default();
     theme.colors.bg = sighurt_ui::Rgba::rgb(0x102030);
     chrome.handle(ChromeEvent::Configure {
