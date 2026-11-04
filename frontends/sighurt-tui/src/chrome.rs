@@ -8,13 +8,19 @@
 //!
 //! The top line is `[2/5] title — address · engine · MODE · keymap`, with `…`
 //! after the title while that tab is loading. The bottom line is the address
-//! editor while it is open, otherwise the notice, otherwise the status.
+//! editor while it is open, otherwise the notice, otherwise the status. After
+//! the editor's text, with the cursor at its end, the rest of a visited address
+//! it completes to shows in grey ([`ChromeState::address_ghost`]).
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::grid::{Attrs, Color, Grid};
 use crate::sanitize::sanitize;
+
+/// The colour of a completion after the address editor's text: the palette's
+/// grey (bright black), which every 256-colour terminal has.
+const GHOST: Color = Color::Indexed(8);
 
 /// Shown in [`ChromeState::mode_label`] while the page is graphics.
 pub const MODE_GRAPHICS: &str = "GFX";
@@ -43,6 +49,10 @@ pub struct ChromeState {
     pub active: usize,
     /// The address editor, while the user is editing it.
     pub address_editing: Option<LineEditor>,
+    /// The rest of the visited address the editor's text completes to, drawn after it while
+    /// the cursor is at its end. Plain ASCII (an address as recorded), still sanitized when
+    /// drawn.
+    pub address_ghost: Option<String>,
     /// `GFX` or `TEXT`. Any other short label is drawn as it is.
     pub mode_label: String,
     /// What the keymap says about itself, such as `NORMAL`.
@@ -59,6 +69,7 @@ impl Default for ChromeState {
             tabs: Vec::new(),
             active: 0,
             address_editing: None,
+            address_ghost: None,
             mode_label: MODE_GRAPHICS.to_string(),
             keymap_indicator: None,
             notice: None,
@@ -108,6 +119,16 @@ impl ChromeState {
             grid.clear_row(row);
             let (text, column) = bottom_line(self, cols);
             put_fitted(grid, row, &text);
+            let at_end = self
+                .address_editing
+                .as_ref()
+                .is_some_and(|editor| editor.at_end() && !editor.selected());
+            let ghost = self.address_ghost.as_deref().filter(|_| at_end);
+            if let (Some(ghost), Some(column)) = (ghost, column) {
+                let room = cols.saturating_sub(column);
+                let ghost = fit_cols(&sanitize(ghost), room);
+                grid.put_text(column, row, &ghost, GHOST, Color::Default, Attrs::default());
+            }
             column.map(|column| Cursor { column, row })
         } else {
             None
@@ -219,6 +240,11 @@ impl LineEditor {
     /// The text before the cursor.
     pub fn before_cursor(&self) -> &str {
         &self.text[..self.cursor]
+    }
+
+    /// Whether the cursor is at the end of the line.
+    pub fn at_end(&self) -> bool {
+        self.cursor == self.text.len()
     }
 
     /// Display columns before the cursor.
@@ -585,6 +611,7 @@ mod tests {
             }],
             active: 0,
             address_editing: None,
+            address_ghost: None,
             mode_label: MODE_GRAPHICS.into(),
             keymap_indicator: Some("NOR\u{1b}[0mMAL".into()),
             notice: None,
