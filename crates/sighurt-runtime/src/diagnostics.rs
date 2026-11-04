@@ -2,14 +2,15 @@
 //!
 //! Counts loop wakeups and iterations, input events, core events and effects, engine pumps and
 //! their events, frame-ready notifications, page frames presented (and not ready), chrome
-//! paints per surface, placements, and the deepest queues seen; counts and times the placements
-//! and chrome snapshots a frontend builds; times the longest pump,
-//! present and chrome paint; keeps the most SHM buffers any target, and any of the chrome's
-//! targets, held, sampled after every presentation (where buffers are allocated). The host adds, per target, its metrics and its
-//! permits, submissions, frame callbacks, buffer releases and presentation feedback, kept
-//! distinct (submission is not display), and its buffers and bytes. Each engine is listed with
-//! how it renders (for Servo, the actual GL renderer and whether it is a software fallback),
-//! whether it runs, and the page readbacks it counted itself.
+//! paints per surface (and chrome frames found unchanged), placements, and the deepest queues
+//! seen; counts and times the placements and chrome snapshots a frontend builds; times the
+//! longest pump, present and chrome paint (and apart, the chrome's drawing of its scene and the
+//! renderer's rendering of it); keeps the most SHM buffers any target, and any of the chrome's
+//! targets, held, sampled after every presentation (where buffers are allocated). The host adds,
+//! per target, its metrics and its permits, submissions, frame callbacks, buffer releases and
+//! presentation feedback, kept distinct (submission is not display), and its buffers and bytes.
+//! Each engine is listed with how it renders (for Servo, the actual GL renderer and whether it
+//! is a software fallback), whether it runs, and the page readbacks it counted itself.
 //!
 //! Page readbacks are the engines' own counts (Servo counts every `read_to_image`; `sig` has
 //! no readback path of its own), taken after each frame an engine submits and at each report:
@@ -24,10 +25,12 @@
 //!   WebRender paint; for the CPU engines the whole `present`) and `present_ms` the `present`
 //!   call; a `renderer` line for each engine at its first frame (`mode=cpu`, or
 //!   `mode=hardware|software gl="<GL_RENDERER>"`); a `first-frame` line for a navigation
-//!   started in the active tab, at the view's first frame after it;
+//!   started in the active tab, at the view's first frame after it; a `chrome` line per chrome
+//!   frame, whose `draw_ms` is the whole of it, `scene_ms` the chrome's drawing and `render_ms`
+//!   the renderer's; and a `chrome-renderer` line when the window starts its renderer;
 //! - on SIGUSR1 and at exit (at exit only with `SIG_DIAG=1`), a `counters` line (cumulative
-//!   counts, as bench/ takes them), a `peaks` line (queue depths, longest calls) and one line
-//!   per target and engine;
+//!   counts, as bench/ takes them), a `peaks` line (queue depths, longest calls), one line
+//!   per target and engine, and a `chrome-renderer` line with what the renderer counted;
 //! - with `--diagnostics FILE`, the same as JSON in FILE, rewritten on SIGUSR1 and at exit,
 //!   with which tab is active, what the status strip shows and each tab's browser state
 //!   (loading, back and forward, a record, an error, the engine its tab is labelled with), never
@@ -94,6 +97,13 @@ pub struct Counters {
     pub paints_status: u64,
     /// A page the chrome draws (`sig://home`, errors: "page") painted.
     pub paints_page: u64,
+    /// Chrome frames whose scene was the surface's last: nothing rendered or committed.
+    pub chrome_unchanged: u64,
+    /// Chrome renders the renderer put off (no swapchain image in time): the target was
+    /// invalidated for a new permit.
+    pub chrome_deferred: u64,
+    /// Times the chrome's renderer was replaced by the CPU one.
+    pub renderer_fallbacks: u64,
     /// Placements applied.
     pub placements: u64,
     /// Placements the host refused.
@@ -129,8 +139,12 @@ pub struct Peaks {
     pub max_pump_us: u64,
     /// The longest `present`, in microseconds.
     pub max_present_us: u64,
-    /// The longest chrome paint, in microseconds.
+    /// The longest chrome paint, in microseconds: its drawing and rendering together.
     pub max_chrome_paint_us: u64,
+    /// The longest drawing of a chrome surface's scene, in microseconds.
+    pub max_chrome_scene_us: u64,
+    /// The longest rendering of a chrome surface's scene, in microseconds.
+    pub max_chrome_render_us: u64,
     /// The most SHM buffers one target held, of every generation.
     pub max_target_buffers: u64,
     /// The most SHM buffers one of the chrome's targets held, of every generation.
@@ -191,6 +205,58 @@ pub struct EngineReport {
     pub state: String,
 }
 
+/// The renderer that draws the chrome (`[ui] renderer`), and what it counted. A measurement
+/// the renderer can't make is `None`.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RendererReport {
+    /// Its name: "cpu", "wgpu", "vulkan".
+    pub name: &'static str,
+    /// What it runs on, as it says.
+    pub describe: String,
+    /// Frames it rendered.
+    pub frames: u64,
+    /// Renders that found the surface's last frame current.
+    pub unchanged: u64,
+    /// Renders it put off.
+    pub deferred: u64,
+    /// Its longest render, in microseconds.
+    pub max_render_us: u64,
+    /// Its latest render, in microseconds.
+    pub last_render_us: u64,
+    /// Rasterized glyphs it holds.
+    pub glyphs: u64,
+    /// Bytes of glyph images it holds on the CPU.
+    pub glyph_bytes: u64,
+    /// Times its glyph cache or atlas started over.
+    pub glyph_resets: u64,
+    /// Native surfaces it has bound.
+    pub surfaces: u64,
+    /// Its atlas pages' sides, and their bytes as textures.
+    pub atlas_mask_size: Option<u32>,
+    pub atlas_color_size: Option<u32>,
+    pub atlas_bytes: Option<u64>,
+    /// Times an atlas page grew, started over, or a frame overflowed it.
+    pub atlas_grows: Option<u64>,
+    pub atlas_resets: Option<u64>,
+    pub atlas_overflows: Option<u64>,
+    /// Swapchain images per surface, when the API says.
+    pub swapchain_images: Option<u32>,
+    /// Device memory of its own resources, as it can tell.
+    pub device_bytes: Option<u64>,
+    /// Swapchain (re)configurations.
+    pub configures: u64,
+    /// Its longest bind, configure and unbind, in microseconds.
+    pub max_bind_us: Option<u64>,
+    pub max_configure_us: Option<u64>,
+    pub max_unbind_us: Option<u64>,
+    /// Times the frontend replaced its renderer with the CPU one, and the last reason.
+    pub fallbacks: u64,
+    pub fallback: Option<String>,
+    /// The renderer it replaced, and the frames that one rendered.
+    pub replaced: Option<&'static str>,
+    pub replaced_frames: u64,
+}
+
 /// One tab, as the core sees it: browser state only, never its address or title.
 #[derive(Clone, Debug, Serialize)]
 pub struct TabReport {
@@ -213,6 +279,8 @@ pub struct Report {
     pub peaks: Peaks,
     pub targets: Vec<TargetReport>,
     pub engines: Vec<EngineReport>,
+    /// The chrome's renderer; `None` in the terminal, which draws no such chrome.
+    pub renderer: Option<RendererReport>,
     /// The tabs, in the tab strip's order.
     pub tabs: Vec<TabReport>,
     /// The active tab's position in the tab strip, from 1.
@@ -371,8 +439,20 @@ impl Diagnostics {
         }
     }
 
-    /// A chrome-drawn surface painted.
-    pub fn chrome(&mut self, surface: &'static str, draw: Duration) {
+    /// The chrome's renderer started: its name and what it runs on.
+    pub fn chrome_renderer(&self, name: &str, describe: &str) {
+        if self.lines {
+            self.line(
+                "chrome-renderer",
+                format_args!("renderer={name} describe={describe:?}"),
+            );
+        }
+    }
+
+    /// A chrome-drawn surface painted: the chrome drew its scene in `scene`, the renderer
+    /// rendered it in `render`.
+    pub fn chrome(&mut self, surface: &'static str, scene: Duration, render: Duration) {
+        let draw = scene + render;
         let c = &mut self.counters;
         c.chrome_paints += 1;
         match surface {
@@ -383,10 +463,18 @@ impl Diagnostics {
         }
         let p = &mut self.peaks;
         p.max_chrome_paint_us = p.max_chrome_paint_us.max(micros(draw));
+        p.max_chrome_scene_us = p.max_chrome_scene_us.max(micros(scene));
+        p.max_chrome_render_us = p.max_chrome_render_us.max(micros(render));
         if self.lines {
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
             self.line(
                 "chrome",
-                format_args!("surface={surface} draw_ms={:.3}", draw.as_secs_f64() * 1e3),
+                format_args!(
+                    "surface={surface} draw_ms={:.3} scene_ms={:.3} render_ms={:.3}",
+                    ms(draw),
+                    ms(scene),
+                    ms(render)
+                ),
             );
         }
     }
@@ -401,6 +489,30 @@ impl Diagnostics {
     pub fn snapshot_built(&mut self, took: Duration) {
         self.counters.snapshots += 1;
         self.counters.snapshot_ns = self.counters.snapshot_ns.saturating_add(nanos(took));
+    }
+
+    /// The renderer put off a chrome surface's frame; the target waits for a new permit.
+    pub fn chrome_deferred(&mut self) {
+        self.counters.chrome_deferred += 1;
+    }
+
+    /// The chrome's renderer `from` could not go on (`why`) and `to` replaced it.
+    pub fn renderer_fallback(&mut self, from: &str, to: &str, why: &str) {
+        self.counters.renderer_fallbacks += 1;
+        log::warn!("the chrome's {from} renderer stopped ({why}); the chrome is drawn by {to}");
+        if self.lines {
+            self.line(
+                "chrome-renderer-fallback",
+                format_args!("from={from} to={to} why={why:?}"),
+            );
+        }
+    }
+
+    /// A chrome-drawn surface's scene was its last frame's: nothing rendered or committed.
+    pub fn chrome_unchanged(&mut self, scene: Duration) {
+        self.counters.chrome_unchanged += 1;
+        let p = &mut self.peaks;
+        p.max_chrome_scene_us = p.max_chrome_scene_us.max(micros(scene));
     }
 
     /// An engine pump took `took` and reported `events`.
@@ -427,6 +539,10 @@ impl Diagnostics {
                 let value = serde_json::to_value(engine).expect("plain data");
                 self.line("engine", format_args!("{}", pairs(&value)));
             }
+            if let Some(renderer) = &report.renderer {
+                let value = serde_json::to_value(renderer).expect("plain data");
+                self.line("chrome-renderer", format_args!("{}", pairs(&value)));
+            }
         }
         if let Some(file) = &self.file {
             let value = json!({
@@ -436,6 +552,7 @@ impl Diagnostics {
                 "peaks": report.peaks,
                 "targets": report.targets,
                 "engines": report.engines,
+                "renderer": report.renderer,
                 "tabs": report.tabs,
                 "active_tab": report.active_tab,
                 "status": report.status,

@@ -20,7 +20,7 @@ engine compiled in loads WebKit only when it starts the runtime.
 refused), on the owner thread, before WebKit is used: it sets JavaScriptCore's options that keep it off
 signals in this process (decision 66) and takes GLib's default main context, whose watch thread
 wakes the owner through the `EngineWaker` (decision 64). The runtime implements `EngineRuntime`
-with `sighurt_wayland::TargetLease` by default (a `PresentMode::Gl` target per view: the
+with `sighurt_wayland::TargetLease` by default (a `PresentMode::Native` target per view: the
 presenter, not the host, attaches and commits) and `FramePermit`. `WpeRuntime<Offscreen<C>>`
 presents into any `CpuTarget` with no Wayland connection: WebKit's shared-memory frames
 (`WPE_PIXEL_FORMAT_ARGB8888`, premultiplied, top-down) are copied into the lent frame, counted

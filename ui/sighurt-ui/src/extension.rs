@@ -4,9 +4,10 @@
 //! A chrome is compiled into `sig` and listed in its registry as a [`ChromeKind`]; `[ui]
 //! chrome` picks one when `sig` starts. `sig` drives it through the [`Chrome`] trait: events in
 //! ([`ChromeEvent`]), actions out ([`ChromeAction`]), a layout of named surfaces
-//! ([`ChromeLayout`]) and painting into buffers the host lends. sighurt-ui's own chrome goes
-//! through the same trait ([`crate::standard`]), and its text, editing and painting helpers
-//! ([`crate::Fonts`], [`crate::text_edit::TextEditor`]) are there for other chromes to use.
+//! ([`ChromeLayout`]) and drawing each surface with a [`Pen`], whose scene the backend `sig`
+//! chose (`[ui] renderer`) renders. sighurt-ui's own chrome goes through the same trait
+//! ([`crate::standard`]), and its text, editing and drawing helpers ([`crate::Fonts`],
+//! [`crate::text_edit::TextEditor`], [`Pen`]) are there for other chromes to use.
 //!
 //! The contract between `sig` and a chrome:
 //!
@@ -16,9 +17,16 @@
 //!   with an empty rectangle has no room and is unmapped. A name the chrome used before but no
 //!   longer lists is hidden: unmapped, keeping its last rectangle. Engine views go at
 //!   [`ChromeLayout::page`], the chrome's surfaces above them in the chrome's order.
+//! - **Drawing is a scene:** [`Chrome::draw`] draws a surface whole with a [`Pen`] (its clear
+//!   colour first), in window-logical coordinates; it names no pixel format, buffer or
+//!   rasterizer. The fonts are shared: `sig` loads them once and hands the chrome a [`Fonts`]
+//!   ([`ChromeKind::new`]) and the backend the same font system. A scene equal to the surface's
+//!   last frame, at the same metrics and layout epoch, is not rendered again, provided that
+//!   frame was submitted and the surface still shows it (`RenderOutcome::Unchanged`).
 //! - **Memory is bounded by the host:** at most 3 buffers per surface at its latest size, plus
 //!   ones the compositor has yet to release; a hidden surface keeps its buffers. A surface as
-//!   big as the page holds about 30 MB a buffer at 1920 × 1000 and 200 %.
+//!   big as the page holds about 30 MB a buffer at 1920 × 1000 and 200 %. A native backend's
+//!   swapchain holds 2 to 4 images of the surface's size, the same order.
 //! - **The page area when no engine shows** (`sig://home`, errors, a blank tab) is the chrome's
 //!   to draw, on a surface of its own at the page's rectangle, listed only while it is needed.
 //! - **Damage is the chrome's to report** ([`ChromeAction::Repaint`]): an identical snapshot,
@@ -57,17 +65,18 @@ use std::fmt;
 
 use sighurt_api::commands::Command;
 use sighurt_api::events::Cursor;
-use sighurt_api::geometry::{LogicalSize, Metrics, SurfaceRect, WindowRect};
+use sighurt_api::geometry::{LogicalSize, SurfaceRect, WindowRect};
 use sighurt_api::ids::{RequestId, TabId};
 use sighurt_api::input::{
     FocusEvent, KeyEvent, KeyboardFocus, PointerEvent, TextInputEvent, TextInputState,
 };
 use sighurt_api::settings::Table;
 
-use crate::canvas::{PaintError, PixelBuffer};
+use sighurt_render::Pen;
+
 use crate::chrome::Colors;
 use crate::state::Snapshot;
-use crate::text::DEFAULT_FONT_SIZE;
+use crate::text::{Fonts, DEFAULT_FONT_SIZE};
 
 /// A chrome's own name for one of its surfaces ("chrome", "page").
 pub type SurfaceName = &'static str;
@@ -75,8 +84,8 @@ pub type SurfaceName = &'static str;
 /// The most surfaces a chrome may use. `sig` refuses a ninth name, with a diagnostic.
 pub const MAX_SURFACES: usize = 8;
 
-/// A chrome: the window's tab list, address line and whatever else it shows, drawn on the CPU
-/// into the surfaces it lays out.
+/// A chrome: the window's tab list, address line and whatever else it shows, drawn as scenes on
+/// the surfaces it lays out.
 pub trait Chrome {
     /// Handles one event and returns what the executable should do, in order.
     fn handle(&mut self, event: ChromeEvent) -> Vec<ChromeAction>;
@@ -84,14 +93,10 @@ pub trait Chrome {
     /// Where the page goes and where the chrome's surfaces are. Read after every `handle`.
     fn layout(&self) -> &ChromeLayout;
 
-    /// Paints `surface` for `metrics` into `buffer` (`metrics.buffer()` in size), covering all
-    /// of it: the buffer may hold an older frame.
-    fn paint(
-        &mut self,
-        surface: SurfaceName,
-        metrics: &Metrics,
-        buffer: PixelBuffer<'_>,
-    ) -> Result<(), PaintError>;
+    /// Draws `surface` with `pen`, whole: the surface's clear colour first ([`Pen::clear`]),
+    /// then everything it shows. The pen's rectangle is the surface's, where the latest layout
+    /// placed it ([`Pen::rect`]), window-logical like everything drawn.
+    fn draw(&mut self, surface: SurfaceName, pen: &mut Pen);
 }
 
 /// What happens to a chrome.
@@ -106,7 +111,7 @@ pub enum ChromeEvent {
         /// `[chrome.<name>]`, empty when the configuration has none.
         settings: Table,
     },
-    /// The window's size; before the first paint and on every change.
+    /// The window's size; before the first drawing and on every change.
     Resize(LogicalSize),
     /// What the browser shows now, after every change the core made that a chrome could show.
     /// Never sent because a page drew a frame.
@@ -161,7 +166,7 @@ pub enum ChromeAction {
     TextInput(Option<TextField>),
     /// Show this pointer over the chrome's surfaces.
     Cursor(Cursor),
-    /// This surface shows something new: paint it again.
+    /// This surface shows something new: draw it again.
     Repaint(SurfaceName),
 }
 
@@ -266,8 +271,9 @@ pub struct ChromeKind {
     pub check: fn(&Table) -> Vec<String>,
     /// The actions it takes as `chrome.<action>` commands, which take no argument.
     pub commands: &'static [&'static str],
-    /// A new chrome, which is configured before anything else.
-    pub new: fn() -> Box<dyn Chrome>,
+    /// A new chrome shaping its text with `fonts` (the font system `sig` shares with its
+    /// renderer), which is configured before anything else.
+    pub new: fn(Fonts) -> Box<dyn Chrome>,
 }
 
 impl fmt::Debug for ChromeKind {

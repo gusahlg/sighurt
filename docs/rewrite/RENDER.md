@@ -439,6 +439,20 @@ Lanes, each in its own worktree with its own `CARGO_TARGET_DIR` under
    cargo wants to change the version of anything already locked (Servo's dependencies), stop
    and pick the newest wgpu that fits the lock, or pin the conflicting dependency; never run a
    broad `cargo update`.
+   *Status (4 November 2026, branch `render`):* done. `gpu` (`prepare`, `Atlas`, the vertex
+   layout, `shaders.wgsl`) and `sighurt-render-wgpu` (`WgpuBackend`); `render-wgpu` in `sig`'s
+   default set with `auto` still the CPU backend; the fallback (`SIG_RENDER_FAIL=device|surface`)
+   and the comparison tests (`render/sighurt-render-wgpu/tests/compare.rs`, headless.sh
+   `renderers`) pass on this desktop; measurements in `bench/results/RENDER.md`. The lock gained
+   entries only. Lane 1's API took the Astra review's amendments first (font-system provenance,
+   bounded glyph admission, shared path rasterization, `RenderOutcome`, extended `BackendStats`,
+   `Pen::clip`; hide unbinds only `Pixels` backends). Deviation from §15: a `Deferred` frame
+   invalidates its target 16 ms later (a one-shot timer in the loop's wait timeout), not at
+   once, since `NotReady` leaves the frame request uncommitted and an immediate invalidation
+   would let the loop spin on a renderer that keeps putting frames off (Astra's review of
+   lane 2). Measured (`bench/results/RENDER.md`): wgpu is slower per render, costs +129 MiB
+   RSS and some idle CPU in a driver thread, so `auto` stays `cpu` (§14.5). Unverified:
+   Mesa's WSI, a real output, `sig` with Servo beside the chrome's device.
 3. **`render-vulkan`** (Opus or Sonnet, after 2's `gpu` module): `sighurt-render-vulkan` with
    `build.rs` on naga; the same tests.
 4. **Docs and measurements** (Sonnet): `extension-api.md` amendments, CLAUDE.md's crate table

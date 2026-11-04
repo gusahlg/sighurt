@@ -1,10 +1,10 @@
-//! The standard chrome's CPU painter: draws what [`Model`] shows on each of its surfaces with a
-//! [`Canvas`], into buffer memory the host lends it.
+//! The standard chrome's drawing: what [`Model`] shows on each of its surfaces, as a scene drawn
+//! with a [`Pen`], which the backend the frontend chose renders.
 //!
-//! Each surface is painted whole, so a buffer that last held an older frame (or garbage) comes
+//! Each surface is drawn whole, so a buffer that last held an older frame (or garbage) comes
 //! out complete: the tab strip and the toolbar on [`CHROME`], the tab list on [`TABS`], the
 //! status line on [`STATUS`] (a strip, or an overlay with a background and border of its own,
-//! since it lies over the page), and a page the chrome draws itself on [`PAGE`]. Painting by
+//! since it lies over the page), and a page the chrome draws itself on [`PAGE`]. Drawing by
 //! surface rather than by rectangle keeps the overlay out of the page area's buffer below it.
 //! Rectangles come from the layout the hit test uses, so controls stay under the pointer; icon
 //! and text sizes scale with the font size as the layout does. An engine page's tab names its
@@ -15,11 +15,11 @@
 //! name is a button: a rounded outline in the theme's colours, brighter under the pointer,
 //! sunk while held, and naming the engine being opened while a switch is under way.
 //!
-//! Must not own: buffers or their lifetime (the host's SHM presenter), or page pixels.
+//! Must not own: buffers, pixels or how a scene is rendered (the backend's), or page pixels.
 
-use sighurt_api::geometry::{Metrics, WindowRect};
+use sighurt_api::geometry::WindowRect;
+use sighurt_render::Pen;
 
-use crate::canvas::{Canvas, PaintError, Pen, PixelBuffer};
 use crate::chrome::{
     engine_label, label_top, Colors, EngineButton, Model, Rgba, Tone, BUTTON_ICON, CARET_WIDTH,
     CHROME, PAGE, STATUS, TABS,
@@ -29,34 +29,6 @@ use crate::hit_test::Target;
 use crate::layout::{LayoutOptions, Status, TabLayout};
 use crate::state::TabSnapshot;
 use crate::text::TextStyle;
-
-/// Paints the standard chrome on the CPU. One painter serves every surface of a window.
-#[derive(Default)]
-pub struct CpuPainter {
-    canvas: Canvas,
-}
-
-impl CpuPainter {
-    /// A painter with empty caches.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Paints `chrome`'s `surface` ([`CHROME`], [`TABS`], [`STATUS`] or [`PAGE`]) into
-    /// `buffer`, which must be `metrics.buffer()` in size, for the rectangle the surface is
-    /// placed at, `metrics.rect()`. An empty rectangle paints nothing; a surface the chrome
-    /// doesn't have gets its background.
-    pub fn paint(
-        &mut self,
-        chrome: &mut Model,
-        surface: SurfaceName,
-        metrics: &Metrics,
-        buffer: PixelBuffer<'_>,
-    ) -> Result<(), PaintError> {
-        self.canvas
-            .paint(metrics, buffer, |pen| draw(pen, chrome, surface))
-    }
-}
 
 fn rect_f(rect: WindowRect) -> [f32; 4] {
     [
@@ -76,8 +48,9 @@ fn tone(colors: &Colors, tone: Tone) -> Rgba {
     }
 }
 
-/// Paints all of `surface`. The chrome is opaque, so the buffer also works as `XRGB8888`.
-fn draw(pen: &mut Pen, chrome: &mut Model, surface: SurfaceName) {
+/// Draws all of `chrome`'s `surface` ([`CHROME`], [`TABS`], [`STATUS`] or [`PAGE`]) with `pen`.
+/// A surface the chrome doesn't have gets its background. The chrome is opaque.
+pub fn draw(pen: &mut Pen, chrome: &mut Model, surface: SurfaceName) {
     let colors = *chrome.colors();
     let layout = chrome.layout().clone();
     let overlay = surface == STATUS && layout.options.status == Status::Overlay;
@@ -195,11 +168,11 @@ fn draw_tab(
         colors.text_muted
     };
     let clip = [left, rect[1], (right - left).max(0.0), rect[3]];
-    pen.text(chrome.fonts(), &text, (left, top), color, clip);
+    pen.text(&text, (left, top), color, clip);
     if let Some((x, label)) = label {
         let at = (x, label_top(chrome.fonts(), options, style, top));
         let clip = [x, rect[1], label.width, rect[3]];
-        pen.text(chrome.fonts(), &label, at, colors.text_muted, clip);
+        pen.text(&label, at, colors.text_muted, clip);
     }
 }
 
@@ -334,16 +307,10 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
         }
     }
     let at = (view.x, view.y);
-    pen.text(chrome.fonts(), &view.shaped, at, colors.text, clip);
+    pen.text(&view.shaped, at, colors.text, clip);
     if let Some((indicator, x)) = &view.indicator {
         let field = rect_f(field);
-        pen.text(
-            chrome.fonts(),
-            indicator,
-            (*x, view.y),
-            colors.text_muted,
-            field,
-        );
+        pen.text(indicator, (*x, view.y), colors.text_muted, field);
     }
     if let Some(button) = &view.engine {
         draw_engine_button(pen, chrome, button, colors);
@@ -378,19 +345,13 @@ fn draw_engine_button(pen: &mut Pen, chrome: &mut Model, button: &EngineButton, 
     let [x, y, w, h] = button.rect;
     let clip = [x, y, w, h];
     let (name, name_x) = &button.name;
-    pen.text(chrome.fonts(), name, (*name_x, button.text_y), text, clip);
+    pen.text(name, (*name_x, button.text_y), text, clip);
     let cy = y + h / 2.0;
     match &button.target {
         None => swap_icon(pen, options, (button.icon_x, cy), text),
         Some((target, target_x)) => {
             arrow(pen, options, (button.icon_x, cy), text);
-            pen.text(
-                chrome.fonts(),
-                target,
-                (*target_x, button.text_y),
-                text,
-                clip,
-            );
+            pen.text(target, (*target_x, button.text_y), text, clip);
         }
     }
 }
@@ -445,13 +406,7 @@ fn draw_status(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     let text = chrome.fonts().fitted(&line, style, width);
     let top = y + (h - f32::from(style.line_height)) / 2.0;
     let clip = [x + k(8.0), y, width, h];
-    pen.text(
-        chrome.fonts(),
-        &text,
-        (x + k(8.0), top),
-        tone(colors, shade),
-        clip,
-    );
+    pen.text(&text, (x + k(8.0), top), tone(colors, shade), clip);
 }
 
 fn draw_page(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
@@ -468,6 +423,6 @@ fn draw_page(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     let clip = rect_f(chrome.layout().page);
     for text in &page.texts {
         let color = tone(colors, text.tone);
-        pen.text(chrome.fonts(), &text.shaped, (text.x, text.y), color, clip);
+        pen.text(&text.shaped, (text.x, text.y), color, clip);
     }
 }

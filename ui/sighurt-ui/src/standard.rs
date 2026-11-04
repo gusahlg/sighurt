@@ -1,6 +1,6 @@
-//! The standard chrome, `[ui] chrome = "standard"`: sighurt-ui's [`Model`] and [`CpuPainter`]
-//! behind the chrome API ([`crate::extension`]), as any other chrome would be. Every build has
-//! it, and it is the default.
+//! The standard chrome, `[ui] chrome = "standard"`: sighurt-ui's [`Model`] and its drawing
+//! ([`crate::paint`]) behind the chrome API ([`crate::extension`]), as any other chrome would
+//! be. Every build has it, and it is the default.
 //!
 //! Its surfaces, bottom to top: [`PAGE`] while it draws the page area (`sig://home`, errors),
 //! [`TABS`] while the tabs are on the left, [`CHROME`] (the tab strip when the tabs are at the
@@ -13,17 +13,16 @@
 //!
 //! Must not own: anything the model doesn't; this is only the adapter.
 
-use sighurt_api::geometry::{Metrics, WindowRect};
+use sighurt_api::geometry::WindowRect;
 use sighurt_api::settings::{Table, Value};
+use sighurt_render::Pen;
 
-use crate::canvas::{PaintError, PixelBuffer};
 use crate::chrome::{Model, CHROME, PAGE, STATUS, TABS};
 use crate::extension::{
     Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout, ChromeSurface, InputArea,
     SurfaceName,
 };
 use crate::layout::{LayoutOptions, Status, Tabs};
-use crate::paint_cpu::CpuPainter;
 use crate::{Colors, Fonts};
 
 /// The standard chrome, for the registry.
@@ -31,7 +30,7 @@ pub const KIND: ChromeKind = ChromeKind {
     name: "standard",
     check,
     commands: &["toggle-tabs"],
-    new: || Box::new(Standard::new(Fonts::system())),
+    new: |fonts| Box::new(Standard::new(fonts)),
 };
 
 /// Everything wrong with `[chrome.standard]`.
@@ -77,7 +76,6 @@ fn option(key: &str, value: &Value, options: &mut LayoutOptions) -> Result<(), S
 /// The standard chrome.
 pub struct Standard {
     model: Model,
-    painter: CpuPainter,
     layout: ChromeLayout,
 }
 
@@ -88,7 +86,6 @@ impl Standard {
         Self {
             layout: layout_of(&model),
             model,
-            painter: CpuPainter::new(),
         }
     }
 
@@ -171,13 +168,7 @@ impl Chrome for Standard {
         &self.layout
     }
 
-    fn paint(
-        &mut self,
-        surface: SurfaceName,
-        metrics: &Metrics,
-        buffer: PixelBuffer<'_>,
-    ) -> Result<(), PaintError> {
-        self.painter
-            .paint(&mut self.model, surface, metrics, buffer)
+    fn draw(&mut self, surface: SurfaceName, pen: &mut Pen) {
+        crate::paint::draw(pen, &mut self.model, surface);
     }
 }

@@ -256,7 +256,7 @@ impl Model {
         page.states.busy = loading;
         if let Some(layout) = self.page_layout() {
             for (i, text) in layout.texts.iter().enumerate() {
-                let content = text.shaped.runs().map(|run| run.text).next().unwrap_or("");
+                let content = text.shaped.lines().next().unwrap_or("");
                 let bounds = WindowRect {
                     x: text.x as i32,
                     y: text.y as i32,

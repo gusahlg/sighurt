@@ -25,7 +25,10 @@
 //! the file does. A user's file that names a keymap this build lacks is an error.
 //! `[input] scroll-speed` scales the scrolling pages get, and `[input.buttons]` binds the
 //! mouse's side buttons to commands. `[ui]` is what every chrome shares: which chrome draws
-//! the window (`chrome`, used from the next start), its font and size, and `[ui.colors]`.
+//! the window (`chrome`, used from the next start), which renderer draws the chrome
+//! (`renderer`, one of the project's names in [`Environment::renderers`], also from the next
+//! start; a build without that renderer says so and uses `auto`), its font and size, and
+//! `[ui.colors]`.
 //!
 //! `[tui]` is the terminal's: how it shows pages, and its own `[tui.keys]`, which `bindings`
 //! installs over `[keys]` in the terminal only. `[tui] default-keys` is accepted and does
@@ -78,6 +81,15 @@ pub const VERSION: i64 = 1;
 
 /// The chrome of `[ui] chrome` when the file names none: sighurt-ui's, in every build.
 pub const DEFAULT_CHROME: &str = "standard";
+
+/// Every renderer `[ui] renderer` can name, whether this build has it or not
+/// (docs/rewrite/RENDER.md): `auto` lets the window choose, `cpu` is in every build, `wgpu`
+/// and `vulkan` are GPU backends behind features. What a frontend puts in
+/// [`Environment::renderers`].
+pub const RENDERERS: &[&str] = &["auto", "cpu", "wgpu", "vulkan"];
+
+/// The renderer of `[ui] renderer` when the file names none.
+pub const DEFAULT_RENDERER: &str = "auto";
 
 /// The terminal chrome's `chrome.<action>` commands, without the `chrome.` prefix.
 ///
@@ -266,6 +278,7 @@ pub struct Config {
     /// `[input.buttons]`: the side buttons bound to commands.
     buttons: Vec<(PointerButton, Command)>,
     chrome: String,
+    renderer: String,
     font: Option<String>,
     font_size: u16,
     colors: BTreeMap<String, String>,
@@ -611,6 +624,13 @@ impl Config {
     /// when `sig` starts.
     pub fn chrome(&self) -> &str {
         &self.chrome
+    }
+
+    /// The renderer that draws the chrome: `[ui] renderer`, one of [`RENDERERS`], which this
+    /// build need not have (the window then uses `auto` and says so). It is chosen when `sig`
+    /// starts.
+    pub fn renderer(&self) -> &str {
+        &self.renderer
     }
 
     /// `[ui] font`: the family the chrome's text is set in, if the file names one. It need not
@@ -1106,6 +1126,7 @@ fn validate(
         scroll_speed,
         buttons,
         chrome: ui.chrome,
+        renderer: ui.renderer,
         font: ui.font,
         font_size: ui.font_size,
         colors: ui.colors,
@@ -1691,17 +1712,19 @@ fn host_pattern(text: &str) -> Result<String, String> {
 /// What `[ui]` sets.
 struct Ui {
     chrome: String,
+    renderer: String,
     font: Option<String>,
     font_size: u16,
     colors: BTreeMap<String, String>,
 }
 
-/// `[ui]`, which every chrome shares: the chrome (one of the build's), its font and size, and
-/// its colors (names the build's chrome has, values `#rrggbb` or `#rrggbbaa`). What an older
+/// `[ui]`, which every chrome shares: the chrome (one of the build's), the renderer (one of the
+/// project's), its font and size, and its colors (names the build's chrome has, values `#rrggbb` or `#rrggbbaa`). What an older
 /// sig kept in `[ui]` is reported with where it went.
 fn check_ui(ui: toml::Table, env: &Environment, problems: &mut Vec<String>) -> Ui {
     let mut checked = Ui {
         chrome: DEFAULT_CHROME.into(),
+        renderer: DEFAULT_RENDERER.into(),
         font: None,
         font_size: DEFAULT_FONT_SIZE,
         colors: BTreeMap::new(),
@@ -1718,6 +1741,16 @@ fn check_ui(ui: toml::Table, env: &Environment, problems: &mut Vec<String>) -> U
                 )),
                 None => problems.push(format!(
                     "[ui] chrome: expected a chrome's name, not {value}"
+                )),
+            },
+            "renderer" => match value.as_str() {
+                Some(name) if env.renderers.contains(&name) => checked.renderer = name.into(),
+                Some(name) => problems.push(format!(
+                    "[ui] renderer: there is no renderer {name:?} (there are: {})",
+                    list(env.renderers.iter().copied())
+                )),
+                None => problems.push(format!(
+                    "[ui] renderer: expected a renderer's name, not {value}"
                 )),
             },
             "font" => match value.as_str() {
@@ -1745,7 +1778,8 @@ fn check_ui(ui: toml::Table, env: &Environment, problems: &mut Vec<String>) -> U
                 "[ui.keys]: key bindings are in [keys], [keys.page] and [keys.location] now".into(),
             ),
             other => problems.push(format!(
-                "[ui] {other}: unknown key ([ui] has chrome, font, font-size and [ui.colors])"
+                "[ui] {other}: unknown key ([ui] has chrome, renderer, font, font-size and \
+                 [ui.colors])"
             )),
         }
     }
@@ -1855,6 +1889,7 @@ mod tests {
             keymaps: vec![FAKE],
             chromes: vec![STANDARD],
             color_names: &COLORS,
+            renderers: RENDERERS,
             frontend: Frontend::Gui,
             web_engines: Vec::new(),
             starting_engine: None,
@@ -1863,6 +1898,25 @@ mod tests {
 
     fn parse(user: &str) -> Result<Config, ConfigError> {
         Config::parse(Some(user), &env())
+    }
+
+    /// `[ui] renderer`: any of the project's renderers, whatever this build has (the window
+    /// says when it lacks one); an unknown name or a value of another kind is an error.
+    #[test]
+    fn the_renderer_is_one_of_the_projects() {
+        assert_eq!(parse("version = 1").unwrap().renderer(), DEFAULT_RENDERER);
+        for name in RENDERERS {
+            let config = parse(&format!("version = 1\n[ui]\nrenderer = {name:?}")).unwrap();
+            assert_eq!(config.renderer(), *name);
+        }
+        assert_eq!(
+            problems("version = 1\n[ui]\nrenderer = \"metal\""),
+            ["[ui] renderer: there is no renderer \"metal\" (there are: auto, cpu, wgpu, vulkan)"]
+        );
+        assert_eq!(
+            problems("version = 1\n[ui]\nrenderer = 3"),
+            ["[ui] renderer: expected a renderer's name, not 3"]
+        );
     }
 
     fn problems(user: &str) -> Vec<String> {

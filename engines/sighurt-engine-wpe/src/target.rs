@@ -131,7 +131,7 @@ impl WpeTarget for TargetLease {
 
     fn unsupported(&self) -> Option<&'static str> {
         match self.mode() {
-            PresentMode::Gl => None,
+            PresentMode::Native => None,
             PresentMode::Shm => Some("WPE views present on native targets"),
         }
     }

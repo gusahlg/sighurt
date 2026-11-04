@@ -1,23 +1,22 @@
 [package]
 name = "sighurt-ui"
-description = "Sighurt's chrome: tab strip and address line, layout, hit testing, text editing, CPU painting"
+description = "Sighurt's chrome: tab strip and address line, layout, hit testing, text editing, drawing scenes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# No sighurt-wayland: the chrome paints into memory the host lends it, so it builds and tests
-# without a compositor.
+# No sighurt-wayland: the chrome draws scenes (sighurt-render), which a backend the frontend
+# chose renders, so it builds and tests without a compositor or a GPU.
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
-cosmic-text.workspace = true
-tiny-skia.workspace = true
+sighurt-render = { path = "../../render/sighurt-render" }
 # Grapheme and word boundaries for editing. cosmic-text uses it too.
 unicode-segmentation = "1.12"
-# Says which font the chrome fell back to when `[ui] font` isn't installed.
-log = "0.4"
 
 [dev-dependencies]
+# Reads and writes the golden images.
+tiny-skia.workspace = true
 # Checks that an address shown decoded parses back to the same URL.
 url.workspace = true

@@ -225,7 +225,7 @@ impl Host {
                     t.surface.commit();
                 }
             }
-            if t.mode == PresentMode::Gl && resized && !metrics.is_empty() {
+            if t.mode == PresentMode::Native && resized && !metrics.is_empty() {
                 // Pending state for the presenter's next swap, which brings the new size.
                 crate::scale::apply(
                     &t.surface,

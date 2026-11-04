@@ -2,7 +2,8 @@
 //! commands, the clipboard, surfaces, damage, where the caret is drawn, and golden images at
 //! 100, 150 and 200 %.
 //!
-//! Golden images are in tests/golden/ and use sighurt-ui's bundled test font. After an intended
+//! Golden images are in tests/golden/, rendered by the CPU backend, and use the bundled test
+//! font (render/sighurt-render/tests/fonts). After an intended
 //! change of the look, regenerate them with `SIGHURT_BLESS=1 cargo test -p sighurt-chrome-line`
 //! and look at every changed image.
 
@@ -18,20 +19,29 @@ use sighurt_api::input::{
 };
 use sighurt_api::settings::{Table, Value};
 use sighurt_chrome_line::{Line, KIND, LINE, PAGE};
+use sighurt_render::{Backend, CpuBackend, Output, PixelBuffer, RenderOutcome, SurfaceKey};
 use sighurt_ui::extension::{Chrome, ChromeAction, ChromeEvent, SurfaceName, Theme};
 use sighurt_ui::{
-    Colors, EngineRow, Fonts, HomeInfo, PixelBuffer, Snapshot, TabContent, TabSnapshot,
+    Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, Pen, Snapshot, TabContent, TabSnapshot,
 };
 use tiny_skia::{IntSize, Pixmap};
 
-/// sighurt-ui's bundled test font (ui/sighurt-ui/tests/fonts/README.md).
-const FONT: &[u8] = include_bytes!("../../../ui/sighurt-ui/tests/fonts/Cantarell-Regular.ttf");
+/// The bundled test font (render/sighurt-render/tests/fonts/README.md).
+const FONT: &[u8] =
+    include_bytes!("../../../render/sighurt-render/tests/fonts/Cantarell-Regular.ttf");
+
+thread_local! {
+    /// The test font's font system, shared by this thread's chromes and backends as `sig`
+    /// shares its own.
+    static FONT_SYSTEM: FontSystemHandle = Fonts::from_data([FONT.to_vec()]).handle();
+}
 
 /// 100 %, 125 %, 150 % and 200 %, as numerators over 120.
 const SCALES: [u32; 4] = [120, 150, 180, 240];
 
 fn line(settings: Table, width: u32, height: u32) -> Box<dyn Chrome> {
-    let mut chrome: Box<dyn Chrome> = Box::new(Line::new(Fonts::from_data([FONT.to_vec()])));
+    let fonts = Fonts::new(FONT_SYSTEM.with(FontSystemHandle::clone));
+    let mut chrome: Box<dyn Chrome> = Box::new(Line::new(fonts));
     chrome.handle(ChromeEvent::Configure {
         theme: Theme::default(),
         settings,
@@ -197,6 +207,8 @@ fn paint(chrome: &mut dyn Chrome, surface: SurfaceName, scale: u32) -> Image {
     let scale = Scale::from_fractional(scale).unwrap();
     let metrics = Metrics::new(LayoutEpoch::next(), rect(chrome, surface), scale);
     let size = metrics.buffer();
+    let mut pen = Pen::new(metrics.rect());
+    chrome.draw(surface, &mut pen);
     let mut data = vec![0u8; size.width as usize * size.height as usize * 4];
     let buffer = PixelBuffer {
         data: &mut data,
@@ -204,7 +216,14 @@ fn paint(chrome: &mut dyn Chrome, surface: SurfaceName, scale: u32) -> Image {
         height: size.height,
         stride: size.width as usize * 4,
     };
-    chrome.paint(surface, &metrics, buffer).unwrap();
+    let mut backend = CpuBackend::new(FONT_SYSTEM.with(FontSystemHandle::clone));
+    let rendered = backend.render(
+        SurfaceKey(1),
+        &metrics,
+        &pen.finish(),
+        Output::Pixels(buffer),
+    );
+    assert_eq!(rendered, Ok(RenderOutcome::Submitted));
     // ARGB8888 little-endian (B, G, R, A) to R, G, B, A.
     let rgba = data
         .as_chunks::<4>()
