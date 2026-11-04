@@ -4011,10 +4011,16 @@ Newest last. Each entry says what was decided and why.
     `JSON.stringify` writes) refused the whole snapshot, now U+FFFD; `contained` kept U+2028
     and U+2029, which a text shaper breaks a line at; the "(truncated)" note of text mode did
     not wrap; a grid cluster of marks with no base was joined to the cell before it by the
-    terminal; a long download name cut after a dot or a space ended in it; `64:ff9b:1::/48`
+    terminal; an edit in the terminal's line editor that joined the text around the cursor
+    into one cluster left the cursor inside it; a long download name cut after a dot or a
+    space ended in it; `64:ff9b:1::/48`
     and the IPv4-translated `::ffff:0:a.b.c.d` were public addresses to the Wasm network
     policy. Open, by design: a Prepend character at the end of one drawn string joins the
     next string's first character on the terminal (two cells the grid draws independently);
     Teredo (`2001::/32`) is public to the Wasm policy; a bracketed paste with no end swallows
     the keyboard until its `CSI 201 ~`; below 8 columns text mode can put a list bullet and a
-    wide character on one line wider than the page.
+    wide character on one line wider than the page. *Cost*: at the default 2 000 cases a
+    target the 38 tests take 7.3 s together in a debug build (the slowest, the address editor and
+    the semantic parser, 1.5 s each); `SIG_FUZZ_ITERATIONS=100000` takes 143 s. Verified: the
+    workspace tests (1076), the two clippy lines, fmt, the terminal frontend's tests with
+    the demo and Wasm engines (198), sighurt-render with all features.
