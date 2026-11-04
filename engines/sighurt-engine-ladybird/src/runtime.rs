@@ -6,14 +6,14 @@
 //! frame). Must not own: how Ladybird's loop works (the shim) or when the host pumps (it gets a
 //! deadline and a waker).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{
-    EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, PresentOutcome,
-    PumpStatus, ViewOptions,
+    EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, FindCommand,
+    PresentOutcome, PumpStatus, ViewOptions,
 };
 use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{Metrics, SurfacePoint, SurfaceRect};
@@ -34,15 +34,15 @@ use crate::waiter::Waiter;
 /// The engine's name in the configuration and the registry.
 pub const NAME: &str = "ladybird";
 
-/// What the engine supports: back and forward within Ladybird's own session history, and page
-/// zoom. Each view's pages run in a WebContent process of Ladybird's. The rest is not wired yet
-/// (docs/rewrite/LADYBIRD.md, "What is missing").
+/// What the engine supports: back and forward within Ladybird's own session history, page zoom,
+/// and find in page (the selected match and the total). Each view's pages run in a WebContent
+/// process of Ladybird's. The rest is not wired yet (docs/rewrite/LADYBIRD.md, "What is missing").
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     history_traversal: true,
     text_input: true,
     accessibility: false,
     screenshots: false,
-    find_in_page: false, // lane B: true once find in page is wired
+    find_in_page: true,
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
@@ -100,6 +100,71 @@ struct View<T: CpuTarget> {
     url: String,
     /// A page's copy, representation by representation, until the last one has come.
     clipboard: Vec<ClipboardData>,
+    /// Find in page.
+    find: Find,
+}
+
+/// Find operations a view may have unanswered; beyond them none are made.
+const MAX_FIND_ASKED: usize = 64;
+
+/// A view's find in page. The shim's result names no operation, but WebContent answers every
+/// search, move and stop of a view once, in the order they were asked (one message each on the
+/// view's connection): [`asked`](Self::asked) stamps each answer with the search and document it
+/// was asked for. A new document or a crash ends the search and forgets the unanswered: a
+/// WebContent process replaced for a cross-site navigation never answers (LibWebView says so).
+/// So the one risk left is an old process answering after its replacement's first answer is
+/// asked for, which a later answer replaces.
+#[derive(Default)]
+struct Find {
+    /// The search moves and stops name, and its document.
+    current: Option<(RequestId, DocumentGeneration)>,
+    /// The operations not answered yet, oldest first: their search and document (none: a stop).
+    asked: VecDeque<Option<(RequestId, DocumentGeneration)>>,
+}
+
+impl Find {
+    /// Notes an operation for `search` (none: a stop) before the shim is asked; false (the shim
+    /// is not asked) when [`MAX_FIND_ASKED`] are unanswered.
+    fn ask(&mut self, search: Option<(RequestId, DocumentGeneration)>) -> bool {
+        if self.asked.len() >= MAX_FIND_ASKED {
+            return false;
+        }
+        self.asked.push_back(search);
+        true
+    }
+
+    /// The shim did not ask (the view is gone): forgets the operation noted last.
+    fn not_asked(&mut self) {
+        self.asked.pop_back();
+    }
+
+    /// Ends the search and forgets the unanswered operations.
+    fn end(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The answer (`index` of the selected match from 0, `total` or -1) to the oldest unanswered
+    /// operation, as a result for `view`, when that operation's search is still the current one.
+    fn answer(&mut self, view: ViewId, index: i64, total: i64) -> Option<EngineEvent> {
+        let (search, document) = self.asked.pop_front()??;
+        if self.current != Some((search, document)) {
+            return None;
+        }
+        let total = u32::try_from(total).ok();
+        let found = total.is_some_and(|n| n > 0);
+        // With no match, LibWeb's index means nothing.
+        let current = found
+            .then(|| u32::try_from(index.saturating_add(1)).ok())
+            .flatten();
+        Some(EngineEvent::FindResult {
+            view,
+            document,
+            search,
+            found,
+            current,
+            total,
+        })
+    }
 }
 
 /// What the browser asked of a view that has not started yet.
@@ -510,10 +575,18 @@ impl<T: CpuTarget> LadybirdRuntime<T> {
                 view.frame_dirty = true;
                 self.queue.push(EngineEvent::FrameReady { view: id });
             }
-            ffi::EV_CRASHED => self.queue.push(EngineEvent::ViewFailed {
-                view: id,
-                message: s0.unwrap_or_else(|| "the page crashed".into()),
-            }),
+            ffi::EV_CRASHED => {
+                view.find.end();
+                self.queue.push(EngineEvent::ViewFailed {
+                    view: id,
+                    message: s0.unwrap_or_else(|| "the page crashed".into()),
+                });
+            }
+            ffi::EV_FIND_RESULT => {
+                if let Some(result) = view.find.answer(id, event.i0, event.i1) {
+                    self.queue.push(result);
+                }
+            }
             // The page closed its own view (window.close() of a script-closable one): Ladybird has
             // already dropped the page, so the view cannot continue. The browser hears the request
             // (and closes a tab the page opened), then that the view failed and is closed.
@@ -947,6 +1020,7 @@ fn settle_commit<T: CpuTarget>(
     let new_document = how == Settle::NewDocument;
     let navigation = if new_document {
         view.document = DocumentGeneration::next();
+        view.find.end();
         deny_held(held, id);
         view.active
             .take()
@@ -987,6 +1061,7 @@ fn replaceable(event: &EngineEvent) -> Option<(u8, ViewId)> {
         EngineEvent::HistoryChanged { view, .. } => (4, *view),
         EngineEvent::TextInputChanged { view, .. } => (5, *view),
         EngineEvent::FrameReady { view } => (6, *view),
+        EngineEvent::FindResult { view, .. } => (7, *view),
         _ => return None,
     })
 }
@@ -997,7 +1072,7 @@ const THROTTLE: Duration = Duration::from_millis(50);
 
 /// Whether `event` is throttled, and its key.
 fn throttled(event: &EngineEvent) -> Option<(u8, ViewId)> {
-    replaceable(event).filter(|(kind, _)| !matches!(kind, 3 | 6))
+    replaceable(event).filter(|(kind, _)| !matches!(kind, 3 | 6 | 7))
 }
 
 /// Keeps the last of each replaceable event per view, in its own place; the others stay in order.
@@ -1108,6 +1183,7 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
                 history: None,
                 url: String::new(),
                 clipboard: Vec::new(),
+                find: Find::default(),
             },
         );
         Ok(())
@@ -1179,7 +1255,48 @@ impl<T: CpuTarget> EngineRuntime for LadybirdRuntime<T> {
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"))
             }
-            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::Find(find) => {
+                let asked = match find {
+                    FindCommand::Search {
+                        search,
+                        document,
+                        text,
+                        case_sensitive,
+                    } => {
+                        // A search of a document that is gone is dropped.
+                        if document != view.document || !view.find.ask(Some((search, document))) {
+                            return Ok(());
+                        }
+                        view.find.current = Some((search, document));
+                        let text = c_string(&text);
+                        unsafe {
+                            ffi::lb_find_in_page(lb, text.as_ptr(), c_int::from(case_sensitive))
+                        }
+                    }
+                    // Moves and stops of a search the view no longer has do nothing.
+                    FindCommand::Next { search } | FindCommand::Previous { search } => {
+                        let current = view.find.current.filter(|(s, _)| *s == search);
+                        if current.is_none() || !view.find.ask(current) {
+                            return Ok(());
+                        }
+                        match matches!(find, FindCommand::Next { .. }) {
+                            true => unsafe { ffi::lb_find_next(lb) },
+                            false => unsafe { ffi::lb_find_previous(lb) },
+                        }
+                    }
+                    FindCommand::Stop { search } => {
+                        let current = view.find.current.is_some_and(|(s, _)| s == search);
+                        if !current || !view.find.ask(None) {
+                            return Ok(());
+                        }
+                        view.find.current = None;
+                        unsafe { ffi::lb_find_stop(lb) }
+                    }
+                };
+                if asked == 0 {
+                    view.find.not_asked();
+                }
+            }
             EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         Ok(())
@@ -1412,6 +1529,55 @@ impl<T: CpuTarget> Drop for LadybirdRuntime<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_answers_are_stamped_in_turn_and_dropped_when_stale() {
+        let view = ViewId::next();
+        let doc = DocumentGeneration::next();
+        let (one, two) = (RequestId::next(), RequestId::next());
+        let result = |search, found, current, total| {
+            Some(EngineEvent::FindResult {
+                view,
+                document: doc,
+                search,
+                found,
+                current,
+                total,
+            })
+        };
+        // A search and a move, answered in turn: LibWeb's index from 0 is the match from 1.
+        let mut find = Find {
+            current: Some((one, doc)),
+            ..Find::default()
+        };
+        assert!(find.ask(Some((one, doc))) && find.ask(Some((one, doc))));
+        assert_eq!(find.answer(view, 0, 4), result(one, true, Some(1), Some(4)));
+        assert_eq!(find.answer(view, 1, 4), result(one, true, Some(2), Some(4)));
+        // Replaced before its answer: the old answer is not given the new id.
+        assert!(find.ask(Some((one, doc))));
+        find.current = Some((two, doc));
+        assert!(find.ask(Some((two, doc))));
+        assert_eq!(find.answer(view, 0, 4), None);
+        // No match: LibWeb's index means nothing; an unknown total is no match either.
+        assert_eq!(find.answer(view, 1, 0), result(two, false, None, Some(0)));
+        assert!(find.ask(Some((two, doc))));
+        assert_eq!(find.answer(view, 0, -1), result(two, false, None, None));
+        // A stop's answer, and one with nothing asked, are nobody's.
+        assert!(find.ask(None));
+        assert_eq!(find.answer(view, 0, -1), None);
+        assert_eq!(find.answer(view, 0, 4), None);
+        // A new document ends the search and its unanswered operations.
+        assert!(find.ask(Some((two, doc))));
+        find.end();
+        assert_eq!(find.answer(view, 0, 4), None);
+        // Bounded; an operation the shim did not make is forgotten.
+        for _ in 0..MAX_FIND_ASKED {
+            assert!(find.ask(None));
+        }
+        assert!(!find.ask(None));
+        find.not_asked();
+        assert!(find.ask(None));
+    }
 
     fn title(view: ViewId, text: &str) -> EngineEvent {
         EngineEvent::TitleChanged {

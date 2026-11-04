@@ -13,7 +13,7 @@ use std::ffi::{c_char, c_double, c_int, c_void, CStr, CString};
 use std::sync::OnceLock;
 
 /// `LB_ABI_VERSION` of the header this crate was written against.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 pub const EV_VIEW_READY: c_int = 1;
 pub const EV_LOAD_START: c_int = 2;
@@ -152,6 +152,10 @@ functions! {
     pub fn lb_set_focus(view: u64, focused: c_int);
     pub fn lb_set_zoom(view: u64, zoom: c_double);
     pub fn lb_run_js(view: u64, script: *const c_char, request: i64);
+    pub fn lb_find_in_page(view: u64, text: *const c_char, case_sensitive: c_int) -> c_int;
+    pub fn lb_find_next(view: u64) -> c_int;
+    pub fn lb_find_previous(view: u64) -> c_int;
+    pub fn lb_find_stop(view: u64) -> c_int;
     pub fn lb_input_key(view: u64, code: *const c_char, key: *const c_char, pressed: c_int, repeat: c_int, modifiers: c_int, code_point: u32);
     pub fn lb_input_pointer_move(view: u64, x: c_int, y: c_int, buttons: c_int, modifiers: c_int);
     pub fn lb_input_pointer_leave(view: u64);

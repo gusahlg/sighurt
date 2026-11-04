@@ -487,6 +487,25 @@ say whether a field is a password, and a password must not reach the input metho
 (`MODE=typing tests/sig-shot.sh`): the click focuses a Ladybird field and "tttest" is typed into it,
 with no tab opened.
 
+### Find in page
+
+`find_in_page` is true (shim ABI 3). `lb_find_in_page` (LibWebView's `find_in_page` with the
+case asked), `lb_find_next`, `lb_find_previous` (`find_in_page_next_match`/`_previous_match`,
+which wrap) and `lb_find_stop` (a search for nothing: LibWeb then forgets the query and clears the
+selection; there are no highlights to clear, LibWeb's find only selects) each return whether the
+view was asked. LibWeb answers each once (`did_find_in_page`: the selected match from 0 and the
+total), and the shim reports it as `LB_EV_FIND_RESULT`, which says nothing of the operation. The
+answers come in the order the operations were asked (one message each on the view's WebContent
+connection), so the adapter keeps the unanswered ones (at most 64) and stamps each answer with the
+search and document it was asked for: answers to a stop, to a replaced or stopped search, or with
+nothing asked are dropped. `FindResult` has `found`, `current` (from 1) and `total`. A new document or
+a crash ends the search and forgets the unanswered operations, since a WebContent process replaced
+for a cross-site navigation never answers (LibWebView's `create_new_process_for_cross_site_navigation`
+says so); the risk left is an old process's answer arriving after a new search is asked, which the
+next answer replaces. Evidence: `tests/find.rs` (a search's match and total, next and previous with
+wrapping, case, no match, no answer given to a later search, moves and stops of a replaced or
+stopped search and a search of a gone document ignored, the search ended by a new document).
+
 ### What is missing, and why
 
 2. **Services (`sighurt_api::services`) as built:** every privileged request of Ladybird's UI half goes
@@ -519,8 +538,9 @@ with no tab opened.
    "hello", name `hello.txt`), a `mailto:` link (`OpenExternal`, denied), a file input (the page reads
    `picked.txt`).
 3. **Zero-copy presentation and dmabuf** (L6), **frame pacing from the output** (L8).
-4. **Text input:** done (below). **Other capabilities** beyond history traversal, zoom (wired through
-   `SetZoom`, not tested), process-per-view and text input: find in page, screenshots, semantics (so no text mode and no
+4. **Text input** and **find in page:** done (below). **Other capabilities** beyond history traversal,
+   zoom (wired through `SetZoom`, not tested), process-per-view, text input and find in page:
+   screenshots, semantics (so no text mode and no
    `sig --dump` in the terminal; the TUI frontend binds the engine and shows its frames as graphics,
    untested), site data.
 5. **Cursor shapes** map only the common `Gfx::StandardCursor`s; image cursors report the arrow.
@@ -681,6 +701,7 @@ tools/cargo build -p sighurt-browser --no-default-features --features engine-lad
 tools/heavy tools/headless-sway -- engines/sighurt-engine-ladybird/tests/sig-shot.sh OUT [URL]
 #   MODE=route | open-in | typing | links selects [routing.ladybird] or page.open-in; screenshots in OUT
 tools/heavy cargo test -p sighurt-engine-ladybird --test headless -- --nocapture
+tools/heavy cargo test -p sighurt-engine-ladybird --test find -- --nocapture
 ```
 
 `CARGO_TARGET_DIR=/data/sig-builds/targets/ladybird` keeps the build off the SSD.
