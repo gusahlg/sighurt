@@ -6,11 +6,13 @@
 # in a compositor of its own.
 #
 #   frontends/sighurt-wayland/tests/headless.sh [test name filter and other test-binary arguments]
+#
+# The test binary is found in cargo's output, so a worktree's CARGO_TARGET_DIR works too.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
 bin=$(SIG_WHAT="build sighurt-wayland headless tests" tools/cargo test -p sighurt-wayland \
-  --test headless --no-run 2>&1 | tee /dev/stderr | grep -o 'target/debug/deps/headless-[0-9a-f]*' | tail -1)
+  --test headless --no-run 2>&1 | tee /dev/stderr | grep -o '[^ (]*/debug/deps/headless-[0-9a-f]*' | tail -1)
 [[ -n $bin ]] || { echo "headless.sh: no test binary" >&2; exit 1; }
 clipboard=$(nix-build '<nixpkgs>' -A wl-clipboard --no-out-link)/bin
 # The EGL vendor file must come from the pinned nixpkgs' Mesa (the one shell.nix puts on
