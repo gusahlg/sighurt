@@ -18,7 +18,7 @@
 //! (the host's permits).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_int;
 use std::rc::Rc;
 use std::time::Instant;
@@ -27,7 +27,7 @@ use glib::prelude::*;
 use glib::translate::*;
 use sighurt_api::events::NavigationError;
 use sighurt_api::geometry::{BufferSize, SurfaceRect};
-use sighurt_api::ids::{LayoutEpoch, RequestId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, RequestId, ViewId};
 use sighurt_api::input::SurroundingText;
 use sighurt_api::services::{
     Permission, PickMode, Service, ServiceReply, ServiceRequest, ServiceResult,
@@ -47,6 +47,12 @@ pub const MAX_REQUESTS: usize = 16;
 /// Navigations a view holds for the browser's answer; the page's beyond them go ahead without
 /// asking.
 pub const MAX_HELD: usize = 16;
+
+/// Find operations a view may have unanswered; WebKit's beyond them are not made.
+pub const MAX_FIND_ASKED: usize = 64;
+
+/// The most matches WebKit counts for a search; beyond them the total is unknown.
+pub const MAX_MATCHES: u32 = 1000;
 
 /// Schemes WebKit loads itself. A navigation of the page's to any other goes to the browser.
 const WEB_SCHEMES: [&str; 6] = ["http", "https", "file", "data", "blob", "about"];
@@ -96,6 +102,9 @@ pub enum Note {
     Semantic(crate::semantic::Tag, Result<String, String>),
     /// The isolated world's observer saw the DOM change.
     Mutated,
+    /// WebKit's find controller answered the oldest find operation not yet answered: the
+    /// matches it counted, or none found.
+    Find(Option<u32>),
 }
 
 /// The replaceable things WebKit said about one view: only the latest matters.
@@ -140,6 +149,82 @@ pub enum RequestKind {
     ClipboardRead,
     /// Nothing to complete: a clipboard write or a download.
     Done,
+}
+
+/// The view's find in page. WebKit's find controller answers every search, next and previous
+/// with one signal (`found-text` or `failed-to-find-text`), which doesn't say which operation it
+/// answers; each operation is one message to the web process, answered in turn, so the answers
+/// come in the order the operations were made, and [`asked`](Self::asked) stamps each with the
+/// search and document it was made for. (A web process swapped during a navigation could answer
+/// out of turn; such an answer is for another document, and dropped, or replaced by the next.)
+/// WebKit marks the matches in the document it searched; a new document has none, and
+/// `search_finish` at its commit clears those of a document restored from the back-forward
+/// cache.
+#[derive(Default)]
+pub struct Find {
+    /// The search moves and stops name, and the document it searches.
+    pub current: Option<(RequestId, DocumentGeneration)>,
+    /// How many matches the current search's answer counted. A move's answer counts only
+    /// itself, so it reports this one.
+    total: Option<u32>,
+    /// The operations WebKit has not answered yet, oldest first: their search, document, and
+    /// whether each is a search (rather than a move).
+    asked: VecDeque<(RequestId, DocumentGeneration, bool)>,
+    /// Whether the view ever searched: its documents may hold WebKit's marks.
+    pub searched: bool,
+}
+
+/// A find answer for the browser: the search, its document, found, and the total.
+pub type Found = (RequestId, DocumentGeneration, bool, Option<u32>);
+
+impl Find {
+    /// Notes an operation of `search` in `document` before WebKit is asked; false (WebKit is
+    /// not asked) when [`MAX_FIND_ASKED`] are unanswered.
+    pub fn ask(
+        &mut self,
+        search: RequestId,
+        document: DocumentGeneration,
+        is_search: bool,
+    ) -> bool {
+        if self.asked.len() >= MAX_FIND_ASKED {
+            return false;
+        }
+        self.asked.push_back((search, document, is_search));
+        if is_search {
+            self.current = Some((search, document));
+            self.total = None;
+            self.searched = true;
+        }
+        true
+    }
+
+    /// Whether moves and stops naming `search` act: it is the current search.
+    pub fn is_current(&self, search: RequestId) -> bool {
+        self.current.is_some_and(|(s, _)| s == search)
+    }
+
+    /// WebKit's answer (`matches`, or none found) to the oldest unanswered operation, for the
+    /// browser when that operation's search is still the current one in `document`, the view's.
+    pub fn answer(
+        &mut self,
+        matches: Option<u32>,
+        document: Option<DocumentGeneration>,
+    ) -> Option<Found> {
+        let (search, searched, is_search) = self.asked.pop_front()?;
+        if self.current != Some((search, searched)) || document != Some(searched) {
+            return None;
+        }
+        // WebKit says "more than the maximum" with the largest count.
+        let total = match (is_search, matches) {
+            (true, Some(n)) => (n <= MAX_MATCHES).then_some(n),
+            (false, Some(_)) => self.total,
+            (_, None) => None,
+        };
+        if is_search {
+            self.total = total;
+        }
+        Some((search, searched, matches.is_some(), total))
+    }
 }
 
 /// WebKit's decision about a navigation the page asks for (`asks`), until the browser
@@ -215,6 +300,8 @@ pub struct Page<T: WpeTarget> {
     pub text_input: Option<TextInput>,
     /// What the frontend asked of the view's semantic snapshots.
     pub semantics: crate::semantic::Semantics,
+    /// Find in page.
+    pub find: Find,
     /// The layout epoch last applied. A CPU permit must name it. A Wayland permit does not.
     pub(crate) epoch: LayoutEpoch,
     /// The buffer size of [`epoch`](Self::epoch).
@@ -232,6 +319,11 @@ impl<T: WpeTarget> Page<T> {
 
     pub fn web(&self) -> *mut ffi::WebKitWebView {
         self.web_view.as_ptr().cast()
+    }
+
+    /// WebKit's find controller of the view (owned by the web view).
+    pub fn find_controller(&self) -> *mut ffi::WebKitFindController {
+        unsafe { ffi::webkit_web_view_get_find_controller(self.web()) }
     }
 
     /// The origin of the committed page, for service requests: scheme, host and port.
@@ -583,6 +675,22 @@ pub fn connect(web_view: &glib::Object, inbox: &Shared, view: ViewId) {
         f(&|facts| facts.status = Some(link.clone()));
         None
     });
+    let find: glib::Object = unsafe {
+        from_glib_none(
+            ffi::webkit_web_view_get_find_controller(raw(web_view))
+                .cast::<glib::gobject_ffi::GObject>(),
+        )
+    };
+    let n = note.clone();
+    find.connect_local("found-text", false, move |args| {
+        n(Note::Find(Some(args[1].get::<u32>().unwrap_or(0))));
+        None
+    });
+    let n = note.clone();
+    find.connect_local("failed-to-find-text", false, move |_| {
+        n(Note::Find(None));
+        None
+    });
     web_view.connect_local("web-process-terminated", false, move |args| {
         note(Note::Terminated(enum_arg(&args[1])));
         None
@@ -713,6 +821,43 @@ fn permissions(request: &glib::Object) -> Vec<Permission> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_answers_are_stamped_in_turn_and_dropped_when_stale() {
+        let (doc, other) = (DocumentGeneration::next(), DocumentGeneration::next());
+        let (one, two) = (RequestId::next(), RequestId::next());
+        let mut find = Find::default();
+        // A search, a move: answered in turn; the move reports the search's total.
+        assert!(find.ask(one, doc, true) && find.ask(one, doc, false));
+        assert_eq!(
+            find.answer(Some(3), Some(doc)),
+            Some((one, doc, true, Some(3)))
+        );
+        assert_eq!(
+            find.answer(Some(1), Some(doc)),
+            Some((one, doc, true, Some(3)))
+        );
+        // A search replaced before its answer: the old answer is dropped, not given the new id.
+        assert!(find.ask(one, doc, true) && find.ask(two, doc, true));
+        assert!(!find.is_current(one) && find.is_current(two));
+        assert_eq!(find.answer(Some(5), Some(doc)), None);
+        assert_eq!(find.answer(None, Some(doc)), Some((two, doc, false, None)));
+        // More than WebKit counts: found, total unknown.
+        assert!(find.ask(two, doc, true));
+        assert_eq!(
+            find.answer(Some(u32::MAX), Some(doc)),
+            Some((two, doc, true, None))
+        );
+        // An answer for another document, or with nothing asked, is dropped.
+        assert!(find.ask(two, doc, false));
+        assert_eq!(find.answer(Some(1), Some(other)), None);
+        assert_eq!(find.answer(Some(1), Some(doc)), None);
+        // Bounded.
+        for _ in 0..MAX_FIND_ASKED {
+            assert!(find.ask(two, doc, false));
+        }
+        assert!(!find.ask(two, doc, false));
+    }
 
     #[test]
     fn webkit_loads_web_schemes_and_hands_over_the_rest() {

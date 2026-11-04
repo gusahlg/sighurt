@@ -42,6 +42,7 @@ opaque!(
     WebKitBackForwardListItem,
     WebKitDownload,
     WebKitFileChooserRequest,
+    WebKitFindController,
     WebKitHitTestResult,
     WebKitNavigationAction,
     WebKitPermissionRequest,
@@ -204,6 +205,10 @@ pub const WPE_INPUT_PURPOSE_PIN: c_uint = 9;
 pub const WEBKIT_LOAD_STARTED: c_uint = 0;
 pub const WEBKIT_LOAD_REDIRECTED: c_uint = 1;
 pub const WEBKIT_LOAD_COMMITTED: c_uint = 2;
+
+// WebKitFindOptions
+pub const WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE: c_uint = 1 << 0;
+pub const WEBKIT_FIND_OPTIONS_WRAP_AROUND: c_uint = 1 << 4;
 
 // WebKitPolicyDecisionType
 pub const WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION: c_uint = 0;
@@ -489,6 +494,18 @@ functions! {
     pub fn webkit_web_view_get_title(web_view: *mut WebKitWebView) -> *const c_char;
     pub fn webkit_web_view_is_loading(web_view: *mut WebKitWebView) -> gboolean;
     pub fn webkit_web_view_set_zoom_level(web_view: *mut WebKitWebView, zoom: c_double);
+    pub fn webkit_web_view_get_find_controller(
+        web_view: *mut WebKitWebView,
+    ) -> *mut WebKitFindController;
+    pub fn webkit_find_controller_search(
+        find_controller: *mut WebKitFindController,
+        search_text: *const c_char,
+        find_options: c_uint,
+        max_match_count: c_uint,
+    );
+    pub fn webkit_find_controller_search_next(find_controller: *mut WebKitFindController);
+    pub fn webkit_find_controller_search_previous(find_controller: *mut WebKitFindController);
+    pub fn webkit_find_controller_search_finish(find_controller: *mut WebKitFindController);
     pub fn webkit_web_view_execute_editing_command(
         web_view: *mut WebKitWebView,
         command: *const c_char,

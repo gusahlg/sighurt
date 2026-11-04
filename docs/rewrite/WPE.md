@@ -757,6 +757,25 @@ caret is: wlroots latches a text-input session's features (surrounding text amon
 is enabled, so a first report without the text would keep it from the input method for that
 field.
 
+**Find in page.** `EngineCommand::Find` drives the view's `WebKitFindController`: a search is
+`webkit_find_controller_search` with `WRAP_AROUND` (and `CASE_INSENSITIVE` unless the search is
+case-sensitive) counting at most 1000 matches, moves are `search_next` and `search_previous`, a
+stop is `search_finish`. WebKit answers each operation with one signal, `found-text` (the count)
+or `failed-to-find-text`, which says neither which operation it answers nor which match is
+selected: so `FindResult` has `total` (the search's count, kept for its moves; `None` beyond 1000)
+and never `current`. The answers come in the order the operations were made (each is one message
+to the web process, answered in turn; WebKit 2.52's `WebPageProxy::findString`), so the view
+keeps the unanswered operations, at most 64, and stamps each answer with the search and document
+it was made for; an answer for a search that is no longer the view's, or for another document, is
+dropped. A web process swapped during a navigation could answer out of turn; that answer is for
+another document and dropped, or replaced by the next. WebKit marks matches in the document it
+searched (`Page::unmarkAllTextMatches` is the only thing that clears them), so a new document has
+none, but a document restored from the back-forward cache keeps its marks: at every new
+document's commit, a view that has searched calls `search_finish`, which clears them.
+`tests/engine.rs` covers totals, case, moves (the selection moves, wrapping), no match, an answer
+not given to a later search, moves and stops of a replaced or stopped search, a search of a gone
+document, and the end of a search at a new document.
+
 **Failures and lifetime.** A web process that dies is `ViewFailed` (its navigations in flight
 fail as cancelled, its requests and input-method state end); a reload or navigation starts a new
 one. A broken connection on the presenter's queue (the host's connection) is `RuntimeFailed`
@@ -934,7 +953,7 @@ whole of `engines.sh`, 217 checks, passes with them):
 6. **Not supported**: `<select>` popups, context menus, script dialogs (closed; `beforeunload`
    leaves the page), HTTP
    authentication (refused), fullscreen, pointer lock, cursor images (names only), touch,
-   accessibility, find in page, screenshots. `TextInputState::multiline` is always `false`
+   accessibility, screenshots. `TextInputState::multiline` is always `false`
    (WebKit's input-method state doesn't say).
 7. **Wakeups per frame**: 4.0 loop wakeups and 2.1 GLib dispatches per animated frame on DMA-BUF,
    from 5.8 before GLib got several turns per pump (decision 73). Counted with temporary counters

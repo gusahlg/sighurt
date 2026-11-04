@@ -74,8 +74,8 @@ use std::time::{Duration, Instant};
 use glib::prelude::*;
 use glib::translate::*;
 use sighurt_api::engine::{
-    EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, PresentOutcome,
-    PumpStatus, ViewOptions,
+    EngineCapabilities, EngineCommand, EngineError, EngineRuntime, EngineWaker, FindCommand,
+    PresentOutcome, PumpStatus, ViewOptions,
 };
 use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{Metrics, SurfaceRect};
@@ -104,7 +104,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     text_input: true,
     accessibility: false,
     screenshots: false,
-    find_in_page: false, // lane B: true once find in page is wired
+    find_in_page: true, // the total only: WebKit's signals don't say which match is selected
     page_zoom: true,
     pointer_lock: false,
     native_popups: false,
@@ -649,6 +649,8 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 }
                 page.requests.clear();
                 page.held.clear();
+                // Its find answers, its documents and their marks are gone with it.
+                page.find = view::Find::default();
                 if page.text_input.take().is_some() {
                     push(
                         events,
@@ -728,6 +730,23 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 }
             }
             Note::Mutated => page.semantics.note_mutation(Instant::now()),
+            Note::Find(matches) => {
+                if let Some((search, document, found, total)) =
+                    page.find.answer(matches, page.navigator.document())
+                {
+                    push(
+                        events,
+                        EngineEvent::FindResult {
+                            view: id,
+                            document,
+                            search,
+                            found,
+                            current: None, // WebKit's signals don't say which match.
+                            total,
+                        },
+                    );
+                }
+            }
             Note::Script(_) | Note::Semantic(..) => unreachable!("handled above"),
         }
         if resample {
@@ -1417,6 +1436,12 @@ fn committed<T: WpeTarget>(page: &mut Page<T>, events: &mut Vec<EngineEvent>, co
     if commit.new_document {
         page.requests.clear();
         page.held.clear();
+        // The search ends with its document. WebKit's marks went with it, but a document
+        // restored from the back-forward cache keeps those it had: cleared now it is shown.
+        page.find.current = None;
+        if page.find.searched {
+            unsafe { ffi::webkit_find_controller_search_finish(page.find_controller()) };
+        }
     }
     push(
         events,
@@ -1663,6 +1688,7 @@ fn push(events: &mut Vec<EngineEvent>, event: EngineEvent) {
             | EngineEvent::HistoryChanged { .. }
             | EngineEvent::TextInputChanged { .. }
             | EngineEvent::SemanticsChanged { .. }
+            | EngineEvent::FindResult { .. }
     );
     if replaceable {
         let kind = std::mem::discriminant(&event);
@@ -1875,6 +1901,7 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                 held: Vec::new(),
                 text_input: None,
                 semantics: Default::default(),
+                find: Default::default(),
                 epoch: metrics.epoch(),
                 buffer: metrics.buffer(),
                 slot,
@@ -2029,7 +2056,60 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                     then = Then::Act(sighurt_semantic::action_script(&action));
                 }
             }
-            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::Find(find) => {
+                let controller = page.find_controller();
+                match find {
+                    FindCommand::Search {
+                        search,
+                        document,
+                        text,
+                        case_sensitive,
+                    } => {
+                        let text = CString::new(text)
+                            .map_err(|_| EngineError::Unsupported("NUL in find text"))?;
+                        // A search for another document is dropped: it is gone.
+                        if page.navigator.document() == Some(document)
+                            && page.find.ask(search, document, true)
+                        {
+                            let mut options = ffi::WEBKIT_FIND_OPTIONS_WRAP_AROUND;
+                            if !case_sensitive {
+                                options |= ffi::WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE;
+                            }
+                            unsafe {
+                                ffi::webkit_find_controller_search(
+                                    controller,
+                                    text.as_ptr(),
+                                    options,
+                                    view::MAX_MATCHES,
+                                )
+                            };
+                        }
+                    }
+                    FindCommand::Next { search } | FindCommand::Previous { search } => {
+                        // A move of a search the view no longer has does nothing.
+                        let current = page.find.current.filter(|&(s, _)| s == search);
+                        if let Some((_, document)) = current {
+                            if page.find.ask(search, document, false) {
+                                let forward = matches!(find, FindCommand::Next { .. });
+                                unsafe {
+                                    match forward {
+                                        true => ffi::webkit_find_controller_search_next(controller),
+                                        false => {
+                                            ffi::webkit_find_controller_search_previous(controller)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    FindCommand::Stop { search } => {
+                        if page.find.is_current(search) {
+                            page.find.current = None;
+                            unsafe { ffi::webkit_find_controller_search_finish(controller) };
+                        }
+                    }
+                }
+            }
             EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         match then {
