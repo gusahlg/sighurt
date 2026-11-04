@@ -453,7 +453,13 @@ fn sanitize(name: &str) -> String {
                 _ => "",
             };
             let stem = &name[..name.len() - ext.len()];
-            format!("{}{ext}", cut(stem, MAX_NAME - ext.len()))
+            // The cut may land after a dot or a space: those are not left at the end of the name.
+            let kept = cut(stem, MAX_NAME - ext.len());
+            let kept = match ext {
+                "" => kept.trim_end_matches(|c: char| c == '.' || c.is_whitespace()),
+                _ => kept,
+            };
+            format!("{kept}{ext}")
         }
     }
 }
@@ -915,3 +921,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "services_fuzz.rs"]
+mod fuzz_tests;
