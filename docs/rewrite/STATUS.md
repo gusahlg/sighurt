@@ -3869,3 +3869,64 @@ Newest last. Each entry says what was decided and why.
     (`sixel-old-38/`). Not yet verified: Servo frames with the fix (same encoder path), the
     user's GPU Rio, and a possible flash between frames at 5 fps. Work: Claude Opus 5.5
     (diagnosis and fix), Claude Fable 5.1 (orchestration).
+122. **A code-reading bug hunt across every layer, with the fixes landed** (3–4 November 2026; the
+    user: "go on a massive bug hunt"). Five independent read-only reviews (Claude Opus 5.5) of
+    the host and GUI loop, the core, runtime and terminal, the Wasm engine and semantics, and the
+    native engine adapters produced 70 findings; every one was read again by the fixing agent
+    before a change, and all were real. Commits on config-ext, each with its tests and suites:
+    b2feb2f (terminal parser: Alt chords never lock the keyboard; Home/End under tmux),
+    b80c88f + 37c22dd (an unusable config.toml at startup stops sig with status 2 instead of
+    silently running on built-in defaults with persistent profiles and session saving the user
+    had turned off; sessions read leniently and kept aside as session.toml.broken-<time>
+    instead of overwritten; MAX_TABS enforced on open; one sig owns session.toml through
+    session.lock; at most 8 downloads in flight; download names cut in bytes; the external-link
+    denylist gains file-manager and remote-share schemes; a committed navigation supersedes
+    the core's older requests; site.forget requests fail with their engine; no PointerRelease to
+    a closing view), 6c02b9c (a view the session forgot while its engine still holds the lease
+    stays in the placement hidden until the lease drops — before, every placement after a Servo
+    RuntimeFailed or during a Servo close was refused as Missing; unmap clears the current frame;
+    SHM generations per layout epoch; caret clamp; key repeat stops with its window; the exit
+    report sees every view; one session write at quit), 8b84d25 (terminal: clipboard reads
+    recover from an unanswered OSC 52, --dump settles after 3 s on a changing page, mouse 1002
+    with 16 ms motion pacing, keys typed during the probe kept), 92ab866 (the host's compositor
+    suite 16/16 again: the pinned Mesa for EGL, no stray Enter), fe31c9e (Ladybird: held events
+    flushed in order and never after ViewClosed, keys released on focus loss, buttons on drags,
+    g_active_view gone, no signal handlers from the shim, window.close() handled — a later call
+    on such a view aborted sig —, shim ABI 2; CEF: navigation events never dropped from a full
+    queue, popups need a gesture, do_close protocol, no shortened history URLs, multi-line
+    paste, IME caret scaled; NetSurf: password fields sensitive, URLs never shortened, repaints
+    by rectangle, hidden views quiet), 0a51c23 (Wasm, decision 123), 40956ca (Servo: text input
+    cleared on a crash, modifiers with clicks, Stop cancels a first navigation, permission
+    requests without an origin always asked about — Servo 0.7 cannot name the asking frame —,
+    bounded traversal holds; WPE: scheme hand-offs only with a user gesture, present errors
+    survive, checked SHM copies, Stop ends stalled requests, clipboard grants revoked per view;
+    the engine test scripts set `[input] keymap = "bindings"` for their `[keys]`, which the
+    example keymap had been ignoring — cef.sh's failing check since c4211d6 was that, not the
+    browser). Engine suites: Servo 3/3, WPE gles2 and pixman, cef.sh 12/12, Ladybird sig-shot
+    16/16 and robust, NetSurf 11/11, Wasm headless, headless.sh 78/78, ui headless 35/35, the
+    pty suite. engines.sh was 270/280 with the re-shown WPE page of 6c02b9c's unmap rule still
+    open (amended below when fixed). Reports: the session's scratchpad `findings/`.
+123. **Wasm guests get one network policy, and the engine's limits are real** (4 November 2026,
+    0a51c23; from the Wasm review). Guests from the web reach only public http(s) and ws(s)
+    hosts: loopback, private, link-local, CGNAT, multicast and reserved addresses are refused at
+    the resolver (so DNS rebinding cannot pass), with at most 5 redirects each checked, an
+    `Origin` header, CONNECT/TRACE/TRACK refused and system proxies off for guest traffic; a
+    `file:` page or a module served from a non-public address may reach local hosts. Video URLs
+    go through the same policy and FFmpeg gets a protocol whitelist (before, `file:`, `pipe:0`
+    — sig's stdin — and `concat:` reached it). Every store has a ResourceLimiter (the documented
+    256 MiB had covered only modules importing `oxide.memory`), 2 GiB per runtime, module nesting
+    2 deep, aborted tasks on handle removal, a 64 MiB per-document budget for buffered network
+    bytes, guest ranges checked before host buffers are sized, the draw list bounded while it is
+    built, a 500 ms delay before the permission prompt accepts Allow, file dialogs only after a
+    click or key within 5 s, key-value quotas (64 MiB per origin, 1 GiB in all). Behaviour
+    guests notice: refused URLs return 0/-1; LAN and localhost are unreachable from web guests;
+    encrypted HLS no longer opens. Still open: FFmpeg re-resolves names and follows its own
+    redirects; ICE/STUN hosts are WebRTC's; in-flight WebSocket messages are not budgeted.
+124. **The owner loop does less per frame, measured** (4 November 2026, 928e9ec;
+    bench/HYPOTHESES.md H-OWN2–5, H-SNAP2; debug sig, headless sway, perf stat on the owner
+    thread, three interleaved runs): the placement is rebuilt only when something feeding it
+    changed (about 2,400 builds per 10 s of animation → 0; 50 animated-tab frames −12 %
+    instructions); a tab's contained snapshot copy is reused while its strings are byte-equal
+    (snapshot 10.4 → 0.36 ms with 50 long-URL tabs; hovering links 10.0 → 4.6 s of owner CPU
+    in 10 s, −80 % instructions); views found by a target map (−2 %); the host-event list
+    reused. H-OWN5 (cloning each engine command for a rare refusal) is 0.03 % and stays.
