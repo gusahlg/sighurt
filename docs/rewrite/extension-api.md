@@ -995,8 +995,9 @@ pub struct ChromeKind {
     pub new: fn(Fonts) -> Box<dyn Chrome>,
 }
 
-/// Untrusted text made safe to show on one line: control characters become spaces; bidi
-/// embedding, override and isolate controls are dropped; at most `max_chars` are kept.
+/// Untrusted text made safe to show on one line: control characters and the line and paragraph
+/// separators (U+2028, U+2029) become spaces; bidi embedding, override and isolate controls are
+/// dropped; at most `max_chars` are kept.
 /// (Today's `sighurt_ui::state::untrusted_line`, made public.)
 pub fn contained(text: &str, max_chars: usize) -> String;
 
