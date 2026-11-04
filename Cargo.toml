@@ -8,6 +8,8 @@ members = [
     # The render framework: scenes, text, the Backend trait and its CPU backend
     # (docs/rewrite/RENDER.md).
     "render/sighurt-render",
+    # The wgpu backend (Vulkan only).
+    "render/sighurt-render-wgpu",
     "apps/sighurt-browser",
     # The terminal frontend (docs/rewrite/TUI.md).
     "frontends/sighurt-tui",

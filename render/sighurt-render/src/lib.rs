@@ -30,6 +30,8 @@ pub mod backend;
 pub mod color;
 pub mod cpu;
 pub mod glyph;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod pen;
 pub mod scene;
 pub mod shape;
