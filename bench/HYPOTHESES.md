@@ -541,6 +541,37 @@ the first paints.
   work, and a page's status text changes once per link hovered, not per motion as on
   `demo://resize`. Left alone.
 
+### H-TUI1: The sixel encoder quantizes runs of one color once and scans only where a color is
+
+- **Seen:** the terminal's page frames go out as sixel in the user's own setup (tmux in Rio).
+  `encode_cost` (frontends/sighurt-tui/tests/encode_cost.rs, release, 30 encodes after 3
+  warm-up ones, a 160×35-cell area of 8×20-pixel cells) on two 1280×696 frames cut from
+  screenshots (`bench/tui/png2bgra.py`: WPE's example.com, a text page; the Wasm gradient
+  showcase, many colors): sixel 2.5–2.8 ms and 3.0–3.3 ms a frame. Per pixel the encoder
+  composites over black and quantizes (`pixel_index`) even inside long runs of one color; per
+  band it clears and scans the whole width once for every color the band has, though most
+  colors sit in a few columns.
+- **Change:** in each row, a pixel equal (as a 32-bit word) to the one before takes its index
+  without quantizing again; each band records, per color, the first and last column it has,
+  and clears, stamps and run-length encodes only between them, writing the columns before the
+  first as the one run of empty sixels the full scan would have written. The output is
+  unchanged: the same registers, runs and bytes.
+- **Prediction:** sixel encode time falls by at least 30 % on both frames.
+- **Guards:** the output of both frames and the synthetic one byte for byte the same as before
+  (`SIG_TUI_DUMP`, `cmp`); sixel.rs's unit tests (the masked path against the scanning path, the
+  registers, the runs); `apps/sighurt-browser/tests/tui.rs`; kitty unchanged.
+- **Outcome:** supported, kept. Five runs of each build's `encode_cost`, interleaved, under
+  `tools/heavy` (`/data/sig-builds/test-out/opt2/encodecost-tui1.txt`), sixel medians (min–max):
+  example.com 2527 (2519–2562) → 1206 (1204–1255) µs, −52 %; gradients 3146 (3120–3192) →
+  1232 (1229–1340) µs, −61 %; synthetic 2303 (2281–2380) → 1133 (1091–1142) µs, −51 %. The
+  output of all three frames is byte for byte the same (`cmp` of `SIG_TUI_DUMP`'s files), and so
+  is kitty's, whose time did not move (11.7 → 11.5 ms on example.com, inside its spread).
+  sixel.rs's unit tests pass, the masked and the scanning paths still agree.
+- **Not changed, kitty:** its encode is 11–12 ms a page frame, nearly all zlib at level 6;
+  b6f1a28 measured level 1 (a document frame 40 KB → 619 KB on the wire) and kept 6. A faster
+  deflate backend for flate2 (zlib-ng, zlib-rs) would change flate2's features for the whole
+  graph Servo shares, so it is an open item, not done here.
+
 ## Predictions for the IPC-removal session (gpui-baseline against 3c510fe)
 
 Written on 2 October 2026, before the session's first run. The session measures the baseline
