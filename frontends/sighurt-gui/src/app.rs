@@ -965,19 +965,13 @@ impl App {
                 break;
             }
         }
-        if self
-            .session
-            .session_due()
-            .is_some_and(|due| due <= Instant::now())
-        {
-            self.session.save_session();
-        }
+        self.session.write_due();
         self.gui.host.flush();
         busy && !self.session.has_quit()
     }
 
-    /// How long the loop may sleep: until the earliest pump deadline, session save or notice
-    /// giving way to the page's status, or until something happens.
+    /// How long the loop may sleep: until the earliest pump deadline, session or history save,
+    /// or notice giving way to the page's status, or until something happens.
     fn timeout(&self) -> Option<Duration> {
         let now = Instant::now();
         let pump = match self.session.registry().next_pump() {
@@ -988,7 +982,7 @@ impl App {
         let retry = self.gui.deferred.iter().map(|&(_, at)| at).min();
         let next = [
             pump,
-            self.session.session_due(),
+            self.session.writes_due(),
             self.gui.notice_first,
             retry,
         ]

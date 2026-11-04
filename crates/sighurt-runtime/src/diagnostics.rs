@@ -120,6 +120,10 @@ pub struct Counters {
     pub config_reloads: u64,
     /// Session snapshots handed to the writer.
     pub session_saves: u64,
+    /// Visits recorded in the history (`Effect::Visited` commits it kept).
+    pub visits_recorded: u64,
+    /// History snapshots handed to its writer, forgets included.
+    pub history_saves: u64,
     /// Bytes of page frames a frontend encoded to send on. The terminal counts each kitty
     /// image it handed to the output buffer. A frontend that doesn't encode leaves this at 0.
     pub encoded_bytes: u64,

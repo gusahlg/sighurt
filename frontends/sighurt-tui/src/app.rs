@@ -711,13 +711,7 @@ impl App {
                 break;
             }
         }
-        if self
-            .session
-            .session_due()
-            .is_some_and(|due| due <= Instant::now())
-        {
-            self.session.save_session();
-        }
+        self.session.write_due();
         if let Err(error) = self.tui.terminal.write_frame(&[]) {
             self.fail(format!("writing to the terminal failed: {error}"));
         }
@@ -751,7 +745,7 @@ impl App {
         let escape = self.tui.terminal.poll_timeout().map(|wait| now + wait);
         [
             pump,
-            self.session.session_due(),
+            self.session.writes_due(),
             self.tui.notice_first,
             self.tui.clipboard_deadline(),
             self.motion_due.filter(|_| self.motion.is_some()),

@@ -4,7 +4,9 @@
 //! into [`Session::run_core`], which hands each to `sighurt_core::update` and carries the
 //! effects out in order. What is not a frontend's job happens here: engine commands, view
 //! bookkeeping, services, notices queued back as events, session writes (and a failed one,
-//! as a notice). What is, is asked of
+//! as a notice), and the history of visited pages ([`crate::history`]: visits recorded,
+//! forgets answered, `[history] remember` followed after every update, saves when due, and
+//! [`Session::complete`] for the address line). What is, is asked of
 //! the [`Frontend`](crate::frontend::Frontend) before the next effect runs. A view's target
 //! exists before any command is sent to that view: [`Effect::OpenView`] starts the engine,
 //! asks the frontend for a target, records the view, places it, and only then calls
@@ -42,7 +44,8 @@ use sighurt_core::{BrowserEvent, BrowserState, Effect, Environment};
 
 use crate::diagnostics::{Diagnostics, EngineReport};
 use crate::frontend::Frontend;
-use crate::persistence::{Paths, SessionWriter};
+use crate::history::{self, History, Ownership};
+use crate::persistence::{self, Paths, SessionWriter};
 use crate::registry::{Registry, State};
 use crate::services::{Completion, Services};
 use crate::view::ViewEntry;
@@ -100,6 +103,8 @@ pub struct Session<F: Frontend> {
     session: Option<SessionWriter>,
     /// When the changed session should be written. `None` when nothing is waiting.
     session_due: Option<Instant>,
+    /// The visited pages. `None` once shutdown has written them.
+    history: Option<History>,
     /// What configurations are checked against. Kept for reloads.
     env: Environment,
     /// Set when the loop must end, with the exit code.
@@ -132,6 +137,18 @@ impl<F: Frontend> Session<F> {
         diag: Diagnostics,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
+        // The history beside the session is this sig's when the session is.
+        let ownership = match (&session, paths.session.as_deref()) {
+            (Some(writer), _) => Ownership::Owner(writer.lock()),
+            (None, Some(path)) if persistence::owned_elsewhere(path) => Ownership::Elsewhere,
+            (None, _) => Ownership::Nobody,
+        };
+        let history = History::open(
+            paths.session.as_deref().map(persistence::history_path),
+            ownership,
+            core.config().remember_history(),
+            Arc::clone(&wake),
+        );
         Self {
             core,
             queue: VecDeque::new(),
@@ -143,6 +160,7 @@ impl<F: Frontend> Session<F> {
             paths,
             session,
             session_due: None,
+            history: Some(history),
             env,
             quit: None,
             shutdown_bound: None,
@@ -220,6 +238,41 @@ impl<F: Frontend> Session<F> {
         self.services.as_mut().expect("services are shut down")
     }
 
+    /// At most [`history::MAX_COMPLETIONS`] visited addresses that `typed`, the address line's
+    /// text, completes ([`history::suffix`]), the most recently visited first. None after
+    /// shutdown, with `[history] remember` off, or without a history (`sig --dump`).
+    pub fn complete(&self, typed: &str) -> Vec<history::Completion> {
+        self.history
+            .as_ref()
+            .map_or_else(Vec::new, |history| history.complete(typed))
+    }
+
+    /// Changes when visited pages were forgotten or dropped: a completion shown may be gone,
+    /// so ask [`Session::complete`] again.
+    pub fn history_generation(&self) -> u64 {
+        self.history.as_ref().map_or(0, History::generation)
+    }
+
+    /// When something should be written: the changed session or history. `None` when nothing
+    /// is waiting.
+    pub fn writes_due(&self) -> Option<Instant> {
+        let history = self.history.as_ref().and_then(History::due);
+        [self.session_due, history].into_iter().flatten().min()
+    }
+
+    /// Writes the session and the history if they are due ([`Session::writes_due`]).
+    pub fn write_due(&mut self) {
+        let now = Instant::now();
+        if self.session_due.is_some_and(|due| due <= now) {
+            self.save_session();
+        }
+        let history = self.history.as_mut();
+        let due = history.filter(|h| h.due().is_some_and(|due| due <= now));
+        if due.is_some_and(History::save) {
+            self.diag.counters.history_saves += 1;
+        }
+    }
+
     /// Hands queued events to the core and carries out its effects, until nothing is queued.
     /// Frontend work runs inside each effect, before the next one.
     pub fn run_core(&mut self, frontend: &mut F) {
@@ -231,6 +284,9 @@ impl<F: Frontend> Session<F> {
             };
             let effects = sighurt_core::update(&mut self.core, event);
             self.diag.counters.effects += effects.len() as u64;
+            if let Some(history) = self.history.as_mut() {
+                history.set_remember(self.core.config().remember_history());
+            }
             for effect in effects {
                 self.apply(frontend, effect);
             }
@@ -356,13 +412,22 @@ impl<F: Frontend> Session<F> {
             Effect::Notice { message, .. } => frontend.notice(message),
             Effect::RedrawChrome => frontend.redraw(),
             Effect::SaveSession => self.session_changed(),
-            // Nothing keeps visits yet, so nothing is left to forget.
-            Effect::Visited { .. } => {}
-            Effect::ForgetVisits { request, .. } => {
-                self.queue.push_back(BrowserEvent::VisitsForgotten {
-                    request,
-                    outcome: sighurt_core::ForgetOutcome::Done { removed: 0 },
-                })
+            Effect::Visited { url, title, commit } => {
+                let history = self.history.as_mut();
+                if history.is_some_and(|h| h.visit(&url, title.as_deref(), commit)) {
+                    self.diag.counters.visits_recorded += 1;
+                }
+            }
+            Effect::ForgetVisits { request, host } => {
+                let Some(history) = self.history.as_mut() else {
+                    return;
+                };
+                match history.forget(request, host.as_deref()) {
+                    Some(outcome) => self
+                        .queue
+                        .push_back(BrowserEvent::VisitsForgotten { request, outcome }),
+                    None => self.diag.counters.history_saves += 1,
+                }
             }
             Effect::Quit => {
                 // `shutdown` writes the session, once and whole; a save due now is that one.
@@ -465,8 +530,9 @@ impl<F: Frontend> Session<F> {
         }
     }
 
-    /// Takes what service threads and the session writer reported. A status line, or a session
-    /// write that failed, becomes a notice. Returns whether there was anything.
+    /// Takes what service threads and the session and history writers reported. A status
+    /// line, a write that failed, or what the history has to say becomes a notice; a forget the
+    /// history wrote goes to the core. Returns whether there was anything.
     pub fn service_completions(&mut self, frontend: &mut F) -> bool {
         let completions = self.services().completions(MAX_COMPLETIONS);
         let mut worked = !completions.is_empty();
@@ -478,6 +544,23 @@ impl<F: Frontend> Session<F> {
         }
         if let Some(failure) = self.session.as_ref().and_then(SessionWriter::take_failure) {
             frontend.notice(failure);
+            worked = true;
+        }
+        let Some(history) = self.history.as_mut() else {
+            return worked;
+        };
+        let notices = history.take_notices();
+        let (forgotten, failure) = history.take_reports();
+        for notice in notices.into_iter().chain(failure) {
+            frontend.notice(notice);
+            worked = true;
+        }
+        if !forgotten.is_empty() {
+            for (request, outcome) in forgotten {
+                self.queue
+                    .push_back(BrowserEvent::VisitsForgotten { request, outcome });
+            }
+            self.run_core(frontend);
             worked = true;
         }
         worked
@@ -821,7 +904,7 @@ impl<F: Frontend> Session<F> {
 
     /// Shuts down the part of plan §20 that is not the frontend tearing itself down, and returns
     /// the exit code. The order is fixed: cancel downloads, write the session (the only write
-    /// at quit) and finish the writer, `report` (the final diagnostics, while every view is
+    /// at quit) and finish the writer, write the history if it changed and finish its writer, `report` (the final diagnostics, while every view is
     /// still there and the runtimes can still say how they render), forget and close every view,
     /// shut the runtimes down, shut services down, delete scratch directories. If a runtime had
     /// to be left running (decision 54), the frontend is asked to clean up and the process ends
@@ -846,7 +929,13 @@ impl<F: Frontend> Session<F> {
         if let Some(writer) = self.session.take() {
             writer.finish();
         }
-        // The session file is written. From here a script thread that will not exit must
+        if let Some(mut history) = self.history.take() {
+            if history.save() {
+                self.diag.counters.history_saves += 1;
+            }
+            history.finish();
+        }
+        // The session and history files are written. From here a script thread that will not exit must
         // not hold the process: Servo's `Drop` sleeps until one does. The guard disarms
         // the thread when this function returns.
         let _bound = self
@@ -968,6 +1057,7 @@ fn end_without_destructors(status: i32) -> ! {
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use sighurt_api::commands::Command;
     use sighurt_api::engine::{
@@ -1352,6 +1442,150 @@ mod tests {
         let saved = std::fs::read_to_string(&path).expect("the session file");
         assert!(saved.contains("https://example.com/"), "{saved}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session on the `idle` engine, saving to `dir`, which opens `open`.
+    fn idle_session(dir: &std::path::Path, config: &str, open: &[&str]) -> Session<Recording> {
+        let path = dir.join("session.toml");
+        let registry = Registry::new(vec![Engine::new(
+            "idle",
+            site_caps(true),
+            "cpu",
+            &[],
+            start_idle,
+        )]);
+        let env = registry.environment(Vec::new(), &[]);
+        let text = format!("version = 1\n[engines]\ndefault = \"idle\"\n{config}");
+        let config = Config::parse(Some(&text), &env).expect("config");
+        let writer = crate::persistence::SessionWriter::new(path.clone(), || {}).ok();
+        let mut session = Session::<Recording>::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            Services::new(|| {}),
+            Paths {
+                config: None,
+                session: Some(path),
+            },
+            writer,
+            Diagnostics::new(None),
+            Arc::new(|| {}),
+        );
+        session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: open
+                .iter()
+                .map(|url| OpenRequest {
+                    input: (*url).into(),
+                    engine: None,
+                })
+                .collect(),
+        });
+        session
+    }
+
+    #[test]
+    fn visits_are_saved_at_quit_completed_from_and_forgotten_with_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut frontend = Recording::default();
+        let mut session = idle_session(dir.path(), "", &["https://www.example.com/a#x"]);
+        session.run_core(&mut frontend);
+        session.pump(&mut frontend);
+        assert_eq!(session.diag.counters.visits_recorded, 1);
+        assert!(session.writes_due().is_some(), "a save waits");
+        let found = session.complete("exa");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].url, "https://www.example.com/a");
+        session.queue_mut().push_back(BrowserEvent::Command(
+            "browser.quit".parse::<Command>().unwrap(),
+        ));
+        session.run_core(&mut frontend);
+        session.shutdown(&mut frontend, |_, _| {});
+        assert_eq!(session.diag.counters.history_saves, 1, "written at quit");
+        let saved = std::fs::read_to_string(dir.path().join("history.toml")).unwrap();
+        assert!(
+            saved.contains("url = \"https://www.example.com/a\""),
+            "{saved}"
+        );
+        assert_eq!(session.complete("exa"), Vec::new(), "none after shutdown");
+
+        // The next sig completes from it, and forgets it in the file at once.
+        let mut session = idle_session(dir.path(), "", &[]);
+        session.run_core(&mut frontend);
+        assert_eq!(session.complete("www.e").len(), 1);
+        let generation = session.history_generation();
+        session.queue_mut().push_back(BrowserEvent::Command(
+            "history.clear".parse::<Command>().unwrap(),
+        ));
+        session.run_core(&mut frontend);
+        assert_ne!(session.history_generation(), generation);
+        assert!(session.complete("www.e").is_empty());
+        for _ in 0..500 {
+            session.service_completions(&mut frontend);
+            if frontend
+                .notices
+                .iter()
+                .any(|n| n == "Forgot 1 visited page.")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            frontend
+                .notices
+                .iter()
+                .any(|n| n == "Forgot 1 visited page."),
+            "{:?}",
+            frontend.notices
+        );
+        let saved = std::fs::read_to_string(dir.path().join("history.toml")).unwrap();
+        assert!(!saved.contains("example.com"), "{saved}");
+        session.shutdown(&mut frontend, |_, _| {});
+    }
+
+    #[test]
+    fn remember_follows_a_reload_and_a_second_sig_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut frontend = Recording::default();
+        let mut owner = idle_session(dir.path(), "", &["https://a.example/"]);
+        owner.run_core(&mut frontend);
+        owner.pump(&mut frontend);
+        owner.write_due();
+        // Due in 30 s, not now.
+        assert_eq!(owner.diag.counters.history_saves, 0);
+        // The same file, while the first sig holds the lock: another sig.
+        let mut other = idle_session(dir.path(), "", &["https://b.example/"]);
+        other.run_core(&mut frontend);
+        other.pump(&mut frontend);
+        other.service_completions(&mut frontend);
+        assert!(frontend
+            .notices
+            .iter()
+            .any(|n| n.starts_with("Another sig owns the history of visited pages")));
+        assert_eq!(other.complete("b.").len(), 1, "its own visits, in memory");
+        assert_eq!(other.history.as_ref().unwrap().due(), None);
+        other.shutdown(&mut frontend, |_, _| {});
+        assert!(
+            !dir.path().join("history.toml").exists(),
+            "never written by it"
+        );
+
+        let env = owner.environment().clone();
+        let off = Config::parse(
+            Some("version = 1\n[engines]\ndefault = \"idle\"\n[history]\nremember = false"),
+            &env,
+        )
+        .unwrap();
+        owner
+            .queue_mut()
+            .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(off))));
+        owner.run_core(&mut frontend);
+        assert!(owner.complete("a.").is_empty(), "dropped at once");
+        let history = owner.history.as_ref().unwrap();
+        assert_eq!(history.due(), None, "and the save waiting");
+        owner.shutdown(&mut frontend, |_, _| {});
+        assert!(!dir.path().join("history.toml").exists());
     }
 
     #[test]
