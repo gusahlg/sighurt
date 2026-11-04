@@ -17,7 +17,7 @@ path = "src/main.rs"
 # Which compiled engines may open pages is runtime configuration. WPE WebKit needs the prefix
 # nix/build-wpewebkit.sh installs (docs/rewrite/WPE.md); without it, build with
 # `--no-default-features --features engine-servo,engine-wasm`.
-default = ["frontend-gui", "frontend-tui", "engine-servo", "engine-wasm", "engine-wpe"]
+default = ["frontend-gui", "frontend-tui", "engine-servo", "engine-wasm", "engine-wpe", "render-wgpu"]
 # Empty, and not what enables the GUI. `--no-default-features` is a GUI with no engines, and
 # the headless builds name engine features without this one, so sighurt-gui is an unconditional
 # dependency: an empty feature cannot both enable an optional dependency and stay on when
@@ -39,6 +39,9 @@ engine-demo = ["sighurt-gui/engine-demo", "sighurt-tui?/engine-demo"]
 engine-netsurf = ["sighurt-gui/engine-netsurf", "sighurt-tui?/engine-netsurf"]
 # Chromes besides sighurt-ui's `standard`, chosen by `[ui] chrome`.
 chrome-line = ["sighurt-gui/chrome-line"]
+# The chrome's wgpu renderer (Vulkan), chosen by `[ui] renderer = "wgpu"`; `auto` stays on the
+# CPU renderer until measured (docs/rewrite/RENDER.md §14.5).
+render-wgpu = ["sighurt-gui/render-wgpu"]
 
 [dependencies]
 sighurt-core = { path = "../../crates/sighurt-core" }

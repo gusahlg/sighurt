@@ -31,6 +31,11 @@
 #               latter in the status strip over the home page); an engine setting
 #               the demo engine can't honor refused; [session] restore off (the saved tabs are
 #               not restored and the file is left as it is) and on again while sig runs
+#   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
+#               (tab churn that hides the page surface right after a frame, a resize storm, a
+#               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
+#               "wgpu", "wgpu" with SIG_RENDER_FAIL=surface (bound again, stays on wgpu) and
+#               SIG_RENDER_FAIL=device (ends on cpu); every screenshot compared with cpu's
 #
 # Exits with the number of failed checks.
 set -u
@@ -43,22 +48,26 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings renderers)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (with other features); this link keeps the binary these
   # runs use. It is made under the same hold of the machine's lock as the build, so no other
   # build can come between them.
-  link='ln -f target/debug/sig target/debug/sig-headless-e2e'
+  tdir=${CARGO_TARGET_DIR:-target}
+  link="ln -f $tdir/debug/sig $tdir/debug/sig-headless-e2e"
   if [[ $build == 1 ]]; then
     SIG_WHAT="build sig (demo engine) for headless tests" tools/heavy bash -c \
-      "cargo build -p sighurt-browser --no-default-features --features engine-demo \
+      "cargo build -p sighurt-browser --no-default-features --features engine-demo,render-wgpu \
        --bins --example virtual-pointer && $link" || exit 1
   else
     $link || exit 1
   fi
   failed=0
   for scenario in "${scenarios[@]}"; do
-    tools/heavy tools/headless-sway -- "$0" --inside "$out/$scenario" "$scenario"
+    # wgpu presents through Vulkan swapchains, which only a GPU compositor composites.
+    sway=()
+    [[ $scenario == renderers ]] && sway=(--renderer gles2)
+    tools/heavy tools/headless-sway "${sway[@]}" -- "$0" --inside "$out/$scenario" "$scenario"
     failed=$((failed + $?))
   done
   echo "headless.sh: $failed failed check(s); screenshots and logs in $out"
@@ -71,6 +80,7 @@ out=$2 scenario=$3
   echo "headless.sh: run me through tools/headless-sway" >&2
   exit 2
 }
+tdir=${CARGO_TARGET_DIR:-target}
 rm -rf "$out"
 mkdir -p "$out/config/sighurt" "$out/state" "$out/downloads"
 export XDG_CONFIG_HOME=$out/config XDG_STATE_HOME=$out/state XDG_DOWNLOAD_DIR=$out/downloads
@@ -107,7 +117,7 @@ shot() { sleep "${2:-0.5}"; grim "$out/$1.png"; step "screenshot $1"; }
 wtype -s 3600000 ' ' &
 keyboard=$!
 mkfifo "$XDG_RUNTIME_DIR/pointer"
-target/debug/examples/virtual-pointer < "$XDG_RUNTIME_DIR/pointer" &
+"$tdir/debug/examples/virtual-pointer" < "$XDG_RUNTIME_DIR/pointer" &
 pointer_pid=$!
 exec 3> "$XDG_RUNTIME_DIR/pointer"
 layout_w=1280 layout_h=800
@@ -117,7 +127,7 @@ key() { wtype "$@"; sleep 0.25; }
 
 sig_pid=
 start_sig() {
-  target/debug/sig-headless-e2e --diagnostics "$out/diag.json" "$@" > "$out/sig.log" 2>&1 &
+  "$tdir/debug/sig-headless-e2e" --diagnostics "$out/diag.json" "$@" > "$out/sig.log" 2>&1 &
   sig_pid=$!
   sleep 2
 }
@@ -570,6 +580,129 @@ settings)
   sess "turning restore on saves the tabs at once" 5 "len(s['tabs'])==2, len(s['tabs'])"
   kill -TERM "$sig_pid"
   wait "$sig_pid"
+  ;;
+
+renderers)
+  if [[ ${SIG_SWAY_RENDERER:-} != gles2 ]]; then
+    check "a GPU compositor for wgpu" 1 "sway runs ${SIG_SWAY_RENDERER:-?}; this scenario needs gles2"
+    finish
+  fi
+  cp "$out/config/sighurt/config.toml" "$out/base.toml"
+  point 640 400
+  # run_renderer NAME RENDERER [SIG_RENDER_FAIL]: the steps, screenshots NAME-*.png, log
+  # NAME.log, diagnostics NAME.json; checks what every renderer must do, and sets `report` to
+  # the renderer's (name, frames, deferred, fallbacks, chrome_deferred, max_render_us, describe).
+  run_renderer() {
+    local name=$1 renderer=$2 fail=${3:-}
+    step "── $name: [ui] renderer = \"$renderer\"${fail:+, SIG_RENDER_FAIL=$fail}"
+    { cat "$out/base.toml"; printf '[ui]\nrenderer = "%s"\n' "$renderer"; } > "$out/config/sighurt/config.toml"
+    rm -rf "$out/state" && mkdir -p "$out/state"
+    swaymsg -q output HEADLESS-1 resolution 1280x800 scale 1
+    if [[ -n $fail ]]; then export SIG_RENDER_FAIL=$fail; else unset SIG_RENDER_FAIL; fi
+    start_sig demo://pattern sig://home
+    unset SIG_RENDER_FAIL
+    shot "$name-01-start" 1
+    key -M alt 2 -m alt
+    shot "$name-02-home"
+    step "tab churn: the page surface hidden right after its frames, 10 times"
+    for _ in $(seq 10); do
+      wtype -M alt 1 -m alt; sleep 0.03
+      wtype -M alt 2 -m alt; sleep 0.03
+    done
+    key -M alt 1 -m alt
+    shot "$name-03-after-churn" 1
+    # Shown again at the same size: a native surface kept its last frame across the hide.
+    key -M alt 2 -m alt
+    shot "$name-03b-home-again" 1
+    key -M alt 1 -m alt
+    step "resize storm, then a window with no room for the page, then back"
+    for i in $(seq 10); do
+      swaymsg -q output HEADLESS-1 resolution $((900 + i * 30))x$((600 + i * 15)); sleep 0.05
+    done
+    swaymsg -q output HEADLESS-1 resolution 1280x80
+    sleep 0.5
+    swaymsg -q output HEADLESS-1 resolution 1280x800
+    shot "$name-04-restored" 1.5
+    key -M alt 2 -m alt
+    swaymsg -q output HEADLESS-1 scale 1.5
+    shot "$name-05-home-150" 1.5
+    swaymsg -q output HEADLESS-1 scale 1
+    key -M alt 1 -m alt
+    sleep 1
+    before=$(diag "c['wakeups'], c['chrome_paints']")
+    sleep 3
+    after=$(diag "c['wakeups'], c['chrome_paints']")
+    check "$name: idle, no wakeups or chrome paints in 3 s" \
+      "$(python3 -c "a=$before; b=$after; print(0 if b[0]-a[0]<=1 and b[1]==a[1] else 1)")" "$before → $after (wakeups, chrome paints)"
+    report=$(diag "d['renderer']['name'], d['renderer']['frames'], d['renderer']['deferred'], d['renderer']['fallbacks'], c['chrome_deferred'], d['renderer']['max_render_us'], d['renderer']['describe']")
+    echo "$name: $report" >> "$out/renderers.txt"
+    key -M ctrl q -m ctrl
+    wait "$sig_pid"; code=$?
+    check "$name: quits cleanly" "$code" "exit code $code"
+    grep -q panicked "$out/sig.log" && check "$name: no panic" 1 "see $name.log"
+    mv "$out/sig.log" "$out/$name.log"
+    mv "$out/diag.json" "$out/$name.json"
+  }
+  run_renderer cpu cpu
+  check "cpu: the CPU renderer draws" "$(python3 -c "r=$report; print(0 if r[0]=='cpu' and r[1]>0 else 1)")" "$report"
+  run_renderer wgpu wgpu
+  check "wgpu: wgpu draws, no fallback" "$(python3 -c "r=$report; print(0 if r[0]=='wgpu' and r[1]>0 and r[3]==0 else 1)")" "$report"
+  check "wgpu: the adapter is named after the first bind" \
+    "$(grep -q 'chrome-renderer renderer=wgpu describe="wgpu 30 on Vulkan: [^t]' "$out/wgpu.log"; echo $?)" \
+    "$(grep -o 'chrome-renderer renderer=wgpu describe=[^ ]* [^ ]* [^ ]* [^ ]* [^ ]*' "$out/wgpu.log" | tail -1)"
+  check "wgpu: no chrome render failed" "$(grep -q "rendering the chrome's" "$out/wgpu.log"; [[ $? == 1 ]]; echo $?)" \
+    "$(grep -c "rendering the chrome's" "$out/wgpu.log") failures in wgpu.log"
+  run_renderer surface wgpu surface
+  check "surface: a lost surface is bound again and wgpu stays" \
+    "$(python3 -c "r=$report; print(0 if r[0]=='wgpu' and r[3]==0 else 1)")" "$report; $(grep -o "lost its surface.*" "$out/surface.log" | head -1)"
+  run_renderer fallback wgpu device
+  check "fallback: a failed device ends on the CPU renderer" \
+    "$(python3 -c "r=$report; print(0 if r[0]=='cpu' and r[3]==1 else 1)")" "$report; $(grep -o 'chrome-renderer-fallback.*' "$out/fallback.log" | head -1)"
+  # Every screenshot of every run against cpu's: the same pixels but near rounded corners.
+  for run in wgpu surface fallback; do
+    for shot in 01-start 02-home 03-after-churn 03b-home-again 04-restored 05-home-150; do
+      found=$(python3 - "$out/cpu-$shot.png" "$out/$run-$shot.png" <<'PY'
+import struct, sys, zlib
+def png(path):
+    data = open(path, 'rb').read()
+    w, h = struct.unpack('>II', data[16:24])
+    chunks, i = b'', 8
+    while i < len(data):
+        n, kind = struct.unpack('>I4s', data[i:i + 8])
+        if kind == b'IDAT':
+            chunks += data[i + 8:i + 8 + n]
+        i += 12 + n
+    raw, bpp = zlib.decompress(chunks), data[25] == 6 and 4 or 3
+    rows, prev, stride = [], bytearray(w * bpp), w * bpp
+    for y in range(h):
+        f, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for x in range(stride):
+            a = line[x - bpp] if x >= bpp else 0
+            b, c = prev[x], prev[x - bpp] if x >= bpp else 0
+            p = a + b - c
+            pr = a if abs(p - a) <= abs(p - b) and abs(p - a) <= abs(p - c) else (b if abs(p - b) <= abs(p - c) else c)
+            line[x] = (line[x] + [0, a, b, (a + b) // 2, pr][f]) & 255
+        rows.append(line)
+        prev = line
+    return w, h, bpp, rows
+w1, h1, b1, a = png(sys.argv[1])
+w2, h2, b2, b = png(sys.argv[2])
+if (w1, h1) != (w2, h2):
+    print(1, f'size {w1}x{h1} vs {w2}x{h2}'); sys.exit()
+differing = worst = 0
+for y in range(h1):
+    for x in range(w1):
+        d = max(abs(a[y][x * b1 + k] - b[y][x * b2 + k]) for k in range(3))
+        worst = max(worst, d)
+        differing += d > 2
+allowed = w1 * h1 // 1000
+print(0 if differing <= allowed and worst <= 32 else 1, f'{differing} pixels differ by more than 2 (at most {allowed}), worst {worst}')
+PY
+)
+      check "$run-$shot looks like cpu-$shot" "${found%% *}" "${found#* }"
+    done
+  done
+  : > "$out/sig.log"  # each run's log is NAME.log; finish looks here
   ;;
 
 disconnect)

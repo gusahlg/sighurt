@@ -212,6 +212,12 @@ impl ChromeTargets {
         self.mode
     }
 
+    /// Targets made from now on present as `presents` says (a fallback to the CPU renderer);
+    /// where the surfaces went is kept.
+    pub fn set_presents(&mut self, presents: Presents) {
+        self.mode = Self::new(presents).mode;
+    }
+
     /// Where the surfaces of `layout` go in a window of `window` size. A name listed twice is
     /// placed once. Allocates; the owner loop uses [`ChromeTargets::place_into`].
     #[cfg(test)]

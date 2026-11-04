@@ -10577,6 +10577,7 @@ dependencies = [
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",
  "sighurt-render",
+ "sighurt-render-wgpu",
  "sighurt-runtime",
  "sighurt-ui",
  "sighurt-wayland",

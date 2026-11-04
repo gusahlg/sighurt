@@ -99,6 +99,11 @@ pub struct Counters {
     pub paints_page: u64,
     /// Chrome frames whose scene was the surface's last: nothing rendered or committed.
     pub chrome_unchanged: u64,
+    /// Chrome renders the renderer put off (no swapchain image in time): the target was
+    /// invalidated for a new permit.
+    pub chrome_deferred: u64,
+    /// Times the chrome's renderer was replaced by the CPU one.
+    pub renderer_fallbacks: u64,
     /// Placements applied.
     pub placements: u64,
     /// Placements the host refused.
@@ -192,8 +197,9 @@ pub struct EngineReport {
     pub state: String,
 }
 
-/// The renderer that draws the chrome (`[ui] renderer`), and what it counted.
-#[derive(Clone, Debug, Serialize)]
+/// The renderer that draws the chrome (`[ui] renderer`), and what it counted. A measurement
+/// the renderer can't make is `None`.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct RendererReport {
     /// Its name: "cpu", "wgpu", "vulkan".
     pub name: &'static str,
@@ -207,10 +213,40 @@ pub struct RendererReport {
     pub deferred: u64,
     /// Its longest render, in microseconds.
     pub max_render_us: u64,
+    /// Its latest render, in microseconds.
+    pub last_render_us: u64,
     /// Rasterized glyphs it holds.
     pub glyphs: u64,
-    /// Times its glyph cache started over.
+    /// Bytes of glyph images it holds on the CPU.
+    pub glyph_bytes: u64,
+    /// Times its glyph cache or atlas started over.
     pub glyph_resets: u64,
+    /// Native surfaces it has bound.
+    pub surfaces: u64,
+    /// Its atlas pages' sides, and their bytes as textures.
+    pub atlas_mask_size: Option<u32>,
+    pub atlas_color_size: Option<u32>,
+    pub atlas_bytes: Option<u64>,
+    /// Times an atlas page grew, started over, or a frame overflowed it.
+    pub atlas_grows: Option<u64>,
+    pub atlas_resets: Option<u64>,
+    pub atlas_overflows: Option<u64>,
+    /// Swapchain images per surface, when the API says.
+    pub swapchain_images: Option<u32>,
+    /// Device memory of its own resources, as it can tell.
+    pub device_bytes: Option<u64>,
+    /// Swapchain (re)configurations.
+    pub configures: u64,
+    /// Its longest bind, configure and unbind, in microseconds.
+    pub max_bind_us: Option<u64>,
+    pub max_configure_us: Option<u64>,
+    pub max_unbind_us: Option<u64>,
+    /// Times the frontend replaced its renderer with the CPU one, and the last reason.
+    pub fallbacks: u64,
+    pub fallback: Option<String>,
+    /// The renderer it replaced, and the frames that one rendered.
+    pub replaced: Option<&'static str>,
+    pub replaced_frames: u64,
 }
 
 /// One tab, as the core sees it: browser state only, never its address or title.
@@ -431,6 +467,23 @@ impl Diagnostics {
                     ms(scene),
                     ms(render)
                 ),
+            );
+        }
+    }
+
+    /// The renderer put off a chrome surface's frame; the target waits for a new permit.
+    pub fn chrome_deferred(&mut self) {
+        self.counters.chrome_deferred += 1;
+    }
+
+    /// The chrome's renderer `from` could not go on (`why`) and `to` replaced it.
+    pub fn renderer_fallback(&mut self, from: &str, to: &str, why: &str) {
+        self.counters.renderer_fallbacks += 1;
+        log::warn!("the chrome's {from} renderer stopped ({why}); the chrome is drawn by {to}");
+        if self.lines {
+            self.line(
+                "chrome-renderer-fallback",
+                format_args!("from={from} to={to} why={why:?}"),
             );
         }
     }
