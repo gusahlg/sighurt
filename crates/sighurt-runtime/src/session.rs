@@ -3,7 +3,8 @@
 //! One pass is what the owner loop used to do between the host and the engines. Events go
 //! into [`Session::run_core`], which hands each to `sighurt_core::update` and carries the
 //! effects out in order. What is not a frontend's job happens here: engine commands, view
-//! bookkeeping, services, notices queued back as events, session writes. What is, is asked of
+//! bookkeeping, services, notices queued back as events, session writes (and a failed one,
+//! as a notice). What is, is asked of
 //! the [`Frontend`](crate::frontend::Frontend) before the next effect runs. A view's target
 //! exists before any command is sent to that view: [`Effect::OpenView`] starts the engine,
 //! asks the frontend for a target, records the view, places it, and only then calls
@@ -455,16 +456,20 @@ impl<F: Frontend> Session<F> {
         }
     }
 
-    /// Takes what service threads reported. A status line becomes a notice. Returns whether
-    /// there was anything.
+    /// Takes what service threads and the session writer reported. A status line, or a session
+    /// write that failed, becomes a notice. Returns whether there was anything.
     pub fn service_completions(&mut self, frontend: &mut F) -> bool {
         let completions = self.services().completions(MAX_COMPLETIONS);
-        let worked = !completions.is_empty();
+        let mut worked = !completions.is_empty();
         for completion in completions {
             match completion {
                 Completion::Status(line) => frontend.notice(line),
                 Completion::Finished(_) => {}
             }
+        }
+        if let Some(failure) = self.session.as_ref().and_then(SessionWriter::take_failure) {
+            frontend.notice(failure);
+            worked = true;
         }
         worked
     }
@@ -1272,7 +1277,7 @@ mod tests {
         let env = registry.environment(Vec::new(), &[]);
         let text = "version = 1\n[engines]\ndefault = \"idle\"\nenabled = [\"idle\"]";
         let config = Config::parse(Some(text), &env).expect("config");
-        let writer = crate::persistence::SessionWriter::new(path.clone()).expect("a writer");
+        let writer = crate::persistence::SessionWriter::new(path.clone(), || {}).expect("a writer");
         let mut session = Session::<Recording>::new(
             BrowserState::new(config, env.clone()),
             env,

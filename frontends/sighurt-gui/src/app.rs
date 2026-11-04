@@ -96,7 +96,7 @@ use sighurt_render::{
 };
 use sighurt_runtime::diagnostics::{Diagnostics, RendererReport, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
-use sighurt_runtime::persistence::{self, ConfigWatch, Paths, SessionWriter};
+use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
 use sighurt_runtime::registry::State;
 use sighurt_runtime::services::{Clipboard, Services};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
@@ -820,16 +820,9 @@ impl App {
             },
         );
         let configured = chrome.handle(chrome::configure(&config, kind.name));
-        let session_writer = match &paths.session {
-            Some(path) => match SessionWriter::new(path.clone()) {
-                Ok(writer) => Some(writer),
-                Err(error) => {
-                    log::warn!("cannot save the session: {error}");
-                    None
-                }
-            },
-            None => None,
-        };
+        let writer_wake = ping.clone();
+        let (session_writer, writer_notice) =
+            persistence::session_writer(paths.session.as_deref(), move || writer_wake.ping());
         let services_wake = ping.clone();
         let services = Services::new(move || services_wake.ping());
         let wake = std::sync::Arc::new(move || ping.ping());
@@ -891,7 +884,7 @@ impl App {
             session: None,
             open: options.open,
         });
-        if let Some(notice) = renderer_notice {
+        for notice in [writer_notice, renderer_notice].into_iter().flatten() {
             gui.show_notice(notice);
         }
         Ok(Self {

@@ -19,7 +19,11 @@
 //!
 //! Sessions are written atomically (a temporary file in the same directory, synced, then renamed
 //! over the old one) by a thread of their own, which writes only the latest snapshot it has been
-//! given; at quit the last one is written before `sig` goes on. Only one `sig` writes a session
+//! given; at quit the last one is written before `sig` goes on. A write that fails (a full disk,
+//! the file size limit) leaves the file as it was; the first failure after a write that worked
+//! is handed to the owner loop ([`SessionWriter::take_failure`], with a wake) to tell the user,
+//! and a session that can't be written at all says so when `sig` starts ([`session_writer`]).
+//! Only one `sig` writes a session
 //! file: the writer holds an advisory lock (`session.lock` beside it) until its last write, and
 //! the OS releases it if `sig` dies. Another `sig` still restores the session, says once that it
 //! won't save it, and never writes it. The owner removes temporary files a crash left behind. A
@@ -37,7 +41,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -405,31 +409,74 @@ pub fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
     result
 }
 
+/// The writer of the session at `path` (none without a path), and the notice for the user when
+/// there is none: the tabs won't be saved. A session another `sig` owns says so when it is
+/// restored ([`load_session`]), so that case has no notice here. `wake` is the owner loop's,
+/// for [`SessionWriter::take_failure`].
+pub fn session_writer(
+    path: Option<&Path>,
+    wake: impl Fn() + Send + 'static,
+) -> (Option<SessionWriter>, Option<String>) {
+    let Some(path) = path else {
+        return (None, None);
+    };
+    match SessionWriter::new(path.to_owned(), wake) {
+        Ok(writer) => (Some(writer), None),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            log::warn!("cannot save the session: {error}");
+            (None, None)
+        }
+        Err(error) => {
+            log::warn!("cannot save the session: {error}");
+            let notice = format!("The tabs won't be saved to {}: {error}", path.display());
+            (None, Some(notice))
+        }
+    }
+}
+
 /// Writes session snapshots on a thread of its own, the latest one only. It owns the session:
 /// its thread holds the session's lock until it has written the last snapshot.
 pub struct SessionWriter {
     sender: Option<Sender<String>>,
     thread: Option<JoinHandle<()>>,
+    /// A failed write the owner has not taken yet.
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl SessionWriter {
     /// A writer to `path`, which takes the session's lock and removes the temporary files a
     /// crash left. Fails when another `sig` owns the session: this `sig` then restores it
-    /// ([`load_session`] says it won't save it) and saves nothing.
-    pub fn new(path: PathBuf) -> io::Result<Self> {
+    /// ([`load_session`] says it won't save it) and saves nothing. `wake` is called when a
+    /// write failed after one that worked (or the first write failed).
+    pub fn new(path: PathBuf, wake: impl Fn() + Send + 'static) -> io::Result<Self> {
         let lock = lock_session(&path)?;
         remove_temporaries(&path);
         let (sender, receiver) = mpsc::channel::<String>();
+        let failure = Arc::new(Mutex::new(None));
+        let failed = Arc::clone(&failure);
         let thread = std::thread::Builder::new()
             .name("sighurt-session".into())
             .spawn(move || {
-                write_latest(&path, receiver);
+                write_latest(&path, receiver, |message| {
+                    *failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(message);
+                    wake();
+                });
                 drop(lock);
             })?;
         Ok(Self {
             sender: Some(sender),
             thread: Some(thread),
+            failure,
         })
+    }
+
+    /// The failure to report since the last call, for the user: once when writes start
+    /// failing, not again until one has worked.
+    pub fn take_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// Queues `text` to be written; an older snapshot not written yet is skipped.
@@ -448,13 +495,26 @@ impl SessionWriter {
     }
 }
 
-fn write_latest(path: &Path, receiver: Receiver<String>) {
+/// Writes the latest snapshot `receiver` has, until it closes. `failed` hears of the first
+/// failure after a write that worked.
+fn write_latest(path: &Path, receiver: Receiver<String>, failed: impl Fn(String)) {
+    let mut failing = false;
     while let Ok(mut text) = receiver.recv() {
         while let Ok(newer) = receiver.try_recv() {
             text = newer;
         }
-        if let Err(error) = write_atomically(path, &text) {
-            log::warn!("cannot save the session to {}: {error}", path.display());
+        match write_atomically(path, &text) {
+            Ok(()) => failing = false,
+            Err(error) => {
+                log::warn!("cannot save the session to {}: {error}", path.display());
+                if !failing {
+                    failing = true;
+                    failed(format!(
+                        "The tabs can't be saved to {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
         }
     }
 }
@@ -518,7 +578,7 @@ mod tests {
     fn sessions_are_written_whole_and_the_latest_wins() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state").join("session.toml");
-        let writer = SessionWriter::new(path.clone()).unwrap();
+        let writer = SessionWriter::new(path.clone(), || {}).unwrap();
         let text = |n: usize| {
             Session {
                 version: sighurt_core::session::VERSION,
@@ -580,7 +640,7 @@ mod tests {
         // What a sig that crashed while writing left.
         fs::write(dir.path().join("session.toml.4242.tmp"), "tabs").unwrap();
         fs::write(dir.path().join("session.toml.x.tmp"), "not ours").unwrap();
-        let owner = SessionWriter::new(path.clone()).unwrap();
+        let owner = SessionWriter::new(path.clone(), || {}).unwrap();
         assert_eq!(
             names(dir.path()),
             ["session.lock", "session.toml.x.tmp"],
@@ -588,7 +648,7 @@ mod tests {
         );
         owner.save(empty_session());
         // The lock is per open file, so a second writer in this process stands for another sig.
-        let error = SessionWriter::new(path.clone()).err().unwrap();
+        let error = SessionWriter::new(path.clone(), || {}).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         owner.finish();
         let session = load_session(&path).unwrap().unwrap();
@@ -598,9 +658,65 @@ mod tests {
         assert!(load_session(&path).is_err());
         assert!(path.exists());
         // The owner let go when it finished: now this one owns the session.
-        SessionWriter::new(path.clone()).unwrap().finish();
+        SessionWriter::new(path.clone(), || {}).unwrap().finish();
         let error = load_session(&path).unwrap_err();
         assert!(error.contains("It is kept as"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_once_until_one_works_and_the_file_stays() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.toml");
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let woken = Arc::clone(&wakes);
+        let writer = SessionWriter::new(path.clone(), move || {
+            woken.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        let until = |done: &dyn Fn() -> bool| {
+            for _ in 0..500 {
+                if done() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timed out");
+        };
+        // A directory where the file goes: renaming over it fails.
+        fs::create_dir_all(path.join("x")).unwrap();
+        writer.save(empty_session());
+        until(&|| wakes.load(Ordering::SeqCst) == 1);
+        let failure = writer.take_failure().unwrap();
+        assert!(
+            failure.starts_with(&format!("The tabs can't be saved to {}: ", path.display())),
+            "{failure}"
+        );
+        assert_eq!(writer.take_failure(), None, "taken");
+        writer.save(empty_session());
+        fs::remove_dir_all(&path).unwrap();
+        writer.save(empty_session());
+        until(&|| path.is_file());
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "a failure goes on unreported"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir_all(path.join("x")).unwrap();
+        writer.save(empty_session());
+        writer.finish();
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            2,
+            "failing again after a write that worked is reported"
+        );
+        assert!(path.join("x").is_dir(), "what was there stays");
+        assert_eq!(
+            names(dir.path()),
+            ["session.lock", "session.toml"],
+            "no temporary file"
+        );
     }
 
     fn empty_session() -> String {
