@@ -27,7 +27,7 @@
 //!   `FrameReady` is the executable's to schedule presentation from, and `SemanticsChanged`
 //!   page content for a frontend that shows text; the core ignores both;
 //! - what its own calls and services produced: [`BrowserEvent::OpenFailed`],
-//!   [`BrowserEvent::CommandFailed`], [`BrowserEvent::ServiceDone`],
+//!   [`BrowserEvent::CommandFailed`], [`BrowserEvent::FindResult`], [`BrowserEvent::ServiceDone`],
 //!   [`BrowserEvent::PermissionAnswered`], [`BrowserEvent::ConfigReloaded`].
 //!
 //! It carries out the returned effects in order: an [`Effect::OpenView`] comes before the
@@ -44,8 +44,8 @@ use std::time::Instant;
 
 use sighurt_api::commands::{Command, SentKey};
 use sighurt_api::engine::{
-    EngineCapabilities, EngineCommand, EngineError, SiteDataKinds, SiteDataRequest, SiteKey,
-    ViewOptions,
+    EngineCapabilities, EngineCommand, EngineError, FindCommand, SiteDataKinds, SiteDataRequest,
+    SiteKey, ViewOptions,
 };
 use sighurt_api::events::{
     Cursor, EngineEvent, HistoryEffect, NavigationError, OpenDisposition, SiteDataOutcome,
@@ -268,6 +268,27 @@ pub enum BrowserEvent {
         /// When the user acted.
         at: Instant,
     },
+    /// What a search ([`Effect::Find`]) found, from whoever searched: a frontend that shows the
+    /// page as text and searched it itself ([`Effect::Find`]), or the runtime saying that
+    /// nobody can (`supported: false`: the frontend declined and the view's engine lacks
+    /// [`EngineCapabilities::find_in_page`]). An engine's own result comes as
+    /// [`EngineEvent::FindResult`] and counts the same. Dropped unless `search` is the view's
+    /// search: ids are never reused and the search ends with its document, so `search` alone
+    /// tells a late result.
+    FindResult {
+        /// The view.
+        view: ViewId,
+        /// The search, as [`FindCommand::Search`] named it.
+        search: RequestId,
+        /// Whether there is a match.
+        found: bool,
+        /// Which match is selected, from 1, when known.
+        current: Option<u32>,
+        /// How many matches there are, when known.
+        total: Option<u32>,
+        /// Whether anything could search the view at all.
+        supported: bool,
+    },
     /// A service the core asked for ([`Effect::Service`]) is done, or failed.
     ServiceDone {
         /// The request.
@@ -309,6 +330,23 @@ pub enum Effect {
         /// The command.
         command: EngineCommand,
     },
+    /// Find in `view`'s page: offer `command` to the frontend first (one that shows the page
+    /// as text searches its own text), then to the view's engine as [`EngineCommand::Find`] if
+    /// it has [`EngineCapabilities::find_in_page`]; with neither, answer a `Search`, `Next` or
+    /// `Previous` with [`BrowserEvent::FindResult`] and `supported: false`. Results come back as
+    /// [`BrowserEvent::FindResult`] or [`EngineEvent::FindResult`]; a refusal of the engine
+    /// command as [`BrowserEvent::CommandFailed`].
+    Find {
+        /// The view.
+        view: ViewId,
+        /// What to do.
+        command: FindCommand,
+    },
+    /// The chrome opens its find field (`page.find` without text; `Focus(Chrome)` comes first),
+    /// holding `text`, the search the page shown has, if any. Each edit there runs `page.find
+    /// <text>`, an empty one `page.find-stop`; Enter keeps the search and gives the page the
+    /// keyboard, Escape ends it. A frontend with no find field ignores it.
+    FindField(String),
     /// Close `view` (`EngineRuntime::close_view`) and retire its target once the engine is
     /// done with it. The core sends it nothing more.
     CloseView {
@@ -428,7 +466,7 @@ pub struct BrowserState {
     pub(crate) active: usize,
     focus: KeyboardFocus,
     /// Every view the core has opened and not seen closed.
-    views: BTreeMap<ViewId, View>,
+    pub(crate) views: BTreeMap<ViewId, View>,
     /// The keymap and the presses it took.
     keys: KeyState,
     /// The side buttons `[input.buttons]` took, whose releases the core owes nobody.
@@ -526,6 +564,21 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             command,
             error,
         } => state.command_failed(view, command, error, &mut fx),
+        BrowserEvent::FindResult {
+            view,
+            search,
+            found,
+            current,
+            total,
+            supported,
+        } => state.find_result(
+            view,
+            None,
+            search,
+            (found, current, total),
+            supported,
+            &mut fx,
+        ),
         BrowserEvent::ServiceDone { request, result } => {
             if let Some(pending) = state.requests.remove(request) {
                 if state.is_document(pending.view, pending.document) {
@@ -921,6 +974,7 @@ impl BrowserState {
             error: tab.error.as_ref(),
             reloads: shown.reloads,
             switching_to: shown.switching.map(|view| view.engine()),
+            find: shown.view.and_then(|view| view.find.as_ref()),
         }
     }
 
@@ -1584,6 +1638,7 @@ impl BrowserState {
         v.loading = false;
         v.navigations.clear();
         let tab = v.tab;
+        self.end_find(view, fx);
         self.cancel_requests(view, None, fx);
         let Some(tab) = self.tab_index(tab) else {
             return;
@@ -1668,6 +1723,12 @@ impl BrowserState {
                     | EngineCommand::Traverse { navigation, .. } => {
                         self.navigation_failed(view, navigation, NavigationError::Load(message), fx)
                     }
+                    // An engine that declared find but refuses it can't search after all.
+                    EngineCommand::Find(
+                        FindCommand::Search { search, .. }
+                        | FindCommand::Next { search }
+                        | FindCommand::Previous { search },
+                    ) => self.find_result(view, None, search, (false, None, None), false, fx),
                     _ => fx.push(Effect::Notice {
                         tab: Some(tab),
                         message,
@@ -1892,8 +1953,21 @@ impl BrowserState {
                 })
             }
             EngineEvent::FrameReady { .. } | EngineEvent::SemanticsChanged { .. } => {}
-            // The core starts no search yet, so every result is stale (lane B).
-            EngineEvent::FindResult { .. } => {}
+            EngineEvent::FindResult {
+                document,
+                search,
+                found,
+                current,
+                total,
+                ..
+            } => self.find_result(
+                id,
+                Some(document),
+                search,
+                (found, current, total),
+                true,
+                fx,
+            ),
             // No engine declares element fullscreen yet (lane D).
             EngineEvent::FullscreenChanged { .. } => {}
             EngineEvent::ServiceRequested(request) => self.service_requested(request, at, fx),
@@ -1979,6 +2053,7 @@ impl BrowserState {
             view.activation = None;
             view.link = None;
             view.hovered = None;
+            self.end_find(id, fx);
             self.cancel_requests(id, Some(document), fx);
         }
         let Some(tab) = self.tab_index(tab) else {

@@ -1,7 +1,7 @@
 //! What the runtime asks a frontend to do.
 //!
-//! Effects the runtime cannot carry out itself — a view's target, focus, the chrome, the
-//! page's cursor and text field, notices, redraws — are handed to the frontend here, one at a
+//! Effects the runtime cannot carry out itself — a view's target, focus, the chrome and its
+//! find field, the page's cursor and text field, notices, redraws — are handed to the frontend here, one at a
 //! time, in the order the core returned them. Opening a target is a handshake: the frontend
 //! returns the target or an error, the runtime records the view and asks for a placement, and
 //! only then does the engine receive the target. A command for a view is never sent before
@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
+use sighurt_api::engine::FindCommand;
 use sighurt_api::events::Cursor;
 use sighurt_api::ids::{TargetId, ViewId};
 use sighurt_api::input::{InputEvent, KeyboardFocus, TextInputState};
@@ -59,6 +60,29 @@ pub trait Frontend: Clipboard {
     /// end, as if typed (`location.focus <text>`). A frontend with no address line ignores it.
     fn line_text(&mut self, text: String, queue: &mut VecDeque<BrowserEvent>) {
         let _ = (text, queue);
+    }
+
+    /// The chrome opens its find field holding `text` (`page.find` without text), after the
+    /// focus moved to it. Each edit there is `page.find <text>`, an empty one `page.find-stop`;
+    /// Enter gives the page the keyboard and keeps the search, Escape ends it. A frontend with
+    /// no find field ignores it.
+    fn find_field(&mut self, text: String, queue: &mut VecDeque<BrowserEvent>) {
+        let _ = (text, queue);
+    }
+
+    /// A search in `view`'s page, before its engine is asked. Return `true` to carry it out
+    /// here: a frontend that shows the page as text searches that text itself (TUI.md §4),
+    /// answering `Search`, `Next` and `Previous` with `BrowserEvent::FindResult` in `queue`.
+    /// `false` leaves it to the engine, or, if the engine can't find in page, to the runtime's
+    /// answer that nobody can.
+    fn find(
+        &mut self,
+        view: ViewId,
+        command: &FindCommand,
+        queue: &mut VecDeque<BrowserEvent>,
+    ) -> bool {
+        let _ = (view, command, queue);
+        false
     }
 
     /// Keyboard input for the chrome. Pointer and window-focus input are not chrome input;
