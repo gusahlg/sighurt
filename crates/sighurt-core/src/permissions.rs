@@ -273,3 +273,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "permissions_fuzz.rs"]
+mod fuzz;
