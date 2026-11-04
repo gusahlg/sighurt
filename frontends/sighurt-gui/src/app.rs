@@ -1011,7 +1011,7 @@ impl App {
         for signal in std::mem::take(&mut self.signals) {
             match i32::from(signal) {
                 libc::SIGUSR1 => report(&self.gui, &mut self.session, false),
-                libc::SIGTERM | libc::SIGINT => {
+                libc::SIGTERM | libc::SIGINT | libc::SIGHUP => {
                     self.session.queue_mut().push_back(BrowserEvent::Command(
                         sighurt_api::commands::Command::BrowserQuit,
                     ));

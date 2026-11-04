@@ -3,7 +3,8 @@
 //! Its sources are the terminal (readable for input; writable only while bytes wait in the
 //! bounded output), the `SIGWINCH` pipe (resize, and the wake after `SIGCONT`), one ping that
 //! engine wakers and service threads share, the signal pipe from `sig` (SIGUSR1 diagnostics,
-//! SIGTERM and SIGINT quit) and the configuration watch.
+//! SIGTERM and SIGINT quit, and SIGHUP until the terminal's handler takes it over) and the
+//! configuration watch.
 //!
 //! One iteration, after the loop wakes, as in the Wayland loop: terminal input (at most
 //! [`MAX_EVENTS`] events a pass, each handed to the core), service completions, the layout's
@@ -781,7 +782,8 @@ impl App {
         for signal in std::mem::take(&mut self.signals) {
             match i32::from(signal) {
                 libc::SIGUSR1 => report(&self.tui, &mut self.session, false),
-                libc::SIGTERM | libc::SIGINT => {
+                // SIGHUP only before the terminal's own handler is installed.
+                libc::SIGTERM | libc::SIGINT | libc::SIGHUP => {
                     self.session
                         .queue_mut()
                         .push_back(BrowserEvent::Command(Command::BrowserQuit));
