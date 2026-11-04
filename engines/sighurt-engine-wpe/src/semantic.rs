@@ -56,8 +56,13 @@ pub const OBSERVER_SCRIPT: &str = r#"(function () {
 
 /// The observer install followed by [`sighurt_semantic::EXTRACT`](sighurt_semantic::EXTRACT), as
 /// one expression whose value is the snapshot JSON. The observer is installed synchronously
-/// before the walk, in the same world.
-pub fn extraction_script() -> String {
+/// before the walk, in the same world. Built once per process.
+pub fn extraction_script() -> &'static str {
+    static SCRIPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(build_extraction_script)
+}
+
+fn build_extraction_script() -> String {
     let extract = sighurt_semantic::EXTRACT.as_str();
     let mut script = String::with_capacity(OBSERVER_SCRIPT.len() + extract.len() + 48);
     // `return` and the expression's first token stay on one line. EXTRACT begins with a

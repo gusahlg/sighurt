@@ -26,8 +26,8 @@ pub struct Input {
     start: Instant,
     /// Keycodes and keysyms of keys the view received as pressed.
     pressed_keys: Vec<(u32, u32)>,
-    /// `WPE_MODIFIER_POINTER_BUTTON*` bits of held buttons.
-    buttons: u32,
+    /// Held buttons, bit `n - 1` for WPE's button `n` (1 to 9).
+    held: u32,
     position: (f64, f64),
 }
 
@@ -36,7 +36,7 @@ impl Default for Input {
         Self {
             start: Instant::now(),
             pressed_keys: Vec::new(),
-            buttons: 0,
+            held: 0,
             position: (0.0, 0.0),
         }
     }
@@ -47,6 +47,16 @@ impl Input {
         self.start.elapsed().as_millis() as u32
     }
 
+    /// The `WPE_MODIFIER_POINTER_BUTTON*` bits of the held buttons. WPE has five; buttons 5 to 9
+    /// (Back and Forward among them) all share the fifth.
+    fn buttons(&self) -> u32 {
+        (0..9)
+            .filter(|n| self.held & (1 << n) != 0)
+            .fold(0, |bits, n| {
+                bits | (ffi::WPE_MODIFIER_POINTER_BUTTON1 << n.min(4))
+            })
+    }
+
     /// The WPE event for a pointer event, if WebKit has one.
     pub fn pointer(&mut self, view: &View, event: &PointerEvent) -> Option<*mut WPEEvent> {
         let view = view.as_ptr();
@@ -55,7 +65,7 @@ impl Input {
         let moved = |input: &mut Self, kind, x: f64, y: f64, modifiers: u32| {
             let (dx, dy) = (x - input.position.0, y - input.position.1);
             input.position = (x, y);
-            let mods = modifiers | input.buttons;
+            let mods = modifiers | input.buttons();
             unsafe { ffi::wpe_event_pointer_move_new(kind, view, mouse, time, mods, x, y, dx, dy) }
         };
         Some(match event {
@@ -94,7 +104,7 @@ impl Input {
                     PointerButton::Forward => 9,
                     PointerButton::Other(_) => return None,
                 };
-                let bit = ffi::WPE_MODIFIER_POINTER_BUTTON1 << (button - 1).min(4);
+                let bit = 1 << (button - 1);
                 let (x, y) = (position.x, position.y);
                 self.position = (x, y);
                 let (kind, count) = match state {
@@ -106,10 +116,10 @@ impl Input {
                     ButtonState::Released => (ffi::WPE_EVENT_POINTER_UP, 0),
                 };
                 // WebKit reads the buttons held before this event changed them.
-                let mods = modifier_bits(modifiers) | self.buttons;
+                let mods = modifier_bits(modifiers) | self.buttons();
                 match state {
-                    ButtonState::Pressed => self.buttons |= bit,
-                    ButtonState::Released => self.buttons &= !bit,
+                    ButtonState::Pressed => self.held |= bit,
+                    ButtonState::Released => self.held &= !bit,
                 }
                 unsafe {
                     ffi::wpe_event_pointer_button_new(
@@ -128,7 +138,7 @@ impl Input {
                     ScrollDelta::Wheel { x, y } => (-x as f64 / 120.0, -y as f64 / 120.0, false),
                     ScrollDelta::Pixels { x, y } => (-x, -y, true),
                 };
-                let mods = modifier_bits(modifiers) | self.buttons;
+                let mods = modifier_bits(modifiers) | self.buttons();
                 unsafe {
                     ffi::wpe_event_scroll_new(
                         view,
@@ -147,11 +157,21 @@ impl Input {
         })
     }
 
-    /// The WPE event for a key event, if its key has a keysym.
+    /// The WPE event for a key event, if its key has a keysym. A release whose key has none
+    /// now (the layout changed while it was held) goes up with the keysym it went down with.
     pub fn key(&mut self, view: &View, event: &KeyEvent) -> Option<*mut WPEEvent> {
         let view = view.as_ptr();
         let keycode = event.code.0 + 8;
-        let keysym = keysym(event)?;
+        let held = || {
+            self.pressed_keys
+                .iter()
+                .find(|&&(code, _)| code == keycode)
+                .map(|&(_, keysym)| keysym)
+        };
+        let keysym = match event.state {
+            ButtonState::Pressed => keysym(event)?,
+            ButtonState::Released => keysym(event).or_else(held)?,
+        };
         let mut mods = modifier_bits(&event.modifiers);
         // As WPE's own seat: a modifier key's event already includes (or no longer includes)
         // its own modifier.
@@ -303,6 +323,23 @@ mod tests {
     use sighurt_api::input::KeyCode;
 
     use super::*;
+
+    #[test]
+    fn back_and_forward_are_held_apart() {
+        let mut input = Input::default();
+        let fifth = ffi::WPE_MODIFIER_POINTER_BUTTON1 << 4;
+        // Back (8) and Forward (9) share WPE's fifth button bit.
+        input.held = (1 << 7) | (1 << 8);
+        assert_eq!(input.buttons(), fifth);
+        // Forward still holds it after Back goes up.
+        input.held &= !(1 << 7);
+        assert_eq!(input.buttons(), fifth);
+        input.held = 1 | (1 << 2);
+        assert_eq!(
+            input.buttons(),
+            ffi::WPE_MODIFIER_POINTER_BUTTON1 | (ffi::WPE_MODIFIER_POINTER_BUTTON1 << 2)
+        );
+    }
 
     fn key(code: u32, key: Key) -> KeyEvent {
         KeyEvent {

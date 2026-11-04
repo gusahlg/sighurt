@@ -33,6 +33,9 @@ version = 1
 [engines]
 default = "ladybird"
 enabled = ["ladybird", "demo"]
+# These keys are the bindings keymap's; the default keymap (example) ignores [keys].
+[input]
+keymap = "bindings"
 [keys]
 "ctrl-t" = "tab.new"
 "ctrl-o" = "page.open-in ladybird file://$home/two.html"
@@ -67,6 +70,9 @@ version = 1
 [engines]
 default = "ladybird"
 enabled = ["ladybird", "demo"]
+# These keys are the bindings keymap's; the default keymap (example) ignores [keys].
+[input]
+keymap = "bindings"
 [keys]
 "t" = "tab.new"
 CONF
@@ -81,6 +87,9 @@ default = "demo"
 enabled = ["demo", "ladybird"]
 [routing.demo]
 schemes = ["demo"]
+# These keys are the bindings keymap's; the default keymap (example) ignores [keys].
+[input]
+keymap = "bindings"
 [keys]
 "ctrl-o" = "page.open-in ladybird $url"
 CONF

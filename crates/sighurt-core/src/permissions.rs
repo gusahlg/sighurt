@@ -5,7 +5,10 @@
 //! outlives that document: its pending requests are cancelled when it is replaced, a late
 //! answer for it is dropped, and a permission the user grants it is granted to it alone. A
 //! refusal is remembered for the tab's lifetime by the request's origin (never by view or URL),
-//! so a page can't keep asking. Only the document a tab shows may ask for anything.
+//! so a page can't keep asking. A request without an origin (the engine can't say which frame
+//! asks: Servo) is never granted from an earlier answer, and a grant to it covers it alone; its
+//! refusal is remembered by the page's origin. Only the document a tab shows may ask for
+//! anything.
 //!
 //! Pages get nothing without the user:
 //!

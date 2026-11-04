@@ -363,7 +363,16 @@ impl<T: ServoTarget> View<T> {
     pub fn translate(&mut self, event: &InputEvent) -> Vec<servo::InputEvent> {
         use sighurt_api::input::{FocusEvent, InputKind};
         match &event.kind {
-            InputKind::Pointer(pointer) => vec![crate::input::pointer(pointer, &self.metrics)],
+            InputKind::Pointer(pointer) => {
+                use sighurt_api::input::PointerEvent;
+                // Servo takes a click's modifiers from the keys it was sent (`crate::input`).
+                let mut events = match pointer {
+                    PointerEvent::Button { modifiers, .. } => self.keys.sync_modifiers(*modifiers),
+                    _ => Vec::new(),
+                };
+                events.push(crate::input::pointer(pointer, &self.metrics));
+                events
+            }
             InputKind::Key(key) => self.keys.key(key).into_iter().collect(),
             InputKind::TextInput(text) => self.composition.update(text),
             InputKind::Focus(focus) => {
@@ -386,6 +395,15 @@ impl<T: ServoTarget> View<T> {
 
     pub fn document(&self) -> Option<DocumentGeneration> {
         self.navigator.document()
+    }
+
+    /// The oldest of the browser's traversals Servo hasn't completed that lands on entry
+    /// `current` of a history of `len` entries.
+    pub fn traversal_landing(&self, len: usize, current: usize) -> Option<NavigationId> {
+        self.traversals
+            .iter()
+            .map(|&(_, navigation)| navigation)
+            .find(|&navigation| self.navigator.traversal_lands(navigation, len, current))
     }
 
     /// Whether Servo may carry out a navigation to `url` itself: web content, and local files

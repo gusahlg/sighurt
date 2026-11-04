@@ -543,6 +543,12 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
     effects
 }
 
+/// The origin of the page at `url` (scheme, host and port), if it has one.
+fn page_origin(url: Option<&str>) -> Option<String> {
+    let origin = url::Url::parse(url?).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
 /// The answer to `request`, for `view`'s engine.
 fn answer(view: ViewId, request: RequestId, result: ServiceResult) -> Effect {
     Effect::Engine {
@@ -2135,16 +2141,21 @@ impl BrowserState {
             Requirement::Activation { consume: false } => permissions::is_active(v.activation, at),
             Requirement::Throttle => permissions::throttle(&mut self.tabs[tab].last_download, at),
             Requirement::Prompt(permission) => {
-                let refused = origin.as_ref().is_some_and(|origin| {
-                    self.tabs[tab]
-                        .refused
-                        .contains(&(origin.clone(), permission))
-                });
-                let answered = v.answers.iter().find(|(p, _)| *p == permission);
+                // Without an origin the engine can't say which frame asks: no grant is
+                // reused for it, and refusals are remembered under the page's origin.
+                let known = origin.is_some();
+                let remembered = origin.clone().or_else(|| page_origin(v.url.as_deref()));
+                let refused = remembered
+                    .is_some_and(|origin| self.tabs[tab].refused.contains(&(origin, permission)));
+                let answered = v
+                    .answers
+                    .iter()
+                    .find(|(p, _)| *p == permission)
+                    .map(|&(_, allow)| allow);
                 match (answered, refused) {
-                    (Some((_, true)), _) => fx.push(answer(view, id, Ok(ServiceReply::Done))),
-                    (Some((_, false)), _) | (None, true) => fx.push(refuse(ServiceError::Denied)),
-                    (None, false) => {
+                    (Some(true), _) if known => fx.push(answer(view, id, Ok(ServiceReply::Done))),
+                    (Some(false), _) | (_, true) => fx.push(refuse(ServiceError::Denied)),
+                    (Some(true) | None, false) => {
                         fx.push(Effect::Prompt {
                             request: id,
                             tab: self.tabs[tab].id,
@@ -2193,10 +2204,22 @@ impl BrowserState {
             return;
         }
         let v = self.views.get_mut(&view).expect("checked above");
+        let known = pending.origin.is_some();
+        // A grant to a request of unknown origin is that request's alone: another frame of the
+        // document may be asking the next time.
+        if allow && !known {
+            self.requests.remove(request);
+            fx.push(answer(view, request, Ok(ServiceReply::Done)));
+            return;
+        }
         v.answers.push((permission, allow));
+        let remembered = pending
+            .origin
+            .clone()
+            .or_else(|| page_origin(v.url.as_deref()));
         let tab = v.tab;
         let tab = self.tab_index(tab);
-        if let (false, Some(origin), Some(tab)) = (allow, pending.origin, tab) {
+        if let (false, Some(origin), Some(tab)) = (allow, remembered, tab) {
             self.tabs[tab].refused.push((origin, permission));
         }
         // The answer holds for every request of this document for the same permission.

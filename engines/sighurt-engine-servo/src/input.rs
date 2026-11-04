@@ -11,6 +11,13 @@
 //! Servo's composition events ([`Composition`]), never also key text. Smooth scrolling and
 //! wheel notches become wheel deltas in device pixels.
 //!
+//! Servo 0.7 takes a mouse event's modifiers only from the keyboard events it was sent (the
+//! constellation's `active_keyboard_modifiers`), so a Ctrl+click whose Ctrl went to the chrome
+//! would be a plain click to the page. Before a button press or release, [`Keys`] sends the
+//! modifier keys (Shift, Control, Alt, Meta) whose state differs from what it last told Servo:
+//! the page sees their `keydown`/`keyup`, as it would had they been pressed in it, and the
+//! synthetic press is held like a real one (released on blur, or by the real release).
+//!
 //! Must not own: shortcut handling (the core consumes browser shortcuts before the page).
 
 use std::collections::HashMap;
@@ -93,7 +100,24 @@ pub(crate) fn pointer(event: &PointerEvent, metrics: &Metrics) -> ServoInput {
 pub(crate) struct Keys {
     /// Evdev code to the key value it went down with.
     pressed: HashMap<u32, ServoKey>,
+    /// The modifiers Servo's constellation holds after the last keyboard event this view sent
+    /// (it keeps one set for every WebView; another view's keys change it too).
+    told: ServoModifiers,
 }
+
+/// The seat's state of a modifier.
+type Held = fn(&Modifiers) -> bool;
+
+/// The modifiers [`Keys::sync_modifiers`] keeps in step: Servo's flag, its key, the evdev code
+/// of the left one, and the seat's state of it.
+const SYNCED: [(ServoModifiers, NamedKey, u32, Held); 4] = [
+    (ServoModifiers::SHIFT, NamedKey::Shift, 42, |m| m.shift),
+    (ServoModifiers::CONTROL, NamedKey::Control, 29, |m| {
+        m.control
+    }),
+    (ServoModifiers::ALT, NamedKey::Alt, 56, |m| m.alt),
+    (ServoModifiers::META, NamedKey::Meta, 125, |m| m.logo),
+];
 
 impl Keys {
     /// The Servo event for `event`, or `None` for a release of a key the page doesn't hold (its
@@ -110,15 +134,70 @@ impl Keys {
                 KeyState::Up
             }
         };
+        let mods = modifiers(event.modifiers);
+        self.track(state, &key, mods);
         Some(ServoInput::Keyboard(KeyboardEvent::new_without_event(
             state,
             key,
             code(event.code.0),
             location(event.code.0),
-            modifiers(event.modifiers),
+            mods,
             event.repeat,
             false,
         )))
+    }
+
+    /// Key events for the modifier keys whose state differs between `wanted` (the seat's, as a
+    /// pointer button event carries them) and what Servo was last told, so that the button
+    /// event that follows has the seat's modifiers in the page.
+    pub fn sync_modifiers(&mut self, wanted: Modifiers) -> Vec<ServoInput> {
+        let mut out = Vec::new();
+        for (flag, named, left, held) in SYNCED {
+            let want = held(&wanted);
+            if want == self.told.contains(flag) {
+                continue;
+            }
+            let key = ServoKey::Named(named);
+            let (state, raw) = if want {
+                self.pressed.insert(left, key.clone());
+                (KeyState::Down, left)
+            } else {
+                // The key the page holds for it, if any: its release is this one.
+                let holding = self
+                    .pressed
+                    .iter()
+                    .find(|(_, k)| modifier_flag(k) == Some(flag))
+                    .map(|(&raw, _)| raw);
+                if let Some(raw) = holding {
+                    self.pressed.remove(&raw);
+                }
+                (KeyState::Up, holding.unwrap_or(left))
+            };
+            let before = self.told;
+            self.track(state, &key, before);
+            out.push(ServoInput::Keyboard(KeyboardEvent::new_without_event(
+                state,
+                key,
+                code(raw),
+                location(raw),
+                before,
+                false,
+                false,
+            )));
+        }
+        out
+    }
+
+    /// Mirrors the constellation: a keyboard event's modifiers become the active ones, changed
+    /// by the event's own key when that is a modifier.
+    fn track(&mut self, state: KeyState, key: &ServoKey, modifiers: ServoModifiers) {
+        self.told = modifiers;
+        if let Some(flag) = modifier_flag(key) {
+            match state {
+                KeyState::Down => self.told.insert(flag),
+                KeyState::Up => self.told.remove(flag),
+            }
+        }
     }
 
     /// Key-ups for every key the page holds, when it loses focus: the real releases go
@@ -126,6 +205,9 @@ impl Keys {
     pub fn release_all(&mut self) -> Vec<ServoInput> {
         let mut pressed: Vec<_> = self.pressed.drain().collect();
         pressed.sort_by_key(|(code, _)| *code);
+        if !pressed.is_empty() {
+            self.told = ServoModifiers::empty();
+        }
         pressed
             .into_iter()
             .map(|(raw, key)| {
@@ -141,6 +223,30 @@ impl Keys {
             })
             .collect()
     }
+}
+
+/// Servo's modifier flag for a modifier key, as the constellation reads it (legacy keys too).
+#[allow(deprecated)]
+fn modifier_flag(key: &ServoKey) -> Option<ServoModifiers> {
+    let ServoKey::Named(named) = key else {
+        return None;
+    };
+    Some(match named {
+        NamedKey::Alt => ServoModifiers::ALT,
+        NamedKey::AltGraph => ServoModifiers::ALT_GRAPH,
+        NamedKey::CapsLock => ServoModifiers::CAPS_LOCK,
+        NamedKey::Control => ServoModifiers::CONTROL,
+        NamedKey::Fn => ServoModifiers::FN,
+        NamedKey::FnLock => ServoModifiers::FN_LOCK,
+        NamedKey::Meta | NamedKey::Super => ServoModifiers::META,
+        NamedKey::NumLock => ServoModifiers::NUM_LOCK,
+        NamedKey::ScrollLock => ServoModifiers::SCROLL_LOCK,
+        NamedKey::Shift => ServoModifiers::SHIFT,
+        NamedKey::Symbol => ServoModifiers::SYMBOL,
+        NamedKey::SymbolLock => ServoModifiers::SYMBOL_LOCK,
+        NamedKey::Hyper => ServoModifiers::HYPER,
+        _ => return None,
+    })
 }
 
 fn servo_key(key: &Key) -> ServoKey {
@@ -230,9 +336,21 @@ impl Composition {
         out
     }
 
-    /// The editor lost focus or went away: whatever was being composed is abandoned.
+    /// The editor went away: whatever was being composed is abandoned, and Servo, whose editor
+    /// is gone with it, is not told.
     pub fn reset(&mut self) {
         self.active = false;
+    }
+
+    /// The view lost focus while its editor still has it: the composition ends there, without
+    /// text (Servo drops the preedit's selection and keeps its text, as a commit would).
+    pub fn abandon(&mut self) -> Option<ServoInput> {
+        std::mem::take(&mut self.active).then(|| {
+            ServoInput::Ime(ImeEvent::Composition(CompositionEvent {
+                state: CompositionState::End,
+                data: String::new(),
+            }))
+        })
     }
 }
 
@@ -487,6 +605,83 @@ mod tests {
             (key, location),
             (ServoKey::Named(NamedKey::AltGraph), Location::Right)
         );
+    }
+
+    #[test]
+    fn a_click_tells_servo_the_modifiers_its_keys_went_elsewhere_for() {
+        let mut keys = Keys::default();
+        let none = Modifiers::default();
+        let ctrl = Modifiers {
+            control: true,
+            ..none
+        };
+        // Ctrl went down while the address bar had focus: the page never saw it.
+        let synced: Vec<_> = keys
+            .sync_modifiers(ctrl)
+            .into_iter()
+            .map(keyboard)
+            .collect();
+        assert_eq!(synced.len(), 1);
+        let (key, code, location, before, state) = synced[0].clone();
+        assert_eq!(
+            (key, code, location, before, state),
+            (
+                ServoKey::Named(NamedKey::Control),
+                Code::ControlLeft,
+                Location::Left,
+                ServoModifiers::empty(),
+                KeyState::Down
+            )
+        );
+        // Told once: the next click with Ctrl sends nothing.
+        assert!(keys.sync_modifiers(ctrl).is_empty());
+        // The real release of that key reaches the page.
+        let up = keys.key(&key_event(
+            29,
+            Key::Named("Control".into()),
+            ButtonState::Released,
+            ctrl,
+        ));
+        assert!(up.is_some());
+        assert!(keys.sync_modifiers(none).is_empty());
+        // Released elsewhere instead: the next plain click releases it first.
+        keys.sync_modifiers(ctrl);
+        let synced: Vec<_> = keys
+            .sync_modifiers(none)
+            .into_iter()
+            .map(keyboard)
+            .collect();
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].4, KeyState::Up);
+        assert!(keys.release_all().is_empty(), "nothing is left held");
+        // A synthetic press is held like a real one: blur releases it.
+        keys.sync_modifiers(Modifiers {
+            shift: true,
+            ..none
+        });
+        let released: Vec<_> = keys.release_all().into_iter().map(keyboard).collect();
+        assert_eq!(released[0].0, ServoKey::Named(NamedKey::Shift));
+        assert!(keys.sync_modifiers(none).is_empty());
+    }
+
+    #[test]
+    fn an_abandoned_composition_ends_in_servo() {
+        let mut composition = Composition::default();
+        assert!(composition.abandon().is_none());
+        composition.update(&TextInputEvent {
+            preedit: Some(Preedit {
+                text: "a".into(),
+                cursor: None,
+            }),
+            ..TextInputEvent::default()
+        });
+        match composition.abandon() {
+            Some(ServoInput::Ime(ImeEvent::Composition(end))) => {
+                assert_eq!((end.state, end.data.as_str()), (CompositionState::End, ""))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(composition.abandon().is_none());
     }
 
     #[test]

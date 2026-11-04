@@ -12,7 +12,9 @@
 //!   finds nothing and the engine is told [`ClipboardCall::Wanted`], for a `ClipboardRead`
 //!   request; once the browser answers, the engine [`grant`](Clipboard::grant)s the text for
 //!   [`GRANT`] and pastes again, and that paste finds it. The page sees a first paste with nothing
-//!   in it (a `paste` event without data), then the real one.
+//!   in it (a `paste` event without data), then the real one. The grant is the view's that
+//!   asked: the runtime [`revoke`](Clipboard::revoke)s it when the user's input goes to another
+//!   view, or that view closes.
 //!
 //! WebKit refuses the async clipboard API's reads in WPE itself (`requestDOMPasteAccess`), so a
 //! read only comes from a paste the user started, in the view with the user's latest input.
@@ -167,6 +169,11 @@ impl Clipboard {
     /// Makes `text` what pastes read for the next [`GRANT`].
     pub fn grant(&self, text: String) {
         self.imp().granted.replace(Some((text, Instant::now())));
+    }
+
+    /// Forgets granted text: the view it was for no longer has the user's input.
+    pub fn revoke(&self) {
+        self.imp().granted.replace(None);
     }
 
     /// Forgets granted text that is too old to read.

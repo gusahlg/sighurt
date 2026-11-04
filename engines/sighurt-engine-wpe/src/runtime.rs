@@ -32,6 +32,14 @@
 //! ignores it; a new document, a crash, closing the view and shutdown ignore what is still held.
 //! `RUST_LOG=sighurt_engine_wpe::timing=debug` logs how long each waited ([`TIMING`]).
 //!
+//! A navigation to an address WebKit doesn't load (`mailto:`, `tel:`, a custom scheme) is
+//! refused in WebKit. The browser's own request for it fails; the page's goes to the browser
+//! (`OpenRequested` in the current view) only when the user started it, as WebKit's
+//! user-gesture flag says: WebKit doesn't say which frame navigates, so a frame's or a script's
+//! navigation without one is refused, never handed over. The browser's request that WebKit
+//! never starts ends with `NavigationFailed`: refused, stopped, or gone nowhere (see
+//! [`crate::navigation`]).
+//!
 //! Semantics stay off until `SetSemantics`. While on, the extraction script runs in the isolated
 //! world `sighurt` after a commit, when loading ends, after an action, and at least 250 ms after
 //! that world's `MutationObserver` posts a change. An extraction is stamped with the document at
@@ -48,7 +56,7 @@
 //! [`EngineRuntime::shutdown`] closes every view (WebKit's view, its buffers and our
 //! `wl_buffer`s, our surface proxy and SHM buffers, then the lease), lets GLib finish WebKit's
 //! teardown, and drops the session, the display and presenter, and GLib's context, in that
-//! order.
+//! order. A runtime dropped without it is shut down then, with an error logged.
 //!
 //! Must not own: tabs, routing or history policy (the core), surfaces (the host), process-wide
 //! setup other than WebKit's own (the executable).
@@ -562,7 +570,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
                     push(events, EngineEvent::LoadingChanged { view: id, loading });
                 }
             }
-            Note::Elsewhere(url) => match page.navigator.refused() {
+            Note::Elsewhere(url, gesture) => match page.navigator.refused(&url) {
                 // The browser asked for it: the core routed a URL here that WebKit can't load.
                 Some(navigation) => push(
                     events,
@@ -574,6 +582,11 @@ impl<T: WpeTarget> WpeRuntime<T> {
                             url.split(':').next().unwrap_or_default()
                         )),
                     },
+                ),
+                // A frame's or a script's navigation the user didn't start (an `<iframe>`
+                // pointing at `tel:`, a timer setting `location`): refused, never handed over.
+                None if !gesture => log::debug!(
+                    "wpe: refused a page's navigation to another scheme without a user gesture"
                 ),
                 None => {
                     if let Some(document) = page.navigator.document() {
@@ -789,7 +802,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
         if run_script(
             page,
             &self.inbox,
-            &script,
+            script,
             Some(semantic::WORLD),
             Tag::Extract(document),
         )
@@ -836,12 +849,13 @@ impl<T: WpeTarget> WpeRuntime<T> {
                         snapshot: Box::new(snapshot),
                     }),
                     Err(error) => {
-                        let head: String = json.chars().take(120).collect();
+                        let (error, head) =
+                            (contained(&error.to_string(), 240), contained(&json, 120));
                         log::debug!("semantic snapshot dropped: {error}; {head}");
                     }
                 },
                 Err(message) => {
-                    let head: String = message.chars().take(160).collect();
+                    let head = contained(&message, 160);
                     log::debug!("semantic extraction failed: {head}");
                 }
             }
@@ -991,28 +1005,41 @@ impl<T: WpeTarget> WpeRuntime<T> {
         }
     }
 
+    /// `view` has the user's latest input (a click or a key press): the clipboard acts for it,
+    /// and text granted to another view's paste is no longer readable.
+    fn note_input(&mut self, view: ViewId) {
+        if self.last_input.replace(view) != Some(view) {
+            self.revoke_clipboard();
+        }
+    }
+
+    fn revoke_clipboard(&self) {
+        if let Some(clipboard) = self.platform.as_ref().and_then(|p| p.display.clipboard()) {
+            clipboard.revoke();
+        }
+    }
+
     fn input(&mut self, view: ViewId, kind: InputKind) {
-        let Some(page) = self.pages.get_mut(&view) else {
+        if !self.pages.contains_key(&view) {
             return;
+        }
+        let pressed = match &kind {
+            InputKind::Pointer(PointerEvent::Button { state, .. }) => {
+                *state == ButtonState::Pressed
+            }
+            InputKind::Key(event) => event.state == ButtonState::Pressed,
+            _ => false,
         };
+        if pressed {
+            self.note_input(view);
+        }
+        let page = self.pages.get_mut(&view).expect("checked above");
         let wpe = page.wpe();
         let events = match kind {
             InputKind::Pointer(event) => {
-                if let PointerEvent::Button {
-                    state: ButtonState::Pressed,
-                    ..
-                } = event
-                {
-                    self.last_input = Some(view);
-                }
                 page.input.pointer(&page.view, &event).into_iter().collect()
             }
-            InputKind::Key(event) => {
-                if event.state == ButtonState::Pressed {
-                    self.last_input = Some(view);
-                }
-                page.input.key(&page.view, &event).into_iter().collect()
-            }
+            InputKind::Key(event) => page.input.key(&page.view, &event).into_iter().collect(),
             InputKind::Focus(FocusEvent::Activated) => {
                 unsafe {
                     ffi::wpe_toplevel_state_changed(toplevel(wpe), ffi::WPE_TOPLEVEL_STATE_ACTIVE)
@@ -1053,6 +1080,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
         self.in_flight.retain(|_, (v, _)| *v != view);
         if self.last_input == Some(view) {
             self.last_input = None;
+            self.revoke_clipboard();
         }
         // WebKit's requests first (dropping them refuses them), then WebKit's view and its
         // buffers (and our wl_buffers in them), then our surface proxy and SHM buffers, then the
@@ -1126,7 +1154,8 @@ impl<T: WpeTarget> WpeRuntime<T> {
 
     /// Attaches a DMA-BUF, or copies shared memory into a `wl_shm` buffer. A frame more than one
     /// pixel off the permit's buffer is stale and not shown. One pixel off is shown: WebKit
-    /// floors `logical × scale` where the host rounds half away from zero.
+    /// floors `logical × scale` where the host rounds half away from zero. A frame that can't be
+    /// imported or copied is given back to WebKit unshown, so it renders the next.
     fn present_wayland(
         &mut self,
         view: ViewId,
@@ -1172,8 +1201,16 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 .shm
                 .copy(wayland, &frame)
                 .map(|buffer| buffer.map(|buffer| (buffer, true)))
-        }
-        .map_err(|message| EngineError::View { view, message })?;
+        };
+        let imported = match imported {
+            Ok(imported) => imported,
+            Err(message) => {
+                self.stats.dropped += 1;
+                finish_unshown(page.wpe(), &frame);
+                T::dismiss(permit, unchanged);
+                return Err(EngineError::View { view, message });
+            }
+        };
         let Some(((wl_buffer, key), copied)) = imported else {
             // Every SHM buffer of ours is still with the compositor: keep the frame.
             page.pending = Some((frame, damage));
@@ -1201,8 +1238,8 @@ impl<T: WpeTarget> WpeRuntime<T> {
 
     /// Copies the held shared-memory frame into the lent CPU frame, then acknowledges it. The
     /// size must match the view's buffer exactly. A mismatch is acknowledged and not shown, so
-    /// WebKit can render the new size. The copy consumes the permit. On a copy error the WebKit
-    /// buffer goes back to `pending` and is not acknowledged.
+    /// WebKit can render the new size. The copy consumes the permit. A frame that can't be
+    /// copied is acknowledged unshown too, so WebKit renders the next.
     fn present_cpu(
         &mut self,
         view: ViewId,
@@ -1212,7 +1249,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
         start: Instant,
     ) -> Result<PresentOutcome, EngineError> {
         let page = self.pages.get_mut(&view).expect("present checked the view");
-        let (frame, damage) = page.pending.take().expect("checked");
+        let (frame, _) = page.pending.take().expect("checked");
         if frame.is_dma_buf() {
             finish_unshown(page.wpe(), &frame);
             T::dismiss(permit, PresentOutcome::NotReady);
@@ -1245,7 +1282,8 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 Ok(PresentOutcome::Submitted)
             }
             Err(message) => {
-                page.pending = Some((frame, damage));
+                self.stats.dropped += 1;
+                finish_unshown(page.wpe(), &frame);
                 Err(EngineError::View { view, message })
             }
         }
@@ -1259,6 +1297,18 @@ impl<T: WpeTarget> WpeRuntime<T> {
         // Events reach the owner only through `pump`: ask for one.
         if !self.events.is_empty() {
             self.waker.wake();
+        }
+    }
+}
+
+/// The executable shuts every runtime down before it releases the host. A runtime dropped
+/// without that (a test, a panic's unwinding) is shut down here, in the order `shutdown`
+/// keeps; the fields' own drop order would release the platform before the views.
+impl<T: WpeTarget> Drop for WpeRuntime<T> {
+    fn drop(&mut self) {
+        if !self.shut_down {
+            log::error!("wpe: the runtime was dropped without shutdown; shutting down now");
+            self.shutdown();
         }
     }
 }
@@ -1291,6 +1341,15 @@ fn committed<T: WpeTarget>(page: &mut Page<T>, events: &mut Vec<EngineEvent>, co
             },
         );
     }
+}
+
+/// Page text for a debug line: its first `chars` characters, with control, format and other
+/// unprintable characters escaped.
+fn contained(text: &str, chars: usize) -> String {
+    text.chars()
+        .take(chars)
+        .flat_map(char::escape_debug)
+        .collect()
 }
 
 fn push_requests(events: &mut Vec<EngineEvent>, requests: Vec<ServiceRequest>) {
@@ -1752,10 +1811,10 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
         let mut then = Then::Nothing;
         match command {
             EngineCommand::Navigate { navigation, url } => {
-                let url =
-                    CString::new(url).map_err(|_| EngineError::Unsupported("NUL in a URL"))?;
-                page.navigator.request(navigation);
-                unsafe { ffi::webkit_web_view_load_uri(web, url.as_ptr()) };
+                let address = CString::new(url.clone())
+                    .map_err(|_| EngineError::Unsupported("NUL in a URL"))?;
+                page.navigator.load(navigation, url);
+                unsafe { ffi::webkit_web_view_load_uri(web, address.as_ptr()) };
             }
             EngineCommand::Reload { navigation } => {
                 if page.navigator.document().is_none() {
@@ -1766,7 +1825,14 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                 page.navigator.request(navigation);
                 unsafe { ffi::webkit_web_view_reload(web) };
             }
-            EngineCommand::Stop => unsafe { ffi::webkit_web_view_stop_loading(web) },
+            EngineCommand::Stop => {
+                unsafe { ffi::webkit_web_view_stop_loading(web) };
+                // A load WebKit started fails by itself; a request it hasn't started yet
+                // never will.
+                if let Some(navigation) = page.navigator.stopped() {
+                    self.push(cancelled(view, navigation));
+                }
+            }
             EngineCommand::Traverse { navigation, delta } => {
                 let item = unsafe {
                     let list = ffi::webkit_web_view_get_back_forward_list(web);
@@ -1896,10 +1962,22 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
             next = self.glib.as_mut().and_then(GlibLoop::iterate);
             self.handle_notes();
             self.kick_mutations();
+            let now = Instant::now();
+            for page in self.pages.values_mut() {
+                if let Some(navigation) = page.navigator.expire(now) {
+                    push(&mut self.events, cancelled(page.id, navigation));
+                }
+            }
             let semantic = self
                 .pages
                 .values()
-                .filter_map(|p| p.semantics.deadline())
+                .filter_map(|p| {
+                    p.semantics
+                        .deadline()
+                        .into_iter()
+                        .chain(p.navigator.deadline())
+                        .min()
+                })
                 .min();
             next = match (next, semantic) {
                 (Some(a), Some(b)) => Some(a.min(b)),

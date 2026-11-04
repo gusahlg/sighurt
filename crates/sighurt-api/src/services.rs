@@ -39,8 +39,10 @@ pub struct ServiceRequest {
     /// Who is asking, for the prompt and for remembered decisions, as the adapter's trusted
     /// loading policy defines it, never as the page claims: for the Wasm engine the app origin
     /// of the app's final URL (`app_origin_of`: scheme, host and port, or the containing
-    /// directory of a `file://` app); for Servo the origin of the committed top-level URL.
-    /// `None` when the engine can't say.
+    /// directory of a `file://` app); for Servo the committed top-level URL's origin for
+    /// clipboard and file requests, and `None` for permission requests, since Servo 0.7 does
+    /// not say which frame asks. `None` when the engine can't say: the core then always asks
+    /// and never grants from an earlier answer.
     pub origin: Option<String>,
     /// What it asks for.
     pub service: Service,

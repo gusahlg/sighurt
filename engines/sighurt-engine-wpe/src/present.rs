@@ -289,14 +289,36 @@ impl ShmBuffers {
         };
         let target = &mut self.buffers[index];
         let raw = frame.as_ptr();
+        // SAFETY: `frame` is a live `WPEBufferSHM` this process holds until it is released; its
+        // bytes are only read, after the checks `copy_argb` makes too. `target.map` is our
+        // mapping of `target.len` bytes, `size` × 4 per row.
         unsafe {
             if ffi::wpe_buffer_shm_get_format(raw) != ffi::WPE_PIXEL_FORMAT_ARGB8888 {
                 return Err("an SHM frame that is not ARGB8888".into());
             }
             let stride = ffi::wpe_buffer_shm_get_stride(raw) as usize;
+            let bytes = ffi::wpe_buffer_shm_get_data(raw);
+            if bytes.is_null() {
+                return Err("SHM frame has no bytes".into());
+            }
             let mut len = 0;
-            let data = glib::ffi::g_bytes_get_data(ffi::wpe_buffer_shm_get_data(raw), &mut len);
+            let data = glib::ffi::g_bytes_get_data(bytes, &mut len);
+            if data.is_null() {
+                return Err("SHM frame data is null".into());
+            }
             let row = size.0 as usize * 4;
+            if stride < row {
+                return Err(format!("SHM stride {stride} does not cover {row} bytes"));
+            }
+            let need = stride
+                .checked_mul(size.1 as usize)
+                .ok_or_else(|| format!("SHM frame {}×{} is too large", size.0, size.1))?;
+            if len < need || target.len < row * size.1 as usize {
+                return Err(format!(
+                    "SHM frame is {len} bytes, {}×{} stride {stride} needs {need}",
+                    size.0, size.1
+                ));
+            }
             let source = std::slice::from_raw_parts(data.cast::<u8>(), len);
             let dest = std::slice::from_raw_parts_mut(target.map.as_ptr(), target.len);
             for (y, out) in dest.chunks_exact_mut(row).enumerate().take(size.1 as usize) {

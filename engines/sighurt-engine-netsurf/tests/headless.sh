@@ -47,6 +47,9 @@ cat > "$out/config/sighurt/config.toml" <<CONF
 version = 1
 [engines]
 default = "netsurf"
+# These keys are the bindings keymap's; the default keymap (example) ignores [keys].
+[input]
+keymap = "bindings"
 [keys]
 "ctrl-t" = "tab.new"
 "ctrl-l" = "location.focus"

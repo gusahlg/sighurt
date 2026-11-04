@@ -12,6 +12,7 @@
 //! in flight per view. Nothing is extracted while semantics is off. The page can forge the
 //! snapshot; native code stamps the document and the parser enforces the bounds.
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use sighurt_api::ids::DocumentGeneration;
@@ -40,8 +41,14 @@ const ATTRIBUTE_FILTER: &str = r#"["hidden", "disabled", "checked", "value", "se
 ///
 /// The flag lives on the extraction slot, which a new document does not have, so the observer
 /// is installed once per document. It is installed before the walk: a change during the walk
-/// counts, and the flag starts clear so a change the walk already covers does not.
-pub fn extraction_script() -> String {
+/// counts, and the flag starts clear so a change the walk already covers does not. Built once
+/// per process: the slot's name and the budget never change.
+pub fn extraction_script() -> &'static str {
+    static SCRIPT: OnceLock<String> = OnceLock::new();
+    SCRIPT.get_or_init(build_extraction_script)
+}
+
+fn build_extraction_script() -> String {
     let key = sighurt_semantic::state_key_literal();
     let extract = sighurt_semantic::extract_script(BUDGET_MS);
     let mut script = String::with_capacity(extract.len() + 1400);
@@ -88,8 +95,13 @@ pub fn extraction_script() -> String {
 /// Returns whether the document changed since the last extraction, and clears the flag.
 ///
 /// Evaluates to a boolean. The flag is on the extraction slot; a document that has not been
-/// extracted yet has none, and this is false.
-pub fn dirty_script() -> String {
+/// extracted yet has none, and this is false. Built once per process.
+pub fn dirty_script() -> &'static str {
+    static SCRIPT: OnceLock<String> = OnceLock::new();
+    SCRIPT.get_or_init(build_dirty_script)
+}
+
+fn build_dirty_script() -> String {
     let key = sighurt_semantic::state_key_literal();
     let mut script = String::with_capacity(key.len() + 400);
     script.push_str("(function(){\n");

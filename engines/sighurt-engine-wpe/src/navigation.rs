@@ -24,6 +24,11 @@
 //!   request already had it): a new entry, or WebKit's `is-loading` going false after the list
 //!   moved, ends it as a same-document commit.
 //!
+//! The browser's request ends without a commit when WebKit refuses its address (another
+//! scheme: only a refusal of the request's own scheme is the request's), when the browser stops
+//! it before WebKit started a load for it, and when WebKit stopped loading and [`STALL`] passed
+//! with no load started and no entry made for it (`expire`).
+//!
 //! Limits: a load the page starts in the moment between the browser's request and WebKit
 //! starting it takes the browser's id; the browser's same-document traversal while the page is
 //! still loading resources commits when that loading ends; a navigation to the very address shown
@@ -31,8 +36,16 @@
 //!
 //! Must not own: WebKit calls (the runtime makes them) or browser policy.
 
+use std::time::{Duration, Instant};
+
 use sighurt_api::events::HistoryEffect;
 use sighurt_api::ids::{DocumentGeneration, NavigationId};
+
+/// How long the browser's request may wait, after WebKit stopped loading, for WebKit to start
+/// its load or make its entry. WebKit 2.52 stops loading between two requests in a row before
+/// it carries out the later one within the document, at once; a request still waiting after
+/// this went nowhere.
+pub const STALL: Duration = Duration::from_secs(2);
 
 /// WebKit's back-forward list at one moment: its entries' identities (`T`) and addresses, and
 /// which is current.
@@ -74,11 +87,15 @@ pub struct Commit {
 }
 
 /// The browser's request WebKit hasn't started a load for.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Sent {
     navigation: NavigationId,
+    /// The address the browser asked for (`Navigate`); `None` for a reload or a traversal.
+    url: Option<String>,
     /// WebKit moved the list's current entry for it (a traversal), before any load.
     moved: bool,
+    /// When WebKit stopped loading with this still waiting.
+    stalled: Option<Instant>,
 }
 
 /// One view's navigation state. See the module documentation.
@@ -119,18 +136,60 @@ impl<T: Clone + PartialEq> Navigator<T> {
         self.url.as_deref()
     }
 
-    /// The browser asks WebKit for `navigation`. A request WebKit hasn't started yet is
-    /// superseded, as the api's ordering rules let the core see.
+    /// The browser asks WebKit for `navigation`, a reload or a traversal. A request WebKit
+    /// hasn't started yet is superseded, as the api's ordering rules let the core see.
     pub fn request(&mut self, navigation: NavigationId) {
+        self.send(navigation, None);
+    }
+
+    /// The browser asks WebKit to load `url` for `navigation`, superseding as
+    /// [`request`](Self::request) does.
+    pub fn load(&mut self, navigation: NavigationId, url: String) {
+        self.send(navigation, Some(url));
+    }
+
+    fn send(&mut self, navigation: NavigationId, url: Option<String>) {
         self.sent = Some(Sent {
             navigation,
+            url,
             moved: false,
+            stalled: None,
         });
     }
 
-    /// The browser's request will never start: refused before it reached WebKit's loader.
-    pub fn refused(&mut self) -> Option<NavigationId> {
-        self.sent.take().map(|s| s.navigation)
+    /// WebKit refused to load `url` (not a web address). If the browser's waiting request asked
+    /// for an address of that scheme, which WebKit refuses as well, the request will never
+    /// start: its id. A navigation of the page's to another scheme leaves the request waiting.
+    /// (The scheme, not the whole address: WebKit may write an address differently.)
+    pub fn refused(&mut self, url: &str) -> Option<NavigationId> {
+        let scheme = |u: &str| u.split_once(':').map(|(s, _)| s.to_ascii_lowercase());
+        let asked = self.sent.as_ref()?.url.as_deref()?;
+        let same = scheme(url).is_some() && scheme(asked) == scheme(url);
+        same.then(|| self.sent.take().map(|s| s.navigation))
+            .flatten()
+    }
+
+    /// The browser stopped the view. Its request that WebKit hasn't started and hasn't moved
+    /// the list for will never start: its id. (A load WebKit started fails by itself.)
+    pub fn stopped(&mut self) -> Option<NavigationId> {
+        match &self.sent {
+            Some(sent) if !sent.moved => self.sent.take().map(|s| s.navigation),
+            _ => None,
+        }
+    }
+
+    /// The browser's request that has waited [`STALL`] since WebKit stopped loading, as of
+    /// `now`: it went nowhere. Its id.
+    pub fn expire(&mut self, now: Instant) -> Option<NavigationId> {
+        let stalled = self.sent.as_ref()?.stalled?;
+        (now >= stalled + STALL)
+            .then(|| self.sent.take().map(|s| s.navigation))
+            .flatten()
+    }
+
+    /// When [`expire`](Self::expire) has something to end.
+    pub fn deadline(&self) -> Option<Instant> {
+        Some(self.sent.as_ref()?.stalled? + STALL)
     }
 
     /// WebKit started a document load (STARTED): the browser's request, if one waits, else the
@@ -197,15 +256,16 @@ impl<T: Clone + PartialEq> Navigator<T> {
 
     /// WebKit stopped loading, with `url` and `history` now. If WebKit moved its list for the
     /// browser's request and started no load, the request was a traversal within the document,
-    /// and this is its commit. Otherwise the request waits on: WebKit drops its marker of a
-    /// pending request when an earlier one is abandoned (two requests in a row) before the later
-    /// one shows itself.
+    /// and this is its commit. Otherwise the request waits on, for at most [`STALL`]: WebKit
+    /// drops its marker of a pending request when an earlier one is abandoned (two requests in a
+    /// row) before the later one shows itself.
     pub fn loading_stopped(&mut self, url: String, history: Snapshot<T>) -> Option<Commit> {
-        if self.loading.is_some()
-            || !self.sent.is_some_and(|s| s.moved)
-            || self.document.is_none()
-            || self.gone
-        {
+        if self.loading.is_some() || self.gone {
+            return None;
+        }
+        let sent = self.sent.as_mut()?;
+        if !sent.moved || self.document.is_none() {
+            sent.stalled.get_or_insert_with(Instant::now);
             return None;
         }
         let sent = self.sent.take()?;
@@ -454,6 +514,63 @@ mod tests {
             .expect("the fragment commits");
         assert_eq!(commit.navigation, second);
         assert_eq!(nav.url_changed(format!("{}#x", url(1)), added), None);
+    }
+
+    #[test]
+    fn a_refusal_ends_only_the_request_for_that_address() {
+        let mut nav = loaded();
+        let typed = NavigationId::next();
+        nav.load(typed, "mailto:a@b.test".into());
+        // The page's own navigation elsewhere in that moment is not the browser's.
+        assert_eq!(nav.refused("tel:123"), None);
+        assert_eq!(nav.refused("mailto:a@b.test"), Some(typed));
+        assert_eq!(nav.refused("mailto:a@b.test"), None);
+        // A reload or traversal has no address to refuse.
+        let reload = NavigationId::next();
+        nav.request(reload);
+        assert_eq!(nav.refused("mailto:a@b.test"), None);
+        assert_eq!(nav.started(), (reload, true));
+    }
+
+    #[test]
+    fn a_request_that_goes_nowhere_ends() {
+        // Stopped before WebKit started it.
+        let mut nav = loaded();
+        let stopped = NavigationId::next();
+        nav.load(stopped, url(2));
+        assert_eq!(nav.stopped(), Some(stopped));
+        assert_eq!(nav.stopped(), None);
+        let (own, browsers) = nav.started();
+        assert!(
+            !browsers && own != stopped,
+            "the next load is the page's own"
+        );
+
+        // WebKit stopped loading and nothing came of it.
+        let mut nav = loaded();
+        let lost = NavigationId::next();
+        nav.load(lost, url(3));
+        assert_eq!(nav.deadline(), None);
+        assert_eq!(nav.loading_stopped(url(1), list(&[1], 0)), None);
+        let due = nav.deadline().expect("waits for the stall");
+        assert_eq!(nav.expire(due - Duration::from_millis(1)), None);
+        assert_eq!(nav.expire(due), Some(lost));
+        assert_eq!(nav.deadline(), None);
+
+        // A traversal WebKit moved the list for is not stopped here: it commits when loading
+        // stops.
+        let mut nav = loaded();
+        nav.started();
+        nav.committed(url(2), list(&[1, 2], 1));
+        let back = NavigationId::next();
+        nav.request(back);
+        nav.list_changed(false, list(&[1, 2], 0));
+        assert_eq!(nav.stopped(), None);
+        assert_eq!(
+            nav.loading_stopped(url(1), list(&[1, 2], 0))
+                .map(|c| c.navigation),
+            Some(back)
+        );
     }
 
     #[test]

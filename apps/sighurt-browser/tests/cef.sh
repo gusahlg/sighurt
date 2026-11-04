@@ -43,6 +43,10 @@ cat > "$out/config/sighurt/config.toml" <<CONF
 version = 1
 [downloads]
 directory = "$out/downloads"
+# The keys below are the bindings keymap's; the default keymap (example) ignores [keys], and
+# binds neither ctrl-l nor h in the window.
+[input]
+keymap = "bindings"
 [keys]
 "ctrl-t" = "tab.new"
 "ctrl-l" = "location.focus"
@@ -142,6 +146,8 @@ for _ in $(seq 60); do [[ -s $out/downloads/dl.txt ]] && break; sleep 0.25; done
 shot 03-attachment 0.2
 check "an attachment goes to the browser's download service, whole" \
   "$([[ $(cat "$out/downloads/dl.txt" 2>/dev/null) == 'downloaded by chromium' ]]; echo "$? $(ls "$out/downloads" | tr '\n' ' ')")"
+check "Ctrl+L took the keyboard from the page's field: none of the command reached it" \
+  "$([[ $(served '/typed/%3A.*') == 0 ]]; echo "$? the page reported $(served '/typed/%3A.*') typed command prefix(es)")"
 info "screenshot $out/02-typed.png"
 # Idle: after load, nothing wakes sig and Chromium's tree does not burn CPU.
 sleep 3

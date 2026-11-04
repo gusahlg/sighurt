@@ -1312,6 +1312,53 @@ fn permissions_belong_to_one_document() {
 }
 
 #[test]
+fn a_request_without_an_origin_is_always_asked_about() {
+    // Servo can't say which frame asks: a third-party frame of the page could be.
+    let mut b = Harness::start("", &["https://a.test/"]);
+    let view = b.shown();
+    let ask = |b: &mut Harness| {
+        let request = ServiceRequest {
+            id: RequestId::next(),
+            view,
+            document: b.document(view),
+            origin: None,
+            service: Service::Permission(Permission::Camera),
+        };
+        let id = request.id;
+        (id, b.engine(EngineEvent::ServiceRequested(request)))
+    };
+    let (first, effects) = ask(&mut b);
+    assert!(matches!(effects[..], [Effect::Prompt { origin: None, .. }]));
+    let (second, _) = ask(&mut b);
+    let effects = b.update(BrowserEvent::PermissionAnswered {
+        request: first,
+        allow: true,
+    });
+    // The grant covers the request answered, not the other one waiting, nor a later one.
+    assert_eq!(answers(&effects, view), [(first, Ok(ServiceReply::Done))]);
+    assert!(!effects.contains(&Effect::CancelService(second)));
+    let (_, effects) = ask(&mut b);
+    assert!(matches!(effects[..], [Effect::Prompt { .. }]));
+    // A refusal holds for the document, and for the page's origin in the tab.
+    let effects = b.update(BrowserEvent::PermissionAnswered {
+        request: second,
+        allow: false,
+    });
+    assert!(answers(&effects, view).contains(&(second, Err(ServiceError::Denied))));
+    let (_, effects) = ask(&mut b);
+    assert!(matches!(
+        answers(&effects, view)[..],
+        [(_, Err(ServiceError::Denied))]
+    ));
+    b.apply(command("page.reload"));
+    let (_, effects) = ask(&mut b);
+    assert!(matches!(
+        answers(&effects, view)[..],
+        [(_, Err(ServiceError::Denied))]
+    ));
+}
+
+#[test]
 fn an_answer_for_a_replaced_document_is_dropped() {
     let mut b = Harness::start("", &["https://a.test/"]);
     let view = b.shown();

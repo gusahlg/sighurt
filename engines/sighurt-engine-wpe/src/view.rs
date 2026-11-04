@@ -5,9 +5,10 @@
 //! [`Inbox`], with what WebKit says at that moment (its address, a [`Snapshot`] of its
 //! back-forward list); the runtime turns them into events after WebKit returns. The few
 //! decisions taken inside a handler are WebKit's own policy, answered at once: which navigations
-//! WebKit performs (web schemes; anything else goes to the browser) and which of the page's it
-//! holds for the browser's answer first (`asks`: links and forms the user clicked, as a
-//! [`PageNavigation`] that refuses when dropped), that a response it can't
+//! WebKit performs (web schemes; anything else is refused, and goes to the browser when it is
+//! the browser's own or the user started it, as WebKit's user-gesture flag says) and which of
+//! the page's it holds for the browser's answer first (`asks`: links and forms the user
+//! clicked, as a [`PageNavigation`] that refuses when dropped), that a response it can't
 //! show becomes a download (which the browser performs), that `window.open` and
 //! `target=_blank` make no WebKit view (the browser opens a tab), that HTTP authentication and
 //! context menus are refused, that a page asking to stay when it is left (`beforeunload`) is
@@ -69,10 +70,12 @@ pub enum Note {
     ListChanged(bool, Snapshot<glib::Object>),
     /// WebKit's address changed.
     Url(String, Snapshot<glib::Object>),
-    /// Loading started (`true`) or stopped, with the address and list then.
+    /// Loading started (`true`) or stopped, with the address and list then (only when it
+    /// stopped: nothing reads them for a start).
     Loading(bool, String, Snapshot<glib::Object>),
-    /// A navigation to a URL WebKit doesn't load: the browser's, or the page's to hand over.
-    Elsewhere(String),
+    /// A navigation to a URL WebKit doesn't load: the browser's, or the page's, and whether
+    /// the user started it (WebKit's user gesture).
+    Elsewhere(String, bool),
     /// A navigation the page asks for, held for the browser's answer, to this URL.
     Navigation(PageNavigation, String),
     /// WebKit's web process ended, for this reason.
@@ -412,7 +415,11 @@ pub fn connect(web_view: &glib::Object, inbox: &Shared, view: ViewId) {
     let n = note.clone();
     web_view.connect_notify_local(Some("is-loading"), move |web, _| {
         let loading = unsafe { ffi::webkit_web_view_is_loading(raw(web)) } != 0;
-        n(Note::Loading(loading, address(web), snapshot(web)));
+        let note = match loading {
+            true => Note::Loading(true, String::new(), Snapshot::default()),
+            false => Note::Loading(false, address(web), snapshot(web)),
+        };
+        n(note);
     });
     let list: glib::Object = unsafe {
         from_glib_none(
@@ -441,8 +448,11 @@ pub fn connect(web_view: &glib::Object, inbox: &Shared, view: ViewId) {
                 let url = unsafe { ffi::string(ffi::webkit_uri_request_get_uri(request)) }
                     .unwrap_or_default();
                 if !loads_itself(&url) {
-                    // Noted first: ignoring it may end the browser's request at once.
-                    n(Note::Elsewhere(url));
+                    // Noted first: ignoring it may end the browser's request at once. WebKit
+                    // doesn't say which frame navigates: whether the user started it decides.
+                    let gesture =
+                        unsafe { ffi::webkit_navigation_action_is_user_gesture(action) } != 0;
+                    n(Note::Elsewhere(url, gesture));
                     unsafe { ffi::webkit_policy_decision_ignore(decision) };
                     return Some(true.to_value());
                 }

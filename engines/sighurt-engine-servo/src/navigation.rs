@@ -10,7 +10,10 @@
 //!
 //! - **Which navigation.** A traversal the browser asked for is known exactly: Servo's
 //!   constellation reports the history change a `go_back`/`go_forward` made right before that
-//!   traversal's `notify_traversal_complete`, and the runtime passes its id in. Servo 0.7's
+//!   traversal's `notify_traversal_complete`, and the runtime passes its id in. To an entry
+//!   whose document Servo evicted, the completion comes only after that document has loaded;
+//!   the runtime waits a quarter second for it, then passes the pending traversal the change
+//!   lands on ([`Navigator::traversal_lands`]). Servo 0.7's
 //!   `WebView::load` still returns no id, and `notify_history_changed` still carries no
 //!   navigation id, so any other commit is attributed to the latest pending
 //!   navigation the browser asked for that fits it (the API allows this): `Navigate` a new
@@ -217,6 +220,18 @@ impl Navigator {
         self.reported.then(|| self.entries[self.current].as_str())
     }
 
+    /// Whether `navigation` is a pending traversal of the browser's that lands on entry
+    /// `current` of a history of `len` entries, from the history as last reported.
+    pub fn traversal_lands(&self, navigation: NavigationId, len: usize, current: usize) -> bool {
+        self.reported
+            && self.entries.len() == len
+            && self.pending.iter().any(|&(id, request)| {
+                id == navigation
+                    && matches!(request, Request::Traverse(delta)
+                        if self.current as i64 + i64::from(delta) == current as i64)
+            })
+    }
+
     /// Whether a traversal by `delta` lands on an entry.
     pub fn can_traverse(&self, delta: i32) -> bool {
         let target = self.current as i64 + i64::from(delta);
@@ -418,6 +433,29 @@ mod tests {
     fn traversed(n: &mut Navigator, entries: &[&str], current: usize, id: NavigationId) -> Commit {
         n.history_changed(urls(entries), current, false, Some(id))
             .expect("a traversal commits")
+    }
+
+    #[test]
+    fn a_traversal_is_known_by_where_it_lands() {
+        let mut n = Navigator::default();
+        load(&mut n, &["a"], 0);
+        load(&mut n, &["a", "b"], 1);
+        load(&mut n, &["a", "b", "c"], 2);
+        let back = NavigationId::next();
+        n.request(back, Request::Traverse(-2));
+        assert!(n.traversal_lands(back, 3, 0));
+        // Somewhere else, or a history of another length, is not this traversal.
+        assert!(!n.traversal_lands(back, 3, 1));
+        assert!(!n.traversal_lands(back, 4, 0));
+        // Nor is a navigation that isn't a traversal.
+        let other = NavigationId::next();
+        n.request(other, Request::Navigate);
+        assert!(!n.traversal_lands(other, 3, 0));
+        assert_eq!(
+            traversed(&mut n, &["a", "b", "c"], 0, back).navigation,
+            back
+        );
+        assert!(!n.traversal_lands(back, 3, 0), "committed");
     }
 
     /// Servo 0.5 names an entry `pushState` made after its neighbour nearer the current one;

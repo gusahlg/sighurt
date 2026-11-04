@@ -25,9 +25,10 @@
 //! doesn't load itself (another scheme; a local file from a web page) is denied and handed to
 //! the browser (`OpenRequested`).
 //!
-//! `Stop` cancels a navigation still queued (see [`crate::view`]), gives up on a top-level load
-//! that has shown no sign of life for [`LOAD_WAIT`](crate::view::LOAD_WAIT) (its
-//! `NavigationFailed` is `Cancelled`), and stops the document's own loading (`window.stop()`).
+//! `Stop` cancels a navigation still queued or still waiting for the view's WebView (see
+//! [`crate::view`]), gives up on a top-level load that has shown no sign of life for
+//! [`LOAD_WAIT`](crate::view::LOAD_WAIT) (its `NavigationFailed` is `Cancelled`), and stops the
+//! document's own loading (`window.stop()`).
 //! Servo 0.7 still has no API to cancel a top-level load that is waiting for its response: that
 //! one goes on and commits when its response comes.
 //!
@@ -106,7 +107,7 @@ use sighurt_api::services::{
 use sighurt_wayland::TargetLease;
 use url::Url;
 
-use crate::delegate::{Coalescing, Delegate, Note};
+use crate::delegate::{contained, Coalescing, Delegate, Note};
 use crate::input::text_input_state;
 use crate::navigation::{Navigator, Request};
 use crate::presentation::{physical, Egl, GlInfo, OffscreenAdapter, PageSurface, Readbacks};
@@ -116,6 +117,8 @@ use crate::view::{Load, Pending, View};
 
 /// Events handed over per pump; the rest wait for the next.
 const MAX_EVENTS_PER_PUMP: usize = 256;
+/// How long a history change waits for Servo to say whether it was the browser's traversal.
+const TRAVERSAL_HOLD: Duration = Duration::from_millis(250);
 /// Service requests a view may have outstanding; beyond them Servo's requests are refused here.
 const MAX_REQUESTS: usize = 16;
 /// Pop-ups a view may have waiting for their first navigation.
@@ -505,7 +508,16 @@ impl<T: ServoTarget> ServoRuntime<T> {
         view.navigator.request(navigation, Request::Navigate);
         view.first = Some((navigation, url));
         view.requests.clear();
-        view.ime = None;
+        // The crash cleared the field already, unless one was focused since.
+        if view.ime.take().is_some() {
+            push(
+                &mut self.events,
+                EngineEvent::TextInputChanged {
+                    view: id,
+                    state: None,
+                },
+            );
+        }
         view.composition.reset();
         view.loading = false;
         if self.servo_focus == Some(id) {
@@ -548,9 +560,10 @@ impl<T: ServoTarget> ServoRuntime<T> {
             self.servo_focus = Some(id);
         } else if !wanted {
             if self.servo_focus == Some(id) {
-                let releases = view.keys.release_all();
-                view.send(releases);
-                view.composition.reset();
+                // A composition in the focused field ends there, then the keys go up.
+                let mut events: Vec<_> = view.composition.abandon().into_iter().collect();
+                events.extend(view.keys.release_all());
+                view.send(events);
                 self.servo_focus = None;
             }
             webview.set_focused(false);
@@ -560,6 +573,12 @@ impl<T: ServoTarget> ServoRuntime<T> {
     /// Asks the browser for `service` on behalf of `view`'s current document, keeping `pending`
     /// until the answer. Without a document, or with too many requests outstanding, `pending`
     /// is dropped, which answers Servo "no".
+    ///
+    /// Servo 0.7 says neither which frame asks nor enforces Permissions-Policy (its
+    /// `allowed_to_use_feature` allows everything), so a permission request carries no origin:
+    /// a third-party frame could be asking, and the core then reuses no grant for it and always
+    /// prompts. The other services need the user's activation in the page, and carry the
+    /// top-level document's origin.
     fn request(&mut self, id: ViewId, service: Service, pending: Pending) {
         let Some(view) = self.views.get_mut(&id) else {
             return;
@@ -572,13 +591,17 @@ impl<T: ServoTarget> ServoRuntime<T> {
         }
         let request = RequestId::next();
         view.requests.push((request, pending));
+        let origin = match service {
+            Service::Permission(_) => None,
+            _ => view.origin(),
+        };
         push(
             &mut self.events,
             EngineEvent::ServiceRequested(ServiceRequest {
                 id: request,
                 view: id,
                 document,
-                origin: view.origin(),
+                origin,
                 service,
             }),
         );
@@ -625,11 +648,28 @@ impl<T: ServoTarget> ServoRuntime<T> {
                             Traversal::Of(navigation) => traversal = Some(navigation),
                             Traversal::No => {}
                             Traversal::Unknown => {
-                                // Its completion comes with Servo's next batch: this note and
-                                // the WebView's later ones wait for it, in order.
-                                holding.push(webview);
-                                self.held.push((webview, note, counted));
-                                continue;
+                                // Its completion usually comes with Servo's next batch: this
+                                // note and the WebView's later ones wait for it, in order, for
+                                // at most `TRAVERSAL_HOLD`. To an entry whose document Servo
+                                // evicted, the completion comes only once that document has
+                                // loaded from the network; the frames, title and loading of
+                                // that wait are not held for it. The change is then the
+                                // traversal it fits, if one does.
+                                let now = Instant::now();
+                                let until = *self
+                                    .history_hold
+                                    .entry(webview)
+                                    .or_insert(now + TRAVERSAL_HOLD);
+                                if now < until {
+                                    holding.push(webview);
+                                    self.held.push((webview, note, counted));
+                                    continue;
+                                }
+                                if let (Note::History(entries, current), Some(v)) =
+                                    (&note, self.views.get(&view))
+                                {
+                                    traversal = v.traversal_landing(entries.len(), *current);
+                                }
                             }
                         }
                         let later = notes[index + 1..].iter_mut().flatten().find(|(id, n, c)| {
@@ -876,6 +916,18 @@ impl<T: ServoTarget> ServoRuntime<T> {
                 view.semantics.reset_page();
                 view.asked.clear();
                 self.page_crashed = true;
+                // The focused field went with the page: the input method (perhaps holding a
+                // password field's state) is told before the error page shows.
+                if view.ime.take().is_some() {
+                    view.composition.reset();
+                    push(
+                        events,
+                        EngineEvent::TextInputChanged {
+                            view: id,
+                            state: None,
+                        },
+                    );
+                }
                 push(
                     events,
                     EngineEvent::ViewFailed {
@@ -1108,7 +1160,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                         match &result {
                             Ok(value) if on && !crashed && value == "true" => extract_again = true,
                             Err(message) => {
-                                let head: String = message.chars().take(160).collect();
+                                let head = contained(message, 160);
                                 log::debug!("semantic change check failed: {head}");
                             }
                             _ => {}
@@ -1404,6 +1456,14 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
             EngineCommand::Stop => {
                 if let Some((old, _)) = view.queued.take() {
                     push(&mut self.events, cancelled(id, old));
+                }
+                // The navigation still waiting for its WebView (no room yet, or a crashed
+                // page's) is never loaded.
+                if view.webview.is_none() {
+                    if let Some((first, _)) = view.first.take() {
+                        view.navigator.forget(first);
+                        push(&mut self.events, cancelled(id, first));
+                    }
                 }
                 // Servo 0.7 still can't cancel a top-level load awaiting its response (there is
                 // no public stop, and `load_url` still drops a load while one is in flight).
@@ -1790,7 +1850,7 @@ fn begin_extract<T: ServoTarget>(view: &mut View<T>, delegate: &Rc<Delegate>) {
     let script = semantic::extraction_script();
     let delegate = Rc::clone(delegate);
     let webview_id = webview.id();
-    webview.evaluate_javascript(&script, move |result| {
+    webview.evaluate_javascript(script, move |result| {
         delegate.script_finished(
             webview_id,
             Tag::Extract { document, token },
@@ -1823,7 +1883,7 @@ fn begin_check<T: ServoTarget>(view: &mut View<T>, delegate: &Rc<Delegate>) {
     let script = semantic::dirty_script();
     let delegate = Rc::clone(delegate);
     let webview_id = webview.id();
-    webview.evaluate_javascript(&script, move |result| {
+    webview.evaluate_javascript(script, move |result| {
         delegate.script_finished(webview_id, Tag::Check(token), js_outcome(result));
     });
 }
@@ -1850,7 +1910,8 @@ fn js_outcome(result: Result<JSValue, JavaScriptEvaluationError>) -> Result<Stri
 }
 
 /// Parses an extraction and pushes the snapshot. A failure is a debug line with a short head
-/// of the JSON or the error, and nothing else: the snapshot is page data.
+/// of the JSON or the error, contained like console text, and nothing else: the snapshot is
+/// page data.
 fn deliver_snapshot(
     events: &mut Events,
     view: ViewId,
@@ -1867,12 +1928,12 @@ fn deliver_snapshot(
                 },
             ),
             Err(error) => {
-                let head: String = json.chars().take(120).collect();
+                let (error, head) = (contained(&error.to_string(), 240), contained(&json, 120));
                 log::debug!("semantic snapshot dropped: {error}; {head}");
             }
         },
         Err(message) => {
-            let head: String = message.chars().take(160).collect();
+            let head = contained(&message, 160);
             log::debug!("semantic extraction failed: {head}");
         }
     }

@@ -533,14 +533,34 @@ fn wpe_views_navigate_present_ask_and_fail_distinctly() {
         }
     }
 
-    // The page's own navigation to another scheme is handed to the browser, and so is its
-    // window.close(); neither is carried out.
+    // The page's own navigation to another scheme is handed to the browser when the user
+    // started it (a link clicked), and refused when a script does it by itself; neither is
+    // carried out. So is its window.close().
+    let hands_mail = |s: &State, doc| {
+        s.events_of(a).any(|e| matches!(e,
+            EngineEvent::OpenRequested { url, document, disposition: OpenDisposition::CurrentView, .. }
+                if url.starts_with("mailto:") && *document == doc))
+    };
     let mailto = d.state.navigate(a, &url("/mailto"));
     assert!(d.run_until(WAIT, |s| committed(s, a, mailto)));
     let (_, _, mailto_doc, _) = commit(&d.state, a).unwrap();
-    assert!(d.run_until(WAIT, |s| s.events_of(a).any(|e| matches!(e,
-        EngineEvent::OpenRequested { url, document, disposition: OpenDisposition::CurrentView, .. }
-            if url.starts_with("mailto:") && *document == mailto_doc))));
+    d.run_for(Duration::from_millis(1500));
+    assert!(
+        !hands_mail(&d.state, mailto_doc),
+        "a script's navigation to mailto: without a gesture is refused"
+    );
+    let link = d
+        .state
+        .navigate(a, &url("/link?mailto:someone@example.test"));
+    assert!(d.run_until(WAIT, |s| committed(s, a, link)));
+    let (_, _, link_doc, _) = commit(&d.state, a).unwrap();
+    d.state.set_focus(Some(a));
+    d.run_for(Duration::from_millis(300));
+    click(&mut d.state, a, 100.0, 100.0);
+    assert!(
+        d.run_until(WAIT, |s| hands_mail(s, link_doc)),
+        "a clicked mailto: link goes to the browser"
+    );
     // A page may close only a tab with one entry (WebKit's rule): a new one.
     let c = d.state.open(&url("/close"), false);
     assert!(d.run_until(WAIT, |s| s

@@ -411,7 +411,13 @@ pub(crate) fn console_line(_level: ConsoleLogLevel, message: &str) -> (log::Leve
 }
 
 fn sanitize_console(message: &str) -> String {
-    let cut = truncate_utf8(message, 1024);
+    contained(message, 1024)
+}
+
+/// Page text for a log line: cut to `max` bytes on a char boundary, then Cc, Cf, Zl and Zp
+/// escaped (as console messages are).
+pub(crate) fn contained(message: &str, max: usize) -> String {
+    let cut = truncate_utf8(message, max);
     let mut out = String::new();
     for ch in cut.chars() {
         if console_char_escaped(ch) {
