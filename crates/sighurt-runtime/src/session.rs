@@ -356,6 +356,14 @@ impl<F: Frontend> Session<F> {
             Effect::Notice { message, .. } => frontend.notice(message),
             Effect::RedrawChrome => frontend.redraw(),
             Effect::SaveSession => self.session_changed(),
+            // Nothing keeps visits yet, so nothing is left to forget.
+            Effect::Visited { .. } => {}
+            Effect::ForgetVisits { request, .. } => {
+                self.queue.push_back(BrowserEvent::VisitsForgotten {
+                    request,
+                    outcome: sighurt_core::ForgetOutcome::Done { removed: 0 },
+                })
+            }
             Effect::Quit => {
                 // `shutdown` writes the session, once and whole; a save due now is that one.
                 self.session_due = None;

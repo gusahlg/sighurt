@@ -241,7 +241,7 @@ forward = "page.forward"
 # and is case-sensitive only when the text has a capital letter; page.find alone opens the
 # chrome's find field. page.find-next and page.find-previous move between the matches and
 # page.find-stop ends the search. A page whose engine can't find in it says so.
-# history.clear forgets the pages you visited. browser.fullscreen puts the window in
+# history.clear forgets the pages you visited ([history] below). browser.fullscreen puts the window in
 # fullscreen, or takes it out; page.exit-fullscreen leaves the fullscreen a page put one of
 # its elements in (a video, a game).
 #
@@ -387,3 +387,21 @@ default-keys = true
 # kept as session.toml.broken-<seconds>, never written over; a damaged tab in it is left out.
 # sig holds at most 1000 tabs.
 restore = true
+
+[history]
+# Whether sig records the pages you visit, to complete what you type in the address line, and
+# saves them in ~/.local/state/sighurt/history.toml (mode 0600): each page's address (without
+# its #fragment), its title, when you last visited it and how often. Only http and https pages
+# you open in the tab shown are recorded: not sig:, file: or data: pages, not addresses with a
+# user name or password in them, not pages of an engine with storage = "ephemeral", not
+# reloads or back and forward, and nothing sig --dump shows. sig keeps the 5000 visited last
+# and forgets visits older than 90 days when it starts; it writes the file at most every 30
+# seconds, and at quit. With false nothing is recorded, what was loaded is dropped at once, and
+# the file is left as it is. history.clear empties the file, and site.forget <host> takes that
+# site's pages out of it, at once, with remember on or off; a history file sig couldn't read,
+# kept as history.toml.broken-<seconds>, is not emptied. As with the session, one sig saves
+# the history: another started while it runs completes from it but doesn't save its own, and
+# what it forgets is forgotten in it only. The history, the session (above) and each engine's
+# storage are separate: to keep nothing, set remember = false and restore = false here, and
+# storage = "ephemeral" for each engine.
+remember = true

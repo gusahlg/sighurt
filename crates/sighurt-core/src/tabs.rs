@@ -201,6 +201,9 @@ pub struct View {
     pub(crate) chosen: bool,
     /// The user's answers to `document`'s permission prompts. Dropped with the document.
     pub(crate) answers: Vec<(Permission, bool)>,
+    /// The visit `document`'s commit recorded, and that document: what a title it reports
+    /// next names (`state`'s "Visited pages").
+    pub(crate) visit: Option<(String, DocumentGeneration)>,
 }
 
 impl View {
@@ -229,6 +232,7 @@ impl View {
             hovered: None,
             chosen: false,
             answers: Vec::new(),
+            visit: None,
         }
     }
 

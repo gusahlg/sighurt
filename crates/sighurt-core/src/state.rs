@@ -28,7 +28,24 @@
 //!   page content for a frontend that shows text; the core ignores both;
 //! - what its own calls and services produced: [`BrowserEvent::OpenFailed`],
 //!   [`BrowserEvent::CommandFailed`], [`BrowserEvent::ServiceDone`],
-//!   [`BrowserEvent::PermissionAnswered`], [`BrowserEvent::ConfigReloaded`].
+//!   [`BrowserEvent::PermissionAnswered`], [`BrowserEvent::ConfigReloaded`],
+//!   [`BrowserEvent::VisitsForgotten`].
+//!
+//! # Visited pages
+//!
+//! The core decides which pages are history ([`Effect::Visited`]); the executable keeps them,
+//! with the time, in its history file. A visit is a commit of a navigation that pushes a new
+//! document (not a reload, a traversal, or a same-document `pushState`, `replaceState` or
+//! fragment) in the view the active tab shows or is switching to (not one restoring a saved
+//! page, the session's or one back or forward), of an http or https address
+//! with no user name or password, at most [`MAX_VISIT_URL`] bytes once its fragment is
+//! dropped, in an engine that did not start with `storage = "ephemeral"`, while `[history]
+//! remember` is on. Its title is the title the same view reports next for that document: the
+//! view remembers which visit its document is, and any other commit, a forget or turning
+//! `remember` off ends that. `history.clear` and `site.forget` forget visits
+//! ([`Effect::ForgetVisits`]) whatever `remember` says; the executable answers each with
+//! [`BrowserEvent::VisitsForgotten`], which becomes a notice (not for a site's forget that
+//! found no visit: the engines' answers speak for the site).
 //!
 //! It carries out the returned effects in order: an [`Effect::OpenView`] comes before the
 //! commands for its view, and a view is sent nothing after its [`Effect::CloseView`]. After any
@@ -63,7 +80,7 @@ use sighurt_api::services::{
 use sighurt_api::settings::Table;
 use url::Url;
 
-use crate::config::{Config, ConfigError, EngineSettings};
+use crate::config::{Config, ConfigError, EngineSettings, Storage};
 use crate::keys::{KeyOutcome, KeyState};
 use crate::navigation::{
     NavigationKind, Record, Segment, Switch, SwitchInto, MAX_SEGMENTS, RETAINED_VIEWS,
@@ -285,6 +302,38 @@ pub enum BrowserEvent {
     /// The configuration file was read again and parsed ([`Config::parse`]). An error keeps
     /// the configuration in use.
     ConfigReloaded(Result<Box<Config>, ConfigError>),
+    /// The executable forgot the visits [`Effect::ForgetVisits`] with `request` named.
+    VisitsForgotten {
+        /// The request.
+        request: RequestId,
+        /// What was forgotten, and where.
+        outcome: ForgetOutcome,
+    },
+}
+
+/// What forgetting visited pages did ([`BrowserEvent::VisitsForgotten`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForgetOutcome {
+    /// `removed` visits are gone, and the history file no longer holds them: it was written and
+    /// synced, or this `sig` keeps no history file (no state directory).
+    Done {
+        /// How many visits were forgotten.
+        removed: usize,
+    },
+    /// `removed` visits are gone from this `sig` only: another `sig` owns the history file,
+    /// which still holds them.
+    HereOnly {
+        /// How many visits were forgotten.
+        removed: usize,
+    },
+    /// `removed` visits are gone from this `sig`, but writing the history file failed, so it
+    /// may still hold them.
+    NotWritten {
+        /// How many visits were forgotten.
+        removed: usize,
+        /// Why the file was not written, for the user.
+        error: String,
+    },
 }
 
 /// What the executable should do, in order.
@@ -382,6 +431,30 @@ pub enum Effect {
     /// The session changed: save [`BrowserState::session`], atomically. Waiting a moment and
     /// saving only the latest is fine, except right before [`Effect::Quit`].
     SaveSession,
+    /// Record a visit to `url` in the history, at the time this is carried out (`commit`), or
+    /// give the visit already recorded for `url` this `title` (not `commit`: the title of the
+    /// document whose commit was the visit; a visit no longer there stays gone). `url` is an
+    /// http or https address without a fragment or user name, at most [`MAX_VISIT_URL`] bytes;
+    /// a title is at most 16 KiB, page text to contain before it is kept. Comes only while
+    /// `[history] remember` is on (see the module documentation).
+    Visited {
+        /// The address.
+        url: String,
+        /// The page's title; `None` at the commit, before the page has said.
+        title: Option<String>,
+        /// A commit: a new visit. Otherwise a title for the visit of `url`.
+        commit: bool,
+    },
+    /// Forget the visits to `host` and the hosts under it, or every visit, in memory and in the
+    /// history file at once (also with `[history] remember` off), dropping a save not written
+    /// yet; then report [`BrowserEvent::VisitsForgotten`] with `request`.
+    ForgetVisits {
+        /// The request, to report the outcome with.
+        request: RequestId,
+        /// The host whose visits go (`www.example.com` goes with `example.com`), or `None` for
+        /// all of them.
+        host: Option<String>,
+    },
     /// Quit: save the session now, shut every runtime down, then the host.
     Quit,
 }
@@ -450,6 +523,9 @@ pub struct BrowserState {
     /// `site.forget` requests still waiting for engines to answer. At most
     /// [`MAX_SITE_REQUESTS`].
     site_requests: BTreeMap<RequestId, SiteForget>,
+    /// Forgets of visited pages the executable has not answered, with the host each names. At
+    /// most [`MAX_VISIT_REQUESTS`].
+    visit_requests: BTreeMap<RequestId, Option<String>>,
     /// What the executable was last told the page area looks like.
     cursor: Cursor,
     text_input: Option<TextInputState>,
@@ -541,6 +617,9 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             tab: None,
             message: format!("{error}\nThe configuration in use stays."),
         }),
+        BrowserEvent::VisitsForgotten { request, outcome } => {
+            state.visits_forgotten(request, outcome, &mut fx)
+        }
     }
     state.settle(&mut fx);
     let mut effects = fx.effects;
@@ -572,6 +651,27 @@ fn answer(view: ViewId, request: RequestId, result: ServiceResult) -> Effect {
 
 /// The most `site.forget` requests left unfinished. Each one is fanned out to every engine.
 const MAX_SITE_REQUESTS: usize = 16;
+
+/// The most forgets of visited pages left unanswered. The executable answers each at once, or
+/// once it has written the history file.
+const MAX_VISIT_REQUESTS: usize = 64;
+
+/// The longest address recorded as a visit, in bytes, without its fragment. A longer one is not
+/// recorded, never shortened.
+pub const MAX_VISIT_URL: usize = 8 * 1024;
+
+/// `url` as a visit records it: an http or https address with no user name or password, its
+/// fragment dropped, at most [`MAX_VISIT_URL`] bytes. `None` for anything else.
+fn visit_url(url: &str) -> Option<String> {
+    let mut url = Url::parse(url).ok()?;
+    let web = matches!(url.scheme(), "http" | "https");
+    if !web || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    url.set_fragment(None);
+    let url = String::from(url);
+    (url.len() <= MAX_VISIT_URL).then_some(url)
+}
 
 /// A `site.forget` the core has sent and not heard the end of.
 #[derive(Debug)]
@@ -820,6 +920,7 @@ impl BrowserState {
             requests: Requests::default(),
             failed: BTreeMap::new(),
             site_requests: BTreeMap::new(),
+            visit_requests: BTreeMap::new(),
             cursor: Cursor::Default,
             text_input: None,
             page_typing: true,
@@ -1019,6 +1120,9 @@ impl BrowserState {
             }
         }
         notify(notices, fx);
+        if !config.remember_history() {
+            self.end_visits(None);
+        }
         self.config = config;
         fx.chrome = true;
     }
@@ -1694,6 +1798,10 @@ impl BrowserState {
                 },
             },
         };
+        // The site's visited pages go too, whatever the engines can forget.
+        if let SiteKey::Host(host) = &key {
+            self.forget_visits(Some(host.clone()), fx);
+        }
         let keepers: Vec<&String> = self
             .env
             .engines
@@ -1877,6 +1985,18 @@ impl BrowserState {
             EngineEvent::TitleChanged { title, .. } => {
                 view.title = title.map(clamp);
                 fx.chrome = true;
+                // The title of the document whose commit was the visit, if it still is.
+                let visit = view
+                    .visit
+                    .as_ref()
+                    .filter(|(_, d)| view.document == Some(*d));
+                if let Some((url, _)) = visit.filter(|_| self.config.remember_history()) {
+                    fx.push(Effect::Visited {
+                        url: url.clone(),
+                        title: view.title.clone(),
+                        commit: false,
+                    });
+                }
             }
             EngineEvent::StatusTextChanged { text, .. } => {
                 view.hovered = text.as_deref().and_then(link);
@@ -1966,6 +2086,11 @@ impl BrowserState {
             .navigations
             .committed(navigation)
             .is_new(new_document, history);
+        // A new document in a new entry may be a visit; any other commit ends the last one.
+        let visit = (new_document && new_entry)
+            .then(|| visit_url(&url))
+            .flatten();
+        view.visit = None;
         view.url = bounded(url);
         view.failure = None;
         if new_entry {
@@ -1985,7 +2110,12 @@ impl BrowserState {
             return;
         };
         let t = &mut self.tabs[tab];
-        if t.switch.is_some_and(|switch| switch.view == id) {
+        let switching = t.switch.filter(|switch| switch.view == id);
+        // Restoring a saved page (a session's, or one back or forward) is not a visit.
+        let restoring = switching.is_some_and(|s| matches!(s.into, SwitchInto::Restore(_)));
+        let shown = (switching.is_some() || t.current_view() == Some(id)) && !restoring;
+        let switching = switching.is_some();
+        if switching {
             self.switch_progress(tab, fx);
         } else if t.current_view() == Some(id) {
             t.error = None;
@@ -1993,6 +2123,113 @@ impl BrowserState {
                 self.prune(tab, fx);
             }
         }
+        if shown && tab == self.active {
+            self.record_visit(id, visit, document, fx);
+        }
+    }
+
+    /// The commit of `document` in `id` was a visit to `url`, if it was one (see the module
+    /// documentation): record it, unless `[history] remember` is off or the view's engine
+    /// started with ephemeral storage.
+    fn record_visit(
+        &mut self,
+        id: ViewId,
+        url: Option<String>,
+        document: DocumentGeneration,
+        fx: &mut Fx,
+    ) {
+        let Some(view) = self.views.get_mut(&id) else {
+            return;
+        };
+        let ephemeral = self
+            .launched
+            .get(&view.engine)
+            .is_some_and(|settings| settings.storage == Storage::Ephemeral);
+        let Some(url) = url.filter(|_| self.config.remember_history() && !ephemeral) else {
+            return;
+        };
+        view.visit = Some((url.clone(), document));
+        fx.push(Effect::Visited {
+            url,
+            title: None,
+            commit: true,
+        });
+    }
+
+    /// Forgets the visits to `host` (and the hosts under it), or all of them: ends the views'
+    /// visits ([`Self::end_visits`]) and asks the executable to forget them.
+    pub(crate) fn forget_visits(&mut self, host: Option<String>, fx: &mut Fx) {
+        if self.visit_requests.len() >= MAX_VISIT_REQUESTS {
+            return notice(
+                format!(
+                    "Too many requests to forget visited pages are still unfinished \
+                     ({MAX_VISIT_REQUESTS})."
+                ),
+                fx,
+            );
+        }
+        self.end_visits(host.as_deref());
+        let request = RequestId::next();
+        self.visit_requests.insert(request, host.clone());
+        fx.push(Effect::ForgetVisits { request, host });
+    }
+
+    /// No view's document is a visit to `host` (or a host under it), or to anything, any more:
+    /// its later title changes nothing.
+    fn end_visits(&mut self, host: Option<&str>) {
+        for view in self.views.values_mut() {
+            let gone = view.visit.as_ref().is_some_and(|(url, _)| {
+                host.is_none_or(|host| {
+                    let visited = Url::parse(url).ok();
+                    let visited = visited.as_ref().and_then(Url::host_str);
+                    visited.is_some_and(|visited| host_under(visited, host))
+                })
+            });
+            if gone {
+                view.visit = None;
+            }
+        }
+    }
+
+    /// The executable answered a forget of visits: say what happened. A site's forget that
+    /// found no visit says nothing: the engines' answers say what happened to the site.
+    fn visits_forgotten(&mut self, request: RequestId, outcome: ForgetOutcome, fx: &mut Fx) {
+        let Some(host) = self.visit_requests.remove(&request) else {
+            return;
+        };
+        let none = matches!(
+            outcome,
+            ForgetOutcome::Done { removed: 0 } | ForgetOutcome::HereOnly { removed: 0 }
+        );
+        if none && host.is_some() {
+            return;
+        }
+        let what = |removed: usize| {
+            let pages = match removed {
+                1 => "1 visited page".to_owned(),
+                n => format!("{n} visited pages"),
+            };
+            match &host {
+                Some(host) => format!("{pages} of {host}"),
+                None => pages,
+            }
+        };
+        notice(
+            match outcome {
+                ForgetOutcome::Done { removed } => format!("Forgot {}.", what(removed)),
+                ForgetOutcome::HereOnly { removed } => format!(
+                    "Forgot {} here only: another sig owns the history file, which still \
+                     holds them.",
+                    what(removed)
+                ),
+                ForgetOutcome::NotWritten { removed, error } => format!(
+                    "Forgot {} here, but the history file could not be written ({error}), so \
+                     it may still hold them.",
+                    what(removed)
+                ),
+            },
+            fx,
+        );
     }
 
     fn navigation_failed(

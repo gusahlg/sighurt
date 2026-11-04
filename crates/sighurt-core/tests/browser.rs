@@ -794,10 +794,12 @@ fn find_history_and_fullscreen_say_what_is_missing() {
         notices(&b.apply(command("page.find hello"))),
         ["This tab shows no page to find in."]
     );
-    assert_eq!(
-        notices(&b.apply(command("history.clear"))),
-        ["sig keeps no history of the pages you visit, so there is nothing to clear."]
-    );
+    // history.clear asks the executable to forget, which answers (tests/history.rs).
+    let effects = b.apply(command("history.clear"));
+    assert!(notices(&effects).is_empty());
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ForgetVisits { host: None, .. })));
     assert_eq!(
         notices(&b.apply(command("browser.fullscreen"))),
         ["browser.fullscreen is not available in this frontend."]
