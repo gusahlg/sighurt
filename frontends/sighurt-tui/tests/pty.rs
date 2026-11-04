@@ -242,19 +242,6 @@ fn read_until(master: &OwnedFd, needle: &[u8], timeout: Duration) -> Vec<u8> {
     }
 }
 
-fn reply_after(master: OwnedFd, delay: Duration, bytes: &'static [u8]) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        if wait_for(&master, b"\x1b[14t\x1b[c", Duration::from_secs(2)).is_ok() {
-            if !delay.is_zero() {
-                thread::sleep(delay);
-            }
-            // A panic here would run the session hook. Missed writes are not
-            // fatal: the probe's own deadline is what the test checks.
-            let _ = try_write_all(&master, bytes);
-        }
-    })
-}
-
 /// Bounds a missing answer. Not an ordering device: the helper writes only
 /// after it has read the probe's query batch.
 const BATCH_BOUND: Duration = Duration::from_secs(4);
@@ -669,10 +656,7 @@ fn probe_ignores_malformed_replies_and_later_keys_stay_keys() {
     // `ESC _` not followed by `G` that lands after the probe is Alt+_ and
     // keys, by design (the parser's reply starts), so timing would decide
     // the outcome otherwise.
-    write_all(
-        &master,
-        b"\x1b[?62;4x\x1b_Nope\x1b\\\x1b]99;nope\x07",
-    );
+    write_all(&master, b"\x1b[?62;4x\x1b_Nope\x1b\\\x1b]99;nope\x07");
     let caps = session.probe(Duration::from_millis(40)).expect("probe");
     assert_eq!(caps, &Capabilities::default());
     write_all(&master, b"q");
