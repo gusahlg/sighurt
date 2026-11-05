@@ -4146,3 +4146,39 @@ Newest last. Each entry says what was decided and why.
     checked. *Left out, with reasons*: bookmarks (a `[keywords]` entry without `{}` already is
     one, and sig never rewrites the user's file); per-site zoom memory (decision 29);
     `sig://history` and a downloads page (after completion exists).
+130. **Find in page** (4–5 November 2026; branch `find` and the engine commits 874dcb0…6fd6335,
+    merged 7c4eff9 and 6aadf40; design [features-2026-11-04.md](features-2026-11-04.md), lane B
+    with the amendments after Astra's review). `page.find [text]`, `page.find-next`,
+    `page.find-previous`, `page.find-stop`. The core keeps one search per view
+    (`tabs::Find`), smart case (an upper-case letter makes it case-sensitive), wrap-around
+    always, and drops a result whose search or document is not the view's; a new document or
+    `ViewFailed` ends the search. Every find command on a view is `Effect::Find`; the runtime
+    offers it to the frontend (`Frontend::find`), then to an engine that declares
+    `find_in_page`, and otherwise answers `BrowserEvent::FindResult { supported: false }`, so
+    there is one result path and "<engine> can't find in page" is said once. The find field
+    is the chrome's own editor mode, never a prefix on the address line (an absolute path
+    starts with `/`): `page.find` with no argument opens it (`Effect::FindField`,
+    `ChromeEvent::FindField`), each edit searches, empty text stops, Enter keeps the search
+    and returns to the page (so `n` and `N` continue), Escape stops it. `Snapshot::find`
+    carries the contained text and the counts; the standard and line chromes and the
+    terminal's bottom line show "3 of 12", "12 matches", "no matches" or "not supported by
+    <engine>". In the terminal's text mode sig searches the page's logical text itself, with
+    any engine that has page text (Servo included), answers when the first snapshot arrives,
+    and ends every search at a mode switch. *Engines*: WPE WebKit through its find controller
+    (total only: the GLib layer drops the match index; `search_finish` at each new-document
+    commit, since a page restored from the back-forward cache keeps its marks), CEF through
+    `cef_browser_host_t::find` (current and total; operations run as UI-thread tasks so a
+    result is stamped with the search current when it arrives), Ladybird through LibWebView
+    (current and total; shim ABI 3 adds `lb_find_in_page`, `lb_find_next`, `lb_find_previous`,
+    `lb_find_stop`), NetSurf through its synchronous search (found only; the frontend wraps,
+    which 3.11 does not), the demo engine for the tests; Servo 0.7 has no find API and says
+    so. Each `FindCommand` names its search and `Search` its document; WPE and Ladybird stamp
+    answers from an in-order queue of unanswered operations, so a late answer is never
+    labelled with a newer search. *Residual*: CEF's routing of results from a stopped
+    session could not be confirmed without its source; the next result replaces a wrong one.
+    *Verified*: core tests (reordered results, navigation during a search, next with no
+    search, smart case), goldens for the find field in both chromes with every older golden
+    byte-identical, headless.sh 152/152 with its find checks, ui 35/35, the terminal's tests
+    (text-mode find, the first-snapshot and mode-switch cases), and a direct test in each
+    engine's suite (WPE `finds_in_the_page`, CEF offscreen section 5 and 38 unit tests,
+    Ladybird `tests/find.rs`, NetSurf `tests/engine.rs`).

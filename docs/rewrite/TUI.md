@@ -446,8 +446,11 @@ Where it differs from the sketches in §2–§3:
   `Previous` wrap; upper case in the text makes the search case-sensitive (the core's rule). It
   answers the core with `BrowserEvent::FindResult`, as an engine would, and again when a new
   snapshot of the same document changes the count; a new document ends the search (the core also
-  sends `Stop`). Changing the mode with a search in the shown page runs `page.find-stop` and says
-  so in a notice: the search belonged to the other mode's finder. What the core's search found is
+  sends `Stop`). A search made before the page's first snapshot is answered when the snapshot
+  arrives. Changing the mode ends every view's search and says so once in a notice, since each
+  search belonged to the other mode's finder: the shown page's through `page.find-stop` at once,
+  a hidden tab's as soon as its tab is shown, its moves reaching neither finder until then.
+  What the core's search found is
   right-aligned on the bottom line ("3 of 12", "12 matches", "no matches", "not supported by
   <engine>"), after the search's text (16 characters at most) when the field is closed; a
   terminal too narrow for both drops it. `--dump` is unchanged.
