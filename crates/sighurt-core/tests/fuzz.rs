@@ -905,7 +905,7 @@ fn fuzz_state_machine_commands() {
             assert!(effects.len() < 10_000);
             let seat = SeatId::next();
             for _ in 0..case.rng.range(1, 30) {
-                let event = match case.rng.below(5) {
+                let event = match case.rng.below(6) {
                     0 | 1 => {
                         let mut text = case
                             .rng
@@ -929,6 +929,7 @@ fn fuzz_state_machine_commands() {
                         },
                         at: Instant::now(),
                     },
+                    4 => BrowserEvent::Fullscreen(case.rng.one_in(2)),
                     _ => match Config::parse(Some(&random_config(&mut case.rng)), &env) {
                         Ok(config) => BrowserEvent::ConfigReloaded(Ok(Box::new(config))),
                         Err(error) => BrowserEvent::ConfigReloaded(Err(error)),

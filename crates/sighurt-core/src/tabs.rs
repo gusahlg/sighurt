@@ -225,6 +225,9 @@ pub struct View {
     pub(crate) answers: Vec<(Permission, bool)>,
     /// Its search, if one is under way. Dropped with the document.
     pub(crate) find: Option<Find>,
+    /// Its engine said an element is fullscreen and has not been told to leave it since
+    /// (`ExitFullscreen`), nor said it left.
+    pub(crate) fullscreen: bool,
 }
 
 impl View {
@@ -254,6 +257,7 @@ impl View {
             chosen: false,
             answers: Vec::new(),
             find: None,
+            fullscreen: false,
         }
     }
 

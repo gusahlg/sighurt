@@ -32,9 +32,10 @@
 //!   counts, as bench/ takes them), a `peaks` line (queue depths, longest calls), one line
 //!   per target and engine, and a `chrome-renderer` line with what the renderer counted;
 //! - with `--diagnostics FILE`, the same as JSON in FILE, rewritten on SIGUSR1 and at exit,
-//!   with which tab is active, what the status strip shows and each tab's browser state
-//!   (loading, back and forward, a record, an error, the engine its tab is labelled with), never
-//!   an address or a title.
+//!   with which tab is active, what the status strip shows, the fullscreen (`wanted`, the
+//!   user's toggle; `window`, what the window is; `page`, an element of the active page) and
+//!   each tab's browser state (loading, back and forward, a record, an error, the engine its
+//!   tab is labelled with), never an address or a title.
 //!
 //! Never logs clipboard contents, credentials, URLs or other page data.
 //!
@@ -295,6 +296,27 @@ impl From<&sighurt_core::tabs::Find> for FindReport {
     }
 }
 
+/// The window's fullscreen and the page's (`BrowserState::fullscreen`).
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct FullscreenReport {
+    /// The user's toggle (`browser.fullscreen`).
+    pub wanted: bool,
+    /// What the frontend last reported the window to be.
+    pub window: bool,
+    /// An element of the active tab's page is fullscreen.
+    pub page: bool,
+}
+
+impl From<sighurt_core::fullscreen::FullscreenState> for FullscreenReport {
+    fn from(state: sighurt_core::fullscreen::FullscreenState) -> Self {
+        Self {
+            wanted: state.wanted,
+            window: state.window,
+            page: state.page.is_some(),
+        }
+    }
+}
+
 /// Everything printed at once.
 pub struct Report {
     pub counters: Counters,
@@ -309,6 +331,8 @@ pub struct Report {
     pub active_tab: usize,
     /// What the status strip shows: "notice", "page" or "error" (never the text itself).
     pub status: Option<&'static str>,
+    /// The window's fullscreen and the page's.
+    pub fullscreen: FullscreenReport,
     /// The compositor's optional protocols, as the host reports them.
     pub capabilities: String,
     /// Host events not taken yet.
@@ -585,6 +609,7 @@ impl Diagnostics {
                 "tabs": report.tabs,
                 "active_tab": report.active_tab,
                 "status": report.status,
+                "fullscreen": report.fullscreen,
                 "keymap_indicator": self.keymap_indicator,
                 "capabilities": report.capabilities,
                 "pending_host_events": report.pending_host_events,

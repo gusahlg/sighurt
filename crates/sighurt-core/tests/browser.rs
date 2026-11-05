@@ -1099,10 +1099,10 @@ fn history_and_fullscreen_say_what_is_missing() {
         notices(&b.apply(command("history.clear"))),
         ["sig keeps no history of the pages you visit, so there is nothing to clear."]
     );
-    assert_eq!(
-        notices(&b.apply(command("browser.fullscreen"))),
-        ["browser.fullscreen is not available in this frontend."]
-    );
+    // The window's fullscreen is asked for (tests/fullscreen.rs has the rest).
+    assert!(b
+        .apply(command("browser.fullscreen"))
+        .contains(&Effect::SetFullscreen(true)));
     assert_eq!(
         notices(&b.apply(command("page.exit-fullscreen"))),
         ["The page shown is not in fullscreen."]

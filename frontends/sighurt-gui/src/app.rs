@@ -1609,6 +1609,7 @@ fn report(gui: &Gui, session: &mut Session<Gui>, at_exit: bool) {
         tabs,
         active_tab,
         status,
+        fullscreen: session.core().fullscreen().into(),
         capabilities: format!("{:?}", host.capabilities),
         pending_host_events: host.pending_events,
         last_error,
