@@ -173,7 +173,7 @@ fn internal(url: &Url, config: &Config) -> Routed {
     let Some(name) = page_name(url) else {
         return Routed::Internal;
     };
-    if config.internal_pages().iter().any(|page| *page == name) {
+    if config.internal_pages().contains(&name) {
         return match config.is_enabled(PAGE_ENGINE) {
             true => Routed::Page(name),
             false => Routed::Error(format!(
