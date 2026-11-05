@@ -41,48 +41,45 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   WebKit is opened on first use and its processes end with the last WPE page, retained views are
   bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
 
-### Paused on 4 November 2026 (evening): the second run, two feature lanes in flight
+### Paused on 5 November 2026 (evening): towards 0.11.0, two lanes left to merge
 
-The user asked for a second run after decision 125: "optimize the renderer and the browser in
-general as much as possible. Do more reliability testing and add in obvious features that are
-missing in a way that goes with the philosophy and design." Landed on `config-ext` (decisions
-126–129 and the lane commits after them): seeded random-input tests for every parser with 8
-fixes (126), the soak and fault suites with 5 fixes (127), the second measured optimization pass
-(128: CPU backend page render −58 %, sixel encode −52 %), the tab commands, the keymap's hovered
-link and `location.focus <text>` with the find and fullscreen API stubbed honestly in every
-engine (129), find in page in the WPE, CEF, Ladybird (shim ABI 3) and NetSurf adapters
-(874dcb0…6fd6335, each with a direct engine test; Servo 0.7 has no find API), and window
-fullscreen in the host (`Host::set_fullscreen`, `WindowConfigured { fullscreen }`, 20/20
-compositor tests). The feature set and its API shapes are
-[features-2026-11-04.md](features-2026-11-04.md) (the deep-design agent's design with the
-orchestrator's amendments after [reviews-features-astra.md](reviews-features-astra.md)).
+The user asked on 5 November to finish the second run and release it as 0.11.0 ("When
+everything is done and tested push a new release: 0.11.0"), and during the day for strict
+modes, a terminal picture that never flickers, more reliability work, a `help` command, more
+`sig://` pages, the configuration editable in the browser, and a `sig://terminal`.
 
-**On branches, pushed, not merged:** `find` (worktree `../sighurt-wt-find`: lane B1, complete —
-find in the core, the runtime's one result path, both windowed chromes, the terminal's find
-field and text mode's own search, the demo engine as the test path; verified on the non-Servo
-set with headless.sh 152/152; the Servo and `--all-features` builds and ui/headless.sh not run)
-and `hist` (worktree `../sighurt-wt-hist`: lane C, stopped by the end of the day — core, runtime
-store and writer, and both windowed chromes done and tested; the GUI's answering of completion
-queries and the terminal's ghost text committed as "WIP:" without tests; README and
-extension-api.md not yet written). Resume notes with the exact shapes and merge hazards are in
-`~/.local/share/sighurt-handoff/2026-11-04/lane-B1-find-resume.md` and `lane-C-history-resume.md`
-(the lanes' reports). Their worktrees build into /data/sig-builds/targets/gwasm and
-/data/sig-builds/targets/merge.
+**Landed on `config-ext`** (local; `origin/config-ext` is still c096c75 of 4 November):
+decisions 126–135 (find in page, visited pages and completion, fullscreen, terminal images
+that are never blanked, strict modes, the third optimization and reliability pass), and the
+internal pages, whose decisions are **not written yet**: the infrastructure, `sig://help` and
+its sections, `[commands]` aliases with the default `help`, the example configuration's `?`,
+F1 and `d` (branch `pages0`, merged f0def28), and `sig://config` (branch `pagecfg`, merged
+0d040bf). The design is [pages-2026-11-05.md](pages-2026-11-05.md), its amendments A1–A10
+binding ([reviews-pages-astra.md](reviews-pages-astra.md)). An outside review of the
+implementation is [reviews-pages-impl-astra.md](reviews-pages-impl-astra.md): five findings,
+none letting a web page reach an internal page.
 
-**To resume, in order:** (1) finish and merge `find`, then `hist` (both touch
-`crates/sighurt-core/src/state.rs` and `ui/sighurt-ui/src/chrome.rs`: expect small conflicts);
-write decisions 130 (find) and 131 (history). (2) Lane D, fullscreen, per the design's "Lane D"
-amendments: the core's three states (wanted, observed, page-owned), `browser.fullscreen` through
-`Host::set_fullscreen`, the chrome listing its surfaces only when needed, page-requested
-fullscreen as a fact gated by activation with `page.exit-fullscreen` and the core's Escape
-safety override, Servo (`notify_fullscreen_state_changed`, `WebView::exit_fullscreen`) and CEF
-first, WPE after its exit path is verified in 2.52's sources; decision 132. (3) The full
-pre-commit list with Servo and WPE (the non-Servo part and the `--all-features` clippy/tests ran
-on the merged tree at the pause: see the log named in the session memory), `engines.sh`,
-`real-terminals.sh`, `coexist.sh`. (4) Rebuild `/data/sig-builds/try/sig` with every engine: the
-one there was built before shim ABI 3 and refuses the rebuilt Ladybird shim (a rebuild was
-started at the pause; `REVISION` there says which commit it is). Still owed from before: the
-0.9.0-vs-0.10.0 benchmark on louise-pc (offline all day).
+**On branches, committed, not merged, not pushed:**
+- `pagefix` (worktree `../sighurt-wt-pagefix`): the review's findings 1, 2 and 5 (a held
+  key's repeats neither lift the input hold nor follow a new page; writing the configuration
+  and starting a terminal need the window focused; the terminal's command line stays open on
+  a command that doesn't parse). Its verification had not finished when the day ended.
+- `pageterm` (worktree `../sighurt-wt-pageterm`): `sig://terminal` (the runtime's `pty`, the
+  engine's `pty`, the guest, the example keymap's rule for it, headless.sh `terminal-page`,
+  faults.sh `terminal`, tui.rs) and the review's findings 3 and 4. It ships only if the
+  verification holds; it is off by default (`[pages.terminal] enabled`).
+- `claude-md-wip`: the CLAUDE.md update for the pages (one commit on f9e2649); check it
+  against what merged before taking it.
+
+**Next, in order:** merge `pagefix`, then `pageterm`; the CI-level check; write the pages'
+decisions (136 and on: infrastructure and help, configured commands, `sig://config`,
+`sig://terminal`, the review's fixes) and take the CLAUDE.md update; the full release
+verification (the pre-commit list with Servo and WPE, headless.sh, the chromes' headless.sh,
+the host suite, engines.sh, cef.sh, Ladybird, NetSurf, real-terminals.sh, coexist.sh, soak.sh,
+faults.sh); the version 0.10.0 → 0.11.0 and the release decision; fast-forward `rewrite` and
+`main`, push `main`, `rewrite` and `config-ext`, and delete the stale `origin/find` and
+`origin/hist`. Still owed from 0.10.0: the louise-pc benchmark against 0.9.0 (the machine was
+unreachable on 4 and 5 November).
 
 ### Paused on 23 October 2026: the terminal in tmux, Servo text, persistent logins
 
