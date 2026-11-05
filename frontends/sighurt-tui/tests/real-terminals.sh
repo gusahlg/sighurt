@@ -32,6 +32,18 @@
 #             PASS if none shows the page rows half or more the terminal's background (a black
 #             flash: tmux redrawing the pane after a blank, before the next image, decision 133). The
 #             count, the time taken and the shots are in OUT/<scenario>/flicker.
+#   idle      on the pattern (a still page), 3 s: sig encodes nothing, tmux (rio-tmux-sixel) sends
+#             no sixel, and 100 screenshots show no flash.
+#   redraw    (rio-tmux-sixel, last) on the pattern, still since it was shown: a second tmux
+#             window, then $REDRAWS (20; 0 leaves it out) times away and back, a refresh-client
+#             every fifth time, and two client resizes (the output's size). tmux sends the pane's
+#             stored sixels again, oldest first, on each redraw. PASS if no redraw sends more
+#             than $REDRAW_MAX (1: the quiet page left tmux one) sixels in its first 300 ms; the
+#             counts are printed and in OUT/<scenario>/redraws.txt (from tap.log). The redraws
+#             stop at Rio's death, which is its own check, rio-redraw: Rio 0.5.28 dies on these
+#             redraws with any sixel in the pane, one that `cat` wrote included.
+#   quiet     (rio-tmux-sixel, INFO) after a tab switch, how many of 100 screenshots show the
+#             blink of the picture written again alone.
 #   tabstorm  F2 $STORM_RATE times a second (30) for $STORM_SECONDS (25; 0 leaves the check
 #             out): PASS if Rio is still running, sig took the keys (input events), answers a
 #             diagnostics report and the page shows again afterwards (Rio lost its Vulkan device
@@ -154,7 +166,9 @@ case $terminal in
     fi
     tmux_args=(-L "$tmux_name" -f "$out/tmux.conf")
     tmux() { command tmux "${tmux_args[@]}" "$@"; }
-    "$exe" -e tmux "${tmux_args[@]}" new-session -s t -- bash "$out/run.sh" > "$out/terminal.log" 2>&1 &
+    # The tmux client runs on sixel-tap.py's pty: tap.log says what tmux sends Rio, read by read.
+    "$exe" -e python3 -I "$repo/frontends/sighurt-tui/tests/sixel-tap.py" "$out/tap.log" \
+      tmux "${tmux_args[@]}" new-session -s t -- bash "$out/run.sh" > "$out/terminal.log" 2>&1 &
     ;;
 esac
 term_pid=$!
@@ -288,7 +302,7 @@ type_keys() { wtype -s 80 "$@"; }
 # "FLASHES SHOTS SECONDS": the shots whose page rows are at least half the terminal's own
 # background (the top-left pixel, Rio's title bar), as blank rows are.
 flicker() {
-  local dir=$out/flicker start end
+  local dir=$out/${flicker_dir:-flicker} start end
   mkdir -p "$dir"
   start=$(date +%s.%N)
   for i in $(seq -w 1 "${FLICKER_SHOTS:-200}"); do grim -t ppm "$dir/$i.ppm"; done
@@ -340,6 +354,13 @@ storm() {
   wtype "${args[@]}"
 }
 
+# Sixels tmux sent (tap.log) from time $1 to $2: "SIXELS BYTES".
+tapped() {
+  awk -v from="$1" -v to="$2" '$1 >= from && $1 < to { n += $2; b += $3 } END { print n + 0, b + 0 }' "$out/tap.log"
+}
+# Rio, or its log, says it died (a panicking Rio is a process while its core is dumped).
+rio_gone() { ! kill -0 "$term_pid" 2>/dev/null || grep -q panicked "$out/terminal.log"; }
+
 # ── demo pages ── (rio-tmux-sixel, rio-sixel, rio-kitty)
 if [[ $demo == 1 ]]; then
   sleep 3
@@ -356,15 +377,43 @@ if [[ $demo == 1 ]]; then
     else
       fail sixel "capabilities '$caps', $encoded bytes encoded, $coloured of $total page-row pixels coloured (screenshot $out/1-pattern.png)"
     fi
+    # ── idle ── the pattern, still.
+    sleep 2
+    report
+    encoded_before=$(field 'd["counters"]["encoded_bytes"]')
+    idle_from=$(date +%s.%N)
+    read -r flashes shots seconds < <(FLICKER_SHOTS=100 flicker_dir=idle flicker)
+    sleep $(python3 -I -c "import time,sys; print(max(0, 3 - (time.time() - float(sys.argv[1]))))" "$idle_from")
+    idle_to=$(date +%s.%N)
+    report
+    encoded=$(( $(field 'd["counters"]["encoded_bytes"]') - ${encoded_before:-0} ))
+    sent=n/a
+    [[ $terminal == rio-tmux-sixel ]] && read -r sent _ < <(tapped "$idle_from" "$idle_to")
+    if [[ $encoded == 0 && ${flashes:-1} == 0 && $sent =~ ^(0|n/a)$ ]]; then
+      pass "idle (0 bytes encoded, $sent sixels from tmux, 0 of $shots screenshots flashed)"
+    else
+      fail idle "$encoded bytes encoded, $sent sixels from tmux, $flashes of $shots screenshots flashed"
+    fi
     # ── flicker ── tab 2, the animation.
     goto_tab 2 || fail flicker "F2 did not switch to tab 2"
     sleep 3
     shot 2-animation
+    flicker_max=${FLICKER_MAX:-0}
     read -r flashes shots seconds < <(flicker)
-    if [[ ${shots:-0} -ge 60 && ${flashes:-1} == 0 ]]; then
-      pass "flicker (0 of $shots screenshots in ${seconds}s without the page)"
+    if [[ ${shots:-0} -ge 60 && ${flashes:-1} -le $flicker_max ]]; then
+      pass "flicker ($flashes of $shots screenshots in ${seconds}s without the page, at most $flicker_max)"
     else
       fail flicker "$flashes of $shots screenshots in ${seconds}s without the page ($out/flicker/flashes.txt)"
+    fi
+    # ── quiet ── (rio-tmux-sixel) a tab switch writes over the sixel on the rows; 400 ms later
+    # the picture goes again after a blank so tmux keeps it alone: how long that blink is.
+    if [[ $terminal == rio-tmux-sixel ]]; then
+      goto_tab 4 > /dev/null && sleep 3
+      wtype -k F2
+      read -r flashes shots seconds < <(FLICKER_SHOTS=100 flicker_dir=quiet flicker)
+      report
+      echo "INFO $terminal quiet: $flashes of $shots screenshots in ${seconds}s after a switch to tab $(field 'd["active_tab"]') without the page ($out/quiet/flashes.txt)"
+      goto_tab 2 > /dev/null
     fi
     # ── tabstorm ── (STORM_SECONDS=0 leaves it out)
     if [[ ${STORM_SECONDS:-25} == 0 ]]; then
@@ -397,7 +446,7 @@ print(100 - sum(p == bg for p in samples) * 100 // len(samples))
 PY
 )
     # A panicking Rio is still a process while its core is dumped: its log says.
-    if ! kill -0 "$term_pid" 2>/dev/null || grep -q panicked "$out/terminal.log"; then
+    if rio_gone; then
       fail tabstorm "Rio is gone after $(( $(date +%s) - storm_started ))s of tab switches ($out/terminal.log)"
     elif ! report; then
       fail tabstorm "sig does not answer after the tab switches"
@@ -412,6 +461,58 @@ PY
         fail tabstorm "the page did not show again (${shown:-0} % of the page rows drawn, $out/3-after-storm.png)"
       fi
     fi
+    fi
+    # ── redraw ── (rio-tmux-sixel) tmux sends its stored sixels again on each pane redraw.
+    # Last: Rio 0.5.28 does not live through it.
+    if [[ $terminal == rio-tmux-sixel && ${REDRAWS:-20} != 0 ]] && ! rio_gone; then
+      goto_tab 1 > /dev/null
+      sleep 2
+      extra=$(tmux new-window -d -t t -P -F '#{window_id}')
+      : > "$out/redraws.txt"
+      worst=0 died=
+      for i in $(seq "${REDRAWS:-20}"); do
+        tmux next-window -t t
+        sleep 0.4
+        mark=$(date +%s.%N)
+        how=window
+        if (( i % 5 == 0 )); then
+          how=refresh
+          tmux refresh-client -t "$(tmux list-clients -F '#{client_name}' | head -1)"
+        fi
+        tmux next-window -t t
+        sleep 1.5
+        # The redraw's burst: what tmux sent in the first 300 ms.
+        read -r n bytes < <(tapped "$mark" "$(python3 -I -c "import sys; print(f'{float(sys.argv[1]) + 0.3:.3f}')" "$mark")")
+        read -r all _ < <(tapped "$mark" "$(date +%s.%N)")
+        echo "$i $how: $n sixels ($bytes bytes) in the first 0.3 s, $all in 1.5 s" >> "$out/redraws.txt"
+        (( n > worst )) && worst=$n
+        rio_gone && { died="after redraw $i"; break; }
+      done
+      if [[ -z $died ]]; then
+        for size in 1200x760 1280x800; do
+          mark=$(date +%s.%N)
+          swaymsg output HEADLESS-1 resolution "$size" > /dev/null
+          sleep 2
+          read -r n bytes < <(tapped "$mark" "$(date +%s.%N)")
+          echo "resize $size: $n sixels, $bytes bytes" >> "$out/redraws.txt"
+          rio_gone && { died="after the resize to $size"; break; }
+        done
+      fi
+      shot 2b-after-redraws
+      # sig's part: what tmux holds for it. Rio 0.5.28 also dies on these redraws with one
+      # still sixel that `cat` wrote, without sig (decision 133): that is its own line.
+      if (( worst > ${REDRAW_MAX:-1} )); then
+        fail redraw "a redraw sent $worst sixels in its first 300 ms, more than ${REDRAW_MAX:-1} ($out/redraws.txt)"
+      else
+        pass "redraw (at most $worst sixels in a redraw's first 300 ms; $out/redraws.txt)"
+      fi
+      if [[ -n $died ]]; then
+        fail rio-redraw "Rio died $died ($out/redraws.txt, $out/terminal.log)"
+      else
+        pass "rio-redraw (Rio alive after ${REDRAWS:-20} redraws and 2 resizes)"
+      fi
+      sed 's/^/  /' "$out/redraws.txt"
+      tmux kill-window -t "$extra" 2>/dev/null
     fi
   else
     shot 1-pattern
