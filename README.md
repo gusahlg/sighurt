@@ -292,7 +292,7 @@ setting; `sig --default-config` prints it. Your file starts with `version = 1`, 
 key is optional.
 
 - Your file goes over the built-in one: `[routing.*]` tables merge field by field, `[engines]`,
-  `[input]`, `[input.buttons]`, `[downloads]` and `[session]` key by key, and `[keywords]`,
+  `[input]`, `[input.buttons]`, `[downloads]`, `[session]` and `[history]` key by key, and `[keywords]`,
   `[engines.*]`, `[keys]`, `[keymap.*]`, `[ui]` and `[chrome.*]` are yours alone.
 - The whole file is checked at once and every problem is reported together. A file with a
   problem is not used. At startup `sig` doesn't start: it prints the file and the problems and
@@ -374,6 +374,7 @@ tabs = "left"
 | `[chrome.line]` | `position` (`"top"`, `"bottom"`), `engine-label` (the page's engine at the line's end) | top, true |
 | `[downloads] directory` | where downloads go: an absolute path or `~/…` | the desktop's download folder, else `~/Downloads` |
 | `[session] restore` | open the tabs of the last run, and save them as they change | `true` |
+| `[history] remember` | record the pages you visit, to complete what you type in the address line, and save them; `false` records nothing, drops what was read, and leaves the file as it is | `true` |
 
 The session is `~/.local/state/sighurt/session.toml`. One `sig` at a time saves it (it holds
 `session.lock` beside it); another started meanwhile restores the same tabs but doesn't save its
@@ -382,6 +383,24 @@ instead of being written over, and a damaged tab in it is left out with a notice
 at most 1000 tabs. Profiles, each private (0700), are
 `~/.local/share/sighurt/servo`, `wpe`, `cef`, `ladybird` and `wasm`. NetSurf keeps no profile
 directory yet.
+
+The visited pages are `~/.local/state/sighurt/history.toml` (0600), beside the session and
+saved by the same `sig`: each address (without its `#fragment`) with its title, when you last
+visited it and how often. Only http and https pages you open in the tab shown are recorded: not
+`sig:`, `file:`, `data:` or `blob:` pages, not addresses with a user name or password in them, not
+reloads, back and forward or a page changing its own address (`pushState`), not pages in a
+background tab or in an engine with `storage = "ephemeral"`, and nothing `sig --dump` shows. It
+keeps the 5000 visited last and forgets visits older than 90 days when it starts; it writes the
+file at most every 30 seconds, only when something changed, and at quit. A file over 4 MiB, or
+one it can't read, is kept as `history.toml.broken-<seconds>`. Another `sig` started meanwhile
+completes from the file but doesn't save its own visits, and says so.
+
+**To keep nothing:** `storage = "ephemeral"` in `[engines.<engine>]` for each engine (cookies,
+site data and caches), `[session] restore = false` (the tabs) and `[history] remember = false`
+(the visited pages). They are separate: each covers its own file. `history.clear` empties the
+history file at once, with `remember` on or off; `site.forget <host>` takes that site's pages out
+of it too. Neither touches a `*.broken-<seconds>` copy. The list of closed tabs `tab.reopen`
+restores is in memory only.
 
 ### Which engine opens a page
 
@@ -441,12 +460,12 @@ command, typed into the address line) all run them.
 | `page.find [text]`, `page.find-next`, `page.find-previous`, `page.find-stop` | find text (at most 1024 bytes) in the page shown, wrapping around (case-sensitive only when the text has a capital letter), or with no text open the chrome's [find field](#find-in-page); move between the matches; end the search. A page nothing can search says so |
 | `page.exit-fullscreen` | leave the fullscreen a page put one of its elements in (a video, a game) |
 | `location.focus [text]` | focus the address line with its text selected; with text, the line holds that text instead (`location.focus :` opens the command line) |
-| `history.clear` | forget the pages you visited |
+| `history.clear` | forget the pages you visited: the history file is emptied at once (in a `sig` that doesn't own it, only its own memory, and it says so) |
 | `browser.fullscreen` | put the window in fullscreen, or take it out |
 | `clipboard.copy <text>` | put the text on the clipboard |
 | `browser.home` | open the home page in the active tab |
 | `browser.quit` | quit, saving the tabs |
-| `site.forget [host]` | forget that site's cookies and stored data in every engine that keeps them (no argument: the page shown); no wildcards |
+| `site.forget [host]` | forget that site's cookies and stored data in every engine that keeps them, and its visited pages (no argument: the page shown); no wildcards |
 | `chrome.<action>` | one of the chrome's own commands, no argument: the standard chrome's is `chrome.toggle-tabs`; the terminal's are `chrome.toggle-mode`, `chrome.text-mode`, `chrome.graphics-mode` and `chrome.refresh` |
 
 ### Keys
@@ -528,6 +547,18 @@ The page's engine searches, where it can: Servo and the Wasm engine can't. In th
 mode `sig` searches the page's text itself, with any engine that has page text: the find field
 is the bottom line, and the match found is highlighted and scrolled into view. Switching between
 text and graphics ends the search.
+
+### Completing addresses
+
+Typing an address in the address line completes it from the pages you visited: the rest of
+the address shows after the cursor, dimmed, and `Right` or `Tab` takes it, the exact address
+you visited (`Enter` alone opens what you typed). What you type matches the start of an address,
+with or without its `https://` or `http://` and its `www.`, in any case: `exa` completes to
+`https://www.example.com/`, `https://www.e` too, but `http://www.e` doesn't. The most recently
+visited address wins. Only typed text completes, with the cursor at its end and nothing
+selected: not the address the line was focused with, not a `:command` and not the find field.
+The standard chrome, the line chrome and the terminal's address line all do this. Nothing is
+completed with `[history] remember = false`.
 
 ### Copy and paste
 
@@ -644,7 +675,7 @@ worked examples are [`sighurt-config-example`](extensions/sighurt-config-example
 | Crate | What it is |
 |---|---|
 | [`sighurt-browser`](apps/sighurt-browser/) | `sig`: arguments, process-wide setup, the choice of frontend |
-| [`sighurt-runtime`](crates/sighurt-runtime/) | what every frontend shares: configuration and session files, the engine registry, carrying out the core's effects, downloads, diagnostics, shutdown |
+| [`sighurt-runtime`](crates/sighurt-runtime/) | what every frontend shares: configuration and session files, the history of visited pages, the engine registry, carrying out the core's effects, downloads, diagnostics, shutdown |
 | [`sighurt-gui`](frontends/sighurt-gui/) | the Wayland frontend: the event loop, the chrome's surfaces, engines bound to Wayland targets, the clipboard |
 | [`sighurt-tui`](frontends/sighurt-tui/) | the terminal frontend: terminal I/O, the cell grid, the chrome as text, pages as kitty graphics or reflowed text, `sig --dump` |
 | [`sighurt-semantic`](engines/sighurt-semantic/) | the DOM extraction script and bounded parser that give text mode a page's content (used by the Servo and WPE adapters) |
