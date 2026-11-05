@@ -17,7 +17,8 @@ default = []
 # constructs the runtime. The demo engine's concrete type never appears here: its descriptor
 # is the name `demo` and no capabilities, so this crate does not depend on it.
 engine-servo = ["dep:sighurt-engine-servo"]
-engine-wasm = ["dep:sighurt-engine-wasm"]
+# The Wasm engine brings Sighurt's internal pages, which run in it (sighurt-pages).
+engine-wasm = ["dep:sighurt-engine-wasm", "dep:sighurt-pages"]
 engine-wpe = ["dep:sighurt-engine-wpe"]
 engine-ladybird = ["dep:sighurt-engine-ladybird"]
 # Chromium (docs/rewrite/CEF.md). Opt-in: its prefix is 2.8 GB.
@@ -35,6 +36,7 @@ sighurt-api = { path = "../sighurt-api" }
 sighurt-core = { path = "../sighurt-core" }
 sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional = true }
 sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm", optional = true }
+sighurt-pages = { path = "../sighurt-pages", optional = true }
 sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = true }
 sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird", optional = true }
 sighurt-engine-netsurf = { path = "../../engines/sighurt-engine-netsurf", optional = true }

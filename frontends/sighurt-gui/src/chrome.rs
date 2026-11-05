@@ -97,11 +97,14 @@ pub fn command(kind: &ChromeKind, action: String) -> Result<ChromeEvent, String>
 }
 
 /// The engine `tab`'s page runs in, by its configured name: the engine of the view it shows, and
-/// none for `sig:` pages, blank tabs and errors. Browser state the core keeps, which the chrome
+/// none for `sig:` pages (the chrome's and the internal pages), blank tabs and errors. Browser state the core keeps, which the chrome
 /// labels the tab with.
 pub fn engine<'a>(core: &'a BrowserState, tab: &TabSummary<'_>) -> Option<&'a str> {
     match tab.content {
-        Content::View(view) => core.view(view).map(|view| view.engine()),
+        Content::View(view) => core
+            .view(view)
+            .filter(|view| view.page().is_none())
+            .map(|view| view.engine()),
         Content::Internal(_) | Content::Blank => None,
     }
 }
@@ -123,6 +126,7 @@ pub fn snapshot(
         home,
         keymap: core.keymap_indicator().map(str::to_owned),
         fullscreen: core.fullscreen().window,
+        commands: core.config().commands().keys().cloned().collect(),
         ..Snapshot::default()
     };
     let count = cache.tabs.len();
