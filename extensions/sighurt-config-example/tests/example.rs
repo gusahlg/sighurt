@@ -198,8 +198,12 @@ fn the_table_is_valid_in_both_frontends() {
                 word.parse::<Chord>()
                     .unwrap_or_else(|e| panic!("{keys:?}: {e}"));
             }
+            // Built-in commands, and `help` of the built-in configuration's `[commands]`.
             if let Action::Run(text) | Action::RunThenPass(text) = action {
-                text.parse::<Command>()
+                let custom = ["help".to_owned()];
+                CommandSet::ANY
+                    .with_custom(&custom)
+                    .parse(text)
                     .unwrap_or_else(|e| panic!("{text:?}: {e}"));
             }
         }
@@ -516,6 +520,7 @@ fn the_shared_table_in_normal_mode() {
         (ctrl('o'), "location.focus"),
         (typed('t'), "tab.new"),
         (typed('x'), "tab.close"),
+        (typed('d'), "tab.close"),
         (typed('u'), "tab.reopen"),
         (typed(':'), "location.focus :"),
         (typed('/'), "page.find"),
@@ -543,6 +548,50 @@ fn the_shared_table_in_normal_mode() {
     assert_eq!(keymap.press(&typed('z'), PAGE, &b), KeyAction::Take);
     let z = typed('z');
     assert_eq!(keymap.press(&repeat(&z), PAGE, &b), KeyAction::Take);
+}
+
+#[test]
+fn question_mark_and_f1_run_the_configurations_help() {
+    let b = Fake::new(Frontend::Gui);
+    let mut keymap = example();
+    let help = KeyAction::Run(Command::Custom("help".into()));
+    let question = KeyEvent {
+        code: KeyCode(53),
+        ..typed('?')
+    };
+    assert_eq!(keymap.press(&question, PAGE, &b), help);
+    let f1 = named("F1", 59);
+    assert_eq!(keymap.press(&f1, PAGE, &b), help);
+    // F1 also from the address line; ? there is typing.
+    assert_eq!(keymap.press(&f1, CHROME, &b), help);
+    assert_eq!(keymap.press(&question, CHROME, &b), KeyAction::Pass);
+}
+
+#[test]
+fn describe_lists_every_binding_of_the_frontend_by_mode() {
+    let keymap = example();
+    for frontend in [Frontend::Gui, Frontend::Terminal] {
+        let described = keymap.describe(frontend);
+        assert_eq!(described.len(), bindings(frontend).count());
+        let find = |keys: &str| {
+            described
+                .iter()
+                .find(|b| b.keys == keys)
+                .unwrap_or_else(|| panic!("{keys}"))
+        };
+        assert_eq!(
+            (find("d").mode.as_str(), find("d").action.as_str()),
+            ("NORMAL", "tab.close")
+        );
+        assert_eq!(find("?").action, "help");
+        assert_eq!(find("f1").applies, "also in the address line");
+        assert_eq!(find("y y").action, "copy the page's address");
+        assert!(described
+            .iter()
+            .any(|b| b.mode == "INSERT" && b.keys == "escape"));
+        let terminal_only = described.iter().any(|b| b.keys == "ctrl-c");
+        assert_eq!(terminal_only, frontend == Frontend::Terminal);
+    }
 }
 
 #[test]

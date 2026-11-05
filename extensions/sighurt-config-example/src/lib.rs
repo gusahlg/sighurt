@@ -34,12 +34,10 @@
 pub mod actions;
 pub mod table;
 
-use std::str::FromStr;
-
 use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::input::{KeyCode, KeyEvent, KeyboardFocus};
 use sighurt_api::keymap::{
-    is_modifier, Browser, Chord, Frontend, KeyAction, KeyContext, Keymap, KeymapKind,
+    is_modifier, Browser, Chord, Frontend, KeyAction, KeyBinding, KeyContext, Keymap, KeymapKind,
 };
 use sighurt_api::settings::Table;
 
@@ -55,16 +53,25 @@ pub const KIND: KeymapKind = KeymapKind {
 /// The most keystrokes in one binding.
 pub const MAX_KEYS: usize = 4;
 
-fn check(table: &Table, _commands: &CommandSet<'_>) -> Vec<String> {
-    table
-        .keys()
-        .map(|key| {
+fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
+    let settings = table.keys().map(|key| {
+        format!(
+            "[keymap.example] takes no settings; the example configuration's bindings are in \
+             its crate (not {key:?})"
+        )
+    });
+    // Its commands of `[commands]` (help) must be the configuration's.
+    let actions = table::NORMAL.iter().chain(table::INSERT);
+    let commands = actions.filter_map(|binding| match binding.action {
+        Action::Run(text) | Action::RunThenPass(text) => commands.parse(text).err().map(|e| {
             format!(
-                "[keymap.example] takes no settings; the example configuration's bindings are \
-                 in its crate (not {key:?})"
+                "the example configuration binds {} to {text}: {e}",
+                binding.keys
             )
-        })
-        .collect()
+        }),
+        _ => None,
+    });
+    settings.chain(commands).collect()
 }
 
 /// The bindings that exist in `frontend`, in both modes, as `(keys, action)`.
@@ -104,8 +111,11 @@ enum Resolved {
 /// Parses `table`'s bindings. A bad built-in key or command is a bug of this crate; the tests
 /// parse every entry.
 fn parse(table: &[Binding]) -> Vec<Parsed> {
+    // Its commands of `[commands]` (help) are checked when the configuration loads (`check`).
     let command = |text: &str| {
-        Command::from_str(text).unwrap_or_else(|e| panic!("built-in command {text:?}: {e}"))
+        CommandSet::ANY
+            .parse(text)
+            .unwrap_or_else(|e| panic!("built-in command {text:?}: {e}"))
     };
     table
         .iter()
@@ -305,5 +315,43 @@ impl Keymap for Example {
 
     fn page_takes_text(&self) -> bool {
         self.mode == Mode::Insert
+    }
+
+    fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
+        let modes = [("NORMAL", table::NORMAL), ("INSERT", table::INSERT)];
+        let mut found = Vec::new();
+        for (mode, table) in modes {
+            for binding in table.iter().filter(|b| exists_in(b.frontend, frontend)) {
+                let action = match binding.action {
+                    Action::Run(text) | Action::RunThenPass(text) => text.to_owned(),
+                    Action::Mode(Mode::Insert) => "INSERT mode".to_owned(),
+                    Action::Mode(Mode::Normal) => "NORMAL mode".to_owned(),
+                    Action::ExitFullscreenOr(Mode::Insert) => {
+                        "INSERT mode (or leave a page's fullscreen)".to_owned()
+                    }
+                    Action::ExitFullscreenOr(Mode::Normal) => {
+                        "NORMAL mode (or leave a page's fullscreen)".to_owned()
+                    }
+                    Action::Custom(_) => describe_custom(binding.keys).to_owned(),
+                };
+                let applies = match binding.scope {
+                    Scope::Page => "in the page",
+                    Scope::NoField => "in the page, not in a text field",
+                    Scope::Always => "also in the address line",
+                };
+                found.push(KeyBinding::new(mode, binding.keys, action, applies));
+            }
+        }
+        found
+    }
+}
+
+/// What a binding computed from the browser does, for the help page.
+fn describe_custom(keys: &str) -> &'static str {
+    match keys {
+        "y y" => "copy the page's address",
+        "y f" => "copy the link under the pointer",
+        "c o" => "close the other tabs",
+        _ => "an action of the example configuration",
     }
 }
