@@ -12,8 +12,8 @@ use std::cell::RefCell;
 
 use sig_page_kit::sig::{self, Program, Status};
 use sighurt_sdk::{
-    canvas_clear, canvas_dimensions, canvas_measure_text, canvas_rect, canvas_text_ex,
-    get_location, FONT_STYLE_ITALIC, FONT_STYLE_NORMAL, TEXT_ALIGN_LEFT,
+    canvas_clear, canvas_dimensions, canvas_measure_text, canvas_rect, canvas_text_ex, get_url,
+    FONT_STYLE_ITALIC, FONT_STYLE_NORMAL, TEXT_ALIGN_LEFT,
 };
 
 use crate::app::{App, Host, Terminal};
@@ -105,7 +105,8 @@ fn face() -> Option<(&'static str, Metrics)> {
 
 #[no_mangle]
 pub extern "C" fn start_app() {
-    let program = get_location().map_or(Program::Shell, |url| crate::program_for(&url));
+    // The page's own address (`api_get_location`, the browser's, is not an internal page's).
+    let program = crate::program_for(&get_url());
     PAGE.with(|page| {
         *page.borrow_mut() = Some(Page {
             app: App::new(program),

@@ -124,6 +124,8 @@ impl<P: Terminal> App<P> {
         let (cols, rows) = self.size;
         self.term = Term::new(rows, cols);
         self.pending.clear();
+        // Close the ended terminal first: a document has one at a time.
+        self.phase = Phase::Start { refused: false };
         self.phase = match host.open(self.program, cols, rows) {
             Some(pty) => Phase::Opening(pty),
             None => Phase::Start { refused: true },
@@ -387,7 +389,9 @@ mod tests {
         type Pty = Pty;
         fn open(&mut self, program: Program, cols: u16, rows: u16) -> Option<Pty> {
             self.opened.push((program, cols, rows));
-            (!self.refuse).then(|| self.pty.clone())
+            // As the engine: one terminal a document, until the page drops it.
+            let held = Rc::strong_count(&self.pty.0) > 1;
+            (!self.refuse && !held).then(|| self.pty.clone())
         }
     }
 
@@ -572,9 +576,13 @@ mod tests {
         app.frame((40, 10));
         assert!(app.take_dirty());
         assert!(shown(&app).contains("exited with status 3. Press Enter"));
-        // Typing does nothing; Enter opens a new terminal.
+        // Typing does nothing; Enter closes the ended terminal and opens a new one.
         app.input(&mut browser, &press("x", "x", 0));
         app.input(&mut browser, &press("Enter", "\r", 0));
         assert_eq!(browser.opened.len(), 2);
+        assert!(
+            matches!(app.phase, Phase::Opening(_)),
+            "refused: a terminal still held"
+        );
     }
 }
