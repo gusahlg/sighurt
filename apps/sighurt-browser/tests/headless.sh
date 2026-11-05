@@ -63,6 +63,11 @@
 #               20 open-and-close cycles no descriptor in sig; sig://terminal/config runs $VISUAL
 #               on the configuration; with the setting off, Enter starts nothing and the page
 #               says how to turn it on (it differs from the start page)
+#   config-page sig://config on a configuration linked from another directory: Escape (INSERT),
+#               a valid change typed and Ctrl+S: the linked file changes and stays linked, the
+#               chrome takes the new tab colour and the core the new [commands] alias; an invalid
+#               line is refused with the file unchanged; a file changed behind the page is
+#               refused as stale, and after "Read the file again" a save keeps both changes
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
 #               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
@@ -81,7 +86,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen pages terminal-page renderers)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen pages config-page terminal-page renderers)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (with other features); this link keeps the binary these
   # runs use. It is made under the same hold of the machine's lock as the build, so no other
@@ -736,6 +741,8 @@ PY
   band 07-cleared
   r=$(same 06-before-clear 07-cleared); check "history.clear takes the completion away" "$([[ ${r%% *} == 1 ]]; echo $?)" "${r#* }"
   key -k Escape
+  # "At once" is without the 30 s save delay: the writer's fsync can take a while on a busy disk.
+  for _ in $(seq 50); do grep -q 'example' "$history" || break; sleep 0.1; done
   check "and empties the file at once" "$(grep -q 'example' "$history"; [[ $? == 1 ]]; echo $?)" "$(wc -c < "$history") bytes"
   check "which stays private" "$([[ $(stat -c %a "$history") == 600 ]]; echo $?)" "mode $(stat -c %a "$history")"
   key -M ctrl q -m ctrl
@@ -1098,6 +1105,101 @@ PY
     "$([[ $(tabs_count) == 3 && $(shown_engine) == "['demo']" && $(diag "d['status']") == notice ]]; echo $?)" \
     "$(tabs_now) $(shown_engine), status $(diag "d['status']")"
   shot 03-refused 0.5
+  key q
+  wait "$sig_pid"
+  ;;
+
+config-page)
+  # The configuration is a link into another directory, as a dotfiles repository makes it: the
+  # file watch sees nothing there, so what applies after a save is the page's own reload.
+  mkdir -p "$out/dotfiles"
+  cat > "$out/dotfiles/sig.toml" <<'CONF'
+version = 1
+[engines]
+default = "demo"
+[routing.demo]
+schemes = ["demo"]
+CONF
+  ln -sf ../../dotfiles/sig.toml "$out/config/sighurt/config.toml"
+  file=$out/dotfiles/sig.toml
+  tabs_count() { diag "len(d['tabs'])"; }
+  # save: Ctrl+S, and the time the page needs to hear back.
+  save() { key -M ctrl s -m ctrl; sleep 1.5; }
+  # violet SHOT: 0 if the top of the window (the tabs) has the colour #7c3aed somewhere.
+  violet() {
+    grim -t ppm "$out/$1.ppm"
+    python3 - "$out/$1.ppm" <<'PY'
+import re, sys
+data = open(sys.argv[1], 'rb').read()
+m = re.match(rb'P6\s+(\d+)\s+(\d+)\s+\d+\s', data)
+w, pixels = int(m[1]), data[m.end():]
+n = sum(1 for y in range(40) for x in range(0, w, 2)
+        if all(abs(a - b) <= 6 for a, b in zip(pixels[3 * (y * w + x):3 * (y * w + x) + 3], (0x7c, 0x3a, 0xed))))
+print(0 if n > 100 else 1, f"{n} violet pixels in the tabs")
+PY
+  }
+  start_sig sig://config
+  sleep 2
+  check "sig://config opens in the Wasm engine" \
+    "$(diag "0 if [x['engine'] for x in t if x['role']=='view' and x['shown']]==['wasm'] else 1")" "$(tabs_now)"
+  shot 01-config 0.5
+  reloads=$(diag "c['config_reloads']")
+  key -k Escape
+  check "Escape: INSERT MODE" "$(diag "0 if d['keymap_indicator']=='INSERT MODE' else 1")" "$(diag "d['keymap_indicator']")"
+  key -M ctrl -k End -m ctrl
+  key -k Return; wtype '[commands]'; key -k Return
+  wtype 'cfgtest = "tab.new demo://pattern"'; key -k Return
+  wtype '[ui.colors]'; key -k Return
+  wtype 'tab = "#7c3aed"'
+  sleep 1
+  shot 02-typed
+  save
+  shot 03-saved
+  check "Ctrl+S writes the linked file" "$(grep -q '^cfgtest = "tab.new demo://pattern"$' "$file"; echo $?)" \
+    "$(tr '\n' '|' < "$file")"
+  check "and the link stays a link" "$([[ -L $out/config/sighurt/config.toml ]]; echo $?)" \
+    "$(ls -l "$out/config/sighurt/config.toml" | sed 's/.* -> /-> /')"
+  check "the frontend reloaded it, though its watch can't see the file" \
+    "$(diag "0 if c['config_reloads']>$reloads else 1")" "$(diag "c['config_reloads']") reloads, $reloads before"
+  colour=$(violet 03-saved)
+  check "the chrome takes the new tab colour" "${colour%% *}" "${colour#* }"
+  key -k Escape
+  key ':'; wtype cfgtest; key -k Return
+  sleep 1
+  check "the core takes the new alias: :cfgtest opens a tab" "$([[ $(tabs_count) == 2 ]]; echo $?)" "$(tabs_now)"
+  key -M alt 1 -m alt
+  sleep 0.5
+  before=$(md5sum < "$file")
+  key -k Escape
+  key -M ctrl -k End -m ctrl
+  key -k Return; wtype 'zoom = 99'
+  save
+  shot 04-invalid-refused
+  check "an invalid save is refused and the file stays" "$([[ $(md5sum < "$file") == "$before" ]]; echo $?)" \
+    "$(tail -1 "$file")"
+  # Take the line back: select it to its start, delete it and the line break.
+  key -M shift -k Home -m shift; key -k BackSpace; key -k BackSpace
+  # The page saved no line break at the end.
+  printf '\n# written elsewhere\n' >> "$file"
+  key -k Return; wtype '# mine'
+  save
+  shot 05-stale-refused
+  check "a file changed behind the page is refused as stale" \
+    "$(grep -q '^# written elsewhere$' "$file" && ! grep -q '^# mine$' "$file"; echo $?)" "$(tail -2 "$file" | tr '\n' '|')"
+  # "Read the file again", left of Save at the header's right: the window is 1280 wide, Save
+  # 70 and the button 170 wide, 12 and 6 apart; the header starts at the page's top.
+  page_h=$(diag "[x['height'] for x in t if x['role']=='view' and x['shown']][0]")
+  top=$((layout_h - 20 - page_h))
+  click $((1280 - 12 - 70 - 6 - 85)) $((top + 16))
+  sleep 1
+  shot 06-read-again
+  key -M ctrl -k End -m ctrl
+  key -k Return; wtype '# mine'
+  save
+  shot 07-saved-over-both
+  check "after reading it again, a save keeps both changes" \
+    "$(grep -q '^# written elsewhere$' "$file" && grep -q '^# mine$' "$file"; echo $?)" "$(tail -3 "$file" | tr '\n' '|')"
+  key -k Escape
   key q
   wait "$sig_pid"
   ;;

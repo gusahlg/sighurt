@@ -302,8 +302,9 @@ the guide to writing them.
 
 ## Configuration
 
-Everything is configured in one TOML file, `~/.config/sighurt/config.toml` (`$XDG_CONFIG_HOME`);
-there is no settings screen. The built-in configuration,
+Everything is configured in one TOML file, `~/.config/sighurt/config.toml` (`$XDG_CONFIG_HOME`),
+which you edit in any editor or in the browser at `sig://config` ([below](#editing-it-in-the-browser)).
+The built-in configuration,
 [`crates/sighurt-core/src/default-config.toml`](crates/sighurt-core/src/default-config.toml), documents every
 setting; `sig --default-config` prints it. Your file starts with `version = 1`, and every other
 key is optional.
@@ -361,6 +362,27 @@ tab = "#7c3aed"
 [chrome.standard]
 tabs = "left"
 ```
+
+### Editing it in the browser
+
+`sig://config` is the file in a plain text editor: line numbers, light TOML colouring,
+selection with Shift and the mouse, undo and redo (Ctrl+Z, Ctrl+Shift+Z), copy, cut and paste.
+With the example keymap, Escape switches to INSERT mode so the keys reach the page; Ctrl+S (or
+the Save button) saves. The text is checked as you type, with the same checks as a reload, and
+the problems are listed under the editor with their lines (a click goes to the line).
+
+- A save is refused when the text has a problem (the file stays as it was), when it is over
+  256 KiB, and when the file changed since the page read it, by another `sig` or an editor:
+  "Read the file again" shows what it holds now, and Ctrl+Z brings your text back. Two `sig`s
+  saving at once take turns (a lock file, `.config.toml.lock`, beside the file), and the second
+  is refused; an editor that doesn't take `sig`'s
+  lock can still write between the check and the save, as with any two editors of one file.
+- A saved file applies at once, as one saved by an editor does, and the page says which settings
+  wait for a restart. A file that is a link (into a dotfiles repository) is saved where the link
+  leads, its mode kept; one that can't be written, such as a home-manager link into the
+  read-only store, is shown and not saved. Without a file, the page starts from `version = 1`
+  and a pointer to `sig://help/config`, and the first save creates it (mode 0600).
+- In the terminal frontend the page needs graphics, like every `sig://` page.
 
 ### Reference
 

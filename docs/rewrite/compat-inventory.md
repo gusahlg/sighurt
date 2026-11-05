@@ -128,7 +128,7 @@ Sources: `sighurt-ui/src/{lib,browser,toolbar,pages}.rs`, `sighurt-core/src/{nav
 | The URL bar shows the tab's URL until the user edits it; switching tabs drops the edit; focusing it selects everything | keep | Plan §6 also separates the edited, requested and committed URL. |
 | Status bar: the page's status text (the link under the pointer) or the latest download status | keep | |
 | `sig://home` (also `sig:home`, `SIG://Home/`): lists each configured engine with its command, whether it was found and which is the default | change | Engines are compiled in: list the compiled and enabled engines with their diagnostics (renderer, fallback mode; plan §26). |
-| Any other `sig:` URL: "Sighurt has no such page. Its only page is sig://home." | keep | |
+| Any other `sig:` URL: "Sighurt has no such page. sig://help lists its pages." | keep | |
 | Errors (an unopenable URL, an engine failure) are drawn in the content area | keep | Plan §16 separates a failed load from a runtime failure. |
 | Each tab has one history across engines; back and forward go through the engine's own history when the neighbouring entry is there, otherwise reopen the entry, possibly in another engine; engine history is matched by URL | change | Plan §16: history segments per engine view; no URL-equality heuristics. |
 | Page zoom per tab, kept when the tab switches engines | keep | `ViewOptions::zoom`. |

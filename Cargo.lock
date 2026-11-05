@@ -10384,6 +10384,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "sig-page-config"
+version = "0.10.0"
+dependencies = [
+ "sig-page-kit",
+ "sighurt-sdk",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "sig-page-help"
 version = "0.10.0"
 dependencies = [
