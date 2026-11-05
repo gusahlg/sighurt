@@ -1072,13 +1072,28 @@ mod tests {
         let _serial = serial();
         let (_home, vars) = home();
         let ptys = ptys();
-        let fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
-        let before = fds();
+        // Other tests of the crate open descriptors meanwhile, so look for this test's own: no
+        // pty is left open, and failing many times leaves no pipes behind.
+        let fds = |what: &str| {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter(|target| target.to_string_lossy().starts_with(what))
+                .count()
+        };
+        let pipes = fds("pipe:");
         let mut exec = sh("", &vars);
         exec.argv = vec!["/nonexistent/program".into()];
-        let err = ptys.start(RequestId::next(), &exec, 80, 24).unwrap_err();
-        assert!(err.contains("/nonexistent/program"), "{err}");
-        assert_eq!(fds(), before);
+        for _ in 0..50 {
+            let err = ptys.start(RequestId::next(), &exec, 80, 24).unwrap_err();
+            assert!(err.contains("/nonexistent/program"), "{err}");
+        }
+        assert_eq!(fds("/dev/ptmx") + fds("/dev/pts/"), 0);
+        assert!(
+            fds("pipe:") < pipes + 50,
+            "{} pipes, {pipes} before",
+            fds("pipe:")
+        );
         assert_eq!(ptys.live(), 0);
     }
 
