@@ -42,7 +42,7 @@ sighurt-engine-cef = { path = "../../engines/sighurt-engine-cef", optional = tru
 # The example configuration, the built-in keymap of every build (docs/rewrite/config-extension.md).
 sighurt-config-example = { path = "../../extensions/sighurt-config-example" }
 # The configuration watch (inotify) and CLOCK_MONOTONIC for the diagnostics lines.
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["event", "fs", "process", "pty", "termios"] }
 # `_exit` after an engine that could not shut down (decision 54).
 libc = "0.2"
 dirs = "5"

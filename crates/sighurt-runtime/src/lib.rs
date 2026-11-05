@@ -14,6 +14,7 @@ pub mod engines;
 pub mod frontend;
 pub mod history;
 pub mod persistence;
+pub mod pty;
 pub mod registry;
 pub mod services;
 pub mod session;
