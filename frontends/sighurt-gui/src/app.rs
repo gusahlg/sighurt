@@ -44,6 +44,10 @@
 //! starts ([`crate::render`]); the fonts are loaded once and shared by the chrome (which shapes)
 //! and the renderer (which rasterizes). A surface the placement hides is unbound from a pixel
 //! renderer, which forgets its last frame: the host detaches a hidden SHM surface's buffer.
+//! The chrome's `ChromeAction::Complete` is answered in the same pass, from the runtime's
+//! history in memory ([`Session::complete`]), as `ChromeEvent::Completions`; the latest request
+//! is answered again when the history forgets or drops visits, so a completion shown can't
+//! outlive them.
 //!
 //! A native renderer (wgpu) binds each chrome target when it is created, keeps the binding across
 //! hides (forgetting the last frame, which the host no longer counts as shown), and renders and
@@ -102,7 +106,8 @@ use sighurt_runtime::services::{Clipboard, Services};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
 use sighurt_runtime::view::ViewEntry;
 use sighurt_ui::extension::{
-    Chrome, ChromeAction, ChromeEvent, SurfaceName, TextField, MAX_SURFACES,
+    contained, Chrome, ChromeAction, ChromeEvent, Completion, SurfaceName, TextField,
+    MAX_COMPLETION_TITLE, MAX_COMPLETION_URL, MAX_SURFACES,
 };
 use sighurt_ui::{Colors, EngineRow, Fonts, HomeInfo, Snapshot};
 use sighurt_wayland::{
@@ -194,6 +199,12 @@ struct Gui {
     notice_first: Option<Instant>,
     /// The chrome's clipboard read in flight.
     paste: Option<RequestId>,
+    /// The chrome's latest `ChromeAction::Complete`, not answered yet.
+    complete: Option<(RequestId, String)>,
+    /// The latest one answered, to answer again when the history forgets visits.
+    completed: Option<(RequestId, String)>,
+    /// [`Session::history_generation`] when the chrome was last answered.
+    history_seen: u64,
     keyboard_target: Option<TargetId>,
     /// The target whose text field the input method has.
     page_text_target: Option<TargetId>,
@@ -540,6 +551,10 @@ impl Gui {
                         self.host.invalidate(target);
                     }
                 }
+                // Answered by the loop, which has the history ([`App::answer_completions`]).
+                ChromeAction::Complete { request, prefix } => {
+                    self.complete = Some((request, prefix));
+                }
             }
         }
     }
@@ -879,6 +894,9 @@ impl App {
             notice: None,
             notice_first: None,
             paste: None,
+            complete: None,
+            completed: None,
+            history_seen: 0,
             keyboard_target: None,
             page_text_target: None,
             retiring: Vec::new(),
@@ -955,6 +973,7 @@ impl App {
             let mut worked = self.drain_host_events();
             worked |= self.session.service_completions(&mut self.gui);
             worked |= self.session.pump(&mut self.gui);
+            worked |= self.answer_completions();
             worked |= self.refresh_chrome();
             worked |= self.present();
             if !worked {
@@ -968,6 +987,43 @@ impl App {
         self.session.write_due();
         self.gui.host.flush();
         busy && !self.session.has_quit()
+    }
+
+    /// Answers the chrome's latest `ChromeAction::Complete` from the history, or the one
+    /// answered last again when the history forgot or dropped visits since. Returns whether it
+    /// answered.
+    fn answer_completions(&mut self) -> bool {
+        let generation = self.session.history_generation();
+        let forgot = std::mem::replace(&mut self.gui.history_seen, generation) != generation;
+        let asked = match self.gui.complete.take() {
+            Some(asked) => asked,
+            None if forgot => match self.gui.completed.take() {
+                Some(asked) => asked,
+                None => return false,
+            },
+            None => return false,
+        };
+        // The address goes as it is, so only one that needs no containing; the title is page
+        // text.
+        let matches = self
+            .session
+            .complete(&asked.1)
+            .into_iter()
+            .filter(|found| {
+                let printable = found.url.bytes().all(|b| (0x21..0x7f).contains(&b));
+                printable && found.url.len() <= MAX_COMPLETION_URL
+            })
+            .map(|found| {
+                let title = contained(&found.title, MAX_COMPLETION_TITLE);
+                Completion::new(found.url, title)
+            })
+            .collect();
+        let request = asked.0;
+        self.gui.completed = Some(asked);
+        let queue = self.session.queue_mut();
+        self.gui
+            .chrome_event(queue, ChromeEvent::Completions { request, matches });
+        true
     }
 
     /// How long the loop may sleep: until the earliest pump deadline, session or history save,

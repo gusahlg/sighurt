@@ -29,6 +29,13 @@
 //! selection (tmux) answers the waiting read. A reply for the address line belongs to that
 //! line and is dropped when the line closes or is replaced.
 //!
+//! The address line completes what is typed from the visited pages: after each pass the loop
+//! asks the runtime's history ([`Session::complete`]) about the line's text, while the cursor is
+//! at its end, nothing is selected, the text is not the address the line opened with and is not
+//! a `:command`; the rest of the first address it completes to shows in grey after the cursor,
+//! and Right or Tab takes that address, exactly. Any change of the line, or the history
+//! forgetting visits, asks again.
+//!
 //! Text mode (TUI.md §4, [`crate::text`]): `[tui] mode`, or `chrome.toggle-mode` for the run,
 //! decides whether the page rows show pixels or the page's text. In text mode the shown view's
 //! engine is asked for snapshots ([`Session::set_semantics`]), the others' are not, and the
@@ -87,6 +94,7 @@ use sighurt_core::{
 };
 use sighurt_runtime::diagnostics::{Diagnostics, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
+use sighurt_runtime::history;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
 use sighurt_runtime::services::{Clipboard, Services, MAX_CLIPBOARD};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
@@ -316,6 +324,12 @@ struct Tui {
     editing_fresh: bool,
     /// The active tab's address when the core last ran, for the address line to start from.
     active_url: String,
+    /// The text the history was last asked to complete, if the line could take one.
+    completed_for: Option<String>,
+    /// The visited address the line's text completes to, and that text.
+    ghost: Option<(String, String)>,
+    /// `Session::history_generation` when the history was last asked.
+    history_seen: u64,
     notice: Option<String>,
     notice_first: Option<Instant>,
     /// The shown page has a text field: a paste goes there.
@@ -586,6 +600,9 @@ impl App {
             line_gen: 0,
             editing_fresh: false,
             active_url: String::new(),
+            completed_for: None,
+            ghost: None,
+            history_seen: 0,
             notice: None,
             notice_first: None,
             page_text: false,
@@ -694,6 +711,7 @@ impl App {
             // After the pump, which may have opened a view: nothing is drawn for it before the
             // engine is asked for its text.
             worked |= self.sync_semantics();
+            worked |= self.sync_completion();
             // Startup in text mode, a resize that loses images, a reload of `[tui] mode`.
             // `chrome_command` already told the core when `m` changed the mode.
             let mut typing = VecDeque::new();
@@ -716,6 +734,42 @@ impl App {
             self.fail(format!("writing to the terminal failed: {error}"));
         }
         busy && !self.session.has_quit()
+    }
+
+    /// Asks the history what the address line's text completes to, when the text changed or the
+    /// history forgot visits since it last asked (see the module's documentation). Returns
+    /// whether the completion changed.
+    fn sync_completion(&mut self) -> bool {
+        let generation = self.session.history_generation();
+        let forgot = std::mem::replace(&mut self.tui.history_seen, generation) != generation;
+        let opened_with = self.tui.active_url.as_str();
+        let wanted = self.tui.editing.as_ref().and_then(|editor| {
+            let text = editor.text();
+            let takes = editor.at_end()
+                && !editor.selected()
+                && !text.is_empty()
+                && !text.trim_start().starts_with(':')
+                && text != opened_with;
+            takes.then(|| text.to_owned())
+        });
+        if wanted == self.tui.completed_for && !forgot {
+            return false;
+        }
+        let ghost = wanted.as_ref().and_then(|text| {
+            let found = self
+                .session
+                .complete(text)
+                .into_iter()
+                .map(|found| found.url);
+            let mut found =
+                found.filter(|url| history::suffix(text, url).is_some_and(|rest| !rest.is_empty()));
+            Some((text.clone(), found.next()?))
+        });
+        self.tui.completed_for = wanted;
+        let changed = ghost != self.tui.ghost;
+        self.tui.ghost = ghost;
+        self.tui.chrome_dirty |= changed;
+        changed
     }
 
     /// Enables the terminal's write source while bytes are waiting, and disables it otherwise.
@@ -1448,6 +1502,7 @@ impl App {
             tabs,
             active,
             address_editing: self.tui.editing.clone(),
+            address_ghost: self.tui.ghost_suffix().map(str::to_owned),
             mode_label: match self.tui.text_mode {
                 true => MODE_TEXT,
                 false => MODE_GRAPHICS,
@@ -1838,6 +1893,17 @@ impl Tui {
         if self.clipboard_keys(event) {
             return;
         }
+        // Right or Tab at the end of the line takes the completion shown, exactly.
+        let takes = matches!(&event.key, Key::Named(name) if name == "ArrowRight" || name == "Tab");
+        let plain = !(event.modifiers.shift || event.modifiers.control || event.modifiers.alt);
+        if takes && plain && self.ghost_suffix().is_some() {
+            if let Some((_, url)) = self.ghost.take() {
+                self.editing = Some(LineEditor::from_text(url));
+                self.editing_fresh = false;
+                self.chrome_dirty = true;
+                return;
+            }
+        }
         let Some(editor) = self.editing.as_mut() else {
             return;
         };
@@ -1875,6 +1941,17 @@ impl Tui {
             },
         }
         self.chrome_dirty = true;
+    }
+
+    /// The rest of the visited address the line completes to, while the line has the text it
+    /// was found for, its cursor at the end and nothing selected.
+    fn ghost_suffix(&self) -> Option<&str> {
+        let editor = self.editing.as_ref()?;
+        let (text, url) = self.ghost.as_ref()?;
+        if editor.text() != text || !editor.at_end() || editor.selected() {
+            return None;
+        }
+        history::suffix(text, url).filter(|rest| !rest.is_empty())
     }
 
     /// Ctrl+C copies the line, Ctrl+X copies it and clears it, Ctrl+V asks the terminal.
@@ -2825,6 +2902,9 @@ mod tests {
             line_gen: 0,
             editing_fresh: false,
             active_url: String::new(),
+            completed_for: None,
+            ghost: None,
+            history_seen: 0,
             notice: None,
             notice_first: None,
             page_text: false,
