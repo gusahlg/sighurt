@@ -69,8 +69,21 @@
 //! does not encode it, so switching back to graphics shows the latest one. A resize is a new
 //! layout epoch: output queued for the old layout is discarded, and a kitty upload the cut
 //! interrupted is ended with an empty `m=0` chunk. Bytes the kernel already accepted cannot be
-//! unsent. A hidden or closed view's image is deleted; a sixel, which has no id, by rewriting
-//! the page rows.
+//! unsent. At most one image is written per frame interval, a frame sent again for a tab just
+//! shown included, and a hidden or closed view's image is deleted or written over only once the
+//! last image has been up for its interval and at least [`MIN_IMAGE_LIFE`] (Rio frees an
+//! image's GPU texture at once, and lost its device when that came a moment after the upload);
+//! the loop wakes when that time comes. Kitty then deletes it by id; a sixel, which has no id,
+//! is written over: with the shown view's frame when it has one for this place and layout,
+//! else with spaces. So a hidden tab's picture stays under the shown tab's title for at most
+//! that long; a resize or a redraw clears the screen at once. A sixel frame for the place and
+//! layout of the one already on the page rows is written over it with nothing in between, and
+//! not at all when it is the same picture: tmux frees a stored image when a cell is written on
+//! it and then redraws the whole pane, so blanking before every frame showed the page black for
+//! a moment each time (decision 133). tmux keeps the sixels written over each other and sends
+//! them all again when it redraws the pane, so inside tmux (`TERM`) a page that has been quiet
+//! for [`SIXEL_QUIET`] with more than one stacked has its picture written again after a blank,
+//! once, and tmux keeps that one; a page that keeps changing is never blanked.
 //!
 //! Logs go to `{state_dir}/sighurt/tui.log` before any engine starts. The terminal's modes are
 //! turned off before the engines shut down (its images are deleted first, while the alternate
@@ -144,6 +157,18 @@ const OUTPUT_CAP: usize = 16 * 1024 * 1024;
 /// How often text mode takes a frame. Still at most `[tui] fps`. The frame is taken so a page
 /// keeps drawing and graphics shows the latest one, not so it can be read back at `[tui] fps`.
 const TEXT_FPS: u32 = 2;
+/// The least time an image stays on the screen before a tab switch deletes it or writes over
+/// it. Rio 0.5.28 frees an image's GPU texture at once, and lost its Vulkan device when that
+/// came a moment after the upload (decision 133); a page's own frames, which replace each
+/// other at `[tui] fps`, did not do that.
+const MIN_IMAGE_LIFE: Duration = Duration::from_millis(250);
+/// How long the page stays without a new sixel before, inside tmux, the sixels stacked there
+/// are replaced by the one picture on the rows ([`App::quiet_stack`]). tmux keeps every sixel
+/// written over another (at most 20 in the server) and sends them all again, oldest first,
+/// when it redraws the pane (a window switched back to). No cap applies while the page keeps
+/// changing: the blank it would take every few frames is a blink each time, and in Rio 0.5.28
+/// spaces over a sixel it shows are what loses its Vulkan device (decision 133).
+const SIXEL_QUIET: Duration = Duration::from_millis(400);
 /// An empty last chunk. Ends a kitty image upload a resize cut after its `m=1`.
 const KITTY_UPLOAD_END: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
 /// The least time between two pointer motions handed to the core. Terminals report motion
@@ -304,6 +329,27 @@ struct Tui {
     graphics: bool,
     /// The protocol [`Self::relayout`] chose for this layout.
     protocol: Protocol,
+    /// The sixel on the page rows: where it was written, for which layout, and a fingerprint
+    /// of its bytes. `None` once the rows were blanked, cleared or drawn as text.
+    sixel_placed: Option<(CellRect, LayoutEpoch, u64)>,
+    /// The sixel on the page rows is a view's that is no longer shown. The first write once
+    /// [`Self::drop_due`] has passed puts the shown view's frame over it, or blanks the rows.
+    sixel_stale: bool,
+    /// Kitty images of views no longer shown, deleted once [`Self::drop_due`] has passed.
+    held_deletes: Vec<u32>,
+    /// The end of the last image's frame interval: the next image is not written before it.
+    /// A frame sent again (a tab shown) counts.
+    image_due: Option<Instant>,
+    /// When the last image was written.
+    image_written: Option<Instant>,
+    /// `sig` runs inside tmux (`TERM`), which stores the sixels written over each other in the
+    /// pane and sends them all again when it redraws the pane.
+    sixel_stack: bool,
+    /// The sixels written over each other since the page rows were last blanked or cleared:
+    /// what tmux holds for them.
+    sixel_depth: u32,
+    /// The next sixel goes after a blank, so tmux keeps it alone ([`App::quiet_stack`]).
+    consolidate: bool,
     /// The page rows.
     page: PageArea,
     /// The page rows show pages as text.
@@ -614,6 +660,14 @@ impl App {
             settings,
             graphics: false,
             protocol: Protocol::None,
+            sixel_placed: None,
+            sixel_stale: false,
+            held_deletes: Vec::new(),
+            image_due: None,
+            image_written: None,
+            sixel_stack: crate::term::inside_multiplexer(std::env::var_os("TERM").as_deref()),
+            sixel_depth: 0,
+            consolidate: false,
             text_mode: false,
             typing_told: None,
             mode_override: None,
@@ -854,6 +908,18 @@ impl App {
             .tui
             .next_frame
             .filter(|_| self.frame_waiting() && self.tui.terminal.pending_len() == 0);
+        // A frame the engine already gave, or a hidden view's image, waits for the image
+        // interval. Only a time still to come: one that has passed was handled in the pass.
+        let image = match self.tui.holding() {
+            true => self.tui.drop_due(),
+            false => self.tui.image_due.filter(|_| self.image_waiting()),
+        };
+        let quiet = self.quiet_stack_at();
+        let image = [image, quiet]
+            .into_iter()
+            .flatten()
+            .min()
+            .filter(|&at| at > now && self.tui.terminal.pending_len() == 0);
         let escape = self.tui.terminal.poll_timeout().map(|wait| now + wait);
         [
             pump,
@@ -862,6 +928,7 @@ impl App {
             self.tui.clipboard_deadline(),
             self.motion_due.filter(|_| self.motion.is_some()),
             frame,
+            image,
             escape,
         ]
         .into_iter()
@@ -884,6 +951,79 @@ impl App {
             .targets
             .get(&target)
             .is_some_and(|pixels| pixels.ready)
+    }
+
+    /// The page rows show images and the shown view has a frame for this layout that the
+    /// terminal does not show yet.
+    fn image_waiting(&self) -> bool {
+        let Some((_, target)) = self.shown() else {
+            return false;
+        };
+        self.tui.graphics
+            && self.tui.targets.get(&target).is_some_and(|pixels| {
+                !pixels.on_screen
+                    && pixels
+                        .handle
+                        .with_frame(self.tui.metrics.epoch(), |_| ())
+                        .is_some()
+            })
+    }
+
+    /// The shown view's frame goes over the hidden view's sixel in this write: it is waiting,
+    /// its time has come, and it is for the place and layout of the sixel on the page rows.
+    fn sixel_replaces_now(&self) -> bool {
+        self.tui.protocol == Protocol::Sixel
+            && self.tui.image_due.is_none_or(|at| at <= Instant::now())
+            && self.tui.drop_due().is_none_or(|at| at <= Instant::now())
+            && self.tui.sixel_placed.is_some_and(|(at, epoch, _)| {
+                at == page_place(self.tui.page) && epoch == self.tui.metrics.epoch()
+            })
+            && self.image_waiting()
+    }
+
+    /// Inside tmux, when the sixels written over each other since the last blank may be
+    /// replaced by the one on the rows: the shown view's picture is on the screen, more than
+    /// one sixel is stacked, and none has come for [`SIXEL_QUIET`]. `None` when that does not
+    /// apply.
+    fn quiet_stack_at(&self) -> Option<Instant> {
+        let tui = &self.tui;
+        if !tui.sixel_stack
+            || tui.protocol != Protocol::Sixel
+            || !tui.graphics
+            || tui.sixel_depth < 2
+            || tui.consolidate
+            || tui.holding()
+        {
+            return None;
+        }
+        let (_, target) = self.shown()?;
+        let shown = tui
+            .targets
+            .get(&target)
+            .is_some_and(|pixels| pixels.on_screen);
+        let placed = tui.sixel_placed.is_some_and(|(at, epoch, _)| {
+            at == page_place(tui.page) && epoch == tui.metrics.epoch()
+        });
+        let written = tui.image_written?;
+        (shown && placed).then(|| written + SIXEL_QUIET.max(MIN_IMAGE_LIFE))
+    }
+
+    /// The page went quiet with sixels stacked in tmux: the shown view's frame is written
+    /// again after a blank, in one write, so tmux frees the stack and keeps one image. The
+    /// blank marks the pane for a redraw, and tmux holds a sixel back from the outer terminal
+    /// while a redraw is pending, then draws the lines and the image in that redraw
+    /// (`screen_write_set_client_cb`): one short blink once the page has stopped changing.
+    fn quiet_stack(&mut self) {
+        if self.quiet_stack_at().is_none_or(|at| at > Instant::now()) {
+            return;
+        }
+        let Some((_, target)) = self.shown() else {
+            return;
+        };
+        if let Some(pixels) = self.tui.targets.get_mut(&target) {
+            pixels.on_screen = false;
+            self.tui.consolidate = true;
+        }
     }
 
     /// `sig` can't go on: reports `error` and quits with a failure.
@@ -1374,11 +1514,41 @@ impl App {
             for pixels in self.tui.targets.values_mut() {
                 pixels.on_screen = false;
             }
+            self.tui.forget_sixel();
+            self.tui.sixel_stale = false;
+            // Deleted with all the others.
+            self.tui.held_deletes.clear();
         }
+        // A hidden view's image stays until the last image's frame interval is over: Rio frees
+        // an image's GPU texture as soon as it is deleted or covered, and lost its device when
+        // that came a moment after the upload (tabs switched at key repeat, decision 133).
+        let due = self.tui.drop_due().is_none_or(|at| at <= Instant::now());
+        if due {
+            for image in std::mem::take(&mut self.tui.held_deletes) {
+                out.extend(kitty::delete(image));
+            }
+            // The shown view's frame goes over a hidden view's sixel in this write if it can
+            // (no blank: under tmux a blank is a black flash); otherwise the rows are blanked
+            // now, before the chrome.
+            if self.tui.sixel_stale && !self.sixel_replaces_now() {
+                self.tui.sixel_stale = false;
+                self.tui.blank_placed(&mut out);
+            }
+        }
+        self.quiet_stack();
         if std::mem::take(&mut self.tui.chrome_dirty) {
             self.draw_chrome(&mut out);
         }
         self.frame(&mut out);
+        // The frame did not go over it after all (it failed, or was not presented): the next
+        // pass blanks the rows, and draws the chrome again for its cursor.
+        if due && std::mem::take(&mut self.tui.sixel_stale) {
+            let mut blank = std::mem::take(&mut self.tui.control);
+            self.tui.blank_placed(&mut blank);
+            self.tui.control = blank;
+            self.tui.chrome_dirty = true;
+            wrote = true;
+        }
         if out.is_empty() {
             return wrote;
         }
@@ -1401,8 +1571,8 @@ impl App {
         for row in area.row..area.row + area.rows {
             self.tui.grid.clear_row(row);
         }
-        if let Some(message) = message {
-            let message = crate::sanitize::sanitize(&message);
+        if let Some(message) = &message {
+            let message = crate::sanitize::sanitize(message);
             let width = unicode_width::UnicodeWidthStr::width(message.as_str());
             let column = usize::from(area.cols).saturating_sub(width) / 2;
             let row = area.row + area.rows / 2;
@@ -1413,6 +1583,10 @@ impl App {
                     .grid
                     .put_text(column, row, &message, fg, bg, Attrs::default());
             }
+        }
+        if message.is_some() || self.tui.text_mode {
+            // The page rows hold text now, not the picture.
+            self.tui.forget_sixel();
         }
         let mut cursor = area.cursor;
         if self.tui.text_mode {
@@ -1629,6 +1803,14 @@ impl App {
                 }
             }
         }
+        // At most one image per frame interval, a frame sent again (a tab shown) included, and
+        // a hidden view's image is not deleted or written over before [`Tui::drop_due`]: the
+        // terminal uploads each image to its GPU, and Rio lost its Vulkan device while tabs
+        // were switched at key repeat (decision 133). The loop wakes for it ([`App::timeout`]).
+        // A blank inside tmux frees every stacked sixel: it waits as a drop does.
+        let blanks_stack = self.tui.consolidate;
+        let held =
+            (self.tui.holding() || blanks_stack) && self.tui.drop_due().is_some_and(|at| at > now);
         let Some(pixels) = self.tui.targets.get_mut(&target) else {
             return;
         };
@@ -1636,17 +1818,26 @@ impl App {
         if pixels.on_screen || !self.tui.graphics {
             return;
         }
+        if held || self.tui.image_due.is_some_and(|at| at > now) {
+            return;
+        }
         let page = self.tui.page;
-        let place = CellRect {
-            column: 0,
-            row: page.row,
-            columns: page.cols,
-            rows: page.rows,
-        };
+        let place = page_place(page);
+        // A sixel for the place and layout of the one on the page rows goes over it as it
+        // is. Blanking first would make tmux free its stored image and redraw the pane, which
+        // shows the rows black until the new image has arrived: a flicker on every frame.
+        // tmux keeps the images written over each other (at most 20 in all, the oldest
+        // freed) and draws them in order when it redraws the pane, the newest last.
+        let placed = self.tui.sixel_placed;
+        let same_place =
+            placed.is_some_and(|(at, epoch, _)| at == place && epoch == metrics.epoch());
+        // Inside tmux, once the page went quiet, its picture goes again after the blank: tmux
+        // then keeps that one alone.
+        let replaces = same_place && !blanks_stack;
         // The blank and its synchronized update sit outside the encoder, so the image
         // itself still has to fit in what remains of the output cap.
         let mut prefix = Vec::new();
-        if protocol == Protocol::Sixel {
+        if protocol == Protocol::Sixel && !replaces {
             prefix.extend_from_slice(SYNC_BEGIN);
             blank_page(&mut prefix, page);
             prefix.extend_from_slice(SYNC_END);
@@ -1674,18 +1865,38 @@ impl App {
             Ok(bytes) => {
                 diag.counters.encoded_bytes += bytes.len() as u64;
                 if protocol == Protocol::Sixel {
-                    // Spaces update tmux's grid, which drops the previous sixel. The image
-                    // comes after the synchronized update that holds them: tmux 3.8 writes
-                    // a sixel through at once but holds a synchronized pane's lines until
-                    // the update ends, and then redraws them over the image, which erases
-                    // it in the outer terminal. The cursor save inside the sixel restores
-                    // the position after the spaces, not the grid's cursor.
-                    out.extend_from_slice(&prefix);
-                    out.extend(bytes);
-                    self.tui.grid.forget_cursor();
-                    self.tui.grid.forget_pen();
+                    let print = fingerprint(&bytes);
+                    // The same picture is on the page rows already: nothing to send (unless
+                    // it is sent again on purpose, to stand alone in tmux).
+                    let same = same_place && placed.is_some_and(|(.., sent)| sent == print);
+                    if !same || self.tui.consolidate {
+                        // When the rows held another layout's image (or none), spaces first:
+                        // they update tmux's grid, which drops what it stored there. The
+                        // image comes after the synchronized update that holds them: tmux
+                        // 3.8 writes a sixel through at once but holds a synchronized
+                        // pane's lines until the update ends, and then redraws them over
+                        // the image, which erases it in the outer terminal. The cursor
+                        // save inside the sixel restores the position after the spaces,
+                        // not the grid's cursor.
+                        out.extend_from_slice(&prefix);
+                        out.extend(bytes);
+                        self.tui.grid.forget_cursor();
+                        self.tui.grid.forget_pen();
+                        self.tui.sixel_placed = Some((place, metrics.epoch(), print));
+                        self.tui.image_due = Some(now + interval);
+                        self.tui.image_written = Some(now);
+                        self.tui.sixel_depth = match prefix.is_empty() {
+                            true => self.tui.sixel_depth + 1,
+                            false => 1,
+                        };
+                        self.tui.consolidate = false;
+                    }
+                    // A hidden view's sixel is under this one, or was this very picture.
+                    self.tui.sixel_stale = false;
                 } else {
                     out.extend(bytes);
+                    self.tui.image_due = Some(now + interval);
+                    self.tui.image_written = Some(now);
                 }
                 pixels.on_screen = true;
             }
@@ -1773,6 +1984,27 @@ impl Tui {
         // After relayout, so a switch onto sixel picks up the 5 fps cap, and text mode its own.
         let interval = frame_interval(self.settings, self.pace_sixel(), self.text_mode);
         self.next_frame = self.next_frame.map(|at| at.min(Instant::now() + interval));
+        self.image_due = self.image_due.map(|at| at.min(Instant::now() + interval));
+    }
+
+    /// The page rows hold no sixel: blanked, cleared or drawn as text, so tmux keeps none.
+    fn forget_sixel(&mut self) {
+        self.sixel_placed = None;
+        self.sixel_depth = 0;
+        self.consolidate = false;
+    }
+
+    /// A hidden view's image is waiting to be deleted or written over.
+    fn holding(&self) -> bool {
+        self.sixel_stale || !self.held_deletes.is_empty()
+    }
+
+    /// When a hidden view's image may be deleted or written over: the last image has been on
+    /// the screen for its frame interval, and for at least [`MIN_IMAGE_LIFE`].
+    fn drop_due(&self) -> Option<Instant> {
+        let interval = frame_interval(self.settings, self.pace_sixel(), self.text_mode);
+        self.image_written
+            .map(|at| at + interval.max(MIN_IMAGE_LIFE))
     }
 
     /// Sixel frames are capped at 5 fps. Text mode on a sixel terminal is not.
@@ -1817,19 +2049,22 @@ impl Tui {
         }
     }
 
-    /// Drops the image a shown view left on the page. Kitty deletes by id. Sixel rewrites
-    /// the page rows.
+    /// Drops the image a shown view left on the page, once the last image's frame interval is
+    /// over. Kitty deletes by id. A sixel, which has no id, is written over: with the shown
+    /// view's frame, or spaces.
     fn drop_placed(&mut self, image: u32) {
         match self.protocol {
-            Protocol::Kitty => self.control.extend(kitty::delete(image)),
-            Protocol::Sixel => self.blank_placed(),
+            Protocol::Kitty => self.held_deletes.push(image),
+            Protocol::Sixel => self.sixel_stale = true,
             Protocol::None => {}
         }
     }
 
-    /// Writes spaces over the page rows so tmux drops the sixel it is holding there.
-    fn blank_placed(&mut self) {
-        blank_page(&mut self.control, self.page);
+    /// Writes spaces over the page rows into `out`, so tmux drops the sixel it is holding
+    /// there and the terminal shows no picture.
+    fn blank_placed(&mut self, out: &mut Vec<u8>) {
+        blank_page(out, self.page);
+        self.forget_sixel();
         self.grid.forget_cursor();
         self.grid.forget_pen();
     }
@@ -2406,11 +2641,8 @@ impl Frontend for Tui {
         }
         self.views.retain(|_, &mut kept| kept != target);
         if let Some(pixels) = self.targets.remove(&target) {
-            let on_screen = pixels.on_screen;
-            match self.protocol {
-                Protocol::Kitty => self.control.extend(kitty::delete(pixels.image)),
-                Protocol::Sixel if on_screen => self.blank_placed(),
-                Protocol::Sixel | Protocol::None => {}
+            if self.protocol == Protocol::Kitty || pixels.on_screen {
+                self.drop_placed(pixels.image);
             }
         }
     }
@@ -2653,6 +2885,16 @@ impl Frontend for Tui {
     }
 }
 
+/// Where a page image goes: all of the page rows.
+fn page_place(page: PageArea) -> CellRect {
+    CellRect {
+        column: 0,
+        row: page.row,
+        columns: page.cols,
+        rows: page.rows,
+    }
+}
+
 /// The page rows for a terminal of `size`: everything between the chrome's top and bottom
 /// lines, as [`ChromeState::draw`] leaves them.
 fn page_area(size: TermSize) -> PageArea {
@@ -2725,6 +2967,14 @@ const TEXT_AREA: (u32, u32) = (1280, 800);
 
 fn empty_metrics() -> Metrics {
     Metrics::new(LayoutEpoch::next(), WindowRect::default(), Scale::ONE)
+}
+
+/// A fingerprint of an encoded frame, to tell the picture on the page rows from a new one.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::hash::DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
 }
 
 fn frame_interval(settings: TuiConfig, sixel: bool, text: bool) -> Duration {
@@ -2950,6 +3200,9 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
         (true, Protocol::Kitty) => "kitty",
         _ => "none",
     };
+    // What the top line shows of the keymap's mode, as the window's report has it.
+    let indicator = session.core().keymap_indicator().map(str::to_owned);
+    session.diagnostics_mut().keymap_indicator = indicator;
     let report = Report {
         counters: session.diagnostics().counters.clone(),
         peaks: session.diagnostics().peaks.clone(),
@@ -3152,6 +3405,14 @@ mod tests {
             settings: TuiConfig::default(),
             graphics: false,
             protocol: Protocol::None,
+            sixel_placed: None,
+            sixel_stale: false,
+            held_deletes: Vec::new(),
+            image_due: None,
+            image_written: None,
+            sixel_stack: false,
+            sixel_depth: 0,
+            consolidate: false,
             page: page_area(size),
             text_mode: false,
             typing_told: None,

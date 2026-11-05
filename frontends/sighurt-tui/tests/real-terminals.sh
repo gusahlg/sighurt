@@ -17,20 +17,44 @@
 #   quit      `q` quits with status 0, the terminal's settings are what they were (stty -g before
 #             and after, in the same terminal) and the shell's text is back (alternate screen left)
 #
-# And one scenario of its own, rio-tmux-sixel (regression test of 36e043a: sixel under tmux had shown
-# nothing for weeks while the diagnostics said all was well, since nothing looked at the screen).
-# Rio runs a private tmux server (a copy of ~/.config/tmux/tmux.conf, else a minimal one) whose
-# one pane runs `sig --tui demo://pattern`; it needs a sig with the demo engine (engine-demo):
-#   sixel     PASS only if the diagnostics say graphics=sixel with encoded bytes > 0 AND the page
-#             rows of a screenshot hold a substantial number of coloured pixels (the pattern's;
-#             a blank page has none). The count is printed.
+# And three scenarios of demo pages, which need only a sig with the demo engine (engine-demo) and
+# bind F2 to tab.next (keymap bindings), with four tabs (pattern, animation, resize, pattern):
+#   rio-tmux-sixel  Rio runs a private tmux server (a copy of ~/.config/tmux/tmux.conf, else a
+#                   minimal one) whose one pane runs sig (regression test of 36e043a: sixel under
+#                   tmux had shown nothing for weeks while the diagnostics said all was well)
+#   rio-sixel       Rio alone, [tui] graphics = "sixel"
+#   rio-kitty       Rio alone, graphics as sig chooses (kitty)
+# Their checks:
+#   sixel     (rio-tmux-sixel) PASS only if the diagnostics say graphics=sixel with encoded bytes
+#             > 0 AND the page rows of a screenshot hold a substantial number of coloured pixels
+#             (the pattern's; a blank page has none). The count is printed.
+#   flicker   on the animation tab, $FLICKER_SHOTS screenshots (200) as fast as grim takes them:
+#             PASS if none shows the page rows half or more the terminal's background (a black
+#             flash: tmux redrawing the pane after a blank, before the next image, decision 133). The
+#             count, the time taken and the shots are in OUT/<scenario>/flicker.
+#   idle      on the pattern (a still page), 3 s: sig encodes nothing, tmux (rio-tmux-sixel) sends
+#             no sixel, and 100 screenshots show no flash.
+#   redraw    (rio-tmux-sixel, last) on the pattern, still since it was shown: a second tmux
+#             window, then $REDRAWS (20; 0 leaves it out) times away and back, a refresh-client
+#             every fifth time, and two client resizes (the output's size). tmux sends the pane's
+#             stored sixels again, oldest first, on each redraw. PASS if no redraw sends more
+#             than $REDRAW_MAX (1: the quiet page left tmux one) sixels in its first 300 ms; the
+#             counts are printed and in OUT/<scenario>/redraws.txt (from tap.log). The redraws
+#             stop at Rio's death, which is its own check, rio-redraw: Rio 0.5.28 dies on these
+#             redraws with any sixel in the pane, one that `cat` wrote included.
+#   quiet     (rio-tmux-sixel, INFO) after a tab switch, how many of 100 screenshots show the
+#             blink of the picture written again alone.
+#   tabstorm  F2 $STORM_RATE times a second (30) for $STORM_SECONDS (25; 0 leaves the check
+#             out): PASS if Rio is still running, sig took the keys (input events), answers a
+#             diagnostics report and the page shows again afterwards (Rio lost its Vulkan device
+#             while tabs were switched at key repeat, decision 133).
 #
 #   sighurt-tui/tests/real-terminals.sh OUT               build sig (default features and the demo
 #                                                         engine), then run all three scenarios
 #   sighurt-tui/tests/real-terminals.sh --no-build OUT    run target/debug/sig as it is
 #   SIG=/path/to/sig sighurt-tui/tests/real-terminals.sh --no-build OUT   run that sig instead
 #   sighurt-tui/tests/real-terminals.sh OUT rio           only these scenarios (rio, kitty,
-#                                                         rio-tmux-sixel)
+#                                                         rio-tmux-sixel, rio-sixel, rio-kitty)
 #
 # Screenshots (*.png), sig's diagnostics and log, and the session files go to OUT/<scenario>; look
 # at the screenshots too. Rio is the user's (`rio` on PATH) or the pinned nixpkgs' one; kitty is
@@ -43,7 +67,7 @@ cd "$repo"
 if [[ ${1:-} != --inside ]]; then
   build=1
   [[ ${1:-} == --no-build ]] && { build=0; shift; }
-  out=$(realpath -m "${1:?usage: real-terminals.sh [--no-build] OUT [rio|kitty|rio-tmux-sixel ...]}")
+  out=$(realpath -m "${1:?usage: real-terminals.sh [--no-build] OUT [rio|kitty|rio-tmux-sixel|rio-sixel|rio-kitty ...]}")
   shift
   terminals=("$@")
   [[ ${#terminals[@]} == 0 ]] && terminals=(rio kitty rio-tmux-sixel)
@@ -60,9 +84,9 @@ if [[ ${1:-} != --inside ]]; then
   failed=0
   for terminal in "${terminals[@]}"; do
     case $terminal in
-      rio | rio-tmux-sixel) exe=$(command -v rio || echo "$(nix-build "$pkgs" -A rio --no-out-link)/bin/rio") ;;
+      rio | rio-tmux-sixel | rio-sixel | rio-kitty) exe=$(command -v rio || echo "$(nix-build "$pkgs" -A rio --no-out-link)/bin/rio") ;;
       kitty) exe="$(nix-build "$pkgs" -A kitty --no-out-link)/bin/kitty" ;;
-      *) echo "real-terminals.sh: no terminal $terminal (rio, kitty, rio-tmux-sixel)" >&2; exit 2 ;;
+      *) echo "real-terminals.sh: no terminal $terminal (rio, kitty, rio-tmux-sixel, rio-sixel, rio-kitty)" >&2; exit 2 ;;
     esac
     [[ -x $exe ]] || { echo "real-terminals.sh: $terminal not found" >&2; failed=$((failed + 1)); continue; }
     tools/heavy tools/headless-sway --renderer gles2 -- "$0" --inside "$out/$terminal" "$terminal" "$exe"
@@ -89,11 +113,16 @@ if [[ -f $HOME/.config/rio/config.toml ]]; then
 else
   echo 'confirm-before-quit = false' > "$home/config/rio/config.toml"
 fi
-if [[ $terminal == rio-tmux-sixel ]]; then
-  # The demo engine opens demo:// pages; example.com needs the network and Servo, this needs neither.
-  printf 'version = 1\n[engines]\ndefault = "demo"\n[routing.demo]\nschemes = ["demo"]\n' \
+demo=0
+[[ $terminal == rio-tmux-sixel || $terminal == rio-sixel || $terminal == rio-kitty ]] && demo=1
+if [[ $demo == 1 ]]; then
+  # The demo engine opens demo:// pages; example.com needs the network and Servo, this needs
+  # neither. F2 is tab.next whatever the example keymap's keys are.
+  graphics=
+  [[ $terminal == rio-sixel ]] && graphics='[tui]\ngraphics = "sixel"\n'
+  printf 'version = 1\n[engines]\ndefault = "demo"\n[routing.demo]\nschemes = ["demo"]\n[input]\nkeymap = "bindings"\n[keys]\n"f2" = "tab.next"\n"q" = "browser.quit"\n'"$graphics" \
     > "$home/config/sighurt/config.toml"
-  url=demo://pattern
+  url="demo://pattern demo://animation demo://resize demo://pattern"
 else
   printf 'version = 1\n' > "$home/config/sighurt/config.toml"
   url=https://example.com/
@@ -109,7 +138,7 @@ fail() { echo "FAIL $terminal $1: $2"; failed=$((failed + 1)); }
 cat > "$out/run.sh" <<RUN
 #!/usr/bin/env bash
 stty -g > '$out/stty-before'
-'$sig' --tui --diagnostics '$diag' '$url' &
+'$sig' --tui --diagnostics '$diag' $url &
 echo \$! > '$pidfile'
 wait \$!
 echo \$? > '$out/status'
@@ -119,7 +148,7 @@ sleep 60
 RUN
 chmod +x "$out/run.sh"
 case $terminal in
-  rio) "$exe" -e "$out/run.sh" > "$out/terminal.log" 2>&1 & ;;
+  rio | rio-sixel | rio-kitty) "$exe" -e "$out/run.sh" > "$out/terminal.log" 2>&1 & ;;
   kitty) "$exe" --config NONE "$out/run.sh" > "$out/terminal.log" 2>&1 & ;;
   rio-tmux-sixel)
     # A private tmux server: its own socket directory and name, never the user's server (TMUX
@@ -137,7 +166,9 @@ case $terminal in
     fi
     tmux_args=(-L "$tmux_name" -f "$out/tmux.conf")
     tmux() { command tmux "${tmux_args[@]}" "$@"; }
-    "$exe" -e tmux "${tmux_args[@]}" new-session -s t -- bash "$out/run.sh" > "$out/terminal.log" 2>&1 &
+    # The tmux client runs on sixel-tap.py's pty: tap.log says what tmux sends Rio, read by read.
+    "$exe" -e python3 -I "$repo/frontends/sighurt-tui/tests/sixel-tap.py" "$out/tap.log" \
+      tmux "${tmux_args[@]}" new-session -s t -- bash "$out/run.sh" > "$out/terminal.log" 2>&1 &
     ;;
 esac
 term_pid=$!
@@ -267,26 +298,228 @@ graphics_encoded() {
 }
 type_keys() { wtype -s 80 "$@"; }
 
-# ── sixel ── (rio-tmux-sixel: this scenario only)
-if [[ $terminal == rio-tmux-sixel ]]; then
+# FLICKER_SHOTS screenshots of the page as fast as grim takes them, into $out/flicker. Prints
+# "FLASHES SHOTS SECONDS": the shots whose page rows are at least half the terminal's own
+# background (the top-left pixel, Rio's title bar), as blank rows are.
+flicker() {
+  local dir=$out/${flicker_dir:-flicker} start end
+  mkdir -p "$dir"
+  start=$(date +%s.%N)
+  for i in $(seq -w 1 "${FLICKER_SHOTS:-200}"); do grim -t ppm "$dir/$i.ppm"; done
+  end=$(date +%s.%N)
+  python3 -I - "$dir" "$start" "$end" <<'PY'
+import os, sys
+d, start, end = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+def share(path):
+    data = open(path, 'rb').read()
+    fields, at = [], 0
+    while len(fields) < 4:
+        while data[at:at+1].isspace(): at += 1
+        if data[at:at+1] == b'#':
+            while data[at:at+1] != b'\n': at += 1
+            continue
+        s = at
+        while not data[at:at+1].isspace(): at += 1
+        fields.append(data[s:at])
+    at += 1
+    w, h = int(fields[1]), int(fields[2])
+    px = data[at:]
+    bg = px[(2 * w + 2) * 3:(2 * w + 2) * 3 + 3]
+    samples = [px[(y * w + x) * 3:(y * w + x) * 3 + 3]
+               for y in range(h // 10, h * 9 // 10, 6) for x in range(0, w, 6)]
+    return sum(p == bg for p in samples) * 100 // max(len(samples), 1)
+flashes = []
+names = sorted(n for n in os.listdir(d) if n.endswith('.ppm'))
+for name in names:
+    blank = share(os.path.join(d, name))
+    if blank >= 50:
+        flashes.append(f'{name}: {blank}% background')
+open(os.path.join(d, 'flashes.txt'), 'w').write('\n'.join(flashes) + '\n')
+print(len(flashes), len(names), f'{end - start:.1f}')
+PY
+}
+# F2 (tab.next) until the active tab is $1 (a new virtual keyboard can lose its first key).
+goto_tab() {
+  for _ in $(seq 20); do
+    report && [[ $(field 'd["active_tab"]') == "$1" ]] && return 0
+    wtype -k F2
+    sleep 1
+  done
+  return 1
+}
+# F2 (tab.next) $STORM_RATE times a second for $STORM_SECONDS seconds, in one wtype.
+storm() {
+  local rate=${STORM_RATE:-30} seconds=${STORM_SECONDS:-25} args=()
+  for _ in $(seq $((rate * seconds))); do args+=(-k F2 -s $((1000 / rate))); done
+  wtype "${args[@]}"
+}
+
+# Sixels tmux sent (tap.log) from time $1 to $2: "SIXELS BYTES".
+tapped() {
+  awk -v from="$1" -v to="$2" '$1 >= from && $1 < to { n += $2; b += $3 } END { print n + 0, b + 0 }' "$out/tap.log"
+}
+# Rio, or its log, says it died (a panicking Rio is a process while its core is dumped).
+rio_gone() { ! kill -0 "$term_pid" 2>/dev/null || grep -q panicked "$out/terminal.log"; }
+
+# ── demo pages ── (rio-tmux-sixel, rio-sixel, rio-kitty)
+if [[ $demo == 1 ]]; then
   sleep 3
-  if until_true 40 loaded && sleep 3 && shot 1-sixel; then
+  if until_true 40 loaded && sleep 3 && shot 1-pattern; then
     report
-    read -r coloured total < <(colourful 1-sixel)
+    read -r coloured total < <(colourful 1-pattern)
     caps=$(field 'd["capabilities"]') encoded=$(field 'd["counters"]["encoded_bytes"]')
     # The pattern fills the page area; half of the sampled rows' pixels is far under what it
     # paints and far over the rest (grays and the status line).
-    if graphics_encoded sixel && [[ ${coloured:-0} -ge $((${total:-1} / 4)) ]]; then
+    if [[ $terminal != rio-tmux-sixel ]]; then
+      echo "INFO $terminal capabilities '$caps', $encoded bytes encoded, $coloured of $total page-row pixels coloured"
+    elif graphics_encoded sixel && [[ ${coloured:-0} -ge $((${total:-1} / 4)) ]]; then
       pass "sixel (graphics=sixel, $encoded bytes encoded, $coloured of $total page-row pixels coloured)"
     else
-      fail sixel "capabilities '$caps', $encoded bytes encoded, $coloured of $total page-row pixels coloured (screenshot $out/1-sixel.png)"
+      fail sixel "capabilities '$caps', $encoded bytes encoded, $coloured of $total page-row pixels coloured (screenshot $out/1-pattern.png)"
+    fi
+    # ── idle ── the pattern, still.
+    sleep 2
+    report
+    encoded_before=$(field 'd["counters"]["encoded_bytes"]')
+    idle_from=$(date +%s.%N)
+    read -r flashes shots seconds < <(FLICKER_SHOTS=100 flicker_dir=idle flicker)
+    sleep $(python3 -I -c "import time,sys; print(max(0, 3 - (time.time() - float(sys.argv[1]))))" "$idle_from")
+    idle_to=$(date +%s.%N)
+    report
+    encoded=$(( $(field 'd["counters"]["encoded_bytes"]') - ${encoded_before:-0} ))
+    sent=n/a
+    [[ $terminal == rio-tmux-sixel ]] && read -r sent _ < <(tapped "$idle_from" "$idle_to")
+    if [[ $encoded == 0 && ${flashes:-1} == 0 && $sent =~ ^(0|n/a)$ ]]; then
+      pass "idle (0 bytes encoded, $sent sixels from tmux, 0 of $shots screenshots flashed)"
+    else
+      fail idle "$encoded bytes encoded, $sent sixels from tmux, $flashes of $shots screenshots flashed"
+    fi
+    # ── flicker ── tab 2, the animation.
+    goto_tab 2 || fail flicker "F2 did not switch to tab 2"
+    sleep 3
+    shot 2-animation
+    flicker_max=${FLICKER_MAX:-0}
+    read -r flashes shots seconds < <(flicker)
+    if [[ ${shots:-0} -ge 60 && ${flashes:-1} -le $flicker_max ]]; then
+      pass "flicker ($flashes of $shots screenshots in ${seconds}s without the page, at most $flicker_max)"
+    else
+      fail flicker "$flashes of $shots screenshots in ${seconds}s without the page ($out/flicker/flashes.txt)"
+    fi
+    # ── quiet ── (rio-tmux-sixel) a tab switch writes over the sixel on the rows; 400 ms later
+    # the picture goes again after a blank so tmux keeps it alone: how long that blink is.
+    if [[ $terminal == rio-tmux-sixel ]]; then
+      goto_tab 4 > /dev/null && sleep 3
+      wtype -k F2
+      read -r flashes shots seconds < <(FLICKER_SHOTS=100 flicker_dir=quiet flicker)
+      report
+      echo "INFO $terminal quiet: $flashes of $shots screenshots in ${seconds}s after a switch to tab $(field 'd["active_tab"]') without the page ($out/quiet/flashes.txt)"
+      goto_tab 2 > /dev/null
+    fi
+    # ── tabstorm ── (STORM_SECONDS=0 leaves it out)
+    if [[ ${STORM_SECONDS:-25} == 0 ]]; then
+      echo "SKIP $terminal tabstorm (STORM_SECONDS=0)"
+    else
+    report
+    keys_before=$(field 'd["counters"]["input_events"]')
+    storm_started=$(date +%s)
+    storm
+    sleep 3
+    shot 3-after-storm
+    shown=$(python3 -I - "$out/3-after-storm.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+fields, at = [], 0
+while len(fields) < 4:
+    while data[at:at+1].isspace(): at += 1
+    if data[at:at+1] == b'#':
+        while data[at:at+1] != b'\n': at += 1
+        continue
+    s = at
+    while not data[at:at+1].isspace(): at += 1
+    fields.append(data[s:at])
+at += 1
+w, h = int(fields[1]), int(fields[2])
+px = data[at:]
+bg = px[(2 * w + 2) * 3:(2 * w + 2) * 3 + 3]
+samples = [px[(y * w + x) * 3:(y * w + x) * 3 + 3] for y in range(h // 10, h * 9 // 10, 6) for x in range(0, w, 6)]
+print(100 - sum(p == bg for p in samples) * 100 // len(samples))
+PY
+)
+    # A panicking Rio is still a process while its core is dumped: its log says.
+    if rio_gone; then
+      fail tabstorm "Rio is gone after $(( $(date +%s) - storm_started ))s of tab switches ($out/terminal.log)"
+    elif ! report; then
+      fail tabstorm "sig does not answer after the tab switches"
+    else
+      frames=$(field 'd["counters"]["page_frames_presented"]') encoded=$(field 'd["counters"]["encoded_bytes"]')
+      keys=$(( $(field 'd["counters"]["input_events"]') - ${keys_before:-0} ))
+      if [[ $keys -lt $(( ${STORM_RATE:-30} * ${STORM_SECONDS:-25} / 2 )) ]]; then
+        fail tabstorm "sig took only $keys input events of $(( ${STORM_RATE:-30} * ${STORM_SECONDS:-25} )) F2 presses"
+      elif [[ ${shown:-0} -ge 50 ]]; then
+        pass "tabstorm (Rio and sig alive after ${STORM_RATE:-30}/s for ${STORM_SECONDS:-25}s; $keys input events, $frames frames presented, $encoded bytes encoded, $shown % of the page rows drawn)"
+      else
+        fail tabstorm "the page did not show again (${shown:-0} % of the page rows drawn, $out/3-after-storm.png)"
+      fi
+    fi
+    fi
+    # ── redraw ── (rio-tmux-sixel) tmux sends its stored sixels again on each pane redraw.
+    # Last: Rio 0.5.28 does not live through it.
+    if [[ $terminal == rio-tmux-sixel && ${REDRAWS:-20} != 0 ]] && ! rio_gone; then
+      goto_tab 1 > /dev/null
+      sleep 2
+      extra=$(tmux new-window -d -t t -P -F '#{window_id}')
+      : > "$out/redraws.txt"
+      worst=0 died=
+      for i in $(seq "${REDRAWS:-20}"); do
+        tmux next-window -t t
+        sleep 0.4
+        mark=$(date +%s.%N)
+        how=window
+        if (( i % 5 == 0 )); then
+          how=refresh
+          tmux refresh-client -t "$(tmux list-clients -F '#{client_name}' | head -1)"
+        fi
+        tmux next-window -t t
+        sleep 1.5
+        # The redraw's burst: what tmux sent in the first 300 ms.
+        read -r n bytes < <(tapped "$mark" "$(python3 -I -c "import sys; print(f'{float(sys.argv[1]) + 0.3:.3f}')" "$mark")")
+        read -r all _ < <(tapped "$mark" "$(date +%s.%N)")
+        echo "$i $how: $n sixels ($bytes bytes) in the first 0.3 s, $all in 1.5 s" >> "$out/redraws.txt"
+        (( n > worst )) && worst=$n
+        rio_gone && { died="after redraw $i"; break; }
+      done
+      if [[ -z $died ]]; then
+        for size in 1200x760 1280x800; do
+          mark=$(date +%s.%N)
+          swaymsg output HEADLESS-1 resolution "$size" > /dev/null
+          sleep 2
+          read -r n bytes < <(tapped "$mark" "$(date +%s.%N)")
+          echo "resize $size: $n sixels, $bytes bytes" >> "$out/redraws.txt"
+          rio_gone && { died="after the resize to $size"; break; }
+        done
+      fi
+      shot 2b-after-redraws
+      # sig's part: what tmux holds for it. Rio 0.5.28 also dies on these redraws with one
+      # still sixel that `cat` wrote, without sig (decision 133): that is its own line.
+      if (( worst > ${REDRAW_MAX:-1} )); then
+        fail redraw "a redraw sent $worst sixels in its first 300 ms, more than ${REDRAW_MAX:-1} ($out/redraws.txt)"
+      else
+        pass "redraw (at most $worst sixels in a redraw's first 300 ms; $out/redraws.txt)"
+      fi
+      if [[ -n $died ]]; then
+        fail rio-redraw "Rio died $died ($out/redraws.txt, $out/terminal.log)"
+      else
+        pass "rio-redraw (Rio alive after ${REDRAWS:-20} redraws and 2 resizes)"
+      fi
+      sed 's/^/  /' "$out/redraws.txt"
+      tmux kill-window -t "$extra" 2>/dev/null
     fi
   else
-    shot 1-sixel
+    shot 1-pattern
     fail sixel "demo://pattern did not finish loading (or sig is not running; does sig have engine-demo?)"
   fi
-  tmux capture-pane -p -t t > "$out/capture.txt" 2>&1
-  tmux kill-server 2>/dev/null
+  [[ $terminal == rio-tmux-sixel ]] && tmux capture-pane -p -t t > "$out/capture.txt" 2>&1
+  [[ $terminal == rio-tmux-sixel ]] && tmux kill-server 2>/dev/null
   cp "$home/state/sighurt/tui.log" "$out/tui.log" 2>/dev/null
   [[ -s $pidfile ]] && kill "$(cat "$pidfile")" 2>/dev/null
   kill "$term_pid" 2>/dev/null

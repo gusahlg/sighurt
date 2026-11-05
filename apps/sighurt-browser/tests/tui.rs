@@ -71,6 +71,11 @@ impl Terminal {
         Self::start_seeded(name, args, replies, tui, None)
     }
 
+    /// [`Self::start_in`] with `TERM=tmux-256color`, as in a tmux pane.
+    fn start_in_tmux(name: &str, args: &[&str], replies: &'static [u8], tui: &str) -> Self {
+        Self::start_as(name, args, replies, tui, None, "tmux-256color")
+    }
+
     /// [`Self::start_in`] with `history` as the history file (`state/sighurt/history.toml`).
     fn start_seeded(
         name: &str,
@@ -78,6 +83,18 @@ impl Terminal {
         replies: &'static [u8],
         tui: &str,
         history: Option<&str>,
+    ) -> Self {
+        Self::start_as(name, args, replies, tui, history, "xterm-kitty")
+    }
+
+    /// [`Self::start_seeded`] with `TERM` set to `term`.
+    fn start_as(
+        name: &str,
+        args: &[&str],
+        replies: &'static [u8],
+        tui: &str,
+        history: Option<&str>,
+        term: &str,
     ) -> Self {
         let dir = std::env::temp_dir().join(format!("sig-tui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -109,7 +126,7 @@ impl Terminal {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CACHE_HOME", dir.join("cache"))
-            .env("TERM", "xterm-kitty")
+            .env("TERM", term)
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("DISPLAY")
             .env_remove("SIG_DIAG")
@@ -789,6 +806,10 @@ fn escape_enters_insert_mode_where_q_does_not_quit() {
         "Escape did not show INSERT MODE\n{}",
         term.context()
     );
+    // The report says what the top line does (`report_until` drops the whitespace).
+    let indicator = |report: &str| report_value(report, "keymap_indicator");
+    let report = term.report_until(|r| indicator(r) == "\"INSERTMODE\"");
+    assert_eq!(indicator(&report), "\"INSERTMODE\"", "{report}");
 
     // In INSERT MODE `q` is not a binding: the page takes the letter, and sig stays up.
     let since = term.got.len();
@@ -812,6 +833,8 @@ fn escape_enters_insert_mode_where_q_does_not_quit() {
     term.type_bytes(&kitty_keys("\x1b"));
     let left = term.wait(since, Duration::from_secs(10), insert_mode_left);
     assert!(left, "Escape did not leave INSERT MODE\n{}", term.context());
+    let report = term.report_until(|r| indicator(r) == "null");
+    assert_eq!(indicator(&report), "null", "{report}");
 
     term.type_bytes(&kitty_keys("q"));
     let status = term.exit();
@@ -1330,16 +1353,29 @@ fn a_click_follows_a_link_in_text_mode() {
     );
 }
 
-/// The first tab's search in a report, as JSON: `null` with none.
-fn tab_find(report: &str) -> &str {
-    let Some(at) = report.find("\"find\":") else {
-        return "";
+/// The value of the first `"key":` in a report, as JSON. An object (flat: its values have no
+/// commas) comes with its fields sorted: serde_json writes them in the order the struct declares
+/// them when a dependency turns on its `preserve_order` (Servo's script crate does, so a `sig`
+/// with Servo does), and sorted otherwise.
+fn report_value(report: &str, key: &str) -> String {
+    let name = format!("\"{key}\":");
+    let Some(at) = report.find(&name) else {
+        return String::new();
     };
-    let rest = &report[at + 7..];
+    let rest = &report[at + name.len()..];
     match rest.find('}') {
-        Some(end) if rest.starts_with('{') => &rest[..=end],
-        _ => rest.split([',', '}']).next().unwrap_or(""),
+        Some(end) if rest.starts_with('{') => {
+            let mut fields: Vec<&str> = rest[1..end].split(',').collect();
+            fields.sort_unstable();
+            format!("{{{}}}", fields.join(","))
+        }
+        _ => rest.split([',', '}']).next().unwrap_or("").to_owned(),
     }
+}
+
+/// The first tab's search in a report, as JSON: `null` with none.
+fn tab_find(report: &str) -> String {
+    report_value(report, "find")
 }
 
 /// `/` opens the find field in text mode; typing searches the page's text, Enter keeps the
@@ -1515,6 +1551,342 @@ fn graphics_none_sends_no_sixel() {
     assert!(term.exit().success(), "{}", term.context());
     assert_eq!(term.counter("encoded_bytes"), 0, "{}", term.context());
     term.assert_restored();
+}
+
+/// Where each finished sixel image is in `bytes`: from its `ESC P 0;2 q` to after its `ESC \`.
+fn sixel_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(start) = bytes[at..]
+        .windows(6)
+        .position(|window| window == b"\x1bP0;2q")
+    {
+        let start = at + start;
+        let Some(end) = bytes[start..].windows(2).position(|w| w == b"\x1b\\") else {
+            break;
+        };
+        let end = start + end + 2;
+        spans.push((start, end));
+        at = end;
+    }
+    spans
+}
+
+/// The first page row written with spaces, as the blank before a sixel writes it, for a
+/// terminal `cols` wide.
+fn blank_row(cols: usize) -> Vec<u8> {
+    let mut row = b"\x1b[2;1H".to_vec();
+    row.extend(std::iter::repeat_n(b' ', cols));
+    row
+}
+
+/// `[tui]` lines for the sixel tests: F2 is `tab.next`, F5 `page.reload`, and nothing else is
+/// bound (the example keymap's modes are not these tests' business).
+const SIXEL_KEYS: &str =
+    "[input]\nkeymap = \"bindings\"\n[keys]\n\"f2\" = \"tab.next\"\n\"f5\" = \"page.reload\"\n\"q\" = \"browser.quit\"";
+/// The end of a synchronized update, then the cursor saved and moved to the page's first row
+/// as a sixel frame begins: a blank right before the image.
+const SYNCED_THEN_SIXEL: &[u8] = b"\x1b[?2026l\x1b[s\x1b[2;1H";
+/// F2 and F5 as a legacy terminal sends them.
+const F2: &[u8] = b"\x1bOQ";
+const F5: &[u8] = b"\x1b[15~";
+
+/// tmux frees the sixel it stores when a cell is written over it, then redraws the pane: the
+/// rows show black until the next image has arrived. So only the first image of a layout is
+/// preceded by the blank (spaces, in a synchronized update that ends before the image); the
+/// next ones go over it as they are. A resize is a new layout: blank again.
+#[test]
+fn sixel_frames_go_over_each_other_and_only_a_new_layout_is_blanked_first() {
+    let mut term = Terminal::start_in(
+        "sixel-over",
+        &["demo://animation"],
+        SIXEL_REPLIES,
+        SIXEL_KEYS,
+    );
+    // More frames than tmux's stack may hold: outside tmux none of them is blanked.
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        sixel_spans(got).len() >= 12
+    });
+    assert!(shown, "fewer than 12 sixel frames\n{}", term.context());
+    let spans = sixel_spans(&term.got);
+    let blank = blank_row(80);
+    let before = &term.got[..spans[0].0];
+    assert!(
+        has(before, &blank) && before.ends_with(SYNCED_THEN_SIXEL),
+        "the first sixel is not preceded by the blank in a synchronized update\n{}",
+        term.context()
+    );
+    for pair in spans.windows(2) {
+        let between = &term.got[pair[0].1..pair[1].0];
+        assert!(
+            !has(between, &blank) && !between.ends_with(SYNCED_THEN_SIXEL),
+            "a sixel for the same layout was blanked first: {:?}\n{}",
+            printable(between),
+            term.context()
+        );
+    }
+    // 100×30 cells: a new layout, blanked once, then frames over each other again.
+    let resized = term.got.len();
+    term.resize(100, 30);
+    let shown = term.wait(resized, Duration::from_secs(15), |got| {
+        has(got, b"\"1;1;1000;558") && sixel_spans(got).len() >= 3
+    });
+    assert!(
+        shown,
+        "no sixel frames after the resize\n{}",
+        term.context()
+    );
+    let after = &term.got[resized..];
+    let spans = sixel_spans(after);
+    let blank = blank_row(100);
+    assert!(
+        has(&after[..spans[0].0], b"\x1b[2J") || has(&after[..spans[0].0], &blank),
+        "the first sixel after the resize is not preceded by a blank\n{}",
+        term.context()
+    );
+    for pair in spans.windows(2) {
+        assert!(
+            !has(&after[pair[0].1..pair[1].0], &blank),
+            "a sixel after the resize was blanked first\n{}",
+            term.context()
+        );
+    }
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// A frame whose sixel is the picture already on the page rows is not written again.
+#[test]
+fn a_sixel_frame_that_is_the_picture_on_the_rows_is_not_written() {
+    let mut term = Terminal::start_in("sixel-same", &["demo://pattern"], SIXEL_REPLIES, SIXEL_KEYS);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        !sixel_spans(got).is_empty()
+    });
+    assert!(shown, "no sixel\n{}", term.context());
+    let presented = |report: &str| {
+        let at = report.find("\"page_frames_presented\":").map(|at| at + 24);
+        at.and_then(|at| {
+            report[at..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or(0)
+    };
+    // Settled: the page drew once for the layout (and once more when it took the keyboard).
+    thread::sleep(Duration::from_millis(500));
+    let report = term.report_until(|_| true);
+    let before = presented(&report);
+    let from = term.got.len();
+    // The demo engine paints the pattern again, pixel for pixel.
+    term.type_bytes(F5);
+    let report = term.report_until(|r| presented(r) > before);
+    assert!(
+        presented(&report) > before,
+        "the reload presented no frame\n{report}\n{}",
+        term.context()
+    );
+    term.wait(term.got.len(), Duration::from_millis(500), |_| false);
+    assert!(
+        sixel_spans(&term.got[from..]).is_empty() && !has(&term.got[from..], &blank_row(80)),
+        "the same picture was written again\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// A tab switch writes the shown tab's frame over the hidden tab's sixel, with no blank in
+/// between. Switches faster than the sixel frame interval (200 ms) are paced: no image, and no
+/// blank of one, comes sooner than that after the image before (250 ms for a hidden tab's: Rio
+/// lost its GPU device while tabs were switched at key repeat, each image blanked a moment
+/// after it came).
+#[test]
+fn a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced() {
+    let mut term = Terminal::start_in(
+        "sixel-tabs",
+        &["demo://animation", "demo://pattern", "demo://resize"],
+        SIXEL_REPLIES,
+        SIXEL_KEYS,
+    );
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        !sixel_spans(got).is_empty()
+    });
+    assert!(shown, "no sixel\n{}", term.context());
+    let (active, tabs) = term.tabs();
+    assert_eq!((active, tabs), (1, 3), "{}", term.context());
+    // Each tab is shown once: a hidden tab is given no frames, so its first one comes after
+    // the blank. Then from the resize page (still) back to the animation, which has a frame
+    // for this layout: it goes over the resize page's sixel in the same write.
+    for tab in [2, 3, 1] {
+        term.wait(term.got.len(), Duration::from_millis(400), |_| false);
+        let from = term.got.len();
+        term.type_bytes(F2);
+        let switched = term.wait(from, Duration::from_secs(5), |got| {
+            !sixel_spans(got).is_empty()
+        });
+        assert!(
+            switched,
+            "no sixel after the switch to tab {tab}\n{}",
+            term.context()
+        );
+        assert_eq!(term.tabs().0, tab, "{}", term.context());
+        if tab == 1 {
+            let after = &term.got[from..];
+            let first = sixel_spans(after)[0];
+            assert!(
+                !has(&after[..first.0], &blank_row(80)),
+                "the switch blanked the rows before the shown tab's frame\n{}",
+                term.context()
+            );
+        }
+    }
+    // A storm: 40 switches 25 ms apart, a second in all.
+    let storm = term.got.len();
+    let started = Instant::now();
+    for _ in 0..40 {
+        term.type_bytes(F2);
+        term.wait(term.got.len(), Duration::from_millis(25), |_| false);
+    }
+    let lasted = started.elapsed();
+    let during = sixel_spans(&term.got[storm..]).len();
+    let most = (lasted.as_millis() / 200 + 2) as usize;
+    assert!(
+        during <= most,
+        "{during} sixels in {lasted:?} of tab switches, more than {most}\n{}",
+        term.context()
+    );
+    // Every tab has a frame for this layout: each goes over the one before, never a blank.
+    assert!(
+        !has(&term.got[storm..], &blank_row(80)),
+        "the rows were blanked between tabs that all have frames\n{}",
+        term.context()
+    );
+    // Settled: the shown tab's frame is the last thing on the rows, after any blank.
+    let blank = blank_row(80);
+    let shown = term.wait(storm, Duration::from_secs(5), |got| {
+        let last_blank = got
+            .windows(blank.len())
+            .rposition(|w| w == blank.as_slice());
+        sixel_spans(got)
+            .last()
+            .is_some_and(|&(start, _)| last_blank.is_none_or(|at| at < start))
+    });
+    let tail = &term.got[storm..];
+    let last_blank = tail
+        .windows(blank.len())
+        .rposition(|w| w == blank.as_slice());
+    let spans = sixel_spans(tail);
+    assert!(
+        shown,
+        "no sixel once the switches stopped: last blank at {last_blank:?}, sixels at {:?}, {} bytes\n{}",
+        spans,
+        tail.len(),
+        printable(&tail[last_blank.unwrap_or(0)..])
+    );
+    assert!(term.running(), "{}", term.context());
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// Inside tmux (TERM) too, a page that keeps changing has its sixels written over each other
+/// with no blank: a blank every few frames would be a blink each time, and spaces over a sixel
+/// Rio shows are what loses Rio its GPU device (decision 133).
+#[test]
+fn inside_tmux_a_changing_page_is_not_blanked_either() {
+    let mut term = Terminal::start_in_tmux(
+        "sixel-stack",
+        &["demo://animation"],
+        SIXEL_REPLIES,
+        SIXEL_KEYS,
+    );
+    let shown = term.wait(0, Duration::from_secs(20), |got| {
+        sixel_spans(got).len() >= 12
+    });
+    assert!(shown, "fewer than 12 sixel frames\n{}", term.context());
+    let spans = sixel_spans(&term.got);
+    let blank = blank_row(80);
+    for pair in spans.windows(2) {
+        assert!(
+            !has(&term.got[pair[0].1..pair[1].0], &blank),
+            "a changing page was blanked inside tmux\n{}",
+            term.context()
+        );
+    }
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// Inside tmux, once a page with sixels over each other is quiet (400 ms without a new one),
+/// its picture is written again after a blank, once, so tmux keeps that one alone. Outside
+/// tmux nothing is stored, and nothing is written again.
+#[test]
+fn inside_tmux_a_quiet_page_is_written_again_alone_and_outside_it_is_not() {
+    for tmux in [true, false] {
+        let name = if tmux {
+            "sixel-quiet-tmux"
+        } else {
+            "sixel-quiet"
+        };
+        let args = ["demo://pattern", "demo://resize"];
+        let mut term = match tmux {
+            true => Terminal::start_in_tmux(name, &args, SIXEL_REPLIES, SIXEL_KEYS),
+            false => Terminal::start_in(name, &args, SIXEL_REPLIES, SIXEL_KEYS),
+        };
+        let shown = term.wait(0, Duration::from_secs(15), |got| {
+            !sixel_spans(got).is_empty()
+        });
+        assert!(shown, "no sixel\n{}", term.context());
+        // To tab 2 and back: tab 1's frame goes over tab 2's sixel, a stack of two or more.
+        for _ in 0..2 {
+            term.wait(term.got.len(), Duration::from_millis(1500), |_| false);
+            term.type_bytes(F2);
+        }
+        let from = term.got.len();
+        term.wait(from, Duration::from_millis(2000), |_| false);
+        let after = &term.got[from..];
+        let spans = sixel_spans(after);
+        let blank = blank_row(80);
+        assert!(
+            !spans.is_empty(),
+            "no sixel after the switch\n{}",
+            term.context()
+        );
+        let first = spans[0];
+        assert!(
+            !has(&after[..first.0], &blank),
+            "the switch blanked first\n{}",
+            term.context()
+        );
+        let last = spans[spans.len() - 1];
+        let blanked = spans.len() >= 2 && has(&after[spans[spans.len() - 2].1..last.0], &blank);
+        if tmux {
+            let before = spans[spans.len() - 2];
+            assert!(
+                blanked && after[before.0..before.1] == after[last.0..last.1],
+                "the quiet page was not written again alone ({} sixels)\n{}",
+                spans.len(),
+                term.context()
+            );
+        } else {
+            assert!(
+                !has(after, &blank),
+                "outside tmux the quiet page was blanked\n{}",
+                term.context()
+            );
+        }
+        // Then nothing: a still page writes no sixel.
+        let quiet = term.got.len();
+        term.wait(quiet, Duration::from_millis(1000), |_| false);
+        assert!(
+            sixel_spans(&term.got[quiet..]).is_empty(),
+            "a still page wrote a sixel\n{}",
+            term.context()
+        );
+        term.type_bytes(b"q");
+        assert!(term.exit().success(), "{}", term.context());
+    }
 }
 
 #[test]
@@ -2020,9 +2392,8 @@ fn fullscreen_in_the_terminal_is_a_notice() {
         image(got, 80, 22, 800, 440)
     });
     assert!(shown, "no image\n{}", term.context());
-    let page = |held: bool| {
-        format!("\"fullscreen\":{{\"page\":{held},\"wanted\":false,\"window\":false}}")
-    };
+    let page = |held: bool| format!("{{\"page\":{held},\"wanted\":false,\"window\":false}}");
+    let fullscreen = |report: &str| report_value(report, "fullscreen");
     let since = term.got.len();
     term.type_bytes(b"\x1b[<0;6;6M\x1b[<0;6;6m");
     let told = term.wait(since, Duration::from_secs(10), |got| {
@@ -2033,11 +2404,16 @@ fn fullscreen_in_the_terminal_is_a_notice() {
         "no notice of the page's fullscreen\n{}",
         term.context()
     );
-    let report = term.report_until(|r| r.contains(&page(true)));
-    assert!(report.contains(&page(true)), "{report}\n{}", term.context());
+    let report = term.report_until(|r| fullscreen(r) == page(true));
+    assert_eq!(
+        fullscreen(&report),
+        page(true),
+        "{report}\n{}",
+        term.context()
+    );
     term.type_bytes(b"\x1b");
     // Left, the notice that said so is taken back: the bottom line says nothing.
-    let left = |r: &str| r.contains(&page(false)) && r.contains("\"status\":null");
+    let left = |r: &str| fullscreen(r) == page(false) && r.contains("\"status\":null");
     let report = term.report_until(left);
     assert!(left(&report), "{report}\n{}", term.context());
     let since = term.got.len();
@@ -2054,7 +2430,7 @@ fn fullscreen_in_the_terminal_is_a_notice() {
     });
     assert!(opened, "the page did not open\n{}", term.context());
     let report = term.report_until(|_| false);
-    assert!(report.contains(&page(false)), "{}", term.context());
+    assert_eq!(fullscreen(&report), page(false), "{}", term.context());
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();

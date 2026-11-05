@@ -39,8 +39,8 @@ use rustix::termios::Winsize;
 use sighurt_api::input::{ButtonState, KeyEvent, Modifiers, PointerButton};
 use sighurt_api::services::Selection;
 
+pub(crate) use modes::{inside_multiplexer, SYNC_BEGIN, SYNC_END};
 pub use modes::{ENTER, KITTY_KEYBOARD_FLAGS, LEAVE, QUERIES};
-pub(crate) use modes::{SYNC_BEGIN, SYNC_END};
 pub use parser::{Wheel, ESC_TIMEOUT};
 pub use probe::{Caps as Capabilities, XtGetTcap, PROBE_DEADLINE};
 pub use session::{
