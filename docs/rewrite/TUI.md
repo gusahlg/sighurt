@@ -119,6 +119,31 @@ at 8 Mpx; one readback per presented frame, counted in the diagnostics; no permi
 or in text mode. Full-frame kitty transmits first (raw, zlib); banded updates via kitty animation
 frames as a measured later step; sixel always full-frame, quantized, default 5 fps.
 
+As built (decision 133): every image written counts against that rate, a frame sent again
+because a tab was shown included, and a hidden tab's image is deleted or written over (by the
+shown tab's image or by spaces) only once the last image has been up for its frame interval and
+at least 250 ms. Rio 0.5.28 makes a Vulkan texture for each image, synchronously, and destroys it
+as soon as the image is deleted or covered, without waiting for the frames in flight that draw
+it. With tabs switched at key repeat (a full-page image each, blanked or deleted a moment later)
+it lost its device (NVIDIA Xid 109, `ERROR_DEVICE_LOST` from its upload's queue submit) within
+seconds, with sixel and with kitty graphics; a page's own frames replacing each other at
+`[tui] fps` (100 ms apart for kitty, 200 ms for sixel, a minute of each) did not. A sixel for
+the place and layout of the one on the page rows is written over it as it is, and not at all
+when its bytes are the same: tmux frees a stored image when any cell is written over it and
+redraws the whole pane, so the blank the frontend used to write before every frame showed the
+rows black until the next image had arrived. Only a new layout, or rows that held text, are
+blanked first (spaces, in a synchronized update that ends before the image). A tab switch
+writes the shown tab's frame over the hidden tab's image when that time comes (kitty deletes
+the hidden one's id in the same write); a tab with no frame for this layout gets the blank then,
+and its frame when it comes. So a hidden tab's picture can stay under the shown tab's title for
+up to 250 ms. tmux keeps the sixels written over each other (at most 20 in the server, the
+oldest freed without a redraw) and sends them all again, oldest first, when it redraws the pane
+(a window switched back to, a reattach). Rio alone, with `[tui] graphics = "sixel"` forced,
+still shows an empty page for a frame now and then when a sixel replaces the one under it
+(4–11 of 200 screenshots in about 4 s; with the old blank before every frame Rio lost its
+device instead); a synchronized update around the image made Rio lose its device too. Rio
+alone picks kitty graphics, which show no such frames.
+
 ## 3. The semantic interface (`sighurt_api::semantic`)
 
 ```rust

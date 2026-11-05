@@ -154,7 +154,8 @@ top; status and notices below) and the page between them in one of two modes:
 - **Graphics**: the page's pixels as kitty graphics, up to `[tui] fps` frames a second (10 by
   default), in a terminal that speaks the kitty graphics protocol (kitty, Rio, ghostty,
   WezTerm), or as sixel, at most 5 a second, where the terminal has sixel but not kitty
-  graphics: inside tmux 3.4 or later, foot, xterm with sixel.
+  graphics: inside tmux 3.4 or later, foot, xterm with sixel. A page a tab switch shows counts
+  against that rate too, so holding the tab-switch key never floods the terminal with images.
 - **Text**: the page's content reflowed into terminal lines, with links and controls you can
   move to and activate. It works in any terminal, and is the mode `auto` picks where the
   terminal can't show images. It needs an engine with the `semantics` capability: Servo, WPE
