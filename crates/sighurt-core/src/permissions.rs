@@ -21,6 +21,14 @@
 //!   opens Sighurt's `sig:` pages, and opens `file:` URLs only if it is a `file:` page itself.
 //! - Camera, microphone, location and screen capture need the user's answer to a prompt.
 //! - Downloads are limited to one per [`DOWNLOAD_INTERVAL`] per tab.
+//! - What only Sighurt's own pages may ask for (`Service::Page`) is granted from the core's own
+//!   record of the view's page and that page's grants, never from the request's origin, which
+//!   must be the page's own (`sig://<name>`) as well. A terminal (`PtyOpen`) and writing the
+//!   configuration (`ConfigWrite`) need the page shown in the selected tab, with the keyboard,
+//!   and a click or key press in it, which they use up. A terminal also needs
+//!   `[pages.terminal] enabled`, no other terminal of the document, and fewer than [`MAX_PTYS`]
+//!   in all. The core tracks each terminal ([`Ptys`]): opening, open, closing, closed, the
+//!   allowance kept until it is closed (the runtime says the program was reaped).
 //!
 //! A request that fits none of this is refused. Requests are bounded per view
 //! ([`MAX_PENDING_REQUESTS`]).
@@ -30,8 +38,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use sighurt_api::ids::{DocumentGeneration, RequestId, ViewId};
-use sighurt_api::services::{DownloadSource, Permission, Service};
+use sighurt_api::ids::{DocumentGeneration, PtySession, RequestId, ViewId};
+use sighurt_api::services::{DownloadSource, PageGrant, Permission, Service};
 
 use crate::tabs::MAX_URL;
 
@@ -43,6 +51,9 @@ pub const DOWNLOAD_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The most service requests one view may have waiting for an answer.
 pub const MAX_PENDING_REQUESTS: usize = 16;
+
+/// The most terminals (`PtyOpen`) running at once, in all.
+pub const MAX_PTYS: usize = 8;
 
 /// Whether the user activated the page recently enough, as of `now`.
 pub(crate) fn is_active(activation: Option<Instant>, now: Instant) -> bool {
@@ -73,6 +84,9 @@ pub(crate) enum Requirement {
     Throttle,
     /// The user's answer, unless the document already has it or the origin was refused.
     Prompt(Permission),
+    /// An internal page's request: the view must be that page, with this grant (and for a
+    /// terminal, the rest of the module documentation's rule).
+    Page(PageGrant),
     /// Nothing: it is refused.
     Refused,
 }
@@ -94,7 +108,7 @@ pub(crate) fn requirement(service: &Service) -> Requirement {
         } if url.len() > MAX_URL || url::Url::parse(url).is_err() => Requirement::Refused,
         Service::Download { .. } => Requirement::Throttle,
         Service::Permission(permission) => Requirement::Prompt(*permission),
-        Service::Page(_) => Requirement::Refused,
+        Service::Page(request) => Requirement::Page(request.grant()),
     }
 }
 
@@ -203,6 +217,79 @@ impl Requests {
             self.0.remove(id);
         }
         ids
+    }
+}
+
+/// Where a terminal an internal page started is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PtyState {
+    /// Allowed, and asked of the executable; no answer yet.
+    Opening,
+    /// Its program runs.
+    Open(PtySession),
+    /// Cancelled: the executable is ending its program, and says when it was reaped.
+    Closing,
+}
+
+/// One terminal, from its request's allowance until its program was reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Pty {
+    pub view: ViewId,
+    /// The document it belongs to: it ends with it.
+    pub document: DocumentGeneration,
+    pub state: PtyState,
+}
+
+/// The terminals, by the request that started each. A terminal counts against the limits in
+/// every state, so a program being ended still holds its place.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Ptys(BTreeMap<RequestId, Pty>);
+
+impl Ptys {
+    pub(crate) fn get(&self, request: RequestId) -> Option<&Pty> {
+        self.0.get(&request)
+    }
+
+    pub(crate) fn insert(&mut self, request: RequestId, pty: Pty) {
+        self.0.insert(request, pty);
+    }
+
+    pub(crate) fn remove(&mut self, request: RequestId) -> Option<Pty> {
+        self.0.remove(&request)
+    }
+
+    /// Whether a terminal may start for `document` of `view`: it has none, and there are fewer
+    /// than [`MAX_PTYS`].
+    pub(crate) fn room(&self, view: ViewId, document: DocumentGeneration) -> bool {
+        self.0.len() < MAX_PTYS
+            && !self
+                .0
+                .values()
+                .any(|pty| pty.view == view && pty.document == document)
+    }
+
+    /// Moves `request`'s terminal to closing; whether it was not closing yet.
+    pub(crate) fn close_one(&mut self, request: RequestId) -> bool {
+        match self.0.get_mut(&request) {
+            Some(pty) if pty.state != PtyState::Closing => {
+                pty.state = PtyState::Closing;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Moves every terminal `end` selects that is not closing yet to closing, and returns
+    /// their requests, to cancel.
+    pub(crate) fn close(&mut self, mut end: impl FnMut(&Pty) -> bool) -> Vec<RequestId> {
+        let mut closed = Vec::new();
+        for (request, pty) in &mut self.0 {
+            if pty.state != PtyState::Closing && end(pty) {
+                pty.state = PtyState::Closing;
+                closed.push(*request);
+            }
+        }
+        closed
     }
 }
 

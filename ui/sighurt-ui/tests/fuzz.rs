@@ -73,6 +73,7 @@ fn fuzz_snapshot_contain() {
                 status: rng.one_in(2).then(|| text(rng)),
                 keymap: rng.one_in(2).then(|| text(rng)),
                 fullscreen: rng.one_in(2),
+                commands: Vec::new(),
                 find: rng.one_in(2).then(|| FindSnapshot {
                     text: text(rng),
                     ..FindSnapshot::default()

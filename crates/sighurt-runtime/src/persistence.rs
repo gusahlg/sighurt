@@ -763,8 +763,11 @@ mod tests {
             1,
             "a failure goes on unreported"
         );
-        fs::remove_file(&path).unwrap();
-        fs::create_dir_all(path.join("x")).unwrap();
+        // A save still queued may write the file once more before the directory is there.
+        until(&|| {
+            let _ = fs::remove_file(&path);
+            fs::create_dir_all(path.join("x")).is_ok()
+        });
         writer.save(empty_session());
         writer.finish();
         assert_eq!(

@@ -10393,6 +10393,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sig-page-help"
+version = "0.10.0"
+dependencies = [
+ "sig-page-kit",
+ "sighurt-sdk",
+]
+
+[[package]]
 name = "sig-page-kit"
 version = "0.10.0"
 dependencies = [
@@ -10602,6 +10610,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sighurt-pages"
+version = "0.10.0"
+dependencies = [
+ "sighurt-api",
+ "sighurt-engine-wasm",
+ "wasmtime",
+]
+
+[[package]]
 name = "sighurt-render"
 version = "0.10.0"
 dependencies = [
@@ -10666,6 +10683,7 @@ dependencies = [
  "sighurt-engine-servo",
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",
+ "sighurt-pages",
  "tempfile",
  "toml 1.1.6+spec-1.1.0",
  "url",

@@ -9,7 +9,7 @@ mod fuzz;
 use std::time::Duration;
 
 use fuzz::{iterations, run, Rng};
-use sighurt_api::commands::{Command, CommandSet, SentKey};
+use sighurt_api::commands::{Command, CommandSet, SentKey, TabMove, MAX_FIND};
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, Modifiers};
 use sighurt_api::keymap::Chord;
 
@@ -163,6 +163,102 @@ fn fuzz_commands_parse_and_round_trip() {
             "canonical"
         );
         assert_eq!(CommandSet::ANY.parse(&text), Ok(command));
+    });
+}
+
+/// An argument for the commands added with find, the tab commands and `location.focus`: text
+/// around `MAX_FIND` (a multi-byte character across the limit), whitespace and control
+/// characters, `tab.move`'s words and numbers at their edges.
+fn new_argument(rng: &mut Rng) -> String {
+    match rng.below(8) {
+        0 => "x".repeat(rng.range(MAX_FIND - 2, MAX_FIND + 2)),
+        1 => format!("{}é", "a".repeat(rng.range(MAX_FIND - 3, MAX_FIND))),
+        2 => rng.string_from(
+            &["a", " ", "\t", "\n", "\u{1b}", "\0", "\u{85}", "\u{a0}"],
+            12,
+        ),
+        3 => rng
+            .pick(&[
+                "left",
+                "right",
+                "LEFT",
+                "Left",
+                "0",
+                "1",
+                "-1",
+                "+2",
+                "4294967296",
+                "18446744073709551616",
+                "1.5",
+                "left right",
+            ])
+            .to_string(),
+        4 => format!(":{}", rng.string(10)),
+        5 => rng.next_u64().to_string(),
+        _ => rng.string(30),
+    }
+}
+
+/// `page.find`, `tab.move`, `tab.new`, `location.focus` and the argument-less new commands:
+/// they parse as their documentation says, round trip, and `page.find` refuses exactly the
+/// text over `MAX_FIND` bytes.
+#[test]
+fn fuzz_the_new_commands() {
+    const NEW: [&str; 11] = [
+        "page.find",
+        "page.find-next",
+        "page.find-previous",
+        "page.find-stop",
+        "tab.move",
+        "tab.new",
+        "tab.duplicate",
+        "tab.reopen",
+        "location.focus",
+        "browser.fullscreen",
+        "page.exit-fullscreen",
+    ];
+    run("fuzz_new_commands", iterations(100) * 2, LIMIT, |case| {
+        let name = *case.rng.pick(&NEW);
+        let argument = new_argument(&mut case.rng);
+        let separator = *case.rng.pick(&[" ", "\t", "  "]);
+        let text = format!("{name}{separator}{argument}");
+        case.note(|| format!("{text:?}"));
+        let parsed = text.parse::<Command>();
+        let argument = argument.trim();
+        if name == "page.find" {
+            match &parsed {
+                Ok(Command::PageFind(Some(found))) => {
+                    assert!(found.len() <= MAX_FIND);
+                    assert_eq!(found, argument);
+                }
+                Ok(Command::PageFind(None)) => assert!(argument.is_empty()),
+                Ok(other) => panic!("{other:?}"),
+                Err(_) => assert!(
+                    argument.len() > MAX_FIND,
+                    "refused {} bytes",
+                    argument.len()
+                ),
+            }
+        }
+        if let Ok(Command::TabMove(to)) = &parsed {
+            match to {
+                TabMove::Left => assert_eq!(argument, "left"),
+                TabMove::Right => assert_eq!(argument, "right"),
+                TabMove::To(n) => {
+                    assert_eq!(argument.parse::<std::num::NonZeroUsize>().ok(), Some(*n))
+                }
+            }
+        }
+        let Ok(command) = parsed else {
+            return;
+        };
+        assert_eq!(command.name(), name);
+        let shown = command.to_string();
+        assert_eq!(
+            shown.parse::<Command>().as_ref(),
+            Ok(&command),
+            "round trip"
+        );
     });
 }
 

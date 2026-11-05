@@ -59,7 +59,7 @@
 //! Must not own: I/O, timers, threads, surface metrics or anything the chrome draws. It is not a
 //! framework: no event bus, no generic UI tree, no plugin registry.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -73,13 +73,14 @@ use sighurt_api::events::{
 };
 use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, TabId, ViewId};
 use sighurt_api::input::{
-    ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyEvent, KeyboardFocus, PointerButton,
-    PointerEvent, ScrollDelta, TextInputState,
+    ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus,
+    PointerButton, PointerEvent, ScrollDelta, TextInputState,
 };
-use sighurt_api::keymap::{Browser, KeyContext, KeymapKind, TabInfo};
+use sighurt_api::keymap::{Browser, KeyBinding, KeyContext, KeymapKind, TabInfo};
 use sighurt_api::semantic::SemanticAction;
 use sighurt_api::services::{
-    Permission, Service, ServiceError, ServiceReply, ServiceRequest, ServiceResult,
+    PageGrant, PageRequest, Permission, Service, ServiceError, ServiceReply, ServiceRequest,
+    ServiceResult,
 };
 use sighurt_api::settings::Table;
 use url::Url;
@@ -90,8 +91,10 @@ use crate::keys::{KeyOutcome, KeyState};
 use crate::navigation::{
     NavigationKind, Record, Segment, Switch, SwitchInto, MAX_SEGMENTS, RETAINED_VIEWS,
 };
-use crate::permissions::{self, Pending, Requests, Requirement, MAX_PENDING_REQUESTS};
-use crate::router::{self, Route};
+use crate::permissions::{
+    self, Pending, Pty, PtyState, Ptys, Requests, Requirement, MAX_PENDING_REQUESTS,
+};
+use crate::router::{self, Route, PAGE_ENGINE};
 use crate::session::{self, Session, SessionSegment, SessionTab};
 use crate::tabs::{
     bounded, clamp, display_title, link, ClosedTab, Content, LoadError, Tab, TabSummary, View,
@@ -139,6 +142,11 @@ pub struct Environment {
     /// applies it on top of every file it reads, so a reload keeps it. `None` uses the
     /// process-wide choice from [`crate::config::set_starting_engine`], if one was set.
     pub starting_engine: Option<String>,
+    /// The build's internal pages (`sig://help` is `help`), with what each may ask for
+    /// ([`Service::Page`]): `sighurt-pages`' table, for a build with the wasm engine. Routing
+    /// opens these in the wasm engine; the core grants a page's requests from this and its own
+    /// record of which page a view is.
+    pub pages: BTreeMap<String, &'static [PageGrant]>,
 }
 
 /// What the core needs of a chrome of the build: its name, the check of its
@@ -532,11 +540,12 @@ impl Fx {
 }
 
 /// Who asks for a navigation: the user, with the engine they chose if they chose one, or the
-/// page the tab shows.
+/// page the tab shows, which is an internal page or not. Only the user and internal pages open
+/// `sig:` pages ([`BrowserState::navigate`] refuses the rest).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum By<'a> {
     User(Option<&'a str>),
-    Page,
+    Page { internal: bool },
 }
 
 /// What the core asks a view to load.
@@ -593,11 +602,36 @@ pub struct BrowserState {
     pub(crate) fullscreen: Fullscreen,
     /// Whether the window has the keyboard: until the frontend says it lost it, it has.
     window_focused: bool,
+    /// The tab that came to the front without the user's command (a page closed its tab):
+    /// its page gets no typing until the user clicks it or runs a command, so keystrokes meant
+    /// for one page never land in another.
+    held: Option<TabId>,
+    /// Which view each key press delivered to a page went to: its repeats and release go there
+    /// only, never to a view shown since.
+    pressed: HashMap<(SeatId, KeyCode), ViewId>,
+    /// The terminals internal pages started.
+    ptys: Ptys,
 }
 
 /// Applies `event` to `state` and returns what the executable should do.
 pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
     let mut fx = Fx::default();
+    let front = state.tabs.get(state.active).map(|tab| tab.id);
+    // What the user does: the tab shown may change, and that is what they asked for.
+    let by_user = matches!(
+        event,
+        BrowserEvent::Start { .. }
+            | BrowserEvent::Command(_)
+            | BrowserEvent::SelectTab(_)
+            | BrowserEvent::CloseTab(_)
+            | BrowserEvent::Open(_)
+            | BrowserEvent::Keyboard { .. }
+            | BrowserEvent::Pointer { .. }
+            | BrowserEvent::PointerRelease { .. }
+            | BrowserEvent::Button { .. }
+            | BrowserEvent::Focus(_)
+            | BrowserEvent::Semantic { .. }
+    );
     match event {
         BrowserEvent::Start { session, open } => state.start(session, open, &mut fx),
         BrowserEvent::Command(command) => state.run_command(command, &mut fx),
@@ -677,6 +711,9 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             supported,
             &mut fx,
         ),
+        BrowserEvent::ServiceDone { request, result } if state.ptys.get(request).is_some() => {
+            state.pty_answered(request, result, &mut fx)
+        }
         BrowserEvent::ServiceDone { request, result } => {
             if let Some(pending) = state.requests.remove(request) {
                 if state.is_document(pending.view, pending.document) {
@@ -696,7 +733,17 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             state.visits_forgotten(request, outcome, &mut fx)
         }
     }
+    let now_front = state.tabs.get(state.active).map(|tab| tab.id);
+    if !by_user && now_front != front && now_front.is_some() {
+        state.hold_input(now_front, &mut fx);
+    }
     state.settle(&mut fx);
+    if fx.quit {
+        // Quitting ends the terminals' programs, as closing their tabs would.
+        for request in state.ptys.close(|_| true) {
+            fx.push(Effect::CancelService(request));
+        }
+    }
     let mut effects = fx.effects;
     if fx.chrome {
         effects.push(Effect::RedrawChrome);
@@ -876,9 +923,10 @@ fn shown<'a>(tab: &'a Tab, views: &'a BTreeMap<ViewId, View>, env: &Environment)
     let loading = switching.is_some() || pending.is_some() || view.is_some_and(|v| v.loading);
     // A failed view is an error, not a page of that engine. A switch that has not replaced
     // the page leaves the previous view's engine, which is what the tab still shows.
+    // An internal page names no engine: it is the browser's own.
     let engine = match tab.current() {
         Some(Segment::View(_)) => view
-            .filter(|view| view.failure.is_none())
+            .filter(|view| view.failure.is_none() && view.page.is_none())
             .map(|view| view.engine()),
         _ => None,
     };
@@ -957,18 +1005,21 @@ impl Browser for CoreBrowser<'_> {
     fn tab(&self, index: usize) -> Option<TabInfo<'_>> {
         let tab = self.tabs.get(index)?;
         let shown = shown(tab, self.views, self.env);
-        Some(TabInfo::new(
-            tab.id,
-            shown.title,
-            shown.url,
-            shown.loading,
-            shown.engine,
-            tab.zoom,
-            shown.can_go_back,
-            shown.can_go_forward,
-            shown.view.and_then(|view| view.hovered.as_deref()),
-            self.fullscreen.is_some() && self.fullscreen == tab.current_view(),
-        ))
+        Some(
+            TabInfo::new(
+                tab.id,
+                shown.title,
+                shown.url,
+                shown.loading,
+                shown.engine,
+                tab.zoom,
+                shown.can_go_back,
+                shown.can_go_forward,
+                shown.view.and_then(|view| view.hovered.as_deref()),
+                self.fullscreen.is_some() && self.fullscreen == tab.current_view(),
+            )
+            .with_internal(shown.view.and_then(View::page)),
+        )
     }
 }
 
@@ -1003,6 +1054,9 @@ impl BrowserState {
             closed: VecDeque::new(),
             fullscreen: Fullscreen::default(),
             window_focused: true,
+            held: None,
+            pressed: HashMap::new(),
+            ptys: Ptys::default(),
         }
     }
 
@@ -1020,6 +1074,17 @@ impl BrowserState {
     /// contains it before a chrome sees it, as it does page text.
     pub fn keymap_indicator(&self) -> Option<&str> {
         self.indicator.as_deref()
+    }
+
+    /// The bindings of the keymap in use, for the running frontend
+    /// (`sighurt_api::keymap::Keymap::describe`), for the help page.
+    pub fn describe_keys(&self) -> Vec<KeyBinding> {
+        self.keys.describe(self.env.frontend)
+    }
+
+    /// What the core was told about the build.
+    pub fn environment(&self) -> &Environment {
+        &self.env
     }
 
     /// Whether the keymap lets text that is not a key press reach the page now
@@ -1106,7 +1171,10 @@ impl BrowserState {
             content: shown.content,
             error: tab.error.as_ref(),
             reloads: shown.reloads,
-            switching_to: shown.switching.map(|view| view.engine()),
+            switching_to: shown
+                .switching
+                .filter(|view| view.page.is_none())
+                .map(|view| view.engine()),
             find: shown.view.and_then(|view| view.find.as_ref()),
         }
     }
@@ -1177,8 +1245,14 @@ impl BrowserState {
 
     /// Takes a reloaded configuration into use. The keymap of the same kind is configured
     /// again, keeping its state; another replaces it. The chrome stays the one `sig` started
-    /// with, and the engines keep the settings they started with.
+    /// with, and the engines keep the settings they started with. A configuration equal to the
+    /// one in use changes nothing and says nothing.
     fn reconfigure(&mut self, config: Config, fx: &mut Fx) {
+        // The same configuration again (sig://config's write, then the file watch seeing it):
+        // nothing changes, and nothing is said twice.
+        if config == self.config {
+            return;
+        }
         self.keys.configure(config.keymap, &config.keymap_settings);
         let mut notices = config.notices().to_vec();
         if config.chrome() != self.chrome {
@@ -1330,12 +1404,26 @@ impl BrowserState {
     /// when the user chose its engine, and no longer when the user navigates it without
     /// choosing; the page's own navigations leave that as it is. A page's navigation does
     /// nothing while the tab loads a new view the user asked for: the page is being left.
+    ///
+    /// Sighurt's own pages: only the user and the internal pages open a `sig:` address; any
+    /// other page's attempt, however it got here, is refused with a notice. An internal page
+    /// opens in a view of its own, of its name, for life: a view is reused only for the same
+    /// page, and a page's view never loads anything else.
     pub(crate) fn navigate(&mut self, tab: usize, url: String, by: By<'_>, fx: &mut Fx) {
         let explicit = match by {
             By::User(engine) => engine,
-            By::Page if self.tabs[tab].switch.is_some_and(|s| !s.by_page) => return,
-            By::Page => None,
+            By::Page { .. } if self.tabs[tab].switch.is_some_and(|s| !s.by_page) => return,
+            By::Page { .. } => None,
         };
+        let sig = Url::parse(&url).is_ok_and(|url| url.scheme() == "sig");
+        if sig && matches!(by, By::Page { internal: false }) {
+            return fx.push(Effect::Notice {
+                tab: Some(self.tabs[tab].id),
+                message: clamp(format!(
+                    "A page tried to open {url}. Pages can't open Sighurt's own pages."
+                )),
+            });
+        }
         fx.chrome = true;
         self.cancel_switch(tab, fx);
         let error = |url: Option<String>, message: String| Some(LoadError { url, message });
@@ -1352,9 +1440,13 @@ impl BrowserState {
             }
         };
         self.tabs[tab].error = None;
-        let engine = match router::route(&parsed, &self.config, explicit) {
+        let (engine, page, url) = match router::route(&parsed, &self.config, explicit) {
             Route::Internal => return self.append(tab, Segment::Internal(parsed.into()), fx),
-            Route::Engine(engine) => engine,
+            Route::Page(name) => {
+                let address = router::canonical(&parsed, &name);
+                (PAGE_ENGINE.to_owned(), Some(name), address)
+            }
+            Route::Engine(engine) => (engine, None, String::from(parsed)),
             Route::Error(message) => {
                 self.tabs[tab].error = error(Some(url), clamp(message));
                 return;
@@ -1364,17 +1456,43 @@ impl BrowserState {
             self.tabs[tab].error = error(Some(url), message);
             return;
         }
-        let url = String::from(parsed);
         // An engine without history of its own gets a new view, so back reaches this page.
         let traverses = self.capabilities(&engine).history_traversal;
         match self.tabs[tab].current_view() {
-            Some(view) if self.views[&view].engine == engine && traverses => {
+            Some(view)
+                if self.views[&view].engine == engine
+                    && self.views[&view].page == page
+                    && traverses =>
+            {
                 if let By::User(_) = by {
                     self.views.get_mut(&view).expect("current").chosen = explicit.is_some();
                 }
                 self.request(view, Request::Navigate(url), fx)
             }
-            _ => self.open_view(tab, engine, url, SwitchInto::Append, by, fx),
+            _ => self.open_view(tab, engine, page, url, SwitchInto::Append, by, fx),
+        }
+    }
+
+    /// Where a saved page at `url`, last in `engine`, opens again: an internal page is routed
+    /// again (it may be gone from this build or the configuration), anything else stays in its
+    /// engine.
+    fn reopened(
+        &self,
+        engine: &str,
+        url: &str,
+    ) -> Result<(String, Option<String>, String), String> {
+        let parsed = Url::parse(url).map_err(|e| format!("{url} is not an address ({e})."))?;
+        if parsed.scheme() != "sig" {
+            return Ok((engine.to_owned(), None, url.to_owned()));
+        }
+        match router::route(&parsed, &self.config, None) {
+            Route::Page(name) => Ok((
+                PAGE_ENGINE.to_owned(),
+                Some(name.clone()),
+                router::canonical(&parsed, &name),
+            )),
+            Route::Error(message) => Err(message),
+            Route::Internal | Route::Engine(_) => Err(format!("There is no page {url}.")),
         }
     }
 
@@ -1422,10 +1540,12 @@ impl BrowserState {
 
     /// Opens a hidden view on `engine` that loads `url`, for tab `tab` to switch to, `by` the
     /// user (chosen if they chose the engine) or the page.
+    #[allow(clippy::too_many_arguments)]
     fn open_view(
         &mut self,
         tab: usize,
         engine: String,
+        page: Option<String>,
         url: String,
         into: SwitchInto,
         by: By<'_>,
@@ -1436,11 +1556,12 @@ impl BrowserState {
         let zoom = if zooms { t.zoom } else { 1.0 };
         let mut view = View::new(engine.clone(), t.id, zoom);
         view.chosen = matches!(by, By::User(Some(_)));
+        view.page = page;
         let id = view.id;
         t.switch = Some(Switch {
             view: id,
             into,
-            by_page: matches!(by, By::Page),
+            by_page: matches!(by, By::Page { .. }),
         });
         let options = ViewOptions {
             visible: false,
@@ -1664,13 +1785,22 @@ impl BrowserState {
         let (engine, url) = (record.engine.clone(), record.url().map(str::to_owned));
         let restore = match url {
             None => Err("This page's address was too long to keep.".to_owned()),
-            Some(url) if self.config.is_enabled(&engine) => self.usable(&engine).map(|()| url),
-            Some(_) => Err(format!(
-                "The {engine} engine is not enabled in the configuration."
-            )),
+            Some(url) => self
+                .reopened(&engine, &url)
+                .and_then(
+                    |(engine, page, url)| match self.config.is_enabled(&engine) {
+                        true => self.usable(&engine).map(|()| (engine, page, url)),
+                        false => Err(format!(
+                            "The {engine} engine is not enabled in the configuration."
+                        )),
+                    },
+                ),
         };
         match restore {
-            Ok(url) => self.open_view(tab, engine, url, SwitchInto::Restore(i), By::User(None), fx),
+            Ok((engine, page, url)) => {
+                let into = SwitchInto::Restore(i);
+                self.open_view(tab, engine, page, url, into, By::User(None), fx)
+            }
             Err(message) => {
                 let t = &mut self.tabs[tab];
                 t.current = i;
@@ -2126,6 +2256,14 @@ impl BrowserState {
                 ..
             } => self.page_fullscreen_changed(id, document, fullscreen, at, fx),
             EngineEvent::ServiceRequested(request) => self.service_requested(request, at, fx),
+            EngineEvent::ServiceCancelled { request, .. }
+                if self.ptys.get(request).is_some_and(|pty| pty.view == id) =>
+            {
+                // The page closed its terminal, or could not take it.
+                if self.ptys.close_one(request) {
+                    fx.push(Effect::CancelService(request));
+                }
+            }
             EngineEvent::ServiceCancelled { request, .. } => {
                 if self.requests.get(request).is_some_and(|p| p.view == id) {
                     self.requests.remove(request);
@@ -2402,13 +2540,14 @@ impl BrowserState {
         if self.refused(id, &url, fx) {
             return;
         }
+        let by = self.by_page(id);
         match disposition {
-            OpenDisposition::CurrentView => self.navigate(tab, url, By::Page, fx),
+            OpenDisposition::CurrentView => self.navigate(tab, url, by, fx),
             OpenDisposition::NewView => {
                 let view = self.views.get_mut(&id).expect("checked by the caller");
                 if permissions::take_activation(&mut view.activation, at) {
                     if let Some(tab) = self.new_tab(true, fx) {
-                        self.navigate(tab, url, By::Page, fx);
+                        self.navigate(tab, url, by, fx);
                     }
                 } else {
                     fx.push(Effect::Notice {
@@ -2420,13 +2559,20 @@ impl BrowserState {
         }
     }
 
+    /// Who a navigation the page in `view` starts is by: an internal page or another.
+    fn by_page(&self, view: ViewId) -> By<'static> {
+        By::Page {
+            internal: self.views.get(&view).is_some_and(|v| v.page.is_some()),
+        }
+    }
+
     /// Whether a page in `view` may not open `url`, telling the user if so: Sighurt's own pages
-    /// never, and local files only from a local page.
+    /// only from one of them, and local files only from a local page.
     fn refused(&self, view: ViewId, url: &str, fx: &mut Fx) -> bool {
         let v = &self.views[&view];
         let is_file = |url: &str| Url::parse(url).is_ok_and(|url| url.scheme() == "file");
         let why = match Url::parse(url).as_ref().map(Url::scheme) {
-            Ok("sig") => "Pages can't open Sighurt's own pages.",
+            Ok("sig") if v.page.is_none() => "Pages can't open Sighurt's own pages.",
             Ok("file") if !v.url.as_deref().is_some_and(is_file) => {
                 "Only local pages can open local files."
             }
@@ -2490,7 +2636,8 @@ impl BrowserState {
             return fx.push(answer(true));
         }
         fx.push(answer(false));
-        self.navigate(tab, url, By::Page, fx);
+        let by = self.by_page(id);
+        self.navigate(tab, url, by, fx);
     }
 
     /// A page asks to close itself: only a tab a page opened, that has shown nothing else.
@@ -2584,9 +2731,42 @@ impl BrowserState {
                 }
                 return;
             }
+            Requirement::Page(grant) => {
+                let page = v.page.clone();
+                let asking = (view, document, page.as_deref());
+                let allowed = self.page_allowed(asking, &origin, grant, &service);
+                let deliberate = matches!(
+                    service,
+                    Service::Page(PageRequest::PtyOpen { .. } | PageRequest::ConfigWrite { .. })
+                );
+                if allowed && deliberate {
+                    // Only the page in front, with the keyboard, after the user acted in it.
+                    let focused = tab == self.active && self.focused_view() == Some(view);
+                    let v = self.views.get_mut(&view).expect("checked above");
+                    focused && permissions::take_activation(&mut v.activation, at)
+                } else {
+                    allowed
+                }
+            }
         };
         if !allowed {
             return fx.push(refuse(ServiceError::Denied));
+        }
+        if let Service::Page(PageRequest::PtyOpen { .. }) = service {
+            let state = PtyState::Opening;
+            self.ptys.insert(
+                id,
+                Pty {
+                    view,
+                    document,
+                    state,
+                },
+            );
+            return fx.push(Effect::Service {
+                request: id,
+                view,
+                service,
+            });
         }
         let pending = Pending {
             view,
@@ -2600,6 +2780,33 @@ impl BrowserState {
             view,
             service,
         });
+    }
+
+    /// Whether `document` of `view`, whose recorded internal page is `page`, may have an
+    /// internal page's request needing `grant`, asked as `origin`: it must be that page, asking as itself, with
+    /// the grant; a terminal also needs `[pages] terminal` and room under the limits (one per
+    /// document, [`permissions::MAX_PTYS`] in all). Being in front and the activation used up
+    /// are the caller's to check.
+    fn page_allowed(
+        &self,
+        (view, document, page): (ViewId, DocumentGeneration, Option<&str>),
+        origin: &Option<String>,
+        grant: PageGrant,
+        service: &Service,
+    ) -> bool {
+        let Some(name) = page else {
+            return false;
+        };
+        let grants = self.env.pages.get(name).copied().unwrap_or_default();
+        if origin.as_deref() != Some(format!("sig://{name}").as_str()) || !grants.contains(&grant) {
+            return false;
+        }
+        match service {
+            Service::Page(PageRequest::PtyOpen { .. }) => {
+                self.config.pages().terminal && self.ptys.room(view, document)
+            }
+            _ => true,
+        }
     }
 
     fn permission_answered(&mut self, request: RequestId, allow: bool, fx: &mut Fx) {
@@ -2705,7 +2912,17 @@ impl BrowserState {
                         // `settle` runs once, after this press. When several commands run, tell
                         // the engines which view is shown after each one, so a later
                         // `page.send-key` follows that view's focus and visibility, as when the
-                        // commands run one by one. One command is left entirely to `settle`.
+                        // commands run one by one. One command is left entirely to `settle`. A
+                        // command of `[commands]` runs its built-in commands here, in its place.
+                        self.release_input();
+                        let mut expanded = Vec::new();
+                        for command in commands {
+                            match command {
+                                Command::Custom(name) => expanded.extend(self.expand(&name, fx)),
+                                command => expanded.push(command),
+                            }
+                        }
+                        let commands = expanded;
                         let between = commands.len() > 1;
                         for command in commands {
                             self.key_ran(&command, at);
@@ -2752,6 +2969,16 @@ impl BrowserState {
             InputKind::Pointer(_) => return,
         }
         match self.focused_view() {
+            // The tab shown came to the front by itself: what is typed was meant for another
+            // page until the user takes this one. A press dropped takes its repeats and release
+            // with it, and grants nothing.
+            Some(_) if self.input_held() && is_typing(&event.kind) => {
+                if let InputKind::Key(key) = &event.kind {
+                    self.keys.take(event.seat, key.code);
+                }
+            }
+            // A key pressed in another view: its repeats and release stay out of this one.
+            Some(view) if !self.delivered_here(&event, view) => {}
             Some(view) => {
                 if matches!(&event.kind, InputKind::Key(key) if key.state == ButtonState::Pressed) {
                     self.views
@@ -2765,6 +2992,46 @@ impl BrowserState {
                 });
             }
             None => fx.push(Effect::ChromeInput(event)),
+        }
+    }
+
+    /// Whether the page shown gets no typing: its tab came to the front by itself and the user
+    /// has not taken it since.
+    fn input_held(&self) -> bool {
+        self.held.is_some() && self.held == self.tabs.get(self.active).map(|tab| tab.id)
+    }
+
+    /// Holds the page of `tab`, which came to the front by itself, until the user takes it
+    /// ([`Self::release_input`]), and says so.
+    fn hold_input(&mut self, tab: Option<TabId>, fx: &mut Fx) {
+        self.held = tab;
+        fx.push(Effect::Notice {
+            tab,
+            message: "This tab came to the front by itself: typing doesn't reach its page until \
+                      you click the page or run a command."
+                .into(),
+        });
+    }
+
+    /// The user took the page shown: a command, or a press in it.
+    pub(crate) fn release_input(&mut self) {
+        self.held = None;
+    }
+
+    /// Records where a key press goes, and whether a repeat or release of a key belongs to
+    /// `view`: one pressed while another view had the keyboard does not.
+    fn delivered_here(&mut self, event: &InputEvent, view: ViewId) -> bool {
+        let InputKind::Key(key) = &event.kind else {
+            return true;
+        };
+        let at = (event.seat, key.code);
+        match (key.state, key.repeat) {
+            (ButtonState::Pressed, false) => {
+                self.pressed.insert(at, view);
+                true
+            }
+            (ButtonState::Pressed, true) => self.pressed.get(&at).is_none_or(|&v| v == view),
+            (ButtonState::Released, _) => self.pressed.remove(&at).is_none_or(|v| v == view),
         }
     }
 
@@ -2795,7 +3062,7 @@ impl BrowserState {
     /// Presses and releases `key` in the page, back to back so that no key stays held, if the
     /// page has the keyboard; otherwise does nothing.
     pub(crate) fn send_key(&mut self, key: &SentKey, fx: &mut Fx) {
-        let Some(view) = self.focused_view() else {
+        let Some(view) = self.focused_view().filter(|_| !self.input_held()) else {
             return;
         };
         for state in [ButtonState::Pressed, ButtonState::Released] {
@@ -2896,6 +3163,7 @@ impl BrowserState {
                 state: ButtonState::Pressed,
                 ..
             }) => {
+                self.release_input();
                 let v = self.views.get_mut(&view).expect("shown");
                 v.activated(at, v.status.clone());
                 if self.focus != KeyboardFocus::Page {
@@ -2921,7 +3189,7 @@ impl BrowserState {
     /// one, so a later command's input follows the focus and visibility an earlier command
     /// needs; a single command leaves it to `settle`. Once the engines have been told, doing it
     /// again adds nothing.
-    fn settle_engines(&mut self, fx: &mut Fx) {
+    pub(crate) fn settle_engines(&mut self, fx: &mut Fx) {
         let unloaded = self.tabs.get(self.active).filter(|t| {
             matches!(t.current(), Some(Segment::Record(_)))
                 && t.switch.is_none()
@@ -2972,6 +3240,7 @@ impl BrowserState {
     /// indicator redraws the chrome.
     fn settle(&mut self, fx: &mut Fx) {
         self.settle_fullscreen(fx);
+        self.settle_ptys(fx);
         self.settle_engines(fx);
         let shown = self.shown_view();
         let focused = self.focused_view();
@@ -2991,6 +3260,58 @@ impl BrowserState {
         if self.keys.indicator() != self.indicator.as_deref() {
             self.indicator = self.keys.indicator().map(str::to_owned);
             fx.chrome = true;
+        }
+    }
+}
+
+/// Whether `kind` is typing: a key press or repeat, or text. A key's release always goes where
+/// its press went.
+fn is_typing(kind: &InputKind) -> bool {
+    match kind {
+        InputKind::Key(key) => key.state == ButtonState::Pressed,
+        InputKind::TextInput(_) => true,
+        InputKind::Focus(_) | InputKind::Pointer(_) => false,
+    }
+}
+
+impl BrowserState {
+    /// Closes every terminal that may not go on: its view is closed or gone, its document was
+    /// replaced (a reload, a navigation), its page became a history entry (the tab left it), or
+    /// `[pages.terminal] enabled` is off. A tab in the background keeps its terminal.
+    fn settle_ptys(&mut self, fx: &mut Fx) {
+        let (views, tabs, enabled) = (&self.views, &self.tabs, self.config.pages().terminal);
+        let ended = |pty: &Pty| {
+            let Some(view) = views.get(&pty.view).filter(|v| !v.closing) else {
+                return true;
+            };
+            let current = tabs.iter().any(|tab| tab.current_view() == Some(pty.view));
+            !enabled || view.document != Some(pty.document) || !current
+        };
+        for request in self.ptys.close(ended) {
+            fx.push(Effect::CancelService(request));
+        }
+    }
+
+    /// The executable answered the terminal `request`: it runs, it could not start, or its
+    /// program ended and was reaped, which closes it for good.
+    fn pty_answered(&mut self, request: RequestId, result: ServiceResult, fx: &mut Fx) {
+        let Some(pty) = self.ptys.get(request).copied() else {
+            return;
+        };
+        let current = self.is_document(pty.view, pty.document);
+        match (&result, pty.state) {
+            (Ok(ServiceReply::PtyEnded { .. }), _) | (Err(_), _) => {
+                self.ptys.remove(request);
+            }
+            (Ok(ServiceReply::Pty(session)), PtyState::Opening) => {
+                let state = PtyState::Open(*session);
+                self.ptys.insert(request, Pty { state, ..pty });
+            }
+            // A second start, or one after it was cancelled: the cancellation stands.
+            (Ok(_), _) => return,
+        }
+        if current {
+            fx.push(answer(pty.view, request, result));
         }
     }
 }

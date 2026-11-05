@@ -46,6 +46,11 @@
 #               core's own Escape leaves it, and so does another tab; f11 during a page's
 #               fullscreen leaves both; after each way out its notice is gone; the
 #               compositor ending fullscreen (swaymsg) resets the toggle
+#   pages       sig://help, a Wasm guest built into sig: the example configuration's :help opens
+#               it in a new tab, which draws (its pixels checked); a click on Keys in its sidebar
+#               switches section (push_state: the session holds sig://help/keys); ? opens it again
+#               and d closes that tab; demo://open-sig asks to open sig://help in its view and in a
+#               new tab when clicked, and gets neither
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
 #               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
@@ -64,7 +69,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen renderers)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen pages renderers)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (with other features); this link keeps the binary these
   # runs use. It is made under the same hold of the machine's lock as the build, so no other
@@ -73,7 +78,7 @@ if [[ ${1:-} != --inside ]]; then
   link="ln -f $tdir/debug/sig $tdir/debug/sig-headless-e2e"
   if [[ $build == 1 ]]; then
     SIG_WHAT="build sig (demo engine) for headless tests" tools/heavy bash -c \
-      "cargo build -p sighurt-browser --no-default-features --features engine-demo,render-wgpu,render-vulkan \
+      "cargo build -p sighurt-browser --no-default-features --features engine-demo,engine-wasm,render-wgpu,render-vulkan \
        --bins --example virtual-pointer && $link" || exit 1
   else
     $link || exit 1
@@ -1000,6 +1005,89 @@ PY
     done
   done
   : > "$out/sig.log"  # each run's log is NAME.log; finish looks here
+  ;;
+
+pages)
+  # The example configuration, the default: its keys open help (`?`, `:help`) and close tabs (`d`).
+  cat > "$out/config/sighurt/config.toml" <<'CONF'
+version = 1
+[engines]
+default = "demo"
+[routing.demo]
+schemes = ["demo"]
+CONF
+  tabs_count() { diag "len(d['tabs'])"; }
+  shown_engine() { diag "[x['engine'] for x in t if x['role']=='view' and x['shown']]"; }
+  start_sig demo://pattern
+  key ':'
+  wtype help
+  key -k Return
+  sleep 3
+  check ":help opens sig://help in a new tab" \
+    "$(diag "0 if d['active_tab']==2 and [x['engine'] for x in t if x['role']=='view' and x['shown']]==['wasm'] else 1")" \
+    "$(tabs_now) $(shown_engine)"
+  shot 01-help 1
+  page_h=$(diag "[x['height'] for x in t if x['role']=='view' and x['shown']][0]")
+  # The page ends where the status strip, 20 pixels high, begins.
+  top=$((layout_h - 20 - page_h))
+  # The page draws: text in many colours over its background, not one flat colour.
+  drawn=$(python3 - "$out/01-help.png" "$top" <<'PY'
+import struct, sys, zlib
+raw = open(sys.argv[1], 'rb').read()
+pos, chunks = 8, []
+while pos < len(raw):
+    n, kind = struct.unpack('>I4s', raw[pos:pos + 8])
+    chunks.append((kind, raw[pos + 8:pos + 8 + n])); pos += 12 + n
+w, h, depth, ctype = struct.unpack('>IIBB', [c for k, c in chunks if k == b'IHDR'][0][:10])
+bpp = {2: 3, 6: 4}[ctype]
+data = zlib.decompress(b''.join(c for k, c in chunks if k == b'IDAT'))
+stride, rows, prev = w * bpp, [], bytearray(w * bpp)
+for y in range(h):
+    f, line = data[y * (stride + 1)], bytearray(data[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+    for i in range(stride):
+        a = line[i - bpp] if i >= bpp else 0
+        b, c = prev[i], prev[i - bpp] if i >= bpp else 0
+        p = a + b - c
+        pred = [0, a, b, (a + b) // 2, a if abs(p - a) <= abs(p - b) and abs(p - a) <= abs(p - c) else (b if abs(p - b) <= abs(p - c) else c)][f]
+        line[i] = (line[i] + pred) & 0xff
+    rows.append(line); prev = line
+top = int(sys.argv[2])
+colours, counts = set(), {}
+for y in range(top + 10, h - 10, 3):
+    for x in range(0, w, 3):
+        px = bytes(rows[y][x * bpp:x * bpp + 3]); colours.add(px); counts[px] = counts.get(px, 0) + 1
+common = max(counts.values()) / sum(counts.values())
+print(0 if len(colours) > 20 and common < 0.97 else 1, f'{len(colours)} colours, the commonest {common:.0%} of the page')
+PY
+)
+  check "sig://help draws" "${drawn%% *}" "${drawn#* }"
+  # The sidebar's second entry, Keys, 72 + 34 pixels into the page and 34 high: the page
+  # changes section by itself (push_state).
+  click 100 $((top + 123))
+  sleep 2.5
+  shot 02-keys 0.5
+  check "a link to another section works" \
+    "$(grep -q 'sig://help/keys' "$out/state/sighurt/session.toml"; echo $?)" \
+    "$(grep -o 'sig://help[^"]*' "$out/state/sighurt/session.toml" | tr '\n' ' ')"
+  check "and the page shows it" "$(cmp -s "$out/01-help.png" "$out/02-keys.png"; [[ $? == 1 ]]; echo $?)" "01-help.png vs 02-keys.png"
+  key '?'
+  sleep 2.5
+  check "? opens help again" "$([[ $(tabs_count) == 3 ]]; echo $?)" "$(tabs_now)"
+  key d
+  sleep 1
+  check "d closes the tab" "$([[ $(tabs_count) == 2 ]]; echo $?)" "$(tabs_now)"
+  key ':'
+  wtype "tab.new demo://open-sig"
+  key -k Return
+  sleep 1.5
+  click 640 $((top + 200))
+  sleep 0.5
+  check "a demo page can't open sig://help, and is told so" \
+    "$([[ $(tabs_count) == 3 && $(shown_engine) == "['demo']" && $(diag "d['status']") == notice ]]; echo $?)" \
+    "$(tabs_now) $(shown_engine), status $(diag "d['status']")"
+  shot 03-refused 0.5
+  key q
+  wait "$sig_pid"
   ;;
 
 disconnect)

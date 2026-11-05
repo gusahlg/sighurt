@@ -25,7 +25,9 @@ use std::fmt;
 use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::SeatId;
 use sighurt_api::input::{ButtonState, KeyCode, KeyEvent, KeyboardFocus};
-use sighurt_api::keymap::{Browser, Chord, KeyAction, KeyContext, Keymap, KeymapKind};
+use sighurt_api::keymap::{
+    Browser, Chord, Frontend, KeyAction, KeyBinding, KeyContext, Keymap, KeymapKind,
+};
 use sighurt_api::settings::{Table, Value};
 
 /// The `bindings` keymap: the default, which every build has.
@@ -204,6 +206,30 @@ impl Keymap for Bindings {
             Some(command) => KeyAction::Run(command.clone()),
             None => KeyAction::Pass,
         }
+    }
+
+    /// Every binding, the layer searched first first: `[keys]` everywhere, then `[keys.page]`
+    /// and `[keys.location]`. A binding a higher layer hides is still listed.
+    fn describe(&self, _frontend: Frontend) -> Vec<KeyBinding> {
+        let mut found = Vec::new();
+        for layer in std::iter::once(self).chain(&self.below) {
+            let lists = [
+                (&layer.global, ""),
+                (&layer.page, "in the page"),
+                (&layer.location, "in the address line"),
+            ];
+            for (list, applies) in lists {
+                found.extend(list.iter().map(|binding| {
+                    KeyBinding::new(
+                        "",
+                        binding.text.clone(),
+                        binding.command.to_string(),
+                        applies,
+                    )
+                }));
+            }
+        }
+        found
     }
 }
 
@@ -385,6 +411,11 @@ impl KeyState {
     /// Whether the keymap lets text that is not a key press reach the page now.
     pub(crate) fn page_takes_text(&self) -> bool {
         self.keymap.page_takes_text()
+    }
+
+    /// The keymap's bindings in `frontend` ([`Keymap::describe`]).
+    pub(crate) fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
+        self.keymap.describe(frontend)
     }
 }
 

@@ -34,17 +34,20 @@
 #             count, the time taken and the shots are in OUT/<scenario>/flicker.
 #   idle      on the pattern (a still page), 3 s: sig encodes nothing, tmux (rio-tmux-sixel) sends
 #             no sixel, and 100 screenshots show no flash.
-#   redraw    (rio-tmux-sixel, last) on the pattern, still since it was shown: a second tmux
+#   redraw    (rio-tmux-sixel, last) on tab 1, a still page: a second tmux
 #             window, then $REDRAWS (20; 0 leaves it out) times away and back, a refresh-client
 #             every fifth time, and two client resizes (the output's size). tmux sends the pane's
 #             stored sixels again, oldest first, on each redraw. PASS if no redraw sends more
-#             than $REDRAW_MAX (2: the quiet page left tmux one, and a frame may come) sixels in its first 300 ms; the
+#             than $REDRAW_MAX (21: tmux holds at most 20, and a frame may come) sixels in its first 300 ms; the
 #             counts are printed and in OUT/<scenario>/redraws.txt (from tap.log). The redraws
 #             stop at Rio's death, which is its own check, rio-redraw: Rio 0.5.28 dies on these
 #             redraws with any sixel in the pane, one that `cat` wrote included. REDRAW_TAB=2
-#             runs it on the animation instead (then REDRAW_MAX=30: tmux holds up to 19).
-#   quiet     (rio-tmux-sixel, INFO) after a tab switch, how many of 100 screenshots show the
-#             blink of the picture written again alone.
+#             runs it on the animation instead.
+#   still     on the pattern, what a user does to a page (typing, three reloads, the address
+#             line and the find field opened, typed in and closed, tab switches and back, a
+#             notice, a navigation in the tab), with screenshots taken all the while: PASS if
+#             none shows the page rows as the terminal's background and (rio-tmux-sixel) tmux
+#             writes no cell and no erase on the page rows meanwhile (tap.log).
 #   tabstorm  F2 $STORM_RATE times a second (30) for $STORM_SECONDS (25; 0 leaves the check
 #             out): PASS if Rio is still running, sig took the keys (input events), answers a
 #             diagnostics report and the page shows again afterwards (Rio lost its Vulkan device
@@ -133,7 +136,7 @@ if [[ $demo == 1 ]]; then
   # neither. F2 is tab.next whatever the example keymap's keys are.
   graphics=
   [[ $terminal == rio-sixel ]] && graphics='[tui]\ngraphics = "sixel"\n'
-  printf 'version = 1\n[engines]\ndefault = "demo"\n[routing.demo]\nschemes = ["demo"]\n[input]\nkeymap = "bindings"\n[keys]\n"f2" = "tab.next"\n"q" = "browser.quit"\n'"$graphics" \
+  printf 'version = 1\n[engines]\ndefault = "demo"\n[routing.demo]\nschemes = ["demo"]\n[input]\nkeymap = "bindings"\n[keys]\n"f2" = "tab.next"\n"f4" = "location.focus"\n"f5" = "page.reload"\n"f8" = "page.find"\n"q" = "browser.quit"\n'"$graphics" \
     > "$home/config/sighurt/config.toml"
   url="demo://pattern demo://animation demo://resize demo://pattern"
 else
@@ -314,11 +317,21 @@ type_keys() { wtype -s 80 "$@"; }
 # FLICKER_SHOTS screenshots of the page as fast as grim takes them, into $out/flicker. Prints
 # "FLASHES SHOTS SECONDS": the shots whose page rows are at least half the terminal's own
 # background (the top-left pixel, Rio's title bar), as blank rows are.
+# With FLICKER_WHILE=PID it takes them while that process runs (at most 1500). Only the flashed
+# shots are kept.
 flicker() {
-  local dir=$out/${flicker_dir:-flicker} start end
+  local dir=$out/${flicker_dir:-flicker} start end i=0
   mkdir -p "$dir"
   start=$(date +%s.%N)
-  for i in $(seq -w 1 "${FLICKER_SHOTS:-200}"); do grim -t ppm "$dir/$i.ppm"; done
+  while :; do
+    i=$((i + 1))
+    grim -t ppm "$dir/$(printf %04d $i).ppm"
+    if [[ -n ${FLICKER_WHILE:-} ]]; then
+      kill -0 "$FLICKER_WHILE" 2>/dev/null && (( i < 1500 )) || break
+    else
+      (( i < ${FLICKER_SHOTS:-200} )) || break
+    fi
+  done
   end=$(date +%s.%N)
   python3 -I - "$dir" "$start" "$end" <<'PY'
 import os, sys
@@ -347,6 +360,8 @@ for name in names:
     blank = share(os.path.join(d, name))
     if blank >= 50:
         flashes.append(f'{name}: {blank}% background')
+    else:
+        os.remove(os.path.join(d, name))
 open(os.path.join(d, 'flashes.txt'), 'w').write('\n'.join(flashes) + '\n')
 print(len(flashes), len(names), f'{end - start:.1f}')
 PY
@@ -410,6 +425,43 @@ if [[ $demo == 1 ]]; then
     else
       fail idle "$encoded bytes encoded, $sent sixels from tmux, $flashes of $shots screenshots flashed"
     fi
+    # ── still ── on the pattern (tab 1): what a user does to a page, and nothing may blank it.
+    # tmux's output (tap.log) may not write a cell on the page rows meanwhile; the screenshots
+    # taken the while may not show the page rows as the terminal's background.
+    activities() {
+      sleep 0.5
+      wtype -s 60 j j j k k k a b c; sleep 0.7
+      for _ in 1 2 3; do wtype -k F5; sleep 0.8; done
+      wtype -k F4; sleep 0.5; wtype -s 60 d e m o; sleep 0.5; wtype -k Escape; sleep 0.7
+      wtype -k F8; sleep 0.5; wtype -s 60 a n i; sleep 0.5; wtype -k Escape; sleep 0.7
+      for _ in 1 2 3 4; do wtype -k F2; sleep 0.6; done
+      wtype -k F4; sleep 0.4; wtype ':chrome.nothing' -k Return; sleep 1
+      wtype -k F4; sleep 0.4; wtype 'demo://resize' -k Return; sleep 1.5
+    }
+    goto_tab 1 > /dev/null
+    sleep 1
+    still_from=$(date +%s.%N)
+    activities &
+    acting=$!
+    read -r flashes shots seconds < <(FLICKER_WHILE=$acting flicker_dir=still flicker)
+    wait "$acting"
+    still_to=$(date +%s.%N)
+    written=n/a
+    if [[ $terminal == rio-tmux-sixel ]]; then
+      pane_rows=$(tmux display -p -t t '#{pane_height}')
+      # The page rows are the pane's rows 2 to height - 1; the pane is at the top of the window.
+      written=$(awk -v from="$still_from" -v to="$still_to" -v last="$((pane_rows - 1))" '
+        $1 >= from && $1 < to && $4 != "-" {
+          n = split($4, rows, ",")
+          for (i = 1; i <= n; i++) if (rows[i] == "*" || (rows[i] >= 2 && rows[i] <= last)) hit++
+        } END { print hit + 0 }' "$out/tap.log")
+    fi
+    report
+    if [[ ${flashes:-1} == 0 && $written =~ ^(0|n/a)$ ]]; then
+      pass "still (typing, reloads, the address line, find, tab switches, a notice, a navigation: 0 of $shots screenshots in ${seconds}s flashed, page-row writes from tmux: $written)"
+    else
+      fail still "$flashes of $shots screenshots in ${seconds}s flashed ($out/still), page-row writes from tmux: $written ($out/tap.log)"
+    fi
     # ── flicker ── tab 2, the animation.
     goto_tab 2 || fail flicker "F2 did not switch to tab 2"
     sleep 3
@@ -420,16 +472,6 @@ if [[ $demo == 1 ]]; then
       pass "flicker ($flashes of $shots screenshots in ${seconds}s without the page, at most $flicker_max)"
     else
       fail flicker "$flashes of $shots screenshots in ${seconds}s without the page ($out/flicker/flashes.txt)"
-    fi
-    # ── quiet ── (rio-tmux-sixel) a tab switch writes over the sixel on the rows; 400 ms later
-    # the picture goes again after a blank so tmux keeps it alone: how long that blink is.
-    if [[ $terminal == rio-tmux-sixel ]]; then
-      goto_tab 4 > /dev/null && sleep 3
-      wtype -k F2
-      read -r flashes shots seconds < <(FLICKER_SHOTS=100 flicker_dir=quiet flicker)
-      report
-      echo "INFO $terminal quiet: $flashes of $shots screenshots in ${seconds}s after a switch to tab $(field 'd["active_tab"]') without the page ($out/quiet/flashes.txt)"
-      goto_tab 2 > /dev/null
     fi
     # ── tabstorm ── (STORM_SECONDS=0 leaves it out)
     if [[ ${STORM_SECONDS:-25} == 0 ]]; then
@@ -517,8 +559,8 @@ PY
       shot 2b-after-redraws
       # sig's part: what tmux holds for it. Rio 0.5.28 also dies on these redraws with one
       # still sixel that `cat` wrote, without sig (decision 133): that is its own line.
-      if (( worst > ${REDRAW_MAX:-2} )); then
-        fail redraw "a redraw sent $worst sixels in its first 300 ms, more than ${REDRAW_MAX:-2} ($out/redraws.txt)"
+      if (( worst > ${REDRAW_MAX:-21} )); then
+        fail redraw "a redraw sent $worst sixels in its first 300 ms, more than ${REDRAW_MAX:-21} ($out/redraws.txt)"
       else
         pass "redraw (at most $worst sixels in a redraw's first 300 ms; $out/redraws.txt)"
       fi

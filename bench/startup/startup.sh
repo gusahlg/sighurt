@@ -11,7 +11,8 @@
 # its first `chrome` line (the first chrome surface rendered, just before its commit), its
 # first `frame engine=demo` line (the page's first frame presented) and its `startup` line
 # when it prints one, then quits it with ctrl+q. Prints one line per run to OUT/runs.txt and
-# the medians per build at the end. Times are milliseconds after exec.
+# the medians per build at the end. Times are milliseconds after exec. HISTORY_FILE, when set,
+# is copied into each run's state directory as the history of visited pages.
 set -u
 out=$(realpath -m "${1:?usage: startup.sh OUT REPS SIG...}")
 reps=${2:?usage: startup.sh OUT REPS SIG...}
@@ -29,6 +30,9 @@ for rep in $(seq 0 "$reps"); do # round 0 warms the page cache and is not report
     sig=${sigs[$i]}
     run=$out/b$i-$rep
     rm -rf "$run" && mkdir -p "$run/config/sighurt" "$run/state" "$run/downloads"
+    if [[ -n ${HISTORY_FILE:-} ]]; then
+      mkdir -m 700 "$run/state/sighurt" && install -m 600 "$HISTORY_FILE" "$run/state/sighurt/history.toml"
+    fi
     cat > "$run/config/sighurt/config.toml" <<CONF
 version = 1
 [engines]

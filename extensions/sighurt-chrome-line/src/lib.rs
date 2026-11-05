@@ -39,7 +39,7 @@
 
 use std::rc::Rc;
 
-use sighurt_api::commands::{Command, MAX_FIND};
+use sighurt_api::commands::{Command, CommandSet, MAX_FIND};
 use sighurt_api::events::Cursor;
 use sighurt_api::geometry::{LogicalSize, SurfacePoint, SurfaceRect, WindowRect};
 use sighurt_api::ids::RequestId;
@@ -501,7 +501,8 @@ impl Line {
         }
         let line = self.editor.text().trim().to_owned();
         if let Some(command) = line.strip_prefix(':') {
-            match command.parse::<Command>() {
+            let commands = CommandSet::ANY.with_custom(&self.snapshot.commands);
+            match commands.parse(command) {
                 Ok(command) => {
                     self.unfocus();
                     actions.push(ChromeAction::Focus(KeyboardFocus::Page));

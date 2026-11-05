@@ -41,13 +41,16 @@ use sighurt_api::engine::{
 use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::BufferSize;
 use sighurt_api::ids::{RequestId, TargetId, ViewId};
-use sighurt_api::services::{ClipboardData, Selection, ServiceError};
+use sighurt_api::services::{
+    ClipboardData, PageRequest, Selection, ServiceError, ServiceReply, ServiceResult,
+};
 use sighurt_core::{BrowserEvent, BrowserState, Effect, Environment};
 
 use crate::diagnostics::{Diagnostics, EngineReport};
 use crate::frontend::Frontend;
 use crate::history::{self, History, Ownership};
 use crate::persistence::{self, Paths, SessionWriter};
+use crate::pty::{self, Ptys};
 use crate::registry::{Registry, State};
 use crate::services::{Completion, Services};
 use crate::view::ViewEntry;
@@ -97,6 +100,8 @@ pub struct Session<F: Frontend> {
     by_target: BTreeMap<TargetId, ViewId>,
     /// Downloads and the page's clipboard bookkeeping. `None` once shutdown has taken it.
     services: Option<Services>,
+    /// The programs `sig://terminal` runs.
+    ptys: Ptys,
     /// Counters and the diagnostics file.
     diag: Diagnostics,
     /// Configuration and session paths.
@@ -158,6 +163,7 @@ impl<F: Frontend> Session<F> {
             views: BTreeMap::new(),
             by_target: BTreeMap::new(),
             services: Some(services),
+            ptys: Ptys::new(Arc::clone(&wake)),
             diag,
             paths,
             session,
@@ -366,6 +372,15 @@ impl<F: Frontend> Session<F> {
                 frontend.page_text_input(shown, state);
             }
             Effect::Service {
+                request,
+                service: sighurt_api::services::Service::Page(page),
+                ..
+            } => {
+                let result = self.page_service(request, page);
+                self.queue
+                    .push_back(BrowserEvent::ServiceDone { request, result });
+            }
+            Effect::Service {
                 request, service, ..
             } => {
                 let downloads = self
@@ -381,7 +396,10 @@ impl<F: Frontend> Session<F> {
                         .push_back(BrowserEvent::ServiceDone { request, result });
                 }
             }
-            Effect::CancelService(request) => self.services().cancel(frontend, request),
+            Effect::CancelService(request) => {
+                self.services().cancel(frontend, request);
+                self.ptys.cancel(request);
+            }
             Effect::Prompt {
                 request,
                 origin,
@@ -567,12 +585,65 @@ impl<F: Frontend> Session<F> {
         }
     }
 
-    /// Takes what service threads and the session and history writers reported. A status
-    /// line, a write that failed, or what the history has to say becomes a notice; a forget the
-    /// history wrote goes to the core. Returns whether there was anything.
+    /// Performs what an internal page asked for, which the core allowed, and answers it. Facts
+    /// are [`crate::page_info`]'s; the configuration's file is [`crate::page_config`]'s, whose new configuration is taken into use at once; terminals
+    /// are [`crate::pty`]'s.
+    fn page_service(&mut self, request: RequestId, page: PageRequest) -> ServiceResult {
+        match page {
+            PageRequest::Info(kind) => Ok(ServiceReply::Text(crate::page_info::info(
+                kind,
+                &self.core,
+                &self.paths,
+            ))),
+            PageRequest::ConfigRead => crate::page_config::read(&self.paths),
+            PageRequest::ConfigCheck { text } => crate::page_config::check(&text, &self.env),
+            PageRequest::ConfigWrite { text, replaces } => {
+                let (result, config) = crate::page_config::write(
+                    &self.paths,
+                    &self.env,
+                    self.core.config(),
+                    &text,
+                    &replaces,
+                );
+                if let Some(config) = config {
+                    self.queue
+                        .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
+                }
+                result
+            }
+            PageRequest::PtyOpen {
+                program,
+                cols,
+                rows,
+            } => {
+                let pages = self.core.config().pages();
+                let launch = pty::Launch {
+                    command: pages.terminal_command.as_deref(),
+                    config: self.paths.config.as_deref(),
+                };
+                self.ptys.open(request, program, cols, rows, launch)
+            }
+        }
+    }
+
+    /// Takes what service threads and the session and history writers reported, and the
+    /// history file once it has been read. A status line, a write that failed, or what the
+    /// history has to say becomes a notice; a forget the history wrote goes to the core; a
+    /// terminal's program that ended tells the core so.
+    /// Returns whether there was anything.
     pub fn service_completions(&mut self, frontend: &mut F) -> bool {
         let completions = self.services().completions(MAX_COMPLETIONS);
         let mut worked = !completions.is_empty();
+        let ended = self.ptys.ended();
+        if !ended.is_empty() {
+            for (request, status) in ended {
+                let result = Ok(ServiceReply::PtyEnded { status });
+                self.queue
+                    .push_back(BrowserEvent::ServiceDone { request, result });
+            }
+            self.run_core(frontend);
+            worked = true;
+        }
         for completion in completions {
             match completion {
                 Completion::Status(line) => frontend.notice(line),
@@ -586,6 +657,8 @@ impl<F: Frontend> Session<F> {
         let Some(history) = self.history.as_mut() else {
             return worked;
         };
+        // The file read at startup is in: completions can be asked again.
+        worked |= history.poll();
         let notices = history.take_notices();
         let (forgotten, failure) = history.take_reports();
         for notice in notices.into_iter().chain(failure) {
@@ -961,6 +1034,8 @@ impl<F: Frontend> Session<F> {
         report: impl FnOnce(&mut Self, &mut F),
     ) -> ExitCode {
         let code = self.quit.take().unwrap_or(ExitCode::SUCCESS);
+        // Terminals' programs end first, whatever the engines' shutdown does after.
+        self.ptys.shutdown();
         self.services().cancel_downloads();
         self.save_session();
         if let Some(writer) = self.session.take() {
@@ -1673,9 +1748,11 @@ mod tests {
         );
         assert_eq!(session.complete("exa"), Vec::new(), "none after shutdown");
 
-        // The next sig completes from it, and forgets it in the file at once.
+        // The next sig completes from it, once the file is read, and forgets it in the file at
+        // once.
         let mut session = idle_session(dir.path(), "", &[]);
         session.run_core(&mut frontend);
+        session.history.as_mut().unwrap().settle();
         assert_eq!(session.complete("www.e").len(), 1);
         let generation = session.history_generation();
         session.queue_mut().push_back(BrowserEvent::Command(

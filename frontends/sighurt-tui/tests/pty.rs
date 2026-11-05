@@ -902,18 +902,25 @@ fn sigtstp_restores_and_sigcont_reenters() {
 }
 
 #[test]
-fn sighup_restores_and_terminates() {
+fn sighup_is_a_flag_the_owner_quits_on() {
     let _deadline = arm_deadline();
     let mut pty = PtyChild::spawn("hangup", false);
     let started = read_until(&pty.master, b"READY", Duration::from_secs(2));
+    // Twice, as a terminal that closes sends it: the kernel, then the shell ending.
+    rustix::process::kill_process(pty.pid(), Signal::HUP).expect("SIGHUP");
     rustix::process::kill_process(pty.pid(), Signal::HUP).expect("SIGHUP");
     let status = pty.wait_timeout(Duration::from_secs(2));
-    assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}");
+    assert!(
+        status.success(),
+        "{status:?} stderr {:?}",
+        pty.stderr_text()
+    );
     let output = drain_for(&pty.master, Duration::from_millis(200));
     let mut all = started;
     all.extend(output);
+    // The handler wrote nothing: the owner wrote after it and then restored.
     assert!(
-        contains_in_order(&all, &[ENTER, b"READY", LEAVE]),
+        contains_in_order(&all, &[ENTER, b"READY", b"HUP", LEAVE]),
         "{all:?}"
     );
     assert!(sighurt_tui::term::termios_matches(

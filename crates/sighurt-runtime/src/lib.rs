@@ -14,6 +14,7 @@ pub mod engines;
 pub mod frontend;
 pub mod history;
 pub mod page_config;
+pub mod page_info;
 pub mod persistence;
 pub mod pty;
 pub mod registry;

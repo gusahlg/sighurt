@@ -10,7 +10,8 @@
 //! The owner thread is the only writer of terminal bytes. `SIGTSTP` only sets
 //! a flag; it and `SIGCONT` wake [`Terminal::winch_fd`]. Call
 //! [`Terminal::take_resumed`] every loop turn to restore, stop, and enter
-//! again. `SIGHUP`, `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL` and `SIGSEGV`
+//! again, and [`Terminal::take_hangup`] to learn of `SIGHUP`, which only sets
+//! a flag and wakes that fd too. `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL` and `SIGSEGV`
 //! (when that signal will kill the process), a panic and
 //! [`restore_before_forced_exit`] are the exception: they restore before the
 //! process dies, from the wire state published before each output `write`.
@@ -39,8 +40,8 @@ use rustix::termios::Winsize;
 use sighurt_api::input::{ButtonState, KeyEvent, Modifiers, PointerButton};
 use sighurt_api::services::Selection;
 
-pub(crate) use modes::{inside_multiplexer, SYNC_BEGIN, SYNC_END};
 pub use modes::{ENTER, KITTY_KEYBOARD_FLAGS, LEAVE, QUERIES};
+pub(crate) use modes::{SYNC_BEGIN, SYNC_END};
 pub use parser::{Wheel, ESC_TIMEOUT};
 pub use probe::{Caps as Capabilities, XtGetTcap, PROBE_DEADLINE};
 pub use session::{
@@ -285,9 +286,15 @@ impl Terminal {
 
     /// `SIGWINCH` wakes [`Self::winch_fd`]. `SIGTSTP` only requests a stop;
     /// [`Self::take_resumed`] restores, stops, and enters again after
-    /// `SIGCONT`. `SIGHUP` restores from the handler and re-raises.
+    /// `SIGCONT`. `SIGHUP` sets the flag [`Self::take_hangup`] reads.
     pub fn install_handlers(&mut self) -> io::Result<()> {
         self.session.install_handlers()
+    }
+
+    /// Whether `SIGHUP` arrived since the last call. The owner loop calls this every turn and
+    /// quits when it did, restoring and saving as on any other quit.
+    pub fn take_hangup(&self) -> bool {
+        self.session.take_hangup()
     }
 
     /// Performs a pending `SIGTSTP` and reports whether `SIGCONT` has

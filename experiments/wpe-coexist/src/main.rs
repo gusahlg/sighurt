@@ -267,6 +267,7 @@ fn setup() -> (State, EventLoop<'static, State>) {
         policy: SandboxPolicy::default(),
         kv_root: std::env::temp_dir().join(format!("wpe-coexist-kv-{}", std::process::id())),
         aot_cache: None,
+        pages: Vec::new(),
     };
     let wasm = WasmRuntime::new(config, wakers[&Kind::Wasm].clone()).expect("the Wasm runtime");
     println!("INFO signals after the Wasm engine: {}", dispositions());

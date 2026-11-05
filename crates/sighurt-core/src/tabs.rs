@@ -55,7 +55,7 @@ pub struct ClosedTab {
 pub struct Find {
     /// Identifies the search in its results; a result for another is stale.
     pub(crate) search: RequestId,
-    /// What it looks for, as the user gave it (trimmed, at most
+    /// What it looks for, as the user gave it (control characters made spaces, trimmed, at most
     /// [`MAX_FIND`](sighurt_api::commands::MAX_FIND) bytes).
     pub text: String,
     /// Whether case matters: the text has an upper-case letter in it (smart case).
@@ -190,6 +190,9 @@ pub enum ViewState {
 pub struct View {
     pub(crate) id: ViewId,
     pub(crate) engine: String,
+    /// The internal page it shows (`help` for `sig://help`), fixed when it opened: a view of a
+    /// page loads only that page, and no other view loads one.
+    pub(crate) page: Option<String>,
     pub(crate) tab: TabId,
     /// The engine said `ViewReady`.
     pub(crate) ready: bool,
@@ -238,6 +241,7 @@ impl View {
         Self {
             id: ViewId::next(),
             engine,
+            page: None,
             tab,
             ready: false,
             failure: None,
@@ -290,6 +294,12 @@ impl View {
     /// The engine it runs in.
     pub fn engine(&self) -> &str {
         &self.engine
+    }
+
+    /// The internal page it shows (`help` for `sig://help`), as the core recorded it when the
+    /// view opened; `None` for every other view. A chrome names no engine for it.
+    pub fn page(&self) -> Option<&str> {
+        self.page.as_deref()
     }
 
     /// The tab it belongs to.

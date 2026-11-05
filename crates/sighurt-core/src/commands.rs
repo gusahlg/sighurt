@@ -39,8 +39,8 @@
 //!   `Effect::LineText`. Commands that change what the page area shows give the page the keyboard.
 //! - `page.find <text>` starts a search in the page the active tab shows, replacing the view's
 //!   search ([`Effect::Find`] with `FindCommand::Search`). Upper case in the text makes it
-//!   case-sensitive (smart case). Text that is only whitespace searches nothing and ends the
-//!   search; text over [`MAX_FIND`] bytes, which only a chrome can make, is refused. A page
+//!   case-sensitive (smart case). Control characters in it are spaces, and it is trimmed; text
+//!   that is only whitespace searches nothing and ends the search; text over [`MAX_FIND`] bytes, which only a chrome can make, is refused. A page
 //!   that has not committed a document yet has nothing to find in. `page.find` without text
 //!   gives the chrome the keyboard and opens its find field ([`Effect::FindField`]) holding the
 //!   view's search. `page.find-next` and `page.find-previous` move in the view's search, and
@@ -59,6 +59,11 @@
 //! - `page.send-key` presses and releases its key in the page only while the page has the
 //!   keyboard; run by a key press, that counts as the user's key press in the page.
 //! - `chrome.<action>` is the chrome's own: the core hands it on (`Effect::ChromeCommand`).
+//! - A command of `[commands]` (`Command::Custom`, such as `help`) runs the built-in commands
+//!   the configuration defines for it, in order, as a key that runs several does. One the
+//!   configuration no longer defines is a notice.
+//! - Any command the user runs gives the page shown its typing back, if its tab came to the
+//!   front by itself (`crate::state`).
 //! - A tab the chrome selects or closes by its identity gets the command for its number now.
 //!
 //! Key presses become commands in [`crate::keys`].
@@ -104,6 +109,8 @@ impl BrowserState {
         if self.tabs.is_empty() {
             return;
         }
+        // Running a command is the user taking the browser back: the page shown may have typing.
+        self.release_input();
         let (active, count) = (self.active, self.tabs.len());
         let tab_number = |n: NonZeroUsize| (n.get() <= count).then(|| n.get() - 1);
         let focus = match command {
@@ -243,15 +250,31 @@ impl BrowserState {
                 None
             }
             Command::Custom(name) => {
-                fx.push(Effect::Notice {
-                    tab: None,
-                    message: format!("unknown command {name:?}"),
-                });
+                for command in self.expand(&name, fx) {
+                    self.run_command(command, fx);
+                    self.settle_engines(fx);
+                }
                 None
             }
         };
         if let Some(focus) = focus {
             self.move_focus(focus, fx);
+        }
+    }
+
+    /// The built-in commands `[commands]` defines for `name`, to run in order as a key that
+    /// runs several does; none, with a notice, for a name it doesn't define (a configuration
+    /// reloaded since the command was typed).
+    pub(crate) fn expand(&self, name: &str, fx: &mut Fx) -> Vec<Command> {
+        match self.config.command(name) {
+            Some(commands) => commands.to_vec(),
+            None => {
+                fx.push(Effect::Notice {
+                    tab: None,
+                    message: format!("unknown command {name:?}"),
+                });
+                Vec::new()
+            }
         }
     }
 
@@ -317,6 +340,12 @@ impl BrowserState {
                 return;
             }
             (Command::PageFind(Some(text)), Some(id)) => {
+                // A control character (a pasted newline or tab, an escape, a NUL) finds nothing
+                // in a page's text, and a NUL can't reach an engine's C API at all: a space.
+                let text: String = text
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
                 let text = text.trim();
                 if text.is_empty() {
                     return self.end_find(id, fx);

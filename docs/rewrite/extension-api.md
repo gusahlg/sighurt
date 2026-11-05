@@ -763,6 +763,14 @@ pub fn is_modifier(key: &KeyEvent) -> bool;
    window enables no input method for it and the terminal pastes into nothing), and the
    terminal's text mode opens no editor for a field. Key presses stay `press`'s to decide; the
    chrome's text is the chrome's.
+8. **`TabInfo::internal` is the core's record.** It names the internal page a tab shows
+   (`help` for `sig://help`), taken from the view the core opened for that page, never from an
+   address a page or engine reports, so a keymap may treat Sighurt's own pages differently
+   (pages-2026-11-05.md, decision 5) without a page being able to pose as one.
+
+**Listing bindings.** `Keymap::describe(frontend) -> Vec<KeyBinding>` lists what a keymap binds
+in a frontend, as data (mode, keys as the configuration writes them, action, where it applies),
+for `sig://help`. It defaults to empty; `bindings` and the example configuration implement it.
 
 ## 2.4 The default keymap through it: `bindings`
 
@@ -1975,3 +1983,18 @@ finding was checked against the plan and the code before it was acted on.
   In INSERT every key, text and paste reach the page and the only binding is an unmodified
   Escape. While the chrome has the keyboard, both modes apply NORMAL's `Always` bindings whose
   first key types nothing, as NORMAL did; the mode stays.
+
+- **Internal pages and configured commands** (pages-2026-11-05.md, with its amendments):
+  `commands::Command::Custom(String)`, a command of the configuration's `[commands]`, which only
+  a `CommandSet` naming those commands (`CommandSet::with_custom`) produces: parsing a string
+  alone still calls a bare word unknown, and a configured command takes no argument. A keymap
+  or chrome that parses commands typed by the user parses them with the configuration's names;
+  a keymap's own table may parse with `CommandSet::ANY`, which accepts any configured name
+  unchecked, and checks them in its `check` against the `CommandSet` it is given.
+  `commands::DOCS` documents every built-in command (held to `Command::NAMES` by a test), and
+  `commands::is_custom_name` and `AREAS` say which words a configured command may be.
+  `keymap::TabInfo` gains `internal` (set with `TabInfo::with_internal`; `TabInfo::new` is
+  unchanged), and `Keymap` gains `describe` with `keymap::KeyBinding`. `sighurt_ui::Snapshot`
+  gains `commands`, the configured names, which the standard chrome's and the line chrome's
+  command lines parse with. `input::TextInputEvent` gains `paste`. The example configuration
+  binds `?` and `f1` (also from the address line) to `help` and `d` to `tab.close`.

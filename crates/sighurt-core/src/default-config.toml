@@ -4,8 +4,8 @@
 # ~/.config/sighurt/config.toml. It starts with `version = 1`, the version of this format;
 # every other key is optional and keeps the value below when you leave it out. [routing]
 # tables merge by engine, field by field, and [engines], [input], [input.buttons], [downloads],
-# [session] and [tui] key by key; [keywords], [engines.*], [keys], [keymap.*], [ui] and
-# [chrome.*] are yours alone. [tui.keys] in your file is a separate table, over [keys], and
+# [session], [commands], [pages.terminal] and [tui] key by key; [keywords], [engines.*],
+# [keys], [keymap.*], [ui] and [chrome.*] are yours alone. [tui.keys] in your file is a separate table, over [keys], and
 # applies only in the terminal when the keymap is bindings.
 #
 # The problems in the file are reported together. A file with any problem is not used: at
@@ -171,7 +171,8 @@ forward = "page.forward"
 # While the page has the keyboard, in both frontends: q quits, o focuses the address line,
 # : opens it as the command line (location.focus :), ctrl-o focuses it from anywhere, / opens
 # the find field (page.find), n and N move to the next and previous match of the search, t
-# opens a tab, x closes the tab, u reopens the tab closed last, J and K move to the next and
+# opens a tab, x and d close the tab, u reopens the tab closed last, ? and f1 (f1 from the
+# address line too) run help, which opens sig://help, J and K move to the next and
 # previous tab, H and L go back and forward, r and ctrl-r reload (ctrl-r from anywhere), f11
 # toggles fullscreen (from anywhere), e
 # reopens the page in the next web engine, j and k scroll, ctrl-d and ctrl-u scroll a page, g
@@ -230,8 +231,8 @@ forward = "page.forward"
 # page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
 # page.find [text], page.find-next, page.find-previous, page.find-stop,
 # page.exit-fullscreen, clipboard.copy <text>, location.focus [text], history.clear,
-# browser.home, browser.fullscreen, browser.quit, site.forget [host], and the chrome's own,
-# chrome.<action>. Tabs count from 1.
+# browser.home, browser.fullscreen, browser.quit, site.forget [host], the chrome's own,
+# chrome.<action>, and the ones [commands] below defines, such as help. Tabs count from 1.
 #
 # tab.new opens the home page in a new tab and puts you in the address line; with an address
 # it opens that as page.open would (keywords, searches and routing included) and gives the
@@ -289,6 +290,48 @@ forward = "page.forward"
 # the window; the UI section says which the windowed chrome has, and the Terminal section
 # which the terminal's chrome has. In [tui.keys] the commands are the terminal's, in either
 # frontend.
+
+# ── Your own commands ────────────────────────────────────────────────────────────────────
+#
+# [commands] names commands of your own: a word of 1 to 32 lower-case letters, digits and
+# dashes, with no dot (and not tab, page, location, history, browser, site, clipboard or
+# chrome), that runs one built-in command or a list of up to 8, in order. Keys, the mouse's
+# buttons and the command line (":help") run them like built-in ones. They take no argument
+# (":help keys" is an error). A command here runs built-in commands only, never another of
+# these, and there are at most 64. A bare word that isn't defined here is an unknown command,
+# in the file as on the command line. Yours merge with these by name: set one to replace it.
+#
+#   [commands]
+#   wiki = "tab.new https://en.wikipedia.org/"
+#   reading = ["page.zoom-reset", "page.zoom-in", "page.zoom-in"]
+#
+# help opens sig://help, sig's own help, in a new tab; the example configuration binds it to
+# ? and f1.
+
+[commands]
+help = "tab.new sig://help"
+
+# ── Internal pages ───────────────────────────────────────────────────────────────────────
+#
+# sig's own pages are Wasm programs built into sig, which the wasm engine runs:
+# sig://help (what you need to know, from this build and this file), sig://config (this file,
+# to read and edit) and sig://terminal (a terminal). sig://home is the chrome's own page. Only
+# you open them, from the address line, a command or the session; a web page can't, and only
+# they reach what they show. They have no network. Without the wasm engine, in the build or
+# in [engines] enabled, they don't open. In the terminal they need graphics: they have no
+# text mode.
+
+[pages.terminal]
+# Whether sig://terminal may run programs. It is a shell with all your rights: the sandbox
+# holds the terminal on the page, not the shell. Off, the page says how to turn it on. A
+# program starts only when you press a key or click in the page shown, at most one per page
+# and 8 at once. It keeps running while its tab is in the background; leaving or reloading the
+# page, closing its tab, turning this off or quitting sig ends it (programs the shell puts in
+# a process group of their own, or that ignore the hangup, can outlive it, as in any terminal).
+enabled = false
+# The program sig://terminal runs, with its arguments, without a shell in between; without
+# it, $SHELL, or /bin/sh.
+# command = "/usr/bin/fish --login"
 
 # ── Terminal ─────────────────────────────────────────────────────────────────────────────
 #
