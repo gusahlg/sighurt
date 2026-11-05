@@ -83,6 +83,9 @@ fn env() -> Environment {
         }],
         color_names: &COLORS,
         renderers: RENDERERS,
+        pages: [("help", &[sighurt_api::services::PageGrant::Info][..])]
+            .map(|(name, grants)| (name.to_owned(), grants))
+            .into(),
         ..Environment::default()
     }
 }
@@ -677,7 +680,12 @@ fn fuzz_routing_of_raw_urls() {
                 "[::1]",
                 "0x0a.0.0.1",
                 "localhost:8080",
-                "ünï.test"
+                "ünï.test",
+                "help",
+                "HELP",
+                "terminal",
+                "me@help",
+                "help:1",
             ]),
             case.rng.pick(&[
                 "",
@@ -700,6 +708,13 @@ fn fuzz_routing_of_raw_urls() {
         let routed = router::routed(&text, &config);
         if let Some(sighurt_core::router::Routed::Engine { engine, .. }) = &routed {
             assert!(config.is_enabled(engine));
+        }
+        // A page only for a name of the build's, from a sig: address.
+        if let Some(sighurt_core::router::Routed::Page(name)) = &routed {
+            assert!(config.internal_pages().contains(name), "{name}");
+            assert!(text
+                .get(..4)
+                .is_some_and(|s| s.eq_ignore_ascii_case("sig:")));
         }
     });
 }

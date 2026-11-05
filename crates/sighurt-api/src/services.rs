@@ -109,18 +109,22 @@ pub enum PageRequest {
     /// Facts about the browser, for the help page: answered with [`ServiceReply::Text`] in the
     /// form [`PageInfo`] documents. Never the configuration's text ([`Self::ConfigRead`]).
     Info(PageInfo),
-    /// The user's configuration file as it is: [`ServiceReply::Text`]. A missing file is
-    /// answered with what a new one would start as.
+    /// The user's configuration file as it is, and where it is: [`ServiceReply::Text`] in the
+    /// form `sighurt_runtime::page_config` documents (`file|new|read-only <path>`, `target
+    /// <resolved target>`, then the text). A missing file is answered with what a new one
+    /// would start as.
     ConfigRead,
-    /// Whether `text` is a valid configuration for this build: [`ServiceReply::Text`] with one
-    /// problem per line, empty when it is valid. Nothing is written.
+    /// Whether `text` is a valid configuration for this build: [`ServiceReply::Text`] in the
+    /// form `sighurt_runtime::page_config` documents (`valid` and `notice <line> <text>` lines,
+    /// or `invalid` and `problem <line> <text>` lines). Nothing is written.
     ConfigCheck {
         /// The configuration to check.
         text: String,
     },
     /// Replace the user's configuration file with `text`, if it still holds `replaces` (what
-    /// the page read), and reload it: [`ServiceReply::Text`] saying what the reload did. A file
-    /// that changed since is refused ([`ServiceError::Failed`]), and so is an invalid `text`.
+    /// the page read), and reload it: [`ServiceReply::Text`] in the form
+    /// `sighurt_runtime::page_config` documents (`saved` and its `restart …`/`notice …` lines,
+    /// or `stale`, `invalid` or `refused` with a message).
     ConfigWrite {
         /// The new file.
         text: String,
