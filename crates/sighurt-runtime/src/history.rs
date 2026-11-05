@@ -1222,6 +1222,24 @@ mod tests {
         );
     }
 
+    /// A temporary file a writer killed mid-write left (`history.toml.<pid>.tmp`) holds URLs:
+    /// the owner removes it when it opens the history; another `sig`, which never writes there
+    /// and may be the one still writing it, leaves it.
+    #[test]
+    fn the_owner_removes_a_dead_writers_temporary_and_another_sig_leaves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let temporary = dir.path().join("history.toml.4242.tmp");
+        let unrelated = dir.path().join("history.toml.x.tmp");
+        fs::write(&temporary, "version = 1\n").unwrap();
+        fs::write(&unrelated, "not a writer's").unwrap();
+        History::open(Some(file(dir.path())), Ownership::Elsewhere, true, quiet()).finish();
+        History::open(Some(file(dir.path())), Ownership::Nobody, true, quiet()).finish();
+        assert!(temporary.exists(), "a sig that doesn't own it removed it");
+        owned(dir.path(), true).finish();
+        assert!(!temporary.exists(), "the owner left it");
+        assert!(unrelated.exists(), "not a pid's temporary: kept");
+    }
+
     #[test]
     fn a_failed_write_is_reported_once_and_a_forget_says_not_written() {
         let dir = tempfile::tempdir().unwrap();
