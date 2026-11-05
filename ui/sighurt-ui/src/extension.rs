@@ -27,6 +27,10 @@
 //!   ones the compositor has yet to release; a hidden surface keeps its buffers. A surface as
 //!   big as the page holds about 30 MB a buffer at 1920 × 1000 and 200 %. A native backend's
 //!   swapchain holds 2 to 4 images of the surface's size, the same order.
+//! - **Fullscreen keeps the controls reachable:** while `Snapshot::fullscreen` holds, a chrome
+//!   lists its surfaces only while it has the keyboard (the address or find field), `status` is
+//!   `Some`, or it draws the page area itself; otherwise it lists none and the page is the
+//!   whole window.
 //! - **The page area when no engine shows** (`sig://home`, errors, a blank tab) is the chrome's
 //!   to draw, on a surface of its own at the page's rectangle, listed only while it is needed.
 //! - **Damage is the chrome's to report** ([`ChromeAction::Repaint`]): an identical snapshot,

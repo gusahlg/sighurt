@@ -4217,3 +4217,48 @@ Newest last. Each entry says what was decided and why.
     `history.clear` emptying the file at once) in 161/161, faults.sh 98/98 with a second
     instance and a read-only state directory, ui 35/35, the workspace tests (1145). *Left
     out*: a `sig://history` page and a list of suggestions (after this has been used).
+132. **Fullscreen: the window's, and a page's as a fact the core judges** (4–5 November 2026;
+    branches `host` (dde8d60) and `fullscreen` (merged 4af7aab), the engine commits 19e24d0,
+    08619eb and 1cdecf8; design [features-2026-11-04.md](features-2026-11-04.md), lane D with
+    the amendments after Astra's review; plan §17). The host can ask for and leave fullscreen
+    and reports the toplevel's state with every configure, state-only changes included
+    (`Host::set_fullscreen`, `WindowConfigured { fullscreen }`). The core
+    (`sighurt_core::fullscreen`) keeps three states apart: what the user asked for
+    (`browser.fullscreen`, `f11` in the example configuration), what the window is
+    (`BrowserEvent::Fullscreen`, the frontend's report of the compositor's answer; two toggles
+    before an answer never both ask for the same thing, and the compositor ending fullscreen
+    resets the toggle) and the page that holds element fullscreen (a view and its document).
+    A page's fullscreen is a fact the engine reports (`EngineEvent::FullscreenChanged`), since
+    Servo and CEF only notify: the core accepts it only for the shown view's current document,
+    with the window focused and an activation within 5 s that it uses up, says so with a
+    notice ("<host> is fullscreen. Escape leaves it.") and puts the window in fullscreen;
+    anything else is answered with `ExitFullscreen`. Every way out (`page.exit-fullscreen`,
+    another tab, a new document, the view failing or closing, the window losing the keyboard,
+    the compositor, the user's toggle, the engine's own `false`) ends it at once and returns
+    the window to what the user had chosen, without waiting for the engine. **Escape is the
+    one key the core takes itself**: while the shown view holds a page's fullscreen and the
+    page has the keyboard, an unmodified Escape press that the keymap passes runs
+    `page.exit-fullscreen`, its repeats and release taken with it; a press passed before
+    fullscreen began is not taken. No configuration can remove it (the example keymap also
+    binds Escape to the command while `TabInfo::fullscreen`). In fullscreen a chrome lists its
+    surfaces only while it has the keyboard, a notice shows or it draws the page area itself
+    (`Snapshot::fullscreen`; the status carries only a fresh notice then), so the controls
+    stay reachable and nothing new is drawn (every golden unchanged). The terminal has no
+    window fullscreen (`browser.fullscreen` says so) and shows a page's as the notice alone.
+    *Engines*: Servo (`notify_fullscreen_state_changed`, `WebView::exit_fullscreen`; it
+    requires transient activation itself and says nothing when a fullscreen document goes, so
+    the adapter reports `false` before the new commit, a crash or a close), CEF
+    (`on_fullscreen_mode_change`, `exit_fullscreen`), WPE WebKit (`enable-fullscreen` on; the
+    adapter sets and clears `WPE_TOPLEVEL_STATE_FULLSCREEN` on its toplevel at WebKit's
+    `enter-fullscreen` and `leave-fullscreen`, keeping the other state bits), the demo engine
+    for the tests (`demo:fullscreen`, `demo:fullscreen-unasked`); Ladybird, NetSurf and Wasm
+    have none and are neither heard nor told. *Known limit*: after a WebKit web process
+    crashes while its page is fullscreen that view cannot enter fullscreen again (WebKit's WPE
+    `closeFullScreenManager` is not implemented); it fails closed. *Verified*: 22 core tests in
+    `tests/fullscreen.rs` (every refusal and every way out, the Escape override with its
+    release and repeats, superseded answers), the host suite 20/20, chrome tests for both
+    chromes, headless.sh `fullscreen` (26 checks: f11, the line over the page, the notice, a
+    click entering and Escape leaving, the unasked page refused, `bindings` with Escape
+    unbound, f11 during a page's fullscreen, the compositor ending it), the terminal's test,
+    and a direct test in each engine's suite (Servo `the_page_goes_fullscreen`, WPE
+    `goes_fullscreen` including a crash while fullscreen, CEF offscreen section 6).
