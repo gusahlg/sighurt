@@ -1676,9 +1676,11 @@ mod tests {
         );
         assert_eq!(session.complete("exa"), Vec::new(), "none after shutdown");
 
-        // The next sig completes from it, and forgets it in the file at once.
+        // The next sig completes from it, once the file is read, and forgets it in the file at
+        // once.
         let mut session = idle_session(dir.path(), "", &[]);
         session.run_core(&mut frontend);
+        session.history.as_mut().unwrap().settle();
         assert_eq!(session.complete("www.e").len(), 1);
         let generation = session.history_generation();
         session.queue_mut().push_back(BrowserEvent::Command(

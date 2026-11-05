@@ -180,7 +180,7 @@ impl Terminal {
     }
 
     /// Reads what `sig` wrote, answering the probe once, until `done` holds for what arrived
-    /// from `since` on, or `timeout`.
+    /// from `since` on, or `timeout`. Returns whether it holds.
     fn wait(&mut self, since: usize, timeout: Duration, done: impl Fn(&[u8]) -> bool) -> bool {
         let start = Instant::now();
         let mut buf = vec![0u8; 1 << 16];
@@ -201,8 +201,9 @@ impl Terminal {
                 // EIO: the slave side has no process left.
                 Err(_) => return done(&self.got[since.min(self.got.len())..]),
             }
+            // What arrived before the wait may already satisfy it, with nothing more to come.
             if start.elapsed() > timeout {
-                return false;
+                return done(&self.got[since.min(self.got.len())..]);
             }
             thread::sleep(Duration::from_millis(5));
         }

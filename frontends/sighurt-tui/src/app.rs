@@ -4254,6 +4254,13 @@ schemes = [\"demo\"]
             session: Some(dir.join("session.toml")),
         });
         let app = &mut demo.app;
+        // The file is read on a thread; the loop takes it as it would.
+        let started = Instant::now();
+        while app.session.history_generation() == 0 {
+            app.session.service_completions(&mut app.tui);
+            assert!(started.elapsed() < Duration::from_secs(5), "never read");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let mut queue = VecDeque::new();
         let key = |app: &mut App, key: KeyEvent, queue: &mut VecDeque<BrowserEvent>| {
             let event = InputEvent {

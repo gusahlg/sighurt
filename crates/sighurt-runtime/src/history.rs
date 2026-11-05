@@ -38,6 +38,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -149,7 +150,7 @@ pub struct History {
     /// is on).
     loaded: bool,
     /// The file being read, until [`History::poll`] or [`History::settle`] takes it.
-    reading: Option<JoinHandle<ReadResult>>,
+    reading: Option<Receiver<ReadResult>>,
     /// The owner loop's wake, which the reader calls when it is done.
     wake: Arc<dyn Fn() + Send + Sync>,
     visits: HashMap<String, Visit>,
@@ -410,13 +411,20 @@ impl History {
         (forgotten, reports.failure)
     }
 
-    /// Takes what the reader read, if it is done (it woke the owner loop when it was), without
-    /// waiting. Returns whether it took anything: the visits are in, and the generation changed.
+    /// Takes what the reader read, if it is done (it woke the owner loop after handing it
+    /// over), without waiting. Returns whether it took anything: the visits are in, and the
+    /// generation changed.
     pub fn poll(&mut self) -> bool {
-        if !self.reading.as_ref().is_some_and(JoinHandle::is_finished) {
+        let Some(reading) = &self.reading else {
             return false;
-        }
-        self.settle();
+        };
+        let read = match reading.try_recv() {
+            Ok(read) => read,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("reading it failed".into()),
+        };
+        self.reading = None;
+        self.take_read(read);
         true
     }
 
@@ -426,7 +434,7 @@ impl History {
             return;
         };
         let read = reading
-            .join()
+            .recv()
             .unwrap_or_else(|_| Err("reading it failed".into()));
         self.take_read(read);
     }
@@ -475,15 +483,16 @@ impl History {
         };
         self.loaded = true;
         let wake = Arc::clone(&self.wake);
+        let (sender, reading) = mpsc::channel();
+        // The thread ends when it has handed over what it read; it is not joined.
         let reader = std::thread::Builder::new()
             .name("sighurt-history-read".into())
             .spawn(move || {
-                let read = read_file(&path);
+                let _ = sender.send(read_file(&path));
                 wake();
-                read
             });
         match reader {
-            Ok(reading) => self.reading = Some(reading),
+            Ok(_) => self.reading = Some(reading),
             Err(_) => {
                 let read = self.path.as_deref().map_or(Ok(None), read_file);
                 self.take_read(read);
