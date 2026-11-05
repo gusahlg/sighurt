@@ -39,8 +39,8 @@
 //!   `Effect::LineText`. Commands that change what the page area shows give the page the keyboard.
 //! - `page.find <text>` starts a search in the page the active tab shows, replacing the view's
 //!   search ([`Effect::Find`] with `FindCommand::Search`). Upper case in the text makes it
-//!   case-sensitive (smart case). Text that is only whitespace searches nothing and ends the
-//!   search; text over [`MAX_FIND`] bytes, which only a chrome can make, is refused. A page
+//!   case-sensitive (smart case). Control characters in it are spaces, and it is trimmed; text
+//!   that is only whitespace searches nothing and ends the search; text over [`MAX_FIND`] bytes, which only a chrome can make, is refused. A page
 //!   that has not committed a document yet has nothing to find in. `page.find` without text
 //!   gives the chrome the keyboard and opens its find field ([`Effect::FindField`]) holding the
 //!   view's search. `page.find-next` and `page.find-previous` move in the view's search, and
@@ -310,6 +310,12 @@ impl BrowserState {
                 return;
             }
             (Command::PageFind(Some(text)), Some(id)) => {
+                // A control character (a pasted newline or tab, an escape, a NUL) finds nothing
+                // in a page's text, and a NUL can't reach an engine's C API at all: a space.
+                let text: String = text
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
                 let text = text.trim();
                 if text.is_empty() {
                     return self.end_find(id, fx);
