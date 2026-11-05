@@ -145,7 +145,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     process_per_view: false,
     semantics: true,
     site_data: sighurt_api::engine::SiteDataKinds::NONE,
-    fullscreen: false, // lane D: true once element fullscreen is wired
+    fullscreen: true,
 };
 
 /// What the executable decides for the Servo runtime.
@@ -852,6 +852,13 @@ impl<T: ServoTarget> ServoRuntime<T> {
                     if let Some((navigation, _, committed)) = &mut view.navigated {
                         *committed |= *navigation == commit.navigation;
                     }
+                    // A document that was fullscreen is gone: Servo says nothing of it, so the
+                    // browser hears it here, before the new document commits.
+                    if Some(commit.document) != before {
+                        if let Some(left) = view.left_fullscreen() {
+                            push(events, left);
+                        }
+                    }
                     let loaded = commit.history != Some(HistoryEffect::Traverse);
                     push(
                         events,
@@ -913,6 +920,9 @@ impl<T: ServoTarget> ServoRuntime<T> {
                 }
             }
             Note::Crashed(reason) => {
+                if let Some(left) = view.left_fullscreen() {
+                    push(events, left);
+                }
                 view.crashed = true;
                 view.semantics.reset_page();
                 view.asked.clear();
@@ -936,6 +946,25 @@ impl<T: ServoTarget> ServoRuntime<T> {
                         message: format!("The page crashed: {reason}"),
                     },
                 );
+            }
+            Note::Fullscreen(true) => {
+                // Servo says so again for a second request: one report per entry.
+                if let (None, Some(document)) = (view.fullscreen, view.document()) {
+                    view.fullscreen = Some(document);
+                    push(
+                        events,
+                        EngineEvent::FullscreenChanged {
+                            view: id,
+                            document,
+                            fullscreen: true,
+                        },
+                    );
+                }
+            }
+            Note::Fullscreen(false) => {
+                if let Some(left) = view.left_fullscreen() {
+                    push(events, left);
+                }
             }
             Note::Closed => {
                 if let Some(document) = view.document() {
@@ -1596,7 +1625,12 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                 }
             }
             EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
-            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
+            EngineCommand::ExitFullscreen => {
+                // Servo's page leaves it and says so; with nothing fullscreen, nothing to do.
+                if let (Some(_), Some(webview)) = (view.fullscreen, &view.webview) {
+                    webview.exit_fullscreen();
+                }
+            }
         }
         Ok(())
     }
@@ -1725,9 +1759,12 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
     }
 
     fn close_view(&mut self, id: ViewId) {
-        let Some(view) = self.views.remove(&id) else {
+        let Some(mut view) = self.views.remove(&id) else {
             return;
         };
+        if let Some(left) = view.left_fullscreen() {
+            push(&mut self.events, left);
+        }
         if self.servo_focus == Some(id) {
             self.servo_focus = None;
         }

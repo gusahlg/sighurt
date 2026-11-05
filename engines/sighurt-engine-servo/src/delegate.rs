@@ -64,6 +64,8 @@ pub(crate) enum Note {
     ClipboardWrite(Option<String>),
     /// `window.stop()` ran in the page.
     Stopped,
+    /// An element of the page entered (`true`) or left element fullscreen.
+    Fullscreen(bool),
     /// A script this runtime evaluated finished. The string is its value, or a short error
     /// with no snapshot body.
     Semantic(crate::semantic::Tag, Result<String, String>),
@@ -344,6 +346,10 @@ impl WebViewDelegate for Delegate {
 
     fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
         self.note(&webview, Note::Crashed(reason));
+    }
+
+    fn notify_fullscreen_state_changed(&self, webview: WebView, is_fullscreen: bool) {
+        self.note(&webview, Note::Fullscreen(is_fullscreen));
     }
 
     fn request_navigation(&self, webview: WebView, request: NavigationRequest) {

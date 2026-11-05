@@ -33,6 +33,7 @@ use servo::{
     UserContentManager, WebView, WebViewBuilder,
 };
 use sighurt_api::engine::ViewOptions;
+use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::Metrics;
 use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, RequestId, ViewId};
 use sighurt_api::input::InputEvent;
@@ -141,6 +142,9 @@ pub(crate) struct View<T: ServoTarget> {
     pub navigated: Option<(NavigationId, Instant, bool)>,
     /// Semantic snapshots. Off until `SetSemantics`, then at most one extraction at a time.
     pub semantics: Semantics,
+    /// The document last reported fullscreen (`FullscreenChanged { fullscreen: true }`), until
+    /// `false` is reported for it.
+    pub fullscreen: Option<DocumentGeneration>,
     /// Dropped last, after the context and everything Servo made from it.
     pub target: T,
 }
@@ -179,7 +183,19 @@ impl<T: ServoTarget> View<T> {
             presented: None,
             navigated: None,
             semantics: Semantics::default(),
+            fullscreen: None,
         }
+    }
+
+    /// Reports that the page left fullscreen, if it was reported in it: Servo's notification,
+    /// or the document, the page or the view going while an element was fullscreen.
+    pub fn left_fullscreen(&mut self) -> Option<EngineEvent> {
+        let document = self.fullscreen.take()?;
+        Some(EngineEvent::FullscreenChanged {
+            view: self.id,
+            document,
+            fullscreen: false,
+        })
     }
 
     /// Makes the GL context once the view has room for one. A hidden Wayland view gives its

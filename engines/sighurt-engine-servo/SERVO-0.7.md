@@ -150,6 +150,16 @@ can show is marked as not measured.
   `notify_accessibility_tree_update`. The accessibility-tree callback is the other half of
   the AccessKit opportunity above. `notify_input_event_handled` could replace some of the
   adapter's own key-release bookkeeping later; it is not wired.
+  `notify_fullscreen_state_changed` is wired (element fullscreen, `fullscreen: true`): it
+  queues a note that becomes `FullscreenChanged` for the view's document, once per entry
+  (Servo says `true` again when the page asks again), and `EngineCommand::ExitFullscreen` is
+  `WebView::exit_fullscreen` (Servo's page leaves and says `false`). Servo refuses
+  `requestFullscreen` without transient user activation itself (`dom/fullscreen/lib.rs`;
+  `dom_fullscreen_test` only changes a log line) and says nothing when a fullscreen document
+  goes, so the adapter reports `false` itself before a new document's commit, before a
+  crash's `ViewFailed` and before `ViewClosed`. Servo only notifies: the page's element fills
+  the view it has, and making the window fullscreen is the browser's. `tests/engine.rs`
+  (`the_page_goes_fullscreen`) covers it.
 - `EmbedderControl`, `PermissionFeature` and `ServoError` variants match 0.5, so the
   delegate's matches stay exhaustive. `RenderingContext` lost `native_context` (it had a
   default). The methods this adapter and the experiments implement are unchanged.

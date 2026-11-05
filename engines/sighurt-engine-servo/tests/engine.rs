@@ -327,6 +327,116 @@ fn title(state: &State, view: ViewId) -> Option<String> {
     })
 }
 
+/// The fullscreen reports of `view`: the document and the state, oldest first.
+fn fullscreen(state: &State, view: ViewId) -> Vec<(DocumentGeneration, bool)> {
+    let reports = state.events_of(view).filter_map(|event| match event {
+        EngineEvent::FullscreenChanged {
+            document,
+            fullscreen,
+            ..
+        } => Some((*document, *fullscreen)),
+        _ => None,
+    });
+    reports.collect()
+}
+
+/// Element fullscreen: a page with no user activation can't enter it (Servo refuses); a click
+/// enters it, reported once for the document even when the page asks again; `ExitFullscreen`
+/// leaves it (the page sees it) and does nothing when nothing is fullscreen; a new document, and
+/// closing the view, report that the document left it before anything else of theirs.
+fn the_page_goes_fullscreen(d: &mut Driver) {
+    let auto = d
+        .state
+        .open(&format!("{}?auto", page("fullscreen.html")), true);
+    d.state.set_focus(Some(auto));
+    assert!(d.run_until(WAIT, |s| title(s, auto).as_deref() == Some("refused")));
+    assert_eq!(
+        fullscreen(&d.state, auto),
+        [],
+        "no fullscreen without activation"
+    );
+    d.state.close(auto);
+
+    let v = d.state.open(&page("fullscreen.html"), true);
+    d.state.set_focus(Some(v));
+    assert!(d.run_until(WAIT, |s| commit(s, v).is_some() && s.submitted(v) > 0));
+    d.run_for(Duration::from_millis(500));
+    let (_, _, document) = commit(&d.state, v).unwrap();
+    click(&mut d.state, v);
+    assert!(
+        d.run_until(WAIT, |s| title(s, v).as_deref() == Some("full")),
+        "a click enters fullscreen: {:?}",
+        title(&d.state, v)
+    );
+    assert_eq!(fullscreen(&d.state, v), [(document, true)]);
+    // Asked again while fullscreen: no second report.
+    click(&mut d.state, v);
+    d.run_for(Duration::from_millis(500));
+    assert_eq!(fullscreen(&d.state, v), [(document, true)]);
+
+    d.state.command(v, EngineCommand::ExitFullscreen);
+    assert!(
+        d.run_until(WAIT, |s| title(s, v).as_deref() == Some("normal")),
+        "ExitFullscreen leaves it, as the page sees"
+    );
+    assert_eq!(
+        fullscreen(&d.state, v),
+        [(document, true), (document, false)]
+    );
+    d.state.command(v, EngineCommand::ExitFullscreen);
+    d.run_for(Duration::from_millis(500));
+    assert_eq!(
+        fullscreen(&d.state, v).len(),
+        2,
+        "nothing to leave: nothing happens"
+    );
+
+    // A new document while fullscreen: the old one left it, reported before the commit.
+    click(&mut d.state, v);
+    assert!(d.run_until(WAIT, |s| fullscreen(s, v).len() == 3));
+    let away = d.state.navigate(v, &page("input.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, v, away)));
+    assert_eq!(fullscreen(&d.state, v)[3], (document, false));
+    let events: Vec<&EngineEvent> = d.state.events_of(v).collect();
+    let left = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, EngineEvent::FullscreenChanged { .. }))
+        .nth(3)
+        .map(|(i, _)| i);
+    let commit_at = events.iter().position(
+        |e| matches!(e, EngineEvent::NavigationCommitted { navigation, .. } if *navigation == away),
+    );
+    assert!(
+        matches!((left, commit_at), (Some(l), Some(c)) if l < c),
+        "left at {left:?}, the commit at {commit_at:?}"
+    );
+
+    // Closing the view while fullscreen: reported left, then closed.
+    let back = d.state.navigate(v, &page("fullscreen.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, v, back) && s.submitted(v) > 0));
+    d.run_for(Duration::from_millis(500));
+    click(&mut d.state, v);
+    assert!(d.run_until(WAIT, |s| fullscreen(s, v).len() == 5));
+    d.state.close(v);
+    let closed = |e: &EngineEvent| matches!(e, EngineEvent::ViewClosed { .. });
+    assert!(d.run_until(WAIT, |s| s.events_of(v).any(closed)));
+    assert!(
+        !fullscreen(&d.state, v)[5].1,
+        "the view left fullscreen before it closed"
+    );
+    let order: Vec<&str> = d
+        .state
+        .events_of(v)
+        .filter_map(|e| match e {
+            EngineEvent::FullscreenChanged { .. } => Some("fullscreen"),
+            EngineEvent::ViewClosed { .. } => Some("closed"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order.last(), Some(&"closed"));
+}
+
 /// A page's own navigations wait for the browser's answer (extension-api.md §1.4): a click on a
 /// link asks first; allowed, it commits as the page's own; denied, nothing loads. A new
 /// document, and closing the view, deny what is held, and a late answer does nothing. At most 16
@@ -628,6 +738,8 @@ fn servo_views_navigate_present_and_fail_distinctly() {
         d.state.set_visible(b, true);
         assert!(d.run_until(WAIT, |s| s.submitted(b) > b_before));
     }
+
+    the_page_goes_fullscreen(&mut d);
 
     // Closing a view.
     let closed = |e: &EngineEvent| matches!(e, EngineEvent::ViewClosed { .. });
