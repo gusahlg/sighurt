@@ -171,7 +171,8 @@ forward = "page.forward"
 # While the page has the keyboard, in both frontends: q quits, o focuses the address line,
 # : opens it as the command line (location.focus :), ctrl-o focuses it from anywhere, / opens
 # the find field (page.find), n and N move to the next and previous match of the search, t
-# opens a tab, x closes the tab, u reopens the tab closed last, J and K move to the next and
+# opens a tab, x and d close the tab, u reopens the tab closed last, ? and f1 (f1 from the
+# address line too) run help, which opens sig://help, J and K move to the next and
 # previous tab, H and L go back and forward, r and ctrl-r reload (ctrl-r from anywhere), f11
 # toggles fullscreen (from anywhere), e
 # reopens the page in the next web engine, j and k scroll, ctrl-d and ctrl-u scroll a page, g
