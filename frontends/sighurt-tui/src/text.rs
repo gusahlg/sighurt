@@ -479,6 +479,19 @@ impl TextPages {
         page.count().expect("a search was just set")
     }
 
+    /// Starts `query` in `view`'s page if the page has come and does not have that search yet:
+    /// a search made before the page's first snapshot, or one a new document's snapshot
+    /// dropped. Returns what it found then; `None` with no page, or when the page already has
+    /// the search.
+    pub fn resume(&mut self, view: ViewId, query: &Query) -> Option<Count> {
+        let page = self.pages.get(&view)?;
+        let has = page
+            .found
+            .as_ref()
+            .is_some_and(|found| found.query == *query);
+        (!has).then(|| self.find(view, query, Step::Start))
+    }
+
     /// Ends `view`'s search and its highlight.
     pub fn stop_find(&mut self, view: ViewId) {
         if let Some(page) = self.pages.get_mut(&view) {

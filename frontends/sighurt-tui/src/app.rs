@@ -35,8 +35,10 @@
 //! the core moving the focus closes it and keeps the search. In text mode every search of the
 //! shown view is the frontend's ([`Frontend::find`]): it searches the page's text and answers
 //! the core with `BrowserEvent::FindResult`, as an engine would; in graphics mode the engine
-//! searches. Changing the mode ends the shown page's search, with a notice. What the search
-//! found, from the core, is right-aligned on the bottom line.
+//! searches. A search made before the page's first snapshot is answered when it comes. Changing
+//! the mode ends every search, with one notice: the shown page's at once, a hidden tab's when it
+//! is shown (`page.find-stop` acts on the tab shown), its moves going nowhere until then. What
+//! the search found, from the core, is right-aligned on the bottom line.
 //!
 //! Text mode (TUI.md §4, [`crate::text`]): `[tui] mode`, or `chrome.toggle-mode` for the run,
 //! decides whether the page rows show pixels or the page's text. In text mode the shown view's
@@ -324,6 +326,10 @@ struct Tui {
     find_sent: String,
     /// Each view's search, as the core last started it ([`Frontend::find`] sees every one).
     searches: HashMap<ViewId, Query>,
+    /// Hidden views whose search began before the mode last changed, so the finder of the
+    /// mode now (the engine, or the page's text) never got it. Its moves go nowhere, and it
+    /// ends (`page.find-stop`) when its view is shown again.
+    orphaned: HashSet<ViewId>,
     /// Events for the core from outside an effect: what the find field typed, a search that
     /// found anew in a new snapshot, the stop a mode change makes. [`App::run_core`] sends them.
     find_events: Vec<BrowserEvent>,
@@ -607,6 +613,7 @@ impl App {
             finding: false,
             find_sent: String::new(),
             searches: HashMap::new(),
+            orphaned: HashSet::new(),
             find_events: Vec::new(),
             shown_view: None,
             line_gen: 0,
@@ -1821,16 +1828,21 @@ impl Tui {
             (0, 0)
         };
         if graphics != self.graphics || text != self.text_mode {
-            // The search was the other mode's finder's: it ends, and says so.
-            let shown_search = self
-                .shown_view
-                .is_some_and(|view| self.searches.contains_key(&view));
-            if text != self.text_mode && shown_search {
-                self.find_events
-                    .push(BrowserEvent::Command(Command::PageFindStop));
+            // Every search was the other mode's finder's. The shown page's ends now; a hidden
+            // one's when its tab is shown, since `page.find-stop` acts on the tab shown. Said
+            // once.
+            if text != self.text_mode && !self.searches.is_empty() {
+                let shown = self.shown_view;
+                let shown_search = shown.is_some_and(|view| self.searches.contains_key(&view));
+                if shown_search {
+                    self.find_events
+                        .push(BrowserEvent::Command(Command::PageFindStop));
+                }
+                let hidden = self.searches.keys().filter(|&&view| Some(view) != shown);
+                self.orphaned.extend(hidden);
                 let now = if text { "as text" } else { "as graphics" };
                 self.show_notice(format!(
-                    "The search in the page ended: the page is shown {now} now."
+                    "Searches in pages ended: pages are shown {now} now."
                 ));
             }
             self.graphics = graphics;
@@ -2308,6 +2320,7 @@ impl Frontend for Tui {
             .collect();
         for view in gone {
             self.searches.remove(&view);
+            self.orphaned.remove(&view);
             self.shown_view.take_if(|shown| *shown == view);
             self.text.forget(view);
             self.semantic_on.remove(&view);
@@ -2393,6 +2406,7 @@ impl Frontend for Tui {
                     case_sensitive: *case_sensitive,
                 };
                 self.searches.insert(view, query);
+                self.orphaned.remove(&view);
                 (*search, Step::Start)
             }
             FindCommand::Next { search } => (*search, Step::Next),
@@ -2404,17 +2418,24 @@ impl Frontend for Tui {
                     .is_some_and(|q| q.search == *search)
                 {
                     self.searches.remove(&view);
+                    self.orphaned.remove(&view);
                     self.text.stop_find(view);
                     self.chrome_dirty = true;
                 }
                 return false;
             }
         };
+        // A search neither finder of this mode got: its moves go nowhere until it ends.
+        if self.orphaned.contains(&view) {
+            return true;
+        }
         if !self.text_mode || !self.semantic_on.contains(&view) {
             return false;
         }
-        // A move in a search that is not the view's does nothing, as in an engine.
-        if let Some(query) = self.searches.get(&view).filter(|q| q.search == search) {
+        // A move in a search that is not the view's does nothing, as in an engine. Before the
+        // page's first snapshot there is nothing to search: the snapshot answers.
+        let query = self.searches.get(&view).filter(|q| q.search == search);
+        if let Some(query) = query.filter(|_| self.text.has(view)) {
             let count = self.text.find(view, query, step);
             queue.push_back(find_result(view, count));
             self.chrome_dirty = true;
@@ -2459,6 +2480,11 @@ impl Frontend for Tui {
     fn show(&mut self, view: ViewId, visible: bool) {
         if visible {
             self.shown_view = Some(view);
+            // Its search began in the other mode: it ends now that its tab is shown.
+            if self.orphaned.remove(&view) {
+                self.find_events
+                    .push(BrowserEvent::Command(Command::PageFindStop));
+            }
         } else {
             self.release_pointer(Some(view));
             self.shown_view.take_if(|shown| *shown == view);
@@ -2522,8 +2548,17 @@ impl Frontend for Tui {
 
     fn semantics_changed(&mut self, view: ViewId, snapshot: Box<SemanticSnapshot>) {
         if self.semantic_on.contains(&view) {
-            // The same document found anew: the core hears the new count.
-            if let Some(count) = self.text.snapshot(view, snapshot) {
+            // The same document found anew, or a search that waited for the page: the core
+            // hears the new count.
+            let mut count = self.text.snapshot(view, snapshot);
+            if count.is_none() {
+                let query = self
+                    .searches
+                    .get(&view)
+                    .filter(|_| !self.orphaned.contains(&view));
+                count = query.and_then(|query| self.text.resume(view, query));
+            }
+            if let Some(count) = count {
                 self.find_events.push(find_result(view, count));
             }
             self.chrome_dirty = true;
@@ -3046,6 +3081,7 @@ mod tests {
             finding: false,
             find_sent: String::new(),
             searches: HashMap::new(),
+            orphaned: HashSet::new(),
             find_events: Vec::new(),
             shown_view: None,
             line_gen: 0,
@@ -3965,9 +4001,142 @@ schemes = [\"demo\"]
             .tui
             .notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("search in the page ended")));
+            .is_some_and(|notice| notice.contains("Searches in pages ended")));
         app.run_core();
         let core = app.session.core();
         assert!(core.tabs().nth(core.active()).unwrap().find.is_none());
+    }
+
+    /// The text page of the shown view, once its snapshot came.
+    #[cfg(feature = "engine-demo")]
+    fn wait_for_page(app: &mut App) -> ViewId {
+        let view = app.session.shown_view().expect("shown").0;
+        for _ in 0..8 {
+            app.sync_semantics();
+            let _ = app.session.pump(&mut app.tui);
+            app.run_core();
+            if app.tui.text.has(view) {
+                break;
+            }
+        }
+        assert!(app.tui.text.has(view), "{}", page_debug(app));
+        view
+    }
+
+    /// The active tab's search as the bottom line says it with the field open.
+    #[cfg(feature = "engine-demo")]
+    fn found(app: &App) -> Option<String> {
+        let core = app.session.core();
+        let tab = core.tabs().nth(core.active()).unwrap();
+        let engine = tab_engine(core, &tab);
+        tab.find.and_then(|find| find_indicator(find, engine, true))
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn run(app: &mut App, command: &str) {
+        let command = command.parse::<Command>().unwrap();
+        app.session
+            .queue_mut()
+            .push_back(BrowserEvent::Command(command));
+        app.run_core();
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn start_demo(app: &mut App, pages: &[&str]) {
+        app.tui.relayout();
+        assert!(app.tui.text_mode, "a pty without pixels is text");
+        app.session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: pages
+                .iter()
+                .map(|page| OpenRequest {
+                    input: (*page).into(),
+                    engine: Some("demo".into()),
+                })
+                .collect(),
+        });
+        settle_document(app);
+    }
+
+    #[cfg(feature = "engine-demo")]
+    #[test]
+    fn a_search_before_the_pages_text_is_answered_when_the_text_comes() {
+        let mut held = demo_app();
+        let app = &mut held.app;
+        start_demo(app, &["demo://pattern"]);
+        let view = app.session.shown_view().expect("shown").0;
+        assert!(!app.tui.text.has(view), "no snapshot yet");
+        run(app, "page.find page");
+        assert_eq!(found(app), None, "nothing is said before the text comes");
+        wait_for_page(app);
+        assert_eq!(found(app).as_deref(), Some("1 of 3"));
+        // A new snapshot of the same document with other matches is answered again.
+        run(app, "page.find pressed");
+        assert_eq!(found(app).as_deref(), Some("no matches"));
+        let document = app.session.core().view(view).unwrap().document().unwrap();
+        let semantic = |action| BrowserEvent::Semantic {
+            view,
+            document,
+            action,
+            link: None,
+            at: Instant::now(),
+        };
+        app.session.queue_mut().push_back(semantic(
+            sighurt_api::semantic::SemanticAction::Activate(sighurt_api::semantic::NodeId(10)),
+        ));
+        app.run_core();
+        for _ in 0..4 {
+            let _ = app.session.pump(&mut app.tui);
+            app.run_core();
+        }
+        assert_eq!(
+            found(app).as_deref(),
+            Some("1 of 1"),
+            "the field says pressed"
+        );
+    }
+
+    #[cfg(feature = "engine-demo")]
+    #[test]
+    fn a_mode_change_ends_every_search_and_a_hidden_tabs_moves_go_nowhere() {
+        let mut held = demo_app();
+        let app = &mut held.app;
+        start_demo(app, &["demo://pattern", "demo://resize"]);
+        let first = wait_for_page(app);
+        run(app, "page.find page");
+        assert_eq!(found(app).as_deref(), Some("1 of 3"));
+        let search = app.tui.searches[&first].search;
+        // The second tab, then graphics: the hidden first tab's search was the text finder's.
+        run(app, "tab.select 2");
+        settle_document(app);
+        app.tui.mode_override = Some(false);
+        app.tui.relayout();
+        assert!(app
+            .tui
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Searches in pages ended")));
+        app.run_core();
+        // Its moves reach neither finder.
+        let mut queue = VecDeque::new();
+        assert!(app
+            .tui
+            .find(first, &FindCommand::Next { search }, &mut queue));
+        assert!(queue.is_empty());
+        // Shown again, it ends.
+        run(app, "tab.select 1");
+        settle_document(app);
+        app.run_core();
+        assert_eq!(found(app), None);
+        assert!(app.session.core().view(first).unwrap().find().is_none());
+        assert!(!app.tui.searches.contains_key(&first));
+        assert!(!app.tui.orphaned.contains(&first));
+        // A new search there is the engine's now, and works.
+        run(app, "page.find page");
+        for _ in 0..4 {
+            let _ = app.session.pump(&mut app.tui);
+            app.run_core();
+        }
+        assert_eq!(found(app).as_deref(), Some("1 of 3"));
     }
 }

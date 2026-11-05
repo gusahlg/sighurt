@@ -1262,7 +1262,7 @@ fn graphics_mode_finds_through_the_engine_and_m_ends_the_search() {
     let since = term.got.len();
     term.type_bytes(b"m");
     let told = term.wait(since, Duration::from_secs(10), |got| {
-        shows(got, "The search in the page ended")
+        shows(got, "Searches in pages ended")
     });
     assert!(told, "no notice\n{}", term.context());
     let report = term.report_until(|r| tab_find(r) == "null");
