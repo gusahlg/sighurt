@@ -334,6 +334,15 @@ fn config<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>, d: &Data) {
          as you save the file; a mistake keeps the previous configuration and is reported. \
          [ui] chrome, [ui] renderer and the [engines.<name>] settings need a restart.",
     );
+    b.para(
+        "You can also edit the file here, at sig://config: it is checked as you type and the \
+         problems are listed with their lines. With the example keymap, press Escape for INSERT \
+         mode to type; Ctrl+S (or Save) saves and applies it. A save is refused when the text has \
+         a problem, or when the file changed elsewhere since the page read it (Read the file \
+         again, then Ctrl+Z brings your text back). A file linked from elsewhere is saved where \
+         the link leads.",
+    );
+    b.link("Open sig://config \u{2192}", "sig://config");
     b.heading(2, "The tables");
     let tables: Vec<Vec<String>> = [
         (
@@ -391,7 +400,7 @@ fn pages<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
     b.para("This page.");
     b.link("sig://help", "sig://help");
     b.heading(2, "sig://config");
-    b.para("View and edit the configuration file in the browser. A change is checked before it is saved and applies live where the setting allows it.");
+    b.para("View and edit the configuration file in the browser: a plain text editor that checks the file as you type. Ctrl+S or Save saves it, only when it is valid and nobody changed the file meanwhile, and the change applies live where the setting allows it.");
     b.link("sig://config", "sig://config");
     b.heading(2, "sig://terminal");
     b.para(
