@@ -11,7 +11,12 @@
 //!
 //! The file is TOML, version [`VERSION`], read like the session: a damaged visit is left out
 //! with one notice, unknown fields are noticed, another version or a file that is not TOML is
-//! refused whole, and so is a file over [`MAX_FILE`], before it is parsed. The `sig` that owns
+//! refused whole, and so is a file over [`MAX_FILE`], before it is parsed. It is read and parsed
+//! on a thread of its own, so a full history does not delay the first frame (H-START2): the owner
+//! takes what it read when it is in ([`History::poll`], each loop pass, after the reader woke the
+//! loop) or when something needs the visits (a visit, a forget, a save, `remember`), waiting
+//! for it then; until then completion answers nothing, and when it comes the generation changes
+//! so that the frontends ask again. The `sig` that owns
 //! the session (its lock, `persistence`) owns the history: it keeps a file it can't read aside
 //! as `history.toml.broken-<seconds>`, and writes the history on a thread of its own, the latest
 //! snapshot only (one slot, never a queue), atomically, synced, mode 0600, at most every
@@ -140,8 +145,13 @@ pub struct History {
     path: Option<PathBuf>,
     /// `[history] remember`.
     remember: bool,
-    /// Whether the file has been read into `visits` (it is while `remember` is on).
+    /// Whether the file has been read into `visits`, or is being read (it is while `remember`
+    /// is on).
     loaded: bool,
+    /// The file being read, until [`History::poll`] or [`History::settle`] takes it.
+    reading: Option<JoinHandle<ReadResult>>,
+    /// The owner loop's wake, which the reader calls when it is done.
+    wake: Arc<dyn Fn() + Send + Sync>,
     visits: HashMap<String, Visit>,
     /// Their [`cost`], all together.
     bytes: usize,
@@ -176,7 +186,7 @@ impl History {
         let owner = match (&path, ownership) {
             (Some(path), Ownership::Owner(lock)) => {
                 remove_temporaries(path);
-                match Writer::new(path.clone(), lock, wake) {
+                match Writer::new(path.clone(), lock, Arc::clone(&wake)) {
                     Ok(writer) => Owner::Me(writer),
                     Err(error) => {
                         told = true;
@@ -195,6 +205,8 @@ impl History {
             path,
             remember: false,
             loaded: false,
+            reading: None,
+            wake,
             visits: HashMap::new(),
             bytes: 0,
             owner,
@@ -220,6 +232,7 @@ impl History {
         if on == self.remember {
             return;
         }
+        self.settle();
         self.remember = on;
         if on {
             self.load();
@@ -256,6 +269,7 @@ impl History {
 
     /// [`History::visit`] at `now`, in seconds since 1970.
     fn record(&mut self, url: &str, title: Option<&str>, commit: bool, now: u64) -> bool {
+        self.settle();
         if !self.remember || !self.loaded || url.len() > MAX_URL {
             return false;
         }
@@ -291,9 +305,9 @@ impl History {
 
     /// At most [`MAX_COMPLETIONS`] visited addresses that `typed` completes ([`suffix`] gives
     /// more than nothing), the most recently visited first. None for empty text, with
-    /// `remember` off, or without a history.
+    /// `remember` off, without a history, or while the file is still being read.
     pub fn complete(&self, typed: &str) -> Vec<Completion> {
-        if typed.is_empty() || !self.remember {
+        if typed.is_empty() || !self.remember || self.reading.is_some() {
             return Vec::new();
         }
         let mut found: Vec<(&String, &Visit)> = self
@@ -325,6 +339,7 @@ impl History {
         if unload {
             self.load();
         }
+        self.settle();
         let before = self.visits.len();
         match host {
             None => self.visits.clear(),
@@ -361,6 +376,7 @@ impl History {
 
     /// Hands the history to the writer now if it changed. Returns whether it did.
     pub fn save(&mut self) -> bool {
+        self.settle();
         self.due = None;
         let Owner::Me(writer) = &self.owner else {
             return false;
@@ -394,7 +410,29 @@ impl History {
         (forgotten, reports.failure)
     }
 
-    /// Changes when visits were forgotten or dropped: completions shown may be gone.
+    /// Takes what the reader read, if it is done (it woke the owner loop when it was), without
+    /// waiting. Returns whether it took anything: the visits are in, and the generation changed.
+    pub fn poll(&mut self) -> bool {
+        if !self.reading.as_ref().is_some_and(JoinHandle::is_finished) {
+            return false;
+        }
+        self.settle();
+        true
+    }
+
+    /// Waits for the file being read, if it is, and takes what it holds.
+    pub fn settle(&mut self) {
+        let Some(reading) = self.reading.take() else {
+            return;
+        };
+        let read = reading
+            .join()
+            .unwrap_or_else(|_| Err("reading it failed".into()));
+        self.take_read(read);
+    }
+
+    /// Changes when visits were forgotten or dropped, or the file was read: completions shown
+    /// may be gone, or new ones there.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -419,7 +457,7 @@ impl History {
         }
     }
 
-    /// Drops every visit in memory and the save waiting.
+    /// Drops every visit in memory and the save waiting. Nothing is being read.
     fn unload(&mut self) {
         self.visits = HashMap::new();
         self.bytes = 0;
@@ -429,16 +467,40 @@ impl History {
         self.generation += 1;
     }
 
-    /// Reads the file into memory, keeping a file that can't be read aside if this `sig` owns
-    /// it.
+    /// Starts reading the file on a thread of its own ([`History::settle`] takes it), or reads
+    /// it here when no thread can be started.
     fn load(&mut self) {
         let Some(path) = self.path.clone() else {
             return;
         };
         self.loaded = true;
-        let read = match read_bounded(&path) {
+        let wake = Arc::clone(&self.wake);
+        let reader = std::thread::Builder::new()
+            .name("sighurt-history-read".into())
+            .spawn(move || {
+                let read = read_file(&path);
+                wake();
+                read
+            });
+        match reader {
+            Ok(reading) => self.reading = Some(reading),
+            Err(_) => {
+                let read = self.path.as_deref().map_or(Ok(None), read_file);
+                self.take_read(read);
+            }
+        }
+    }
+
+    /// Puts what was read in memory, keeping a file that can't be read aside if this `sig`
+    /// owns it.
+    fn take_read(&mut self, read: ReadResult) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        self.generation += 1;
+        let read = match read {
             Ok(None) => return,
-            Ok(Some(text)) => parse(&text, unix_now()),
+            Ok(Some(parsed)) => Ok(parsed),
             Err(error) => Err(error),
         };
         match read {
@@ -602,6 +664,17 @@ fn read_bounded(path: &Path) -> Result<Option<String>, String> {
 
 /// The visits a history file holds, and what reading it left out, for the user.
 type Parsed = (Vec<(String, Visit)>, Vec<String>);
+
+/// What reading the history file gave: nothing (no file), its visits, or why it can't be read.
+type ReadResult = Result<Option<Parsed>, String>;
+
+/// Reads and parses the history file at `path`.
+fn read_file(path: &Path) -> ReadResult {
+    match read_bounded(path)? {
+        None => Ok(None),
+        Some(text) => parse(&text, unix_now()).map(Some),
+    }
+}
 
 /// The visits in a history file's `text`, without those older than [`RETENTION`] at `now`, and
 /// what reading it left out, for the user. `Err` for text that is not a history of this
@@ -858,15 +931,21 @@ mod tests {
         Arc::new(|| {})
     }
 
-    /// A history this test owns at `dir/history.toml`.
+    /// A history this test owns at `dir/history.toml`, its file read.
     fn owned(dir: &Path, remember: bool) -> History {
         let lock = fs::File::create(dir.join("session.lock")).unwrap();
-        History::open(
+        opened(
             Some(dir.join("history.toml")),
             Ownership::Owner(Arc::new(lock)),
             remember,
-            quiet(),
         )
+    }
+
+    /// [`History::open`], waiting for its file to be read.
+    fn opened(path: Option<PathBuf>, ownership: Ownership, remember: bool) -> History {
+        let mut history = History::open(path, ownership, remember, quiet());
+        history.settle();
+        history
     }
 
     fn file(dir: &Path) -> PathBuf {
@@ -992,6 +1071,7 @@ mod tests {
         // Long addresses fill the file's budget before the count.
         let mut history = owned(dir.path(), false);
         history.set_remember(true);
+        history.settle();
         history.visits.clear();
         history.bytes = 0;
         let long = "x".repeat(MAX_URL - 40);
@@ -1064,10 +1144,12 @@ mod tests {
         let big = format!("version = 1\n#{}\n", "x".repeat(MAX_FILE as usize));
         fs::write(file(dir.path()), &big).unwrap();
         // Another sig's: it stays where it is.
-        let mut other = History::open(Some(file(dir.path())), Ownership::Elsewhere, true, quiet());
+        let mut other = opened(Some(file(dir.path())), Ownership::Elsewhere, true);
         let notices = other.take_notices();
         assert!(
-            notices[0].contains("over the limit of 4194304 bytes"),
+            notices
+                .iter()
+                .any(|n| n.contains("over the limit of 4194304 bytes")),
             "{notices:?}"
         );
         assert!(file(dir.path()).exists());
@@ -1084,6 +1166,44 @@ mod tests {
             .find(|name| name.starts_with("history.toml.broken-"))
             .unwrap();
         assert_eq!(fs::read_to_string(dir.path().join(kept)).unwrap(), big);
+    }
+
+    /// The file is read on a thread (H-START2): until it is in, completion answers nothing;
+    /// the reader wakes the loop, [`History::poll`] takes it and changes the generation, and a
+    /// visit that comes first waits for it, so nothing read is lost.
+    #[test]
+    fn the_file_is_read_on_a_thread_and_taken_when_it_is_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = owned(dir.path(), true);
+        history.record("https://a.example/", None, true, unix_now());
+        history.finish();
+        let (sender, woken) = std::sync::mpsc::channel();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = sender.send(());
+        });
+        let mut history = History::open(Some(file(dir.path())), Ownership::Elsewhere, true, wake);
+        let generation = history.generation();
+        assert!(history.complete("a.").is_empty(), "nothing before it is in");
+        woken
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reader woke the loop");
+        assert!(history.poll());
+        assert!(!history.poll(), "taken once");
+        assert_ne!(history.generation(), generation);
+        assert_eq!(urls(&history.complete("a.")), ["https://a.example/"]);
+        // A visit before the file is in waits for it.
+        let mut history =
+            History::open(Some(file(dir.path())), Ownership::Elsewhere, true, quiet());
+        assert!(history.visit("https://b.example/", None, true));
+        assert_eq!(
+            urls(&history.complete("")),
+            Vec::<&str>::new(),
+            "empty text completes nothing"
+        );
+        assert_eq!(
+            history.complete("a.").len() + history.complete("b.").len(),
+            2
+        );
     }
 
     #[test]
@@ -1132,6 +1252,7 @@ mod tests {
         assert!(!history.record("https://c.example/", None, true, NOW + 2));
         assert!(!history.save());
         history.set_remember(true);
+        history.settle();
         assert_eq!(urls(&history.complete("a")), ["https://a.example/"]);
         assert!(history.complete("b").is_empty(), "never saved");
         history.finish();
@@ -1187,7 +1308,7 @@ mod tests {
         owner.record("https://a.example/", None, true, unix_now());
         owner.finish();
         let before = fs::read_to_string(file(dir.path())).unwrap();
-        let mut other = History::open(Some(file(dir.path())), Ownership::Elsewhere, true, quiet());
+        let mut other = opened(Some(file(dir.path())), Ownership::Elsewhere, true);
         assert_eq!(
             other.take_notices(),
             [
@@ -1206,14 +1327,14 @@ mod tests {
         other.finish();
         assert_eq!(fs::read_to_string(file(dir.path())).unwrap(), before);
         // Nobody's lock (a read-only state directory): forgetting can't reach the file.
-        let mut stuck = History::open(Some(file(dir.path())), Ownership::Nobody, true, quiet());
+        let mut stuck = opened(Some(file(dir.path())), Ownership::Nobody, true);
         assert!(stuck.take_notices()[0].contains("sig can't lock its state files"));
         assert!(matches!(
             stuck.forget(RequestId::next(), None),
             Some(ForgetOutcome::NotWritten { removed: 1, .. })
         ));
         // No path at all (sig --dump): nothing is kept, and nothing is left to forget.
-        let mut none = History::open(None, Ownership::Nobody, true, quiet());
+        let mut none = opened(None, Ownership::Nobody, true);
         assert!(!none.visit("https://a.example/", None, true));
         assert!(none.take_notices().is_empty());
         assert_eq!(
@@ -1232,8 +1353,8 @@ mod tests {
         let unrelated = dir.path().join("history.toml.x.tmp");
         fs::write(&temporary, "version = 1\n").unwrap();
         fs::write(&unrelated, "not a writer's").unwrap();
-        History::open(Some(file(dir.path())), Ownership::Elsewhere, true, quiet()).finish();
-        History::open(Some(file(dir.path())), Ownership::Nobody, true, quiet()).finish();
+        opened(Some(file(dir.path())), Ownership::Elsewhere, true).finish();
+        opened(Some(file(dir.path())), Ownership::Nobody, true).finish();
         assert!(temporary.exists(), "a sig that doesn't own it removed it");
         owned(dir.path(), true).finish();
         assert!(!temporary.exists(), "the owner left it");

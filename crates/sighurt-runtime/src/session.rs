@@ -567,9 +567,10 @@ impl<F: Frontend> Session<F> {
         }
     }
 
-    /// Takes what service threads and the session and history writers reported. A status
-    /// line, a write that failed, or what the history has to say becomes a notice; a forget the
-    /// history wrote goes to the core. Returns whether there was anything.
+    /// Takes what service threads and the session and history writers reported, and the
+    /// history file once it has been read. A status line, a write that failed, or what the
+    /// history has to say becomes a notice; a forget the history wrote goes to the core.
+    /// Returns whether there was anything.
     pub fn service_completions(&mut self, frontend: &mut F) -> bool {
         let completions = self.services().completions(MAX_COMPLETIONS);
         let mut worked = !completions.is_empty();
@@ -586,6 +587,8 @@ impl<F: Frontend> Session<F> {
         let Some(history) = self.history.as_mut() else {
             return worked;
         };
+        // The file read at startup is in: completions can be asked again.
+        worked |= history.poll();
         let notices = history.take_notices();
         let (forgotten, failure) = history.take_reports();
         for notice in notices.into_iter().chain(failure) {

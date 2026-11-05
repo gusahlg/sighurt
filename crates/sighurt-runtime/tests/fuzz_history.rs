@@ -254,6 +254,7 @@ fn fuzz_history_files() {
             false => Ownership::Elsewhere,
         };
         let mut history = History::open(Some(path.clone()), ownership, true, quiet());
+        history.settle();
         let notices = history.take_notices();
         let urls: Vec<String> = history
             .complete("h")
@@ -315,6 +316,7 @@ fn fuzz_history_file_size_limit() {
         case.note(|| format!("{size} bytes"));
         fs::write(&path, &text).unwrap();
         let mut history = History::open(Some(path.clone()), Ownership::Elsewhere, true, quiet());
+        history.settle();
         let notices = history.take_notices();
         let found = history.complete("example");
         if size as u64 > MAX_FILE {
@@ -340,6 +342,7 @@ fn fuzz_history_store() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.toml");
         let mut history = History::open(Some(path), ownership, true, quiet());
+        history.settle();
         let mut urls: Vec<String> = Vec::new();
         for _ in 0..case.rng.range(1, 60) {
             match case.rng.below(10) {
@@ -366,7 +369,10 @@ fn fuzz_history_store() {
                     case.note(|| format!("forget {host:?}"));
                     history.forget(RequestId::next(), host.as_deref());
                 }
-                7 => history.set_remember(case.rng.one_in(2)),
+                7 => {
+                    history.set_remember(case.rng.one_in(2));
+                    history.settle();
+                }
                 _ => {
                     let text = typed(&mut case.rng, &urls);
                     case.note(|| format!("complete {text:?}"));
