@@ -23,12 +23,9 @@
 //! keeps honest code correct, and does not contain an exploited engine.
 
 use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use crate::ids::{DocumentGeneration, RequestId, ViewId};
+use crate::ids::{DocumentGeneration, PtySession, RequestId, ViewId};
 
 /// A view asking for a privileged service.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -130,11 +127,18 @@ pub enum PageRequest {
         /// What the page read, which the file must still hold.
         replaces: String,
     },
-    /// Start `program` on a new pseudo-terminal of `cols` by `rows` cells: [`ServiceReply::Pty`]
-    /// with its master side. The browser builds the program's arguments, environment and
-    /// working directory; the page only chooses from this closed set. The request stays held
-    /// after its answer: cancelling it ([`ServiceError::Cancelled`] or `CancelService`) ends
-    /// the program.
+    /// Start `program` on a new pseudo-terminal of `cols` by `rows` cells: answered with
+    /// [`ServiceReply::Pty`], the session, once the program runs. The browser builds the
+    /// program's arguments, environment and working directory; the page only chooses from this
+    /// closed set. The master side reaches the engine by the session, once, outside this type
+    /// (the Wasm engine's `pty::take`); no descriptor is in a service type.
+    ///
+    /// The core tracks the session (opening, open, closing, closed). Cancelling the request
+    /// (the engine's `ServiceCancelled`, or the core when the document ends, the page becomes
+    /// a history entry, the tab closes, the setting goes off or `sig` quits) ends the program.
+    /// When the program has ended and been reaped, whether by itself or cancelled, the
+    /// executable answers the same request a second time with [`ServiceReply::PtyEnded`], which
+    /// frees the allowance; the engine gets it too while the document lasts.
     PtyOpen {
         /// What runs.
         program: PtyProgram,
@@ -231,9 +235,10 @@ pub enum PtyProgram {
     EditConfig,
 }
 
-/// What one internal page may ask for. Each page is given a fixed set at build time (the
-/// `PAGES` table of `sighurt-pages`); the Wasm engine checks it at every `sig` host function and
-/// the core again from its record of the view's page.
+/// What one internal page may ask for, per operation. Each page is given a fixed set at build
+/// time (the `PAGES` table of `sighurt-pages`: help has `Info`; config the configuration's;
+/// terminal `Pty`); the Wasm engine checks it at every `sig` host function and the core again
+/// from its record of the view's page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PageGrant {
     /// [`PageRequest::Info`].
@@ -246,46 +251,6 @@ pub enum PageGrant {
     Pty,
     /// [`Service::ClipboardWrite`], under its usual rule (a click or key press in the page).
     Clipboard,
-}
-
-/// The master side of a pseudo-terminal a [`PageRequest::PtyOpen`] started, shared by whoever
-/// holds the answer. Two handles are equal when they share one descriptor. The browser keeps no
-/// other copy, so when the last handle is dropped the kernel hangs the terminal up.
-#[derive(Clone)]
-pub struct PtyHandle(Arc<OwnedFd>);
-
-impl PtyHandle {
-    /// A handle owning `master`.
-    pub fn new(master: OwnedFd) -> Self {
-        Self(Arc::new(master))
-    }
-}
-
-impl AsFd for PtyHandle {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
-    }
-}
-
-impl fmt::Debug for PtyHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use std::os::fd::AsRawFd;
-        write!(f, "PtyHandle({})", self.0.as_raw_fd())
-    }
-}
-
-impl PartialEq for PtyHandle {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for PtyHandle {}
-
-impl Hash for PtyHandle {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state);
-    }
 }
 
 /// Which clipboard: Wayland keeps the ordinary clipboard and the primary selection apart.
@@ -354,8 +319,14 @@ pub enum ServiceReply {
     Files(Vec<PathBuf>),
     /// Text an internal page asked for ([`PageRequest`]).
     Text(String),
-    /// A pseudo-terminal an internal page started ([`PageRequest::PtyOpen`]).
-    Pty(PtyHandle),
+    /// The terminal an internal page started runs ([`PageRequest::PtyOpen`]): its session.
+    Pty(PtySession),
+    /// The program of an answered [`PageRequest::PtyOpen`] has ended and was reaped: its exit
+    /// status, or `None` when a signal ended it. The second and last answer of that request.
+    PtyEnded {
+        /// The exit status, if it exited.
+        status: Option<i32>,
+    },
 }
 
 /// Why a service request did not succeed.

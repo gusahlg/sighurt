@@ -14,13 +14,11 @@ pub enum Kind {
     ConfigCheck = 3,
     /// Replacing the configuration file.
     ConfigWrite = 4,
-    /// A terminal running a program.
-    PtyOpen = 5,
     /// Putting text on the clipboard.
-    ClipboardCopy = 6,
+    ClipboardCopy = 5,
 }
 
-/// What [`PtyOpen`](Kind::PtyOpen) runs.
+/// What a terminal ([`Pty::open`]) runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Program {
@@ -40,6 +38,12 @@ extern "C" {
     fn _reply(id: u32, ptr: u32, cap: u32) -> i32;
     #[link_name = "cancel"]
     fn _cancel(id: u32) -> i32;
+    #[link_name = "pty_open"]
+    fn _pty_open(program: u32, cols: u32, rows: u32) -> u32;
+    #[link_name = "pty_status"]
+    fn _pty_status(handle: u32) -> i32;
+    #[link_name = "pty_close"]
+    fn _pty_close(handle: u32) -> i32;
     #[link_name = "pty_read"]
     fn _pty_read(id: u32, ptr: u32, cap: u32) -> i32;
     #[link_name = "pty_write"]
@@ -99,23 +103,9 @@ impl Request {
         Self::new(Kind::ConfigWrite, &payload)
     }
 
-    /// A terminal of `cols` by `rows` cells running `program`.
-    pub fn pty_open(program: Program, cols: u16, rows: u16) -> Option<Self> {
-        let mut payload = [0u8; 5];
-        payload[0] = program as u8;
-        payload[1..3].copy_from_slice(&cols.to_le_bytes());
-        payload[3..5].copy_from_slice(&rows.to_le_bytes());
-        Self::new(Kind::PtyOpen, &payload)
-    }
-
     /// Putting `text` on the clipboard. Needs a click or key press in the page in the last 5 s.
     pub fn clipboard_copy(text: &str) -> Option<Self> {
         Self::new(Kind::ClipboardCopy, text.as_bytes())
-    }
-
-    /// Its id, which names a terminal it opened.
-    pub fn id(&self) -> u32 {
-        self.0
     }
 
     /// Where it is, with the answer's text once there is one.
@@ -142,11 +132,6 @@ impl Request {
             buf.resize(len, 0);
         }
     }
-
-    /// The terminal this answered request opened.
-    pub fn pty(&self) -> Pty<'_> {
-        Pty(self)
-    }
 }
 
 impl Drop for Request {
@@ -155,27 +140,71 @@ impl Drop for Request {
     }
 }
 
-/// A terminal an answered [`Request::pty_open`] opened; it ends when the request is dropped.
-#[derive(Debug)]
-pub struct Pty<'a>(&'a Request);
+/// A terminal of the document: a program running on a pseudo-terminal the browser started.
+/// Dropping it closes it, which ends the program.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Pty(u32);
 
-impl Pty<'_> {
+/// Where a terminal is ([`Pty::status`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Waiting for the browser.
+    Opening,
+    /// The program runs.
+    Running,
+    /// The program closed the terminal; its status is not known yet.
+    EndOfFile,
+    /// Refused, closed, or lost with its document.
+    Cancelled,
+    /// The program exited with this status.
+    Exited(u8),
+    /// A signal ended the program.
+    Signalled,
+}
+
+impl Pty {
+    /// Asks for a terminal of `cols` by `rows` cells running `program`; `None` when refused at
+    /// once. Needs a click or key press in the page, which it uses up; a refusal after that is
+    /// [`Status::Cancelled`].
+    pub fn open(program: Program, cols: u16, rows: u16) -> Option<Self> {
+        let handle = unsafe { _pty_open(program as u32, u32::from(cols), u32::from(rows)) };
+        (handle != 0).then_some(Self(handle))
+    }
+
+    /// Where it is.
+    pub fn status(&self) -> Status {
+        match unsafe { _pty_status(self.0) } {
+            0 => Status::Opening,
+            1 => Status::Running,
+            2 => Status::EndOfFile,
+            n @ 0x100..=0x1ff => Status::Exited((n - 0x100) as u8),
+            0x200 => Status::Signalled,
+            _ => Status::Cancelled,
+        }
+    }
+
     /// The program's output waiting, into `buf`: how many bytes, `Some(0)` for none now, `None`
     /// once it has ended.
     pub fn read(&self, buf: &mut [u8]) -> Option<usize> {
-        let n = unsafe { _pty_read(self.0 .0, buf.as_mut_ptr() as u32, buf.len() as u32) };
+        let n = unsafe { _pty_read(self.0, buf.as_mut_ptr() as u32, buf.len() as u32) };
         usize::try_from(n).ok()
     }
 
     /// Gives the program `bytes` as input: how many it took, `None` once it has ended.
     pub fn write(&self, bytes: &[u8]) -> Option<usize> {
-        let n = unsafe { _pty_write(self.0 .0, bytes.as_ptr() as u32, bytes.len() as u32) };
+        let n = unsafe { _pty_write(self.0, bytes.as_ptr() as u32, bytes.len() as u32) };
         usize::try_from(n).ok()
     }
 
     /// Tells the program the terminal is `cols` by `rows` cells.
     pub fn resize(&self, cols: u16, rows: u16) -> bool {
-        unsafe { _pty_resize(self.0 .0, u32::from(cols), u32::from(rows)) == 0 }
+        unsafe { _pty_resize(self.0, u32::from(cols), u32::from(rows)) == 0 }
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        unsafe { _pty_close(self.0) };
     }
 }
 
@@ -186,8 +215,10 @@ pub enum InputKind {
     Press,
     /// An auto-repeat of a key held down.
     Repeat,
-    /// Text no key press typed: a terminal's paste, or an input method's commit.
+    /// A terminal's paste, whole: tabs, newlines and control characters as pasted.
     Paste,
+    /// An input method's text.
+    Commit,
 }
 
 /// Modifier bits of an input record.
@@ -234,7 +265,9 @@ impl Input {
     /// `allowed` (the locks never count).
     pub fn is_key(&self, key: &str, allowed: u8) -> bool {
         let locks = modifiers::CAPS_LOCK | modifiers::NUM_LOCK;
-        self.kind != InputKind::Paste && self.key == key && self.modifiers & !(allowed | locks) == 0
+        matches!(self.kind, InputKind::Press | InputKind::Repeat)
+            && self.key == key
+            && self.modifiers & !(allowed | locks) == 0
     }
 
     /// Reads a record as `input_next` wrote it.
@@ -244,6 +277,7 @@ impl Input {
             1 => InputKind::Press,
             2 => InputKind::Repeat,
             3 => InputKind::Paste,
+            4 => InputKind::Commit,
             _ => return None,
         };
         let key_len = usize::from(u16::from_le_bytes([header[2], header[3]]));
