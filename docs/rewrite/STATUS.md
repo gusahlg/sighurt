@@ -4358,5 +4358,39 @@ Newest last. Each entry says what was decided and why.
     `graphics_mode_gives_a_focused_field_keys_and_pastes_only_in_insert` and the text-mode
     test, headless.sh `example`, the workspace tests; `coexist.sh` and engines.sh `showcase`
     were changed to enter INSERT before typing and are run in the release verification
-    (decision 135). *Not stopped*: a middle-click paste of the primary selection is a mouse
+    (the 0.11.0 release decision). *Not stopped*: a middle-click paste of the primary selection is a mouse
     action and still reaches the page in NORMAL.
+
+135. **A third optimization and reliability pass** (5 November 2026, branch `opt3`; the user:
+    "Continue optimizing and improving reliability a bit more"). *The terminal's SIGHUP* only
+    sets a flag and wakes the loop, which quits as for SIGTERM: the session and the history
+    are written and the terminal is restored on the normal path. A hung-up tty fails writes
+    with EIO, so nothing waits on it. This closes decision 127's open item; `tui.rs` tests it
+    with a SIGHUP and with the pty as sig's controlling terminal closing, and both tests fail
+    against the old handler (which restored the terminal in the handler and re-raised). The
+    exit status of a closed terminal is 0 or 1 by which sig sees first, the signal or the
+    failed read; never a death by signal. *Temporary files*: the history's `.tmp` of a dead
+    writer was already removed by the lock's owner; now tested, and faults.sh checks that a
+    live owner's temporaries are left alone. *Seeded tests* (decision 126's harness): the core
+    driven with engine answers in random orders (a page is fullscreen only in the shown view's
+    current document with the window focused; nothing is sent to a view after `CloseView`;
+    `ExitFullscreen` only to engines that have fullscreen), the history file and store, the
+    new commands, and the example keymap's modes (`-p sighurt-config-example` joins the fuzz
+    line). They found one fault: control characters in find text reached the engines, and WPE
+    WebKit refuses a NUL, which marked the view as unable to find for its whole life. Control
+    characters are now spaces before the text is trimmed. soak.sh covers find, the tab
+    commands, fullscreen and history with `remember` flipped: 207/207 in 10 minutes (RSS
+    100.9–101.7 MiB from the second cycle, 25 fds, 24 threads); faults.sh 100/100. *Measured*
+    (bench/HYPOTHESES.md H-START2; release, startup.sh, 10 interleaved runs, this desktop,
+    headless sway): the history file is read on its own thread and handed over a channel, not
+    before the first frame. With 5 000 visits, exec to the first chrome surface went from 35.4
+    to 20.0 ms and to the page's first frame from 35.8 to 20.9 ms; without a history nothing
+    moved. Completion answers nothing until the file is in, then both frontends ask again.
+    *Left alone, measured*: completion over 5 000 visits (at most 157 µs a keystroke), the
+    owner loop's per-pass work for find, history and fullscreen, ghost-text shaping. *Test
+    harness*: `tui.rs`'s `wait` checks its condition once more when time runs out (a paced
+    tab-storm test failed one run in three without it), and the session writer's
+    failed-write test no longer races a queued save. *Open*: inside nix-shell, exec to `main`
+    takes about 15 ms because the loader searches `LD_LIBRARY_PATH` for the Wasm engine's
+    FFmpeg and its 105 libraries; loading FFmpeg when a guest first uses media would remove
+    most of it.
