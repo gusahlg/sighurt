@@ -344,7 +344,9 @@ impl Internal {
                 }
             }
             Ok(ServiceReply::PtyEnded { status }) => {
-                terminal.pty = None;
+                // The terminal stays until the page has read what the program wrote last (it
+                // reads its end) or closes it: the program's end comes from the runtime, and
+                // may come before the page has read its output.
                 terminal.status = match status {
                     Some(code) => pty_status::EXITED + (code & 0xff),
                     None => pty_status::SIGNALLED,
