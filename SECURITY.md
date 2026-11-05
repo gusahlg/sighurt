@@ -90,3 +90,33 @@ Engines report what pages do as events, and the browser core decides. Everything
 5. **Origin-scoped storage**: session and persistent storage are per origin. Session storage is cleared on cross-origin navigation.
 6. **Limits**: fuel (500M instructions to start, 50M per callback), wall-clock time (10 s to start, 1 s per callback, so a guest that keeps calling the host is stopped too), 256 MB of guest memory, and bounds on everything a guest can make the host allocate.
 7. **No clipboard**: clipboard access is always refused.
+
+### Sighurt's own pages
+
+`sig://help`, `sig://config` and `sig://terminal` are Wasm guests built into `sig` from source in
+this repository and run by the WASM engine. They are where the browser gives a page more than any
+web page gets, so what they get is held at several layers:
+
+- **Only the user opens them.** The core refuses a `sig:` address to every page that is not one
+  of these, by any route (a link, a page's own navigation, a new tab, a navigation request, a
+  history entry, a session file); only the address line, commands and session restore, and the
+  pages themselves, open them. A restored page loads again and starts nothing.
+- **Identity is the browser's, not the page's.** The core records which page a view is when it
+  opens it, from its own routing, and keeps that for the view's life; a page's view loads only
+  that page, and a view of anything else never loads a page. Privileges come from that record and
+  from the module embedded in `sig`, never from an address the engine reports, an origin a request
+  claims, or a downloaded copy of the same guest.
+- **The privileged import module `sig`** is linked only into an internal page's document, never a
+  worker's or a module it loads, and every function checks that page's grants again. The core
+  then decides each request from its own record: help may ask for facts about the build and the
+  configuration (never the configuration's text); config may read, check and replace the
+  configuration file; terminal may start a terminal. Writing the configuration and starting a
+  terminal also need the page in front, with the keyboard, and a click or key press in it.
+- **No network, no code loading.** An internal page has a deny-all network policy, and fails to
+  load if it imports the network, workers, module loading, files or devices.
+- **Typing goes where you meant it.** After a tab comes to the front without your command (a page
+  that closed its tab), its page gets no keys, text or paste until you click it or run a command.
+
+`sig://terminal` is off unless `[pages.terminal] enabled = true`. It is a shell with all your
+rights: the Wasm sandbox contains the terminal emulator that draws it, not the shell or what you
+run in it, and the shell's environment is hygiene, not isolation.

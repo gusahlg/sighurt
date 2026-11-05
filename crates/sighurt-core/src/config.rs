@@ -49,6 +49,14 @@
 //! type is an error. `[downloads] directory`, `[session] restore` and `[history] remember` are
 //! the executable's, checked here.
 //!
+//! `[commands]` defines the configuration's own commands ([`Command::Custom`]): a bare
+//! kebab-case word that runs one to [`MAX_COMMAND_STEPS`] built-in commands
+//! ([`Config::command`]), with no argument. They are checked whole when the file loads, and
+//! `[keys]`, `[keymap.<name>]`, `[tui.keys]` and `[input.buttons]` may bind them; a bare word
+//! the table doesn't define is an unknown command there. `[pages.terminal]` holds
+//! `sig://terminal`'s settings: `enabled`, whether it may start programs, and `command`, the
+//! shell it runs.
+//!
 //! Must not own: reading or watching files, which the executable does, or deciding what a
 //! reload means for open pages ([`crate::state`]).
 
@@ -289,8 +297,30 @@ pub struct Config {
     remember_history: bool,
     /// `[tui]`. The windowed frontend leaves it unused.
     tui: TuiConfig,
+    /// `[commands]`, by name: the built-in commands each runs, in order.
+    commands: BTreeMap<String, Vec<Command>>,
+    /// `[pages]`.
+    pages: PagesConfig,
+    /// The internal pages this build has ([`Environment::pages`]), which routing opens.
+    internal_pages: Vec<String>,
     notices: Vec<String>,
 }
+
+/// `[pages.*]`: the internal pages' settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PagesConfig {
+    /// `[pages.terminal] enabled`: whether `sig://terminal` may start programs. Off by default.
+    pub terminal: bool,
+    /// `[pages.terminal] command`: the program `sig://terminal` runs instead of `$SHELL`, if
+    /// set, as written (the runtime splits it into a program and its arguments).
+    pub terminal_command: Option<String>,
+}
+
+/// The most commands `[commands]` may define.
+pub const MAX_COMMANDS: usize = 64;
+
+/// The most built-in commands one command of `[commands]` runs.
+pub const MAX_COMMAND_STEPS: usize = 8;
 
 /// The URLs one engine opens besides those that go to the default engine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -366,6 +396,11 @@ struct Raw {
     session: RawSession,
     #[serde(default)]
     history: RawHistory,
+    /// `[commands]`, as TOML parsed it.
+    commands: Option<toml::Table>,
+    /// `[pages]`.
+    #[serde(default)]
+    pages: RawPages,
     /// `[tui]`, including `[tui.keys]` until that table is split out.
     #[serde(default)]
     tui: toml::Table,
@@ -397,6 +432,20 @@ struct RawSession {
 #[serde(deny_unknown_fields)]
 struct RawHistory {
     remember: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawPages {
+    #[serde(default)]
+    terminal: RawTerminalPage,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawTerminalPage {
+    enabled: Option<bool>,
+    command: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -689,6 +738,32 @@ impl Config {
         &self.tui
     }
 
+    /// `[input] keymap`: the name of the keymap that reads the keyboard.
+    pub fn keymap_name(&self) -> &str {
+        self.keymap.name
+    }
+
+    /// The built-in commands `[commands]` runs for `name`, if it defines it.
+    pub fn command(&self, name: &str) -> Option<&[Command]> {
+        self.commands.get(name).map(Vec::as_slice)
+    }
+
+    /// `[commands]`: every command the configuration defines, by name.
+    pub fn commands(&self) -> &BTreeMap<String, Vec<Command>> {
+        &self.commands
+    }
+
+    /// `[pages]`: the internal pages' settings.
+    pub fn pages(&self) -> &PagesConfig {
+        &self.pages
+    }
+
+    /// The internal pages of the build this configuration was checked for, by name
+    /// (`help` for `sig://help`): what routing opens in the wasm engine.
+    pub fn internal_pages(&self) -> &[String] {
+        &self.internal_pages
+    }
+
     /// What the user should know about the file although it is valid: tables for keymaps,
     /// chromes and engines this build doesn't have, and key tables no keymap reads. One line
     /// each.
@@ -793,6 +868,8 @@ fn sections(mut table: toml::Table, problems: &mut Vec<String>) -> Raw {
         downloads: section(&mut table, "downloads", problems).unwrap_or_default(),
         session: section(&mut table, "session", problems).unwrap_or_default(),
         history: section(&mut table, "history", problems).unwrap_or_default(),
+        commands: user_table(&mut table, "commands", problems),
+        pages: section(&mut table, "pages", problems).unwrap_or_default(),
         tui: user_table(&mut table, "tui", problems).unwrap_or_default(),
     };
     for key in table.keys() {
@@ -806,7 +883,7 @@ fn sections(mut table: toml::Table, problems: &mut Vec<String>) -> Raw {
 
 /// `user`'s settings over `defaults`. `[keywords]`, `[keys]`, `[keymap.*]`, `[ui]` and
 /// `[chrome.*]` are the user's alone, and so is `[engines.*]`, which the built-in file can't
-/// hold. `[tui]` merges key by key; `[tui.keys]` was split out of both tables first, because
+/// hold. `[commands]`, `[pages]` and `[tui]` merge key by key; `[tui.keys]` was split out of both tables first, because
 /// the user's is a layer of its own over `[keys]`, not a field of `[tui]`.
 fn merge(defaults: Raw, user: Raw) -> Raw {
     let mut routing = defaults.routing;
@@ -858,6 +935,24 @@ fn merge(defaults: Raw, user: Raw) -> Raw {
         },
         history: RawHistory {
             remember: user.history.remember.or(defaults.history.remember),
+        },
+        commands: match (defaults.commands, user.commands) {
+            (Some(base), Some(user)) => Some(merge_table(base, user)),
+            (base, user) => user.or(base),
+        },
+        pages: RawPages {
+            terminal: RawTerminalPage {
+                enabled: user
+                    .pages
+                    .terminal
+                    .enabled
+                    .or(defaults.pages.terminal.enabled),
+                command: user
+                    .pages
+                    .terminal
+                    .command
+                    .or(defaults.pages.terminal.command),
+            },
         },
         tui: merge_table(defaults.tui, user.tui),
     }
@@ -1063,9 +1158,16 @@ fn validate(
         );
     }
     // `[keys]` and the buttons use the running frontend's chrome. `[tui.keys]` is the
-    // terminal's in either frontend, so it is checked against the terminal chrome.
-    let commands = running_commands(env, &ui.chrome);
-    let terminal = CommandSet::new("terminal", TERMINAL_CHROME_COMMANDS);
+    // terminal's in either frontend, so it is checked against the terminal chrome. Both may
+    // bind the commands `[commands]` defines, which run built-in ones only.
+    let custom = check_commands(
+        raw.commands.unwrap_or_default(),
+        &running_commands(env, &ui.chrome),
+        &mut problems,
+    );
+    let names: Vec<String> = custom.keys().cloned().collect();
+    let commands = running_commands(env, &ui.chrome).with_custom(&names);
+    let terminal = CommandSet::new("terminal", TERMINAL_CHROME_COMMANDS).with_custom(&names);
     let user_wrote_tui_keys = user_tui_keys.is_some();
     // The built-in file no longer ships a key table. One that appears is still checked, and
     // not installed: the example configuration owns the default keys.
@@ -1123,6 +1225,19 @@ fn validate(
         }
         selected
     };
+    let pages = PagesConfig {
+        terminal: raw.pages.terminal.enabled.unwrap_or(false),
+        terminal_command: raw.pages.terminal.command.filter(|command| {
+            let fits = !command.trim().is_empty() && command.len() <= 4096;
+            if !fits {
+                problems.push(format!(
+                    "[pages.terminal] command: expected a program, at most 4096 bytes, not \
+                     {command:?}"
+                ));
+            }
+            fits
+        }),
+    };
     let downloads = raw.downloads.directory.and_then(|directory| {
         directory_path(&directory, env.home_dir.as_deref())
             .map_err(|e| problems.push(format!("[downloads] directory: {e}")))
@@ -1155,6 +1270,9 @@ fn validate(
         restore_session: raw.session.restore.unwrap_or(true),
         remember_history: raw.history.remember.unwrap_or(true),
         tui,
+        commands: custom,
+        pages,
+        internal_pages: env.pages.keys().cloned().collect(),
         notices,
     };
     if let Err(problem) = apply_starting_engine(&mut config, env) {
@@ -1210,6 +1328,62 @@ fn apply_starting_engine(config: &mut Config, env: &Environment) -> Result<(), S
             Err(problem)
         }
     }
+}
+
+/// `[commands]`: each name 1 to 32 lower-case letters, digits and dashes with no dot, and not
+/// an area of the built-in commands ([`sighurt_api::commands::is_custom_name`]); each value a
+/// built-in command, or a list of one to [`MAX_COMMAND_STEPS`], parsed with `builtin`, which
+/// names no command of `[commands]` (so none runs another: there is no recursion). At most
+/// [`MAX_COMMANDS`].
+fn check_commands(
+    table: toml::Table,
+    builtin: &CommandSet<'_>,
+    problems: &mut Vec<String>,
+) -> BTreeMap<String, Vec<Command>> {
+    if table.len() > MAX_COMMANDS {
+        problems.push(format!(
+            "[commands]: at most {MAX_COMMANDS} commands, not {}",
+            table.len()
+        ));
+    }
+    let mut commands = BTreeMap::new();
+    for (name, value) in table.into_iter().take(MAX_COMMANDS) {
+        if !sighurt_api::commands::is_custom_name(&name) {
+            problems.push(format!(
+                "[commands] {name:?}: a command's name is 1 to 32 lower-case letters, digits and \
+                 dashes, with no dot, and not {}",
+                sighurt_api::commands::AREAS.join(", ")
+            ));
+            continue;
+        }
+        let texts: Vec<Option<String>> = match value {
+            toml::Value::String(text) => vec![Some(text)],
+            toml::Value::Array(list) if (1..=MAX_COMMAND_STEPS).contains(&list.len()) => list
+                .into_iter()
+                .map(|item| item.as_str().map(str::to_owned))
+                .collect(),
+            _ => vec![None],
+        };
+        if texts.iter().any(Option::is_none) {
+            problems.push(format!(
+                "[commands] {name}: expected a command in quotes, or a list of 1 to \
+                 {MAX_COMMAND_STEPS}"
+            ));
+            continue;
+        }
+        let mut parsed = Vec::new();
+        for text in texts.into_iter().flatten() {
+            match builtin.parse(&text) {
+                Ok(command) => parsed.push(command),
+                Err(error) => problems.push(format!(
+                    "[commands] {name} = {text:?}: {error} (a command of [commands] runs \
+                     built-in commands)"
+                )),
+            }
+        }
+        commands.insert(name, parsed);
+    }
+    commands
 }
 
 /// The commands `[keys]` and `[input.buttons]` may bind for the frontend that is running.
@@ -1914,6 +2088,7 @@ mod tests {
             frontend: Frontend::Gui,
             web_engines: Vec::new(),
             starting_engine: None,
+            pages: Default::default(),
         }
     }
 

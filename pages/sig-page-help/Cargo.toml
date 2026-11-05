@@ -1,0 +1,16 @@
+[package]
+name = "sig-page-help"
+description = "sig://help: what a new user of sig needs, as a Wasm guest built into sig"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sighurt-sdk = { path = "../../sdk/sighurt-sdk" }
+sig-page-kit = { path = "../sig-page-kit" }

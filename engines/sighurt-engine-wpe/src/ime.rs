@@ -337,6 +337,7 @@ mod tests {
                 text: text.into(),
                 cursor,
             }),
+            paste: false,
         };
 
         context.apply(&preedit("åä", Some(2..2)), None);
@@ -355,6 +356,7 @@ mod tests {
             }),
             commit: Some("ö".into()),
             preedit: None,
+            paste: false,
         };
         context.apply(&commit, Some(&surrounding));
         assert_eq!(context.imp().preedit(), (String::new(), 0));

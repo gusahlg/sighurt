@@ -232,7 +232,7 @@ fn choose_dump_engine(
     // The core's parser: IDNA hosts and percent-encoded paths, the same ones a tab uses.
     let (name, matched) = match sighurt_core::router::routed(&fixed, config) {
         None => return Err(format!("{fixed} is not an address")),
-        Some(sighurt_core::router::Routed::Internal) => {
+        Some(sighurt_core::router::Routed::Internal | sighurt_core::router::Routed::Page(_)) => {
             return Err("sig: pages are Sighurt's own and have no page text for --dump".into())
         }
         Some(sighurt_core::router::Routed::Error(message)) => return Err(message),

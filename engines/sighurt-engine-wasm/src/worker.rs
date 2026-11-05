@@ -136,6 +136,8 @@ impl WorkerState {
             // The page's network policy, and its budget of buffered bytes.
             net: parent.net.clone(),
             worker_outbox: Some(outbox.clone()),
+            // A worker is never an internal page, whoever starts it.
+            internal: None,
             ..Default::default()
         };
         let page_url = parent.current_url.lock().unwrap().clone();

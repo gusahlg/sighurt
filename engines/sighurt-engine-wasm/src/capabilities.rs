@@ -149,6 +149,10 @@ pub struct HostState {
     /// The page's last user activation (a click or key press in the view), which a file dialog
     /// needs. Page-level: it carries over to every document of the view.
     pub activation: Arc<UserActivation>,
+    /// Set only for a document of one of Sighurt's own pages ([`crate::pages`]): which page, and
+    /// what it asked for. The `sig` module is linked only when it is set. Never carried to a
+    /// worker or a module the document loads.
+    pub internal: Option<Arc<crate::pages::Internal>>,
 }
 
 impl HostState {
@@ -2478,6 +2482,8 @@ fn load_module(engine: &WasmEngine, parent: &HostState, url: &str) -> Option<(i3
         memory: None,
         budget: parent.budget.nested(),
         module_depth: parent.module_depth + 1,
+        // A loaded module is never an internal page, whoever loads it.
+        internal: None,
         ..parent.clone()
     };
     let (mut store, instance) = match crate::runtime::instantiate(engine, child, &module) {

@@ -73,6 +73,7 @@ fn fuzz_snapshot_contain() {
                 status: rng.one_in(2).then(|| text(rng)),
                 keymap: rng.one_in(2).then(|| text(rng)),
                 fullscreen: rng.one_in(2),
+                commands: Vec::new(),
                 find: rng.one_in(2).then(|| FindSnapshot {
                     text: text(rng),
                     ..FindSnapshot::default()
@@ -432,6 +433,7 @@ fn fuzz_address_editor() {
                             }),
                             commit: rng.one_in(2).then(|| piece.clone()),
                             preedit: rng.one_in(2).then_some(Preedit { text, cursor }),
+                            paste: false,
                         });
                     }
                     12 => editor.clear_preedit(),

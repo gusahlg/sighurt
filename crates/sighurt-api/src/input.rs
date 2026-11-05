@@ -400,6 +400,10 @@ pub struct TextInputEvent {
     pub commit: Option<String>,
     /// The composition to show at the cursor until the next update. `None` clears it.
     pub preedit: Option<Preedit>,
+    /// `commit` is a paste, not an input method's text: a terminal's bracketed paste. An engine
+    /// that tells the two apart (the Wasm engine's internal pages) keeps a paste whole and
+    /// apart from typing.
+    pub paste: bool,
 }
 
 /// How much text to delete around the cursor, in UTF-8 bytes.

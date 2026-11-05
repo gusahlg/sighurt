@@ -46,6 +46,16 @@
 //! shown, as in browsers, so a key or click meant for the page just before it appeared doesn't
 //! answer it; blocking takes effect at once.
 //!
+//! ## Internal pages
+//!
+//! A view's first load fixes what it is for life: one internal page, by name
+//! (`sig://help` and its paths), or apps from the web and files. A load of anything else
+//! (another page, a web app in a page's view, a page in an app's view) fails, whichever of
+//! Navigate, Reload or Traverse asks for it. An internal document reports what its guest asks
+//! through the `sig` module as service requests and gets the answers
+//! ([`crate::pages::Internal`]); its key presses, repeats and pastes also go to its ordered
+//! input queue; a page that edits text says it has a text field, so pastes reach it.
+//!
 //! ## User activation
 //!
 //! A click or key press in the view is a user activation of the page
@@ -184,8 +194,19 @@ struct Shown {
     cursor: Cursor,
 }
 
+/// What a view loads, fixed by its first load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Apps from the web and files.
+    Apps,
+    /// The internal page of this name.
+    Page(&'static str),
+}
+
 pub struct View {
     id: ViewId,
+    /// What it loads; `None` until its first load.
+    kind: Option<Kind>,
     /// The latest metrics from the host.
     metrics: Metrics,
     /// The last non-empty logical size: what the canvas follows.
@@ -276,6 +297,7 @@ impl View {
         };
         let view = Self {
             id,
+            kind: None,
             page: HostState {
                 engine: Some(engine),
                 ..HostState::default()
@@ -392,11 +414,16 @@ impl View {
                 self.invalidate(out);
             }
             EngineCommand::Input(event) => self.input(event, out),
-            // Its only requests are downloads, which need nothing back (see "Downloads"), and
-            // it hands every guest navigation to the browser (`OpenRequested`), so it asks
+            // An internal document's requests get their answers; a download needs none (see
+            // "Downloads"), and a late answer for a document replaced since is dropped.
+            EngineCommand::ResolveServiceRequest { request, result } => {
+                if let Some(internal) = &self.page.internal {
+                    internal.resolve(self.id, request, result, out);
+                }
+            }
+            // It hands every guest navigation to the browser (`OpenRequested`), so it asks
             // about none.
-            EngineCommand::ResolveServiceRequest { .. }
-            | EngineCommand::AnswerNavigation { .. } => {}
+            EngineCommand::AnswerNavigation { .. } => {}
             // A guest draws on a canvas: there is no content as structure (TUI.md §3).
             EngineCommand::SetSemantics(_) | EngineCommand::Semantic { .. } => {
                 return Err(EngineError::Unsupported("semantics"))
@@ -430,6 +457,28 @@ impl View {
         jobs: &impl Jobs,
         out: &mut Outbox,
     ) {
+        let kind = match crate::pages::page_name(&url) {
+            Some(name) => self
+                .page
+                .engine
+                .as_ref()
+                .and_then(|e| e.page(&name))
+                .map(|p| Kind::Page(p.name)),
+            None => Some(Kind::Apps),
+        };
+        let fits = kind.is_some() && self.kind.is_none_or(|fixed| Some(fixed) == kind);
+        if !fits {
+            let why = match kind {
+                None => format!("there is no page {url}"),
+                Some(_) => format!("this view can't load {url}: it is for another kind of page"),
+            };
+            return out.push(EngineEvent::NavigationFailed {
+                view: self.id,
+                navigation,
+                error: NavigationError::Load(why),
+            });
+        }
+        self.kind = kind;
         self.cancel_load(jobs);
         let shown = history
             .current()
@@ -561,6 +610,7 @@ impl View {
                 self.prompt_shown_at = None;
                 self.report_history(Some(navigation), out);
                 self.report_title(out);
+                self.report_field(out);
                 // No list yet: an on_frame guest that has not drawn. The first step publishes
                 // the frame. FrameReady now would present a buffer nothing has painted.
                 if self.list.is_some() {
@@ -609,6 +659,9 @@ impl View {
     fn after_run(&mut self, out: &mut Outbox) {
         let requested = lock(&self.page.pending_navigation).take();
         let downloads = mem::take(&mut *lock(&self.page.downloads));
+        if let (Some(document), Some(internal)) = (&self.document, &self.page.internal) {
+            internal.report(self.id, document.generation, out);
+        }
         if let Some(document) = &self.document {
             if let Some(url) = requested.filter(|url| url.len() <= MAX_URL) {
                 out.push(EngineEvent::OpenRequested {
@@ -685,12 +738,14 @@ impl View {
         });
     }
 
-    /// The app's name from its manifest is the document's title.
+    /// The app's name from its manifest is the document's title; an internal page's is its own.
     fn report_title(&mut self, out: &mut Outbox) {
+        let internal = self.page.internal.as_ref().map(|i| i.page.title.to_owned());
         let title = lock(&self.page.manifest)
             .as_ref()
             .map(|manifest| manifest.name.trim().to_string())
-            .filter(|title| !title.is_empty());
+            .filter(|title| !title.is_empty())
+            .or(internal);
         if title != self.shown.title {
             self.shown.title.clone_from(&title);
             out.push(EngineEvent::TitleChanged {
@@ -698,6 +753,29 @@ impl View {
                 title,
             });
         }
+    }
+
+    /// Says whether the document has a text field: an internal page that edits text (the
+    /// configuration, a terminal) has one, its whole canvas, so a terminal's paste reaches it.
+    fn report_field(&mut self, out: &mut Outbox) {
+        use sighurt_api::geometry::SurfaceRect;
+        use sighurt_api::input::{TextInputState, TextPurpose};
+        let edits = self.page.internal.as_ref().is_some_and(|i| i.page.edits());
+        let state = edits.then_some(TextInputState {
+            caret: SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 16,
+            },
+            surrounding: None,
+            purpose: TextPurpose::Normal,
+            multiline: true,
+        });
+        out.push(EngineEvent::TextInputChanged {
+            view: self.id,
+            state,
+        });
     }
 
     /// What the view shows changed: it needs presenting again.
@@ -869,6 +947,9 @@ impl View {
             InputKind::Key(key) => self.key(&key, out),
             InputKind::TextInput(text) => {
                 if let Some(commit) = text.commit {
+                    if let Some(internal) = &self.page.internal {
+                        internal.text(&commit, text.paste);
+                    }
                     self.type_text(&commit);
                 }
             }
@@ -1043,6 +1124,9 @@ impl View {
                 input.keys_down.retain(|&held| held != code);
             }
             return;
+        }
+        if let Some(internal) = &self.page.internal {
+            internal.key(event);
         }
         if let Some(code) = code {
             if !input.keys_down.contains(&code) {
@@ -1261,6 +1345,10 @@ pub fn document_state(page: &HostState, url: &str, history: NavigationStack) -> 
         input_state: carry(&page.input_state),
         focused: page.focused.clone(),
         activation: page.activation.clone(),
+        // An internal page's document, which only the view's own page loads ([`View::load`]).
+        internal: crate::pages::page_name(url)
+            .and_then(|name| page.engine.as_ref()?.page(&name))
+            .map(|internal| Arc::new(crate::pages::Internal::new(internal))),
         ..Default::default()
     };
     {
@@ -1472,5 +1560,78 @@ mod tests {
         view.close(&jobs);
         assert!(page.is_cancelled() && loads[1].budget.is_cancelled());
         assert_eq!(jobs.retired.get(), 2);
+    }
+
+    #[test]
+    fn a_view_loads_one_kind_for_life() {
+        use sighurt_api::geometry::{Scale, WindowRect};
+        use sighurt_api::services::PageGrant;
+        let module: &'static [u8] =
+            Box::leak(wat::parse_str("(module)").unwrap().into_boxed_slice());
+        let page = |name| crate::pages::InternalPage {
+            name,
+            title: name,
+            wasm: module,
+            grants: &[PageGrant::Info],
+        };
+        let engine = crate::engine::WasmEngine::new(crate::WasmConfig {
+            policy: Default::default(),
+            kv_root: std::env::temp_dir().join("sighurt-wasm-view-kind-test-kv"),
+            aot_cache: None,
+            pages: vec![page("help"), page("config")],
+        })
+        .unwrap();
+        let rect = WindowRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let scale = Scale::from_fractional(120).unwrap();
+        let metrics = Metrics::new(LayoutEpoch::next(), rect, scale);
+        let jobs = Recorded::default();
+        // Loads the URLs in a new view and says which failed.
+        let failed = |urls: &[&str]| -> Vec<bool> {
+            let mut view = View::new(
+                ViewId::next(),
+                engine.clone(),
+                metrics,
+                ViewOptions::default(),
+            );
+            urls.iter()
+                .map(|url| {
+                    let mut out = Outbox::default();
+                    let navigation = NavigationId::next();
+                    let url = url.to_string();
+                    view.command(EngineCommand::Navigate { navigation, url }, &jobs, &mut out)
+                        .unwrap();
+                    out.take()
+                        .iter()
+                        .any(|e| matches!(e, EngineEvent::NavigationFailed { .. }))
+                })
+                .collect()
+        };
+        assert_eq!(failed(&["sig://help", "sig://HELP/keys"]), [false, false]);
+        assert_eq!(
+            failed(&["sig://help", "https://a.test/app.wasm"]),
+            [false, true]
+        );
+        assert_eq!(failed(&["sig://help", "sig://config"]), [false, true]);
+        assert_eq!(
+            failed(&["https://a.test/app.wasm", "sig://help"]),
+            [false, true]
+        );
+        assert_eq!(
+            failed(&["file:///a.wasm", "https://a.test/b.wasm"]),
+            [false, false]
+        );
+        assert_eq!(failed(&["sig://nope"]), [true]);
+        // An internal document is the page's, with its own origin; another one is not.
+        let loads = jobs.loads.take();
+        assert!(loads[0]
+            .internal
+            .as_ref()
+            .is_some_and(|i| i.page.name == "help"));
+        assert!(loads.iter().filter(|s| s.internal.is_none()).count() >= 3);
     }
 }

@@ -108,7 +108,7 @@ use std::time::{Duration, Instant};
 use calloop::generic::Generic;
 use calloop::ping::make_ping;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
-use sighurt_api::commands::{Command, MAX_FIND};
+use sighurt_api::commands::{Command, CommandSet, MAX_FIND};
 use sighurt_api::engine::{EngineCommand, EngineWaker, FindCommand, PresentOutcome};
 use sighurt_api::events::Cursor;
 use sighurt_api::geometry::{Metrics, Scale, SurfacePoint, WindowRect};
@@ -204,6 +204,14 @@ const WHEEL_LINES: isize = 3;
 const TOO_BIG: &str = "The page area is too big for an image";
 /// The page rows' message for a `sig:` page.
 const INTERNAL: &str = "sig: pages aren't shown in the terminal yet";
+/// The page rows' message for one of sig's own pages (`sig://help`) where no image can show:
+/// they are drawn, with no text to show instead.
+const PAGE_NEEDS_GRAPHICS: &str =
+    "sig's own pages, such as sig://help, are drawn: they need graphics, which this terminal \
+     can't show";
+/// The page rows' message for one of sig's own pages in text mode.
+const PAGE_HAS_NO_TEXT: &str =
+    "sig's own pages, such as sig://help, are drawn and have no text: m shows graphics";
 /// The most characters of an address the page rows' loading message shows.
 const MESSAGE_URL: usize = 256;
 /// The chromes the window has, by name. The terminal ignores `[ui] chrome` and `[chrome.*]`,
@@ -323,6 +331,8 @@ struct Tui {
     grid: Grid,
     seat: SeatId,
     settings: TuiConfig,
+    /// The configuration's own commands (`[commands]`), by name, which the command line runs.
+    commands: Vec<String>,
     /// The page rows show images.
     graphics: bool,
     /// The protocol [`Self::relayout`] chose for this layout.
@@ -628,6 +638,7 @@ impl App {
         let services = Services::new(move || services_wake.ping());
         let wake = std::sync::Arc::new(move || ping.ping());
         let settings = *config.tui();
+        let commands = config.commands().keys().cloned().collect();
         let mut session = Session::new(
             BrowserState::new(config, env.clone()),
             env,
@@ -696,6 +707,7 @@ impl App {
             mouse_on: true,
             outbound: None,
             left: false,
+            commands,
         };
         tui.adopt(settings);
         if let Some(notice) = writer_notice {
@@ -1152,6 +1164,7 @@ impl App {
         self.tui.page_text.then(|| {
             InputKind::TextInput(TextInputEvent {
                 commit: Some(text),
+                paste: true,
                 ..TextInputEvent::default()
             })
         })
@@ -1582,6 +1595,8 @@ impl App {
         enum Kind {
             Blank,
             Internal,
+            /// One of sig's own pages: a view, drawn.
+            Page,
             View,
         }
         let (kind, error, loading) = {
@@ -1595,6 +1610,9 @@ impl App {
             let kind = match tab.content {
                 Content::Blank => Kind::Blank,
                 Content::Internal(_) => Kind::Internal,
+                Content::View(view) if core.view(view).is_some_and(|v| v.page().is_some()) => {
+                    Kind::Page
+                }
                 Content::View(_) => Kind::View,
             };
             (kind, error, loading)
@@ -1607,6 +1625,15 @@ impl App {
                 (None, None) => None,
             },
             Kind::Internal => Some(error.unwrap_or_else(|| INTERNAL.into())),
+            // sig's own pages are drawn: they have no text mode.
+            Kind::Page if self.tui.text_mode && self.tui.images_possible() => {
+                Some(error.unwrap_or_else(|| PAGE_HAS_NO_TEXT.into()))
+            }
+            Kind::Page if !self.tui.images_possible() => {
+                Some(error.unwrap_or_else(|| PAGE_NEEDS_GRAPHICS.into()))
+            }
+            Kind::Page if self.shown_has_frame() => None,
+            Kind::Page => error,
             // The page's text covers these rows once its first snapshot is in.
             Kind::View if self.tui.text_mode => {
                 let view = self.shown().map(|(view, _)| view)?;
@@ -1869,6 +1896,7 @@ impl App {
                     self.session.session_changed();
                 }
                 let settings = *config.tui();
+                self.tui.commands = config.commands().keys().cloned().collect();
                 self.session
                     .queue_mut()
                     .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
@@ -2421,7 +2449,7 @@ impl Tui {
         } else if let Some(command) = line.strip_prefix(':') {
             self.close_address();
             queue.push_back(BrowserEvent::Focus(KeyboardFocus::Page));
-            match command.parse::<Command>() {
+            match CommandSet::ANY.with_custom(&self.commands).parse(command) {
                 Ok(command) => queue.push_back(BrowserEvent::Command(command)),
                 Err(error) => self.show_notice(format!(":{}: {error}", command.trim())),
             }
@@ -3033,10 +3061,14 @@ fn active_url(core: &BrowserState) -> String {
         .to_owned()
 }
 
-/// The engine `tab`'s page runs in: its view's, and none for `sig:` pages and blank tabs.
+/// The engine `tab`'s page runs in: its view's, and none for `sig:` pages (the chrome's and the
+/// internal pages) and blank tabs.
 fn tab_engine<'a>(core: &'a BrowserState, tab: &TabSummary<'_>) -> Option<&'a str> {
     match tab.content {
-        Content::View(view) => core.view(view).map(|view| view.engine()),
+        Content::View(view) => core
+            .view(view)
+            .filter(|view| view.page().is_none())
+            .map(|view| view.engine()),
         Content::Internal(_) | Content::Blank => None,
     }
 }
@@ -3395,6 +3427,7 @@ mod tests {
             mouse_on: true,
             outbound: None,
             left: false,
+            commands: Vec::new(),
         }
     }
 

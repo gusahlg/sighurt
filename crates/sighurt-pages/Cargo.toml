@@ -1,0 +1,18 @@
+[package]
+name = "sighurt-pages"
+description = "Sighurt's internal pages (sig://help and the rest): their Wasm guests, built and embedded, and what each may ask for"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+sighurt-api = { path = "../sighurt-api" }
+
+[dev-dependencies]
+# The tests read the blobs' imports and check them against the engine's `sig` module.
+sighurt-engine-wasm = { path = "../../engines/sighurt-engine-wasm" }
+wasmtime.workspace = true

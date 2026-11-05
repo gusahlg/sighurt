@@ -7,8 +7,14 @@
 //! it, so unknown names and bad arguments are reported then rather than ignored later.
 //! Formatting a [`Command`] gives back its canonical string.
 //!
-//! A configuration's commands are parsed with a [`CommandSet`]: the built-in commands, and the
-//! `chrome.<action>` commands of the chrome the configuration selects.
+//! A configuration's commands are parsed with a [`CommandSet`]: the built-in commands, the
+//! `chrome.<action>` commands of the chrome the configuration selects, and the configuration's
+//! own commands (`[commands]`), which are bare kebab-case words such as `help`
+//! ([`Command::Custom`]). The core resolves a configuration's command into the built-in
+//! commands it stands for; the browser itself defines none.
+//!
+//! [`DOCS`] says what each built-in command does, for help pages; a test holds it to
+//! [`Command::NAMES`].
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -114,6 +120,12 @@ pub enum Command {
     /// `chrome.<action>`: one of the chrome's own commands, such as `chrome.toggle-tabs`. Holds
     /// the action. Each chrome has its own ([`CommandSet`]); they take no argument.
     Chrome(String),
+    /// `<name>`: a command of the configuration's `[commands]` table, a bare word of 1 to 32
+    /// lower-case letters, digits and dashes with no dot, such as `help`. Only a
+    /// [`CommandSet`] that knows the table's names makes one ([`CommandSet::with_custom`]);
+    /// parsing a string alone ([`FromStr`]) calls a bare word unknown, as it always did. The
+    /// core runs the built-in commands it stands for, in order. It takes no argument.
+    Custom(String),
 }
 
 impl Command {
@@ -153,7 +165,8 @@ impl Command {
         "clipboard.copy",
     ];
 
-    /// The command's name, without its argument; `chrome` for every `chrome.<action>`.
+    /// The command's name, without its argument; `chrome` for every `chrome.<action>` and
+    /// `custom` for every command of `[commands]` ([`Self::Custom`]).
     pub fn name(&self) -> &'static str {
         match self {
             Self::TabNew(_) => "tab.new",
@@ -189,9 +202,133 @@ impl Command {
             Self::SiteForget(_) => "site.forget",
             Self::ClipboardCopy(_) => "clipboard.copy",
             Self::Chrome(_) => "chrome",
+            Self::Custom(_) => "custom",
         }
     }
 }
+
+/// The areas of the built-in commands (`tab.new` is in `tab`). None of them is a name of
+/// `[commands]`, so `chrome` alone stays the unknown command it always was.
+pub const AREAS: [&str; 8] = [
+    "tab",
+    "page",
+    "location",
+    "history",
+    "browser",
+    "site",
+    "clipboard",
+    "chrome",
+];
+
+/// Whether `name` can name a command of `[commands]`: 1 to 32 lower-case ASCII letters, digits
+/// and dashes in kebab-case, no dot, and not one of [`AREAS`].
+pub fn is_custom_name(name: &str) -> bool {
+    is_action(name) && !AREAS.contains(&name)
+}
+
+/// What one built-in command does, for a help page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandDoc {
+    /// Its name, as in [`Command::NAMES`].
+    pub name: &'static str,
+    /// Its argument as the command line writes it: `<url>` when it needs one, `[n]` when it
+    /// may take one, empty when it takes none.
+    pub argument: &'static str,
+    /// What it does, in one line.
+    pub description: &'static str,
+}
+
+const fn doc(name: &'static str, argument: &'static str, description: &'static str) -> CommandDoc {
+    CommandDoc {
+        name,
+        argument,
+        description,
+    }
+}
+
+/// Every built-in command, in [`Command::NAMES`] order, with what it does.
+pub const DOCS: [CommandDoc; 32] = [
+    doc(
+        "tab.new",
+        "[address]",
+        "Open a tab on the home page, or on the address",
+    ),
+    doc(
+        "tab.duplicate",
+        "",
+        "Open the selected tab's address again in a tab after it",
+    ),
+    doc(
+        "tab.move",
+        "<left|right|n>",
+        "Move the selected tab one place, or to position n",
+    ),
+    doc("tab.reopen", "", "Open the tab closed last again"),
+    doc("tab.close", "[n]", "Close tab n, or the selected tab"),
+    doc("tab.next", "", "Select the next tab"),
+    doc("tab.previous", "", "Select the previous tab"),
+    doc("tab.select", "<n>", "Select tab n (tabs count from 1)"),
+    doc("tab.last", "", "Select the last tab"),
+    doc(
+        "page.open",
+        "<address>",
+        "Open an address, or search for the text, in this tab",
+    ),
+    doc(
+        "page.open-in",
+        "<engine> [address]",
+        "Open the address, or this page, in the engine named",
+    ),
+    doc(
+        "page.switch-engine",
+        "",
+        "Open this page again in the next web engine",
+    ),
+    doc("page.reload", "", "Reload the page"),
+    doc("page.stop", "", "Stop loading"),
+    doc("page.back", "", "Go back"),
+    doc("page.forward", "", "Go forward"),
+    doc("page.zoom-in", "", "Zoom in"),
+    doc("page.zoom-out", "", "Zoom out"),
+    doc("page.zoom-reset", "", "Back to the configured zoom"),
+    doc(
+        "page.send-key",
+        "<key>",
+        "Press a named key in the page: down, pageup, shift-space, ...",
+    ),
+    doc(
+        "page.find",
+        "[text]",
+        "Find the text in the page, or open the find field",
+    ),
+    doc("page.find-next", "", "The next match"),
+    doc("page.find-previous", "", "The previous match"),
+    doc("page.find-stop", "", "End the search"),
+    doc(
+        "page.exit-fullscreen",
+        "",
+        "Leave the fullscreen of an element of the page",
+    ),
+    doc(
+        "location.focus",
+        "[text]",
+        "Focus the address line, or put the text in it (: opens the command line)",
+    ),
+    doc("history.clear", "", "Forget every page visited"),
+    doc("browser.home", "", "Open the home page in this tab"),
+    doc(
+        "browser.fullscreen",
+        "",
+        "Put the window in fullscreen, or take it out",
+    ),
+    doc("browser.quit", "", "Quit sig"),
+    doc(
+        "site.forget",
+        "[host]",
+        "Forget a site's cookies and stored data, or this page's",
+    ),
+    doc("clipboard.copy", "<text>", "Put the text on the clipboard"),
+];
 
 impl FromStr for Command {
     type Err = CommandError;
@@ -306,6 +443,9 @@ impl FromStr for Command {
 
 impl fmt::Display for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Custom(name) = self {
+            return f.write_str(name);
+        }
         f.write_str(self.name())?;
         match self {
             Self::TabClose(Some(n)) | Self::TabSelect(n) => write!(f, " {n}"),
@@ -537,39 +677,61 @@ impl fmt::Display for SentKey {
     }
 }
 
-/// The commands a configuration may bind: every built-in command, and the `chrome.<action>`
-/// commands of the chrome the configuration selects.
+/// The commands a configuration may bind: every built-in command, the `chrome.<action>`
+/// commands of the chrome the configuration selects, and the configuration's own
+/// (`[commands]`, [`Command::Custom`]).
 #[derive(Clone, Copy, Debug)]
 pub struct CommandSet<'a> {
     /// The chrome's name, for messages.
     chrome: &'a str,
     /// The chrome's actions; `None` leaves them unchecked.
     actions: Option<&'a [&'static str]>,
+    /// The names of `[commands]`; `None` takes any name of their form unchecked.
+    custom: Option<&'a [String]>,
 }
 
 impl<'a> CommandSet<'a> {
-    /// Every command, with no chrome to check against: for reading a table again that a check
-    /// with the selected chrome's set accepted.
+    /// Every command, with no chrome and no `[commands]` to check against: for reading a table
+    /// again that a check with the configuration's set accepted, and for tables built into
+    /// `sig` whose commands are checked when the configuration loads.
     pub const ANY: CommandSet<'static> = CommandSet {
         chrome: "",
         actions: None,
+        custom: None,
     };
 
-    /// The built-in commands and the chrome `chrome`'s `actions`.
+    /// The built-in commands and the chrome `chrome`'s `actions`, and no command of
+    /// `[commands]` until [`Self::with_custom`] names them.
     pub fn new(chrome: &'a str, actions: &'a [&'static str]) -> Self {
         Self {
             chrome,
             actions: Some(actions),
+            custom: Some(&[]),
         }
     }
 
-    /// `text` as a command, or why it can't be bound here: an unknown name, a bad argument, or
-    /// a chrome action the selected chrome doesn't have ("the standard chrome has no command
-    /// chrome.toggle-tab; it has chrome.toggle-tabs").
+    /// This set, with the configuration's own commands (`[commands]`) named `names`: a bare
+    /// word among them is a [`Command::Custom`]; any other stays an unknown command.
+    pub fn with_custom(self, names: &'a [String]) -> Self {
+        Self {
+            custom: Some(names),
+            ..self
+        }
+    }
+
+    /// `text` as a command, or why it can't be bound here: an unknown name, a bad argument, a
+    /// chrome action the selected chrome doesn't have ("the standard chrome has no command
+    /// chrome.toggle-tab; it has chrome.toggle-tabs"), or a name `[commands]` doesn't have.
     pub fn parse(&self, text: &str) -> Result<Command, String> {
-        let command = text
-            .parse()
-            .map_err(|error: CommandError| error.to_string())?;
+        let command = match text.parse() {
+            Err(CommandError::Unknown(name)) if self.is_custom(&name) => {
+                return match text.trim() == name {
+                    true => Ok(Command::Custom(name)),
+                    false => Err(format!("{name} takes no argument")),
+                };
+            }
+            parsed => parsed.map_err(|error: CommandError| error.to_string())?,
+        };
         if let (Command::Chrome(action), Some(actions)) = (&command, self.actions) {
             if !actions.contains(&action.as_str()) {
                 let has = match actions {
@@ -583,6 +745,14 @@ impl<'a> CommandSet<'a> {
             }
         }
         Ok(command)
+    }
+
+    /// Whether `name` is a command of `[commands]` here.
+    fn is_custom(&self, name: &str) -> bool {
+        is_custom_name(name)
+            && self
+                .custom
+                .is_none_or(|names| names.iter().any(|known| known == name))
     }
 }
 
@@ -822,6 +992,54 @@ mod tests {
             assert!(error.to_string().contains("no argument"), "{error}");
         }
         assert_eq!(parse("chrome"), Err(CommandError::Unknown("chrome".into())));
+    }
+
+    #[test]
+    fn bare_words_are_commands_only_of_a_set_that_names_them() {
+        // Alone, a bare word is unknown, as it always was.
+        assert_eq!(parse("help"), Err(CommandError::Unknown("help".into())));
+        let names = ["help".to_owned(), "open-2".to_owned()];
+        let set = CommandSet::new("standard", &[]).with_custom(&names);
+        assert_eq!(set.parse(" help "), Ok(Command::Custom("help".into())));
+        assert_eq!(set.parse("open-2"), Ok(Command::Custom("open-2".into())));
+        assert_eq!(set.parse("help").unwrap().name(), "custom");
+        assert_eq!(set.parse("help").unwrap().to_string(), "help");
+        assert_eq!(set.parse("help keys"), Err("help takes no argument".into()));
+        assert_eq!(set.parse("nope"), Err("unknown command \"nope\"".into()));
+        assert_eq!(
+            CommandSet::new("standard", &[]).parse("help"),
+            Err("unknown command \"help\"".into())
+        );
+        // Unchecked: any name of the form, for tables checked at load.
+        assert_eq!(
+            CommandSet::ANY.parse("nope"),
+            Ok(Command::Custom("nope".into()))
+        );
+        // Areas, dots, upper case and other forms are never one.
+        for bad in [
+            "tab", "page", "chrome", "Help", "he_lp", "a.b", "-x", "x-", "a--b",
+        ] {
+            assert!(CommandSet::ANY.parse(bad).is_err(), "{bad}");
+        }
+        assert!(CommandSet::ANY.parse(&"a".repeat(33)).is_err());
+        assert!(CommandSet::ANY.parse(&"a".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn every_command_has_its_documentation_in_order() {
+        let names: Vec<&str> = DOCS.iter().map(|doc| doc.name).collect();
+        assert_eq!(names, Command::NAMES);
+        for doc in DOCS {
+            assert!(!doc.description.is_empty() && !doc.description.contains(['\t', '\n']));
+            // A command that needs its argument says so with <...>; one that takes none, none.
+            match parse(doc.name) {
+                Err(CommandError::MissingArgument(_)) => {
+                    assert!(doc.argument.starts_with('<'), "{}", doc.name)
+                }
+                Ok(_) => assert!(!doc.argument.starts_with('<'), "{}", doc.name),
+                Err(e) => panic!("{}: {e}", doc.name),
+            }
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::ids::{DocumentGeneration, RequestId, ViewId};
+use crate::ids::{DocumentGeneration, PtySession, RequestId, ViewId};
 
 /// A view asking for a privileged service.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -96,6 +96,165 @@ pub enum Service {
     /// Use a sensitive capability. Answered with [`ServiceReply::Done`] when granted; any
     /// error means not granted.
     Permission(Permission),
+    /// What only Sighurt's own pages (`sig://help`, `sig://config`, `sig://terminal`) may ask
+    /// for. The core grants it from its own record of which page the view is, fixed when the
+    /// view opened, and that page's [`PageGrant`]s; never from the request's `origin` or a URL
+    /// the engine reports. Any other view is refused.
+    Page(PageRequest),
+}
+
+/// What an internal page asks for ([`Service::Page`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PageRequest {
+    /// Facts about the browser, for the help page: answered with [`ServiceReply::Text`] in the
+    /// form [`PageInfo`] documents. Never the configuration's text ([`Self::ConfigRead`]).
+    Info(PageInfo),
+    /// The user's configuration file as it is, and where it is: [`ServiceReply::Text`] in the
+    /// form `sighurt_runtime::page_config` documents (`file|new|read-only <path>`, `target
+    /// <resolved target>`, then the text). A missing file is answered with what a new one
+    /// would start as.
+    ConfigRead,
+    /// Whether `text` is a valid configuration for this build: [`ServiceReply::Text`] in the
+    /// form `sighurt_runtime::page_config` documents (`valid` and `notice <line> <text>` lines,
+    /// or `invalid` and `problem <line> <text>` lines). Nothing is written.
+    ConfigCheck {
+        /// The configuration to check.
+        text: String,
+    },
+    /// Replace the user's configuration file with `text`, if it still holds `replaces` (what
+    /// the page read), and reload it: [`ServiceReply::Text`] in the form
+    /// `sighurt_runtime::page_config` documents (`saved` and its `restart …`/`notice …` lines,
+    /// or `stale`, `invalid` or `refused` with a message).
+    ConfigWrite {
+        /// The new file.
+        text: String,
+        /// What the page read, which the file must still hold.
+        replaces: String,
+    },
+    /// Start `program` on a new pseudo-terminal of `cols` by `rows` cells: answered with
+    /// [`ServiceReply::Pty`], the session, once the program runs. The browser builds the
+    /// program's arguments, environment and working directory; the page only chooses from this
+    /// closed set. The master side reaches the engine by the session, once, outside this type
+    /// (the Wasm engine's `pty::take`); no descriptor is in a service type.
+    ///
+    /// The core tracks the session (opening, open, closing, closed). Cancelling the request
+    /// (the engine's `ServiceCancelled`, or the core when the document ends, the page becomes
+    /// a history entry, the tab closes, the setting goes off or `sig` quits) ends the program.
+    /// When the program has ended and been reaped, whether by itself or cancelled, the
+    /// executable answers the same request a second time with [`ServiceReply::PtyEnded`], which
+    /// frees the allowance; the engine gets it too while the document lasts.
+    PtyOpen {
+        /// What runs.
+        program: PtyProgram,
+        /// The terminal's width, in cells.
+        cols: u16,
+        /// The terminal's height, in cells.
+        rows: u16,
+    },
+}
+
+impl PageRequest {
+    /// The grant a page needs for this request.
+    pub fn grant(&self) -> PageGrant {
+        match self {
+            Self::Info(_) => PageGrant::Info,
+            Self::ConfigRead | Self::ConfigCheck { .. } => PageGrant::ConfigRead,
+            Self::ConfigWrite { .. } => PageGrant::ConfigWrite,
+            Self::PtyOpen { .. } => PageGrant::Pty,
+        }
+    }
+}
+
+/// Which facts [`PageRequest::Info`] asks for. Each answer is UTF-8 text, one record per line,
+/// its fields separated by tabs (`\t`); a field never holds a tab or a line break (the browser
+/// replaces them with spaces). Fields are listed in order; a later version may add fields at
+/// the end of a record, and readers ignore what they don't know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PageInfo {
+    /// `key, value` records: `version` (sig's version), `license`, `authors`, `frontend`
+    /// (`window` or `terminal`), `keymap` (the active keymap's name), `chrome`, `renderer`.
+    About,
+    /// One record per engine of this build, in descriptor order: `name, enabled, default, web,
+    /// capabilities` (`yes`/`no` for the three flags; capabilities a space-separated list of
+    /// what the engine supports, such as `history page-zoom find semantics`).
+    Engines,
+    /// One record per built-in command, in [`crate::commands::DOCS`] order: `name, argument,
+    /// description` (`argument` as the command line writes it, `[url]`, `<n>`, or empty).
+    Commands,
+    /// One record per `[commands]` entry of the configuration: `name, commands` (the commands
+    /// it runs, as the configuration writes them, separated by ` ; `).
+    UserCommands,
+    /// The active keymap's bindings for the running frontend
+    /// ([`crate::keymap::Keymap::describe`]): `mode, keys, action, applies`.
+    Keys,
+    /// `name, path` records: `config` (the configuration file), `config-dir`, `state-dir`,
+    /// `session`, `history`, `downloads`. A path the build has none of is left out.
+    Paths,
+    /// `setting, value` records: the effective values of the settings a new user asks about
+    /// (`home`, `search`, `zoom`, `engines.default`, `engines.enabled`, `input.keymap`,
+    /// `ui.chrome`, `ui.renderer`, `session.restore`, `history.remember`, `pages.terminal`,
+    /// `tui.mode`, `tui.graphics`).
+    Settings,
+}
+
+impl PageInfo {
+    /// Every kind, in a fixed order.
+    pub const ALL: [PageInfo; 7] = [
+        Self::About,
+        Self::Engines,
+        Self::Commands,
+        Self::UserCommands,
+        Self::Keys,
+        Self::Paths,
+        Self::Settings,
+    ];
+
+    /// Its name in the `sig` import module's `request` (`info:<name>`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::About => "about",
+            Self::Engines => "engines",
+            Self::Commands => "commands",
+            Self::UserCommands => "user-commands",
+            Self::Keys => "keys",
+            Self::Paths => "paths",
+            Self::Settings => "settings",
+        }
+    }
+
+    /// The kind named `name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+}
+
+/// What [`PageRequest::PtyOpen`] runs. The browser decides the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PtyProgram {
+    /// The user's shell: `[pages.terminal] command`, else `$SHELL`, else `/bin/sh`, in the home
+    /// directory.
+    Shell,
+    /// The user's editor (`$VISUAL`, else `$EDITOR`) on the configuration file, in its
+    /// directory.
+    EditConfig,
+}
+
+/// What one internal page may ask for, per operation. Each page is given a fixed set at build
+/// time (the `PAGES` table of `sighurt-pages`: help has `Info`; config the configuration's;
+/// terminal `Pty`); the Wasm engine checks it at every `sig` host function and the core again
+/// from its record of the view's page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PageGrant {
+    /// [`PageRequest::Info`].
+    Info,
+    /// [`PageRequest::ConfigRead`] and [`PageRequest::ConfigCheck`].
+    ConfigRead,
+    /// [`PageRequest::ConfigWrite`].
+    ConfigWrite,
+    /// [`PageRequest::PtyOpen`].
+    Pty,
+    /// [`Service::ClipboardWrite`], under its usual rule (a click or key press in the page).
+    Clipboard,
 }
 
 /// Which clipboard: Wayland keeps the ordinary clipboard and the primary selection apart.
@@ -162,6 +321,16 @@ pub enum ServiceReply {
     /// Files or a folder the user picked. The engine decides what its content may see of them:
     /// the Wasm engine hands guests opaque handles, never paths.
     Files(Vec<PathBuf>),
+    /// Text an internal page asked for ([`PageRequest`]).
+    Text(String),
+    /// The terminal an internal page started runs ([`PageRequest::PtyOpen`]): its session.
+    Pty(PtySession),
+    /// The program of an answered [`PageRequest::PtyOpen`] has ended and was reaped: its exit
+    /// status, or `None` when a signal ended it. The second and last answer of that request.
+    PtyEnded {
+        /// The exit status, if it exited.
+        status: Option<i32>,
+    },
 }
 
 /// Why a service request did not succeed.
