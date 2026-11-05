@@ -27,7 +27,7 @@ use sighurt_render::Presents;
 use sighurt_ui::extension::{
     ChromeEvent, ChromeKind, ChromeLayout, InputArea, SurfaceName, Theme, MAX_SURFACES,
 };
-use sighurt_ui::{HomeInfo, Snapshot, TabContent, TabSnapshot};
+use sighurt_ui::{FindSnapshot, HomeInfo, Snapshot, TabContent, TabSnapshot};
 use sighurt_wayland::{InputRegion, PresentMode};
 
 /// The chromes compiled into this build: the standard one always, then those of features.
@@ -106,8 +106,8 @@ pub fn engine<'a>(core: &'a BrowserState, tab: &TabSummary<'_>) -> Option<&'a st
     }
 }
 
-/// What the chrome shows of `core`: its tabs, `status` (the active tab's status line) and
-/// `home`, with every string contained to the bound its field states.
+/// What the chrome shows of `core`: its tabs, `status` (the active tab's status line), the
+/// active tab's search and `home`, with every string contained to the bound its field states.
 ///
 /// A tab whose strings are what `cache` holds from the previous snapshot reuses its contained
 /// copy (byte comparisons, no containing again); the others, and everything outside the tabs,
@@ -134,6 +134,13 @@ pub fn snapshot(
             snapshot.can_go_back = tab.can_go_back;
             snapshot.can_go_forward = tab.can_go_forward;
             snapshot.status = status(&tab);
+            snapshot.find = tab.find.map(|find| FindSnapshot {
+                text: find.text.clone(),
+                found: find.found,
+                current: find.current,
+                total: find.total,
+                supported: find.supported,
+            });
         }
         let matches = |cached: &Option<CachedTab>| {
             cached

@@ -1,8 +1,8 @@
 //! Text mode: reflow a page's semantic snapshot into terminal lines.
 //!
 //! Owns: the laid-out document ([`layout`]), the viewport and item focus
-//! ([`TextView`]), painting those lines into a [`crate::grid::Grid`], and the
-//! plain `--dump` text. Must not own: the terminal, the engine, browser
+//! ([`TextView`]), finding text in it ([`find`]), painting those lines into a
+//! [`crate::grid::Grid`], and the plain `--dump` text. Must not own: the terminal, the engine, browser
 //! policy, or which keys are bound. The app maps `j`/`k`, `ctrl-d`/`ctrl-u`
 //! and `g`/`G` onto [`TextView`]'s scroll operations; this module never reads
 //! input.
@@ -16,6 +16,7 @@
 
 mod draw;
 mod dump;
+mod find;
 mod layout;
 mod types;
 mod view;
@@ -25,6 +26,7 @@ mod tests;
 
 pub use draw::{draw, Area};
 pub use dump::{dump, dump_document};
+pub use find::find;
 pub use layout::layout;
-pub use types::{CellRange, Item, ItemKind, Span, Style, TextDocument, TextLine};
+pub use types::{CellRange, Item, ItemKind, Joined, Span, Style, TextDocument, TextLine};
 pub use view::{Intent, TextView};

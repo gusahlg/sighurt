@@ -119,6 +119,7 @@ pub fn three_tabs() -> Snapshot {
         status: Some("https://sighurt.example/docs/räksmörgås".into()),
         keymap: None,
         home: home_info(),
+        find: None,
     }
 }
 

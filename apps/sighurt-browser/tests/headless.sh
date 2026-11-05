@@ -26,7 +26,8 @@
 #               again and x closes a tab; a command line opened with ":" (where letters type),
 #               a chrome command the chrome lacks, the mouse's side buttons over the chrome
 #               and the page; :tab.new with an address, :tab.move left, u (tab.reopen) after
-#               x; q quits, and the session has the moved tab first
+#               x; find in page (:page.find, n, N, the find field opened with /, Enter and
+#               Escape); q quits, and the session has the moved tab first
 #   settings    `zoom` for new tabs and page.zoom-reset, kept by open tabs across a reload;
 #               page.open-in, and its errors (an engine the build lacks, a sig: page, the
 #               latter in the status strip over the home page); an engine setting
@@ -507,6 +508,34 @@ CONF
   key :
   key 'tab.move left'
   key -k Return
+  step "find in page on demo://pattern: :page.find page, n and N; / opens the find field, Enter keeps the search, Escape ends it"
+  find="d['tabs'][d['active_tab']-1]['find']"
+  key :
+  key 'page.find page'
+  key -k Return
+  sleep 0.3
+  check ":page.find finds the page's three matches, the first selected" \
+    "$(diag "0 if ($find or {}).get('total')==3 and $find['current']==1 else 1")" "$(diag "$find")"
+  key n
+  check "n (page.find-next) selects the second" "$(diag "0 if ($find or {}).get('current')==2 else 1")" "$(diag "$find")"
+  # Shift+N, as a keyboard sends it: wtype types "N" as a key of its own, without Shift.
+  key -M shift n -m shift
+  check "N (page.find-previous) selects the first again" "$(diag "0 if ($find or {}).get('current')==1 else 1")" "$(diag "$find")"
+  key -M shift n -m shift
+  check "N again wraps around to the third" "$(diag "0 if ($find or {}).get('current')==3 else 1")" "$(diag "$find")"
+  key /
+  key Press
+  shot 04-find-field
+  check "/ opens the find field, which searches as it is typed (smart case: one match)" \
+    "$(diag "0 if ($find or {}).get('total')==1 else 1")" "$(diag "$find")"
+  key -k Return
+  key n
+  check "Enter keeps the search and gives the page the keyboard: n moves in it, wrapping" \
+    "$(diag "0 if ($find or {}).get('total')==1 and $find['current']==1 else 1")" "$(diag "$find")"
+  shot 05-find-kept
+  key /
+  key -k Escape
+  check "Escape in the find field ends the search" "$(diag "0 if $find is None else 1")" "$(diag "$find")"
   step "q quits"
   key q
   wait "$sig_pid"; code=$?

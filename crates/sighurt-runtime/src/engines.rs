@@ -77,12 +77,13 @@ pub fn descriptors() -> Vec<Descriptor> {
         Descriptor {
             name: "demo",
             web: false,
-            // `sighurt_engine_demo::CAPABILITIES`: content as structure, and cookies and
-            // storage in memory. Repeated here so this crate does not depend on the demo
-            // engine: that crate names the host's target types. `Registry::start` warns if a
-            // runtime reports otherwise.
+            // `sighurt_engine_demo::CAPABILITIES`: content as structure, find in page, and
+            // cookies and storage in memory. Repeated here so this crate does not depend on the
+            // demo engine: that crate names the host's target types. `Registry::start` warns if
+            // a runtime reports otherwise.
             capabilities: EngineCapabilities {
                 semantics: true,
+                find_in_page: true,
                 site_data: SiteDataKinds {
                     cookies: true,
                     storage: true,

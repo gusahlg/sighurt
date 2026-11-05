@@ -3,12 +3,14 @@
 //! The snapshot is read-only input: the executable fills it from the core's state after every
 //! change, and contains every string in it first ([`Snapshot::contain`]), within the bound its
 //! field states. `ChromeState` holds what only the chrome needs: the address editor's text,
-//! selection, composition and scroll, whether it has focus, what the pointer hovers over and
-//! presses, and how the tabs are shown and scrolled.
+//! selection, composition and scroll, whether it has focus, whether the find field is open in
+//! its place, what the pointer hovers over and presses, and how the tabs are shown and
+//! scrolled.
 //!
 //! Must not own: the committed URL, the tab list, tab titles, which commands move the keyboard
-//! focus, or anything else the core owns. Editing the address never changes the committed
-//! address; submitting it issues a command.
+//! focus, the search's state (the core's, in [`Snapshot::find`]), or anything else the core
+//! owns. Editing the address never changes the committed address; submitting it issues a
+//! command.
 
 use sighurt_api::ids::{RequestId, TabId};
 
@@ -32,6 +34,49 @@ pub struct Snapshot {
     pub keymap: Option<String>,
     /// What `sig://home` shows.
     pub home: HomeInfo,
+    /// The search in the active tab's page, if one is under way: what the find field shows
+    /// beside it.
+    pub find: Option<FindSnapshot>,
+}
+
+/// A search in the page (`page.find`), as the chrome shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FindSnapshot {
+    /// What it looks for. Typed by the user, but contained like the rest; at most 1 024
+    /// characters.
+    pub text: String,
+    /// Whether there is a match; `None` until the first result.
+    pub found: Option<bool>,
+    /// Which match is selected, from 1, when the finder knows.
+    pub current: Option<u32>,
+    /// How many matches there are, when the finder knows.
+    pub total: Option<u32>,
+    /// `false` when nothing could search the page: the frontend did not, and its engine
+    /// can't.
+    pub supported: bool,
+}
+
+impl FindSnapshot {
+    /// What a chrome says about the search beside its field: "3 of 12", "12 matches" when the
+    /// finder doesn't say which is selected, "no matches", "not supported by `engine`", or
+    /// nothing before the first result.
+    pub fn indicator(&self, engine: Option<&str>) -> String {
+        if !self.supported {
+            return match engine {
+                Some(engine) => format!("not supported by {engine}"),
+                None => "not supported".into(),
+            };
+        }
+        match (self.found, self.current, self.total) {
+            (None, ..) => String::new(),
+            (Some(false), ..) | (Some(true), _, Some(0)) => "no matches".into(),
+            (Some(true), Some(current), Some(total)) => format!("{current} of {total}"),
+            (Some(true), None, Some(1)) => "1 match".into(),
+            (Some(true), None, Some(total)) => format!("{total} matches"),
+            (Some(true), Some(current), None) => format!("match {current}"),
+            (Some(true), None, None) => "found".into(),
+        }
+    }
 }
 
 impl Snapshot {
@@ -67,6 +112,9 @@ impl Snapshot {
         if let Some(keymap) = &mut self.keymap {
             contain(keymap, MAX_INDICATOR);
         }
+        if let Some(find) = &mut self.find {
+            contain(&mut find.text, MAX_FIND_TEXT);
+        }
         contain(&mut self.home.config_path, MAX_PATH);
         for engine in &mut self.home.engines {
             contain(&mut engine.name, MAX_ENGINE_NAME);
@@ -85,6 +133,8 @@ pub(crate) const MAX_STATUS: usize = 2000;
 pub(crate) const MAX_MESSAGE: usize = 4000;
 /// Characters kept of the keymap's indicator.
 const MAX_INDICATOR: usize = 64;
+/// Characters kept of the search's text.
+const MAX_FIND_TEXT: usize = 1024;
 /// Characters kept of the configuration's path.
 const MAX_PATH: usize = 1000;
 /// Characters kept of an engine's name and of its line on the home page.
@@ -233,6 +283,21 @@ pub struct ChromeState {
     pub first_row: usize,
     /// Scrolling of the tab list not yet a whole row, in logical pixels.
     pub scrolled: f64,
+    /// The find field is open in the address line's place (`page.find` without text): the
+    /// line's editor holds the search's text, and this the address line it replaced, until
+    /// the field closes.
+    pub find: Option<FindField>,
+}
+
+/// The find field while it is open.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FindField {
+    /// The address line as it was when the field opened; it comes back when the field
+    /// closes.
+    pub address: TextEditor,
+    /// The text the field last searched for (`page.find <text>`), so only an edit that changes
+    /// it searches again. Empty when it ended the search.
+    pub searched: String,
 }
 
 #[cfg(test)]
@@ -306,6 +371,10 @@ mod tests {
             tabs: vec![tab],
             status: Some(long('s', 3000)),
             keymap: Some(long('k', 100)),
+            find: Some(FindSnapshot {
+                text: long('f', 2000),
+                ..FindSnapshot::default()
+            }),
             home: HomeInfo {
                 config_path: long('p', 2000),
                 engines: vec![EngineRow {
@@ -330,6 +399,7 @@ mod tests {
             (message, 4000),
             (snapshot.status.as_ref().unwrap(), 2000),
             (snapshot.keymap.as_ref().unwrap(), 64),
+            (&snapshot.find.as_ref().unwrap().text, 1024),
             (&snapshot.home.config_path, 1000),
             (&engine.name, 100),
             (&engine.detail, 500),
@@ -375,6 +445,33 @@ mod tests {
         tab.content = TabContent::Blank;
         tab.switching_to = Some("wpe".into());
         assert_eq!(tab.switching_label(), None);
+    }
+
+    #[test]
+    fn find_indicators() {
+        let find = |found, current, total, supported| FindSnapshot {
+            text: "x".into(),
+            found,
+            current,
+            total,
+            supported,
+        };
+        let says = |f: FindSnapshot| f.indicator(Some("servo"));
+        assert_eq!(says(find(Some(true), Some(3), Some(12), true)), "3 of 12");
+        assert_eq!(says(find(Some(true), None, Some(12), true)), "12 matches");
+        assert_eq!(says(find(Some(true), None, Some(1), true)), "1 match");
+        assert_eq!(says(find(Some(false), None, Some(0), true)), "no matches");
+        assert_eq!(says(find(Some(false), None, None, true)), "no matches");
+        assert_eq!(says(find(Some(true), None, None, true)), "found");
+        assert_eq!(says(find(None, None, None, true)), "");
+        assert_eq!(
+            says(find(None, None, None, false)),
+            "not supported by servo"
+        );
+        assert_eq!(
+            find(None, None, None, false).indicator(None),
+            "not supported"
+        );
     }
 
     #[test]

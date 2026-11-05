@@ -30,6 +30,11 @@
 //! semantic action reports `TextInputChanged`; a new document clears it. `CAPABILITIES.text_input`
 //! stays false: that flag is IME composition, which this engine does not do.
 //!
+//! Find in page searches the page's own text, the strings of its content tree ([`snapshot`]):
+//! the matches are counted in order, `Next` and `Previous` walk them and wrap around, and each
+//! answers with `FindResult` (found, current and total). Nothing is highlighted, and a new
+//! document ends the search.
+//!
 //! The engine has no history of its own (`history_traversal: false`, so the core gives it a view
 //! per page) and no page zoom. Visiting a page records the site name `demo` (a page that fails
 //! to load does not). [`EngineRuntime::site_data`] lists those names and forgets them, in
@@ -49,14 +54,14 @@ use std::mem::{discriminant, Discriminant};
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{
-    EngineCapabilities, EngineCommand, EngineError, EngineRuntime, PresentOutcome, PumpStatus,
-    SiteDataKinds, SiteDataRequest, SiteKey, ViewOptions,
+    EngineCapabilities, EngineCommand, EngineError, EngineRuntime, FindCommand, PresentOutcome,
+    PumpStatus, SiteDataKinds, SiteDataRequest, SiteKey, ViewOptions,
 };
 use sighurt_api::events::{
     Cursor, EngineEvent, NavigationError, OpenDisposition, SiteDataOutcome, SiteEntry, MAX_SITES,
 };
 use sighurt_api::geometry::{Metrics, SurfacePoint, SurfaceRect};
-use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, RequestId, ViewId};
 use sighurt_api::input::{ButtonState, InputKind, Key, PointerEvent, TextInputState, TextPurpose};
 use sighurt_api::present::CpuTarget;
 use sighurt_api::semantic::{NodeId, NodeKind, SemanticAction, SemanticNode, SemanticSnapshot};
@@ -66,15 +71,15 @@ use sighurt_wayland::TargetLease;
 pub const NAME: &str = "demo";
 
 /// What the demo engine supports: content as structure (a small fixed tree, see [`snapshot`]),
-/// and cookies and storage in memory ([`EngineRuntime::site_data`]). None of the other
-/// optional operations. `text_input` is IME composition, not the text field's focus, which is
+/// find in page over that tree's text, and cookies and storage in memory
+/// ([`EngineRuntime::site_data`]). None of the other optional operations. `text_input` is IME composition, not the text field's focus, which is
 /// reported as `TextInputChanged`.
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     history_traversal: false,
     text_input: false,
     accessibility: false,
     screenshots: false,
-    find_in_page: false,
+    find_in_page: true,
     page_zoom: false,
     pointer_lock: false,
     native_popups: false,
@@ -175,6 +180,9 @@ struct View<T: CpuTarget> {
     /// The demo form's state: the checkbox and the select's choice.
     agreed: bool,
     colour: u32,
+    /// The search in the page: its id, how many matches it has and which one is selected
+    /// (from 1; 0 with none).
+    find: Option<(RequestId, u32, u32)>,
 }
 
 impl<T: CpuTarget> View<T> {
@@ -197,6 +205,7 @@ impl<T: CpuTarget> View<T> {
             semantics: false,
             agreed: false,
             colour: 0,
+            find: None,
         }
     }
 
@@ -219,6 +228,67 @@ impl<T: CpuTarget> View<T> {
 
     fn page(&self) -> Option<Page> {
         self.page.as_ref().map(|(page, _)| *page)
+    }
+
+    /// Carries out a search command. A move or stop for another search does nothing.
+    fn find(&mut self, id: ViewId, command: FindCommand, queue: &mut Vec<EngineEvent>) {
+        let (search, current) = match command {
+            FindCommand::Search {
+                search,
+                document,
+                text,
+                case_sensitive,
+            } => {
+                let Some((page, _)) = self
+                    .page
+                    .as_ref()
+                    .filter(|_| self.document == Some(document))
+                else {
+                    return;
+                };
+                let snapshot = snapshot(
+                    document,
+                    page.title(),
+                    &self.typed,
+                    self.agreed,
+                    self.colour,
+                );
+                let total = count_matches(&snapshot, &text, case_sensitive);
+                self.find = Some((search, total, u32::from(total > 0)));
+                (search, u32::from(total > 0))
+            }
+            FindCommand::Next { search } | FindCommand::Previous { search } => {
+                let next = matches!(command, FindCommand::Next { .. });
+                let Some((_, total, current)) = self.find.as_mut().filter(|(s, ..)| *s == search)
+                else {
+                    return;
+                };
+                if *total > 0 {
+                    *current = match next {
+                        true => *current % *total + 1,
+                        false => (*current + *total - 2) % *total + 1,
+                    };
+                }
+                (search, *current)
+            }
+            FindCommand::Stop { search } => {
+                if self.find.is_some_and(|(s, ..)| s == search) {
+                    self.find = None;
+                }
+                return;
+            }
+        };
+        let (Some(document), Some((_, total, _))) = (self.document, self.find) else {
+            return;
+        };
+        queue.push(EngineEvent::FindResult {
+            view: id,
+            document,
+            search,
+            found: total > 0,
+            current: (total > 0).then_some(current),
+            total: Some(total),
+        });
     }
 
     fn title(&self) -> Option<String> {
@@ -331,6 +401,7 @@ impl<T: CpuTarget> DemoRuntime<T> {
                 view.start_slow_frame(Instant::now());
                 let document = DocumentGeneration::next();
                 view.document = Some(document);
+                view.find = None;
                 view.agreed = false;
                 view.colour = 0;
                 queue.push(EngineEvent::NavigationCommitted {
@@ -573,6 +644,25 @@ fn snapshot(
     }
 }
 
+/// How many times `text` occurs, without overlapping, in the strings of `snapshot`: its nodes'
+/// text, labels, values and options. Without `case_sensitive`, case does not matter.
+fn count_matches(snapshot: &SemanticSnapshot, text: &str, case_sensitive: bool) -> u32 {
+    let fold = |s: &str| match case_sensitive {
+        true => s.to_owned(),
+        false => s.to_lowercase(),
+    };
+    let needle = fold(text);
+    if needle.is_empty() {
+        return 0;
+    }
+    let strings = snapshot.nodes.iter().flat_map(|node| {
+        let own = [&node.text, &node.label, &node.value];
+        own.into_iter().flatten().chain(&node.options)
+    });
+    let count: usize = strings.map(|s| fold(s).matches(&needle).count()).sum();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 /// The text field's input state. The caret is unused: the terminal has no input method.
 fn text_field_state() -> TextInputState {
     TextInputState {
@@ -606,6 +696,7 @@ fn coalesce(events: &mut Vec<EngineEvent>) {
                 | EngineEvent::TextInputChanged { .. }
                 | EngineEvent::FrameReady { .. }
                 | EngineEvent::SemanticsChanged { .. }
+                | EngineEvent::FindResult { .. }
         )
     }
     let mut seen: HashSet<(Discriminant<EngineEvent>, Option<ViewId>)> = HashSet::new();
@@ -695,7 +786,7 @@ impl<T: CpuTarget> EngineRuntime for DemoRuntime<T> {
                     self.act(id, action)?;
                 }
             }
-            EngineCommand::Find(_) => return Err(EngineError::Unsupported("find in page")),
+            EngineCommand::Find(command) => view.find(id, command, &mut self.queue),
             EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
         }
         Ok(())
@@ -993,6 +1084,108 @@ mod tests {
             EngineEvent::TextInputChanged { state, .. } => Some(state.is_some()),
             _ => None,
         })
+    }
+
+    #[test]
+    fn find_counts_the_pages_text_and_walks_the_matches_around() {
+        use sighurt_api::geometry::{Scale, WindowRect};
+
+        let mut runtime = DemoRuntime::new();
+        let view = ViewId::next();
+        let metrics = Metrics::new(
+            LayoutEpoch::next(),
+            WindowRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 40,
+            },
+            Scale::ONE,
+        );
+        runtime
+            .open_view(view, ViewOptions::default(), Mem { metrics })
+            .unwrap();
+        let navigate = |runtime: &mut DemoRuntime<Mem>| {
+            runtime
+                .command(
+                    view,
+                    EngineCommand::Navigate {
+                        navigation: NavigationId::next(),
+                        url: "demo://pattern".into(),
+                    },
+                )
+                .unwrap();
+            pump_all(runtime)
+                .iter()
+                .find_map(|event| match event {
+                    EngineEvent::NavigationCommitted { document, .. } => Some(*document),
+                    _ => None,
+                })
+                .expect("committed")
+        };
+        let document = navigate(&mut runtime);
+        let find = |runtime: &mut DemoRuntime<Mem>, command| {
+            runtime.command(view, EngineCommand::Find(command)).unwrap();
+            pump_all(runtime)
+                .into_iter()
+                .filter_map(|event| match event {
+                    EngineEvent::FindResult {
+                        document: d,
+                        found,
+                        current,
+                        total,
+                        ..
+                    } => Some((d, found, current, total)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let search = RequestId::next();
+        let start = |text: &str, case_sensitive| FindCommand::Search {
+            search,
+            document,
+            text: text.into(),
+            case_sensitive,
+        };
+        // "page": the paragraph and both links.
+        let three = (document, true, Some(1), Some(3));
+        assert_eq!(find(&mut runtime, start("page", false)), [three]);
+        assert_eq!(
+            find(&mut runtime, start("PAGE", false)),
+            [three],
+            "case does not matter"
+        );
+        assert_eq!(
+            find(&mut runtime, start("PAGE", true)),
+            [(document, false, None, Some(0))],
+            "unless asked"
+        );
+        find(&mut runtime, start("page", false));
+        let next = FindCommand::Next { search };
+        let previous = FindCommand::Previous { search };
+        assert_eq!(find(&mut runtime, next.clone())[0].2, Some(2));
+        assert_eq!(find(&mut runtime, next.clone())[0].2, Some(3));
+        assert_eq!(find(&mut runtime, next.clone())[0].2, Some(1), "wraps");
+        assert_eq!(find(&mut runtime, previous.clone())[0].2, Some(3), "back");
+        // Another search's move does nothing.
+        let other = RequestId::next();
+        assert!(find(&mut runtime, FindCommand::Next { search: other }).is_empty());
+        // A new document ends the search.
+        navigate(&mut runtime);
+        assert!(find(&mut runtime, next.clone()).is_empty());
+        // A search for an old document is dropped.
+        assert!(find(&mut runtime, start("page", false)).is_empty());
+        // Stop ends it.
+        let document = navigate(&mut runtime);
+        let start = FindCommand::Search {
+            search,
+            document,
+            text: "Press".into(),
+            case_sensitive: true,
+        };
+        assert_eq!(find(&mut runtime, start)[0].3, Some(1));
+        assert!(find(&mut runtime, FindCommand::Stop { search }).is_empty());
+        assert!(find(&mut runtime, previous).is_empty());
     }
 
     #[test]

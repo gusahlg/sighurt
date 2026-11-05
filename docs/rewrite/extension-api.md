@@ -868,7 +868,7 @@ How it behaves:
 | Leaving a text field with `escape` | Escape leaves insert mode, but the page's field keeps the keyboard: no command blurs a field, and the engine contract has no such operation. `j` then moves the caret there. A later `page.blur` would need `EngineCommand` support. |
 | Insert mode when the user clicks a second field | `typing` stays true from one field to the next, so `context` isn't called. If the user had left insert mode, the keymap stays in normal mode. This needs `TextInputState` to carry a field identity (decision 55). |
 | Link hints (`f`) | They need the page's links and a way to draw over them. Neither is in the engine contract. |
-| Find (`/`, `n`) | No command or engine operation finds text in a page yet: every engine declares `find_in_page: false`. |
+| Find (`/`, `n`) | Since decision 128 (see the changelog): `page.find [text]`, `page.find-next`, `page.find-previous` and `page.find-stop`, bound to `/`, `n` and `N` by the example configuration. WPE WebKit (total only), CEF (current and total), Ladybird (current and total), NetSurf (found only) and the demo engine find in page; Servo and Wasm don't, and the chrome says so. The terminal's text mode searches the page's text itself. |
 | Copying the URL (`yy`) | No command copies the URL. A `page.copy-url` command would be a small addition. |
 | Counts (`5j`, `3gt`) | `KeyAction` runs exactly one command. A later `KeyAction::RunAll(Vec<Command>)` would allow them as an addition. |
 | Visual mode | Selection belongs to the page. |
@@ -1841,11 +1841,41 @@ finding was checked against the plan and the code before it was acted on.
   `EngineCommand::Find(FindCommand)` (each `FindCommand` names its search, and `Search` its
   document, so late ones are dropped), `EngineCommand::ExitFullscreen`,
   `EngineEvent::FindResult` (replaceable per view), `EngineEvent::FullscreenChanged` (ordered)
-  and `EngineCapabilities::fullscreen`; no engine sets `find_in_page` or `fullscreen` yet, and
-  every adapter refuses both commands as unsupported. The chrome API gains
+  and `EngineCapabilities::fullscreen`; no engine set `find_in_page` or `fullscreen` then, and
+  every adapter refused both commands as unsupported (WPE WebKit, CEF, Ladybird and NetSurf
+  find in page since lane B2, the demo engine since decision 128; Servo still refuses, and no
+  engine sets `fullscreen` yet). The chrome API gains
   `ChromeEvent::LineText(String)`: right after `Focus(Chrome)`, `location.focus <text>` puts
   the text in the line as if typed over the selected address, the caret at its end (the core's
   `Effect::LineText`, the runtime's `Frontend::line_text`). The example configuration binds `:`
   to `location.focus :` instead of `RunThenPass(location.focus)`, `/` to `page.find`, `u` to
   `tab.reopen`, `y f` to copying `TabInfo::link`, and Escape to `page.exit-fullscreen` while
   `TabInfo::fullscreen` holds (its mode switch otherwise).
+- **Find in page: the core, the runtime and the chromes** (4 November 2026, STATUS decision
+  128). The core keeps one search per view (`sighurt_core::tabs::Find`, read through
+  `View::find` and `TabSummary::find`), with smart case, and sends every find command as
+  `Effect::Find { view, command: FindCommand }`; the runtime offers it to
+  `Frontend::find(view, &FindCommand, &mut VecDeque<BrowserEvent>) -> bool` first (the
+  terminal's text mode searches its own text), then to the engine if it declares
+  `find_in_page`, and otherwise answers with `BrowserEvent::FindResult { view, search, found,
+  current, total, supported: false }`; a frontend's own answer is the same event with
+  `supported: true`. Results whose search is not the view's, or (for an engine's) whose
+  document is not the view's, are dropped; a new document or a failed one ends the search with
+  a `Stop`. `page.find` without text is `Effect::FindField(String)` after `Focus(Chrome)`
+  (`Frontend::find_field`). The chrome API gains `ChromeEvent::FindField(String)` (open the
+  find field holding the text; each edit runs `page.find <text>`, an empty one
+  `page.find-stop`; Enter closes it with `ChromeAction::Focus(Page)` and keeps the search,
+  Escape also runs `page.find-stop`; the core's `Focus` or another tab closes it and keeps the
+  search) and `Snapshot::find: Option<FindSnapshot>` (`text`, contained to 1 024 characters,
+  `found`, `current`, `total`, `supported`, for the active tab), with
+  `FindSnapshot::indicator(engine)` for "3 of 12", "12 matches", "no matches" and "not
+  supported by servo". `Snapshot` is not `non_exhaustive`, so a chrome or test that builds one
+  field by field adds `find: None`. `ChromeState::find: Option<FindField>` is the standard
+  chrome's open field. The standard chrome draws the field in the address line's place with a
+  muted `/` and the indicator at its right (before the engine button while the field is
+  closed); the line chrome puts `/` in place of the tab's place and the indicator before the
+  status. With no search, both chromes draw as before: every golden image is unchanged, and
+  new ones show the field (`find-125`, `find-closed-100`, `find-unsupported-100`; the line
+  chrome's `find-150`, `find-closed-100`). The example configuration binds `n` and `N` to
+  `page.find-next` and `page.find-previous`. The demo engine finds in its own content tree's
+  text (`find_in_page: true`).

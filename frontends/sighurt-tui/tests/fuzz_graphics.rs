@@ -13,7 +13,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use fuzz::{iterations, run, Rng};
 use sighurt_api::geometry::BufferSize;
-use sighurt_api::ids::{DocumentGeneration, ViewId};
+use sighurt_api::ids::{DocumentGeneration, RequestId, ViewId};
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, Modifiers};
 use sighurt_api::present::Frame;
 use sighurt_api::semantic::{NodeId, NodeKind, SemanticNode, SemanticSnapshot};
@@ -22,7 +22,7 @@ use sighurt_tui::grid::{Attrs, Color, Grid};
 use sighurt_tui::kitty::{self, CellRect, CHUNK_BYTES};
 use sighurt_tui::sanitize::sanitize;
 use sighurt_tui::sixel;
-use sighurt_tui::text::TextPages;
+use sighurt_tui::text::{Query, Step, TextPages};
 use sighurt_tui::textmode::{self, Area, TextView};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -1086,19 +1086,23 @@ fn key_event(rng: &mut Rng) -> KeyEvent {
     }
 }
 
-/// The text pages, driven with random snapshots, keys, clicks, pastes and resizes: no panic, and
-/// the grid they paint into stays the size it was.
+/// The text pages, driven with random snapshots, keys, clicks, pastes, searches and resizes: no
+/// panic, the grid they paint into stays the size it was, and a search's current match is one
+/// of its matches.
 #[test]
 fn fuzz_text_pages_driven_by_input() {
     run("fuzz_text_pages", iterations(100) / 8, LIMIT, |case| {
         let mut pages = TextPages::new(case.rng.range(1, 100) as u16, case.rng.range(1, 30) as u16);
         let views = [ViewId::next(), ViewId::next()];
+        let searches = [RequestId::next(), RequestId::next()];
         let mut grid = Grid::new(case.rng.range(1, 100) as u16, case.rng.range(1, 32) as u16);
         for step in 0..case.rng.range(1, 30) {
             let view = *case.rng.pick(&views);
             case.note(|| format!("step {step}"));
-            match case.rng.below(10) {
-                0 => pages.snapshot(view, Box::new(snapshot(&mut case.rng))),
+            match case.rng.below(12) {
+                0 => {
+                    let _ = pages.snapshot(view, Box::new(snapshot(&mut case.rng)));
+                }
                 1 => pages.set_area(case.rng.range(1, 100) as u16, case.rng.range(1, 30) as u16),
                 2 | 3 => {
                     let key = key_event(&mut case.rng);
@@ -1121,6 +1125,22 @@ fn fuzz_text_pages_driven_by_input() {
                 8 => {
                     let key = key_event(&mut case.rng);
                     let _ = pages.prompt_key(&key);
+                }
+                9 => {
+                    let query = Query {
+                        search: *case.rng.pick(&searches),
+                        text: case.rng.string(3),
+                        case_sensitive: case.rng.one_in(2),
+                    };
+                    let step = *case.rng.pick(&[Step::Start, Step::Next, Step::Previous]);
+                    let count = pages.find(view, &query, step);
+                    assert!(
+                        count.current.is_none_or(|n| n >= 1 && n <= count.total),
+                        "{count:?}"
+                    );
+                    if case.rng.one_in(4) {
+                        pages.stop_find(view);
+                    }
                 }
                 _ => {
                     let area = Area {

@@ -1,14 +1,18 @@
 //! The terminal chrome: one line above the page and one line below it.
 //!
 //! Owns: the plain data the lines are drawn from, the grapheme editor for the
-//! address, and which rows are left for the page. Must not own: tabs, the
+//! address and the find field, and which rows are left for the page. Must not own: tabs, the
 //! committed URL, the keymap, or the terminal. Every page-supplied string is
 //! passed through [`crate::sanitize`] before it is drawn, and cut to the row's
 //! width.
 //!
 //! The top line is `[2/5] title — address · engine · MODE · keymap`, with `…`
 //! after the title while that tab is loading. The bottom line is the address
-//! editor while it is open, otherwise the notice, otherwise the status.
+//! editor (prompt `→ `) or the find field (prompt `/`) while one is open,
+//! otherwise the notice, otherwise the status. What the search in the page
+//! found ("3 of 12") is right-aligned on it while there is one, after the
+//! search's text when the field is closed; a terminal too narrow for both
+//! drops it.
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -43,6 +47,10 @@ pub struct ChromeState {
     pub active: usize,
     /// The address editor, while the user is editing it.
     pub address_editing: Option<LineEditor>,
+    /// [`Self::address_editing`] is the find field: drawn after a `/`.
+    pub finding: bool,
+    /// What the search in the page found, while there is one: right-aligned on the bottom line.
+    pub find: Option<String>,
     /// `GFX` or `TEXT`. Any other short label is drawn as it is.
     pub mode_label: String,
     /// What the keymap says about itself, such as `NORMAL`.
@@ -59,6 +67,8 @@ impl Default for ChromeState {
             tabs: Vec::new(),
             active: 0,
             address_editing: None,
+            finding: false,
+            find: None,
             mode_label: MODE_GRAPHICS.to_string(),
             keymap_indicator: None,
             notice: None,
@@ -86,6 +96,9 @@ impl ChromeState {
         }
         if let Some(status) = &mut self.status {
             *status = sanitize(status);
+        }
+        if let Some(find) = &mut self.find {
+            *find = sanitize(find);
         }
         if let Some(editor) = &mut self.address_editing {
             editor.resanitize();
@@ -448,9 +461,41 @@ fn top_line(state: &ChromeState, cols: u16) -> String {
     fit_cols(&line, cols)
 }
 
+/// The bottom line, with the find indicator right-aligned when it leaves the line at least
+/// [`FIND_ROOM`] columns.
 fn bottom_line(state: &ChromeState, cols: u16) -> (String, Option<u16>) {
+    let find = state
+        .find
+        .as_deref()
+        .map(sanitize)
+        .filter(|find| !find.is_empty())
+        .map(|find| fit_cols(&find, cols / 2));
+    let left_cols = match &find {
+        Some(find) => usize::from(cols).saturating_sub(find.width() + 1),
+        None => usize::from(cols),
+    };
+    let (find, left_cols) = match find {
+        Some(find) if left_cols >= FIND_ROOM => (Some(find), left_cols),
+        _ => (None, usize::from(cols)),
+    };
+    let left_cols = u16::try_from(left_cols).unwrap_or(u16::MAX);
+    let (left, cursor) = left_line(state, left_cols);
+    match find {
+        Some(find) => {
+            let pad = usize::from(left_cols).saturating_sub(left.width());
+            (format!("{left}{} {find}", " ".repeat(pad)), cursor)
+        }
+        None => (left, cursor),
+    }
+}
+
+/// The least columns the bottom line keeps for itself beside the find indicator.
+const FIND_ROOM: usize = 12;
+
+fn left_line(state: &ChromeState, cols: u16) -> (String, Option<u16>) {
     if let Some(editor) = &state.address_editing {
-        return editor_line(editor, cols);
+        let prompt = if state.finding { FIND_PROMPT } else { PROMPT };
+        return editor_line(editor, prompt, cols);
     }
     if let Some(notice) = state.notice.as_deref().map(sanitize) {
         if !notice.is_empty() {
@@ -466,16 +511,18 @@ fn bottom_line(state: &ChromeState, cols: u16) -> (String, Option<u16>) {
 }
 
 const PROMPT: &str = "→ ";
+/// The find field's prompt.
+const FIND_PROMPT: &str = "/";
 
-fn editor_line(editor: &LineEditor, cols: u16) -> (String, Option<u16>) {
+fn editor_line(editor: &LineEditor, prompt: &str, cols: u16) -> (String, Option<u16>) {
     let cols = usize::from(cols);
-    let prompt_width = PROMPT.width();
+    let prompt_width = prompt.width();
     if cols == 0 {
         return (String::new(), None);
     }
     if prompt_width >= cols {
         return (
-            fit_cols(PROMPT, u16::try_from(cols).unwrap_or(u16::MAX)),
+            fit_cols(prompt, u16::try_from(cols).unwrap_or(u16::MAX)),
             Some(0),
         );
     }
@@ -485,7 +532,7 @@ fn editor_line(editor: &LineEditor, cols: u16) -> (String, Option<u16>) {
     let (visible, _) = slice_columns(editor.text(), start, room);
     let cursor_col = prompt_width + cursor - start;
     let cursor_col = u16::try_from(cursor_col.min(cols.saturating_sub(1))).unwrap_or(u16::MAX);
-    (format!("{PROMPT}{visible}"), Some(cursor_col))
+    (format!("{prompt}{visible}"), Some(cursor_col))
 }
 
 fn put_fitted(grid: &mut Grid, row: u16, text: &str) {
@@ -585,6 +632,8 @@ mod tests {
             }],
             active: 0,
             address_editing: None,
+            finding: false,
+            find: None,
             mode_label: MODE_GRAPHICS.into(),
             keymap_indicator: Some("NOR\u{1b}[0mMAL".into()),
             notice: None,
@@ -722,6 +771,43 @@ mod tests {
         state.address_editing.as_mut().unwrap().left();
         let page = state.draw(&mut grid);
         assert_eq!(page.cursor, Some(Cursor { column: 3, row: 3 }));
+    }
+
+    #[test]
+    fn the_find_field_has_a_slash_and_the_result_sits_at_the_right() {
+        let mut state = ChromeState {
+            address_editing: Some(LineEditor::from_text("needle")),
+            finding: true,
+            find: Some("3 of 12".into()),
+            ..ChromeState::default()
+        };
+        let mut grid = Grid::new(40, 4);
+        let page = state.draw(&mut grid);
+        let bottom = row_text(&grid, 3);
+        assert!(bottom.starts_with("/needle "), "{bottom}");
+        assert!(bottom.ends_with(" 3 of 12"), "{bottom}");
+        assert_eq!(bottom.width(), 40);
+        assert_eq!(page.cursor, Some(Cursor { column: 7, row: 3 }));
+        // Closed, beside the status; hostile text stays out.
+        state.address_editing = None;
+        state.finding = false;
+        state.status = Some("https://a.test/".into());
+        state.find = Some("/ne\u{1b}[2Jedle 3 of 12".into());
+        state.contain();
+        state.draw(&mut grid);
+        let bottom = row_text(&grid, 3);
+        assert!(bottom.starts_with("https://a.test/"), "{bottom}");
+        assert!(bottom.ends_with(" /needle 3 of 12"), "{bottom}");
+        assert_safe(&grid);
+        // Too narrow for both: the line keeps its own text.
+        let mut narrow = Grid::new(20, 4);
+        state.find = Some("not supported by servo".into());
+        state.draw(&mut narrow);
+        assert_eq!(row_text(&narrow, 3), "https://a.test/");
+        // No search: the line is as it always was.
+        state.find = None;
+        state.draw(&mut grid);
+        assert_eq!(row_text(&grid, 3), "https://a.test/");
     }
 
     #[test]

@@ -120,7 +120,7 @@ fn fuzz_session_writer_keeps_the_latest_whole() {
                 .path()
                 .join(format!("case{}", case.index))
                 .join("session.toml");
-            let writer = SessionWriter::new(path.clone()).unwrap();
+            let writer = SessionWriter::new(path.clone(), || {}).unwrap();
             let mut last = String::new();
             for _ in 0..case.rng.range(1, 20) {
                 last = session(&mut case.rng).to_text();

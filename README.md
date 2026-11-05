@@ -438,7 +438,7 @@ command, typed into the address line) all run them.
 | `page.reload`, `page.stop`, `page.back`, `page.forward` | the page's own |
 | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` | page zoom |
 | `page.send-key <key>` | press and release a named key in the page, as if typed: `down`, `pageup`, `end`, `space`, `enter`, `f5`, `shift-space`, … |
-| `page.find [text]`, `page.find-next`, `page.find-previous`, `page.find-stop` | find text (at most 1024 bytes) in the page shown, wrapping around (case-sensitive only when the text has a capital letter), or with no text open the chrome's find field; move between the matches; end the search. A page whose engine can't find says so |
+| `page.find [text]`, `page.find-next`, `page.find-previous`, `page.find-stop` | find text (at most 1024 bytes) in the page shown, wrapping around (case-sensitive only when the text has a capital letter), or with no text open the chrome's [find field](#find-in-page); move between the matches; end the search. A page nothing can search says so |
 | `page.exit-fullscreen` | leave the fullscreen a page put one of its elements in (a video, a game) |
 | `location.focus [text]` | focus the address line with its text selected; with text, the line holds that text instead (`location.focus :` opens the command line) |
 | `history.clear` | forget the pages you visited |
@@ -461,7 +461,8 @@ address line or a page's text field, and the keys no row names pass to the page.
 | `q` | `browser.quit` |
 | `o`, `ctrl-o` | `location.focus` (the address line) |
 | `:` | `location.focus :`: the command line, where a command typed after `:` runs (`:tab.move left`, `:tab.duplicate`, `:tab.new <address>`) |
-| `/` | `page.find`: the find field |
+| `/` | `page.find`: the [find field](#find-in-page) |
+| `n`, `N` | `page.find-next`, `page.find-previous`: the next and previous match of the search |
 | `t`, `x`, `u` | `tab.new`, `tab.close`, `tab.reopen` |
 | `J`, `K` | `tab.next`, `tab.previous` |
 | `alt-1` to `alt-9` | `tab.select 1` to `9` |
@@ -511,6 +512,23 @@ it: the example takes no settings. To change the keys, copy
 [`sighurt-config-example`](extensions/sighurt-config-example/) (its bindings are one table in
 `table.rs`) and put your copy in `KEYMAPS`, as below.
 
+### Find in page
+
+`/` (or `page.find` with no text) opens the find field in the address line's place, with a `/`
+before it. It searches as you type, and beside it the chrome says what it found: `3 of 12`,
+`12 matches` where the engine doesn't say which is selected, `no matches`, or `not supported by
+servo`. Upper case anywhere in the text makes the search case-sensitive. `Enter` closes the field
+and gives the page the keyboard, keeping the search, so `n` and `N` move between its matches;
+`Escape` closes it and ends the search. Selecting another tab, or clicking the page, closes the
+field and keeps the search; a new page in the tab ends it. `:page.find <text>` searches without
+the field. While a search is under way, the standard chrome shows what it found before the
+engine button, and the line chrome before the status.
+
+The page's engine searches, where it can: Servo and the Wasm engine can't. In the terminal's text
+mode `sig` searches the page's text itself, with any engine that has page text: the find field
+is the bottom line, and the match found is highlighted and scrolled into view. Switching between
+text and graphics ends the search.
+
 ### Copy and paste
 
 Pages copy and paste with their own keys (Ctrl+C and Ctrl+V in the window: nothing binds them, so
@@ -525,7 +543,7 @@ the command line.
 The `standard` chrome is a tab strip, a toolbar with back, forward, reload and the address line,
 and a status strip; `[chrome.standard]` moves the tabs to a list on the left or hides them, shows
 the status over the page only while there is something to say, drops the buttons or makes it
-compact. The line chrome (feature `chrome-line`, `[ui] chrome = "line"`) is one line at the top or
+compact. The address line is also the command line (`:`) and the find field (`/`). The line chrome (feature `chrome-line`, `[ui] chrome = "line"`) is one line at the top or
 the bottom of the window: the tab's place (`[2/5]`), the keymap's mode, the address and the status;
 tabs are reached by keys and commands. Both name the engine a page runs in (`servo`, `wpe`,
 `wasm`, `cef`, `ladybird`, `netsurf`), small and muted: the standard chrome in each tab and at the address bar's right end, the

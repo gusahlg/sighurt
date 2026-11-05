@@ -19,7 +19,7 @@ use sighurt_api::input::{
 use sighurt_render::{Backend, RenderError, RenderOutcome};
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::layout::{Status, Tabs};
-use sighurt_ui::{Colors, LayoutOptions, Model, TabContent};
+use sighurt_ui::{Colors, FindSnapshot, LayoutOptions, Model, TabContent};
 use tiny_skia::{IntSize, Pixmap};
 
 fn key(key: Key, text: Option<&str>) -> KeyEvent {
@@ -118,6 +118,33 @@ fn golden_status() {
     assert!(chrome.state().command_error.is_some());
     golden("status-error-100", &paint(&mut chrome, STATUS, 120));
     golden("command-error-100", &paint(&mut chrome, CHROME, 120));
+}
+
+/// The find field: the `/` prompt, the search's text and what it found; once the field is
+/// closed, what it found before the engine button; and an engine that can't find.
+#[test]
+fn golden_find() {
+    let mut snapshot = labelled(three_tabs(), &["servo", "wasm", ""]);
+    let mut find = FindSnapshot {
+        text: "blåbär".into(),
+        found: Some(true),
+        current: Some(3),
+        total: Some(12),
+        supported: true,
+    };
+    snapshot.find = Some(find.clone());
+    let mut chrome = chrome(700, 600, snapshot.clone());
+    chrome.window_focus(FocusEvent::Activated);
+    chrome.set_focus(KeyboardFocus::Chrome);
+    chrome.find_field("blå");
+    type_text(&mut chrome, "blåbär");
+    golden("find-125", &paint(&mut chrome, CHROME, 150));
+    chrome.key(&key(Key::Named("Enter".into()), None));
+    golden("find-closed-100", &paint(&mut chrome, CHROME, 120));
+    find.supported = false;
+    snapshot.find = Some(find);
+    chrome.set_snapshot(snapshot);
+    golden("find-unsupported-100", &paint(&mut chrome, CHROME, 120));
 }
 
 /// sig://home and an error page, which the chrome draws in the page area.
