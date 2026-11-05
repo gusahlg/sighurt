@@ -714,3 +714,64 @@ fn a_late_or_repeated_false_changes_nothing() {
     assert_eq!(exits(&effects, view), 0);
     assert!(requests(&effects).is_empty());
 }
+
+/// The notices `effects` take back.
+fn withdrawn(effects: &[Effect]) -> Vec<&str> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::WithdrawNotice(message) => Some(message.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// "a.test is fullscreen" is no longer true once the page's fullscreen ended, however it ended:
+/// the notice is taken back, once, with the very text it was shown with.
+#[test]
+fn every_way_out_takes_the_notice_back() {
+    type Leave = fn(&mut Harness) -> Vec<Effect>;
+    let ways: [(&str, Leave); 10] = [
+        ("Escape", |h| h.key(escape(Modifiers::default()))),
+        ("exit command", |h| h.command("page.exit-fullscreen")),
+        ("tab change", |h| h.command("tab.select 2")),
+        ("new document", |h| {
+            h.command("page.open https://a.test/next")
+        }),
+        ("focus lost", |h| h.window_focus(FocusEvent::Deactivated)),
+        ("compositor", |h| h.apply(BrowserEvent::Fullscreen(false))),
+        ("the user's toggle", |h| h.command("browser.fullscreen")),
+        ("the engine", |h| h.page_says(false)),
+        ("view failed", |h| {
+            let view = h.shown();
+            h.engine(EngineEvent::ViewFailed {
+                view,
+                message: "crashed".into(),
+            })
+        }),
+        ("tab closed", |h| h.command("tab.close")),
+    ];
+    for (name, leave) in ways {
+        let mut h = Harness::window(&["https://a.test/", "https://b.test/"]);
+        let entered = h.enter_page_fullscreen();
+        assert_eq!(notices(&entered), [NOTICE], "{name}");
+        h.apply(BrowserEvent::Fullscreen(true));
+        assert_eq!(withdrawn(&leave(&mut h)), [NOTICE], "{name}");
+        // Once: nothing is left to take back.
+        assert!(withdrawn(&h.page_says(false)).is_empty(), "{name}");
+        assert!(
+            withdrawn(&h.command("page.exit-fullscreen")).is_empty(),
+            "{name}"
+        );
+    }
+}
+
+const NOTICE: &str = "a.test is fullscreen. Escape leaves it.";
+
+#[test]
+fn a_refused_fullscreen_shows_and_takes_back_nothing() {
+    let mut h = Harness::window(&["https://a.test/"]);
+    let effects = h.page_says(true);
+    assert!(notices(&effects).is_empty() && withdrawn(&effects).is_empty());
+    assert!(withdrawn(&h.page_says(false)).is_empty());
+}

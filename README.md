@@ -574,7 +574,8 @@ clicked or typed in it, once per click, while its tab is shown and the window ha
 otherwise it is told no. The window goes fullscreen with it, and a notice says so: `example.com
 is fullscreen. Escape leaves it.` `Escape` (`page.exit-fullscreen`) leaves it, and so does
 selecting another tab, a new page, the window losing the keyboard, or `f11`, which leaves the
-window's fullscreen too; the window returns to what you had chosen at once, whatever the page does.
+window's fullscreen too; the window returns to what you had chosen at once, whatever the page does,
+and the notice goes (a newer one stays).
 An unmodified `Escape` that the keymap lets through always leaves a page's fullscreen: no
 configuration removes that. Servo, WPE WebKit, CEF and the demo engine (`demo:fullscreen`) have
 element fullscreen; Ladybird, NetSurf and Wasm apps don't. In the terminal there is no window

@@ -2543,6 +2543,14 @@ impl Frontend for Tui {
         self.show_notice(message);
     }
 
+    fn withdraw_notice(&mut self, message: &str) {
+        if self.notice.as_deref() == Some(message) {
+            self.notice = None;
+            self.notice_first = None;
+            self.chrome_dirty = true;
+        }
+    }
+
     fn redraw(&mut self) {
         self.chrome_dirty = true;
     }

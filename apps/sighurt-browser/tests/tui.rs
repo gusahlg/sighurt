@@ -1968,8 +1968,10 @@ fn fullscreen_in_the_terminal_is_a_notice() {
     let report = term.report_until(|r| r.contains(&page(true)));
     assert!(report.contains(&page(true)), "{report}\n{}", term.context());
     term.type_bytes(b"\x1b");
-    let report = term.report_until(|r| r.contains(&page(false)));
-    assert!(report.contains(&page(false)), "{}", term.context());
+    // Left, the notice that said so is taken back: the bottom line says nothing.
+    let left = |r: &str| r.contains(&page(false)) && r.contains("\"status\":null");
+    let report = term.report_until(left);
+    assert!(left(&report), "{report}\n{}", term.context());
     let since = term.got.len();
     term.type_bytes(b":browser.fullscreen\r");
     let told = term.wait(since, Duration::from_secs(10), |got| {

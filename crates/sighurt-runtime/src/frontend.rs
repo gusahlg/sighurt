@@ -102,6 +102,12 @@ pub trait Frontend: Clipboard {
     /// Tell the user something. Not logged: a notice can hold page data.
     fn notice(&mut self, message: String);
 
+    /// Take back the notice `message` if it is still the one shown, wherever it shows; a newer
+    /// notice stays. A frontend that keeps no notice ignores it.
+    fn withdraw_notice(&mut self, message: &str) {
+        let _ = message;
+    }
+
     /// Ask for the window to be fullscreen, or not. What it becomes is reported to the core as
     /// `BrowserEvent::Fullscreen`, when the compositor says; nothing may assume the request
     /// succeeded. A frontend without a window ignores it (the core sends it only to the window).

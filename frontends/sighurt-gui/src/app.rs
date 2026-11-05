@@ -471,6 +471,14 @@ impl Frontend for Gui {
         self.show_notice(message);
     }
 
+    fn withdraw_notice(&mut self, message: &str) {
+        if self.notice.as_deref() == Some(message) {
+            self.notice = None;
+            self.notice_first = None;
+            self.snapshot_dirty = true;
+        }
+    }
+
     fn fullscreen(&mut self, on: bool) {
         // The compositor answers with a configure, which `WindowConfigured` reports.
         self.host.set_fullscreen(self.window, on);

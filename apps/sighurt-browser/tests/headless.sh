@@ -43,7 +43,8 @@
 #               f11 again; demo://fullscreen: a click puts its element in fullscreen, with a
 #               notice, and Escape (the example's) leaves it and the chrome returns;
 #               demo://fullscreen-unasked is refused; with `bindings` and Escape unbound, the
-#               core's own Escape leaves it; f11 during a page's fullscreen leaves both; the
+#               core's own Escape leaves it, and so does another tab; f11 during a page's
+#               fullscreen leaves both; after each way out its notice is gone; the
 #               compositor ending fullscreen (swaymsg) resets the toggle
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
@@ -789,6 +790,8 @@ CONF
   step "Escape (the example's page.exit-fullscreen) leaves it, and the mode stays"
   key -k Escape
   check "Escape leaves the page's fullscreen" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  sleep 1
+  check "the fullscreen notice is gone after Escape" "$(diag "0 if d['status']!='notice' else 1")" "$(diag "d['status']")"
   check "the chrome is back" "$(until_diag 5 "'chrome' in $chrome_up")" "$(diag "$chrome_up")"
   check "the keymap stays in normal mode" "$(diag "0 if d['keymap_indicator'] is None else 1")" "$(diag "d['keymap_indicator']")"
   check "the page is where it was" "$(diag "0 if $page_size==$windowed else 1")" "$(diag "$page_size")"
@@ -819,17 +822,32 @@ keymap = "bindings"
 [keys]
 "f11" = "browser.fullscreen"
 "ctrl-q" = "browser.quit"
+"alt-1" = "tab.select 1"
+"alt-2" = "tab.select 2"
 CONF
-  start_sig demo://fullscreen
+  start_sig demo://fullscreen demo://pattern
+  key -M alt 1 -m alt
   click 640 400
   check "the click's fullscreen is accepted" "$(until_diag 5 "($fs)==(False, True, True)")" "$(diag "$fs")"
   key -k Escape
   check "an unbound Escape leaves it" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  sleep 1
+  check "the fullscreen notice is gone after an unbound Escape" "$(diag "0 if d['status']!='notice' else 1")" "$(diag "d['status']")"
+  step "another tab ends a page's fullscreen"
+  click 640 400
+  check "fullscreen on a new click" "$(until_diag 5 "($fs)==(False, True, True)")" "$(diag "$fs")"
+  key -M alt 2 -m alt
+  check "another tab leaves it" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  sleep 1
+  check "the fullscreen notice is gone after another tab" "$(diag "0 if d['status']!='notice' else 1")" "$(diag "d['status']")"
+  key -M alt 1 -m alt
   step "f11 while a page is fullscreen leaves both"
   click 640 400
   check "fullscreen again on a new click" "$(until_diag 5 "($fs)==(False, True, True)")" "$(diag "$fs")"
   key -k F11
   check "f11 leaves the page's and the window's fullscreen" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  sleep 1
+  check "the fullscreen notice is gone after f11" "$(diag "0 if d['status']!='notice' else 1")" "$(diag "d['status']")"
   step "the compositor ending the window's fullscreen"
   key -k F11
   check "f11 makes the window fullscreen" "$(until_diag 5 "($fs)==(True, True, False)")" "$(diag "$fs")"

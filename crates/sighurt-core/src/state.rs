@@ -472,6 +472,9 @@ pub enum Effect {
         /// What to say.
         message: String,
     },
+    /// Take back the notice that said this, if it is still the one shown: what it said is no
+    /// longer true (a page's fullscreen ended). A newer notice stays.
+    WithdrawNotice(String),
     /// Ask for the window to be fullscreen, or not. The compositor decides: report what the
     /// window became as [`BrowserEvent::Fullscreen`], and assume nothing until then. Only the
     /// window gets it.

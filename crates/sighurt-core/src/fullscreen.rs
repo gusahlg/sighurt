@@ -32,8 +32,9 @@
 //! Escape, [`crate::state`]), another tab, a new document, the view closing or failing, the
 //! window losing the keyboard, the compositor ending the window's fullscreen, the user's
 //! `browser.fullscreen` (which leaves the window's fullscreen too), or the engine saying the
-//! element left. The engine is told `ExitFullscreen` unless it said so itself, and the window
-//! returns to what the user wants.
+//! element left. The engine is told `ExitFullscreen` unless it said so itself, the window
+//! returns to what the user wants, and the notice is taken back
+//! ([`Effect::WithdrawNotice`]): it is no longer true, though a newer notice stays.
 //!
 //! Must not own: windows or surfaces (the frontend's), what the chrome hides (the chrome's), or
 //! which key leaves fullscreen (the keymap's, but for the override in [`crate::state`]).
@@ -68,6 +69,8 @@ pub(crate) struct Fullscreen {
     requested: bool,
     /// Requests sent since the window last changed (saturating).
     unanswered: u8,
+    /// The notice that says a page is fullscreen, while one is.
+    notice: Option<String>,
 }
 
 impl BrowserState {
@@ -183,20 +186,25 @@ impl BrowserState {
             .filter(|url| matches!(url.scheme(), "http" | "https"))
             .and_then(|url| url.host_str().map(str::to_owned))
             .unwrap_or_else(|| "The page".into());
+        let message = clamp(format!("{who} is fullscreen. Escape leaves it."));
+        self.fullscreen.notice = Some(message.clone());
         fx.push(Effect::Notice {
             tab: Some(v.tab),
-            message: clamp(format!("{who} is fullscreen. Escape leaves it.")),
+            message,
         });
         fx.chrome = true;
     }
 
     /// Ends the page's fullscreen, if one holds it: the engine is told to leave unless it said
-    /// it did, or its view is closing or gone.
+    /// it did, or its view is closing or gone, and the notice that said so is taken back.
     pub(crate) fn end_page_fullscreen(&mut self, fx: &mut Fx) {
         let Some((view, _)) = self.fullscreen.state.page.take() else {
             return;
         };
         fx.chrome = true;
+        if let Some(message) = self.fullscreen.notice.take() {
+            fx.push(Effect::WithdrawNotice(message));
+        }
         if let Some(v) = self
             .views
             .get_mut(&view)
