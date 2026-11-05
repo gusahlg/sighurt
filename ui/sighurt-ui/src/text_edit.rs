@@ -570,6 +570,7 @@ mod tests {
             }),
             commit: Some("か".into()),
             preedit: None,
+            paste: false,
         });
         assert_eq!(editor.text(), "sökか");
         assert_eq!(editor.display().preedit, None);

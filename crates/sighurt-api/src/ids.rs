@@ -17,6 +17,8 @@
 //! - [`DocumentGeneration`], whenever a view commits a new document.
 //! - [`RequestId`], for each service request and each navigation request its view makes, and
 //!   for each site-data request the core makes.
+//!
+//! The executable allocates [`PtySession`]s.
 
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +75,10 @@ ids! {
     RequestId;
     /// An input seat: a group of input devices the compositor treats as one user's.
     SeatId;
+    /// A terminal an internal page started (`sighurt_api::services::PageRequest::PtyOpen`), from
+    /// its program's start until it ends. The executable allocates it; the engine receives the
+    /// terminal's master side by it, once.
+    PtySession;
 }
 
 /// The next serial from `last`, which holds the last one handed out. At the end of the range
