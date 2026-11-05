@@ -134,25 +134,35 @@ redraws the whole pane, so the blank the frontend used to write before every fra
 rows black until the next image had arrived. Only a new layout, or rows that held text, are
 blanked first (spaces, in a synchronized update that ends before the image). A tab switch
 writes the shown tab's frame over the hidden tab's image when that time comes (kitty deletes
-the hidden one's id in the same write); a tab with no frame for this layout gets the blank then,
-and its frame when it comes. So a hidden tab's picture can stay under the shown tab's title for
-up to 250 ms. tmux keeps the sixels written over each other (at most 20 in the server, the
-oldest freed without a redraw) and sends them all again, oldest first, when it redraws the pane
-(a window switched back to, a refresh, a resize): 25–27 sixels a redraw on the animation page.
-So inside tmux (`TERM` starting with `tmux` or `screen`), once a page has gone 400 ms without a
-new sixel and more than one is stacked, its picture is written again after the blank in one
-write: tmux frees the stack, marks the pane for a redraw, holds that sixel back from the outer
-terminal while the redraw is pending (`screen_write_set_client_cb`) and draws the lines and the
-one image in that redraw. A still page then costs one sixel a redraw. A page that keeps changing
-is not capped: a blank every few frames would blink each time, and spaces over a sixel Rio
-shows are what loses Rio its device. In the private sway Rio died within 3 to 12 tmux window
+the hidden one's id in the same write). A view with no frame for this layout yet (a new
+document's view, another engine's, a tab not shown before) leaves the old picture in place until
+its first frame comes and goes over it, as a browser keeps the old page until the new one
+paints; the rows are blanked only when they must say something instead (an error, a `sig:`
+page, a new tab's first load). So while a picture is placed and the layout stays, nothing is
+written on the page rows: typing, scrolling, reloads, a navigation in the tab, the address line
+and the find field (the bottom row), notices, tab switches. The pty test
+`nothing_is_written_on_the_page_rows_under_a_picture` checks sig's bytes for that, inside tmux
+and not, and real-terminals.sh's `still` check checks tmux's output (through `sixel-tap.py`)
+during the same steps: no cell and no erase on the page rows. Only a resize, a text/graphics
+mode switch, `chrome.refresh` or a resume (SIGCONT) clear the screen, and a page with no picture
+to show gets the blank.
+
+tmux keeps the sixels written over each other (at most 20 in the server, the oldest freed
+without a redraw) and sends them all again, oldest first, when it redraws the pane (a window
+switched back to, a refresh): 19 sixels, about 230 KB, within 300 ms of the switch on a still
+page after activity (Rio's CPU renderer). That replay is the price of never blanking: tmux
+frees a stored sixel only when text is written over it, which is a visible redraw. An earlier
+version wrote a still page's picture again after a blank 400 ms after its last frame, to leave
+tmux one image; on the user's display that showed as a blink after every burst of typing or
+scrolling, and it was taken out. In the private sway Rio died within 3 to 12 tmux window
 switches whatever sig had stacked (25–27, 8 or 1), and with one still sixel that `cat` wrote and
-no sig at all: Rio 0.5.28 under tmux does not live through pane redraws with a sixel shown, and
-nothing the frontend sends avoids that. Rio alone, with `[tui] graphics = "sixel"` forced,
-still shows an empty page for a frame now and then when a sixel replaces the one under it
-(4–11 of 200 screenshots in about 4 s; with the old blank before every frame Rio lost its
-device instead); a synchronized update around the image made Rio lose its device too. Rio
-alone picks kitty graphics, which show no such frames.
+no sig at all: Rio 0.5.28's Vulkan renderer does not live through pane redraws with a sixel
+shown, and nothing the frontend sends avoids that; its CPU renderer (`[renderer] use-cpu =
+true`) does. Rio itself sometimes shows a frame of nothing when a sixel replaces the one under
+it (no cell written on those rows by sig or tmux: a race inside Rio): 2 of 630 screenshots
+during the `still` steps under tmux, 2–11 of 200 on the animation with Rio alone and sixel
+forced; Rio alone picks kitty graphics, which show no such frames. A synchronized update around
+the image made Rio lose its device.
 
 ## 3. The semantic interface (`sighurt_api::semantic`)
 

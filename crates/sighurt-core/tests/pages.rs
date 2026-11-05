@@ -730,7 +730,7 @@ fn the_commands_table_is_checked_when_it_loads() {
     ] {
         assert!(problems(bad).contains(why), "{bad}: {}", problems(bad));
     }
-    let nine = vec!["\"page.reload\""; 9].join(", ");
+    let nine = ["\"page.reload\""; 9].join(", ");
     assert!(problems(&format!("x = [{nine}]")).contains("list of 1 to 8"));
     let many: String = (0..65)
         .map(|i| format!("c{i} = \"page.reload\"\n"))

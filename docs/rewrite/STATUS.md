@@ -4262,8 +4262,8 @@ Newest last. Each entry says what was decided and why.
     unbound, f11 during a page's fullscreen, the compositor ending it), the terminal's test,
     and a direct test in each engine's suite (Servo `the_page_goes_fullscreen`, WPE
     `goes_fullscreen` including a crash while fullscreen, CEF offscreen section 6).
-133. **Terminal images: sixel over sixel, every image paced, a hidden tab's image held, and a
-    quiet page re-sent alone inside tmux** (5 November 2026, branch `tuifix`; the user: "this
+133. **Terminal images: sixel over sixel and never a blank under a picture, every image paced,
+    a hidden tab's image held** (5 November 2026, branch `tuifix`; the user: "this
     bug with the TUI version that makes the entire sixel ui flicker black once every half
     second or so", only under tmux, and "the browser has a tendency to crash when I switch
     tabs quickly"). *The flicker*: since decision 121 the terminal wrote spaces over the page
@@ -4284,25 +4284,37 @@ Newest last. Each entry says what was decided and why.
     included, and a hidden tab's image is deleted or written over only once the last image
     has been up for its interval and at least 250 ms (`MIN_IMAGE_LIFE`), the shown tab's
     frame going over it in the same write when it has one; so another tab's picture can stay
-    under the shown tab's title for up to 250 ms. *Inside tmux* (`TERM` starting with tmux or
-    screen) tmux keeps every sixel written over another, at most 20 in the server, and sends
-    them all again, oldest first, when it redraws the pane (25–27 a window switch on an
-    animation); so once a page has been quiet for 400 ms with more than one stacked, sig
-    writes the blank and its picture again in one write, tmux keeps that one, and a still
-    page costs one sixel a redraw. A changing page is not capped: a blank every few frames
-    blinks, and in Rio spaces over a shown sixel are what loses Rio its device (a cap of 8
-    killed Rio during the plain animation check). *Measured* (private headless sway
+    under the shown tab's title for up to 250 ms. *Inside tmux* a placed page picture is never blanked while the layout stays (the user,
+    after trying a first version that re-sent a quiet page's picture after a blank, 400 ms
+    after its last frame: "when anything gets updated it flickers still … make it so that
+    it never flickers"; that rewrite showed on their display as a blink after every burst of
+    typing, scrolling or reloading, and is gone). Each sixel goes over the one before; a view
+    with no frame yet (a navigation that makes a new view, an engine switch, a tab not shown
+    before) keeps the old picture until its first frame replaces it, and the rows are blanked
+    only when they must say something (an error, a `sig:` page, a new tab's first load). tmux
+    keeps every sixel written over another, at most 20 in the server, and replays them,
+    oldest first, when it redraws the pane: 19 sixels, about 230 KB, within 300 ms of a
+    window switch. That replay is the accepted price, because tmux frees a stored sixel only
+    when text is written over it, and that is a visible redraw. A cap on the stack was tried
+    and dropped (a blank every few frames blinks, and in Rio spaces over a shown sixel are
+    what loses Rio its device: a cap of 8 killed Rio during the plain animation check).
+    Proof at the byte level: the pty test `nothing_is_written_on_the_page_rows_under_a_picture`
+    (sig's own bytes, with TERM as tmux and as xterm, through typing into the page, reloads,
+    the address line, the find field, a tab switch and back, a notice, a navigation) and
+    real-terminals.sh `still` (tmux's output to Rio through `sixel-tap.py`: 0 writes on the
+    page rows, against 145 for the version with the rewrite). What can still blank is by
+    design (a resize, a text/graphics switch, `chrome.refresh`, a page with no picture) or
+    Rio's (it sometimes renders a frame of nothing when a sixel replaces a sixel: 2 of 630
+    screenshots on its Vulkan renderer with no write from sig or tmux, 0 of 637 on its CPU
+    renderer). *Measured* (private headless sway
     1280×800, Rio 0.5.28 on Vulkan on this desktop's NVIDIA GPU, tmux 3.8;
     `frontends/sighurt-tui/tests/real-terminals.sh`, scenarios `rio-tmux-sixel`, `rio-sixel`,
     `rio-kitty`, a tap on tmux's output counting the sixels it sends): flicker under tmux on
     the animation page, flashed screenshots of 200: 23 before, 0 after; a still page: 0
-    bytes, 0 sixels, 0 flashes of 100; the quiet re-send: no screenshot of 100 in 2 s caught
-    it (under 20 ms); a tab storm (30 a second for 25 s): Rio died before in all three
-    setups, survived after under tmux, alone with sixel and alone with kitty; a tmux redraw of
-    a still page: 1 sixel. Three pty tests fail against the code before
+    bytes, 0 sixels, 0 flashes of 100; a tab storm (30 a second for 25 s): Rio died before in all three
+    setups, survived after under tmux, alone with sixel and alone with kitty. Three pty tests fail against the code before
     (`sixel_frames_go_over_each_other…`, `a_sixel_frame_that_is_the_picture_on_the_rows_is_not_written`,
-    `a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced`), two more
-    cover tmux. **Known and outside sig**: Rio 0.5.28 under tmux loses its device on tmux
+    `a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced`). **Known and outside sig**: Rio 0.5.28 under tmux loses its device on tmux
     pane redraws (window switches, a resize) with any sixel shown: it died within 3 to 12
     switches whatever sig had stacked, and with one still sixel written by `cat` and no sig
     running. sig cannot prevent that; it should go to Rio's maintainers. *Workaround, measured*:
@@ -4346,5 +4358,39 @@ Newest last. Each entry says what was decided and why.
     `graphics_mode_gives_a_focused_field_keys_and_pastes_only_in_insert` and the text-mode
     test, headless.sh `example`, the workspace tests; `coexist.sh` and engines.sh `showcase`
     were changed to enter INSERT before typing and are run in the release verification
-    (decision 135). *Not stopped*: a middle-click paste of the primary selection is a mouse
+    (the 0.11.0 release decision). *Not stopped*: a middle-click paste of the primary selection is a mouse
     action and still reaches the page in NORMAL.
+
+135. **A third optimization and reliability pass** (5 November 2026, branch `opt3`; the user:
+    "Continue optimizing and improving reliability a bit more"). *The terminal's SIGHUP* only
+    sets a flag and wakes the loop, which quits as for SIGTERM: the session and the history
+    are written and the terminal is restored on the normal path. A hung-up tty fails writes
+    with EIO, so nothing waits on it. This closes decision 127's open item; `tui.rs` tests it
+    with a SIGHUP and with the pty as sig's controlling terminal closing, and both tests fail
+    against the old handler (which restored the terminal in the handler and re-raised). The
+    exit status of a closed terminal is 0 or 1 by which sig sees first, the signal or the
+    failed read; never a death by signal. *Temporary files*: the history's `.tmp` of a dead
+    writer was already removed by the lock's owner; now tested, and faults.sh checks that a
+    live owner's temporaries are left alone. *Seeded tests* (decision 126's harness): the core
+    driven with engine answers in random orders (a page is fullscreen only in the shown view's
+    current document with the window focused; nothing is sent to a view after `CloseView`;
+    `ExitFullscreen` only to engines that have fullscreen), the history file and store, the
+    new commands, and the example keymap's modes (`-p sighurt-config-example` joins the fuzz
+    line). They found one fault: control characters in find text reached the engines, and WPE
+    WebKit refuses a NUL, which marked the view as unable to find for its whole life. Control
+    characters are now spaces before the text is trimmed. soak.sh covers find, the tab
+    commands, fullscreen and history with `remember` flipped: 207/207 in 10 minutes (RSS
+    100.9–101.7 MiB from the second cycle, 25 fds, 24 threads); faults.sh 100/100. *Measured*
+    (bench/HYPOTHESES.md H-START2; release, startup.sh, 10 interleaved runs, this desktop,
+    headless sway): the history file is read on its own thread and handed over a channel, not
+    before the first frame. With 5 000 visits, exec to the first chrome surface went from 35.4
+    to 20.0 ms and to the page's first frame from 35.8 to 20.9 ms; without a history nothing
+    moved. Completion answers nothing until the file is in, then both frontends ask again.
+    *Left alone, measured*: completion over 5 000 visits (at most 157 µs a keystroke), the
+    owner loop's per-pass work for find, history and fullscreen, ghost-text shaping. *Test
+    harness*: `tui.rs`'s `wait` checks its condition once more when time runs out (a paced
+    tab-storm test failed one run in three without it), and the session writer's
+    failed-write test no longer races a queued save. *Open*: inside nix-shell, exec to `main`
+    takes about 15 ms because the loader searches `LD_LIBRARY_PATH` for the Wasm engine's
+    FFmpeg and its 105 libraries; loading FFmpeg when a guest first uses media would remove
+    most of it.

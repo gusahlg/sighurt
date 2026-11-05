@@ -585,8 +585,8 @@ impl<F: Frontend> Session<F> {
         }
     }
 
-    /// Performs what an internal page asked for, which the core allowed, and answers it. Facts are [`crate::page_info`]'s; the configuration's file is
-    /// [`crate::page_config`]'s, whose new configuration is taken into use at once; terminals
+    /// Performs what an internal page asked for, which the core allowed, and answers it. Facts
+    /// are [`crate::page_info`]'s; the configuration's file is [`crate::page_config`]'s, whose new configuration is taken into use at once; terminals
     /// are [`crate::pty`]'s.
     fn page_service(&mut self, request: RequestId, page: PageRequest) -> ServiceResult {
         match page {
@@ -626,9 +626,10 @@ impl<F: Frontend> Session<F> {
         }
     }
 
-    /// Takes what service threads and the session and history writers reported. A status
-    /// line, a write that failed, or what the history has to say becomes a notice; a forget the
-    /// history wrote goes to the core; a terminal's program that ended tells the core so.
+    /// Takes what service threads and the session and history writers reported, and the
+    /// history file once it has been read. A status line, a write that failed, or what the
+    /// history has to say becomes a notice; a forget the history wrote goes to the core; a
+    /// terminal's program that ended tells the core so.
     /// Returns whether there was anything.
     pub fn service_completions(&mut self, frontend: &mut F) -> bool {
         let completions = self.services().completions(MAX_COMPLETIONS);
@@ -656,6 +657,8 @@ impl<F: Frontend> Session<F> {
         let Some(history) = self.history.as_mut() else {
             return worked;
         };
+        // The file read at startup is in: completions can be asked again.
+        worked |= history.poll();
         let notices = history.take_notices();
         let (forgotten, failure) = history.take_reports();
         for notice in notices.into_iter().chain(failure) {
@@ -1745,9 +1748,11 @@ mod tests {
         );
         assert_eq!(session.complete("exa"), Vec::new(), "none after shutdown");
 
-        // The next sig completes from it, and forgets it in the file at once.
+        // The next sig completes from it, once the file is read, and forgets it in the file at
+        // once.
         let mut session = idle_session(dir.path(), "", &[]);
         session.run_core(&mut frontend);
+        session.history.as_mut().unwrap().settle();
         assert_eq!(session.complete("www.e").len(), 1);
         let generation = session.history_generation();
         session.queue_mut().push_back(BrowserEvent::Command(

@@ -156,6 +156,8 @@ top; status and notices below) and the page between them in one of two modes:
   WezTerm), or as sixel, at most 5 a second, where the terminal has sixel but not kitty
   graphics: inside tmux 3.4 or later, foot, xterm with sixel. A page a tab switch shows counts
   against that rate too, so holding the tab-switch key never floods the terminal with images.
+  Each frame goes over the one before, and a new page's first frame over the old page, so the
+  page is not blanked while you type, scroll, reload or follow a link.
 - **Text**: the page's content reflowed into terminal lines, with links and controls you can
   move to and activate. It works in any terminal, and is the mode `auto` picks where the
   terminal can't show images. It needs an engine with the `semantics` capability: Servo, WPE

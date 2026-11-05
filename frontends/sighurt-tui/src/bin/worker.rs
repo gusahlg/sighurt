@@ -73,9 +73,13 @@ fn worker_hangup() -> io::Result<()> {
     let mut terminal = Terminal::enter(stdout_fd()?)?;
     terminal.install_handlers()?;
     terminal.write_frame(b"READY")?;
-    loop {
-        thread::sleep(Duration::from_secs(30));
+    // As the owner loop does: the flag, then a normal restore and exit.
+    while !terminal.take_hangup() {
+        thread::sleep(Duration::from_millis(20));
     }
+    terminal.write_frame(b"HUP")?;
+    terminal.restore()?;
+    Ok(())
 }
 
 fn worker_force_exit() -> io::Result<()> {

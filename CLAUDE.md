@@ -174,7 +174,7 @@ apps/sighurt-browser/tests/engines.sh OUT
 # snapshot, the terminal's input, the chrome's contained text and readable URLs, the sixel and
 # kitty encoders and the grid, download names, the external-link denylist, the Wasm network
 # policy. N = 2000 cases by default; a failure prints the seed and case to replay.
-tools/cargo test -p sighurt-api -p sighurt-core -p sighurt-runtime -p sighurt-semantic -p sighurt-ui -p sighurt-tui -p sighurt-engine-wasm -- fuzz
+tools/cargo test -p sighurt-api -p sighurt-core -p sighurt-runtime -p sighurt-semantic -p sighurt-ui -p sighurt-tui -p sighurt-engine-wasm -p sighurt-config-example -- fuzz
 SIG_FUZZ_ITERATIONS=100000 tools/cargo test -p sighurt-core -- fuzz     # more cases
 SIG_FUZZ_SEED=<seed> SIG_FUZZ_CASE=<case> tools/cargo test -p <crate> -- <test>   # replay one
 

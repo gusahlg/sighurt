@@ -761,7 +761,7 @@ impl View {
         use sighurt_api::geometry::SurfaceRect;
         use sighurt_api::input::{TextInputState, TextPurpose};
         let edits = self.page.internal.as_ref().is_some_and(|i| i.page.edits());
-        let state = edits.then(|| TextInputState {
+        let state = edits.then_some(TextInputState {
             caret: SurfaceRect {
                 x: 0,
                 y: 0,

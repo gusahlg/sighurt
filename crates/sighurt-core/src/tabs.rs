@@ -55,7 +55,7 @@ pub struct ClosedTab {
 pub struct Find {
     /// Identifies the search in its results; a result for another is stale.
     pub(crate) search: RequestId,
-    /// What it looks for, as the user gave it (trimmed, at most
+    /// What it looks for, as the user gave it (control characters made spaces, trimmed, at most
     /// [`MAX_FIND`](sighurt_api::commands::MAX_FIND) bytes).
     pub text: String,
     /// Whether case matters: the text has an upper-case letter in it (smart case).

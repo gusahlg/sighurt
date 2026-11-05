@@ -18,8 +18,9 @@
 #               status 1 and a message, at once)
 #   lock        the session lock held by a live process: this sig restores the tabs, says it
 #               won't save them, and never writes the file, nor the history file beside it
-#               (history.clear forgets in this sig only, and says so); a lock file a dead sig left (and its
-#               temporary file): taken over, the temporary removed, the session saved
+#               (history.clear forgets in this sig only, and says so) and leaves the owner's
+#               temporary files alone; a lock file a dead sig left (and its temporary files): taken
+#               over, the session's and the history's temporaries removed, the session saved
 #   writes      file writes failing (ulimit -f, EFBIG): the session save and a download fail, sig
 #               keeps running, says so in the status line, and the previous session file stays
 #               whole; and its log on stderr failing too (a file that can't grow, a closed pipe)
@@ -216,9 +217,13 @@ lock)
   step "the lock held by a live process"
   flock "$d/state/sighurt/session.lock" sleep 300 &
   holder=$!
+  # What the live owner may be writing at this moment: its temporary files are its own.
+  echo 'version = 1' > "$d/state/sighurt/session.toml.$holder.tmp"
+  echo 'version = 1' > "$d/state/sighurt/history.toml.$holder.tmp"
   sleep 0.3
   start_sig "$d"
   verdict "a held lock: the saved tabs are restored" "$(dg "len(d['tabs'])==2, len(d['tabs'])")"
+  check "the owner's temporary files are left alone" "$([[ -e $d/state/sighurt/session.toml.$holder.tmp && -e $d/state/sighurt/history.toml.$holder.tmp ]]; echo $?)" "$(ls "$d/state/sighurt" | tr '\n' ' ')"
   verdict "and sig says it won't save them" "$(dg "d['status']=='notice', d['status']")"
   key -M ctrl t -m ctrl
   sleep 1.5
@@ -240,10 +245,12 @@ lock)
   # temporary file of a pid that no longer runs.
   echo 999999 > "$d/state/sighurt/session.lock"
   echo 'version = 1' > "$d/state/sighurt/session.toml.999999.tmp"
-  step "a lock and a temporary file a dead sig left"
+  echo 'version = 1' > "$d/state/sighurt/history.toml.999999.tmp"
+  step "a lock and temporary files a dead sig left"
   start_sig "$d"
   verdict "a stale lock: the tabs are restored, no notice" "$(dg "len(d['tabs'])==2 and d['status']!='notice', (len(d['tabs']), d['status'])")"
-  check "the temporary file is removed" "$([[ ! -e $d/state/sighurt/session.toml.999999.tmp ]]; echo $?)" "$(ls "$d/state/sighurt" | tr '\n' ' ')"
+  check "the session's temporary file is removed" "$([[ ! -e $d/state/sighurt/session.toml.999999.tmp ]]; echo $?)" "$(ls "$d/state/sighurt" | tr '\n' ' ')"
+  check "and the history's" "$([[ ! -e $d/state/sighurt/history.toml.999999.tmp ]]; echo $?)" "$(ls "$d/state/sighurt" | tr '\n' ' ')"
   key -M ctrl t -m ctrl
   quit; code=$status
   check "it quits cleanly" "$([[ $code == 0 ]]; echo $?)" "exit status $code"
