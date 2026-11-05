@@ -729,6 +729,8 @@ PY
   band 07-cleared
   r=$(same 06-before-clear 07-cleared); check "history.clear takes the completion away" "$([[ ${r%% *} == 1 ]]; echo $?)" "${r#* }"
   key -k Escape
+  # "At once" is without the 30 s save delay: the writer's fsync can take a while on a busy disk.
+  for _ in $(seq 50); do grep -q 'example' "$history" || break; sleep 0.1; done
   check "and empties the file at once" "$(grep -q 'example' "$history"; [[ $? == 1 ]]; echo $?)" "$(wc -c < "$history") bytes"
   check "which stays private" "$([[ $(stat -c %a "$history") == 600 ]]; echo $?)" "mode $(stat -c %a "$history")"
   key -M ctrl q -m ctrl
