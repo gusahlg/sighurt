@@ -300,8 +300,25 @@ impl Host {
         Self::in_dir(policy, dir)
     }
 
+    /// A host with these internal pages (`sig://<name>`).
+    pub fn with_pages(pages: Vec<sighurt_engine_wasm::pages::InternalPage>) -> Self {
+        Self::build(
+            SandboxPolicy::default(),
+            tempfile::tempdir().unwrap(),
+            pages,
+        )
+    }
+
     /// A host whose key-value store lives in `dir`.
     pub fn in_dir(policy: SandboxPolicy, dir: tempfile::TempDir) -> Self {
+        Self::build(policy, dir, Vec::new())
+    }
+
+    fn build(
+        policy: SandboxPolicy,
+        dir: tempfile::TempDir,
+        pages: Vec<sighurt_engine_wasm::pages::InternalPage>,
+    ) -> Self {
         let woken = Arc::new((Mutex::new(false), Condvar::new()));
         let wakes = Arc::new(AtomicUsize::new(0));
         let (notify, count) = (woken.clone(), wakes.clone());
@@ -314,7 +331,7 @@ impl Host {
             policy,
             kv_root: dir.path().join("kv"),
             aot_cache: None,
-            pages: Vec::new(),
+            pages,
         };
         Self {
             runtime: WasmRuntime::new(config, waker.clone()).unwrap(),

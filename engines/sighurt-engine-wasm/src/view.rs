@@ -644,8 +644,12 @@ impl View {
             self.invalidate(out);
         }
         if let Some(message) = error {
-            // The guest ended with the step.
+            // The guest ended with the step, and an internal document's requests and terminals
+            // with it: no answer will come to release them.
             self.live = None;
+            if let Some(internal) = &self.page.internal {
+                internal.revoke();
+            }
             out.push(EngineEvent::ViewFailed {
                 view: self.id,
                 message,
