@@ -7,7 +7,10 @@
 //! `{state_dir}/sighurt`) are mode 0700. An existing directory that is wider is tightened to
 //! 0700; a profile is created only by an engine that keeps one; shared XDG parents are not
 //! changed. Files this module writes, including
-//! `session.toml` and `history.toml`, are mode 0600.
+//! `session.toml` and `history.toml`, are mode 0600. The configuration file, which only
+//! `sig://config` writes ([`crate::page_config`]), has a writer of its own
+//! ([`replace_config`]): it keeps the file's mode and changes nothing about its directory,
+//! which may be the target of a symbolic link (a dotfiles repository).
 //!
 //! The core parses and validates the configuration, against what the build has (its engines,
 //! keymaps and chromes, and the chrome's color names: `sighurt_core::Environment`). A file with
@@ -426,6 +429,34 @@ pub fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Replaces the file `target` (not a symbolic link: the caller resolves one) with `text`,
+/// atomically, for `sig://config`: a temporary file created exclusively under an unpredictable
+/// name beside it (`.<name>.<random>.tmp`), mode `mode` (of 0o777), written and synced, renamed
+/// over `target`, and the directory synced. Nothing about the directory changes, its mode
+/// included; it must exist. A failure leaves `target` as it was and removes the temporary file.
+pub(crate) fn replace_config(target: &Path, text: &str, mode: u32) -> io::Result<()> {
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(io::Error::other("no directory"));
+    };
+    let mode = mode & 0o777;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{}.", name.to_string_lossy()))
+        .suffix(".tmp")
+        .permissions(fs::Permissions::from_mode(0o600))
+        .tempfile_in(dir)?;
+    let file = temporary.as_file_mut();
+    // The umask may have narrowed it; the target's own mode is what it gets.
+    let mut permissions = file.metadata()?.permissions();
+    if (permissions.mode() & 0o777) != mode {
+        permissions.set_mode(mode);
+        file.set_permissions(permissions)?;
+    }
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    temporary.persist(target).map_err(|error| error.error)?;
+    fs::File::open(dir)?.sync_all()
 }
 
 /// The writer of the session at `path` (none without a path), and the notice for the user when
