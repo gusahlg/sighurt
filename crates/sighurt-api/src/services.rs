@@ -26,7 +26,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::ids::{DocumentGeneration, RequestId, ViewId};
 
@@ -251,32 +251,63 @@ pub enum PageGrant {
 /// The master side of a pseudo-terminal a [`PageRequest::PtyOpen`] started, shared by whoever
 /// holds the answer. Two handles are equal when they share one descriptor. The browser keeps no
 /// other copy, so when the last handle is dropped the kernel hangs the terminal up.
+///
+/// It also carries how the program ended ([`PtyHandle::exit`]), which whoever reaps the program
+/// records without holding the master.
 #[derive(Clone)]
-pub struct PtyHandle(Arc<OwnedFd>);
+pub struct PtyHandle {
+    master: Arc<OwnedFd>,
+    exit: PtyExit,
+}
 
 impl PtyHandle {
     /// A handle owning `master`.
     pub fn new(master: OwnedFd) -> Self {
-        Self(Arc::new(master))
+        Self {
+            master: Arc::new(master),
+            exit: PtyExit::default(),
+        }
+    }
+
+    /// Where the program's exit is recorded: a copy shares it without keeping the master open.
+    pub fn exit(&self) -> PtyExit {
+        self.exit.clone()
+    }
+}
+
+/// How the program of a [`PtyHandle`] ended, once it has: its exit code, or 128 plus the signal
+/// that ended it, as shells report it. Shared by every copy.
+#[derive(Clone, Debug, Default)]
+pub struct PtyExit(Arc<OnceLock<i32>>);
+
+impl PtyExit {
+    /// Records the program's exit; only the first record counts.
+    pub fn set(&self, code: i32) {
+        let _ = self.0.set(code);
+    }
+
+    /// The program's exit, if it has ended and been reaped.
+    pub fn get(&self) -> Option<i32> {
+        self.0.get().copied()
     }
 }
 
 impl AsFd for PtyHandle {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        self.master.as_fd()
     }
 }
 
 impl fmt::Debug for PtyHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use std::os::fd::AsRawFd;
-        write!(f, "PtyHandle({})", self.0.as_raw_fd())
+        write!(f, "PtyHandle({})", self.master.as_raw_fd())
     }
 }
 
 impl PartialEq for PtyHandle {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.master, &other.master)
     }
 }
 
@@ -284,7 +315,7 @@ impl Eq for PtyHandle {}
 
 impl Hash for PtyHandle {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state);
+        Arc::as_ptr(&self.master).hash(state);
     }
 }
 
