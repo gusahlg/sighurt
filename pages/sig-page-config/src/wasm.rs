@@ -1,9 +1,11 @@
 //! The guest's entry points: input from the engine into the page, and the page drawn with the
 //! canvas API, only when something changed (the canvas keeps what was drawn).
 //!
-//! Input is polled from the SDK each frame (keys, typed text, the pointer, the wheel), which
-//! loses the order within a frame and tells no paste from typing; Ctrl+V pastes what the page
-//! itself copied. The `sig` module's ordered input queue replaces this when it exists.
+//! In `sig`, the browser is the privileged `sig` module ([`KitHost`]) and keys, typed text and
+//! pastes come in order from its input queue. Built with `fake-host`, the page runs as an
+//! ordinary guest over a file in memory, and keys and text are polled from the SDK, which loses
+//! their order within a frame and tells no paste from typing (Ctrl+V pastes what the page
+//! itself copied). The pointer and the wheel are polled either way.
 //!
 //! Must not own: editing or the page's logic, which are tested on the host.
 
@@ -11,8 +13,13 @@ use std::cell::RefCell;
 
 use sighurt_sdk::*;
 
-use crate::editor::{Input, Key, Mods};
-use crate::host::FakeHost;
+#[cfg(feature = "fake-host")]
+use crate::editor::Key;
+use crate::editor::{Input, Mods};
+#[cfg(feature = "fake-host")]
+use crate::host::FakeHost as PageHost;
+#[cfg(not(feature = "fake-host"))]
+use crate::host::{Host, Poll, Request};
 use crate::layout::{Measure, Widths};
 use crate::page::{Page, RowKind, Validity, PANEL_ROWS};
 use crate::syntax::{self, Style};
@@ -31,7 +38,7 @@ const MONOSPACE: &[&str] = &[
 ];
 
 const HINT: &str = "With the example keymap, press Escape for INSERT mode to type here. Ctrl+S \
-                    saves. Every setting is described at sig://help/config.";
+                    or Save saves. Every setting is described at sig://help/config.";
 
 type Rgb = (u8, u8, u8);
 const BG: Rgb = (29, 31, 36);
@@ -66,9 +73,53 @@ impl Measure for HostMeasure {
     }
 }
 
+/// The browser through the privileged `sig` module. A request is held until its answer is
+/// taken (dropping it cancels it, so the browser forgets it).
+#[cfg(not(feature = "fake-host"))]
+#[derive(Default)]
+struct PageHost {
+    held: Vec<sig_page_kit::sig::Request>,
+}
+
+#[cfg(not(feature = "fake-host"))]
+impl Host for PageHost {
+    fn request(&mut self, request: Request) -> Result<u32, String> {
+        use sig_page_kit::sig::Request as Sig;
+        let sent = match request {
+            Request::ConfigRead => Sig::config_read(),
+            Request::ConfigCheck { text } => Sig::config_check(&text),
+            Request::ConfigWrite { text, replaces } => Sig::config_write(&text, &replaces),
+            Request::ClipboardWrite { text } => Sig::clipboard_copy(&text),
+        };
+        let sent = sent.ok_or("the browser refused the request")?;
+        let id = sent.id();
+        self.held.push(sent);
+        Ok(id)
+    }
+
+    fn poll(&mut self, id: u32) -> Poll {
+        use sig_page_kit::sig::Poll as Sig;
+        let Some(at) = self.held.iter().position(|r| r.id() == id) else {
+            return Poll::Done(Err("no such request".into()));
+        };
+        let answer = match self.held[at].poll() {
+            Sig::Waiting => return Poll::Pending,
+            Sig::Done(text) => Ok(text),
+            Sig::Failed(why) => Err(why),
+            Sig::Gone => Err("the browser forgot the request".into()),
+        };
+        self.held.remove(at);
+        Poll::Done(answer)
+    }
+
+    fn cancel(&mut self, id: u32) {
+        self.held.retain(|r| r.id() != id);
+    }
+}
+
 struct App {
     page: Page,
-    host: FakeHost,
+    host: PageHost,
     mono: &'static str,
     size: (u32, u32),
     pointer: (f32, f32),
@@ -81,7 +132,8 @@ thread_local! {
 
 #[no_mangle]
 pub extern "C" fn start_app() {
-    log("sig://config: running over an in-memory file (no sig module yet)");
+    #[cfg(feature = "fake-host")]
+    log("sig://config: an ordinary guest over a file in memory (built with fake-host)");
 }
 
 #[no_mangle]
@@ -112,7 +164,7 @@ impl App {
         let size = crate::page::Sizes::default().font;
         let mono = monospace(size);
         let mut page = Page::new(Widths::new(Box::new(HostMeasure { family: mono, size })));
-        let mut host = FakeHost::default();
+        let mut host = PageHost::default();
         page.start(&mut host);
         Self {
             page,
@@ -140,7 +192,7 @@ impl App {
         }
     }
 
-    /// This frame's input, polled.
+    /// This frame's input: the pointer and the wheel polled, then the keys.
     fn inputs(&mut self) -> Vec<Input> {
         let mut out = Vec::new();
         let bits = modifiers();
@@ -169,6 +221,31 @@ impl App {
             // The SDK's delta is positive scrolling up or left.
             out.push(Input::Wheel { dx: -sx, dy: -sy });
         }
+        self.keys(mods, &mut out);
+        out
+    }
+
+    /// Keys, text and pastes from the `sig` input queue, in order.
+    #[cfg(not(feature = "fake-host"))]
+    fn keys(&mut self, _mods: Mods, out: &mut Vec<Input>) {
+        while let Some(record) = sig_page_kit::sig::input_next() {
+            let kind = match record.kind {
+                sig_page_kit::sig::InputKind::Press => crate::record::PRESS,
+                sig_page_kit::sig::InputKind::Repeat => crate::record::REPEAT,
+                sig_page_kit::sig::InputKind::Paste => crate::record::PASTE,
+            };
+            out.extend(crate::record::input(
+                kind,
+                record.modifiers,
+                &record.key,
+                &record.text,
+            ));
+        }
+    }
+
+    /// Keys and text polled from the SDK.
+    #[cfg(feature = "fake-host")]
+    fn keys(&mut self, mods: Mods, out: &mut Vec<Input>) {
         for &(code, key) in KEYS {
             if key_pressed(code) {
                 out.push(Input::Key(key, mods));
@@ -191,10 +268,10 @@ impl App {
                 out.push(Input::Text(text));
             }
         }
-        out
     }
 }
 
+#[cfg(feature = "fake-host")]
 const KEYS: &[(u32, Key)] = &[
     (KEY_ENTER, Key::Enter),
     (KEY_ESCAPE, Key::Escape),
@@ -261,19 +338,12 @@ fn draw(page: &mut Page, mono: &str) {
         TEXT_ALIGN_LEFT,
         HINT,
     );
-    if let Some(b) = l.reload {
+    for (b, label) in [(l.save, "Save"), (l.reload, "Read the file again")] {
+        let Some(b) = b else { continue };
         canvas_rounded_rect(b.x, b.y, b.w, b.h, 4.0, 70, 90, 140, 255);
         let y = b.y + (b.h - s.ui_line) / 2.0;
-        text(
-            b.x + b.w / 2.0,
-            y,
-            s.ui_font,
-            TEXT,
-            "",
-            600,
-            TEXT_ALIGN_CENTER,
-            "Read the file again",
-        );
+        let x = b.x + b.w / 2.0;
+        text(x, y, s.ui_font, TEXT, "", 600, TEXT_ALIGN_CENTER, label);
     }
 
     let t = l.text;
@@ -326,12 +396,10 @@ fn draw_text(page: &mut Page, mono: &str) {
     let widths = &mut page.widths;
     let buf = page.editor.buffer();
     let space = widths.space();
-    for row in 0..rows {
-        let n = top + row;
-        if n >= buf.line_count() {
-            break;
-        }
-        let line = buf.line(n);
+    let shown = top..(top + rows).min(buf.line_count());
+    // The gutter and the line backgrounds, then the text under one clip: the rasterizer paints
+    // a clip as a layer its size, and a layer per line would use up its budget for a frame.
+    for (row, n) in shown.clone().enumerate() {
         let y = t.y + row as f32 * s.line;
         if n == caret.line {
             rect(0.0, y, g.w + t.w + s.pad, s.line, LINE_BG);
@@ -351,9 +419,12 @@ fn draw_text(page: &mut Page, mono: &str) {
             TEXT_ALIGN_RIGHT,
             &number,
         );
-
-        canvas_save();
-        canvas_clip(t.x, t.y, t.w, t.h);
+    }
+    canvas_save();
+    canvas_clip(t.x, t.y, t.w, t.h);
+    for (row, n) in shown.enumerate() {
+        let line = buf.line(n);
+        let y = t.y + row as f32 * s.line;
         if let Some((start, end)) = selection.filter(|(a, b)| a.line <= n && n <= b.line) {
             let x0 = if n == start.line {
                 widths.x_of(line, start.col)
@@ -399,8 +470,8 @@ fn draw_text(page: &mut Page, mono: &str) {
             let cx = widths.x_of(line, caret.col);
             rect(t.x + cx - scroll_x, y + 1.0, 2.0, s.line - 2.0, CARET);
         }
-        canvas_restore();
     }
+    canvas_restore();
 }
 
 fn draw_status(page: &mut Page) {

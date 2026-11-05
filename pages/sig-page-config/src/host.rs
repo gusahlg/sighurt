@@ -8,6 +8,8 @@
 //!
 //! Must not own: what the answers mean (`reply`, the page).
 
+use crate::reply::Read;
+
 /// A request to the browser.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -81,31 +83,33 @@ const DEMO: &str = "# A configuration in memory: this page runs as an ordinary g
                     font-size = 14\n\n[keywords]\nw = \"https://en.wikipedia.org/wiki/{}\"\n";
 
 impl FakeHost {
+    /// The answer to `request`, as the browser gives it: refusals are failures.
     fn answer(&mut self, request: &Request) -> Result<String, String> {
-        Ok(match request {
-            Request::ConfigRead => match &self.file {
-                Some(text) if self.read_only => format!("read-only {}\n{text}", self.path),
-                Some(text) => format!("file {}\n{text}", self.path),
-                None => format!("new {}\nversion = 1\n", self.path),
-            },
-            Request::ConfigCheck { text } => rough_check(text),
+        let path = &self.path;
+        match request {
+            Request::ConfigRead => Ok(match &self.file {
+                Some(text) if self.read_only => format!("read-only {path}\ntarget {path}\n{text}"),
+                Some(text) => format!("file {path}\ntarget {path}\n{text}"),
+                None => format!("new {path}\ntarget {path}\nversion = 1\n"),
+            }),
+            Request::ConfigCheck { text } => Ok(rough_check(text)),
             Request::ConfigWrite { text, replaces } => {
-                if self.file.as_deref().unwrap_or("") != replaces {
-                    "stale\nThe file changed since this page read it.".into()
+                if *replaces != Read::replaces(path, self.file.as_deref()) {
+                    Err("stale\nThe file changed since this page read it.".into())
                 } else if self.read_only {
-                    "refused\nThe file is read-only.".into()
+                    Err("refused\nThe file is read-only.".into())
                 } else if rough_check(text).starts_with("invalid") {
-                    rough_check(text)
+                    Err(rough_check(text))
                 } else {
                     self.file = Some(text.clone());
-                    "saved\n".into()
+                    Ok("saved\n".into())
                 }
             }
             Request::ClipboardWrite { text } => {
                 self.clipboard = text.clone();
-                String::new()
+                Ok(String::new())
             }
-        })
+        }
     }
 }
 

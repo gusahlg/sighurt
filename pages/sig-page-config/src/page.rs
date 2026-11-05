@@ -66,6 +66,8 @@ pub struct Layout {
     pub header: Rect,
     /// The "Read the file again" button, when a save was refused as stale.
     pub reload: Option<Rect>,
+    /// The Save button, when the file can be saved.
+    pub save: Option<Rect>,
     pub gutter: Rect,
     pub text: Rect,
     pub status: Rect,
@@ -113,13 +115,18 @@ pub struct Page {
     pub sizes: Sizes,
     state: State,
     pub path: String,
-    /// What the file held when the page last read or wrote it: what a save replaces.
-    disk: String,
+    /// The file a save replaces: where the configuration's links lead.
+    pub target: String,
+    /// What the file held when the page last read or wrote it (`None`: there was none): what
+    /// a save replaces.
+    disk: Option<String>,
     /// The editor's revision that `disk` holds.
     saved: u64,
     pub read_only: bool,
     /// A read in flight, and whether it replaces the text (a read again) or starts the page.
     read: Option<u32>,
+    /// A copy to the clipboard in flight.
+    copy: Option<u32>,
     /// A save in flight: its id, and the text and revision sent.
     save: Option<(u32, String, u64)>,
     /// A check in flight and the revision it is about; when the next is due.
@@ -153,10 +160,12 @@ impl Page {
             sizes: Sizes::default(),
             state: State::Loading,
             path: String::new(),
-            disk: String::new(),
+            target: String::new(),
+            disk: None,
             saved: 0,
             read_only: false,
             read: None,
+            copy: None,
             save: None,
             check: None,
             check_due: None,
@@ -283,15 +292,17 @@ impl Page {
             w,
             h: s.pad * 1.5 + s.ui_line * 2.0,
         };
-        let reload = self.stale.then(|| {
-            let bw = 170.0_f32.min(w / 3.0);
-            Rect {
-                x: w - bw - s.pad,
-                y: s.pad * 0.5,
-                w: bw,
-                h: s.ui_line * 1.5,
-            }
-        });
+        // Buttons at the header's right: Save, and Read the file again after a stale save.
+        let button = |right: f32, width: f32| Rect {
+            x: right - width,
+            y: s.pad * 0.5,
+            w: width,
+            h: s.ui_line * 1.5,
+        };
+        let save =
+            (self.ready() && !self.read_only).then(|| button(w - s.pad, 70.0_f32.min(w / 4.0)));
+        let left = save.map_or(w - s.pad, |b| b.x - s.pad * 0.5);
+        let reload = self.stale.then(|| button(left, 170.0_f32.min(w / 3.0)));
         let rows = self.rows().len().min(PANEL_ROWS);
         let panel_h = if rows == 0 {
             0.0
@@ -333,6 +344,7 @@ impl Page {
         self.layout = Layout {
             header,
             reload,
+            save,
             gutter,
             text,
             status,
@@ -372,8 +384,12 @@ impl Page {
         let action = self.editor.input(input, &mut self.widths);
         match action {
             Some(Action::Copy(text)) => {
-                if let Err(why) = host.request(Request::ClipboardWrite { text }) {
-                    self.say(format!("Nothing was copied: {why}"), true);
+                if let Some(old) = self.copy.take() {
+                    host.cancel(old);
+                }
+                match host.request(Request::ClipboardWrite { text }) {
+                    Ok(id) => self.copy = Some(id),
+                    Err(why) => self.say(format!("Nothing was copied: {why}"), true),
                 }
             }
             Some(Action::Save) => self.save_now(host),
@@ -390,9 +406,14 @@ impl Page {
         self.dirty = true;
     }
 
-    /// A press outside the text: the reload button or a row of the panel. Whether it is
-    /// the text's.
+    /// A press outside the text: a button or a row of the panel. Whether it is the text's.
     fn press(&mut self, x: f32, y: f32, host: &mut dyn Host) -> bool {
+        if let Some(button) = self.layout.save {
+            if button.contains(x, y) {
+                self.save_now(host);
+                return false;
+            }
+        }
         if let Some(button) = self.layout.reload {
             if button.contains(x, y) {
                 self.read_again(host);
@@ -429,7 +450,7 @@ impl Page {
         let text = self.editor.text();
         let request = Request::ConfigWrite {
             text: text.clone(),
-            replaces: self.disk.clone(),
+            replaces: reply::Read::replaces(&self.target, self.disk.as_deref()),
         };
         if let Some(id) = self.send(host, request) {
             self.save = Some((id, text, self.editor.revision()));
@@ -461,6 +482,14 @@ impl Page {
 
     /// Takes the answers that came and sends the check that is due, at time `now`.
     pub fn tick(&mut self, host: &mut dyn Host, now: u64) {
+        if let Some(id) = self.copy {
+            if let Poll::Done(answer) = host.poll(id) {
+                self.copy = None;
+                if let Err(why) = answer {
+                    self.say(format!("Nothing was copied: {why}"), true);
+                }
+            }
+        }
         if let Some(id) = self.read {
             if let Poll::Done(answer) = host.poll(id) {
                 self.read = None;
@@ -508,16 +537,18 @@ impl Page {
     fn read_done(&mut self, answer: Result<String, String>, now: u64) {
         let answer = match answer {
             Ok(answer) => reply::read(&answer),
+            Err(why) if why.starts_with("refused\n") => reply::read(&why),
             Err(why) => reply::Read::Refused(format!("sig could not read the file: {why}")),
         };
         let first = !self.ready();
-        let (path, text, disk, read_only) = match answer {
+        let (path, target, text, disk, read_only) = match answer {
             reply::Read::File {
                 path,
+                target,
                 text,
                 read_only,
-            } => (path, text.clone(), text, read_only),
-            reply::Read::New { path, text } => (path, text, String::new(), false),
+            } => (path, target, text.clone(), Some(text), read_only),
+            reply::Read::New { path, target, text } => (path, target, text, None, false),
             reply::Read::Refused(why) => {
                 if first {
                     self.state = State::Unavailable(why);
@@ -536,6 +567,7 @@ impl Page {
             return;
         }
         self.path = path;
+        self.target = target;
         self.disk = disk;
         self.read_only = read_only;
         self.saved = self.editor.revision();
@@ -564,13 +596,21 @@ impl Page {
     fn save_done(&mut self, answer: Result<String, String>, text: String, revision: u64) {
         let answer = match answer {
             Ok(answer) => reply::write(&answer),
-            Err(why) => reply::Write::Refused(format!("sig could not save the file: {why}")),
+            // The browser's refusals say why in the answer's own form.
+            Err(why)
+                if ["stale\n", "invalid\n", "refused\n"]
+                    .iter()
+                    .any(|head| why.starts_with(head)) =>
+            {
+                reply::write(&why)
+            }
+            Err(why) => reply::Write::Refused(format!("sig refused the save: {why}")),
         };
         self.restart.clear();
         self.reloaded.clear();
         match answer {
             reply::Write::Saved { restart, notices } => {
-                self.disk = text;
+                self.disk = Some(text);
                 self.saved = revision;
                 self.stale = false;
                 self.restart = restart;
@@ -736,6 +776,19 @@ mod tests {
     }
 
     #[test]
+    fn the_save_button_saves() {
+        let mut host = fake(Some("version = 1\n"));
+        let mut p = page(&mut host);
+        key(&mut p, &mut host, Key::End, Mods::CTRL, 0);
+        type_text(&mut p, &mut host, "# x", 0);
+        let button = p.layout.save.expect("the button shows");
+        p.click(button.x + 1.0, button.y + 1.0, &mut host, 1);
+        p.tick(&mut host, 2);
+        assert_eq!(host.file.as_deref(), Some("version = 1\n# x"));
+        assert!(!p.modified());
+    }
+
+    #[test]
     fn a_missing_file_starts_from_the_starter_and_saves_over_nothing() {
         let mut host = fake(None);
         let mut p = page(&mut host);
@@ -749,7 +802,7 @@ mod tests {
             .iter()
             .find(|r| matches!(r, Request::ConfigWrite { .. }));
         assert!(
-            matches!(write, Some(Request::ConfigWrite { replaces, .. }) if replaces.is_empty())
+            matches!(write, Some(Request::ConfigWrite { replaces, .. }) if replaces.starts_with("missing "))
         );
     }
 

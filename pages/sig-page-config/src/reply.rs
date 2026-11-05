@@ -16,15 +16,28 @@ pub enum Read {
     /// The file and its text. `read_only`: saves will be refused.
     File {
         path: String,
+        target: String,
         text: String,
         read_only: bool,
     },
-    /// There is no file: the text to start from, over an empty file.
+    /// There is no file: the text to start from.
     New {
         path: String,
+        target: String,
         text: String,
     },
     Refused(String),
+}
+
+impl Read {
+    /// What a save over this read sends as `replaces`: the file it read, and what it held or
+    /// that there was none.
+    pub fn replaces(target: &str, contents: Option<&str>) -> String {
+        match contents {
+            Some(text) => format!("file {target}\n{text}"),
+            None => format!("missing {target}\n"),
+        }
+    }
 }
 
 /// The answer to a check.
@@ -55,22 +68,32 @@ fn head(answer: &str) -> (&str, &str) {
 }
 
 pub fn read(answer: &str) -> Read {
-    let (first, text) = head(answer);
+    let (first, rest) = head(answer);
     let (state, path) = first.split_once(' ').unwrap_or((first, ""));
-    let (path, text) = (path.to_owned(), text.to_owned());
+    if state == "refused" {
+        return Read::Refused(rest.to_owned());
+    }
+    let (second, text) = head(rest);
+    let Some(target) = second.strip_prefix("target ") else {
+        return Read::Refused(format!(
+            "sig answered what this page doesn't read: {second:?}"
+        ));
+    };
+    let (path, target, text) = (path.to_owned(), target.to_owned(), text.to_owned());
     match state {
         "file" => Read::File {
             path,
+            target,
             text,
             read_only: false,
         },
         "read-only" => Read::File {
             path,
+            target,
             text,
             read_only: true,
         },
-        "new" => Read::New { path, text },
-        "refused" => Read::Refused(text),
+        "new" => Read::New { path, target, text },
         _ => Read::Refused(format!(
             "sig answered what this page doesn't read: {first:?}"
         )),
@@ -126,29 +149,37 @@ mod tests {
     #[test]
     fn answers_as_the_runtime_writes_them() {
         assert_eq!(
-            read("file /h/.config/sighurt/config.toml\nversion = 1\n"),
+            read("file /h/.config/sighurt/config.toml\ntarget /d/sig.toml\nversion = 1\n"),
             Read::File {
                 path: "/h/.config/sighurt/config.toml".into(),
+                target: "/d/sig.toml".into(),
                 text: "version = 1\n".into(),
                 read_only: false
             }
         );
         assert!(matches!(
-            read("read-only /p\nx"),
+            read("read-only /p\ntarget /p\nx"),
             Read::File {
                 read_only: true,
                 ..
             }
         ));
         assert_eq!(
-            read("new /a b\n# x\nversion = 1\n"),
+            read("new /a b\ntarget /a b\n# x\nversion = 1\n"),
             Read::New {
                 path: "/a b".into(),
+                target: "/a b".into(),
                 text: "# x\nversion = 1\n".into()
             }
         );
         assert_eq!(read("refused\nno"), Read::Refused("no".into()));
         assert!(matches!(read("what"), Read::Refused(_)));
+        assert!(
+            matches!(read("file /p\nversion = 1\n"), Read::Refused(_)),
+            "no target"
+        );
+        assert_eq!(Read::replaces("/t", Some("")), "file /t\n");
+        assert_eq!(Read::replaces("/t", None), "missing /t\n");
         assert_eq!(check("valid\n"), Check::Valid(vec![]));
         assert_eq!(
             check("invalid\nproblem 4 [ui] renderer: no\nproblem 0 the file needs it\n"),

@@ -12,9 +12,16 @@ publish = false
 # cdylib for the page itself; rlib so the editor's logic is tested on the host.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Runs the page as an ordinary guest over a file in memory, with polled input, instead of
+# through the privileged `sig` module, which only `sig://config` gets: for trying the page
+# with `sig page.wasm` or the Wasm engine's tests.
+fake-host = []
+
 [dependencies]
 # Caret movement by grapheme cluster. Already in Cargo.lock (cosmic-text's).
 unicode-segmentation = "1.12"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 sighurt-sdk = { path = "../../sdk/sighurt-sdk" }
+sig-page-kit = { path = "../sig-page-kit" }
