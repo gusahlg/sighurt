@@ -20,18 +20,22 @@ pub enum Where {
 /// A mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Keys are commands; unbound keys reach the page.
+    /// Keys are commands; no key and no text reaches the page.
     Normal,
-    /// Every key reaches whatever has the keyboard, except Escape.
+    /// Every key and all text reach the page; only Escape is the keymap's.
     Insert,
 }
 
-/// Where in the window a binding applies: `Page` while the page has the keyboard; `Always` in
-/// the page and, if its first key types nothing, in the address line too.
+/// Where in the window a binding applies: `Page` while the page has the keyboard; `NoField`
+/// while the page has it and none of its text fields does; `Always` in the page and, if its
+/// first key types nothing, in the address line and the find field too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     /// Only while the page has the keyboard.
     Page,
+    /// Only while the page has the keyboard and no text field of it does: a key the binding
+    /// sends would type or submit there (Space, Enter), so in a field NORMAL takes it instead.
+    NoField,
     /// Also while the address line has it.
     Always,
 }
@@ -76,10 +80,11 @@ const fn bind(keys: &'static str, action: Action, scope: Scope, frontend: Where)
 }
 
 use Action::{Custom, ExitFullscreenOr, Run};
-use Scope::{Always, Page};
+use Scope::{Always, NoField, Page};
 use Where::{Both, Terminal};
 
-/// NORMAL: the terminal's keys of 0.9.0 for both frontends, plus two actions of its own.
+/// NORMAL: the terminal's keys of 0.9.0 for both frontends, the page's own navigation keys,
+/// plus three actions of its own. No other key reaches the page.
 pub const NORMAL: &[Binding] = &[
     bind("q", Run("browser.quit"), Page, Both),
     bind("o", Run("location.focus"), Page, Both),
@@ -109,6 +114,25 @@ pub const NORMAL: &[Binding] = &[
     bind("+", Run("page.zoom-in"), Page, Both),
     bind("-", Run("page.zoom-out"), Page, Both),
     bind("=", Run("page.zoom-reset"), Page, Both),
+    // The page's own keys for scrolling, moving between links and following one, sent to it.
+    bind("down", Run("page.send-key down"), Page, Both),
+    bind("up", Run("page.send-key up"), Page, Both),
+    bind("left", Run("page.send-key left"), Page, Both),
+    bind("right", Run("page.send-key right"), Page, Both),
+    bind("pagedown", Run("page.send-key pagedown"), Page, Both),
+    bind("pageup", Run("page.send-key pageup"), Page, Both),
+    bind("home", Run("page.send-key home"), Page, Both),
+    bind("end", Run("page.send-key end"), Page, Both),
+    bind("tab", Run("page.send-key tab"), Page, Both),
+    bind("shift-tab", Run("page.send-key shift-tab"), Page, Both),
+    bind("space", Run("page.send-key space"), NoField, Both),
+    bind(
+        "shift-space",
+        Run("page.send-key shift-space"),
+        NoField,
+        Both,
+    ),
+    bind("enter", Run("page.send-key enter"), NoField, Both),
     bind("alt-1", Run("tab.select 1"), Always, Both),
     bind("alt-2", Run("tab.select 2"), Always, Both),
     bind("alt-3", Run("tab.select 3"), Always, Both),
@@ -118,7 +142,7 @@ pub const NORMAL: &[Binding] = &[
     bind("alt-7", Run("tab.select 7"), Always, Both),
     bind("alt-8", Run("tab.select 8"), Always, Both),
     bind("alt-9", Run("tab.select 9"), Always, Both),
-    // Terminal only: its chrome's commands, and Ctrl+C as the way out of a page field.
+    // Terminal only: its chrome's commands, and Ctrl+C, a terminal's usual way out.
     bind("ctrl-c", Run("browser.quit"), Page, Terminal),
     bind("m", Run("chrome.toggle-mode"), Page, Terminal),
     bind("ctrl-l", Run("chrome.refresh"), Always, Terminal),
@@ -130,5 +154,5 @@ pub const NORMAL: &[Binding] = &[
     bind("c o", Custom(close_other_tabs), Page, Both),
 ];
 
-/// INSERT: only Escape; every other key passes.
+/// INSERT: only Escape; every other key reaches the page.
 pub const INSERT: &[Binding] = &[bind("escape", ExitFullscreenOr(Mode::Normal), Page, Both)];

@@ -23,7 +23,7 @@
 #   disconnect  the compositor going away: sig saves the session and exits with 1
 #   example     the default keymap, the example configuration: t opens a tab, Escape switches
 #               to insert mode (the indicator reads INSERT MODE, keys pass to the page), Escape
-#               again and x closes a tab; a command line opened with ":" (where letters type),
+#               again and x closes a tab, and normal mode gives the page no key (z, Backspace); a command line opened with ":" (where letters type),
 #               a chrome command the chrome lacks, the mouse's side buttons over the chrome
 #               and the page; :tab.new with an address, :tab.move left, u (tab.reopen) after
 #               x; find in page (:page.find, n, N, the find field opened with /, Enter and
@@ -458,6 +458,9 @@ CONF
   key hej
   key -k Escape
   check "the indicator is gone in normal mode" "$(diag "0 if $indicator is None else 1")" "$(diag "$indicator")"
+  step "z and Backspace in normal mode: taken, and the page gets neither (the title check at the end)"
+  key z
+  key -k BackSpace
   step "alt-2: the second tab; : opens the command line with a colon in it; t, bound in normal mode, types there"
   key -M alt 2 -m alt
   check "alt-2 shows the second tab" "$(diag "0 if d['active_tab']==2 else 1")" "$(tabs_now)"
@@ -553,7 +556,7 @@ CONF
   wait "$sig_pid"; code=$?
   check "q exits cleanly" "$code" "exit code $code"
   session=$out/state/sighurt/session.toml
-  check "only what insert mode passed (t, hej) reached the page" \
+  check "only what insert mode passed (t, hej) reached the page; normal mode's z and Backspace did not" \
     "$(grep -q 'title = "Demo: resize · thej"$' "$session"; echo $?)" "$(grep -o 'title = .*' "$session" | tr '\n' ' ')"
   entries=$(grep -o 'entries = .*' "$session" | tr '\n' ' ')
   check "the session saves the reopened, moved tab first" \

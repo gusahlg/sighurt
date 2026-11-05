@@ -144,6 +144,32 @@ fn escape() -> KeyEvent {
     named("Escape", 1)
 }
 
+fn shifted(key: KeyEvent) -> KeyEvent {
+    KeyEvent {
+        modifiers: SHIFT,
+        ..key
+    }
+}
+
+/// The keys NORMAL sends the page, with the key each sends.
+fn navigation() -> [(KeyEvent, &'static str); 13] {
+    [
+        (named("ArrowDown", 108), "page.send-key down"),
+        (named("ArrowUp", 103), "page.send-key up"),
+        (named("ArrowLeft", 105), "page.send-key left"),
+        (named("ArrowRight", 106), "page.send-key right"),
+        (named("PageDown", 109), "page.send-key pagedown"),
+        (named("PageUp", 104), "page.send-key pageup"),
+        (named("Home", 102), "page.send-key home"),
+        (named("End", 107), "page.send-key end"),
+        (named("Tab", 15), "page.send-key tab"),
+        (shifted(named("Tab", 15)), "page.send-key shift-tab"),
+        (named("Enter", 28), "page.send-key enter"),
+        (typed(' '), "page.send-key space"),
+        (with(' ', SHIFT), "page.send-key shift-space"),
+    ]
+}
+
 fn example() -> Box<dyn Keymap> {
     let mut keymap = (KIND.new)();
     keymap.configure(&Table::new());
@@ -220,13 +246,40 @@ fn escape_toggles_insert_and_the_indicator() {
     assert_eq!(keymap.indicator(), None);
     assert_eq!(keymap.press(&escape(), PAGE, &b), KeyAction::Take);
     assert_eq!(keymap.indicator(), Some("INSERT MODE"));
-    // Insert passes everything else, bound in normal or not, modifiers included.
-    for key in [typed('j'), typed('q'), ctrl('o'), with('1', ALT), ctrl('c')] {
-        assert_eq!(keymap.press(&key, PAGE, &b), KeyAction::Pass);
+    // Insert passes every other key, bound in normal or not, the chords that apply everywhere
+    // in normal included, in both frontends, in a field or not.
+    let term = Fake::new(Frontend::Terminal);
+    let insert = [
+        typed('j'),
+        typed('q'),
+        typed('Z'),
+        typed(' '),
+        ctrl('o'),
+        ctrl('r'),
+        with('1', ALT),
+        with('9', ALT),
+        ctrl('c'),
+        ctrl('l'),
+        named("F11", 87),
+        named("Backspace", 14),
+        named("Shift", 42),
+        shifted(escape()),
+    ];
+    for frontend in [&b, &term] {
+        for context in [PAGE, FIELD] {
+            for key in insert.iter().chain(navigation().iter().map(|(key, _)| key)) {
+                assert_eq!(
+                    keymap.press(key, context, frontend),
+                    KeyAction::Pass,
+                    "{key:?}"
+                );
+            }
+        }
     }
     assert_eq!(keymap.press(&typed('y'), PAGE, &b), KeyAction::Pass);
     assert_eq!(keymap.press(&typed('y'), PAGE, &b), KeyAction::Pass);
-    assert_eq!(keymap.press(&escape(), PAGE, &b), KeyAction::Take);
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+    assert_eq!(keymap.press(&escape(), FIELD, &b), KeyAction::Take);
     assert_eq!(keymap.indicator(), None);
     assert_eq!(
         keymap.press(&typed('j'), PAGE, &b),
@@ -260,20 +313,109 @@ fn escape_leaves_a_pages_fullscreen_first() {
 }
 
 #[test]
-fn normal_keeps_typing_keys_for_a_field() {
+fn only_insert_gives_the_page_text() {
     let b = Fake::new(Frontend::Gui);
     let mut keymap = example();
-    for c in "jkqtxyJ:".chars() {
-        assert_eq!(keymap.press(&typed(c), FIELD, &b), KeyAction::Pass, "{c}");
+    assert!(!keymap.page_takes_text(), "NORMAL to start with");
+    keymap.press(&escape(), PAGE, &b);
+    assert!(keymap.page_takes_text());
+    // In the line, the mode stays, and so does what the page takes.
+    keymap.press(&escape(), CHROME, &b);
+    assert!(keymap.page_takes_text());
+    keymap.press(&escape(), FIELD, &b);
+    assert!(!keymap.page_takes_text());
+    // A page's fullscreen left with Escape keeps the mode, and what the page takes.
+    let mut full = Fake::new(Frontend::Gui);
+    full.fullscreen = true;
+    keymap.press(&escape(), PAGE, &full);
+    assert!(!keymap.page_takes_text());
+}
+
+#[test]
+fn normal_runs_commands_in_a_field_and_passes_nothing() {
+    let b = Fake::new(Frontend::Gui);
+    let mut keymap = example();
+    // A text field has the keyboard: the bindings fire as they do without one.
+    for (c, command) in [
+        ('j', "page.send-key down"),
+        ('k', "page.send-key up"),
+        ('q', "browser.quit"),
+        ('t', "tab.new"),
+        ('x', "tab.close"),
+        ('J', "tab.next"),
+        (':', "location.focus :"),
+        ('/', "page.find"),
+    ] {
+        assert_eq!(keymap.press(&typed(c), FIELD, &b), run(command), "{c}");
     }
-    // Keys that don't type still fire: Ctrl+O, Alt+1, and Escape leaving for insert mode.
     assert_eq!(keymap.press(&ctrl('o'), FIELD, &b), run("location.focus"));
     assert_eq!(
         keymap.press(&with('1', ALT), FIELD, &b),
         run("tab.select 1")
     );
+    // Whatever would type or edit is taken, in a field or not: unbound letters, digits and
+    // punctuation, Backspace and Delete, chords no binding has, modifiers and dead keys.
+    let dead = KeyEvent {
+        key: Key::Dead(Some('¨')),
+        ..named("Dead", 27)
+    };
+    for context in [PAGE, FIELD] {
+        for key in [
+            typed('z'),
+            typed('Z'),
+            typed('5'),
+            typed(','),
+            typed('ä'),
+            named("Backspace", 14),
+            named("Delete", 111),
+            named("Insert", 110),
+            ctrl('v'),
+            ctrl('a'),
+            named("Shift", 42),
+            named("Control", 29),
+            dead.clone(),
+        ] {
+            assert_eq!(keymap.press(&key, context, &b), KeyAction::Take, "{key:?}");
+        }
+    }
+    // Space and Enter would type or submit in a field: taken there, sent to the page outside.
+    for key in [typed(' '), with(' ', SHIFT), named("Enter", 28)] {
+        assert_eq!(keymap.press(&key, FIELD, &b), KeyAction::Take, "{key:?}");
+        assert!(matches!(keymap.press(&key, PAGE, &b), KeyAction::Run(_)));
+    }
+    // Escape still leaves for insert mode.
+    assert_eq!(keymap.indicator(), None);
     assert_eq!(keymap.press(&escape(), FIELD, &b), KeyAction::Take);
     assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+}
+
+#[test]
+fn normal_sends_the_page_its_navigation_keys() {
+    for b in [Fake::new(Frontend::Gui), Fake::new(Frontend::Terminal)] {
+        let mut keymap = example();
+        for (key, command) in navigation() {
+            assert_eq!(keymap.press(&key, PAGE, &b), run(command), "{key:?}");
+            // Held, it repeats.
+            assert_eq!(keymap.press(&repeat(&key), PAGE, &b), run(command));
+        }
+        // The arrows, the page keys and Tab move the caret or the focus in a field: they are
+        // sent there too.
+        for (key, command) in navigation().into_iter().take(10) {
+            assert_eq!(keymap.press(&key, FIELD, &b), run(command), "{key:?}");
+        }
+        // With a modifier no binding names, a navigation key is taken.
+        assert_eq!(
+            keymap.press(&with_named("ArrowDown", 108, CTRL), PAGE, &b),
+            KeyAction::Take
+        );
+    }
+}
+
+fn with_named(name: &str, code: u32, modifiers: Modifiers) -> KeyEvent {
+    KeyEvent {
+        modifiers,
+        ..named(name, code)
+    }
 }
 
 #[test]
@@ -295,9 +437,46 @@ fn in_the_line_only_always_applies() {
         run("tab.select 3")
     );
     assert_eq!(keymap.press(&ctrl('l'), CHROME, &b), run("chrome.refresh"));
-    // Page-scope keys that don't type, too: Ctrl+C is the line's (it copies).
+    // Page-scope keys that don't type, too: Ctrl+C is the line's (it copies), and so are the
+    // keys NORMAL sends the page.
     assert_eq!(keymap.press(&ctrl('c'), CHROME, &b), KeyAction::Pass);
+    for (key, _) in navigation() {
+        assert_eq!(keymap.press(&key, CHROME, &b), KeyAction::Pass, "{key:?}");
+    }
+    // Modifiers and unbound keys are the line's too.
+    assert_eq!(
+        keymap.press(&named("Shift", 42), CHROME, &b),
+        KeyAction::Pass
+    );
+    assert_eq!(keymap.press(&ctrl('v'), CHROME, &b), KeyAction::Pass);
     assert_eq!(keymap.indicator(), None, "the mode is unchanged");
+}
+
+#[test]
+fn in_the_line_insert_is_normal() {
+    let b = Fake::new(Frontend::Terminal);
+    let mut keymap = example();
+    keymap.press(&escape(), PAGE, &b);
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+    // The modes are the page's: the line keeps NORMAL's few bindings, and Escape is its own.
+    for c in "jqtx:rJ ".chars() {
+        assert_eq!(keymap.press(&typed(c), CHROME, &b), KeyAction::Pass, "{c}");
+    }
+    assert_eq!(keymap.press(&escape(), CHROME, &b), KeyAction::Pass);
+    assert_eq!(keymap.press(&ctrl('o'), CHROME, &b), run("location.focus"));
+    assert_eq!(keymap.press(&ctrl('r'), CHROME, &b), run("page.reload"));
+    assert_eq!(keymap.press(&ctrl('l'), CHROME, &b), run("chrome.refresh"));
+    assert_eq!(
+        keymap.press(&with('3', ALT), CHROME, &b),
+        run("tab.select 3")
+    );
+    assert_eq!(
+        keymap.indicator(),
+        Some("INSERT MODE"),
+        "the mode is unchanged"
+    );
+    // Back in the page, insert still passes them.
+    assert_eq!(keymap.press(&ctrl('o'), PAGE, &b), KeyAction::Pass);
 }
 
 #[test]
@@ -305,9 +484,10 @@ fn terminal_bindings_exist_only_in_the_terminal() {
     let gui = Fake::new(Frontend::Gui);
     let term = Fake::new(Frontend::Terminal);
     let mut keymap = example();
-    assert_eq!(keymap.press(&ctrl('c'), PAGE, &gui), KeyAction::Pass);
-    assert_eq!(keymap.press(&typed('m'), PAGE, &gui), KeyAction::Pass);
-    assert_eq!(keymap.press(&ctrl('l'), PAGE, &gui), KeyAction::Pass);
+    // Unbound in the window, so taken there, as any key no binding has.
+    assert_eq!(keymap.press(&ctrl('c'), PAGE, &gui), KeyAction::Take);
+    assert_eq!(keymap.press(&typed('m'), PAGE, &gui), KeyAction::Take);
+    assert_eq!(keymap.press(&ctrl('l'), PAGE, &gui), KeyAction::Take);
     assert_eq!(keymap.press(&ctrl('c'), PAGE, &term), run("browser.quit"));
     assert_eq!(
         keymap.press(&typed('m'), PAGE, &term),
@@ -359,12 +539,10 @@ fn the_shared_table_in_normal_mode() {
     ] {
         assert_eq!(keymap.press(&key, PAGE, &b), run(command), "{command}");
     }
-    // Unbound keys pass; nothing is swallowed.
-    assert_eq!(keymap.press(&typed('z'), PAGE, &b), KeyAction::Pass);
-    assert_eq!(
-        keymap.press(&named("ArrowDown", 108), PAGE, &b),
-        KeyAction::Pass
-    );
+    // Unbound keys are taken: nothing reaches the page.
+    assert_eq!(keymap.press(&typed('z'), PAGE, &b), KeyAction::Take);
+    let z = typed('z');
+    assert_eq!(keymap.press(&repeat(&z), PAGE, &b), KeyAction::Take);
 }
 
 #[test]
@@ -428,11 +606,12 @@ fn a_key_that_doesnt_continue_a_sequence_starts_afresh() {
         [KeyAction::Take, run("page.send-key down")]
     );
     assert_eq!(keymap.indicator(), None);
-    // y then an unbound key: it passes, and the sequence is gone.
+    // y then an unbound key: it is taken, and the sequence is gone.
     assert_eq!(
         press(&mut keymap, "yz", PAGE, &b),
-        [KeyAction::Take, KeyAction::Pass]
+        [KeyAction::Take, KeyAction::Take]
     );
+    assert_eq!(keymap.indicator(), None);
     assert_eq!(keymap.press(&typed('t'), PAGE, &b), run("tab.new"));
     // y, then y y: the second y starts the sequence afresh.
     keymap.press(&typed('c'), PAGE, &b);
@@ -447,12 +626,13 @@ fn modifiers_and_dead_keys_are_not_keys_of_a_sequence() {
     let b = Fake::new(Frontend::Gui);
     let mut keymap = example();
     keymap.press(&typed('y'), PAGE, &b);
-    assert_eq!(keymap.press(&named("Shift", 42), PAGE, &b), KeyAction::Pass);
+    // Taken, as every key in normal mode the page would get.
+    assert_eq!(keymap.press(&named("Shift", 42), PAGE, &b), KeyAction::Take);
     let dead = KeyEvent {
         key: Key::Dead(Some('¨')),
         ..named("Dead", 27)
     };
-    assert_eq!(keymap.press(&dead, PAGE, &b), KeyAction::Pass);
+    assert_eq!(keymap.press(&dead, PAGE, &b), KeyAction::Take);
     assert_eq!(keymap.indicator(), Some("y"), "still waiting");
     assert!(matches!(
         keymap.press(&typed('y'), PAGE, &b),

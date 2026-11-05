@@ -55,7 +55,7 @@
 #           and a reload; closing every WPE tab ends WebKit's web processes; the profile WebKit
 #           keeps
 #   showcase  a configuration that changes much: the example keymap (J and K, Escape and the
-#           INSERT MODE indicator, typing in a page field, a command line), the standard chrome's tab list
+#           INSERT MODE indicator, typing in a page field in INSERT mode, a command line), the standard chrome's tab list
 #           on the left and chrome.toggle-tabs, [ui] font-size, a [routing.wpe] hosts rule, a
 #           [keywords] template; a color added while sig runs applies at once and the keymap goes on working, and a
 #           new [ui] chrome gets a notice; started again, the line chrome with the same keymap, showing INSERT MODE
@@ -1078,19 +1078,22 @@ CONF
   check "J shows the next tab" "$(shows_tab 2 servo)"
   key -M shift k -m shift
   check "K shows the one before" "$(shows_tab 1 wpe)"
-  step "a click on the WPE page's field: åäö typed there; Escape is insert mode, Escape again normal mode"
+  step "a click on the WPE page's field; Escape is insert mode, where åäö is typed there; Escape again normal mode"
   click $((list + 100)) $((toolbar + 215))
-  key 'åäö'
-  check "what is typed reaches WebKit's field" "$(sess 8 "url(1).endswith('#field åäö'), url(1).split('#')[1]")"
   key -k Escape
   check "Escape: the keymap's indicator reads INSERT MODE" "$(dg 3 "d['keymap_indicator']=='INSERT MODE', d['keymap_indicator']")"
+  key 'åäö'
+  check "what is typed in insert mode reaches WebKit's field" "$(sess 8 "url(1).endswith('#field åäö'), url(1).split('#')[1]")"
   shot 02-insert-mode 0.3
   key -k Escape
   check "Escape again: normal mode shows no indicator" "$(dg 3 "d['keymap_indicator'] is None, d['keymap_indicator']")"
+  key z
+  sleep 0.5
+  check "in normal mode an unbound letter does not reach the field" "$(sess 3 "url(1).endswith('#field åäö'), url(1).split('#')[1]")"
   shot 03-normal-mode 0.3
 
-  # The page's field still has the keyboard, so plain letters type into it (o would too);
-  # ctrl-o is an Always binding of the example configuration and works from a field.
+  # The page's field still has the keyboard, but normal mode gives the page no key: ctrl-o (o
+  # would do too) is a binding of the example configuration, and works from a field.
   step "ctrl-o (location.focus, from the page's field), a keyword search: t åäö"
   key -M ctrl o -m ctrl
   key 't åäö'

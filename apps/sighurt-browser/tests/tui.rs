@@ -1135,10 +1135,32 @@ fn text_mode_shows_the_page_as_text_and_tab_enter_follow_a_link_and_fill_a_field
         term.context()
     );
 
-    // Three more Tabs reach the field (link, link, field); Enter edits it, `q` is typed into
-    // it, not run, and Enter sets it.
+    // Three more Tabs reach the field (link, link, field). In NORMAL, Enter opens no editor:
+    // a notice says the mode types nothing into the page, and a key closes it.
     let since = term.got.len();
     term.type_bytes(b"\t\t\t\r");
+    let refused = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "This keymap mode doesn't type into the page")
+    });
+    assert!(
+        refused,
+        "no notice for the field in NORMAL\n{}",
+        term.context()
+    );
+    term.type_bytes(b" ");
+    // In INSERT, Enter edits it, `q` is typed into it, not run, and Enter sets it.
+    let since = term.got.len();
+    term.type_bytes(b"\x1b");
+    let insert = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "INSERT MODE")
+    });
+    assert!(
+        insert,
+        "Escape did not show INSERT MODE\n{}",
+        term.context()
+    );
+    let since = term.got.len();
+    term.type_bytes(b"\r");
     let editing = term.wait(since, Duration::from_secs(10), |got| shows(got, "Edit:"));
     assert!(editing, "no field editor\n{}", term.context());
     let since = term.got.len();
@@ -1152,15 +1174,22 @@ fn text_mode_shows_the_page_as_text_and_tab_enter_follow_a_link_and_fill_a_field
         term.context()
     );
 
-    // The field is focused, and text mode told the core the page is not typing: `q` quits.
+    // Back in NORMAL, `q` quits.
+    let since = term.got.len();
+    term.type_bytes(b"\x1b");
+    let left = term.wait(since, Duration::from_secs(10), |got| {
+        !got.is_empty() && !shows(got, "INSERT MODE")
+    });
+    assert!(left, "Escape did not leave INSERT MODE\n{}", term.context());
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
 }
 
-/// With a field focused, graphics lets the page take letters: `q` types, and Ctrl-C still quits.
+/// With a field focused in graphics, NORMAL gives the page no key and no paste; INSERT gives it
+/// both, `q` and Ctrl-C included; back in NORMAL, Ctrl-C quits.
 #[test]
-fn graphics_mode_keeps_a_focused_fields_letters_for_the_page() {
+fn graphics_mode_gives_a_focused_field_keys_and_pastes_only_in_insert() {
     let mut term = Terminal::start_in(
         "text-field",
         &["demo://pattern"],
@@ -1175,7 +1204,19 @@ fn graphics_mode_keeps_a_focused_fields_letters_for_the_page() {
         shows(got, "Demo: animation")
     });
     assert!(followed, "link not followed\n{}", term.context());
-    term.type_bytes(b"\t\t\t\r");
+    // The field's editor opens in INSERT.
+    term.type_bytes(b"\t\t\t");
+    let since = term.got.len();
+    term.type_bytes(b"\x1b");
+    let insert = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "INSERT MODE")
+    });
+    assert!(
+        insert,
+        "Escape did not show INSERT MODE\n{}",
+        term.context()
+    );
+    term.type_bytes(b"\r");
     let since = term.got.len();
     let editing = term.wait(since, Duration::from_secs(10), |got| shows(got, "Edit:"));
     assert!(editing, "no field editor\n{}", term.context());
@@ -1186,25 +1227,52 @@ fn graphics_mode_keeps_a_focused_fields_letters_for_the_page() {
     });
     assert!(set, "field not set\n{}", term.context());
 
+    // Back in NORMAL, and in graphics with the field focused: a letter no binding has and a
+    // paste reach nothing.
+    term.type_bytes(b"\x1b");
+    thread::sleep(Duration::from_millis(200));
     let since = term.got.len();
     term.type_bytes(b"m");
     let graphics = term.wait(since, Duration::from_secs(10), |got| shows(got, "GFX"));
     assert!(graphics, "`m` did not show graphics\n{}", term.context());
-    // `q` goes to the page's field and does not run its binding: sig is still up a second on.
-    term.type_bytes(b"q");
+    term.type_bytes(b"z\x1b[200~normal\x1b[201~");
+    thread::sleep(Duration::from_millis(300));
+    // INSERT: a paste and `q` go to the page's field, and `q` does not quit: sig is still up a
+    // second on. What reached the page shows that NORMAL's letter and paste did not.
+    let since = term.got.len();
+    term.type_bytes(b"\x1b");
+    let insert = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "INSERT MODE")
+    });
+    assert!(
+        insert,
+        "Escape did not show INSERT MODE\n{}",
+        term.context()
+    );
+    term.type_bytes(b"\x1b[200~P\x1b[201~q");
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(1) {
         term.wait(term.got.len(), Duration::from_millis(20), |_| false);
         assert!(
             term.child.try_wait().unwrap().is_none(),
-            "q quit while the field was focused in graphics\n{}",
+            "q quit in INSERT\n{}",
             term.context()
         );
     }
-    // Ctrl-C quits from anywhere, field or not.
+    // Ctrl-C is the page's in INSERT too; in NORMAL it quits.
+    term.type_bytes(b"\x1b");
+    thread::sleep(Duration::from_millis(200));
     term.type_bytes(b"\x03");
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
+    // The page's title ends with what it was given (the status line is redrawn as a diff, so
+    // the saved session says it): INSERT's paste and q, and nothing of NORMAL's.
+    let session = fs::read_to_string(term.dir.join("state/sighurt/session.toml"));
+    assert!(
+        session.as_deref().is_ok_and(|s| s.contains("zqPq\"")),
+        "INSERT's paste and q did not reach the page, or NORMAL's did: {session:?}\n{}",
+        term.context()
+    );
 }
 
 /// Decision 105: text mode gives the engine a real page area and takes its frames, but never
