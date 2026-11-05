@@ -980,7 +980,8 @@ impl App {
     fn iterate(&mut self) -> bool {
         self.session.diagnostics_mut().counters.iterations += 1;
         self.handle_signals();
-        if std::mem::take(&mut self.config_changed) {
+        // The file changed, or sig://config wrote it: the watch misses a linked target.
+        if std::mem::take(&mut self.config_changed) | self.session.take_config_written() {
             self.reload_config();
         }
         let now = Instant::now();
@@ -1478,15 +1479,20 @@ impl App {
                 if config.restore_session() && !self.session.core().config().restore_session() {
                     self.session.session_changed();
                 }
+                // The configuration in use already (sig://config wrote it): the core says
+                // nothing about it again, so what it said when it took it stays shown.
+                let same = config == *self.session.core().config();
                 let configure = chrome::configure(&config, self.gui.chrome_name);
                 let queue = self.session.queue_mut();
                 self.gui.chrome_event(queue, configure);
                 self.session
                     .queue_mut()
                     .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
-                self.gui.notice_first = None;
-                if self.gui.notice.take().is_some() {
-                    self.gui.snapshot_dirty = true;
+                if !same {
+                    self.gui.notice_first = None;
+                    if self.gui.notice.take().is_some() {
+                        self.gui.snapshot_dirty = true;
+                    }
                 }
             }
             Err(persistence::LoadError::Config(error)) => {

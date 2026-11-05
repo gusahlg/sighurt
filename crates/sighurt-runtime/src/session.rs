@@ -124,6 +124,9 @@ pub struct Session<F: Frontend> {
     handling: Option<Instant>,
     /// Engine wakers and service threads call this.
     wake: Arc<dyn Fn() + Send + Sync>,
+    /// `sig://config` wrote the configuration file and the frontend has not reloaded it yet
+    /// ([`Session::take_config_written`]).
+    config_written: bool,
     /// Engines due on the current pump. Reused so a pump does not allocate the list.
     due_scratch: Vec<&'static str>,
     /// Events from the runtime being pumped. Reused so a pump does not allocate the buffer.
@@ -174,6 +177,7 @@ impl<F: Frontend> Session<F> {
             shutdown_bound: None,
             handling: None,
             wake,
+            config_written: false,
             due_scratch: Vec::new(),
             event_scratch: Vec::new(),
             _frontend: PhantomData,
@@ -208,6 +212,15 @@ impl<F: Frontend> Session<F> {
     /// What configurations are checked against.
     pub fn environment(&self) -> &Environment {
         &self.env
+    }
+
+    /// Whether `sig://config` wrote the configuration file since the last call. The core has
+    /// taken the written configuration into use already; the frontend reloads the file as it
+    /// does when its watch sees a change, for what it applies itself (the chrome's colors and
+    /// fonts, the terminal's settings), since the watch misses a file a link points to. The
+    /// core ignores that reload when it finds the same configuration.
+    pub fn take_config_written(&mut self) -> bool {
+        std::mem::take(&mut self.config_written)
     }
 
     /// Counters and the diagnostics file.
@@ -608,6 +621,8 @@ impl<F: Frontend> Session<F> {
                 if let Some(config) = config {
                     self.queue
                         .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
+                    self.config_written = true;
+                    (self.wake)();
                 }
                 result
             }
