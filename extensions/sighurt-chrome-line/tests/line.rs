@@ -1210,3 +1210,50 @@ fn golden_find() {
     named(&mut *chrome, "Enter");
     golden("find-closed-100", &paint(&mut *chrome, LINE, 120));
 }
+
+/// In fullscreen the line is listed only while it has the keyboard or there is status text,
+/// over the page, which keeps the whole window; listed again, it is drawn again.
+#[test]
+fn fullscreen_shows_the_line_only_while_it_is_needed() {
+    let mut chrome = line(Table::new(), 800, 600);
+    let window = WindowRect {
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 600,
+    };
+    let page = showing("https://a.test/", TabContent::Engine);
+    chrome.handle(ChromeEvent::Snapshot(page.clone()));
+    let normal = chrome.layout().page;
+    assert_ne!(normal, window);
+    let full = Snapshot {
+        fullscreen: true,
+        ..page.clone()
+    };
+    chrome.handle(ChromeEvent::Snapshot(full.clone()));
+    assert!(names(&*chrome).is_empty());
+    assert_eq!(chrome.layout().page, window);
+    let actions = chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    assert_eq!(names(&*chrome), [LINE]);
+    assert_eq!(chrome.layout().page, window);
+    assert_eq!(repaints(&actions), [LINE]);
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Page));
+    assert!(names(&*chrome).is_empty());
+    let notice = Snapshot {
+        status: Some("a.test is fullscreen. Escape leaves it.".into()),
+        ..full
+    };
+    let actions = chrome.handle(ChromeEvent::Snapshot(notice));
+    assert_eq!(names(&*chrome), [LINE]);
+    assert_eq!(repaints(&actions), [LINE]);
+    let home = Snapshot {
+        fullscreen: true,
+        ..showing("sig://home", TabContent::Internal)
+    };
+    chrome.handle(ChromeEvent::Snapshot(home));
+    assert_eq!(names(&*chrome), [PAGE, LINE]);
+    assert_eq!(chrome.layout().page, normal);
+    chrome.handle(ChromeEvent::Snapshot(page));
+    assert_eq!(names(&*chrome), [LINE]);
+    assert_eq!(chrome.layout().page, normal);
+}

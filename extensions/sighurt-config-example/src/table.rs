@@ -98,6 +98,7 @@ pub const NORMAL: &[Binding] = &[
     bind("L", Run("page.forward"), Page, Both),
     bind("r", Run("page.reload"), Page, Both),
     bind("ctrl-r", Run("page.reload"), Always, Both),
+    bind("f11", Run("browser.fullscreen"), Always, Both),
     bind("e", Run("page.switch-engine"), Page, Both),
     bind("j", Run("page.send-key down"), Page, Both),
     bind("k", Run("page.send-key up"), Page, Both),

@@ -18,6 +18,7 @@
 //! - [`navigation`]: navigations and cross-engine history segments.
 //! - [`router`]: which engine opens a URL; turning typed text into a URL.
 //! - [`commands`]: carrying out browser commands.
+//! - [`fullscreen`]: the window's fullscreen and a page's.
 //! - [`keys`]: the `bindings` keymap, and the keys any keymap took.
 //! - [`permissions`]: what pages may ask for.
 //! - [`config`]: the configuration format.
@@ -28,6 +29,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod fullscreen;
 pub mod keys;
 pub mod navigation;
 pub mod permissions;

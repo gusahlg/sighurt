@@ -785,3 +785,59 @@ fn the_standard_chrome_completes_from_the_visited_pages() {
         ["https://recept.example/sylt"]
     );
 }
+
+/// In fullscreen the standard chrome lists its surfaces only while they are needed, over the
+/// page, which keeps the whole window; a surface listed again is drawn again.
+#[test]
+fn fullscreen_shows_the_chrome_only_while_it_is_needed() {
+    let mut chrome = standard(800, 600);
+    let window = WindowRect {
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 600,
+    };
+    let page = Snapshot {
+        status: None,
+        ..showing("https://a.test/", TabContent::Engine)
+    };
+    chrome.handle(ChromeEvent::Snapshot(page.clone()));
+    let normal = chrome.layout().page;
+    assert_ne!(normal, window);
+    let full = Snapshot {
+        fullscreen: true,
+        ..page.clone()
+    };
+    chrome.handle(ChromeEvent::Snapshot(full.clone()));
+    assert!(names(&*chrome).is_empty());
+    assert_eq!(chrome.layout().page, window);
+    // The keyboard in the line brings it back, over the page.
+    let actions = chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    assert_eq!(names(&*chrome), ["chrome", "status"]);
+    assert_eq!(chrome.layout().page, window);
+    assert_eq!(repaints(&actions), ["chrome", "status"]);
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Page));
+    assert!(names(&*chrome).is_empty());
+    // So does a notice, for as long as it shows.
+    let notice = Snapshot {
+        status: Some("a.test is fullscreen. Escape leaves it.".into()),
+        ..full.clone()
+    };
+    let actions = chrome.handle(ChromeEvent::Snapshot(notice));
+    assert_eq!(names(&*chrome), ["chrome", "status"]);
+    assert!(repaints(&actions).contains(&"status"));
+    chrome.handle(ChromeEvent::Snapshot(full.clone()));
+    assert!(names(&*chrome).is_empty());
+    // A page the chrome draws is drawn as without fullscreen.
+    let home = Snapshot {
+        fullscreen: true,
+        ..showing("sig://home", TabContent::Internal)
+    };
+    chrome.handle(ChromeEvent::Snapshot(home));
+    assert_eq!(names(&*chrome), ["page", "chrome", "status"]);
+    assert_eq!(chrome.layout().page, normal);
+    // Out of fullscreen, the layout is what it was.
+    chrome.handle(ChromeEvent::Snapshot(page));
+    assert_eq!(names(&*chrome), ["chrome", "status"]);
+    assert_eq!(chrome.layout().page, normal);
+}

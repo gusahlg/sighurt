@@ -102,6 +102,9 @@ pub(crate) fn paint(frame: Frame<'_>, scene: &Scene, metrics: Metrics) {
         (Page::Pattern, false) => bands(&mut canvas, &PATTERN),
         (Page::Slow, false) => bands(&mut canvas, &SLOW),
         (Page::Crash, false) => stripes(&mut canvas, rgb(0x1c1917), rgb(0x292524)),
+        (Page::Fullscreen | Page::FullscreenUnasked, false) => {
+            stripes(&mut canvas, rgb(0x172554), rgb(0x1e3a8a))
+        }
         (Page::Animation, false) => animation(&mut canvas, scene.elapsed),
         // Where the contract's conversion puts the pointer, as the status text says.
         (Page::Resize, false) => resize(&mut canvas, scene.pointer.map(|p| metrics.to_buffer(p))),

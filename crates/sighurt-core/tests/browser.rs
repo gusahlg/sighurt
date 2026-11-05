@@ -1101,10 +1101,10 @@ fn history_and_fullscreen_say_what_is_missing() {
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, Effect::ForgetVisits { host: None, .. })));
-    assert_eq!(
-        notices(&b.apply(command("browser.fullscreen"))),
-        ["browser.fullscreen is not available in this frontend."]
-    );
+    // The window's fullscreen is asked for (tests/fullscreen.rs has the rest).
+    assert!(b
+        .apply(command("browser.fullscreen"))
+        .contains(&Effect::SetFullscreen(true)));
     assert_eq!(
         notices(&b.apply(command("page.exit-fullscreen"))),
         ["The page shown is not in fullscreen."]

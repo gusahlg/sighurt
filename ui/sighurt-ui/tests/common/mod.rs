@@ -120,6 +120,7 @@ pub fn three_tabs() -> Snapshot {
         keymap: None,
         home: home_info(),
         find: None,
+        fullscreen: false,
     }
 }
 

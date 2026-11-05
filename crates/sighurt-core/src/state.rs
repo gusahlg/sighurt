@@ -26,6 +26,9 @@
 //!   as failed, and a failed engine is asked nothing more. `SitesListed` is ignored until a command lists sites.
 //!   `FrameReady` is the executable's to schedule presentation from, and `SemanticsChanged`
 //!   page content for a frontend that shows text; the core ignores both;
+//! - what the window became when it went in or out of fullscreen, as
+//!   [`BrowserEvent::Fullscreen`] (it is asked with [`Effect::SetFullscreen`]; see
+//!   [`crate::fullscreen`]);
 //! - what its own calls and services produced: [`BrowserEvent::OpenFailed`],
 //!   [`BrowserEvent::CommandFailed`], [`BrowserEvent::FindResult`], [`BrowserEvent::ServiceDone`],
 //!   [`BrowserEvent::PermissionAnswered`], [`BrowserEvent::ConfigReloaded`],
@@ -69,8 +72,8 @@ use sighurt_api::events::{
 };
 use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, TabId, ViewId};
 use sighurt_api::input::{
-    ButtonState, FocusEvent, InputEvent, InputKind, KeyboardFocus, PointerButton, PointerEvent,
-    ScrollDelta, TextInputState,
+    ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyEvent, KeyboardFocus, PointerButton,
+    PointerEvent, ScrollDelta, TextInputState,
 };
 use sighurt_api::keymap::{Browser, KeyContext, KeymapKind, TabInfo};
 use sighurt_api::semantic::SemanticAction;
@@ -81,6 +84,7 @@ use sighurt_api::settings::Table;
 use url::Url;
 
 use crate::config::{Config, ConfigError, EngineSettings, Storage};
+use crate::fullscreen::Fullscreen;
 use crate::keys::{KeyOutcome, KeyState};
 use crate::navigation::{
     NavigationKind, Record, Segment, Switch, SwitchInto, MAX_SEGMENTS, RETAINED_VIEWS,
@@ -243,6 +247,10 @@ pub enum BrowserEvent {
     /// `false`: a field the page focuses then keeps no character binding from running, and
     /// `Effect::PageTextInput` is `None`. `true` at start; the window never sends it.
     PageTyping(bool),
+    /// The window is fullscreen now, or no longer: what the compositor made it, whether the
+    /// core asked for it ([`Effect::SetFullscreen`]) or not. Sent at least whenever it changes;
+    /// an unchanged state does nothing. The terminal never sends it.
+    Fullscreen(bool),
     /// Something an engine reported.
     Engine {
         /// The engine whose pump reported it.
@@ -464,6 +472,10 @@ pub enum Effect {
         /// What to say.
         message: String,
     },
+    /// Ask for the window to be fullscreen, or not. The compositor decides: report what the
+    /// window became as [`BrowserEvent::Fullscreen`], and assume nothing until then. Only the
+    /// window gets it.
+    SetFullscreen(bool),
     /// Something the chrome shows changed: draw it again.
     RedrawChrome,
     /// The session changed: save [`BrowserState::session`], atomically. Waiting a moment and
@@ -572,6 +584,10 @@ pub struct BrowserState {
     /// The tabs closed since the browser started, the latest last: what `tab.reopen` restores.
     /// At most [`MAX_CLOSED`]; never saved.
     pub(crate) closed: VecDeque<ClosedTab>,
+    /// The window's fullscreen and the page's ([`crate::fullscreen`]).
+    pub(crate) fullscreen: Fullscreen,
+    /// Whether the window has the keyboard: until the frontend says it lost it, it has.
+    window_focused: bool,
 }
 
 /// Applies `event` to `state` and returns what the executable should do.
@@ -623,6 +639,7 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             fx.chrome = true;
         }
         BrowserEvent::PageTyping(on) => state.page_typing = on,
+        BrowserEvent::Fullscreen(on) => state.window_fullscreen(on, &mut fx),
         BrowserEvent::Engine { engine, event, at } => {
             state.engine_event(&engine, event, at, &mut fx)
         }
@@ -911,6 +928,8 @@ struct CoreBrowser<'a> {
     active: usize,
     context: KeyContext,
     env: &'a Environment,
+    /// The view whose element is fullscreen, if any.
+    fullscreen: Option<ViewId>,
 }
 
 impl Browser for CoreBrowser<'_> {
@@ -943,8 +962,7 @@ impl Browser for CoreBrowser<'_> {
             shown.can_go_back,
             shown.can_go_forward,
             shown.view.and_then(|view| view.hovered.as_deref()),
-            // No engine reports element fullscreen yet (lane D).
-            false,
+            self.fullscreen.is_some() && self.fullscreen == tab.current_view(),
         ))
     }
 }
@@ -978,6 +996,8 @@ impl BrowserState {
             text_input: None,
             page_typing: true,
             closed: VecDeque::new(),
+            fullscreen: Fullscreen::default(),
+            window_focused: true,
         }
     }
 
@@ -1080,7 +1100,7 @@ impl BrowserState {
     }
 
     /// What `engine` supports.
-    fn capabilities(&self, engine: &str) -> EngineCapabilities {
+    pub(crate) fn capabilities(&self, engine: &str) -> EngineCapabilities {
         engine_capabilities(&self.env, engine)
     }
 
@@ -2088,8 +2108,11 @@ impl BrowserState {
                 true,
                 fx,
             ),
-            // No engine declares element fullscreen yet (lane D).
-            EngineEvent::FullscreenChanged { .. } => {}
+            EngineEvent::FullscreenChanged {
+                document,
+                fullscreen,
+                ..
+            } => self.page_fullscreen_changed(id, document, fullscreen, at, fx),
             EngineEvent::ServiceRequested(request) => self.service_requested(request, at, fx),
             EngineEvent::ServiceCancelled { request, .. } => {
                 if self.requests.get(request).is_some_and(|p| p.view == id) {
@@ -2615,9 +2638,19 @@ impl BrowserState {
     // ── Input ─────────────────────────────────────────────────────────────────────────────
 
     /// The view shown in the page area: the active tab's current one.
-    fn shown_view(&self) -> Option<ViewId> {
+    pub(crate) fn shown_view(&self) -> Option<ViewId> {
         let view = self.tabs.get(self.active)?.current_view()?;
         (!self.views[&view].closing).then_some(view)
+    }
+
+    /// Whether the window has the keyboard, as far as the frontend said.
+    pub(crate) fn window_focused(&self) -> bool {
+        self.window_focused
+    }
+
+    /// Which frontend runs.
+    pub(crate) fn frontend(&self) -> Frontend {
+        self.env.frontend
     }
 
     /// The view that has the keyboard, if the page has it.
@@ -2651,6 +2684,7 @@ impl BrowserState {
                         active: self.active,
                         context,
                         env: &self.env,
+                        fullscreen: self.page_fullscreen(),
                     };
                     self.keys.handle(context, event.seat, key, &browser)
                 };
@@ -2671,6 +2705,16 @@ impl BrowserState {
                         return;
                     }
                     KeyOutcome::Consumed => return,
+                    // The one guarantee a configuration cannot remove: while the page shown
+                    // holds an element fullscreen, an unmodified Escape press that the keymap
+                    // let through leaves it, and its repeats and release are taken with it
+                    // (`KeyState`). A press the page got before fullscreen began is not taken:
+                    // only a fresh press counts.
+                    KeyOutcome::Deliver if self.escape_leaves_fullscreen(key) => {
+                        self.keys.take(event.seat, key.code);
+                        self.run_command(Command::PageExitFullscreen, fx);
+                        return;
+                    }
                     // The press goes where the keyboard is after the command.
                     KeyOutcome::RunThenDeliver(command) => {
                         self.key_ran(&command, at);
@@ -2679,8 +2723,12 @@ impl BrowserState {
                     KeyOutcome::Deliver => {}
                 }
             }
-            InputKind::Focus(FocusEvent::Deactivated) => self.keys.forget(event.seat),
-            InputKind::Focus(FocusEvent::Activated) | InputKind::TextInput(_) => {}
+            InputKind::Focus(FocusEvent::Deactivated) => {
+                self.window_focused = false;
+                self.keys.forget(event.seat);
+            }
+            InputKind::Focus(FocusEvent::Activated) => self.window_focused = true,
+            InputKind::TextInput(_) => {}
             // Pointer input comes with the view it is for.
             InputKind::Pointer(_) => return,
         }
@@ -2699,6 +2747,19 @@ impl BrowserState {
             }
             None => fx.push(Effect::ChromeInput(event)),
         }
+    }
+
+    /// Whether `key` is a fresh, unmodified Escape press for a page that has the keyboard and
+    /// holds an element fullscreen: the press the core's override takes.
+    fn escape_leaves_fullscreen(&self, key: &KeyEvent) -> bool {
+        let m = key.modifiers;
+        let unmodified = !(m.shift || m.control || m.alt || m.alt_graph || m.logo);
+        key.state == ButtonState::Pressed
+            && !key.repeat
+            && unmodified
+            && matches!(&key.key, Key::Named(name) if name == "Escape")
+            && self.focused_view().is_some()
+            && self.focused_view() == self.page_fullscreen()
     }
 
     /// A key press ran `command`. A key it sends the page counts as the user's key press there,
@@ -2890,6 +2951,7 @@ impl BrowserState {
     /// the page has it), at the tab's zoom, the host knows the page's cursor and text field, and
     /// the keymap knows the context; a changed keymap indicator redraws the chrome.
     fn settle(&mut self, fx: &mut Fx) {
+        self.settle_fullscreen(fx);
         self.settle_engines(fx);
         let shown = self.shown_view();
         let focused = self.focused_view();

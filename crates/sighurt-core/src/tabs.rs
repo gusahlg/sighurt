@@ -228,6 +228,9 @@ pub struct View {
     /// The visit `document`'s commit recorded, and that document: what a title it reports
     /// next names (`state`'s "Visited pages").
     pub(crate) visit: Option<(String, DocumentGeneration)>,
+    /// Its engine said an element is fullscreen and has not been told to leave it since
+    /// (`ExitFullscreen`), nor said it left.
+    pub(crate) fullscreen: bool,
 }
 
 impl View {
@@ -258,6 +261,7 @@ impl View {
             answers: Vec::new(),
             find: None,
             visit: None,
+            fullscreen: false,
         }
     }
 

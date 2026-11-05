@@ -52,8 +52,10 @@
 //!   tells the user "<engine> can't find in page" when it first hears it, not at every key
 //!   typed in the find field.
 //! - `history.clear` forgets every visited page (`Effect::ForgetVisits`), with `[history]
-//!   remember` on or off; the executable's answer is a notice. `browser.fullscreen` says the frontend has no fullscreen yet, and
-//!   `page.exit-fullscreen` that the page is not in fullscreen.
+//!   remember` on or off; the executable's answer is a notice.
+//! - `browser.fullscreen` asks for the window's fullscreen, or leaves it; `page.exit-fullscreen`
+//!   leaves the fullscreen of an element of the page shown, or says there is none
+//!   ([`crate::fullscreen`]). In the terminal `browser.fullscreen` is a notice.
 //! - `page.send-key` presses and releases its key in the page only while the page has the
 //!   keyboard; run by a key press, that counts as the user's key press in the page.
 //! - `chrome.<action>` is the chrome's own: the core hands it on (`Effect::ChromeCommand`).
@@ -213,15 +215,11 @@ impl BrowserState {
                 None
             }
             Command::PageExitFullscreen => {
-                self.tab_notice(active, "The page shown is not in fullscreen.", fx);
+                self.exit_page_fullscreen(active, fx);
                 None
             }
             Command::BrowserFullscreen => {
-                self.tab_notice(
-                    active,
-                    "browser.fullscreen is not available in this frontend.",
-                    fx,
-                );
+                self.toggle_fullscreen(active, fx);
                 None
             }
             Command::BrowserHome => {

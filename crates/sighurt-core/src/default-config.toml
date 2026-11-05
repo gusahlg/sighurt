@@ -172,11 +172,13 @@ forward = "page.forward"
 # : opens it as the command line (location.focus :), ctrl-o focuses it from anywhere, / opens
 # the find field (page.find), n and N move to the next and previous match of the search, t
 # opens a tab, x closes the tab, u reopens the tab closed last, J and K move to the next and
-# previous tab, H and L go back and forward, r and ctrl-r reload (ctrl-r from anywhere), e
+# previous tab, H and L go back and forward, r and ctrl-r reload (ctrl-r from anywhere), f11
+# toggles fullscreen (from anywhere), e
 # reopens the page in the next web engine, j and k scroll, ctrl-d and ctrl-u scroll a page, g
 # and G go to the top and the bottom, and + - = zoom.
 # alt-1 to alt-9 select those tabs from anywhere. Escape enters INSERT MODE, which shows
-# INSERT MODE and passes every other key until Escape leaves it. y y copies the page's
+# INSERT MODE and passes every other key until Escape leaves it; while a page's element is
+# fullscreen, Escape leaves that instead. y y copies the page's
 # address, y f the link the pointer is over, and c o closes the other tabs, highest number
 # first. Those three are key sequences of the example configuration, not of [keys]. The
 # other tab commands are typed after ":": tab.move left, tab.duplicate, tab.new <address>.
@@ -245,9 +247,14 @@ forward = "page.forward"
 # and page.find-stop ends the search; a new page in the tab ends it too. The chrome shows what
 # the search found ("3 of 12"). The page's engine searches (Servo and Wasm can't, and say so);
 # in the terminal's text mode sig searches the page's text itself.
-# history.clear forgets the pages you visited ([history] below). browser.fullscreen puts the window in
-# fullscreen, or takes it out; page.exit-fullscreen leaves the fullscreen a page put one of
-# its elements in (a video, a game).
+# history.clear forgets the pages you visited ([history] below). browser.fullscreen puts the
+# window in fullscreen, or takes it out (in the window only; the compositor decides), and leaves a
+# page's fullscreen with it; page.exit-fullscreen leaves the fullscreen a page put one of its
+# elements in (a video, a game). A page gets that only right after a click or key press in
+# it, once per click, with a notice saying so; another tab, a new page or the window losing
+# the keyboard ends it, and an unmodified Escape the keymap lets through always does. In
+# fullscreen the chrome shows only while it has the keyboard, a notice shows, or it draws the
+# page (sig://home, errors).
 #
 # clipboard.copy <text> puts the text on the clipboard. The runtime refuses text over its
 # limit and says so, rather than cutting it.

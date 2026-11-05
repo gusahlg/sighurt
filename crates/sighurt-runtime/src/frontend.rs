@@ -1,7 +1,7 @@
 //! What the runtime asks a frontend to do.
 //!
 //! Effects the runtime cannot carry out itself — a view's target, focus, the chrome and its
-//! find field, the page's cursor and text field, notices, redraws — are handed to the frontend here, one at a
+//! find field, the page's cursor and text field, notices, the window's fullscreen, redraws — are handed to the frontend here, one at a
 //! time, in the order the core returned them. Opening a target is a handshake: the frontend
 //! returns the target or an error, the runtime records the view and asks for a placement, and
 //! only then does the engine receive the target. A command for a view is never sent before
@@ -101,6 +101,13 @@ pub trait Frontend: Clipboard {
 
     /// Tell the user something. Not logged: a notice can hold page data.
     fn notice(&mut self, message: String);
+
+    /// Ask for the window to be fullscreen, or not. What it becomes is reported to the core as
+    /// `BrowserEvent::Fullscreen`, when the compositor says; nothing may assume the request
+    /// succeeded. A frontend without a window ignores it (the core sends it only to the window).
+    fn fullscreen(&mut self, on: bool) {
+        let _ = on;
+    }
 
     /// Something the chrome shows changed.
     fn redraw(&mut self);

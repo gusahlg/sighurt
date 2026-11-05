@@ -458,10 +458,10 @@ command, typed into the address line) all run them.
 | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` | page zoom |
 | `page.send-key <key>` | press and release a named key in the page, as if typed: `down`, `pageup`, `end`, `space`, `enter`, `f5`, `shift-space`, … |
 | `page.find [text]`, `page.find-next`, `page.find-previous`, `page.find-stop` | find text (at most 1024 bytes) in the page shown, wrapping around (case-sensitive only when the text has a capital letter), or with no text open the chrome's [find field](#find-in-page); move between the matches; end the search. A page nothing can search says so |
-| `page.exit-fullscreen` | leave the fullscreen a page put one of its elements in (a video, a game) |
+| `page.exit-fullscreen` | leave the [fullscreen](#fullscreen) a page put one of its elements in (a video, a game) |
 | `location.focus [text]` | focus the address line with its text selected; with text, the line holds that text instead (`location.focus :` opens the command line) |
 | `history.clear` | forget the pages you visited: the history file is emptied at once (in a `sig` that doesn't own it, only its own memory, and it says so) |
-| `browser.fullscreen` | put the window in fullscreen, or take it out |
+| `browser.fullscreen` | put the window in [fullscreen](#fullscreen), or take it out (and a page's with it); not in the terminal |
 | `clipboard.copy <text>` | put the text on the clipboard |
 | `browser.home` | open the home page in the active tab |
 | `browser.quit` | quit, saving the tabs |
@@ -487,6 +487,7 @@ address line or a page's text field, and the keys no row names pass to the page.
 | `alt-1` to `alt-9` | `tab.select 1` to `9` |
 | `H`, `L` | `page.back`, `page.forward` |
 | `r`, `ctrl-r` | `page.reload` |
+| `f11` | `browser.fullscreen` (from the address line too) |
 | `e` | `page.switch-engine` |
 | `j`, `k` | scroll down, up (`page.send-key down`, `up`) |
 | `ctrl-d`, `ctrl-u` | page down, up |
@@ -559,6 +560,26 @@ visited address wins. Only typed text completes, with the cursor at its end and 
 selected: not the address the line was focused with, not a `:command` and not the find field.
 The standard chrome, the line chrome and the terminal's address line all do this. Nothing is
 completed with `[history] remember = false`.
+
+### Fullscreen
+
+`f11` (`browser.fullscreen`) asks for the window's fullscreen, or leaves it; the compositor
+decides, and ending it from the compositor counts as leaving. In fullscreen the page fills the
+window and the chrome hides. It comes back over the page, which keeps its size, while it has the
+keyboard (`:`, `o`, `/`), for the few seconds a notice of `sig`'s shows, and whenever it draws
+the page itself (`sig://home`, an error).
+
+A page may put one of its elements in fullscreen (a video's button, a game) only right after you
+clicked or typed in it, once per click, while its tab is shown and the window has the keyboard;
+otherwise it is told no. The window goes fullscreen with it, and a notice says so: `example.com
+is fullscreen. Escape leaves it.` `Escape` (`page.exit-fullscreen`) leaves it, and so does
+selecting another tab, a new page, the window losing the keyboard, or `f11`, which leaves the
+window's fullscreen too; the window returns to what you had chosen at once, whatever the page does.
+An unmodified `Escape` that the keymap lets through always leaves a page's fullscreen: no
+configuration removes that. Servo, WPE WebKit, CEF and the demo engine (`demo:fullscreen`) have
+element fullscreen; Ladybird, NetSurf and Wasm apps don't. In the terminal there is no window
+fullscreen (`browser.fullscreen` says so), and a page's fullscreen is the notice alone: the page
+keeps its rows.
 
 ### Copy and paste
 

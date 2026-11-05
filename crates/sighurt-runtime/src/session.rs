@@ -414,6 +414,7 @@ impl<F: Frontend> Session<F> {
                 }
             }
             Effect::Notice { message, .. } => frontend.notice(message),
+            Effect::SetFullscreen(on) => frontend.fullscreen(on),
             Effect::RedrawChrome => frontend.redraw(),
             Effect::SaveSession => self.session_changed(),
             Effect::Visited { url, title, commit } => {

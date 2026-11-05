@@ -356,6 +356,12 @@ impl KeyState {
         }
     }
 
+    /// Takes `code`'s press on `seat` for the core, as if the keymap had: its repeats and
+    /// release go nowhere.
+    pub(crate) fn take(&mut self, seat: SeatId, code: KeyCode) {
+        self.taken.insert((seat, code));
+    }
+
     /// Tells the keymap the context, if it changed since it was last told.
     pub(crate) fn set_context(&mut self, context: KeyContext) {
         if self.context != Some(context) {

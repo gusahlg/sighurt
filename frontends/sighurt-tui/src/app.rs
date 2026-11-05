@@ -2944,6 +2944,7 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
         tabs,
         active_tab,
         status,
+        fullscreen: session.core().fullscreen().into(),
         capabilities: format!(
             "terminal graphics={graphics} cells={}x{} cell={}x{}",
             size.cols, size.rows, size.cell_width, size.cell_height

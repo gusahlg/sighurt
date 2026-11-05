@@ -38,6 +38,13 @@
 #               visited address (screenshots compared), Tab makes the line that exact address
 #               (pixel for pixel what typing it whole gives), Enter opens it; history.clear
 #               takes the completion away at once and empties the file
+#   fullscreen  f11 makes the window fullscreen: the page fills the output and the chrome hides;
+#               ":" shows the line over the page, and a notice the status, until it gives way;
+#               f11 again; demo://fullscreen: a click puts its element in fullscreen, with a
+#               notice, and Escape (the example's) leaves it and the chrome returns;
+#               demo://fullscreen-unasked is refused; with `bindings` and Escape unbound, the
+#               core's own Escape leaves it; f11 during a page's fullscreen leaves both; the
+#               compositor ending fullscreen (swaymsg) resets the toggle
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
 #               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
@@ -56,7 +63,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history renderers)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen renderers)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (with other features); this link keeps the binary these
   # runs use. It is made under the same hold of the machine's lock as the build, so no other
@@ -714,6 +721,123 @@ PY
   wait "$sig_pid"; code=$?
   check "ctrl-q exits cleanly" "$code" "exit code $code"
   check "a history save was counted" "$(python3 -c "import json; print(0 if json.load(open('$out/diag.json'))['counters']['history_saves']>=1 else 1)")" "history_saves"
+  ;;
+
+fullscreen)
+  # The example configuration (f11, ":", Escape), then `bindings` with Escape unbound.
+  cat > "$out/config/sighurt/config.toml" <<'CONF'
+version = 1
+[engines]
+default = "demo"
+[routing.demo]
+schemes = ["demo"]
+CONF
+  fs="d['fullscreen']['wanted'], d['fullscreen']['window'], d['fullscreen']['page']"
+  page_size="[(x['width'], x['height']) for x in t if x['role']=='view' and x['shown']]"
+  chrome_up="sorted(x['role'] for x in t if x['role'] in ('chrome', 'status', 'page') and x['mapped'])"
+  # until_diag SECONDS EXPR: asks for the diagnostics every 0.2 s until EXPR holds, for at
+  # most SECONDS; prints 0 or 1.
+  until_diag() {
+    local end=$((SECONDS + $1))
+    while :; do
+      [[ $(diag "1 if ($2) else 0") == 1 ]] && { echo 0; return; }
+      [[ $SECONDS -ge $end ]] && { echo 1; return; }
+      sleep 0.2
+    done
+  }
+  start_sig demo://pattern
+  check "windowed at the start" "$(diag "0 if ($fs)==(False, False, False) else 1")" "$(diag "$fs") (wanted, window, page)"
+  windowed=$(diag "$page_size")
+  step "f11: the window's fullscreen"
+  key -k F11
+  check "f11 makes the window fullscreen" "$(until_diag 5 "($fs)==(True, True, False)")" "$(diag "$fs")"
+  sleep 0.5
+  shot 01-f11-fullscreen
+  check "the page fills the output" "$(diag "0 if $page_size==[(1280, 800)] else 1")" "$(diag "$page_size") (windowed: $windowed)"
+  check "the chrome hides" "$(diag "0 if $chrome_up==[] else 1")" "$(diag "$chrome_up")"
+  step ": opens the command line, shown over the page"
+  key :
+  sleep 0.5
+  shot 02-command-line-over-the-page
+  check ": shows the chrome" "$(diag "0 if 'chrome' in $chrome_up else 1")" "$(diag "$chrome_up")"
+  check "the page keeps the whole output" "$(diag "0 if $page_size==[(1280, 800)] else 1")" "$(diag "$page_size")"
+  step "a command that answers with a notice: the status shows, then hides"
+  key 'page.exit-fullscreen'
+  key -k Return
+  sleep 0.5
+  shot 03-notice-in-fullscreen
+  check "a notice shows the status surface" \
+    "$(diag "0 if d['status']=='notice' and 'status' in $chrome_up else 1")" "$(diag "d['status'], $chrome_up")"
+  check "the notice gives way and the chrome hides again" "$(until_diag 8 "$chrome_up==[]")" "$(diag "d['status'], $chrome_up")"
+  step "f11 again: windowed"
+  key -k F11
+  check "f11 leaves fullscreen" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  check "the page is where it was" "$(diag "0 if $page_size==$windowed else 1")" "$(diag "$page_size") (before: $windowed)"
+
+  step "demo://fullscreen: a click puts its element in fullscreen"
+  key :
+  key 'page.open demo://fullscreen'
+  key -k Return
+  sleep 1
+  click 640 400
+  check "the click's fullscreen is accepted" "$(until_diag 5 "($fs)==(False, True, True)")" "$(diag "$fs")"
+  sleep 0.3
+  shot 04-page-fullscreen-notice
+  check "the page fills the output" "$(diag "0 if $page_size==[(1280, 800)] else 1")" "$(diag "$page_size")"
+  check "the notice says so, over the page" \
+    "$(diag "0 if d['status']=='notice' and 'status' in $chrome_up else 1")" "$(diag "d['status'], $chrome_up")"
+  step "Escape (the example's page.exit-fullscreen) leaves it, and the mode stays"
+  key -k Escape
+  check "Escape leaves the page's fullscreen" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  check "the chrome is back" "$(until_diag 5 "'chrome' in $chrome_up")" "$(diag "$chrome_up")"
+  check "the keymap stays in normal mode" "$(diag "0 if d['keymap_indicator'] is None else 1")" "$(diag "d['keymap_indicator']")"
+  check "the page is where it was" "$(diag "0 if $page_size==$windowed else 1")" "$(diag "$page_size")"
+  shot 05-left-page-fullscreen
+
+  step "demo://fullscreen-unasked: fullscreen without a click is refused"
+  key :
+  key 'page.open demo://fullscreen-unasked'
+  key -k Return
+  sleep 1.5
+  check "a page's fullscreen without the user is refused" "$(diag "0 if ($fs)==(False, False, False) else 1")" "$(diag "$fs")"
+  shot 06-unasked-refused
+  key q
+  wait "$sig_pid"; code=$?
+  check "q exits cleanly" "$code" "exit code $code"
+
+  step "bindings with no Escape: the core's own Escape leaves a page's fullscreen"
+  cat > "$out/config/sighurt/config.toml" <<'CONF'
+version = 1
+[engines]
+default = "demo"
+[routing.demo]
+schemes = ["demo"]
+[session]
+restore = false
+[input]
+keymap = "bindings"
+[keys]
+"f11" = "browser.fullscreen"
+"ctrl-q" = "browser.quit"
+CONF
+  start_sig demo://fullscreen
+  click 640 400
+  check "the click's fullscreen is accepted" "$(until_diag 5 "($fs)==(False, True, True)")" "$(diag "$fs")"
+  key -k Escape
+  check "an unbound Escape leaves it" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  step "f11 while a page is fullscreen leaves both"
+  click 640 400
+  check "fullscreen again on a new click" "$(until_diag 5 "($fs)==(False, True, True)")" "$(diag "$fs")"
+  key -k F11
+  check "f11 leaves the page's and the window's fullscreen" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  step "the compositor ending the window's fullscreen"
+  key -k F11
+  check "f11 makes the window fullscreen" "$(until_diag 5 "($fs)==(True, True, False)")" "$(diag "$fs")"
+  swaymsg -q fullscreen disable
+  check "the compositor's exit resets the toggle" "$(until_diag 5 "($fs)==(False, False, False)")" "$(diag "$fs")"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$code" "exit code $code"
   ;;
 
 renderers)
