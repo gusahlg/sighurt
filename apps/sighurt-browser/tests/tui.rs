@@ -71,6 +71,11 @@ impl Terminal {
         Self::start_seeded(name, args, replies, tui, None)
     }
 
+    /// [`Self::start_in`] with `TERM=tmux-256color`, as in a tmux pane.
+    fn start_in_tmux(name: &str, args: &[&str], replies: &'static [u8], tui: &str) -> Self {
+        Self::start_as(name, args, replies, tui, None, "tmux-256color")
+    }
+
     /// [`Self::start_in`] with `history` as the history file (`state/sighurt/history.toml`).
     fn start_seeded(
         name: &str,
@@ -78,6 +83,18 @@ impl Terminal {
         replies: &'static [u8],
         tui: &str,
         history: Option<&str>,
+    ) -> Self {
+        Self::start_as(name, args, replies, tui, history, "xterm-kitty")
+    }
+
+    /// [`Self::start_seeded`] with `TERM` set to `term`.
+    fn start_as(
+        name: &str,
+        args: &[&str],
+        replies: &'static [u8],
+        tui: &str,
+        history: Option<&str>,
+        term: &str,
     ) -> Self {
         let dir = std::env::temp_dir().join(format!("sig-tui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -109,7 +126,7 @@ impl Terminal {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CACHE_HOME", dir.join("cache"))
-            .env("TERM", "xterm-kitty")
+            .env("TERM", term)
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("DISPLAY")
             .env_remove("SIG_DIAG")
@@ -1518,10 +1535,11 @@ fn sixel_frames_go_over_each_other_and_only_a_new_layout_is_blanked_first() {
         SIXEL_REPLIES,
         SIXEL_KEYS,
     );
+    // More frames than tmux's stack may hold: outside tmux none of them is blanked.
     let shown = term.wait(0, Duration::from_secs(15), |got| {
-        sixel_spans(got).len() >= 4
+        sixel_spans(got).len() >= 12
     });
-    assert!(shown, "fewer than 4 sixel frames\n{}", term.context());
+    assert!(shown, "fewer than 12 sixel frames\n{}", term.context());
     let spans = sixel_spans(&term.got);
     let blank = blank_row(80);
     let before = &term.got[..spans[0].0];
@@ -1687,14 +1705,120 @@ fn a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced()
             .last()
             .is_some_and(|&(start, _)| last_blank.is_none_or(|at| at < start))
     });
+    let tail = &term.got[storm..];
+    let last_blank = tail
+        .windows(blank.len())
+        .rposition(|w| w == blank.as_slice());
+    let spans = sixel_spans(tail);
     assert!(
         shown,
-        "no sixel once the switches stopped\n{}",
-        term.context()
+        "no sixel once the switches stopped: last blank at {last_blank:?}, sixels at {:?}, {} bytes\n{}",
+        spans,
+        tail.len(),
+        printable(&tail[last_blank.unwrap_or(0)..])
     );
     assert!(term.running(), "{}", term.context());
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
+}
+
+/// Inside tmux (TERM) too, a page that keeps changing has its sixels written over each other
+/// with no blank: a blank every few frames would be a blink each time, and spaces over a sixel
+/// Rio shows are what loses Rio its GPU device (decision 133).
+#[test]
+fn inside_tmux_a_changing_page_is_not_blanked_either() {
+    let mut term = Terminal::start_in_tmux(
+        "sixel-stack",
+        &["demo://animation"],
+        SIXEL_REPLIES,
+        SIXEL_KEYS,
+    );
+    let shown = term.wait(0, Duration::from_secs(20), |got| {
+        sixel_spans(got).len() >= 12
+    });
+    assert!(shown, "fewer than 12 sixel frames\n{}", term.context());
+    let spans = sixel_spans(&term.got);
+    let blank = blank_row(80);
+    for pair in spans.windows(2) {
+        assert!(
+            !has(&term.got[pair[0].1..pair[1].0], &blank),
+            "a changing page was blanked inside tmux\n{}",
+            term.context()
+        );
+    }
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// Inside tmux, once a page with sixels over each other is quiet (400 ms without a new one),
+/// its picture is written again after a blank, once, so tmux keeps that one alone. Outside
+/// tmux nothing is stored, and nothing is written again.
+#[test]
+fn inside_tmux_a_quiet_page_is_written_again_alone_and_outside_it_is_not() {
+    for tmux in [true, false] {
+        let name = if tmux {
+            "sixel-quiet-tmux"
+        } else {
+            "sixel-quiet"
+        };
+        let args = ["demo://pattern", "demo://resize"];
+        let mut term = match tmux {
+            true => Terminal::start_in_tmux(name, &args, SIXEL_REPLIES, SIXEL_KEYS),
+            false => Terminal::start_in(name, &args, SIXEL_REPLIES, SIXEL_KEYS),
+        };
+        let shown = term.wait(0, Duration::from_secs(15), |got| {
+            !sixel_spans(got).is_empty()
+        });
+        assert!(shown, "no sixel\n{}", term.context());
+        // To tab 2 and back: tab 1's frame goes over tab 2's sixel, a stack of two or more.
+        for _ in 0..2 {
+            term.wait(term.got.len(), Duration::from_millis(1500), |_| false);
+            term.type_bytes(F2);
+        }
+        let from = term.got.len();
+        term.wait(from, Duration::from_millis(2000), |_| false);
+        let after = &term.got[from..];
+        let spans = sixel_spans(after);
+        let blank = blank_row(80);
+        assert!(
+            !spans.is_empty(),
+            "no sixel after the switch\n{}",
+            term.context()
+        );
+        let first = spans[0];
+        assert!(
+            !has(&after[..first.0], &blank),
+            "the switch blanked first\n{}",
+            term.context()
+        );
+        let last = spans[spans.len() - 1];
+        let blanked = spans.len() >= 2 && has(&after[spans[spans.len() - 2].1..last.0], &blank);
+        if tmux {
+            let before = spans[spans.len() - 2];
+            assert!(
+                blanked && after[before.0..before.1] == after[last.0..last.1],
+                "the quiet page was not written again alone ({} sixels)\n{}",
+                spans.len(),
+                term.context()
+            );
+        } else {
+            assert!(
+                !has(after, &blank),
+                "outside tmux the quiet page was blanked\n{}",
+                term.context()
+            );
+        }
+        // Then nothing: a still page writes no sixel.
+        let quiet = term.got.len();
+        term.wait(quiet, Duration::from_millis(1000), |_| false);
+        assert!(
+            sixel_spans(&term.got[quiet..]).is_empty(),
+            "a still page wrote a sixel\n{}",
+            term.context()
+        );
+        term.type_bytes(b"q");
+        assert!(term.exit().success(), "{}", term.context());
+    }
 }
 
 #[test]

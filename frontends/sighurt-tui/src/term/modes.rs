@@ -1,6 +1,7 @@
 //! The byte sequences the terminal sends and the startup queries.
 //!
-//! Owns: the fixed enter, leave and probe bytes. Must not own: the parser, the
+//! Owns: the fixed enter, leave and probe bytes, and whether `TERM` names a
+//! multiplexer (tmux, screen). Must not own: the parser, the
 //! grid, or what a reply means. Enter and leave are fixed slices so a signal
 //! handler can write them without allocating. The kitty keyboard push asks for
 //! every flag the parser understands, including associated text (bit 16).
@@ -65,6 +66,12 @@ pub(super) fn startup_queries(term: Option<&std::ffi::OsStr>) -> &'static [u8] {
 }
 
 fn skip_kitty_graphics_query(term: Option<&std::ffi::OsStr>) -> bool {
+    inside_multiplexer(term)
+}
+
+/// `term` is what tmux or screen sets in their panes (it starts with `screen` or `tmux`). tmux
+/// stores the sixels written in a pane and sends them all again when it redraws the pane.
+pub(crate) fn inside_multiplexer(term: Option<&std::ffi::OsStr>) -> bool {
     let Some(term) = term else {
         return false;
     };
