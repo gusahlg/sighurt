@@ -242,6 +242,13 @@ impl BrowserState {
                 fx.push(Effect::ChromeCommand(action));
                 None
             }
+            Command::Custom { name, .. } => {
+                fx.push(Effect::Notice {
+                    tab: None,
+                    message: format!("unknown command {name:?}"),
+                });
+                None
+            }
         };
         if let Some(focus) = focus {
             self.move_focus(focus, fx);
