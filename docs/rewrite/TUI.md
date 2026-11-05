@@ -138,7 +138,17 @@ the hidden one's id in the same write); a tab with no frame for this layout gets
 and its frame when it comes. So a hidden tab's picture can stay under the shown tab's title for
 up to 250 ms. tmux keeps the sixels written over each other (at most 20 in the server, the
 oldest freed without a redraw) and sends them all again, oldest first, when it redraws the pane
-(a window switched back to, a reattach). Rio alone, with `[tui] graphics = "sixel"` forced,
+(a window switched back to, a refresh, a resize): 25–27 sixels a redraw on the animation page.
+So inside tmux (`TERM` starting with `tmux` or `screen`), once a page has gone 400 ms without a
+new sixel and more than one is stacked, its picture is written again after the blank in one
+write: tmux frees the stack, marks the pane for a redraw, holds that sixel back from the outer
+terminal while the redraw is pending (`screen_write_set_client_cb`) and draws the lines and the
+one image in that redraw. A still page then costs one sixel a redraw. A page that keeps changing
+is not capped: a blank every few frames would blink each time, and spaces over a sixel Rio
+shows are what loses Rio its device. In the private sway Rio died within 3 to 12 tmux window
+switches whatever sig had stacked (25–27, 8 or 1), and with one still sixel that `cat` wrote and
+no sig at all: Rio 0.5.28 under tmux does not live through pane redraws with a sixel shown, and
+nothing the frontend sends avoids that. Rio alone, with `[tui] graphics = "sixel"` forced,
 still shows an empty page for a frame now and then when a sixel replaces the one under it
 (4–11 of 200 screenshots in about 4 s; with the old blank before every frame Rio lost its
 device instead); a synchronized update around the image made Rio lose its device too. Rio
