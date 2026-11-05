@@ -1262,16 +1262,29 @@ fn a_click_follows_a_link_in_text_mode() {
     );
 }
 
-/// The first tab's search in a report, as JSON: `null` with none.
-fn tab_find(report: &str) -> &str {
-    let Some(at) = report.find("\"find\":") else {
-        return "";
+/// The value of the first `"key":` in a report, as JSON. An object (flat: its values have no
+/// commas) comes with its fields sorted: serde_json writes them in the order the struct declares
+/// them when a dependency turns on its `preserve_order` (Servo's script crate does, so a `sig`
+/// with Servo does), and sorted otherwise.
+fn report_value(report: &str, key: &str) -> String {
+    let name = format!("\"{key}\":");
+    let Some(at) = report.find(&name) else {
+        return String::new();
     };
-    let rest = &report[at + 7..];
+    let rest = &report[at + name.len()..];
     match rest.find('}') {
-        Some(end) if rest.starts_with('{') => &rest[..=end],
-        _ => rest.split([',', '}']).next().unwrap_or(""),
+        Some(end) if rest.starts_with('{') => {
+            let mut fields: Vec<&str> = rest[1..end].split(',').collect();
+            fields.sort_unstable();
+            format!("{{{}}}", fields.join(","))
+        }
+        _ => rest.split([',', '}']).next().unwrap_or("").to_owned(),
     }
+}
+
+/// The first tab's search in a report, as JSON: `null` with none.
+fn tab_find(report: &str) -> String {
+    report_value(report, "find")
 }
 
 /// `/` opens the find field in text mode; typing searches the page's text, Enter keeps the
@@ -1952,9 +1965,8 @@ fn fullscreen_in_the_terminal_is_a_notice() {
         image(got, 80, 22, 800, 440)
     });
     assert!(shown, "no image\n{}", term.context());
-    let page = |held: bool| {
-        format!("\"fullscreen\":{{\"page\":{held},\"wanted\":false,\"window\":false}}")
-    };
+    let page = |held: bool| format!("{{\"page\":{held},\"wanted\":false,\"window\":false}}");
+    let fullscreen = |report: &str| report_value(report, "fullscreen");
     let since = term.got.len();
     term.type_bytes(b"\x1b[<0;6;6M\x1b[<0;6;6m");
     let told = term.wait(since, Duration::from_secs(10), |got| {
@@ -1965,11 +1977,16 @@ fn fullscreen_in_the_terminal_is_a_notice() {
         "no notice of the page's fullscreen\n{}",
         term.context()
     );
-    let report = term.report_until(|r| r.contains(&page(true)));
-    assert!(report.contains(&page(true)), "{report}\n{}", term.context());
+    let report = term.report_until(|r| fullscreen(r) == page(true));
+    assert_eq!(
+        fullscreen(&report),
+        page(true),
+        "{report}\n{}",
+        term.context()
+    );
     term.type_bytes(b"\x1b");
-    let report = term.report_until(|r| r.contains(&page(false)));
-    assert!(report.contains(&page(false)), "{}", term.context());
+    let report = term.report_until(|r| fullscreen(r) == page(false));
+    assert_eq!(fullscreen(&report), page(false), "{}", term.context());
     let since = term.got.len();
     term.type_bytes(b":browser.fullscreen\r");
     let told = term.wait(since, Duration::from_secs(10), |got| {
@@ -1984,7 +2001,7 @@ fn fullscreen_in_the_terminal_is_a_notice() {
     });
     assert!(opened, "the page did not open\n{}", term.context());
     let report = term.report_until(|_| false);
-    assert!(report.contains(&page(false)), "{}", term.context());
+    assert_eq!(fullscreen(&report), page(false), "{}", term.context());
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
