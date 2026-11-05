@@ -38,6 +38,7 @@ members = [
     # Sighurt's internal pages (sig://help and the rest): Wasm guests built into sig by
     # crates/sighurt-pages, and their shared kit (docs/rewrite/pages-2026-11-05.md).
     "pages/sig-page-kit",
+    "pages/sig-page-terminal",
     # Guest SDK and example guests.
     "sdk/sighurt-sdk",
     "examples/hello-sighurt",

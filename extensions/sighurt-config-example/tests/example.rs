@@ -81,19 +81,21 @@ impl Browser for Fake {
     }
     fn tab(&self, index: usize) -> Option<TabInfo<'_>> {
         let url = *self.urls.get(index)?;
-        Some(TabInfo::new(
-            TabId::next(),
-            None,
-            url,
-            false,
-            None,
-            1.0,
-            false,
-            false,
-            self.link,
-            self.fullscreen,
+        Some(
+            TabInfo::new(
+                TabId::next(),
+                None,
+                url,
+                false,
+                None,
+                1.0,
+                false,
+                false,
+                self.link,
+                self.fullscreen,
+            )
+            .with_internal(self.internal),
         )
-        .with_internal(self.internal))
     }
 }
 
