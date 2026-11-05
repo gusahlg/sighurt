@@ -15,6 +15,10 @@
 //! A new snapshot of the same document, or a new width, finds again and keeps the current match
 //! by its number; another document ends the search.
 //!
+//! A field opens the editor only while the keymap gives the page text (`page_takes_text`, a
+//! mode that types nothing into pages has it `false`); otherwise a notice says so, and the
+//! option chooser, which types nothing, opens either way.
+//!
 //! Enter in the field editor sends `SetValue` when the text changed and `Submit` where HTML
 //! submits implicitly: a single-line field in a form with a button or with no other text
 //! field, never a text area. A value too long to be whole in the snapshot is not edited. A value with a newline is not edited here:
@@ -34,6 +38,9 @@ use crate::chrome::LineEditor;
 use crate::grid::{Attrs, Color, Grid};
 use crate::sanitize::sanitize;
 use crate::textmode::{self, Area, CellRange, Intent, TextDocument, TextView};
+
+/// The notice for a field activated while the keymap's mode types nothing into the page.
+pub const NO_TYPING: &str = "This keymap mode doesn't type into the page";
 
 /// The most option rows the chooser shows at once.
 const CHOOSER_ROWS: u16 = 8;
@@ -524,8 +531,10 @@ impl TextPages {
         Some((page.view.scroll, page.view.focused_item))
     }
 
-    /// A key the keymap left for `view`'s page. Returns the action it chose, if any.
-    pub fn page_key(&mut self, view: ViewId, key: &KeyEvent) -> Option<Act> {
+    /// A key the keymap left for `view`'s page. Returns the action it chose, if any. A field it
+    /// activates opens the editor only if the page `takes_text` (the keymap's
+    /// `page_takes_text`); otherwise a notice says why not.
+    pub fn page_key(&mut self, view: ViewId, key: &KeyEvent, takes_text: bool) -> Option<Act> {
         let nav = Nav::of(key)?;
         if nav == Nav::Activate && key.repeat {
             return None;
@@ -544,18 +553,19 @@ impl TextPages {
             Nav::Previous => text.focus_previous(doc, rows),
             Nav::Activate => {
                 let intent = text.activate(doc)?;
-                return self.intent(view, intent);
+                return self.intent(view, intent, takes_text);
             }
         }
         None
     }
 
-    /// A click at a cell of the page rows: focuses the link or control there and activates it.
-    pub fn click(&mut self, view: ViewId, col: u16, row: u16) -> Option<Act> {
+    /// A click at a cell of the page rows: focuses the link or control there and activates it,
+    /// a field only as [`Self::page_key`] does.
+    pub fn click(&mut self, view: ViewId, col: u16, row: u16, takes_text: bool) -> Option<Act> {
         let page = self.pages.get_mut(&view)?;
         page.view.click(&page.doc, col, row)?;
         let intent = page.view.activate(&page.doc)?;
-        self.intent(view, intent)
+        self.intent(view, intent, takes_text)
     }
 
     /// The wheel: `lines` down, or up when negative.
@@ -566,8 +576,9 @@ impl TextPages {
         }
     }
 
-    /// An activation's [`Intent`]: an action to send, or a prompt to open.
-    fn intent(&mut self, view: ViewId, intent: Intent) -> Option<Act> {
+    /// An activation's [`Intent`]: an action to send, or a prompt to open. A field's editor
+    /// opens only if the page `takes_text`.
+    fn intent(&mut self, view: ViewId, intent: Intent, takes_text: bool) -> Option<Act> {
         let page = self.pages.get(&view)?;
         let document = page.doc.document;
         match intent {
@@ -577,6 +588,10 @@ impl TextPages {
                 action,
                 link,
             }),
+            Intent::EditField { .. } if !takes_text => {
+                self.prompt = Some((view, Prompt::Notice(NO_TYPING.into())));
+                None
+            }
             Intent::EditField { node, value } => {
                 let password = page
                     .doc
@@ -937,30 +952,32 @@ mod tests {
     #[test]
     fn keys_scroll_and_focus_and_enter_follows_a_link() {
         let (mut pages, view, document) = pages();
-        assert!(pages.page_key(view, &key("ArrowDown", false)).is_none());
+        assert!(pages
+            .page_key(view, &key("ArrowDown", false), true)
+            .is_none());
         assert_eq!(pages.place(view), Some((1, None)));
-        pages.page_key(view, &key("End", false));
+        pages.page_key(view, &key("End", false), true);
         assert!(pages.place(view).unwrap().0 > 1);
-        pages.page_key(view, &key("Home", false));
+        pages.page_key(view, &key("Home", false), true);
         assert_eq!(pages.place(view), Some((0, None)));
         // The first Tab focuses the link, which Enter follows.
-        pages.page_key(view, &key("Tab", false));
-        let act = pages.page_key(view, &key("Enter", false)).unwrap();
+        pages.page_key(view, &key("Tab", false), true);
+        let act = pages.page_key(view, &key("Enter", false), true).unwrap();
         assert_eq!(act.view, view);
         assert_eq!(act.document, document);
         assert_eq!(act.action, SemanticAction::Activate(NodeId(2)));
         assert_eq!(act.link.as_deref(), Some("https://x.test/"));
         // Shift-Tab wraps from the first item to the last.
-        pages.page_key(view, &key("Tab", true));
+        pages.page_key(view, &key("Tab", true), true);
         assert_eq!(pages.place(view).unwrap().1, Some(2));
     }
 
     #[test]
     fn a_field_opens_an_editor_whose_enter_sets_the_value() {
         let (mut pages, view, document) = pages();
-        pages.page_key(view, &key("Tab", false));
-        pages.page_key(view, &key("Tab", false));
-        assert!(pages.page_key(view, &key("Enter", false)).is_none());
+        pages.page_key(view, &key("Tab", false), true);
+        pages.page_key(view, &key("Tab", false), true);
+        assert!(pages.page_key(view, &key("Enter", false), true).is_none());
         assert!(pages.prompting());
         // The value starts selected, so typing replaces it. `q` is text here, not a command.
         assert!(pages.prompt_key(&typed("q")).is_empty());
@@ -980,11 +997,35 @@ mod tests {
     }
 
     #[test]
+    fn a_page_that_takes_no_text_gets_a_notice_for_a_field_and_a_chooser_for_options() {
+        let (mut pages, view, _) = pages();
+        pages.page_key(view, &key("Tab", false), true);
+        pages.page_key(view, &key("Tab", false), true);
+        assert!(pages.page_key(view, &key("Enter", false), false).is_none());
+        // A notice, not the editor: a paste and typing go nowhere, and a key closes it.
+        assert!(pages.prompting());
+        assert!(pages.paste("pasted"));
+        assert!(pages.prompt_key(&typed("x")).is_empty());
+        assert!(!pages.prompting());
+        // Choosing an option types nothing: the chooser opens.
+        pages.page_key(view, &key("Tab", false), true);
+        assert!(pages.page_key(view, &key("Enter", false), false).is_none());
+        assert!(pages.prompting());
+        pages.prompt_key(&key("Escape", false));
+        // The page takes text again: the field opens its editor.
+        pages.page_key(view, &key("Tab", true), true);
+        pages.page_key(view, &key("Enter", false), true);
+        pages.prompt_key(&typed("y"));
+        let acts = pages.prompt_key(&key("Enter", false));
+        assert!(matches!(&acts[0].action, SemanticAction::SetValue { value, .. } if value == "y"));
+    }
+
+    #[test]
     fn a_field_never_takes_more_than_the_value_bound() {
         let (mut pages, view, _) = pages();
-        pages.page_key(view, &key("Tab", false));
-        pages.page_key(view, &key("Tab", false));
-        pages.page_key(view, &key("Enter", false));
+        pages.page_key(view, &key("Tab", false), true);
+        pages.page_key(view, &key("Tab", false), true);
+        pages.page_key(view, &key("Enter", false), true);
         // Pastes of 10 KiB of two-byte characters, three times, and typing after.
         let paste = "é".repeat(5 * 1024);
         for _ in 0..3 {
@@ -1003,12 +1044,12 @@ mod tests {
     #[test]
     fn escape_cancels_a_prompt_and_the_chooser_picks_an_option() {
         let (mut pages, view, _) = pages();
-        pages.page_key(view, &key("Tab", true));
-        assert!(pages.page_key(view, &key("Enter", false)).is_none());
+        pages.page_key(view, &key("Tab", true), true);
+        assert!(pages.page_key(view, &key("Enter", false), true).is_none());
         assert!(pages.prompting());
         pages.prompt_key(&key("Escape", false));
         assert!(!pages.prompting());
-        pages.page_key(view, &key("Enter", false));
+        pages.page_key(view, &key("Enter", false), true);
         pages.prompt_key(&key("ArrowDown", false));
         pages.prompt_key(&key("ArrowDown", false));
         let acts = pages.prompt_key(&key("Enter", false));
@@ -1033,7 +1074,7 @@ mod tests {
         let (mut pages, view, _) = pages();
         pages.wheel(view, 3);
         assert_eq!(pages.place(view), Some((3, None)));
-        assert!(pages.click(view, 0, 0).is_none());
+        assert!(pages.click(view, 0, 0, true).is_none());
         pages.wheel(view, 1000);
         let mut grid = Grid::new(40, 10);
         let area = Area {
@@ -1046,16 +1087,16 @@ mod tests {
         let row = (0..10u16)
             .find(|&r| row_text(&grid, r).starts_with("go"))
             .expect("the link is on screen");
-        let act = pages.click(view, 1, row).unwrap();
+        let act = pages.click(view, 1, row, true).unwrap();
         assert_eq!(act.action, SemanticAction::Activate(NodeId(2)));
     }
 
     #[test]
     fn the_editor_overlays_the_last_row_and_masks_a_password() {
         let (mut pages, view, _) = pages();
-        pages.page_key(view, &key("Tab", false));
-        pages.page_key(view, &key("Tab", false));
-        pages.page_key(view, &key("Enter", false));
+        pages.page_key(view, &key("Tab", false), true);
+        pages.page_key(view, &key("Tab", false), true);
+        pages.page_key(view, &key("Enter", false), true);
         let mut grid = Grid::new(40, 10);
         let area = Area {
             col: 0,
@@ -1142,9 +1183,9 @@ mod tests {
     #[test]
     fn a_new_document_drops_a_prompt_and_resets_the_place() {
         let (mut pages, view, _) = pages();
-        pages.page_key(view, &key("Tab", false));
-        pages.page_key(view, &key("Tab", false));
-        pages.page_key(view, &key("Enter", false));
+        pages.page_key(view, &key("Tab", false), true);
+        pages.page_key(view, &key("Tab", false), true);
+        pages.page_key(view, &key("Enter", false), true);
         assert!(pages.prompting());
         pages.snapshot(view, snapshot(DocumentGeneration::next()));
         assert!(!pages.prompting());
@@ -1193,8 +1234,8 @@ mod tests {
     }
 
     fn open_field(pages: &mut TextPages, view: ViewId) {
-        pages.page_key(view, &key("Tab", false));
-        assert!(pages.page_key(view, &key("Enter", false)).is_none());
+        pages.page_key(view, &key("Tab", false), true);
+        assert!(pages.page_key(view, &key("Enter", false), true).is_none());
         assert!(pages.prompting());
     }
 
@@ -1343,9 +1384,9 @@ mod tests {
         let submits = |fields: Vec<SemanticNode>, tabs: usize| {
             let (mut pages, view) = a_form_page(fields, false);
             for _ in 0..tabs {
-                pages.page_key(view, &key("Tab", false));
+                pages.page_key(view, &key("Tab", false), true);
             }
-            pages.page_key(view, &key("Enter", false));
+            pages.page_key(view, &key("Enter", false), true);
             let acts = pages.prompt_key(&key("Enter", false));
             acts.iter()
                 .any(|act| matches!(act.action, SemanticAction::Submit(_)))
@@ -1376,8 +1417,8 @@ mod tests {
                 ],
                 truncated,
             );
-            pages.page_key(view, &key("Tab", false));
-            pages.page_key(view, &key("Enter", false));
+            pages.page_key(view, &key("Tab", false), true);
+            pages.page_key(view, &key("Enter", false), true);
             let (row, _) = draw_last(&pages, view);
             row.starts_with("This value is too long to edit here")
         };
@@ -1392,12 +1433,12 @@ mod tests {
     #[test]
     fn a_held_enter_activates_once() {
         let (mut pages, view, _) = field_page(NodeKind::TextField, "a", false, true);
-        pages.page_key(view, &key("Tab", false));
+        pages.page_key(view, &key("Tab", false), true);
         let mut held = key("Enter", false);
         held.repeat = true;
-        assert!(pages.page_key(view, &held).is_none());
+        assert!(pages.page_key(view, &held, true).is_none());
         assert!(!pages.prompting());
-        pages.page_key(view, &key("Enter", false));
+        pages.page_key(view, &key("Enter", false), true);
         assert!(pages.prompting());
         pages.prompt_key(&typed("b"));
         assert!(pages.prompt_key(&held).is_empty());

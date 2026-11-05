@@ -301,6 +301,14 @@ nine entries.)
 
 ## 3.2 Behaviour
 
+> **Amended by decision 134 (5 November 2026).** NORMAL now gives the page no key and no text,
+> a field focused or not: the `typing` exemption below is gone, unbound keys are taken, and the
+> arrows, PageUp/PageDown, Home/End, Tab/Shift+Tab, Space/Shift+Space and Enter are bound to
+> `page.send-key` (Space and Enter taken while a page field has the keyboard). INSERT passes every
+> key but an unmodified Escape, and only INSERT gives the page text (`Keymap::page_takes_text`).
+> In the address line both modes apply NORMAL's `Always` bindings. The example crate's module
+> doc and the README describe it as it is; the text below is the design as first proposed.
+
 - **NORMAL.** The bindings above apply while the page has the keyboard. A binding whose first
   keystroke types a character (`Chord::types`) does not fire while `context.typing` is true (a
   page field or the line has the keyboard), so forms are typed into without changing mode; the

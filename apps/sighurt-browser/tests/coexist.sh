@@ -13,8 +13,8 @@
 # Uses target/debug/sig, which must be built with every engine (SIG_BIN overrides it).
 #
 # Checks: every tab loads in its engine (diagnostics, session titles); each tab's screenshot
-# shows its page when selected; switching back and forth; typing into one engine's field
-# reaches that page only (and no keymap binding); a link in the Servo page routed to WPE moves
+# shows its page when selected; switching back and forth; typing into one engine's field in
+# INSERT mode reaches that page only (and no keymap binding); a link in the Servo page routed to WPE moves
 # the tab; closing Ladybird's and CEF's tabs and reopening them leaves WPE's web process alive
 # and its page working; `q` quits within the shutdown bound; no child of sig is left. It also
 # records the process tree's RSS and the idle CPU of the whole tree over 10 s.
@@ -119,6 +119,8 @@ click() { point "$1" "$2"; sleep 0.3; echo click >&3; sleep 0.2; }
 key() { wtype "$@"; sleep 0.25; }
 # Every page has its field at page (20..320, 20..50) and its link at (20..520, 100..160).
 field_click() { click 100 $((chrome_h + 35)); sleep 0.4; }
+# The example keymap gives the page keys only in INSERT mode: Escape enters it and leaves it.
+insert() { key -k Escape; key "$@"; key -k Escape; }
 blank_click() { click 1000 $((chrome_h + 600)); sleep 0.3; }
 until_ok() {
   local end=$((SECONDS + $1)) reply
@@ -311,7 +313,7 @@ for e in servo wpe ladybird cef; do
   key -M alt "$i" -m alt
   sleep 1
   field_click
-  key "${word[$e]}"
+  insert "${word[$e]}"
   sleep 1.5
   t=$(typed_log | grep "^127.0.0.$i/" | tr '\n' ' ')
   check "$e: '${word[$e]}' typed into its field reaches its page" \
@@ -337,7 +339,7 @@ sleep 1
 shot "netsurf-before-typing" 0.3
 before=$(dark "$out/netsurf-before-typing.ppm" 20 $((chrome_h + 20)) 320 $((chrome_h + 50)))
 field_click
-key ox
+insert ox
 sleep 1
 shot "typed-$i-netsurf" 0.3
 after=$(dark "$out/typed-$i-netsurf.ppm" 20 $((chrome_h + 20)) 320 $((chrome_h + 50)))
@@ -398,7 +400,7 @@ wpe_works() {
   key r
   sleep 3
   field_click
-  key "$w"
+  insert "$w"
   sleep 1.5
   check "$1: WPE's page, reloaded, takes '$w' typed into it" \
     "$(answer "$(typed_log | grep -qx "127.0.0.2/$w"; echo $?)" "page reported: $(typed_log | grep '^127.0.0.2/' | tr '\n' ' ')")"

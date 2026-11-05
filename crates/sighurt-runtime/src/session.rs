@@ -334,7 +334,9 @@ impl<F: Frontend> Session<F> {
                             .view(view)
                             .and_then(|v| v.activation())
                             .filter(|&at| Some(at) == self.handling);
-                        if frontend.page_input(view, event, activation, &mut self.queue) {
+                        let takes_text = self.core.page_takes_text();
+                        if frontend.page_input(view, event, activation, takes_text, &mut self.queue)
+                        {
                             return;
                         }
                     }

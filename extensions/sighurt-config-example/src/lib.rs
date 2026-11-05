@@ -3,14 +3,23 @@
 //! written in Rust against `sighurt_api::keymap` (docs/rewrite/config-extension.md, §3). Select it
 //! with `[input] keymap = "example"`; copy the crate and edit the tables to make your own.
 //!
-//! - **NORMAL** applies while the page has the keyboard. A binding whose first key types does
-//!   not fire while a text field (or the line) has it, so forms are typed into without changing
-//!   mode. Unbound keys pass. The indicator is empty, or the keys of an unfinished sequence.
-//! - **INSERT** binds Escape only; every other key passes. The indicator is `INSERT MODE`.
+//! - **NORMAL**, the mode it starts in: while the page has the keyboard, keys are commands and
+//!   none reaches the page, whether or not a text field of it has the keyboard. A bound key runs
+//!   its command (the arrows, PageUp, PageDown, Home, End, Space, Tab, Enter and their shifted
+//!   forms send that key to the page, to scroll and to move between and follow links); an
+//!   unbound key, a modifier and a dead key are taken and do nothing. Space and Enter, which
+//!   would type or submit, are taken too while a text field has the keyboard
+//!   ([`Scope::NoField`]). No text reaches the page either ([`Keymap::page_takes_text`]): no
+//!   input method, no paste. The indicator is empty, or the keys of an unfinished sequence.
+//! - **INSERT**: every key reaches the page, and no binding listens, the `Always` ones neither;
+//!   the one key taken is an unmodified Escape. Text and pastes reach the page. The indicator is
+//!   `INSERT MODE`.
 //! - **Escape** switches mode, except while the page shown holds an element fullscreen (a
 //!   video): then it runs `page.exit-fullscreen` and the mode stays.
-//! - **The address line.** While the chrome has the keyboard only `Always` bindings whose first
-//!   key types nothing apply; Escape and the editing keys are the line's.
+//! - **The address line and the find field.** The modes are the page's: while the chrome has
+//!   the keyboard, in either mode, only NORMAL's `Always` bindings whose first key types nothing
+//!   apply, and every other key, Escape included, is the line's. The mode stays.
+//! - **The mouse** is not typing: clicks reach the page in both modes and change no mode.
 //! - **Sequences** are at most 4 keys, no binding the start of another, and never wait for a
 //!   timeout. Modifier and dead keys are not keys of a sequence; a key that doesn't continue
 //!   one drops it and starts afresh; `context` and `reset` drop it.
@@ -167,15 +176,18 @@ impl Example {
     /// What `keys` are in the bindings that apply now.
     fn find(&self, keys: &[KeyEvent], context: KeyContext, frontend: Frontend) -> Found<'_> {
         let chrome = context.focus == KeyboardFocus::Chrome;
-        let table = match self.mode {
-            Mode::Normal => &self.normal,
-            Mode::Insert => &self.insert,
+        // The modes are the page's: the line keeps NORMAL's few bindings in both.
+        let table = match (chrome, self.mode) {
+            (true, _) | (false, Mode::Normal) => &self.normal,
+            (false, Mode::Insert) => &self.insert,
         };
         let applies = |binding: &&Parsed| {
-            let types = binding.keys[0].types();
             exists_in(binding.frontend, frontend)
-                && !(chrome && (binding.scope != Scope::Always || types))
-                && !(context.typing && types)
+                && match binding.scope {
+                    Scope::Always => !(chrome && binding.keys[0].types()),
+                    Scope::Page => !chrome,
+                    Scope::NoField => !chrome && !context.typing,
+                }
         };
         let fits = |binding: &&Parsed| {
             binding.keys.len() >= keys.len()
@@ -221,8 +233,14 @@ impl Keymap for Example {
                 _ => KeyAction::Take,
             };
         }
+        // What becomes of a key no binding has: in NORMAL the page gets no key at all.
+        let page = context.focus == KeyboardFocus::Page;
+        let unbound = match (page, self.mode) {
+            (true, Mode::Normal) => KeyAction::Take,
+            _ => KeyAction::Pass,
+        };
         if is_modifier(key) {
-            return KeyAction::Pass;
+            return unbound;
         }
         self.held = None;
         let frontend = browser.frontend();
@@ -266,7 +284,7 @@ impl Keymap for Example {
                 KeyAction::Take
             }
             Some(Resolved::Custom(f)) => KeyAction::RunAll(f(browser)),
-            None => KeyAction::Pass,
+            None => unbound,
         }
     }
 
@@ -283,5 +301,9 @@ impl Keymap for Example {
 
     fn indicator(&self) -> Option<&str> {
         Some(self.indicator.as_str()).filter(|text| !text.is_empty())
+    }
+
+    fn page_takes_text(&self) -> bool {
+        self.mode == Mode::Insert
     }
 }

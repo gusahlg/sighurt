@@ -29,6 +29,9 @@
 //!    change the tab list change the numbering the later ones see (`tab.close 3` renumbers tab
 //!    4), as typing them one after another would, so a keymap closing several tabs by number
 //!    closes the highest first.
+//! 9. [`Keymap::page_takes_text`] is asked after every update: while it says `false`, text that
+//!    is not a key press (an input method's, a terminal's paste) does not reach the page, and
+//!    the host enables no input method for the page's fields.
 //!
 //! A keymap is the browser's configuration in Rust (docs/rewrite/config-extension.md): it reads
 //! what the browser shows through [`Browser`], defines its own actions as commands computed from
@@ -189,6 +192,13 @@ pub trait Keymap {
     /// at most 64 characters of one line.
     fn indicator(&self) -> Option<&str> {
         None
+    }
+
+    /// Whether the page may be given text that is not a key press: an input method's text, a
+    /// terminal's paste (guarantee 9). `false` in a mode whose keys are only commands, so
+    /// nothing the user types reaches the page there. Key presses are [`Self::press`]'s.
+    fn page_takes_text(&self) -> bool {
+        true
     }
 }
 

@@ -1109,12 +1109,13 @@ fn fuzz_text_pages_driven_by_input() {
                     if pages.prompting() {
                         let _ = pages.prompt_key(&key);
                     } else {
-                        let _ = pages.page_key(view, &key);
+                        let takes_text = case.rng.below(2) == 0;
+                        let _ = pages.page_key(view, &key, takes_text);
                     }
                 }
                 4 => {
-                    let _ =
-                        pages.click(view, case.rng.below(120) as u16, case.rng.below(40) as u16);
+                    let (col, row) = (case.rng.below(120) as u16, case.rng.below(40) as u16);
+                    let _ = pages.click(view, col, row, case.rng.below(2) == 0);
                 }
                 5 => pages.wheel(view, case.rng.range(0, 60) as isize - 30),
                 6 => {
