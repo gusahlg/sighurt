@@ -68,9 +68,24 @@ impl Terminal {
 
     /// [`Self::start_with`] with `tui` more lines in the configuration's `[tui]` table.
     fn start_in(name: &str, args: &[&str], replies: &'static [u8], tui: &str) -> Self {
+        Self::start_seeded(name, args, replies, tui, None)
+    }
+
+    /// [`Self::start_in`] with `history` as the history file (`state/sighurt/history.toml`).
+    fn start_seeded(
+        name: &str,
+        args: &[&str],
+        replies: &'static [u8],
+        tui: &str,
+        history: Option<&str>,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!("sig-tui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("config/sighurt")).unwrap();
+        if let Some(history) = history {
+            fs::create_dir_all(dir.join("state/sighurt")).unwrap();
+            fs::write(dir.join("state/sighurt/history.toml"), history).unwrap();
+        }
         fs::write(
             dir.join("config/sighurt/config.toml"),
             format!(
@@ -940,6 +955,53 @@ fn a_key_typed_during_the_probe_is_kept() {
 }
 
 /// Ctrl+C in the address line copies the line with OSC 52, and does not quit.
+/// Typing in the address line completes from the history file: the rest of the address shows
+/// after the cursor, Tab makes the line that exact address (Ctrl+C copies it to show it), and
+/// Enter opens it.
+#[test]
+fn the_address_line_completes_from_the_history() {
+    const URL: &str = "https://www.example.com/page";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let history =
+        format!("version = 1\n[[visits]]\nurl = \"{URL}\"\ntitle = \"Example\"\nlast = {now}\ncount = 2\n");
+    let mut term = Terminal::start_seeded("history", &["demo://pattern"], REPLIES, "", Some(&history));
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"o");
+    let editing = term.wait(since, Duration::from_secs(10), |got| has(got, b"demo://pattern"));
+    assert!(editing, "`o` did not open the address line\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"exa");
+    let completed = term.wait(since, Duration::from_secs(10), |got| shows(got, "mple.com/page"));
+    assert!(completed, "no completion after the cursor\n{}", term.context());
+    let since = term.got.len();
+    // Tab, then Ctrl+C, as a legacy terminal sends them.
+    term.type_bytes(b"\t\x03");
+    let taken = term.wait(since, Duration::from_secs(10), |got| {
+        has(got, &osc52(URL.as_bytes()))
+    });
+    assert!(taken, "Tab did not make the line {URL}\n{}", term.context());
+    term.type_bytes(b"\r");
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(500) {
+        term.wait(term.got.len(), Duration::from_millis(20), |_| false);
+    }
+    term.type_bytes(b"q");
+    let status = term.exit();
+    assert!(status.success(), "sig exited with {status:?}\n{}", term.context());
+    term.assert_restored();
+    // Only http and https pages are visits; the demo engine's are not, and the file stays.
+    assert_eq!(term.counter("visits_recorded"), 0);
+    let kept = fs::read_to_string(term.dir.join("state/sighurt/history.toml")).unwrap();
+    assert!(kept.contains(URL), "{kept}");
+}
+
 #[test]
 fn ctrl_c_in_the_line_copies_it() {
     let mut term = Terminal::start("copy-line", &["demo://pattern"]);
