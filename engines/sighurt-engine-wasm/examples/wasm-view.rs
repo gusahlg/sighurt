@@ -217,6 +217,7 @@ fn main() {
         policy: Default::default(),
         kv_root: kv.path().to_path_buf(),
         aot_cache: None,
+        pages: Vec::new(),
     };
     let mut runtime = WasmRuntime::new(config, waker.clone()).expect("the Wasm runtime");
     let view = ViewId::next();

@@ -128,6 +128,8 @@ pub struct WasmConfig {
     /// Where compiled modules are cached ([`default_aot_cache`] for `sig`), or `None` to compile
     /// every module every time.
     pub aot_cache: Option<PathBuf>,
+    /// Sighurt's own pages, which `sig://<name>` loads ([`crate::pages`]); empty for none.
+    pub pages: Vec<crate::pages::InternalPage>,
 }
 
 /// The shared engine: Wasmtime, the limits, the epoch ticker and the runtime's directories.
@@ -143,6 +145,8 @@ pub struct WasmEngine {
     worker_threads: Arc<AtomicUsize>,
     /// Bytes of linear memory all stores of this runtime hold.
     memory: Arc<AtomicUsize>,
+    /// The internal pages.
+    pages: Arc<[crate::pages::InternalPage]>,
     /// The network resources guests share, made on first use (`None` if they can't be).
     net: Arc<OnceLock<Option<Arc<Net>>>>,
     /// Bytes all documents' connections hold for their guests.
@@ -175,6 +179,7 @@ impl WasmEngine {
             kv: Arc::new(KvQuota::new(&config.kv_root)),
             kv_root: config.kv_root.into(),
             aot_cache: config.aot_cache.map(Into::into),
+            pages: config.pages.into(),
             ticker: Arc::new(TickerHandle(ticker)),
             worker_threads: Arc::default(),
             memory: Arc::default(),
@@ -194,6 +199,11 @@ impl WasmEngine {
     }
 
     /// Where the persistent key-value store keeps each origin's keys.
+    /// The internal page named `name`, if this runtime has it.
+    pub fn page(&self, name: &str) -> Option<crate::pages::InternalPage> {
+        self.pages.iter().find(|page| page.name == name).copied()
+    }
+
     pub fn kv_root(&self) -> &Path {
         &self.kv_root
     }
@@ -788,6 +798,7 @@ pub(crate) mod tests {
             policy,
             kv_root: std::env::temp_dir().join("sighurt-wasm-unit-test-kv"),
             aot_cache: None,
+            pages: Vec::new(),
         })
         .unwrap()
     }

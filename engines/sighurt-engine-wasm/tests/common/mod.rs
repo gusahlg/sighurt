@@ -314,6 +314,7 @@ impl Host {
             policy,
             kv_root: dir.path().join("kv"),
             aot_cache: None,
+            pages: Vec::new(),
         };
         Self {
             runtime: WasmRuntime::new(config, waker.clone()).unwrap(),

@@ -127,9 +127,17 @@ impl AppUrl {
     ///   change the origin).
     /// - `file`: the containing directory, so different local apps don't share state while
     ///   an app and its sibling assets do.
+    /// - `sig`: `sig://<page>`, the internal page's own, so no two pages share anything.
     /// - Other schemes fall back to [`AppUrl::origin_str`].
     pub fn app_origin(&self) -> String {
-        if self.is_local_file() {
+        if self.is_internal() {
+            let page = self
+                .inner
+                .host_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            format!("sig://{page}")
+        } else if self.is_local_file() {
             let path = self.inner.path();
             let dir = match path.rfind('/') {
                 Some(0) => "/",
