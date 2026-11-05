@@ -202,8 +202,16 @@ const READING: &str = "Reading the page…";
 const WHEEL_LINES: isize = 3;
 /// The page rows' message when the page area has more pixels than an image may.
 const TOO_BIG: &str = "The page area is too big for an image";
-/// The page rows' message for a `sig:` page.
-const INTERNAL: &str = "sig: pages aren't shown in the terminal yet";
+/// The page rows' message for a `sig:` address that names no page; the home page's rows are
+/// empty.
+const NO_SUCH_PAGE: &str = "sig has no such page: sig://help lists its pages";
+
+/// Whether a `sig:` URL names the home page (`sig:home`, `SIG://Home/` and the like too).
+fn is_home(url: &str) -> bool {
+    let rest = url.split_once(':').map_or("", |(_, rest)| rest);
+    let name = rest.trim_start_matches('/').split(['/', '?', '#']).next();
+    name.is_some_and(|name| name.eq_ignore_ascii_case("home"))
+}
 /// The page rows' message for one of sig's own pages (`sig://help`) where no image can show:
 /// they are drawn, with no text to show instead.
 const PAGE_NEEDS_GRAPHICS: &str =
@@ -1594,6 +1602,9 @@ impl App {
     fn page_message(&self) -> Option<String> {
         enum Kind {
             Blank,
+            /// The home page: nothing to say.
+            Home,
+            /// A `sig:` address that names no page.
             Internal,
             /// One of sig's own pages: a view, drawn.
             Page,
@@ -1609,6 +1620,7 @@ impl App {
             };
             let kind = match tab.content {
                 Content::Blank => Kind::Blank,
+                Content::Internal(url) if is_home(url) => Kind::Home,
                 Content::Internal(_) => Kind::Internal,
                 Content::View(view) if core.view(view).is_some_and(|v| v.page().is_some()) => {
                     Kind::Page
@@ -1624,7 +1636,8 @@ impl App {
                 (None, Some(url)) => Some(format!("Loading {url}…")),
                 (None, None) => None,
             },
-            Kind::Internal => Some(error.unwrap_or_else(|| INTERNAL.into())),
+            Kind::Home => error,
+            Kind::Internal => Some(error.unwrap_or_else(|| NO_SUCH_PAGE.into())),
             // sig's own pages are drawn: they have no text mode.
             Kind::Page if self.tui.text_mode && self.tui.images_possible() => {
                 Some(error.unwrap_or_else(|| PAGE_HAS_NO_TEXT.into()))

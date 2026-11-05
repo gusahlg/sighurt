@@ -781,13 +781,15 @@ fn kitty_keys_open_addresses_tabs_and_quit() {
     );
 
     // `t` opens a tab with the address line open; Escape closes it, `J` and `K` switch.
-    let since = term.got.len();
     term.type_bytes(&kitty_keys("t"));
-    let opened = term.wait(since, Duration::from_secs(10), |got| {
-        shows(got, "sig: pages aren't shown in the terminal yet")
-    });
-    assert!(opened, "`t` opened no tab\n{}", term.context());
-    assert_eq!(term.tabs(), (2, 2));
+    let start = Instant::now();
+    while term.tabs() != (2, 2) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "`t` opened no tab\n{}",
+            term.context()
+        );
+    }
     for (keys, active) in [("\x1bJ", 1), ("K", 2)] {
         term.type_bytes(&kitty_keys(keys));
         let start = Instant::now();

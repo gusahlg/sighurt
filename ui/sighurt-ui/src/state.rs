@@ -214,7 +214,7 @@ pub struct EngineRow {
 }
 
 /// What the page area says about `sig:` URLs other than the home page.
-pub const NO_SUCH_PAGE: &str = "Sighurt has no such page. Its only page is sig://home.";
+pub const NO_SUCH_PAGE: &str = "Sighurt has no such page. sig://help lists its pages.";
 
 /// Whether a `sig:` URL names the home page (`sig:home`, `SIG://Home/` and the like work too).
 pub fn is_home(url: &str) -> bool {
