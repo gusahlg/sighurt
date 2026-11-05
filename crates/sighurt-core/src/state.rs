@@ -2741,8 +2741,11 @@ impl BrowserState {
                     Service::Page(PageRequest::PtyOpen { .. } | PageRequest::ConfigWrite { .. })
                 );
                 if allowed && deliberate {
-                    // Only the page in front, with the keyboard, after the user acted in it.
-                    let focused = tab == self.active && self.focused_view() == Some(view);
+                    // Only the page in front, with the keyboard, in a window that has it, after
+                    // the user acted in it.
+                    let focused = tab == self.active
+                        && self.focused_view() == Some(view)
+                        && self.window_focused();
                     let v = self.views.get_mut(&view).expect("checked above");
                     focused && permissions::take_activation(&mut v.activation, at)
                 } else {

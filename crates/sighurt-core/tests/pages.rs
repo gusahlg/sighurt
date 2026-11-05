@@ -9,9 +9,10 @@ use sighurt_api::engine::{EngineCapabilities, EngineCommand};
 use sighurt_api::events::{EngineEvent, OpenDisposition};
 use sighurt_api::ids::{DocumentGeneration, PtySession, RequestId, SeatId, ViewId};
 use sighurt_api::input::{
-    ButtonState, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers,
-    PointerButton, PointerEvent,
+    ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus,
+    Modifiers, PointerButton, PointerEvent,
 };
+use sighurt_api::keymap::Frontend;
 use sighurt_api::services::{
     PageGrant, PageInfo, PageRequest, PtyProgram, Service, ServiceError, ServiceReply,
     ServiceRequest, ServiceResult,
@@ -967,4 +968,62 @@ fn a_key_the_chrome_got_does_not_repeat_into_the_tab_it_opened() {
         assert!(delivered_to(&h.apply(c), shown), "{command}");
     }
     assert!(!delivered(&h.apply(enter(ButtonState::Released, false))));
+}
+
+fn config_write() -> Service {
+    Service::Page(PageRequest::ConfigWrite {
+        text: "version = 1".into(),
+        replaces: String::new(),
+    })
+}
+
+fn window_focus(focus: FocusEvent) -> BrowserEvent {
+    BrowserEvent::Keyboard {
+        event: InputEvent {
+            seat: SeatId::next(),
+            kind: InputKind::Focus(focus),
+        },
+        at: Instant::now(),
+    }
+}
+
+#[test]
+fn an_unfocused_window_writes_no_configuration_and_opens_no_terminal() {
+    let on = "[pages.terminal]\nenabled = true";
+    for (url, service) in [
+        ("sig://config", config_write()),
+        ("sig://terminal", pty_open()),
+    ] {
+        let mut h = Harness::start(on, &[url]);
+        let view = h.shown();
+        h.click(view);
+        h.apply(window_focus(FocusEvent::Deactivated));
+        let (id, effects) = h.ask(view, Some(url), service.clone());
+        assert_eq!(
+            answer(&effects, id),
+            Some(&Err(ServiceError::Denied)),
+            "{url}"
+        );
+        // The refusal used nothing up: back in front, the click still counts.
+        h.apply(window_focus(FocusEvent::Activated));
+        let (id, effects) = h.ask(view, Some(url), service.clone());
+        assert!(performs(&effects, id), "{url}");
+        // The terminal reports no focus unless it was asked to: there the window has it.
+        let env = Environment {
+            frontend: Frontend::Terminal,
+            ..environment()
+        };
+        let mut h = Harness::with(on, env);
+        h.apply(BrowserEvent::Start {
+            session: None,
+            open: vec![OpenRequest {
+                input: url.into(),
+                engine: None,
+            }],
+        });
+        let view = h.shown();
+        h.click(view);
+        let (id, effects) = h.ask(view, Some(url), service);
+        assert!(performs(&effects, id), "{url} in the terminal");
+    }
 }

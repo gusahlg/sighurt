@@ -111,7 +111,8 @@ web page gets, so what they get is held at several layers:
   then decides each request from its own record: help may ask for facts about the build and the
   configuration (never the configuration's text); config may read, check and replace the
   configuration file; terminal may start a terminal. Writing the configuration and starting a
-  terminal also need the page in front, with the keyboard, and a click or key press in it.
+  terminal also need the page in front, with the keyboard, in a window that has it, and a click
+  or key press in it.
 - **No network, no code loading.** An internal page has a deny-all network policy, and fails to
   load if it imports the network, workers, module loading, files or devices.
 - **Typing goes where you meant it.** After a tab comes to the front without your command (a page
