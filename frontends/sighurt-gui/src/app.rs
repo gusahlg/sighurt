@@ -460,6 +460,11 @@ impl Frontend for Gui {
         self.show_notice(message);
     }
 
+    fn fullscreen(&mut self, on: bool) {
+        // The compositor answers with a configure, which `WindowConfigured` reports.
+        self.host.set_fullscreen(self.window, on);
+    }
+
     fn redraw(&mut self) {
         self.snapshot_dirty = true;
     }
@@ -770,8 +775,21 @@ impl Gui {
     }
 
     /// What the status strip shows for `tab`, and where it comes from. A tab's error is shown
-    /// there unless the page area shows it (a tab with nothing else to show).
-    fn status<'a>(&'a self, tab: &TabSummary<'a>) -> Option<(&'static str, &'a str)> {
+    /// there unless the page area shows it (a tab with nothing else to show). While the window
+    /// is `fullscreen`, only a fresh notice: the chrome shows itself for it alone, and hides
+    /// again when the notice gives way.
+    fn status<'a>(
+        &'a self,
+        tab: &TabSummary<'a>,
+        fullscreen: bool,
+    ) -> Option<(&'static str, &'a str)> {
+        if fullscreen {
+            let notice = self
+                .notice
+                .as_deref()
+                .filter(|_| self.notice_first.is_some());
+            return notice.map(|text| ("notice", text));
+        }
         let error = tab
             .error
             .filter(|_| !matches!(tab.content, Content::Blank))
@@ -1050,10 +1068,13 @@ impl App {
     fn host_event(&mut self, event: HostEvent) {
         let at = Instant::now();
         match event {
-            HostEvent::WindowConfigured { size, .. } => {
+            HostEvent::WindowConfigured {
+                size, fullscreen, ..
+            } => {
                 self.gui.size = Some(size);
                 let queue = self.session.queue_mut();
                 self.gui.chrome_event(queue, ChromeEvent::Resize(size));
+                queue.push_back(BrowserEvent::Fullscreen(fullscreen));
                 self.gui.place_now = true;
             }
             HostEvent::CloseRequested { .. } => self.session.queue_mut().push_back(
@@ -1165,7 +1186,9 @@ impl App {
     fn snapshot(&mut self) -> Snapshot {
         let home = self.home_info();
         let gui = &self.gui;
-        let status = |tab: &TabSummary<'_>| gui.status(tab).map(|(_, text)| text.to_owned());
+        let fullscreen = self.session.core().fullscreen().window;
+        let status =
+            |tab: &TabSummary<'_>| gui.status(tab, fullscreen).map(|(_, text)| text.to_owned());
         let cache = &mut self.snapshot_cache;
         chrome::snapshot(self.session.core(), home, status, cache)
     }
@@ -1580,20 +1603,11 @@ fn report(gui: &Gui, session: &mut Session<Gui>, at_exit: bool) {
     let active_tab = session.core().active() + 1;
     let status = {
         let core = session.core();
+        let fullscreen = core.fullscreen().window;
         let index = core.active();
-        core.tabs().nth(index).and_then(|tab| {
-            let error = tab
-                .error
-                .filter(|_| !matches!(tab.content, Content::Blank))
-                .map(|error| error.message.as_str());
-            status_line(
-                gui.notice.as_deref(),
-                gui.notice_first.is_some(),
-                tab.status,
-                error,
-            )
-            .map(|(from, _)| from)
-        })
+        core.tabs()
+            .nth(index)
+            .and_then(|tab| gui.status(&tab, fullscreen).map(|(from, _)| from))
     };
     let counters = session.diagnostics().counters.clone();
     let peaks = session.diagnostics().peaks.clone();

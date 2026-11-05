@@ -28,7 +28,8 @@ pub struct Snapshot {
     /// Whether the active tab can go forward.
     pub can_go_forward: bool,
     /// The status line: the active page's hovered link, or `sig`'s own notice. Untrusted;
-    /// at most 2 000 characters.
+    /// at most 2 000 characters. While the window is fullscreen, only a fresh notice of `sig`'s
+    /// own, for a few seconds.
     pub status: Option<String>,
     /// What the keymap says about itself ("NORMAL"), if anything; at most 64 characters.
     pub keymap: Option<String>,
@@ -37,6 +38,11 @@ pub struct Snapshot {
     /// The search in the active tab's page, if one is under way: what the find field shows
     /// beside it.
     pub find: Option<FindSnapshot>,
+    /// The window is fullscreen (the user's `browser.fullscreen`, or a page's element). A chrome
+    /// then lists its surfaces only while they are needed: while it has the keyboard, while
+    /// [`Snapshot::status`] is `Some`, and while it draws the page area; otherwise it lists none
+    /// and puts the page at the whole window.
+    pub fullscreen: bool,
 }
 
 /// A search in the page (`page.find`), as the chrome shows it.

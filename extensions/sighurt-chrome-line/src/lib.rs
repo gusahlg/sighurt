@@ -24,8 +24,10 @@
 //! and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
 //! shows no engine's page (`sig://home`, an error), a few lines of text say what there is.
 //!
-//! Its surfaces, bottom to top: [`PAGE`] while it draws the page area, and [`LINE`]. It repaints
-//! only what changed, and nothing ticks: the caret is steady.
+//! Its surfaces, bottom to top: [`PAGE`] while it draws the page area, and [`LINE`]. While the
+//! window is fullscreen, the line is listed only while it has the keyboard or there is status
+//! text, over the page, which keeps the whole window. It repaints only what changed, and
+//! nothing ticks: the caret is steady.
 //!
 //! Must not own: browser state (the core's, which arrives as snapshots), targets and placement
 //! (`sig` and the host), or what a key does (the keymap's: only keys it passes reach the line).
@@ -227,10 +229,31 @@ impl Line {
     }
 
     fn relayout(&mut self) {
+        let line = ChromeSurface::new(LINE, self.line_rect());
+        if self.snapshot.fullscreen && !self.draws_page() {
+            // Over the page, which keeps the whole window, and only while it is needed.
+            let window = WindowRect {
+                x: 0,
+                y: 0,
+                width: self.window.width,
+                height: self.window.height,
+            };
+            let needed = self.focused || self.error.is_some() || self.snapshot.status.is_some();
+            let surfaces = needed.then_some(line).into_iter().collect();
+            self.layout = ChromeLayout::new(window, surfaces);
+            return;
+        }
         let page = self.page_rect();
         let page_surface = self.draws_page().then(|| ChromeSurface::new(PAGE, page));
-        let line = ChromeSurface::new(LINE, self.line_rect());
         self.layout = ChromeLayout::new(page, page_surface.into_iter().chain([line]).collect());
+    }
+
+    /// Whether the latest layout lists the line.
+    fn lists_line(&self) -> bool {
+        self.layout
+            .surfaces
+            .iter()
+            .any(|surface| surface.name == LINE)
     }
 
     fn set_snapshot(&mut self, snapshot: Snapshot) {
@@ -629,8 +652,11 @@ impl Line {
             let field = text_input.map(|state| TextField::new(LINE, state));
             actions.push(ChromeAction::TextInput(field));
         }
+        let listed = self.lists_line();
         self.relayout();
-        if std::mem::take(&mut self.line_changed) {
+        // A line listed again after fullscreen hid it is drawn again, changed or not.
+        let changed = std::mem::take(&mut self.line_changed);
+        if self.lists_line() && (changed || !listed) {
             actions.push(ChromeAction::Repaint(LINE));
         }
         if std::mem::take(&mut self.page_changed) && self.draws_page() {

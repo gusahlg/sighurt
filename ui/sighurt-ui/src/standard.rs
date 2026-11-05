@@ -7,6 +7,11 @@
 //! top, and the toolbar) and [`STATUS`] (the status strip, or the overlay while there is status
 //! text, which takes no pointer input so the page under it keeps its hover).
 //!
+//! While the window is fullscreen ([`Snapshot::fullscreen`](crate::Snapshot::fullscreen)) it
+//! lists them only while they are needed: while it draws the page area, as always; while the
+//! address or find line has the keyboard, or there is status text, over the page, which keeps
+//! the whole window. Otherwise it lists none.
+//!
 //! `[chrome.standard]` takes `tabs` (`"top"`, `"left"` or `"hidden"`), `status` (`"strip"` or
 //! `"overlay"`), `buttons`, `compact` and `engine-label` (true or false); its one command is
 //! `chrome.toggle-tabs`. `[ui] font` and `font-size` set its text.
@@ -105,6 +110,16 @@ impl Standard {
 /// The surfaces `model` shows now.
 fn layout_of(model: &Model) -> ChromeLayout {
     let layout = model.layout();
+    let fullscreen = model.snapshot().fullscreen && !model.draws_page();
+    let window = WindowRect {
+        x: 0,
+        y: 0,
+        width: layout.window.width,
+        height: layout.window.height,
+    };
+    if fullscreen && !model.state().focused && model.status_line().is_none() {
+        return ChromeLayout::new(window, Vec::new());
+    }
     let mut surfaces = Vec::new();
     if model.draws_page() {
         surfaces.push(ChromeSurface::new(PAGE, layout.page));
@@ -122,7 +137,9 @@ fn layout_of(model: &Model) -> ChromeLayout {
         }
         Status::Overlay => {}
     }
-    ChromeLayout::new(layout.page, surfaces)
+    // In fullscreen the chrome shows over the page, which keeps its size.
+    let page = if fullscreen { window } else { layout.page };
+    ChromeLayout::new(page, surfaces)
 }
 
 impl Chrome for Standard {
@@ -156,13 +173,26 @@ impl Chrome for Standard {
             ChromeEvent::Pasted { request, text } => self.model.paste(request, &text),
             ChromeEvent::Command(action) => self.model.command(&action),
         };
-        self.layout = layout_of(&self.model);
-        // A surface that isn't listed shows nothing; when it is listed again, what lists it
-        // (a page to draw, the tabs moving, status text) damages it then.
+        let before = std::mem::replace(&mut self.layout, layout_of(&self.model));
+        // A surface that isn't listed shows nothing; when it is listed again, it is drawn
+        // again: what lists it (a page to draw, the tabs moving, status text) damages it, and
+        // so does listing it at all (fullscreen hides every surface, and brings them back for
+        // a focused line).
         let listed = &self.layout.surfaces;
+        let is_listed = |name: &SurfaceName| listed.iter().any(|surface| surface.name == *name);
+        let was_listed = |name: &SurfaceName| before.surfaces.iter().any(|s| s.name == *name);
         let damaged = self.model.take_damage().surfaces();
-        let repaints = damaged.filter(|name| listed.iter().any(|surface| surface.name == *name));
-        actions.extend(repaints.map(ChromeAction::Repaint));
+        let revealed = listed
+            .iter()
+            .map(|s| s.name)
+            .filter(|name| !was_listed(name));
+        let mut repaints: Vec<SurfaceName> = Vec::new();
+        for name in damaged.chain(revealed) {
+            if is_listed(&name) && !repaints.contains(&name) {
+                repaints.push(name);
+            }
+        }
+        actions.extend(repaints.into_iter().map(ChromeAction::Repaint));
         actions
     }
 

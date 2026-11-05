@@ -19,6 +19,10 @@
 //! - `demo:error`: a recoverable error: the navigation fails and the previous page stays.
 //! - `demo:crash`: another: a click or key press fails the view (`ViewFailed`), and reloading
 //!   recovers it.
+//! - `demo:fullscreen`: an element fullscreen, as a video's button asks for it: a click or Enter
+//!   reports `FullscreenChanged { fullscreen: true }`, and `ExitFullscreen` leaves it
+//!   (`FullscreenChanged { fullscreen: false }`). `demo:fullscreen-unasked` reports `true` as
+//!   it commits, with no click: what a page may not do by itself.
 //!
 //! Both `demo:page` and `demo://page` name a page; the address bar keeps only the second form as
 //! typed (it reads `demo:pattern` as a search, as it does any text without `://`), and routing
@@ -71,8 +75,9 @@ use sighurt_wayland::TargetLease;
 pub const NAME: &str = "demo";
 
 /// What the demo engine supports: content as structure (a small fixed tree, see [`snapshot`]),
-/// find in page over that tree's text, and cookies and storage in memory
-/// ([`EngineRuntime::site_data`]). None of the other optional operations. `text_input` is IME composition, not the text field's focus, which is
+/// find in page over that tree's text, cookies and storage in memory
+/// ([`EngineRuntime::site_data`]), and element fullscreen (`demo:fullscreen`). None of the
+/// other optional operations. `text_input` is IME composition, not the text field's focus, which is
 /// reported as `TextInputChanged`.
 pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     history_traversal: false,
@@ -91,7 +96,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
         caches: false,
         hsts: false,
     },
-    fullscreen: false,
+    fullscreen: true,
 };
 
 /// How long `demo:slow` takes to have a frame for a new layout: longer than the host's resize
@@ -116,6 +121,10 @@ pub enum Page {
     Resize,
     /// A page that fails its view when clicked or typed into.
     Crash,
+    /// A page whose element goes fullscreen when clicked, or on Enter.
+    Fullscreen,
+    /// A page whose element goes fullscreen as it commits, unasked.
+    FullscreenUnasked,
 }
 
 impl Page {
@@ -132,6 +141,8 @@ impl Page {
             "slow" => Ok(Self::Slow),
             "resize" => Ok(Self::Resize),
             "crash" => Ok(Self::Crash),
+            "fullscreen" => Ok(Self::Fullscreen),
+            "fullscreen-unasked" => Ok(Self::FullscreenUnasked),
             "error" => Err(NavigationError::Load(
                 "demo:error fails to load on purpose; the previous page stays".into(),
             )),
@@ -148,6 +159,8 @@ impl Page {
             Self::Slow => "Demo: slow frame",
             Self::Resize => "Demo: resize",
             Self::Crash => "Demo: click to crash",
+            Self::Fullscreen => "Demo: click for fullscreen",
+            Self::FullscreenUnasked => "Demo: fullscreen, unasked",
         }
     }
 }
@@ -183,6 +196,8 @@ struct View<T: CpuTarget> {
     /// The search in the page: its id, how many matches it has and which one is selected
     /// (from 1; 0 with none).
     find: Option<(RequestId, u32, u32)>,
+    /// The page's element is fullscreen (`demo:fullscreen`).
+    fullscreen: bool,
 }
 
 impl<T: CpuTarget> View<T> {
@@ -206,6 +221,7 @@ impl<T: CpuTarget> View<T> {
             agreed: false,
             colour: 0,
             find: None,
+            fullscreen: false,
         }
     }
 
@@ -404,6 +420,8 @@ impl<T: CpuTarget> DemoRuntime<T> {
                 view.find = None;
                 view.agreed = false;
                 view.colour = 0;
+                // The old document's element went with it.
+                view.fullscreen = page == Page::FullscreenUnasked;
                 queue.push(EngineEvent::NavigationCommitted {
                     view: id,
                     navigation,
@@ -411,13 +429,20 @@ impl<T: CpuTarget> DemoRuntime<T> {
                     document,
                     history: None,
                 });
+                if view.fullscreen {
+                    queue.push(EngineEvent::FullscreenChanged {
+                        view: id,
+                        document,
+                        fullscreen: true,
+                    });
+                }
                 queue.push(EngineEvent::TitleChanged {
                     view: id,
                     title: view.title(),
                 });
                 let cursor = match page {
                     Page::Resize => Cursor::Crosshair,
-                    Page::Crash => Cursor::Pointer,
+                    Page::Crash | Page::Fullscreen => Cursor::Pointer,
                     _ => Cursor::Default,
                 };
                 queue.push(EngineEvent::CursorChanged { view: id, cursor });
@@ -509,6 +534,7 @@ impl<T: CpuTarget> DemoRuntime<T> {
         let view = self.views.get_mut(&id).expect("checked by the caller");
         let queue = &mut self.queue;
         let mut activated = false;
+        let (mut enter, mut pressed) = (false, false);
         match kind {
             InputKind::Pointer(pointer) => match pointer {
                 PointerEvent::Enter { position } | PointerEvent::Motion { position, .. } => {
@@ -522,6 +548,7 @@ impl<T: CpuTarget> DemoRuntime<T> {
                 } => {
                     view.pointer = Some(position);
                     activated = true;
+                    pressed = true;
                 }
                 PointerEvent::Button { .. } | PointerEvent::Scroll { .. } => {}
             },
@@ -541,6 +568,7 @@ impl<T: CpuTarget> DemoRuntime<T> {
                     keep_last_chars(&mut view.typed, MAX_TYPED);
                     view.typed_changed(id, queue);
                 }
+                enter = matches!(&key.key, Key::Named(name) if name == "Enter");
                 activated = true;
             }
             InputKind::TextInput(text) => {
@@ -559,6 +587,14 @@ impl<T: CpuTarget> DemoRuntime<T> {
                 queue.push(EngineEvent::StatusTextChanged { view: id, text });
             }
             Some(Page::Slow) if activated => view.start_slow_frame(Instant::now()),
+            Some(Page::Fullscreen) if (pressed || enter) && !view.fullscreen => {
+                view.fullscreen = true;
+                queue.push(EngineEvent::FullscreenChanged {
+                    view: id,
+                    document: view.document.expect("a page has a document"),
+                    fullscreen: true,
+                });
+            }
             Some(Page::Crash) if activated && !view.failed => {
                 view.failed = true;
                 view.dirty = true;
@@ -787,7 +823,15 @@ impl<T: CpuTarget> EngineRuntime for DemoRuntime<T> {
                 }
             }
             EngineCommand::Find(command) => view.find(id, command, &mut self.queue),
-            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
+            EngineCommand::ExitFullscreen => {
+                if std::mem::take(&mut view.fullscreen) {
+                    self.queue.push(EngineEvent::FullscreenChanged {
+                        view: id,
+                        document: view.document.expect("a page has a document"),
+                        fullscreen: false,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -984,6 +1028,11 @@ mod tests {
         assert_eq!(Page::from_url("demo://animation"), Ok(Page::Animation));
         assert_eq!(Page::from_url("DEMO:Slow?x#y"), Ok(Page::Slow));
         assert_eq!(Page::from_url("demo:"), Ok(Page::Pattern));
+        assert_eq!(Page::from_url("demo://fullscreen"), Ok(Page::Fullscreen));
+        assert_eq!(
+            Page::from_url("demo:fullscreen-unasked"),
+            Ok(Page::FullscreenUnasked)
+        );
         assert!(matches!(
             Page::from_url("demo:error"),
             Err(NavigationError::Load(_))

@@ -122,6 +122,7 @@ pub fn snapshot(
     let mut snapshot = Snapshot {
         home,
         keymap: core.keymap_indicator().map(str::to_owned),
+        fullscreen: core.fullscreen().window,
         ..Snapshot::default()
     };
     let count = cache.tabs.len();
