@@ -48,6 +48,8 @@ members = [
     "examples/gradient-demo",
     "examples/typography-demo",
     "examples/sse-demo",
+    # sig's internal pages, Wasm guests (docs/rewrite/pages-2026-11-05.md).
+    "pages/sig-page-config",
     # M0: Servo and Wasmtime initialized and used in one process (docs/rewrite/M0.md).
     "experiments/m0-coexist",
     # M1: CPU chrome and a Servo page in one Wayland window (docs/rewrite/M1.md).
