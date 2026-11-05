@@ -63,12 +63,16 @@ fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
     // Its commands of `[commands]` (help) must be the configuration's.
     let actions = table::NORMAL.iter().chain(table::INSERT);
     let commands = actions.filter_map(|binding| match binding.action {
-        Action::Run(text) | Action::RunThenPass(text) => commands.parse(text).err().map(|e| {
-            format!(
-                "the example configuration binds {} to {text}: {e}",
-                binding.keys
-            )
-        }),
+        Action::Run(text) | Action::RunThenPass(text)
+            if matches!(CommandSet::ANY.parse(text), Ok(Command::Custom(_))) =>
+        {
+            commands.parse(text).err().map(|e| {
+                format!(
+                    "the example configuration binds {} to {text}: {e}",
+                    binding.keys
+                )
+            })
+        }
         _ => None,
     });
     settings.chain(commands).collect()
