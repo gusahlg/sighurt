@@ -1,0 +1,12 @@
+[package]
+name = "sig-page-kit"
+description = "The guest side of Sighurt's internal pages: the privileged `sig` import module and what the pages share"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+sighurt-sdk = { path = "../../sdk/sighurt-sdk" }

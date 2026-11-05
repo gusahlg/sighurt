@@ -15,6 +15,7 @@ pub mod frontend;
 pub mod history;
 pub mod page_config;
 pub mod persistence;
+pub mod pty;
 pub mod registry;
 pub mod services;
 pub mod session;

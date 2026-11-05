@@ -10392,6 +10392,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sig-page-kit"
+version = "0.10.0"
+dependencies = [
+ "sighurt-sdk",
+]
+
+[[package]]
 name = "sighurt-api"
 version = "0.10.0"
 

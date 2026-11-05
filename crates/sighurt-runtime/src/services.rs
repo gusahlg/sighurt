@@ -165,7 +165,7 @@ impl Services {
                     .and_then(|dir| self.download(source, suggested_name, dir)),
             ),
             Service::OpenExternal { url } => Some(open_external(&url)),
-            Service::PickFiles { .. } | Service::Permission(_) => {
+            Service::PickFiles { .. } | Service::Permission(_) | Service::Page(_) => {
                 Some(Err(ServiceError::Unsupported))
             }
         }
