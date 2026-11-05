@@ -6,16 +6,17 @@
 //! what runs from a closed choice the guest made ([`PtyProgram`]): the guest never names a
 //! program, an argument, a directory or a variable. [`Ptys::open`] opens the pty with its size
 //! set, starts the program as the leader of a new session with the slave as its controlling
-//! terminal, and gives the master away ([`Opened`]) for the Wasm engine to take; nothing here
-//! keeps a copy of it. Every descriptor is close-on-exec from its creation, so no other child of
+//! terminal, and hands the master to the Wasm engine under a new [`PtySession`], which the
+//! answer carries; nothing here keeps a copy of it. Every descriptor is close-on-exec from its creation, so no other child of
 //! `sig` inherits a master or a slave.
 //!
 //! Each program has a watcher thread that holds the unreaped child and its pidfd. Cancelling
 //! ([`Ptys::cancel`]; closing the tab, navigating away, reloading, quitting) wakes it: SIGHUP and
 //! SIGCONT to the program's process group, SIGKILL to the group after [`GRACE`], and the program
 //! reaped. Signals go out only while the program is unreaped, so its pid, which is also its
-//! group's id, cannot have been reused. The program's own exit is reaped the same way and
-//! recorded for the page ([`Opened::exit`]).
+//! group's id, cannot have been reused. The program's own exit is reaped the same way. Either
+//! way [`Ptys::ended`] reports the end, and the session answers the request a second time
+//! (`ServiceReply::PtyEnded`), which ends the core's record of it.
 //!
 //! What is guaranteed: the program `sig` started is signalled and reaped; no zombie and no child
 //! of `sig` remains. What is best effort, as in any terminal: jobs the shell put in process
@@ -29,6 +30,10 @@
 //! Owns: the child processes until they are reaped. Must not own: the master's bytes (the Wasm
 //! engine's `pty` module carries them), the policy (the core's), or what the page shows.
 
+// Without the Wasm engine nothing can take a terminal, so `Ptys::open` refuses and the rest is
+// reached only by the tests, which run it in every build.
+#![cfg_attr(not(feature = "engine-wasm"), allow(dead_code))]
+
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -37,7 +42,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -47,8 +52,8 @@ use rustix::pipe::PipeFlags;
 use rustix::process::{Pid, PidfdFlags, Signal};
 use rustix::pty::OpenptFlags;
 use rustix::termios::{InputModes, OptionalActions, Winsize};
-use sighurt_api::ids::RequestId;
-use sighurt_api::services::{PtyProgram, ServiceError};
+use sighurt_api::ids::{PtySession, RequestId};
+use sighurt_api::services::{PtyProgram, ServiceError, ServiceReply, ServiceResult};
 
 /// Most programs started and not yet reaped in one process. The core holds pages to the same
 /// number.
@@ -175,33 +180,45 @@ pub fn scrubbed(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(Os
     env
 }
 
-/// A program started on a new terminal: what the Wasm engine takes, once.
-#[derive(Debug)]
-pub struct Opened {
-    /// The terminal's master side. Its only copy.
-    pub master: OwnedFd,
-    /// How the program ended, once it has been reaped: its exit code, or 128 plus the signal
-    /// that ended it, as shells report it.
-    pub exit: Arc<OnceLock<i32>>,
-}
+/// Programs that ended and were reaped, with their exit status (`None` for a signal), for
+/// [`Ptys::ended`].
+type Ended = Arc<Mutex<Vec<(RequestId, Option<i32>)>>>;
 
 /// The programs running, by the request that started each, counted against [`MAX_SESSIONS`]
 /// from before the spawn until they are reaped.
-#[derive(Debug, Default)]
 pub struct Ptys {
     live: Arc<AtomicUsize>,
     sessions: HashMap<RequestId, Session>,
+    ended: Ended,
+    /// Wakes the owner loop when a program has ended.
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for Ptys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ptys")
+            .field("live", &self.live)
+            .field("sessions", &self.sessions)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Ptys {
-    /// No programs.
-    pub fn new() -> Self {
-        Self::default()
+    /// No programs. `wake` wakes the owner loop when a program has ended.
+    pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            live: Arc::default(),
+            sessions: HashMap::new(),
+            ended: Ended::default(),
+            wake,
+        }
     }
 
-    /// Starts `program` on a new terminal of `cols` by `rows` cells for `request`. Fails, having
-    /// started nothing and kept nothing open, when [`MAX_SESSIONS`] programs are live, `request`
-    /// has one already, or the program cannot be started.
+    /// Starts `program` on a new terminal of `cols` by `rows` cells for `request`:
+    /// `ServiceReply::Pty` with a new session, its master handed to the engine
+    /// (`sighurt_engine_wasm::pty::hand_over`). Fails, having started nothing and kept nothing
+    /// open, when [`MAX_SESSIONS`] programs are live, `request` has one already, the program
+    /// cannot be started, or the build has no Wasm engine to take the terminal.
     pub fn open(
         &mut self,
         request: RequestId,
@@ -209,30 +226,60 @@ impl Ptys {
         cols: u16,
         rows: u16,
         launch: Launch<'_>,
-    ) -> Result<Opened, ServiceError> {
-        let exec = exec(program, launch, std::env::vars_os()).map_err(ServiceError::Failed)?;
-        self.open_exec(request, &exec, cols, rows)
+    ) -> ServiceResult {
+        #[cfg(feature = "engine-wasm")]
+        {
+            let exec = exec(program, launch, std::env::vars_os()).map_err(ServiceError::Failed)?;
+            self.open_exec(
+                request,
+                &exec,
+                cols,
+                rows,
+                sighurt_engine_wasm::pty::hand_over,
+            )
+        }
+        #[cfg(not(feature = "engine-wasm"))]
+        {
+            let _ = (request, program, cols, rows, launch);
+            Err(ServiceError::Unsupported)
+        }
     }
 
+    /// [`Ptys::open`] for a prepared program, giving the master to `deliver`.
     fn open_exec(
         &mut self,
         request: RequestId,
         exec: &Exec,
         cols: u16,
         rows: u16,
-    ) -> Result<Opened, ServiceError> {
+        deliver: impl FnOnce(PtySession, OwnedFd),
+    ) -> ServiceResult {
         if self.sessions.contains_key(&request) {
             return Err(ServiceError::Failed("this terminal is open already".into()));
         }
-        let (opened, session) = self.start(exec, cols, rows).map_err(ServiceError::Failed)?;
+        let (master, session) = self
+            .start(request, exec, cols, rows)
+            .map_err(ServiceError::Failed)?;
+        let pty = session.pty;
+        deliver(pty, master);
         self.sessions.insert(request, session);
-        Ok(opened)
+        Ok(ServiceReply::Pty(pty))
     }
 
-    /// Ends the program `request` started, without waiting; whether there was one. A program
-    /// that has exited already is only forgotten.
+    /// Ends the program `request` started, if it is one of these, without waiting: SIGHUP, then
+    /// SIGKILL after [`GRACE`]. Whether it was one. Its end comes through [`Ptys::ended`].
     pub fn cancel(&mut self, request: RequestId) -> bool {
         self.sessions.remove(&request).is_some()
+    }
+
+    /// The programs that ended and were reaped since the last call, with their exit status
+    /// (`None` when a signal ended them), whether they ended by themselves or were cancelled.
+    pub fn ended(&mut self) -> Vec<(RequestId, Option<i32>)> {
+        let ended = std::mem::take(&mut *self.ended.lock().unwrap_or_else(PoisonError::into_inner));
+        for (request, _) in &ended {
+            self.sessions.remove(request);
+        }
+        ended
     }
 
     /// Ends every program and waits until they are reaped, at most [`GRACE`] and a second: for
@@ -255,8 +302,15 @@ impl Ptys {
         self.live.load(Ordering::Acquire)
     }
 
-    /// Opens a pty and starts `exec` on it, counted in [`Ptys::live`] until it is reaped.
-    fn start(&self, exec: &Exec, cols: u16, rows: u16) -> Result<(Opened, Session), String> {
+    /// Opens a pty and starts `exec` on it, counted in [`Ptys::live`] until it is reaped, when
+    /// its end is reported as `request`'s.
+    fn start(
+        &self,
+        request: RequestId,
+        exec: &Exec,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(OwnedFd, Session), String> {
         if self
             .live
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
@@ -287,15 +341,17 @@ impl Ptys {
         // To kill the program if there is no thread to watch it.
         let spare = pidfd.try_clone();
         let exit = Arc::new(Exit::default());
-        let shown = Arc::new(OnceLock::new());
-        let (watched, told) = (exit.clone(), shown.clone());
+        let (watched, ended, owner) = (exit.clone(), self.ended.clone(), self.wake.clone());
         let watcher = std::thread::Builder::new()
             .name("sighurt-pty-watch".into())
             .spawn(move || {
                 let status = watch(child, &pidfd, &woken);
-                let _ = told.set(exit_code(status));
                 watched.set(status);
                 drop(counted);
+                let mut ended = ended.lock().unwrap_or_else(PoisonError::into_inner);
+                ended.push((request, status.code()));
+                drop(ended);
+                owner();
             });
         if let Err(err) = watcher {
             // The closure owned the child and dropped it unreaped: kill it, though it stays a
@@ -305,13 +361,12 @@ impl Ptys {
             }
             return Err(format!("could not watch the program: {err}"));
         }
-        Ok((
-            Opened {
-                master,
-                exit: shown,
-            },
-            Session { _wake: wake, exit },
-        ))
+        let session = Session {
+            _wake: wake,
+            exit,
+            pty: PtySession::next(),
+        };
+        Ok((master, session))
     }
 }
 
@@ -326,11 +381,19 @@ impl Drop for Counted {
 }
 
 /// A program the watcher thread holds. Dropping it closes `_wake`, which tells the watcher to
-/// end the program.
+/// end the program, and closes the master if the engine never took it.
 #[derive(Debug)]
 struct Session {
     _wake: OwnedFd,
     exit: Arc<Exit>,
+    pty: PtySession,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        #[cfg(feature = "engine-wasm")]
+        sighurt_engine_wasm::pty::forget(self.pty);
+    }
 }
 
 /// The watcher: waits for the program to exit or for the session to be dropped; on the latter,
@@ -416,14 +479,6 @@ impl Exit {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
         self.gone.notify_all();
     }
-}
-
-/// The number a page shows for an exit: the exit code, or 128 plus the signal that ended it.
-fn exit_code(status: ExitStatus) -> i32 {
-    status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal))
-        .unwrap_or(-1)
 }
 
 /// Opens the pty, sets its size and starts the program on it. The parent's copies of the slave
@@ -572,10 +627,44 @@ mod tests {
         exec
     }
 
-    fn start(ptys: &Ptys, exec: &Exec, cols: u16, rows: u16) -> (Opened, Session, Arc<Exit>) {
-        let (opened, session) = ptys.start(exec, cols, rows).unwrap();
+    fn ptys() -> Ptys {
+        Ptys::new(Arc::new(|| {}))
+    }
+
+    fn start(ptys: &Ptys, exec: &Exec, cols: u16, rows: u16) -> (OwnedFd, Session, Arc<Exit>) {
+        let (master, session) = ptys.start(RequestId::next(), exec, cols, rows).unwrap();
         let exit = session.exit.clone();
-        (opened, session, exit)
+        (master, session, exit)
+    }
+
+    /// Opens `exec` for `request` as a page would, keeping the master in `masters`.
+    fn open(
+        ptys: &mut Ptys,
+        request: RequestId,
+        exec: &Exec,
+        masters: &mut Vec<OwnedFd>,
+    ) -> ServiceResult {
+        ptys.open_exec(request, exec, 80, 24, |_, master| masters.push(master))
+    }
+
+    /// The number a shell shows for an exit: the code, or 128 plus the signal.
+    fn exit_code(status: ExitStatus) -> i32 {
+        status
+            .code()
+            .or_else(|| status.signal().map(|signal| 128 + signal))
+            .unwrap()
+    }
+
+    /// The ends `ptys` reports within `limit`, at least `count` of them.
+    fn ends(ptys: &mut Ptys, count: usize, limit: Duration) -> Vec<(RequestId, Option<i32>)> {
+        let deadline = Instant::now() + limit;
+        let mut ends = Vec::new();
+        while ends.len() < count {
+            assert!(Instant::now() < deadline, "{ends:?}");
+            ends.extend(ptys.ended());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ends
     }
 
     /// How the program ended, within `limit`.
@@ -710,7 +799,7 @@ mod tests {
     fn the_child_has_a_tty_its_fds_its_environment_and_default_signals() {
         let _serial = serial();
         let (home, vars) = home();
-        let ptys = Ptys::default();
+        let ptys = ptys();
         let script = "ls /proc/self/fd | tr '\\n' ' '; echo; \
                       env | sort | tr '\\n' ' '; echo; \
                       tty; pwd; \
@@ -731,14 +820,14 @@ mod tests {
             libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut mask);
             (ignored, mask)
         };
-        let (opened, _session, exit) = start(&ptys, &sh(script, &vars), 80, 24);
+        let (master, _session, exit) = start(&ptys, &sh(script, &vars), 80, 24);
         // SAFETY: restores what the block above changed.
         unsafe {
             libc::signal(libc::SIGUSR2, ignored);
             libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
         }
         drop(stray);
-        let out = read_all(&opened.master);
+        let out = read_all(&master);
         let lines: Vec<_> = out.lines().map(str::trim).collect();
         // `ls` itself opens its directory: 0, 1, 2 and that one.
         let fds: Vec<_> = lines[0].split_whitespace().collect();
@@ -768,7 +857,6 @@ mod tests {
         assert!(lines[4].contains("SigBlk:\t0000000000000000"), "{out}");
         assert_eq!(lines[5], "all-ttys", "{out}");
         assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 0);
-        assert_eq!(opened.exit.get(), Some(&0));
         assert_eq!(ptys.live(), 0);
     }
 
@@ -776,8 +864,8 @@ mod tests {
     fn the_program_leads_its_own_session_in_the_foreground_of_its_tty() {
         let _serial = serial();
         let (_home, vars) = home();
-        let ptys = Ptys::default();
-        let (opened, _session, _exit) = start(
+        let ptys = ptys();
+        let (master, _session, _exit) = start(
             &ptys,
             &sh(
                 "echo pid=$$; cat /proc/self/stat; exec </dev/tty && echo ctty",
@@ -786,7 +874,7 @@ mod tests {
             80,
             24,
         );
-        let out = read_all(&opened.master);
+        let out = read_all(&master);
         let stat = out.lines().nth(1).unwrap();
         let fields: Vec<_> = stat
             .rsplit_once(')')
@@ -810,12 +898,12 @@ mod tests {
     fn the_size_and_a_resize_reach_the_program() {
         let _serial = serial();
         let (_home, vars) = home();
-        let ptys = Ptys::default();
-        let (opened, _session, exit) =
+        let ptys = ptys();
+        let (master, _session, exit) =
             start(&ptys, &sh("stty size; read x; stty size", &vars), 91, 37);
-        read_until(&opened.master, "37 91", Duration::from_secs(10));
+        read_until(&master, "37 91", Duration::from_secs(10));
         rustix::termios::tcsetwinsize(
-            &opened.master,
+            &master,
             Winsize {
                 ws_row: 50,
                 ws_col: 132,
@@ -824,8 +912,8 @@ mod tests {
             },
         )
         .unwrap();
-        rustix::io::write(&opened.master, b"\n").unwrap();
-        assert!(read_all(&opened.master).contains("50 132"));
+        rustix::io::write(&master, b"\n").unwrap();
+        assert!(read_all(&master).contains("50 132"));
         assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 0);
     }
 
@@ -833,24 +921,35 @@ mod tests {
     fn the_exit_status_is_reported() {
         let _serial = serial();
         let (_home, vars) = home();
-        let ptys = Ptys::default();
-        let (opened, _session, exit) = start(&ptys, &sh("exit 7", &vars), 80, 24);
-        let _ = read_all(&opened.master);
-        assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 7);
-        assert_eq!(opened.exit.get(), Some(&7), "the page sees it");
-        let (opened, _session, exit) = start(&ptys, &sh("kill -TERM $$", &vars), 80, 24);
-        assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 128 + 15);
-        assert_eq!(opened.exit.get(), Some(&(128 + 15)));
+        let woken = Arc::new(AtomicUsize::new(0));
+        let count = woken.clone();
+        let mut ptys = Ptys::new(Arc::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        }));
+        let mut masters = Vec::new();
+        let (seven, killed) = (RequestId::next(), RequestId::next());
+        open(&mut ptys, seven, &sh("exit 7", &vars), &mut masters).unwrap();
+        open(&mut ptys, killed, &sh("kill -TERM $$", &vars), &mut masters).unwrap();
+        let mut ends = ends(&mut ptys, 2, Duration::from_secs(5));
+        ends.sort_by_key(|(request, _)| *request != seven);
+        assert_eq!(
+            ends,
+            [(seven, Some(7)), (killed, None)],
+            "a signal is no status"
+        );
+        assert_eq!(woken.load(Ordering::Acquire), 2, "each end woke the owner");
+        assert!(!ptys.cancel(seven), "an ended program is forgotten");
+        assert_eq!(ptys.live(), 0);
     }
 
     #[test]
     fn cancelling_kills_a_program_that_ignores_sighup_after_the_grace() {
         let _serial = serial();
         let (_home, vars) = home();
-        let ptys = Ptys::default();
+        let ptys = ptys();
         let script = "trap '' HUP; echo pid=$$; exec sleep 1000";
-        let (opened, session, exit) = start(&ptys, &sh(script, &vars), 80, 24);
-        let pid = pid_in(&read_until(&opened.master, "pid=", Duration::from_secs(10)));
+        let (master, session, exit) = start(&ptys, &sh(script, &vars), 80, 24);
+        let pid = pid_in(&read_until(&master, "pid=", Duration::from_secs(10)));
         // Not ended, though its terminal is still open.
         std::thread::sleep(Duration::from_millis(100));
         let started = Instant::now();
@@ -866,16 +965,17 @@ mod tests {
     fn a_program_that_obeys_sighup_ends_at_once() {
         let _serial = serial();
         let (_home, vars) = home();
-        let mut ptys = Ptys::new();
+        let mut ptys = ptys();
         let request = RequestId::next();
-        let opened = ptys
-            .open_exec(request, &sh("echo pid=$$; exec sleep 1000", &vars), 80, 24)
-            .unwrap();
-        let pid = pid_in(&read_until(&opened.master, "pid=", Duration::from_secs(10)));
+        let mut masters = Vec::new();
+        let script = sh("echo pid=$$; exec sleep 1000", &vars);
+        let reply = open(&mut ptys, request, &script, &mut masters);
+        assert!(matches!(reply, Ok(ServiceReply::Pty(_))), "{reply:?}");
+        let pid = pid_in(&read_until(&masters[0], "pid=", Duration::from_secs(10)));
         let started = Instant::now();
         ptys.shutdown();
         assert!(started.elapsed() < GRACE, "{:?}", started.elapsed());
-        assert_eq!(opened.exit.get(), Some(&(128 + libc::SIGHUP)));
+        assert_eq!(ptys.ended(), [(request, None)]);
         assert!(gone(pid));
         assert_eq!(ptys.live(), 0);
     }
@@ -884,53 +984,55 @@ mod tests {
     fn cancelling_at_once_after_the_spawn_still_reaps() {
         let _serial = serial();
         let (_home, vars) = home();
-        let mut ptys = Ptys::new();
+        let mut ptys = ptys();
         // The reply never reaches a page: the request is cancelled as soon as it is answered.
+        let mut requests = Vec::new();
         for _ in 0..20 {
             let request = RequestId::next();
-            let opened = ptys
-                .open_exec(request, &sh("exec sleep 1000", &vars), 80, 24)
-                .unwrap();
+            let mut masters = Vec::new();
+            open(
+                &mut ptys,
+                request,
+                &sh("exec sleep 1000", &vars),
+                &mut masters,
+            )
+            .unwrap();
             assert!(ptys.cancel(request));
-            drop(opened);
+            drop(masters);
+            requests.push(request);
         }
-        let deadline = Instant::now() + GRACE + Duration::from_secs(2);
-        while ptys.live() > 0 {
-            assert!(Instant::now() < deadline, "{} left", ptys.live());
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let mut ends = ends(&mut ptys, 20, GRACE + Duration::from_secs(3));
+        ends.sort_by_key(|(request, _)| requests.iter().position(|r| r == request));
+        assert_eq!(ends.iter().map(|(r, _)| *r).collect::<Vec<_>>(), requests);
+        assert_eq!(ptys.live(), 0);
     }
 
     #[test]
     fn shutdown_kills_what_ignores_sighup_within_the_grace() {
         let _serial = serial();
         let (_home, vars) = home();
-        let mut ptys = Ptys::new();
-        let mut opened = Vec::new();
+        let mut ptys = ptys();
+        let mut masters = Vec::new();
+        let script = sh(
+            "trap '' HUP TERM; echo pid=$$; while :; do sleep 1; done",
+            &vars,
+        );
         for _ in 0..3 {
-            opened.push(
-                ptys.open_exec(
-                    RequestId::next(),
-                    &sh(
-                        "trap '' HUP TERM; echo pid=$$; while :; do sleep 1; done",
-                        &vars,
-                    ),
-                    80,
-                    24,
-                )
-                .unwrap(),
-            );
+            open(&mut ptys, RequestId::next(), &script, &mut masters).unwrap();
         }
-        for one in &opened {
-            read_until(&one.master, "pid=", Duration::from_secs(10));
-            assert_eq!(one.exit.get(), None);
+        // Their terminals stay open: the masters are held here.
+        for master in &masters {
+            read_until(master, "pid=", Duration::from_secs(10));
         }
         let started = Instant::now();
         ptys.shutdown();
         assert!(started.elapsed() < GRACE + REAP_WAIT);
-        for one in &opened {
-            assert_eq!(one.exit.get(), Some(&(128 + libc::SIGKILL)));
-        }
+        let ends = ptys.ended();
+        assert_eq!(ends.len(), 3);
+        assert!(
+            ends.iter().all(|(_, status)| status.is_none()),
+            "killed: {ends:?}"
+        );
         assert_eq!(ptys.live(), 0);
     }
 
@@ -938,19 +1040,17 @@ mod tests {
     fn eight_programs_at_most_counted_until_reaped() {
         let _serial = serial();
         let (_home, vars) = home();
-        let mut ptys = Ptys::new();
-        let mut requests = Vec::new();
+        let mut ptys = ptys();
         let mut masters = Vec::new();
+        let mut requests = Vec::new();
+        let sleep = sh("exec sleep 1000", &vars);
         for _ in 0..MAX_SESSIONS {
             let request = RequestId::next();
-            masters.push(
-                ptys.open_exec(request, &sh("exec sleep 1000", &vars), 80, 24)
-                    .unwrap(),
-            );
+            open(&mut ptys, request, &sleep, &mut masters).unwrap();
             requests.push(request);
         }
         assert_eq!(ptys.live(), MAX_SESSIONS);
-        let refused = ptys.open_exec(RequestId::next(), &sh("exit 0", &vars), 80, 24);
+        let refused = open(&mut ptys, RequestId::next(), &sleep, &mut masters);
         assert!(matches!(refused, Err(ServiceError::Failed(m)) if m.contains("8 terminal")));
         // A cancelled program holds its place until it is reaped.
         let first = requests.remove(0);
@@ -960,14 +1060,9 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(ptys
-            .open_exec(RequestId::next(), &sh("exec sleep 1000", &vars), 80, 24)
-            .is_ok());
-        assert!(
-            ptys.open_exec(requests[0], &sh("exit 0", &vars), 80, 24)
-                .is_err(),
-            "one per request"
-        );
+        open(&mut ptys, RequestId::next(), &sleep, &mut masters).unwrap();
+        let again = open(&mut ptys, requests[0], &sleep, &mut masters);
+        assert!(again.is_err(), "one per request");
         ptys.shutdown();
         assert_eq!(ptys.live(), 0);
     }
@@ -976,12 +1071,12 @@ mod tests {
     fn a_program_that_does_not_exist_starts_nothing_and_leaks_nothing() {
         let _serial = serial();
         let (_home, vars) = home();
-        let ptys = Ptys::default();
+        let ptys = ptys();
         let fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
         let before = fds();
         let mut exec = sh("", &vars);
         exec.argv = vec!["/nonexistent/program".into()];
-        let err = ptys.start(&exec, 80, 24).unwrap_err();
+        let err = ptys.start(RequestId::next(), &exec, 80, 24).unwrap_err();
         assert!(err.contains("/nonexistent/program"), "{err}");
         assert_eq!(fds(), before);
         assert_eq!(ptys.live(), 0);
@@ -991,9 +1086,9 @@ mod tests {
     fn the_master_reads_end_of_file_once_the_session_is_gone() {
         let _serial = serial();
         let (_home, vars) = home();
-        let ptys = Ptys::default();
-        let (opened, _session, _exit) = start(&ptys, &sh("echo bye", &vars), 80, 24);
+        let ptys = ptys();
+        let (master, _session, _exit) = start(&ptys, &sh("echo bye", &vars), 80, 24);
         // read_all panics without end-of-file: no copy of the slave stays open in sig.
-        assert!(read_all(&opened.master).contains("bye"));
+        assert!(read_all(&master).contains("bye"));
     }
 }
