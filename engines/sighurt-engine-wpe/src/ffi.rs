@@ -184,6 +184,7 @@ pub const WPE_MODIFIER_KEYBOARD_CAPS_LOCK: c_uint = 1 << 4;
 pub const WPE_MODIFIER_POINTER_BUTTON1: c_uint = 1 << 8;
 
 // WPEToplevelState
+pub const WPE_TOPLEVEL_STATE_FULLSCREEN: c_uint = 1 << 0;
 pub const WPE_TOPLEVEL_STATE_ACTIVE: c_uint = 1 << 2;
 
 // WPEBufferFormatUsage
@@ -349,6 +350,7 @@ functions! {
     pub fn wpe_toplevel_resized(toplevel: *mut WPEToplevel, width: c_int, height: c_int);
     pub fn wpe_toplevel_scale_changed(toplevel: *mut WPEToplevel, scale: c_double);
     pub fn wpe_toplevel_state_changed(toplevel: *mut WPEToplevel, state: c_uint);
+    pub fn wpe_toplevel_get_state(toplevel: *mut WPEToplevel) -> c_uint;
 
     // WPEBuffer
     pub fn wpe_buffer_get_width(buffer: *mut WPEBuffer) -> c_int;

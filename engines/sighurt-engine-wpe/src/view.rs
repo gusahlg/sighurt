@@ -105,6 +105,9 @@ pub enum Note {
     /// WebKit's find controller answered the oldest find operation not yet answered: the
     /// matches it counted, or none found.
     Find(Option<u32>),
+    /// An element of the page is entering (`true`) or leaving element fullscreen
+    /// (`enter-fullscreen`, `leave-fullscreen`).
+    Fullscreen(bool),
 }
 
 /// The replaceable things WebKit said about one view: only the latest matters.
@@ -302,6 +305,8 @@ pub struct Page<T: WpeTarget> {
     pub semantics: crate::semantic::Semantics,
     /// Find in page.
     pub find: Find,
+    /// The document last reported in element fullscreen, until it is reported out of it.
+    pub fullscreen: Option<DocumentGeneration>,
     /// The layout epoch last applied. A CPU permit must name it. A Wayland permit does not.
     pub(crate) epoch: LayoutEpoch,
     /// The buffer size of [`epoch`](Self::epoch).
@@ -319,6 +324,16 @@ impl<T: WpeTarget> Page<T> {
 
     pub fn web(&self) -> *mut ffi::WebKitWebView {
         self.web_view.as_ptr().cast()
+    }
+
+    /// Reports that the page left element fullscreen, if it was reported in it.
+    pub fn left_fullscreen(&mut self) -> Option<sighurt_api::events::EngineEvent> {
+        let document = self.fullscreen.take()?;
+        Some(sighurt_api::events::EngineEvent::FullscreenChanged {
+            view: self.id,
+            document,
+            fullscreen: false,
+        })
     }
 
     /// WebKit's find controller of the view (owned by the web view).
@@ -690,6 +705,18 @@ pub fn connect(web_view: &glib::Object, inbox: &Shared, view: ViewId) {
     find.connect_local("failed-to-find-text", false, move |_| {
         n(Note::Find(None));
         None
+    });
+    // Element fullscreen. Not handled (false): WebKit asks the view's toplevel, whose state
+    // the runtime sets when it takes the note in, which completes WebKit's transition.
+    let n = note.clone();
+    web_view.connect_local("enter-fullscreen", false, move |_| {
+        n(Note::Fullscreen(true));
+        Some(false.to_value())
+    });
+    let n = note.clone();
+    web_view.connect_local("leave-fullscreen", false, move |_| {
+        n(Note::Fullscreen(false));
+        Some(false.to_value())
     });
     web_view.connect_local("web-process-terminated", false, move |args| {
         note(Note::Terminated(enum_arg(&args[1])));

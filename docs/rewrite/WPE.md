@@ -738,8 +738,7 @@ when dropped, which also happens when a new document commits):
   scheme WebKit doesn't load (`mailto:`, `sig:`, a custom one) is `OpenRequested(CurrentView)`
   when the page asks and a failed navigation when the browser does. `window.close()` is
   `CloseRequested` (WebKit allows it only in a tab with one entry).
-- Refused outright: HTTP authentication, context menus, fullscreen (off until §17's coordination
-  exists). `alert`, `confirm` and `prompt` are closed by WebKit's WPE default (`confirm` and
+- Refused outright: HTTP authentication, context menus. `alert`, `confirm` and `prompt` are closed by WebKit's WPE default (`confirm` and
   `prompt` cancelled); a page asking to stay when it is left (`beforeunload`) is left, as in
   Servo, since WebKit's default answer (stay) cancelled the browser's navigation with no event
   once the user had touched the page (decision 84); `<select>` popups don't open.
@@ -775,6 +774,22 @@ document's commit, a view that has searched calls `search_finish`, which clears 
 `tests/engine.rs` covers totals, case, moves (the selection moves, wrapping), no match, an answer
 not given to a later search, moves and stops of a replaced or stopped search, a search of a gone
 document, and the end of a search at a new document.
+
+**Element fullscreen** (`fullscreen: true`; `enable-fullscreen` on). In WebKit 2.52's WPE
+Platform view (`WPEWebViewPlatform.cpp`) an element entering fullscreen emits `enter-fullscreen`
+and then asks the view's toplevel (`wpe_toplevel_fullscreen`); WebKit's transition completes when
+the toplevel's state gains `WPE_TOPLEVEL_STATE_FULLSCREEN`, and leaving (`leave-fullscreen`)
+completes when it loses it; the toplevel losing it while an element is fullscreen asks the page
+to leave (`requestExitFullScreen`). The engine's toplevels are plain `WPEToplevel`s with no
+`set_fullscreen`, so the adapter does it: the signals (left unhandled) become notes, and taking a
+note in sets or clears the bit (`wpe_toplevel_state_changed`, the other bits kept) and reports
+`FullscreenChanged` for the document shown, once per entry. `ExitFullscreen` clears the bit;
+WebKit's page leaves and `leave-fullscreen` reports it. A new document, a crashed web process and
+closing the view report `false` first if the view was reported fullscreen. WebKit requires a user
+gesture (a page asking at load is refused). Known limit: after a web process crashed while
+fullscreen, WebKit's view keeps believing it is fullscreen (`PageClientImpl::closeFullScreenManager`
+is not implemented), so that view's pages can't enter fullscreen again; nothing is reported for
+them. `tests/engine.rs` (`goes_fullscreen`) covers all of it.
 
 **Failures and lifetime.** A web process that dies is `ViewFailed` (its navigations in flight
 fail as cancelled, its requests and input-method state end); a reload or navigation starts a new
@@ -952,7 +967,7 @@ whole of `engines.sh`, 217 checks, passes with them):
    only when one exists.
 6. **Not supported**: `<select>` popups, context menus, script dialogs (closed; `beforeunload`
    leaves the page), HTTP
-   authentication (refused), fullscreen, pointer lock, cursor images (names only), touch,
+   authentication (refused), pointer lock, cursor images (names only), touch,
    accessibility, screenshots. `TextInputState::multiline` is always `false`
    (WebKit's input-method state doesn't say).
 7. **Wakeups per frame**: 4.0 loop wakeups and 2.1 GLib dispatches per animated frame on DMA-BUF,

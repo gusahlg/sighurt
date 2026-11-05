@@ -6,7 +6,8 @@
 //! fail closed; a page asks before it goes where the user's click takes it, and the answer
 //! decides; the configured user agent is sent and seen; the display path copies nothing on
 //! DMA-BUF; the profile is locked while WebKit uses it; find in page counts, moves and stops,
-//! and an answer is never given to a later search or document.
+//! and an answer is never given to a later search or document; element fullscreen is entered on
+//! a click only, left on `ExitFullscreen`, and ended by a new document, a crash or closing.
 //!
 //! WebKit runs once per process, so this is one test, one scenario after another. It needs a
 //! Wayland compositor and is `#[ignore]`d: `tests/headless.sh` runs it in a private headless sway.
@@ -286,6 +287,185 @@ fn finds_in_the_page(d: &mut Driver, a: ViewId) {
         found(&d.state, a, again).len(),
         1,
         "the search ended with its document"
+    );
+}
+
+/// `view`'s fullscreen reports: the document and the state, oldest first.
+fn fullscreen(state: &State, view: ViewId) -> Vec<(DocumentGeneration, bool)> {
+    let reports = state.events_of(view).filter_map(|event| match event {
+        EngineEvent::FullscreenChanged {
+            document,
+            fullscreen,
+            ..
+        } => Some((*document, *fullscreen)),
+        _ => None,
+    });
+    reports.collect()
+}
+
+/// Where the `n`th fullscreen report of `view` is among its events, and where its commit of
+/// `navigation` is.
+fn report_and_commit(
+    state: &State,
+    view: ViewId,
+    n: usize,
+    navigation: NavigationId,
+) -> (Option<usize>, Option<usize>) {
+    let events: Vec<&EngineEvent> = state.events_of(view).collect();
+    let report = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, EngineEvent::FullscreenChanged { .. }))
+        .nth(n)
+        .map(|(i, _)| i);
+    let commit = events.iter().position(
+        |e| matches!(e, EngineEvent::NavigationCommitted { navigation: c, .. } if *c == navigation),
+    );
+    (report, commit)
+}
+
+/// Element fullscreen: a page with no user activation can't enter it (WebKit refuses); a click
+/// enters it, reported once for the document even when the page asks again, and the page sees
+/// it; `ExitFullscreen` leaves it and does nothing when nothing is fullscreen; the page leaving
+/// it itself is reported; a new document, a crashed web process and closing the view report
+/// that the document left it before anything else of theirs, and WebKit can enter it again.
+fn goes_fullscreen(d: &mut Driver) {
+    let auto = d
+        .state
+        .open(&format!("{}?auto", page("fullscreen.html")), true);
+    assert!(
+        d.run_until(WAIT, |s| titled(s, auto, "refused")),
+        "{:?}",
+        d.state.title(auto)
+    );
+    assert_eq!(
+        fullscreen(&d.state, auto),
+        [],
+        "no fullscreen without activation"
+    );
+    d.state.close(auto);
+
+    let v = d.state.open(&page("fullscreen.html"), true);
+    d.state.set_focus(Some(v));
+    assert!(d.run_until(WAIT, |s| commit(s, v).is_some() && s.submitted(v) > 0));
+    d.run_for(Duration::from_millis(300));
+    let (_, _, document, _) = commit(&d.state, v).unwrap();
+    let enter = |d: &mut Driver| {
+        click(&mut d.state, v, 200.0, 200.0);
+        assert!(
+            d.run_until(WAIT, |s| titled(s, v, "full")),
+            "a click enters fullscreen: {:?}",
+            d.state.title(v)
+        );
+    };
+    enter(d);
+    assert_eq!(fullscreen(&d.state, v), [(document, true)]);
+    click(&mut d.state, v, 200.0, 200.0);
+    d.run_for(Duration::from_millis(500));
+    assert_eq!(
+        fullscreen(&d.state, v),
+        [(document, true)],
+        "asked again: one report"
+    );
+
+    d.state.command(v, EngineCommand::ExitFullscreen);
+    assert!(
+        d.run_until(WAIT, |s| titled(s, v, "normal")),
+        "ExitFullscreen leaves it, as the page sees: {:?}",
+        d.state.title(v)
+    );
+    assert_eq!(
+        fullscreen(&d.state, v),
+        [(document, true), (document, false)]
+    );
+    d.state.command(v, EngineCommand::ExitFullscreen);
+    d.run_for(Duration::from_millis(500));
+    assert_eq!(
+        fullscreen(&d.state, v).len(),
+        2,
+        "nothing to leave: nothing happens"
+    );
+
+    // The page leaves by itself.
+    enter(d);
+    d.eval(v, "document.exitFullscreen(); 0").ok();
+    assert!(d.run_until(WAIT, |s| titled(s, v, "normal")));
+    assert_eq!(fullscreen(&d.state, v).len(), 4);
+    assert_eq!(fullscreen(&d.state, v)[3], (document, false));
+
+    // A new document while fullscreen: reported before its commit.
+    enter(d);
+    let away = d.state.navigate(v, &page("plain.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, v, away)));
+    assert_eq!(fullscreen(&d.state, v)[5], (document, false));
+    let (left, at) = report_and_commit(&d.state, v, 5, away);
+    assert!(
+        matches!((left, at), (Some(l), Some(c)) if l < c),
+        "left at {left:?}, the commit at {at:?}"
+    );
+
+    // Closing a view while fullscreen: reported left, then closed.
+    let w = d.state.open(&page("fullscreen.html"), true);
+    d.state.set_focus(Some(w));
+    assert!(d.run_until(WAIT, |s| titled(s, w, "normal") && s.submitted(w) > 0));
+    d.run_for(Duration::from_millis(300));
+    click(&mut d.state, w, 200.0, 200.0);
+    assert!(d.run_until(WAIT, |s| titled(s, w, "full")));
+    let (_, _, w_document, _) = commit(&d.state, w).unwrap();
+    d.state.close(w);
+    let closed = |e: &EngineEvent| matches!(e, EngineEvent::ViewClosed { .. });
+    assert!(d.run_until(WAIT, |s| s.events_of(w).any(closed)));
+    assert_eq!(
+        fullscreen(&d.state, w),
+        [(w_document, true), (w_document, false)]
+    );
+
+    // A crashed web process while fullscreen: reported before the failure. WebKit 2.52's WPE
+    // view keeps believing it is fullscreen afterwards (`PageClientImpl::closeFullScreenManager`
+    // is not implemented), so that view's pages can't enter fullscreen again: nothing is
+    // reported for them.
+    d.state.set_focus(Some(v));
+    let back = d.state.navigate(v, &page("fullscreen.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, v, back) && titled(s, v, "normal")));
+    d.run_for(Duration::from_millis(300));
+    enter(d);
+    let reports = fullscreen(&d.state, v).len();
+    d.state.runtime.terminate_web_process(v).unwrap();
+    let failed = |e: &EngineEvent| matches!(e, EngineEvent::ViewFailed { .. });
+    assert!(d.run_until(WAIT, |s| s.events_of(v).any(failed)));
+    assert_eq!(fullscreen(&d.state, v).len(), reports + 1);
+    assert!(
+        !fullscreen(&d.state, v)[reports].1,
+        "the crash left fullscreen"
+    );
+    let (report, failure) = {
+        let events: Vec<&EngineEvent> = d.state.events_of(v).collect();
+        let last = |f: &dyn Fn(&EngineEvent) -> bool| events.iter().rposition(|e| f(e));
+        (
+            last(&|e| matches!(e, EngineEvent::FullscreenChanged { .. })),
+            last(&|e| matches!(e, EngineEvent::ViewFailed { .. })),
+        )
+    };
+    assert!(
+        matches!((report, failure), (Some(r), Some(f)) if r < f),
+        "reported before the failure"
+    );
+    let reload = d.state.reload(v);
+    assert!(d.run_until(WAIT, |s| committed(s, v, reload) && titled(s, v, "normal")));
+    d.run_for(Duration::from_millis(300));
+    click(&mut d.state, v, 200.0, 200.0);
+    d.run_for(Duration::from_millis(1000));
+    assert_eq!(
+        fullscreen(&d.state, v).len(),
+        reports + 1,
+        "nothing after the crash"
+    );
+    d.state.close(v);
+    assert!(d.run_until(WAIT, |s| s.events_of(v).any(closed)));
+    assert_eq!(
+        fullscreen(&d.state, v).len(),
+        reports + 1,
+        "closed: nothing to leave"
     );
 }
 
@@ -588,6 +768,8 @@ fn wpe_views_navigate_present_ask_and_fail_distinctly() {
     );
 
     finds_in_the_page(&mut d, a);
+    goes_fullscreen(&mut d);
+    d.state.set_focus(Some(a));
 
     let server = common::serve();
     let url = |path: &str| format!("{server}{path}");

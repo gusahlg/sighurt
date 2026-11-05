@@ -63,7 +63,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::{c_uint, c_void, CString};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -111,7 +111,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
     process_per_view: true,
     semantics: true,
     site_data: sighurt_api::engine::SiteDataKinds::NONE,
-    fullscreen: false, // lane D: true once element fullscreen is wired
+    fullscreen: true,
 };
 
 /// The `log` target of the timing lines: `RUST_LOG=sighurt_engine_wpe::timing=debug`.
@@ -649,6 +649,9 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 }
                 page.requests.clear();
                 page.held.clear();
+                if let Some(left) = page.left_fullscreen() {
+                    push(events, left);
+                }
                 // Its find answers, its documents and their marks are gone with it.
                 page.find = view::Find::default();
                 if page.text_input.take().is_some() {
@@ -730,6 +733,28 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 }
             }
             Note::Mutated => page.semantics.note_mutation(Instant::now()),
+            Note::Fullscreen(true) => {
+                // WebKit's transition completes when the toplevel is fullscreen. Reported once,
+                // for the document shown.
+                set_toplevel(page.wpe(), ffi::WPE_TOPLEVEL_STATE_FULLSCREEN, true);
+                if let (None, Some(document)) = (page.fullscreen, page.navigator.document()) {
+                    page.fullscreen = Some(document);
+                    push(
+                        events,
+                        EngineEvent::FullscreenChanged {
+                            view: id,
+                            document,
+                            fullscreen: true,
+                        },
+                    );
+                }
+            }
+            Note::Fullscreen(false) => {
+                set_toplevel(page.wpe(), ffi::WPE_TOPLEVEL_STATE_FULLSCREEN, false);
+                if let Some(left) = page.left_fullscreen() {
+                    push(events, left);
+                }
+            }
             Note::Find(matches) => {
                 if let Some((search, document, found, total)) =
                     page.find.answer(matches, page.navigator.document())
@@ -1064,13 +1089,11 @@ impl<T: WpeTarget> WpeRuntime<T> {
             }
             InputKind::Key(event) => page.input.key(&page.view, &event).into_iter().collect(),
             InputKind::Focus(FocusEvent::Activated) => {
-                unsafe {
-                    ffi::wpe_toplevel_state_changed(toplevel(wpe), ffi::WPE_TOPLEVEL_STATE_ACTIVE)
-                };
+                set_toplevel(wpe, ffi::WPE_TOPLEVEL_STATE_ACTIVE, true);
                 Vec::new()
             }
             InputKind::Focus(FocusEvent::Deactivated) => {
-                unsafe { ffi::wpe_toplevel_state_changed(toplevel(wpe), 0) };
+                set_toplevel(wpe, ffi::WPE_TOPLEVEL_STATE_ACTIVE, false);
                 page.input.release_keys(&page.view)
             }
             InputKind::TextInput(event) => {
@@ -1436,6 +1459,12 @@ fn committed<T: WpeTarget>(page: &mut Page<T>, events: &mut Vec<EngineEvent>, co
     if commit.new_document {
         page.requests.clear();
         page.held.clear();
+        // A document that was fullscreen is gone: reported before the new one commits, and
+        // WebKit's view is asked to leave if it hasn't.
+        if let Some(left) = page.left_fullscreen() {
+            push(events, left);
+            set_toplevel(page.wpe(), ffi::WPE_TOPLEVEL_STATE_FULLSCREEN, false);
+        }
         // The search ends with its document. WebKit's marks went with it, but a document
         // restored from the back-forward cache keeps those it had: cleared now it is shown.
         page.find.current = None;
@@ -1711,6 +1740,16 @@ fn toplevel(view: *mut ffi::WPEView) -> *mut ffi::WPEToplevel {
     toplevel.as_ptr().cast()
 }
 
+/// Sets or clears `bits` of the view's toplevel state, keeping the others. WebKit's view follows
+/// its toplevel: FULLSCREEN set completes WebKit's entering element fullscreen, cleared completes
+/// its leaving, and cleared while an element is fullscreen asks the page to leave.
+fn set_toplevel(view: *mut ffi::WPEView, bits: c_uint, on: bool) {
+    let toplevel = toplevel(view);
+    let state = unsafe { ffi::wpe_toplevel_get_state(toplevel) };
+    let state = if on { state | bits } else { state & !bits };
+    unsafe { ffi::wpe_toplevel_state_changed(toplevel, state) };
+}
+
 /// A CSS cursor name as the api's cursor.
 fn cursor(name: &str) -> Cursor {
     const ALL: [Cursor; 35] = [
@@ -1853,9 +1892,9 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
         let settings: glib::Object =
             unsafe { from_glib_none(ffi::webkit_web_view_get_settings(web_view.as_ptr().cast())) };
         // Camera and microphone reach the page only through the browser's permission service;
-        // fullscreen waits for an api to coordinate it with the chrome (§17).
+        // element fullscreen is reported to the browser (`FullscreenChanged`), which decides.
         settings.set_property("enable-media-stream", true);
-        settings.set_property("enable-fullscreen", false);
+        settings.set_property("enable-fullscreen", true);
         if let Some(agent) = &self.config.user_agent {
             settings.set_property("user-agent", agent);
         }
@@ -1902,6 +1941,7 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                 text_input: None,
                 semantics: Default::default(),
                 find: Default::default(),
+                fullscreen: None,
                 epoch: metrics.epoch(),
                 buffer: metrics.buffer(),
                 slot,
@@ -2110,7 +2150,13 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
                     }
                 }
             }
-            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
+            EngineCommand::ExitFullscreen => {
+                // The toplevel leaving fullscreen asks the page to leave; `leave-fullscreen`
+                // reports it. With nothing fullscreen, nothing to do.
+                if page.fullscreen.is_some() {
+                    set_toplevel(page.wpe(), ffi::WPE_TOPLEVEL_STATE_FULLSCREEN, false);
+                }
+            }
         }
         match then {
             Then::Nothing => {}
@@ -2217,6 +2263,9 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
     }
 
     fn close_view(&mut self, view: ViewId) {
+        if let Some(left) = self.pages.get_mut(&view).and_then(Page::left_fullscreen) {
+            self.push(left);
+        }
         if self.close(view) {
             self.push(EngineEvent::ViewClosed { view });
         }
