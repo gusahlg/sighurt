@@ -156,3 +156,14 @@ pub const NORMAL: &[Binding] = &[
 
 /// INSERT: only Escape; every other key reaches the page.
 pub const INSERT: &[Binding] = &[bind("escape", ExitFullscreenOr(Mode::Normal), Page, Both)];
+
+/// INSERT on `sig://terminal` (the tab's internal page is `terminal`), in place of [`INSERT`]:
+/// Escape is the program's (nvim needs it), so it reaches the page like every other key, and
+/// `ctrl-\ ctrl-n`, nvim's own way out of its terminal mode, leaves INSERT. Everywhere else
+/// [`INSERT`] stands.
+pub const INSERT_TERMINAL: &[Binding] = &[bind(
+    "ctrl-\\ ctrl-n",
+    Action::Mode(Mode::Normal),
+    Page,
+    Both,
+)];

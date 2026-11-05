@@ -39,6 +39,8 @@ struct Fake {
     link: Option<&'static str>,
     /// Whether every tab's page holds an element fullscreen.
     fullscreen: bool,
+    /// Every tab's internal page.
+    internal: Option<&'static str>,
 }
 
 impl Fake {
@@ -49,6 +51,7 @@ impl Fake {
             active: 0,
             link: None,
             fullscreen: false,
+            internal: None,
         }
     }
     fn tabs(urls: usize, active: usize) -> Self {
@@ -58,6 +61,7 @@ impl Fake {
             active,
             link: None,
             fullscreen: false,
+            internal: None,
         }
     }
 }
@@ -88,7 +92,8 @@ impl Browser for Fake {
             false,
             self.link,
             self.fullscreen,
-        ))
+        )
+        .with_internal(self.internal))
     }
 }
 
@@ -204,7 +209,11 @@ fn the_table_is_valid_in_both_frontends() {
             }
         }
         // No binding is the same keys as, or the start of, another in its mode.
-        for (mode, tab) in [("normal", table::NORMAL), ("insert", table::INSERT)] {
+        for (mode, tab) in [
+            ("normal", table::NORMAL),
+            ("insert", table::INSERT),
+            ("insert on the terminal page", table::INSERT_TERMINAL),
+        ] {
             let chords = |keys: &str| -> Vec<Chord> {
                 keys.split_whitespace()
                     .map(|k| k.parse().unwrap())
@@ -294,6 +303,66 @@ fn escape_toggles_insert_and_the_indicator() {
         table::INSERT[0].action,
         Action::ExitFullscreenOr(Mode::Normal)
     ));
+}
+
+#[test]
+fn on_the_terminal_page_escape_is_the_programs_and_ctrl_backslash_ctrl_n_leaves_insert() {
+    let mut keymap = example();
+    let terminal = Fake {
+        internal: Some("terminal"),
+        ..Fake::new(Frontend::Gui)
+    };
+    // Escape enters INSERT there as everywhere.
+    assert_eq!(keymap.press(&escape(), PAGE, &terminal), KeyAction::Take);
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+    // Then it is the program's, in both frontends and with a field or not.
+    let term = Fake {
+        internal: Some("terminal"),
+        ..Fake::new(Frontend::Terminal)
+    };
+    for browser in [&terminal, &term] {
+        for context in [PAGE, FIELD] {
+            assert_eq!(keymap.press(&escape(), context, browser), KeyAction::Pass);
+        }
+    }
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+    // ctrl-\ starts the way out and ctrl-n ends it; neither reaches the program.
+    assert_eq!(keymap.press(&ctrl('\\'), PAGE, &terminal), KeyAction::Take);
+    assert_eq!(keymap.press(&ctrl('n'), PAGE, &terminal), KeyAction::Take);
+    assert_eq!(keymap.indicator(), None);
+    // A ctrl-\ another key follows is dropped; that key reaches the program.
+    keymap.press(&escape(), PAGE, &terminal);
+    assert_eq!(keymap.press(&ctrl('\\'), PAGE, &terminal), KeyAction::Take);
+    assert_eq!(keymap.press(&typed('x'), PAGE, &terminal), KeyAction::Pass);
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+    // In the address line the line has every key, as on any page.
+    assert_eq!(keymap.press(&escape(), CHROME, &terminal), KeyAction::Pass);
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+    keymap.press(&ctrl('\\'), PAGE, &terminal);
+    keymap.press(&ctrl('n'), PAGE, &terminal);
+
+    // Everywhere else decision 134 stands: Escape leaves INSERT, and the chord is the page's.
+    let web = Fake::new(Frontend::Gui);
+    let help = Fake {
+        internal: Some("help"),
+        ..Fake::new(Frontend::Gui)
+    };
+    for browser in [&web, &help] {
+        assert_eq!(keymap.press(&escape(), PAGE, browser), KeyAction::Take);
+        assert_eq!(keymap.press(&ctrl('\\'), PAGE, browser), KeyAction::Pass);
+        assert_eq!(keymap.press(&ctrl('n'), PAGE, browser), KeyAction::Pass);
+        assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+        assert_eq!(keymap.press(&escape(), PAGE, browser), KeyAction::Take);
+        assert_eq!(keymap.indicator(), None);
+    }
+    // The page's address does not make it the terminal: only the core's record does.
+    let lookalike = Fake {
+        urls: vec![Some("sig://terminal")],
+        ..Fake::new(Frontend::Gui)
+    };
+    keymap.press(&escape(), PAGE, &lookalike);
+    assert_eq!(keymap.press(&escape(), PAGE, &lookalike), KeyAction::Take);
+    assert_eq!(keymap.indicator(), None);
 }
 
 #[test]
