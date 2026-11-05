@@ -5,7 +5,13 @@
 //!
 //! 1. An explicit engine choice wins, if that engine is enabled and may open the URL's scheme
 //!    (http, https, file, or one it is configured for). `sig:` never goes to an engine.
-//! 2. `sig:` URLs are Sighurt's internal pages.
+//! 2. `sig:` URLs are Sighurt's internal pages: `sig://home` and the ones the build lacks are the
+//!    chrome's ([`Route::Internal`], which shows "no such page" for any but home); the pages of
+//!    the build ([`Config::internal_pages`]) are Wasm guests ([`Route::Page`]), which open in
+//!    the wasm engine ([`PAGE_ENGINE`]) and need it enabled. A page's name is the URL's host in
+//!    lower case: `sig:help`, or one with a user name, password or port, is no page.
+//!    [`canonical`] gives the address a page view loads. In a build without the wasm engine a
+//!    `sig://<name>` other than home says why it can't open.
 //! 3. Other schemes go to the engine configured for them, or are an error.
 //! 4. A `file:` URL goes to the engine that claims its extension: local apps, which the engine
 //!    validates when it loads them.
@@ -31,11 +37,16 @@ use url::Url;
 
 use crate::config::{Config, EngineRoutes};
 
+/// The engine that runs the internal pages ([`Route::Page`]).
+pub const PAGE_ENGINE: &str = "wasm";
+
 /// Where a URL goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
-    /// A `sig:` URL: one of Sighurt's internal pages, which the chrome draws.
+    /// A `sig:` URL the chrome draws: `sig://home`, or a page that doesn't exist.
     Internal,
+    /// One of the build's internal pages, by name (`help`), in [`PAGE_ENGINE`].
+    Page(String),
     /// The engine with this name.
     Engine(String),
     /// Nothing can open it, and why, for the user.
@@ -76,8 +87,10 @@ pub fn route(url: &Url, config: &Config, explicit: Option<&str>) -> Route {
 /// is the default engine with `matched` false.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Routed {
-    /// A `sig:` URL: one of Sighurt's internal pages, which the chrome draws.
+    /// A `sig:` URL the chrome draws: `sig://home`, or a page that doesn't exist.
     Internal,
+    /// One of the build's internal pages, by name, in [`PAGE_ENGINE`].
+    Page(String),
     /// An engine opens it.
     Engine {
         /// The engine's name.
@@ -94,6 +107,7 @@ impl From<Routed> for Route {
     fn from(routed: Routed) -> Self {
         match routed {
             Routed::Internal => Self::Internal,
+            Routed::Page(name) => Self::Page(name),
             Routed::Engine { engine, .. } => Self::Engine(engine),
             Routed::Error(message) => Self::Error(message),
         }
@@ -114,7 +128,7 @@ fn classify(url: &Url, config: &Config) -> Routed {
     let scheme = url.scheme();
     let routes = config.routes();
     let (engine, matched) = if scheme == "sig" {
-        return Routed::Internal;
+        return internal(url, config);
     } else if !matches!(scheme, "http" | "https" | "file") {
         match routes
             .iter()
@@ -152,6 +166,43 @@ fn classify(url: &Url, config: &Config) -> Routed {
         ));
     }
     Routed::Engine { engine, matched }
+}
+
+/// Where a `sig:` URL goes: a page of the build, or the chrome's.
+fn internal(url: &Url, config: &Config) -> Routed {
+    let Some(name) = page_name(url) else {
+        return Routed::Internal;
+    };
+    if config.internal_pages().iter().any(|page| *page == name) {
+        return match config.is_enabled(PAGE_ENGINE) {
+            true => Routed::Page(name),
+            false => Routed::Error(format!(
+                "sig://{name} runs in the {PAGE_ENGINE} engine, which [engines] enabled leaves out."
+            )),
+        };
+    }
+    match name.as_str() {
+        "home" => Routed::Internal,
+        _ if config.internal_pages().is_empty() => Routed::Error(format!(
+            "sig://{name} is not a page of this build of sig: its pages besides sig://home run \
+             in the {PAGE_ENGINE} engine, which this build doesn't have."
+        )),
+        _ => Routed::Internal,
+    }
+}
+
+/// The page a `sig:` URL names: its host, in lower case, if it has one and no user name,
+/// password or port.
+fn page_name(url: &Url) -> Option<String> {
+    let plain = url.username().is_empty() && url.password().is_none() && url.port().is_none();
+    let host = url.host_str().filter(|host| plain && !host.is_empty())?;
+    Some(host.to_ascii_lowercase())
+}
+
+/// The address a page view loads for `url`, which routes to the page `name`:
+/// `sig://<name>`, then the URL's path, query and fragment as given.
+pub fn canonical(url: &Url, name: &str) -> String {
+    format!("sig://{name}{}", &url[url::Position::BeforePath..])
 }
 
 fn routes_of<'a>(routes: &'a [EngineRoutes], engine: &str) -> Option<&'a EngineRoutes> {

@@ -390,6 +390,9 @@ tabs = "left"
 | `[downloads] directory` | where downloads go: an absolute path or `~/…` | the desktop's download folder, else `~/Downloads` |
 | `[session] restore` | open the tabs of the last run, and save them as they change | `true` |
 | `[history] remember` | record the pages you visit, to complete what you type in the address line, and save them; `false` records nothing, drops what was read, and leaves the file as it is | `true` |
+| `[commands]` | `name = "command"` or a list of up to 8: [your own commands](#your-own-commands), at most 64 | `help = "tab.new sig://help"` |
+| `[pages.terminal] enabled` | whether `sig://terminal` may run programs (a shell with all your rights) | `false` |
+| `[pages.terminal] command` | the program it runs, with its arguments, without a shell between | `$SHELL`, else `/bin/sh` |
 
 The session is `~/.local/state/sighurt/session.toml`. One `sig` at a time saves it (it holds
 `session.lock` beside it); another started meanwhile restores the same tabs but doesn't save its
@@ -482,6 +485,43 @@ command, typed into the address line) all run them.
 | `browser.quit` | quit, saving the tabs |
 | `site.forget [host]` | forget that site's cookies and stored data in every engine that keeps them, and its visited pages (no argument: the page shown); no wildcards |
 | `chrome.<action>` | one of the chrome's own commands, no argument: the standard chrome's is `chrome.toggle-tabs`; the terminal's are `chrome.toggle-mode`, `chrome.text-mode`, `chrome.graphics-mode` and `chrome.refresh` |
+| `help`, and any other word `[commands]` defines | your own commands (below); `help` opens `sig://help` in a new tab |
+
+#### Your own commands
+
+`[commands]` in the configuration defines commands of your own: a bare word (lower-case letters,
+digits and dashes, no dot) that runs one built-in command, or a list of up to 8 in order. Keys,
+the mouse's buttons and the command line run them like built-in ones (`:help`). They take no
+argument, run only built-in commands (never another of these), and there are at most 64. A word
+the table doesn't define is an unknown command, in the file as on the command line. The built-in
+configuration defines one; yours merge with it by name:
+
+```toml
+[commands]
+help = "tab.new sig://help"          # built in
+wiki = "tab.new https://en.wikipedia.org/"
+reading = ["page.zoom-reset", "page.zoom-in", "page.zoom-in"]
+```
+
+### Sighurt's own pages
+
+`sig://help` is what a new user needs: the modes and the keys to know, then sections on the
+keys (the active keymap's, as it lists them), the commands (built-in and yours), the
+configuration (its path, the main tables, what is in effect), these pages, this build's engines,
+the terminal frontend, and the version, license and credits. `sig://help/keys`,
+`sig://help/commands`, `sig://help/config`, `sig://help/pages`, `sig://help/engines`,
+`sig://help/terminal-frontend` and `sig://help/about` open a section. `?` and `F1` open it (the
+`help` command). `sig://config` shows the configuration file to read and edit, and
+`sig://terminal` is a terminal, off unless `[pages.terminal] enabled = true`: it runs your shell
+with all your rights. `sig://home` is the chrome's own start page.
+
+These pages are Wasm programs built into `sig` and run by the wasm engine, so a build or a
+configuration without that engine doesn't open them, and in the terminal they need graphics (they
+have no text mode, and `sig --dump` can't show them). Only you open them (from the address line,
+a command, or the saved session); a web page can't, by any route. Each is a view of its own, has
+no network, and may ask the browser only for what that page needs (help: facts about the build
+and configuration; config: the configuration file; terminal: a terminal), which the browser
+checks itself.
 
 ### Keys
 
@@ -510,7 +550,8 @@ the keys marked "from the address line too" run their commands.
 | `:` | `location.focus :`: the command line, where a command typed after `:` runs (`:tab.move left`, `:tab.duplicate`, `:tab.new <address>`) |
 | `/` | `page.find`: the [find field](#find-in-page) |
 | `n`, `N` | `page.find-next`, `page.find-previous`: the next and previous match of the search |
-| `t`, `x`, `u` | `tab.new`, `tab.close`, `tab.reopen` |
+| `t`, `x` or `d`, `u` | `tab.new`, `tab.close`, `tab.reopen` |
+| `?`, `f1` | `help`: `sig://help` in a new tab (`f1` from the address line too) |
 | `J`, `K` | `tab.next`, `tab.previous` |
 | `alt-1` to `alt-9` | `tab.select 1` to `9` (from the address line too) |
 | `H`, `L` | `page.back`, `page.forward` |
@@ -805,7 +846,9 @@ they use Oxide's widget kit. The guide and the API overview are in [DOCS.md](./D
 The engines run in `sig`'s process. That is a design for correct code, not a sandbox: an engine
 that is exploited, or crashes, takes the browser with it ([SECURITY.md](./SECURITY.md) says what
 holds and what doesn't). What pages say (titles, status text, addresses) is bounded and shown
-contained; pages can't open `sig:` pages, can't write the address line, and open a tab or move
+contained; pages can't open `sig:` pages (Sighurt's own, such as `sig://help`, are Wasm
+programs with no network that only you open, each granted only what it needs), can't write the
+address line, and open a tab or move
 the tab to another engine only right after a click or key press of yours. Wasm apps get no WASI
 and only the host functions Sighurt registers, with camera, microphone, location and screen
 capture behind a prompt. Servo and WebKit pages get their engines' web security; WebKit's pages

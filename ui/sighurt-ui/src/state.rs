@@ -43,6 +43,9 @@ pub struct Snapshot {
     /// [`Snapshot::status`] is `Some`, and while it draws the page area; otherwise it lists none
     /// and puts the page at the whole window.
     pub fullscreen: bool,
+    /// The configuration's own commands (`[commands]`), by name: the bare words the command
+    /// line runs besides the built-in commands.
+    pub commands: Vec<String>,
 }
 
 /// A search in the page (`page.find`), as the chrome shows it.

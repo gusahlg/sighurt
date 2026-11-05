@@ -50,6 +50,7 @@ pub fn start(dir: &Path) -> Result<Runtime, String> {
         policy: SandboxPolicy::default(),
         kv_root: dir.join("kv"),
         aot_cache: None,
+        pages: Vec::new(),
     };
     // The loop below polls, so the waker has nothing to wake.
     WasmRuntime::new(config, EngineWaker::new(|| {})).map_err(|e| format!("{e:?}"))

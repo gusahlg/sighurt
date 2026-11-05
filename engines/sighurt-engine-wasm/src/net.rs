@@ -64,6 +64,8 @@ pub struct NetPolicy {
     origin: Option<String>,
     /// Whether loopback, private and link-local destinations are allowed.
     allow_private: bool,
+    /// Nothing at all is allowed: an internal page's ([`NetPolicy::offline`]).
+    offline: bool,
 }
 
 impl Default for NetPolicy {
@@ -72,6 +74,7 @@ impl Default for NetPolicy {
         Self {
             origin: Some("null".into()),
             allow_private: false,
+            offline: false,
         }
     }
 }
@@ -82,7 +85,23 @@ impl NetPolicy {
         Self {
             origin: None,
             allow_private: true,
+            offline: false,
         }
+    }
+
+    /// The policy of Sighurt's own pages (`crate::pages`): no destination at all, whatever the
+    /// scheme or address.
+    pub fn offline() -> Self {
+        Self {
+            origin: None,
+            allow_private: false,
+            offline: true,
+        }
+    }
+
+    /// Whether this is [`Self::offline`].
+    pub fn is_offline(&self) -> bool {
+        self.offline
     }
 
     /// The policy of a page whose module was loaded from `page_url`, served from
@@ -96,10 +115,12 @@ impl NetPolicy {
             "file" => Self {
                 origin: Some("null".into()),
                 allow_private: true,
+                offline: false,
             },
             "http" | "https" => Self {
                 origin: Some(url.origin().ascii_serialization()),
                 allow_private: served_from.is_some_and(|ip| !is_public(ip)),
+                offline: false,
             },
             _ => Self::default(),
         }
@@ -116,7 +137,7 @@ impl NetPolicy {
 
     /// Whether a connection to `ip` is allowed.
     pub fn allows(&self, ip: IpAddr) -> bool {
-        self.allow_private || is_public(ip)
+        !self.offline && (self.allow_private || is_public(ip))
     }
 
     /// `url` parsed, if a guest may connect to it: absolute, with one of `schemes`, and with a
@@ -129,6 +150,9 @@ impl NetPolicy {
     }
 
     fn check_url(&self, url: &Url, schemes: &[&str]) -> Result<(), String> {
+        if self.offline {
+            return Err("this page has no network".into());
+        }
         if !schemes.contains(&url.scheme()) {
             return Err(format!("{}: URLs are not allowed here", url.scheme()));
         }
@@ -149,6 +173,9 @@ impl NetPolicy {
     /// process doesn't make itself (FFmpeg's). Blocks while it resolves.
     pub fn check_resolved(&self, url: &Url) -> Result<(), String> {
         use std::net::ToSocketAddrs;
+        if self.offline {
+            return Err("this page has no network".into());
+        }
         let Some(Host::Domain(host)) = url.host() else {
             return Ok(());
         };
@@ -235,6 +262,7 @@ pub async fn resolve(host: &str, port: u16, allow_private: bool) -> io::Result<V
     let policy = NetPolicy {
         origin: None,
         allow_private,
+        offline: false,
     };
     let allowed: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await?
@@ -268,6 +296,7 @@ fn redirects(allow_private: bool) -> reqwest::redirect::Policy {
         let policy = NetPolicy {
             origin: None,
             allow_private,
+            offline: false,
         };
         if attempt.previous().len() > MAX_REDIRECTS {
             return attempt.error(format!("more than {MAX_REDIRECTS} redirects"));

@@ -23,6 +23,8 @@
 //!   reports `FullscreenChanged { fullscreen: true }`, and `ExitFullscreen` leaves it
 //!   (`FullscreenChanged { fullscreen: false }`). `demo:fullscreen-unasked` reports `true` as
 //!   it commits, with no click: what a page may not do by itself.
+//! - `demo:open-sig`: a click asks to open `sig://help` in the page's own view and in a new
+//!   tab, as a hostile page would: the browser refuses both.
 //!
 //! Both `demo:page` and `demo://page` name a page; the address bar keeps only the second form as
 //! typed (it reads `demo:pattern` as a search, as it does any text without `://`), and routing
@@ -125,6 +127,9 @@ pub enum Page {
     Fullscreen,
     /// A page whose element goes fullscreen as it commits, unasked.
     FullscreenUnasked,
+    /// A page that asks to open `sig://help`, in its own view and in a new tab, when clicked:
+    /// what no page may do.
+    OpenSig,
 }
 
 impl Page {
@@ -143,6 +148,7 @@ impl Page {
             "crash" => Ok(Self::Crash),
             "fullscreen" => Ok(Self::Fullscreen),
             "fullscreen-unasked" => Ok(Self::FullscreenUnasked),
+            "open-sig" => Ok(Self::OpenSig),
             "error" => Err(NavigationError::Load(
                 "demo:error fails to load on purpose; the previous page stays".into(),
             )),
@@ -161,6 +167,7 @@ impl Page {
             Self::Crash => "Demo: click to crash",
             Self::Fullscreen => "Demo: click for fullscreen",
             Self::FullscreenUnasked => "Demo: fullscreen, unasked",
+            Self::OpenSig => "Demo: click to open sig://help",
         }
     }
 }
@@ -594,6 +601,17 @@ impl<T: CpuTarget> DemoRuntime<T> {
                     document: view.document.expect("a page has a document"),
                     fullscreen: true,
                 });
+            }
+            Some(Page::OpenSig) if pressed => {
+                let document = view.document.expect("a page has a document");
+                for disposition in [OpenDisposition::CurrentView, OpenDisposition::NewView] {
+                    queue.push(EngineEvent::OpenRequested {
+                        view: id,
+                        document,
+                        url: "sig://help".into(),
+                        disposition,
+                    });
+                }
             }
             Some(Page::Crash) if activated && !view.failed => {
                 view.failed = true;

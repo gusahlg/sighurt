@@ -16,6 +16,8 @@ members = [
     # The terminal frontend (docs/rewrite/TUI.md).
     "frontends/sighurt-tui",
     "crates/sighurt-runtime",
+    # The internal pages, built from pages/ and embedded (docs/rewrite/pages-2026-11-05.md).
+    "crates/sighurt-pages",
     "frontends/sighurt-gui",
     # Chromes besides the standard one, compiled into `sig` through sighurt-browser's features.
     "extensions/sighurt-chrome-line",
@@ -38,6 +40,7 @@ members = [
     # Sighurt's internal pages (sig://help and the rest): Wasm guests built into sig by
     # crates/sighurt-pages, and their shared kit (docs/rewrite/pages-2026-11-05.md).
     "pages/sig-page-kit",
+    "pages/sig-page-help",
     "pages/sig-page-terminal",
     # Guest SDK and example guests.
     "sdk/sighurt-sdk",

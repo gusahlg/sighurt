@@ -84,7 +84,7 @@ use Scope::{Always, NoField, Page};
 use Where::{Both, Terminal};
 
 /// NORMAL: the terminal's keys of 0.9.0 for both frontends, the page's own navigation keys,
-/// plus three actions of its own. No other key reaches the page.
+/// help, plus three actions of its own. No other key reaches the page.
 pub const NORMAL: &[Binding] = &[
     bind("q", Run("browser.quit"), Page, Both),
     bind("o", Run("location.focus"), Page, Both),
@@ -96,6 +96,7 @@ pub const NORMAL: &[Binding] = &[
     bind("ctrl-o", Run("location.focus"), Always, Both),
     bind("t", Run("tab.new"), Page, Both),
     bind("x", Run("tab.close"), Page, Both),
+    bind("d", Run("tab.close"), Page, Both),
     bind("u", Run("tab.reopen"), Page, Both),
     bind("J", Run("tab.next"), Page, Both),
     bind("K", Run("tab.previous"), Page, Both),
@@ -104,6 +105,9 @@ pub const NORMAL: &[Binding] = &[
     bind("r", Run("page.reload"), Page, Both),
     bind("ctrl-r", Run("page.reload"), Always, Both),
     bind("f11", Run("browser.fullscreen"), Always, Both),
+    // `help` is the configuration's own command (`[commands]`): sig://help in a new tab.
+    bind("?", Run("help"), Page, Both),
+    bind("f1", Run("help"), Always, Both),
     bind("e", Run("page.switch-engine"), Page, Both),
     bind("j", Run("page.send-key down"), Page, Both),
     bind("k", Run("page.send-key up"), Page, Both),

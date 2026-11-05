@@ -121,6 +121,7 @@ pub fn three_tabs() -> Snapshot {
         home: home_info(),
         find: None,
         fullscreen: false,
+        commands: Vec::new(),
     }
 }
 

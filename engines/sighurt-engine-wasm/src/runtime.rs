@@ -222,6 +222,11 @@ pub fn instantiate(
 ) -> Result<(Store<HostState>, Instance)> {
     let mut linker = Linker::new(engine.engine());
     register_host_functions(&mut linker)?;
+    // Only an internal page's document gets the privileged module; any other module that
+    // imports it fails to instantiate here.
+    if host_state.internal.is_some() {
+        crate::pages::register_page_functions(&mut linker)?;
+    }
     let mut store = engine.create_store(host_state)?;
     let memory = engine.create_bounded_memory(&mut store)?;
     linker.define(&store, "oxide", "memory", memory)?;
@@ -254,6 +259,9 @@ pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Lo
         anyhow::ensure!(!host_state.budget.is_cancelled(), "cancelled");
         Ok(())
     };
+    if let Some(internal) = &host_state.internal {
+        return load_internal(engine, host_state, internal.page, url);
+    }
     let parsed = AppUrl::parse(url).map_err(|e| anyhow::anyhow!("{e}"))?;
     check()?;
     // Fetching waits on the network: other loads go on meanwhile. The user asked for this
@@ -280,7 +288,46 @@ pub fn load(engine: &WasmEngine, host_state: &HostState, url: &str) -> Result<Lo
 
     check()?;
     let module = engine.compile_module(&wasm_bytes)?;
-    let (mut store, instance) = instantiate(engine, host_state.clone(), &module)?;
+    start(engine, host_state, &module)
+}
+
+/// Loads one of Sighurt's own pages ([`crate::pages`]) into `host_state`: its module from the
+/// table, never fetched, with no network ([`NetPolicy::offline`]) and no manifest, its origin
+/// `sig://<name>`. A module importing what an internal page may not have fails to load.
+fn load_internal(
+    engine: &WasmEngine,
+    host_state: &HostState,
+    page: crate::pages::InternalPage,
+    url: &str,
+) -> Result<Loaded> {
+    host_state.net.set_policy(NetPolicy::offline());
+    crate::capabilities::set_module_origin(host_state, url);
+    let module = engine.compile_module(page.wasm)?;
+    for import in module.imports() {
+        let allowed = match import.module() {
+            "oxide" => crate::pages::allowed_import(import.name()),
+            "sig" => true,
+            _ => false,
+        };
+        anyhow::ensure!(
+            allowed,
+            "sig://{} may not import {}.{}",
+            page.name,
+            import.module(),
+            import.name()
+        );
+    }
+    anyhow::ensure!(!host_state.budget.is_cancelled(), "cancelled");
+    start(engine, host_state, &module)
+}
+
+/// Instantiates `module` into `host_state`, runs `start_app` and makes the [`Loaded`] document.
+fn start(engine: &WasmEngine, host_state: &HostState, module: &Module) -> Result<Loaded> {
+    let check = || {
+        anyhow::ensure!(!host_state.budget.is_cancelled(), "cancelled");
+        Ok(())
+    };
+    let (mut store, instance) = instantiate(engine, host_state.clone(), module)?;
     let start_app = instance
         .get_typed_func::<(), ()>(&mut store, "start_app")
         .context("module must export `start_app` as extern \"C\" fn()")?;

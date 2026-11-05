@@ -39,6 +39,7 @@
 //! Must not own: routing policy (the core decides which engine opens a URL), windows, or the
 //! concrete target and permit types.
 
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -431,7 +432,20 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             renderers: sighurt_core::config::RENDERERS,
             frontend: Frontend::Gui,
             starting_engine: None,
+            pages: self.pages(),
         }
+    }
+
+    /// The internal pages of this build ([`Environment::pages`]): those `sighurt-pages` built,
+    /// when the Wasm engine, which runs them, is in the registry.
+    fn pages(&self) -> BTreeMap<String, &'static [sighurt_api::services::PageGrant]> {
+        #[cfg(feature = "engine-wasm")]
+        if self.engine("wasm").is_some() {
+            return sighurt_pages::built()
+                .map(|(page, _)| (page.name.to_owned(), page.grants))
+                .collect();
+        }
+        BTreeMap::new()
     }
 
     /// Every engine, in build order.
@@ -643,10 +657,19 @@ pub fn wasm_config(mut launch: Launch<'_>) -> Result<sighurt_engine_wasm::WasmCo
         Storage::Profile => (kv::default_root(), default_aot_cache()),
         Storage::Ephemeral => (launch.scratch()?.join("kv"), None),
     };
+    let pages = sighurt_pages::built()
+        .map(|(page, wasm)| sighurt_engine_wasm::pages::InternalPage {
+            name: page.name,
+            title: page.title,
+            wasm,
+            grants: page.grants,
+        })
+        .collect();
     Ok(WasmConfig {
         policy: SandboxPolicy::default(),
         kv_root,
         aot_cache,
+        pages,
     })
 }
 
