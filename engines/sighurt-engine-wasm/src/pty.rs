@@ -1,8 +1,9 @@
 //! The bytes of `sig://terminal`: the master side of the pty the runtime started its program
 //! on, between that program and the page's guest.
 //!
-//! The runtime opened the pty and started the program; the core answered the page's request
-//! with the master. [`Pty`] owns that descriptor from then on: an I/O thread reads the
+//! The runtime opened the pty and started the program, and handed the master over once, by
+//! value: the guest knows its terminal only by the session's id, never by a descriptor. [`Pty`]
+//! owns the descriptor from then on: an I/O thread reads the
 //! program's output into a queue of at most [`MAX_OUTPUT`] bytes and stops reading while it is
 //! full, so a program that writes faster than the guest reads blocks in its `write` instead of
 //! growing `sig`'s memory; what the guest writes waits in a queue of at most [`MAX_INPUT`]
@@ -10,9 +11,13 @@
 //! its own cadence (every step), so nothing wakes the owner: output waits at most one step,
 //! a frame while the page is shown, a second while it is hidden.
 //!
-//! Dropping the [`Pty`] (with the document's `HostState`: the view closed, the document
-//! replaced, the runtime shut down) stops the thread and closes the master, which hangs the
-//! program's terminal up.
+//! The thread never blocks: it polls the master together with a wake-up pipe, so it waits for
+//! room in a full queue, for input, or for the end, and leaves when told. [`Pty::close`] (and
+//! dropping the [`Pty`], with the document's `HostState`: the view closed, the document
+//! replaced, the runtime shut down) stops it at once, discards the input not yet written and
+//! closes the master, which hangs the program's terminal up; the runtime ends the program.
+//! [`Pty::status`] tells the guest which of running, end of file, cancelled and exited (with the
+//! status the runtime recorded when it reaped the program) the terminal is.
 //!
 //! Owns: the master descriptor and its two queues. Must not own: the program (the runtime's
 //! `pty`), what the bytes mean (the guest's emulator), or the policy (the core's).
@@ -20,7 +25,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 
 use rustix::event::{PollFd, PollFlags};
@@ -47,13 +52,30 @@ pub enum Read {
     Ended,
 }
 
+/// Where a terminal is, for the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// The program's side is open, or it closed with output still to read.
+    Running,
+    /// The program's side closed and everything was read; the program is not reaped yet.
+    EndOfFile,
+    /// The page closed it.
+    Cancelled,
+    /// The program's side closed, everything was read, and the program ended with this exit
+    /// code (128 plus the signal for a killed one).
+    Exited(i32),
+}
+
 /// The master of one page's pty and the thread that moves its bytes.
 pub struct Pty {
-    master: Arc<OwnedFd>,
+    /// The master, shared with the thread only; `None` once closed.
+    master: Option<Arc<OwnedFd>>,
     shared: Arc<Mutex<Queues>>,
     /// Written to whenever the thread has something new to do (and to stop it).
     wake: OwnedFd,
     thread: Option<JoinHandle<()>>,
+    /// The runtime records the program's exit here when it reaps it.
+    exit: Arc<OnceLock<i32>>,
 }
 
 #[derive(Default)]
@@ -71,9 +93,11 @@ fn lock(queues: &Mutex<Queues>) -> MutexGuard<'_, Queues> {
 
 impl Pty {
     /// Takes over `master`: makes it non-blocking and starts the thread that moves its bytes.
-    pub fn new(master: Arc<OwnedFd>) -> io::Result<Self> {
-        let flags = rustix::fs::fcntl_getfl(&*master)?;
-        rustix::fs::fcntl_setfl(&*master, flags | OFlags::NONBLOCK)?;
+    /// `exit` is where the runtime records how the program ended.
+    pub fn new(master: OwnedFd, exit: Arc<OnceLock<i32>>) -> io::Result<Self> {
+        let flags = rustix::fs::fcntl_getfl(&master)?;
+        rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK)?;
+        let master = Arc::new(master);
         let (woken, wake) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
         let shared = Arc::new(Mutex::new(Queues::default()));
         let (fd, queues) = (master.clone(), shared.clone());
@@ -81,11 +105,43 @@ impl Pty {
             .name("sighurt-wasm-pty".into())
             .spawn(move || pump(&fd, &queues, &woken))?;
         Ok(Self {
-            master,
+            master: Some(master),
             shared,
             wake,
             thread: Some(thread),
+            exit,
         })
+    }
+
+    /// Where the terminal is.
+    pub fn status(&self) -> Status {
+        let queues = lock(&self.shared);
+        if self.master.is_none() {
+            Status::Cancelled
+        } else if !queues.ended || !queues.output.is_empty() {
+            Status::Running
+        } else {
+            self.exit
+                .get()
+                .map_or(Status::EndOfFile, |&code| Status::Exited(code))
+        }
+    }
+
+    /// Stops the thread, discards what was not written yet and closes the master. Reads find
+    /// the end, writes are refused, and the status is [`Status::Cancelled`] from then on.
+    pub fn close(&mut self) {
+        {
+            let mut queues = lock(&self.shared);
+            queues.stop = true;
+            queues.ended = true;
+            queues.input.clear();
+            queues.output.clear();
+        }
+        self.wake();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.master = None;
     }
 
     /// Moves the program's output into `out`, as much as fits.
@@ -128,8 +184,9 @@ impl Pty {
 
     /// Sets the terminal's size, which signals the program's foreground group (SIGWINCH).
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let master = self.master.as_deref().ok_or(io::ErrorKind::NotConnected)?;
         rustix::termios::tcsetwinsize(
-            &*self.master,
+            master,
             Winsize {
                 ws_row: rows,
                 ws_col: cols,
@@ -148,11 +205,7 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        lock(&self.shared).stop = true;
-        self.wake();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.close();
     }
 }
 
@@ -249,7 +302,7 @@ mod tests {
         let mut termios = rustix::termios::tcgetattr(&slave).unwrap();
         termios.make_raw();
         rustix::termios::tcsetattr(&slave, OptionalActions::Now, &termios).unwrap();
-        (Pty::new(Arc::new(master)).unwrap(), slave)
+        (Pty::new(master, Arc::default()).unwrap(), slave)
     }
 
     /// Reads from `pty` until `want` bytes came or `Ended`.
@@ -361,15 +414,56 @@ mod tests {
     }
 
     #[test]
-    fn the_end_comes_after_the_last_output() {
+    fn the_end_comes_after_the_last_output_and_then_the_exit() {
         let (pty, slave) = pty();
         rustix::io::write(&slave, b"last words").unwrap();
         drop(slave);
+        // Closed with output left: still running for the guest.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(pty.status(), Status::Running);
         let (got, ended) = read_from(&pty, usize::MAX);
         assert!(ended);
         assert_eq!(got, b"last words");
         assert_eq!(pty.read(&mut [0; 8]), Read::Ended);
         assert_eq!(pty.write(b"x"), 0);
+        assert_eq!(pty.status(), Status::EndOfFile, "not reaped yet");
+        pty.exit.set(3).unwrap();
+        assert_eq!(pty.status(), Status::Exited(3));
+    }
+
+    #[test]
+    fn closing_with_a_full_queue_stops_at_once_and_discards_the_input() {
+        let (mut pty, slave) = pty();
+        let flags = rustix::fs::fcntl_getfl(&slave).unwrap();
+        rustix::fs::fcntl_setfl(&slave, flags | OFlags::NONBLOCK).unwrap();
+        let block = vec![b'y'; 4096];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while lock(&pty.shared).output.len() < MAX_OUTPUT {
+            assert!(Instant::now() < deadline);
+            let _ = rustix::io::write(&slave, &block);
+        }
+        // Input the program never reads: it stays queued.
+        assert_eq!(pty.write(&[b'x'; 100]), 100);
+        let started = Instant::now();
+        pty.close();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(pty.status(), Status::Cancelled);
+        assert!(lock(&pty.shared).input.is_empty());
+        assert_eq!(pty.read(&mut [0; 8]), Read::Ended);
+        assert_eq!(pty.write(b"x"), 0);
+        assert!(pty.resize(80, 24).is_err());
+        pty.close();
+        drop(pty);
+        let mut fds = [PollFd::new(&slave, PollFlags::IN)];
+        rustix::event::poll(&mut fds, None).unwrap();
+        assert!(
+            fds[0].revents().contains(PollFlags::HUP),
+            "the master is closed"
+        );
     }
 
     #[test]
@@ -383,7 +477,7 @@ mod tests {
     #[test]
     fn dropping_it_stops_the_thread_and_hangs_the_terminal_up() {
         let (pty, slave) = pty();
-        let master = Arc::downgrade(&pty.master);
+        let master = Arc::downgrade(pty.master.as_ref().unwrap());
         pty.write(b"queued");
         assert_eq!(read_slave(&slave, 6), b"queued");
         let started = Instant::now();
