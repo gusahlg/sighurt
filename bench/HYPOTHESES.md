@@ -705,6 +705,25 @@ the sandbox), never committed.
   this cost; loading FFmpeg only when a guest first uses media would remove most of it. Left
   as an open item.
 
+### Optimization session (5 November 2026): measured and left alone
+
+- **Completion over a full history** (`History::complete`, asked once per edit of the address
+  line): the ignored test `measure_completing_from_5000_visits` (sighurt-runtime, release,
+  median of 200 queries, three runs) takes 146–157 µs for a prefix every visit matches ("h",
+  "w": a scan of all 5 000 and a sort of the matches), 110–113 µs for "site1", 39–45 µs for a
+  prefix few or none match. Under a millisecond a keystroke even at the bound; a top-eight
+  selection instead of the sort would save perhaps 100 µs nobody sees. Not changed.
+- **The owner loop's new per-pass work** (decisions 130–132), read rather than profiled:
+  `answer_completions` returns at once unless the chrome asked or the history's generation
+  changed; `History::poll` is one `is_finished` while the file is read and nothing after;
+  `writes_due` is two `Option` reads; the snapshot carries the find text as one clone per
+  snapshot, and snapshots are built only when the core changed something (decision 124's
+  `snapshot_dirty`). Nothing per iteration that should be per change.
+- **Shaping the address line's ghost text** (decision 131): the ghost and the typed text are
+  two cached lines (`Fonts::line`), shaped once per edit, and a frame that redraws an
+  unchanged line hits the cache. Decision 128's 0.5 ms status-line shaping is cold caches
+  after an idle gap, not the shaper. Not changed.
+
 ## Predictions for the IPC-removal session (gpui-baseline against 3c510fe)
 
 Written on 2 October 2026, before the session's first run. The session measures the baseline

@@ -1432,4 +1432,49 @@ mod tests {
         );
         history.finish();
     }
+
+    /// Run with `--release --ignored --nocapture` to time completion over a full history: the
+    /// median of 200 queries for each prefix, from one that matches every visit to one that
+    /// matches a few.
+    #[test]
+    #[ignore]
+    fn measure_completing_from_5000_visits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = owned(dir.path(), true);
+        for i in 0..MAX_VISITS as u64 {
+            let url = format!(
+                "https://www.site{}.example.com/articles/{i}/a-typical-slug?ref=feed",
+                i % 300
+            );
+            history.record(&url, None, true, NOW + i);
+            history.record(
+                &url,
+                Some("A typical page title — Example Site"),
+                false,
+                NOW + i,
+            );
+        }
+        for typed in [
+            "h",
+            "w",
+            "site1",
+            "site12.example.com/articles/1",
+            "nothing",
+        ] {
+            let mut times: Vec<Duration> = (0..200)
+                .map(|_| {
+                    let started = Instant::now();
+                    std::hint::black_box(history.complete(std::hint::black_box(typed)));
+                    started.elapsed()
+                })
+                .collect();
+            times.sort();
+            println!(
+                "complete({typed:?}): {} found, median {:?}",
+                history.complete(typed).len(),
+                times[100]
+            );
+        }
+        history.finish();
+    }
 }
