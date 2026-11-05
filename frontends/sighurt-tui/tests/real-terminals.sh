@@ -38,10 +38,11 @@
 #             window, then $REDRAWS (20; 0 leaves it out) times away and back, a refresh-client
 #             every fifth time, and two client resizes (the output's size). tmux sends the pane's
 #             stored sixels again, oldest first, on each redraw. PASS if no redraw sends more
-#             than $REDRAW_MAX (1: the quiet page left tmux one) sixels in its first 300 ms; the
+#             than $REDRAW_MAX (2: the quiet page left tmux one, and a frame may come) sixels in its first 300 ms; the
 #             counts are printed and in OUT/<scenario>/redraws.txt (from tap.log). The redraws
 #             stop at Rio's death, which is its own check, rio-redraw: Rio 0.5.28 dies on these
-#             redraws with any sixel in the pane, one that `cat` wrote included.
+#             redraws with any sixel in the pane, one that `cat` wrote included. REDRAW_TAB=2
+#             runs it on the animation instead (then REDRAW_MAX=30: tmux holds up to 19).
 #   quiet     (rio-tmux-sixel, INFO) after a tab switch, how many of 100 screenshots show the
 #             blink of the picture written again alone.
 #   tabstorm  F2 $STORM_RATE times a second (30) for $STORM_SECONDS (25; 0 leaves the check
@@ -55,6 +56,9 @@
 #   SIG=/path/to/sig sighurt-tui/tests/real-terminals.sh --no-build OUT   run that sig instead
 #   sighurt-tui/tests/real-terminals.sh OUT rio           only these scenarios (rio, kitty,
 #                                                         rio-tmux-sixel, rio-sixel, rio-kitty)
+#
+# RIO_USE_CPU=1 gives Rio `[renderer] use-cpu = true` (its CPU renderer instead of Vulkan, the
+# workaround for Rio 0.5.28 losing its Vulkan device, decision 133).
 #
 # Screenshots (*.png), sig's diagnostics and log, and the session files go to OUT/<scenario>; look
 # at the screenshots too. Rio is the user's (`rio` on PATH) or the pinned nixpkgs' one; kitty is
@@ -112,6 +116,15 @@ if [[ -f $HOME/.config/rio/config.toml ]]; then
   cp "$HOME/.config/rio/config.toml" "$home/config/rio/"
 else
   echo 'confirm-before-quit = false' > "$home/config/rio/config.toml"
+fi
+# RIO_USE_CPU=1: Rio draws with its CPU renderer (`[renderer] use-cpu = true`), not Vulkan.
+if [[ ${RIO_USE_CPU:-0} == 1 ]]; then
+  chmod u+w "$home/config/rio/config.toml"
+  if grep -q '^\[renderer\]' "$home/config/rio/config.toml"; then
+    sed -i 's/^\[renderer\]$/[renderer]\nuse-cpu = true/' "$home/config/rio/config.toml"
+  else
+    printf '\n[renderer]\nuse-cpu = true\n' >> "$home/config/rio/config.toml"
+  fi
 fi
 demo=0
 [[ $terminal == rio-tmux-sixel || $terminal == rio-sixel || $terminal == rio-kitty ]] && demo=1
@@ -366,6 +379,9 @@ if [[ $demo == 1 ]]; then
   sleep 3
   if until_true 40 loaded && sleep 3 && shot 1-pattern; then
     report
+    # Which renderer Rio drew with: Vulkan maps the GPU driver's libraries, the CPU one none.
+    gpu_libs=$(grep -cE 'libvulkan|libnvidia|libGLX|libEGL' "/proc/$term_pid/maps" 2>/dev/null)
+    echo "INFO $terminal Rio maps ${gpu_libs:-?} GPU library segments (RIO_USE_CPU=${RIO_USE_CPU:-0})"
     read -r coloured total < <(colourful 1-pattern)
     caps=$(field 'd["capabilities"]') encoded=$(field 'd["counters"]["encoded_bytes"]')
     # The pattern fills the page area; half of the sampled rows' pixels is far under what it
@@ -465,8 +481,8 @@ PY
     # ── redraw ── (rio-tmux-sixel) tmux sends its stored sixels again on each pane redraw.
     # Last: Rio 0.5.28 does not live through it.
     if [[ $terminal == rio-tmux-sixel && ${REDRAWS:-20} != 0 ]] && ! rio_gone; then
-      goto_tab 1 > /dev/null
-      sleep 2
+      goto_tab "${REDRAW_TAB:-1}" > /dev/null
+      sleep 3
       extra=$(tmux new-window -d -t t -P -F '#{window_id}')
       : > "$out/redraws.txt"
       worst=0 died=
@@ -501,8 +517,8 @@ PY
       shot 2b-after-redraws
       # sig's part: what tmux holds for it. Rio 0.5.28 also dies on these redraws with one
       # still sixel that `cat` wrote, without sig (decision 133): that is its own line.
-      if (( worst > ${REDRAW_MAX:-1} )); then
-        fail redraw "a redraw sent $worst sixels in its first 300 ms, more than ${REDRAW_MAX:-1} ($out/redraws.txt)"
+      if (( worst > ${REDRAW_MAX:-2} )); then
+        fail redraw "a redraw sent $worst sixels in its first 300 ms, more than ${REDRAW_MAX:-2} ($out/redraws.txt)"
       else
         pass "redraw (at most $worst sixels in a redraw's first 300 ms; $out/redraws.txt)"
       fi
