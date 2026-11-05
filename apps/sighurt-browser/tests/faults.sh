@@ -11,12 +11,14 @@
 #
 # Scenarios, each in a sway of its own:
 #   dirs        the state directory read-only, or a regular file: sig runs and says the tabs
-#               won't be saved; the configuration directory missing (the built-in configuration),
+#               won't be saved; history.clear there can't empty the history file, says so,
+#               and leaves it whole; the configuration directory missing (the built-in configuration),
 #               a regular file or a symlink loop (sig stops with status 2 before anything starts);
 #               HOME unset (the XDG directories are enough); XDG_RUNTIME_DIR unset (no compositor:
 #               status 1 and a message, at once)
 #   lock        the session lock held by a live process: this sig restores the tabs, says it
-#               won't save them, and never writes the file; a lock file a dead sig left (and its
+#               won't save them, and never writes the file, nor the history file beside it
+#               (history.clear forgets in this sig only, and says so); a lock file a dead sig left (and its
 #               temporary file): taken over, the temporary removed, the session saved
 #   writes      file writes failing (ulimit -f, EFBIG): the session save and a download fail, sig
 #               keeps running, says so in the status line, and the previous session file stays
@@ -90,6 +92,13 @@ finish() {
 windows() { swaymsg -t get_tree | grep -c '"app_id": "sighurt"'; }
 # quit: ctrl-q, and the exit status within 5 s.
 quit() { key -M ctrl q -m ctrl; exited "$sig_pid" 5; }
+# history FILE: a history file of two visits, both of now.
+history() {
+  local now
+  now=$(date +%s)
+  printf 'version = 1\n[[visits]]\nurl = "https://www.example.com/"\nlast = %s\ncount = 1\n[[visits]]\nurl = "https://example.org/a"\nlast = %s\ncount = 2\n' \
+    "$now" "$now" > "$1"
+}
 # session FILE TABS [ACTIVE]: a session of TABS demo tabs, each address padded to PAD bytes.
 session() {
   python3 - "$@" <<'PY'
@@ -113,11 +122,18 @@ dirs)
   d=$out/state-readonly
   private "$d"
   mkdir -p "$d/state/sighurt"
+  history "$d/state/sighurt/history.toml"
+  sum=$(md5sum < "$d/state/sighurt/history.toml")
   chmod 500 "$d/state/sighurt"
   start_sig "$d" demo://pattern
   verdict "read-only state: sig runs and shows the page" "$(dg "len(views)==1 and shown is not None, len(views)")"
   verdict "and says the tabs won't be saved" "$(dg "d['status']=='notice', d['status']")"
   shot state-readonly
+  cmd history.clear
+  verdict "history.clear says the history file wasn't emptied" "$(dg "d['status']=='notice', d['status']")"
+  shot state-readonly-history-clear
+  check "and the history file is left whole" "$([[ $(md5sum < "$d/state/sighurt/history.toml") == "$sum" ]]; echo $?)" "md5 compared"
+  check "sig still runs" "$(alive; echo $?)" "pid $sig_pid"
   quit; code=$status
   check "and quits cleanly" "$([[ $code == 0 ]]; echo $?)" "exit status $code"
   check "the log says why" "$(grep -q 'cannot save the session' "$d/sig.log"; echo $?)" \
@@ -190,6 +206,8 @@ lock)
   mkdir -p "$d/state/sighurt" && chmod 700 "$d/state/sighurt"
   session "$d/state/sighurt/session.toml" 2
   sum=$(md5sum < "$d/state/sighurt/session.toml")
+  history "$d/state/sighurt/history.toml"
+  hsum=$(md5sum < "$d/state/sighurt/history.toml")
   step "the lock held by a live process"
   flock "$d/state/sighurt/session.lock" sleep 300 &
   holder=$!
@@ -199,9 +217,13 @@ lock)
   verdict "and sig says it won't save them" "$(dg "d['status']=='notice', d['status']")"
   key -M ctrl t -m ctrl
   sleep 1.5
+  cmd history.clear
+  verdict "history.clear says it forgot in this sig only" "$(dg "d['status']=='notice', d['status']")"
+  shot held-history-clear
   quit; code=$status
   check "it quits cleanly" "$([[ $code == 0 ]]; echo $?)" "exit status $code"
   check "and never wrote the session" "$([[ $(md5sum < "$d/state/sighurt/session.toml") == "$sum" ]]; echo $?)" "md5 compared"
+  check "nor the history file" "$([[ $(md5sum < "$d/state/sighurt/history.toml") == "$hsum" ]]; echo $?)" "md5 compared"
   kill "$holder" 2>/dev/null
   wait "$holder" 2>/dev/null
 
