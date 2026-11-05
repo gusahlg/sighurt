@@ -1861,3 +1861,51 @@ fn dump_of_the_slow_page_ends_within_its_caps() {
     assert!(out.starts_with("Demo: slow"), "{out}");
     assert!(took < Duration::from_secs(12), "{took:?}");
 }
+
+/// The terminal has no window fullscreen: `browser.fullscreen` says so. A page's element
+/// fullscreen follows the window's policy (a click lets it, a notice says so, Escape leaves it)
+/// and the page keeps its rows; without a click it is refused.
+#[test]
+fn fullscreen_in_the_terminal_is_a_notice() {
+    let mut term = Terminal::start("fullscreen", &["demo://fullscreen"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "no image\n{}", term.context());
+    let page = |held: bool| {
+        format!("\"fullscreen\":{{\"page\":{held},\"wanted\":false,\"window\":false}}")
+    };
+    let since = term.got.len();
+    term.type_bytes(b"\x1b[<0;6;6M\x1b[<0;6;6m");
+    let told = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "The page is fullscreen. Escape leaves it.")
+    });
+    assert!(
+        told,
+        "no notice of the page's fullscreen\n{}",
+        term.context()
+    );
+    let report = term.report_until(|r| r.contains(&page(true)));
+    assert!(report.contains(&page(true)), "{report}\n{}", term.context());
+    term.type_bytes(b"\x1b");
+    let report = term.report_until(|r| r.contains(&page(false)));
+    assert!(report.contains(&page(false)), "{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b":browser.fullscreen\r");
+    let told = term.wait(since, Duration::from_secs(10), |got| {
+        // The grid's diff skips cells the last notice left as they are: match what differs.
+        shows(got, "browser.fullscreen is not available in")
+    });
+    assert!(told, "no notice\n{}", term.context());
+    // A page asking by itself is refused.
+    term.type_bytes(b":page.open demo://fullscreen-unasked\r");
+    let opened = term.wait(term.got.len(), Duration::from_secs(10), |got| {
+        shows(got, "unask")
+    });
+    assert!(opened, "the page did not open\n{}", term.context());
+    let report = term.report_until(|_| false);
+    assert!(report.contains(&page(false)), "{}", term.context());
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+    term.assert_restored();
+}
