@@ -3,7 +3,8 @@
 //! in it: no tab list while the tabs are hidden, no buttons that `[chrome.standard]` leaves out.
 //! An engine page's tab is described by its engine ("Engine: servo") while the chrome labels
 //! tabs with it. The address field's engine button is "Switch engine (now: servo)", or
-//! "Switching to wpe" and busy while a switch is under way.
+//! "Switching to wpe" and busy while a switch is under way. The find field, in the address
+//! line's place, is "Find in page", described by what the search found ("3 of 12").
 //!
 //! When an engine view shows the page, the document node is the container its accessibility
 //! subtree will hang under once engines provide one; none does yet, and the node says only
@@ -67,7 +68,7 @@ pub enum Role {
     Toolbar,
     /// A button.
     Button,
-    /// A one-line text field that takes a URL (or a command).
+    /// A one-line text field that takes a URL (or a command, or what to find in the page).
     UrlInput,
     /// A web page, or the container for an engine's tree.
     Document,
@@ -218,11 +219,21 @@ impl Model {
             toolbar.children.push(id);
             nodes.push(button);
         }
-        let mut address = node(NodeId::Address, Role::UrlInput, "Address", layout.address);
+        // The find field takes the address line's place, and says what the search found.
+        let name = match state.find {
+            Some(_) => "Find in page",
+            None => "Address",
+        };
+        let mut address = node(NodeId::Address, Role::UrlInput, name, layout.address);
         address.value = Some(state.address.text().to_owned());
         address.states.focused = state.focused;
         address.states.invalid = state.command_error.is_some();
         address.description = state.command_error.clone();
+        if let Some(find) = snapshot.find.as_ref().filter(|_| state.find.is_some()) {
+            let engine = snapshot.active().and_then(|tab| tab.engine_label());
+            let found = find.indicator(engine.as_deref());
+            address.description = (!found.is_empty()).then_some(found);
+        }
         toolbar.children.push(NodeId::Address);
         nodes.push(address);
         let tab = snapshot.active().filter(|_| !state.focused);

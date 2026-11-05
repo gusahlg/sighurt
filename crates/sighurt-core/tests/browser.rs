@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use sighurt_api::engine::{EngineCapabilities, EngineCommand, EngineError, ViewOptions};
+use sighurt_api::engine::{
+    EngineCapabilities, EngineCommand, EngineError, FindCommand, ViewOptions,
+};
 use sighurt_api::events::{Cursor, EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
 use sighurt_api::geometry::{SurfacePoint, SurfaceRect};
 use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, TabId, ViewId};
@@ -34,7 +36,7 @@ struct FakeView {
 }
 
 /// The engines of a build: servo and wasm traverse their history and zoom, the demo engine
-/// does neither.
+/// does neither. Only wasm finds in page.
 fn engines(names: &[&str]) -> BTreeMap<String, EngineCapabilities> {
     let full = EngineCapabilities {
         history_traversal: true,
@@ -43,6 +45,10 @@ fn engines(names: &[&str]) -> BTreeMap<String, EngineCapabilities> {
     };
     let capabilities = |name| match name {
         "demo" => EngineCapabilities::default(),
+        "wasm" => EngineCapabilities {
+            find_in_page: true,
+            ..full
+        },
         _ => full,
     };
     names
@@ -173,8 +179,29 @@ impl Harness {
         all
     }
 
-    /// What the fake engine reports after `effect`.
+    /// What the fake engine reports after `effect`. A search the engine can't do is answered
+    /// as the runtime answers it; one it can is left for the test to answer.
     fn answer(&mut self, effect: &Effect) -> Vec<BrowserEvent> {
+        if let Effect::Find { view, command } = effect {
+            let finds = self.views[view].engine == "wasm";
+            return match command {
+                FindCommand::Search { search, .. }
+                | FindCommand::Next { search }
+                | FindCommand::Previous { search }
+                    if !finds =>
+                {
+                    vec![BrowserEvent::FindResult {
+                        view: *view,
+                        search: *search,
+                        found: false,
+                        current: None,
+                        total: None,
+                        supported: false,
+                    }]
+                }
+                _ => Vec::new(),
+            };
+        }
         let (view, events) = match effect {
             Effect::OpenView { view, .. } => (*view, vec![EngineEvent::ViewReady { view: *view }]),
             Effect::CloseView { view } => (*view, vec![EngineEvent::ViewClosed { view: *view }]),
@@ -762,38 +789,312 @@ fn location_focus_with_text_hands_the_line_its_text_after_the_focus() {
     assert!(!effects.iter().any(|e| matches!(e, Effect::LineText(_))));
 }
 
+/// The find commands of the effects, by view.
+fn finds(effects: &[Effect]) -> Vec<(ViewId, &FindCommand)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Find { view, command } => Some((*view, command)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The search a `Search` among the effects started.
+fn started(effects: &[Effect]) -> RequestId {
+    let searches: Vec<RequestId> = finds(effects)
+        .into_iter()
+        .filter_map(|(_, command)| match command {
+            FindCommand::Search { search, .. } => Some(*search),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(searches.len(), 1, "{effects:?}");
+    searches[0]
+}
+
+/// `view`'s search as the chrome sees it: found, current, total, supported.
+type FindView = (String, Option<bool>, Option<u32>, Option<u32>, bool);
+
+fn find_state(b: &Harness) -> Option<FindView> {
+    b.active().find.map(|find| {
+        (
+            find.text.clone(),
+            find.found,
+            find.current,
+            find.total,
+            find.supported,
+        )
+    })
+}
+
+/// An engine's result for `search` in `view`'s document.
+fn found(view: ViewId, document: DocumentGeneration, search: RequestId, n: u32) -> EngineEvent {
+    EngineEvent::FindResult {
+        view,
+        document,
+        search,
+        found: n > 0,
+        current: (n > 0).then_some(1),
+        total: Some(n),
+    }
+}
+
 #[test]
-fn find_history_and_fullscreen_say_what_is_missing() {
-    use sighurt_api::commands::{Command, MAX_FIND};
+fn find_goes_to_the_view_with_smart_case_and_its_results_fill_the_chrome() {
+    let mut b = Harness::start("", &["file:///tmp/app.wasm"]);
+    let view = b.shown();
+    let document = b.document(view);
+    let effects = b.apply(command("page.find hello"));
+    assert!(notices(&effects).is_empty(), "{effects:?}");
+    let search = started(&effects);
+    assert_eq!(
+        finds(&effects),
+        [(
+            view,
+            &FindCommand::Search {
+                search,
+                document,
+                text: "hello".into(),
+                case_sensitive: false,
+            }
+        )]
+    );
+    assert!(effects.contains(&Effect::RedrawChrome));
+    assert_eq!(
+        find_state(&b),
+        Some(("hello".into(), None, None, None, true))
+    );
+    let effects = b.engine(found(view, document, search, 12));
+    assert!(effects.contains(&Effect::RedrawChrome));
+    assert_eq!(
+        find_state(&b),
+        Some(("hello".into(), Some(true), Some(1), Some(12), true))
+    );
+    // Upper case anywhere makes it case-sensitive.
+    let effects = b.apply(command("page.find Hello"));
+    assert!(matches!(
+        finds(&effects)[..],
+        [(
+            _,
+            FindCommand::Search {
+                case_sensitive: true,
+                ..
+            }
+        )]
+    ));
+    let search = started(&effects);
+    // The moves name the search.
+    let effects = b.apply(command("page.find-next"));
+    assert_eq!(finds(&effects), [(view, &FindCommand::Next { search })]);
+    let effects = b.apply(command("page.find-previous"));
+    assert_eq!(finds(&effects), [(view, &FindCommand::Previous { search })]);
+    // No match: no current one.
+    b.engine(EngineEvent::FindResult {
+        view,
+        document,
+        search,
+        found: false,
+        current: Some(3),
+        total: Some(0),
+    });
+    assert_eq!(
+        find_state(&b),
+        Some(("Hello".into(), Some(false), None, Some(0), true))
+    );
+    // Stop ends it.
+    let effects = b.apply(command("page.find-stop"));
+    assert_eq!(finds(&effects), [(view, &FindCommand::Stop { search })]);
+    assert_eq!(find_state(&b), None);
+    // A result after the stop is late.
+    b.engine(found(view, document, search, 4));
+    assert_eq!(find_state(&b), None);
+    // Stopping again sends nothing.
+    assert!(finds(&b.apply(command("page.find-stop"))).is_empty());
+}
+
+#[test]
+fn a_late_result_of_a_replaced_search_or_another_document_is_dropped() {
+    let mut b = Harness::start("", &["file:///tmp/app.wasm"]);
+    let view = b.shown();
+    let document = b.document(view);
+    let a = started(&b.apply(command("page.find a")));
+    let ab = started(&b.apply(command("page.find ab")));
+    assert_ne!(a, ab);
+    b.engine(found(view, document, ab, 2));
+    // A's result arrives after B's: dropped.
+    b.engine(found(view, document, a, 9));
+    assert_eq!(
+        find_state(&b),
+        Some(("ab".into(), Some(true), Some(1), Some(2), true))
+    );
+    // A result for another document is dropped too.
+    b.engine(found(view, DocumentGeneration::next(), ab, 7));
+    assert_eq!(find_state(&b).unwrap().3, Some(2));
+    // And one from the frontend for an old search.
+    b.apply(BrowserEvent::FindResult {
+        view,
+        search: a,
+        found: true,
+        current: Some(5),
+        total: Some(5),
+        supported: true,
+    });
+    assert_eq!(find_state(&b).unwrap().3, Some(2));
+    // The frontend's answer for the search counts like the engine's.
+    b.apply(BrowserEvent::FindResult {
+        view,
+        search: ab,
+        found: true,
+        current: Some(2),
+        total: Some(3),
+        supported: true,
+    });
+    assert_eq!(
+        find_state(&b),
+        Some(("ab".into(), Some(true), Some(2), Some(3), true))
+    );
+}
+
+#[test]
+fn a_new_document_or_a_failed_one_ends_the_search() {
+    let mut b = Harness::start("", &["file:///tmp/app.wasm"]);
+    let view = b.shown();
+    let document = b.document(view);
+    let search = started(&b.apply(command("page.find x")));
+    // A fragment navigation stays in the document and keeps the search.
+    let effects = b.apply(command("page.open file:///tmp/app.wasm#part"));
+    assert!(finds(&effects).is_empty(), "{effects:?}");
+    assert_eq!(b.document(view), document);
+    assert!(find_state(&b).is_some());
+    // A new document ends it, and whoever searched is told.
+    let effects = b.apply(command("page.open file:///tmp/other.wasm"));
+    assert_eq!(b.shown(), view, "the same view");
+    assert_eq!(finds(&effects), [(view, &FindCommand::Stop { search })]);
+    assert_eq!(find_state(&b), None);
+    // The old document's late result is dropped.
+    b.engine(found(view, document, search, 3));
+    assert_eq!(find_state(&b), None);
+    let moves = b.apply(command("page.find-next"));
+    assert_eq!(
+        notices(&moves),
+        ["Nothing to find: page.find <text> first."]
+    );
+    assert!(finds(&moves).is_empty());
+    // A failed document ends it as well.
+    let search = started(&b.apply(command("page.find y")));
+    let effects = b.engine(EngineEvent::ViewFailed {
+        view,
+        message: "trapped".into(),
+    });
+    assert_eq!(finds(&effects), [(view, &FindCommand::Stop { search })]);
+    assert!(b.state.view(view).unwrap().find().is_none());
+    // A failed view has no document to search.
+    assert_eq!(
+        notices(&b.apply(command("page.find y"))),
+        ["The page has not loaded yet: there is nothing to find in."]
+    );
+}
+
+#[test]
+fn a_page_nobody_can_search_says_so_once() {
     let mut b = Harness::start("", &["https://a.test/"]);
     let view = b.shown();
+    // The core asks anyway: the frontend may search its text itself.
     let effects = b.apply(command("page.find hello"));
+    assert_eq!(finds(&effects).len(), 1);
     assert_eq!(notices(&effects), ["servo can't find in page."]);
-    assert!(commands(&effects, view).is_empty(), "no engine is asked");
+    assert_eq!(
+        find_state(&b),
+        Some(("hello".into(), None, None, None, false))
+    );
+    // Typing on in the find field: asked again, but not told again.
+    let effects = b.apply(command("page.find hello w"));
+    assert_eq!(finds(&effects).len(), 1);
+    assert!(notices(&effects).is_empty(), "{effects:?}");
+    // The moves have nothing to move in.
+    for moves in ["page.find-next", "page.find-previous"] {
+        let effects = b.apply(command(moves));
+        assert_eq!(notices(&effects), ["servo can't find in page."]);
+        assert!(finds(&effects).is_empty());
+    }
+    // An engine that declared find and then refuses it counts as unable.
+    let mut b = Harness::start("", &["file:///tmp/app.wasm"]);
+    let wasm = b.shown();
+    let effects = b.apply(command("page.find z"));
+    let FindCommand::Search { .. } = finds(&effects)[0].1 else {
+        panic!("{effects:?}")
+    };
+    let command = EngineCommand::Find(finds(&effects)[0].1.clone());
+    let effects = b.apply(BrowserEvent::CommandFailed {
+        view: wasm,
+        command,
+        error: EngineError::Unsupported("find"),
+    });
+    assert_eq!(notices(&effects), ["wasm can't find in page."]);
+    assert!(!b.active().find.unwrap().supported);
+    let _ = view;
+}
+
+#[test]
+fn find_without_text_opens_the_find_field_with_the_search() {
+    let mut b = Harness::start("", &["file:///tmp/app.wasm"]);
+    let effects = b.apply(command("page.find"));
+    let focus = effects
+        .iter()
+        .position(|e| *e == Effect::Focus(KeyboardFocus::Chrome));
+    let field = effects
+        .iter()
+        .position(|e| *e == Effect::FindField(String::new()));
+    assert!(focus.is_some() && focus < field, "{effects:?}");
+    assert!(finds(&effects).is_empty());
+    b.apply(command("page.find Some text"));
+    let effects = b.apply(command("page.find"));
+    assert!(effects.contains(&Effect::FindField("Some text".into())));
+}
+
+#[test]
+fn find_says_what_it_cannot_do() {
+    use sighurt_api::commands::{Command, MAX_FIND};
+    let mut b = Harness::start("", &["file:///tmp/app.wasm"]);
     for moves in ["page.find-next", "page.find-previous"] {
         let effects = b.apply(command(moves));
         assert_eq!(
             notices(&effects),
             ["Nothing to find: page.find <text> first."]
         );
+        assert!(finds(&effects).is_empty());
     }
-    assert!(notices(&b.apply(command("page.find-stop"))).is_empty());
-    // The find field: the page's engine can't find either.
-    assert_eq!(
-        notices(&b.apply(command("page.find"))),
-        ["servo can't find in page."]
-    );
+    assert!(b.apply(command("page.find-stop")).is_empty());
     // Only a chrome can make a longer one; the core refuses it.
     let long = BrowserEvent::Command(Command::PageFind(Some("a".repeat(MAX_FIND + 1))));
+    let effects = b.apply(long);
     assert_eq!(
-        notices(&b.apply(long)),
+        notices(&effects),
         ["page.find searches for at most 1024 bytes of text."]
     );
-    b.apply(command("tab.new"));
+    assert!(finds(&effects).is_empty());
+    // Whitespace is not searched for: it ends the search.
+    let search = started(&b.apply(command("page.find a")));
+    let blank = BrowserEvent::Command(Command::PageFind(Some("  \t ".into())));
+    let effects = b.apply(blank);
     assert_eq!(
-        notices(&b.apply(command("page.find hello"))),
-        ["This tab shows no page to find in."]
+        finds(&effects),
+        [(b.shown(), &FindCommand::Stop { search })]
     );
+    assert!(notices(&effects).is_empty());
+    b.apply(command("tab.new"));
+    for find in ["page.find hello", "page.find"] {
+        assert_eq!(
+            notices(&b.apply(command(find))),
+            ["This tab shows no page to find in."]
+        );
+    }
+}
+
+#[test]
+fn history_and_fullscreen_say_what_is_missing() {
+    let mut b = Harness::start("", &["https://a.test/"]);
     // history.clear asks the executable to forget, which answers (tests/history.rs).
     let effects = b.apply(command("history.clear"));
     assert!(notices(&effects).is_empty());

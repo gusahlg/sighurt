@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::time::Instant;
 
 use sighurt_api::events::Cursor;
-use sighurt_api::ids::{DocumentGeneration, TabId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, RequestId, TabId, ViewId};
 use sighurt_api::input::TextInputState;
 use sighurt_api::services::Permission;
 
@@ -46,6 +46,28 @@ pub struct ClosedTab {
     pub engine: Option<String>,
     /// Its page zoom.
     pub zoom: f64,
+}
+
+/// A view's search (`page.find`): what it looks for and what the last result for it said. One
+/// per view; a new `page.find` replaces it, and it ends with `page.find-stop`, a new document,
+/// or the document failing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Find {
+    /// Identifies the search in its results; a result for another is stale.
+    pub(crate) search: RequestId,
+    /// What it looks for, as the user gave it (trimmed, at most
+    /// [`MAX_FIND`](sighurt_api::commands::MAX_FIND) bytes).
+    pub text: String,
+    /// Whether case matters: the text has an upper-case letter in it (smart case).
+    pub case_sensitive: bool,
+    /// Whether there is a match; `None` until a result comes.
+    pub found: Option<bool>,
+    /// Which match is selected, from 1, when the finder knows.
+    pub current: Option<u32>,
+    /// How many matches there are, when the finder knows.
+    pub total: Option<u32>,
+    /// `false` once neither the frontend nor the page's engine could search.
+    pub supported: bool,
 }
 
 /// `text`, if it is an http, https or file URL no longer than [`MAX_LINK`]: as the URL parser
@@ -201,6 +223,8 @@ pub struct View {
     pub(crate) chosen: bool,
     /// The user's answers to `document`'s permission prompts. Dropped with the document.
     pub(crate) answers: Vec<(Permission, bool)>,
+    /// Its search, if one is under way. Dropped with the document.
+    pub(crate) find: Option<Find>,
     /// The visit `document`'s commit recorded, and that document: what a title it reports
     /// next names (`state`'s "Visited pages").
     pub(crate) visit: Option<(String, DocumentGeneration)>,
@@ -232,6 +256,7 @@ impl View {
             hovered: None,
             chosen: false,
             answers: Vec::new(),
+            find: None,
             visit: None,
         }
     }
@@ -279,6 +304,11 @@ impl View {
             Self { visible: true, .. } => ViewState::LiveVisible,
             Self { .. } => ViewState::LiveHidden,
         }
+    }
+
+    /// Its search, if one is under way.
+    pub fn find(&self) -> Option<&Find> {
+        self.find.as_ref()
     }
 
     /// Its pending navigations.
@@ -352,6 +382,9 @@ pub struct TabSummary<'a> {
     /// The engine of the view the tab is switching to, until that view has committed and can
     /// present, or the switch fails or is cancelled. It can be the engine the tab shows now.
     pub switching_to: Option<&'a str>,
+    /// The search in the page it shows, if one is under way: what the chrome's find field
+    /// shows beside it ("3 of 12").
+    pub find: Option<&'a Find>,
 }
 
 /// A short title for a page that doesn't name itself.

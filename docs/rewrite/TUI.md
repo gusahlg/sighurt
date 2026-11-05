@@ -176,7 +176,7 @@ Reflow to cells lives only in `frontends/sighurt-tui/src/textmode/`.
 - **Chrome**: its own small trait `TerminalChrome { handle(ChromeEvent) -> Vec<ChromeAction>;
   rows() -> (top, bottom); draw(&mut Grid) }` over `sighurt_api::chrome::Snapshot`; the
   standard one has a top line (`[2/5] address · engine · MODE · keymap`) and a bottom line
-  (status, notices). Config `[tui] chrome`, `graphics`, `mode`, `fps`, `mouse`; `[keys]`, the
+  (status, notices, the address line, the find field and what the search found). Config `[tui] chrome`, `graphics`, `mode`, `fps`, `mouse`; `[keys]`, the
   keymaps and `[ui.colors]` apply as they are.
 - **Keys → `KeyEvent`**: with the kitty keyboard protocol, `key` from the codepoint and `code`
   from the base-layout key through a US-layout → evdev table (so `code:` bindings work); in
@@ -431,6 +431,26 @@ Where it differs from the sketches in §2–§3:
   s) exits 2. If stderr is a terminal, logging goes to the log file. The demo engine now has
   semantics (a heading, a paragraph, two links, a field, a checkbox, a select and a button), so
   all of this is tested in a pty without WPE (`apps/sighurt-browser/tests/tui.rs`).
+- **Find in page** (decision 128). `page.find` without text opens the find field: the bottom
+  line's editor behind a `/` prompt, holding the view's search selected. Each edit runs `page.find
+  <text>` (trimmed, at most 1024 bytes), text that is empty or only whitespace `page.find-stop`;
+  Enter closes the field and gives the page the keyboard, keeping the search for `page.find-next`
+  and `page.find-previous` (`n` and `N` in the example keymap); Escape closes it and ends the
+  search; the core moving the focus (`location.focus`, a tab change) closes it and keeps the
+  search. The core's search reaches the runtime as `Effect::Find`, which offers it to
+  `Frontend::find` first. In graphics mode the TUI declines and the engine searches. In text mode
+  it takes every search of the shown view: `textmode::find` searches the page's logical lines, the
+  text before wrapping (rows a wrap broke are joined, with the space a break dropped; a row's
+  prefix, an indent, quote bar or list marker, is not page text), maps each match back to its
+  rows and columns, scrolls the current match into view and draws it in reverse video; `Next` and
+  `Previous` wrap; upper case in the text makes the search case-sensitive (the core's rule). It
+  answers the core with `BrowserEvent::FindResult`, as an engine would, and again when a new
+  snapshot of the same document changes the count; a new document ends the search (the core also
+  sends `Stop`). Changing the mode with a search in the shown page runs `page.find-stop` and says
+  so in a notice: the search belonged to the other mode's finder. What the core's search found is
+  right-aligned on the bottom line ("3 of 12", "12 matches", "no matches", "not supported by
+  <engine>"), after the search's text (16 characters at most) when the field is closed; a
+  terminal too narrow for both drops it. `--dump` is unchanged.
 - **Open.** A stale page stays on screen until the new document's first snapshot (the frontend
   isn't told of commits); WPE text mode and `--dump` against real sites are checked by hand, not by
   `engines.sh` yet.

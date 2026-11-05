@@ -541,11 +541,21 @@ links (`NavigationRequested`, cancel-and-replay with a one-shot allow), popups a
 as `OpenRequested`, `window.close()` as `CloseRequested`, zoom, resize and scale (the buffer is
 what CEF paints; a mismatch with the host's rounding is padded with opaque white), hidden views,
 pointer, wheel, keys with text, focus (held keys released on loss), the cursor, title and status,
-crashes as `ViewFailed` (reload recovers), downloads as `Service::Download`, clipboard as above.
+crashes as `ViewFailed` (reload recovers), downloads as `Service::Download`, clipboard as above,
+find in page (`src/find.rs`: `cef_browser_host_t::find` with `findNext` always set, since without
+it CEF 150 selects no match for a new search; `stop_finding(1)`; `OnFindResult` gives found,
+`current` from `activeMatchOrdinal` and `total` from `count`; an update that has found nothing
+yet is not reported, so only the last says "no match"). CEF's identifier increases with every
+`find` call in the process but isn't returned, so each operation runs as a task on CEF's UI
+thread that also sets the view's current search there, and a result is stamped with the search
+current when it arrives; a new search first calls `stop_finding`, after which Chromium reports
+nothing more of the old one, and a result whose identifier is no higher than the highest seen
+when the search started is dropped as an earlier search's. A new document or a crashed renderer
+ends the search; results for another document are dropped.
 Refused: JS dialogs (suppressed), permission prompts and media access (denied), file choosers
 (cancelled), context menus (emptied), HTTP authentication and certificate errors (cancelled),
 `javascript:` addresses from the browser. Not supported: `<select>` popups (`PET_POPUP` is
-ignored), drag and drop, find in page, accessibility, semantics, DMA-BUF frames. Site data is
+ignored), drag and drop, accessibility, semantics, DMA-BUF frames. Site data is
 declared; listing and forgetting it is refused.
 
 **Tests.**
@@ -554,7 +564,10 @@ declared; listing and forgetting it is refused.
   private headless sway, 1 test, about 6 s warm): page pixels (ARGB, top-down, stride padding),
   started/committed order with a Push, a held link answered, traversal (Traverse; beyond the list
   Cancelled), the text-input state of a focused field, typing, Ctrl+V through the service, an
-  input-method commit, an `OpenRequested` popup, an attachment as a download request, a resize,
+  input-method commit, an `OpenRequested` popup, an attachment as a download request, find in
+  page (count and selected match, next and previous wrapping, case, no match, no result stamped
+  with a later search, moves and stops of a replaced or stopped search and a search of a gone
+  document ignored, the search ended by a new document), a resize,
   idle wakeups (0 in 3 s), `ViewClosed`, and no helper process after `shutdown`.
 - `apps/sighurt-browser/tests/cef.sh` (`sig` with the cef and demo engines, private sway and
   D-Bus, every XDG directory under OUT): `page.open-in cef https://example.com/` opens in

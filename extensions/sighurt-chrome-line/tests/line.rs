@@ -1099,3 +1099,101 @@ fn golden_engine_button() {
     golden("engine-busy-100", &paint(&mut *chrome, LINE, 120));
     golden("engine-busy-200", &paint(&mut *chrome, LINE, 240));
 }
+
+/// The line showing `snapshot`, opened as the find field, as `sig` opens it for `page.find`.
+fn finding(snapshot: &Snapshot, text: &str) -> Box<dyn Chrome> {
+    let mut chrome = line(Table::new(), 700, 400);
+    chrome.handle(ChromeEvent::Snapshot(snapshot.clone()));
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    let actions = chrome.handle(ChromeEvent::FindField(text.into()));
+    assert!(commands(&actions).is_empty(), "opening searches nothing");
+    assert_eq!(repaints(&actions), [LINE]);
+    chrome
+}
+
+/// The find field searches as it is edited; Enter keeps the search, Escape ends it, and the
+/// core moving the keyboard or another tab closes the field and keeps it.
+#[test]
+fn the_find_field() {
+    let find = |text: &str| Command::PageFind(Some(text.into()));
+    let tabs = five_engine_tabs();
+    let mut chrome = finding(&tabs, "");
+    let mut sent = Vec::new();
+    for c in ["l", "i", "n"] {
+        sent.extend(commands(&chrome.handle(ChromeEvent::Key(key(
+            Key::Character(c.into()),
+            Some(c),
+            Modifiers::default(),
+        )))));
+    }
+    assert_eq!(sent, [find("l"), find("li"), find("lin")]);
+    for _ in 0..2 {
+        named(&mut *chrome, "Backspace");
+    }
+    assert_eq!(
+        commands(&named(&mut *chrome, "Backspace")),
+        [Command::PageFindStop]
+    );
+    // Only whitespace searches nothing.
+    type_text(&mut *chrome, "  ");
+    assert_eq!(
+        commands(&named(&mut *chrome, "Escape")),
+        [Command::PageFindStop]
+    );
+
+    let mut chrome = finding(&tabs, "lin");
+    type_text(&mut *chrome, "x");
+    let actions = named(&mut *chrome, "Escape");
+    assert_eq!(commands(&actions), [Command::PageFindStop]);
+    assert!(actions.contains(&ChromeAction::Focus(KeyboardFocus::Page)));
+
+    let mut chrome = finding(&tabs, "lin");
+    let actions = named(&mut *chrome, "Enter");
+    assert!(commands(&actions).is_empty(), "{actions:?}");
+    assert!(actions.contains(&ChromeAction::Focus(KeyboardFocus::Page)));
+    // Focused again, the line is the address line.
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    type_text(&mut *chrome, "a");
+    let actions = named(&mut *chrome, "Enter");
+    assert_eq!(commands(&actions), [Command::PageOpen("a".into())]);
+
+    for focus in [KeyboardFocus::Page, KeyboardFocus::Chrome] {
+        let mut chrome = finding(&tabs, "lin");
+        let actions = chrome.handle(ChromeEvent::Focus(focus));
+        assert!(commands(&actions).is_empty(), "{actions:?}");
+        type_text(&mut *chrome, "b");
+        assert!(commands(&named(&mut *chrome, "Escape")).is_empty());
+    }
+    let mut chrome = finding(&tabs, "lin");
+    let mut snapshot = tabs.clone();
+    snapshot.tabs[1].active = false;
+    snapshot.tabs[2].active = true;
+    chrome.handle(ChromeEvent::Snapshot(snapshot));
+    type_text(&mut *chrome, "b");
+    assert!(commands(&named(&mut *chrome, "Escape")).is_empty());
+    // Not focused: ignored.
+    let mut chrome = line(Table::new(), 700, 400);
+    let actions = chrome.handle(ChromeEvent::FindField("x".into()));
+    assert!(repaints(&actions).is_empty());
+}
+
+/// The find field at 150 % (its `/` and what the search found), and the search's state on the
+/// unfocused line at 100 %.
+#[test]
+fn golden_find() {
+    let mut snapshot = five_engine_tabs();
+    let mut chrome = finding(&snapshot, "");
+    type_text(&mut *chrome, "lingon");
+    snapshot.find = Some(sighurt_ui::FindSnapshot {
+        text: "lingon".into(),
+        found: Some(true),
+        current: Some(2),
+        total: Some(7),
+        supported: true,
+    });
+    let actions = chrome.handle(ChromeEvent::Snapshot(snapshot));
+    assert_eq!(repaints(&actions), [LINE]);
+    golden("find-150", &paint(&mut *chrome, LINE, 180));
+    named(&mut *chrome, "Enter");
+    golden("find-closed-100", &paint(&mut *chrome, LINE, 120));
+}

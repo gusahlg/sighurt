@@ -275,6 +275,28 @@ pub struct TabReport {
     /// The engine the chrome is told its page runs in (`TabSnapshot::engine`); none for `sig:`
     /// pages, blank tabs and errors.
     pub engine: Option<String>,
+    /// The search in its page, if one is under way: what it found, never what it looks for.
+    pub find: Option<FindReport>,
+}
+
+/// What a tab's search found (`TabSummary::find`), without its text.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct FindReport {
+    pub found: Option<bool>,
+    pub current: Option<u32>,
+    pub total: Option<u32>,
+    pub supported: bool,
+}
+
+impl From<&sighurt_core::tabs::Find> for FindReport {
+    fn from(find: &sighurt_core::tabs::Find) -> Self {
+        Self {
+            found: find.found,
+            current: find.current,
+            total: find.total,
+            supported: find.supported,
+        }
+    }
 }
 
 /// Everything printed at once.

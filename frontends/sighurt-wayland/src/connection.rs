@@ -31,6 +31,10 @@
 //! 3. End the iteration with [`Host::flush`], which commits finished layout transactions,
 //!    forgets retired targets and flushes the connection.
 //!
+//! Fullscreen is asked for with [`Host::set_fullscreen`] and read from [`HostEvent::WindowConfigured`]
+//! (or [`Host::is_fullscreen`]): the compositor's configure decides, and reports it even when it
+//! ended fullscreen itself.
+//!
 //! Must not own: what the window shows.
 
 use std::cell::RefCell;
@@ -185,9 +189,9 @@ impl std::error::Error for HostError {}
 /// Something that happened, for the application to act on.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostEvent {
-    /// The window was configured for the first time, or its size or scale changed. Answer with
-    /// a placement for exactly this size ([`Host::apply_placement`]). Only the latest one per
-    /// window waits in the queue.
+    /// The window was configured for the first time, or its size, scale or fullscreen state
+    /// changed. Answer with a placement for exactly this size ([`Host::apply_placement`]). Only
+    /// the latest one per window waits in the queue.
     WindowConfigured {
         /// The window.
         window: WindowId,
@@ -195,6 +199,9 @@ pub enum HostEvent {
         size: LogicalSize,
         /// The scale it renders at.
         scale: Scale,
+        /// Whether the compositor has the toplevel fullscreen: the state its latest configure
+        /// gave, whether [`Host::set_fullscreen`] asked for it or the compositor did.
+        fullscreen: bool,
     },
     /// The user asked to close the window. The browser decides whether it closes.
     CloseRequested {

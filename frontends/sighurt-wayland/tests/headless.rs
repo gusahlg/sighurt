@@ -688,6 +688,101 @@ fn resizes_and_scale_changes_reach_the_buffers() {
     );
 }
 
+/// The size and fullscreen state of the latest `WindowConfigured` the application has seen
+/// since its events were last cleared.
+fn last_configured(app: &App) -> Option<(LogicalSize, bool)> {
+    app.events.iter().rev().find_map(|e| match e {
+        HostEvent::WindowConfigured {
+            size, fullscreen, ..
+        } => Some((*size, *fullscreen)),
+        _ => None,
+    })
+}
+
+#[test]
+#[ignore = "needs tools/headless-sway: run frontends/sighurt-wayland/tests/headless.sh"]
+fn fullscreen_is_requested_and_reported_with_the_outputs_size() {
+    let mut h = Harness::new();
+    // A floating window smaller than the output, so fullscreen changes the size too.
+    sway(&["floating enable, resize set 600 400"]);
+    let small = LogicalSize {
+        width: 600,
+        height: 400,
+    };
+    h.wait("the floating size", |app| app.size == Some(small));
+    assert!(!h.app.host.is_fullscreen(h.app.window));
+    h.app.events.clear();
+    h.app.host.set_fullscreen(h.app.window, true);
+    h.wait("fullscreen", |app| {
+        last_configured(app).is_some_and(|(_, fullscreen)| fullscreen) && app.shown()
+    });
+    let full = LogicalSize {
+        width: 1280,
+        height: 800,
+    };
+    assert_eq!(last_configured(&h.app), Some((full, true)));
+    assert!(h.app.host.is_fullscreen(h.app.window));
+    let metrics = h.app.metrics(h.app.page.id()).unwrap();
+    assert_eq!(
+        metrics.rect().size().width,
+        1280,
+        "the page fills the output"
+    );
+    h.app.events.clear();
+    h.app.host.set_fullscreen(h.app.window, false);
+    h.wait("the way back", |app| {
+        last_configured(app).is_some_and(|(_, fullscreen)| !fullscreen) && app.shown()
+    });
+    assert_eq!(last_configured(&h.app), Some((small, false)));
+    assert!(!h.app.host.is_fullscreen(h.app.window));
+    assert!(!h.app.host.is_lost(), "no protocol error");
+}
+
+#[test]
+#[ignore = "needs tools/headless-sway: run frontends/sighurt-wayland/tests/headless.sh"]
+fn a_fullscreen_toggle_at_an_unchanged_size_is_still_reported() {
+    // The tiled window already fills the 1280x800 output: only the state changes.
+    let mut h = Harness::new();
+    let size = LogicalSize {
+        width: 1280,
+        height: 800,
+    };
+    assert_eq!(h.app.size, Some(size));
+    h.app.events.clear();
+    h.app.host.set_fullscreen(h.app.window, true);
+    h.wait("fullscreen", |app| {
+        last_configured(app).is_some_and(|(_, fullscreen)| fullscreen)
+    });
+    assert_eq!(last_configured(&h.app), Some((size, true)));
+    h.app.events.clear();
+    h.app.host.set_fullscreen(h.app.window, false);
+    h.wait("the way back", |app| {
+        last_configured(app).is_some_and(|(_, fullscreen)| !fullscreen)
+    });
+    assert_eq!(last_configured(&h.app), Some((size, false)));
+}
+
+#[test]
+#[ignore = "needs tools/headless-sway: run frontends/sighurt-wayland/tests/headless.sh"]
+fn the_compositor_ending_fullscreen_is_reported() {
+    let mut h = Harness::new();
+    h.app.host.set_fullscreen(h.app.window, true);
+    h.wait("fullscreen", |app| app.host.is_fullscreen(app.window));
+    h.app.events.clear();
+    sway(&["fullscreen disable"]);
+    h.wait("the compositor's change", |app| {
+        last_configured(app).is_some_and(|(_, fullscreen)| !fullscreen)
+    });
+    assert!(!h.app.host.is_fullscreen(h.app.window));
+    // And the other way: the compositor puts the window into fullscreen on its own.
+    h.app.events.clear();
+    sway(&["fullscreen enable"]);
+    h.wait("the compositor's fullscreen", |app| {
+        last_configured(app).is_some_and(|(_, fullscreen)| fullscreen)
+    });
+    assert!(h.app.host.is_fullscreen(h.app.window));
+}
+
 #[test]
 #[ignore = "needs tools/headless-sway: run frontends/sighurt-wayland/tests/headless.sh"]
 fn an_idle_window_sleeps() {

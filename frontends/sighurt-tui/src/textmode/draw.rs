@@ -46,8 +46,8 @@ fn pen(style: Style, focused: bool) -> (Color, Attrs) {
     (fg, attrs)
 }
 
-/// Paint the visible lines into `area`. Rows past the document are blank. The focused item is
-/// drawn in reverse video.
+/// Paint the visible lines into `area`. Rows past the document are blank. The focused item and
+/// the current match of a search ([`TextView::found`]) are drawn in reverse video.
 pub fn draw(doc: &TextDocument, view: &TextView, grid: &mut Grid, area: Area) {
     let right = area.col.saturating_add(area.cols).min(grid.cols());
     for r in 0..area.rows {
@@ -65,8 +65,15 @@ pub fn draw(doc: &TextDocument, view: &TextView, grid: &mut Grid, area: Area) {
                 Attrs::default(),
             );
         }
-        let Some(line) = doc.lines.get(view.scroll + usize::from(r)) else {
+        let index = view.scroll + usize::from(r);
+        let Some(line) = doc.lines.get(index) else {
             continue;
+        };
+        let found = |col: u16| {
+            let col = col - area.col;
+            view.found
+                .iter()
+                .any(|range| range.line == index && (range.start..range.end).contains(&col))
         };
         let mut col = area.col;
         'spans: for span in &line.spans {
@@ -82,6 +89,10 @@ pub fn draw(doc: &TextDocument, view: &TextView, grid: &mut Grid, area: Area) {
                 if u32::from(col) + u32::from(gw) > u32::from(right) {
                     break 'spans;
                 }
+                let attrs = Attrs {
+                    reverse: attrs.reverse || found(col),
+                    ..attrs
+                };
                 grid.put_cluster(col, row, g, fg, Color::Default, attrs);
                 col += gw;
             }

@@ -1237,6 +1237,43 @@ void lb_run_js(uint64_t id, char const* script, int64_t request)
     view->run_javascript(MUST(String::from_utf8(StringView { script, strlen(script) })));
 }
 
+int lb_find_in_page(uint64_t id, char const* text, int case_sensitive)
+{
+    auto* view = LbView::find(id);
+    if (!view)
+        return 0;
+    view->find_in_page(Utf16String::from_utf8(StringView { text, strlen(text) }), case_sensitive ? CaseSensitivity::CaseSensitive : CaseSensitivity::CaseInsensitive);
+    return 1;
+}
+
+int lb_find_next(uint64_t id)
+{
+    auto* view = LbView::find(id);
+    if (!view)
+        return 0;
+    view->find_in_page_next_match();
+    return 1;
+}
+
+int lb_find_previous(uint64_t id)
+{
+    auto* view = LbView::find(id);
+    if (!view)
+        return 0;
+    view->find_in_page_previous_match();
+    return 1;
+}
+
+int lb_find_stop(uint64_t id)
+{
+    auto* view = LbView::find(id);
+    if (!view)
+        return 0;
+    // An empty query ends LibWeb's search and clears the selection; it is answered like the others.
+    view->find_in_page(Utf16String {});
+    return 1;
+}
+
 void lb_input_key(uint64_t id, char const* w3c_code, char const* key, int pressed, int repeat, int modifiers, uint32_t code_point)
 {
     auto* view = LbView::find(id);

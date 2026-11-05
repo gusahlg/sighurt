@@ -200,6 +200,15 @@ int nsh_view_form_at(nsh_view *view, int x, int y);
 /* Copies the core's selection. Returns the byte length, or -1. */
 int nsh_view_selection(nsh_view *view, char *buf, size_t buflen);
 
+/* Find in page. The search runs before the call returns: each returns 1 if there is a match
+ * (selected, and scrolled to), else 0. nsh_view_find starts a search (the first match from the
+ * top); nsh_view_find_move moves to the next (forwards 1) or previous match, wrapping around; a
+ * move with no search, or none found, is 0. nsh_view_find_stop ends the search and its highlight.
+ * A new content ends the search too. NetSurf says only whether there is a match. */
+int nsh_view_find(nsh_view *view, const char *text, int case_sensitive);
+int nsh_view_find_move(nsh_view *view, int forwards);
+void nsh_view_find_stop(nsh_view *view);
+
 /* stride is bytes per row. Paints what changed since the last paint into the view's own copy of
  * its picture, then copies the whole picture into bgra (the host's buffers rotate, so each needs
  * the whole frame). Returns 1 if it drew. A hidden view paints nothing and drops its copy. */

@@ -6,7 +6,9 @@
 //! bookkeeping, services, notices queued back as events, session writes (and a failed one,
 //! as a notice), and the history of visited pages ([`crate::history`]: visits recorded,
 //! forgets answered, `[history] remember` followed after every update, saves when due, and
-//! [`Session::complete`] for the address line). What is, is asked of
+//! [`Session::complete`] for the address line). A search ([`Effect::Find`]) is offered to the
+//! frontend, then to the view's engine if it can find in page, else answered as one nobody can
+//! carry out. What is, is asked of
 //! the [`Frontend`](crate::frontend::Frontend) before the next effect runs. A view's target
 //! exists before any command is sent to that view: [`Effect::OpenView`] starts the engine,
 //! asks the frontend for a target, records the view, places it, and only then calls
@@ -34,7 +36,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use sighurt_api::engine::{
-    EngineCommand, EngineError, EngineWaker, PresentOutcome, SiteDataRequest,
+    EngineCommand, EngineError, EngineWaker, FindCommand, PresentOutcome, SiteDataRequest,
 };
 use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::BufferSize;
@@ -340,6 +342,8 @@ impl<F: Frontend> Session<F> {
                 }
                 self.engine_command(view, command, true);
             }
+            Effect::Find { view, command } => self.find(frontend, view, command),
+            Effect::FindField(text) => frontend.find_field(text, &mut self.queue),
             Effect::CloseView { view } => {
                 let engine = self.views.get(&view).map(|entry| entry.engine.clone());
                 self.forget_view(frontend, view);
@@ -476,6 +480,35 @@ impl<F: Frontend> Session<F> {
             self.forget_view(frontend, view);
         }
         opened
+    }
+
+    /// A search in `view`'s page: the frontend's if it takes it, else the engine's if it can
+    /// find in page, else answered as one nobody can carry out.
+    fn find(&mut self, frontend: &mut F, view: ViewId, command: FindCommand) {
+        if frontend.find(view, &command, &mut self.queue) {
+            return;
+        }
+        let finds = self
+            .views
+            .get(&view)
+            .and_then(|entry| self.env.engines.get(&entry.engine))
+            .is_some_and(|capabilities| capabilities.find_in_page);
+        match command {
+            _ if finds => self.engine_command(view, EngineCommand::Find(command), true),
+            FindCommand::Search { search, .. }
+            | FindCommand::Next { search }
+            | FindCommand::Previous { search } => {
+                self.queue.push_back(BrowserEvent::FindResult {
+                    view,
+                    search,
+                    found: false,
+                    current: None,
+                    total: None,
+                    supported: false,
+                });
+            }
+            FindCommand::Stop { .. } => {}
+        }
     }
 
     /// Starts or stops `view`'s content snapshots ([`Frontend::semantics_changed`]), for a
@@ -1061,8 +1094,8 @@ mod tests {
 
     use sighurt_api::commands::Command;
     use sighurt_api::engine::{
-        EngineCapabilities, EngineCommand, EngineError, EngineRuntime, PresentOutcome, PumpStatus,
-        SiteDataKinds, SiteDataRequest, SiteKey, ViewOptions,
+        EngineCapabilities, EngineCommand, EngineError, EngineRuntime, FindCommand, PresentOutcome,
+        PumpStatus, SiteDataKinds, SiteDataRequest, SiteKey, ViewOptions,
     };
     use sighurt_api::events::{Cursor, EngineEvent, SiteDataOutcome};
     use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, TargetId, ViewId};
@@ -1122,6 +1155,9 @@ mod tests {
         targets: BTreeMap<TargetId, ViewId>,
         forgotten: Vec<TargetId>,
         notices: Vec<String>,
+        /// Whether it searches pages itself, as the terminal's text mode does; what it was
+        /// asked.
+        finds: Option<Vec<FindCommand>>,
     }
 
     impl Clipboard for Recording {
@@ -1165,6 +1201,28 @@ mod tests {
         fn show(&mut self, _: ViewId, _: bool) {}
         fn frame_ready(&mut self, _: TargetId) {}
         fn before_forced_exit(&mut self) {}
+        fn find(
+            &mut self,
+            view: ViewId,
+            command: &FindCommand,
+            queue: &mut VecDeque<BrowserEvent>,
+        ) -> bool {
+            let Some(finds) = &mut self.finds else {
+                return false;
+            };
+            finds.push(command.clone());
+            if let FindCommand::Search { search, .. } = command {
+                queue.push_back(BrowserEvent::FindResult {
+                    view,
+                    search: *search,
+                    found: true,
+                    current: Some(1),
+                    total: Some(2),
+                    supported: true,
+                });
+            }
+            true
+        }
     }
 
     #[test]
@@ -1214,6 +1272,8 @@ mod tests {
     /// built by a function pointer.
     static SITE_CALLS: Mutex<Vec<(&'static str, SiteDataRequest)>> = Mutex::new(Vec::new());
     static RELOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// The searches the scripted engine named "finds" was given.
+    static FINDS: Mutex<Vec<FindCommand>> = Mutex::new(Vec::new());
 
     struct Scripted {
         name: &'static str,
@@ -1262,6 +1322,7 @@ mod tests {
                     RELOADS.lock().unwrap().push(url.clone());
                     self.commit(view, navigation, url);
                 }
+                EngineCommand::Find(command) => FINDS.lock().unwrap().push(command),
                 _ => {}
             }
             Ok(())
@@ -1359,6 +1420,105 @@ mod tests {
         _: crate::registry::Launch<'_>,
     ) -> Result<Runtime<(), ()>, String> {
         Ok(Runtime::Demo(Box::new(scripted("plain", false, None))))
+    }
+
+    fn start_finds(
+        _: sighurt_api::engine::EngineWaker,
+        _: crate::registry::Launch<'_>,
+    ) -> Result<Runtime<(), ()>, String> {
+        let mut engine = scripted("finds", false, None);
+        engine.caps.find_in_page = true;
+        Ok(Runtime::Demo(Box::new(engine)))
+    }
+
+    /// A session of the engine `name` with one page open and loaded.
+    fn one_page(
+        name: &str,
+        engine: Engine<(), ()>,
+        frontend: &mut Recording,
+    ) -> Session<Recording> {
+        let registry = Registry::new(vec![engine]);
+        let env = registry.environment(Vec::new(), &[]);
+        let text = format!("version = 1\n[engines]\ndefault = \"{name}\"\nenabled = [\"{name}\"]");
+        let config = Config::parse(Some(&text), &env).expect("config");
+        let mut session = Session::<Recording>::new(
+            BrowserState::new(config, env.clone()),
+            env,
+            registry,
+            Services::new(|| {}),
+            Paths {
+                config: None,
+                session: None,
+            },
+            None,
+            Diagnostics::new(None),
+            Arc::new(|| {}),
+        );
+        session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: vec![OpenRequest {
+                input: "https://example.com/".into(),
+                engine: None,
+            }],
+        });
+        session.run_core(frontend);
+        session.pump(frontend);
+        session
+    }
+
+    fn find(session: &mut Session<Recording>, frontend: &mut Recording, text: &str) {
+        let command = format!("page.find {text}").parse::<Command>().unwrap();
+        session
+            .queue_mut()
+            .push_back(BrowserEvent::Command(command));
+        session.run_core(frontend);
+    }
+
+    #[test]
+    fn a_search_goes_to_the_frontend_then_the_engine_else_nobody_can() {
+        let idle = || Engine::new("idle", site_caps(true), "cpu", &[], start_idle);
+        // Neither the frontend nor the engine: the runtime says nobody can.
+        let mut frontend = Recording::default();
+        let mut session = one_page("idle", idle(), &mut frontend);
+        find(&mut session, &mut frontend, "hello");
+        assert_eq!(frontend.notices, ["idle can't find in page."]);
+        let search = session.core().tabs().next().unwrap().find.cloned().unwrap();
+        assert!(!search.supported);
+
+        // The frontend takes it, and its answer fills the chrome's view.
+        let mut frontend = Recording {
+            finds: Some(Vec::new()),
+            ..Recording::default()
+        };
+        let mut session = one_page("idle", idle(), &mut frontend);
+        find(&mut session, &mut frontend, "hello");
+        assert!(frontend.notices.is_empty(), "{:?}", frontend.notices);
+        assert!(matches!(
+            frontend.finds.as_deref(),
+            Some([FindCommand::Search { text, .. }]) if text == "hello"
+        ));
+        let search = session.core().tabs().next().unwrap().find.cloned().unwrap();
+        assert_eq!(
+            (search.found, search.current, search.total),
+            (Some(true), Some(1), Some(2))
+        );
+
+        // An engine that finds in page gets it when the frontend declines.
+        FINDS.lock().unwrap().clear();
+        let mut frontend = Recording::default();
+        let caps = EngineCapabilities {
+            find_in_page: true,
+            ..site_caps(false)
+        };
+        let engine = Engine::new("finds", caps, "cpu", &[], start_finds);
+        let mut session = one_page("finds", engine, &mut frontend);
+        find(&mut session, &mut frontend, "hello");
+        assert!(frontend.notices.is_empty(), "{:?}", frontend.notices);
+        let finds = std::mem::take(&mut *FINDS.lock().unwrap());
+        assert!(
+            matches!(&finds[..], [FindCommand::Search { .. }]),
+            "{finds:?}"
+        );
     }
 
     #[test]

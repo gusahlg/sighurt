@@ -37,9 +37,20 @@
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
 //!   `Effect::Focus`; `location.focus <text>` then hands the line its text with
 //!   `Effect::LineText`. Commands that change what the page area shows give the page the keyboard.
-//! - `page.find [text]`, `page.find-next`, `page.find-previous` and `page.find-stop`: no engine
-//!   finds in page yet, so `page.find` says the page's engine can't, and the moves that there is
-//!   no search. A `page.find` over [`MAX_FIND`] bytes, which only a chrome can make, is refused.
+//! - `page.find <text>` starts a search in the page the active tab shows, replacing the view's
+//!   search ([`Effect::Find`] with `FindCommand::Search`). Upper case in the text makes it
+//!   case-sensitive (smart case). Text that is only whitespace searches nothing and ends the
+//!   search; text over [`MAX_FIND`] bytes, which only a chrome can make, is refused. A page
+//!   that has not committed a document yet has nothing to find in. `page.find` without text
+//!   gives the chrome the keyboard and opens its find field ([`Effect::FindField`]) holding the
+//!   view's search. `page.find-next` and `page.find-previous` move in the view's search, and
+//!   with none, or one nothing could carry out, say so; `page.find-stop` ends it. A search
+//!   belongs to its view's document: a new document, or the document failing, ends it.
+//!   Results are [`BrowserEvent::FindResult`](crate::BrowserEvent::FindResult) and
+//!   `EngineEvent::FindResult`; one for a search that is not the view's, or for another
+//!   document, is dropped. When nobody can search the page the result says so, and the core
+//!   tells the user "<engine> can't find in page" when it first hears it, not at every key
+//!   typed in the find field.
 //! - `history.clear` forgets every visited page (`Effect::ForgetVisits`), with `[history]
 //!   remember` on or off; the executable's answer is a notice. `browser.fullscreen` says the frontend has no fullscreen yet, and
 //!   `page.exit-fullscreen` that the page is not in fullscreen.
@@ -53,12 +64,13 @@
 use std::num::NonZeroUsize;
 
 use sighurt_api::commands::{Command, TabMove, MAX_FIND};
-use sighurt_api::ids::TabId;
+use sighurt_api::engine::FindCommand;
+use sighurt_api::ids::{DocumentGeneration, RequestId, TabId, ViewId};
 use sighurt_api::input::KeyboardFocus;
 
 use crate::navigation::Segment;
 use crate::state::{BrowserState, By, Effect, Fx};
-use crate::tabs::MAX_CLOSED;
+use crate::tabs::{Find, MAX_CLOSED};
 
 /// Page zoom levels in percent, as in common browsers.
 pub const ZOOM_STEPS: [u32; 13] = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300];
@@ -193,7 +205,7 @@ impl BrowserState {
             | Command::PageFindNext
             | Command::PageFindPrevious
             | Command::PageFindStop => {
-                self.find(active, &command, fx);
+                self.find(active, command, fx);
                 None
             }
             Command::HistoryClear => {
@@ -282,24 +294,140 @@ impl BrowserState {
         Some(KeyboardFocus::Page)
     }
 
-    /// `page.find` and its moves. No engine finds in page yet: `page.find` names the page's
-    /// engine as unable, and the moves have no search to move in.
-    fn find(&mut self, tab: usize, command: &Command, fx: &mut Fx) {
-        let engine = self
-            .shown_engine(tab)
-            .filter(|_| self.tabs[tab].current_view().is_some());
-        let message = match (command, engine) {
+    /// `page.find` and its moves, in the view tab `tab` shows.
+    fn find(&mut self, tab: usize, command: Command, fx: &mut Fx) {
+        let view = self.tabs[tab]
+            .current_view()
+            .filter(|id| self.views.get(id).is_some_and(|v| !v.closing));
+        let next = command == Command::PageFindNext;
+        let message = match (command, view) {
             (Command::PageFind(Some(text)), _) if text.len() > MAX_FIND => {
                 format!("page.find searches for at most {MAX_FIND} bytes of text.")
             }
-            (Command::PageFind(_), Some(engine)) => format!("{engine} can't find in page."),
             (Command::PageFind(_), None) => "This tab shows no page to find in.".to_owned(),
-            (Command::PageFindNext | Command::PageFindPrevious, _) => {
-                "Nothing to find: page.find <text> first.".to_owned()
+            (Command::PageFind(None), Some(id)) => {
+                let text = self.views[&id].find.as_ref().map(|f| f.text.clone());
+                self.move_focus(KeyboardFocus::Chrome, fx);
+                fx.push(Effect::FindField(text.unwrap_or_default()));
+                return;
             }
+            (Command::PageFind(Some(text)), Some(id)) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    return self.end_find(id, fx);
+                }
+                match self.views[&id].document {
+                    Some(document) => return self.search(id, document, text, fx),
+                    None => "The page has not loaded yet: there is nothing to find in.".to_owned(),
+                }
+            }
+            (Command::PageFindNext | Command::PageFindPrevious, view) => {
+                let v = view.map(|id| &self.views[&id]);
+                match v.and_then(|v| v.find.as_ref().map(|find| (v, find))) {
+                    None => "Nothing to find: page.find <text> first.".to_owned(),
+                    Some((v, find)) if !find.supported => {
+                        format!("{} can't find in page.", v.engine)
+                    }
+                    Some((v, find)) => {
+                        let search = find.search;
+                        let command = if next {
+                            FindCommand::Next { search }
+                        } else {
+                            FindCommand::Previous { search }
+                        };
+                        let view = v.id;
+                        return fx.push(Effect::Find { view, command });
+                    }
+                }
+            }
+            (Command::PageFindStop, Some(id)) => return self.end_find(id, fx),
             _ => return,
         };
         self.tab_notice(tab, &message, fx);
+    }
+
+    /// Starts a search for `text` in `view`'s `document`, replacing the view's search. Case
+    /// matters when the text has an upper-case letter.
+    fn search(&mut self, view: ViewId, document: DocumentGeneration, text: &str, fx: &mut Fx) {
+        let v = self.views.get_mut(&view).expect("checked by the caller");
+        let search = RequestId::next();
+        let case_sensitive = text.chars().any(char::is_uppercase);
+        // What could not search the view before can't now either, until something says it
+        // can: the user is told once, not at every key typed in the find field.
+        let supported = v.find.as_ref().is_none_or(|find| find.supported);
+        v.find = Some(Find {
+            search,
+            text: text.to_owned(),
+            case_sensitive,
+            found: None,
+            current: None,
+            total: None,
+            supported,
+        });
+        fx.chrome = true;
+        fx.push(Effect::Find {
+            view,
+            command: FindCommand::Search {
+                search,
+                document,
+                text: text.to_owned(),
+                case_sensitive,
+            },
+        });
+    }
+
+    /// Ends `view`'s search, if it has one: whoever searches drops it and its highlights.
+    pub(crate) fn end_find(&mut self, view: ViewId, fx: &mut Fx) {
+        let Some(find) = self.views.get_mut(&view).and_then(|v| v.find.take()) else {
+            return;
+        };
+        fx.chrome = true;
+        fx.push(Effect::Find {
+            view,
+            command: FindCommand::Stop {
+                search: find.search,
+            },
+        });
+    }
+
+    /// What `search` found in `view`, from the engine (with the `document` it searched) or the
+    /// frontend. Dropped unless it is the view's search and, when named, its document.
+    /// `(found, current, total)` replace what the view's search said before.
+    pub(crate) fn find_result(
+        &mut self,
+        view: ViewId,
+        document: Option<DocumentGeneration>,
+        search: RequestId,
+        (found, current, total): (bool, Option<u32>, Option<u32>),
+        supported: bool,
+        fx: &mut Fx,
+    ) {
+        let Some(v) = self.views.get_mut(&view).filter(|v| !v.closing) else {
+            return;
+        };
+        if document.is_some_and(|document| v.document != Some(document)) {
+            return;
+        }
+        let Some(find) = v.find.as_mut().filter(|find| find.search == search) else {
+            return;
+        };
+        let told = !find.supported;
+        *find = Find {
+            found: supported.then_some(found),
+            current: current.filter(|_| supported && found),
+            total: total.filter(|_| supported),
+            supported,
+            ..find.clone()
+        };
+        fx.chrome = true;
+        if !supported && !told {
+            let message = format!("{} can't find in page.", v.engine);
+            let tab = v.tab;
+            fx.push(Effect::Notice {
+                tab: Some(tab),
+                message,
+            });
+        }
     }
 
     /// Reopens the page in the next enabled web engine, in [`Environment::web_engines`] order,

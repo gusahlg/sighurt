@@ -236,6 +236,9 @@ mod raw {
         ) -> usize;
         pub fn nsh_view_form_at(view: *mut View, x: c_int, y: c_int) -> c_int;
         pub fn nsh_view_selection(view: *mut View, buf: *mut c_char, buflen: usize) -> c_int;
+        pub fn nsh_view_find(view: *mut View, text: *const c_char, case_sensitive: c_int) -> c_int;
+        pub fn nsh_view_find_move(view: *mut View, forwards: c_int) -> c_int;
+        pub fn nsh_view_find_stop(view: *mut View);
         pub fn nsh_view_paint(
             view: *mut View,
             bgra: *mut u32,
@@ -370,6 +373,29 @@ impl Handle {
         };
         // SAFETY: live handle, a NUL-terminated string for the call.
         unsafe { raw::nsh_view_follow(self.0.as_ptr(), url.as_ptr()) != 0 }
+    }
+
+    /// Starts a search for `text` (NULs are dropped): whether there is a match, the first of
+    /// which is selected.
+    pub fn find(&self, text: &str, case_sensitive: bool) -> bool {
+        let text = CString::new(text.replace('\0', "")).expect("NULs removed");
+        // SAFETY: live handle, a NUL-terminated string for the call.
+        unsafe {
+            raw::nsh_view_find(self.0.as_ptr(), text.as_ptr(), c_int::from(case_sensitive)) != 0
+        }
+    }
+
+    /// Moves the search to the next (`forwards`) or previous match, wrapping around: whether
+    /// there is a match.
+    pub fn find_move(&self, forwards: bool) -> bool {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_find_move(self.0.as_ptr(), c_int::from(forwards)) != 0 }
+    }
+
+    /// Ends the search and its highlight.
+    pub fn find_stop(&self) {
+        // SAFETY: live handle.
+        unsafe { raw::nsh_view_find_stop(self.0.as_ptr()) }
     }
 
     /// Reloads.

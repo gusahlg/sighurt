@@ -339,6 +339,8 @@ fn the_shared_table_in_normal_mode() {
         (typed('u'), "tab.reopen"),
         (typed(':'), "location.focus :"),
         (typed('/'), "page.find"),
+        (typed('n'), "page.find-next"),
+        (typed('N'), "page.find-previous"),
         (typed('J'), "tab.next"),
         (typed('K'), "tab.previous"),
         (typed('H'), "page.back"),

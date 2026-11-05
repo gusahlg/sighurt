@@ -27,9 +27,20 @@ for personal use and must not be distributed. What is built, and the evidence:
 | 8 new windows, link handover | done | `tests/engine.rs`: a link click is `NavigationRequested`, deny drops it, allow follows it; `target=_blank` is `OpenRequested { NewView }`; history stays the core's (`history_traversal: false`) |
 | 9 services | done except two | clipboard read (held paste key) and write (copy), downloads (`Service::Download` with the body and the proposed name), file input and external URLs are wired; the last two have no test |
 | 10 `sig` end to end | done | `tests/headless.sh` in a private sway: PASS for page render, link click both ways, typing with accents, a configured plain-letter binding not firing while typing in a field (`TextInputChanged`), scale 2, an idle chrome with no repaints, and `sig --tui` in kitty drawing the page as an image |
-| 11 quality passes | not started | glyph cache and fontconfig families, SVG paths and Béziers, shaping, semantics, find, JavaScript feature |
+| 11 quality passes | find done; the rest not started | find in page: `tests/engine.rs` (a search, next and previous wrapping both ways, case as asked, no match, moves and stops of a replaced or stopped search and a search of a gone document ignored, the search ended by a new document); not started: glyph cache and fontconfig families, SVG paths and Béziers, shaping, semantics, JavaScript feature |
 
 What differs from the design below:
+
+- **Find in page** (`find_in_page: true`) is the core's `browser_window_search`, which is
+  synchronous: the search table's `status`, `forward_state` and `back_state` are called before it
+  returns, so each command's `FindResult` is known when the call returns and names the search
+  and document the command did (no late result can exist). NetSurf says only whether there is a
+  match (`current` and `total` are `None`). A new search clears the last first (the core would
+  continue one for the same text). NetSurf 3.11 does not wrap; the frontend does
+  (`window.c`): next at the last match searches again (the first match), previous at the first
+  steps forwards to the last, at most 4096 steps, since each step walks every match (a page with
+  more matches wraps only that far). A stop clears the search and its highlight; a new content
+  ends the search.
 
 - **Root-page scrolling is the frontend's.** NetSurf scrolls only boxes and frames inside a
   page; for the page itself every frontend keeps a scroll offset, adds it to the positions it
@@ -323,7 +334,7 @@ void nsh_download_answer(uint64_t id, bool accept);
 | Contract | NetSurf |
 |---|---|
 | `Target`, `FramePermit` | `TargetLease` and `FramePermit` through `CpuTarget` (as the Wasm engine: `submit(permit, paint)` lends the `Frame`, the C side paints into `Frame.pixels`/`stride`: ARGB8888 premultiplied, which is what the plotters write: opaque pixels, `0xff000000 | r<<16 | g<<8 | b`) |
-| `capabilities()` | `history_traversal: false` at first (see below), `page_zoom: true`, `text_input: false` (no IME), `semantics: false` (no extraction script; a later step could walk libdom), `find_in_page: false` (the core has `search`, a later step), `process_per_view: false`, `native_popups: false`, `site_data`: cookies only at first |
+| `capabilities()` | `history_traversal: false` at first (see below), `page_zoom: true`, `text_input: false` (no IME), `semantics: false` (no extraction script; a later step could walk libdom), `find_in_page: true` (the core's `search`, step 11), `process_per_view: false`, `native_popups: false`, `site_data`: cookies only at first |
 | `open_view` | allocates a `ViewId`-keyed `nsh_view`; `browser_window_create(BW_CREATE_HISTORY ...)` then `ViewReady`; the gui_window's `get_dimensions` answers the target's metrics in buffer pixels divided by the scale (see Scale); empty metrics: create with a 1x1 viewport and resize later |
 | `command(Navigate)` | `browser_window_navigate`; `NavigationStarted` is synthesized by the adapter (it knows the id and URL) |
 | `command(Reload/Stop)` | `browser_window_reload(bw, true)` / `browser_window_stop` |

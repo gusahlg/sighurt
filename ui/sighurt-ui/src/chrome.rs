@@ -26,6 +26,15 @@
 //! it brightens and the cursor is a hand; while held it sinks; while a switch is under way it
 //! names the engine being opened and ignores clicks.
 //!
+//! The find field takes the address line's place while it is open: `page.find` without text
+//! opens it ([`Model::find_field`]), with a `/` before the text and the search's state
+//! ("3 of 12", [`FindSnapshot::indicator`](crate::FindSnapshot::indicator)) at its right. Each
+//! edit runs `page.find <text>`, and one that leaves only whitespace `page.find-stop`. Enter
+//! closes it and gives the page the keyboard, keeping the search; Escape closes it and runs
+//! `page.find-stop`. The core moving the keyboard, or another tab being selected, closes it
+//! and keeps the search. While a search is under way and the field is closed, the line shows
+//! its state before the engine button.
+//!
 //! The chrome marks what needs repainting ([`Damage`]) only after an edit, a hover change, a
 //! snapshot change it shows, a configuration change or a layout change: a static chrome needs
 //! no tick, and a page animating never repaints it. The caret is steady, so no timer runs.
@@ -40,7 +49,7 @@
 use std::fmt;
 use std::rc::Rc;
 
-use sighurt_api::commands::Command;
+use sighurt_api::commands::{Command, MAX_FIND};
 use sighurt_api::events::Cursor;
 use sighurt_api::geometry::{LogicalSize, SurfaceRect, WindowPoint, WindowRect};
 use sighurt_api::ids::RequestId;
@@ -53,8 +62,8 @@ use crate::extension::{contained, readable_url, ChromeAction, Completion, Surfac
 use crate::hit_test::{hit_test, Target};
 use crate::layout::{Layout, LayoutOptions, Tabs};
 use crate::state::{
-    is_home, ChromeState, HomeInfo, Snapshot, TabContent, TabSnapshot, MAX_ENGINE_DETAIL,
-    MAX_ENGINE_NAME, MAX_MESSAGE, MAX_STATUS, NO_SUCH_PAGE,
+    is_home, ChromeState, FindField, HomeInfo, Snapshot, TabContent, TabSnapshot,
+    MAX_ENGINE_DETAIL, MAX_ENGINE_NAME, MAX_MESSAGE, MAX_STATUS, NO_SUCH_PAGE,
 };
 use crate::text::{Fonts, ShapedText, TextStyle};
 
@@ -70,6 +79,8 @@ pub const PAGE: SurfaceName = "page";
 
 /// Space between the address field's border and its text.
 const ADDRESS_PADDING: f32 = 12.0;
+/// What the find field shows before its text.
+const FIND_PROMPT: &str = "/";
 /// Rows of the tab list a wheel notch scrolls.
 const ROWS_PER_NOTCH: f64 = 3.0;
 /// The caret's width in logical pixels.
@@ -287,6 +298,10 @@ pub(crate) struct AddressView {
     pub indicator: Option<(Rc<ShapedText>, f32)>,
     /// The active tab's engine button before the indicator.
     pub engine: Option<EngineButton>,
+    /// The find field's prompt, and where it starts, while the field is open.
+    pub prompt: Option<(Rc<ShapedText>, f32)>,
+    /// The search's state ("3 of 12") before the engine button, and where it starts.
+    pub find: Option<(Rc<ShapedText>, f32)>,
 }
 
 /// The engine button at the address field's right end, in window coordinates: its engine's
@@ -453,7 +468,8 @@ impl Model {
             let toolbar = old.can_go_back != new.can_go_back
                 || old.can_go_forward != new.can_go_forward
                 || active(&old) != active(new)
-                || old.keymap != new.keymap;
+                || old.keymap != new.keymap
+                || old.find != new.find;
             let at_top = self.layout.options.tabs == Tabs::Top;
             self.damage.chrome |= toolbar || tabs && at_top;
             self.damage.tabs |= tabs && !at_top;
@@ -478,6 +494,8 @@ impl Model {
     /// address, stops loading or is switched away from. Reports no focus action, since the move
     /// is done.
     pub fn set_focus(&mut self, focus: KeyboardFocus) -> Vec<ChromeAction> {
+        // The find field closes, and the search stays.
+        self.close_find();
         match focus {
             KeyboardFocus::Chrome => self.focus_address(),
             KeyboardFocus::Page => self.page_takes_focus(),
@@ -494,6 +512,27 @@ impl Model {
             self.state.address.select_all();
             self.state.address.insert(text);
             self.edited(&before);
+        }
+        self.finish(Vec::new())
+    }
+
+    /// Opens the find field in the address line's place, holding `text` selected, ready to
+    /// type over (`page.find` without text, right after the core focused the line). Ignored
+    /// while the line doesn't have the keyboard. Opening it searches nothing: `text` is the
+    /// search already under way, if any.
+    pub fn find_field(&mut self, text: &str) -> Vec<ChromeAction> {
+        if self.state.focused {
+            let searched = text.trim().to_owned();
+            if self.state.find.is_none() {
+                let address = std::mem::take(&mut self.state.address);
+                self.state.find = Some(FindField { address, searched });
+            } else if let Some(field) = &mut self.state.find {
+                field.searched = searched;
+            }
+            self.state.address.set_text(text);
+            self.state.address.select_all();
+            self.clear_error();
+            self.damage.chrome = true;
         }
         self.finish(Vec::new())
     }
@@ -675,6 +714,13 @@ impl Model {
     /// it or it shows a line opened with Enter whose tab is still loading from the same
     /// committed address. Switching tabs drops both, and a pending paste.
     fn sync_address(&mut self) {
+        // The find field holds the search, not the address; another tab closes it.
+        if self.state.find.is_some() {
+            if self.snapshot.active().map(|tab| tab.id) == self.state.address_tab {
+                return;
+            }
+            self.close_find();
+        }
         let active = self.snapshot.active();
         let tab = active.map(|tab| tab.id);
         let url = active.map_or("", |tab| tab.url.as_str());
@@ -710,6 +756,15 @@ impl Model {
         }
         self.state.opened = None;
         self.clear_error();
+    }
+
+    /// Closes the find field, if it is open: the address line comes back as it was. The search
+    /// stays.
+    fn close_find(&mut self) {
+        if let Some(field) = self.state.find.take() {
+            self.state.address = field.address;
+            self.damage.chrome = true;
+        }
     }
 
     fn clear_error(&mut self) {
@@ -783,6 +838,12 @@ impl Model {
         let editor = &mut self.state.address;
         match &event.key {
             Key::Named(name) => match name.as_str() {
+                "Escape" if self.state.find.is_some() => {
+                    self.close_find();
+                    self.discard_edit();
+                    self.leave(actions);
+                    actions.push(ChromeAction::Command(Command::PageFindStop));
+                }
                 "Escape" => {
                     self.discard_edit();
                     self.leave(actions);
@@ -825,6 +886,13 @@ impl Model {
 
     /// Enter: open what was typed, or run it as a command after a `:`.
     fn submit(&mut self, actions: &mut Vec<ChromeAction>) {
+        // The find field: the current match is the one wanted; the search stays.
+        if self.state.find.is_some() {
+            self.close_find();
+            self.discard_edit();
+            self.leave(actions);
+            return;
+        }
         let line = self.state.address.text().trim();
         if let Some(command) = line.strip_prefix(':') {
             match command.parse::<Command>() {
@@ -990,19 +1058,28 @@ impl Model {
         if self.state.address.preedit().is_some() {
             return self.state.address.cursor();
         }
-        let options = self.layout.options;
-        let shaped = self
-            .fonts
-            .line(self.state.address.text(), options.text(TextStyle::SM));
-        let left = self.layout.address.x as f32 + options.scaled(ADDRESS_PADDING);
-        shaped.offset_at(x - left + self.state.address.scroll())
+        let view = self.address_view();
+        view.shaped.offset_at(x - view.x)
     }
 
     /// Scrolls the address line to its caret, asks for completions of what was typed, and
     /// reports what the host needs to know.
     fn finish(&mut self, mut actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
+        // The find field searches as it is edited.
+        if let Some(field) = &mut self.state.find {
+            let text = cut(self.state.address.text().trim(), MAX_FIND);
+            if text != field.searched {
+                field.searched = text.to_owned();
+                actions.push(ChromeAction::Command(match text.is_empty() {
+                    true => Command::PageFindStop,
+                    false => Command::PageFind(Some(text.to_owned())),
+                }));
+            }
+        }
+        // An address typed completes; a command line or the find field never does.
         let state = &mut self.state;
-        actions.extend(state.completion.update(&state.address, state.focused));
+        let completes = state.focused && state.find.is_none();
+        actions.extend(state.completion.update(&state.address, completes));
         let before = self.state.address.scroll();
         if self.state.focused {
             let view = self.address_view();
@@ -1052,7 +1129,10 @@ impl Model {
                 height: self.layout.options.text(TextStyle::SM).line_height.into(),
             },
             surrounding: Some(self.state.address.surrounding()),
-            purpose: TextPurpose::Url,
+            purpose: match self.state.find {
+                Some(_) => TextPurpose::Normal,
+                None => TextPurpose::Url,
+            },
             multiline: false,
         }
     }
@@ -1085,10 +1165,33 @@ impl Model {
         let engine = active.and_then(|tab| {
             engine_button_text(&mut self.fonts, options, tab, field.width as f32 / 3.0)
         });
-        let text_right = engine
+        let find_right = engine
             .as_ref()
             .map_or(label_right, |button| label_right - button.width - padding);
-        let clip = (field.x as f32 + padding, text_right.max(field.x as f32));
+        // The search's state before them, in the find field and while the line isn't edited.
+        let finding = self.state.find.is_some();
+        let find = self
+            .snapshot
+            .find
+            .as_ref()
+            .filter(|_| finding || !self.state.focused);
+        let engine_name = self.snapshot.active().and_then(TabSnapshot::engine_label);
+        let find = find
+            .map(|find| find.indicator(engine_name.as_deref()))
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                let shaped = self.fonts.fitted(&text, style, field.width as f32 / 3.0);
+                let x = find_right - shaped.width;
+                (shaped, x)
+            });
+        let text_right = find.as_ref().map_or(find_right, |(_, x)| x - padding);
+        // The find field's prompt, where the text would start.
+        let left = field.x as f32 + padding;
+        let prompt = finding.then(|| (self.fonts.line(FIND_PROMPT, style), left));
+        let text_left = prompt
+            .as_ref()
+            .map_or(left, |(shaped, x)| x + shaped.width + options.scaled(4.0));
+        let clip = (text_left, text_right.max(text_left));
         let x = clip.0 - editor.scroll();
         // On a whole logical pixel, as the input method's caret rectangle is.
         let y =
@@ -1136,6 +1239,8 @@ impl Model {
             clip,
             indicator,
             engine,
+            prompt,
+            find,
         }
     }
 
@@ -1334,6 +1439,15 @@ pub(crate) fn internal_page(snapshot: &Snapshot) -> Option<InternalPage<'_>> {
 
 /// The letter of a Ctrl shortcut: the key's character, or for layouts without Latin letters
 /// (Cyrillic, Greek, ...) the physical key's, so Ctrl+C copies on every layout.
+/// `text` cut to at most `max` bytes at a character boundary.
+fn cut(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn shortcut_letter(event: &KeyEvent) -> Option<char> {
     if let Key::Character(text) = &event.key {
         let mut chars = text.chars();

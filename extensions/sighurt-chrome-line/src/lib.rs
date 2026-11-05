@@ -15,10 +15,15 @@
 //! "[servo -> wpe…]" on the selection color and clicks do nothing. `sig:` pages, blank tabs and
 //! errors have none. A click on the rest of the line, or `location.focus`, makes it an editor: Enter
 //! opens what was typed, a line starting with `:` runs a command, and Escape gives the page the
-//! keyboard. Typing an address completes it from the visited pages, as the standard chrome does
-//! ([`InlineCompletion`]): the rest shows after the caret, muted, and Right or Tab at the end
-//! takes it. There are no buttons, no tab strip
-//! and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
+//! keyboard. `page.find` without text makes it the find field instead: a `/` in place of the tab's
+//! place, each edit runs `page.find <text>` (one that leaves only whitespace `page.find-stop`),
+//! Enter gives the page the keyboard keeping the search, Escape does so and runs
+//! `page.find-stop`; the core moving the keyboard, or another tab, closes it and keeps the
+//! search. What the search found ("3 of 12") shows before the status while the field is open,
+//! and while the line is not being edited. Typing an address (not in the find field) completes it
+//! from the visited pages, as the standard chrome does ([`InlineCompletion`]): the rest shows
+//! after the caret, muted, and Right or Tab at the end takes it. There are no buttons, no tab
+//! strip and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
 //! shows no engine's page (`sig://home`, an error), a few lines of text say what there is.
 //!
 //! Its surfaces, bottom to top: [`PAGE`] while it draws the page area, and [`LINE`]. It repaints
@@ -32,7 +37,7 @@
 
 use std::rc::Rc;
 
-use sighurt_api::commands::Command;
+use sighurt_api::commands::{Command, MAX_FIND};
 use sighurt_api::events::Cursor;
 use sighurt_api::geometry::{LogicalSize, SurfacePoint, SurfaceRect, WindowRect};
 use sighurt_api::ids::RequestId;
@@ -121,6 +126,9 @@ pub struct Line {
     /// The visited address what is typed completes to, while the line has the keyboard and
     /// its tab.
     completion: InlineCompletion,
+    /// While the line is the find field: the text it last searched for, empty when it ended
+    /// the search.
+    find: Option<String>,
     /// The field the executable was last told about, so only changes are reported.
     text_input: Option<TextInputState>,
     cursor: Cursor,
@@ -152,6 +160,8 @@ struct View {
     mark: Option<f32>,
     /// The status text, where it starts, and whether it says what went wrong.
     status: Option<(Rc<ShapedText>, f32, bool)>,
+    /// What the search found ("3 of 12"), and where it starts.
+    find: Option<(Rc<ShapedText>, f32)>,
     /// The engine of the active tab's page as a bracketed button, and where its text's origin
     /// is, and whether a switch is under way.
     engine: Option<(Rc<ShapedText>, f32, f32, bool)>,
@@ -176,6 +186,7 @@ impl Line {
             error: None,
             paste: None,
             completion: InlineCompletion::default(),
+            find: None,
             text_input: None,
             cursor: Cursor::Default,
             line_changed: true,
@@ -239,9 +250,11 @@ impl Line {
         self.page_changed |= in_page(&old) != in_page(&self.snapshot);
         let active = |snapshot: &Snapshot| snapshot.active().map(|tab| tab.id);
         if active(&old) != active(&self.snapshot) {
-            // Another tab: what was typed for the last one goes, with its paste and completion.
+            // Another tab: what was typed for the last one goes, with its paste and completion,
+            // and the find field closes.
             self.paste = None;
             self.line_changed |= self.completion.clear();
+            self.find = None;
             if self.focused {
                 self.editor.set_text(&self.address());
                 self.editor.select_all();
@@ -265,9 +278,19 @@ impl Line {
         self.editor.select_all();
     }
 
-    /// The page takes the keyboard: what was typed goes.
+    /// The line becomes the find field, holding `text` selected (`page.find` without text,
+    /// right after the core focused the line).
+    fn find_field(&mut self, text: &str) {
+        self.find = Some(text.trim().to_owned());
+        self.editor.set_text(text);
+        self.editor.select_all();
+        self.error = None;
+    }
+
+    /// The page takes the keyboard: what was typed goes, and the find field closes.
     fn unfocus(&mut self) {
         self.focused = false;
+        self.find = None;
         self.paste = None;
         self.error = None;
         self.editor.clear_preedit();
@@ -404,8 +427,12 @@ impl Line {
         match &event.key {
             Key::Named(name) => match name.as_str() {
                 "Escape" => {
+                    let finding = self.find.is_some();
                     self.unfocus();
                     actions.push(ChromeAction::Focus(KeyboardFocus::Page));
+                    if finding {
+                        actions.push(ChromeAction::Command(Command::PageFindStop));
+                    }
                 }
                 "Enter" => self.submit(&mut actions),
                 "ArrowLeft" | "ArrowRight" => editor.move_grapheme(name == "ArrowRight", select),
@@ -443,6 +470,12 @@ impl Line {
     /// Enter: open what was typed, or run it as a command after a `:`. The keyboard goes to the
     /// page before a command runs, so a command for the page finds it there.
     fn submit(&mut self, actions: &mut Vec<ChromeAction>) {
+        // The find field: the match found is the one wanted, and the search stays.
+        if self.find.is_some() {
+            self.unfocus();
+            actions.push(ChromeAction::Focus(KeyboardFocus::Page));
+            return;
+        }
         let line = self.editor.text().trim().to_owned();
         if let Some(command) = line.strip_prefix(':') {
             match command.parse::<Command>() {
@@ -484,6 +517,10 @@ impl Line {
             prefix.push_str("  ");
             prefix.push_str(indicator);
         }
+        // The find field's prompt in its place.
+        if self.find.is_some() {
+            prefix = "/".into();
+        }
         let prefix = self.fonts.line(&prefix, style);
 
         // The engine at the end, smaller, on the line's baseline, if it fits whole in a third
@@ -518,6 +555,19 @@ impl Line {
             let x = right - shaped.width;
             (shaped, x, error)
         });
+        // What the search found, before the status, in the find field and while the line is
+        // not being edited.
+        let right = status.as_ref().map_or(right, |(_, x, _)| x - gap);
+        let shown = self.find.is_some() || !self.focused;
+        let engine_name = self.snapshot.active().and_then(|tab| tab.engine_label());
+        let find = (self.snapshot.find.as_ref())
+            .filter(|_| shown)
+            .map(|find| find.indicator(engine_name.as_deref()))
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                let shaped = self.fonts.fitted(&text, style, line.width as f32 / 4.0);
+                (right - shaped.width, shaped)
+            });
 
         let loading = self.snapshot.active().is_some_and(|tab| tab.loading);
         let mark_room = if loading { self.scaled(MARK_ROOM) } else { 0.0 };
@@ -525,7 +575,7 @@ impl Line {
             true => left + prefix.width + gap,
             false => left,
         };
-        let end = status.as_ref().map_or(right, |(_, x, _)| x - gap) - mark_room;
+        let end = find.as_ref().map_or(right, |(x, _)| x - gap) - mark_room;
         let field = (start, end.max(start));
         let mark = loading.then_some(field.1);
 
@@ -560,6 +610,7 @@ impl Line {
             ghost,
             mark,
             status,
+            find: find.map(|(x, shaped)| (shaped, x)),
             engine: engine.map(|(x, shaped, busy)| (shaped, x, engine_top, busy)),
         }
     }
@@ -567,7 +618,20 @@ impl Line {
     /// Keeps the caret in view, asks for completions of what was typed, and reports what the
     /// executable needs to know.
     fn finish(&mut self, mut actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
-        actions.extend(self.completion.update(&self.editor, self.focused));
+        // The find field searches as it is edited.
+        if let Some(searched) = &mut self.find {
+            let text = cut(self.editor.text().trim(), MAX_FIND);
+            if text != searched {
+                *searched = text.to_owned();
+                actions.push(ChromeAction::Command(match text.is_empty() {
+                    true => Command::PageFindStop,
+                    false => Command::PageFind(Some(text.to_owned())),
+                }));
+            }
+        }
+        // An address typed completes; a command line or the find field never does.
+        let completes = self.focused && self.find.is_none();
+        actions.extend(self.completion.update(&self.editor, completes));
         let before = self.editor.scroll();
         if self.focused {
             let view = self.view();
@@ -608,7 +672,10 @@ impl Line {
                 height: self.style().line_height.into(),
             },
             surrounding: Some(self.editor.surrounding()),
-            purpose: TextPurpose::Url,
+            purpose: match self.find {
+                Some(_) => TextPurpose::Normal,
+                None => TextPurpose::Url,
+            },
             multiline: false,
         }
     }
@@ -682,6 +749,9 @@ impl Line {
                 colors.text_muted
             };
             pen.text(status, (*at, view.top), color, all);
+        }
+        if let Some((find, at)) = &view.find {
+            pen.text(find, (*at, view.top), colors.text_muted, all);
         }
         if let Some((engine, x, top, busy)) = &view.engine {
             // Muted at rest, bright and underlined under the pointer, reversed while held, and
@@ -799,6 +869,7 @@ fn in_line(snapshot: &Snapshot) -> impl PartialEq {
         tab,
         snapshot.keymap.clone(),
         snapshot.status.clone(),
+        snapshot.find.clone(),
     )
 }
 
@@ -808,6 +879,15 @@ fn in_page(snapshot: &Snapshot) -> impl PartialEq {
     let drawn =
         tab.filter(|tab| matches!(tab.content, TabContent::Internal | TabContent::Error(_)));
     drawn.map(|tab| (tab.content.clone(), tab.url.clone(), snapshot.home.clone()))
+}
+
+/// `text` cut to at most `max` bytes at a character boundary.
+fn cut(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The letter of a Ctrl shortcut: the key's character, or for layouts without Latin letters
@@ -827,7 +907,12 @@ fn shortcut_letter(event: &KeyEvent) -> Option<char> {
 
 impl Chrome for Line {
     fn handle(&mut self, event: ChromeEvent) -> Vec<ChromeAction> {
-        let before = (self.editor.clone(), self.error.clone(), self.focused);
+        let before = (
+            self.editor.clone(),
+            self.error.clone(),
+            self.focused,
+            self.find.is_some(),
+        );
         let actions = match event {
             ChromeEvent::Configure { theme, settings } => {
                 let position = settings.get("position").and_then(Value::as_str);
@@ -851,6 +936,10 @@ impl Chrome for Line {
                 Vec::new()
             }
             ChromeEvent::Focus(KeyboardFocus::Chrome) => {
+                // The find field closes and the line holds the address again; the search stays.
+                if self.find.take().is_some() {
+                    self.focused = false;
+                }
                 self.focus();
                 Vec::new()
             }
@@ -862,6 +951,11 @@ impl Chrome for Line {
             ChromeEvent::LineText(text) if self.focused => {
                 self.editor.select_all();
                 self.editor.insert(&text);
+                Vec::new()
+            }
+            // `page.find` without text: the line becomes the find field.
+            ChromeEvent::FindField(text) if self.focused => {
+                self.find_field(&text);
                 Vec::new()
             }
             ChromeEvent::WindowFocus(event) => {
@@ -894,7 +988,8 @@ impl Chrome for Line {
             // which the line chrome has none of.
             _ => Vec::new(),
         };
-        let (editor, error, focused) = before;
+        let (editor, error, focused, find) = before;
+        self.line_changed |= self.find.is_some() != find;
         if self.editor != editor {
             self.line_changed = true;
             if self.editor.text() != editor.text() {

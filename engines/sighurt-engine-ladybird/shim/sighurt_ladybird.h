@@ -13,7 +13,7 @@ extern "C" {
 #endif
 #pragma GCC visibility push(default)
 
-#define LB_ABI_VERSION 2
+#define LB_ABI_VERSION 3
 
 /* Sizes of the Ladybird types this library was compiled against, to be compared with what the
  * libraries at run time were built with (the ABI-skew guard). */
@@ -47,7 +47,8 @@ enum {
     LB_EV_HISTORY,          /* i0 = current index, i1 = count; s0 = entries, one URL per line */
     LB_EV_JS_RESULT,        /* i0 = request id; s0 = result (JSON), or NULL on failure */
     LB_EV_INPUT_METHOD,     /* i0 = 1 when an editable field has focus; s0 = caret "x,y,w,h" in device pixels */
-    LB_EV_FIND_RESULT,      /* i0 = current match, i1 = total (-1 unknown) */
+    LB_EV_FIND_RESULT,      /* i0 = current match, from 0; i1 = total (-1 unknown): one for each lb_find_*
+                             * call that returned 1, in the order of the calls */
     LB_EV_CLIPBOARD_WRITE,  /* s0 = MIME type, data = bytes; i1 = representations still to come */
     LB_EV_CLIPBOARD_WANT,   /* a paste found nothing: answer with lb_clipboard_grant or _deny */
     LB_EV_DOWNLOAD,         /* s0 = url, s1 = suggested name, data = the path of the staged file (at most
@@ -95,6 +96,15 @@ void lb_set_visible(uint64_t view, int visible);
 void lb_set_focus(uint64_t view, int focused);
 void lb_set_zoom(uint64_t view, double zoom);
 void lb_run_js(uint64_t view, const char* script, int64_t request);
+
+/* Find in page (LibWebView's find_in_page). Each returns 1 when the view's WebContent process was
+ * asked, and its LB_EV_FIND_RESULT follows; 0 for a view that is gone. A search selects the first
+ * match from the selection; next and previous wrap around; stop is a search for nothing: it ends
+ * the search and clears the selection. */
+int lb_find_in_page(uint64_t view, const char* text, int case_sensitive);
+int lb_find_next(uint64_t view);
+int lb_find_previous(uint64_t view);
+int lb_find_stop(uint64_t view);
 
 /* Input. Positions are in device pixels of the view. modifiers: 1 alt, 2 ctrl, 4 shift, 8 super. */
 void lb_input_key(uint64_t view, const char* w3c_code, const char* key, int pressed, int repeat, int modifiers, uint32_t code_point);

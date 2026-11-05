@@ -242,6 +242,32 @@ impl Terminal {
         }
     }
 
+    /// Asks for a report (SIGUSR1) until its JSON, without whitespace, satisfies `done`, for up
+    /// to five seconds. Returns the last one.
+    fn report_until(&mut self, done: impl Fn(&str) -> bool) -> String {
+        let path = self.dir.join("diag.json");
+        let start = Instant::now();
+        let mut last = String::new();
+        while start.elapsed() < Duration::from_secs(5) {
+            let _ = fs::remove_file(&path);
+            // SAFETY: kill(2) on the child.
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGUSR1) };
+            let asked = Instant::now();
+            while asked.elapsed() < Duration::from_secs(1) {
+                self.wait(self.got.len(), Duration::from_millis(20), |_| false);
+                let json = fs::read_to_string(&path).unwrap_or_default();
+                if json.contains("\"tabs\":") {
+                    last = json.split_whitespace().collect();
+                    break;
+                }
+            }
+            if done(&last) {
+                break;
+            }
+        }
+        last
+    }
+
     /// The terminal is as it was: alternate screen left, termios back.
     fn assert_restored(&self) {
         assert!(
@@ -1154,6 +1180,93 @@ fn a_click_follows_a_link_in_text_mode() {
         "the click did not follow the link\n{}",
         term.context()
     );
+}
+
+/// The first tab's search in a report, as JSON: `null` with none.
+fn tab_find(report: &str) -> &str {
+    let Some(at) = report.find("\"find\":") else {
+        return "";
+    };
+    let rest = &report[at + 7..];
+    match rest.find('}') {
+        Some(end) if rest.starts_with('{') => &rest[..=end],
+        _ => rest.split([',', '}']).next().unwrap_or(""),
+    }
+}
+
+/// `/` opens the find field in text mode; typing searches the page's text, Enter keeps the
+/// search for `n` and `N`, which wrap around, and Escape in the field ends it.
+#[test]
+fn text_mode_finds_in_the_pages_text_with_the_find_field() {
+    let mut term = Terminal::start_in("find-text", &["demo://pattern"], REPLIES, "mode = \"text\"");
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        shows(got, "Animation page[1]") && shows(got, "TEXT")
+    });
+    assert!(shown, "no page text\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"/page");
+    let counted = term.wait(since, Duration::from_secs(10), |got| shows(got, " of "));
+    assert!(counted, "no count on the bottom line\n{}", term.context());
+    let at = |current: u32| {
+        format!("{{\"current\":{current},\"found\":true,\"supported\":true,\"total\":3}}")
+    };
+    let report = term.report_until(|r| tab_find(r) == at(1));
+    assert_eq!(tab_find(&report), at(1), "{}", term.context());
+    // Enter keeps the search; `n` and `N` walk it, wrapping.
+    term.type_bytes(b"\r");
+    term.type_bytes(b"n");
+    let report = term.report_until(|r| tab_find(r) == at(2));
+    assert_eq!(tab_find(&report), at(2), "{}", term.context());
+    term.type_bytes(b"NN");
+    let report = term.report_until(|r| tab_find(r) == at(3));
+    assert_eq!(tab_find(&report), at(3), "{}", term.context());
+    // Upper case: case-sensitive, no match.
+    term.type_bytes(b"/Page\r");
+    let none = "{\"current\":null,\"found\":false,\"supported\":true,\"total\":0}";
+    let report = term.report_until(|r| tab_find(r) == none);
+    assert_eq!(tab_find(&report), none, "{}", term.context());
+    // Escape in the field ends the search.
+    term.type_bytes(b"/");
+    term.wait(term.got.len(), Duration::from_millis(300), |_| false);
+    term.type_bytes(b"\x1b");
+    let report = term.report_until(|r| tab_find(r) == "null");
+    assert_eq!(tab_find(&report), "null", "{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"n");
+    let told = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "Nothing to find")
+    });
+    assert!(told, "n without a search says so\n{}", term.context());
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+    term.assert_restored();
+}
+
+/// In graphics mode the engine searches; switching to text ends the search and says so.
+#[test]
+fn graphics_mode_finds_through_the_engine_and_m_ends_the_search() {
+    let mut term = Terminal::start("find-gfx", &["demo://pattern"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440) && shows(got, "GFX")
+    });
+    assert!(shown, "no image\n{}", term.context());
+    term.type_bytes(b":page.find page\r");
+    let at = |current: u32| {
+        format!("{{\"current\":{current},\"found\":true,\"supported\":true,\"total\":3}}")
+    };
+    let report = term.report_until(|r| tab_find(r) == at(1));
+    assert_eq!(tab_find(&report), at(1), "{}", term.context());
+    term.type_bytes(b"n");
+    let report = term.report_until(|r| tab_find(r) == at(2));
+    assert_eq!(tab_find(&report), at(2), "{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(b"m");
+    let told = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "The search in the page ended")
+    });
+    assert!(told, "no notice\n{}", term.context());
+    let report = term.report_until(|r| tab_find(r) == "null");
+    assert_eq!(tab_find(&report), "null", "{}", term.context());
 }
 
 #[test]

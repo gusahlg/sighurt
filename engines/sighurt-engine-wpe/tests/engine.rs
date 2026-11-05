@@ -5,7 +5,8 @@
 //! files, permissions, downloads, other schemes, closing) reaches the browser as requests that
 //! fail closed; a page asks before it goes where the user's click takes it, and the answer
 //! decides; the configured user agent is sent and seen; the display path copies nothing on
-//! DMA-BUF; the profile is locked while WebKit uses it.
+//! DMA-BUF; the profile is locked while WebKit uses it; find in page counts, moves and stops,
+//! and an answer is never given to a later search or document.
 //!
 //! WebKit runs once per process, so this is one test, one scenario after another. It needs a
 //! Wayland compositor and is `#[ignore]`d: `tests/headless.sh` runs it in a private headless sway.
@@ -16,7 +17,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::{Driver, Layout, State};
-use sighurt_api::engine::{EngineCommand, EngineError, EngineRuntime, EngineWaker, ViewOptions};
+use sighurt_api::engine::{
+    EngineCommand, EngineError, EngineRuntime, EngineWaker, FindCommand, ViewOptions,
+};
 use sighurt_api::events::{EngineEvent, HistoryEffect, NavigationError, OpenDisposition};
 use sighurt_api::geometry::SurfacePoint;
 use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, ViewId};
@@ -152,6 +155,138 @@ fn requested(state: &State, view: ViewId) -> Vec<(DocumentGeneration, RequestId,
         _ => None,
     });
     requests.collect()
+}
+
+/// `view`'s find results for `search`: found and total, oldest first.
+fn found(state: &State, view: ViewId, search: RequestId) -> Vec<(bool, Option<u32>)> {
+    let results = state.events_of(view).filter_map(|event| match event {
+        EngineEvent::FindResult {
+            search: s,
+            found,
+            current,
+            total,
+            ..
+        } if *s == search => {
+            assert_eq!(*current, None, "WebKit doesn't say which match");
+            Some((*found, *total))
+        }
+        _ => None,
+    });
+    results.collect()
+}
+
+/// Every find result of `view`.
+fn find_results(state: &State, view: ViewId) -> usize {
+    count(state, view, |e| matches!(e, EngineEvent::FindResult { .. }))
+}
+
+/// Find in page on `a`: a search counts its matches (case as asked), moves select the next and
+/// previous match and keep the total, a search with none fails; an answer is never stamped with
+/// a later search, a search for a gone document and moves or stops of a search the view no
+/// longer has do nothing, and a new document ends the search.
+fn finds_in_the_page(d: &mut Driver, a: ViewId) {
+    let to_find = d.state.navigate(a, &page("find.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, a, to_find) && titled(s, a, "find")));
+    let (_, _, document, _) = commit(&d.state, a).unwrap();
+    let search = |state: &mut State, text: &str, case_sensitive: bool| {
+        let search = RequestId::next();
+        let text = text.into();
+        let command = FindCommand::Search {
+            search,
+            document,
+            text,
+            case_sensitive,
+        };
+        state.command(a, EngineCommand::Find(command));
+        search
+    };
+    let selected = |d: &mut Driver| {
+        d.eval(a, "window.getSelection().anchorNode.parentNode.id")
+            .unwrap()
+    };
+
+    let apple = search(&mut d.state, "apple", false);
+    assert!(d.run_until(WAIT, |s| !found(s, a, apple).is_empty()));
+    assert_eq!(found(&d.state, a, apple), [(true, Some(4))]);
+    assert_eq!(selected(d), "one", "the first match is selected");
+    d.state
+        .command(a, EngineCommand::Find(FindCommand::Next { search: apple }));
+    assert!(d.run_until(WAIT, |s| found(s, a, apple).len() == 2));
+    assert_eq!(
+        found(&d.state, a, apple)[1],
+        (true, Some(4)),
+        "a move keeps the total"
+    );
+    assert_eq!(selected(d), "two");
+    for _ in 0..2 {
+        let before = found(&d.state, a, apple).len();
+        let previous = FindCommand::Previous { search: apple };
+        d.state.command(a, EngineCommand::Find(previous));
+        assert!(d.run_until(WAIT, |s| found(s, a, apple).len() == before + 1));
+    }
+    assert_eq!(selected(d), "four", "previous wraps around");
+
+    let sensitive = search(&mut d.state, "Apple", true);
+    assert!(d.run_until(WAIT, |s| !found(s, a, sensitive).is_empty()));
+    assert_eq!(found(&d.state, a, sensitive), [(true, Some(1))]);
+    let pear = search(&mut d.state, "pear", false);
+    assert!(d.run_until(WAIT, |s| !found(s, a, pear).is_empty()));
+    assert_eq!(found(&d.state, a, pear), [(false, None)]);
+
+    // Two searches before WebKit answers: the first answer (four matches) is not the second's.
+    let replaced = search(&mut d.state, "apple", false);
+    let three = search(&mut d.state, "three", false);
+    assert!(d.run_until(WAIT, |s| !found(s, a, three).is_empty()));
+    d.run_for(Duration::from_millis(300));
+    assert_eq!(found(&d.state, a, replaced), []);
+    assert_eq!(found(&d.state, a, three), [(true, Some(1))]);
+
+    // Moves and stops of a search the view no longer has, a search of a gone document: nothing.
+    let results = find_results(&d.state, a);
+    let gone = FindCommand::Search {
+        search: RequestId::next(),
+        document: DocumentGeneration::next(),
+        text: "apple".into(),
+        case_sensitive: false,
+    };
+    for command in [
+        FindCommand::Next { search: replaced },
+        FindCommand::Previous { search: replaced },
+        FindCommand::Stop { search: replaced },
+        gone,
+    ] {
+        d.state.command(a, EngineCommand::Find(command));
+    }
+    d.run_for(Duration::from_millis(300));
+    assert_eq!(find_results(&d.state, a), results, "nothing answered");
+    // The current search still moves; stopped, it doesn't.
+    d.state
+        .command(a, EngineCommand::Find(FindCommand::Next { search: three }));
+    assert!(d.run_until(WAIT, |s| found(s, a, three).len() == 2));
+    d.state
+        .command(a, EngineCommand::Find(FindCommand::Stop { search: three }));
+    d.state
+        .command(a, EngineCommand::Find(FindCommand::Next { search: three }));
+    d.run_for(Duration::from_millis(300));
+    assert_eq!(
+        found(&d.state, a, three).len(),
+        2,
+        "a stopped search doesn't move"
+    );
+
+    // A new document ends the search.
+    let again = search(&mut d.state, "apple", false);
+    assert!(d.run_until(WAIT, |s| !found(s, a, again).is_empty()));
+    let away = d.state.navigate(a, &page("second.html"));
+    assert!(d.run_until(WAIT, |s| committed(s, a, away)));
+    d.state
+        .command(a, EngineCommand::Find(FindCommand::Next { search: again }));
+    d.run_for(Duration::from_millis(300));
+    assert_eq!(
+        found(&d.state, a, again).len(),
+        1,
+        "the search ended with its document"
+    );
 }
 
 /// A page asks before it goes where the user's click takes it (a link, a GET form, in a frame
@@ -451,6 +586,8 @@ fn wpe_views_navigate_present_ask_and_fail_distinctly() {
         d.run_until(WAIT, |s| committed(s, a, away)),
         "a page asking to stay doesn't keep the browser's navigation from committing"
     );
+
+    finds_in_the_page(&mut d, a);
 
     let server = common::serve();
     let url = |path: &str| format!("{server}{path}");

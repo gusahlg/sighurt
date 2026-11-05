@@ -41,6 +41,6 @@ pub use connection::{Capabilities, Diagnostics, Host, HostError, HostEvent, Targ
 pub use damage::{begin_paint, buffer_age, end_paint, report_damage, DamageRect};
 pub use placement::{InputRegion, Placement, PlacementError, TargetPlacement, RESIZE_GRACE};
 pub use scheduler::PresentStats;
-pub use shm::{rgba_to_argb8888, BufferStats, ShmFrame, BYTES_PER_PIXEL};
+pub use shm::{BufferStats, ShmFrame, BYTES_PER_PIXEL};
 pub use targets::{FramePermit, GlHandles, PresentError, PresentMode, TargetLease};
 pub use window::WindowOptions;

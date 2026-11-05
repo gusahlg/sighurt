@@ -13,7 +13,9 @@
 //! which shows only whole, and only if it fits in half the tab's room for text less a gap, so
 //! tabs of one width agree whatever their titles. At the address field's right end the same
 //! name is a button: a rounded outline in the theme's colours, brighter under the pointer,
-//! sunk while held, and naming the engine being opened while a switch is under way.
+//! sunk while held, and naming the engine being opened while a switch is under way. The find
+//! field, in the address field's place, has a muted `/` before its text; the search's state
+//! ("3 of 12") is muted text at the field's right, before the engine button.
 //!
 //! Must not own: buffers, pixels or how a scene is rendered (the backend's), or page pixels.
 
@@ -311,9 +313,12 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     if let Some((ghost, x)) = &view.ghost {
         pen.text(ghost, (*x, view.y), colors.text_muted, clip);
     }
-    if let Some((indicator, x)) = &view.indicator {
-        let field = rect_f(field);
-        pen.text(indicator, (*x, view.y), colors.text_muted, field);
+    // The keymap's indicator, the find field's prompt and the search's state.
+    for (text, x) in [&view.indicator, &view.prompt, &view.find]
+        .into_iter()
+        .flatten()
+    {
+        pen.text(text, (*x, view.y), colors.text_muted, rect_f(field));
     }
     if let Some(button) = &view.engine {
         draw_engine_button(pen, chrome, button, colors);

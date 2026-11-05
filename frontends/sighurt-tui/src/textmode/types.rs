@@ -37,6 +37,19 @@ pub struct Span {
     pub item: Option<usize>,
 }
 
+/// How a row continues the row above it: whether both are one run of text that wrapping
+/// broke, and what the break took out. Find in page searches the text before wrapping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Joined {
+    /// The row starts its own text.
+    #[default]
+    No,
+    /// The run broke at a space, which no row shows.
+    Space,
+    /// The run broke inside a word too wide for the row.
+    Directly,
+}
+
 /// One row of the laid-out page, already wrapped to [`TextDocument::width`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextLine {
@@ -44,6 +57,10 @@ pub struct TextLine {
     pub spans: Vec<Span>,
     /// The block this row came from, when it has one. Scroll anchoring uses it.
     pub node: Option<NodeId>,
+    /// Whether the row continues the row above.
+    pub joined: Joined,
+    /// The first span is the block's prefix (indent, quote bars, a list marker), not page text.
+    pub prefixed: bool,
 }
 
 impl TextLine {

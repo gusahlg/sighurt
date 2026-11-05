@@ -41,6 +41,49 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   WebKit is opened on first use and its processes end with the last WPE page, retained views are
   bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
 
+### Paused on 4 November 2026 (evening): the second run, two feature lanes in flight
+
+The user asked for a second run after decision 125: "optimize the renderer and the browser in
+general as much as possible. Do more reliability testing and add in obvious features that are
+missing in a way that goes with the philosophy and design." Landed on `config-ext` (decisions
+126–129 and the lane commits after them): seeded random-input tests for every parser with 8
+fixes (126), the soak and fault suites with 5 fixes (127), the second measured optimization pass
+(128: CPU backend page render −58 %, sixel encode −52 %), the tab commands, the keymap's hovered
+link and `location.focus <text>` with the find and fullscreen API stubbed honestly in every
+engine (129), find in page in the WPE, CEF, Ladybird (shim ABI 3) and NetSurf adapters
+(874dcb0…6fd6335, each with a direct engine test; Servo 0.7 has no find API), and window
+fullscreen in the host (`Host::set_fullscreen`, `WindowConfigured { fullscreen }`, 20/20
+compositor tests). The feature set and its API shapes are
+[features-2026-11-04.md](features-2026-11-04.md) (the deep-design agent's design with the
+orchestrator's amendments after [reviews-features-astra.md](reviews-features-astra.md)).
+
+**On branches, pushed, not merged:** `find` (worktree `../sighurt-wt-find`: lane B1, complete —
+find in the core, the runtime's one result path, both windowed chromes, the terminal's find
+field and text mode's own search, the demo engine as the test path; verified on the non-Servo
+set with headless.sh 152/152; the Servo and `--all-features` builds and ui/headless.sh not run)
+and `hist` (worktree `../sighurt-wt-hist`: lane C, stopped by the end of the day — core, runtime
+store and writer, and both windowed chromes done and tested; the GUI's answering of completion
+queries and the terminal's ghost text committed as "WIP:" without tests; README and
+extension-api.md not yet written). Resume notes with the exact shapes and merge hazards are in
+`~/.local/share/sighurt-handoff/2026-11-04/lane-B1-find-resume.md` and `lane-C-history-resume.md`
+(the lanes' reports). Their worktrees build into /data/sig-builds/targets/gwasm and
+/data/sig-builds/targets/merge.
+
+**To resume, in order:** (1) finish and merge `find`, then `hist` (both touch
+`crates/sighurt-core/src/state.rs` and `ui/sighurt-ui/src/chrome.rs`: expect small conflicts);
+write decisions 130 (find) and 131 (history). (2) Lane D, fullscreen, per the design's "Lane D"
+amendments: the core's three states (wanted, observed, page-owned), `browser.fullscreen` through
+`Host::set_fullscreen`, the chrome listing its surfaces only when needed, page-requested
+fullscreen as a fact gated by activation with `page.exit-fullscreen` and the core's Escape
+safety override, Servo (`notify_fullscreen_state_changed`, `WebView::exit_fullscreen`) and CEF
+first, WPE after its exit path is verified in 2.52's sources; decision 132. (3) The full
+pre-commit list with Servo and WPE (the non-Servo part and the `--all-features` clippy/tests ran
+on the merged tree at the pause: see the log named in the session memory), `engines.sh`,
+`real-terminals.sh`, `coexist.sh`. (4) Rebuild `/data/sig-builds/try/sig` with every engine: the
+one there was built before shim ABI 3 and refuses the rebuilt Ladybird shim (a rebuild was
+started at the pause; `REVISION` there says which commit it is). Still owed from before: the
+0.9.0-vs-0.10.0 benchmark on louise-pc (offline all day).
+
 ### Paused on 23 October 2026: the terminal in tmux, Servo text, persistent logins
 
 The user's report ("basically all keybindings in the TUI malfunction") was tmux: sig ran inside
@@ -4046,3 +4089,60 @@ Newest last. Each entry says what was decided and why.
     text is cleared, so the strip says why it failed. *Open*: the terminal's SIGHUP restores
     the terminal and re-raises without the last session write (at most 1 s of changes lost);
     under `ulimit -f` the SHM buffers (memfd) can't be sized either, so pages don't present.
+128. **A second measured optimization pass: the CPU backend and the sixel encoder** (4 November
+    2026, branch `opt2`, merged dbcb533; bench/HYPOTHESES.md H-START1, H-CPU1, H-CPU2, H-TUI1,
+    H-SHM1, H-MEM1, each written before it was measured; release builds, this desktop, headless
+    sway 1280×800, interleaved runs with fresh XDG directories). *Kept*: the CPU backend paints
+    straight into the buffers' B, G, R, A byte order instead of swapping red and blue over the
+    whole buffer after drawing (H-CPU1: the home page surface 427 → 181 µs a frame in the
+    microbenchmark, 1769 → 687 µs at 200 %; in sig, chrome.sh with the cpu renderer, page
+    1.78 → 1.18 ms, chrome 0.200 → 0.166 ms, status 0.205 → 0.167 ms), glyphs blended a row
+    slice at a time (H-CPU2, beyond the spread only at 200 %: home 695 → 648 µs), and the sixel
+    encoder quantizing each run of equal pixels once and visiting each colour only over the
+    columns it spans (H-TUI1: example.com 2527 → 1206 µs a frame, byte-identical output; all 252
+    registers still defined, decision 121). Every golden image stayed byte-identical. *Not
+    supported, reverted*: the font scan on its own thread with the window created first
+    (H-START1: exec → first chrome frame 5.00 → 5.10 ms; release startup is about 7 ms in all,
+    the font scan 2.3 ms of it — the 35 ms first paint of H-UI2 was a debug-build figure).
+    *Rejected*: pre-faulting new SHM buffers with MADV_POPULATE_WRITE (H-SHM1: a page-surface
+    show 1.16 → 1.59 ms). *Measured, nothing to fix*: 20 cycles of tab churn with the demo and
+    Wasm engines keep RSS within −4.0 … +0.7 MiB from cycle 5, the SHM bytes and the glyph cache
+    identical at every cycle's end (H-MEM1, `bench/memory/churn.sh`); the shaped-text, glyph and
+    snapshot caches are bounded by construction. New harness pieces: `bench/startup/startup.sh`,
+    a hover phase and `CHROME_BUILDS`/`CHROME_RENDERERS` in `bench/render/chrome.sh`, the ignored
+    timing tests `frame_cost` (sighurt-ui) and `encode_cost` (sighurt-tui). *Open*: the kitty
+    encoder spends 11–12 ms a page frame in zlib level 6 (a faster deflate backend would change
+    flate2's features for Servo's graph too); the owner loop was not re-profiled (`perf` is not
+    available in the sandbox); a text-mode layout of a 20 000-node snapshot takes 7 ms, once per
+    snapshot. The host's `rgba_to_argb8888` lost its last caller and is gone.
+129. **Tab commands, the keymap's hovered link, and `location.focus <text>`** (4 November 2026,
+    branch `features`, merged c6f8fb4; the user: "add in obvious features that are missing in a
+    way that goes with the philosophy and design"; the feature set was chosen by the deep-design
+    agent and amended after GPT-6 Astra's review — the design and both reviews are in the
+    session's records, the amendments summarized here). `tab.new [url]` opens the address
+    through the same path as `page.open`; `tab.duplicate` makes a tab right after the selected
+    one at its committed address, zoom and chosen engine; `tab.move left|right|<n>` wraps for
+    left and right and clamps `n`; `tab.reopen` reopens the most recently closed tab from a
+    bounded list of ten `ClosedTab { url, title, engine, zoom }` records (an address, never the
+    history; recorded only by a close that removed a tab, the page's own `window.close()`
+    included; `MAX_TABS` checked first). `location.focus <text>` focuses the line with that text
+    (`Effect::Focus(Chrome)` then `Effect::LineText`; `ChromeEvent::LineText` in the chrome API;
+    the terminal's line does the same), which is how `:` types itself now. The keymap's
+    `TabInfo` gains `link` — the hovered link as a document-scoped URL the router would open
+    (http, https, file; at most 8 KiB, dropped rather than shortened; cleared at a new document
+    and on `ViewFailed`), never the raw status text, so the example keymap's `y f` copies a link
+    and nothing reinterprets page text as command syntax — and `fullscreen` (for decision 132).
+    The example keymap binds `u` to `tab.reopen`, `/` to `page.find` and `:` to
+    `location.focus :`. With the same commit the API for find in page and fullscreen landed with
+    honest stubs: every adapter answers `EngineCommand::Find` and `ExitFullscreen` with
+    `Unsupported` and reports `find_in_page: false` and `fullscreen: false` until its lane lands
+    (decisions 130–132); `page.find [text]` refuses text over 1024 bytes at parse time, and the
+    `FindCommand` variants each name their search (and `Search` its document) so a late result
+    is recognisably stale. *Verified*: core tests for every command and bound (reopen after 11
+    closes, the last-tab guard, `MAX_TABS`, a chosen engine; the link's schemes, size and
+    clearing), API parse round trips, chrome and terminal `line_text` tests, the example
+    keymap's tests, headless.sh 145/145 (`:tab.new demo://pattern`, `:tab.move left`, `x` then
+    `u`, the saved order), ui 35/35, the workspace tests, the Servo, WPE and NetSurf crates
+    checked. *Left out, with reasons*: bookmarks (a `[keywords]` entry without `{}` already is
+    one, and sig never rewrites the user's file); per-site zoom memory (decision 29);
+    `sig://history` and a downloads page (after completion exists).

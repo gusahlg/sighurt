@@ -86,6 +86,8 @@ pub const NORMAL: &[Binding] = &[
     // The command line: the line opens holding ":". "/" opens the chrome's find field.
     bind(":", Run("location.focus :"), Page, Both),
     bind("/", Run("page.find"), Page, Both),
+    bind("n", Run("page.find-next"), Page, Both),
+    bind("N", Run("page.find-previous"), Page, Both),
     bind("ctrl-o", Run("location.focus"), Always, Both),
     bind("t", Run("tab.new"), Page, Both),
     bind("x", Run("tab.close"), Page, Both),

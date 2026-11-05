@@ -667,3 +667,97 @@ fn a_field_stores_the_raw_value_and_draws_a_sanitized_rendering() {
     assert!(area_lines.iter().all(|line| !line.contains("line 24")));
     check_widths(&doc);
 }
+
+/// The text of `line`'s cells `range.start..range.end`.
+fn cells_text(doc: &TextDocument, range: CellRange) -> String {
+    let text = text_of(&doc.lines[range.line]);
+    let mut out = String::new();
+    let mut col = 0usize;
+    for g in text.graphemes(true) {
+        if col >= usize::from(range.start) && col < usize::from(range.end) {
+            out.push_str(g);
+        }
+        col += g.width();
+    }
+    out
+}
+
+#[test]
+fn find_searches_the_text_before_wrapping_and_maps_matches_to_rows() {
+    let mut f = Fx::new();
+    f.para(1, "alpha bravo charlie delta echo foxtrot");
+    let doc = layout(&f.snap(), 12);
+    // Wrapped: "alpha bravo" / "charlie" / "delta echo" / "foxtrot".
+    assert!(doc.lines.len() >= 3, "{:?}", doc.lines);
+    // A match across a wrap: the joining space shows on no row.
+    let found = find(&doc, "bravo charlie", false);
+    assert_eq!(found.len(), 1);
+    let rows: Vec<String> = found[0].iter().map(|r| cells_text(&doc, *r)).collect();
+    assert_eq!(rows, ["bravo", "charlie"]);
+    assert_eq!(found[0][0].line + 1, found[0][1].line);
+    // Case: either, unless asked.
+    assert_eq!(find(&doc, "ECHO", false).len(), 1);
+    assert!(find(&doc, "ECHO", true).is_empty());
+    assert_eq!(find(&doc, "echo", true).len(), 1);
+    // Non-overlapping, in reading order.
+    let mut f = Fx::new();
+    f.para(1, "aaaa");
+    f.para(1, "xaa");
+    let doc = layout(&f.snap(), 40);
+    let found = find(&doc, "aa", false);
+    assert_eq!(found.len(), 3);
+    assert!(found[0][0].line < found[2][0].line);
+    assert!(find(&doc, "", false).is_empty());
+}
+
+#[test]
+fn find_joins_a_word_broken_inside_and_leaves_prefixes_out() {
+    let mut f = Fx::new();
+    f.para(1, "supercalifragilistic");
+    let doc = layout(&f.snap(), 8);
+    let found = find(&doc, "fragil", false);
+    assert_eq!(found.len(), 1);
+    let text: String = found[0].iter().map(|r| cells_text(&doc, *r)).collect();
+    assert_eq!(text, "fragil");
+    // A list's bullet and hang are not page text, and its columns are skipped.
+    let doc = layout(&nested_lists(), 30);
+    let bullet = text_of(&doc.lines[0]);
+    let marker = bullet.trim_start().chars().next().unwrap().to_string();
+    assert!(find(&doc, &marker, false).is_empty(), "{bullet}");
+    let all: Vec<String> = doc.lines.iter().map(text_of).collect();
+    let word = all[0]
+        .split_whitespace()
+        .last()
+        .expect("a word on the first row")
+        .to_owned();
+    let found = find(&doc, &word, true);
+    assert!(!found.is_empty());
+    assert_eq!(cells_text(&doc, found[0][0]), word);
+}
+
+#[test]
+fn the_current_match_is_drawn_in_reverse() {
+    let mut f = Fx::new();
+    f.para(1, "one two three");
+    let doc = layout(&f.snap(), 40);
+    let mut view = TextView::new(40);
+    view.found = find(&doc, "two", false).remove(0);
+    let mut grid = Grid::new(40, 3);
+    draw(
+        &doc,
+        &view,
+        &mut grid,
+        Area {
+            col: 0,
+            row: 1,
+            cols: 40,
+            rows: 2,
+        },
+    );
+    let reversed: String = (0..40)
+        .filter_map(|col| grid.cell(col, 1))
+        .filter(|cell| cell.attrs.reverse)
+        .map(|cell| cell.grapheme.clone())
+        .collect();
+    assert_eq!(reversed, "two");
+}

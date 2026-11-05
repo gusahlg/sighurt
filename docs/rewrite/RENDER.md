@@ -229,8 +229,9 @@ Unchanged` rule ships. The text stays as the record of the idea and its conditio
 
 Today's `Canvas`/`Pen` code, moved and split: `Pen` is now the scene builder (§3); the pixel
 work is `cpu::CpuBackend::render`, which walks the scene with tiny-skia and the shared glyph
-rasterizer, swaps R and B once at the end (or through the padded-stride scratch pixmap, as
-today) and returns the damage. Its glyph cache keeps today's budget (2048 glyphs, starting over
+rasterizer, handing every color over with R and B exchanged so that what it paints is already
+ARGB8888's byte order (no pass over the buffer swaps them; bench/HYPOTHESES.md H-CPU1), through
+the padded-stride scratch pixmap as today, and returns the damage. Its glyph cache keeps today's budget (2048 glyphs, starting over
 when the scale changes).
 
 **Incremental painting (new, measured).** `ShmFrame::age()` says how many submissions ago the

@@ -270,6 +270,7 @@ vtables!(
     CefDialogHandler,
     CefDisplayHandler,
     CefDownloadHandler,
+    CefFindHandler,
     CefJsdialogHandler,
     CefKeyboardHandler,
     CefLifeSpanHandler,

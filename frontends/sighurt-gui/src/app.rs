@@ -98,7 +98,9 @@ use sighurt_render::{
     Backend, CpuBackend, FontSystemHandle, Output, Pen, PixelBuffer, Presents, RenderError,
     RenderOutcome, SurfaceKey,
 };
-use sighurt_runtime::diagnostics::{Diagnostics, RendererReport, Report, TabReport, TargetReport};
+use sighurt_runtime::diagnostics::{
+    Diagnostics, FindReport, RendererReport, Report, TabReport, TargetReport,
+};
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
 use sighurt_runtime::registry::State;
@@ -421,6 +423,10 @@ impl Frontend for Gui {
 
     fn line_text(&mut self, text: String, queue: &mut VecDeque<BrowserEvent>) {
         self.chrome_event(queue, ChromeEvent::LineText(text));
+    }
+
+    fn find_field(&mut self, text: String, queue: &mut VecDeque<BrowserEvent>) {
+        self.chrome_event(queue, ChromeEvent::FindField(text));
     }
 
     fn chrome_input(&mut self, event: InputEvent, queue: &mut VecDeque<BrowserEvent>) {
@@ -1617,6 +1623,7 @@ fn report(gui: &Gui, session: &mut Session<Gui>, at_exit: bool) {
                 reloads: tab.reloads,
                 error: tab.error.is_some(),
                 engine: chrome::engine(core, &tab).map(str::to_owned),
+                find: tab.find.map(FindReport::from),
             })
             .collect()
     };

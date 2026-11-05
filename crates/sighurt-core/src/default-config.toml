@@ -169,11 +169,12 @@ forward = "page.forward"
 # work without any.
 #
 # While the page has the keyboard, in both frontends: q quits, o focuses the address line,
-# : opens it as the command line (location.focus :), / opens the find field (page.find),
-# ctrl-o focuses it from anywhere, t opens a tab, x closes the tab, u reopens the tab closed
-# last, J and K move to the next and previous tab, H and L go back and forward, r and ctrl-r
-# reload (ctrl-r from anywhere), e reopens the page in the next web engine, j and k scroll,
-# ctrl-d and ctrl-u scroll a page, g and G go to the top and the bottom, and + - = zoom.
+# : opens it as the command line (location.focus :), ctrl-o focuses it from anywhere, / opens
+# the find field (page.find), n and N move to the next and previous match of the search, t
+# opens a tab, x closes the tab, u reopens the tab closed last, J and K move to the next and
+# previous tab, H and L go back and forward, r and ctrl-r reload (ctrl-r from anywhere), e
+# reopens the page in the next web engine, j and k scroll, ctrl-d and ctrl-u scroll a page, g
+# and G go to the top and the bottom, and + - = zoom.
 # alt-1 to alt-9 select those tabs from anywhere. Escape enters INSERT MODE, which shows
 # INSERT MODE and passes every other key until Escape leaves it. y y copies the page's
 # address, y f the link the pointer is over, and c o closes the other tabs, highest number
@@ -239,8 +240,11 @@ forward = "page.forward"
 #
 # page.find <text> finds the text (at most 1024 bytes) in the page shown, wrapping around,
 # and is case-sensitive only when the text has a capital letter; page.find alone opens the
-# chrome's find field. page.find-next and page.find-previous move between the matches and
-# page.find-stop ends the search. A page whose engine can't find in it says so.
+# chrome's find field, which searches as you type: Enter keeps the search and gives the page
+# the keyboard, Escape ends it. page.find-next and page.find-previous move between the matches
+# and page.find-stop ends the search; a new page in the tab ends it too. The chrome shows what
+# the search found ("3 of 12"). The page's engine searches (Servo and Wasm can't, and say so);
+# in the terminal's text mode sig searches the page's text itself.
 # history.clear forgets the pages you visited ([history] below). browser.fullscreen puts the window in
 # fullscreen, or takes it out; page.exit-fullscreen leaves the fullscreen a page put one of
 # its elements in (a video, a game).
