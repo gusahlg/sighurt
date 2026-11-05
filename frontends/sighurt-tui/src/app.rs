@@ -3631,6 +3631,14 @@ schemes = [\"demo\"]
 
     #[cfg(feature = "engine-demo")]
     fn demo_app() -> DemoApp {
+        demo_app_with(Paths {
+            config: None,
+            session: None,
+        })
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn demo_app_with(paths: Paths) -> DemoApp {
         let (master, slave) = crate::term::open_pty().expect("pty");
         rustix::termios::tcsetwinsize(
             &slave,
@@ -3653,10 +3661,7 @@ schemes = [\"demo\"]
             env,
             registry,
             Services::new(|| {}),
-            Paths {
-                config: None,
-                session: None,
-            },
+            paths,
             None,
             Diagnostics::new(None),
             std::sync::Arc::new(|| {}),
@@ -3904,6 +3909,70 @@ schemes = [\"demo\"]
                 _ => None,
             })
             .collect()
+    }
+
+    /// What is typed in the address line completes from the history: the rest of the address
+    /// shows while the cursor is at the end, Tab takes the exact address, and neither the
+    /// address the line opened with, a command line nor the find field completes.
+    #[cfg(feature = "engine-demo")]
+    #[test]
+    fn the_address_line_completes_from_the_history() {
+        const URL: &str = "https://www.example.com/page";
+        let dir = std::env::temp_dir().join(format!("sighurt-tui-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let seeded = format!(
+            "version = 1\n[[visits]]\nurl = \"{URL}\"\ntitle = \"Example\"\nlast = {now}\ncount = 2\n"
+        );
+        std::fs::write(dir.join("history.toml"), seeded).unwrap();
+        let mut demo = demo_app_with(Paths {
+            config: None,
+            session: Some(dir.join("session.toml")),
+        });
+        let app = &mut demo.app;
+        let mut queue = VecDeque::new();
+        let key = |app: &mut App, key: KeyEvent, queue: &mut VecDeque<BrowserEvent>| {
+            let event = InputEvent {
+                seat: app.tui.seat,
+                kind: InputKind::Key(key),
+            };
+            app.tui.chrome_input(event, queue);
+            app.sync_completion();
+        };
+        app.tui.focus(KeyboardFocus::Chrome, &mut queue);
+        assert!(!app.sync_completion(), "the address it opened with is not typed");
+        for letter in ["e", "x", "a"] {
+            key(app, typed(letter), &mut queue);
+        }
+        assert_eq!(app.tui.ghost_suffix(), Some("mple.com/page"));
+        key(app, named("ArrowLeft"), &mut queue);
+        assert_eq!(app.tui.ghost_suffix(), None, "the cursor is off the end");
+        key(app, named("ArrowRight"), &mut queue);
+        assert_eq!(app.tui.editing.as_ref().unwrap().text(), "exa", "Right only moved");
+        assert_eq!(app.tui.ghost_suffix(), Some("mple.com/page"));
+        key(app, named("Tab"), &mut queue);
+        assert_eq!(app.tui.editing.as_ref().unwrap().text(), URL);
+        assert_eq!(app.tui.ghost_suffix(), None);
+        key(app, named("Enter"), &mut queue);
+        assert_eq!(commands(&queue), [format!("page.open {URL}")]);
+        queue.clear();
+
+        // A command line, and the find field, never complete.
+        app.tui.focus(KeyboardFocus::Chrome, &mut queue);
+        for letter in [":", "e", "x"] {
+            key(app, typed(letter), &mut queue);
+        }
+        assert_eq!(app.tui.ghost_suffix(), None);
+        app.tui.find_field(String::new(), &mut queue);
+        for letter in ["e", "x"] {
+            key(app, typed(letter), &mut queue);
+        }
+        assert!(app.tui.finding);
+        assert_eq!(app.tui.ghost_suffix(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

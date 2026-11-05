@@ -672,6 +672,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_completion_shows_in_grey_after_the_editor_at_its_end_only() {
+        let mut state = ChromeState {
+            address_editing: Some(LineEditor::from_text("exa")),
+            address_ghost: Some("mple.com/page".into()),
+            ..ChromeState::default()
+        };
+        let mut grid = Grid::new(40, 5);
+        let area = state.draw(&mut grid);
+        assert_eq!(row_text(&grid, 4), "→ example.com/page");
+        let cursor = area.cursor.expect("the editor's cursor");
+        assert_eq!(cursor.column, 5, "the cursor stays after what was typed");
+        let typed = grid.cell(4, 4).unwrap();
+        let ghost = grid.cell(5, 4).unwrap();
+        assert_eq!((typed.grapheme.as_str(), typed.fg), ("a", Color::Default));
+        assert_eq!((ghost.grapheme.as_str(), ghost.fg), ("m", GHOST));
+        // Cut to the line.
+        let mut narrow = Grid::new(12, 5);
+        state.draw(&mut narrow);
+        assert_eq!(row_text(&narrow, 4), "→ example.c…");
+        // Not with the cursor off the end, nothing selected aside, or in the find field.
+        let mut editor = LineEditor::from_text("exa");
+        editor.left();
+        state.address_editing = Some(editor);
+        let mut grid = Grid::new(40, 5);
+        state.draw(&mut grid);
+        assert_eq!(row_text(&grid, 4), "→ exa");
+        state.address_editing = Some(LineEditor::from_text("exa"));
+        state.finding = true;
+        let mut grid = Grid::new(40, 5);
+        state.draw(&mut grid);
+        assert_eq!(row_text(&grid, 4), "/exa");
+    }
+
     fn row_text(grid: &Grid, row: u16) -> String {
         let mut text = String::new();
         let mut col = 0;
