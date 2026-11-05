@@ -2435,3 +2435,30 @@ fn fullscreen_in_the_terminal_is_a_notice() {
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
 }
+
+/// No graphics: DA1 without sixel, and no kitty reply.
+const NO_GRAPHICS_REPLIES: &[u8] = b"\x1b[6;20;10t\x1b[?62c";
+
+/// sig's own pages are drawn and have no text: without graphics, the page rows say so instead
+/// of suggesting text mode, and in text mode they say graphics shows them. Needs the Wasm
+/// engine: run with `--features frontend-tui,engine-demo,engine-wasm`.
+#[cfg(feature = "engine-wasm")]
+#[test]
+fn sig_pages_need_graphics_and_say_so() {
+    let mut term = Terminal::start_with("pages-text", &["sig://help"], NO_GRAPHICS_REPLIES);
+    let said = term.wait(0, Duration::from_secs(20), |got| shows(got, "need graphics"));
+    assert!(said, "no notice for a sig page without graphics\n{}", term.context());
+    assert!(
+        !shows(&term.got, "chrome.text-mode"),
+        "it suggests text mode\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+
+    let mut term = Terminal::start_in("pages-mode", &["sig://help"], REPLIES, "mode = \"text\"");
+    let said = term.wait(0, Duration::from_secs(20), |got| shows(got, "have no text"));
+    assert!(said, "no notice for a sig page in text mode\n{}", term.context());
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
