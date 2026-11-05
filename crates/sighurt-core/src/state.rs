@@ -606,9 +606,10 @@ pub struct BrowserState {
     /// its page gets no typing until the user clicks it or runs a command, so keystrokes meant
     /// for one page never land in another.
     held: Option<TabId>,
-    /// Which view each key press delivered to a page went to: its repeats and release go there
-    /// only, never to a view shown since.
-    pressed: HashMap<(SeatId, KeyCode), ViewId>,
+    /// Where each key press went: the view that had the keyboard once it was handled, or `None`
+    /// for the chrome. Its repeats go nowhere once another has it, and its release into no
+    /// other page.
+    pressed: HashMap<(SeatId, KeyCode), Option<ViewId>>,
     /// The terminals internal pages started.
     ptys: Ptys,
 }
@@ -2891,8 +2892,14 @@ impl BrowserState {
 
     fn keyboard(&mut self, event: InputEvent, at: Instant, fx: &mut Fx) {
         self.seat = event.seat;
+        let went = self.press_went(&event);
         match &event.kind {
             InputKind::Key(key) => {
+                // A repeat goes only where its press went: a page that took the keyboard since,
+                // or the chrome, gets nothing of it, and it runs nothing.
+                if key.repeat && went.is_some_and(|v| v != self.focused_view()) {
+                    return;
+                }
                 // The keymap reads the tabs through a borrow of the fields it needs, which
                 // ends before any command of this press changes them.
                 let context = self.key_context();
@@ -2908,6 +2915,9 @@ impl BrowserState {
                     self.keys.handle(context, event.seat, key, &browser)
                 };
                 match outcome {
+                    // Only a fresh press is the user taking the page shown: a repeat lifts no
+                    // hold, so while one is on it runs nothing.
+                    KeyOutcome::Run(_) if key.repeat && self.input_held() => return,
                     KeyOutcome::Run(commands) => {
                         // `settle` runs once, after this press. When several commands run, tell
                         // the engines which view is shown after each one, so a later
@@ -2931,6 +2941,9 @@ impl BrowserState {
                                 self.settle_engines(fx);
                             }
                         }
+                        // Its repeats follow where its own commands moved the keyboard.
+                        self.pressed
+                            .insert((event.seat, key.code), self.focused_view());
                         return;
                     }
                     KeyOutcome::Consumed => return,
@@ -2948,6 +2961,8 @@ impl BrowserState {
                     KeyOutcome::RunThenDeliver(command) => {
                         self.key_ran(&command, at);
                         self.run_command(command, fx);
+                        self.pressed
+                            .insert((event.seat, key.code), self.focused_view());
                     }
                     KeyOutcome::Deliver => {}
                 }
@@ -2977,8 +2992,9 @@ impl BrowserState {
                     self.keys.take(event.seat, key.code);
                 }
             }
-            // A key pressed in another view: its repeats and release stay out of this one.
-            Some(view) if !self.delivered_here(&event, view) => {}
+            // A key pressed in another view, or in the chrome: its repeats and release stay out
+            // of this one.
+            Some(view) if went.is_some_and(|v| v != Some(view)) => {}
             Some(view) => {
                 if matches!(&event.kind, InputKind::Key(key) if key.state == ButtonState::Pressed) {
                     self.views
@@ -3018,20 +3034,22 @@ impl BrowserState {
         self.held = None;
     }
 
-    /// Records where a key press goes, and whether a repeat or release of a key belongs to
-    /// `view`: one pressed while another view had the keyboard does not.
-    fn delivered_here(&mut self, event: &InputEvent, view: ViewId) -> bool {
+    /// For a key's repeat or release, where its press went ([`Self::pressed`]), if the core saw
+    /// it; a release forgets it. A fresh press is recorded where the keyboard is now, before
+    /// the keymap decides it: what the keymap runs moves it ([`KeyOutcome::Run`]), and so does
+    /// delivering it where the keyboard is after a command.
+    fn press_went(&mut self, event: &InputEvent) -> Option<Option<ViewId>> {
         let InputKind::Key(key) = &event.kind else {
-            return true;
+            return None;
         };
         let at = (event.seat, key.code);
         match (key.state, key.repeat) {
             (ButtonState::Pressed, false) => {
-                self.pressed.insert(at, view);
-                true
+                self.pressed.insert(at, self.focused_view());
+                None
             }
-            (ButtonState::Pressed, true) => self.pressed.get(&at).is_none_or(|&v| v == view),
-            (ButtonState::Released, _) => self.pressed.remove(&at).is_none_or(|v| v == view),
+            (ButtonState::Pressed, true) => self.pressed.get(&at).copied(),
+            (ButtonState::Released, _) => self.pressed.remove(&at),
         }
     }
 

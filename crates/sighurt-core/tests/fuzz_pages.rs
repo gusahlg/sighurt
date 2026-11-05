@@ -1,6 +1,7 @@
 //! Seeded random-input tests of the core with engines answering, in random orders: find in page
 //! and fullscreen (`sighurt_core::fullscreen`) under tab commands, documents committing, views
-//! failing and closing, the window's reports, its keyboard focus, clicks and Escape. A fake
+//! failing and closing, the window's reports, its keyboard focus, clicks, Escape, and Enter bound
+//! to `page.send-key enter` (its repeats run it again). A fake
 //! engine answers the core's effects, each answer either at once or held back and delivered
 //! later in a random order, and pages say on their own that they entered or left fullscreen,
 //! for current documents and stale ones, for views alive and gone.
@@ -10,6 +11,8 @@
 //! after the core closed it (`ExitFullscreen` and finds included); `ExitFullscreen` goes only to
 //! an engine that has fullscreen; and the text of a search that reaches an engine is the trimmed
 //! text the user gave, non-empty, at most `MAX_FIND` bytes, with no control character in it.
+//! A key's repeats and release reach only a page its press reached (the chrome, a tab that came
+//! to the front, or another view shown since get none of them).
 //! `tools/fuzz/mod.rs` describes the environment variables.
 
 #[path = "../../../tools/fuzz/mod.rs"]
@@ -77,6 +80,10 @@ struct Harness {
     held: Vec<BrowserEvent>,
     /// Whether the window has the keyboard.
     focused: bool,
+    /// The physical key being delivered, while it is.
+    key: Option<KeyEvent>,
+    /// The views each key's press sent input to, from its press to its release.
+    pressed: BTreeMap<u32, BTreeSet<ViewId>>,
     seat: SeatId,
     now: Instant,
     rng: Rng,
@@ -85,7 +92,10 @@ struct Harness {
 impl Harness {
     fn new(rng: Rng) -> Self {
         let env = environment();
-        let text = format!("version = 1\n[engines]\ndefault = \"{FULL}\"\n");
+        let text = format!(
+            "version = 1\n[engines]\ndefault = \"{FULL}\"\n[input]\nkeymap = \"bindings\"\n\
+             [keys]\n\"enter\" = \"page.send-key enter\"\n"
+        );
         let config = Config::parse(Some(&text), &env).unwrap();
         Self {
             state: BrowserState::new(config, env),
@@ -96,6 +106,8 @@ impl Harness {
             searches: BTreeMap::new(),
             held: Vec::new(),
             focused: true,
+            key: None,
+            pressed: BTreeMap::new(),
             seat: SeatId::next(),
             now: Instant::now(),
             rng,
@@ -109,6 +121,27 @@ impl Harness {
                     !self.closed.contains(view),
                     "{command:?} sent to {view:?} after it was closed"
                 );
+                if let (
+                    EngineCommand::Input(InputEvent {
+                        kind: InputKind::Key(_),
+                        ..
+                    }),
+                    Some(key),
+                ) = (command, &self.key)
+                {
+                    // A key whose press came before the window had the keyboard is not checked.
+                    let views = self.pressed.get_mut(&key.code.0);
+                    match views {
+                        Some(views) if key.state == ButtonState::Pressed && !key.repeat => {
+                            views.insert(*view);
+                        }
+                        Some(views) => assert!(
+                            views.contains(view),
+                            "{key:?} reached {view:?}, which its press did not"
+                        ),
+                        None => {}
+                    }
+                }
                 if matches!(command, EngineCommand::ExitFullscreen) {
                     REACHED[1].fetch_add(1, Ordering::Relaxed);
                     let engine = self.views.get(view).map(|(e, _)| e.as_str());
@@ -320,6 +353,25 @@ impl Harness {
         });
     }
 
+    /// Delivers `key`, keeping track of the views its press reached.
+    fn key(&mut self, key: KeyEvent) {
+        let fresh = key.state == ButtonState::Pressed && !key.repeat;
+        if fresh {
+            self.pressed.insert(key.code.0, BTreeSet::new());
+        }
+        let event = self.input(InputKind::Key(key.clone()));
+        let (code, released) = (key.code.0, key.state == ButtonState::Released);
+        self.key = Some(key);
+        self.deliver(BrowserEvent::Keyboard {
+            event,
+            at: self.now,
+        });
+        self.key = None;
+        if released {
+            self.pressed.remove(&code);
+        }
+    }
+
     fn input(&mut self, kind: InputKind) -> InputEvent {
         InputEvent {
             seat: self.seat,
@@ -467,14 +519,21 @@ fn fuzz_find_and_fullscreen_in_random_orders() {
                         false => FocusEvent::Deactivated,
                     };
                     case.note(|| format!("{focus:?}"));
+                    // No release comes for a key held while the window lost the keyboard.
+                    if !h.focused {
+                        h.pressed.clear();
+                    }
                     let event = h.input(InputKind::Focus(focus));
                     h.deliver(BrowserEvent::Keyboard { event, at: h.now });
                 }
                 13 => {
-                    let key = escape(rng);
+                    let mut key = escape(rng);
+                    if rng.one_in(2) {
+                        key.code = KeyCode(28);
+                        key.key = Key::Named("Enter".into());
+                    }
                     case.note(|| format!("{key:?}"));
-                    let event = h.input(InputKind::Key(key));
-                    h.deliver(BrowserEvent::Keyboard { event, at: h.now });
+                    h.key(key);
                 }
                 14 => {
                     let Some(view) = h.some_view() else { continue };
