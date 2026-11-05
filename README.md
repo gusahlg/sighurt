@@ -623,6 +623,34 @@ and pastes arrive through the terminal's own paste key (bracketed paste) or, whe
 answers OSC 52 reads, from its clipboard. `clipboard.copy <text>` copies text from a binding or
 the command line.
 
+### The terminal page
+
+`sig://terminal` is a small terminal in a tab: your shell (`[pages.terminal] command` if set,
+else `$SHELL`, else `/bin/sh`, in your home directory). `sig://terminal/config` runs your editor
+(`$VISUAL`, else `$EDITOR`, else `vi`) on `sig`'s configuration file instead, so `nvim` on your
+configuration is one address away. The program runs with your full rights, as in any terminal;
+only the terminal emulator, which reads what the program prints, runs in the Wasm sandbox
+([SECURITY.md](./SECURITY.md)). It is off until you turn it on in `config.toml`:
+
+```toml
+[pages.terminal]
+enabled = true
+```
+
+The page starts nothing by itself: it says what will run, and Enter starts it. With the example
+keymap, keys reach the program in INSERT mode, which Escape enters; on this page Escape then goes
+to the program (nvim needs it), and `ctrl-\ ctrl-n`, nvim's own way out of its terminal mode,
+leaves INSERT (a `ctrl-\` followed by another key is dropped). Pastes reach the program with
+control characters removed, bracketed when the program asks. When the program ends, the page says
+how, and Enter starts it again. Closing the tab, navigating away, reloading or quitting ends the
+program (SIGHUP, then SIGKILL after 2 seconds); jobs your shell put in the background in groups
+of their own may survive, as in any terminal.
+
+Limits: it is an xterm-like terminal (`TERM=xterm-256color`, 256 colours and true colour) without
+scrollback, mouse reporting, a title, clipboard access or images; clicks only give the page the
+keyboard. A program in a background tab has its output read once a second, so a busy one waits
+until you look. At most eight terminals run at once.
+
 ### Chromes
 
 The `standard` chrome is a tab strip, a toolbar with back, forward, reload and the address line,
@@ -781,8 +809,9 @@ contained; pages can't open `sig:` pages, can't write the address line, and open
 the tab to another engine only right after a click or key press of yours. Wasm apps get no WASI
 and only the host functions Sighurt registers, with camera, microphone, location and screen
 capture behind a prompt. Servo and WebKit pages get their engines' web security; WebKit's pages
-run in its own sandboxed web processes. To report a vulnerability, see
-[SECURITY.md](./SECURITY.md).
+run in its own sandboxed web processes. `sig://terminal`, off by default, is a shell with your
+full rights: the sandbox holds its terminal emulator, not the shell. To report a vulnerability,
+see [SECURITY.md](./SECURITY.md).
 
 Logins stay across runs: each engine keeps its own cookies in its profile, which only you can
 read (0700 directories, 0600 files). Only persistent cookies are kept; session cookies end with
