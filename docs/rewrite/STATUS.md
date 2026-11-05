@@ -4262,6 +4262,56 @@ Newest last. Each entry says what was decided and why.
     unbound, f11 during a page's fullscreen, the compositor ending it), the terminal's test,
     and a direct test in each engine's suite (Servo `the_page_goes_fullscreen`, WPE
     `goes_fullscreen` including a crash while fullscreen, CEF offscreen section 6).
+133. **Terminal images: sixel over sixel, every image paced, a hidden tab's image held, and a
+    quiet page re-sent alone inside tmux** (5 November 2026, branch `tuifix`; the user: "this
+    bug with the TUI version that makes the entire sixel ui flicker black once every half
+    second or so", only under tmux, and "the browser has a tendency to crash when I switch
+    tabs quickly"). *The flicker*: since decision 121 the terminal wrote spaces over the page
+    rows before every sixel, so that tmux drops its copy of the previous image. tmux 3.8
+    (image.c, screen-write.c) frees a stored image when any cell is written over it and then
+    redraws the whole pane, so the rows were black until the next image had arrived. A sixel
+    for the place and layout of the one on the rows is now written over it with nothing in
+    between, and not at all when its bytes are the same (`Tui::sixel_placed`: a still page
+    writes nothing); only a new layout, or rows that held text, are blanked first. *The
+    crash* was the terminal's, not sig's: Rio 0.5.28 aborted twice that morning in
+    `VulkanImageTexture::upload_rgba` with `queue_submit(oneshot): ERROR_DEVICE_LOST` (NVIDIA
+    Xid 109 in the kernel log for Rio's pid at both times), and sig died with its terminal.
+    Rio destroys an image's Vulkan texture as soon as the image is covered or erased, without
+    waiting for its frames in flight; what loses it the device is an image erased a moment
+    after its upload, which a tab switch did (blank, then the shown tab's frame re-sent at
+    once, unpaced, 30 times a second with the key held), with sixel and with kitty. Now every
+    image write counts against the frame interval, a frame re-sent for a newly shown tab
+    included, and a hidden tab's image is deleted or written over only once the last image
+    has been up for its interval and at least 250 ms (`MIN_IMAGE_LIFE`), the shown tab's
+    frame going over it in the same write when it has one; so another tab's picture can stay
+    under the shown tab's title for up to 250 ms. *Inside tmux* (`TERM` starting with tmux or
+    screen) tmux keeps every sixel written over another, at most 20 in the server, and sends
+    them all again, oldest first, when it redraws the pane (25–27 a window switch on an
+    animation); so once a page has been quiet for 400 ms with more than one stacked, sig
+    writes the blank and its picture again in one write, tmux keeps that one, and a still
+    page costs one sixel a redraw. A changing page is not capped: a blank every few frames
+    blinks, and in Rio spaces over a shown sixel are what loses Rio its device (a cap of 8
+    killed Rio during the plain animation check). *Measured* (private headless sway
+    1280×800, Rio 0.5.28 on Vulkan on this desktop's NVIDIA GPU, tmux 3.8;
+    `frontends/sighurt-tui/tests/real-terminals.sh`, scenarios `rio-tmux-sixel`, `rio-sixel`,
+    `rio-kitty`, a tap on tmux's output counting the sixels it sends): flicker under tmux on
+    the animation page, flashed screenshots of 200: 23 before, 0 after; a still page: 0
+    bytes, 0 sixels, 0 flashes of 100; the quiet re-send: no screenshot of 100 in 2 s caught
+    it (under 20 ms); a tab storm (30 a second for 25 s): Rio died before in all three
+    setups, survived after under tmux, alone with sixel and alone with kitty; a tmux redraw of
+    a still page: 1 sixel. Three pty tests fail against the code before
+    (`sixel_frames_go_over_each_other…`, `a_sixel_frame_that_is_the_picture_on_the_rows_is_not_written`,
+    `a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced`), two more
+    cover tmux. **Known and outside sig**: Rio 0.5.28 under tmux loses its device on tmux
+    pane redraws (window switches, a resize) with any sixel shown: it died within 3 to 12
+    switches whatever sig had stacked, and with one still sixel written by `cat` and no sig
+    running. sig cannot prevent that; it should go to Rio's maintainers. Also: Rio alone with
+    sixel forced shows an empty frame now and then when one sixel replaces another (3 of 200;
+    Rio alone picks kitty, which shows none). The measurements lost the GPU device for
+    private Rio processes about twenty times, the desktop session unaffected. With this
+    change the terminal's report fills `keymap_indicator`, and the terminal tests compare
+    diagnostics objects whatever their key order (`servo-script` turns on serde_json's
+    `preserve_order` for an all-features build, which had failed three of them).
 134. **The example configuration separates the modes cleanly** (5 November 2026, branch `modes`,
     merged 31c61e9; the user: "not being in insert mode makes it so that you can't write any
     text into UI text boxes in the browser. The separation should be clean: in normal mode your
