@@ -2,15 +2,16 @@
 //! slave side, reaping it and ending it.
 //!
 //! The core has authorised a `PtyOpen` (the page's grant, `[pages] terminal`, a consumed
-//! activation, the limits) before anything here runs. [`launch`] builds what runs from a closed
-//! choice the guest made ([`Program`]): the guest never names a program, an argument, a
+//! activation, the limits) before anything here runs. [`exec`] builds what runs from a closed
+//! choice the guest made ([`PtyProgram`]): the guest never names a program, an argument, a
 //! directory or a variable. [`Ptys::open`] opens the pty with its size already set, starts the
-//! program as the leader of a new session with the slave as its controlling terminal, and hands
-//! the master back; the runtime keeps no copy of it, so when `sig` ends, however it ends, the
-//! kernel hangs the session up. A waiter thread reaps the child and records its exit
-//! ([`Exit`]). Ending a [`Session`] (cancelling the request, closing the view, quitting) sends
-//! SIGHUP to every process of the session, waits [`GRACE`] for them to go, and kills what is
-//! left.
+//! program as the leader of a new session with the slave as its controlling terminal, and
+//! answers with the master ([`PtyHandle`]); the runtime keeps no copy of it, so when `sig` ends,
+//! however it ends, the kernel hangs the session up. A waiter thread reaps the child and
+//! records its exit in the handle ([`PtyHandle::exit`]), for the page to show. The request stays
+//! held in the core after its answer, so closing the view, navigating or quitting cancels it:
+//! [`Ptys::cancel`] sends SIGHUP to every process of the session, waits [`GRACE`] for them to
+//! go, and kills what is left; [`Ptys::shutdown`] does it for all of them and waits.
 //!
 //! The child inherits nothing it was not given: only descriptors 0 to 2 (the slave), default
 //! signal dispositions and an empty signal mask, and `sig`'s environment without what `sig`
@@ -21,10 +22,9 @@
 //! bytes (the Wasm engine's `pty` module carries them), the policy (the core's), or what the
 //! page shows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -36,6 +36,8 @@ use rustix::fs::{Mode, OFlags};
 use rustix::process::{Pid, Signal};
 use rustix::pty::OpenptFlags;
 use rustix::termios::{InputModes, OptionalActions, Winsize};
+use sighurt_api::ids::RequestId;
+use sighurt_api::services::{PtyHandle, PtyProgram, ServiceError, ServiceReply, ServiceResult};
 
 /// Most programs with a live session in one process. The core holds pages to the same number.
 pub const MAX_SESSIONS: usize = 8;
@@ -46,34 +48,32 @@ const EDITOR: &str = "vi";
 /// The shell when neither the configuration nor `SHELL` names one.
 const SHELL: &str = "/bin/sh";
 
-/// What the page asked to run. The guest picks one of these; it names nothing else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Program {
-    /// The configured command, else the user's shell.
-    Shell,
-    /// The user's editor on the configuration file.
-    EditConfig,
+/// What a program is started with, from the configuration and the session's paths.
+#[derive(Clone, Copy, Debug)]
+pub struct Launch<'a> {
+    /// `[pages.terminal] command`, if set: the shell to run instead of `$SHELL`.
+    pub command: Option<&'a str>,
+    /// The configuration file, for [`PtyProgram::EditConfig`].
+    pub config: Option<&'a Path>,
 }
 
 /// A program ready to start: its argument vector, working directory and whole environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Launch {
-    /// Never empty: [`launch`] makes sure of it.
+pub struct Exec {
+    /// Never empty: [`exec`] makes sure of it.
     pub argv: Vec<OsString>,
     pub cwd: PathBuf,
     pub env: Vec<(OsString, OsString)>,
 }
 
-/// What runs for `program`. `command` is `[pages.terminal] command`, split at white space with
-/// no shell and no quoting; `config` is the configuration file `EditConfig` opens; `vars` is
-/// `sig`'s environment. The working directory is `HOME` (`/` without one), and the directory of
-/// the configuration file for `EditConfig`.
-pub fn launch(
-    program: Program,
-    command: Option<&str>,
-    config: &Path,
+/// What runs for `program`. `launch.command` is split at white space with no shell and no
+/// quoting; `vars` is `sig`'s environment. The working directory is `HOME` (`/` without one),
+/// and the directory of the configuration file for `EditConfig`, which fails without one.
+pub fn exec(
+    program: PtyProgram,
+    launch: Launch<'_>,
     vars: impl IntoIterator<Item = (OsString, OsString)>,
-) -> Launch {
+) -> Result<Exec, String> {
     let vars: Vec<_> = vars.into_iter().collect();
     let var = |name: &str| {
         vars.iter()
@@ -88,15 +88,18 @@ pub fn launch(
     };
     let home = var("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
     let (argv, cwd) = match program {
-        Program::Shell => {
-            let configured = command.map(|line| words(OsStr::new(line)));
+        PtyProgram::Shell => {
+            let configured = launch.command.map(|line| words(OsStr::new(line)));
             let argv = configured
                 .filter(|argv| !argv.is_empty())
                 .or_else(|| var("SHELL").map(|shell| vec![shell]))
                 .unwrap_or_else(|| vec![SHELL.into()]);
             (argv, home)
         }
-        Program::EditConfig => {
+        PtyProgram::EditConfig => {
+            let config = launch
+                .config
+                .ok_or("this build has no configuration file")?;
             let mut argv = var("VISUAL")
                 .or_else(|| var("EDITOR"))
                 .map(|line| words(&line))
@@ -110,11 +113,11 @@ pub fn launch(
             (argv, cwd)
         }
     };
-    Launch {
+    Ok(Exec {
         argv,
         cwd,
         env: scrubbed(vars),
-    }
+    })
 }
 
 /// `vars` without what `sig`'s `main` set for WebKit (`JSC_*`, `WEBKIT_GST_DISABLE_GL_SINK`,
@@ -154,19 +157,20 @@ pub fn scrubbed(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(Os
 
 /// How a session's program ended, once it has: filled in by the waiter thread that reaped it.
 #[derive(Debug, Default)]
-pub struct Exit {
+struct Exit {
     status: Mutex<Option<ExitStatus>>,
     gone: Condvar,
 }
 
 impl Exit {
     /// The status, if the program has ended and been reaped.
-    pub fn status(&self) -> Option<ExitStatus> {
+    #[cfg(test)]
+    fn status(&self) -> Option<ExitStatus> {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Waits until the program has been reaped or `deadline` has passed; whether it was.
-    pub fn wait_until(&self, deadline: Instant) -> bool {
+    fn wait_until(&self, deadline: Instant) -> bool {
         let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
         while status.is_none() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -189,36 +193,81 @@ impl Exit {
 
 /// The number a page shows for an exit: the exit code, or 128 plus the signal that ended it,
 /// as shells report it.
-pub fn exit_code(status: ExitStatus) -> i32 {
+fn exit_code(status: ExitStatus) -> i32 {
     status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(-1)
 }
 
-/// The sessions of one process: counts them against [`MAX_SESSIONS`].
+/// The programs running, by the request that started each, counted against [`MAX_SESSIONS`].
 #[derive(Debug, Default)]
 pub struct Ptys {
+    /// Programs started and not yet reaped, whether or not their request is still held.
     live: Arc<AtomicUsize>,
+    sessions: HashMap<RequestId, Session>,
 }
 
 impl Ptys {
+    /// No programs.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Starts `program` on a new terminal of `cols` by `rows` cells for `request`:
+    /// `ServiceReply::Pty` with its master side. Fails, having started nothing and kept
+    /// nothing open, when [`MAX_SESSIONS`] programs are live, `request` has one already, or the
+    /// program cannot be started.
+    pub fn open(
+        &mut self,
+        request: RequestId,
+        program: PtyProgram,
+        cols: u16,
+        rows: u16,
+        launch: Launch<'_>,
+    ) -> ServiceResult {
+        let exec = exec(program, launch, std::env::vars_os()).map_err(ServiceError::Failed)?;
+        self.open_exec(request, &exec, cols, rows)
+    }
+
+    fn open_exec(
+        &mut self,
+        request: RequestId,
+        exec: &Exec,
+        cols: u16,
+        rows: u16,
+    ) -> ServiceResult {
+        if self.sessions.contains_key(&request) {
+            return Err(ServiceError::Failed("this terminal is open already".into()));
+        }
+        let (master, session) = self.start(exec, cols, rows).map_err(ServiceError::Failed)?;
+        self.sessions.insert(request, session);
+        Ok(ServiceReply::Pty(master))
+    }
+
+    /// Ends the program `request` started, if it is one of these, without waiting; whether it
+    /// was.
+    pub fn cancel(&mut self, request: RequestId) -> bool {
+        self.sessions
+            .remove(&request)
+            .map(Session::cancel)
+            .is_some()
+    }
+
+    /// Ends every program and waits for them, at most [`GRACE`] and the time killing what is
+    /// left takes, at shutdown.
+    pub fn shutdown(&mut self) {
+        Session::end_all(self.sessions.drain().map(|(_, session)| session));
+    }
+
     /// Programs started and not yet reaped.
-    pub fn live(&self) -> usize {
+    #[cfg(test)]
+    fn live(&self) -> usize {
         self.live.load(Ordering::Acquire)
     }
 
-    /// Opens a pty of `cols` × `rows` cells and starts `launch` on it. Returns the master and
-    /// the session; `exited` runs on the waiter thread once the program has been reaped (to
-    /// wake whoever reports it). Fails, having started nothing and kept nothing open, when
-    /// [`MAX_SESSIONS`] programs are live or the program cannot be started.
-    pub fn open(
-        &self,
-        launch: &Launch,
-        cols: u16,
-        rows: u16,
-        exited: impl FnOnce(ExitStatus) + Send + 'static,
-    ) -> Result<(OwnedFd, Session), String> {
+    /// Opens a pty and starts `exec` on it, counted in [`Ptys::live`] until it is reaped.
+    fn start(&self, exec: &Exec, cols: u16, rows: u16) -> Result<(PtyHandle, Session), String> {
         if self
             .live
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
@@ -229,16 +278,21 @@ impl Ptys {
             return Err(format!("{MAX_SESSIONS} terminal programs are running"));
         }
         let counted = Counted(self.live.clone());
-        let (master, child) = spawn(launch, cols, rows).map_err(|err| {
-            let program = launch.argv[0].to_string_lossy();
+        let (master, child) = spawn(exec, cols, rows).map_err(|err| {
+            let program = exec.argv[0].to_string_lossy();
             format!("could not start {program}: {err}")
         })?;
+        let master = PtyHandle::new(master);
         let pid = Pid::from_child(&child);
         let exit = Arc::new(Exit::default());
-        let waiter = exit.clone();
+        let (waiter, shown) = (exit.clone(), master.exit());
         let started = std::thread::Builder::new()
             .name("sighurt-pty-wait".into())
-            .spawn(move || reap(child, &waiter, counted, exited));
+            .spawn(move || {
+                reap(child, &waiter, counted, |status| {
+                    shown.set(exit_code(status))
+                })
+            });
         if let Err(err) = started {
             // The child went with the closure: kill it so it does not run unwatched (it stays a
             // zombie until sig exits; there is no thread to reap it).
@@ -281,7 +335,7 @@ fn reap(mut child: Child, exit: &Exit, counted: Counted, exited: impl FnOnce(Exi
 
 /// A started program. Dropping it ends the session as [`Session::cancel`] does.
 #[derive(Debug)]
-pub struct Session {
+struct Session {
     /// The program's pid, which is also its session's and process group's id.
     pid: Pid,
     exit: Arc<Exit>,
@@ -289,18 +343,14 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn pid(&self) -> u32 {
+    #[cfg(test)]
+    fn pid(&self) -> u32 {
         self.pid.as_raw_nonzero().get() as u32
-    }
-
-    /// How the program ended, shared with the waiter thread.
-    pub fn exit(&self) -> &Arc<Exit> {
-        &self.exit
     }
 
     /// Ends the session without waiting: SIGHUP to its processes now, SIGKILL to those left
     /// after [`GRACE`], on a thread of its own.
-    pub fn cancel(mut self) {
+    fn cancel(mut self) {
         self.ended = true;
         hang_up(self.pid);
         let (pid, exit) = (self.pid, self.exit.clone());
@@ -314,7 +364,7 @@ impl Session {
 
     /// Ends every session in `sessions` and waits for them, at most [`GRACE`] and the time
     /// killing what is left takes: for quitting.
-    pub fn end_all(sessions: impl IntoIterator<Item = Session>) {
+    fn end_all(sessions: impl IntoIterator<Item = Session>) {
         let mut sessions: Vec<_> = sessions.into_iter().collect();
         for session in &mut sessions {
             session.ended = true;
@@ -410,7 +460,7 @@ fn members(session: Pid) -> Vec<Pid> {
 /// Opens the pty, sets its size and starts the program on it. The parent's copies of the slave
 /// are closed before this returns, so the master reads end-of-file once the session has closed
 /// its side.
-fn spawn(launch: &Launch, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> {
+fn spawn(exec: &Exec, cols: u16, rows: u16) -> io::Result<(std::os::fd::OwnedFd, Child)> {
     let master = rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
     rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
     rustix::pty::grantpt(&master)?;
@@ -435,12 +485,12 @@ fn spawn(launch: &Launch, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> 
     termios.input_modes |= InputModes::IUTF8;
     rustix::termios::tcsetattr(&slave, OptionalActions::Now, &termios)?;
 
-    let mut command = Command::new(&launch.argv[0]);
+    let mut command = Command::new(&exec.argv[0]);
     command
-        .args(&launch.argv[1..])
+        .args(&exec.argv[1..])
         .env_clear()
-        .envs(launch.env.iter().map(|(k, v)| (k, v)))
-        .current_dir(&launch.cwd)
+        .envs(exec.env.iter().map(|(k, v)| (k, v)))
+        .current_dir(&exec.cwd)
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave));
@@ -500,7 +550,6 @@ fn spawn(launch: &Launch, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> 
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsFd;
-    use std::sync::mpsc;
 
     use rustix::io::Errno;
     use rustix::process::WaitOptions;
@@ -541,17 +590,16 @@ mod tests {
         (home, vars)
     }
 
-    /// `/bin/sh -c script` as the page's shell would run (`launch` splits a configured
+    /// `/bin/sh -c script` as the page's shell would run (`exec` splits a configured
     /// command at white space, so the script is put in afterwards).
-    fn sh(script: &str, vars: &[(OsString, OsString)]) -> Launch {
-        let mut launch = launch(
-            Program::Shell,
-            None,
-            Path::new("/nonexistent/config.toml"),
-            vars.iter().cloned(),
-        );
-        launch.argv = vec!["/bin/sh".into(), "-c".into(), script.into()];
-        launch
+    fn sh(script: &str, vars: &[(OsString, OsString)]) -> Exec {
+        let no_config = Launch {
+            command: None,
+            config: None,
+        };
+        let mut exec = exec(PtyProgram::Shell, no_config, vars.iter().cloned()).unwrap();
+        exec.argv = vec!["/bin/sh".into(), "-c".into(), script.into()];
+        exec
     }
 
     /// Everything the master gives until end-of-file, or `limit`.
@@ -593,19 +641,16 @@ mod tests {
         ) && !Path::new(&format!("/proc/{}", pid.as_raw_nonzero())).exists()
     }
 
-    fn open(
-        ptys: &Ptys,
-        launch: &Launch,
-        cols: u16,
-        rows: u16,
-    ) -> (OwnedFd, Session, mpsc::Receiver<ExitStatus>) {
-        let (tx, rx) = mpsc::channel();
-        let (master, session) = ptys
-            .open(launch, cols, rows, move |status| {
-                let _ = tx.send(status);
-            })
-            .unwrap();
-        (master, session, rx)
+    fn open(ptys: &Ptys, exec: &Exec, cols: u16, rows: u16) -> (PtyHandle, Session, Arc<Exit>) {
+        let (master, session) = ptys.start(exec, cols, rows).unwrap();
+        let exit = session.exit.clone();
+        (master, session, exit)
+    }
+
+    /// How the program ended, within `limit`.
+    fn exited(exit: &Exit, limit: Duration) -> ExitStatus {
+        assert!(exit.wait_until(Instant::now() + limit), "not reaped");
+        exit.status().unwrap()
     }
 
     #[test]
@@ -618,36 +663,42 @@ mod tests {
                 .map(|(k, v)| (k.into(), v.into()))
                 .collect()
         };
-        let shell = launch(Program::Shell, None, config, vars(&[]));
+        let run = |program, command, extra: &[(&str, &str)]| {
+            let launch = Launch {
+                command,
+                config: Some(config),
+            };
+            exec(program, launch, vars(extra)).unwrap()
+        };
+        let shell = run(PtyProgram::Shell, None, &[]);
         assert_eq!(shell.argv, ["/bin/zsh"]);
         assert_eq!(shell.cwd, Path::new("/home/u"));
-        let configured = launch(Program::Shell, Some(" fish  -l "), config, vars(&[]));
+        let configured = run(PtyProgram::Shell, Some(" fish  -l "), &[]);
         assert_eq!(configured.argv, ["fish", "-l"]);
-        let blank = launch(Program::Shell, Some("  "), config, vars(&[]));
+        let blank = run(PtyProgram::Shell, Some("  "), &[]);
         assert_eq!(blank.argv, ["/bin/zsh"]);
-        let bare = launch(Program::Shell, None, config, Vec::new());
+        let none = Launch {
+            command: None,
+            config: None,
+        };
+        let bare = exec(PtyProgram::Shell, none, Vec::new()).unwrap();
         assert_eq!(
             (bare.argv, bare.cwd),
             (vec![OsString::from("/bin/sh")], "/".into())
         );
 
-        let edit = launch(
-            Program::EditConfig,
+        let edit = run(
+            PtyProgram::EditConfig,
             Some("fish"),
-            config,
-            vars(&[("EDITOR", "nano"), ("VISUAL", "nvim -u NONE")]),
+            &[("EDITOR", "nano"), ("VISUAL", "nvim -u NONE")],
         );
         assert_eq!(edit.argv, ["nvim", "-u", "NONE", config.to_str().unwrap()]);
         assert_eq!(edit.cwd, Path::new("/home/u/.config/sighurt"));
-        let editor = launch(
-            Program::EditConfig,
-            None,
-            config,
-            vars(&[("EDITOR", "nano")]),
-        );
+        let editor = run(PtyProgram::EditConfig, None, &[("EDITOR", "nano")]);
         assert_eq!(editor.argv, ["nano", config.to_str().unwrap()]);
-        let vi = launch(Program::EditConfig, None, config, vars(&[("VISUAL", "")]));
+        let vi = run(PtyProgram::EditConfig, None, &[("VISUAL", "")]);
         assert_eq!(vi.argv, ["vi", config.to_str().unwrap()]);
+        assert!(exec(PtyProgram::EditConfig, none, vars(&[])).is_err());
     }
 
     #[test]
@@ -691,7 +742,7 @@ mod tests {
             libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut mask);
             (ignored, mask)
         };
-        let (master, session, rx) = open(&ptys, &sh(script, &vars), 80, 24);
+        let (master, session, exit) = open(&ptys, &sh(script, &vars), 80, 24);
         // SAFETY: restores what the block above changed.
         unsafe {
             libc::signal(libc::SIGUSR2, ignored);
@@ -725,7 +776,7 @@ mod tests {
         assert!(lines[4].contains("SigIgn:\t0000000000000000"), "{out}");
         assert!(lines[4].contains("SigBlk:\t0000000000000000"), "{out}");
         assert_eq!(lines[5], "all-ttys", "{out}");
-        let status = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let status = exited(&exit, Duration::from_secs(5));
         assert_eq!(exit_code(status), 0);
         assert!(reaped(session.pid()));
         assert_eq!(ptys.live(), 0);
@@ -736,7 +787,7 @@ mod tests {
         let _serial = serial();
         let (_home, vars) = home();
         let ptys = Ptys::default();
-        let (master, session, _rx) = open(
+        let (master, session, _exit) = open(
             &ptys,
             &sh("cat /proc/self/stat; exec </dev/tty && echo ctty", &vars),
             80,
@@ -768,7 +819,7 @@ mod tests {
         let (_home, vars) = home();
         let ptys = Ptys::default();
         // The program waits for a line, then reports the size again.
-        let (master, _session, rx) =
+        let (master, _session, exit) =
             open(&ptys, &sh("stty size; read x; stty size", &vars), 91, 37);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = Vec::new();
@@ -796,10 +847,7 @@ mod tests {
         rustix::io::write(&master, b"\n").unwrap();
         let out = read_all(&master, Duration::from_secs(10));
         assert!(out.contains("50 132"), "{out}");
-        assert_eq!(
-            exit_code(rx.recv_timeout(Duration::from_secs(5)).unwrap()),
-            0
-        );
+        assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 0);
     }
 
     #[test]
@@ -807,18 +855,17 @@ mod tests {
         let _serial = serial();
         let (_home, vars) = home();
         let ptys = Ptys::default();
-        let (master, session, rx) = open(&ptys, &sh("exit 7", &vars), 80, 24);
+        let (master, session, exit) = open(&ptys, &sh("exit 7", &vars), 80, 24);
         let _ = read_all(&master, Duration::from_secs(10));
+        assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 7);
+        assert_eq!(session.exit.status().map(exit_code), Some(7));
         assert_eq!(
-            exit_code(rx.recv_timeout(Duration::from_secs(5)).unwrap()),
-            7
+            master.exit().get(),
+            Some(7),
+            "the page sees it in the handle"
         );
-        assert_eq!(session.exit().status().map(exit_code), Some(7));
-        let (_master, session, rx) = open(&ptys, &sh("kill -TERM $$", &vars), 80, 24);
-        assert_eq!(
-            exit_code(rx.recv_timeout(Duration::from_secs(5)).unwrap()),
-            128 + 15
-        );
+        let (_master, session, exit) = open(&ptys, &sh("kill -TERM $$", &vars), 80, 24);
+        assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 128 + 15);
         assert!(reaped(session.pid()));
     }
 
@@ -829,7 +876,7 @@ mod tests {
         let ptys = Ptys::default();
         // The shell ignores HUP and has a background child that ignores it too.
         let script = "trap '' HUP; (trap '' HUP; exec sleep 1000) & echo ready; wait";
-        let (master, session, rx) = open(&ptys, &sh(script, &vars), 80, 24);
+        let (master, session, exit) = open(&ptys, &sh(script, &vars), 80, 24);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = Vec::new();
         let mut buf = [0u8; 256];
@@ -843,7 +890,7 @@ mod tests {
         assert_eq!(members(pid).len(), 2, "the shell and sleep");
         let started = Instant::now();
         session.cancel();
-        let status = rx.recv_timeout(GRACE + Duration::from_secs(3)).unwrap();
+        let status = exited(&exit, GRACE + Duration::from_secs(3));
         assert!(started.elapsed() >= GRACE - Duration::from_millis(100));
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -861,14 +908,14 @@ mod tests {
         let _serial = serial();
         let (_home, vars) = home();
         let ptys = Ptys::default();
-        let (_master, session, rx) = open(&ptys, &sh("echo up; exec sleep 1000", &vars), 80, 24);
+        let (_master, session, exit) = open(&ptys, &sh("echo up; exec sleep 1000", &vars), 80, 24);
         std::thread::sleep(Duration::from_millis(200));
         let started = Instant::now();
         let pid = session.pid();
         Session::end_all([session]);
         assert!(started.elapsed() < GRACE, "{:?}", started.elapsed());
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap().signal(),
+            exited(&exit, Duration::from_secs(1)).signal(),
             Some(libc::SIGHUP)
         );
         assert!(reaped(pid));
@@ -879,10 +926,10 @@ mod tests {
         let _serial = serial();
         let (_home, vars) = home();
         let ptys = Ptys::default();
-        let (_master, session, rx) = open(&ptys, &sh("exec sleep 1000", &vars), 80, 24);
+        let (_master, session, exit) = open(&ptys, &sh("exec sleep 1000", &vars), 80, 24);
         let pid = session.pid();
         drop(session);
-        assert!(rx.recv_timeout(GRACE + Duration::from_secs(2)).is_ok());
+        exited(&exit, GRACE + Duration::from_secs(2));
         assert!(reaped(pid));
     }
 
@@ -896,11 +943,11 @@ mod tests {
             open_ones.push(open(&ptys, &sh("exec sleep 1000", &vars), 80, 24));
         }
         assert_eq!(ptys.live(), MAX_SESSIONS);
-        let refused = ptys.open(&sh("exit 0", &vars), 80, 24, |_| {});
+        let refused = ptys.start(&sh("exit 0", &vars), 80, 24);
         assert!(refused.unwrap_err().contains("8 terminal programs"));
-        let (master, session, rx) = open_ones.pop().unwrap();
+        let (master, session, exit) = open_ones.pop().unwrap();
         session.cancel();
-        rx.recv_timeout(GRACE + Duration::from_secs(2)).unwrap();
+        exited(&exit, GRACE + Duration::from_secs(2));
         drop(master);
         assert_eq!(ptys.live(), MAX_SESSIONS - 1);
         open_ones.push(open(&ptys, &sh("exec sleep 1000", &vars), 80, 24));
@@ -919,9 +966,9 @@ mod tests {
         let ptys = Ptys::default();
         let fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
         let before = fds();
-        let mut launch = sh("", &vars);
-        launch.argv = vec!["/nonexistent/program".into()];
-        let err = ptys.open(&launch, 80, 24, |_| {}).unwrap_err();
+        let mut exec = sh("", &vars);
+        exec.argv = vec!["/nonexistent/program".into()];
+        let err = ptys.start(&exec, 80, 24).unwrap_err();
         assert!(err.contains("/nonexistent/program"), "{err}");
         assert_eq!(fds(), before);
         assert_eq!(ptys.live(), 0);
@@ -932,8 +979,40 @@ mod tests {
         let _serial = serial();
         let (_home, vars) = home();
         let ptys = Ptys::default();
-        let (master, _session, _rx) = open(&ptys, &sh("echo bye", &vars), 80, 24);
+        let (master, _session, _exit) = open(&ptys, &sh("echo bye", &vars), 80, 24);
         // read_all panics without end-of-file: no copy of the slave stays open in sig.
         assert!(read_all(&master, Duration::from_secs(10)).contains("bye"));
+    }
+
+    #[test]
+    fn requests_name_their_programs_and_cancelling_one_ends_it() {
+        let _serial = serial();
+        let (_home, vars) = home();
+        let mut ptys = Ptys::new();
+        let (first, second) = (RequestId::next(), RequestId::next());
+        let exec = sh("exec sleep 1000", &vars);
+        let Ok(ServiceReply::Pty(master)) = ptys.open_exec(first, &exec, 80, 24) else {
+            panic!("no terminal");
+        };
+        assert!(
+            ptys.open_exec(first, &exec, 80, 24).is_err(),
+            "one per request"
+        );
+        assert!(ptys.open_exec(second, &exec, 80, 24).is_ok());
+        assert_eq!(ptys.live(), 2);
+        assert!(ptys.cancel(first));
+        assert!(!ptys.cancel(first), "only once");
+        // The program died of SIGHUP: the page reads it from its handle.
+        let deadline = Instant::now() + GRACE + Duration::from_secs(1);
+        while master.exit().get().is_none() {
+            assert!(Instant::now() < deadline, "not ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(master.exit().get(), Some(128 + libc::SIGHUP));
+        let started = Instant::now();
+        ptys.shutdown();
+        assert!(started.elapsed() < GRACE);
+        assert_eq!(ptys.live(), 0);
+        assert!(!ptys.cancel(second), "shutdown ended it");
     }
 }
