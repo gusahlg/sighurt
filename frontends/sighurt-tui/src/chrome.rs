@@ -513,7 +513,11 @@ fn bottom_line(state: &ChromeState, cols: u16) -> (String, Option<u16>, u16) {
     match find {
         Some(find) => {
             let pad = usize::from(left_cols).saturating_sub(left.width());
-            (format!("{left}{} {find}", " ".repeat(pad)), cursor, left_cols)
+            (
+                format!("{left}{} {find}", " ".repeat(pad)),
+                cursor,
+                left_cols,
+            )
         }
         None => (left, cursor, left_cols),
     }

@@ -14,11 +14,11 @@ use sighurt_api::input::{
     PointerEvent, ScrollDelta, TextInputState, TextPurpose,
 };
 use sighurt_api::settings::{Table, Value};
+use sighurt_ui::chrome::CHROME;
 use sighurt_ui::extension::{
     completion_suffix, contained, Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout,
     ChromeSurface, Completion, InputArea, SurfaceName, TextField, Theme,
 };
-use sighurt_ui::chrome::CHROME;
 use sighurt_ui::standard::{self, Standard};
 use sighurt_ui::{Fonts, Pen, Snapshot, TabContent};
 
@@ -710,7 +710,10 @@ fn the_completion_suffix_skips_the_scheme_and_www() {
     let url = "https://www.example.com/a";
     assert_eq!(completion_suffix("exa", url), Some("mple.com/a"));
     assert_eq!(completion_suffix("WWW.Ex", url), Some("ample.com/a"));
-    assert_eq!(completion_suffix("https://www.e", url), Some("xample.com/a"));
+    assert_eq!(
+        completion_suffix("https://www.e", url),
+        Some("xample.com/a")
+    );
     assert_eq!(completion_suffix("http://www.e", url), None);
     assert_eq!(completion_suffix("https://exa", url), None);
     assert_eq!(completion_suffix("ample", url), None);
@@ -726,13 +729,21 @@ fn the_standard_chrome_completes_from_the_visited_pages() {
     chrome.handle(ChromeEvent::Snapshot(three_tabs()));
     chrome.handle(ChromeEvent::WindowFocus(FocusEvent::Activated));
     let actions = chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
-    assert!(!actions.iter().any(|a| matches!(a, ChromeAction::Complete { .. })));
+    assert!(!actions
+        .iter()
+        .any(|a| matches!(a, ChromeAction::Complete { .. })));
     let asked = type_asking(&mut *chrome, "exa");
     let texts: Vec<&str> = asked.iter().map(|(_, text)| text.as_str()).collect();
     assert_eq!(texts, ["e", "ex", "exa"]);
     let plain = paint_surface(&mut *chrome, CHROME, 120);
-    assert!(repaints(&answer(&mut *chrome, asked[1].0, &[URL])).is_empty(), "stale");
-    assert_eq!(repaints(&answer(&mut *chrome, asked[2].0, &[URL])), [CHROME]);
+    assert!(
+        repaints(&answer(&mut *chrome, asked[1].0, &[URL])).is_empty(),
+        "stale"
+    );
+    assert_eq!(
+        repaints(&answer(&mut *chrome, asked[2].0, &[URL])),
+        [CHROME]
+    );
     let shown = paint_surface(&mut *chrome, CHROME, 120);
     assert_ne!(plain.rgba, shown.rgba, "the rest shows after the caret");
     // Answered again with nothing, as after history.clear: it goes.
@@ -769,5 +780,8 @@ fn the_standard_chrome_completes_from_the_visited_pages() {
     chrome.handle(ChromeEvent::Snapshot(other));
     named(&mut *chrome, "End");
     named(&mut *chrome, "Tab");
-    assert_eq!(opened(&named(&mut *chrome, "Enter")), ["https://recept.example/sylt"]);
+    assert_eq!(
+        opened(&named(&mut *chrome, "Enter")),
+        ["https://recept.example/sylt"]
+    );
 }

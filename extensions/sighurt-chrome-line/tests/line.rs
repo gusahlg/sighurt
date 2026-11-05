@@ -20,9 +20,7 @@ use sighurt_api::input::{
 use sighurt_api::settings::{Table, Value};
 use sighurt_chrome_line::{Line, KIND, LINE, PAGE};
 use sighurt_render::{Backend, CpuBackend, Output, PixelBuffer, RenderOutcome, SurfaceKey};
-use sighurt_ui::extension::{
-    Chrome, ChromeAction, ChromeEvent, Completion, SurfaceName, Theme,
-};
+use sighurt_ui::extension::{Chrome, ChromeAction, ChromeEvent, Completion, SurfaceName, Theme};
 use sighurt_ui::{
     Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, Pen, Snapshot, TabContent, TabSnapshot,
 };
@@ -737,18 +735,27 @@ fn typing_completes_from_the_visited_pages() {
     let mut chrome = line(Table::new(), 800, 600);
     chrome.handle(ChromeEvent::Snapshot(five_tabs()));
     let actions = chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
-    assert!(asked(&actions).is_empty(), "the address it focused with is not typed");
+    assert!(
+        asked(&actions).is_empty(),
+        "the address it focused with is not typed"
+    );
     let requests = type_asking(&mut *chrome, "exa");
     let prefixes: Vec<&str> = requests.iter().map(|(_, text)| text.as_str()).collect();
     assert_eq!(prefixes, ["e", "ex", "exa"]);
     let (older, latest) = (requests[1].0, requests[2].0);
     let plain = paint(&mut *chrome, LINE, 180);
-    assert!(repaints(&answer(&mut *chrome, older, &[URL])).is_empty(), "a stale answer");
+    assert!(
+        repaints(&answer(&mut *chrome, older, &[URL])).is_empty(),
+        "a stale answer"
+    );
     // The first address the text starts wins; one it doesn't start is no completion.
     let actions = answer(&mut *chrome, latest, &["https://other.test/", URL]);
     assert_eq!(repaints(&actions), [LINE]);
     let shown = paint(&mut *chrome, LINE, 180);
-    assert!(!differing(&plain, &shown).is_empty(), "the rest shows after the caret");
+    assert!(
+        !differing(&plain, &shown).is_empty(),
+        "the rest shows after the caret"
+    );
     golden("completion-150", &shown);
     // Answered again with nothing (the history forgot it): gone.
     assert_eq!(repaints(&answer(&mut *chrome, latest, &[])), [LINE]);
@@ -757,7 +764,10 @@ fn typing_completes_from_the_visited_pages() {
     // Tab takes it, exactly; Enter opens that address.
     let actions = named(&mut *chrome, "Tab");
     assert_eq!(asked(&actions).len(), 1, "the new text is asked about");
-    assert_eq!(commands(&named(&mut *chrome, "Enter")), [Command::PageOpen(URL.into())]);
+    assert_eq!(
+        commands(&named(&mut *chrome, "Enter")),
+        [Command::PageOpen(URL.into())]
+    );
     chrome.handle(ChromeEvent::Focus(KeyboardFocus::Page));
 
     // The caret off the end: no completion, and Right moves the caret.
@@ -767,7 +777,10 @@ fn typing_completes_from_the_visited_pages() {
     named(&mut *chrome, "ArrowLeft");
     named(&mut *chrome, "ArrowRight");
     named(&mut *chrome, "ArrowLeft");
-    assert!(asked(&named(&mut *chrome, "ArrowRight")).len() == 1, "back at the end: asked");
+    assert!(
+        asked(&named(&mut *chrome, "ArrowRight")).len() == 1,
+        "back at the end: asked"
+    );
     type_text(&mut *chrome, "x");
     assert_eq!(
         commands(&named(&mut *chrome, "Enter")),

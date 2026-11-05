@@ -3943,7 +3943,10 @@ schemes = [\"demo\"]
             app.sync_completion();
         };
         app.tui.focus(KeyboardFocus::Chrome, &mut queue);
-        assert!(!app.sync_completion(), "the address it opened with is not typed");
+        assert!(
+            !app.sync_completion(),
+            "the address it opened with is not typed"
+        );
         for letter in ["e", "x", "a"] {
             key(app, typed(letter), &mut queue);
         }
@@ -3951,7 +3954,11 @@ schemes = [\"demo\"]
         key(app, named("ArrowLeft"), &mut queue);
         assert_eq!(app.tui.ghost_suffix(), None, "the cursor is off the end");
         key(app, named("ArrowRight"), &mut queue);
-        assert_eq!(app.tui.editing.as_ref().unwrap().text(), "exa", "Right only moved");
+        assert_eq!(
+            app.tui.editing.as_ref().unwrap().text(),
+            "exa",
+            "Right only moved"
+        );
         assert_eq!(app.tui.ghost_suffix(), Some("mple.com/page"));
         key(app, named("Tab"), &mut queue);
         assert_eq!(app.tui.editing.as_ref().unwrap().text(), URL);

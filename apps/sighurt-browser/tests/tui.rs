@@ -965,21 +965,35 @@ fn the_address_line_completes_from_the_history() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let history =
-        format!("version = 1\n[[visits]]\nurl = \"{URL}\"\ntitle = \"Example\"\nlast = {now}\ncount = 2\n");
-    let mut term = Terminal::start_seeded("history", &["demo://pattern"], REPLIES, "", Some(&history));
+    let history = format!(
+        "version = 1\n[[visits]]\nurl = \"{URL}\"\ntitle = \"Example\"\nlast = {now}\ncount = 2\n"
+    );
+    let mut term =
+        Terminal::start_seeded("history", &["demo://pattern"], REPLIES, "", Some(&history));
     let shown = term.wait(0, Duration::from_secs(15), |got| {
         image(got, 80, 22, 800, 440)
     });
     assert!(shown, "the page did not show\n{}", term.context());
     let since = term.got.len();
     term.type_bytes(b"o");
-    let editing = term.wait(since, Duration::from_secs(10), |got| has(got, b"demo://pattern"));
-    assert!(editing, "`o` did not open the address line\n{}", term.context());
+    let editing = term.wait(since, Duration::from_secs(10), |got| {
+        has(got, b"demo://pattern")
+    });
+    assert!(
+        editing,
+        "`o` did not open the address line\n{}",
+        term.context()
+    );
     let since = term.got.len();
     term.type_bytes(b"exa");
-    let completed = term.wait(since, Duration::from_secs(10), |got| shows(got, "mple.com/page"));
-    assert!(completed, "no completion after the cursor\n{}", term.context());
+    let completed = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "mple.com/page")
+    });
+    assert!(
+        completed,
+        "no completion after the cursor\n{}",
+        term.context()
+    );
     let since = term.got.len();
     // Tab, then Ctrl+C, as a legacy terminal sends them.
     term.type_bytes(b"\t\x03");
@@ -994,7 +1008,11 @@ fn the_address_line_completes_from_the_history() {
     }
     term.type_bytes(b"q");
     let status = term.exit();
-    assert!(status.success(), "sig exited with {status:?}\n{}", term.context());
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
     term.assert_restored();
     // Only http and https pages are visits; the demo engine's are not, and the file stays.
     assert_eq!(term.counter("visits_recorded"), 0);
