@@ -801,7 +801,8 @@ impl App {
             self.signals.push(libc::SIGHUP as u8);
         }
         self.handle_signals();
-        if std::mem::take(&mut self.config_changed) {
+        // The file changed, or sig://config wrote it: the watch misses a linked target.
+        if std::mem::take(&mut self.config_changed) | self.session.take_config_written() {
             self.reload_config();
         }
         if self
@@ -1908,13 +1909,18 @@ impl App {
                 if config.restore_session() && !self.session.core().config().restore_session() {
                     self.session.session_changed();
                 }
+                // The configuration in use already (sig://config wrote it): the core says
+                // nothing about it again, so what it said when it took it stays shown.
+                let same = config == *self.session.core().config();
                 let settings = *config.tui();
                 self.tui.commands = config.commands().keys().cloned().collect();
                 self.session
                     .queue_mut()
                     .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
-                self.tui.notice_first = None;
-                self.tui.notice = None;
+                if !same {
+                    self.tui.notice_first = None;
+                    self.tui.notice = None;
+                }
                 self.tui.adopt(settings);
             }
             Err(persistence::LoadError::Config(error)) => {
