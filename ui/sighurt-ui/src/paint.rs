@@ -310,6 +310,9 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     }
     let at = (view.x, view.y);
     pen.text(&view.shaped, at, colors.text, clip);
+    if let Some((ghost, x)) = &view.ghost {
+        pen.text(ghost, (*x, view.y), colors.text_muted, clip);
+    }
     // The keymap's indicator, the find field's prompt and the search's state.
     for (text, x) in [&view.indicator, &view.prompt, &view.find]
         .into_iter()

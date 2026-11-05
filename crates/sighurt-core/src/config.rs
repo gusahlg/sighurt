@@ -46,8 +46,8 @@
 //! error, never ignored. `experimental-features` turns on Servo's experimental web-platform
 //! preferences (off by default, which is Servo's own default). `preferences` then sets
 //! individual Servo 0.7 preferences by field name; an unknown name or a value of the wrong
-//! type is an error. `[downloads] directory` and `[session] restore` are the executable's,
-//! checked here.
+//! type is an error. `[downloads] directory`, `[session] restore` and `[history] remember` are
+//! the executable's, checked here.
 //!
 //! Must not own: reading or watching files, which the executable does, or deciding what a
 //! reload means for open pages ([`crate::state`]).
@@ -286,6 +286,7 @@ pub struct Config {
     chrome_settings: BTreeMap<String, Table>,
     downloads: Option<PathBuf>,
     restore_session: bool,
+    remember_history: bool,
     /// `[tui]`. The windowed frontend leaves it unused.
     tui: TuiConfig,
     notices: Vec<String>,
@@ -363,6 +364,8 @@ struct Raw {
     downloads: RawDownloads,
     #[serde(default)]
     session: RawSession,
+    #[serde(default)]
+    history: RawHistory,
     /// `[tui]`, including `[tui.keys]` until that table is split out.
     #[serde(default)]
     tui: toml::Table,
@@ -388,6 +391,12 @@ struct RawDownloads {
 #[serde(deny_unknown_fields)]
 struct RawSession {
     restore: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawHistory {
+    remember: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -667,6 +676,13 @@ impl Config {
         self.restore_session
     }
 
+    /// `[history] remember`: whether `sig` records the http and https pages the user visits, to
+    /// complete addresses from, and saves them. Off, nothing is recorded, what was loaded is
+    /// dropped, and the history file is left as it is (`history.clear` still empties it).
+    pub fn remember_history(&self) -> bool {
+        self.remember_history
+    }
+
     /// `[tui]`: the terminal's settings. The windowed frontend accepts them and does not use
     /// them.
     pub fn tui(&self) -> &TuiConfig {
@@ -776,6 +792,7 @@ fn sections(mut table: toml::Table, problems: &mut Vec<String>) -> Raw {
         chrome: user_tables(&mut table, "chrome", problems),
         downloads: section(&mut table, "downloads", problems).unwrap_or_default(),
         session: section(&mut table, "session", problems).unwrap_or_default(),
+        history: section(&mut table, "history", problems).unwrap_or_default(),
         tui: user_table(&mut table, "tui", problems).unwrap_or_default(),
     };
     for key in table.keys() {
@@ -838,6 +855,9 @@ fn merge(defaults: Raw, user: Raw) -> Raw {
         },
         session: RawSession {
             restore: user.session.restore.or(defaults.session.restore),
+        },
+        history: RawHistory {
+            remember: user.history.remember.or(defaults.history.remember),
         },
         tui: merge_table(defaults.tui, user.tui),
     }
@@ -1133,6 +1153,7 @@ fn validate(
         chrome_settings,
         downloads,
         restore_session: raw.session.restore.unwrap_or(true),
+        remember_history: raw.history.remember.unwrap_or(true),
         tui,
         notices,
     };
@@ -2924,6 +2945,22 @@ mod tests {
         assert_problem(
             "version = 1\n[session]\nsave = false",
             "[session]: unknown field `save`",
+        );
+    }
+
+    #[test]
+    fn history_is_remembered_unless_the_file_says_not() {
+        assert!(Config::default().remember_history());
+        assert!(parse("version = 1\n[history]").unwrap().remember_history());
+        let config = parse("version = 1\n[history]\nremember = false").unwrap();
+        assert!(!config.remember_history());
+        assert_problem(
+            "version = 1\n[history]\nremember = 0",
+            "[history]: invalid type",
+        );
+        assert_problem(
+            "version = 1\n[history]\nmax = 10",
+            "[history]: unknown field `max`",
         );
     }
 

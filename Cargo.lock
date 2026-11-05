@@ -10651,6 +10651,7 @@ dependencies = [
  "sighurt-engine-wasm",
  "sighurt-engine-wpe",
  "tempfile",
+ "toml 1.1.6+spec-1.1.0",
  "url",
 ]
 

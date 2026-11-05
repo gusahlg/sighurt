@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use sighurt_api::commands::Command;
 use sighurt_api::events::Cursor;
 use sighurt_api::geometry::{LogicalSize, Metrics, Scale, SurfacePoint, WindowRect};
-use sighurt_api::ids::{LayoutEpoch, TabId};
+use sighurt_api::ids::{LayoutEpoch, RequestId, TabId};
 use sighurt_api::input::{
     ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerButton,
     PointerEvent,
@@ -20,7 +20,7 @@ use sighurt_api::input::{
 use sighurt_api::settings::{Table, Value};
 use sighurt_chrome_line::{Line, KIND, LINE, PAGE};
 use sighurt_render::{Backend, CpuBackend, Output, PixelBuffer, RenderOutcome, SurfaceKey};
-use sighurt_ui::extension::{Chrome, ChromeAction, ChromeEvent, SurfaceName, Theme};
+use sighurt_ui::extension::{Chrome, ChromeAction, ChromeEvent, Completion, SurfaceName, Theme};
 use sighurt_ui::{
     Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, Pen, Snapshot, TabContent, TabSnapshot,
 };
@@ -696,6 +696,119 @@ fn golden_images() {
     chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
     type_text(&mut *chrome, "https://exempel.se/sök?q=blåbär och lingon");
     golden("engine-typing-150", &paint(&mut *chrome, LINE, 180));
+}
+
+/// The completions `actions` ask for, as (request, text).
+fn asked(actions: &[ChromeAction]) -> Vec<(RequestId, String)> {
+    let ask = |action: &ChromeAction| match action {
+        ChromeAction::Complete { request, prefix } => Some((*request, prefix.clone())),
+        _ => None,
+    };
+    actions.iter().filter_map(ask).collect()
+}
+
+/// Types `text` a character at a time, and returns the completions each key asked for.
+fn type_asking(chrome: &mut dyn Chrome, text: &str) -> Vec<(RequestId, String)> {
+    let mut all = Vec::new();
+    for c in text.chars() {
+        let c = c.to_string();
+        let event = key(Key::Character(c.clone()), Some(&c), Modifiers::default());
+        all.extend(asked(&chrome.handle(ChromeEvent::Key(event))));
+    }
+    all
+}
+
+fn answer(chrome: &mut dyn Chrome, request: RequestId, urls: &[&str]) -> Vec<ChromeAction> {
+    let matches = urls
+        .iter()
+        .map(|url| Completion::new((*url).into(), "A page".into()))
+        .collect();
+    chrome.handle(ChromeEvent::Completions { request, matches })
+}
+
+/// Typing an address asks what the visited pages complete it to; only the latest answer, for
+/// the text still typed, shows after the caret; Right or Tab takes that exact address; anything
+/// that changes the line, moves the caret off its end, or takes its tab or keyboard drops it.
+#[test]
+fn typing_completes_from_the_visited_pages() {
+    const URL: &str = "https://www.example.com/page";
+    let mut chrome = line(Table::new(), 800, 600);
+    chrome.handle(ChromeEvent::Snapshot(five_tabs()));
+    let actions = chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    assert!(
+        asked(&actions).is_empty(),
+        "the address it focused with is not typed"
+    );
+    let requests = type_asking(&mut *chrome, "exa");
+    let prefixes: Vec<&str> = requests.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(prefixes, ["e", "ex", "exa"]);
+    let (older, latest) = (requests[1].0, requests[2].0);
+    let plain = paint(&mut *chrome, LINE, 180);
+    assert!(
+        repaints(&answer(&mut *chrome, older, &[URL])).is_empty(),
+        "a stale answer"
+    );
+    // The first address the text starts wins; one it doesn't start is no completion.
+    let actions = answer(&mut *chrome, latest, &["https://other.test/", URL]);
+    assert_eq!(repaints(&actions), [LINE]);
+    let shown = paint(&mut *chrome, LINE, 180);
+    assert!(
+        !differing(&plain, &shown).is_empty(),
+        "the rest shows after the caret"
+    );
+    golden("completion-150", &shown);
+    // Answered again with nothing (the history forgot it): gone.
+    assert_eq!(repaints(&answer(&mut *chrome, latest, &[])), [LINE]);
+    assert!(differing(&plain, &paint(&mut *chrome, LINE, 180)).is_empty());
+    answer(&mut *chrome, latest, &[URL]);
+    // Tab takes it, exactly; Enter opens that address.
+    let actions = named(&mut *chrome, "Tab");
+    assert_eq!(asked(&actions).len(), 1, "the new text is asked about");
+    assert_eq!(
+        commands(&named(&mut *chrome, "Enter")),
+        [Command::PageOpen(URL.into())]
+    );
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Page));
+
+    // The caret off the end: no completion, and Right moves the caret.
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    let (request, _) = type_asking(&mut *chrome, "www.e").pop().unwrap();
+    answer(&mut *chrome, request, &[URL]);
+    named(&mut *chrome, "ArrowLeft");
+    named(&mut *chrome, "ArrowRight");
+    named(&mut *chrome, "ArrowLeft");
+    assert!(
+        asked(&named(&mut *chrome, "ArrowRight")).len() == 1,
+        "back at the end: asked"
+    );
+    type_text(&mut *chrome, "x");
+    assert_eq!(
+        commands(&named(&mut *chrome, "Enter")),
+        [Command::PageOpen("www.ex".into())]
+    );
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Page));
+
+    // A command line asks nothing.
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    assert!(type_asking(&mut *chrome, ":tab.n").is_empty());
+    named(&mut *chrome, "Escape");
+
+    // An answer after the line lost the keyboard, or its tab, shows nothing.
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    let (request, _) = type_asking(&mut *chrome, "exa").pop().unwrap();
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Page));
+    assert!(repaints(&answer(&mut *chrome, request, &[URL])).is_empty());
+    chrome.handle(ChromeEvent::Focus(KeyboardFocus::Chrome));
+    let (request, _) = type_asking(&mut *chrome, "exa").pop().unwrap();
+    answer(&mut *chrome, request, &[URL]);
+    let mut other = five_tabs();
+    other.tabs[1].active = false;
+    other.tabs[0].active = true;
+    chrome.handle(ChromeEvent::Snapshot(other));
+    named(&mut *chrome, "End");
+    let actions = named(&mut *chrome, "Tab");
+    assert!(repaints(&actions).is_empty(), "nothing to take");
+    assert!(!commands(&named(&mut *chrome, "Enter")).contains(&Command::PageOpen(URL.into())));
 }
 
 /// The pixels where `a` and `b` differ.

@@ -225,6 +225,9 @@ pub struct View {
     pub(crate) answers: Vec<(Permission, bool)>,
     /// Its search, if one is under way. Dropped with the document.
     pub(crate) find: Option<Find>,
+    /// The visit `document`'s commit recorded, and that document: what a title it reports
+    /// next names (`state`'s "Visited pages").
+    pub(crate) visit: Option<(String, DocumentGeneration)>,
 }
 
 impl View {
@@ -254,6 +257,7 @@ impl View {
             chosen: false,
             answers: Vec::new(),
             find: None,
+            visit: None,
         }
     }
 

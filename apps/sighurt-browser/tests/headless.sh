@@ -33,6 +33,11 @@
 #               latter in the status strip over the home page); an engine setting
 #               the demo engine can't honor refused; [session] restore off (the saved tabs are
 #               not restored and the file is left as it is) and on again while sig runs
+#   history     completing addresses from a seeded history file (the demo engine's pages are
+#               not http(s), so they are never recorded): typing a prefix shows the rest of a
+#               visited address (screenshots compared), Tab makes the line that exact address
+#               (pixel for pixel what typing it whole gives), Enter opens it; history.clear
+#               takes the completion away at once and empties the file
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
 #               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
@@ -51,7 +56,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings renderers)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history renderers)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (with other features); this link keeps the binary these
   # runs use. It is made under the same hold of the machine's lock as the build, so no other
@@ -638,6 +643,77 @@ settings)
   sess "turning restore on saves the tabs at once" 5 "len(s['tabs'])==2, len(s['tabs'])"
   kill -TERM "$sig_pid"
   wait "$sig_pid"
+  ;;
+
+history)
+  url=https://www.example.com/page
+  history=$out/state/sighurt/history.toml
+  mkdir -p "$out/state/sighurt"
+  now=$(date +%s)
+  printf 'version = 1\n[[visits]]\nurl = "%s"\ntitle = "Example"\nlast = %s\ncount = 3\n[[visits]]\nurl = "https://example.org/older"\ntitle = "Older"\nlast = %s\ncount = 1\n' \
+    "$url" "$now" "$((now - 60))" > "$history"
+  printf '"ctrl-h" = "history.clear"\n' >> "$out/config/sighurt/config.toml"
+  # band NAME: a screenshot of the toolbar's band (rows 36 to 90, where the address line is).
+  band() { sleep 0.4; grim -t ppm "$out/$1.ppm"; step "screenshot $1"; }
+  # same A B: 0 if the address band of screenshots A and B is the same, then how many differ.
+  same() {
+    python3 - "$out/$1.ppm" "$out/$2.ppm" <<'PY'
+import re, sys
+def load(path):
+    data = open(path, 'rb').read()
+    m = re.match(rb'P6\s+(\d+)\s+(\d+)\s+\d+\s', data)
+    return int(m[1]), data[m.end():]
+(w, a), (_, b) = load(sys.argv[1]), load(sys.argv[2])
+rows = range(36, 90)
+differing = sum(1 for y in rows for x in range(w) if a[3 * (y * w + x):3 * (y * w + x) + 3] != b[3 * (y * w + x):3 * (y * w + x) + 3])
+print(0 if differing == 0 else 1, f'{differing} pixels differ in the address band')
+PY
+  }
+  start_sig demo://pattern
+  step "type exa: the rest of $url shows after the caret"
+  key -M ctrl l -m ctrl
+  key exa
+  band 01-completion
+  key -k Escape
+  key -M ctrl l -m ctrl
+  key exa
+  key -k Left
+  key -k Right
+  band 02-completion-again
+  r=$(same 01-completion 02-completion-again); check "the completion comes back with the caret at the end" "${r%% *}" "${r#* }"
+  step "Tab: the line is $url, as typing it whole shows it"
+  key -k Tab
+  band 03-taken
+  key -k Escape
+  key -M ctrl l -m ctrl
+  key "$url"
+  band 04-typed
+  r=$(same 03-taken 04-typed); check "Tab makes the line the exact address" "${r%% *}" "${r#* }"
+  step "Enter on the taken address opens it (the demo engine can't, so the tab says so)"
+  key -k Escape
+  key -M ctrl l -m ctrl
+  key exa
+  key -k Tab
+  key -k Return
+  sleep 0.5
+  check "Enter opens the address taken: the tab's error is the demo engine's" \
+    "$(diag "0 if d['status']=='error' else 1")" "$(diag "d['status']")"
+  check "nothing was recorded (only http and https pages are)" "$(diag "0 if c['visits_recorded']==0 else 1")" \
+    "visits_recorded $(diag "c['visits_recorded']")"
+  step "ctrl-h (history.clear) while a completion shows: it goes at once, and so does the file's"
+  key -M ctrl l -m ctrl
+  key exa
+  band 06-before-clear
+  key -M ctrl h -m ctrl
+  band 07-cleared
+  r=$(same 06-before-clear 07-cleared); check "history.clear takes the completion away" "$([[ ${r%% *} == 1 ]]; echo $?)" "${r#* }"
+  key -k Escape
+  check "and empties the file at once" "$(grep -q 'example' "$history"; [[ $? == 1 ]]; echo $?)" "$(wc -c < "$history") bytes"
+  check "which stays private" "$([[ $(stat -c %a "$history") == 600 ]]; echo $?)" "mode $(stat -c %a "$history")"
+  key -M ctrl q -m ctrl
+  wait "$sig_pid"; code=$?
+  check "ctrl-q exits cleanly" "$code" "exit code $code"
+  check "a history save was counted" "$(python3 -c "import json; print(0 if json.load(open('$out/diag.json'))['counters']['history_saves']>=1 else 1)")" "history_saves"
   ;;
 
 renderers)

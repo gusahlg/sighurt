@@ -385,8 +385,14 @@ An engine that needs another setting adds it to this vocabulary, and the other e
 it unsupported. There are no engine-specific escape hatches. `javascript` is left out (§1.10).
 
 **Privacy** is these settings combined: `storage = "ephemeral"` for each engine, plus
-`[session] restore = false`, which stops `sig` from reading or writing the session file.
-Downloads still land in the download folder.
+`[session] restore = false`, which stops `sig` from reading or writing the session file, plus
+`[history] remember = false`, which stops it recording visited pages (and drops what it read)
+and leaves `history.toml` as it is; `history.clear` empties that file, also with `remember`
+off. The three are separate scopes: an engine's storage (cookies, site data, caches), the saved
+tabs (`session.toml`), and the visited pages the address line completes from (`history.toml`,
+at most 5 000, none older than 90 days). The reopen list of closed tabs is in memory only.
+Kept-aside `*.broken-<seconds>` copies of a file `sig` could not read are not touched by any of
+them. Downloads still land in the download folder.
 
 ## 1.6 Search keywords
 
@@ -931,6 +937,8 @@ pub enum ChromeEvent {
     Pasted { request: RequestId, text: String },
     /// `chrome.<action>` ran; `action` is one of the kind's `commands`.
     Command(String),
+    /// What the visited pages complete `ChromeAction::Complete`'s text to (decision 129).
+    Completions { request: RequestId, matches: Vec<Completion> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -944,7 +952,12 @@ pub enum ChromeAction {
     TextInput(Option<TextField>),   // the chrome's text field, for the input method
     Cursor(Cursor),
     Repaint(SurfaceName),           // it shows something new
+    Complete { request: RequestId, prefix: String },   // what does the line's text complete to?
 }
+
+/// A visited address: `url` exact (printable ASCII, at most 32 KiB), `title` contained (200).
+#[non_exhaustive]
+pub struct Completion { pub url: String, pub title: String }
 
 /// The text field the chrome edits, for the input method. The caret is in `surface`'s
 /// coordinates.
@@ -1081,6 +1094,22 @@ system, so a chrome no longer loads fonts itself.
   forget them. The URL's is the address editor's cap (text_edit.rs:26); the indicator's and the
   path's are new. A chrome draws page text only where page text belongs, and never shows a title
   as the address (plan §17).
+- **Completion is a query, never a snapshot field** (decision 129). A chrome asks with
+  `ChromeAction::Complete { request, prefix }` what the visited pages complete its line's text
+  to, and `sig` answers in the same pass, from the history in memory, with
+  `ChromeEvent::Completions { request, matches }`: at most 8 addresses the text starts
+  (`completion_suffix`: after an optional `https://` or `http://` and `www.`, ASCII case
+  ignored), the most recently visited first. `sig` answers the latest request again, perhaps
+  with nothing, when the history forgets or drops visits (`history.clear`, `site.forget`,
+  `[history] remember = false`), so a completion shown can't outlive them. An answer counts only
+  for the latest request and the text it asked about. A completion's `url` is put in the line
+  as it is, never contained or decoded, since that would change where it goes.
+  `InlineCompletion` does all of this for a line edited with a `TextEditor`: it asks while the
+  line has the keyboard, holds typed text (not the address it was focused with) with the caret
+  at its end, nothing selected and no composition, and is neither a `:command` nor the find
+  field; `ghost` is the rest of the address to draw after the caret (both chromes draw it in
+  `text_muted`); `accept` (Right or Tab) replaces the line with the exact address; any change
+  of those conditions, or another tab (`clear`), drops it.
 - **A chrome must show `status` whenever it is `Some`:** visibly, not under page content, cut to
   fit if it must. `status` carries `sig`'s own notices (configuration errors, downloads, refused
   prompts; plan §17, decisions 46 and 47), which the user must be able to see.
@@ -1879,3 +1908,17 @@ finding was checked against the plan and the code before it was acted on.
   chrome's `find-150`, `find-closed-100`). The example configuration binds `n` and `N` to
   `page.find-next` and `page.find-previous`. The demo engine finds in its own content tree's
   text (`find_in_page: true`).
+- **History and completion** (5 November 2026, STATUS decision 129). The chrome API gains
+  `ChromeAction::Complete { request, prefix }`, `ChromeEvent::Completions { request, matches }`,
+  `Completion { url, title }` (`non_exhaustive`, made with `Completion::new`),
+  `completion_suffix`, `InlineCompletion` and the bounds `MAX_COMPLETIONS` (8),
+  `MAX_COMPLETION_URL` (32 KiB) and `MAX_COMPLETION_TITLE` (200 characters).
+  `ChromeAction` is not `non_exhaustive`, so a frontend that matches it adds the arm.
+  `ChromeState::completion` is the standard chrome's. Both chromes draw a completion after the
+  caret in `text_muted`; without one nothing changes, and every golden image is unchanged
+  (new: `completion-150` in each). The core gains `Effect::Visited { url, title, commit }`,
+  `Effect::ForgetVisits { request, host }`, `BrowserEvent::VisitsForgotten { request, outcome }`
+  and `ForgetOutcome` (`Done`, `HereOnly`, `NotWritten`), and `[history] remember`; the runtime
+  `history` (`History`, `history::Completion`, `history::suffix`), `Session::complete`,
+  `Session::history_generation`, and `Session::writes_due`/`write_due` in place of the loops'
+  `session_due`/`save_session`.

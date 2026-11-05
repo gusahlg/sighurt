@@ -54,6 +54,13 @@
 //!   `:commands` run as `chrome.<action>`; `sig` hands each to the chrome as
 //!   [`ChromeEvent::Command`]. They take no argument and carry no identity: like keys, they act
 //!   on the chrome as it is.
+//! - **Completion is a query, never a snapshot field:** a chrome asks with
+//!   [`ChromeAction::Complete`] what the visited pages complete its line's text to, and `sig`
+//!   answers at once, from memory, with [`ChromeEvent::Completions`] for that request; it answers
+//!   the latest request again, perhaps with nothing, when visited pages are forgotten or
+//!   `[history] remember` turns off. A chrome shows only an answer to its latest request for the
+//!   text it still has. [`InlineCompletion`] does all of that for a line edited with a
+//!   [`TextEditor`]: the rest of the address after the caret ("ghost text"), accepted whole.
 //!
 //! Chromes are trusted code compiled into `sig`. The API keeps correct code correct; like the
 //! in-process engines, it is not a sandbox. There is no stability promise yet: see
@@ -80,6 +87,7 @@ use sighurt_render::Pen;
 use crate::chrome::Colors;
 use crate::state::Snapshot;
 use crate::text::{Fonts, DEFAULT_FONT_SIZE};
+use crate::text_edit::TextEditor;
 
 /// A chrome's own name for one of its surfaces ("chrome", "page").
 pub type SurfaceName = &'static str;
@@ -158,6 +166,16 @@ pub enum ChromeEvent {
     },
     /// `chrome.<action>` ran: `action` is one of the kind's [`ChromeKind::commands`].
     Command(String),
+    /// What the visited pages complete the text of [`ChromeAction::Complete`] with `request`
+    /// to: at most [`MAX_COMPLETIONS`], the most recently visited first, each an address that
+    /// text starts ([`completion_suffix`]). Comes right after the request, and again for the
+    /// latest request when visited pages were forgotten or `[history] remember` turned off.
+    Completions {
+        /// The request.
+        request: RequestId,
+        /// The addresses, possibly none.
+        matches: Vec<Completion>,
+    },
 }
 
 /// What a chrome asks the executable to do.
@@ -183,6 +201,170 @@ pub enum ChromeAction {
     Cursor(Cursor),
     /// This surface shows something new: draw it again.
     Repaint(SurfaceName),
+    /// Ask what the visited pages complete `prefix`, the line's text, to; the answer is
+    /// [`ChromeEvent::Completions`] with `request`, which the chrome made with
+    /// `RequestId::next`. A newer request makes older ones stale.
+    Complete {
+        /// The request.
+        request: RequestId,
+        /// The line's text.
+        prefix: String,
+    },
+}
+
+/// The most completions [`ChromeEvent::Completions`] carries.
+pub const MAX_COMPLETIONS: usize = 8;
+/// The longest address a [`Completion`] carries, in bytes: what a [`TextEditor`] holds.
+pub const MAX_COMPLETION_URL: usize = crate::text_edit::MAX_TEXT;
+/// The most characters of a [`Completion`]'s title.
+pub const MAX_COMPLETION_TITLE: usize = 200;
+
+/// A visited address the line's text completes to.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Completion {
+    /// The exact address, to put in the line as it is when the user accepts it: printable
+    /// ASCII, at most [`MAX_COMPLETION_URL`] bytes. Not page text to contain: changing it would
+    /// change where it goes.
+    pub url: String,
+    /// Its page's title as last seen, [`contained`], at most [`MAX_COMPLETION_TITLE`]
+    /// characters; empty when it had none.
+    pub title: String,
+}
+
+impl Completion {
+    /// A completion to `url`, titled `title`.
+    pub fn new(url: String, title: String) -> Self {
+        Self { url, title }
+    }
+}
+
+/// What `typed` completes `url` with: the rest of `url` after it, when `typed` starts `url`,
+/// or `url` without its `https://` or `http://`, or without that and `www.`, ignoring ASCII
+/// case. `None` when it starts none of them, so a typed scheme must be `url`'s. The rule
+/// `sig`'s history matches by.
+pub fn completion_suffix<'a>(typed: &str, url: &'a str) -> Option<&'a str> {
+    let schemeless = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    let hostname = schemeless.and_then(|rest| rest.strip_prefix("www."));
+    [Some(url), schemeless, hostname]
+        .into_iter()
+        .flatten()
+        .find_map(|form| {
+            let head = form.get(..typed.len())?;
+            head.eq_ignore_ascii_case(typed)
+                .then(|| &form[typed.len()..])
+        })
+}
+
+/// Inline completion for an address line a [`TextEditor`] edits: after each change the chrome
+/// calls [`InlineCompletion::update`], which asks for completions while the line could take
+/// one, and hands it the answers ([`InlineCompletion::answer`]); [`InlineCompletion::ghost`] is
+/// the rest of the address to draw after the caret, and [`InlineCompletion::accept`] (Right or
+/// Tab at the end of the line) replaces the line with that exact address.
+///
+/// The line can take a completion while it has the keyboard, holds text the user typed (not
+/// the address it was focused with), has the caret at its end with nothing selected and no
+/// input-method composition, and is not a `:command`. Anything else drops the completion and
+/// the request waiting, and so does a changed text, which asks again; the chrome calls
+/// [`InlineCompletion::clear`] when the line changes tabs. An answer counts only for the latest
+/// request and the text it asked about.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InlineCompletion {
+    /// The latest request, and the text it asked about.
+    asked: Option<(RequestId, String)>,
+    /// The address its answer completes that text to.
+    candidate: Option<String>,
+}
+
+impl InlineCompletion {
+    /// Follows a change of `editor`, or of whether the line has the keyboard (`focused`):
+    /// drops what no longer applies, and returns the request to make when the line's text has
+    /// none yet.
+    pub fn update(&mut self, editor: &TextEditor, focused: bool) -> Option<ChromeAction> {
+        let text = editor.text();
+        if !(focused && Self::takes(editor)) {
+            self.clear();
+            return None;
+        }
+        if self.asked.as_ref().is_some_and(|(_, asked)| asked == text) {
+            return None;
+        }
+        self.candidate = None;
+        let request = RequestId::next();
+        self.asked = Some((request, text.to_owned()));
+        Some(ChromeAction::Complete {
+            request,
+            prefix: text.to_owned(),
+        })
+    }
+
+    /// The answer to `request`: the first match the line's text completes becomes the
+    /// completion, if `request` is the latest and `editor` still has its text. Returns whether
+    /// the completion changed.
+    pub fn answer(
+        &mut self,
+        request: RequestId,
+        matches: &[Completion],
+        editor: &TextEditor,
+    ) -> bool {
+        let Some((latest, text)) = &self.asked else {
+            return false;
+        };
+        if *latest != request || text != editor.text() {
+            return false;
+        }
+        let candidate = matches
+            .iter()
+            .filter(|m| m.url.len() <= MAX_COMPLETION_URL)
+            .find(|m| completion_suffix(text, &m.url).is_some_and(|rest| !rest.is_empty()))
+            .map(|m| m.url.clone());
+        let changed = candidate != self.candidate;
+        self.candidate = candidate;
+        changed
+    }
+
+    /// The rest of the completed address, to draw after the caret, while `editor` is as it
+    /// was asked about.
+    pub fn ghost(&self, editor: &TextEditor) -> Option<&str> {
+        let (_, text) = self.asked.as_ref()?;
+        let url = self.candidate.as_deref()?;
+        if text != editor.text() || !Self::takes(editor) {
+            return None;
+        }
+        completion_suffix(text, url).filter(|rest| !rest.is_empty())
+    }
+
+    /// Replaces the line with the completed address, exactly, the caret at its end, if there
+    /// is a completion to show. Returns whether it did.
+    pub fn accept(&mut self, editor: &mut TextEditor) -> bool {
+        if self.ghost(editor).is_none() {
+            return false;
+        }
+        let url = self.candidate.take().expect("shown above");
+        editor.select_all();
+        editor.insert(&url);
+        self.asked = None;
+        true
+    }
+
+    /// Drops the completion and the request waiting. Returns whether there was a completion.
+    pub fn clear(&mut self) -> bool {
+        self.asked = None;
+        self.candidate.take().is_some()
+    }
+
+    /// Whether `editor` could take a completion (see the type's documentation), focus aside.
+    fn takes(editor: &TextEditor) -> bool {
+        let text = editor.text();
+        editor.is_modified()
+            && editor.preedit().is_none()
+            && editor.selection().is_empty()
+            && editor.cursor() == text.len()
+            && !text.is_empty()
+            && !text.trim_start().starts_with(':')
+    }
 }
 
 /// The text field a chrome edits, for the input method. The caret is in `surface`'s

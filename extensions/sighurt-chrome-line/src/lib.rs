@@ -20,8 +20,10 @@
 //! Enter gives the page the keyboard keeping the search, Escape does so and runs
 //! `page.find-stop`; the core moving the keyboard, or another tab, closes it and keeps the
 //! search. What the search found ("3 of 12") shows before the status while the field is open,
-//! and while the line is not being edited. There are no buttons, no tab strip
-//! and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
+//! and while the line is not being edited. Typing an address (not in the find field) completes it
+//! from the visited pages, as the standard chrome does ([`InlineCompletion`]): the rest shows
+//! after the caret, muted, and Right or Tab at the end takes it. There are no buttons, no tab
+//! strip and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
 //! shows no engine's page (`sig://home`, an error), a few lines of text say what there is.
 //!
 //! Its surfaces, bottom to top: [`PAGE`] while it draws the page area, and [`LINE`]. It repaints
@@ -46,7 +48,7 @@ use sighurt_api::input::{
 use sighurt_api::settings::{Table, Value};
 use sighurt_ui::extension::{
     contained, readable_url, Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout,
-    ChromeSurface, SurfaceName, TextField, Theme,
+    ChromeSurface, InlineCompletion, SurfaceName, TextField, Theme,
 };
 use sighurt_ui::state::{is_home, NO_SUCH_PAGE};
 use sighurt_ui::text_edit::TextEditor;
@@ -121,6 +123,9 @@ pub struct Line {
     /// The clipboard read the line waits for: the latest Ctrl+V's, while it has the keyboard
     /// and its tab.
     paste: Option<RequestId>,
+    /// The visited address what is typed completes to, while the line has the keyboard and
+    /// its tab.
+    completion: InlineCompletion,
     /// While the line is the find field: the text it last searched for, empty when it ended
     /// the search.
     find: Option<String>,
@@ -149,6 +154,8 @@ struct View {
     caret: Option<f32>,
     selection: Option<(f32, f32)>,
     preedit: Option<(f32, f32)>,
+    /// The rest of a completed address after the text, and where it starts.
+    ghost: Option<(Rc<ShapedText>, f32)>,
     /// The loading mark's left edge, while the page loads.
     mark: Option<f32>,
     /// The status text, where it starts, and whether it says what went wrong.
@@ -178,6 +185,7 @@ impl Line {
             window_active: false,
             error: None,
             paste: None,
+            completion: InlineCompletion::default(),
             find: None,
             text_input: None,
             cursor: Cursor::Default,
@@ -242,9 +250,10 @@ impl Line {
         self.page_changed |= in_page(&old) != in_page(&self.snapshot);
         let active = |snapshot: &Snapshot| snapshot.active().map(|tab| tab.id);
         if active(&old) != active(&self.snapshot) {
-            // Another tab: what was typed for the last one goes, with its paste, and the find
-            // field closes.
+            // Another tab: what was typed for the last one goes, with its paste and completion,
+            // and the find field closes.
             self.paste = None;
+            self.line_changed |= self.completion.clear();
             self.find = None;
             if self.focused {
                 self.editor.set_text(&self.address());
@@ -409,6 +418,11 @@ impl Line {
         // Control and Alt as modifiers, not as keys the layout used to make a character.
         let control = event.modifiers.control && !event.consumed.control;
         let alt = event.modifiers.alt && !event.consumed.alt;
+        // Right or Tab at the end of the line takes the completion shown.
+        let takes = matches!(&event.key, Key::Named(name) if name == "ArrowRight" || name == "Tab");
+        if takes && !(select || control || alt) && self.completion.accept(&mut self.editor) {
+            return actions;
+        }
         let editor = &mut self.editor;
         match &event.key {
             Key::Named(name) => match name.as_str() {
@@ -565,7 +579,7 @@ impl Line {
         let field = (start, end.max(start));
         let mark = loading.then_some(field.1);
 
-        let (text, text_x, caret, selection, preedit) = if self.focused {
+        let (text, text_x, caret, selection, preedit, ghost) = if self.focused {
             let display = self.editor.display();
             let text = self.fonts.line(&display.text, style);
             let x = field.0 - self.editor.scroll();
@@ -576,11 +590,13 @@ impl Line {
             let caret = display.caret.map(|offset| x + text.x_at(offset));
             let selection = (!display.selection.is_empty()).then(|| span(&display.selection));
             let preedit = display.preedit.as_ref().map(span);
-            (text, x, caret, selection, preedit)
+            let ghost = self.completion.ghost(&self.editor);
+            let ghost = ghost.map(|rest| (self.fonts.line(rest, style), x + text.width));
+            (text, x, caret, selection, preedit, ghost)
         } else {
             let address = self.address();
             let text = self.fonts.fitted(&address, style, field.1 - field.0);
-            (text, field.0, None, None, None)
+            (text, field.0, None, None, None, None)
         };
         View {
             top,
@@ -591,6 +607,7 @@ impl Line {
             caret,
             selection,
             preedit,
+            ghost,
             mark,
             status,
             find: find.map(|(x, shaped)| (shaped, x)),
@@ -598,7 +615,8 @@ impl Line {
         }
     }
 
-    /// Keeps the caret in view and reports what the executable needs to know.
+    /// Keeps the caret in view, asks for completions of what was typed, and reports what the
+    /// executable needs to know.
     fn finish(&mut self, mut actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
         // The find field searches as it is edited.
         if let Some(searched) = &mut self.find {
@@ -611,6 +629,9 @@ impl Line {
                 }));
             }
         }
+        // An address typed completes; a command line or the find field never does.
+        let completes = self.focused && self.find.is_none();
+        actions.extend(self.completion.update(&self.editor, completes));
         let before = self.editor.scroll();
         if self.focused {
             let view = self.view();
@@ -704,6 +725,9 @@ impl Line {
         }
         let at = (view.text_x, view.top);
         pen.text(&view.text, at, colors.text, field);
+        if let Some((ghost, x)) = &view.ghost {
+            pen.text(ghost, (*x, view.top), colors.text_muted, field);
+        }
         if let Some(preedit) = view.preedit.and_then(clipped) {
             let underline = view.top + text_height - self.scaled(2.0);
             pen.fill([preedit[0], underline, preedit[2], 1.0], colors.text);
@@ -954,6 +978,10 @@ impl Chrome for Line {
             ChromeEvent::Pasted { request, text } if self.paste == Some(request) => {
                 self.paste = None;
                 self.editor.paste(&text);
+                Vec::new()
+            }
+            ChromeEvent::Completions { request, matches } => {
+                self.line_changed |= self.completion.answer(request, &matches, &self.editor);
                 Vec::new()
             }
             // Keys and text for a line without the keyboard, a late paste, and commands,

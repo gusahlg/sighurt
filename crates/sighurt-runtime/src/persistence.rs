@@ -1,11 +1,13 @@
 //! Files: reading and watching the configuration (`{config_dir}/sighurt/config.toml`), and
-//! loading and saving the session (`{state_dir}/sighurt/session.toml`).
+//! loading and saving the session (`{state_dir}/sighurt/session.toml`). The history of visited
+//! pages beside it (`history.toml`) is [`crate::history`]'s, written with this module's
+//! atomic writes under the session's lock.
 //!
 //! Sighurt's own directories (`{data_dir}/sighurt`, the engines' profiles under it, and
 //! `{state_dir}/sighurt`) are mode 0700. An existing directory that is wider is tightened to
 //! 0700; a profile is created only by an engine that keeps one; shared XDG parents are not
 //! changed. Files this module writes, including
-//! `session.toml`, are mode 0600.
+//! `session.toml` and `history.toml`, are mode 0600.
 //!
 //! The core parses and validates the configuration, against what the build has (its engines,
 //! keymaps and chromes, and the chrome's color names: `sighurt_core::Environment`). A file with
@@ -25,7 +27,9 @@
 //! and a session that can't be written at all says so when `sig` starts ([`session_writer`]).
 //! Only one `sig` writes a session
 //! file: the writer holds an advisory lock (`session.lock` beside it) until its last write, and
-//! the OS releases it if `sig` dies. Another `sig` still restores the session, says once that it
+//! the OS releases it if `sig` dies. The history's writer shares that lock
+//! ([`SessionWriter::lock`]): one open lock file, held until both writers have finished, so
+//! the `sig` that owns the session owns the history too. Another `sig` still restores the session, says once that it
 //! won't save it, and never writes it. The owner removes temporary files a crash left behind. A
 //! session file that can't be read is kept aside as `session.toml.broken-<seconds>` before
 //! anything is saved over it.
@@ -293,9 +297,9 @@ pub fn load_session(path: &Path) -> Result<Option<Session>, String> {
     }
 }
 
-/// Renames the session file at `path` to `<path>.broken-<seconds since 1970>`, never over
-/// another file, and returns the new path.
-fn keep_aside(path: &Path) -> io::Result<PathBuf> {
+/// Renames the session or history file at `path` to `<path>.broken-<seconds since 1970>`,
+/// never over another file, and returns the new path.
+pub(crate) fn keep_aside(path: &Path) -> io::Result<PathBuf> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
@@ -312,7 +316,22 @@ fn keep_aside(path: &Path) -> io::Result<PathBuf> {
             return Ok(kept);
         }
     }
-    Err(io::Error::other("too many kept session files"))
+    Err(io::Error::other("too many kept files"))
+}
+
+/// Whether another `sig` held the lock of the session at `path` when this one asked for it
+/// ([`SessionWriter::new`]): that `sig` owns the session and the history beside it.
+pub(crate) fn owned_elsewhere(path: &Path) -> bool {
+    OWNED_ELSEWHERE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|owned| owned == path)
+}
+
+/// The history file beside the session at `path`: `history.toml`.
+pub fn history_path(session: &Path) -> PathBuf {
+    session.with_file_name("history.toml")
 }
 
 /// The lock file of the session at `path`: `session.lock` beside `session.toml`.
@@ -355,7 +374,7 @@ fn lock_session(path: &Path) -> io::Result<fs::File> {
 /// Removes the temporary files [`write_atomically`] left beside `path` when a `sig` died
 /// before renaming one: they hold URLs and titles. Called with the session's lock held, when
 /// no other `sig` writes there.
-fn remove_temporaries(path: &Path) {
+pub(crate) fn remove_temporaries(path: &Path) {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return;
     };
@@ -437,6 +456,9 @@ pub fn session_writer(
 /// Writes session snapshots on a thread of its own, the latest one only. It owns the session:
 /// its thread holds the session's lock until it has written the last snapshot.
 pub struct SessionWriter {
+    /// The session's lock, which the thread holds too. The history's writer takes a share
+    /// ([`SessionWriter::lock`]).
+    lock: Arc<fs::File>,
     sender: Option<Sender<String>>,
     thread: Option<JoinHandle<()>>,
     /// A failed write the owner has not taken yet.
@@ -449,11 +471,12 @@ impl SessionWriter {
     /// ([`load_session`] says it won't save it) and saves nothing. `wake` is called when a
     /// write failed after one that worked (or the first write failed).
     pub fn new(path: PathBuf, wake: impl Fn() + Send + 'static) -> io::Result<Self> {
-        let lock = lock_session(&path)?;
+        let lock = Arc::new(lock_session(&path)?);
         remove_temporaries(&path);
         let (sender, receiver) = mpsc::channel::<String>();
         let failure = Arc::new(Mutex::new(None));
         let failed = Arc::clone(&failure);
+        let held = Arc::clone(&lock);
         let thread = std::thread::Builder::new()
             .name("sighurt-session".into())
             .spawn(move || {
@@ -461,13 +484,20 @@ impl SessionWriter {
                     *failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(message);
                     wake();
                 });
-                drop(lock);
+                drop(held);
             })?;
         Ok(Self {
+            lock,
             sender: Some(sender),
             thread: Some(thread),
             failure,
         })
+    }
+
+    /// A share of the session's lock, for the history's writer, which holds it until it has
+    /// written its last snapshot. The lock is released when every share is dropped.
+    pub fn lock(&self) -> Arc<fs::File> {
+        Arc::clone(&self.lock)
     }
 
     /// The failure to report since the last call, for the user: once when writes start

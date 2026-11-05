@@ -2,7 +2,7 @@
 //!
 //! Owns the engine registry and runtime lifecycle, carrying out the core's effects (except
 //! what a frontend does), per-view bookkeeping, services, configuration and session files,
-//! diagnostics, and the [`session::Session`] that runs events in, the core, effects out,
+//! the history of visited pages and completing addresses from it, diagnostics, and the [`session::Session`] that runs events in, the core, effects out,
 //! engine pumps, and events back. A frontend — the Wayland GUI, and later the terminal —
 //! supplies targets, permits, the clipboard and the chrome through [`frontend::Frontend`].
 //!
@@ -12,6 +12,7 @@
 pub mod diagnostics;
 pub mod engines;
 pub mod frontend;
+pub mod history;
 pub mod persistence;
 pub mod registry;
 pub mod services;

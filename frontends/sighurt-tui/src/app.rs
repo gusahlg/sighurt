@@ -29,6 +29,13 @@
 //! selection (tmux) answers the waiting read. A reply for the address line belongs to that
 //! line and is dropped when the line closes or is replaced.
 //!
+//! The address line completes what is typed from the visited pages: after each pass the loop
+//! asks the runtime's history ([`Session::complete`]) about the line's text, while the cursor is
+//! at its end, nothing is selected, the text is not the address the line opened with and is not
+//! a `:command`, and the line is not the find field; the rest of the first address it completes to shows in grey after the cursor,
+//! and Right or Tab takes that address, exactly. Any change of the line, or the history
+//! forgetting visits, asks again.
+//!
 //! Find in page (TUI.md §4): `page.find` without text opens the find field on the bottom line
 //! (the address line's editor behind a `/`); each edit runs `page.find <text>`, an empty one
 //! `page.find-stop`; Enter keeps the search and gives the page the keyboard, Escape ends it, and
@@ -98,6 +105,7 @@ use sighurt_core::{
 };
 use sighurt_runtime::diagnostics::{Diagnostics, FindReport, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
+use sighurt_runtime::history;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
 use sighurt_runtime::services::{Clipboard, Services, MAX_CLIPBOARD};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
@@ -343,6 +351,12 @@ struct Tui {
     editing_fresh: bool,
     /// The active tab's address when the core last ran, for the address line to start from.
     active_url: String,
+    /// The text the history was last asked to complete, if the line could take one.
+    completed_for: Option<String>,
+    /// The visited address the line's text completes to, and that text.
+    ghost: Option<(String, String)>,
+    /// `Session::history_generation` when the history was last asked.
+    history_seen: u64,
     notice: Option<String>,
     notice_first: Option<Instant>,
     /// The shown page has a text field: a paste goes there.
@@ -619,6 +633,9 @@ impl App {
             line_gen: 0,
             editing_fresh: false,
             active_url: String::new(),
+            completed_for: None,
+            ghost: None,
+            history_seen: 0,
             notice: None,
             notice_first: None,
             page_text: false,
@@ -742,6 +759,7 @@ impl App {
             // After the pump, which may have opened a view: nothing is drawn for it before the
             // engine is asked for its text.
             worked |= self.sync_semantics();
+            worked |= self.sync_completion();
             // A snapshot that found the search anew, a mode change that ended it.
             if !self.tui.find_events.is_empty() {
                 self.run_core();
@@ -764,17 +782,48 @@ impl App {
                 break;
             }
         }
-        if self
-            .session
-            .session_due()
-            .is_some_and(|due| due <= Instant::now())
-        {
-            self.session.save_session();
-        }
+        self.session.write_due();
         if let Err(error) = self.tui.terminal.write_frame(&[]) {
             self.fail(format!("writing to the terminal failed: {error}"));
         }
         busy && !self.session.has_quit()
+    }
+
+    /// Asks the history what the address line's text completes to, when the text changed or the
+    /// history forgot visits since it last asked (see the module's documentation). Returns
+    /// whether the completion changed.
+    fn sync_completion(&mut self) -> bool {
+        let generation = self.session.history_generation();
+        let forgot = std::mem::replace(&mut self.tui.history_seen, generation) != generation;
+        let opened_with = self.tui.active_url.as_str();
+        let editing = self.tui.editing.as_ref().filter(|_| !self.tui.finding);
+        let wanted = editing.and_then(|editor| {
+            let text = editor.text();
+            let takes = editor.at_end()
+                && !editor.selected()
+                && !text.is_empty()
+                && !text.trim_start().starts_with(':')
+                && text != opened_with;
+            takes.then(|| text.to_owned())
+        });
+        if wanted == self.tui.completed_for && !forgot {
+            return false;
+        }
+        let ghost = wanted.as_ref().and_then(|text| {
+            let found = self
+                .session
+                .complete(text)
+                .into_iter()
+                .map(|found| found.url);
+            let mut found =
+                found.filter(|url| history::suffix(text, url).is_some_and(|rest| !rest.is_empty()));
+            Some((text.clone(), found.next()?))
+        });
+        self.tui.completed_for = wanted;
+        let changed = ghost != self.tui.ghost;
+        self.tui.ghost = ghost;
+        self.tui.chrome_dirty |= changed;
+        changed
     }
 
     /// Enables the terminal's write source while bytes are waiting, and disables it otherwise.
@@ -804,7 +853,7 @@ impl App {
         let escape = self.tui.terminal.poll_timeout().map(|wait| now + wait);
         [
             pump,
-            self.session.session_due(),
+            self.session.writes_due(),
             self.tui.notice_first,
             self.tui.clipboard_deadline(),
             self.motion_due.filter(|_| self.motion.is_some()),
@@ -1512,6 +1561,7 @@ impl App {
             tabs,
             active,
             address_editing: self.tui.editing.clone(),
+            address_ghost: self.tui.ghost_suffix().map(str::to_owned),
             finding: self.tui.finding,
             find,
             mode_label: match self.tui.text_mode {
@@ -1923,6 +1973,17 @@ impl Tui {
         if self.clipboard_keys(event) {
             return;
         }
+        // Right or Tab at the end of the line takes the completion shown, exactly.
+        let takes = matches!(&event.key, Key::Named(name) if name == "ArrowRight" || name == "Tab");
+        let plain = !(event.modifiers.shift || event.modifiers.control || event.modifiers.alt);
+        if takes && plain && self.ghost_suffix().is_some() {
+            if let Some((_, url)) = self.ghost.take() {
+                self.editing = Some(LineEditor::from_text(url));
+                self.editing_fresh = false;
+                self.chrome_dirty = true;
+                return;
+            }
+        }
         let Some(editor) = self.editing.as_mut() else {
             return;
         };
@@ -1970,6 +2031,17 @@ impl Tui {
             },
         }
         self.chrome_dirty = true;
+    }
+
+    /// The rest of the visited address the line completes to, while the line has the text it
+    /// was found for, its cursor at the end and nothing selected.
+    fn ghost_suffix(&self) -> Option<&str> {
+        let editor = self.editing.as_ref().filter(|_| !self.finding)?;
+        let (text, url) = self.ghost.as_ref()?;
+        if editor.text() != text || !editor.at_end() || editor.selected() {
+            return None;
+        }
+        history::suffix(text, url).filter(|rest| !rest.is_empty())
     }
 
     /// What the find field's text asks of the core since it last asked: `page.find <text>`, or
@@ -3087,6 +3159,9 @@ mod tests {
             line_gen: 0,
             editing_fresh: false,
             active_url: String::new(),
+            completed_for: None,
+            ghost: None,
+            history_seen: 0,
             notice: None,
             notice_first: None,
             page_text: false,
@@ -3592,6 +3667,14 @@ schemes = [\"demo\"]
 
     #[cfg(feature = "engine-demo")]
     fn demo_app() -> DemoApp {
+        demo_app_with(Paths {
+            config: None,
+            session: None,
+        })
+    }
+
+    #[cfg(feature = "engine-demo")]
+    fn demo_app_with(paths: Paths) -> DemoApp {
         let (master, slave) = crate::term::open_pty().expect("pty");
         rustix::termios::tcsetwinsize(
             &slave,
@@ -3614,10 +3697,7 @@ schemes = [\"demo\"]
             env,
             registry,
             Services::new(|| {}),
-            Paths {
-                config: None,
-                session: None,
-            },
+            paths,
             None,
             Diagnostics::new(None),
             std::sync::Arc::new(|| {}),
@@ -3865,6 +3945,77 @@ schemes = [\"demo\"]
                 _ => None,
             })
             .collect()
+    }
+
+    /// What is typed in the address line completes from the history: the rest of the address
+    /// shows while the cursor is at the end, Tab takes the exact address, and neither the
+    /// address the line opened with, a command line nor the find field completes.
+    #[cfg(feature = "engine-demo")]
+    #[test]
+    fn the_address_line_completes_from_the_history() {
+        const URL: &str = "https://www.example.com/page";
+        let dir = std::env::temp_dir().join(format!("sighurt-tui-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let seeded = format!(
+            "version = 1\n[[visits]]\nurl = \"{URL}\"\ntitle = \"Example\"\nlast = {now}\ncount = 2\n"
+        );
+        std::fs::write(dir.join("history.toml"), seeded).unwrap();
+        let mut demo = demo_app_with(Paths {
+            config: None,
+            session: Some(dir.join("session.toml")),
+        });
+        let app = &mut demo.app;
+        let mut queue = VecDeque::new();
+        let key = |app: &mut App, key: KeyEvent, queue: &mut VecDeque<BrowserEvent>| {
+            let event = InputEvent {
+                seat: app.tui.seat,
+                kind: InputKind::Key(key),
+            };
+            app.tui.chrome_input(event, queue);
+            app.sync_completion();
+        };
+        app.tui.focus(KeyboardFocus::Chrome, &mut queue);
+        assert!(
+            !app.sync_completion(),
+            "the address it opened with is not typed"
+        );
+        for letter in ["e", "x", "a"] {
+            key(app, typed(letter), &mut queue);
+        }
+        assert_eq!(app.tui.ghost_suffix(), Some("mple.com/page"));
+        key(app, named("ArrowLeft"), &mut queue);
+        assert_eq!(app.tui.ghost_suffix(), None, "the cursor is off the end");
+        key(app, named("ArrowRight"), &mut queue);
+        assert_eq!(
+            app.tui.editing.as_ref().unwrap().text(),
+            "exa",
+            "Right only moved"
+        );
+        assert_eq!(app.tui.ghost_suffix(), Some("mple.com/page"));
+        key(app, named("Tab"), &mut queue);
+        assert_eq!(app.tui.editing.as_ref().unwrap().text(), URL);
+        assert_eq!(app.tui.ghost_suffix(), None);
+        key(app, named("Enter"), &mut queue);
+        assert_eq!(commands(&queue), [format!("page.open {URL}")]);
+        queue.clear();
+
+        // A command line, and the find field, never complete.
+        app.tui.focus(KeyboardFocus::Chrome, &mut queue);
+        for letter in [":", "e", "x"] {
+            key(app, typed(letter), &mut queue);
+        }
+        assert_eq!(app.tui.ghost_suffix(), None);
+        app.tui.find_field(String::new(), &mut queue);
+        for letter in ["e", "x"] {
+            key(app, typed(letter), &mut queue);
+        }
+        assert!(app.tui.finding);
+        assert_eq!(app.tui.ghost_suffix(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

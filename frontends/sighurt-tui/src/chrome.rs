@@ -12,13 +12,19 @@
 //! otherwise the notice, otherwise the status. What the search in the page
 //! found ("3 of 12") is right-aligned on it while there is one, after the
 //! search's text when the field is closed; a terminal too narrow for both
-//! drops it.
+//! drops it. After the
+//! address editor's text, with the cursor at its end, the rest of a visited
+//! address it completes to shows in grey ([`ChromeState::address_ghost`]).
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::grid::{Attrs, Color, Grid};
 use crate::sanitize::sanitize;
+
+/// The colour of a completion after the address editor's text: the palette's
+/// grey (bright black), which every 256-colour terminal has.
+const GHOST: Color = Color::Indexed(8);
 
 /// Shown in [`ChromeState::mode_label`] while the page is graphics.
 pub const MODE_GRAPHICS: &str = "GFX";
@@ -47,6 +53,10 @@ pub struct ChromeState {
     pub active: usize,
     /// The address editor, while the user is editing it.
     pub address_editing: Option<LineEditor>,
+    /// The rest of the visited address the editor's text completes to, drawn after it while
+    /// the cursor is at its end. Plain ASCII (an address as recorded), still sanitized when
+    /// drawn.
+    pub address_ghost: Option<String>,
     /// [`Self::address_editing`] is the find field: drawn after a `/`.
     pub finding: bool,
     /// What the search in the page found, while there is one: right-aligned on the bottom line.
@@ -67,6 +77,7 @@ impl Default for ChromeState {
             tabs: Vec::new(),
             active: 0,
             address_editing: None,
+            address_ghost: None,
             finding: false,
             find: None,
             mode_label: MODE_GRAPHICS.to_string(),
@@ -119,8 +130,20 @@ impl ChromeState {
         let cursor = if rows >= 2 {
             let row = rows - 1;
             grid.clear_row(row);
-            let (text, column) = bottom_line(self, cols);
+            let (text, column, left_cols) = bottom_line(self, cols);
             put_fitted(grid, row, &text);
+            let at_end = self
+                .address_editing
+                .as_ref()
+                .is_some_and(|editor| editor.at_end() && !editor.selected());
+            let ghost = self.address_ghost.as_deref();
+            let ghost = ghost.filter(|_| at_end && !self.finding);
+            if let (Some(ghost), Some(column)) = (ghost, column) {
+                // Within the editor's part of the line, before what the search found.
+                let room = left_cols.saturating_sub(column);
+                let ghost = fit_cols(&sanitize(ghost), room);
+                grid.put_text(column, row, &ghost, GHOST, Color::Default, Attrs::default());
+            }
             column.map(|column| Cursor { column, row })
         } else {
             None
@@ -232,6 +255,11 @@ impl LineEditor {
     /// The text before the cursor.
     pub fn before_cursor(&self) -> &str {
         &self.text[..self.cursor]
+    }
+
+    /// Whether the cursor is at the end of the line.
+    pub fn at_end(&self) -> bool {
+        self.cursor == self.text.len()
     }
 
     /// Display columns before the cursor.
@@ -463,7 +491,9 @@ fn top_line(state: &ChromeState, cols: u16) -> String {
 
 /// The bottom line, with the find indicator right-aligned when it leaves the line at least
 /// [`FIND_ROOM`] columns.
-fn bottom_line(state: &ChromeState, cols: u16) -> (String, Option<u16>) {
+/// The bottom line, the cursor's column, and how many columns its left part (the editor, the
+/// notice or the status) has.
+fn bottom_line(state: &ChromeState, cols: u16) -> (String, Option<u16>, u16) {
     let find = state
         .find
         .as_deref()
@@ -483,9 +513,13 @@ fn bottom_line(state: &ChromeState, cols: u16) -> (String, Option<u16>) {
     match find {
         Some(find) => {
             let pad = usize::from(left_cols).saturating_sub(left.width());
-            (format!("{left}{} {find}", " ".repeat(pad)), cursor)
+            (
+                format!("{left}{} {find}", " ".repeat(pad)),
+                cursor,
+                left_cols,
+            )
         }
-        None => (left, cursor),
+        None => (left, cursor, left_cols),
     }
 }
 
@@ -632,6 +666,7 @@ mod tests {
             }],
             active: 0,
             address_editing: None,
+            address_ghost: None,
             finding: false,
             find: None,
             mode_label: MODE_GRAPHICS.into(),
@@ -639,6 +674,40 @@ mod tests {
             notice: None,
             status: Some("ok".into()),
         }
+    }
+
+    #[test]
+    fn a_completion_shows_in_grey_after_the_editor_at_its_end_only() {
+        let mut state = ChromeState {
+            address_editing: Some(LineEditor::from_text("exa")),
+            address_ghost: Some("mple.com/page".into()),
+            ..ChromeState::default()
+        };
+        let mut grid = Grid::new(40, 5);
+        let area = state.draw(&mut grid);
+        assert_eq!(row_text(&grid, 4), "→ example.com/page");
+        let cursor = area.cursor.expect("the editor's cursor");
+        assert_eq!(cursor.column, 5, "the cursor stays after what was typed");
+        let typed = grid.cell(4, 4).unwrap();
+        let ghost = grid.cell(5, 4).unwrap();
+        assert_eq!((typed.grapheme.as_str(), typed.fg), ("a", Color::Default));
+        assert_eq!((ghost.grapheme.as_str(), ghost.fg), ("m", GHOST));
+        // Cut to the line.
+        let mut narrow = Grid::new(12, 5);
+        state.draw(&mut narrow);
+        assert_eq!(row_text(&narrow, 4), "→ example.c…");
+        // Not with the cursor off the end, nothing selected aside, or in the find field.
+        let mut editor = LineEditor::from_text("exa");
+        editor.left();
+        state.address_editing = Some(editor);
+        let mut grid = Grid::new(40, 5);
+        state.draw(&mut grid);
+        assert_eq!(row_text(&grid, 4), "→ exa");
+        state.address_editing = Some(LineEditor::from_text("exa"));
+        state.finding = true;
+        let mut grid = Grid::new(40, 5);
+        state.draw(&mut grid);
+        assert_eq!(row_text(&grid, 4), "/exa");
     }
 
     fn row_text(grid: &Grid, row: u16) -> String {

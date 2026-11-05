@@ -30,8 +30,8 @@
 //!   not http(s) or a file, shows a notice and leaves the page.
 //! - `browser.home` opens the home page in the active tab.
 //! - `site.forget [host]` forgets that site's cookies and stored data in every engine that
-//!   keeps any. No argument is the page shown. A `sig:` page, a tab with no page, or a host
-//!   that is not one, shows a notice.
+//!   keeps any, and its visited pages (`Effect::ForgetVisits`). No argument is the page shown.
+//!   A `sig:` page, a tab with no page, or a host that is not one, shows a notice.
 //! - `clipboard.copy <text>` puts that text on the clipboard ([`Effect::ClipboardWrite`]).
 //!   The runtime refuses text over its own limit and says so; the core does not cut it.
 //! - `location.focus` is the chrome's: the core moves the focus and says so with
@@ -51,8 +51,8 @@
 //!   document, is dropped. When nobody can search the page the result says so, and the core
 //!   tells the user "<engine> can't find in page" when it first hears it, not at every key
 //!   typed in the find field.
-//! - `history.clear`: sig keeps no history of visited pages yet, so it says there is nothing to
-//!   clear. `browser.fullscreen` says the frontend has no fullscreen yet, and
+//! - `history.clear` forgets every visited page (`Effect::ForgetVisits`), with `[history]
+//!   remember` on or off; the executable's answer is a notice. `browser.fullscreen` says the frontend has no fullscreen yet, and
 //!   `page.exit-fullscreen` that the page is not in fullscreen.
 //! - `page.send-key` presses and releases its key in the page only while the page has the
 //!   keyboard; run by a key press, that counts as the user's key press in the page.
@@ -209,11 +209,7 @@ impl BrowserState {
                 None
             }
             Command::HistoryClear => {
-                self.tab_notice(
-                    active,
-                    "sig keeps no history of the pages you visit, so there is nothing to clear.",
-                    fx,
-                );
+                self.forget_visits(None, fx);
                 None
             }
             Command::PageExitFullscreen => {

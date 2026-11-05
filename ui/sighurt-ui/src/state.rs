@@ -14,7 +14,7 @@
 
 use sighurt_api::ids::{RequestId, TabId};
 
-use crate::extension::{contained, is_contained};
+use crate::extension::{contained, is_contained, InlineCompletion};
 use crate::hit_test::Target;
 use crate::text_edit::TextEditor;
 
@@ -277,6 +277,9 @@ pub struct ChromeState {
     /// The clipboard read the line waits for: the latest Ctrl+V's, until it is answered or
     /// the line loses focus or its tab.
     pub paste: Option<RequestId>,
+    /// The visited address the typed text completes to, shown after the caret, and the
+    /// request for it; dropped as the line changes, loses focus or its tab.
+    pub completion: InlineCompletion,
     /// `chrome.toggle-tabs` hid the tabs, or showed those `[chrome.standard]` hides.
     pub tabs_toggled: bool,
     /// The tab list's first row shown.
