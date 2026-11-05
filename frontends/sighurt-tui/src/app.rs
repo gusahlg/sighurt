@@ -54,7 +54,11 @@
 //! frontend's, an activation goes to the core as `BrowserEvent::Semantic`. Text mode tells the
 //! core `BrowserEvent::PageTyping(false)`, so a focused field does not swallow character
 //! bindings; graphics tells it `true`. A press in the page in graphics mode captures the
-//! pointer until that button is released.
+//! pointer until that button is released. A paste goes to the address line while it is open,
+//! to text mode's field editor while it is open, else to the page's text field only while the
+//! core offers the host one (`Frontend::page_text_input`, which is `None` while the keymap gives
+//! the page no text); text mode opens a field's editor only while the keymap gives the page
+//! text, and shows a notice otherwise.
 //!
 //! Page frames (TUI.md §2 and §8.6): a permit only for the shown view, only when its engine has
 //! a new frame, at most `[tui] fps` a second (in text mode at most [`TEXT_FPS`], and only when
@@ -1203,10 +1207,12 @@ impl App {
             return None;
         }
         self.tui.chrome_dirty = true;
-        let act = self
-            .tui
-            .text
-            .click(view, mouse.column, mouse.row - page.row)?;
+        let act = self.tui.text.click(
+            view,
+            mouse.column,
+            mouse.row - page.row,
+            self.session.core().page_takes_text(),
+        )?;
         Some(semantic_event(act, at))
     }
 
@@ -2598,6 +2604,7 @@ impl Frontend for Tui {
         view: ViewId,
         event: &InputEvent,
         activation: Option<Instant>,
+        takes_text: bool,
         queue: &mut VecDeque<BrowserEvent>,
     ) -> bool {
         let InputKind::Key(key) = &event.kind else {
@@ -2610,7 +2617,7 @@ impl Frontend for Tui {
         // An action takes the user's activation along only if the core took this key as the
         // user's: a key a command made (`:page.send-key enter`) scrolls and focuses but follows
         // nothing.
-        if let Some(act) = self.text.page_key(view, key) {
+        if let Some(act) = self.text.page_key(view, key, takes_text) {
             if let Some(at) = activation {
                 queue.push_back(semantic_event(act, at));
             }
@@ -3820,7 +3827,9 @@ schemes = [\"demo\"]
             }],
         });
         let document = settle_document(app);
-        press_page(app, "z");
+        // A key the user pressed in the page: `j`, which NORMAL sends the page as a key of its
+        // own (an unbound key would be taken, and activate nothing).
+        press_page(app, "j");
         let request = request_clipboard(app, document);
         let control = app.tui.control.clone();
         let query = clipboard::query(Selection::Clipboard);
@@ -3844,7 +3853,7 @@ schemes = [\"demo\"]
             )))
         );
         app.run_core();
-        press_page(app, "z");
+        press_page(app, "j");
         // The timed-out read is given up, so the page may ask again at once.
         let request = request_clipboard(app, document);
         assert_eq!(app.tui.control, clipboard::query(Selection::Clipboard));

@@ -12,7 +12,8 @@ use sighurt_api::geometry::{SurfacePoint, SurfaceRect};
 use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, TabId, ViewId};
 use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus,
-    Modifiers, PointerButton, PointerEvent, ScrollDelta, TextInputState, TextPurpose,
+    Modifiers, PointerButton, PointerEvent, ScrollDelta, TextInputEvent, TextInputState,
+    TextPurpose,
 };
 use sighurt_api::semantic::{NodeId, SemanticAction};
 use sighurt_api::services::{
@@ -3084,6 +3085,8 @@ mod script {
 
     enum Rule {
         Take,
+        /// Taken, and the page takes text no more, or again.
+        Mute,
         Run(Command),
         Then(Command),
         All(Vec<Command>),
@@ -3111,11 +3114,12 @@ mod script {
         }
         match text.split_once(' ') {
             None if text == "take" => Ok(Rule::Take),
+            None if text == "mute" => Ok(Rule::Mute),
             None if text == "copy-link" => Ok(Rule::CopyLink),
             Some(("run", command)) => commands.parse(command).map(Rule::Run),
             Some(("then", command)) => commands.parse(command).map(Rule::Then),
             _ => Err(format!(
-                "{text:?}: expected take, run, then, all, close-titled or copy-link"
+                "{text:?}: expected take, mute, run, then, all, close-titled or copy-link"
             )),
         }
     }
@@ -3150,6 +3154,7 @@ mod script {
         rules: Vec<(String, Rule)>,
         presses: usize,
         indicator: String,
+        muted: bool,
     }
 
     impl Keymap for Script {
@@ -3175,6 +3180,10 @@ mod script {
             };
             match self.rules.iter().find(|(typed, _)| typed == text) {
                 Some((_, Rule::Take)) if !key.repeat => KeyAction::Take,
+                Some((_, Rule::Mute)) => {
+                    self.muted ^= !key.repeat;
+                    KeyAction::Take
+                }
                 Some((_, Rule::Run(command))) => KeyAction::Run(command.clone()),
                 Some((_, Rule::Then(command))) => KeyAction::RunThenPass(command.clone()),
                 Some((_, Rule::All(commands))) => KeyAction::RunAll(commands.clone()),
@@ -3200,6 +3209,10 @@ mod script {
 
         fn indicator(&self) -> Option<&str> {
             (self.presses > 0).then_some(self.indicator.as_str())
+        }
+
+        fn page_takes_text(&self) -> bool {
+            !self.muted
         }
     }
 }
@@ -3297,6 +3310,69 @@ fn the_keymap_hears_context_changes() {
         at: b.now,
     });
     assert_eq!(script::log(), ["reset"]);
+}
+
+#[test]
+fn a_keymap_that_gives_the_page_no_text_gets_it_no_input_method_and_no_text() {
+    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\"m\" = \"mute\"";
+    let mut b = Harness::start(config, &["https://a.test/"]);
+    let view = b.shown();
+    let field = TextInputState {
+        caret: SurfaceRect::default(),
+        surrounding: None,
+        purpose: TextPurpose::Normal,
+        multiline: false,
+    };
+    let effects = b.engine(EngineEvent::TextInputChanged {
+        view,
+        state: Some(field.clone()),
+    });
+    assert_eq!(effects, [Effect::PageTextInput(Some(field.clone()))]);
+    let commit = |b: &mut Harness| {
+        b.update(BrowserEvent::Keyboard {
+            event: InputEvent {
+                seat: b.seat,
+                kind: InputKind::TextInput(TextInputEvent {
+                    commit: Some("typed".into()),
+                    ..TextInputEvent::default()
+                }),
+            },
+            at: b.now,
+        })
+    };
+    assert!(delivers(&commit(&mut b), view));
+    // The keymap stops giving the page text: the host's input method lets go of the field, and
+    // a commit or paste that comes anyway reaches nobody.
+    let effects = b.key(typed("m"));
+    assert!(
+        effects.contains(&Effect::PageTextInput(None)),
+        "{effects:?}"
+    );
+    assert!(!delivers(&commit(&mut b), view));
+    // A field the page focuses now is not offered to the input method either.
+    b.engine(EngineEvent::TextInputChanged { view, state: None });
+    let effects = b.engine(EngineEvent::TextInputChanged {
+        view,
+        state: Some(field.clone()),
+    });
+    assert!(!effects
+        .iter()
+        .any(|e| matches!(e, Effect::PageTextInput(_))));
+    // Key presses are the keymap's to decide: one it passes still reaches the page.
+    assert!(delivers(&b.key(typed("u")), view));
+    // Given text again, the field the page has is offered at once.
+    let effects = b.key(typed("m"));
+    assert!(
+        effects.contains(&Effect::PageTextInput(Some(field))),
+        "{effects:?}"
+    );
+    assert!(delivers(&commit(&mut b), view));
+    // The chrome's text is the chrome's whatever the keymap says of the page.
+    b.key(typed("m"));
+    b.apply(command("location.focus"));
+    assert!(commit(&mut b)
+        .iter()
+        .any(|e| matches!(e, Effect::ChromeInput(_))));
 }
 
 #[test]

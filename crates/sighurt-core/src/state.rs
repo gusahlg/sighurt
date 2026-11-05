@@ -16,7 +16,8 @@
 //!   as [`BrowserEvent::Pointer`], and the mouse's side buttons wherever the pointer is as
 //!   [`BrowserEvent::Button`]. The core asks its keymap ([`crate::keys`]) about key presses and
 //!   `[input.buttons]` about side buttons, and routes the rest to the page or, as
-//!   [`Effect::ChromeInput`], to the chrome;
+//!   [`Effect::ChromeInput`], to the chrome; text that is no key press (an input method's, a
+//!   paste) reaches the page only while the keymap says it takes text;
 //! - every event of every engine pump as [`BrowserEvent::Engine`], in order. The core drops the
 //!   ones about views it has closed or replaced and requests from replaced documents, and
 //!   answers every navigation a view it knows asks about (`NavigationRequested`): a link the
@@ -426,7 +427,8 @@ pub enum Effect {
     /// The pointer's shape over the page area.
     PageCursor(Cursor),
     /// The text field of the focused page, for the host's input method; `None` when it has
-    /// none or the page doesn't have the keyboard.
+    /// none, the page doesn't have the keyboard, or the keymap gives the page no text
+    /// (`Keymap::page_takes_text`).
     PageTextInput(Option<TextInputState>),
     /// Perform `service` for `view`, then report [`BrowserEvent::ServiceDone`].
     Service {
@@ -1015,6 +1017,13 @@ impl BrowserState {
     /// contains it before a chrome sees it, as it does page text.
     pub fn keymap_indicator(&self) -> Option<&str> {
         self.indicator.as_deref()
+    }
+
+    /// Whether the keymap lets text that is not a key press reach the page now
+    /// (`sighurt_api::keymap::Keymap::page_takes_text`): a frontend that edits the page's
+    /// fields itself (the terminal's text mode) opens no editor while it is `false`.
+    pub fn page_takes_text(&self) -> bool {
+        self.keys.page_takes_text()
     }
 
     /// The index of the active tab in [`Self::tabs`].
@@ -2728,6 +2737,13 @@ impl BrowserState {
                 self.keys.forget(event.seat);
             }
             InputKind::Focus(FocusEvent::Activated) => self.window_focused = true,
+            // Text that is no key press, an input method's or a paste: not for a page while the
+            // keymap says so.
+            InputKind::TextInput(_)
+                if self.focused_view().is_some() && !self.keys.page_takes_text() =>
+            {
+                return
+            }
             InputKind::TextInput(_) => {}
             // Pointer input comes with the view it is for.
             InputKind::Pointer(_) => return,
@@ -2948,8 +2964,9 @@ impl BrowserState {
 
     /// Brings the engines, the host and the keymap in line with the state after an update: the
     /// active tab loads a record it shows, only its view is visible and has the keyboard (when
-    /// the page has it), at the tab's zoom, the host knows the page's cursor and text field, and
-    /// the keymap knows the context; a changed keymap indicator redraws the chrome.
+    /// the page has it), at the tab's zoom, the host knows the page's cursor and text field (if
+    /// the keymap gives the page text), and the keymap knows the context; a changed keymap
+    /// indicator redraws the chrome.
     fn settle(&mut self, fx: &mut Fx) {
         self.settle_fullscreen(fx);
         self.settle_engines(fx);
@@ -2961,7 +2978,7 @@ impl BrowserState {
             fx.push(Effect::PageCursor(cursor));
         }
         let text_input = focused
-            .filter(|_| self.page_typing)
+            .filter(|_| self.page_typing && self.keys.page_takes_text())
             .and_then(|id| self.views[&id].text_input.clone());
         if text_input != self.text_input {
             self.text_input.clone_from(&text_input);

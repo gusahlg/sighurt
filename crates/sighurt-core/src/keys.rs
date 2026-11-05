@@ -381,6 +381,11 @@ impl KeyState {
     pub(crate) fn indicator(&self) -> Option<&str> {
         self.keymap.indicator()
     }
+
+    /// Whether the keymap lets text that is not a key press reach the page now.
+    pub(crate) fn page_takes_text(&self) -> bool {
+        self.keymap.page_takes_text()
+    }
 }
 
 #[cfg(test)]
