@@ -660,6 +660,19 @@ fn describe_lists_every_binding_of_the_frontend_by_mode() {
         assert!(described
             .iter()
             .any(|b| b.mode == "INSERT" && b.keys == "escape"));
+        let leave = find("ctrl-\\ ctrl-n");
+        assert_eq!(
+            (
+                leave.mode.as_str(),
+                leave.action.as_str(),
+                leave.applies.as_str()
+            ),
+            ("INSERT", "NORMAL mode", "on sig://terminal")
+        );
+        assert_eq!(find("escape").applies, "in the page");
+        assert!(described.iter().any(|b| b.mode == "INSERT"
+            && b.keys == "escape"
+            && b.applies == "in the page, except on sig://terminal"));
         let terminal_only = described.iter().any(|b| b.keys == "ctrl-c");
         assert_eq!(terminal_only, frontend == Frontend::Terminal);
     }

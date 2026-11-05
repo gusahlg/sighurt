@@ -343,9 +343,18 @@ impl Keymap for Example {
     }
 
     fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
-        let modes = [("NORMAL", table::NORMAL), ("INSERT", table::INSERT)];
+        // INSERT's Escape is not sig://terminal's, where the program has it.
+        let modes = [
+            ("NORMAL", table::NORMAL, None),
+            (
+                "INSERT",
+                table::INSERT,
+                Some("in the page, except on sig://terminal"),
+            ),
+            ("INSERT", table::INSERT_TERMINAL, Some("on sig://terminal")),
+        ];
         let mut found = Vec::new();
-        for (mode, table) in modes {
+        for (mode, table, page) in modes {
             for binding in table.iter().filter(|b| exists_in(b.frontend, frontend)) {
                 let action = match binding.action {
                     Action::Run(text) | Action::RunThenPass(text) => text.to_owned(),
@@ -360,7 +369,7 @@ impl Keymap for Example {
                     Action::Custom(_) => describe_custom(binding.keys).to_owned(),
                 };
                 let applies = match binding.scope {
-                    Scope::Page => "in the page",
+                    Scope::Page => page.unwrap_or("in the page"),
                     Scope::NoField => "in the page, not in a text field",
                     Scope::Always => "also in the address line",
                 };
