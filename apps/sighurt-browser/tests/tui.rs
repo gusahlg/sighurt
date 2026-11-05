@@ -1818,70 +1818,161 @@ fn inside_tmux_a_changing_page_is_not_blanked_either() {
     assert!(term.exit().success(), "{}", term.context());
 }
 
-/// Inside tmux, once a page with sixels over each other is quiet (400 ms without a new one),
-/// its picture is written again after a blank, once, so tmux keeps that one alone. Outside
-/// tmux nothing is stored, and nothing is written again.
+/// Where `bytes` writes a cell or erases on rows `first..=last` (1-based): the offsets. Escape
+/// strings (sixel, OSC, APC) and cursor moves are not writes. Follows the cursor through `CUP`,
+/// `VPA`, `CUU`/`CUD`/`CNL`/`CPL`, save and restore, line feeds and reverse index.
+fn page_row_writes(bytes: &[u8], first: u32, last: u32) -> Vec<usize> {
+    let (mut row, mut saved, mut at, mut found) = (1u32, 1u32, 0usize, Vec::new());
+    let on_page = |row: u32| (first..=last).contains(&row);
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == 0x1b {
+            match bytes.get(at + 1) {
+                Some(b'[') => {
+                    let start = at + 2;
+                    let mut end = start;
+                    while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                        end += 1;
+                    }
+                    let Some(&final_byte) = bytes.get(end) else {
+                        break;
+                    };
+                    let params = String::from_utf8_lossy(&bytes[start..end]);
+                    let first_param = |default: u32| {
+                        params
+                            .trim_start_matches('?')
+                            .split(';')
+                            .next()
+                            .and_then(|p| p.parse::<u32>().ok())
+                            .filter(|&n| n > 0)
+                            .unwrap_or(default)
+                    };
+                    match final_byte {
+                        b'H' | b'f' | b'd' => row = first_param(1),
+                        b'A' | b'F' => row = row.saturating_sub(first_param(1)).max(1),
+                        b'B' | b'E' | b'e' => row += first_param(1),
+                        b's' => saved = row,
+                        b'u' => row = saved,
+                        b'K' | b'X' | b'@' | b'P' | b'L' | b'M' if on_page(row) => found.push(at),
+                        b'J' if !params.starts_with('?') => found.push(at),
+                        _ => {}
+                    }
+                    at = end + 1;
+                }
+                Some(b'P' | b']' | b'_') => {
+                    let mut end = at + 2;
+                    while end < bytes.len()
+                        && bytes[end] != 0x07
+                        && bytes.get(end..end + 2) != Some(b"\x1b\\")
+                    {
+                        end += 1;
+                    }
+                    at = end + if bytes.get(end) == Some(&0x07) { 1 } else { 2 };
+                }
+                // `ESC (` and kin take one more byte, a charset.
+                Some(b'(' | b')' | b'*' | b'+' | b'#' | b'%') => at += 3,
+                Some(b'7') => {
+                    saved = row;
+                    at += 2;
+                }
+                Some(b'8') => {
+                    row = saved;
+                    at += 2;
+                }
+                Some(b'M') => {
+                    row = row.saturating_sub(1).max(1);
+                    at += 2;
+                }
+                _ => at += 2,
+            }
+            continue;
+        }
+        match byte {
+            b'\n' | 0x0b | 0x0c => row += 1,
+            b' '..=0x7e | 0x80.. if on_page(row) => found.push(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    found
+}
+
+/// While a page's picture is on the rows and the layout stays, nothing writes a cell or an
+/// erase on the page rows, inside tmux or not: typing into the page, reloads, a navigation in
+/// the tab, the address line and the find field opened and closed, tab switches, a notice.
+/// Every frame goes over the picture as it is, and a view with no frame yet (a new document,
+/// a tab not shown before) leaves the old picture until its first one comes (decision 133).
 #[test]
-fn inside_tmux_a_quiet_page_is_written_again_alone_and_outside_it_is_not() {
+fn nothing_is_written_on_the_page_rows_under_a_picture() {
     for tmux in [true, false] {
         let name = if tmux {
-            "sixel-quiet-tmux"
+            "sixel-still-tmux"
         } else {
-            "sixel-quiet"
+            "sixel-still"
         };
-        let args = ["demo://pattern", "demo://resize"];
+        // F4 opens the address line, F8 the find field.
+        let keys = format!("{SIXEL_KEYS}\n\"f4\" = \"location.focus\"\n\"f8\" = \"page.find\"");
+        // A still page first: its frames come only from what the steps do (the focus square).
+        let args = ["demo://pattern", "demo://animation"];
         let mut term = match tmux {
-            true => Terminal::start_in_tmux(name, &args, SIXEL_REPLIES, SIXEL_KEYS),
-            false => Terminal::start_in(name, &args, SIXEL_REPLIES, SIXEL_KEYS),
+            true => Terminal::start_in_tmux(name, &args, SIXEL_REPLIES, &keys),
+            false => Terminal::start_in(name, &args, SIXEL_REPLIES, &keys),
         };
         let shown = term.wait(0, Duration::from_secs(15), |got| {
             !sixel_spans(got).is_empty()
         });
         assert!(shown, "no sixel\n{}", term.context());
-        // To tab 2 and back: tab 1's frame goes over tab 2's sixel, a stack of two or more.
-        for _ in 0..2 {
-            term.wait(term.got.len(), Duration::from_millis(1500), |_| false);
-            term.type_bytes(F2);
-        }
+        // Tab 2 once, so both tabs have a frame, then back; from here on a picture is placed.
+        term.type_bytes(F2);
+        term.wait(term.got.len(), Duration::from_millis(800), |_| false);
+        term.type_bytes(F2);
+        term.wait(term.got.len(), Duration::from_millis(800), |_| false);
         let from = term.got.len();
-        term.wait(from, Duration::from_millis(2000), |_| false);
-        let after = &term.got[from..];
-        let spans = sixel_spans(after);
-        let blank = blank_row(80);
-        assert!(
-            !spans.is_empty(),
-            "no sixel after the switch\n{}",
-            term.context()
-        );
-        let first = spans[0];
-        assert!(
-            !has(&after[..first.0], &blank),
-            "the switch blanked first\n{}",
-            term.context()
-        );
-        let last = spans[spans.len() - 1];
-        let blanked = spans.len() >= 2 && has(&after[spans[spans.len() - 2].1..last.0], &blank);
-        if tmux {
-            let before = spans[spans.len() - 2];
-            assert!(
-                blanked && after[before.0..before.1] == after[last.0..last.1],
-                "the quiet page was not written again alone ({} sixels)\n{}",
-                spans.len(),
-                term.context()
+        let pause = |term: &mut Terminal, ms| {
+            term.wait(term.got.len(), Duration::from_millis(ms), |_| false);
+        };
+        let steps: [(&str, &[u8]); 10] = [
+            ("typing into the page", b"jjjkkkabc"),
+            ("a reload", F5),
+            ("another reload", F5),
+            ("the address line", b"\x1bOS"),
+            ("typing in the address line", b"demo://res"),
+            ("Escape", b"\x1b"),
+            ("the find field and Escape", b"\x1b[19~ani\x1b"),
+            ("a tab switch and back", b"\x1bOQ"),
+            ("a notice", b"\x1bOS:chrome.nothing\r"),
+            ("a navigation in the tab", b"\x1bOSdemo://resize\r"),
+        ];
+        for (what, bytes) in steps {
+            let at = term.got.len();
+            term.type_bytes(bytes);
+            pause(
+                &mut term,
+                if what == "a tab switch and back" {
+                    400
+                } else {
+                    700
+                },
             );
-        } else {
-            assert!(
-                !has(after, &blank),
-                "outside tmux the quiet page was blanked\n{}",
-                term.context()
-            );
+            if what == "a tab switch and back" {
+                term.type_bytes(F2);
+                pause(&mut term, 700);
+            }
+            let writes = page_row_writes(&term.got[at..], 2, 23);
+            if let Some(&first) = writes.first() {
+                let start = at + first.saturating_sub(40);
+                let end = (start + 160).min(term.got.len());
+                panic!(
+                    "{what} wrote on the page rows (tmux {tmux}), {} times: {}\n{}",
+                    writes.len(),
+                    printable(&term.got[start..end]),
+                    term.context()
+                );
+            }
         }
-        // Then nothing: a still page writes no sixel.
-        let quiet = term.got.len();
-        term.wait(quiet, Duration::from_millis(1000), |_| false);
         assert!(
-            sixel_spans(&term.got[quiet..]).is_empty(),
-            "a still page wrote a sixel\n{}",
+            sixel_spans(&term.got[from..]).len() >= 2,
+            "the steps drew too few frames\n{}",
             term.context()
         );
         term.type_bytes(b"q");
