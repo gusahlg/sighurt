@@ -2,7 +2,8 @@
 # sig with the CEF engine, end to end, in a private headless sway on a private D-Bus session:
 # example.com and a local input page open in Chromium (`page.open-in cef`), the page is
 # shown, typing reaches a field and not the keymap, a paste goes through the clipboard service,
-# the page shows again after another tab was shown, and an idle page costs nothing.
+# find in page gives the current match and the total, the page shows again after another tab
+# was shown, and an idle page costs nothing.
 # Screenshots and logs in OUT. Builds sig with the cef and
 # demo engines (no Servo, no WPE). Never touches the desktop or the user's configuration: every
 # XDG directory is under OUT.
@@ -151,6 +152,27 @@ check "an attachment goes to the browser's download service, whole" \
 check "Ctrl+L took the keyboard from the page's field: none of the command reached it" \
   "$([[ $(served '/typed/%3A.*') == 0 ]]; echo "$? the page reported $(served '/typed/%3A.*') typed command prefix(es)")"
 info "screenshot $out/02-typed.png"
+# Find in page: Chromium says which match is selected and how many there are.
+find="tabs[d['active_tab'] - 1]['find']"
+open ":page.open-in cef $base/find.html"
+check "the find page opens in Chromium" \
+  "$(sess 25 "url(1)=='$base/find.html' and segs(1)[-1][0]=='cef', (segs(1), url(1))")"
+sleep 1
+open ":page.find apple"
+check ":page.find apple: the first of four matches" \
+  "$(dg 10 "($find or {}).get('total')==4 and $find['current']==1 and $find['found'], $find")"
+open ":page.find-next"
+check "page.find-next selects the second" "$(dg 10 "($find or {}).get('current')==2 and $find['total']==4, $find")"
+open ":page.find-previous"
+open ":page.find-previous"
+check "page.find-previous twice wraps around to the fourth" "$(dg 10 "($find or {}).get('current')==4 and $find['total']==4, $find")"
+shot 03-find 0.3
+open ":page.find Apple"
+check "upper case makes the search case-sensitive: one match" "$(dg 10 "($find or {}).get('total')==1 and $find['current']==1, $find")"
+open ":page.find pear"
+check "no match is said" "$(dg 10 "$find is not None and $find['found'] is False and $find['total']==0, $find")"
+open ":page.find-stop"
+check "page.find-stop ends the search" "$(dg 10 "$find is None, $find")"
 # Another tab, then back: the CEF view, hidden meanwhile, presents again although its page
 # paints nothing new, and the host maps it (a target shown again waits for a frame).
 key -M ctrl t -m ctrl

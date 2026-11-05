@@ -11,8 +11,8 @@
 #
 # Checks: the page renders (background, heading, text) through the host's SHM target; a click on
 # a link follows it (through NavigationRequested); typing into a field, with accents; scale 2 and
-# a resize; the idle chrome repaints nothing; and sig --tui in kitty shows the page as a kitty
-# graphics image.
+# a resize; the idle chrome repaints nothing; find in page (NetSurf says only whether there is a
+# match); and sig --tui in kitty shows the page as a kitty graphics image.
 # Exits with the number of failed checks.
 set -u
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -143,6 +143,28 @@ sleep 4
 kill -USR1 "$sig_pid"; sleep 0.3
 paints_b=$(python3 -c "import json; print(json.load(open('$out/diag.json'))['counters']['chrome_paints'])")
 check "an idle page repaints no chrome" "$([[ $paints_a == $paints_b ]]; echo $?)" "$paints_a -> $paints_b chrome paints in 4 s"
+
+# Find in page, read from the diagnostics (each tab's search: found, current, total, never its
+# text). NetSurf says only whether there is a match. "netsurf" is twice in the page's text.
+find="tabs[d['active_tab'] - 1]['find']"
+run() { wtype -M ctrl l -m ctrl; sleep 0.3; wtype "$1"; sleep 0.3; wtype -k Return; sleep 0.8; }
+found() { # found NAME EXPR
+  local reply
+  reply=$(python3 "$repo/apps/sighurt-browser/tests/probe.py" diag "$sig_pid" "$out/diag.json" "$2, $find")
+  check "$1" "${reply%% *}" "${reply:2}"
+}
+run ":page.find netsurf"
+found ":page.find netsurf finds it, and counts nothing" \
+  "$find is not None and $find['found'] is True and $find['current'] is None and $find['total'] is None and $find['supported']"
+run ":page.find-previous"
+found "page.find-previous from the first match wraps around to the last" "$find is not None and $find['found'] is True"
+run ":page.find-next"
+found "page.find-next from the last wraps around to the first" "$find is not None and $find['found'] is True"
+shot 07-find 0.3
+run ":page.find pear"
+found "no match is said" "$find is not None and $find['found'] is False"
+run ":page.find-stop"
+found "page.find-stop ends the search" "$find is None"
 
 kill "$sig_pid" 2>/dev/null; wait "$sig_pid" 2>/dev/null
 

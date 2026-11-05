@@ -6,6 +6,8 @@
 #
 # Build first: tools/cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
 # (CARGO_TARGET_DIR as you built it; SIG_BIN overrides the binary.) OUT gets shot.png and sig.log.
+# MODE=find: find in page through sig (:page.find, next, previous, no match, stop), read from
+# sig's diagnostics (each tab's search: found, current, total, never its text).
 set -u
 out=$(realpath -m "${1:?usage: sig-shot.sh OUT [URL]}")
 url=${2:-https://example.com/}
@@ -19,7 +21,27 @@ mkdir -p "$XDG_CONFIG_HOME/sighurt"
 # MODE=engine: Ladybird is the default engine (sig --engine ladybird). MODE=route: the demo engine
 # is, and [routing.ladybird] gives Ladybird the host of the URL.
 host=$(sed -E 's|^[a-z]+://([^/:]+).*|\1|' <<<"$url")
-if [[ ${MODE:-engine} == second ]]; then
+sig_args=()
+if [[ ${MODE:-engine} == find ]]; then
+  cat > "$home/find.html" <<HTML
+<!doctype html><title>find</title><body style="font:20px sans-serif">
+<p>apple one<p>Apple two<p>apple three<p style="margin-top:1500px">apple four
+HTML
+  cat > "$XDG_CONFIG_HOME/sighurt/config.toml" <<CONF
+version = 1
+[engines]
+default = "ladybird"
+enabled = ["ladybird", "demo"]
+# These keys are the bindings keymap's; the default keymap (example) ignores [keys].
+[input]
+keymap = "bindings"
+[keys]
+"ctrl-l" = "location.focus"
+CONF
+  engine_args=(--engine ladybird)
+  sig_args=(--diagnostics "$out/diag.json")
+  url_to_open=file://$home/find.html
+elif [[ ${MODE:-engine} == second ]]; then
   # A second Ladybird view: a page from the command line, a new tab (sig://home), then
   # page.open-in ladybird into that tab; then back to the first tab, whose page must show again.
   cat > "$home/one.html" <<HTML
@@ -117,10 +139,39 @@ CONF
 fi
 failures=0
 check() { if "${@:2}"; then echo "PASS $1"; else echo "FAIL $1"; failures=$((failures + 1)); fi }
-SIG_DIAG=1 RUST_LOG=${RUST_LOG:-info} "$sig" --gui "${engine_args[@]}" "${url_to_open:-$url}" > "$out/sig.log" 2>&1 &
+SIG_DIAG=1 RUST_LOG=${RUST_LOG:-info} "$sig" --gui "${sig_args[@]}" "${engine_args[@]}" "${url_to_open:-$url}" > "$out/sig.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 ${SIG_SETTLE:-15}); do sleep 1; kill -0 "$pid" 2>/dev/null || break; done
-if [[ ${MODE:-engine} == second ]]; then
+if [[ ${MODE:-engine} == find ]]; then
+  wtype -s 3600000 ' ' &
+  keyboard=$!
+  sleep 2
+  find="tabs[d['active_tab'] - 1]['find']"
+  # run COMMAND: types it into the command line.
+  run() { wtype -M ctrl l -m ctrl; sleep 0.3; wtype "$1"; sleep 0.3; wtype -k Return; sleep 1; }
+  # holds EXPR: the diagnostics' verdict on EXPR, with its detail printed.
+  holds() {
+    local reply
+    reply=$(python3 "$repo/apps/sighurt-browser/tests/probe.py" diag "$pid" "$out/diag.json" "$1, $find")
+    echo "  ${reply:2}"
+    [[ $reply == 0* ]]
+  }
+  run ":page.find apple"
+  check ":page.find apple: the first of four matches" holds "($find or {}).get('total')==4 and $find['current']==1"
+  run ":page.find-next"
+  check "page.find-next selects the second" holds "($find or {}).get('current')==2"
+  run ":page.find-previous"
+  run ":page.find-previous"
+  check "page.find-previous twice wraps around to the fourth" holds "($find or {}).get('current')==4"
+  grim "$out/find.png"
+  run ":page.find Apple"
+  check "upper case makes the search case-sensitive: one match" holds "($find or {}).get('total')==1"
+  run ":page.find pear"
+  check "no match is said" holds "$find is not None and $find['found'] is False and $find['total']==0"
+  run ":page.find-stop"
+  check "page.find-stop ends the search" holds "$find is None"
+  kill $keyboard 2>/dev/null
+elif [[ ${MODE:-engine} == second ]]; then
   wtype -s 3600000 ' ' &
   keyboard=$!
   sleep 6

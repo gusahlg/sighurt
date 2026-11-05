@@ -64,6 +64,9 @@
 #           false turns them off while sig runs; the line chrome names the page's engine too
 #   switch  page.switch-engine moves https://example.com/ from Servo to WPE and back, checked
 #           from the diagnostics and the session's history segments
+#   find    find in page through the engines: in WPE, :page.find counts the matches (WebKit
+#           says no current one), smart case, page.find-next, no match and page.find-stop; in
+#           Servo, which can't find in page, the tab's search says so and a notice shows
 #
 # Exits with the number of failed checks.
 set -u
@@ -77,7 +80,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: engines.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase labels switch)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase labels switch find)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (the demo engine's tests build it with other
   # features); this link keeps the binary these runs use. It is made under the same hold of the
@@ -1246,6 +1249,48 @@ CONF
   point 1000 700
   sleep 1
   shot_ppm 07-line-wpe
+  key -M ctrl q -m ctrl
+  wait_sig; code=$?
+  check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+  ;;
+
+find)
+  lh=http://localhost:$(cat "$out/port")
+  cat >> "$out/config/sighurt/config.toml" <<CONF
+[routing.wpe]
+hosts = ["localhost"]
+CONF
+  # The diagnostics give each tab's search: found, current, total and supported, never its text.
+  find="tabs[d['active_tab'] - 1]['find']"
+  step "find.html on localhost, which the routing gives WPE"
+  start_sig "$lh/find.html"
+  check "the page opens in WebKit" "$(sess 30 "url(1)=='$lh/find.html' and seg(1)['engine']=='wpe', (seg(1)['engine'], url(1))")"
+  check "its WPE view is shown" "$(shows_tab 1 wpe)"
+  step ":page.find apple"
+  open ":page.find apple"
+  check "WebKit counts the four matches, and says no current one" \
+    "$(dg 10 "($find or {}).get('total')==4 and $find['found'] and $find['current'] is None and $find['supported'], $find")"
+  shot 01-wpe-find
+  open ":page.find-next"
+  sleep 0.5
+  check "page.find-next keeps the total" \
+    "$(dg 10 "($find or {}).get('total')==4 and $find['found'] and $find['current'] is None, $find")"
+  open ":page.find Apple"
+  check "upper case makes the search case-sensitive: one match" "$(dg 10 "($find or {}).get('total')==1 and $find['found'], $find")"
+  open ":page.find pear"
+  check "no match is said" "$(dg 10 "$find is not None and $find['found'] is False and $find['total'] is None, $find")"
+  shot 02-wpe-no-match
+  open ":page.find-stop"
+  check "page.find-stop ends the search" "$(dg 10 "$find is None, $find")"
+  step "a tab of Servo's: it can't find in page"
+  key -M ctrl t -m ctrl
+  open "$base/find.html"
+  check "the page opens in Servo" "$(sess 30 "url(2)=='$base/find.html' and seg(2)['engine']=='servo', (seg(2)['engine'], url(2))")"
+  open ":page.find apple"
+  check "the tab's search says Servo can't find in page" \
+    "$(dg 10 "$find is not None and $find['supported'] is False, $find")"
+  check "and a notice shows (\"servo can't find in page\": see 03-servo-notice.png)" "$(dg 5 "d['status']=='notice', d['status']")"
+  shot 03-servo-notice
   key -M ctrl q -m ctrl
   wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
