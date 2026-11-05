@@ -4305,7 +4305,12 @@ Newest last. Each entry says what was decided and why.
     cover tmux. **Known and outside sig**: Rio 0.5.28 under tmux loses its device on tmux
     pane redraws (window switches, a resize) with any sixel shown: it died within 3 to 12
     switches whatever sig had stacked, and with one still sixel written by `cat` and no sig
-    running. sig cannot prevent that; it should go to Rio's maintainers. Also: Rio alone with
+    running. sig cannot prevent that; it should go to Rio's maintainers. *Workaround, measured*:
+    with `[renderer] use-cpu = true` in Rio's `config.toml` (no GPU library mapped in Rio's
+    process, where the Vulkan renderer maps 116 segments) Rio survived every run that kills
+    its Vulkan renderer (20 window switches with a refresh and two resizes on a still page
+    and on the animation, the tab storm, the `cat` control), showed the images correctly and
+    was not visibly slower (`RIO_USE_CPU=1` in real-terminals.sh). Also: Rio alone with
     sixel forced shows an empty frame now and then when one sixel replaces another (3 of 200;
     Rio alone picks kitty, which shows none). The measurements lost the GPU device for
     private Rio processes about twenty times, the desktop session unaffected. With this

@@ -173,6 +173,18 @@ the link or control under it). Logs, and anything else written to stderr, go to
 `$XDG_STATE_HOME/sighurt/tui.log` (`~/.local/state/sighurt/tui.log`). The terminal is restored
 on every way out.
 
+**Rio 0.5.28 and images.** Rio's Vulkan renderer can lose its GPU device, and Rio then exits
+(taking what runs in it along), when an image it shows is erased or redrawn: inside tmux that
+happens when tmux redraws the pane (switching windows, a resize), with any program's sixel, not
+only `sig`'s. `sig` spaces its images out and keeps each up for a quarter of a second so that
+its own tab switches don't cause it, but it cannot stop tmux's redraws. Until Rio fixes it,
+Rio's CPU renderer avoids the crash (measured, decision 133) — in `~/.config/rio/config.toml`:
+
+```toml
+[renderer]
+use-cpu = true
+```
+
 The terminal's keys are the [default keys](#keys), the same as the window's, with three more of
 its own: `ctrl-c` quits (only while the page has the keyboard in NORMAL; in the address line it
 copies, in INSERT it goes to the page),
