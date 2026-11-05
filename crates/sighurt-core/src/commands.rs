@@ -242,7 +242,7 @@ impl BrowserState {
                 fx.push(Effect::ChromeCommand(action));
                 None
             }
-            Command::Custom { name, .. } => {
+            Command::Custom(name) => {
                 fx.push(Effect::Notice {
                     tab: None,
                     message: format!("unknown command {name:?}"),

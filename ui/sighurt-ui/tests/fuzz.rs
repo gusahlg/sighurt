@@ -432,6 +432,7 @@ fn fuzz_address_editor() {
                             }),
                             commit: rng.one_in(2).then(|| piece.clone()),
                             preedit: rng.one_in(2).then_some(Preedit { text, cursor }),
+                            paste: false,
                         });
                     }
                     12 => editor.clear_preedit(),

@@ -120,17 +120,12 @@ pub enum Command {
     /// `chrome.<action>`: one of the chrome's own commands, such as `chrome.toggle-tabs`. Holds
     /// the action. Each chrome has its own ([`CommandSet`]); they take no argument.
     Chrome(String),
-    /// `<name> [argument]`: a command of the configuration's `[commands]` table, a bare word of
-    /// 1 to 32 lower-case letters, digits and dashes with no dot, such as `help`. The core runs
-    /// the built-in commands it stands for, the argument appended to the last of them when that
-    /// one takes an argument it was not given. A word that names an area of the built-in
-    /// commands (`tab`, `page`, ...) is not one.
-    Custom {
-        /// Its name in `[commands]`.
-        name: String,
-        /// What followed the name (trimmed, never empty).
-        argument: Option<String>,
-    },
+    /// `<name>`: a command of the configuration's `[commands]` table, a bare word of 1 to 32
+    /// lower-case letters, digits and dashes with no dot, such as `help`. Only a
+    /// [`CommandSet`] that knows the table's names makes one ([`CommandSet::with_custom`]);
+    /// parsing a string alone ([`FromStr`]) calls a bare word unknown, as it always did. The
+    /// core runs the built-in commands it stands for, in order. It takes no argument.
+    Custom(String),
 }
 
 impl Command {
@@ -207,7 +202,7 @@ impl Command {
             Self::SiteForget(_) => "site.forget",
             Self::ClipboardCopy(_) => "clipboard.copy",
             Self::Chrome(_) => "chrome",
-            Self::Custom { .. } => "custom",
+            Self::Custom(_) => "custom",
         }
     }
 }
@@ -436,12 +431,6 @@ impl FromStr for Command {
             "browser.home" => Self::BrowserHome,
             "browser.fullscreen" => Self::BrowserFullscreen,
             "browser.quit" => Self::BrowserQuit,
-            custom if is_custom_name(custom) => {
-                return Ok(Self::Custom {
-                    name: custom.to_owned(),
-                    argument: Some(argument.to_owned()).filter(|a| !a.is_empty()),
-                })
-            }
             unknown => return Err(CommandError::Unknown(unknown.to_owned())),
         };
         // The rest take no argument.
@@ -454,12 +443,8 @@ impl FromStr for Command {
 
 impl fmt::Display for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Self::Custom { name, argument } = self {
-            f.write_str(name)?;
-            return match argument {
-                Some(argument) => write!(f, " {argument}"),
-                None => Ok(()),
-            };
+        if let Self::Custom(name) = self {
+            return f.write_str(name);
         }
         f.write_str(self.name())?;
         match self {
@@ -701,31 +686,32 @@ pub struct CommandSet<'a> {
     chrome: &'a str,
     /// The chrome's actions; `None` leaves them unchecked.
     actions: Option<&'a [&'static str]>,
-    /// The names of `[commands]`; `None` leaves them unchecked.
+    /// The names of `[commands]`; `None` takes any name of their form unchecked.
     custom: Option<&'a [String]>,
 }
 
 impl<'a> CommandSet<'a> {
-    /// Every command, with no chrome to check against: for reading a table again that a check
-    /// with the selected chrome's set accepted.
+    /// Every command, with no chrome and no `[commands]` to check against: for reading a table
+    /// again that a check with the configuration's set accepted, and for tables built into
+    /// `sig` whose commands are checked when the configuration loads.
     pub const ANY: CommandSet<'static> = CommandSet {
         chrome: "",
         actions: None,
         custom: None,
     };
 
-    /// The built-in commands and the chrome `chrome`'s `actions`. The configuration's own
-    /// commands are left unchecked until [`Self::with_custom`] names them.
+    /// The built-in commands and the chrome `chrome`'s `actions`, and no command of
+    /// `[commands]` until [`Self::with_custom`] names them.
     pub fn new(chrome: &'a str, actions: &'a [&'static str]) -> Self {
         Self {
             chrome,
             actions: Some(actions),
-            custom: None,
+            custom: Some(&[]),
         }
     }
 
-    /// This set, whose configuration's own commands (`[commands]`) are `names`: a
-    /// [`Command::Custom`] with another name is an unknown command.
+    /// This set, with the configuration's own commands (`[commands]`) named `names`: a bare
+    /// word among them is a [`Command::Custom`]; any other stays an unknown command.
     pub fn with_custom(self, names: &'a [String]) -> Self {
         Self {
             custom: Some(names),
@@ -737,14 +723,15 @@ impl<'a> CommandSet<'a> {
     /// chrome action the selected chrome doesn't have ("the standard chrome has no command
     /// chrome.toggle-tab; it has chrome.toggle-tabs"), or a name `[commands]` doesn't have.
     pub fn parse(&self, text: &str) -> Result<Command, String> {
-        let command = text
-            .parse()
-            .map_err(|error: CommandError| error.to_string())?;
-        if let (Command::Custom { name, .. }, Some(names)) = (&command, self.custom) {
-            if !names.iter().any(|known| known == name) {
-                return Err(CommandError::Unknown(name.clone()).to_string());
+        let command = match text.parse() {
+            Err(CommandError::Unknown(name)) if self.is_custom(&name) => {
+                return match text.trim() == name {
+                    true => Ok(Command::Custom(name)),
+                    false => Err(format!("{name} takes no argument")),
+                };
             }
-        }
+            parsed => parsed.map_err(|error: CommandError| error.to_string())?,
+        };
         if let (Command::Chrome(action), Some(actions)) = (&command, self.actions) {
             if !actions.contains(&action.as_str()) {
                 let has = match actions {
@@ -758,6 +745,14 @@ impl<'a> CommandSet<'a> {
             }
         }
         Ok(command)
+    }
+
+    /// Whether `name` is a command of `[commands]` here.
+    fn is_custom(&self, name: &str) -> bool {
+        is_custom_name(name)
+            && self
+                .custom
+                .is_none_or(|names| names.iter().any(|known| known == name))
     }
 }
 
@@ -1000,41 +995,34 @@ mod tests {
     }
 
     #[test]
-    fn bare_words_are_the_configurations_commands() {
-        let custom = |name: &str, argument: Option<&str>| Command::Custom {
-            name: name.into(),
-            argument: argument.map(Into::into),
-        };
-        assert_eq!(parse("help"), Ok(custom("help", None)));
+    fn bare_words_are_commands_only_of_a_set_that_names_them() {
+        // Alone, a bare word is unknown, as it always was.
+        assert_eq!(parse("help"), Err(CommandError::Unknown("help".into())));
+        let names = ["help".to_owned(), "open-2".to_owned()];
+        let set = CommandSet::new("standard", &[]).with_custom(&names);
+        assert_eq!(set.parse(" help "), Ok(Command::Custom("help".into())));
+        assert_eq!(set.parse("open-2"), Ok(Command::Custom("open-2".into())));
+        assert_eq!(set.parse("help").unwrap().name(), "custom");
+        assert_eq!(set.parse("help").unwrap().to_string(), "help");
+        assert_eq!(set.parse("help keys"), Err("help takes no argument".into()));
+        assert_eq!(set.parse("nope"), Err("unknown command \"nope\"".into()));
         assert_eq!(
-            parse(" help  keys  now "),
-            Ok(custom("help", Some("keys  now")))
+            CommandSet::new("standard", &[]).parse("help"),
+            Err("unknown command \"help\"".into())
         );
-        assert_eq!(parse("open-2"), Ok(custom("open-2", None)));
-        assert_eq!(parse("help").unwrap().name(), "custom");
-        for text in ["help", "help keys", "close-all 3"] {
-            let command = parse(text).unwrap();
-            assert_eq!(command.to_string(), text);
-            assert_eq!(parse(&command.to_string()), Ok(command));
-        }
-        // Areas, dots, upper case and other forms stay unknown.
+        // Unchecked: any name of the form, for tables checked at load.
+        assert_eq!(
+            CommandSet::ANY.parse("nope"),
+            Ok(Command::Custom("nope".into()))
+        );
+        // Areas, dots, upper case and other forms are never one.
         for bad in [
             "tab", "page", "chrome", "Help", "he_lp", "a.b", "-x", "x-", "a--b",
         ] {
-            assert_eq!(parse(bad), Err(CommandError::Unknown(bad.into())), "{bad}");
+            assert!(CommandSet::ANY.parse(bad).is_err(), "{bad}");
         }
-        assert!(parse(&"a".repeat(33)).is_err());
-        assert!(parse(&"a".repeat(32)).is_ok());
-    }
-
-    #[test]
-    fn a_command_set_knows_the_configurations_commands() {
-        let names = ["help".to_owned()];
-        let set = CommandSet::new("standard", &[]).with_custom(&names);
-        assert!(set.parse("help").is_ok());
-        assert!(set.parse("help keys").is_ok());
-        assert_eq!(set.parse("nope"), Err("unknown command \"nope\"".into()));
-        assert!(CommandSet::ANY.parse("nope").is_ok());
+        assert!(CommandSet::ANY.parse(&"a".repeat(33)).is_err());
+        assert!(CommandSet::ANY.parse(&"a".repeat(32)).is_ok());
     }
 
     #[test]
