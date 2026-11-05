@@ -4262,3 +4262,34 @@ Newest last. Each entry says what was decided and why.
     unbound, f11 during a page's fullscreen, the compositor ending it), the terminal's test,
     and a direct test in each engine's suite (Servo `the_page_goes_fullscreen`, WPE
     `goes_fullscreen` including a crash while fullscreen, CEF offscreen section 6).
+134. **The example configuration separates the modes cleanly** (5 November 2026, branch `modes`,
+    merged 31c61e9; the user: "not being in insert mode makes it so that you can't write any
+    text into UI text boxes in the browser. The separation should be clean: in normal mode your
+    typing goes only to browser commands and with insert mode your typing goes to the browser
+    and all commands (except escape …) stop listening"). NORMAL gives the page no key and no
+    text: bound keys run, and every other key, modifier and dead key is taken with its repeats
+    and release, a page field focused or not (the `typing` exemption is gone for this keymap).
+    So the page stays usable from NORMAL, the arrows, PageUp, PageDown, Home, End, Tab and
+    Shift+Tab are bound to `page.send-key` of that key; so are Space, Shift+Space and Enter,
+    but only while no page field has the keyboard (`Scope::NoField`: `page.send-key space`
+    types a space, and Enter submits a form). INSERT passes every key, the `Always` chords
+    included (ctrl-o, ctrl-r, alt-1…9, f11, the terminal's ctrl-c and ctrl-l), and takes only
+    an unmodified Escape: back to NORMAL, or `page.exit-fullscreen` first while the page holds
+    element fullscreen, keeping the mode. In the address line and the find field both modes
+    apply NORMAL's `Always` bindings whose first key types nothing; the mode is about the
+    page. Clicks reach the page in both modes and change no mode. *API*:
+    `Keymap::page_takes_text() -> bool` (default true, so `bindings` is unchanged), asked by
+    the core after every update: while it is false, input-method text and pastes meant for
+    the page are dropped, `Effect::PageTextInput` is `None` (the window enables no input
+    method for the page, the terminal has no paste target), and the terminal's text mode
+    opens no field editor (a notice instead; an option chooser still opens);
+    `BrowserState::page_takes_text`; `Frontend::page_input` takes `takes_text`. *Verified*:
+    the example crate's tests (NORMAL in a field runs commands and passes nothing, the
+    navigation keys with repeats, INSERT passing every former `Always` chord in both
+    frontends, Escape during fullscreen, sequences), the core's
+    `a_keymap_that_gives_the_page_no_text_gets_it_no_input_method_and_no_text`, the terminal's
+    `graphics_mode_gives_a_focused_field_keys_and_pastes_only_in_insert` and the text-mode
+    test, headless.sh `example`, the workspace tests; `coexist.sh` and engines.sh `showcase`
+    were changed to enter INSERT before typing and are run in the release verification
+    (decision 135). *Not stopped*: a middle-click paste of the primary selection is a mouse
+    action and still reaches the page in NORMAL.
