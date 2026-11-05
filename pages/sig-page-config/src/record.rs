@@ -1,6 +1,6 @@
 //! The `sig` input queue's records as the editor's inputs: a key press or repeat becomes a
-//! key the editor knows (with Control, a shortcut) or the text it typed, and a paste stays a
-//! paste. The record's layout is `sig-page-kit`'s; this takes its fields.
+//! key the editor knows (with Control, a shortcut) or the text it typed, a paste stays a
+//! paste, and an input method's text is typed text. The record's layout is `sig-page-kit`'s; this takes its fields.
 //!
 //! Must not own: reading the queue (the wasm entry points), or what an input does (the
 //! editor).
@@ -11,6 +11,7 @@ use crate::editor::{Input, Key, Mods};
 pub const PRESS: u8 = 1;
 pub const REPEAT: u8 = 2;
 pub const PASTE: u8 = 3;
+pub const COMMIT: u8 = 4;
 
 /// Modifier bits.
 const SHIFT: u8 = 1;
@@ -23,6 +24,7 @@ const ALT_GRAPH: u8 = 16;
 pub fn input(kind: u8, modifiers: u8, key: &str, text: &str) -> Option<Input> {
     match kind {
         PASTE => return Some(Input::Paste(text.to_owned())),
+        COMMIT => return (!text.is_empty()).then(|| Input::Text(text.to_owned())),
         PRESS | REPEAT => {}
         _ => return None,
     }
@@ -93,6 +95,10 @@ mod tests {
         assert_eq!(
             input(PASTE, 0, "", "a\tb\n"),
             Some(Input::Paste("a\tb\n".into()))
+        );
+        assert_eq!(
+            input(COMMIT, 0, "", "日本"),
+            Some(Input::Text("日本".into()))
         );
         assert_eq!(input(9, 0, "a", "a"), None);
     }

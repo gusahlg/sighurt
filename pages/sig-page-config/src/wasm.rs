@@ -78,7 +78,9 @@ impl Measure for HostMeasure {
 #[cfg(not(feature = "fake-host"))]
 #[derive(Default)]
 struct PageHost {
-    held: Vec<sig_page_kit::sig::Request>,
+    /// The requests held, by the page's own ids.
+    held: Vec<(u32, sig_page_kit::sig::Request)>,
+    next: u32,
 }
 
 #[cfg(not(feature = "fake-host"))]
@@ -92,17 +94,17 @@ impl Host for PageHost {
             Request::ClipboardWrite { text } => Sig::clipboard_copy(&text),
         };
         let sent = sent.ok_or("the browser refused the request")?;
-        let id = sent.id();
-        self.held.push(sent);
-        Ok(id)
+        self.next += 1;
+        self.held.push((self.next, sent));
+        Ok(self.next)
     }
 
     fn poll(&mut self, id: u32) -> Poll {
         use sig_page_kit::sig::Poll as Sig;
-        let Some(at) = self.held.iter().position(|r| r.id() == id) else {
+        let Some(at) = self.held.iter().position(|(held, _)| *held == id) else {
             return Poll::Done(Err("no such request".into()));
         };
-        let answer = match self.held[at].poll() {
+        let answer = match self.held[at].1.poll() {
             Sig::Waiting => return Poll::Pending,
             Sig::Done(text) => Ok(text),
             Sig::Failed(why) => Err(why),
@@ -113,7 +115,7 @@ impl Host for PageHost {
     }
 
     fn cancel(&mut self, id: u32) {
-        self.held.retain(|r| r.id() != id);
+        self.held.retain(|(held, _)| *held != id);
     }
 }
 
@@ -233,6 +235,7 @@ impl App {
                 sig_page_kit::sig::InputKind::Press => crate::record::PRESS,
                 sig_page_kit::sig::InputKind::Repeat => crate::record::REPEAT,
                 sig_page_kit::sig::InputKind::Paste => crate::record::PASTE,
+                sig_page_kit::sig::InputKind::Commit => crate::record::COMMIT,
             };
             out.extend(crate::record::input(
                 kind,
