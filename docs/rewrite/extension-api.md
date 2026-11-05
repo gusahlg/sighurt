@@ -1084,6 +1084,14 @@ system, so a chrome no longer loads fonts itself.
 - **A chrome must show `status` whenever it is `Some`:** visibly, not under page content, cut to
   fit if it must. `status` carries `sig`'s own notices (configuration errors, downloads, refused
   prompts; plan §17, decisions 46 and 47), which the user must be able to see.
+- **Fullscreen keeps the controls reachable.** While `Snapshot::fullscreen` holds (the window is
+  fullscreen: the user's `browser.fullscreen` or a page's element), a chrome lists its surfaces
+  only while they are needed: while it has the keyboard (the address or find line), while
+  `status` is `Some` (in fullscreen `sig` sends only a fresh notice of its own there, for a
+  few seconds), and while it draws the page area (`sig://home`, errors, a blank tab).
+  Otherwise it lists none and `layout.page` is the whole window. Shown for the keyboard or a
+  notice, its surfaces lie over the page, which keeps the whole window; a surface listed again
+  is drawn again (`Repaint`). Not fullscreen, nothing changes.
 - **Keyboard.**
   - The core decides where the keyboard is. The chrome follows `Focus` events and reports its own
     moves (`ChromeAction::Focus`), as in decision 40.
@@ -1879,3 +1887,24 @@ finding was checked against the plan and the code before it was acted on.
   chrome's `find-150`, `find-closed-100`). The example configuration binds `n` and `N` to
   `page.find-next` and `page.find-previous`. The demo engine finds in its own content tree's
   text (`find_in_page: true`).
+- **Fullscreen: the core, the runtime and the chromes** (5 November 2026, STATUS decision 132).
+  The core keeps three states (`sighurt_core::fullscreen::FullscreenState`: `wanted`, the
+  user's toggle; `window`, what the frontend reported; `page`, the `(ViewId,
+  DocumentGeneration)` holding element fullscreen), read with `BrowserState::fullscreen`. It
+  asks for the window with `Effect::SetFullscreen(bool)` (the runtime's
+  `Frontend::fullscreen(bool)`, a no-op by default) and hears what the window became as
+  `BrowserEvent::Fullscreen(bool)`; the window only, the terminal neither. A page's
+  `EngineEvent::FullscreenChanged { fullscreen: true }` is accepted for the shown view's
+  current document, with the window focused and an activation within 5 s, which it uses up;
+  otherwise `EngineCommand::ExitFullscreen`. Every way out (`page.exit-fullscreen`, another
+  tab, a new document, the view failing or closing, focus lost, the compositor, the user's
+  toggle, the engine's `false`) ends it at once. While the shown view holds it, an unmodified
+  Escape the keymap passes runs `page.exit-fullscreen`, its release taken with it.
+  `TabInfo::fullscreen` is now true while the tab's page holds it. The chrome API gains
+  `Snapshot::fullscreen: bool` (a chrome or test that builds a `Snapshot` field by field adds
+  `fullscreen: false`) and the contract line above; in fullscreen the window's `status` carries
+  only a fresh notice. The standard and line chromes follow it; their golden images are
+  unchanged (fullscreen draws nothing new: a surface is either hidden or drawn as before). The
+  example configuration binds `f11` to `browser.fullscreen`. The demo engine has element
+  fullscreen (`fullscreen: true`: `demo:fullscreen`, and `demo:fullscreen-unasked` to be
+  refused). Diagnostics gain `"fullscreen": {"page", "wanted", "window"}`.
