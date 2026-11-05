@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>normal</title>
+<!-- Element fullscreen (engines.sh fullscreen, cef.sh): a click anywhere asks for it; with ?auto
+     the page asks at load, with no user activation. The page reports its state as it changes,
+     as its title and as a request to /fs/STATE (full, normal, refused), which the server logs. -->
+<style>html, body { margin: 0; height: 100%; } button { position: fixed; inset: 0; width: 100%; height: 100%; font: 24px sans-serif; }</style>
+<button id="go">fullscreen</button>
+<script>
+  const say = (state) => { document.title = state; fetch("/fs/" + state).catch(() => {}); };
+  const ask = () => document.documentElement.requestFullscreen().catch(() => say("refused"));
+  document.getElementById("go").onclick = ask;
+  document.onfullscreenchange = () => say(document.fullscreenElement ? "full" : "normal");
+  if (location.search == "?auto") addEventListener("load", ask);
+</script>

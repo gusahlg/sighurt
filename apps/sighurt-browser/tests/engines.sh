@@ -67,6 +67,11 @@
 #   find    find in page through the engines: in WPE, :page.find counts the matches (WebKit
 #           says no current one), smart case, page.find-next, no match and page.find-stop; in
 #           Servo, which can't find in page, the tab's search says so and a notice shows
+#   fullscreen  a page's element fullscreen in Servo and in WPE: a click on the page's button
+#           makes the page and the window fullscreen (the page fills the output, the chrome
+#           hides); Escape (unbound: the core's own) leaves both and the page sees it; a click
+#           enters again; tab.next leaves; f11 during it leaves both; a page asking at load is
+#           refused; in WPE, the window losing the keyboard (another workspace) leaves it
 #
 # Exits with the number of failed checks.
 set -u
@@ -80,7 +85,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: engines.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase labels switch find)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(servo wasm cross settings links wpe showcase labels switch find fullscreen)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (the demo engine's tests build it with other
   # features); this link keeps the binary these runs use. It is made under the same hold of the
@@ -1294,6 +1299,92 @@ CONF
   key -M ctrl q -m ctrl
   wait_sig; code=$?
   check "ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+  ;;
+
+fullscreen)
+  lh=http://localhost:$(cat "$out/port")
+  # The bindings keymap leaves Escape unbound, so the core's own Escape leaves a page's
+  # fullscreen; f11 is the window's toggle.
+  sed -i 's/^"ctrl-q" = "browser.quit"$/&\n"f11" = "browser.fullscreen"/' "$out/config/sighurt/config.toml"
+  cat >> "$out/config/sighurt/config.toml" <<CONF
+[routing.wpe]
+hosts = ["localhost"]
+CONF
+  fs="d['fullscreen']['wanted'], d['fullscreen']['window'], d['fullscreen']['page']"
+  page_size="[(x['width'], x['height']) for x in views if x['shown']]"
+  chrome_up="sorted(x['role'] for x in t if x['role'] in ('chrome', 'status', 'page') and x['mapped'])"
+  title1="seg(1).get('title')"
+  # page_says STATE: the page's latest report of its fullscreen state (its request to /fs/STATE)
+  # is STATE, within 10 s; an answer for check. Titles are not saved at once, requests are logged.
+  page_says() {
+    local said
+    for _ in $(seq 40); do
+      said=$(grep -o ' GET /fs/[a-z]*' "$out/server.log" | tail -1 | sed 's| GET /fs/||')
+      [[ $said == "$1" ]] && break
+      sleep 0.25
+    done
+    answer "$([[ $said == "$1" ]]; echo $?)" "the page said: ${said:-nothing}"
+  }
+  # page_fullscreen ENGINE URL: the checks, in a sig with URL in tab 1 and another page in tab 2.
+  page_fullscreen() {
+    local engine=$1 url=$2
+    step "$engine: $url, a page whose button asks for fullscreen"
+    start_sig "$url" "$base/find.html"
+    check "$engine: the page opens in its engine" "$(sess 30 "url(1)=='$url' and seg(1)['engine']=='$engine' and $title1=='normal', (seg(1)['engine'], url(1), $title1)")"
+    check "$engine: its view is shown" "$(shows_tab 1 "$engine")"
+    check "$engine: windowed at the start" "$(dg 5 "($fs)==(False, False, False), ($fs)")"
+    windowed=$(value "$page_size")
+    sleep 1
+    click 640 400
+    check "$engine: a click makes the page and the window fullscreen" "$(dg 10 "($fs)==(False, True, True), ($fs)")"
+    check "$engine: the page fills the output" "$(dg 5 "$page_size==[(1280, 800)], $page_size")"
+    check "$engine: the page's element is fullscreen" "$(page_says full)"
+    shot "$engine-01-page-fullscreen" 0.5
+    check "$engine: the chrome hides once the notice has gone" "$(dg 10 "$chrome_up==[], (d['status'], $chrome_up)")"
+    step "$engine: Escape"
+    key -k Escape
+    check "$engine: Escape leaves the page's and the window's fullscreen" "$(dg 10 "($fs)==(False, False, False), ($fs)")"
+    check "$engine: the chrome is back" "$(dg 10 "'chrome' in $chrome_up, $chrome_up")"
+    check "$engine: the page is where it was" "$(dg 10 "$page_size==$windowed, ($page_size, '$windowed')")"
+    check "$engine: the page's element left it (no fullscreen element)" "$(page_says normal)"
+    info "$engine: after Escape the status strip shows $(value "d['status']") (see $engine-02-left.png)"
+    shot "$engine-02-left" 0.5
+    step "$engine: a click enters again; tab.next leaves"
+    click 640 400
+    check "$engine: a second click enters again" "$(dg 10 "($fs)==(False, True, True), ($fs)")"
+    key -M ctrl -k Tab -m ctrl
+    check "$engine: tab.next leaves it" "$(dg 10 "($fs)==(False, False, False) and d['active_tab']==2, (($fs), d['active_tab'])")"
+    key -M alt 1 -m alt
+    check "$engine: back on the first tab, the page's element is not fullscreen" "$(page_says normal)"
+    step "$engine: f11 during the page's fullscreen"
+    sleep 0.5
+    click 640 400
+    check "$engine: a click enters again" "$(dg 10 "($fs)==(False, True, True), ($fs)")"
+    key -k F11
+    check "$engine: f11 leaves the page's and the window's fullscreen" "$(dg 10 "($fs)==(False, False, False), ($fs)")"
+    check "$engine: and the page's element left it" "$(page_says normal)"
+    if [[ $engine == wpe ]]; then
+      step "wpe: the window loses the keyboard (another workspace) during the page's fullscreen"
+      sleep 0.5
+      click 640 400
+      check "wpe: a click enters again" "$(dg 10 "($fs)==(False, True, True), ($fs)")"
+      swaymsg -q workspace 2
+      check "wpe: losing the focus leaves the page's fullscreen" "$(dg 10 "($fs)==(False, False, False), ($fs)")"
+      swaymsg -q workspace 1
+      check "wpe: and the page's element left it" "$(page_says normal)"
+    fi
+    step "$engine: a page asking at load"
+    open "$url?auto"
+    check "$engine: a page asking at load is refused" "$(page_says refused)"
+    check "$engine: and nothing is fullscreen" "$(dg 3 "($fs)==(False, False, False), ($fs)")"
+    shot "$engine-03-refused" 0.3
+    key -M ctrl q -m ctrl
+    wait_sig; code=$?
+    check "$engine: ctrl-q exits cleanly" "$(answer "$code" "exit code $code")"
+    rm -f "$session"
+  }
+  page_fullscreen servo "$base/fullscreen.html"
+  page_fullscreen wpe "$lh/fullscreen.html"
   ;;
 
 switch)

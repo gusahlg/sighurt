@@ -2,8 +2,9 @@
 # sig with the CEF engine, end to end, in a private headless sway on a private D-Bus session:
 # example.com and a local input page open in Chromium (`page.open-in cef`), the page is
 # shown, typing reaches a field and not the keymap, a paste goes through the clipboard service,
-# find in page gives the current match and the total, the page shows again after another tab
-# was shown, and an idle page costs nothing.
+# find in page gives the current match and the total, a click on a page's button makes the page
+# and the window fullscreen and Escape leaves (a page asking at load is refused), the page shows
+# again after another tab was shown, and an idle page costs nothing.
 # Screenshots and logs in OUT. Builds sig with the cef and
 # demo engines (no Servo, no WPE). Never touches the desktop or the user's configuration: every
 # XDG directory is under OUT.
@@ -173,6 +174,40 @@ open ":page.find pear"
 check "no match is said" "$(dg 10 "$find is not None and $find['found'] is False and $find['total']==0, $find")"
 open ":page.find-stop"
 check "page.find-stop ends the search" "$(dg 10 "$find is None, $find")"
+# Element fullscreen: accepted for a click, with the window; Escape (unbound in this keymap:
+# the core's own) leaves both. A page asking at load is refused.
+fs="d['fullscreen']['wanted'], d['fullscreen']['window'], d['fullscreen']['page']"
+# page_says STATE: the page's latest report of its fullscreen state (its request to /fs/STATE)
+# is STATE, within 10 s. Titles are not saved at once; requests are logged.
+page_says() {
+  local said
+  for _ in $(seq 40); do
+    said=$(grep -o ' GET /fs/[a-z]*' "$out/server.log" | tail -1 | sed 's| GET /fs/||')
+    [[ $said == "$1" ]] && break
+    sleep 0.25
+  done
+  [[ $said == "$1" ]]; echo "$? the page said: ${said:-nothing}"
+}
+page_size="[(x['width'], x['height']) for x in views if x['shown']]"
+chrome_up="sorted(x['role'] for x in t if x['role'] in ('chrome', 'status', 'page') and x['mapped'])"
+open ":page.open-in cef $base/fullscreen.html"
+check "the fullscreen page opens in Chromium" \
+  "$(sess 25 "url(1)=='$base/fullscreen.html' and segs(1)[-1][0]=='cef' and seg(1).get('title')=='normal', (segs(1), url(1), seg(1).get('title'))")"
+windowed=$(value "$page_size")
+sleep 1
+click 640 400
+check "a click makes the page and the window fullscreen" "$(dg 10 "($fs)==(False, True, True), ($fs)")"
+check "the page fills the output" "$(dg 5 "$page_size==[(1280, 800)], $page_size")"
+check "the page's element is fullscreen" "$(page_says full)"
+shot 04-fullscreen 0.5
+key -k Escape
+check "Escape leaves the page's and the window's fullscreen" "$(dg 10 "($fs)==(False, False, False), ($fs)")"
+check "the chrome is back" "$(dg 10 "'chrome' in $chrome_up, $chrome_up")"
+check "the page is where it was" "$(dg 10 "$page_size==$windowed, ($page_size, '$windowed')")"
+check "the page's element left it" "$(page_says normal)"
+open ":page.open-in cef $base/fullscreen.html?auto"
+check "a page asking at load is refused" "$(page_says refused)"
+check "and nothing is fullscreen" "$(dg 3 "($fs)==(False, False, False), ($fs)")"
 # Another tab, then back: the CEF view, hidden meanwhile, presents again although its page
 # paints nothing new, and the host maps it (a target shown again waits for a frame).
 key -M ctrl t -m ctrl
@@ -180,7 +215,7 @@ check "a new tab hides the CEF view" "$(dg 10 "len(tabs)==2 and (shown is None o
 key -M alt 1 -m alt
 check "back on the first tab, the CEF view is shown and mapped" \
   "$(dg 10 "shown is not None and shown['engine']=='cef' and shown['mapped'], shown and (shown['engine'], shown['mapped'])")"
-shot 04-shown-again 0.5
+shot 05-shown-again 0.5
 # Idle: after load, nothing wakes sig and Chromium's tree does not burn CPU.
 sleep 3
 before=$(tree)
