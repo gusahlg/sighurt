@@ -653,6 +653,77 @@ Written after its measurement, which was a probe: recorded because it was reject
   acquire, submit and present (bench/results/RENDER.md), `auto` does not choose them, and the
   CPU renderer is now the faster one per frame by more than before.
 
+### Optimization session (5 November 2026): method
+
+Written on 5 November 2026 on tensor-ash (the same machine as the 4 November session), branch
+`opt3` off 63d3e4c, before any change below was measured. The method is the 4 November one:
+release builds of `sig` (`--no-default-features --features
+engine-demo,engine-wasm,frontend-tui,render-wgpu`), the build before a change and after it run
+interleaved in one private compositor, 1280×800 at scale 1, fresh XDG directories each run;
+temporary timing lines where `perf` would have said where time goes (it cannot open events in
+the sandbox), never committed.
+
+### H-START2: The history file is read after the first frame, not before it
+
+- **Seen:** since decision 131 the runtime reads and parses `history.toml` in `Session::new`
+  (`History::open` → `set_remember(true)` → `load`), which the GUI calls after it creates the
+  window and before its loop runs, so before the first configure is answered; the terminal
+  does the same before its first frame. A full history (5 000 visits, 807 KB) took 37–47 ms
+  to read and parse in a debug build (decision 131); a release build should take several
+  milliseconds, against a whole release startup of about 7 ms (H-START1).
+- **Change:** `History` reads and parses the file on a thread of its own, started when the
+  history is opened; the owner takes the result when it is ready (each loop pass asks, without
+  waiting) or when something needs the visits (a visit, a forget, a save, `remember`), waiting
+  then if it must. Completion answers nothing until the file is in, and the frontends ask again
+  when it arrives (the history's generation changes). What is read and kept is unchanged.
+- **Prediction:** with a 5 000-visit history in the state directory, the time from exec to the
+  first chrome surface and to the page's first frame (`bench/startup/startup.sh`,
+  `demo://pattern`) falls by at least 3 ms; without a history file it does not move beyond
+  the spread. Ten runs a build, interleaved; a change counts when the medians differ by more
+  than the larger of the two builds' spreads (min–max).
+- **Guards:** the runtime's history tests (the store, the writer, forgets with `remember` off,
+  another `sig`'s history), the history fuzz tests, headless.sh `history` (the ghost text from
+  a seeded file), the terminal's `the_address_line_completes_from_the_history`; no thread left
+  after startup (the reader ends when it has read).
+- **Outcome:** supported, kept. `startup.sh`, ten runs a build interleaved, headless sway
+  (pixman), with `HISTORY_FILE` a 5 000-visit file of 807 KB
+  (`/data/sig-builds/test-out/opt3/start2-hist`), medians (min–max) in ms: exec → first chrome
+  surface 35.35 (34.30–36.00) → 19.95 (19.40–21.10), −15.4 ms; → the page's first frame
+  35.75 (35.30–36.30) → 20.90 (20.30–21.80), −14.9 ms. The spreads do not overlap. Without a
+  history file (`start2-nohist`): first chrome 20.75 (19.00–21.90) → 19.90 (18.80–22.60), first
+  page 20.65 (20.10–21.40) → 20.70 (20.10–24.40), inside the spread. A release build takes
+  about 15 ms to read and parse the full history (more than the 3 ms predicted), so it was
+  three quarters of the whole startup. The guards pass (the runtime's 50 tests with a new
+  one for the read on a thread, the fuzz tests, and the end-to-end suites listed in the
+  session's report).
+- **Seen while measuring (not a change):** in this harness exec → `main` takes about 15 ms of
+  the 20 (temporary probes, three runs, `start-probe`), where H-START1 found 1.1 ms. It is the
+  dynamic loader's search, not sig: this build links the Wasm engine's FFmpeg and its codec
+  libraries (105 shared objects), and inside `nix-shell` `LD_LIBRARY_PATH` has 21 directories,
+  so loading them makes 2 564 failed `openat` calls (`strace`, `--version`). Outside the shell
+  the binary does not start at all (another glibc), so where `sig` is started from decides
+  this cost; loading FFmpeg only when a guest first uses media would remove most of it. Left
+  as an open item.
+
+### Optimization session (5 November 2026): measured and left alone
+
+- **Completion over a full history** (`History::complete`, asked once per edit of the address
+  line): the ignored test `measure_completing_from_5000_visits` (sighurt-runtime, release,
+  median of 200 queries, three runs) takes 146–157 µs for a prefix every visit matches ("h",
+  "w": a scan of all 5 000 and a sort of the matches), 110–113 µs for "site1", 39–45 µs for a
+  prefix few or none match. Under a millisecond a keystroke even at the bound; a top-eight
+  selection instead of the sort would save perhaps 100 µs nobody sees. Not changed.
+- **The owner loop's new per-pass work** (decisions 130–132), read rather than profiled:
+  `answer_completions` returns at once unless the chrome asked or the history's generation
+  changed; `History::poll` is one `is_finished` while the file is read and nothing after;
+  `writes_due` is two `Option` reads; the snapshot carries the find text as one clone per
+  snapshot, and snapshots are built only when the core changed something (decision 124's
+  `snapshot_dirty`). Nothing per iteration that should be per change.
+- **Shaping the address line's ghost text** (decision 131): the ghost and the typed text are
+  two cached lines (`Fonts::line`), shaped once per edit, and a frame that redraws an
+  unchanged line hits the cache. Decision 128's 0.5 ms status-line shaping is cold caches
+  after an idle gap, not the shaper. Not changed.
+
 ## Predictions for the IPC-removal session (gpui-baseline against 3c510fe)
 
 Written on 2 October 2026, before the session's first run. The session measures the baseline

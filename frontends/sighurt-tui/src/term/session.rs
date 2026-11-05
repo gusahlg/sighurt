@@ -9,7 +9,10 @@
 //! the terminal before the process dies. `SIGTSTP` and `SIGCONT` only set an
 //! atomic and wake the self-pipe; [`Session::take_resumed`] restores, stops,
 //! and enters raw mode again after `SIGCONT`. `SIGWINCH` only writes that
-//! pipe. `SIGHUP`, `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL`, `SIGSEGV`, the
+//! pipe. `SIGHUP` sets an atomic and wakes the pipe too: the owner quits as it
+//! would for SIGTERM ([`Session::take_hangup`]), so what it has to save is
+//! saved; a hung-up terminal fails every write at once, so nothing waits on it.
+//! `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL`, `SIGSEGV`, the
 //! panic hook and [`restore_before_forced_exit`] still write, and only with
 //! async-signal-safe calls (`write`, `poll`, `fcntl`, `tcsetattr`,
 //! `clock_gettime`): no allocation and no lock. A fatal signal chains to the
@@ -152,6 +155,8 @@ struct Shared {
     /// write the terminal or stop the process itself.
     suspend_requested: AtomicBool,
     resumed: AtomicBool,
+    /// `SIGHUP` arrived and the owner has not taken it yet.
+    hangup: AtomicBool,
     /// Set before `sigaction`, so drop leaks the box rather than freeing it
     /// under a live handler.
     handlers: AtomicBool,
@@ -222,6 +227,7 @@ impl Session {
             wire_packed: AtomicU64::new(u64::from(Wire::Ground as u8)),
             suspend_requested: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
+            hangup: AtomicBool::new(false),
             handlers: AtomicBool::new(false),
         });
         let state = Box::into_raw(shared);
@@ -307,7 +313,7 @@ impl Session {
 
     /// `SIGTSTP` asks the owner to stop; the owner does it in
     /// [`Self::take_resumed`]. `SIGCONT` only wakes the self-pipe. `SIGHUP`
-    /// restores and re-raises, because the process is about to die.
+    /// sets the flag [`Self::take_hangup`] reads and wakes the self-pipe.
     /// `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGILL` and `SIGSEGV` do the same when
     /// their saved disposition is the default, and otherwise chain to that
     /// handler without touching the terminal. `SIGWINCH` writes one byte to
@@ -357,6 +363,12 @@ impl Session {
             self.suspend_owner();
         }
         self.shared().resumed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether `SIGHUP` arrived since the last call: the terminal hung up (or someone sent it),
+    /// and the owner should quit. Nothing was written or restored for it.
+    pub fn take_hangup(&self) -> bool {
+        self.shared().hangup.swap(false, Ordering::AcqRel)
     }
 
     /// The terminal file descriptor. Register it for readability.
@@ -1003,7 +1015,7 @@ fn wait_out(fd: RawFd, deadline: Mono) -> bool {
 }
 
 /// `CLOCK_MONOTONIC` time. `clock_gettime` is async-signal-safe; this is the
-/// deadline clock for restoration, including the `SIGHUP` handler.
+/// deadline clock for restoration, including the fatal signals' handlers.
 #[derive(Clone, Copy)]
 struct Mono {
     sec: i64,
@@ -1204,15 +1216,13 @@ fn wake_winch() {
     }
 }
 
+/// The owner quits on its next turn. A hung-up terminal is sent `SIGHUP` more than once (by
+/// the kernel, then again as the shell ends), so a second one changes nothing.
 extern "C" fn handle_hup(_signal: libc::c_int) {
     let saved = errno_raw();
     if let Some(state) = load_state() {
-        let _ = restore_signal_safe(state);
-        set_default(libc::SIGHUP);
-        // Unblock before `raise`, or the signal stays pending and this handler
-        // returns into the owner loop.
-        unblock_signal(libc::SIGHUP);
-        unsafe { libc::raise(libc::SIGHUP) };
+        state.hangup.store(true, Ordering::Release);
+        wake_winch();
     }
     set_errno_raw(saved);
 }

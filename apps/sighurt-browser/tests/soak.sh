@@ -8,12 +8,18 @@
 #                 animation, resize, slow) and two Wasm guests (raf-demo, hello-sighurt), then
 #                 closed again
 #   switching     ctrl-tab through them all, alt-1..3
-#   history       a page opened in the third tab, then back, forward, back
+#   history       a page opened in the third tab, then back, forward, back; a Wasm guest from
+#                 the local web server (serve.py), a visit recorded while `[history] remember`
+#                 is on (odd cycles) and none while it is off; an address completed from it
 #   zoom          page.zoom-in, zoom-out, zoom-reset
+#   find, tabs    page.find in the first tab, find-next, find-previous, find-stop;
+#                 tab.duplicate, tab.move left, the copy closed and tab.reopen'ed and closed
+#   fullscreen    browser.fullscreen on and off again, the window's state following
 #   output        four sizes at scales 1, 1.25, 1.5 and 2, then 1280x800 at 1
 #   hide, show    another workspace shown over sig's for a second
-#   configuration config.toml rewritten with another tab colour; every third cycle an invalid
-#                 file first, which must be reported (a notice) and kept out (the keys still work)
+#   configuration config.toml rewritten with another tab colour and `[history] remember`
+#                 flipped; every third cycle an invalid file first, which must be reported (a
+#                 notice) and kept out (the keys still work)
 #   clipboard     clipboard.copy, read back with wl-paste; wl-copy, pasted into the address line
 #                 and opened
 #
@@ -73,8 +79,17 @@ rm -rf "$run" "$out"/*.png "$out"/*.tsv "$out/steps.log"
 private "$run"
 export RUST_LOG=${RUST_LOG:-info}
 config=$run/config/sighurt/config.toml
-cp "$config" "$out/base.toml"
 g=$out/guests
+# The web server for the history's visits: Wasm guests over http, which the Wasm engine opens
+# for its origin.
+python3 "$repo/apps/sighurt-browser/tests/serve.py" "$repo/apps/sighurt-browser/tests/pages" "$g" \
+  "$out/port" "$out/server.log" &
+server=$!
+rm -f "$out/port"
+for _ in $(seq 50); do [[ -s $out/port ]] && break; sleep 0.1; done
+web=http://127.0.0.1:$(cat "$out/port")
+printf '[routing.wasm]\norigins = ["%s"]\n' "$web" >> "$config"
+cp "$config" "$out/base.toml"
 pages=(demo://pattern demo://animation demo://resize demo://slow "file://$g/raf_demo.wasm" "file://$g/hello_sighurt.wasm")
 
 # An input device that stays plugged in: each wtype command plugs in its own keyboard.
@@ -143,10 +158,52 @@ while [[ $SECONDS -lt $end ]] && alive; do
   cmd page.back
   cmd page.forward
   cmd page.back
+  # Odd cycles remember (the configuration step below sets the next cycle's).
+  visits=$(dg "c['visits_recorded']" | cut -d' ' -f2)
+  cmd "page.open $web/guests/hello_sighurt.wasm?$cycle"
+  sleep 1
+  if [[ $((cycle % 2)) == 1 ]]; then
+    verdict "cycle $cycle: the page over http is a visit" "$(dg "c['visits_recorded']>$visits, c['visits_recorded']")"
+  else
+    verdict "cycle $cycle: with remember off, it is not" "$(dg "c['visits_recorded']==$visits, c['visits_recorded']")"
+  fi
+  key -M ctrl l -m ctrl
+  key "${web#http://}"
+  key -k Escape
+  cmd page.back
   step "zoom"
   cmd page.zoom-in
   cmd page.zoom-out
   cmd page.zoom-reset
+  tick
+
+  step "find in the first tab"
+  key -M alt 1 -m alt
+  cmd "page.find demo"
+  verdict "cycle $cycle: a search in the first tab" "$(dg "d['tabs'][0]['find'] is not None, d['tabs'][0]['find']")"
+  cmd page.find-next
+  cmd page.find-previous
+  cmd page.find-stop
+  verdict "cycle $cycle: and stopped" "$(dg "d['tabs'][0]['find'] is None, d['tabs'][0]['find']")"
+
+  step "tab.duplicate, tab.move, tab.reopen (23 tabs: the churned ones are still open)"
+  cmd tab.duplicate
+  cmd "tab.move left"
+  verdict "cycle $cycle: the copy is first" "$(dg "len(d['tabs'])==24 and d['active_tab']==1, (len(d['tabs']), d['active_tab'])")"
+  key -M ctrl w -m ctrl
+  cmd tab.reopen
+  verdict "cycle $cycle: closed and reopened" "$(tab_count 24)"
+  key -M ctrl w -m ctrl
+  verdict "cycle $cycle: 23 tabs again" "$(tab_count 23)"
+  tick
+
+  step "browser.fullscreen on and off"
+  cmd browser.fullscreen
+  sleep 0.5
+  verdict "cycle $cycle: the window is fullscreen" "$(dg "d['fullscreen']['window'], d['fullscreen']")"
+  cmd browser.fullscreen
+  sleep 0.5
+  verdict "cycle $cycle: and is not again" "$(dg "not d['fullscreen']['window'], d['fullscreen']")"
   tick
 
   step "output sizes and scales"
@@ -185,7 +242,8 @@ while [[ $SECONDS -lt $end ]] && alive; do
     verdict "cycle $cycle: and kept out: ctrl-t still opens a tab" "$(tab_count 24)"
     key -M ctrl w -m ctrl
   fi
-  { cat "$out/base.toml"; printf '[ui.colors]\ntab = "%s"\n' "${colours[$((cycle % 2))]}"; } > "$config"
+  remember=$([[ $(((cycle + 1) % 2)) == 1 ]] && echo true || echo false)
+  { cat "$out/base.toml"; printf '[ui.colors]\ntab = "%s"\n[history]\nremember = %s\n' "${colours[$((cycle % 2))]}" "$remember"; } > "$config"
   sleep 0.7
   verdict "cycle $cycle: a valid file is taken" "$(dg "d['status']!='notice', d['status']")"
   tick
@@ -282,7 +340,7 @@ shot 04-restored 0
 key -M ctrl q -m ctrl
 exited "$sig_pid" 5; code=$status
 check "and quits cleanly" "$([[ $code == 0 ]]; echo $?)" "exit status $code"
-kill "$keyboard" 2>/dev/null
+kill "$keyboard" "$server" 2>/dev/null
 grep -l panicked "$out"/sig-soak.log "$run/sig.log" > /dev/null 2>&1 && check "no panic" 1 "see the logs"
 cp "$run/sig.log" "$out/sig-restore.log"
 cp "${SIG_SWAY_LOG:-/dev/null}" "$out/sway.log" 2>/dev/null

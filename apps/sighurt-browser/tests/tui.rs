@@ -73,7 +73,7 @@ impl Terminal {
 
     /// [`Self::start_in`] with `TERM=tmux-256color`, as in a tmux pane.
     fn start_in_tmux(name: &str, args: &[&str], replies: &'static [u8], tui: &str) -> Self {
-        Self::start_as(name, args, replies, tui, None, "tmux-256color")
+        Self::start_as(name, args, replies, tui, None, "tmux-256color", false)
     }
 
     /// [`Self::start_in`] with `history` as the history file (`state/sighurt/history.toml`).
@@ -84,10 +84,17 @@ impl Terminal {
         tui: &str,
         history: Option<&str>,
     ) -> Self {
-        Self::start_as(name, args, replies, tui, history, "xterm-kitty")
+        Self::start_as(name, args, replies, tui, history, "xterm-kitty", false)
     }
 
-    /// [`Self::start_seeded`] with `TERM` set to `term`.
+    /// [`Self::start`] with the pty as `sig`'s controlling terminal, in a session of its own, as
+    /// in a terminal emulator: closing the master then sends it `SIGHUP`.
+    fn start_controlling(name: &str, args: &[&str]) -> Self {
+        Self::start_as(name, args, REPLIES, "", None, "xterm-kitty", true)
+    }
+
+    /// [`Self::start_seeded`] with `TERM` set to `term`, and the pty as the controlling terminal
+    /// when `controlling`.
     fn start_as(
         name: &str,
         args: &[&str],
@@ -95,6 +102,7 @@ impl Terminal {
         tui: &str,
         history: Option<&str>,
         term: &str,
+        controlling: bool,
     ) -> Self {
         let dir = std::env::temp_dir().join(format!("sig-tui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -117,7 +125,22 @@ impl Terminal {
         tcsetwinsize(&slave, winsize(80, 24)).unwrap();
         let original = tcgetattr(&slave).unwrap();
         let stderr = fs::File::create(dir.join("stderr")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_sig"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sig"));
+        if controlling {
+            // SAFETY: setsid(2) and ioctl(2) only, between fork and exec. The session's id is
+            // the child's pid, which the watchdog kills as a process group.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        } else {
+            command.process_group(0);
+        }
+        let child = command
             .arg("--tui")
             .arg("--diagnostics")
             .arg(dir.join("diag.json"))
@@ -133,7 +156,6 @@ impl Terminal {
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(stderr)
-            .process_group(0)
             .spawn()
             .unwrap();
         let (stop, stopped) = mpsc::channel::<()>();
@@ -158,7 +180,7 @@ impl Terminal {
     }
 
     /// Reads what `sig` wrote, answering the probe once, until `done` holds for what arrived
-    /// from `since` on, or `timeout`.
+    /// from `since` on, or `timeout`. Returns whether it holds.
     fn wait(&mut self, since: usize, timeout: Duration, done: impl Fn(&[u8]) -> bool) -> bool {
         let start = Instant::now();
         let mut buf = vec![0u8; 1 << 16];
@@ -179,8 +201,9 @@ impl Terminal {
                 // EIO: the slave side has no process left.
                 Err(_) => return done(&self.got[since.min(self.got.len())..]),
             }
+            // What arrived before the wait may already satisfy it, with nothing more to come.
             if start.elapsed() > timeout {
-                return false;
+                return done(&self.got[since.min(self.got.len())..]);
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -2459,6 +2482,104 @@ fn closing_the_terminal_ends_sig_with_a_failure() {
         "the session was not saved: {session:?}\n{}",
         term.context()
     );
+}
+
+/// Opens a second tab, `demo://pattern`, with `:tab.new`, and waits until `sig` reports it.
+fn open_second_tab(term: &mut Terminal) {
+    term.type_bytes(b":tab.new demo://pattern\r");
+    let start = Instant::now();
+    while term.tabs().1 != 2 {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no second tab\n{}",
+            term.context()
+        );
+    }
+}
+
+/// The session file holds the second tab, and no temporary file is left beside it.
+fn assert_saved_whole(term: &Terminal) {
+    let state = term.dir.join("state/sighurt");
+    let session = fs::read_to_string(state.join("session.toml"));
+    assert!(
+        session
+            .as_deref()
+            .is_ok_and(|s| s.contains("demo://animation") && s.contains("demo://pattern")),
+        "the latest tabs were not saved: {session:?}\n{}",
+        term.context()
+    );
+    let left: Vec<String> = fs::read_dir(&state)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+}
+
+/// `SIGHUP` quits like `SIGTERM`: the terminal restored, status 0, and the tab opened a moment
+/// before (inside the session's one-second save delay) saved. It used to restore the terminal
+/// from the handler and die of the signal, without the last save.
+#[test]
+fn sighup_quits_saving_the_latest_tabs() {
+    let mut term = Terminal::start("sighup", &["demo://animation"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    open_second_tab(&mut term);
+    // SAFETY: kill(2) on the child.
+    unsafe { libc::kill(term.child.id() as i32, libc::SIGHUP) };
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+    assert_saved_whole(&term);
+}
+
+/// The terminal emulator goes away while `sig` runs in it: `sig`'s controlling terminal hangs
+/// up, the kernel sends it `SIGHUP` and its reads and writes fail. `sig` exits by itself
+/// (status 0 for the signal, or the failure of the terminal read if the loop sees that first),
+/// never killed by the signal, with the latest tabs saved and nothing half-written left.
+#[test]
+fn the_controlling_terminal_closing_saves_the_latest_tabs() {
+    let mut term = Terminal::start_controlling("ctty-hangup", &["demo://animation"]);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    open_second_tab(&mut term);
+    let null = fs::File::open("/dev/null").unwrap();
+    // SAFETY: dup2(2) onto a descriptor this test owns: the master closes.
+    assert!(
+        unsafe {
+            libc::dup2(
+                std::os::fd::AsRawFd::as_raw_fd(&null),
+                std::os::fd::AsRawFd::as_raw_fd(&term.master),
+            )
+        } >= 0
+    );
+    let closed = Instant::now();
+    let status = loop {
+        if let Some(status) = term.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            closed.elapsed() < Duration::from_secs(10),
+            "sig still runs 10 s after its terminal went away\n{}",
+            term.context()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.code().is_some(),
+        "sig was killed: {status:?}\n{}",
+        term.context()
+    );
+    assert_saved_whole(&term);
 }
 
 /// `--dump` of the slow page: done within the settle cap (3 s after its first snapshot) and the

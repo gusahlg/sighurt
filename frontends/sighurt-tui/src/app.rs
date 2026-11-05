@@ -3,7 +3,8 @@
 //! Its sources are the terminal (readable for input; writable only while bytes wait in the
 //! bounded output), the `SIGWINCH` pipe (resize, and the wake after `SIGCONT`), one ping that
 //! engine wakers and service threads share, the signal pipe from `sig` (SIGUSR1 diagnostics,
-//! SIGTERM and SIGINT quit, and SIGHUP until the terminal's handler takes it over) and the
+//! SIGTERM and SIGINT quit, and SIGHUP until the terminal's handler takes it over; that handler
+//! only sets a flag and wakes the `SIGWINCH` pipe, and the loop quits the same way) and the
 //! configuration watch.
 //!
 //! One iteration, after the loop wakes, as in the Wayland loop: terminal input (at most
@@ -90,9 +91,10 @@
 //!
 //! Logs go to `{state_dir}/sighurt/tui.log` before any engine starts. The terminal's modes are
 //! turned off before the engines shut down (its images are deleted first, while the alternate
-//! screen is up), and restored on every other way out: error, panic (the terminal's hook),
-//! SIGHUP (its handler) and [`Frontend::before_forced_exit`]; SIGTSTP suspends and SIGCONT
-//! redraws everything.
+//! screen is up), and restored on every other way out: error, panic (the terminal's hook) and
+//! [`Frontend::before_forced_exit`]; SIGTSTP suspends and SIGCONT redraws everything. SIGHUP
+//! (the terminal closed, or a `kill -HUP`) quits like SIGTERM, saving the session and the
+//! history; a hung-up terminal fails each write at once (EIO), so its restore cannot wait.
 //!
 //! Must not own: browser policy (the core) or which effect runs (the session).
 
@@ -775,6 +777,9 @@ impl App {
         if self.tui.terminal.take_resumed() {
             self.resumed();
         }
+        if self.tui.terminal.take_hangup() {
+            self.signals.push(libc::SIGHUP as u8);
+        }
         self.handle_signals();
         if std::mem::take(&mut self.config_changed) {
             self.reload_config();
@@ -988,7 +993,8 @@ impl App {
         for signal in std::mem::take(&mut self.signals) {
             match i32::from(signal) {
                 libc::SIGUSR1 => report(&self.tui, &mut self.session, false),
-                // SIGHUP only before the terminal's own handler is installed.
+                // SIGHUP from `sig`'s pipe before the terminal's handler is installed, from
+                // that handler's flag after.
                 libc::SIGTERM | libc::SIGINT | libc::SIGHUP => {
                     self.session
                         .queue_mut()
@@ -4184,6 +4190,13 @@ schemes = [\"demo\"]
             session: Some(dir.join("session.toml")),
         });
         let app = &mut demo.app;
+        // The file is read on a thread; the loop takes it as it would.
+        let started = Instant::now();
+        while app.session.history_generation() == 0 {
+            app.session.service_completions(&mut app.tui);
+            assert!(started.elapsed() < Duration::from_secs(5), "never read");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let mut queue = VecDeque::new();
         let key = |app: &mut App, key: KeyEvent, queue: &mut VecDeque<BrowserEvent>| {
             let event = InputEvent {
