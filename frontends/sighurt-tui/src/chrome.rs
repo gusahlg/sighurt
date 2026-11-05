@@ -11,8 +11,9 @@
 //! editor (prompt `→ `) or the find field (prompt `/`) while one is open,
 //! otherwise the notice, otherwise the status. What the search in the page
 //! found ("3 of 12") is right-aligned on it while there is one, after the
-//! search's text when the field is closed; a terminal too narrow for both
-//! drops it. After the
+//! search's text when the field is closed, and in its place the error of a
+//! command the address editor holds; a terminal too narrow for both drops it.
+//! After the
 //! address editor's text, with the cursor at its end, the rest of a visited
 //! address it completes to shows in grey ([`ChromeState::address_ghost`]).
 
@@ -61,6 +62,9 @@ pub struct ChromeState {
     pub finding: bool,
     /// What the search in the page found, while there is one: right-aligned on the bottom line.
     pub find: Option<String>,
+    /// Why the command in the address editor doesn't run: right-aligned on the bottom line while
+    /// the editor is open, in place of [`Self::find`]. Holds what the user typed.
+    pub error: Option<String>,
     /// `GFX` or `TEXT`. Any other short label is drawn as it is.
     pub mode_label: String,
     /// What the keymap says about itself, such as `NORMAL`.
@@ -80,6 +84,7 @@ impl Default for ChromeState {
             address_ghost: None,
             finding: false,
             find: None,
+            error: None,
             mode_label: MODE_GRAPHICS.to_string(),
             keymap_indicator: None,
             notice: None,
@@ -110,6 +115,9 @@ impl ChromeState {
         }
         if let Some(find) = &mut self.find {
             *find = sanitize(find);
+        }
+        if let Some(error) = &mut self.error {
+            *error = sanitize(error);
         }
         if let Some(editor) = &mut self.address_editing {
             editor.resanitize();
@@ -494,9 +502,12 @@ fn top_line(state: &ChromeState, cols: u16) -> String {
 /// The bottom line, the cursor's column, and how many columns its left part (the editor, the
 /// notice or the status) has.
 fn bottom_line(state: &ChromeState, cols: u16) -> (String, Option<u16>, u16) {
-    let find = state
-        .find
+    let error = state
+        .error
         .as_deref()
+        .filter(|_| state.address_editing.is_some());
+    let find = error
+        .or(state.find.as_deref())
         .map(sanitize)
         .filter(|find| !find.is_empty())
         .map(|find| fit_cols(&find, cols / 2));
@@ -669,6 +680,7 @@ mod tests {
             address_ghost: None,
             finding: false,
             find: None,
+            error: None,
             mode_label: MODE_GRAPHICS.into(),
             keymap_indicator: Some("NOR\u{1b}[0mMAL".into()),
             notice: None,
@@ -840,6 +852,28 @@ mod tests {
         state.address_editing.as_mut().unwrap().left();
         let page = state.draw(&mut grid);
         assert_eq!(page.cursor, Some(Cursor { column: 3, row: 3 }));
+    }
+
+    #[test]
+    fn a_commands_error_sits_at_the_right_of_the_open_editor_only() {
+        let mut state = ChromeState {
+            address_editing: Some(LineEditor::from_text(":hlep")),
+            find: Some("3 of 12".into()),
+            error: Some(":hlep: unknown \u{1b}[2Jcommand".into()),
+            ..ChromeState::default()
+        };
+        state.contain();
+        let mut grid = Grid::new(60, 4);
+        let page = state.draw(&mut grid);
+        let bottom = row_text(&grid, 3);
+        assert!(bottom.starts_with("→ :hlep "), "{bottom}");
+        assert!(bottom.ends_with(" :hlep: unknown command"), "{bottom}");
+        assert_eq!(page.cursor, Some(Cursor { column: 7, row: 3 }));
+        assert_safe(&grid);
+        // Closed: what the search found again.
+        state.address_editing = None;
+        state.draw(&mut grid);
+        assert!(row_text(&grid, 3).ends_with(" 3 of 12"));
     }
 
     #[test]
