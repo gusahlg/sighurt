@@ -4262,8 +4262,8 @@ Newest last. Each entry says what was decided and why.
     unbound, f11 during a page's fullscreen, the compositor ending it), the terminal's test,
     and a direct test in each engine's suite (Servo `the_page_goes_fullscreen`, WPE
     `goes_fullscreen` including a crash while fullscreen, CEF offscreen section 6).
-133. **Terminal images: sixel over sixel, every image paced, a hidden tab's image held, and a
-    quiet page re-sent alone inside tmux** (5 November 2026, branch `tuifix`; the user: "this
+133. **Terminal images: sixel over sixel and never a blank under a picture, every image paced,
+    a hidden tab's image held** (5 November 2026, branch `tuifix`; the user: "this
     bug with the TUI version that makes the entire sixel ui flicker black once every half
     second or so", only under tmux, and "the browser has a tendency to crash when I switch
     tabs quickly"). *The flicker*: since decision 121 the terminal wrote spaces over the page
@@ -4284,25 +4284,37 @@ Newest last. Each entry says what was decided and why.
     included, and a hidden tab's image is deleted or written over only once the last image
     has been up for its interval and at least 250 ms (`MIN_IMAGE_LIFE`), the shown tab's
     frame going over it in the same write when it has one; so another tab's picture can stay
-    under the shown tab's title for up to 250 ms. *Inside tmux* (`TERM` starting with tmux or
-    screen) tmux keeps every sixel written over another, at most 20 in the server, and sends
-    them all again, oldest first, when it redraws the pane (25–27 a window switch on an
-    animation); so once a page has been quiet for 400 ms with more than one stacked, sig
-    writes the blank and its picture again in one write, tmux keeps that one, and a still
-    page costs one sixel a redraw. A changing page is not capped: a blank every few frames
-    blinks, and in Rio spaces over a shown sixel are what loses Rio its device (a cap of 8
-    killed Rio during the plain animation check). *Measured* (private headless sway
+    under the shown tab's title for up to 250 ms. *Inside tmux* a placed page picture is never blanked while the layout stays (the user,
+    after trying a first version that re-sent a quiet page's picture after a blank, 400 ms
+    after its last frame: "when anything gets updated it flickers still … make it so that
+    it never flickers"; that rewrite showed on their display as a blink after every burst of
+    typing, scrolling or reloading, and is gone). Each sixel goes over the one before; a view
+    with no frame yet (a navigation that makes a new view, an engine switch, a tab not shown
+    before) keeps the old picture until its first frame replaces it, and the rows are blanked
+    only when they must say something (an error, a `sig:` page, a new tab's first load). tmux
+    keeps every sixel written over another, at most 20 in the server, and replays them,
+    oldest first, when it redraws the pane: 19 sixels, about 230 KB, within 300 ms of a
+    window switch. That replay is the accepted price, because tmux frees a stored sixel only
+    when text is written over it, and that is a visible redraw. A cap on the stack was tried
+    and dropped (a blank every few frames blinks, and in Rio spaces over a shown sixel are
+    what loses Rio its device: a cap of 8 killed Rio during the plain animation check).
+    Proof at the byte level: the pty test `nothing_is_written_on_the_page_rows_under_a_picture`
+    (sig's own bytes, with TERM as tmux and as xterm, through typing into the page, reloads,
+    the address line, the find field, a tab switch and back, a notice, a navigation) and
+    real-terminals.sh `still` (tmux's output to Rio through `sixel-tap.py`: 0 writes on the
+    page rows, against 145 for the version with the rewrite). What can still blank is by
+    design (a resize, a text/graphics switch, `chrome.refresh`, a page with no picture) or
+    Rio's (it sometimes renders a frame of nothing when a sixel replaces a sixel: 2 of 630
+    screenshots on its Vulkan renderer with no write from sig or tmux, 0 of 637 on its CPU
+    renderer). *Measured* (private headless sway
     1280×800, Rio 0.5.28 on Vulkan on this desktop's NVIDIA GPU, tmux 3.8;
     `frontends/sighurt-tui/tests/real-terminals.sh`, scenarios `rio-tmux-sixel`, `rio-sixel`,
     `rio-kitty`, a tap on tmux's output counting the sixels it sends): flicker under tmux on
     the animation page, flashed screenshots of 200: 23 before, 0 after; a still page: 0
-    bytes, 0 sixels, 0 flashes of 100; the quiet re-send: no screenshot of 100 in 2 s caught
-    it (under 20 ms); a tab storm (30 a second for 25 s): Rio died before in all three
-    setups, survived after under tmux, alone with sixel and alone with kitty; a tmux redraw of
-    a still page: 1 sixel. Three pty tests fail against the code before
+    bytes, 0 sixels, 0 flashes of 100; a tab storm (30 a second for 25 s): Rio died before in all three
+    setups, survived after under tmux, alone with sixel and alone with kitty. Three pty tests fail against the code before
     (`sixel_frames_go_over_each_other…`, `a_sixel_frame_that_is_the_picture_on_the_rows_is_not_written`,
-    `a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced`), two more
-    cover tmux. **Known and outside sig**: Rio 0.5.28 under tmux loses its device on tmux
+    `a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced`). **Known and outside sig**: Rio 0.5.28 under tmux loses its device on tmux
     pane redraws (window switches, a resize) with any sixel shown: it died within 3 to 12
     switches whatever sig had stacked, and with one still sixel written by `cat` and no sig
     running. sig cannot prevent that; it should go to Rio's maintainers. *Workaround, measured*:
