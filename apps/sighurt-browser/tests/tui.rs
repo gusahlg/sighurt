@@ -2684,3 +2684,52 @@ fn sig_pages_need_graphics_and_say_so() {
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
 }
+
+/// sig://config in the terminal: drawn as graphics, typed into in INSERT MODE, and Ctrl+S saves
+/// the file (the key press is the deliberate action a write needs). Needs the Wasm engine: run
+/// with `--features frontend-tui,engine-demo,engine-wasm`.
+#[cfg(feature = "engine-wasm")]
+#[test]
+fn sig_config_is_edited_and_saved_in_the_terminal() {
+    let mut term = Terminal::start_with("config-page", &["sig://config"], KITTY_REPLIES);
+    let path = term.dir.join("config/sighurt/config.toml");
+    let before = fs::read_to_string(&path).unwrap();
+    let shown = term.wait(0, Duration::from_secs(20), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "sig://config did not show\n{}", term.context());
+
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("\x1b"));
+    let insert = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "INSERT MODE")
+    });
+    assert!(
+        insert,
+        "Escape did not show INSERT MODE\n{}",
+        term.context()
+    );
+    // At the top of the file, a comment and Enter, then Ctrl+S (kitty: `s` with Control).
+    term.type_bytes(&kitty_keys("# typed here\r"));
+    term.type_bytes(b"\x1b[115;5u\x1b[115;5:3u");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut now = before.clone();
+    while Instant::now() < deadline && now == before {
+        thread::sleep(Duration::from_millis(100));
+        now = fs::read_to_string(&path).unwrap();
+    }
+    assert_eq!(
+        now,
+        format!("# typed here\n{before}"),
+        "Ctrl+S did not save the typed line\n{}",
+        term.context()
+    );
+
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("\x1b"));
+    let left = term.wait(since, Duration::from_secs(10), insert_mode_left);
+    assert!(left, "Escape did not leave INSERT MODE\n{}", term.context());
+    term.type_bytes(&kitty_keys("q"));
+    assert!(term.exit().success(), "{}", term.context());
+    term.assert_restored();
+}
