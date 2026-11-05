@@ -789,6 +789,10 @@ fn escape_enters_insert_mode_where_q_does_not_quit() {
         "Escape did not show INSERT MODE\n{}",
         term.context()
     );
+    // The report says what the top line does (`report_until` drops the whitespace).
+    let indicator = |report: &str| report_value(report, "keymap_indicator");
+    let report = term.report_until(|r| indicator(r) == "\"INSERTMODE\"");
+    assert_eq!(indicator(&report), "\"INSERTMODE\"", "{report}");
 
     // In INSERT MODE `q` is not a binding: the page takes the letter, and sig stays up.
     let since = term.got.len();
@@ -812,6 +816,8 @@ fn escape_enters_insert_mode_where_q_does_not_quit() {
     term.type_bytes(&kitty_keys("\x1b"));
     let left = term.wait(since, Duration::from_secs(10), insert_mode_left);
     assert!(left, "Escape did not leave INSERT MODE\n{}", term.context());
+    let report = term.report_until(|r| indicator(r) == "null");
+    assert_eq!(indicator(&report), "null", "{report}");
 
     term.type_bytes(&kitty_keys("q"));
     let status = term.exit();

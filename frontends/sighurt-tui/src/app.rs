@@ -3092,6 +3092,9 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
         (true, Protocol::Kitty) => "kitty",
         _ => "none",
     };
+    // What the top line shows of the keymap's mode, as the window's report has it.
+    let indicator = session.core().keymap_indicator().map(str::to_owned);
+    session.diagnostics_mut().keymap_indicator = indicator;
     let report = Report {
         counters: session.diagnostics().counters.clone(),
         peaks: session.diagnostics().peaks.clone(),
