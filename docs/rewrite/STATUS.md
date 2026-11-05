@@ -4182,3 +4182,38 @@ Newest last. Each entry says what was decided and why.
     (text-mode find, the first-snapshot and mode-switch cases), and a direct test in each
     engine's suite (WPE `finds_in_the_page`, CEF offscreen section 5 and 38 unit tests,
     Ladybird `tests/find.rs`, NetSurf `tests/engine.rs`).
+131. **Visited history and inline address completion** (4–5 November 2026; branch `hist`, merged
+    4150f99; design [features-2026-11-04.md](features-2026-11-04.md), lane C with the
+    amendments after Astra's review). The core emits facts and reads no clock:
+    `Effect::Visited { url, title, commit }` for a commit that pushes a new document in the
+    view the active tab shows, http or https only, without userinfo, the fragment stripped, at
+    most 8 KiB, never from an engine launched with ephemeral storage, never from a restore or
+    traversal, and only while `[history] remember` (default true) is on; a title updates only
+    the visit of the commit it belongs to (`View::visit`: url and document), so a late title
+    cannot bring back a forgotten page. The runtime owns the store (`sighurt-runtime`'s
+    `history`: at most 5 000 visits and a byte budget under 4 MiB, least recently visited out
+    first, visits older than 90 days dropped at load, a file over 4 MiB refused before parsing
+    and kept aside) and the file `history.toml` in the state directory (0600, atomic write and
+    fsync, a one-slot mailbox written at most every 30 s and only when changed, once more at
+    quit, under the session's lock so a second sig completes from it and never writes it).
+    Forgetting is acknowledged: `history.clear` and `site.forget [host]` are
+    `Effect::ForgetVisits { request, host }`, the pending save is superseded and the file
+    written at once, also with remember off, and the answer (`VisitsForgotten`: done, here
+    only because another sig owns the file, or not written) is a notice; `.broken-*` copies
+    are not touched. Turning remember off drops the visits in memory; `--dump` has none.
+    Completion is a query, never a snapshot field: `ChromeAction::Complete { request, prefix }`
+    answered in the same loop pass with `ChromeEvent::Completions` (at most 8, contained), the
+    terminal asking the runtime directly; the address line shows the rest of the newest
+    matching address in the muted colour after the caret (the prefix rule skips `https://`,
+    `http://` and `www.`), Right or Tab at the end takes the exact URL, and the suggestion
+    goes when the text changes, the caret leaves the end, anything is selected, a composition
+    is under way, the line is a `:` command or the find field, focus leaves or the tab
+    changes. *Measured* (this desktop): 5 000 visits are 807 KB, serialized in 12 ms, written
+    and synced in 16 ms on the NVMe state directory (79 ms on the HDD), read in 37–47 ms.
+    *Verified*: core `tests/history.rs` (every excluded case, reloads and traversals, a title
+    after a clear), the runtime's store and writer tests, goldens `completion-150.png` in both
+    chromes with every older golden unchanged, the terminal's unit and pty tests against a
+    seeded file, headless.sh `history` (the ghost text, Tab pixel-identical to typing the URL,
+    `history.clear` emptying the file at once) in 161/161, faults.sh 98/98 with a second
+    instance and a read-only state directory, ui 35/35, the workspace tests (1145). *Left
+    out*: a `sig://history` page and a list of suggestions (after this has been used).

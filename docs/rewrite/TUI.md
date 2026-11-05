@@ -431,7 +431,7 @@ Where it differs from the sketches in §2–§3:
   s) exits 2. If stderr is a terminal, logging goes to the log file. The demo engine now has
   semantics (a heading, a paragraph, two links, a field, a checkbox, a select and a button), so
   all of this is tested in a pty without WPE (`apps/sighurt-browser/tests/tui.rs`).
-- **Find in page** (decision 128). `page.find` without text opens the find field: the bottom
+- **Find in page** (decision 130). `page.find` without text opens the find field: the bottom
   line's editor behind a `/` prompt, holding the view's search selected. Each edit runs `page.find
   <text>` (trimmed, at most 1024 bytes), text that is empty or only whitespace `page.find-stop`;
   Enter closes the field and gives the page the keyboard, keeping the search for `page.find-next`

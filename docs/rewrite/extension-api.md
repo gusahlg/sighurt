@@ -874,7 +874,7 @@ How it behaves:
 | Leaving a text field with `escape` | Escape leaves insert mode, but the page's field keeps the keyboard: no command blurs a field, and the engine contract has no such operation. `j` then moves the caret there. A later `page.blur` would need `EngineCommand` support. |
 | Insert mode when the user clicks a second field | `typing` stays true from one field to the next, so `context` isn't called. If the user had left insert mode, the keymap stays in normal mode. This needs `TextInputState` to carry a field identity (decision 55). |
 | Link hints (`f`) | They need the page's links and a way to draw over them. Neither is in the engine contract. |
-| Find (`/`, `n`) | Since decision 128 (see the changelog): `page.find [text]`, `page.find-next`, `page.find-previous` and `page.find-stop`, bound to `/`, `n` and `N` by the example configuration. WPE WebKit (total only), CEF (current and total), Ladybird (current and total), NetSurf (found only) and the demo engine find in page; Servo and Wasm don't, and the chrome says so. The terminal's text mode searches the page's text itself. |
+| Find (`/`, `n`) | Since decision 130 (see the changelog): `page.find [text]`, `page.find-next`, `page.find-previous` and `page.find-stop`, bound to `/`, `n` and `N` by the example configuration. WPE WebKit (total only), CEF (current and total), Ladybird (current and total), NetSurf (found only) and the demo engine find in page; Servo and Wasm don't, and the chrome says so. The terminal's text mode searches the page's text itself. |
 | Copying the URL (`yy`) | No command copies the URL. A `page.copy-url` command would be a small addition. |
 | Counts (`5j`, `3gt`) | `KeyAction` runs exactly one command. A later `KeyAction::RunAll(Vec<Command>)` would allow them as an addition. |
 | Visual mode | Selection belongs to the page. |
@@ -937,7 +937,7 @@ pub enum ChromeEvent {
     Pasted { request: RequestId, text: String },
     /// `chrome.<action>` ran; `action` is one of the kind's `commands`.
     Command(String),
-    /// What the visited pages complete `ChromeAction::Complete`'s text to (decision 129).
+    /// What the visited pages complete `ChromeAction::Complete`'s text to (decision 131).
     Completions { request: RequestId, matches: Vec<Completion> },
 }
 
@@ -1094,7 +1094,7 @@ system, so a chrome no longer loads fonts itself.
   forget them. The URL's is the address editor's cap (text_edit.rs:26); the indicator's and the
   path's are new. A chrome draws page text only where page text belongs, and never shows a title
   as the address (plan §17).
-- **Completion is a query, never a snapshot field** (decision 129). A chrome asks with
+- **Completion is a query, never a snapshot field** (decision 131). A chrome asks with
   `ChromeAction::Complete { request, prefix }` what the visited pages complete its line's text
   to, and `sig` answers in the same pass, from the history in memory, with
   `ChromeEvent::Completions { request, matches }`: at most 8 addresses the text starts
@@ -1853,7 +1853,7 @@ finding was checked against the plan and the code before it was acted on.
   `FontSystemHandle` are sighurt-render's, re-exported from sighurt-ui at their old paths;
   `ShapedText::lines` is new; `paint_cpu` is `paint` (`paint::draw`). The standard chrome's and
   the line chrome's golden images are unchanged, pixel for pixel.
-- **Tabs, find, history and fullscreen: the API** (4 November 2026, STATUS decisions 126–129).
+- **Tabs, find, history and fullscreen: the API** (4 November 2026, STATUS decisions 129–132).
   `Command` gains `TabDuplicate`, `TabMove`
   (with `commands::TabMove`: `Left`, `Right`, `To(n)`), `TabReopen`, `PageFind(Option<String>)`
   (no text opens the chrome's find field; text over `commands::MAX_FIND`, 1024 bytes, is
@@ -1872,7 +1872,7 @@ finding was checked against the plan and the code before it was acted on.
   `EngineEvent::FindResult` (replaceable per view), `EngineEvent::FullscreenChanged` (ordered)
   and `EngineCapabilities::fullscreen`; no engine set `find_in_page` or `fullscreen` then, and
   every adapter refused both commands as unsupported (WPE WebKit, CEF, Ladybird and NetSurf
-  find in page since lane B2, the demo engine since decision 128; Servo still refuses, and no
+  find in page since lane B2, the demo engine since decision 130; Servo still refuses, and no
   engine sets `fullscreen` yet). The chrome API gains
   `ChromeEvent::LineText(String)`: right after `Focus(Chrome)`, `location.focus <text>` puts
   the text in the line as if typed over the selected address, the caret at its end (the core's
@@ -1908,7 +1908,7 @@ finding was checked against the plan and the code before it was acted on.
   chrome's `find-150`, `find-closed-100`). The example configuration binds `n` and `N` to
   `page.find-next` and `page.find-previous`. The demo engine finds in its own content tree's
   text (`find_in_page: true`).
-- **History and completion** (5 November 2026, STATUS decision 129). The chrome API gains
+- **History and completion** (5 November 2026, STATUS decision 131). The chrome API gains
   `ChromeAction::Complete { request, prefix }`, `ChromeEvent::Completions { request, matches }`,
   `Completion { url, title }` (`non_exhaustive`, made with `Completion::new`),
   `completion_suffix`, `InlineCompletion` and the bounds `MAX_COMPLETIONS` (8),
