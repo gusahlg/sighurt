@@ -32,6 +32,11 @@
 //! 9. [`Keymap::page_takes_text`] is asked after every update: while it says `false`, text that
 //!    is not a key press (an input method's, a terminal's paste) does not reach the page, and
 //!    the host enables no input method for the page's fields.
+//! 10. [`TabInfo::internal`] names the internal page a tab shows (`sig://help` is `help`) from
+//!     the core's own record of the view, never from an address a page or engine reports, so a
+//!     keymap may treat a page of the browser's own differently.
+//!
+//! [`Keymap::describe`] lists what a keymap binds, as data, for the help page.
 //!
 //! A keymap is the browser's configuration in Rust (docs/rewrite/config-extension.md): it reads
 //! what the browser shows through [`Browser`], defines its own actions as commands computed from
@@ -109,6 +114,9 @@ pub struct TabInfo<'a> {
     pub loading: bool,
     /// The engine of the page it shows; `None` for `sig:` pages, blank tabs and errors.
     pub engine: Option<&'a str>,
+    /// The internal page it shows, by name (`help` for `sig://help`), as the core recorded it
+    /// when the view opened: never taken from an address. `None` for every other page.
+    pub internal: Option<&'a str>,
     /// The page zoom, 1.0 being 100 %.
     pub zoom: f64,
     /// Whether `page.back` has somewhere to go.
@@ -149,6 +157,47 @@ impl<'a> TabInfo<'a> {
             can_go_forward,
             link,
             fullscreen,
+            internal: None,
+        }
+    }
+
+    /// This tab, showing the internal page `internal` (or none).
+    pub const fn with_internal(mut self, internal: Option<&'a str>) -> Self {
+        self.internal = internal;
+        self
+    }
+}
+
+/// One binding a keymap has, as [`Keymap::describe`] lists it for a help page.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBinding {
+    /// The mode it applies in, as the keymap names its modes ("NORMAL"); empty for a keymap
+    /// without modes.
+    pub mode: String,
+    /// Its keystrokes as the configuration writes them, separated by spaces ("y y", "ctrl-o").
+    pub keys: String,
+    /// What it does: the command it runs as the configuration writes it ("tab.close"), or a
+    /// short description ("INSERT mode").
+    pub action: String,
+    /// Where it applies, in a few words ("in the page", "also in the address line"); empty
+    /// for wherever the keyboard is.
+    pub applies: String,
+}
+
+impl KeyBinding {
+    /// A binding with these fields.
+    pub fn new(
+        mode: impl Into<String>,
+        keys: impl Into<String>,
+        action: impl Into<String>,
+        applies: impl Into<String>,
+    ) -> Self {
+        Self {
+            mode: mode.into(),
+            keys: keys.into(),
+            action: action.into(),
+            applies: applies.into(),
         }
     }
 }
@@ -199,6 +248,12 @@ pub trait Keymap {
     /// nothing the user types reaches the page there. Key presses are [`Self::press`]'s.
     fn page_takes_text(&self) -> bool {
         true
+    }
+
+    /// The bindings it has in `frontend`, in the order a reader should see them, for the help
+    /// page. Empty by default: a keymap that can't list its bindings lists none.
+    fn describe(&self, _frontend: Frontend) -> Vec<KeyBinding> {
+        Vec::new()
     }
 }
 

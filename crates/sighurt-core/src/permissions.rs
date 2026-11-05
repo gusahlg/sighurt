@@ -94,6 +94,7 @@ pub(crate) fn requirement(service: &Service) -> Requirement {
         } if url.len() > MAX_URL || url::Url::parse(url).is_err() => Requirement::Refused,
         Service::Download { .. } => Requirement::Throttle,
         Service::Permission(permission) => Requirement::Prompt(*permission),
+        Service::Page(_) => Requirement::Refused,
     }
 }
 

@@ -38,6 +38,7 @@ pub mod media_capture;
 pub mod midi;
 pub mod navigation;
 pub mod net;
+pub mod pages;
 pub mod permissions;
 mod pool;
 pub mod pty;
