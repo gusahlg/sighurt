@@ -707,6 +707,10 @@ pub trait Keymap {
     /// What the chrome shows about the keymap ("NORMAL", "NORMAL g"). The executable passes on
     /// at most 64 characters of one line.
     fn indicator(&self) -> Option<&str> { None }
+
+    /// Whether the page may be given text that is not a key press: an input method's text, a
+    /// terminal's paste. `false` in a mode whose keys are only commands (added by decision 134).
+    fn page_takes_text(&self) -> bool { true }
 }
 
 /// A keymap a build can offer. Each keymap crate exports one, as `KIND`.
@@ -753,6 +757,12 @@ pub fn is_modifier(key: &KeyEvent) -> bool;
    sequence, and never logs them (CLAUDE.md, diagnostics).
 6. **A changed indicator redraws the chrome** (`Effect::RedrawChrome`). The indicator changes
    only on presses and context changes, so it costs nothing while idle.
+7. **Text follows `page_takes_text`** (decision 134). The core asks it after every update.
+   While it is `false`, an input method's commit or preedit and a terminal's paste meant for the
+   page are dropped, the host is offered no page field (`Effect::PageTextInput(None)`, so the
+   window enables no input method for it and the terminal pastes into nothing), and the
+   terminal's text mode opens no editor for a field. Key presses stay `press`'s to decide; the
+   chrome's text is the chrome's.
 
 ## 2.4 The default keymap through it: `bindings`
 
@@ -1951,3 +1961,17 @@ finding was checked against the plan and the code before it was acted on.
   example configuration binds `f11` to `browser.fullscreen`. The demo engine has element
   fullscreen (`fullscreen: true`: `demo:fullscreen`, and `demo:fullscreen-unasked` to be
   refused). Diagnostics gain `"fullscreen": {"page", "wanted", "window"}`.
+- **Modes that keep typing from the page** (5 November 2026, STATUS decision 134). `Keymap`
+  gains `page_takes_text(&self) -> bool`, `true` by default (so `bindings` and every other
+  keymap keep what they did): whether text that is not a key press may reach the page, which the
+  core asks after every update (guarantee 7 of §2.3; guarantee 9 of `sighurt_api::keymap`).
+  `BrowserState::page_takes_text` reads it, and `Frontend::page_input` takes it as a new fourth
+  argument, `takes_text`, after `activation`. The example configuration uses it for a clean
+  separation: in NORMAL no key press and no text reaches the page, a field focused or not
+  (unbound keys, modifiers and dead keys are taken; the `typing` exemption is gone), and the
+  arrows, PageUp, PageDown, Home, End, Tab, Shift+Tab, Space, Shift+Space and Enter are bound to
+  `page.send-key` of that key (Space, Shift+Space and Enter only while no field of the page has
+  the keyboard: in one they would type or submit, so they are taken; the new `Scope::NoField`).
+  In INSERT every key, text and paste reach the page and the only binding is an unmodified
+  Escape. While the chrome has the keyboard, both modes apply NORMAL's `Always` bindings whose
+  first key types nothing, as NORMAL did; the mode stays.

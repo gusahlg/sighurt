@@ -173,11 +173,13 @@ the link or control under it). Logs, and anything else written to stderr, go to
 on every way out.
 
 The terminal's keys are the [default keys](#keys), the same as the window's, with three more of
-its own: `ctrl-c` quits (only while the page has the keyboard; in the address line it copies),
+its own: `ctrl-c` quits (only while the page has the keyboard in NORMAL; in the address line it
+copies, in INSERT it goes to the page),
 `m` switches between text and graphics, and `ctrl-l` draws the page again.
 
 In text mode `Tab` and `Shift-Tab` move between links and controls and `Enter` activates one
-(a text field opens a one-line editor, a list a chooser; `Escape` cancels). `Enter` in the
+(a text field opens a one-line editor, in INSERT mode only, since NORMAL types nothing into the
+page; a list a chooser, in both; `Escape` cancels). `Enter` in the
 editor sets the field, and submits its form where a browser would (a form with a button, or
 with that one field); otherwise activate the form's button. The terminal's other
 chrome commands are `chrome.text-mode` and `chrome.graphics-mode`. Terminals that speak the kitty
@@ -471,35 +473,52 @@ command, typed into the address line) all run them.
 ### Keys
 
 The default keys are the example configuration's (`extensions/sighurt-config-example`, the
-default `[input] keymap = "example"`), the same in the window and the terminal. They apply while
-the page has the keyboard; a key that types a character does not fire while you type into the
-address line or a page's text field, and the keys no row names pass to the page.
+default `[input] keymap = "example"`), the same in the window and the terminal. It has two modes,
+and the separation is clean:
+
+- **NORMAL** (the mode it starts in) never types into a page. While the page has the keyboard
+  every key is a command: the keys in the table below run theirs, and every other key does
+  nothing, even while a text field of the page is focused. No paste and no input method text
+  reaches the page either. The arrows, `PageUp`, `PageDown`, `Home`, `End`, `Space` and
+  `shift-space` scroll, and `Tab`, `shift-tab` and `Enter` move between links and follow the
+  focused one (`Space` and `Enter` do nothing while a text field is focused).
+- **INSERT** (`Escape`, which shows `INSERT MODE`) is where the page gets the keyboard: every key,
+  paste and input method text goes to the page, and no binding listens, `ctrl-o`, `alt-1`… and
+  `f11` included. Only `Escape` is the browser's: it returns to NORMAL.
+
+The mouse is not typing: clicks reach the page in both modes and leave the mode as it is. While
+the address line or the find field has the keyboard, typing goes there in either mode, and only
+the keys marked "from the address line too" run their commands.
 
 | Key | Command |
 |---|---|
 | `q` | `browser.quit` |
-| `o`, `ctrl-o` | `location.focus` (the address line) |
+| `o`, `ctrl-o` | `location.focus` (the address line; `ctrl-o` from the address line too) |
 | `:` | `location.focus :`: the command line, where a command typed after `:` runs (`:tab.move left`, `:tab.duplicate`, `:tab.new <address>`) |
 | `/` | `page.find`: the [find field](#find-in-page) |
 | `n`, `N` | `page.find-next`, `page.find-previous`: the next and previous match of the search |
 | `t`, `x`, `u` | `tab.new`, `tab.close`, `tab.reopen` |
 | `J`, `K` | `tab.next`, `tab.previous` |
-| `alt-1` to `alt-9` | `tab.select 1` to `9` |
+| `alt-1` to `alt-9` | `tab.select 1` to `9` (from the address line too) |
 | `H`, `L` | `page.back`, `page.forward` |
-| `r`, `ctrl-r` | `page.reload` |
+| `r`, `ctrl-r` | `page.reload` (`ctrl-r` from the address line too) |
 | `f11` | `browser.fullscreen` (from the address line too) |
 | `e` | `page.switch-engine` |
 | `j`, `k` | scroll down, up (`page.send-key down`, `up`) |
 | `ctrl-d`, `ctrl-u` | page down, up |
 | `g`, `G` | top, bottom of the page |
+| arrows, `PageUp`, `PageDown`, `Home`, `End` | that key, sent to the page (`page.send-key down`, …): scrolling |
+| `Space`, `shift-space` | `page.send-key space`, `shift-space`: a page down, up (not while a text field is focused) |
+| `Tab`, `shift-tab` | `page.send-key tab`, `shift-tab`: the next, previous link or control |
+| `Enter` | `page.send-key enter`: follow the focused link (not while a text field is focused) |
 | `+`, `-`, `=` | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` |
-| `Escape` | `page.exit-fullscreen` while the page shown has an element in fullscreen; otherwise insert mode: every key but `Escape` passes to the page or the line, and the chrome shows `INSERT MODE`; `Escape` again returns |
+| `Escape` | `page.exit-fullscreen` while the page shown has an element in fullscreen (the mode stays); otherwise INSERT mode: every key but `Escape`, and pastes and input method text, go to the page, and the chrome shows `INSERT MODE`; `Escape` again returns to NORMAL |
 | `y y` | copy the address of the tab shown (`clipboard.copy`) |
 | `y f` | copy the link the pointer is over |
 | `c o` | close every tab but the one shown |
 | terminal only: `ctrl-c` | `browser.quit` (only while the page has the keyboard) |
 | terminal only: `m` | `chrome.toggle-mode` (text or graphics) |
-| terminal only: `ctrl-l` | `chrome.refresh` (draw the page again) |
+| terminal only: `ctrl-l` | `chrome.refresh` (draw the page again; from the address line too) |
 
 `y y`, `y f` and `c o` are written in Rust in the example, against the keymap API's read-only view of the
 tabs. With `[input] keymap = "bindings"` nothing is bound until you bind it in `[keys]` (and

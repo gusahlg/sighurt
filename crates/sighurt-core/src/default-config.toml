@@ -175,18 +175,23 @@ forward = "page.forward"
 # previous tab, H and L go back and forward, r and ctrl-r reload (ctrl-r from anywhere), f11
 # toggles fullscreen (from anywhere), e
 # reopens the page in the next web engine, j and k scroll, ctrl-d and ctrl-u scroll a page, g
-# and G go to the top and the bottom, and + - = zoom.
+# and G go to the top and the bottom, and + - = zoom. The arrows, pageup, pagedown, home, end,
+# space and shift-space are sent to the page to scroll it, and tab, shift-tab and enter to move
+# between its links and follow one (space and enter not while a text field of the page has the
+# keyboard). Every other key does nothing: this NORMAL mode never types into the page, a text
+# field focused or not, and gives it no paste or input method text either.
 # alt-1 to alt-9 select those tabs from anywhere. Escape enters INSERT MODE, which shows
-# INSERT MODE and passes every other key until Escape leaves it; while a page's element is
-# fullscreen, Escape leaves that instead. y y copies the page's
+# INSERT MODE and gives the page every key, paste and input method text, with no binding
+# listening (the "from anywhere" ones neither), until Escape returns to NORMAL; while a page's
+# element is fullscreen, Escape leaves that instead and the mode stays. The mouse reaches the
+# page in both modes; the address line and the find field take typing in both. y y copies the page's
 # address, y f the link the pointer is over, and c o closes the other tabs, highest number
 # first. Those three are key sequences of the example configuration, not of [keys]. The
 # other tab commands are typed after ":": tab.move left, tab.duplicate, tab.new <address>.
 #
 # In the terminal only: ctrl-c quits and m switches between text and graphics, both while
-# the page has the keyboard, and ctrl-l redraws the page wherever the keyboard is. A
-# keystroke that types a character does not run while a text field of the page has the
-# keyboard; ctrl- and alt- bindings still do.
+# the page has the keyboard, and ctrl-l redraws the page wherever the keyboard is (in NORMAL,
+# or while the address line has it). In text mode a field's editor opens only in INSERT.
 #
 #   [keys]                                # everywhere
 #   "ctrl-t" = "tab.new"

@@ -408,7 +408,12 @@ Where it differs from the sketches in §2–§3:
   the configured commands plus those named keys; nothing is bound in code.
 - **Activation.** `Action` goes to the core as `BrowserEvent::Semantic` (never to the engine);
   `EditField` opens a one-line editor over the last page row and `ChooseOption` a list over the
-  bottom rows (8 at most). While one is open every key goes to it before the keymap (typing `q`
+  bottom rows (8 at most). The editor opens only while the keymap gives the page text
+  (`Keymap::page_takes_text`, passed to `Frontend::page_input`; the example configuration's
+  INSERT mode, decision 134): in NORMAL a field's activation shows a notice instead, and the
+  chooser, which types nothing, opens in both. A paste reaches a page's field only while the
+  core offers the host one (`Frontend::page_text_input`), which it does not while the keymap
+  gives the page no text. While one is open every key goes to it before the keymap (typing `q`
   is typing; Escape cancels, Enter commits as `SetValue` or `SelectOption`; the chooser takes the
   arrow keys, Home and End). A multi-line text area is edited as one line. A password's value is
   masked and starts empty. A new document drops an open prompt.
