@@ -205,7 +205,9 @@ impl App {
         };
         let pointer = mouse_position();
         let down = mouse_button_down(0);
-        if down && !self.down {
+        // A click whose press and release fell between two frames shows only as clicked.
+        let pressed = (down || mouse_button_clicked(0)) && !self.down;
+        if pressed {
             out.push(Input::Press {
                 x: pointer.0,
                 y: pointer.1,
