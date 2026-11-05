@@ -40,6 +40,7 @@ pub mod navigation;
 pub mod net;
 pub mod permissions;
 mod pool;
+pub mod pty;
 mod raster;
 pub mod rtc;
 pub mod runtime;

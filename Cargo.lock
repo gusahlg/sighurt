@@ -10519,6 +10519,7 @@ dependencies = [
  "reqwest",
  "rfd",
  "rodio",
+ "rustix 1.1.5",
  "screenshots",
  "serde",
  "serde_json",

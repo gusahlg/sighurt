@@ -55,11 +55,15 @@ flate2 = "1.1.9"
 sys-locale = "0.3.2"
 iana-time-zone = "0.1.65"
 starship-battery = "0.11.0"
+# The master side of `sig://terminal`'s pty (`pty`).
+rustix = { workspace = true, features = ["event", "fs", "termios"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coremidi = "0.7"
 
 [dev-dependencies]
 wat = "1"
+# A pty standing in for the runtime's in the `pty` tests.
+rustix = { workspace = true, features = ["pty"] }
 # The `wasm-view` example's event loop.
 calloop.workspace = true
