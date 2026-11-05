@@ -99,6 +99,7 @@ pub fn make_client(view: &View) -> *mut CefClient {
     display.on_title_change = Some(on_title_change);
     display.on_status_message = Some(on_status_message);
     display.on_cursor_change = Some(on_cursor_change);
+    display.on_fullscreen_mode_change = Some(on_fullscreen_mode_change);
     let mut request: CefRequestHandler = zeroed();
     request.on_before_browse = Some(on_before_browse);
     request.on_render_process_terminated = Some(on_render_process_terminated);
@@ -528,7 +529,8 @@ unsafe extern "C" fn do_close(this: *mut CefLifeSpanHandler, browser: *mut CefBr
         if view.is_closing() {
             return 0;
         }
-        let mut events = Vec::with_capacity(2);
+        let mut events = Vec::with_capacity(3);
+        events.extend(view.left_fullscreen());
         if let Some(document) = lock(&view.nav).document() {
             events.push(EngineEvent::CloseRequested {
                 view: view.id,
@@ -564,6 +566,9 @@ unsafe extern "C" fn on_before_close(this: *mut CefLifeSpanHandler, browser: *mu
         // itself keeps its request and its failure, in order, before the `ViewClosed`.
         if view.is_closing() {
             view.shared.forget(view.id);
+        }
+        if let Some(left) = view.left_fullscreen() {
+            view.shared.push(left);
         }
         view.shared.push(EngineEvent::ViewClosed { view: view.id });
     });
@@ -669,6 +674,10 @@ unsafe extern "C" fn on_load_start(
         }
         keep_history(&mut events, complete);
         if lock(&view.nav).document() != before {
+            // A document that was fullscreen is gone: reported before the new one commits.
+            if let Some(left) = view.left_fullscreen() {
+                events.insert(0, left);
+            }
             lock(&view.find).end();
             *lock(&view.text_input) = None;
             events.push(EngineEvent::TextInputChanged {
@@ -844,10 +853,28 @@ unsafe extern "C" fn on_render_process_terminated(
         let view = unsafe { view(this) };
         lock(&view.nav).crashed();
         lock(&view.find).end();
+        if let Some(left) = view.left_fullscreen() {
+            view.shared.push(left);
+        }
         view.shared.push(EngineEvent::ViewFailed {
             view: view.id,
             message: format!("the page's content process ended (status {status})"),
         });
+    });
+}
+
+unsafe extern "C" fn on_fullscreen_mode_change(
+    this: *mut CefDisplayHandler,
+    browser: *mut CefBrowser,
+    fullscreen: i32,
+) {
+    own!(browser);
+    guard(|| {
+        // SAFETY: as above.
+        let view = unsafe { view(this) };
+        if let Some(event) = view.fullscreen_changed(fullscreen != 0) {
+            view.shared.push(event);
+        }
     });
 }
 

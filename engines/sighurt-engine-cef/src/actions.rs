@@ -71,6 +71,8 @@ pub enum Action {
     ImeSet(String),
     /// Drop the composition.
     ImeCancel,
+    /// Leave the page's element fullscreen (the view keeps its size).
+    ExitFullscreen,
     /// Close the browser (forced: its page is not asked).
     Close,
 }
@@ -194,6 +196,7 @@ impl Action {
                     );
                 }
                 Self::ImeCancel => call!(h, ime_cancel_composition),
+                Self::ExitFullscreen => call!(h, exit_fullscreen, 0),
                 Self::Close => call!(h, close_browser, 1),
             }
         }

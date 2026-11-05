@@ -552,6 +552,13 @@ current when it arrives; a new search first calls `stop_finding`, after which Ch
 nothing more of the old one, and a result whose identifier is no higher than the highest seen
 when the search started is dropped as an earlier search's. A new document or a crashed renderer
 ends the search; results for another document are dropped.
+Element fullscreen (`fullscreen: true`): `OnFullscreenModeChange` becomes `FullscreenChanged`
+for the document shown, once per entry; `ExitFullscreen` is `cef_browser_host_t::exit_fullscreen(0)`
+(the windowless view keeps its size), and Chromium's page leaves and says so. Chromium refuses
+`requestFullscreen` without a user gesture. A new document (reported before its commit), a
+crashed renderer, a page closing itself and the browser closing report `false` first when the
+view was reported fullscreen. Chromium's content fills the view it has; making the window
+fullscreen is the browser's.
 Refused: JS dialogs (suppressed), permission prompts and media access (denied), file choosers
 (cancelled), context menus (emptied), HTTP authentication and certificate errors (cancelled),
 `javascript:` addresses from the browser. Not supported: `<select>` popups (`PET_POPUP` is
@@ -567,7 +574,9 @@ declared; listing and forgetting it is refused.
   input-method commit, an `OpenRequested` popup, an attachment as a download request, find in
   page (count and selected match, next and previous wrapping, case, no match, no result stamped
   with a later search, moves and stops of a replaced or stopped search and a search of a gone
-  document ignored, the search ended by a new document), a resize,
+  document ignored, the search ended by a new document), element fullscreen (refused without
+  a gesture, entered on a click and reported once, left on `ExitFullscreen`, ended by a new
+  document before its commit), a resize,
   idle wakeups (0 in 3 s), `ViewClosed`, and no helper process after `shutdown`.
 - `apps/sighurt-browser/tests/cef.sh` (`sig` with the cef and demo engines, private sway and
   D-Bus, every XDG directory under OUT): `page.open-in cef https://example.com/` opens in

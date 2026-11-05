@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use sighurt_api::engine::EngineWaker;
 use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::SurfaceRect;
-use sighurt_api::ids::ViewId;
+use sighurt_api::ids::{DocumentGeneration, ViewId};
 use sighurt_api::input::TextInputState;
 
 use crate::actions::Action;
@@ -518,6 +518,8 @@ pub struct ViewShared {
     pub closing: AtomicBool,
     /// Find in page, as CEF's UI thread sees it.
     pub find: Mutex<FindState>,
+    /// The document last reported in element fullscreen, until it is reported out of it.
+    pub fullscreen: Mutex<Option<DocumentGeneration>>,
 }
 
 impl ViewShared {
@@ -535,6 +537,7 @@ impl ViewShared {
             text_input: Mutex::new(None),
             closing: AtomicBool::new(false),
             find: Mutex::new(FindState::default()),
+            fullscreen: Mutex::new(None),
         })
     }
 
@@ -569,6 +572,37 @@ impl ViewShared {
                 256,
             ))
         }
+    }
+
+    /// The page entered (`true`) or left element fullscreen, as Chromium said: the event to
+    /// report, if any. Entering is reported once, for the document shown; leaving, for the
+    /// document that entered.
+    pub fn fullscreen_changed(&self, fullscreen: bool) -> Option<EngineEvent> {
+        if !fullscreen {
+            return self.left_fullscreen();
+        }
+        let document = lock(&self.nav).document()?;
+        let mut current = lock(&self.fullscreen);
+        if current.is_some() {
+            return None;
+        }
+        *current = Some(document);
+        Some(EngineEvent::FullscreenChanged {
+            view: self.id,
+            document,
+            fullscreen: true,
+        })
+    }
+
+    /// Reports that the page left element fullscreen, if it was last reported in it: Chromium
+    /// said so, or the document, the page or the view went while it was.
+    pub fn left_fullscreen(&self) -> Option<EngineEvent> {
+        let document = lock(&self.fullscreen).take()?;
+        Some(EngineEvent::FullscreenChanged {
+            view: self.id,
+            document,
+            fullscreen: false,
+        })
     }
 
     /// Whether `close_view` ran.

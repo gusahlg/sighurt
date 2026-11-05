@@ -63,7 +63,7 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
         caches: true,
         hsts: true,
     },
-    fullscreen: false, // lane D: true once element fullscreen is wired
+    fullscreen: true,
 };
 
 /// The most events one `pump` hands over.
@@ -519,7 +519,13 @@ impl<T: CpuTarget> EngineRuntime for CefRuntime<T> {
                 return Err(EngineError::Unsupported("semantics"));
             }
             EngineCommand::Find(find) => shared.find(find),
-            EngineCommand::ExitFullscreen => return Err(EngineError::Unsupported("fullscreen")),
+            EngineCommand::ExitFullscreen => {
+                // Chromium's page leaves it and `OnFullscreenModeChange` says so; with nothing
+                // fullscreen, nothing to do.
+                if lock(&shared.fullscreen).is_some() {
+                    shared.run(Action::ExitFullscreen);
+                }
+            }
         }
         Ok(())
     }

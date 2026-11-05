@@ -6,8 +6,9 @@
 //! history, a link the user clicks being held and answered, a popup becoming `OpenRequested`,
 //! typing, the text-input state, a paste through the clipboard service (a multi-line one as
 //! text, never Enter), a popup nobody clicked for refused, find in page (counts, moves, stops,
-//! no result given to a later search or document), a page closing itself (asked, then failed
-//! and closed), resizing, idling without wakeups, and a clean shutdown.
+//! no result given to a later search or document), element fullscreen (entered on a click,
+//! reported once, left on `ExitFullscreen`, ended by a new document), a page closing itself
+//! (asked, then failed and closed), resizing, idling without wakeups, and a clean shutdown.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1064,7 +1065,91 @@ fn chromium_in_the_engine_contract() {
     h.idle(Duration::from_millis(500));
     assert_eq!(results(&h, from), 0, "the search ended with its document");
 
-    // 6. Resizing.
+    // 6. Element fullscreen: none without a user's activation; a click enters it, reported once
+    // for the document even when the page asks again; `ExitFullscreen` leaves it (the page sees
+    // it) and does nothing when nothing is fullscreen; a new document reports that the old one
+    // left it, before its commit.
+    let fullscreen = |h: &Harness, from: usize| -> Vec<(DocumentGeneration, bool)> {
+        let reports = h.log[from..].iter().filter_map(|e| match e {
+            EngineEvent::FullscreenChanged {
+                document,
+                fullscreen,
+                ..
+            } => Some((*document, *fullscreen)),
+            _ => None,
+        });
+        reports.collect()
+    };
+    let committed = |h: &Harness, from: usize| {
+        h.log[from..].iter().rev().find_map(|e| match e {
+            EngineEvent::NavigationCommitted { document, .. } => Some(*document),
+            _ => None,
+        })
+    };
+    let from = h.log.len();
+    h.navigate(&format!("{}?auto", page("fullscreen.html")));
+    assert!(
+        h.title(from, "refused"),
+        "a page with no activation is refused"
+    );
+    assert_eq!(fullscreen(&h, from), []);
+    let from = h.log.len();
+    h.navigate(&page("fullscreen.html"));
+    let document = committed(&h, from).expect("committed");
+    h.frame_where(|_| true);
+    h.click(400.0, 300.0);
+    assert!(
+        h.title(from, "full"),
+        "a click enters fullscreen: {}",
+        h.trace(from)
+    );
+    assert_eq!(fullscreen(&h, from), [(document, true)]);
+    h.click(400.0, 300.0);
+    h.idle(Duration::from_millis(500));
+    assert_eq!(
+        fullscreen(&h, from),
+        [(document, true)],
+        "asked again: one report"
+    );
+    let at = h.log.len();
+    h.send(EngineCommand::ExitFullscreen);
+    assert!(
+        h.title(at, "normal"),
+        "ExitFullscreen leaves it, as the page sees"
+    );
+    assert_eq!(fullscreen(&h, from), [(document, true), (document, false)]);
+    h.send(EngineCommand::ExitFullscreen);
+    h.idle(Duration::from_millis(500));
+    assert_eq!(
+        fullscreen(&h, from).len(),
+        2,
+        "nothing to leave: nothing happens"
+    );
+    let at = h.log.len();
+    h.click(400.0, 300.0);
+    assert!(h.title(at, "full"));
+    // (A white page, as the resize below expects.)
+    let at = h.log.len();
+    h.navigate(&page("find.html"));
+    assert_eq!(
+        fullscreen(&h, at),
+        [(document, false)],
+        "the old document left it"
+    );
+    let left = h.log[at..]
+        .iter()
+        .position(|e| matches!(e, EngineEvent::FullscreenChanged { .. }));
+    let commit = h.log[at..]
+        .iter()
+        .position(|e| matches!(e, EngineEvent::NavigationCommitted { .. }));
+    assert!(
+        matches!((left, commit), (Some(l), Some(c)) if l < c),
+        "reported before the commit: {}",
+        h.trace(at)
+    );
+    h.frame_where(|f| pixel(f, 0, 0) == [0xff, 0xff, 0xff, 0xff]);
+
+    // 7. Resizing.
     let big = metrics(1000, 700);
     h.metrics = big;
     h.send(EngineCommand::SetMetrics(big));
@@ -1130,7 +1215,7 @@ fn chromium_in_the_engine_contract() {
     // The browser closing it afterwards, as when its rule allows the request, is harmless.
     h.rt.close_view(closer);
 
-    // 7. Idle: nothing wakes the owner, and nothing is queued.
+    // 8. Idle: nothing wakes the owner, and nothing is queued.
     h.frame_where(|_| true);
     std::thread::sleep(Duration::from_millis(500));
     h.pump();
@@ -1144,7 +1229,7 @@ fn chromium_in_the_engine_contract() {
         "an idle page wakes the owner {idle} times in 3 s"
     );
 
-    // 8. Close and shut down; nothing of Chromium is left.
+    // 9. Close and shut down; nothing of Chromium is left.
     h.rt.close_view(view);
     assert!(
         h.wait(0, |e| matches!(e, EngineEvent::ViewClosed { .. })
