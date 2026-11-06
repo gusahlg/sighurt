@@ -73,7 +73,8 @@
 #               changes, the editor is reaped and the file read again (a new alias works); a
 #               linked file is written where the link leads and read again (the new tab colour);
 #               an invalid edit keeps the configuration, with the notice and the problem on the
-#               page; with [pages.config] enabled = false or no editor found, the page says so
+#               page; an editor that ends with nothing else due (its tab closed from another)
+#               has the linked file read again with no input; with [pages.config] enabled = false or no editor found, the page says so
 #               and nothing starts; nvim, if on PATH, writes the file with o, Escape and :wq
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
@@ -1287,6 +1288,26 @@ PY
   check "and the page lists the problem" "${found%% *}" "${found#* }"
   found=$(colour 04-invalid 7c3aed 100)
   check "the tab colour stays" "${found%% *}" "${found#* }"
+  key q
+  wait "$sig_pid"
+
+  # An editor that ends when nothing else is due still has the linked file read again, with no
+  # input: it writes the file when its tab, closed from another (home), hangs it up, ignores the
+  # hang-up and is killed 2 s later. One report after that: asking for one wakes sig, which
+  # would read the file then. No restored tabs: tab 1 is the page's.
+  printf '%s\n[session]\nrestore = false\n' "$base" > "$out/dotfiles/sig.toml"
+  printf '#!/bin/sh\ntrap '"'"'printf "[commands]\\nhupped = \\"tab.new\\"\\n" >> "$1"'"'"' HUP\nwhile :; do sleep 0.2; done\n' > "$home/hup-editor"
+  chmod +x "$home/hup-editor"
+  start_editor VISUAL="$home/hup-editor" "${sig_args[@]}" sig://config >> "$out/sig.log" 2>&1
+  reloads=$(diag "c['config_reloads']")
+  edit_in_page
+  running=$(programs)
+  key t; key -k Escape
+  key ':'; wtype 'tab.close 1'; key -k Return
+  sleep 5
+  check "an editor ended with nothing else due: the linked file is read again with no input" \
+    "$([[ ${running%% *} -ge 1 && $(programs) == '0 0' ]] && grep -q '^hupped = "tab.new"$' "$out/dotfiles/sig.toml" && [[ $(diag "c['config_reloads']") -gt $reloads ]]; echo $?)" \
+    "programs $running then $(programs), $reloads reloads before; $(tail -1 "$out/dotfiles/sig.toml")"
   key q
   wait "$sig_pid"
 

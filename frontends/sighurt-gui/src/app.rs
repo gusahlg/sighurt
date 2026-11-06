@@ -983,8 +983,8 @@ impl App {
     fn iterate(&mut self) -> bool {
         self.session.diagnostics_mut().counters.iterations += 1;
         self.handle_signals();
-        // The file changed, or sig://config's editor ended: the watch misses a linked target.
-        if std::mem::take(&mut self.config_changed) | self.session.take_config_edited() {
+        // The watch saw the file change.
+        if std::mem::take(&mut self.config_changed) {
             self.reload_config();
         }
         let now = Instant::now();
@@ -1008,6 +1008,12 @@ impl App {
         for _ in 0..MAX_PASSES {
             let mut worked = self.drain_host_events();
             worked |= self.session.service_completions(&mut self.gui);
+            // sig://config's editor ended, which the watch misses for a linked target: read
+            // the file in this pass, since nothing may wake the loop again.
+            if self.session.take_config_edited() {
+                self.reload_config();
+                worked = true;
+            }
             worked |= self.session.pump(&mut self.gui);
             worked |= self.answer_completions();
             worked |= self.refresh_chrome();

@@ -228,6 +228,8 @@ impl<F: Frontend> Session<F> {
     /// reads the configuration file again as it does when its watch sees a change, since the
     /// watch misses a file a link points to. The core ignores a reload equal to the
     /// configuration in use, and an invalid file keeps it, with the frontend's notice.
+    /// [`Session::service_completions`] sets it, and nothing wakes the loop for it again: ask
+    /// right after that call, in the same pass.
     pub fn take_config_edited(&mut self) -> bool {
         std::mem::take(&mut self.config_edited)
     }
@@ -407,8 +409,9 @@ impl<F: Frontend> Session<F> {
                             .and_then(|v| v.activation())
                             .filter(|&at| Some(at) == self.handling);
                         let takes_text = self.core.page_takes_text();
-                        if frontend.page_input(view, event, activation, takes_text, &mut self.queue)
-                        {
+                        let page = self.core.view(view).is_some_and(|v| v.page().is_some());
+                        let queue = &mut self.queue;
+                        if frontend.page_input(view, event, activation, takes_text, page, queue) {
                             return;
                         }
                     }
@@ -679,7 +682,8 @@ impl<F: Frontend> Session<F> {
     /// Takes what service threads and the session and history writers reported, and the
     /// history file once it has been read. A status line, a write that failed, or what the
     /// history has to say becomes a notice; a forget the history wrote goes to the core; a
-    /// terminal's program that ended tells the core so.
+    /// terminal's program that ended tells the core so. The history file read after home was
+    /// built asks the frontend to redraw ([`Frontend::redraw`]), once.
     /// Returns whether there was anything.
     pub fn service_completions(&mut self, frontend: &mut F) -> bool {
         let completions = self.services().completions(MAX_COMPLETIONS);
@@ -711,8 +715,14 @@ impl<F: Frontend> Session<F> {
         let Some(history) = self.history.as_mut() else {
             return worked;
         };
-        // The file read at startup is in: completions can be asked again.
-        worked |= history.poll();
+        // The file read at startup is in: completions can be asked again, and a home built
+        // before it (shown, so drawn) lacks its visits: the frontend draws it once more.
+        if history.poll() {
+            worked = true;
+            if self.home.is_some() {
+                frontend.redraw();
+            }
+        }
         let notices = history.take_notices();
         let (forgotten, failure) = history.take_reports();
         for notice in notices.into_iter().chain(failure) {
@@ -1299,6 +1309,8 @@ mod tests {
         /// Whether it searches pages itself, as the terminal's text mode does; what it was
         /// asked.
         finds: Option<Vec<FindCommand>>,
+        /// How many times it was asked to redraw the chrome.
+        redraws: usize,
     }
 
     impl Clipboard for Recording {
@@ -1338,7 +1350,9 @@ mod tests {
         fn notice(&mut self, message: String) {
             self.notices.push(message);
         }
-        fn redraw(&mut self) {}
+        fn redraw(&mut self) {
+            self.redraws += 1;
+        }
         fn show(&mut self, _: ViewId, _: bool) {}
         fn frame_ready(&mut self, _: TargetId) {}
         fn before_forced_exit(&mut self) {}
@@ -1886,6 +1900,55 @@ mod tests {
         assert!(session.home().recent.is_empty(), "remember is off");
         session.home();
         assert_eq!(session.diag.counters.home_builds, 3);
+        session.shutdown(&mut frontend, |_, _| {});
+    }
+
+    #[test]
+    fn the_history_read_after_home_was_built_redraws_it_once() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let file = format!(
+            "version = 1\n[[visits]]\nurl = \"https://a.example/\"\ntitle = \"A\"\nlast = {now}\ncount = 1\n"
+        );
+        // Home drawn before the file was read: it is drawn once more when the visits are in.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("history.toml"), &file).unwrap();
+        let mut frontend = Recording::default();
+        let mut session = idle_session(dir.path(), "", &[]);
+        session.run_core(&mut frontend);
+        assert!(session.home().recent.is_empty(), "not read yet");
+        let before = frontend.redraws;
+        for _ in 0..500 {
+            session.service_completions(&mut frontend);
+            if frontend.redraws > before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(frontend.redraws, before + 1, "the read asks for a redraw");
+        assert_eq!(session.home().recent.len(), 1, "and home has the visit");
+        session.service_completions(&mut frontend);
+        assert_eq!(frontend.redraws, before + 1, "once");
+        session.shutdown(&mut frontend, |_, _| {});
+
+        // No home built: nothing to draw again.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("history.toml"), &file).unwrap();
+        let mut frontend = Recording::default();
+        let mut session = idle_session(dir.path(), "", &[]);
+        session.run_core(&mut frontend);
+        let (before, generation) = (frontend.redraws, session.history_generation());
+        for _ in 0..500 {
+            session.service_completions(&mut frontend);
+            if session.history_generation() != generation {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(session.history_generation(), generation, "read");
+        assert_eq!(frontend.redraws, before, "no home, no redraw");
         session.shutdown(&mut frontend, |_, _| {});
     }
 

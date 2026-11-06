@@ -59,7 +59,8 @@
 //! to text mode's field editor while it is open, else to the page's text field only while the
 //! core offers the host one (`Frontend::page_text_input`, which is `None` while the keymap gives
 //! the page no text); text mode opens a field's editor only while the keymap gives the page
-//! text, and shows a notice otherwise.
+//! text, and shows a notice otherwise. sig's own pages (`sig://config`) have no text: while the
+//! page rows don't show their pixels, they get no input but releases ([`Tui::page_input`]).
 //!
 //! Page frames (TUI.md §2 and §8.6): a permit only for the shown view, only when its engine has
 //! a new frame, at most `[tui] fps` a second (in text mode at most [`TEXT_FPS`], and only when
@@ -214,13 +215,13 @@ fn is_home(url: &str) -> bool {
     name.is_some_and(|name| name.eq_ignore_ascii_case("home"))
 }
 /// The page rows' message for one of sig's own pages (`sig://help`) where no image can show:
-/// they are drawn, with no text to show instead.
+/// they are drawn, with no text to show instead, and while they are not drawn they get no input
+/// ([`Tui::page_input`]).
 const PAGE_NEEDS_GRAPHICS: &str =
-    "sig's own pages, such as sig://help, are drawn: they need graphics, which this terminal \
-     can't show";
-/// The page rows' message for one of sig's own pages in text mode.
-const PAGE_HAS_NO_TEXT: &str =
-    "sig's own pages, such as sig://help, are drawn and have no text: m shows graphics";
+    "sig's pages need graphics (kitty, sixel or sig --gui) and get no input here";
+/// The page rows' message for one of sig's own pages in text mode, before the keys that show
+/// graphics ([`App::graphics_keys`]).
+const PAGE_HAS_NO_TEXT: &str = "sig's pages have no text and get no input here:";
 /// The most characters of an address the page rows' loading message shows.
 const MESSAGE_URL: usize = 256;
 /// The chromes the window has, by name. The terminal ignores `[ui] chrome` and `[chrome.*]`,
@@ -812,8 +813,8 @@ impl App {
             self.signals.push(libc::SIGHUP as u8);
         }
         self.handle_signals();
-        // The file changed, or sig://config's editor ended: the watch misses a linked target.
-        if std::mem::take(&mut self.config_changed) | self.session.take_config_edited() {
+        // The watch saw the file change.
+        if std::mem::take(&mut self.config_changed) {
             self.reload_config();
         }
         if self
@@ -833,6 +834,12 @@ impl App {
             let mut worked = self.drain_input();
             worked |= self.deliver_clipboard_failures();
             worked |= self.session.service_completions(&mut self.tui);
+            // sig://config's editor ended, which the watch misses for a linked target: read
+            // the file in this pass, since nothing may wake the loop again.
+            if self.session.take_config_edited() {
+                self.reload_config();
+                worked = true;
+            }
             worked |= self.send_metrics();
             self.tui.active_url = active_url(self.session.core());
             worked |= self.session.pump(&mut self.tui);
@@ -1723,7 +1730,9 @@ impl App {
             Kind::Internal => Some(error.unwrap_or_else(|| NO_SUCH_PAGE.into())),
             // sig's own pages are drawn: they have no text mode.
             Kind::Page if self.tui.text_mode && self.tui.images_possible() => {
-                Some(error.unwrap_or_else(|| PAGE_HAS_NO_TEXT.into()))
+                Some(error.unwrap_or_else(|| {
+                    format!("{PAGE_HAS_NO_TEXT} {} shows graphics", self.graphics_keys())
+                }))
             }
             Kind::Page if !self.tui.images_possible() => {
                 Some(error.unwrap_or_else(|| PAGE_NEEDS_GRAPHICS.into()))
@@ -1750,6 +1759,19 @@ impl App {
                 .into()
             })),
         }
+    }
+
+    /// The keys the keymap in use binds to showing graphics (`chrome.toggle-mode` or
+    /// `chrome.graphics-mode`), its first mode's first; the command to type in the address
+    /// line when it binds none.
+    fn graphics_keys(&self) -> String {
+        let shows = |action: &str| matches!(action, "chrome.toggle-mode" | "chrome.graphics-mode");
+        self.session
+            .core()
+            .describe_keys()
+            .into_iter()
+            .find(|binding| shows(&binding.action))
+            .map_or_else(|| ":chrome.graphics-mode".into(), |binding| binding.keys)
     }
 
     /// Whether the shown view has a frame for this layout, so the page rows are not empty.
@@ -2939,14 +2961,35 @@ impl Frontend for Tui {
 
     /// In text mode the shown page's keys scroll, focus and activate its text; nothing reaches
     /// the engine (TUI.md §8.11).
+    ///
+    /// sig's own pages are drawn. While the page rows show a message instead (text mode, a
+    /// terminal without graphics or a page area too big for an image), nothing reaches them that
+    /// could start a program or type into one: no key press or repeat, whether typed or made by
+    /// `page.send-key`, no text or paste, and no pointer motion, press or scroll. A program
+    /// already running keeps running and gets input again once graphics show the page. Key and
+    /// button releases still go, so nothing stays held in the page.
     fn page_input(
         &mut self,
         view: ViewId,
         event: &InputEvent,
         activation: Option<Instant>,
         takes_text: bool,
+        page: bool,
         queue: &mut VecDeque<BrowserEvent>,
     ) -> bool {
+        if page && !self.graphics {
+            let release = matches!(
+                &event.kind,
+                InputKind::Key(KeyEvent {
+                    state: ButtonState::Released,
+                    ..
+                }) | InputKind::Pointer(PointerEvent::Button {
+                    state: ButtonState::Released,
+                    ..
+                })
+            );
+            return !release;
+        }
         let InputKind::Key(key) = &event.kind else {
             return false;
         };

@@ -152,10 +152,16 @@ pub fn info(kind: PageInfo, core: &BrowserState, paths: &Paths) -> String {
                 let new = !file.exists();
                 records.push(pair("file", &file.display().to_string()));
                 records.push(pair("new", yes(new)));
-                if let Err(persistence::LoadError::Config(error)) =
-                    persistence::load_config(Some(file.as_path()), env)
-                {
-                    records.extend(error.problems().iter().map(|p| pair("problem", p)));
+                // A missing file is new, not a problem; one that can't be read is, as for the
+                // reload that would refuse it.
+                match persistence::load_config(Some(file.as_path()), env) {
+                    Err(persistence::LoadError::Config(error)) => {
+                        records.extend(error.problems().iter().map(|p| pair("problem", p)));
+                    }
+                    Err(persistence::LoadError::Other(message)) if !new => {
+                        records.push(pair("problem", &message));
+                    }
+                    _ => {}
                 }
             }
             records
@@ -278,5 +284,47 @@ mod tests {
         assert!(answer.contains("new\tno\nproblem\t"), "{answer}");
         assert!(answer.contains("zoom"), "{answer}");
         assert!(info(PageInfo::Settings, &core, &paths).contains("pages.config.enabled\ttrue"));
+    }
+
+    #[test]
+    fn a_file_that_cant_be_read_is_a_problem_and_a_missing_one_is_new() {
+        use std::os::unix::fs::PermissionsExt;
+        let core = core();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let paths = Paths {
+            config: Some(file.clone()),
+            session: None,
+        };
+        let problems = |answer: &str| -> Vec<String> {
+            answer
+                .lines()
+                .filter_map(|line| line.strip_prefix("problem\t"))
+                .map(str::to_owned)
+                .collect()
+        };
+        let answer = info(PageInfo::Editor, &core, &paths);
+        assert!(answer.contains("new\tyes\n"), "{answer}");
+        assert_eq!(problems(&answer), Vec::<String>::new(), "missing is new");
+
+        std::fs::write(&file, b"version = 1\n# \xff\xfe\n").unwrap();
+        let answer = info(PageInfo::Editor, &core, &paths);
+        assert!(answer.contains("new\tno\n"), "{answer}");
+        let found = problems(&answer);
+        assert_eq!(found.len(), 1, "{answer}");
+        assert!(found[0].contains("cannot read"), "{answer}");
+
+        // Root reads it anyway.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        std::fs::write(&file, "version = 1\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let answer = info(PageInfo::Editor, &core, &paths);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(answer.contains("new\tno\n"), "{answer}");
+        let found = problems(&answer);
+        assert_eq!(found.len(), 1, "{answer}");
+        assert!(found[0].contains("cannot read"), "{answer}");
     }
 }

@@ -365,7 +365,8 @@ enabled = false
 enabled = true
 # The editor, with its arguments, without a shell in between; the file's path is added as its
 # last argument. Without it, $VISUAL, then $EDITOR, then the first of nvim, vim, vi and nano
-# found on PATH.
+# found in PATH's absolute directories: a relative or empty entry (the current directory) is
+# never searched, since sig's current directory is wherever it was started.
 # editor = "nvim -u NONE"
 
 # ── Terminal ─────────────────────────────────────────────────────────────────────────────

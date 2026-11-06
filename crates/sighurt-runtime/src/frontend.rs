@@ -142,16 +142,19 @@ pub trait Frontend: Clipboard {
     /// key press in the page. An action the frontend derives from this input may claim the user's
     /// activation only with this time. `takes_text` is the core's
     /// `BrowserState::page_takes_text` after this event: while it is `false` the frontend types
-    /// nothing into the page itself either (it opens no editor for a field).
+    /// nothing into the page itself either (it opens no editor for a field). `page` is whether
+    /// the view shows one of sig's own pages (`sig://help`, `sig://config`): a frontend that
+    /// can't draw them at the moment keeps their input from them.
     fn page_input(
         &mut self,
         view: ViewId,
         event: &InputEvent,
         activation: Option<Instant>,
         takes_text: bool,
+        page: bool,
         queue: &mut VecDeque<BrowserEvent>,
     ) -> bool {
-        let _ = (view, event, activation, takes_text, queue);
+        let _ = (view, event, activation, takes_text, page, queue);
         false
     }
 

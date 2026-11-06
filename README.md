@@ -368,7 +368,8 @@ tabs = "left"
 
 `sig://config` runs your editor on the file, in a terminal on the page: `[pages.config] editor`
 if you set it, else `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `vim`, `vi` and `nano`
-found on `PATH`. The page says which editor and which file before anything starts, and Enter
+found in an absolute directory of `PATH` (a relative or empty entry, the current directory, is
+never searched). The page says which editor and which file before anything starts, and Enter
 starts it; keys reach it in the keymap's INSERT mode (`sig://help/keys` lists the keys that enter
 and leave it there). When the editor ends, `sig` reads the file again, a file linked from
 elsewhere (a dotfiles repository) included: what changed applies at once where the setting
@@ -557,7 +558,9 @@ the engines go first, then the recent pages, then the keys.
 
 These pages are Wasm programs built into `sig` and run by the wasm engine, so a build or a
 configuration without that engine doesn't open them, and in the terminal they need graphics (they
-have no text mode, and `sig --dump` can't show them). Only you open them (from the address line,
+have no text mode, and `sig --dump` can't show them): while the terminal can't draw one (text mode,
+a terminal without graphics) it gets no keys, pastes or clicks, so nothing starts or is typed into
+a program you can't see, and the page rows name the key that shows graphics. Only you open them (from the address line,
 a command, or the saved session); a web page can't, by any route. Each is a view of its own, has
 no network, and may ask the browser only for what that page needs (help: facts about the build
 and configuration; config: the configuration file; terminal: a terminal), which the browser
