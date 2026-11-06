@@ -413,6 +413,9 @@ struct Tui {
     completed_for: Option<String>,
     /// The visited address the line's text completes to, and that text.
     ghost: Option<(String, String)>,
+    /// The text of a command the line held that doesn't parse, and why: shown while the line
+    /// still holds that text.
+    line_error: Option<(String, String)>,
     /// `Session::history_generation` when the history was last asked.
     history_seen: u64,
     notice: Option<String>,
@@ -699,6 +702,7 @@ impl App {
             active_url: String::new(),
             completed_for: None,
             ghost: None,
+            line_error: None,
             history_seen: 0,
             notice: None,
             notice_first: None,
@@ -1745,6 +1749,7 @@ impl App {
             address_ghost: self.tui.ghost_suffix().map(str::to_owned),
             finding: self.tui.finding,
             find,
+            error: self.tui.line_error().map(str::to_owned),
             mode_label: match self.tui.text_mode {
                 true => MODE_TEXT,
                 false => MODE_GRAPHICS,
@@ -2192,6 +2197,7 @@ impl Tui {
     fn close_address(&mut self) {
         self.editing_fresh = false;
         self.finding = false;
+        self.line_error = None;
         if self.editing.take().is_some() {
             self.line_gen = self.line_gen.wrapping_add(1);
             self.chrome_dirty = true;
@@ -2264,6 +2270,13 @@ impl Tui {
             },
         }
         self.chrome_dirty = true;
+    }
+
+    /// Why the command the line holds doesn't run, while it still holds the text that failed.
+    fn line_error(&self) -> Option<&str> {
+        let editor = self.editing.as_ref().filter(|_| !self.finding)?;
+        let (text, error) = self.line_error.as_ref()?;
+        (editor.text() == text).then_some(error.as_str())
     }
 
     /// The rest of the visited address the line completes to, while the line has the text it
@@ -2454,23 +2467,29 @@ impl Tui {
     }
 
     /// Enter: open what was typed, or run it as a command after a `:`. The window's address
-    /// bar does the same; a command that doesn't parse closes the line here, with its error as
-    /// a notice, since the line covers the notice while it is open.
+    /// bar does the same: a command that doesn't parse leaves the line open with what was
+    /// typed, and its error beside it until the text changes.
     fn submit(&mut self, queue: &mut VecDeque<BrowserEvent>) {
-        let line = self
+        let text = self
             .editing
             .as_ref()
-            .map_or("", |editor| editor.text().trim())
+            .map_or("", |editor| editor.text())
             .to_owned();
+        let line = text.trim().to_owned();
         if line.is_empty() {
             self.close_address();
             queue.push_back(BrowserEvent::Focus(KeyboardFocus::Page));
         } else if let Some(command) = line.strip_prefix(':') {
-            self.close_address();
-            queue.push_back(BrowserEvent::Focus(KeyboardFocus::Page));
             match CommandSet::ANY.with_custom(&self.commands).parse(command) {
-                Ok(command) => queue.push_back(BrowserEvent::Command(command)),
-                Err(error) => self.show_notice(format!(":{}: {error}", command.trim())),
+                Ok(parsed) => {
+                    self.close_address();
+                    queue.push_back(BrowserEvent::Focus(KeyboardFocus::Page));
+                    queue.push_back(BrowserEvent::Command(parsed));
+                }
+                Err(error) => {
+                    self.line_error = Some((text, format!(":{}: {error}", command.trim())));
+                    self.chrome_dirty = true;
+                }
             }
         } else {
             // The core gives the page the keyboard, which closes the line.
@@ -3431,6 +3450,7 @@ mod tests {
             active_url: String::new(),
             completed_for: None,
             ghost: None,
+            line_error: None,
             history_seen: 0,
             notice: None,
             notice_first: None,
@@ -3520,6 +3540,38 @@ mod tests {
             tui.clipboard_out.as_deref(),
             Some(clipboard::set(Selection::Clipboard, b"hej").as_slice())
         );
+    }
+
+    /// A9: a command that doesn't parse keeps the line open, with what was typed and the error
+    /// the window's chromes give, until the text changes; one that parses closes it and runs.
+    #[test]
+    fn a_command_that_does_not_parse_leaves_the_line_open_with_its_error() {
+        let (_master, mut tui) = on_pty();
+        tui.commands = vec!["help".into()];
+        let mut queue = VecDeque::new();
+        for (typed, why) in [
+            (":hlep", "unknown command \"hlep\""),
+            (":help unexpected", ""),
+        ] {
+            tui.editing = Some(LineEditor::from_text(typed));
+            tui.edit_key(&named("Enter"), &mut queue);
+            assert_eq!(tui.editing.as_ref().map(LineEditor::text), Some(typed));
+            assert!(queue.is_empty(), "{typed}: {queue:?}");
+            let error = tui.line_error().expect(typed);
+            assert!(error.starts_with(&format!("{typed}: {why}")), "{error}");
+        }
+        // The error goes with the text it was about.
+        tui.edit_key(&named("Backspace"), &mut queue);
+        assert_eq!(tui.line_error(), None);
+        assert!(tui.editing.is_some());
+        tui.editing = Some(LineEditor::from_text(":page.reload"));
+        tui.edit_key(&named("Enter"), &mut queue);
+        assert!(tui.editing.is_none());
+        assert_eq!(commands(&queue), ["page.reload"]);
+        assert!(matches!(
+            queue.front(),
+            Some(BrowserEvent::Focus(KeyboardFocus::Page))
+        ));
     }
 
     #[test]

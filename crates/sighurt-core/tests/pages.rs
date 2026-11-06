@@ -9,9 +9,10 @@ use sighurt_api::engine::{EngineCapabilities, EngineCommand};
 use sighurt_api::events::{EngineEvent, OpenDisposition};
 use sighurt_api::ids::{DocumentGeneration, PtySession, RequestId, SeatId, ViewId};
 use sighurt_api::input::{
-    ButtonState, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers,
-    PointerButton, PointerEvent,
+    ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus,
+    Modifiers, PointerButton, PointerEvent,
 };
+use sighurt_api::keymap::Frontend;
 use sighurt_api::services::{
     PageGrant, PageInfo, PageRequest, PtyProgram, Service, ServiceError, ServiceReply,
     ServiceRequest, ServiceResult,
@@ -826,4 +827,203 @@ fn typing_waits_for_the_user_after_a_page_closes_its_tab() {
     // ...until the user clicks it, or runs a command.
     h.click(first);
     assert!(delivered(&h.apply(key('c'))));
+}
+
+/// `name`'s key on `seat`: pressed afresh, repeating, or released.
+fn key_on(seat: SeatId, code: u32, name: &str, state: ButtonState, repeat: bool) -> BrowserEvent {
+    let key = match name.chars().count() {
+        1 => Key::Character(name.into()),
+        _ => Key::Named(name.into()),
+    };
+    let text = (name.chars().count() == 1).then(|| name.to_owned());
+    BrowserEvent::Keyboard {
+        event: InputEvent {
+            seat,
+            kind: InputKind::Key(KeyEvent {
+                code: KeyCode(code),
+                key,
+                state,
+                repeat,
+                modifiers: Modifiers::default(),
+                consumed: Modifiers::default(),
+                text,
+            }),
+        },
+        at: Instant::now(),
+    }
+}
+
+/// Whether `effects` sends `view` a key.
+fn delivered_to(effects: &[Effect], view: ViewId) -> bool {
+    effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::Engine {
+                view: v,
+                command: EngineCommand::Input(InputEvent {
+                    kind: InputKind::Key(_),
+                    ..
+                }),
+            } if *v == view
+        )
+    })
+}
+
+/// A page-opened tab in front, with the keyboard: returns the opener's view and the tab's.
+fn popup_in_front(h: &mut Harness) -> (ViewId, ViewId) {
+    let first = h.shown();
+    let document = h.document(first);
+    h.click(first);
+    h.engine(
+        first,
+        EngineEvent::OpenRequested {
+            view: first,
+            document,
+            url: "https://pop.test/".into(),
+            disposition: OpenDisposition::NewView,
+        },
+    );
+    h.command("tab.select 2");
+    h.apply(BrowserEvent::Focus(KeyboardFocus::Page));
+    (first, h.shown())
+}
+
+/// The popup closes itself: the opener comes to the front by itself, its click long past.
+fn popup_closes(h: &mut Harness, popup: ViewId) {
+    let document = h.document(popup);
+    let effects = h.engine(
+        popup,
+        EngineEvent::CloseRequested {
+            view: popup,
+            document,
+        },
+    );
+    assert!(notices(&effects)
+        .iter()
+        .any(|n| n.contains("came to the front by itself")));
+    h.now += Duration::from_secs(6);
+}
+
+#[test]
+fn enter_held_while_its_tab_closes_itself_reaches_no_other_page() {
+    // Enter is `page.send-key enter`, as in the example configuration's NORMAL, and each of its
+    // repeats runs it again. Every other key goes to the page.
+    let config = "[input]\nkeymap = \"bindings\"\n[keys]\n\"enter\" = \"page.send-key enter\"";
+    let mut h = Harness::start(config, &["https://a.test/"]);
+    let (first, popup) = popup_in_front(&mut h);
+    let seat = SeatId::next();
+    let enter = |state, repeat| key_on(seat, 28, "Enter", state, repeat);
+    assert!(delivered_to(
+        &h.apply(enter(ButtonState::Pressed, false)),
+        popup
+    ));
+    popup_closes(&mut h, popup);
+    assert_eq!(h.shown(), first);
+    for _ in 0..3 {
+        assert!(!delivered(&h.apply(enter(ButtonState::Pressed, true))));
+    }
+    assert!(!delivered(&h.apply(enter(ButtonState::Released, false))));
+    // The repeats were no key press in the page: it may not open a tab...
+    let document = h.document(first);
+    h.engine(
+        first,
+        EngineEvent::OpenRequested {
+            view: first,
+            document,
+            url: "https://b.test/".into(),
+            disposition: OpenDisposition::NewView,
+        },
+    );
+    assert_eq!(h.state.tabs().len(), 1);
+    // ...and they lifted no hold: typing still doesn't reach it.
+    let b = |state| key_on(seat, 48, "b", state, false);
+    assert!(!delivered(&h.apply(b(ButtonState::Pressed))));
+    assert!(!delivered(&h.apply(b(ButtonState::Released))));
+    // Enter pressed afresh is a command the user ran: it takes the page, and reaches it.
+    assert!(delivered_to(
+        &h.apply(enter(ButtonState::Pressed, false)),
+        first
+    ));
+    h.apply(enter(ButtonState::Released, false));
+    assert!(delivered_to(&h.apply(b(ButtonState::Pressed)), first));
+}
+
+#[test]
+fn a_key_the_chrome_got_does_not_repeat_into_the_tab_it_opened() {
+    // No bindings: Enter goes to the address line, which runs a command that opens a tab.
+    let mut h = Harness::start("[input]\nkeymap = \"bindings\"", &["https://a.test/"]);
+    h.apply(BrowserEvent::Focus(KeyboardFocus::Chrome));
+    let seat = SeatId::next();
+    let enter = |state, repeat| key_on(seat, 28, "Enter", state, repeat);
+    let effects = h.apply(enter(ButtonState::Pressed, false));
+    assert!(effects.iter().any(|e| matches!(e, Effect::ChromeInput(_))));
+    assert!(!delivered(&effects));
+    for command in ["tab.new https://b.test/", "page.open https://c.test/"] {
+        h.command(command);
+        let shown = h.shown();
+        assert!(!delivered(&h.apply(enter(ButtonState::Pressed, true))));
+        assert!(!delivered(&h.apply(enter(ButtonState::Pressed, true))));
+        // Its own keys do reach it.
+        let c = key_on(seat, 46, "c", ButtonState::Pressed, false);
+        assert!(delivered_to(&h.apply(c), shown), "{command}");
+    }
+    assert!(!delivered(&h.apply(enter(ButtonState::Released, false))));
+}
+
+fn config_write() -> Service {
+    Service::Page(PageRequest::ConfigWrite {
+        text: "version = 1".into(),
+        replaces: String::new(),
+    })
+}
+
+fn window_focus(focus: FocusEvent) -> BrowserEvent {
+    BrowserEvent::Keyboard {
+        event: InputEvent {
+            seat: SeatId::next(),
+            kind: InputKind::Focus(focus),
+        },
+        at: Instant::now(),
+    }
+}
+
+#[test]
+fn an_unfocused_window_writes_no_configuration_and_opens_no_terminal() {
+    let on = "[pages.terminal]\nenabled = true";
+    for (url, service) in [
+        ("sig://config", config_write()),
+        ("sig://terminal", pty_open()),
+    ] {
+        let mut h = Harness::start(on, &[url]);
+        let view = h.shown();
+        h.click(view);
+        h.apply(window_focus(FocusEvent::Deactivated));
+        let (id, effects) = h.ask(view, Some(url), service.clone());
+        assert_eq!(
+            answer(&effects, id),
+            Some(&Err(ServiceError::Denied)),
+            "{url}"
+        );
+        // The refusal used nothing up: back in front, the click still counts.
+        h.apply(window_focus(FocusEvent::Activated));
+        let (id, effects) = h.ask(view, Some(url), service.clone());
+        assert!(performs(&effects, id), "{url}");
+        // The terminal reports no focus unless it was asked to: there the window has it.
+        let env = Environment {
+            frontend: Frontend::Terminal,
+            ..environment()
+        };
+        let mut h = Harness::with(on, env);
+        h.apply(BrowserEvent::Start {
+            session: None,
+            open: vec![OpenRequest {
+                input: url.into(),
+                engine: None,
+            }],
+        });
+        let view = h.shown();
+        h.click(view);
+        let (id, effects) = h.ask(view, Some(url), service);
+        assert!(performs(&effects, id), "{url} in the terminal");
+    }
 }
