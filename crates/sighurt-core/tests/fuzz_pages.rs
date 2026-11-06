@@ -13,6 +13,14 @@
 //! text the user gave, non-empty, at most `MAX_FIND` bytes, with no control character in it.
 //! A key's repeats and release reach only a page its press reached (the chrome, a tab that came
 //! to the front, or another view shown since get none of them).
+//!
+//! A second test runs `sig://config` pages among web pages, asking at random to start their
+//! editor (`PtyOpen`), with Enter passed to the page, F2 bound to `page.send-key enter`, F3 to
+//! `tab.select 2` then `page.send-key enter`, keys pressed, repeating and released, clicks and
+//! time passing. Each editor the core starts was preceded, since the last it started for that
+//! view, by a fresh key press or a click that reached that view's current document. F3's
+//! repeats run its commands again and may reach a tab opened since its press: they are not held
+//! to the rule above about repeats.
 //! `tools/fuzz/mod.rs` describes the environment variables.
 
 #[path = "../../../tools/fuzz/mod.rs"]
@@ -27,10 +35,14 @@ use sighurt_api::commands::{Command, MAX_FIND};
 use sighurt_api::engine::{EngineCapabilities, EngineCommand, FindCommand};
 use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::SurfacePoint;
-use sighurt_api::ids::{DocumentGeneration, NavigationId, RequestId, SeatId, ViewId};
+use sighurt_api::ids::{DocumentGeneration, NavigationId, PtySession, RequestId, SeatId, ViewId};
+use sighurt_api::input::KeyboardFocus;
 use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, Modifiers,
     PointerButton, PointerEvent,
+};
+use sighurt_api::services::{
+    PageGrant, PageRequest, PtyProgram, Service, ServiceReply, ServiceRequest,
 };
 use sighurt_core::config::Config;
 use sighurt_core::tabs::Content;
@@ -41,6 +53,9 @@ const LIMIT: Duration = Duration::from_secs(5);
 /// How often the cases reached what they check: a page fullscreen, an `ExitFullscreen`, a
 /// search sent, a view closed. All must happen for the test to mean anything.
 static REACHED: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+/// How often the second test's pages started a program, and were refused one.
+static LAUNCHES: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 
 /// Can find in page and go fullscreen.
 const FULL: &str = "full";
@@ -72,6 +87,9 @@ struct Harness {
     closed: BTreeSet<ViewId>,
     /// Every view ever opened, for events about views alive and gone.
     known: Vec<ViewId>,
+    /// The document of each view a fresh key press or a click reached since the core last
+    /// started a program for it.
+    pressed_in: BTreeMap<ViewId, DocumentGeneration>,
     /// Every document ever committed, for stale events.
     documents: Vec<DocumentGeneration>,
     /// The searches the core started, per view.
@@ -84,6 +102,9 @@ struct Harness {
     key: Option<KeyEvent>,
     /// The views each key's press sent input to, from its press to its release.
     pressed: BTreeMap<u32, BTreeSet<ViewId>>,
+    /// A key whose repeats run commands that move to another tab: its repeats may reach a
+    /// page its press did not, and are not checked for it.
+    moving: Option<u32>,
     seat: SeatId,
     now: Instant,
     rng: Rng,
@@ -91,23 +112,28 @@ struct Harness {
 
 impl Harness {
     fn new(rng: Rng) -> Self {
-        let env = environment();
         let text = format!(
             "version = 1\n[engines]\ndefault = \"{FULL}\"\n[input]\nkeymap = \"bindings\"\n\
              [keys]\n\"enter\" = \"page.send-key enter\"\n"
         );
-        let config = Config::parse(Some(&text), &env).unwrap();
+        Self::with(rng, environment(), &text)
+    }
+
+    fn with(rng: Rng, env: Environment, text: &str) -> Self {
+        let config = Config::parse(Some(text), &env).unwrap();
         Self {
             state: BrowserState::new(config, env),
             views: BTreeMap::new(),
             closed: BTreeSet::new(),
             known: Vec::new(),
+            pressed_in: BTreeMap::new(),
             documents: Vec::new(),
             searches: BTreeMap::new(),
             held: Vec::new(),
             focused: true,
             key: None,
             pressed: BTreeMap::new(),
+            moving: None,
             seat: SeatId::next(),
             now: Instant::now(),
             rng,
@@ -121,6 +147,28 @@ impl Harness {
                     !self.closed.contains(view),
                     "{command:?} sent to {view:?} after it was closed"
                 );
+                // What may start a program: a click, or a key pressed afresh, that reached the
+                // page.
+                let fresh = |key: &KeyEvent| key.state == ButtonState::Pressed && !key.repeat;
+                let reached = match command {
+                    EngineCommand::Input(InputEvent {
+                        kind:
+                            InputKind::Pointer(PointerEvent::Button {
+                                state: ButtonState::Pressed,
+                                ..
+                            }),
+                        ..
+                    }) => true,
+                    EngineCommand::Input(InputEvent {
+                        kind: InputKind::Key(sent),
+                        ..
+                    }) => fresh(sent) && self.key.as_ref().is_some_and(fresh),
+                    _ => false,
+                };
+                let document = self.state.view(*view).and_then(|v| v.document());
+                if let (true, Some(document)) = (reached, document) {
+                    self.pressed_in.insert(*view, document);
+                }
                 if let (
                     EngineCommand::Input(InputEvent {
                         kind: InputKind::Key(_),
@@ -130,7 +178,10 @@ impl Harness {
                 ) = (command, &self.key)
                 {
                     // A key whose press came before the window had the keyboard is not checked.
-                    let views = self.pressed.get_mut(&key.code.0);
+                    let views = self
+                        .pressed
+                        .get_mut(&key.code.0)
+                        .filter(|_| self.moving != Some(key.code.0));
                     match views {
                         Some(views) if key.state == ButtonState::Pressed && !key.repeat => {
                             views.insert(*view);
@@ -169,6 +220,24 @@ impl Harness {
                 self.closed.insert(*view);
                 REACHED[3].fetch_add(1, Ordering::Relaxed);
             }
+            Effect::Service {
+                view,
+                service: Service::Page(PageRequest::PtyOpen { .. }),
+                ..
+            } => {
+                LAUNCHES[0].fetch_add(1, Ordering::Relaxed);
+                let document = self.state.view(*view).and_then(|v| v.document());
+                assert!(
+                    document.is_some(),
+                    "a program for {view:?} with no document"
+                );
+                assert_eq!(
+                    self.pressed_in.remove(view),
+                    document,
+                    "a program started in {view:?} with no fresh press or click in its document \
+                     since the last"
+                );
+            }
             _ => {}
         }
     }
@@ -182,6 +251,21 @@ impl Harness {
                 (*view, vec![EngineEvent::ViewReady { view: *view }])
             }
             Effect::CloseView { view } => (*view, vec![EngineEvent::ViewClosed { view: *view }]),
+            // The program starts, and ends at some time.
+            Effect::Service {
+                request,
+                service: Service::Page(PageRequest::PtyOpen { .. }),
+                ..
+            } => {
+                let started = Ok(ServiceReply::Pty(PtySession::next()));
+                let ended = Ok(ServiceReply::PtyEnded { status: Some(0) });
+                return [started, ended]
+                    .map(|result| BrowserEvent::ServiceDone {
+                        request: *request,
+                        result,
+                    })
+                    .into();
+            }
             Effect::Engine {
                 view,
                 command: EngineCommand::Navigate { navigation, url },
@@ -581,6 +665,178 @@ fn fuzz_find_and_fullscreen_in_random_orders() {
         let reached = REACHED.each_ref().map(|n| n.load(Ordering::Relaxed));
         eprintln!("fuzz_pages reached: fullscreen, exits, searches, closes = {reached:?}");
         assert!(reached.iter().all(|&n| n > 0), "{reached:?}");
+    }
+}
+
+/// The configuration page's grant.
+const EDITOR: &[PageGrant] = &[PageGrant::Editor];
+
+fn pages_environment() -> Environment {
+    let mut env = environment();
+    env.engines
+        .insert("wasm".into(), EngineCapabilities::default());
+    env.pages = [("config".to_owned(), EDITOR)].into();
+    env
+}
+
+fn launch_command(rng: &mut Rng) -> Command {
+    let n = rng.range(1, 4);
+    let text = match rng.below(10) {
+        0 | 1 => "tab.new sig://config".into(),
+        2 => "tab.new https://a.test/".into(),
+        3 => "page.open sig://config".into(),
+        4 => format!("tab.select {n}"),
+        5 => "tab.next".into(),
+        6 => "tab.close".into(),
+        7 => "page.reload".into(),
+        8 => "page.back".into(),
+        _ => "browser.home".into(),
+    };
+    text.parse().unwrap()
+}
+
+#[test]
+fn fuzz_a_program_starts_only_after_a_fresh_press_or_a_click_in_its_page() {
+    let text = format!(
+        "version = 1\n[engines]\ndefault = \"{FULL}\"\n[input]\nkeymap = \"bindings\"\n\
+         [commands]\ngo = [\"tab.select 2\", \"page.send-key enter\"]\n\
+         [keys]\n\"f2\" = \"page.send-key enter\"\n\"f3\" = \"go\"\n"
+    );
+    run("fuzz_pages_launch", iterations(100) / 4, LIMIT, |case| {
+        let mut h = Harness::with(case.rng.clone(), pages_environment(), &text);
+        h.moving = Some(61);
+        let open = ["sig://config", "https://s.test/"]
+            .map(|url| OpenRequest {
+                input: url.into(),
+                engine: None,
+            })
+            .into();
+        h.deliver(BrowserEvent::Start {
+            session: None,
+            open,
+        });
+        for _ in 0..case.rng.range(5, 80) {
+            let rng = &mut case.rng;
+            match rng.below(18) {
+                0..=2 => {
+                    let command = launch_command(rng);
+                    case.note(|| format!("{command:?}"));
+                    h.deliver(BrowserEvent::Command(command));
+                }
+                3 | 4 if !h.held.is_empty() => {
+                    let at = rng.below(h.held.len());
+                    let event = h.held.swap_remove(at);
+                    case.note(|| format!("held {event:?}"));
+                    h.deliver(event);
+                }
+                5 | 6 => {
+                    let Some(view) = h.some_view() else { continue };
+                    let event = h.input(InputKind::Pointer(PointerEvent::Button {
+                        button: PointerButton::Left,
+                        state: ButtonState::Pressed,
+                        position: SurfacePoint { x: 5.0, y: 5.0 },
+                        modifiers: Modifiers::default(),
+                    }));
+                    case.note(|| format!("click in {view:?}"));
+                    h.deliver(BrowserEvent::Pointer {
+                        view,
+                        event,
+                        at: h.now,
+                    });
+                }
+                7..=9 => {
+                    let (code, name) = *rng.pick(&[(28, "Enter"), (60, "F2"), (61, "F3")]);
+                    let state = *rng.pick(&[ButtonState::Pressed, ButtonState::Released]);
+                    let key = KeyEvent {
+                        code: KeyCode(code),
+                        key: Key::Named(name.into()),
+                        state,
+                        repeat: state == ButtonState::Pressed && rng.one_in(2),
+                        modifiers: Modifiers::default(),
+                        consumed: Modifiers::default(),
+                        text: None,
+                    };
+                    case.note(|| format!("{key:?}"));
+                    h.key(key);
+                }
+                10 => {
+                    h.focused = rng.one_in(2);
+                    let focus = match h.focused {
+                        true => FocusEvent::Activated,
+                        false => FocusEvent::Deactivated,
+                    };
+                    case.note(|| format!("{focus:?}"));
+                    if !h.focused {
+                        h.pressed.clear();
+                    }
+                    let event = h.input(InputKind::Focus(focus));
+                    h.deliver(BrowserEvent::Keyboard { event, at: h.now });
+                }
+                11 => {
+                    let focus = *rng.pick(&[KeyboardFocus::Page, KeyboardFocus::Chrome]);
+                    case.note(|| format!("focus {focus:?}"));
+                    h.deliver(BrowserEvent::Focus(focus));
+                }
+                12 => {
+                    let ms = rng.below(7_000) as u64;
+                    case.note(|| format!("{ms} ms pass"));
+                    h.now += Duration::from_millis(ms);
+                }
+                13..=15 => {
+                    // A page asks to start its editor: mostly a configuration page, for its
+                    // current document.
+                    let Some(view) = h.some_view() else { continue };
+                    let document = h.some_document(view);
+                    let request = ServiceRequest {
+                        id: RequestId::next(),
+                        view,
+                        document,
+                        origin: Some("sig://config".into()),
+                        service: Service::Page(PageRequest::PtyOpen {
+                            program: PtyProgram::EditConfig,
+                            cols: 80,
+                            rows: 24,
+                        }),
+                    };
+                    case.note(|| format!("{view:?} {document:?} asks for its editor"));
+                    let before = LAUNCHES[0].load(Ordering::Relaxed);
+                    h.engine_event(EngineEvent::ServiceRequested(request));
+                    if LAUNCHES[0].load(Ordering::Relaxed) == before {
+                        LAUNCHES[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                _ => {
+                    let Some(view) = h.some_view() else { continue };
+                    let event = match rng.below(3) {
+                        0 => EngineEvent::ViewFailed {
+                            view,
+                            message: "gone".into(),
+                        },
+                        _ => {
+                            let navigation = NavigationId::next();
+                            let page = h.state.view(view).and_then(|v| v.page());
+                            let url = match page {
+                                Some(_) => "sig://config",
+                                None => "https://own.test/",
+                            };
+                            h.commit(view, navigation, url.into())
+                        }
+                    };
+                    case.note(|| format!("{event:?}"));
+                    h.engine_event(event);
+                }
+            }
+        }
+        while !h.held.is_empty() {
+            let at = case.rng.below(h.held.len());
+            let event = h.held.swap_remove(at);
+            h.deliver(event);
+        }
+    });
+    if std::env::var_os("SIG_FUZZ_CASE").is_none() {
+        let launches = LAUNCHES.each_ref().map(|n| n.load(Ordering::Relaxed));
+        eprintln!("fuzz_pages_launch: started, refused = {launches:?}");
+        assert!(launches.iter().all(|&n| n > 0), "{launches:?}");
     }
 }
 

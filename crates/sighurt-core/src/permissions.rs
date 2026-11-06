@@ -25,8 +25,14 @@
 //!   record of the view's page and that page's grants, never from the request's origin, which
 //!   must be the page's own (`sig://<name>`) as well. A terminal (`PtyOpen`) needs the page's
 //!   grant for its program (`sig://terminal` the shell, `sig://config` the editor), the page
-//!   shown in the selected tab, with the keyboard, and a click or key press in it, which it
-//!   uses up (a missing grant is refused first, so it uses up nothing). It also needs its
+//!   shown in the selected tab, with the keyboard, and a click or a fresh key press in it
+//!   within the last [`ACTIVATION`], which it uses up with the page's activation (a missing
+//!   grant is refused first, so it uses up nothing). The key press counts only if it was delivered to that page, or its own
+//!   `page.send-key` was, with the page and its document shown and with the keyboard when it
+//!   was pressed and until then (a command before it in the key's list that moved the keyboard
+//!   to another page, even and then back, takes it away). A repeat never counts, and neither
+//!   does a press or click while the document has a terminal: those are its program's. It
+//!   also needs its
 //!   page's setting (`[pages.terminal] enabled` for the shell, `[pages.config] enabled` for the
 //!   editor), no other terminal of the document, and fewer than [`MAX_PTYS`] in all, shells
 //!   and editors together. The core tracks each terminal ([`Ptys`]): opening, open, closing,
@@ -265,11 +271,14 @@ impl Ptys {
     /// Whether a terminal may start for `document` of `view`: it has none, and there are fewer
     /// than [`MAX_PTYS`].
     pub(crate) fn room(&self, view: ViewId, document: DocumentGeneration) -> bool {
-        self.0.len() < MAX_PTYS
-            && !self
-                .0
-                .values()
-                .any(|pty| pty.view == view && pty.document == document)
+        self.0.len() < MAX_PTYS && !self.runs(view, document)
+    }
+
+    /// Whether `document` of `view` has a terminal, in any state.
+    pub(crate) fn runs(&self, view: ViewId, document: DocumentGeneration) -> bool {
+        self.0
+            .values()
+            .any(|pty| pty.view == view && pty.document == document)
     }
 
     /// Moves `request`'s terminal to closing; whether it was not closing yet.
