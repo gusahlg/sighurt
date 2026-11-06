@@ -119,6 +119,8 @@ pub struct Counters {
     pub snapshot_ns: u64,
     /// Configuration reloads, valid or not.
     pub config_reloads: u64,
+    /// Times what `sig://home` says was built (`Session::home`): only when its inputs changed.
+    pub home_builds: u64,
     /// Session snapshots handed to the writer.
     pub session_saves: u64,
     /// Visits recorded in the history (`Effect::Visited` commits it kept).
