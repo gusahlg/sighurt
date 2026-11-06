@@ -4391,3 +4391,125 @@ Newest last. Each entry says what was decided and why.
     takes about 15 ms because the loader searches `LD_LIBRARY_PATH` for the Wasm engine's
     FFmpeg and its 105 libraries; loading FFmpeg when a guest first uses media would remove
     most of it.
+
+136. **Internal pages: `sig://help`, the `sig` module, configured commands** (5 November 2026,
+    branch `pages0`, merged f0def28; the user: "add in a command called help that opens a new
+    tab … with all relevant sig information and help that a new person might need. The page
+    should use pure wasm through sig's wasm engine", "adding in new commands in the
+    configuration should not mean you hardcode it into the browser", "Add in more different
+    sig pages"). The design is [pages-2026-11-05.md](pages-2026-11-05.md): the deep-design
+    agent's review, then amendments A1–A10 after an outside review
+    ([reviews-pages-astra.md](reviews-pages-astra.md)), which are binding. *Pages*:
+    `sig://help` (with `/keys`, `/commands`, `/config`, `/pages`, `/engines`,
+    `/terminal-frontend`, `/about`), `sig://config` (137) and `sig://terminal` (138) are Wasm
+    guests under `pages/`, built for wasm32 by `crates/sighurt-pages`' build script (a nested
+    cargo, or `SIGHURT_PAGES_PREBUILT`) and embedded; `PAGES` is the one table of names,
+    titles, modules and grants that the core and the engine both read. `sig://home` stays the
+    chrome's. *The core* routes them (`Route::Page`), records each view's page for the view's
+    life, refuses every `sig:` address a non-internal page asks for, and routes a restored
+    session's addresses again. *The engine* loads an internal document from the embedded
+    bytes with origin `sig://<name>`, a deny-all network policy and an import denylist, and
+    links the privileged import module `"sig"` only for it: requests (`request`, `poll`,
+    `reply`, `cancel`), an ordered input queue with a paste marker (512 records, 256 KiB),
+    and terminals by session id. A view's kind is fixed for life; loaded modules and workers
+    never get the module. *Services*: `Service::Page(PageRequest)` (`Info`, `ConfigRead`,
+    `ConfigCheck`, `ConfigWrite`, `PtyOpen`), granted from the recorded page and its grants
+    (help: Info; config: ConfigRead and ConfigWrite; terminal: Pty); `ConfigWrite` and
+    `PtyOpen` also need the shown tab with the keyboard and an activation they use up. The
+    help page's facts come from the browser (`page_info`: the command table, the keymap's
+    `describe`, the build's engines, the configuration in use), so it cannot go stale.
+    *Input hold* (A1): after the front tab changes without the user choosing it, keys, text
+    and pastes are dropped, with a notice, until a click in the page or a command.
+    *Configured commands*: `[commands]` names argument-less aliases of up to 8 built-in
+    commands (at most 64, no alias of an alias, no built-in's name), validated at load;
+    `Command::Custom` exists only through a `CommandSet` that knows the table, so a bare
+    unknown word is still an error, and the chromes and the terminal keep the line open on
+    one. `help` is the default alias `tab.new sig://help`: configuration, not a command of
+    the core. The example configuration binds `?` and F1 to `help` and `d` to `tab.close`
+    (the user: "closes the current tab when I click d"). `Keymap::describe` and
+    `TabInfo.internal` are new in the keymap API; `TextInputEvent.paste` marks a paste (the
+    terminal's bracketed paste; the window has no distinct paste yet). *Measured*: a
+    demo+Wasm debug `sig` grew 2.7 % (the help module is 117 KiB); the nested build takes
+    1.3 s clean. *Verified*: `crates/sighurt-core/tests/pages.rs`, the engine's pages and
+    view tests, `crates/sighurt-pages/tests/blobs.rs`, headless.sh `pages`, tui.rs
+    `sig_pages_need_graphics_and_say_so`; in the terminal the pages need graphics (they are
+    drawn and have no text mode).
+
+137. **`sig://config`: the configuration read and edited in the browser** (5 November 2026,
+    branch `pagecfg`, merged 0d040bf; the user: "it would genuinely be pretty cool if you
+    could go and see and edit your configuration inside of the browser"). A plain text editor
+    as a Wasm guest (`pages/sig-page-config`): grapheme-aware caret and selection, undo and
+    redo (1 000 steps, 4 MiB), light TOML colouring, a problems panel whose rows jump to
+    their line; the text is checked 400 ms after the last change with the core's own
+    validation, and saved only by Ctrl+S or the Save button. *The runtime*
+    (`sighurt_runtime::page_config`) reads, checks and writes: a write names what it replaces
+    (`file <target>` and its contents, or `missing <target>`), takes an advisory lock next to
+    the resolved target, reads the file again and refuses a stale write; it writes through a
+    dedicated `persistence::replace_config` (an exclusive temporary, the target's mode kept or
+    0600 for a new file, fsync, rename, fsync of the directory), follows a symlink without
+    replacing it, refuses a read-only file or directory with a message, and caps the file at
+    256 KiB. An editor that takes no lock can still race it; documented. A save is taken into
+    use at once (`ConfigReloaded`, and the frontends' own reload step, so colours, fonts and
+    command names apply for a symlinked file the watch cannot see); the core ignores a reload
+    equal to the configuration in use. Restart-only settings are named in the answer.
+    *Verified*: 13 runtime tests (eight writers racing: exactly one saves; the lock held;
+    symlinks, modes, the cap), 24 guest tests, headless.sh `config-page` (10 checks on a
+    symlinked configuration: typing, Ctrl+S, the new tab colour, a new alias run from `:`, an
+    invalid save refused, a stale file refused then read again), tui.rs
+    `sig_config_is_edited_and_saved_in_the_terminal`.
+
+138. **`sig://terminal`: a terminal whose emulator is sandboxed and whose shell is not**
+    (5 November 2026, branch `pageterm`, merged aaadd81; the user: "See if you can add in a
+    sig://terminal that is like a super simplified and wasm-sandboxed terminal … launch nvim
+    inside of the browser and edit your configuration"). Off by default: `[pages.terminal]
+    enabled = false`, and `command` for the program (else `$SHELL`, else `/bin/sh`). **It runs
+    a shell with all the user's rights; only the emulator runs in the Wasm sandbox**, and
+    README, SECURITY.md, the default configuration and the page's own start screen say so.
+    Nothing starts on opening the page: Enter in the shown, focused page starts the program,
+    one per document and 8 at once. *The runtime* (`sighurt_runtime::pty`) opens the pty
+    (rustix, close-on-exec from creation), spawns with `setsid`, the controlling terminal,
+    default signal dispositions and `close_range` over every other descriptor (a kernel that
+    cannot seal them fails the launch), a scrubbed environment (`TERM=xterm-256color`), no
+    shell between sig and a configured command, and keeps one watcher thread with the
+    unreaped child and a pidfd per program. The master goes to the engine once, by session
+    id, with no descriptor in any API type. Ending (the document replaced, the tab closed,
+    the setting turned off, quit) sends SIGHUP and SIGCONT to the process group, SIGKILL after
+    2 s, then reaps; the core holds the allowance until the reap is reported. A job in another
+    process group or one that ignores the hangup can outlive it, as in any terminal;
+    documented. *The engine* (`sighurt_engine_wasm::pty`) moves bytes on its own thread with
+    bounded queues (1 MiB out, 64 KiB in) and never blocks the guest. *The guest*
+    (`pages/sig-page-terminal`) is vt100 0.16.2 (MIT, pure Rust; its dependencies were in
+    the lock) with xterm key encoding, answers only DA1, DSR and CPR, and filters pastes (no
+    ESC or other controls but tab and newline; bracketed when asked). `sig://terminal/config`
+    runs `$VISUAL` or `$EDITOR` on the configuration file. *Keys*: on this page the example
+    configuration's INSERT gives Escape to the program, and `ctrl-\ ctrl-n` leaves INSERT (so
+    `ctrl-\` alone never reaches the program). *Verified*: headless.sh `terminal-page` (24
+    checks: a shell, `echo`, `stty size` following a resize, nvim writing a file, `exit` and
+    restart, 20 s of `yes` with another tab responsive, every way of ending leaving no
+    program and no zombie, descriptors 17 → 17 over 20 cycles, the setting off), faults.sh
+    `terminal` (100 open-close cycles with descriptors and threads unchanged; no shell
+    outlives sig after quit, SIGKILL, SIGTERM, SIGINT, SIGHUP or the compositor killed),
+    tui.rs `sig_terminal_runs_a_shell_in_the_terminal_frontend`, 13 runtime, 11 engine and 31
+    guest tests. *Not there*: scrollback, mouse reporting, the title, the clipboard, images;
+    REP, DECRQM, XTGETTCAP, OSC 11. A paste and held keys across an involuntary tab change
+    are tested in units only.
+
+139. **An outside review of the pages' implementation: five findings, all fixed** (5 November
+    2026; [reviews-pages-impl-astra.md](reviews-pages-impl-astra.md); branches `pagefix` and
+    `pageterm`). It found no way for a web page or an ordinary guest to reach an internal
+    page, the `sig` module or a page service. (1) A held key's repeats lifted the input hold
+    and followed a new page: the core now records where each fresh press went
+    (`pressed`, by seat and key), drops a repeat whose press went elsewhere, never delivers a
+    release to another page, and lets only a fresh press lift the hold. So a key held while
+    the keyboard moves to the chrome no longer repeats there. (2) `ConfigWrite` and `PtyOpen`
+    were allowed with the window unfocused: both need the focused window now, checked before
+    the activation is used up (the terminal frontend, which reports no focus, still
+    allows). (3) An internal page's requests and cancellations reached the core only after a
+    drawn frame: unreported work is part of the worker's wake condition. (4) A guest trap
+    kept a terminal's master until the view closed: a failed step revokes the document's
+    requests, terminals and input before `ViewFailed`. (5) The terminal's command line closed
+    on a command that does not parse: it stays open with the error, as the chromes' lines do.
+    Each has a test that fails without its fix (`crates/sighurt-core/tests/pages.rs`, the
+    seeded `fuzz_pages`, the engine's `tests/runtime.rs`, the terminal's unit tests). Also:
+    the terminal's home page no longer claims sig's pages are not shown in the terminal, and
+    "no such page" in both frontends points at `sig://help`.
