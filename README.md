@@ -736,7 +736,8 @@ is off until you turn it on in `config.toml`:
 enabled = true
 ```
 
-The page starts nothing by itself: it says what will run, and Enter starts it. With the example
+The page starts nothing by itself: it says what will run, and Enter starts it, pressed afresh in
+that page (a held Enter repeating, or a key pressed in another tab, starts nothing). With the example
 keymap, keys reach the program in INSERT mode, which Escape enters; on these pages Escape then goes
 to the program (nvim needs it), and `ctrl-escape` or `f12` leaves INSERT ([Keys](#keys): `f12`
 where the terminal sends `ctrl-escape` as `Escape`). Pastes reach the program with

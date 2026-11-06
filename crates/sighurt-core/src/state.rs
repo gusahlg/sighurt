@@ -13,7 +13,8 @@
 //!   button as [`BrowserEvent::SelectTab`] or [`BrowserEvent::CloseTab`], and focus the chrome
 //!   moves itself (a click in the address bar, Escape) as [`BrowserEvent::Focus`];
 //! - every keyboard event as [`BrowserEvent::Keyboard`], every pointer event on a page target
-//!   as [`BrowserEvent::Pointer`], and the mouse's side buttons wherever the pointer is as
+//!   as [`BrowserEvent::Pointer`], a button pressed in a page the chrome draws as
+//!   [`BrowserEvent::ChromePagePress`], and the mouse's side buttons wherever the pointer is as
 //!   [`BrowserEvent::Button`]. The core asks its keymap ([`crate::keys`]) about key presses and
 //!   `[input.buttons]` about side buttons, and routes the rest to the page or, as
 //!   [`Effect::ChromeInput`], to the chrome; text that is no key press (an input method's, a
@@ -249,6 +250,11 @@ pub enum BrowserEvent {
         /// When it happened.
         at: Instant,
     },
+    /// A button went down in the page area while it shows a page the chrome draws
+    /// (`sig://home`), on a link or not: the user took that page, as a press in an engine's page
+    /// is ([`BrowserEvent::Pointer`]), and typing reaches it again if its tab came to the front
+    /// by itself. The frontend sends it before any command the press runs.
+    ChromePagePress,
     /// The chrome moved the keyboard focus itself.
     Focus(KeyboardFocus),
     /// Whether typing the keymap leaves for the page reaches the page's text fields. A frontend
@@ -603,8 +609,9 @@ pub struct BrowserState {
     /// Whether the window has the keyboard: until the frontend says it lost it, it has.
     window_focused: bool,
     /// The tab that came to the front without the user's command (a page closed its tab):
-    /// its page gets no typing until the user clicks it or runs a command, so keystrokes meant
-    /// for one page never land in another.
+    /// its page, an engine's or one the chrome draws, gets no typing until the user clicks it
+    /// or runs a command, so keystrokes meant for one page never land in another. The chrome's
+    /// own line and find field still get theirs.
     held: Option<TabId>,
     /// Where each key press went: the view that had the keyboard once it was handled, or `None`
     /// for the chrome. Its repeats go nowhere once another has it, and its release into no
@@ -630,6 +637,7 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             | BrowserEvent::Pointer { .. }
             | BrowserEvent::PointerRelease { .. }
             | BrowserEvent::Button { .. }
+            | BrowserEvent::ChromePagePress
             | BrowserEvent::Focus(_)
             | BrowserEvent::Semantic { .. }
     );
@@ -674,6 +682,8 @@ pub fn update(state: &mut BrowserState, event: BrowserEvent) -> Vec<Effect> {
             link,
             at,
         } => state.semantic(view, document, action, link, at, &mut fx),
+        BrowserEvent::ChromePagePress if state.chrome_page_shown() => state.release_input(),
+        BrowserEvent::ChromePagePress => {}
         BrowserEvent::Focus(focus) => {
             state.focus = focus;
             fx.chrome = true;
@@ -2350,6 +2360,7 @@ impl BrowserState {
             view.document = Some(document);
             view.answers.clear();
             view.activation = None;
+            view.launch = None;
             view.link = None;
             view.hovered = None;
             self.end_find(id, fx);
@@ -2739,12 +2750,14 @@ impl BrowserState {
                 let deliberate = matches!(service, Service::Page(PageRequest::PtyOpen { .. }));
                 if allowed && deliberate {
                     // Only the page in front, with the keyboard, in a window that has it, after
-                    // the user acted in it.
+                    // a fresh key press or a click in it (`View::launch`), which it uses up
+                    // with the press's activation.
                     let focused = tab == self.active
                         && self.focused_view() == Some(view)
                         && self.window_focused();
                     let v = self.views.get_mut(&view).expect("checked above");
-                    focused && permissions::take_activation(&mut v.activation, at)
+                    let launch = focused && permissions::take_activation(&mut v.launch, at);
+                    launch && permissions::take_activation(&mut v.activation, at)
                 } else {
                     allowed
                 }
@@ -2895,12 +2908,18 @@ impl BrowserState {
     fn keyboard(&mut self, event: InputEvent, at: Instant, fx: &mut Fx) {
         self.seat = event.seat;
         let went = self.press_went(&event);
+        // For a fresh press, the page and document that had the keyboard when it came: the one
+        // page it may let start a program (`View::launch`), while its commands stay there.
+        let mut origin = None;
         match &event.kind {
             InputKind::Key(key) => {
                 // A repeat goes only where its press went: a page that took the keyboard since,
                 // or the chrome, gets nothing of it, and it runs nothing.
                 if key.repeat && went.is_some_and(|v| v != self.focused_view()) {
                     return;
+                }
+                if key.state == ButtonState::Pressed && !key.repeat {
+                    origin = self.keyboard_document();
                 }
                 // The keymap reads the tabs through a borrow of the fields it needs, which
                 // ends before any command of this press changes them.
@@ -2937,8 +2956,15 @@ impl BrowserState {
                         let commands = expanded;
                         let between = commands.len() > 1;
                         for command in commands {
-                            self.key_ran(&command, at);
-                            self.run_command(command, fx);
+                            // A command before this one that moved the keyboard to another
+                            // page, or away and back, keeps the press from starting a program.
+                            origin = origin.filter(|&o| Some(o) == self.keyboard_document());
+                            self.key_ran(&command, origin, at);
+                            match command {
+                                // A repeat sends a repeat, so the page can tell it from a press.
+                                Command::PageSendKey(sent) => self.send_key(&sent, key.repeat, fx),
+                                command => self.run_command(command, fx),
+                            }
                             if between {
                                 self.settle_engines(fx);
                             }
@@ -2961,10 +2987,11 @@ impl BrowserState {
                     }
                     // The press goes where the keyboard is after the command.
                     KeyOutcome::RunThenDeliver(command) => {
-                        self.key_ran(&command, at);
+                        self.key_ran(&command, origin, at);
                         self.run_command(command, fx);
                         self.pressed
                             .insert((event.seat, key.code), self.focused_view());
+                        origin = origin.filter(|&o| Some(o) == self.keyboard_document());
                     }
                     KeyOutcome::Deliver => {}
                 }
@@ -2985,11 +3012,13 @@ impl BrowserState {
             // Pointer input comes with the view it is for.
             InputKind::Pointer(_) => return,
         }
+        let for_page = self.focused_view().is_some() || self.chrome_page_focused();
         match self.focused_view() {
             // The tab shown came to the front by itself: what is typed was meant for another
-            // page until the user takes this one. A press dropped takes its repeats and release
-            // with it, and grants nothing.
-            Some(_) if self.input_held() && is_typing(&event.kind) => {
+            // page until the user takes this one, an engine's or one the chrome draws (the
+            // chrome's own line and find field still take it). A press dropped takes its
+            // repeats and release with it, and grants nothing.
+            _ if for_page && self.input_held() && is_typing(&event.kind) => {
                 if let InputKind::Key(key) = &event.kind {
                     self.keys.take(event.seat, key.code);
                 }
@@ -3004,12 +3033,46 @@ impl BrowserState {
                         .expect("shown")
                         .activated(at, None);
                 }
+                // Only a fresh press that came here, and stayed, may start a program.
+                if origin.is_some_and(|o| Some(o) == self.keyboard_document()) {
+                    self.launch_activated(view, at);
+                }
                 fx.push(Effect::Engine {
                     view,
                     command: EngineCommand::Input(event),
                 });
             }
             None => fx.push(Effect::ChromeInput(event)),
+        }
+    }
+
+    /// The view that has the keyboard and its document, if the page has it and it committed one.
+    fn keyboard_document(&self) -> Option<(ViewId, DocumentGeneration)> {
+        let view = self.focused_view()?;
+        Some((view, self.views[&view].document?))
+    }
+
+    /// Whether the page area shows a page the chrome draws (`sig://home`).
+    fn chrome_page_shown(&self) -> bool {
+        self.shown_view().is_none()
+            && self
+                .tabs
+                .get(self.active)
+                .and_then(Tab::current)
+                .is_some_and(|segment| matches!(segment, Segment::Internal(_)))
+    }
+
+    /// Whether the page has the keyboard and is one the chrome draws.
+    fn chrome_page_focused(&self) -> bool {
+        self.focus == KeyboardFocus::Page && self.chrome_page_shown()
+    }
+
+    /// The user pressed a key afresh in `view`'s page or clicked it at `at`: what may start one
+    /// program (`View::launch`), unless its document runs one, whose keys and clicks it is.
+    fn launch_activated(&mut self, view: ViewId, at: Instant) {
+        let v = self.views.get_mut(&view).expect("shown");
+        if v.document.is_some_and(|d| !self.ptys.runs(view, d)) {
+            v.launch = Some(at);
         }
     }
 
@@ -3069,35 +3132,41 @@ impl BrowserState {
     }
 
     /// A key press ran `command`. A key it sends the page counts as the user's key press there,
-    /// as a key delivered to the page does.
-    fn key_ran(&mut self, command: &Command, at: Instant) {
+    /// as a key delivered to the page does; it may start a program only for a fresh press whose
+    /// `origin`, the page and document it was pressed in, still has the keyboard.
+    fn key_ran(
+        &mut self,
+        command: &Command,
+        origin: Option<(ViewId, DocumentGeneration)>,
+        at: Instant,
+    ) {
         if let (Command::PageSendKey(_), Some(view)) = (command, self.focused_view()) {
             self.views
                 .get_mut(&view)
                 .expect("shown")
                 .activated(at, None);
+            if origin.is_some_and(|o| Some(o) == self.keyboard_document()) {
+                self.launch_activated(view, at);
+            }
         }
     }
 
     /// Presses and releases `key` in the page, back to back so that no key stays held, if the
-    /// page has the keyboard; otherwise does nothing. A page the chrome draws (`sig://home`)
-    /// gets it as [`Effect::ChromeInput`], as it gets the keys passed to it.
-    pub(crate) fn send_key(&mut self, key: &SentKey, fx: &mut Fx) {
-        let view = self.focused_view().filter(|_| !self.input_held());
-        let chrome_page = self.focus == KeyboardFocus::Page
-            && self.shown_view().is_none()
-            && self
-                .tabs
-                .get(self.active)
-                .and_then(Tab::current)
-                .is_some_and(|segment| matches!(segment, Segment::Internal(_)));
-        if view.is_none() && !chrome_page {
+    /// page has the keyboard; otherwise does nothing. The press is a `repeat` when the key
+    /// that sent it repeats. A page the chrome draws (`sig://home`) gets it as
+    /// [`Effect::ChromeInput`], as it gets the keys passed to it.
+    pub(crate) fn send_key(&mut self, key: &SentKey, repeat: bool, fx: &mut Fx) {
+        let not_held = !self.input_held();
+        let view = self.focused_view().filter(|_| not_held);
+        if view.is_none() && !(self.chrome_page_focused() && not_held) {
             return;
         }
         for state in [ButtonState::Pressed, ButtonState::Released] {
+            let mut sent = key.event(state);
+            sent.repeat = repeat && state == ButtonState::Pressed;
             let event = InputEvent {
                 seat: self.seat,
-                kind: InputKind::Key(key.event(state)),
+                kind: InputKind::Key(sent),
             };
             fx.push(match view {
                 Some(view) => Effect::Engine {
@@ -3198,6 +3267,7 @@ impl BrowserState {
                 self.release_input();
                 let v = self.views.get_mut(&view).expect("shown");
                 v.activated(at, v.status.clone());
+                self.launch_activated(view, at);
                 if self.focus != KeyboardFocus::Page {
                     self.move_focus(KeyboardFocus::Page, fx);
                 }

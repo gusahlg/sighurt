@@ -216,6 +216,10 @@ pub struct View {
     pub(crate) navigations: Navigations,
     /// When the user last clicked or pressed a key in it, unless used up.
     pub(crate) activation: Option<Instant>,
+    /// When the user last pressed a key afresh in it or clicked it while its document ran no
+    /// program, unless used up: what lets an internal page start one (`PtyOpen`). A repeat
+    /// never sets it, nor a key that a command of its own took there from another page.
+    pub(crate) launch: Option<Instant>,
     /// The link the pointer was over (the page's status text) when that was a click; `None`
     /// after a key press.
     pub(crate) link: Option<String>,
@@ -259,6 +263,7 @@ impl View {
             history: EngineHistory::default(),
             navigations: Navigations::default(),
             activation: None,
+            launch: None,
             link: None,
             hovered: None,
             chosen: false,

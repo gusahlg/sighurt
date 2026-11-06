@@ -155,8 +155,10 @@ impl<P: Terminal> App<P> {
     /// One record of the browser's input queue.
     pub fn input(&mut self, host: &mut impl Host<Pty = P>, input: &Input) {
         match &self.phase {
+            // Only Enter pressed afresh: one held since the program ran, or a key bound to send
+            // Enter, repeats, and its repeats start nothing.
             Phase::Start { .. } | Phase::Ended(..) => {
-                if input.is_key("Enter", 0) {
+                if input.kind == InputKind::Press && input.is_key("Enter", 0) {
                     self.start(host);
                 }
             }
@@ -583,6 +585,14 @@ mod tests {
         }
     }
 
+    /// An auto-repeat of `key`, held down.
+    fn repeat(key: &str, text: &str) -> Input {
+        Input {
+            kind: InputKind::Repeat,
+            ..press(key, text, 0)
+        }
+    }
+
     fn paste_of(text: &str) -> Input {
         Input {
             kind: InputKind::Paste,
@@ -627,6 +637,7 @@ mod tests {
         app.input(&mut browser, &press("a", "a", 0));
         app.input(&mut browser, &press("Enter", "\r", CONTROL));
         app.input(&mut browser, &paste_of("\n"));
+        app.input(&mut browser, &repeat("Enter", "\r"));
         assert!(browser.opened.is_empty());
         let text = shown(&app);
         assert!(text.contains("Press Enter to start."), "{text}");
@@ -760,8 +771,11 @@ mod tests {
         app.frame((40, 10));
         assert!(app.take_dirty());
         assert!(shown(&app).contains("exited with status 3. Press Enter"));
-        // Typing does nothing; Enter closes the ended terminal and opens a new one.
+        // Typing does nothing, nor Enter held since the program ran; Enter pressed afresh
+        // closes the ended terminal and opens a new one.
         app.input(&mut browser, &press("x", "x", 0));
+        app.input(&mut browser, &repeat("Enter", "\r"));
+        assert_eq!(browser.opened.len(), 1);
         app.input(&mut browser, &press("Enter", "\r", 0));
         assert_eq!(browser.opened.len(), 2);
         assert!(
