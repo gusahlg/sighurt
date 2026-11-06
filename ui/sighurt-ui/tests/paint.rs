@@ -17,6 +17,7 @@ use sighurt_api::input::{
     PointerEvent, Preedit, TextInputEvent,
 };
 use sighurt_render::{Backend, RenderError, RenderOutcome};
+use sighurt_ui::accessibility::NodeId;
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::extension::{ChromeAction, Completion};
 use sighurt_ui::layout::{Status, Tabs};
@@ -167,11 +168,37 @@ fn golden_find() {
     golden("find-unsupported-100", &paint(&mut chrome, CHROME, 120));
 }
 
-/// sig://home and an error page, which the chrome draws in the page area.
+/// sig://home (with room for the pages and keys, and for every section, a link under the
+/// pointer) and an error page, which the chrome draws in the page area.
 #[test]
 fn golden_pages() {
     let mut chrome = chrome(800, 600, showing("sig://home", TabContent::Internal));
     golden("home-100", &paint(&mut chrome, PAGE, 120));
+    let mut chrome = common::chrome(800, 900, showing("sig://home", TabContent::Internal));
+    let page = chrome.layout().page;
+    let tree = chrome.accessibility();
+    let link = tree
+        .node(NodeId::Page)
+        .unwrap()
+        .children
+        .iter()
+        .map(|id| tree.node(*id).unwrap())
+        .find(|node| node.name == "Configuration")
+        .unwrap()
+        .bounds;
+    let position = SurfacePoint {
+        x: f64::from(link.x - page.x) + 4.0,
+        y: f64::from(link.y - page.y) + 4.0,
+    };
+    let modifiers = Modifiers::default();
+    chrome.pointer(
+        page,
+        &PointerEvent::Motion {
+            position,
+            modifiers,
+        },
+    );
+    golden("home-tall-100", &paint(&mut chrome, PAGE, 120));
     let message = "The server at unknown.example could not be found.".to_owned();
     let error = showing("https://unknown.example/", TabContent::Error(message));
     let mut chrome = common::chrome(640, 480, error);

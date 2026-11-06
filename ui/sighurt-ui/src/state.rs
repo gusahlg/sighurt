@@ -124,8 +124,28 @@ impl Snapshot {
         if let Some(find) = &mut self.find {
             contain(&mut find.text, MAX_FIND_TEXT);
         }
-        contain(&mut self.home.config_path, MAX_PATH);
-        for engine in &mut self.home.engines {
+        let home = &mut self.home;
+        contain(&mut home.version, MAX_VERSION);
+        contain(&mut home.config_path, MAX_PATH);
+        for (links, max) in [
+            (&mut home.pages, MAX_HOME_PAGES),
+            (&mut home.recent, MAX_RECENT),
+        ] {
+            links.truncate(max);
+            // An address is opened as it is: one containing would change is no link.
+            links.retain(|link| is_contained(&link.url, MAX_LINK_URL));
+            for link in links {
+                contain(&mut link.title, MAX_TITLE);
+                contain(&mut link.detail, MAX_ENGINE_DETAIL);
+            }
+        }
+        home.keys.truncate(MAX_HOME_KEYS);
+        for key in &mut home.keys {
+            contain(&mut key.keys, MAX_INDICATOR);
+            contain(&mut key.action, MAX_TITLE);
+        }
+        home.engines.truncate(MAX_ENGINES);
+        for engine in &mut home.engines {
             contain(&mut engine.name, MAX_ENGINE_NAME);
             contain(&mut engine.detail, MAX_ENGINE_DETAIL);
         }
@@ -146,9 +166,18 @@ const MAX_INDICATOR: usize = 64;
 const MAX_FIND_TEXT: usize = 1024;
 /// Characters kept of the configuration's path.
 const MAX_PATH: usize = 1000;
-/// Characters kept of an engine's name and of its line on the home page.
+/// Characters kept of an engine's name and of its line on the home page (and of a link's).
 pub(crate) const MAX_ENGINE_NAME: usize = 100;
 pub(crate) const MAX_ENGINE_DETAIL: usize = 500;
+/// Characters kept of the version on the home page.
+const MAX_VERSION: usize = 64;
+/// Characters of a home page link's address: the longest the history keeps.
+const MAX_LINK_URL: usize = 8 * 1024;
+/// The most pages, keys, visited pages and engines kept on the home page.
+const MAX_HOME_PAGES: usize = 8;
+const MAX_HOME_KEYS: usize = 12;
+const MAX_RECENT: usize = 8;
+const MAX_ENGINES: usize = 16;
 
 /// One tab.
 #[derive(Clone, Debug, PartialEq)]
@@ -192,13 +221,43 @@ pub enum TabContent {
     Error(String),
 }
 
-/// What the home page says.
+/// What the home page says. The executable fills it from `sighurt_runtime::home`; each list is
+/// at most as long as its field says, and longer ones are cut by [`Snapshot::contain`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HomeInfo {
+    /// The build's version; at most 64 characters.
+    pub version: String,
     /// Where the configuration file is; at most 1 000 characters.
     pub config_path: String,
-    /// The engines this build has, in the configuration's order.
+    /// Sighurt's own pages that open in this build, as links; at most 8.
+    pub pages: Vec<HomeLink>,
+    /// Keys of the keymap in use and what they do; at most 12.
+    pub keys: Vec<HomeKey>,
+    /// The pages visited last, the newest first, as links; at most 8.
+    pub recent: Vec<HomeLink>,
+    /// The engines this build has, in the configuration's order; at most 16.
     pub engines: Vec<EngineRow>,
+}
+
+/// A link on the home page: a click runs `page.open` with its address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HomeLink {
+    /// What it opens, exactly: printable ASCII of at most 8 192 characters. A link whose
+    /// address is anything else is left out when contained, never changed.
+    pub url: String,
+    /// What it is called (a visited page's title, which may be empty); at most 200 characters.
+    pub title: String,
+    /// One line about it, or empty; at most 500 characters.
+    pub detail: String,
+}
+
+/// A key on the home page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HomeKey {
+    /// Its keystrokes as the configuration writes them ("o, ctrl-o"); at most 64 characters.
+    pub keys: String,
+    /// What it does; at most 200 characters.
+    pub action: String,
 }
 
 /// One engine on the home page.
@@ -275,6 +334,12 @@ pub struct ChromeState {
     pub label_pressed: bool,
     /// The pointer is over the engine label (the button at the address field's right end).
     pub label_hover: bool,
+    /// The address of the home page's link under the pointer. Not a [`Target`]: links are where
+    /// the page's text is laid out (`Model`'s page layout), not in the [`crate::Layout`].
+    pub link_hover: Option<String>,
+    /// The address of the link the primary button went down on; a release still on that link
+    /// runs `page.open` with it.
+    pub link_pressed: Option<String>,
     /// Whether dragging with the button down selects text in the address line.
     pub selecting: bool,
     /// Why the last `:command` typed into the address line failed, until the line changes.
@@ -388,7 +453,36 @@ mod tests {
                 ..FindSnapshot::default()
             }),
             home: HomeInfo {
+                version: long('v', 100),
                 config_path: long('p', 2000),
+                pages: vec![
+                    HomeLink {
+                        url: "sig://help".into(),
+                        title: long('t', 300),
+                        detail: long('d', 600),
+                    },
+                    HomeLink {
+                        url: "https://a.test/\u{202e}".into(),
+                        ..HomeLink::default()
+                    },
+                ],
+                keys: vec![
+                    HomeKey {
+                        keys: long('k', 100),
+                        action: long('a', 300),
+                    };
+                    20
+                ],
+                recent: vec![
+                    HomeLink {
+                        url: format!("https://a.test/{}", long('u', 9000)),
+                        ..HomeLink::default()
+                    },
+                    HomeLink {
+                        url: "https://a.test/".into(),
+                        ..HomeLink::default()
+                    },
+                ],
                 engines: vec![EngineRow {
                     name: long('n', 200),
                     detail: long('d', 600),
@@ -402,7 +496,13 @@ mod tests {
         let TabContent::Error(message) = &tab.content else {
             panic!("{:?}", tab.content)
         };
-        let engine = &snapshot.home.engines[0];
+        let home = &snapshot.home;
+        let engine = &home.engines[0];
+        // The links whose addresses containing would change are gone; the others stay exact.
+        let urls = |links: &[HomeLink]| links.iter().map(|l| l.url.clone()).collect::<Vec<_>>();
+        assert_eq!(urls(&home.pages), ["sig://help"]);
+        assert_eq!(urls(&home.recent), ["https://a.test/"]);
+        assert_eq!(home.keys.len(), 12);
         let strings = [
             (&tab.title, 200),
             (&tab.url, 32 * 1024),
@@ -415,6 +515,11 @@ mod tests {
             (&snapshot.home.config_path, 1000),
             (&engine.name, 100),
             (&engine.detail, 500),
+            (&home.version, 64),
+            (&home.pages[0].title, 200),
+            (&home.pages[0].detail, 500),
+            (&home.keys[0].keys, 64),
+            (&home.keys[0].action, 200),
         ];
         for (text, bound) in strings {
             assert!(text.starts_with("a b"), "{text:.10}");

@@ -1095,7 +1095,10 @@ fn accessibility_matches_the_hit_targets() {
         .map(|id| tree.node(*id).unwrap().name.as_str())
         .collect();
     assert_eq!(names[0], "Sighurt");
-    assert!(names.contains(&"servo"), "{names:?}");
+    assert!(names.contains(&"Help"), "{names:?}");
+    // The keys read down the first column, then the second.
+    let at = |name| names.iter().position(|n| *n == name).unwrap();
+    assert!(at("Close the tab") < at("Next tab"), "{names:?}");
 }
 
 #[test]
@@ -2056,4 +2059,134 @@ fn the_find_field_is_named_and_says_what_was_found() {
     let field = tree.node(NodeId::Address).unwrap();
     assert_eq!(field.name, "Find in page");
     assert_eq!(field.description.as_deref(), Some("3 of 12"));
+}
+
+/// The page text nodes of `chrome`'s accessibility tree: their names and bounds, in order.
+fn page_texts(chrome: &mut Model) -> Vec<(String, WindowRect)> {
+    let tree = chrome.accessibility();
+    let page = tree.node(NodeId::Page).unwrap();
+    page.children
+        .iter()
+        .map(|id| {
+            let node = tree.node(*id).unwrap();
+            (node.name.clone(), node.bounds)
+        })
+        .collect()
+}
+
+/// The pointer moves to window position `at`, over the page area the chrome draws.
+fn hover(chrome: &mut Model, at: WindowPoint) -> Vec<ChromeAction> {
+    let surface = chrome.layout().page;
+    let position = SurfacePoint {
+        x: at.x - f64::from(surface.x),
+        y: at.y - f64::from(surface.y),
+    };
+    let modifiers = Modifiers::default();
+    chrome.pointer(
+        surface,
+        &PointerEvent::Motion {
+            position,
+            modifiers,
+        },
+    )
+}
+
+#[test]
+fn home_links_open_their_page_under_the_hand() {
+    let mut home = common::chrome(800, 600, showing("sig://home", TabContent::Internal));
+    let texts = page_texts(&mut home);
+    let bounds = |name: &str| texts.iter().find(|(n, _)| n == name).unwrap().1;
+    let help = center(bounds("Help"));
+    home.take_damage();
+    let actions = hover(&mut home, help);
+    assert!(
+        actions.contains(&ChromeAction::Cursor(Cursor::Pointer)),
+        "{actions:?}"
+    );
+    assert_eq!(home.state().link_hover.as_deref(), Some("sig://help"));
+    let damage = home.take_damage();
+    assert!(damage.page && !damage.chrome, "{damage:?}");
+    assert_eq!(
+        commands(&click(&mut home, help)),
+        [Command::PageOpen("sig://help".into())]
+    );
+    // A link's description is no link.
+    let detail = center(bounds("Every key of the keymap in use"));
+    let actions = hover(&mut home, detail);
+    assert!(
+        actions.contains(&ChromeAction::Cursor(Cursor::Default)),
+        "{actions:?}"
+    );
+    assert!(commands(&click(&mut home, detail)).is_empty());
+    // Pressed on one link and released on another: nothing opens.
+    let config = center(bounds("Configuration"));
+    let surface = home.layout().page;
+    let local = |at: WindowPoint| WindowPoint {
+        x: at.x - f64::from(surface.x),
+        y: at.y - f64::from(surface.y),
+    };
+    let mut actions = home.pointer(
+        surface,
+        &button(local(help), PointerButton::Left, ButtonState::Pressed),
+    );
+    actions.extend(home.pointer(
+        surface,
+        &button(local(config), PointerButton::Left, ButtonState::Released),
+    ));
+    assert!(commands(&actions).is_empty(), "{actions:?}");
+    // A visited page's link opens its exact address.
+    let mut tall = common::chrome(800, 1200, showing("sig://home", TabContent::Internal));
+    let texts = page_texts(&mut tall);
+    let visited = texts
+        .iter()
+        .find(|(n, _)| n == "Blåbärssylt och kanelbullar")
+        .unwrap();
+    assert_eq!(
+        commands(&click(&mut tall, center(visited.1))),
+        [Command::PageOpen("https://recept.example/sylt".into())]
+    );
+    // Leaving the page area ends the hover.
+    hover(&mut home, help);
+    let actions = home.pointer(surface, &PointerEvent::Leave);
+    assert!(
+        actions.contains(&ChromeAction::Cursor(Cursor::Default)),
+        "{actions:?}"
+    );
+    assert_eq!(home.state().link_hover, None);
+}
+
+#[test]
+fn a_short_page_area_drops_the_home_pages_sections_from_the_bottom() {
+    const SECTIONS: [&str; 4] = ["PAGES", "KEYS", "RECENTLY VISITED", "ENGINES"];
+    let mut shown_before = SECTIONS.len();
+    for height in [1200, 800, 600, 480, 360, 200] {
+        let mut home = common::chrome(800, height, showing("sig://home", TabContent::Internal));
+        let names: Vec<String> = page_texts(&mut home).into_iter().map(|(n, _)| n).collect();
+        let shown: Vec<&str> = SECTIONS
+            .into_iter()
+            .filter(|section| names.iter().any(|n| n == section))
+            .collect();
+        // Whole sections, in order: Engines goes first, then Recently visited, then Keys.
+        assert_eq!(shown, SECTIONS[..shown.len()], "{height}: {names:?}");
+        assert!(shown.len() <= shown_before, "{height}: {shown:?}");
+        shown_before = shown.len();
+        match height {
+            1200 => assert_eq!(shown.len(), 4),
+            360 | 200 => assert_eq!(shown, ["PAGES"], "{height}"),
+            _ => {}
+        }
+        // What is shown fits in the page area, unless only the pages are left.
+        let page = home.layout().page;
+        let bottom = page_texts(&mut home)
+            .iter()
+            .map(|(_, rect)| rect.y + rect.height as i32)
+            .max()
+            .unwrap();
+        if shown.len() > 1 {
+            assert!(
+                bottom <= page.y + page.height as i32,
+                "{height}: {bottom} > {page:?}"
+            );
+        }
+    }
 }

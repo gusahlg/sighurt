@@ -13,8 +13,8 @@ use sighurt_render::{
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::extension::SurfaceName;
 use sighurt_ui::{
-    Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, LayoutOptions, Model, Pen, Snapshot,
-    TabContent, TabSnapshot,
+    Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, HomeKey, HomeLink, LayoutOptions, Model,
+    Pen, Snapshot, TabContent, TabSnapshot,
 };
 use tiny_skia::{IntSize, Pixmap};
 
@@ -135,8 +135,54 @@ pub fn labelled(mut snapshot: Snapshot, engines: &[&str]) -> Snapshot {
 }
 
 pub fn home_info() -> HomeInfo {
+    let link = |url: &str, title: &str, detail: &str| HomeLink {
+        url: url.into(),
+        title: title.into(),
+        detail: detail.into(),
+    };
+    let key = |keys: &str, action: &str| HomeKey {
+        keys: keys.into(),
+        action: action.into(),
+    };
     HomeInfo {
+        version: "0.10.0".into(),
         config_path: "/home/user/.config/sighurt/config.toml".into(),
+        pages: vec![
+            link(
+                "sig://help",
+                "Help",
+                "Getting started, the keys, the commands, the configuration",
+            ),
+            link("sig://help/keys", "Keys", "Every key of the keymap in use"),
+            link(
+                "sig://config",
+                "Configuration",
+                "Edit the configuration file in your editor",
+            ),
+            link(
+                "sig://terminal",
+                "Terminal",
+                "Off: [pages.terminal] enabled = true turns it on",
+            ),
+        ],
+        keys: vec![
+            key("o, ctrl-o", "Address or search"),
+            key("escape", "INSERT mode"),
+            key("escape", "Back to NORMAL mode"),
+            key("t", "New tab"),
+            key("x, d", "Close the tab"),
+            key("J", "Next tab"),
+            key("K", "Previous tab"),
+            key("?, f1", "Help"),
+        ],
+        recent: vec![
+            link(
+                "https://recept.example/sylt",
+                "Blåbärssylt och kanelbullar",
+                "",
+            ),
+            link("https://sighurt.example/", "", ""),
+        ],
         engines: vec![
             EngineRow {
                 name: "servo".into(),

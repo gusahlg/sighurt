@@ -103,7 +103,6 @@ use sighurt_runtime::diagnostics::{
 };
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
-use sighurt_runtime::registry::State;
 use sighurt_runtime::services::{Clipboard, Services};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
 use sighurt_runtime::view::ViewEntry;
@@ -111,7 +110,7 @@ use sighurt_ui::extension::{
     contained, Chrome, ChromeAction, ChromeEvent, Completion, SurfaceName, TextField,
     MAX_COMPLETION_TITLE, MAX_COMPLETION_URL, MAX_SURFACES,
 };
-use sighurt_ui::{Colors, EngineRow, Fonts, HomeInfo, Snapshot};
+use sighurt_ui::{Colors, Fonts, HomeInfo, Snapshot};
 use sighurt_wayland::{
     FramePermit, Host, HostEvent, InputRegion, Placement, PresentMode, TargetLease,
     TargetPlacement, WindowOptions,
@@ -247,6 +246,9 @@ struct App {
     buffer_scratch: Vec<(usize, usize, bool)>,
     /// The tabs of the last snapshot, contained, for the next.
     snapshot_cache: SnapshotCache,
+    /// What `sig://home` says, contained ([`chrome::home_info`]), and the
+    /// `Session::home_generation` it was made from.
+    home: Option<(u64, HomeInfo)>,
 }
 
 /// Runs the Wayland frontend until it quits.
@@ -950,6 +952,7 @@ impl App {
             host_events: Vec::new(),
             buffer_scratch: Vec::new(),
             snapshot_cache: SnapshotCache::default(),
+            home: None,
         })
     }
 
@@ -1252,51 +1255,26 @@ impl App {
         chrome::snapshot(self.session.core(), home, status, cache)
     }
 
-    /// What `sig://home` says: the configuration file and the engines of this build.
-    fn home_info(&self) -> HomeInfo {
-        let listed: Vec<_> = self
-            .session
-            .registry()
-            .engines()
-            .map(|engine| {
-                let failed = match engine.state() {
-                    State::Failed(why) => Some(why.to_owned()),
-                    _ => None,
-                };
-                (engine.name, engine.renderer, failed)
-            })
-            .collect();
-        let config_path = self
-            .session
-            .paths()
-            .config
-            .as_ref()
-            .map_or_else(String::new, |path| path.display().to_string());
-        let config = self.session.core().config();
-        let engines = listed
-            .into_iter()
-            .map(|(name, renderer, failed)| {
-                let mut detail = vec![format!("compiled in, {renderer}")];
-                if name == config.default_engine() {
-                    detail.push("default".into());
-                }
-                let enabled = config.is_enabled(name);
-                if !enabled {
-                    detail.push("disabled in the configuration".into());
-                }
-                if let Some(why) = &failed {
-                    detail.push(format!("failed: {why}"));
-                }
-                EngineRow {
-                    name: name.to_owned(),
-                    detail: detail.join(" · "),
-                    available: enabled && failed.is_none(),
-                }
-            })
-            .collect();
-        HomeInfo {
-            config_path,
-            engines,
+    /// What `sig://home` says, while the active tab shows it; nothing otherwise. Contained
+    /// once each time the session builds it anew (`Session::home`), not for every snapshot.
+    fn home_info(&mut self) -> HomeInfo {
+        let core = self.session.core();
+        let shows_home = core.tabs().nth(core.active()).is_some_and(
+            |tab| matches!(tab.content, Content::Internal(url) if sighurt_ui::state::is_home(url)),
+        );
+        if !shows_home {
+            return HomeInfo::default();
+        }
+        // Built anew only if something it says changed.
+        self.session.home();
+        let generation = self.session.home_generation();
+        match &self.home {
+            Some((made, info)) if *made == generation => info.clone(),
+            _ => {
+                let info = chrome::home_info(self.session.home());
+                self.home = Some((generation, info.clone()));
+                info
+            }
         }
     }
 

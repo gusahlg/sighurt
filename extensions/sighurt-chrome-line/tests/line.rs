@@ -22,7 +22,8 @@ use sighurt_chrome_line::{Line, KIND, LINE, PAGE};
 use sighurt_render::{Backend, CpuBackend, Output, PixelBuffer, RenderOutcome, SurfaceKey};
 use sighurt_ui::extension::{Chrome, ChromeAction, ChromeEvent, Completion, SurfaceName, Theme};
 use sighurt_ui::{
-    Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, Pen, Snapshot, TabContent, TabSnapshot,
+    Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, HomeKey, HomeLink, Pen, Snapshot,
+    TabContent, TabSnapshot,
 };
 use tiny_skia::{IntSize, Pixmap};
 
@@ -97,7 +98,28 @@ fn showing(url: &str, content: TabContent) -> Snapshot {
     Snapshot {
         tabs: vec![only],
         home: HomeInfo {
+            version: "0.10.0".into(),
             config_path: "/home/user/.config/sighurt/config.toml".into(),
+            pages: vec![HomeLink {
+                url: "sig://help".into(),
+                title: "Help".into(),
+                detail: "Getting started, the keys, the commands, the configuration".into(),
+            }],
+            keys: vec![
+                HomeKey {
+                    keys: "o, ctrl-o".into(),
+                    action: "Address or search".into(),
+                },
+                HomeKey {
+                    keys: "?, f1".into(),
+                    action: "Help".into(),
+                },
+            ],
+            recent: vec![HomeLink {
+                url: "https://recept.example/sylt".into(),
+                title: "Blåbärssylt".into(),
+                detail: String::new(),
+            }],
             engines: vec![
                 engine("servo", "compiled in · default", true),
                 engine("demo", "not compiled into this build", false),

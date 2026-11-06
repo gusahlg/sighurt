@@ -47,6 +47,15 @@ fn tone(colors: &Colors, tone: Tone) -> Rgba {
         Tone::Muted => colors.text_muted,
         Tone::Dim => colors.text_dim,
         Tone::Error => colors.error,
+        Tone::Link => link_color(colors),
+    }
+}
+
+/// Links: the accent, the selection's color without its transparency.
+fn link_color(colors: &Colors) -> Rgba {
+    Rgba {
+        a: 0xff,
+        ..colors.selection
     }
 }
 
@@ -432,5 +441,17 @@ fn draw_page(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     for text in &page.texts {
         let color = tone(colors, text.tone);
         pen.text(&text.shaped, (text.x, text.y), color, clip);
+    }
+    // The link under the pointer is underlined.
+    let hovered = chrome.state().link_hover.as_deref();
+    let line = options.scaled(1.0).max(1.0);
+    for link in page
+        .links
+        .iter()
+        .filter(|link| Some(link.url.as_str()) == hovered)
+    {
+        let [x, y, width, height] = link.rect;
+        let under = [x, y + height - line, width, line];
+        pen.clip(clip, |pen| pen.fill(under, link_color(colors)));
     }
 }
