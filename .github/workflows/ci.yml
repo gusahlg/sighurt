@@ -29,8 +29,11 @@ jobs:
             libv4l-dev libudev-dev \
             libwayland-dev libfontconfig1-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The compiler of nix/nixpkgs.nix and of the workspace's rust-version: a newer stable
+      # deprecates what this one still needs, and -D warnings then fails the build.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.1
           components: clippy, rustfmt
           targets: wasm32-unknown-unknown
 
@@ -95,8 +98,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The compiler of nix/nixpkgs.nix and of the workspace's rust-version: a newer stable
+      # deprecates what this one still needs, and -D warnings then fails the build.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.1
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2

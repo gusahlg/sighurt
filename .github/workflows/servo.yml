@@ -64,8 +64,11 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
             libavdevice-dev libswscale-dev libswresample-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The compiler of nix/nixpkgs.nix and of the workspace's rust-version: a newer stable
+      # deprecates what this one still needs, and -D warnings then fails the build.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.1
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
