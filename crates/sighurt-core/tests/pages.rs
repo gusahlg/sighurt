@@ -209,6 +209,21 @@ impl Harness {
         self.apply(BrowserEvent::ServiceDone { request, result })
     }
 
+    /// `name`'s key on `seat` now: pressed afresh, repeating, or released.
+    fn key(
+        &mut self,
+        seat: SeatId,
+        (code, name): (u32, &str),
+        state: ButtonState,
+        repeat: bool,
+    ) -> Vec<Effect> {
+        let mut event = key_on(seat, code, name, state, repeat);
+        if let BrowserEvent::Keyboard { at, .. } = &mut event {
+            *at = self.now;
+        }
+        self.apply(event)
+    }
+
     fn command(&mut self, text: &str) -> Vec<Effect> {
         let names: Vec<String> = self.state.config().commands().keys().cloned().collect();
         let command = sighurt_api::commands::CommandSet::ANY
@@ -1101,4 +1116,289 @@ fn an_unfocused_window_opens_no_terminal_and_no_editor() {
         let (id, effects) = h.ask(view, Some(url), service);
         assert!(performs(&effects, id), "{url} in the terminal");
     }
+}
+
+// ── What starts a program ────────────────────────────────────────────────────────────────────
+
+/// Enter goes to the page, as the example configuration's INSERT gives it every key.
+const PASSED: &str = "[input]\nkeymap = \"bindings\"";
+/// Enter is `page.send-key enter`, as in the example configuration's NORMAL; its repeats run it
+/// again.
+const SENT: &str = "[input]\nkeymap = \"bindings\"\n[keys]\n\"enter\" = \"page.send-key enter\"";
+
+const ENTER: (u32, &str) = (28, "Enter");
+const TAB: (u32, &str) = (15, "Tab");
+
+/// The request of `view`'s editor if it starts when the page asks now; `None` if it is refused.
+fn starts(h: &mut Harness, view: ViewId) -> Option<RequestId> {
+    let (id, effects) = h.ask(view, Some("sig://config"), editor_open());
+    if performs(&effects, id) {
+        return Some(id);
+    }
+    assert_eq!(answer(&effects, id), Some(&Err(ServiceError::Denied)));
+    None
+}
+
+/// The keys `effects` sends `view`: pressed or released, and whether as a repeat.
+fn keys_to(effects: &[Effect], view: ViewId) -> Vec<(ButtonState, bool)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Engine {
+                view: v,
+                command:
+                    EngineCommand::Input(InputEvent {
+                        kind: InputKind::Key(key),
+                        ..
+                    }),
+            } if *v == view => Some((key.state, key.repeat)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The keys `effects` gives the chrome.
+fn chrome_keys(effects: &[Effect]) -> Vec<(ButtonState, bool)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::ChromeInput(InputEvent {
+                kind: InputKind::Key(key),
+                ..
+            }) => Some((key.state, key.repeat)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn enter_held_across_the_editors_exit_does_not_start_it_again() {
+    for config in [PASSED, SENT] {
+        let mut h = Harness::start(config, &["sig://config"]);
+        let view = h.shown();
+        let seat = SeatId::next();
+        h.key(seat, ENTER, ButtonState::Pressed, false);
+        let id = starts(&mut h, view).expect(config);
+        h.key(seat, ENTER, ButtonState::Released, false);
+        h.done(id, Ok(ServiceReply::Pty(PtySession::next())));
+        // `:wq` and Enter, held down: the press is the editor's.
+        assert!(delivered_to(
+            &h.key(seat, ENTER, ButtonState::Pressed, false),
+            view
+        ));
+        h.done(id, Ok(ServiceReply::PtyEnded { status: Some(0) }));
+        // The end screen, with Enter still repeating: nothing starts.
+        for _ in 0..3 {
+            assert!(delivered_to(
+                &h.key(seat, ENTER, ButtonState::Pressed, true),
+                view
+            ));
+            assert_eq!(starts(&mut h, view), None, "{config}");
+        }
+        h.key(seat, ENTER, ButtonState::Released, false);
+        // Enter pressed afresh starts it again.
+        h.key(seat, ENTER, ButtonState::Pressed, false);
+        assert!(starts(&mut h, view).is_some(), "{config}");
+    }
+}
+
+#[test]
+fn a_repeat_never_renews_what_starts_a_program() {
+    for config in [PASSED, SENT] {
+        let mut h = Harness::start(config, &["sig://config"]);
+        let view = h.shown();
+        let seat = SeatId::next();
+        h.key(seat, ENTER, ButtonState::Pressed, false);
+        h.now += Duration::from_secs(6);
+        for _ in 0..3 {
+            h.key(seat, ENTER, ButtonState::Pressed, true);
+            h.now += Duration::from_millis(30);
+        }
+        assert_eq!(starts(&mut h, view), None, "{config}");
+        h.key(seat, ENTER, ButtonState::Released, false);
+        h.key(seat, ENTER, ButtonState::Pressed, false);
+        assert!(starts(&mut h, view).is_some(), "{config}");
+    }
+}
+
+#[test]
+fn a_key_pressed_in_another_tab_starts_no_program() {
+    let config = "[input]\nkeymap = \"bindings\"\n\
+                  [commands]\ngo = [\"tab.select 2\", \"page.send-key enter\"]\n\
+                  back = [\"tab.select 1\", \"tab.select 2\", \"page.send-key enter\"]\n\
+                  [keys]\n\"f2\" = \"go\"\n\"f3\" = \"back\"";
+    let mut h = Harness::start(config, &["https://a.test/", "sig://config"]);
+    // The configuration page has loaded; the web page is in front.
+    h.command("tab.select 2");
+    let view = h.shown();
+    h.command("tab.select 1");
+    let seat = SeatId::next();
+    let f2 = (60, "F2");
+    let effects = h.key(seat, f2, ButtonState::Pressed, false);
+    assert_eq!(h.shown(), view);
+    assert!(delivered_to(&effects, view), "Enter reached it");
+    assert_eq!(starts(&mut h, view), None);
+    h.key(seat, f2, ButtonState::Released, false);
+    // Pressed in the configuration page, the same key starts it: `tab.select 2` changes nothing.
+    h.key(seat, f2, ButtonState::Pressed, false);
+    let id = starts(&mut h, view).expect("pressed in the page");
+    h.done(id, Ok(ServiceReply::PtyEnded { status: Some(0) }));
+    h.key(seat, f2, ButtonState::Released, false);
+    // A command before it that leaves the page, even one that comes back, takes it away.
+    let f3 = (61, "F3");
+    assert!(delivered_to(
+        &h.key(seat, f3, ButtonState::Pressed, false),
+        view
+    ));
+    assert_eq!(starts(&mut h, view), None);
+}
+
+#[test]
+fn a_fresh_enter_in_the_config_page_starts_one_editor() {
+    for config in [PASSED, SENT] {
+        let mut h = Harness::start(config, &["sig://config"]);
+        let view = h.shown();
+        let seat = SeatId::next();
+        // NORMAL's Enter, `page.send-key enter`, starts it as INSERT's does.
+        assert!(delivered_to(
+            &h.key(seat, ENTER, ButtonState::Pressed, false),
+            view
+        ));
+        let id = starts(&mut h, view).expect(config);
+        assert_eq!(starts(&mut h, view), None, "one at a time");
+        h.done(id, Ok(ServiceReply::PtyEnded { status: Some(0) }));
+        assert_eq!(starts(&mut h, view), None, "the press is used up");
+    }
+}
+
+#[test]
+fn a_click_in_the_config_page_starts_one_editor_but_not_while_one_runs() {
+    let mut h = Harness::start("", &["sig://config"]);
+    let view = h.shown();
+    h.click(view);
+    let id = starts(&mut h, view).expect("a click");
+    h.done(id, Ok(ServiceReply::Pty(PtySession::next())));
+    // A click while the editor runs is the editor's.
+    h.click(view);
+    h.done(id, Ok(ServiceReply::PtyEnded { status: Some(0) }));
+    assert_eq!(starts(&mut h, view), None);
+    h.click(view);
+    assert!(starts(&mut h, view).is_some());
+}
+
+#[test]
+fn a_repeat_page_send_key_reaches_the_page_as_a_repeat() {
+    let mut h = Harness::start(SENT, &["https://a.test/"]);
+    let view = h.shown();
+    let seat = SeatId::next();
+    let fresh = [
+        (ButtonState::Pressed, false),
+        (ButtonState::Released, false),
+    ];
+    let repeat = [(ButtonState::Pressed, true), (ButtonState::Released, false)];
+    let effects = h.key(seat, ENTER, ButtonState::Pressed, false);
+    assert_eq!(keys_to(&effects, view), fresh);
+    let effects = h.key(seat, ENTER, ButtonState::Pressed, true);
+    assert_eq!(keys_to(&effects, view), repeat);
+    h.key(seat, ENTER, ButtonState::Released, false);
+    // Home, which the chrome draws, gets them the same way.
+    h.command("tab.new");
+    h.apply(BrowserEvent::Focus(KeyboardFocus::Page));
+    let effects = h.key(seat, ENTER, ButtonState::Pressed, false);
+    assert_eq!(chrome_keys(&effects), fresh);
+    let effects = h.key(seat, ENTER, ButtonState::Pressed, true);
+    assert_eq!(chrome_keys(&effects), repeat);
+}
+
+// ── Home, after it came to the front by itself ───────────────────────────────────────────────
+
+/// The page in tab 1 opens a tab, which closes itself and leaves the home tab after it in
+/// front by itself, with the keyboard on the page.
+fn home_in_front(h: &mut Harness) {
+    h.command("tab.new");
+    h.command("tab.select 1");
+    let first = h.shown();
+    let document = h.document(first);
+    h.click(first);
+    h.engine(
+        first,
+        EngineEvent::OpenRequested {
+            view: first,
+            document,
+            url: "https://pop.test/".into(),
+            disposition: OpenDisposition::NewView,
+        },
+    );
+    let popup = h
+        .state
+        .tabs()
+        .position(|t| matches!(t.content, Content::View(v) if v != first))
+        .unwrap();
+    h.command(&format!("tab.select {}", popup + 1));
+    h.apply(BrowserEvent::Focus(KeyboardFocus::Page));
+    let popup = h.shown();
+    popup_closes(h, popup);
+    let tab = h.state.tabs().nth(h.state.active()).unwrap();
+    assert!(matches!(tab.content, Content::Internal(_)), "home in front");
+}
+
+#[test]
+fn home_that_came_to_the_front_by_itself_waits_for_the_user() {
+    // Every key goes to the page, as in the example configuration's INSERT; F9 runs a command.
+    let config = "[input]\nkeymap = \"bindings\"\n[keys]\n\"f9\" = \"page.zoom-in\"";
+    let mut h = Harness::start(config, &["https://a.test/"]);
+    home_in_front(&mut h);
+    let seat = SeatId::next();
+    // Tab and Enter, which select and follow home's links, reach nothing: the hold stays.
+    for _ in 0..2 {
+        for key in [TAB, ENTER] {
+            assert_eq!(
+                chrome_keys(&h.key(seat, key, ButtonState::Pressed, false)),
+                []
+            );
+            assert_eq!(
+                chrome_keys(&h.key(seat, key, ButtonState::Pressed, true)),
+                []
+            );
+            assert_eq!(
+                chrome_keys(&h.key(seat, key, ButtonState::Released, false)),
+                []
+            );
+        }
+    }
+    // The address line still takes typing.
+    h.apply(BrowserEvent::Focus(KeyboardFocus::Chrome));
+    let a = (30, "a");
+    let effects = h.key(seat, a, ButtonState::Pressed, false);
+    assert_eq!(chrome_keys(&effects), [(ButtonState::Pressed, false)]);
+    h.key(seat, a, ButtonState::Released, false);
+    h.apply(BrowserEvent::Focus(KeyboardFocus::Page));
+    assert_eq!(
+        chrome_keys(&h.key(seat, TAB, ButtonState::Pressed, false)),
+        []
+    );
+    h.key(seat, TAB, ButtonState::Released, false);
+    // A key that runs a command takes the page.
+    h.key(seat, (67, "F9"), ButtonState::Pressed, false);
+    h.key(seat, (67, "F9"), ButtonState::Released, false);
+    for key in [TAB, ENTER] {
+        let effects = h.key(seat, key, ButtonState::Pressed, false);
+        assert_eq!(chrome_keys(&effects), [(ButtonState::Pressed, false)]);
+        h.key(seat, key, ButtonState::Released, false);
+    }
+}
+
+#[test]
+fn a_click_in_home_takes_it_after_it_came_to_the_front_by_itself() {
+    let mut h = Harness::start(PASSED, &["https://a.test/"]);
+    home_in_front(&mut h);
+    let seat = SeatId::next();
+    assert_eq!(
+        chrome_keys(&h.key(seat, TAB, ButtonState::Pressed, false)),
+        []
+    );
+    h.key(seat, TAB, ButtonState::Released, false);
+    h.apply(BrowserEvent::ChromePagePress);
+    let effects = h.key(seat, TAB, ButtonState::Pressed, false);
+    assert_eq!(chrome_keys(&effects), [(ButtonState::Pressed, false)]);
 }
