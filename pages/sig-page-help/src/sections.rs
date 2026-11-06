@@ -162,7 +162,9 @@ fn start<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
         "The default keymap has two modes. In NORMAL mode, which sig starts in, keys are commands \
          and none of them reaches the page: j and k scroll, t opens a tab, o opens the address \
          line. Escape switches to INSERT mode, where every key goes to the page, so you can type \
-         into a form. Escape in INSERT returns to NORMAL.",
+         into a form. Escape in INSERT returns to NORMAL, except on sig://terminal and \
+         sig://config, where Escape goes to the program; the Keys section lists the keys that \
+         leave INSERT there.",
     );
     b.heading(2, "The ten keys to know");
     let keys: Vec<Vec<String>> = [
@@ -179,7 +181,11 @@ fn start<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
         ),
         ("? or F1", "This help (the configured command help)"),
         ("q", "Quit"),
-        ("Escape", "Switch between NORMAL and INSERT"),
+        (
+            "Escape",
+            "Switch between NORMAL and INSERT (on sig://terminal and sig://config, INSERT gives \
+             Escape to the program: see Keys)",
+        ),
     ]
     .iter()
     .map(|(k, v)| vec![k.to_string(), v.to_string()])
