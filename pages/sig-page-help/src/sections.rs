@@ -162,7 +162,9 @@ fn start<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
         "The default keymap has two modes. In NORMAL mode, which sig starts in, keys are commands \
          and none of them reaches the page: j and k scroll, t opens a tab, o opens the address \
          line. Escape switches to INSERT mode, where every key goes to the page, so you can type \
-         into a form. Escape in INSERT returns to NORMAL.",
+         into a form. Escape in INSERT returns to NORMAL, except on sig://terminal and \
+         sig://config, where Escape goes to the program; the Keys section lists the keys that \
+         leave INSERT there.",
     );
     b.heading(2, "The ten keys to know");
     let keys: Vec<Vec<String>> = [
@@ -179,7 +181,11 @@ fn start<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
         ),
         ("? or F1", "This help (the configured command help)"),
         ("q", "Quit"),
-        ("Escape", "Switch between NORMAL and INSERT"),
+        (
+            "Escape",
+            "Switch between NORMAL and INSERT (on sig://terminal and sig://config, INSERT gives \
+             Escape to the program: see Keys)",
+        ),
     ]
     .iter()
     .map(|(k, v)| vec![k.to_string(), v.to_string()])
@@ -335,12 +341,12 @@ fn config<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>, d: &Data) {
          [ui] chrome, [ui] renderer and the [engines.<name>] settings need a restart.",
     );
     b.para(
-        "You can also edit the file here, at sig://config: it is checked as you type and the \
-         problems are listed with their lines. With the example keymap, press Escape for INSERT \
-         mode to type; Ctrl+S (or Save) saves and applies it. A save is refused when the text has \
-         a problem, or when the file changed elsewhere since the page read it (Read the file \
-         again, then Ctrl+Z brings your text back). A file linked from elsewhere is saved where \
-         the link leads.",
+        "You can also edit the file from here: sig://config runs your editor on it, in a \
+         terminal on the page ([pages.config] editor, else $VISUAL, else $EDITOR, else the first \
+         of nvim, vim, vi and nano found). Press Enter there to start it; keys reach it in the \
+         keymap's INSERT mode. When the editor ends, sig reads the file again, a file linked \
+         from elsewhere included; a mistake keeps the previous configuration, and the page lists \
+         the problems. The editor runs with your full rights, as in any terminal.",
     );
     b.link("Open sig://config \u{2192}", "sig://config");
     b.heading(2, "The tables");
@@ -357,7 +363,10 @@ fn config<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>, d: &Data) {
         ("[keys]", "Key bindings, for the bindings keymap"),
         ("[ui]", "The chrome and the renderer"),
         ("[commands]", "Commands of your own"),
-        ("[pages]", "The internal pages, such as the terminal page"),
+        (
+            "[pages]",
+            "The internal pages: the editor sig://config runs, the terminal page",
+        ),
         (
             "[tui]",
             "The terminal frontend: text or graphics, frame rate, mouse",
@@ -389,7 +398,7 @@ fn config<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>, d: &Data) {
     b.heading(2, "Where sig keeps things");
     pairs(b, &d.paths, "Name", "Path");
     b.link(
-        "Edit the configuration in the browser \u{2192}",
+        "Edit the configuration in your editor \u{2192}",
         "sig://config",
     );
 }
@@ -400,7 +409,16 @@ fn pages<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
     b.para("This page.");
     b.link("sig://help", "sig://help");
     b.heading(2, "sig://config");
-    b.para("View and edit the configuration file in the browser: a plain text editor that checks the file as you type. Ctrl+S or Save saves it, only when it is valid and nobody changed the file meanwhile, and the change applies live where the setting allows it.");
+    b.para(
+        "Your editor on the configuration file, in a terminal on the page: [pages.config] editor, \
+         else $VISUAL, else $EDITOR, else the first of nvim, vim, vi and nano found. Nothing \
+         starts until you press Enter in the page. When the editor ends, sig reads the file \
+         again; a mistake keeps the previous configuration and the page lists the problems. It \
+         is on by default. The editor runs with your full rights, as in any terminal (an editor \
+         can run shell commands); the WebAssembly sandbox contains the terminal emulator, not \
+         the editor. To turn it off:",
+    );
+    b.code("[pages.config]\nenabled = false");
     b.link("sig://config", "sig://config");
     b.heading(2, "sig://terminal");
     b.para(

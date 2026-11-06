@@ -32,11 +32,12 @@
 #               message, having saved the session, without spinning
 #   signals     SIGTERM, SIGINT and SIGHUP while pages load: the session saved, status 0 within
 #               5 s, no thread or child process left
-#   terminal    sig://terminal ([pages.terminal] on, /bin/sh, a private home): 100 cycles of
-#               opening the page, starting the shell and closing the tab, each shell started,
-#               ended and reaped, and sig's descriptors and threads not grown; then the shell
-#               ends with sig on ctrl-q, SIGKILL (the kernel's hang-up), SIGTERM, SIGINT, SIGHUP
-#               and the compositor killed
+#   terminal    sig://terminal ([pages.terminal] on, /bin/sh, a private home) and sig://config
+#               (an editor that waits): 100 cycles of opening one of them, starting its program
+#               and closing the tab, each program started, ended and reaped, and sig's
+#               descriptors and threads not grown; then the shell and the editor end with sig on
+#               ctrl-q, SIGKILL (the kernel's hang-up), SIGTERM, SIGINT, SIGHUP and the compositor
+#               killed
 #   crash       demo://crash failing while tabs switch and the window resizes, next to
 #               demo://slow: the failure names its tab, the other tabs keep working, F5 recovers
 #   flood       200 tab.new in about a second, then 1000 resizes: no placement errors, buffers
@@ -458,9 +459,10 @@ signals)
   ;;
 
 terminal)
-  # sig://terminal's program ends with sig however sig ends, and 100 times opening the page,
-  # starting the shell and closing the tab leave no program, no zombie and nothing grown. The
-  # programs carry a marker in their environment; a home of their own per run.
+  # sig://terminal's shell and sig://config's editor end with sig however sig ends, and 100
+  # times opening one of the pages, starting its program and closing the tab leave no program,
+  # no zombie and nothing grown. The programs carry a marker in their environment; a home of
+  # their own per run; the editor ($VISUAL) is a script that waits.
   term_config() {
     printf '%s\n[pages.terminal]\nenabled = true\ncommand = "/bin/sh"\n' "$CONFIG" > "$1/config/sighurt/config.toml"
   }
@@ -470,7 +472,9 @@ terminal)
     private "$d"
     term_config "$d"
     mkdir -p "$d/home"
-    launch=(env "HOME=$d/home" "PAGETERM_MARK=$d" ENV=/dev/null)
+    printf '#!/bin/sh\nexec sleep 1000\n' > "$d/home/editor"
+    chmod +x "$d/home/editor"
+    launch=(env "HOME=$d/home" "PAGETERM_MARK=$d" "VISUAL=$d/home/editor" ENV=/dev/null)
     start_sig "$d" "$@"
     launch=()
   }
@@ -507,17 +511,20 @@ PY
   read -r _ _ fds0 threads0 <<< "$(proc "$sig_pid")"
   missed=0
   for i in $(seq 100); do
-    cmd 'tab.new sig://terminal'
+    # Every other one sig://config, whose editor counts against the same limits.
+    page=sig://terminal
+    [[ $((i % 2)) == 1 ]] && page=sig://config
+    cmd "tab.new $page"
     sleep 0.5
     key -k Return
-    until_programs "$d" '2 0' 10 || { missed=$((missed + 1)); step "cycle $i: no second shell ($(programs "$d"))"; }
+    until_programs "$d" '2 0' 10 || { missed=$((missed + 1)); step "cycle $i: no second program in $page ($(programs "$d"))"; }
     key -M ctrl w -m ctrl
     until_programs "$d" '1 0' 10 || { missed=$((missed + 1)); step "cycle $i: not ended ($(programs "$d"))"; }
     # The first 10 cycles warm up (fonts, the compiled guest).
     [[ $i == 10 ]] && read -r _ _ fds0 threads0 <<< "$(proc "$sig_pid")"
   done
   read -r rss hwm fds threads <<< "$(proc "$sig_pid")"
-  check "100 cycles of open, start and close: each shell started and ended, reaped" \
+  check "100 cycles of open, start and close (shells and editors): each started and ended, reaped" \
     "$([[ $missed == 0 && $(programs "$d") == '1 0' ]]; echo $?)" "$missed missed; programs $(programs "$d")"
   check "and nothing grew from cycle 10 to 100" "$([[ $fds -le $fds0 && $threads -le $threads0 ]]; echo $?)" \
     "descriptors $fds0 -> $fds, threads $threads0 -> $threads, VmRSS $rss kB, VmHWM $hwm kB"
@@ -531,6 +538,10 @@ PY
     start_term "$d" sig://terminal
     key -k Return
     until_programs "$d" '1 0'
+    cmd 'tab.new sig://config'
+    sleep 0.5
+    key -k Return
+    until_programs "$d" '2 0'
     if [[ $how == compositor ]]; then
       step "kill -KILL sway"
       kill -KILL "$SIG_SWAY_PID"
@@ -540,7 +551,7 @@ PY
     fi
     exited "$sig_pid" 5
     # SIGKILL: sig does nothing; the kernel hangs the terminal up when sig's descriptors close.
-    check "$how: the shell does not outlive sig" "$(until_programs "$d" '0 0'; echo $?)" \
+    check "$how: neither the shell nor the editor outlives sig" "$(until_programs "$d" '0 0'; echo $?)" \
       "exit status $status, programs $(programs "$d")"
   done
   ;;

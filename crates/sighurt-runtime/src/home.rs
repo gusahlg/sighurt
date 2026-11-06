@@ -170,7 +170,10 @@ fn pages(core: &BrowserState) -> Vec<Link> {
             "config" => found.push(link(
                 "sig://config",
                 "Configuration",
-                "Edit the configuration file in your editor",
+                match config.pages().config {
+                    true => "Edit the configuration file in your editor",
+                    false => "Off: [pages.config] enabled = true turns it on",
+                },
             )),
             "terminal" => found.push(link(
                 "sig://terminal",

@@ -1813,7 +1813,7 @@ fn internal_page(wat: &str) -> Host {
         name: "terminal",
         title: "a page",
         wasm,
-        grants: &[PageGrant::Info, PageGrant::Pty],
+        grants: &[PageGrant::Info, PageGrant::Shell],
     }])
 }
 

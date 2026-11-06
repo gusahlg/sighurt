@@ -44,7 +44,7 @@ use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::BufferSize;
 use sighurt_api::ids::{RequestId, TargetId, ViewId};
 use sighurt_api::services::{
-    ClipboardData, PageRequest, Selection, ServiceError, ServiceReply, ServiceResult,
+    ClipboardData, PageRequest, PtyProgram, Selection, ServiceError, ServiceReply, ServiceResult,
 };
 use sighurt_core::{BrowserEvent, BrowserState, Effect, Environment};
 
@@ -132,9 +132,9 @@ pub struct Session<F: Frontend> {
     handling: Option<Instant>,
     /// Engine wakers and service threads call this.
     wake: Arc<dyn Fn() + Send + Sync>,
-    /// `sig://config` wrote the configuration file and the frontend has not reloaded it yet
-    /// ([`Session::take_config_written`]).
-    config_written: bool,
+    /// `sig://config`'s editor ended and the frontend has not read the configuration file again
+    /// yet ([`Session::take_config_edited`]).
+    config_edited: bool,
     /// Engines due on the current pump. Reused so a pump does not allocate the list.
     due_scratch: Vec<&'static str>,
     /// Events from the runtime being pumped. Reused so a pump does not allocate the buffer.
@@ -187,7 +187,7 @@ impl<F: Frontend> Session<F> {
             shutdown_bound: None,
             handling: None,
             wake,
-            config_written: false,
+            config_edited: false,
             due_scratch: Vec::new(),
             event_scratch: Vec::new(),
             _frontend: PhantomData,
@@ -224,13 +224,12 @@ impl<F: Frontend> Session<F> {
         &self.env
     }
 
-    /// Whether `sig://config` wrote the configuration file since the last call. The core has
-    /// taken the written configuration into use already; the frontend reloads the file as it
-    /// does when its watch sees a change, for what it applies itself (the chrome's colors and
-    /// fonts, the terminal's settings), since the watch misses a file a link points to. The
-    /// core ignores that reload when it finds the same configuration.
-    pub fn take_config_written(&mut self) -> bool {
-        std::mem::take(&mut self.config_written)
+    /// Whether an editor `sig://config` ran has ended since the last call. The frontend then
+    /// reads the configuration file again as it does when its watch sees a change, since the
+    /// watch misses a file a link points to. The core ignores a reload equal to the
+    /// configuration in use, and an invalid file keeps it, with the frontend's notice.
+    pub fn take_config_edited(&mut self) -> bool {
+        std::mem::take(&mut self.config_edited)
     }
 
     /// Counters and the diagnostics file.
@@ -653,8 +652,7 @@ impl<F: Frontend> Session<F> {
     }
 
     /// Performs what an internal page asked for, which the core allowed, and answers it. Facts
-    /// are [`crate::page_info`]'s; the configuration's file is [`crate::page_config`]'s, whose new configuration is taken into use at once; terminals
-    /// are [`crate::pty`]'s.
+    /// are [`crate::page_info`]'s; terminals, the shell's and the editor's, are [`crate::pty`]'s.
     fn page_service(&mut self, request: RequestId, page: PageRequest) -> ServiceResult {
         match page {
             PageRequest::Info(kind) => Ok(ServiceReply::Text(crate::page_info::info(
@@ -662,24 +660,6 @@ impl<F: Frontend> Session<F> {
                 &self.core,
                 &self.paths,
             ))),
-            PageRequest::ConfigRead => crate::page_config::read(&self.paths),
-            PageRequest::ConfigCheck { text } => crate::page_config::check(&text, &self.env),
-            PageRequest::ConfigWrite { text, replaces } => {
-                let (result, config) = crate::page_config::write(
-                    &self.paths,
-                    &self.env,
-                    self.core.config(),
-                    &text,
-                    &replaces,
-                );
-                if let Some(config) = config {
-                    self.queue
-                        .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(config))));
-                    self.config_written = true;
-                    (self.wake)();
-                }
-                result
-            }
             PageRequest::PtyOpen {
                 program,
                 cols,
@@ -688,6 +668,7 @@ impl<F: Frontend> Session<F> {
                 let pages = self.core.config().pages();
                 let launch = pty::Launch {
                     command: pages.terminal_command.as_deref(),
+                    editor: pages.editor.as_deref(),
                     config: self.paths.config.as_deref(),
                 };
                 self.ptys.open(request, program, cols, rows, launch)
@@ -705,7 +686,11 @@ impl<F: Frontend> Session<F> {
         let mut worked = !completions.is_empty();
         let ended = self.ptys.ended();
         if !ended.is_empty() {
-            for (request, status) in ended {
+            for (request, status, program) in ended {
+                // The editor may have changed the file: read it again, as the watch would.
+                if program == PtyProgram::EditConfig {
+                    self.config_edited = true;
+                }
                 let result = Ok(ServiceReply::PtyEnded { status });
                 self.queue
                     .push_back(BrowserEvent::ServiceDone { request, result });

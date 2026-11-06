@@ -1,11 +1,13 @@
-//! `sig://terminal`: a terminal emulator inside sig's Wasm sandbox, for a program the browser
-//! starts (docs/rewrite/pages-2026-11-05.md, D, E and the amendments).
+//! `sig://terminal` and `sig://config`: a terminal emulator inside sig's Wasm sandbox, for a
+//! program the browser starts (docs/rewrite/pages-2026-11-05.md, D, E and the amendments;
+//! STATUS decisions 138 and 140).
 //!
-//! The program is the user's shell (`sig://terminal`) or their editor on sig's configuration
-//! (`sig://terminal/config`); the page only chooses between the two, and the browser builds the
-//! rest and runs it with the user's full rights. What runs here is the emulator: it reads the
-//! program's output, which is untrusted, draws the screen on the canvas, and turns keys and
-//! pastes into the program's input. Nothing starts until the user presses Enter in the page.
+//! The program is the user's shell on `sig://terminal` and the user's editor on sig's
+//! configuration on `sig://config`: one module, two pages, and the page's grant decides which
+//! program the browser lets it start. The browser builds the rest and runs it with the user's
+//! full rights. What runs here is the emulator: it reads the program's output, which is
+//! untrusted, draws the screen on the canvas, and turns keys and pastes into the program's
+//! input. Nothing starts until the user presses Enter in the page.
 //!
 //! The logic is plain Rust, tested on the host: keys ([`keys`]), pastes ([`paste`]), the
 //! emulator and its query answers ([`term`]), drawing ([`draw`]) and the page's states
@@ -25,17 +27,16 @@ mod page;
 
 use sig_page_kit::sig::Program;
 
-/// What `url` runs: `sig://terminal/config` the editor on the configuration, anything else of
-/// the page the shell.
+/// What the page at `url` runs: `sig://config` the editor on the configuration, any other (the
+/// terminal) the shell. The browser lets each page start only its own.
 pub fn program_for(url: &str) -> Program {
-    let path = url
+    let host = url
         .split_once("://")
         .map_or(url, |(_, rest)| rest)
-        .split(['?', '#'])
+        .split(['/', '?', '#'])
         .next()
         .unwrap_or("");
-    let path = path.split_once('/').map_or("", |(_, path)| path);
-    if path.trim_end_matches('/') == "config" {
+    if host.eq_ignore_ascii_case("config") {
         Program::EditConfig
     } else {
         Program::Shell
@@ -47,16 +48,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_address_picks_the_program() {
+    fn the_page_picks_the_program() {
         assert_eq!(program_for("sig://terminal"), Program::Shell);
         assert_eq!(program_for("sig://terminal/"), Program::Shell);
-        assert_eq!(program_for("sig://terminal/config"), Program::EditConfig);
-        assert_eq!(program_for("sig://terminal/config/"), Program::EditConfig);
-        assert_eq!(
-            program_for("sig://terminal/config?x#y"),
-            Program::EditConfig
-        );
-        assert_eq!(program_for("sig://terminal/configure"), Program::Shell);
-        assert_eq!(program_for("sig://terminal/x/config"), Program::Shell);
+        assert_eq!(program_for("sig://terminal/config"), Program::Shell);
+        assert_eq!(program_for("sig://config"), Program::EditConfig);
+        assert_eq!(program_for("sig://config/"), Program::EditConfig);
+        assert_eq!(program_for("sig://config?x#y"), Program::EditConfig);
+        assert_eq!(program_for("sig://configure"), Program::Shell);
     }
 }

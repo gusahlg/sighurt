@@ -28,17 +28,11 @@
 //!   [`MAX_REQUESTS`] requests already (answered ones count until they are cancelled). A refusal
 //!   emits nothing. The kinds ([`Kind`]):
 //!   - `1` info: the payload is a [`PageInfo`] name (`about`, `engines`, `commands`,
-//!     `user-commands`, `keys`, `paths`, `settings`); the reply is text in the form
-//!     [`PageInfo`] documents.
-//!   - `2` config read: no payload.
-//!   - `3` config check: the payload is a configuration.
-//!   - `4` config write: the payload is the byte length of `replaces` (u32), `replaces` (what
-//!     the page read), then the new text.
-//!
-//!   The replies of `2` to `4` are text in the form `sighurt_runtime::page_config`'s module
-//!   documentation gives (read: `file|new|read-only <path>`, `target <resolved target>`, then
-//!   the text; check: `valid` or `invalid` and their `notice`/`problem` lines; write: `saved`
-//!   and its `restart`/`notice` lines, or `stale`, `invalid` or `refused` with a message).
+//!     `user-commands`, `keys`, `paths`, `settings`, which need the info grant, and `editor`,
+//!     which needs the editor's); the reply is text in the form [`PageInfo`] documents.
+//!   - `2`, `3` and `4` are reserved: they were the configuration editor's read, check and
+//!     write, which `sig://config` no longer has (it runs the user's editor). They are refused,
+//!     and never to be given another meaning.
 //!   - `5` clipboard copy: the payload is text, put on the clipboard as `text/plain`. The
 //!     browser's rule for any page applies: a click or key press in the page in the last 5 s.
 //! - `poll(id: u32) -> i32`: `0` still waiting, `1` answered, `2` failed (its message is the
@@ -52,13 +46,13 @@
 //! ## Terminals
 //!
 //! A terminal is a handle of the document (never an OS descriptor; the master side stays in the
-//! engine, which gets it from the runtime by the session, once: [`crate::pty`]). The terminal
-//! lane implements the data plane; until it does a terminal opens and then ends at once.
+//! engine, which gets it from the runtime by the session, once: [`crate::pty`]).
 //!
 //! - `pty_open(program: u32, cols: u32, rows: u32) -> u32`: asks for a terminal of `cols` by
-//!   `rows` cells running `program` (`0` the user's shell, `1` the user's editor on the
-//!   configuration file). Returns its handle (never 0), or 0 when refused at once (no grant, a
-//!   terminal open already in this document). It needs a click or key press in the page, which
+//!   `rows` cells running `program` (`0` the user's shell, which needs the shell's grant
+//!   (`sig://terminal`), `1` the user's editor on the configuration file, which needs the
+//!   editor's (`sig://config`)). Returns its handle (never 0), or 0 when refused at once (not
+//!   the page's program, a terminal open already in this document). It needs a click or key press in the page, which
 //!   it uses up; the browser may still refuse it, which `pty_status` then says.
 //! - `pty_status(handle: u32) -> i32`: `0` opening, `1` running, `2` end of file (the program
 //!   closed the terminal; its status is not known yet), `3` cancelled (refused, closed, or its
@@ -180,10 +174,10 @@ impl InternalPage {
         self.grants.contains(&grant)
     }
 
-    /// Whether it edits text that a paste may go to (the configuration, a terminal), so its
-    /// view says it has a text field.
+    /// Whether it runs a terminal, which a paste may go to, so its view says it has a text
+    /// field.
     pub fn edits(&self) -> bool {
-        self.may(PageGrant::ConfigWrite) || self.may(PageGrant::Pty)
+        self.may(PageGrant::Shell) || self.may(PageGrant::Editor)
     }
 }
 
@@ -466,18 +460,6 @@ fn service(kind: Kind, payload: &[u8]) -> Option<Service> {
     let text = || String::from_utf8(payload.to_vec()).ok();
     Some(match kind {
         Kind::Info => Service::Page(PageRequest::Info(PageInfo::from_name(&text()?)?)),
-        Kind::ConfigRead if payload.is_empty() => Service::Page(PageRequest::ConfigRead),
-        Kind::ConfigRead => return None,
-        Kind::ConfigCheck => Service::Page(PageRequest::ConfigCheck { text: text()? }),
-        Kind::ConfigWrite => {
-            let len = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) as usize;
-            let replaces = payload.get(4..4usize.checked_add(len)?)?;
-            let new = &payload[4 + len..];
-            Service::Page(PageRequest::ConfigWrite {
-                text: String::from_utf8(new.to_vec()).ok()?,
-                replaces: String::from_utf8(replaces.to_vec()).ok()?,
-            })
-        }
         Kind::ClipboardCopy => Service::ClipboardWrite {
             selection: Selection::Clipboard,
             items: vec![ClipboardData {
@@ -498,13 +480,15 @@ pub fn register_page_functions(linker: &mut Linker<HostState>) -> Result<()> {
             let Some(page) = internal(&caller) else {
                 return 0;
             };
-            let Some(kind) = Kind::from_u32(kind).filter(|kind| page.page.may(kind.grant())) else {
+            let Some(kind) = Kind::from_u32(kind) else {
                 return 0;
             };
             if len as usize > MAX_PAYLOAD {
                 return 0;
             }
-            let Some(service) = guest_bytes(&caller, ptr, len).and_then(|p| service(kind, &p))
+            let Some(service) = guest_bytes(&caller, ptr, len)
+                .and_then(|p| service(kind, &p))
+                .filter(|service| page.page.may(grant(service)))
             else {
                 return 0;
             };
@@ -574,13 +558,19 @@ pub fn register_page_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "sig",
         "pty_open",
         |caller: Caller<'_, HostState>, program: u32, cols: u32, rows: u32| -> u32 {
-            let Some(page) = internal(&caller).filter(|page| page.page.may(PageGrant::Pty)) else {
-                return 0;
-            };
             let program = match program {
                 0 => PtyProgram::Shell,
                 1 => PtyProgram::EditConfig,
                 _ => return 0,
+            };
+            // The page's program only: the shell's page the shell, the editor's the editor.
+            let open = PageRequest::PtyOpen {
+                program,
+                cols: 0,
+                rows: 0,
+            };
+            let Some(page) = internal(&caller).filter(|page| page.page.may(open.grant())) else {
+                return 0;
             };
             let size = |n: u32| n.clamp(1, 1000) as u16;
             let mut state = page.lock();
@@ -723,12 +713,7 @@ pub fn register_page_functions(linker: &mut Linker<HostState>) -> Result<()> {
 pub enum Kind {
     /// [`PageInfo`] facts.
     Info = 1,
-    /// The configuration file.
-    ConfigRead = 2,
-    /// A check of a configuration.
-    ConfigCheck = 3,
-    /// Writing the configuration file.
-    ConfigWrite = 4,
+    // 2, 3 and 4 were the configuration editor's read, check and write: reserved, never reused.
     /// Putting text on the clipboard.
     ClipboardCopy = 5,
 }
@@ -738,22 +723,17 @@ impl Kind {
     pub fn from_u32(kind: u32) -> Option<Self> {
         Some(match kind {
             1 => Self::Info,
-            2 => Self::ConfigRead,
-            3 => Self::ConfigCheck,
-            4 => Self::ConfigWrite,
             5 => Self::ClipboardCopy,
             _ => return None,
         })
     }
+}
 
-    /// The grant a page needs for it.
-    pub fn grant(self) -> PageGrant {
-        match self {
-            Self::Info => PageGrant::Info,
-            Self::ConfigRead | Self::ConfigCheck => PageGrant::ConfigRead,
-            Self::ConfigWrite => PageGrant::ConfigWrite,
-            Self::ClipboardCopy => PageGrant::Clipboard,
-        }
+/// The grant a page needs for what a `request` asks.
+fn grant(service: &Service) -> PageGrant {
+    match service {
+        Service::Page(request) => request.grant(),
+        _ => PageGrant::Clipboard,
     }
 }
 
@@ -944,18 +924,14 @@ mod tests {
         let info = service(Kind::Info, b"keys");
         assert_eq!(info, Some(Service::Page(PageRequest::Info(PageInfo::Keys))));
         assert_eq!(service(Kind::Info, b"nope"), None);
-        assert_eq!(service(Kind::ConfigRead, b"x"), None);
-        let mut write = 3u32.to_le_bytes().to_vec();
-        write.extend_from_slice(b"oldnew");
-        assert_eq!(
-            service(Kind::ConfigWrite, &write),
-            Some(Service::Page(PageRequest::ConfigWrite {
-                text: "new".into(),
-                replaces: "old".into()
-            }))
-        );
-        assert_eq!(service(Kind::ConfigWrite, &[9, 0, 0, 0, b'x']), None);
-        assert_eq!(service(Kind::ConfigWrite, &[1, 0]), None);
+        // The editor's facts need the editor's grant, the rest the info grant.
+        let editor = service(Kind::Info, b"editor").unwrap();
+        assert_eq!(grant(&editor), PageGrant::Editor);
+        assert_eq!(grant(&info.unwrap()), PageGrant::Info);
+        // The configuration editor's kinds are reserved: refused, whatever the payload.
+        for reserved in 2..=4 {
+            assert_eq!(Kind::from_u32(reserved), None);
+        }
         assert!(matches!(
             service(Kind::ClipboardCopy, b"hi"),
             Some(Service::ClipboardWrite { .. })

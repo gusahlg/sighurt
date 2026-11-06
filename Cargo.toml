@@ -41,7 +41,6 @@ members = [
     # crates/sighurt-pages, and their shared kit (docs/rewrite/pages-2026-11-05.md).
     "pages/sig-page-kit",
     "pages/sig-page-help",
-    "pages/sig-page-config",
     "pages/sig-page-terminal",
     # Guest SDK and example guests.
     "sdk/sighurt-sdk",

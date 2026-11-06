@@ -8,7 +8,9 @@
 //!
 //! To add a page: a guest crate `pages/sig-page-<name>` (a workspace member, `cdylib`, on
 //! `sighurt-sdk` and `sig-page-kit`), which `build.rs` finds by its directory, and a line in
-//! [`PAGES`] with its title and grants.
+//! [`PAGES`] with its title and grants. Two pages may share a module (`sig://config` runs the
+//! terminal's, with the editor's grant): the module learns which page it is from its own
+//! address, and the grants, which the core checks, are the page's.
 //!
 //! Must not own: what a page may do beyond its grants (the core decides each request), or
 //! loading one (the engine).
@@ -41,17 +43,19 @@ pub const PAGES: &[Page] = &[
         wasm: blob!("help"),
         grants: &[PageGrant::Info],
     },
+    // The terminal's module, which runs the user's editor on the configuration here: its grant
+    // is the editor's, so the core lets it start nothing else.
     Page {
         name: "config",
-        title: "sig configuration",
-        wasm: blob!("config"),
-        grants: &[PageGrant::ConfigRead, PageGrant::ConfigWrite],
+        title: "Configuration",
+        wasm: blob!("terminal"),
+        grants: &[PageGrant::Editor],
     },
     Page {
         name: "terminal",
         title: "sig terminal",
         wasm: blob!("terminal"),
-        grants: &[PageGrant::Pty],
+        grants: &[PageGrant::Shell],
     },
 ];
 

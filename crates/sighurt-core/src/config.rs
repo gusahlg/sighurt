@@ -55,7 +55,8 @@
 //! `[keys]`, `[keymap.<name>]`, `[tui.keys]` and `[input.buttons]` may bind them; a bare word
 //! the table doesn't define is an unknown command there. `[pages.terminal]` holds
 //! `sig://terminal`'s settings: `enabled`, whether it may start programs, and `command`, the
-//! shell it runs.
+//! shell it runs. `[pages.config]` holds `sig://config`'s: `enabled`, whether it may run the
+//! editor (on unless the file turns it off), and `editor`, the editor it runs.
 //!
 //! Must not own: reading or watching files, which the executable does, or deciding what a
 //! reload means for open pages ([`crate::state`]).
@@ -314,6 +315,12 @@ pub struct PagesConfig {
     /// `[pages.terminal] command`: the program `sig://terminal` runs instead of `$SHELL`, if
     /// set, as written (the runtime splits it into a program and its arguments).
     pub terminal_command: Option<String>,
+    /// `[pages.config] enabled`: whether `sig://config` may run the editor. On by default.
+    pub config: bool,
+    /// `[pages.config] editor`: the editor `sig://config` runs instead of `$VISUAL`, `$EDITOR`
+    /// or one found on `PATH`, if set, as written (the runtime splits it into a program and its
+    /// arguments, and adds the configuration file).
+    pub editor: Option<String>,
 }
 
 /// The most commands `[commands]` may define.
@@ -439,6 +446,15 @@ struct RawHistory {
 struct RawPages {
     #[serde(default)]
     terminal: RawTerminalPage,
+    #[serde(default)]
+    config: RawConfigPage,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawConfigPage {
+    enabled: Option<bool>,
+    editor: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -953,6 +969,10 @@ fn merge(defaults: Raw, user: Raw) -> Raw {
                     .command
                     .or(defaults.pages.terminal.command),
             },
+            config: RawConfigPage {
+                enabled: user.pages.config.enabled.or(defaults.pages.config.enabled),
+                editor: user.pages.config.editor.or(defaults.pages.config.editor),
+            },
         },
         tui: merge_table(defaults.tui, user.tui),
     }
@@ -1233,6 +1253,16 @@ fn validate(
                 problems.push(format!(
                     "[pages.terminal] command: expected a program, at most 4096 bytes, not \
                      {command:?}"
+                ));
+            }
+            fits
+        }),
+        config: raw.pages.config.enabled.unwrap_or(true),
+        editor: raw.pages.config.editor.filter(|editor| {
+            let fits = !editor.trim().is_empty() && editor.len() <= 4096;
+            if !fits {
+                problems.push(format!(
+                    "[pages.config] editor: expected a program, at most 4096 bytes, not {editor:?}"
                 ));
             }
             fits

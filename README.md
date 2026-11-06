@@ -303,7 +303,8 @@ the guide to writing them.
 ## Configuration
 
 Everything is configured in one TOML file, `~/.config/sighurt/config.toml` (`$XDG_CONFIG_HOME`),
-which you edit in any editor or in the browser at `sig://config` ([below](#editing-it-in-the-browser)).
+which you edit in any editor, or from the browser at `sig://config`, which runs your editor on
+it ([below](#editing-it-in-the-browser)).
 The built-in configuration,
 [`crates/sighurt-core/src/default-config.toml`](crates/sighurt-core/src/default-config.toml), documents every
 setting; `sig --default-config` prints it. Your file starts with `version = 1`, and every other
@@ -365,24 +366,27 @@ tabs = "left"
 
 ### Editing it in the browser
 
-`sig://config` is the file in a plain text editor: line numbers, light TOML colouring,
-selection with Shift and the mouse, undo and redo (Ctrl+Z, Ctrl+Shift+Z), copy, cut and paste.
-With the example keymap, Escape switches to INSERT mode so the keys reach the page; Ctrl+S (or
-the Save button) saves. The text is checked as you type, with the same checks as a reload, and
-the problems are listed under the editor with their lines (a click goes to the line).
+`sig://config` runs your editor on the file, in a terminal on the page: `[pages.config] editor`
+if you set it, else `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `vim`, `vi` and `nano`
+found on `PATH`. The page says which editor and which file before anything starts, and Enter
+starts it; keys reach it in the keymap's INSERT mode (`sig://help/keys` lists the keys that enter
+and leave it there). When the editor ends, `sig` reads the file again, a file linked from
+elsewhere (a dotfiles repository) included: what changed applies at once where the setting
+allows it, and a file with a problem keeps the configuration in use, with a notice and the
+problems on the page. Without a file the editor starts on the path, and the directory is made
+(mode 0700); the editor creates the file when you save. A file the editor can't write (a link
+into a read-only store) is the editor's to report.
 
-- A save is refused when the text has a problem (the file stays as it was), when it is over
-  256 KiB, and when the file changed since the page read it, by another `sig` or an editor:
-  "Read the file again" shows what it holds now, and Ctrl+Z brings your text back. Two `sig`s
-  saving at once take turns (a lock file, `.config.toml.lock`, beside the file), and the second
-  is refused; an editor that doesn't take `sig`'s
-  lock can still write between the check and the save, as with any two editors of one file.
-- A saved file applies at once, as one saved by an editor does, and the page says which settings
-  wait for a restart. A file that is a link (into a dotfiles repository) is saved where the link
-  leads, its mode kept; one that can't be written, such as a home-manager link into the
-  read-only store, is shown and not saved. Without a file, the page starts from `version = 1`
-  and a pointer to `sig://help/config`, and the first save creates it (mode 0600).
-- In the terminal frontend the page needs graphics, like every `sig://` page.
+**`sig://config` is on by default, and the editor runs with your full rights**, as in any
+terminal: an editor can run shell commands. Only the terminal emulator on the page runs in the
+Wasm sandbox ([SECURITY.md](./SECURITY.md)). To turn it off:
+
+```toml
+[pages.config]
+enabled = false
+```
+
+In the terminal frontend the page needs graphics, like every `sig://` page.
 
 ### Reference
 
@@ -417,6 +421,8 @@ the problems are listed under the editor with their lines (a click goes to the l
 | `[commands]` | `name = "command"` or a list of up to 8: [your own commands](#your-own-commands), at most 64 | `help = "tab.new sig://help"` |
 | `[pages.terminal] enabled` | whether `sig://terminal` may run programs (a shell with all your rights) | `false` |
 | `[pages.terminal] command` | the program it runs, with its arguments, without a shell between | `$SHELL`, else `/bin/sh` |
+| `[pages.config] enabled` | whether `sig://config` may run your editor on this file (with all your rights) | `true` |
+| `[pages.config] editor` | the editor, with its arguments, without a shell between; the file is added | `$VISUAL`, `$EDITOR`, else `nvim`, `vim`, `vi` or `nano` |
 
 The session is `~/.local/state/sighurt/session.toml`. One `sig` at a time saves it (it holds
 `session.lock` beside it); another started meanwhile restores the same tabs but doesn't save its
@@ -535,9 +541,9 @@ configuration (its path, the main tables, what is in effect), these pages, this 
 the terminal frontend, and the version, license and credits. `sig://help/keys`,
 `sig://help/commands`, `sig://help/config`, `sig://help/pages`, `sig://help/engines`,
 `sig://help/terminal-frontend` and `sig://help/about` open a section. `?` and `F1` open it (the
-`help` command). `sig://config` shows the configuration file to read and edit, and
-`sig://terminal` is a terminal, off unless `[pages.terminal] enabled = true`: it runs your shell
-with all your rights.
+`help` command). `sig://config` runs your editor on the configuration file, and
+`sig://terminal` is a terminal, off unless `[pages.terminal] enabled = true`: they run your
+editor and your shell with all your rights.
 
 `sig://home`, the page of new tabs, is the chrome's own, in the window and in the terminal: no
 engine draws it, so it works without the wasm engine and in a terminal without graphics. It says
@@ -719,11 +725,11 @@ the command line.
 ### The terminal page
 
 `sig://terminal` is a small terminal in a tab: your shell (`[pages.terminal] command` if set,
-else `$SHELL`, else `/bin/sh`, in your home directory). `sig://terminal/config` runs your editor
-(`$VISUAL`, else `$EDITOR`, else `vi`) on `sig`'s configuration file instead, so `nvim` on your
-configuration is one address away. The program runs with your full rights, as in any terminal;
-only the terminal emulator, which reads what the program prints, runs in the Wasm sandbox
-([SECURITY.md](./SECURITY.md)). It is off until you turn it on in `config.toml`:
+else `$SHELL`, else `/bin/sh`, in your home directory). `sig://config` is the same terminal
+running your editor on `sig`'s configuration file ([above](#editing-it-in-the-browser)). The
+program runs with your full rights, as in any terminal; only the terminal emulator, which reads
+what the program prints, runs in the Wasm sandbox ([SECURITY.md](./SECURITY.md)). The terminal
+is off until you turn it on in `config.toml`:
 
 ```toml
 [pages.terminal]
@@ -731,7 +737,7 @@ enabled = true
 ```
 
 The page starts nothing by itself: it says what will run, and Enter starts it. With the example
-keymap, keys reach the program in INSERT mode, which Escape enters; on this page Escape then goes
+keymap, keys reach the program in INSERT mode, which Escape enters; on these pages Escape then goes
 to the program (nvim needs it), and `ctrl-escape` or `f12` leaves INSERT ([Keys](#keys): `f12`
 where the terminal sends `ctrl-escape` as `Escape`). Pastes reach the program with
 control characters removed, bracketed when the program asks. When the program ends, the page says
@@ -742,7 +748,7 @@ of their own may survive, as in any terminal.
 Limits: it is an xterm-like terminal (`TERM=xterm-256color`, 256 colours and true colour) without
 scrollback, mouse reporting, a title, clipboard access or images; clicks only give the page the
 keyboard. A program in a background tab has its output read once a second, so a busy one waits
-until you look. At most eight terminals run at once.
+until you look. At most eight programs run at once, shells and editors together.
 
 ### Chromes
 
@@ -905,7 +911,8 @@ the tab to another engine only right after a click or key press of yours. Wasm a
 and only the host functions Sighurt registers, with camera, microphone, location and screen
 capture behind a prompt. Servo and WebKit pages get their engines' web security; WebKit's pages
 run in its own sandboxed web processes. `sig://terminal`, off by default, is a shell with your
-full rights: the sandbox holds its terminal emulator, not the shell. To report a vulnerability,
+full rights, and `sig://config`, on by default, runs your editor with them: the sandbox holds
+their terminal emulator, not the programs. To report a vulnerability,
 see [SECURITY.md](./SECURITY.md).
 
 Logins stay across runs: each engine keeps its own cookies in its profile, which only you can

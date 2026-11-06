@@ -4,7 +4,7 @@
 # ~/.config/sighurt/config.toml. It starts with `version = 1`, the version of this format;
 # every other key is optional and keeps the value below when you leave it out. [routing]
 # tables merge by engine, field by field, and [engines], [input], [input.buttons], [downloads],
-# [session], [commands], [pages.terminal] and [tui] key by key; [keywords], [engines.*],
+# [session], [commands], [pages.terminal], [pages.config] and [tui] key by key; [keywords], [engines.*],
 # [keys], [keymap.*], [ui] and [chrome.*] are yours alone. [tui.keys] in your file is a separate table, over [keys], and
 # applies only in the terminal when the keymap is bindings.
 #
@@ -336,8 +336,8 @@ help = "tab.new sig://help"
 # ── Internal pages ───────────────────────────────────────────────────────────────────────
 #
 # sig's own pages are Wasm programs built into sig, which the wasm engine runs:
-# sig://help (what you need to know, from this build and this file), sig://config (this file,
-# to read and edit) and sig://terminal (a terminal). sig://home is the chrome's own page. Only
+# sig://help (what you need to know, from this build and this file), sig://config (your editor
+# on this file, in a terminal on the page) and sig://terminal (a terminal). sig://home is the chrome's own page. Only
 # you open them, from the address line, a command or the session; a web page can't, and only
 # they reach what they show. They have no network. Without the wasm engine, in the build or
 # in [engines] enabled, they don't open. In the terminal they need graphics: they have no
@@ -354,6 +354,19 @@ enabled = false
 # The program sig://terminal runs, with its arguments, without a shell in between; without
 # it, $SHELL, or /bin/sh.
 # command = "/usr/bin/fish --login"
+
+[pages.config]
+# Whether sig://config may run your editor on this file, in a terminal on the page. On by
+# default. The editor runs with all your rights, as in any terminal (an editor can run shell
+# commands); only the terminal on the page is in the sandbox. Nothing starts until you press
+# Enter in the page shown; the rules of [pages.terminal] apply, and the 8 programs at once
+# count both pages. When the editor ends, sig reads this file again. Turning this off ends an
+# editor that runs.
+enabled = true
+# The editor, with its arguments, without a shell in between; the file's path is added as its
+# last argument. Without it, $VISUAL, then $EDITOR, then the first of nvim, vim, vi and nano
+# found on PATH.
+# editor = "nvim -u NONE"
 
 # ── Terminal ─────────────────────────────────────────────────────────────────────────────
 #
