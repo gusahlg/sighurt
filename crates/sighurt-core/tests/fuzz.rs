@@ -144,6 +144,10 @@ forward = "page.forward"
 "alt-j" = "page.send-key down"
 [keys.location]
 "alt-enter" = "page.open https://example.com"
+[keys.url."sig://terminal"]
+"ctrl-escape" = "page.back"
+[keys.url."https://*.example.com/docs"]
+"f12" = "page.reload"
 [tui]
 mode = "text"
 graphics = "kitty"
@@ -151,6 +155,8 @@ fps = 30
 mouse = false
 [tui.keys]
 "m" = "chrome.toggle-mode"
+[tui.keys.url."sig://config"]
+"f12" = "chrome.refresh"
 [ui]
 chrome = "standard"
 renderer = "cpu"
@@ -183,10 +189,17 @@ const TABLES: &[&str] = &[
     "keys.page",
     "keys.location",
     "keys.other",
+    "keys.url",
+    "keys.url.\"sig://terminal\"",
+    "keys.url.\"https://*.example.com/docs\"",
+    "keys.url.\"SIG://terminal/\"",
+    "keys.url.\"terminal\"",
+    "keys.url.\"https://a.org:1/?q\"",
     "keymap.example",
     "tui",
     "tui.keys",
     "tui.keys.page",
+    "tui.keys.url.\"sig://config\"",
     "ui",
     "ui.colors",
     "chrome.standard",
@@ -224,6 +237,9 @@ const KEYS: &[&str] = &[
     "\"ctrl-+\"",
     "\"code:KeyQ\"",
     "\"f5\"",
+    "\"f12\"",
+    "\"ctrl-escape\"",
+    "\"sig://terminal\"",
     "mode",
     "graphics",
     "fps",

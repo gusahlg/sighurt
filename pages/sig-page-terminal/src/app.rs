@@ -345,8 +345,8 @@ impl<P: Terminal> App<P> {
         }
         lines.push(blank());
         lines.push(Line::new(
-            "Keys reach the program in the keymap's INSERT mode; sig://help/keys lists the keys \
-             that enter and leave it on this page.",
+            "With sig's example keymap, keys reach the program in INSERT mode. sig://help/keys \
+             lists the keys that enter and leave it on this page.",
             MUTED,
         ));
         lines.push(Line::new(

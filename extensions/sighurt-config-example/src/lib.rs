@@ -13,13 +13,14 @@
 //!   input method, no paste. The indicator is empty, or the keys of an unfinished sequence.
 //! - **INSERT**: every key reaches the page, and no binding listens, the `Always` ones neither;
 //!   the one key taken is an unmodified Escape. Text and pastes reach the page. The indicator is
-//!   `INSERT MODE`. On `sig://terminal` (the tab's [`TabInfo::internal`] is `terminal`) Escape
-//!   reaches the page too, for the program there, and `ctrl-\ ctrl-n` leaves INSERT
-//!   ([`table::INSERT_TERMINAL`]); a `ctrl-\` that another key follows is dropped, as any
-//!   unfinished sequence.
-//!
-//! [`TabInfo::internal`]: sighurt_api::keymap::TabInfo::internal
-//! - **Escape** switches mode, except while the page shown holds an element fullscreen (a
+//!   `INSERT MODE`.
+//! - **Sites** ([`table::SITES`]): on an address a site's pattern matches, a table the site
+//!   gives for a mode replaces that mode's general table while the page has the keyboard, so
+//!   a site can take Escape away from INSERT and leave it on other keys. The address is the
+//!   shown tab's committed one ([`TabInfo::url`]), never one loading or a link; the most
+//!   specific matching pattern wins ([`UrlPattern`]). No address is named here: the sites are
+//!   data in `table`.
+//! - **Escape** switches mode (in the general tables), except while the page shown holds an element fullscreen (a
 //!   video): then it runs `page.exit-fullscreen` and the mode stays.
 //! - **The address line and the find field.** The modes are the page's: while the chrome has
 //!   the keyboard, in either mode, only NORMAL's `Always` bindings whose first key types nothing
@@ -29,6 +30,8 @@
 //!   timeout. Modifier and dead keys are not keys of a sequence; a key that doesn't continue
 //!   one drops it and starts afresh; `context` and `reset` drop it.
 //! - **Repeats** run a single-key `Run` again; anything else taken is held quietly.
+//!
+//! [`TabInfo::url`]: sighurt_api::keymap::TabInfo::url
 //!
 //! Must not own: the presses taken (the core's) or what a command does. It keeps no more of what
 //! the user types than an unfinished sequence, and logs nothing.
@@ -43,10 +46,11 @@ use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::input::{KeyCode, KeyEvent, KeyboardFocus};
 use sighurt_api::keymap::{
     is_modifier, Browser, Chord, Frontend, KeyAction, KeyBinding, KeyContext, Keymap, KeymapKind,
+    UrlPattern,
 };
 use sighurt_api::settings::Table;
 
-pub use table::{Action, Binding, Mode, Scope, Where};
+pub use table::{Action, Binding, Mode, Scope, Site, Where};
 
 /// The example configuration, for the registry: `[input] keymap = "example"`.
 pub const KIND: KeymapKind = KeymapKind {
@@ -66,7 +70,7 @@ fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
         )
     });
     // Its commands of `[commands]` (help) must be the configuration's.
-    let actions = table::NORMAL.iter().chain(table::INSERT);
+    let actions = tables().flat_map(|(_, _, table)| table);
     let commands = actions.filter_map(|binding| match binding.action {
         Action::Run(text) | Action::RunThenPass(text)
             if matches!(CommandSet::ANY.parse(text), Ok(Command::Custom(_))) =>
@@ -83,12 +87,26 @@ fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
     settings.chain(commands).collect()
 }
 
-/// The bindings that exist in `frontend`, in both modes, as `(keys, action)`.
+/// Every table, as `(mode, site, bindings)`: the general NORMAL and INSERT (no site), then each
+/// site's tables in [`table::SITES`] order.
+pub fn tables() -> impl Iterator<Item = (Mode, Option<&'static str>, &'static [Binding])> {
+    let general = [
+        (Mode::Normal, None, table::NORMAL),
+        (Mode::Insert, None, table::INSERT),
+    ];
+    let sites = table::SITES.iter().flat_map(|site| {
+        [(Mode::Normal, site.normal), (Mode::Insert, site.insert)]
+            .into_iter()
+            .filter_map(move |(mode, table)| Some((mode, Some(site.url), table?)))
+    });
+    general.into_iter().chain(sites)
+}
+
+/// The bindings that exist in `frontend`, in every table, as `(keys, action)`; a site's
+/// bindings once per site.
 pub fn bindings(frontend: Frontend) -> impl Iterator<Item = (&'static str, &'static Action)> {
-    table::NORMAL
-        .iter()
-        .chain(table::INSERT)
-        .chain(table::INSERT_TERMINAL)
+    tables()
+        .flat_map(|(_, _, table)| table)
         .filter(move |binding| exists_in(binding.frontend, frontend))
         .map(|binding| (binding.keys, &binding.action))
 }
@@ -116,6 +134,14 @@ enum Resolved {
     Mode(Mode),
     ExitFullscreenOr(Mode),
     Custom(fn(&dyn Browser) -> Vec<Command>),
+}
+
+/// A site's tables, parsed.
+#[derive(Debug)]
+struct ParsedSite {
+    pattern: UrlPattern,
+    normal: Option<Vec<Parsed>>,
+    insert: Option<Vec<Parsed>>,
 }
 
 /// Parses `table`'s bindings. A bad built-in key or command is a bug of this crate; the tests
@@ -166,8 +192,7 @@ enum Found<'a> {
 pub struct Example {
     normal: Vec<Parsed>,
     insert: Vec<Parsed>,
-    /// INSERT on `sig://terminal`.
-    insert_terminal: Vec<Parsed>,
+    sites: Vec<ParsedSite>,
     mode: Mode,
     /// The keys of an unfinished sequence, at most `MAX_KEYS - 1`.
     pending: Vec<KeyEvent>,
@@ -188,7 +213,17 @@ impl Example {
         Self {
             normal: parse(table::NORMAL),
             insert: parse(table::INSERT),
-            insert_terminal: parse(table::INSERT_TERMINAL),
+            sites: table::SITES
+                .iter()
+                .map(|site| ParsedSite {
+                    pattern: site
+                        .url
+                        .parse()
+                        .unwrap_or_else(|e| panic!("built-in site {:?}: {e}", site.url)),
+                    normal: site.normal.map(parse),
+                    insert: site.insert.map(parse),
+                })
+                .collect(),
             mode: Mode::Normal,
             pending: Vec::new(),
             held: None,
@@ -196,21 +231,39 @@ impl Example {
         }
     }
 
-    /// What `keys` are in the bindings that apply now; `terminal` is whether the tab shown is
-    /// `sig://terminal`.
+    /// The table of the mode while the page has the keyboard on `address`: the most specific
+    /// matching site's for the mode, or the mode's general one.
+    fn table(&self, address: Option<&str>) -> &[Parsed] {
+        let general = match self.mode {
+            Mode::Normal => &self.normal,
+            Mode::Insert => &self.insert,
+        };
+        let sites = self.sites.iter().filter_map(|site| {
+            let table = match self.mode {
+                Mode::Normal => site.normal.as_ref(),
+                Mode::Insert => site.insert.as_ref(),
+            };
+            Some((&site.pattern, table?))
+        });
+        address
+            .and_then(|address| UrlPattern::most_specific(sites, address))
+            .unwrap_or(general)
+    }
+
+    /// What `keys` are in the bindings that apply now; `address` is the shown tab's committed
+    /// address.
     fn find(
         &self,
         keys: &[KeyEvent],
         context: KeyContext,
         frontend: Frontend,
-        terminal: bool,
+        address: Option<&str>,
     ) -> Found<'_> {
         let chrome = context.focus == KeyboardFocus::Chrome;
         // The modes are the page's: the line keeps NORMAL's few bindings in both.
-        let table = match (chrome, self.mode) {
-            (true, _) | (false, Mode::Normal) => &self.normal,
-            (false, Mode::Insert) if terminal => &self.insert_terminal,
-            (false, Mode::Insert) => &self.insert,
+        let table = match chrome {
+            true => &self.normal[..],
+            false => self.table(address),
         };
         let applies = |binding: &&Parsed| {
             exists_in(binding.frontend, frontend)
@@ -275,17 +328,15 @@ impl Keymap for Example {
         }
         self.held = None;
         let frontend = browser.frontend();
-        // From the core's record of the view, never from an address.
-        let terminal = browser
-            .tab(browser.active_tab())
-            .is_some_and(|tab| tab.internal == Some("terminal"));
+        let tab = browser.tab(browser.active_tab());
+        let address = tab.and_then(|tab| tab.url);
         let mut keys = std::mem::take(&mut self.pending);
         keys.push(key.clone());
         // Keys that continue no sequence drop it, and the last starts afresh.
-        let mut found = self.find(&keys, context, frontend, terminal);
+        let mut found = self.find(&keys, context, frontend, address);
         if matches!(found, Found::None) && keys.len() > 1 {
             keys.drain(..keys.len() - 1);
-            found = self.find(&keys, context, frontend, terminal);
+            found = self.find(&keys, context, frontend, address);
         }
         let action = match found {
             Found::Complete(binding) => Some(binding.action.clone()),
@@ -307,11 +358,7 @@ impl Keymap for Example {
                 KeyAction::Run(command)
             }
             Some(Resolved::RunThenPass(command)) => KeyAction::RunThenPass(command),
-            Some(Resolved::ExitFullscreenOr(_))
-                if browser
-                    .tab(browser.active_tab())
-                    .is_some_and(|tab| tab.fullscreen) =>
-            {
+            Some(Resolved::ExitFullscreenOr(_)) if tab.is_some_and(|tab| tab.fullscreen) => {
                 KeyAction::Run(Command::PageExitFullscreen)
             }
             Some(Resolved::Mode(mode) | Resolved::ExitFullscreenOr(mode)) => {
@@ -343,18 +390,25 @@ impl Keymap for Example {
     }
 
     fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
-        // INSERT's Escape is not sig://terminal's, where the program has it.
-        let modes = [
-            ("NORMAL", table::NORMAL, None),
-            (
-                "INSERT",
-                table::INSERT,
-                Some("in the page, except on sig://terminal"),
-            ),
-            ("INSERT", table::INSERT_TERMINAL, Some("on sig://terminal")),
-        ];
         let mut found = Vec::new();
-        for (mode, table, page) in modes {
+        for (mode, site, table) in tables() {
+            // The sites that replace this general table, where its page bindings don't apply.
+            let replaced: Vec<&str> = table::SITES
+                .iter()
+                .filter(|other| match mode {
+                    Mode::Normal => other.normal.is_some(),
+                    Mode::Insert => other.insert.is_some(),
+                })
+                .map(|other| other.url)
+                .collect();
+            let except = match (site, replaced.is_empty()) {
+                (None, false) => format!(", except on {}", replaced.join(", ")),
+                _ => String::new(),
+            };
+            let name = match mode {
+                Mode::Normal => "NORMAL",
+                Mode::Insert => "INSERT",
+            };
             for binding in table.iter().filter(|b| exists_in(b.frontend, frontend)) {
                 let action = match binding.action {
                     Action::Run(text) | Action::RunThenPass(text) => text.to_owned(),
@@ -368,12 +422,19 @@ impl Keymap for Example {
                     }
                     Action::Custom(_) => describe_custom(binding.keys).to_owned(),
                 };
-                let applies = match binding.scope {
-                    Scope::Page => page.unwrap_or("in the page"),
-                    Scope::NoField => "in the page, not in a text field",
-                    Scope::Always => "also in the address line",
+                let applies = match (site, binding.scope) {
+                    (Some(url), Scope::Page | Scope::Always) => format!("on {url}"),
+                    (Some(url), Scope::NoField) => format!("on {url}, not in a text field"),
+                    (None, Scope::Page) => format!("in the page{except}"),
+                    (None, Scope::NoField) => format!("in the page, not in a text field{except}"),
+                    (None, Scope::Always) if except.is_empty() => {
+                        "also in the address line".to_owned()
+                    }
+                    (None, Scope::Always) => {
+                        format!("also in the address line; in the page{except}")
+                    }
                 };
-                found.push(KeyBinding::new(mode, binding.keys, action, applies));
+                found.push(KeyBinding::new(name, binding.keys, action, applies));
             }
         }
         found

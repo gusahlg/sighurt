@@ -29,6 +29,8 @@ const LIMIT: Duration = Duration::from_secs(40);
 const FPS: u64 = 10;
 /// The probe's last query (DA1): the fake terminal answers when it sees it.
 const DA1: &[u8] = b"\x1b[c";
+/// How long `sig` may take no input before a write to it gives up.
+const STALL: Duration = Duration::from_secs(30);
 /// Kitty graphics, cells of 10×20 pixels, and DA1. No kitty keyboard: keys arrive as a legacy
 /// terminal sends them.
 const REPLIES: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
@@ -193,7 +195,7 @@ impl Terminal {
                     self.got.extend_from_slice(&buf[..n]);
                     if !self.answered && has(&self.got, DA1) {
                         self.answered = true;
-                        self.type_bytes(self.replies);
+                        self.answer();
                     }
                     if done(&self.got[since.min(self.got.len())..]) {
                         return true;
@@ -212,11 +214,52 @@ impl Terminal {
         }
     }
 
+    /// Answers the probe with `replies`, reading what `sig` writes meanwhile, so neither side
+    /// waits on a full pty however long the answer is.
+    fn answer(&mut self) {
+        let mut rest = self.replies;
+        let mut buf = vec![0u8; 1 << 16];
+        let mut progress = Instant::now();
+        while !rest.is_empty() {
+            match rustix::io::write(&self.master, rest) {
+                Ok(n) => {
+                    rest = &rest[n..];
+                    progress = Instant::now();
+                }
+                Err(Errno::AGAIN) | Err(Errno::INTR) => {
+                    if let Ok(n) = rustix::io::read(&self.master, &mut buf) {
+                        self.got.extend_from_slice(&buf[..n]);
+                    }
+                    self.assert_taking(progress);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("writing to the pty: {error}"),
+            }
+        }
+    }
+
+    /// Fails the test when `sig` has taken no input since `progress` for [`STALL`]: it is gone
+    /// or stuck, and the pty would refuse the rest for ever.
+    fn assert_taking(&self, progress: Instant) {
+        assert!(
+            progress.elapsed() < STALL,
+            "sig took no more input for {STALL:?}\n{}",
+            self.context()
+        );
+    }
+
     fn type_bytes(&self, mut bytes: &[u8]) {
+        let mut progress = Instant::now();
         while !bytes.is_empty() {
             match rustix::io::write(&self.master, bytes) {
-                Ok(n) => bytes = &bytes[n..],
-                Err(Errno::AGAIN) | Err(Errno::INTR) => thread::sleep(Duration::from_millis(1)),
+                Ok(n) => {
+                    bytes = &bytes[n..];
+                    progress = Instant::now();
+                }
+                Err(Errno::AGAIN) | Err(Errno::INTR) => {
+                    self.assert_taking(progress);
+                    thread::sleep(Duration::from_millis(1));
+                }
                 Err(error) => panic!("writing to the pty: {error}"),
             }
         }
@@ -2187,10 +2230,15 @@ impl Terminal {
     fn flood(&mut self, bytes: &[u8]) {
         for chunk in bytes.chunks(4096) {
             let mut rest = chunk;
+            let mut progress = Instant::now();
             while !rest.is_empty() {
                 match rustix::io::write(&self.master, rest) {
-                    Ok(n) => rest = &rest[n..],
+                    Ok(n) => {
+                        rest = &rest[n..];
+                        progress = Instant::now();
+                    }
                     Err(Errno::AGAIN) | Err(Errno::INTR) => {
+                        self.assert_taking(progress);
                         self.wait(self.got.len(), Duration::from_millis(1), |_| false);
                     }
                     Err(error) => panic!("writing to the pty: {error}"),
@@ -2691,8 +2739,9 @@ fn sig_pages_need_graphics_and_say_so() {
 }
 
 /// sig://terminal in the terminal frontend with graphics: the page shows, Escape and Enter start
-/// the shell, typed keys reach it, `ctrl-\ ctrl-n` leaves INSERT, and `q` quits sig with the
-/// shell ended. Needs the Wasm engine: run with `--features frontend-tui,engine-demo,engine-wasm`.
+/// the shell, typed keys reach it, Escape in INSERT is the shell's, the example configuration's
+/// `ctrl-escape` (kitty's `CSI 27;5u`) and `f12` (`CSI 24~`) leave INSERT, and `q` quits sig
+/// with the shell ended. Needs the Wasm engine: run with `--features frontend-tui,engine-demo,engine-wasm`.
 #[cfg(feature = "engine-wasm")]
 #[test]
 fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
@@ -2722,14 +2771,40 @@ fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
     let pid = fs::read_to_string(home.join("pid")).unwrap();
     let shell = Path::new("/proc").join(pid.trim());
     assert!(shell.exists(), "the shell is not running");
-    // ctrl-\ ctrl-n, then q in NORMAL.
-    term.type_bytes(b"\x1b[92;5u\x1b[92;5:3u\x1b[110;5u\x1b[110;5:3u");
+    // Escape is the shell's: INSERT stays, and the shell still reads the next line once
+    // Ctrl+C has dropped what the Escape began.
+    term.type_bytes(&kitty_keys("\x1b"));
+    thread::sleep(Duration::from_millis(300));
+    term.type_bytes(b"\x1b[99;5u\x1b[99;5:3u");
+    thread::sleep(Duration::from_secs(1));
+    term.type_bytes(&kitty_keys("echo esc > ~/esc.txt\r"));
+    let start = Instant::now();
+    while fs::read_to_string(home.join("esc.txt")).ok().as_deref() != Some("esc\n") {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "after Escape, INSERT no longer gave the shell the keys\n{}",
+            term.context()
+        );
+        term.wait(term.got.len(), Duration::from_millis(100), |_| false);
+    }
+    // ctrl-escape leaves INSERT; Escape enters it again, and f12 leaves it.
+    term.type_bytes(b"\x1b[27;5u\x1b[27;5:3u");
     let left = term.wait(term.got.len(), Duration::from_secs(10), insert_mode_left);
+    assert!(left, "ctrl-escape did not leave INSERT\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("\x1b"));
+    let insert = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "INSERT MODE")
+    });
     assert!(
-        left,
-        "ctrl-\\ ctrl-n did not leave INSERT\n{}",
+        insert,
+        "Escape did not enter INSERT again\n{}",
         term.context()
     );
+    term.type_bytes(b"\x1b[24~\x1b[24;1:3~");
+    let left = term.wait(term.got.len(), Duration::from_secs(10), insert_mode_left);
+    assert!(left, "f12 did not leave INSERT\n{}", term.context());
+    // Then q in NORMAL.
     term.type_bytes(&kitty_keys("q"));
     let status = term.exit();
     assert!(
@@ -2802,11 +2877,16 @@ fn sig_config_runs_the_editor_in_the_terminal() {
         );
         term.wait(term.got.len(), Duration::from_millis(100), |_| false);
     }
-    // INSERT left as this tree's keymap leaves it on this page, then q.
+    // On sig://config INSERT gives Escape to the page; the example configuration's
+    // ctrl-escape leaves it.
     let since = term.got.len();
-    term.type_bytes(&kitty_keys("\x1b"));
+    term.type_bytes(b"\x1b[27;5u\x1b[27;5:3u");
     let left = term.wait(since, Duration::from_secs(10), insert_mode_left);
-    assert!(left, "Escape did not leave INSERT MODE\n{}", term.context());
+    assert!(
+        left,
+        "ctrl-escape did not leave INSERT MODE\n{}",
+        term.context()
+    );
     term.type_bytes(&kitty_keys("q"));
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();

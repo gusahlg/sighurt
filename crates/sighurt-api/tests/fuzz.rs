@@ -1,4 +1,4 @@
-//! Seeded random-input tests for the API's parsers: commands and keystrokes. They hold
+//! Seeded random-input tests for the API's parsers: commands, keystrokes and address patterns. They hold
 //! three things for any text: no panic, a return within the watchdog's limit, and a round
 //! trip (what parses formats to a string that parses to the same value).
 //! `SIG_FUZZ_ITERATIONS`, `SIG_FUZZ_SEED` and `SIG_FUZZ_CASE` are in `tools/fuzz/mod.rs`.
@@ -11,7 +11,7 @@ use std::time::Duration;
 use fuzz::{iterations, run, Rng};
 use sighurt_api::commands::{Command, CommandSet, SentKey, TabMove, MAX_FIND};
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, Modifiers};
-use sighurt_api::keymap::Chord;
+use sighurt_api::keymap::{Chord, UrlPattern};
 
 const LIMIT: Duration = Duration::from_secs(2);
 
@@ -306,6 +306,84 @@ fn fuzz_chords_parse_and_round_trip() {
         };
         let _ = chord.matches(&event);
         let _ = chord.types();
+    });
+}
+
+const URL_WORDS: &[&str] = &[
+    "sig",
+    "https",
+    "http",
+    "SIG",
+    "file",
+    "x-y.z+1",
+    "1x",
+    "://",
+    ":",
+    "//",
+    "/",
+    "*.",
+    "*",
+    "terminal",
+    "Terminal",
+    "config",
+    "example.com",
+    "a.example.com",
+    "EXAMPLE.org",
+    "[::1]",
+    "[",
+    "]",
+    "@",
+    "user@",
+    ":8080",
+    "?",
+    "#",
+    "/docs",
+    "/docs/",
+    "/x/y",
+    "-x",
+    ".",
+    "..",
+    "%20",
+    "ä",
+    "xn--bcher-kva.de",
+    " ",
+    "\t",
+    "",
+];
+
+/// Address patterns parse or say why, print in a form that parses to the same pattern, match
+/// their own text (a wildcard's hosts under it), and match any address without a panic.
+#[test]
+fn fuzz_url_patterns_parse_and_match() {
+    run("fuzz_url_patterns", iterations(100) * 3, LIMIT, |case| {
+        let rng = &mut case.rng;
+        let mut text = rng.string_from(URL_WORDS, 8);
+        if rng.one_in(3) {
+            text = rng.mutate(&text);
+        }
+        let address = match rng.below(3) {
+            0 => rng.string_from(URL_WORDS, 10),
+            1 => rng.mutate(&text),
+            _ => rng.string(30),
+        };
+        case.note(|| format!("{text:?} against {address:?}"));
+        let _ = address.parse::<UrlPattern>();
+        let Ok(pattern) = text.parse::<UrlPattern>() else {
+            return;
+        };
+        let shown = pattern.to_string();
+        assert_eq!(
+            shown.parse::<UrlPattern>().as_ref(),
+            Ok(&pattern),
+            "round trip"
+        );
+        let own = shown.replacen("://*.", "://w.", 1);
+        assert!(pattern.matches(&own), "{pattern} does not match {own:?}");
+        let _ = pattern.matches(&address);
+        assert_eq!(
+            UrlPattern::most_specific([(&pattern, ())], &address).is_some(),
+            pattern.matches(&address)
+        );
     });
 }
 

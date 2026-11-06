@@ -407,7 +407,7 @@ In the terminal frontend the page needs graphics, like every `sig://` page.
 | `[input] keymap` | the keymap: `example` (the example configuration's keys, in both frontends), `bindings` (reads `[keys]`), or one compiled in | `"example"` |
 | `[input] scroll-speed` | how far a wheel notch or a swipe scrolls a page, 0.1 to 10 | `1.0` |
 | `[input.buttons]` | `back`, `forward`: the mouse's side buttons, a command or `""` | `page.back`, `page.forward` |
-| `[keys]`, `[keys.page]`, `[keys.location]` | the `bindings` keymap: everywhere, while the page has the keyboard, while the address line has it | none |
+| `[keys]`, `[keys.page]`, `[keys.location]`, `[keys.url."<address>"]` | the `bindings` keymap: everywhere, while the page has the keyboard, while the address line has it, while the page has it on those addresses | none |
 | `[keymap.<name>]` | another keymap's own table | — |
 | `[ui] chrome` | the chrome that draws the window (at the next start) | `"standard"` |
 | `[ui] renderer` | what renders the chrome (at the next start): `"auto"`, `"cpu"`, `"wgpu"` (the GPU through Vulkan; a surface it can't present on, or a GPU that fails, gives the chrome back to the CPU) or `"vulkan"` (Vulkan directly, in a `sig` built with `render-vulkan`); one this build lacks gives a notice and `"auto"` is used, which is the CPU until wgpu is measured at least as good | `"auto"` |
@@ -568,6 +568,11 @@ and the separation is clean:
 - **INSERT** (`Escape`, which shows `INSERT MODE`) is where the page gets the keyboard: every key,
   paste and input method text goes to the page, and no binding listens, `ctrl-o`, `alt-1`… and
   `f11` included. Only `Escape` is the browser's: it returns to NORMAL.
+- **On the pages that run a program in a terminal**, `sig://terminal` (and `sig://terminal/…`)
+  and `sig://config`, INSERT gives `Escape` to the program too, and `ctrl-escape` or `f12`
+  returns to NORMAL. In a terminal with legacy keys, tmux among them by default, `ctrl-escape`
+  arrives as a plain `Escape` and goes to the program: use `f12` there. These are bindings of the
+  example configuration for those addresses (`SITES` in its `table.rs`), not of the browser.
 
 The mouse is not typing: clicks reach the page in both modes and leave the mode as it is. While
 the address line or the find field has the keyboard, typing goes there in either mode, and only
@@ -597,6 +602,7 @@ the keys marked "from the address line too" run their commands.
 | `Enter` | `page.send-key enter`: follow the focused link (not while a text field is focused) |
 | `+`, `-`, `=` | `page.zoom-in`, `page.zoom-out`, `page.zoom-reset` |
 | `Escape` | `page.exit-fullscreen` while the page shown has an element in fullscreen (the mode stays); otherwise INSERT mode: every key but `Escape`, and pastes and input method text, go to the page, and the chrome shows `INSERT MODE`; `Escape` again returns to NORMAL |
+| on `sig://terminal` and `sig://config`, in INSERT: `ctrl-escape`, `f12` | NORMAL mode (`Escape` goes to the program there) |
 | `y y` | copy the address of the tab shown (`clipboard.copy`) |
 | `y f` | copy the link the pointer is over |
 | `c o` | close every tab but the one shown |
@@ -621,7 +627,19 @@ without any keys. With the `bindings` keymap:
 
 [keys.location]               # while the address line has it
 "alt-enter" = "page.open https://example.com"
+
+[keys.url."https://*.example.com"]  # while the page has it, on these addresses
+"ctrl-r" = "page.reload"
 ```
+
+`[keys.url."<address>"]` binds keys for some addresses, over `[keys.page]` and `[keys]`, while
+the page has the keyboard. The address is `scheme://host` and an optional path: it matches the
+tab's address (the one it shows, not one loading) when the scheme and the host are the same, case
+aside, and the path starts with the given one at a `/`, so `"sig://terminal"` is also
+`sig://terminal/config` and never `sig://terminal-x`. `*.example.com` is the hosts under
+example.com, not example.com itself. Of the tables that match, only the most specific applies: an
+exact host before a `*.`, a longer `*.` before a shorter one, then the longer path. At most 64
+tables; `[tui.keys.url."<address>"]` is the terminal's, over all of `[keys]`.
 
 A keystroke is modifiers (`ctrl`, `alt`, `shift`, `super`, `altgr`) and a key, joined by `-`. The
 key is a character as your layout types it (`"ctrl-+"`, `"ctrl-å"`), a key name (`enter`,
@@ -632,8 +650,8 @@ running its command. A key the browser takes never reaches the page, release inc
 
 `[keys]` while `example` is selected gets a notice, and so does `[keymap.example]` with any key in
 it: the example takes no settings. To change the keys, copy
-[`sighurt-config-example`](extensions/sighurt-config-example/) (its bindings are one table in
-`table.rs`) and put your copy in `KEYMAPS`, as below.
+[`sighurt-config-example`](extensions/sighurt-config-example/) (its bindings are tables in
+`table.rs`: one per mode, and in `SITES` those for some addresses) and put your copy in `KEYMAPS`, as below.
 
 ### Find in page
 
@@ -708,9 +726,10 @@ is off until you turn it on in `config.toml`:
 enabled = true
 ```
 
-The page starts nothing by itself: it says what will run, and Enter starts it. Keys reach the
-program in the keymap's INSERT mode; `sig://help/keys` lists the keys that enter and leave it on
-these pages. Pastes reach the program with
+The page starts nothing by itself: it says what will run, and Enter starts it. With the example
+keymap, keys reach the program in INSERT mode, which Escape enters; on these pages Escape then goes
+to the program (nvim needs it), and `ctrl-escape` or `f12` leaves INSERT ([Keys](#keys): `f12`
+where the terminal sends `ctrl-escape` as `Escape`). Pastes reach the program with
 control characters removed, bracketed when the program asks. When the program ends, the page says
 how, and Enter starts it again. Closing the tab, navigating away, reloading or quitting ends the
 program (SIGHUP, then SIGKILL after 2 seconds); jobs your shell put in the background in groups

@@ -57,7 +57,8 @@
 #               (the pixels of the first rows); stty size is the grid that fits the page, and
 #               follows a resize of the output; exit ends it, Enter starts it again; 20 s of
 #               `yes` keep sig's memory bounded, another tab responsive and the view alive, and
-#               Ctrl+C gets the shell back; nvim (if on PATH) follows a resize (its &columns and
+#               Ctrl+C gets the shell back; Escape in INSERT goes to the program, and the
+#               example configuration's ctrl-escape and f12 for this page leave INSERT; nvim (if on PATH) follows a resize (its &columns and
 #               &lines) and writes a file with i, Escape and :wq; closing the tab, navigating
 #               away, reloading, quitting and SIGTERM each leave no program and no zombie, and
 #               20 open-and-close cycles no descriptor in sig; with the setting off, Enter starts
@@ -68,7 +69,7 @@
 #               linked file is written where the link leads and read again (the new tab colour);
 #               an invalid edit keeps the configuration, with the notice and the problem on the
 #               page; with [pages.config] enabled = false or no editor found, the page says so
-#               and nothing starts; nvim, if on PATH, writes the file with :normal and :wq
+#               and nothing starts; nvim, if on PATH, writes the file with o, Escape and :wq
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
 #               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
@@ -1166,7 +1167,9 @@ n = sum(1 for i in range(0, len(px) - 2, 3) if all(abs(px[i + k] - want[k]) < 30
 print(0 if n > int(sys.argv[3]) else 1, f'{n} pixels of #{sys.argv[2]}')
 PY
   }
-  edit_in_page() { key -k Escape; key -k Return; sleep 2; key -k Escape; }
+  # edit_in_page: Escape (INSERT), Enter (the editor runs, here at once), ctrl-escape (leaves
+  # INSERT on this page, where Escape is the editor's).
+  edit_in_page() { key -k Escape; key -k Return; sleep 2; key -M ctrl -k Escape -m ctrl; }
 
   # A plain file.
   printf '%s\n' "$base" > "$out/config/sighurt/config.toml"
@@ -1244,7 +1247,7 @@ PY
   key q
   wait "$sig_pid"
 
-  # A real editor, driven with : commands only (Escape leaves INSERT on this page here).
+  # A real editor: insert, Escape (the editor's on this page) and :wq.
   if command -v nvim >/dev/null; then
     env -u VISUAL HOME="$home" EDITOR="nvim -u NONE -i NONE" PAGETERM_MARK="$out" \
       "${sig_args[@]}" sig://config >> "$out/sig.log" 2>&1 &
@@ -1254,14 +1257,15 @@ PY
     key -k Escape; key -k Return
     sleep 2.5
     shot 07-nvim 0.5
-    wtype ':normal Go# written by nvim'; key -k Return
+    key G; key o; wtype '# written by nvim'; sleep 0.3
+    key -k Escape
     wtype ':wq'; key -k Return
     sleep 2
-    check "nvim: :normal and :wq write the file" \
+    check "nvim: o, Escape and :wq write the file" \
       "$(grep -q '^# written by nvim$' "$out/dotfiles/sig.toml"; echo $?)" "$(tail -1 "$out/dotfiles/sig.toml")"
     check "and it is read again when nvim ends" "$(reloaded "$reloads"; echo $?)" \
       "$(diag "c['config_reloads']") reloads, $reloads before"
-    key -k Escape
+    key -M ctrl -k Escape -m ctrl
     key q
     wait "$sig_pid"
   else
@@ -1321,7 +1325,7 @@ PY
   }
   enter() { key -k Return; }
   type_line() { wtype "$1"; sleep 0.2; enter; }
-  normal() { wtype -M ctrl '\' -m ctrl; wtype -M ctrl n -m ctrl; sleep 0.3; } # ctrl-\ ctrl-n
+  normal() { wtype -M ctrl -k Escape -m ctrl; sleep 0.3; } # ctrl-escape: INSERT to NORMAL on this page
   command_line() { key ':'; wtype "$1"; sleep 0.2; enter; sleep 1.5; }
   view() { diag "[(x['width'], x['height']) for x in t if x['role']=='view' and x['shown']][0]"; }
   rss() { awk '/VmRSS/ {print $2}' "/proc/$sig_pid/status"; }
@@ -1389,6 +1393,7 @@ PY
   type_line 'yes'
   sleep 5
   normal
+  check "ctrl-escape leaves INSERT" "$(diag "0 if d['keymap_indicator'] is None else 1")" "$(diag "d['keymap_indicator']")"
   command_line 'tab.new demo://pattern'
   check "another tab is responsive during an output flood" "$(shows_tab 2)" "$(tabs_now)"
   # K (tab.previous), with the Shift a keyboard sends: wtype's own `K` has none.
@@ -1437,7 +1442,12 @@ PY
     echo "SKIP $scenario: nvim is not on PATH"
   fi
 
-  normal
+  # Escape in INSERT is the program's on this page, and f12 leaves INSERT too.
+  key -k Escape
+  check "Escape in INSERT goes to the program: the mode stays" \
+    "$(diag "0 if d['keymap_indicator']=='INSERT MODE' else 1")" "$(diag "d['keymap_indicator']")"
+  key -k F12
+  check "f12 leaves INSERT" "$(diag "0 if d['keymap_indicator'] is None else 1")" "$(diag "d['keymap_indicator']")"
   key x
   check "closing the tab ends the shell, reaped" "$(until_programs '0 0'; echo $?)" "programs $(programs)"
   # 20 cycles of opening the page, starting the shell and closing the tab: sig's descriptors

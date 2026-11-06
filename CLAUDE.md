@@ -242,7 +242,9 @@ tools/cargo test -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-defau
 SIG_WHAT="servo build" tools/cargo clippy -p sighurt-engine-servo -p sighurt-engine-wpe -p sighurt-browser -p m0-coexist -p m1-mixed -p wpe-coexist -p tui-servo -p wpe-cpu --all-targets -- -D warnings
 SIG_WHAT="servo build" tools/cargo clippy -p sighurt-browser -p sighurt-runtime -p sighurt-gui --all-features --all-targets -- -D warnings
 SIG_WHAT="servo build" tools/cargo test -p sighurt-engine-servo -p sighurt-engine-wpe --lib
-SIG_WHAT="servo build" tools/cargo test -p sighurt-browser -p sighurt-runtime -p sighurt-gui --all-features
+# -j 3: the test binaries of an --all-features sig each link every engine, and more links at
+# once than that pass tools/cargo's 9 G cap (the linker is killed)
+SIG_WHAT="servo build" tools/cargo test -p sighurt-browser -p sighurt-runtime -p sighurt-gui --all-features -j 3
 ```
 
 `--workspace` alone, `sighurt-browser` with its default features, `m0-coexist`, `m1-mixed`, `wpe-coexist`, `tui-servo` and `wpe-cpu` compile Servo; `sighurt-engine-wpe`, `wpe-coexist`, `wpe-cpu` and `sig`'s default features need the WPE WebKit prefix. `sighurt-engine-netsurf` compiles NetSurf's C core and needs the nix-shell (`SIGHURT_NETSURF_SRC` and the rest); CI excludes it, and so do the workspace commands above. `sighurt-engine-cef` and `sighurt-engine-ladybird` compile without their prefixes (a missing prefix is a `cargo::warning`, and the runtime refuses to start). Dependencies are built at `opt-level = 3` without debug info even in dev builds (Servo is unusable unoptimized); the Servo artifacts in `target/` were built with the same dependency settings, so keep them.
