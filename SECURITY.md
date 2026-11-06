@@ -81,14 +81,14 @@ Engines report what pages do as events, and the browser core decides. Everything
 - Password fields go to the input method marked sensitive and hidden, without their text.
 - The diagnostics and the logs hold no clipboard contents, credentials or page data.
 
-### `sig://terminal` is a shell with your full rights
+### `sig://terminal` and `sig://config` run programs with your full rights
 
-`sig://terminal` runs a program as you: your shell, or your editor on `sig`'s configuration (`sig://terminal/config`). The program has your full rights, as in any terminal: your files, your credentials, your agent sockets, your shell's startup files. Sighurt's Wasm sandbox contains the page's terminal emulator, the code that reads what the program prints; it does not contain the program. The page is off unless the configuration turns it on (`[pages.terminal] enabled = true`).
+`sig://terminal` runs your shell, and `sig://config` runs your editor on `sig`'s configuration file. Each program runs as you, with your full rights, as in any terminal: your files, your credentials, your agent sockets, your shell's startup files; an editor can run shell commands too. Sighurt's Wasm sandbox contains the pages' terminal emulator, the code that reads what the program prints; it does not contain the program. `sig://terminal` is off unless the configuration turns it on (`[pages.terminal] enabled = true`). **`sig://config` is on by default**, so that the configuration can be edited from the browser before it is ever written; `[pages.config] enabled = false` turns it off.
 
-- **What runs is the browser's choice.** The page chooses only between the shell and the editor. `sig` builds the command (`[pages.terminal] command`, else `$SHELL`, else `/bin/sh`; `$VISUAL`, else `$EDITOR`, else `vi`, with the configuration file as an argument of its own, never through a shell), its environment and its directory. A program starts only after Enter in the page itself while its tab is shown. Web pages and Wasm apps can't open the page or reach a terminal.
+- **What runs is the browser's choice, and each page has one program.** `sig://terminal` may start only the shell and `sig://config` only the editor; the core checks it from its own record of the page. `sig` builds the command (`[pages.terminal] command`, else `$SHELL`, else `/bin/sh`; `[pages.config] editor`, else `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `vim`, `vi` and `nano` on `PATH`, with the configuration file as an argument of its own; never through a shell), its environment and its directory. A program starts only after Enter in the page itself while its tab is shown and the window has the keyboard. Web pages and Wasm apps can't open these pages or reach a terminal.
 - **The program gets the terminal and nothing else of `sig`'s**: the terminal on descriptors 0 to 2 (every other descriptor of `sig`'s is close-on-exec), default signal handling, an empty signal mask and a session of its own. Its environment drops `sig`'s own variables and those describing the terminal `sig` runs in; that is hygiene, not isolation.
 - **The emulator reflects nothing.** It answers only queries with fixed answers (device attributes, status, cursor position) and never sends back what the program sent (no title report, no clipboard access). A paste has ESC and the other control characters removed (tabs and line breaks stay), so it can't type keys or end a bracketed paste early.
-- **Ending it.** Closing the tab, navigating away, reloading and quitting send SIGHUP to the program's process group and SIGKILL after 2 seconds, and `sig` reaps the program: no child of `sig` is left. Jobs the shell put in process groups of their own, programs that ignore SIGHUP after `disown`, and detached sessions get the terminal's hang-up and may survive it, as in any terminal. At most eight terminals run at once.
+- **Ending it.** Closing the tab, navigating away, reloading, turning the page's setting off and quitting send SIGHUP to the program's process group and SIGKILL after 2 seconds, and `sig` reaps the program: no child of `sig` is left. Jobs the shell put in process groups of their own, programs that ignore SIGHUP after `disown`, and detached sessions get the terminal's hang-up and may survive it, as in any terminal. At most eight programs run at once, shells and editors together.
 - **A flood waits.** The program's output is held in a queue of 1 MiB; a program that writes faster than the page reads waits in its `write`.
 
 ### WASM engine
@@ -119,15 +119,15 @@ web page gets, so what they get is held at several layers:
 - **The privileged import module `sig`** is linked only into an internal page's document, never a
   worker's or a module it loads, and every function checks that page's grants again. The core
   then decides each request from its own record: help may ask for facts about the build and the
-  configuration (never the configuration's text); config may read, check and replace the
-  configuration file; terminal may start a terminal. Writing the configuration and starting a
-  terminal also need the page in front, with the keyboard, in a window that has it, and a click
-  or key press in it.
+  configuration (never the configuration's text); config may start the editor and ask which it
+  is; terminal may start the shell. Starting a program also needs the page in front, with the
+  keyboard, in a window that has it, and a click or key press in it.
 - **No network, no code loading.** An internal page has a deny-all network policy, and fails to
   load if it imports the network, workers, module loading, files or devices.
 - **Typing goes where you meant it.** After a tab comes to the front without your command (a page
   that closed its tab), its page gets no keys, text or paste until you click it or run a command.
 
-`sig://terminal` is off unless `[pages.terminal] enabled = true`. It is a shell with all your
-rights: the Wasm sandbox contains the terminal emulator that draws it, not the shell or what you
-run in it, and the shell's environment is hygiene, not isolation.
+`sig://terminal` is off unless `[pages.terminal] enabled = true`; `sig://config` is on unless
+`[pages.config] enabled = false`. They run your shell and your editor with all your rights: the
+Wasm sandbox contains the terminal emulator that draws them, not the programs or what you run in
+them, and the programs' environment is hygiene, not isolation.
