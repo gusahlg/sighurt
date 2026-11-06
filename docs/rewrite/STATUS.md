@@ -4435,7 +4435,8 @@ Newest last. Each entry says what was decided and why.
     `sig_pages_need_graphics_and_say_so`; in the terminal the pages need graphics (they are
     drawn and have no text mode).
 
-137. **`sig://config`: the configuration read and edited in the browser** (5 November 2026,
+137. **`sig://config`: the configuration read and edited in the browser** (superseded by
+    decision 142 the next day: the editor page is gone; 5 November 2026,
     branch `pagecfg`, merged 0d040bf; the user: "it would genuinely be pretty cool if you
     could go and see and edit your configuration inside of the browser"). A plain text editor
     as a Wasm guest (`pages/sig-page-config`): grapheme-aware caret and selection, undo and
@@ -4582,4 +4583,41 @@ Newest last. Each entry says what was decided and why.
     tests at 80x22, 40x8 and 20x3, tui.rs (home in kitty, sixel and no-graphics modes; a
     picture tab, a home tab and back in kitty and sixel; a click and Tab then Enter on a
     link), headless.sh `home`. *Not there*: find in page and `--dump` do not cover home.
+
+142. **`sig://config` runs the user's editor; the configuration editor is gone** (6 November
+    2026, branch `pageterm`, merged 9d010dd; supersedes 137; the user, after trying
+    sig://terminal: "it would make more sense if sig://config was simply running an editor
+    like nvim, vim or nano (whatever the default is set as on the computer) on the actual
+    configuration through the terminal. It seems like it is a bad idea to reinvent a code
+    editor so this solution would be cleaner"). `sig://config` is the terminal page's module
+    running `PtyProgram::EditConfig` on the configuration file: one blob, two pages in
+    `PAGES`. Each page's grant is its program (`PageGrant::Shell`, `PageGrant::Editor`, which
+    replace `Pty`); the core refuses the other page's program before any activation is used.
+    `[pages.config] enabled` is **on by default**, so the configuration can be edited before
+    it exists (the orchestrator's choice, put to the user: the editor can run shell commands,
+    so a program with the user's rights is reachable out of the box, but only by Enter in the
+    shown, focused page, which no web page can open); `editor` names the program (words, no
+    shell, the file as its own last argument); without it `$VISUAL`, `$EDITOR`, then the
+    first of nvim, vim, vi and nano on PATH, resolved before the fork; with none the page
+    says so. `[pages.terminal] enabled` still gates only the shell; each setting turned off
+    ends its own programs, and the eight at once count both. Everything else of 138 holds for
+    the editor. `PageInfo::Editor` (needs `Editor`) gives the start screen the command that
+    will run, the file, whether it is new, and the file's problems. A missing directory is
+    made 0700; the file is the editor's to make. When an editor ends, the frontends read the
+    file again through the watch's own path (`Session::take_config_edited`), a symlinked file
+    included; an invalid file keeps the configuration with the notice, and the page lists
+    the problems on its end screen. **The editor runs with all the user's rights; only the
+    emulator is sandboxed**: README, SECURITY.md, the default configuration and the page say
+    so. Removed (4 883 lines against 1 005 added): `pages/sig-page-config`,
+    `sighurt_runtime::page_config`, `persistence::replace_config`, `PageRequest::{ConfigRead,
+    ConfigCheck, ConfigWrite}`, the kit's config requests, and `sig://terminal/config`; the
+    `sig` ABI's request kinds 2–4 are reserved, never to be reused. *Verified*: core tests of
+    the split grant, the setting and the shared cap; runtime tests of the editor's
+    resolution, the private directory and the editor's end; headless.sh `config-page` (17
+    checks: a script as `$VISUAL` on a plain and a symlinked file, the reload, an alias and
+    the tab colour, an invalid edit, the setting off, no editor found, a real nvim);
+    tui.rs `sig_config_runs_the_editor_in_the_terminal`; faults.sh `terminal` (sig://config
+    in the 100 cycles and in the no-program-outlives-sig checks). *Known*: the editor is
+    resolved for the start screen and again at Enter, so a PATH changed in between runs
+    something else than shown; a GUI editor (`code --wait`) opens outside the page.
 
