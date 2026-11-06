@@ -3834,10 +3834,16 @@ fn a_sent_key_needs_the_page_to_have_the_keyboard() {
     let effects = b.key(press(36, "j", ALT));
     assert!(keys_sent(&effects, view).is_empty(), "{effects:?}");
     assert!(!effects.iter().any(|e| matches!(e, Effect::ChromeInput(_))));
-    // The page has the keyboard, but the tab shows a page of Sighurt's own.
+    // The page has the keyboard, but the tab shows the chrome's own page (sig://home): the
+    // chrome gets the key, as it gets the keys passed to that page, and no engine does.
     b.apply(command("tab.select 2"));
     assert_eq!(b.state.focus(), KeyboardFocus::Page);
-    assert_eq!(b.update(command("page.send-key down")), []);
+    let effects = b.update(command("page.send-key down"));
+    assert_eq!(effects.len(), 2, "{effects:?}");
+    assert!(
+        effects.iter().all(|e| matches!(e, Effect::ChromeInput(_))),
+        "{effects:?}"
+    );
     // Back to the web page: it reaches it.
     b.apply(command("tab.select 1"));
     assert_eq!(

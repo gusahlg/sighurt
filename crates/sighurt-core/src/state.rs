@@ -3081,19 +3081,31 @@ impl BrowserState {
     }
 
     /// Presses and releases `key` in the page, back to back so that no key stays held, if the
-    /// page has the keyboard; otherwise does nothing.
+    /// page has the keyboard; otherwise does nothing. A page the chrome draws (`sig://home`)
+    /// gets it as [`Effect::ChromeInput`], as it gets the keys passed to it.
     pub(crate) fn send_key(&mut self, key: &SentKey, fx: &mut Fx) {
-        let Some(view) = self.focused_view().filter(|_| !self.input_held()) else {
+        let view = self.focused_view().filter(|_| !self.input_held());
+        let chrome_page = self.focus == KeyboardFocus::Page
+            && self.shown_view().is_none()
+            && self
+                .tabs
+                .get(self.active)
+                .and_then(Tab::current)
+                .is_some_and(|segment| matches!(segment, Segment::Internal(_)));
+        if view.is_none() && !chrome_page {
             return;
-        };
+        }
         for state in [ButtonState::Pressed, ButtonState::Released] {
             let event = InputEvent {
                 seat: self.seat,
                 kind: InputKind::Key(key.event(state)),
             };
-            fx.push(Effect::Engine {
-                view,
-                command: EngineCommand::Input(event),
+            fx.push(match view {
+                Some(view) => Effect::Engine {
+                    view,
+                    command: EngineCommand::Input(event),
+                },
+                None => Effect::ChromeInput(event),
             });
         }
     }
