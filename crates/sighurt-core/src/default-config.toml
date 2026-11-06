@@ -307,7 +307,8 @@ forward = "page.forward"
 # page.send-key presses and releases a key in the page while the page has the keyboard, as if
 # you pressed it: down, up, left, right, pageup, pagedown, home, end, space, enter, escape,
 # tab, f1 to f24, or a W3C key name such as BrowserBack, with modifiers ("shift-space"). It
-# never types a character. chrome.<action> runs one of the commands of the chrome that draws
+# never types a character. On sig://home, which the chrome draws, the chrome gets it (in the
+# terminal, tab moves between home's links and enter follows one). chrome.<action> runs one of the commands of the chrome that draws
 # the window; the UI section says which the windowed chrome has, and the Terminal section
 # which the terminal's chrome has. In [tui.keys] the commands are the terminal's, in either
 # frontend.

@@ -78,5 +78,6 @@ pub use chrome::{ColorError, Colors, Damage, Model};
 pub use layout::{Layout, LayoutOptions};
 pub use sighurt_render::{FontSystemHandle, Fonts, PathBuilder, Pen, Rgba, ShapedText, TextStyle};
 pub use state::{
-    ChromeState, EngineRow, FindField, FindSnapshot, HomeInfo, Snapshot, TabContent, TabSnapshot,
+    ChromeState, EngineRow, FindField, FindSnapshot, HomeInfo, HomeKey, HomeLink, Snapshot,
+    TabContent, TabSnapshot,
 };

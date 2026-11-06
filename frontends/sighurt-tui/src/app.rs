@@ -137,6 +137,7 @@ use crate::chrome::{
     ChromeState, Cursor as CellCursor, LineEditor, PageArea, TabLine, MODE_GRAPHICS, MODE_TEXT,
 };
 use crate::grid::{Attrs, Color, Grid};
+use crate::home::HomePage;
 use crate::input::{
     cell_to_page_offset, cell_to_page_pixel, CellPixels, PageCells, PointerCapture, Release,
 };
@@ -202,8 +203,8 @@ const READING: &str = "Reading the page…";
 const WHEEL_LINES: isize = 3;
 /// The page rows' message when the page area has more pixels than an image may.
 const TOO_BIG: &str = "The page area is too big for an image";
-/// The page rows' message for a `sig:` address that names no page; the home page's rows are
-/// empty.
+/// The page rows' message for a `sig:` address that names no page. The home page's rows show
+/// home ([`crate::home`]).
 const NO_SUCH_PAGE: &str = "sig has no such page: sig://help lists its pages";
 
 /// Whether a `sig:` URL names the home page (`sig:home`, `SIG://Home/` and the like too).
@@ -368,6 +369,10 @@ struct Tui {
     mode_override: Option<bool>,
     /// Each view's page as text, and the field editor over it.
     text: TextPages,
+    /// `sig://home`, laid out for the page rows.
+    home: HomePage,
+    /// The page rows show home now: keys and clicks that reach the page are its.
+    home_drawn: bool,
     /// The views whose engines were asked for page content.
     semantic_on: HashSet<ViewId>,
     /// The view and button of a press in the page, until that button is released.
@@ -681,6 +686,8 @@ impl App {
             typing_told: None,
             mode_override: None,
             text: TextPages::new(size.cols, page_area(size).rows),
+            home: HomePage::new(),
+            home_drawn: false,
             semantic_on: HashSet::new(),
             capture: PointerCapture::default(),
             releases: Vec::new(),
@@ -1209,6 +1216,9 @@ impl App {
             });
             return Some(BrowserEvent::Button { view, event, at });
         }
+        if let Some(event) = self.home_mouse(&mouse) {
+            return event;
+        }
         if self.tui.text_mode {
             return self.text_mouse(&mouse, at);
         }
@@ -1511,7 +1521,10 @@ impl App {
         let due = self.tui.drop_due().is_none_or(|at| at <= Instant::now())
             && !self.awaiting_first_frame();
         if due {
-            for image in std::mem::take(&mut self.tui.held_deletes) {
+            let deletes = std::mem::take(&mut self.tui.held_deletes);
+            // What the page rows show instead (home) is drawn now that the image goes.
+            self.tui.chrome_dirty |= !deletes.is_empty();
+            for image in deletes {
                 out.extend(kitty::delete(image));
             }
             // The shown view's frame goes over a hidden view's sixel in this write if it can
@@ -1570,7 +1583,14 @@ impl App {
                     .put_text(column, row, &message, fg, bg, Attrs::default());
             }
         }
-        if message.is_some() || self.tui.text_mode {
+        // Home is drawn once a hidden view's picture may go (decision 133): until then the rows
+        // keep it, and the loop wakes to blank it and draw home.
+        let held = self.tui.holding() && self.tui.drop_due().is_some_and(|at| at > Instant::now());
+        self.tui.home_drawn = message.is_none() && !held && self.shows_home();
+        if self.tui.home_drawn {
+            self.draw_home(area);
+        }
+        if message.is_some() || self.tui.text_mode || self.tui.home_drawn {
             // The page rows hold text now, not the picture.
             self.tui.forget_sixel();
         }
@@ -1601,6 +1621,64 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// Whether the active tab shows `sig://home`, with no error to say instead.
+    fn shows_home(&self) -> bool {
+        let core = self.session.core();
+        core.tabs().nth(core.active()).is_some_and(|tab| {
+            tab.error.is_none() && matches!(tab.content, Content::Internal(url) if is_home(url))
+        })
+    }
+
+    /// Draws home into the page rows `area`, laid out again only when what it says or the rows'
+    /// size changed.
+    fn draw_home(&mut self, area: PageArea) {
+        let (cols, rows) = (area.cols, area.rows);
+        // Built anew only when something it says changed (`Session::home`).
+        self.session.home();
+        let generation = self.session.home_generation();
+        if !self.tui.home.is(generation, cols, rows) {
+            let home = self.session.home();
+            self.tui.home.lay_out(home, generation, cols, rows);
+        }
+        let area = Area {
+            col: 0,
+            row: area.row,
+            cols,
+            rows,
+        };
+        self.tui.home.draw(&mut self.tui.grid, area);
+    }
+
+    /// The mouse over the page rows while they show home: the wheel scrolls it and a left press
+    /// on a link opens its address. `None` when home is not shown or the mouse is elsewhere.
+    fn home_mouse(&mut self, mouse: &MouseEvent) -> Option<Option<BrowserEvent>> {
+        let page = self.tui.page;
+        let inside =
+            (page.row..page.row + page.rows).contains(&mouse.row) && mouse.column < page.cols;
+        if !self.tui.home_drawn || !inside {
+            return None;
+        }
+        if let Some(wheel) = mouse.wheel {
+            let lines = match wheel {
+                Wheel::Up => -WHEEL_LINES,
+                Wheel::Down => WHEEL_LINES,
+                Wheel::Left | Wheel::Right => 0,
+            };
+            self.tui.home.wheel(lines);
+            self.tui.chrome_dirty = true;
+            return Some(None);
+        }
+        let press = !mouse.motion
+            && mouse.state == ButtonState::Pressed
+            && mouse.button == Some(PointerButton::Left);
+        if !press {
+            return Some(None);
+        }
+        self.tui.chrome_dirty = true;
+        let url = self.tui.home.click(mouse.column, mouse.row - page.row);
+        Some(url.map(|url| BrowserEvent::Command(Command::PageOpen(url))))
     }
 
     /// What the page rows say instead of showing an image, if anything.
@@ -2064,6 +2142,10 @@ impl Tui {
         self.forget_sixel();
         self.grid.forget_cursor();
         self.grid.forget_pen();
+        // The rows are blank on the terminal now: what the grid holds there (home's text) is
+        // written again.
+        self.grid.blanked(self.page.row, self.page.rows);
+        self.chrome_dirty = true;
     }
 
     /// Whether the page rows are text: what `chrome.toggle-mode` chose, else `[tui] mode`, which
@@ -2677,6 +2759,13 @@ impl Frontend for Tui {
 
     fn chrome_input(&mut self, event: InputEvent, queue: &mut VecDeque<BrowserEvent>) {
         match event.kind {
+            // A key for the page while it shows home (passed, or `page.send-key`): home's, as
+            // text mode's keys are a page's.
+            InputKind::Key(key) if self.editing.is_none() && self.home_drawn => {
+                let (took, url) = self.home.key(&key);
+                self.chrome_dirty |= took;
+                queue.extend(url.map(|url| BrowserEvent::Command(Command::PageOpen(url))));
+            }
             InputKind::Key(key) => self.edit_key(&key, queue),
             InputKind::TextInput(TextInputEvent {
                 commit: Some(text), ..
@@ -3430,6 +3519,8 @@ mod tests {
             typing_told: None,
             mode_override: None,
             text: TextPages::new(size.cols, page_area(size).rows),
+            home: HomePage::new(),
+            home_drawn: false,
             semantic_on: HashSet::new(),
             capture: PointerCapture::default(),
             releases: Vec::new(),

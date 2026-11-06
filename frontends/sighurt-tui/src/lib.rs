@@ -4,7 +4,8 @@
 //!
 //! Owns: the terminal's owner loop and the [`sighurt_runtime::frontend::Frontend`] it gives the
 //! session ([`app`]), terminal I/O, capability detection, the cell grid and its writer, the
-//! terminal chrome, `sig --dump` (`dump`), the page's CPU target and its graphics encoding, key and
+//! terminal chrome, `sig://home` in the page rows ([`home`]), `sig --dump` (`dump`), the page's
+//! CPU target and its graphics encoding, key and
 //! mouse mapping, and
 //! binding the compiled-in engines to that target ([`engines`]). Must not own: browser policy
 //! (the core), which effect runs (the runtime), engine internals, or anything of Wayland or
@@ -15,6 +16,7 @@ pub mod chrome;
 mod dump;
 mod engines;
 pub mod grid;
+pub mod home;
 pub mod input;
 pub mod kitty;
 pub mod sanitize;

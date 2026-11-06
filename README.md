@@ -537,7 +537,17 @@ the terminal frontend, and the version, license and credits. `sig://help/keys`,
 `sig://help/terminal-frontend` and `sig://help/about` open a section. `?` and `F1` open it (the
 `help` command). `sig://config` shows the configuration file to read and edit, and
 `sig://terminal` is a terminal, off unless `[pages.terminal] enabled = true`: it runs your shell
-with all your rights. `sig://home` is the chrome's own start page.
+with all your rights.
+
+`sig://home`, the page of new tabs, is the chrome's own, in the window and in the terminal: no
+engine draws it, so it works without the wasm engine and in a terminal without graphics. It says
+what this build is (its version, the configuration file), links to the pages above that this
+build and configuration open (`sig://terminal` says when it is off and which setting turns it
+on), the keys of your keymap for the common commands (taken from the keymap, so they are always
+yours), the pages you visited last (while `[history] remember` is on) and the engines. A click
+on a link opens it in that tab; in the terminal Tab and Shift+Tab move between the links and
+Enter follows one, as in text mode, and the arrows scroll. When there is not room for all of it,
+the engines go first, then the recent pages, then the keys.
 
 These pages are Wasm programs built into `sig` and run by the wasm engine, so a build or a
 configuration without that engine doesn't open them, and in the terminal they need graphics (they

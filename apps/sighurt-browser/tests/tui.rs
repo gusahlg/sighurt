@@ -2877,3 +2877,198 @@ fn sig_config_is_edited_and_saved_in_the_terminal() {
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
 }
+
+/// The screen a terminal of `cols`×`rows` shows after `bytes`, as lines of text.
+fn screen(bytes: &[u8], cols: u16, rows: u16) -> Vec<String> {
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(bytes);
+    parser.screen().rows(0, cols).collect()
+}
+
+/// The 1-based column and row of the first `text` on `screen`.
+fn find_on(screen: &[String], text: &str) -> Option<(usize, usize)> {
+    screen.iter().enumerate().find_map(|(row, line)| {
+        line.find(text)
+            .map(|at| (line[..at].chars().count() + 1, row + 1))
+    })
+}
+
+/// A left click (press and release) at a 1-based cell, as SGR mouse reports.
+fn left_click(column: usize, row: usize) -> Vec<u8> {
+    format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m").into_bytes()
+}
+
+/// sig://home is the chrome's own page: its heading and sections are text in the page rows,
+/// with graphics and without, and an idle home builds nothing again.
+#[test]
+fn home_is_text_in_the_page_rows_with_graphics_and_without() {
+    for (name, replies) in [
+        ("home-kitty", KITTY_REPLIES),
+        ("home-sixel", SIXEL_REPLIES),
+        ("home-none", NO_GRAPHICS_REPLIES),
+    ] {
+        let mut term = Terminal::start_with(name, &["sig://home"], replies);
+        let shown = term.wait(0, Duration::from_secs(15), |got| {
+            let rows = screen(got, 80, 24);
+            find_on(&rows, "Sighurt ").is_some()
+                && find_on(&rows, "KEYS").is_some()
+                && find_on(&rows, "Address or search").is_some()
+        });
+        assert!(shown, "{name}: home is not shown\n{}", term.context());
+        let rows = screen(&term.got, 80, 24);
+        let (_, heading) = find_on(&rows, "Sighurt ").unwrap();
+        assert_eq!(
+            heading, 2,
+            "{name}: home starts on the first page row\n{rows:#?}"
+        );
+        if name == "home-kitty" {
+            eprintln!("sig --tui sig://home at 80x24:\n{}", rows.join("\n"));
+        }
+        // Idle: nothing is built or drawn again.
+        term.wait(term.got.len(), Duration::from_millis(800), |_| false);
+        let idle = term.got.len();
+        term.wait(idle, Duration::from_millis(800), |_| false);
+        assert_eq!(term.got.len(), idle, "{name}: an idle home writes");
+        term.type_bytes(b"q");
+        assert!(term.exit().success(), "{}", term.context());
+        assert!(
+            term.counter("home_builds") <= 2,
+            "{name}: home was built again"
+        );
+    }
+}
+
+/// A new tab opened over a picture shows home: the picture goes (kitty deletes it, a sixel is
+/// blanked) before home's text is written, and going back shows the picture again.
+#[test]
+fn a_new_tab_over_a_picture_shows_home_and_the_picture_comes_back() {
+    // Kitty: `t` opens the new tab (the example configuration), J goes back to the first.
+    let mut term = Terminal::start_with("home-over-kitty", &["demo://pattern"], KITTY_REPLIES);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    term.wait(term.got.len(), Duration::from_millis(300), |_| false);
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("t"));
+    let home = term.wait(since, Duration::from_secs(10), |got| shows(got, "Sighurt"));
+    assert!(home, "the new tab does not show home\n{}", term.context());
+    let after = &term.got[since..];
+    let delete = after.windows(7).position(|w| w == b"\x1b_Ga=d,");
+    let text = after
+        .windows(b"Sighurt".len())
+        .position(|w| w == b"Sighurt");
+    assert!(
+        delete.is_some_and(|delete| text.is_some_and(|text| delete < text)),
+        "the picture was not deleted before home's text ({delete:?}, {text:?})\n{}",
+        term.context()
+    );
+    // Escape leaves the address line tab.new opened; K is tab.previous.
+    term.type_bytes(&kitty_keys("\x1b"));
+    term.wait(term.got.len(), Duration::from_millis(300), |_| false);
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("K"));
+    let back = term.wait(since, Duration::from_secs(10), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(back, "the picture did not come back\n{}", term.context());
+    term.type_bytes(&kitty_keys("q"));
+    assert!(term.exit().success(), "{}", term.context());
+
+    // Sixel: F3 opens a tab, F2 cycles them.
+    let keys = format!("{SIXEL_KEYS}\n\"f3\" = \"tab.new\"");
+    let mut term = Terminal::start_in("home-over-sixel", &["demo://pattern"], SIXEL_REPLIES, &keys);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        !sixel_spans(got).is_empty()
+    });
+    assert!(shown, "no sixel\n{}", term.context());
+    let blank = blank_row(80);
+    for round in 0..2 {
+        term.wait(term.got.len(), Duration::from_millis(400), |_| false);
+        let since = term.got.len();
+        term.type_bytes(if round == 0 { b"\x1bOR" } else { F2 });
+        let home = term.wait(since, Duration::from_secs(10), |got| shows(got, "Sighurt"));
+        assert!(home, "round {round}: no home\n{}", term.context());
+        let after = &term.got[since..];
+        let blanked = after
+            .windows(blank.len())
+            .position(|w| w == blank.as_slice());
+        let text = after
+            .windows(b"Sighurt".len())
+            .position(|w| w == b"Sighurt");
+        assert!(
+            blanked.is_some_and(|blanked| text.is_some_and(|text| blanked < text)),
+            "round {round}: the sixel was not blanked before home's text\n{}",
+            term.context()
+        );
+        assert!(
+            sixel_spans(after).is_empty(),
+            "round {round}: a sixel over home\n{}",
+            term.context()
+        );
+        if round == 0 {
+            // The address line tab.new opened is closed by Escape (the line's own key).
+            term.type_bytes(b"\x1b");
+            term.wait(term.got.len(), Duration::from_millis(300), |_| false);
+        }
+        term.wait(term.got.len(), Duration::from_millis(400), |_| false);
+        let since = term.got.len();
+        term.type_bytes(F2);
+        let back = term.wait(since, Duration::from_secs(10), |got| {
+            !sixel_spans(got).is_empty()
+        });
+        assert!(
+            back,
+            "round {round}: the sixel did not come back\n{}",
+            term.context()
+        );
+    }
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// Home's links: a left click on one, and Tab then Enter (the example configuration sends them
+/// to the page with `page.send-key`), open sig://help in the tab. Needs the Wasm engine: run
+/// with `--features frontend-tui,engine-demo,engine-wasm`.
+#[cfg(feature = "engine-wasm")]
+#[test]
+fn home_links_open_by_click_and_by_tab_and_enter() {
+    let mut term = Terminal::start_with("home-click", &["sig://home"], KITTY_REPLIES);
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        find_on(&screen(got, 80, 24), "Help[1]").is_some()
+    });
+    assert!(shown, "no Help link on home\n{}", term.context());
+    let (column, row) = find_on(&screen(&term.got, 80, 24), "Help[1]").unwrap();
+    let since = term.got.len();
+    term.type_bytes(&left_click(column + 1, row));
+    let opened = term.wait(since, Duration::from_secs(20), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(
+        opened,
+        "the click did not open sig://help\n{}",
+        term.context()
+    );
+    assert_eq!(term.tabs(), (1, 1), "{}", term.context());
+    term.type_bytes(&kitty_keys("q"));
+    assert!(term.exit().success(), "{}", term.context());
+
+    let mut term = Terminal::start_with("home-keys", &["sig://home"], NO_GRAPHICS_REPLIES);
+    let shown = term.wait(0, Duration::from_secs(15), |got| shows(got, "Help[1]"));
+    assert!(shown, "no Help link on home\n{}", term.context());
+    let since = term.got.len();
+    // Tab and Enter as a legacy terminal sends them.
+    term.type_bytes(b"\t");
+    term.wait(since, Duration::from_millis(500), |_| false);
+    term.type_bytes(b"\r");
+    let opened = term.wait(since, Duration::from_secs(20), |got| {
+        shows(got, "need graphics")
+    });
+    assert!(
+        opened,
+        "Tab and Enter did not open sig://help\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}

@@ -6,7 +6,9 @@
 //! bookkeeping, services, notices queued back as events, session writes (and a failed one,
 //! as a notice), and the history of visited pages ([`crate::history`]: visits recorded,
 //! forgets answered, `[history] remember` followed after every update, saves when due, and
-//! [`Session::complete`] for the address line). A search ([`Effect::Find`]) is offered to the
+//! [`Session::complete`] for the address line), and what `sig://home` says ([`Session::home`],
+//! built again only when the configuration, the history or an engine's failure changed it).
+//! A search ([`Effect::Find`]) is offered to the
 //! frontend, then to the view's engine if it can find in page, else answered as one nobody can
 //! carry out. What is, is asked of
 //! the [`Frontend`](crate::frontend::Frontend) before the next effect runs. A view's target
@@ -49,6 +51,7 @@ use sighurt_core::{BrowserEvent, BrowserState, Effect, Environment};
 use crate::diagnostics::{Diagnostics, EngineReport};
 use crate::frontend::Frontend;
 use crate::history::{self, History, Ownership};
+use crate::home::{self, EngineFact, Home};
 use crate::persistence::{self, Paths, SessionWriter};
 use crate::pty::{self, Ptys};
 use crate::registry::{Registry, State};
@@ -112,6 +115,11 @@ pub struct Session<F: Frontend> {
     session_due: Option<Instant>,
     /// The visited pages. `None` once shutdown has written them.
     history: Option<History>,
+    /// What `sig://home` said last, and what it was built from. `None` until it is asked for,
+    /// and after a configuration was reloaded.
+    home: Option<(HomeInputs, Home)>,
+    /// How many times `home` was built: [`Session::home_generation`].
+    home_generation: u64,
     /// What configurations are checked against. Kept for reloads.
     env: Environment,
     /// Set when the loop must end, with the exit code.
@@ -172,6 +180,8 @@ impl<F: Frontend> Session<F> {
             session,
             session_due: None,
             history: Some(history),
+            home: None,
+            home_generation: 0,
             env,
             quit: None,
             shutdown_bound: None,
@@ -274,6 +284,46 @@ impl<F: Frontend> Session<F> {
         self.history.as_ref().map_or(0, History::generation)
     }
 
+    /// What `sig://home` says ([`crate::home`]). Built when first asked for, and again only
+    /// when what it was built from changed: the configuration was reloaded, the history's
+    /// visits changed, or an engine failed. Otherwise the one built last.
+    pub fn home(&mut self) -> &Home {
+        let inputs = HomeInputs {
+            history: self.history.as_ref().map(History::revision),
+            failed: self
+                .registry
+                .engines()
+                .enumerate()
+                .filter(|(_, engine)| matches!(engine.state(), State::Failed(_)))
+                .fold(0, |failed, (index, _)| failed | (1u64 << (index % 64))),
+        };
+        if self.home.as_ref().is_none_or(|(built, _)| *built != inputs) {
+            self.diag.counters.home_builds += 1;
+            self.home_generation += 1;
+            let engines = self.registry.engines().map(|engine| EngineFact {
+                name: engine.name,
+                renderer: engine.renderer,
+                failed: match engine.state() {
+                    State::Failed(why) => Some(why.as_str()),
+                    _ => None,
+                },
+            });
+            let recent = self
+                .history
+                .as_ref()
+                .map_or_else(Vec::new, |history| history.recent(home::MAX_RECENT));
+            let built = home::build(&self.core, self.paths.config.as_deref(), engines, recent);
+            self.home = Some((inputs, built));
+        }
+        &self.home.as_ref().expect("built").1
+    }
+
+    /// Changes each time [`Session::home`] builds anew, so a frontend that keeps a copy of
+    /// what it said (contained, laid out) knows when it is stale.
+    pub fn home_generation(&self) -> u64 {
+        self.home_generation
+    }
+
     /// When something should be written: the changed session or history. `None` when nothing
     /// is waiting.
     pub fn writes_due(&self) -> Option<Instant> {
@@ -303,6 +353,10 @@ impl<F: Frontend> Session<F> {
                 BrowserEvent::Keyboard { at, .. } => Some(*at),
                 _ => None,
             };
+            // Home says what the configuration does: built again when next asked for.
+            if matches!(event, BrowserEvent::ConfigReloaded(Ok(_))) {
+                self.home = None;
+            }
             let effects = sighurt_core::update(&mut self.core, event);
             self.diag.counters.effects += effects.len() as u64;
             if let Some(history) = self.history.as_mut() {
@@ -1110,6 +1164,14 @@ fn stall_shutdown_for_tests() {
 }
 
 /// Set while a shutdown bound is in force. Dropping it disarms the thread: shutdown returned.
+/// What [`Session::home`] was built from, besides the configuration: the history's revision
+/// and which engines had failed, one bit each in the registry's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HomeInputs {
+    history: Option<u64>,
+    failed: u64,
+}
+
 struct ShutdownBound {
     done: Arc<AtomicBool>,
 }
@@ -1797,6 +1859,48 @@ mod tests {
         );
         let saved = std::fs::read_to_string(dir.path().join("history.toml")).unwrap();
         assert!(!saved.contains("example.com"), "{saved}");
+        session.shutdown(&mut frontend, |_, _| {});
+    }
+
+    #[test]
+    fn home_is_built_once_and_again_only_when_its_inputs_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut frontend = Recording::default();
+        let mut session = idle_session(dir.path(), "", &[]);
+        session.run_core(&mut frontend);
+        session.history.as_mut().unwrap().settle();
+        assert!(session.home().recent.is_empty());
+        assert_eq!(session.home().engines[0].name, "idle");
+        for _ in 0..100 {
+            session.home();
+        }
+        assert_eq!(session.diag.counters.home_builds, 1, "nothing changed");
+        // A visit is in the next one.
+        session.queue_mut().push_back(BrowserEvent::Command(
+            "page.open https://a.example/".parse::<Command>().unwrap(),
+        ));
+        session.run_core(&mut frontend);
+        session.pump(&mut frontend);
+        assert_eq!(session.diag.counters.visits_recorded, 1);
+        let recent = session.home().recent.clone();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].url, "https://a.example/");
+        session.home();
+        assert_eq!(session.diag.counters.home_builds, 2);
+        // So is a reloaded configuration, once.
+        let env = session.environment().clone();
+        let off = Config::parse(
+            Some("version = 1\n[engines]\ndefault = \"idle\"\n[history]\nremember = false"),
+            &env,
+        )
+        .unwrap();
+        session
+            .queue_mut()
+            .push_back(BrowserEvent::ConfigReloaded(Ok(Box::new(off))));
+        session.run_core(&mut frontend);
+        assert!(session.home().recent.is_empty(), "remember is off");
+        session.home();
+        assert_eq!(session.diag.counters.home_builds, 3);
         session.shutdown(&mut frontend, |_, _| {});
     }
 

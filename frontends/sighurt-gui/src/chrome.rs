@@ -24,10 +24,13 @@ use sighurt_core::config::Config;
 use sighurt_core::tabs::{Content, TabSummary};
 use sighurt_core::{BrowserState, ChromeChecks};
 use sighurt_render::Presents;
+use sighurt_runtime::home::Home;
 use sighurt_ui::extension::{
     ChromeEvent, ChromeKind, ChromeLayout, InputArea, SurfaceName, Theme, MAX_SURFACES,
 };
-use sighurt_ui::{FindSnapshot, HomeInfo, Snapshot, TabContent, TabSnapshot};
+use sighurt_ui::{
+    EngineRow, FindSnapshot, HomeInfo, HomeKey, HomeLink, Snapshot, TabContent, TabSnapshot,
+};
 use sighurt_wayland::{InputRegion, PresentMode};
 
 /// The chromes compiled into this build: the standard one always, then those of features.
@@ -109,8 +112,47 @@ pub fn engine<'a>(core: &'a BrowserState, tab: &TabSummary<'_>) -> Option<&'a st
     }
 }
 
+/// What the chrome is told `sig://home` says: `home` (`sighurt_runtime::home`), every string
+/// contained to the bound its field states (`Snapshot::contain`), for [`snapshot`].
+pub fn home_info(home: &Home) -> HomeInfo {
+    let link = |link: &sighurt_runtime::home::Link| HomeLink {
+        url: link.url.clone(),
+        title: link.title.clone(),
+        detail: link.detail.clone(),
+    };
+    let mut contained = Snapshot {
+        home: HomeInfo {
+            version: home.version.clone(),
+            config_path: home.config_path.clone(),
+            pages: home.pages.iter().map(link).collect(),
+            keys: home
+                .keys
+                .iter()
+                .map(|key| HomeKey {
+                    keys: key.keys.clone(),
+                    action: key.action.clone(),
+                })
+                .collect(),
+            recent: home.recent.iter().map(link).collect(),
+            engines: home
+                .engines
+                .iter()
+                .map(|engine| EngineRow {
+                    name: engine.name.clone(),
+                    detail: engine.detail.clone(),
+                    available: engine.available,
+                })
+                .collect(),
+        },
+        ..Snapshot::default()
+    };
+    contained.contain();
+    contained.home
+}
+
 /// What the chrome shows of `core`: its tabs, `status` (the active tab's status line), the
-/// active tab's search and `home`, with every string contained to the bound its field states.
+/// active tab's search and `home` ([`home_info`], contained already), with every string
+/// contained to the bound its field states.
 ///
 /// A tab whose strings are what `cache` holds from the previous snapshot reuses its contained
 /// copy (byte comparisons, no containing again); the others, and everything outside the tabs,
@@ -170,10 +212,12 @@ pub fn snapshot(
         snapshot.tabs.push(cached.contained.clone());
         cache.tabs.push(Some(cached));
     }
-    // The strings outside the tabs; the tabs are contained already.
+    // The strings outside the tabs and home; those are contained already.
     let tabs = std::mem::take(&mut snapshot.tabs);
+    let home = std::mem::take(&mut snapshot.home);
     snapshot.contain();
     snapshot.tabs = tabs;
+    snapshot.home = home;
     snapshot
 }
 
@@ -478,6 +522,56 @@ mod tests {
         entries
             .map(|placed| (placed.name, placed.visible))
             .collect()
+    }
+
+    /// Home's strings reach the chrome contained, and a link whose address containing would
+    /// change is left out rather than opened changed.
+    #[test]
+    fn home_is_contained_once_and_kept_by_the_snapshot() {
+        use sighurt_runtime::home::{Home, Key, Link};
+        let hostile = |n| format!("\u{202e}a\nb{}", "x".repeat(n));
+        let home = Home {
+            version: hostile(100),
+            config_path: hostile(2000),
+            pages: vec![Link {
+                url: "sig://help".into(),
+                title: hostile(300),
+                detail: hostile(600),
+            }],
+            keys: vec![Key {
+                keys: hostile(100),
+                action: hostile(300),
+            }],
+            recent: vec![
+                Link {
+                    url: "https://a.test/\u{202e}".into(),
+                    ..Link::default()
+                },
+                Link {
+                    url: "https://b.test/".into(),
+                    ..Link::default()
+                },
+            ],
+            engines: Vec::new(),
+        };
+        let info = home_info(&home);
+        assert_eq!(info.version.chars().count(), 64);
+        assert!(info.version.starts_with("a b"));
+        assert_eq!(info.config_path.chars().count(), 1000);
+        assert_eq!(info.pages[0].title.chars().count(), 200);
+        assert_eq!(info.keys[0].keys.chars().count(), 64);
+        assert_eq!(info.recent.len(), 1);
+        assert_eq!(info.recent[0].url, "https://b.test/");
+        // The snapshot keeps it as it was given.
+        let env = Environment {
+            engines: [("demo".to_owned(), EngineCapabilities::default())].into(),
+            ..Environment::default()
+        };
+        let config = Config::parse(None, &env).unwrap();
+        let core = BrowserState::new(config, env);
+        let mut cache = SnapshotCache::default();
+        let snapshot = snapshot(&core, info.clone(), |_| None, &mut cache);
+        assert_eq!(snapshot.home, info);
     }
 
     #[test]

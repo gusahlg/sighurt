@@ -602,7 +602,8 @@ already puts there. A keymap crate depends on `sighurt-api` alone.
 
 - The core never calls a chrome; the executable does.
 - Every type a chrome exchanges, besides the shared input, geometry and id types, already lives
-  in sighurt-ui: `Snapshot`, `TabSnapshot`, `TabContent`, `HomeInfo`, `EngineRow`, `Colors`.
+  in sighurt-ui: `Snapshot`, `TabSnapshot`, `TabContent`, `HomeInfo` (with `HomeLink`, `HomeKey`),
+  `EngineRow`, `Colors`.
   So nothing moves, and `sighurt-api` stays the neutral contract of plan §5, with no pixel
   buffers or palettes in it (§28, question 4).
 - A chrome draws with `sighurt-render` (docs/rewrite/RENDER.md): a `Pen` records a scene, which
@@ -2054,3 +2055,17 @@ finding was checked against the plan and the code before it was acted on.
   `f12` (`table::INSERT_PROGRAM`; `ctrl-escape` is a plain Escape in a terminal with legacy
   keys, and in tmux by default). `TabInfo::internal` stays. `describe` lists a site's bindings
   "on <pattern>" in both keymaps.
+
+- **Home's links** (6 November 2026): `sighurt_ui::HomeInfo` gains `version`, `pages` and
+  `recent` (`HomeLink`: an exact address, a title and a detail) and `keys` (`HomeKey`: the
+  keystrokes and what they do), filled by `sig` from `sighurt_runtime::home` while the active
+  tab shows `sig://home` and empty otherwise; `Snapshot::contain` bounds them (8 pages, 12 keys,
+  8 visited pages, 16 engines) and leaves out a link whose address containing would change,
+  rather than open it changed. A chrome that builds a `HomeInfo` names the new fields (or uses
+  `..HomeInfo::default()`). `ChromeState` gains `link_hover` and `link_pressed`. The standard
+  chrome's home page shows the sections as links (a click runs `page.open <url>` through
+  `ChromeAction::Command`, the hand cursor over them) and drops whole sections from the bottom
+  when the page area is short; its `home-100` and `font-18-home-100` golden images change, and
+  `home-tall-100` is new. The line chrome lists the same as plain lines (its `home-100`
+  changes). In the core, `page.send-key` on a page the chrome draws (`sig://home`) is
+  `Effect::ChromeInput`, as the keys passed to it are.

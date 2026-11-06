@@ -295,6 +295,18 @@ impl Grid {
         out
     }
 
+    /// Something else wrote blanks with default attributes over `rows` rows from `row`: the
+    /// terminal shows them blank, and the next diff writes what the grid holds there.
+    pub fn blanked(&mut self, row: u16, rows: u16) {
+        let end = row.saturating_add(rows).min(self.rows);
+        for row in row.min(end)..end {
+            for col in 0..self.cols {
+                let index = self.index(col, row);
+                self.published[index] = Cell::blank();
+            }
+        }
+    }
+
     /// Something else moved the terminal's cursor: the next diff addresses its first cell
     /// absolutely instead of moving from where the last diff left the cursor.
     pub fn forget_cursor(&mut self) {

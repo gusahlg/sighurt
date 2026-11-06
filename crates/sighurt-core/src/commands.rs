@@ -57,7 +57,8 @@
 //!   leaves the fullscreen of an element of the page shown, or says there is none
 //!   ([`crate::fullscreen`]). In the terminal `browser.fullscreen` is a notice.
 //! - `page.send-key` presses and releases its key in the page only while the page has the
-//!   keyboard; run by a key press, that counts as the user's key press in the page.
+//!   keyboard; run by a key press, that counts as the user's key press in the page. On a page
+//!   the chrome draws (`sig://home`) the chrome gets it (`Effect::ChromeInput`).
 //! - `chrome.<action>` is the chrome's own: the core hands it on (`Effect::ChromeCommand`).
 //! - A command of `[commands]` (`Command::Custom`, such as `help`) runs the built-in commands
 //!   the configuration defines for it, in order, as a key that runs several does. One the

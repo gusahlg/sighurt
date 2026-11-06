@@ -13,7 +13,9 @@ use sighurt_api::ids::TabId;
 use sighurt_api::input::{DeleteSurrounding, Preedit, TextInputEvent};
 use sighurt_ui::extension::{contained, readable_url};
 use sighurt_ui::text_edit::{TextEditor, MAX_TEXT};
-use sighurt_ui::{EngineRow, FindSnapshot, HomeInfo, Snapshot, TabContent, TabSnapshot};
+use sighurt_ui::{
+    EngineRow, FindSnapshot, HomeInfo, HomeKey, HomeLink, Snapshot, TabContent, TabSnapshot,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Characters a one-line text must not hold: controls, the bidi embeddings, overrides and
@@ -58,6 +60,18 @@ fn tab(rng: &mut Rng) -> TabSnapshot {
     }
 }
 
+/// A home page link: an address that is plain ASCII half the time, with any title and detail.
+fn link(rng: &mut Rng) -> HomeLink {
+    HomeLink {
+        url: match rng.one_in(2) {
+            true => format!("https://a.test/{}", rng.below(1000)),
+            false => text(rng),
+        },
+        title: text(rng),
+        detail: text(rng),
+    }
+}
+
 #[test]
 fn fuzz_snapshot_contain() {
     run(
@@ -79,7 +93,16 @@ fn fuzz_snapshot_contain() {
                     ..FindSnapshot::default()
                 }),
                 home: HomeInfo {
+                    version: text(rng),
                     config_path: text(rng),
+                    pages: (0..rng.below(12)).map(|_| link(rng)).collect(),
+                    keys: (0..rng.below(16))
+                        .map(|_| HomeKey {
+                            keys: text(rng),
+                            action: text(rng),
+                        })
+                        .collect(),
+                    recent: (0..rng.below(12)).map(|_| link(rng)).collect(),
                     engines: (0..rng.below(3))
                         .map(|_| EngineRow {
                             name: text(rng),
@@ -118,7 +141,25 @@ fn fuzz_snapshot_contain() {
             if let Some(find) = &snapshot.find {
                 check("find", &find.text, 1024);
             }
-            check("config path", &snapshot.home.config_path, 1000);
+            let home = &snapshot.home;
+            check("version", &home.version, 64);
+            check("config path", &home.config_path, 1000);
+            assert!(home.pages.len() <= 8 && home.recent.len() <= 8 && home.keys.len() <= 12);
+            for link in home.pages.iter().chain(&home.recent) {
+                // Kept exact or left out: printable ASCII.
+                assert!(link.url.len() <= 8192, "{} bytes", link.url.len());
+                assert!(
+                    link.url.bytes().all(|b| (0x20..0x7f).contains(&b)),
+                    "{:?}",
+                    link.url
+                );
+                check("link title", &link.title, 200);
+                check("link detail", &link.detail, 500);
+            }
+            for key in &home.keys {
+                check("keys", &key.keys, 64);
+                check("key action", &key.action, 200);
+            }
             for row in &snapshot.home.engines {
                 check("engine name", &row.name, 100);
                 check("engine detail", &row.detail, 500);

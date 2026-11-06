@@ -411,7 +411,11 @@ fn pages<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
     b.code("[pages.terminal]\nenabled = true");
     b.link("sig://terminal", "sig://terminal");
     b.heading(2, "sig://home");
-    b.para("The home page, drawn by the chrome. The home setting chooses what new tabs open.");
+    b.para(
+        "The home page, drawn by the chrome in the window and in the terminal, with no engine: \
+         links to these pages, the keys of your keymap for the common commands, the pages you \
+         visited last and the engines. The home setting chooses what new tabs open.",
+    );
     b.link("sig://home", "sig://home");
 }
 

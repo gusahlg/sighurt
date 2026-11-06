@@ -164,6 +164,8 @@ pub struct History {
     /// Changes when visits are forgotten or dropped, so that completions shown can be asked
     /// again.
     generation: u64,
+    /// Visits recorded or retitled: with `generation`, what [`History::revision`] counts.
+    edits: u64,
     /// Forgets the writer has not reported, with how many visits each removed.
     forgetting: BTreeMap<RequestId, usize>,
     /// For the user, not told yet.
@@ -214,6 +216,7 @@ impl History {
             changed: false,
             due: None,
             generation: 0,
+            edits: 0,
             forgetting: BTreeMap::new(),
             notices,
             told,
@@ -300,6 +303,7 @@ impl History {
             self.bytes = self.bytes - before + cost(url, visit);
             self.evict();
         }
+        self.edits += 1;
         self.changed();
         commit
     }
@@ -324,6 +328,35 @@ impl History {
         found
             .into_iter()
             .take(MAX_COMPLETIONS)
+            .map(|(url, visit)| Completion {
+                url: url.clone(),
+                title: visit.title.clone(),
+            })
+            .collect()
+    }
+
+    /// At most `n` visited addresses, the most recently visited first, each once. None with
+    /// `remember` off, without a history, or while the file is still being read.
+    pub fn recent(&self, n: usize) -> Vec<Completion> {
+        if !self.remember || self.reading.is_some() || n == 0 {
+            return Vec::new();
+        }
+        // The `n` latest, kept sorted, without sorting every visit.
+        let mut found: Vec<(&String, &Visit)> = Vec::with_capacity(n + 1);
+        let later = |(a, x): &(&String, &Visit), (b, y): &(&String, &Visit)| {
+            (y.last, y.count)
+                .cmp(&(x.last, x.count))
+                .then_with(|| a.cmp(b))
+        };
+        for entry in &self.visits {
+            let at = found.partition_point(|kept| later(kept, &entry).is_le());
+            if at < n {
+                found.insert(at, entry);
+                found.truncate(n);
+            }
+        }
+        found
+            .into_iter()
             .map(|(url, visit)| Completion {
                 url: url.clone(),
                 title: visit.title.clone(),
@@ -443,6 +476,13 @@ impl History {
     /// may be gone, or new ones there.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Changes whenever the visits do: a visit recorded or retitled, as well as everything
+    /// that changes [`History::generation`]. What [`History::recent`] lists may differ.
+    pub fn revision(&self) -> u64 {
+        // Both only grow, so their sum does.
+        self.generation.wrapping_add(self.edits)
     }
 
     /// What to tell the user, once.
@@ -1242,6 +1282,42 @@ mod tests {
         assert!(history.complete("https://other.test/").is_empty());
         assert!(history.complete("").is_empty());
         assert!(history.complete("ther").is_empty());
+    }
+
+    #[test]
+    fn recent_visits_are_the_newest_first_each_once_and_none_with_remember_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = owned(dir.path(), true);
+        let revision = history.revision();
+        for i in 0..12u64 {
+            history.record(&format!("https://a.test/{i}"), None, true, NOW + i);
+        }
+        assert_ne!(history.revision(), revision, "a visit changes the revision");
+        // Visited again: still one entry, now the newest, with its title.
+        history.record("https://a.test/3", None, true, NOW + 50);
+        let revision = history.revision();
+        history.record("https://a.test/3", Some("Three"), false, NOW + 50);
+        assert_ne!(history.revision(), revision, "a new title changes it too");
+        let recent = history.recent(8);
+        assert_eq!(
+            urls(&recent),
+            [
+                "https://a.test/3",
+                "https://a.test/11",
+                "https://a.test/10",
+                "https://a.test/9",
+                "https://a.test/8",
+                "https://a.test/7",
+                "https://a.test/6",
+                "https://a.test/5"
+            ]
+        );
+        assert_eq!(recent[0].title, "Three");
+        assert_eq!(history.recent(2).len(), 2);
+        assert!(history.recent(0).is_empty());
+        assert_eq!(history.recent(100).len(), 12);
+        history.set_remember(false);
+        assert!(history.recent(8).is_empty());
     }
 
     #[test]

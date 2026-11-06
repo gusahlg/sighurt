@@ -683,3 +683,45 @@ fn typing_suppresses_character_bindings_and_not_modifiers() {
         )
     }));
 }
+
+#[test]
+fn a_key_sent_to_the_home_page_goes_to_the_chrome_that_draws_it() {
+    let mut terminal = Harness::start(
+        Frontend::Terminal,
+        "[keys]\n\"j\" = \"page.send-key ArrowDown\"\n",
+        &[],
+    );
+    let home = |terminal: &Harness| {
+        let tab = terminal.state.tabs().nth(terminal.state.active()).unwrap();
+        matches!(tab.content, Content::Internal(url) if url == "sig://home")
+    };
+    assert!(home(&terminal));
+    terminal.command("browser.home");
+    assert_eq!(terminal.state.focus(), KeyboardFocus::Page);
+    let chrome_keys = |effects: &[Effect]| -> Vec<KeyEvent> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ChromeInput(InputEvent {
+                    kind: InputKind::Key(key),
+                    ..
+                }) => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let keys = chrome_keys(&terminal.key(press("j", Modifiers::default())));
+    assert!(
+        sent(&keys.iter().collect::<Vec<_>>(), "ArrowDown"),
+        "{keys:?}"
+    );
+    // With the address line focused, a sent key goes nowhere, as for an engine's page.
+    terminal.command("location.focus");
+    let keys = chrome_keys(&terminal.key(press("j", Modifiers::default())));
+    assert!(
+        !keys
+            .iter()
+            .any(|key| matches!(&key.key, Key::Named(name) if name == "ArrowDown")),
+        "{keys:?}"
+    );
+}

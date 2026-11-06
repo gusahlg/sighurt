@@ -24,7 +24,8 @@
 //! from the visited pages, as the standard chrome does ([`InlineCompletion`]): the rest shows
 //! after the caret, muted, and Right or Tab at the end takes it. There are no buttons, no tab
 //! strip and no commands of its own: tabs are reached by keys and `:tab.select 3`. While the active tab
-//! shows no engine's page (`sig://home`, an error), a few lines of text say what there is.
+//! shows no engine's page (`sig://home`, an error), a few lines of text say what there is: for
+//! `sig://home`, the standard chrome's sections as plain lines, a link as its address.
 //!
 //! Its surfaces, bottom to top: [`PAGE`] while it draws the page area, and [`LINE`]. While the
 //! window is fullscreen, the line is listed only while it has the keyboard or there is status
@@ -818,19 +819,59 @@ impl Line {
         match &tab.content {
             TabContent::Internal if is_home(&tab.url) => {
                 let home = &self.snapshot.home;
-                let mut lines = vec![
-                    ("Sighurt".to_owned(), colors.text),
+                let (text, muted) = (colors.text, colors.text_muted);
+                let mut lines =
+                    vec![
+                    (format!("Sighurt {}", home.version).trim_end().to_owned(), text),
                     (
                         "Click the line, or use location.focus, to type an address, a search or \
                          a command after a colon, such as :tab.new."
                             .to_owned(),
-                        colors.text_muted,
+                        muted,
                     ),
                     (
                         format!("The configuration is in {}.", home.config_path),
-                        colors.text_muted,
+                        muted,
                     ),
                 ];
+                // Each section as a heading line and a line per entry; a link is its address.
+                let mut section = |name: &str, entries: Vec<String>| {
+                    if !entries.is_empty() {
+                        lines.push((name.to_owned(), text));
+                        lines.extend(entries.into_iter().map(|entry| (entry, muted)));
+                    }
+                };
+                let link = |url: &str, name: &str, detail: &str| {
+                    [url, name, detail]
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                };
+                section(
+                    "Pages",
+                    home.pages
+                        .iter()
+                        .map(|page| link(&page.url, &page.title, &page.detail))
+                        .collect(),
+                );
+                section(
+                    "Keys",
+                    home.keys
+                        .iter()
+                        .map(|key| format!("{}: {}", key.keys, key.action))
+                        .collect(),
+                );
+                section(
+                    "Recently visited",
+                    home.recent
+                        .iter()
+                        .map(|visit| link(&readable_url(&visit.url), visit.title.trim(), ""))
+                        .collect(),
+                );
+                if !home.engines.is_empty() {
+                    lines.push(("Engines".to_owned(), text));
+                }
                 for engine in &home.engines {
                     let color = match engine.available {
                         true => colors.text_muted,

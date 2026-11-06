@@ -35,6 +35,15 @@
 //! and keeps the search. While a search is under way and the field is closed, the line shows
 //! its state before the engine button.
 //!
+//! The page area of `sig://home` is the chrome's own: a card with the heading and a hint, then
+//! the sections of [`HomeInfo`] that fit, in this order: Pages, Keys (two columns where there is
+//! room), Recently visited, Engines. When the page area is too short for all of them, whole
+//! sections are left out, Engines first, then Recently visited, then Keys. A page's or a visited
+//! page's name is a link in the accent color (the selection's, opaque): under the pointer it is
+//! underlined and the cursor is a hand, and a release on the link the button went down on runs
+//! `page.open <url>`, as a button runs its command. Links are not [`Target`]s: they are where the
+//! page's text is laid out, so a hit is found in that layout.
+//!
 //! The chrome marks what needs repainting ([`Damage`]) only after an edit, a hover change, a
 //! snapshot change it shows, a configuration change or a layout change: a static chrome needs
 //! no tick, and a page animating never repaints it. The caret is steady, so no timer runs.
@@ -263,6 +272,8 @@ pub(crate) enum Tone {
     Muted,
     Dim,
     Error,
+    /// A link: the accent color.
+    Link,
 }
 
 /// One block of text on a page the chrome draws, placed in window-logical coordinates.
@@ -274,12 +285,84 @@ pub(crate) struct PageText {
     pub heading: bool,
 }
 
+/// A link on a page the chrome draws: its text's rectangle in window-logical coordinates
+/// (x, y, width, height) and the address a click opens.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PageLink {
+    pub rect: [f32; 4],
+    pub url: String,
+}
+
 /// A page the chrome draws: a card with text, centred in the page area.
 pub(crate) struct PageLayout {
     /// The card: x, y, width, height.
     pub card: [f32; 4],
     pub texts: Vec<PageText>,
+    pub links: Vec<PageLink>,
 }
+
+/// Part of a page the chrome draws, laid out from its own top: its texts and links, and how
+/// tall it is.
+#[derive(Default)]
+struct Block {
+    texts: Vec<PageText>,
+    links: Vec<PageLink>,
+    height: f32,
+}
+
+impl Block {
+    /// Puts `shaped` at `x`, `y`; returns its height.
+    fn text(&mut self, shaped: Rc<ShapedText>, (x, y): (f32, f32), tone: Tone) -> f32 {
+        let height = shaped.height;
+        let heading = false;
+        self.texts.push(PageText {
+            shaped,
+            x,
+            y,
+            tone,
+            heading,
+        });
+        height
+    }
+
+    /// Puts `shaped` at `x`, `y` as a link to `url`; returns its height.
+    fn link(&mut self, shaped: Rc<ShapedText>, (x, y): (f32, f32), url: &str) -> f32 {
+        let rect = [x, y, shaped.width, shaped.height];
+        self.links.push(PageLink {
+            rect,
+            url: url.to_owned(),
+        });
+        self.text(shaped, (x, y), Tone::Link)
+    }
+
+    /// Adds `other` below what this holds, `gap` under it.
+    fn append(&mut self, other: Block, gap: f32) {
+        let top = self.height + gap;
+        for mut text in other.texts {
+            text.y += top;
+            self.texts.push(text);
+        }
+        for mut link in other.links {
+            link.rect[1] += top;
+            self.links.push(link);
+        }
+        self.height = top + other.height;
+    }
+}
+
+/// The parts of the home page below its heading, in the order they are shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeSection {
+    Pages,
+    Keys,
+    Recent,
+    Engines,
+}
+
+/// The sections a short page area leaves out first: Engines, then Recently visited, then Keys.
+/// Pages always stays.
+const DROPPED_FIRST: [HomeSection; 3] =
+    [HomeSection::Engines, HomeSection::Recent, HomeSection::Keys];
 
 /// The address line as drawn: its shaped text and where things are, in window coordinates.
 pub(crate) struct AddressView {
@@ -474,7 +557,13 @@ impl Model {
             self.damage.chrome |= toolbar || tabs && at_top;
             self.damage.tabs |= tabs && !at_top;
             self.damage.status |= old.status != new.status;
-            self.damage.page |= internal_page(&old) != internal_page(new);
+            let page = internal_page(&old) != internal_page(new);
+            self.damage.page |= page;
+            if page {
+                // Its links may be gone: the pointer's next move finds the one under it.
+                self.state.link_hover = None;
+                self.state.link_pressed = None;
+            }
             if old.active().map(|tab| tab.id) != new.active().map(|tab| tab.id) {
                 self.reveal_active();
             }
@@ -547,6 +636,7 @@ impl Model {
             // again.
             self.damage.chrome |= self.state.label_pressed;
             self.state.label_pressed = false;
+            self.state.link_pressed = None;
         }
         // Only the focused address line looks different: its caret and selection show while
         // the window is active.
@@ -566,6 +656,7 @@ impl Model {
             PointerEvent::Leave => {
                 self.leave_label();
                 self.set_hover(None);
+                self.set_link_hover(None);
             }
             PointerEvent::Button {
                 button,
@@ -920,6 +1011,8 @@ impl Model {
     }
 
     fn motion(&mut self, point: WindowPoint) {
+        let link = self.link_at(point);
+        self.set_link_hover(link);
         let over = self.on_engine_label(point);
         if over != self.state.label_hover {
             self.state.label_hover = over;
@@ -932,6 +1025,28 @@ impl Model {
             let before = self.state.address.clone();
             self.state.address.move_to(offset, true);
             self.edited(&before);
+        }
+    }
+
+    /// The address of the link at `point` on the page the chrome draws, if one is there.
+    fn link_at(&mut self, point: WindowPoint) -> Option<String> {
+        if !self.layout.page.contains(point) {
+            return None;
+        }
+        let (x, y) = (point.x as f32, point.y as f32);
+        let layout = self.page_layout()?;
+        let link = layout.links.into_iter().find(|link| {
+            let [left, top, width, height] = link.rect;
+            (left..left + width).contains(&x) && (top..top + height).contains(&y)
+        });
+        link.map(|link| link.url)
+    }
+
+    /// The pointer is over the link to `url`, or over none.
+    fn set_link_hover(&mut self, url: Option<String>) {
+        if url != self.state.link_hover {
+            self.state.link_hover = url;
+            self.damage.page = true;
         }
     }
 
@@ -973,6 +1088,7 @@ impl Model {
             return;
         }
         self.state.label_pressed = false;
+        self.state.link_pressed = self.link_at(point);
         let target = hit_test(&self.layout, point).filter(|&target| self.enabled(target));
         self.state.pressed = target;
         match target {
@@ -1006,6 +1122,13 @@ impl Model {
             self.damage.chrome = true;
             if self.on_engine_label(point) && !self.engine_busy() {
                 actions.push(ChromeAction::Command(Command::PageSwitchEngine));
+            }
+            return;
+        }
+        // A link opens when the button comes up on the link it went down on.
+        if let Some(url) = self.state.link_pressed.take() {
+            if self.link_at(point).as_ref() == Some(&url) {
+                actions.push(ChromeAction::Command(Command::PageOpen(url)));
             }
             return;
         }
@@ -1105,8 +1228,9 @@ impl Model {
         }
         let idle_button = self.address_view().engine.map(|button| !button.busy);
         let on_button = self.state.label_hover && idle_button == Some(true);
+        let on_link = self.state.link_hover.is_some();
         let cursor = match self.state.hover {
-            _ if on_button => Cursor::Pointer,
+            _ if on_button || on_link => Cursor::Pointer,
             Some(Target::Address) => Cursor::Text,
             Some(_) => Cursor::Pointer,
             None => Cursor::Default,
@@ -1274,6 +1398,7 @@ impl Model {
         let inner = card_width - k(40.0);
         let fonts = &mut self.fonts;
         let mut texts = Vec::new();
+        let mut links = Vec::new();
         let mut y = 0.0;
         let mut add = |shaped: Rc<ShapedText>, x: f32, top: f32, tone, heading| {
             let height = shaped.height;
@@ -1288,45 +1413,12 @@ impl Model {
         };
         match internal_page(&self.snapshot)? {
             InternalPage::Home(home) => {
-                y += add(
-                    fonts.line("Sighurt", style(TextStyle::HEADING)),
-                    0.0,
-                    y,
-                    Tone::Text,
-                    true,
-                );
-                y += k(8.0);
-                let hint = format!(
-                    "Type an address or a search above, or a command after a colon, such as \
-                     :tab.new. Engines, search, keys and colors are set in {}.",
-                    home.config_path
-                );
-                y += add(
-                    fonts.wrapped(&hint, style(TextStyle::SM), inner),
-                    0.0,
-                    y,
-                    Tone::Muted,
-                    false,
-                );
-                y += k(16.0);
-                let label = fonts.line("ENGINES", style(TextStyle::XS.weight(600)));
-                y += add(label, 0.0, y, Tone::Dim, false);
-                for engine in &home.engines {
-                    y += k(8.0);
-                    let name = contained(&engine.name, MAX_ENGINE_NAME);
-                    let name = fonts.fitted(&name, style(TextStyle::SM.weight(600)), k(64.0));
-                    let tone = if engine.available {
-                        Tone::Muted
-                    } else {
-                        Tone::Error
-                    };
-                    let detail = contained(&engine.detail, MAX_ENGINE_DETAIL);
-                    let column = k(76.0);
-                    let width = (inner - column).max(1.0);
-                    let detail = fonts.wrapped(&detail, style(TextStyle::SM), width);
-                    let row = add(name, 0.0, y, Tone::Text, false);
-                    y += row.max(add(detail, column, y, tone, false));
-                }
+                // The room the card's text has without leaving the page area.
+                let room = page.height as f32 - k(32.0) - k(40.0);
+                let block = home_page(fonts, options, home, inner, room);
+                texts.extend(block.texts);
+                links = block.links;
+                y += block.height;
             }
             InternalPage::Error { url, message } => {
                 let heading = fonts.line("Can't show this address", style(TextStyle::HEADING));
@@ -1354,11 +1446,184 @@ impl Model {
             text.x += card_x + k(20.0);
             text.y += card_y + k(20.0);
         }
+        for link in &mut links {
+            link.rect[0] += card_x + k(20.0);
+            link.rect[1] += card_y + k(20.0);
+        }
         Some(PageLayout {
             card: [card_x, card_y, card_width, card_height],
             texts,
+            links,
         })
     }
+}
+
+/// The home page's text, `inner` wide: its heading and hint, then the sections that fit in
+/// `room` (see [`DROPPED_FIRST`]). An empty section is not shown.
+fn home_page(
+    fonts: &mut Fonts,
+    options: LayoutOptions,
+    home: &HomeInfo,
+    inner: f32,
+    room: f32,
+) -> Block {
+    let (k, style) = (|px| options.scaled(px), |style| options.text(style));
+    let mut top = Block::default();
+    let heading = fonts.line("Sighurt", style(TextStyle::HEADING));
+    let heading_width = heading.width;
+    top.height = top.text(heading, (0.0, 0.0), Tone::Text);
+    top.texts[0].heading = true;
+    if !home.version.is_empty() {
+        let version = contained(&home.version, 64);
+        let version_style = style(TextStyle::XS);
+        let y = fonts.baseline(style(TextStyle::HEADING)) - fonts.baseline(version_style);
+        let version = fonts.fitted(&version, version_style, (inner - heading_width).max(0.0));
+        top.text(version, (heading_width + k(8.0), y), Tone::Dim);
+    }
+    let file = match home.config_path.as_str() {
+        "" => "its configuration file".to_owned(),
+        path => contained(path, 1000),
+    };
+    let hint = format!(
+        "Type an address or a search above, or a command after a colon, such as :tab.new. \
+         Engines, search, keys and colors are set in {file}."
+    );
+    let mut hint_block = Block::default();
+    hint_block.height = hint_block.text(
+        fonts.wrapped(&hint, style(TextStyle::SM), inner),
+        (0.0, 0.0),
+        Tone::Muted,
+    );
+    top.append(hint_block, k(8.0));
+
+    let mut sections: Vec<(HomeSection, Block)> = [
+        HomeSection::Pages,
+        HomeSection::Keys,
+        HomeSection::Recent,
+        HomeSection::Engines,
+    ]
+    .into_iter()
+    .filter_map(|section| Some((section, home_section(fonts, options, home, section, inner)?)))
+    .collect();
+    let gap = k(16.0);
+    let height = |sections: &[(HomeSection, Block)]| {
+        top.height + sections.iter().map(|(_, b)| gap + b.height).sum::<f32>()
+    };
+    for dropped in DROPPED_FIRST {
+        if height(&sections) <= room {
+            break;
+        }
+        sections.retain(|(section, _)| *section != dropped);
+    }
+    for (_, block) in sections {
+        top.append(block, gap);
+    }
+    top
+}
+
+/// One section of the home page, `inner` wide: its label and rows. `None` when it has none.
+fn home_section(
+    fonts: &mut Fonts,
+    options: LayoutOptions,
+    home: &HomeInfo,
+    section: HomeSection,
+    inner: f32,
+) -> Option<Block> {
+    let (k, style) = (|px| options.scaled(px), |style| options.text(style));
+    let (name, rows) = match section {
+        HomeSection::Pages => ("PAGES", home.pages.len()),
+        HomeSection::Keys => ("KEYS", home.keys.len()),
+        HomeSection::Recent => ("RECENTLY VISITED", home.recent.len()),
+        HomeSection::Engines => ("ENGINES", home.engines.len()),
+    };
+    if rows == 0 {
+        return None;
+    }
+    let mut block = Block::default();
+    let label = fonts.line(name, style(TextStyle::XS.weight(600)));
+    block.height = block.text(label, (0.0, 0.0), Tone::Dim);
+    let text = style(TextStyle::SM);
+    let strong = style(TextStyle::SM.weight(600));
+    let row_gap = k(6.0);
+    match section {
+        HomeSection::Pages => {
+            let column = k(112.0);
+            let width = (inner - column).max(1.0);
+            for page in &home.pages {
+                let y = block.height + row_gap;
+                let title = contained(&page.title, MAX_ENGINE_NAME);
+                let title = fonts.fitted(&title, text, column - k(8.0));
+                let row = block.link(title, (0.0, y), &page.url);
+                let detail = contained(&page.detail, MAX_ENGINE_DETAIL);
+                let detail = fonts.wrapped(&detail, text, width);
+                block.height = y + row.max(block.text(detail, (column, y), Tone::Muted));
+            }
+        }
+        HomeSection::Keys => {
+            // Two columns where they fit, the first half of the keys down the left one.
+            let columns = if inner >= k(400.0) { 2 } else { 1 };
+            let gutter = k(20.0);
+            let width = (inner - gutter * (columns - 1) as f32) / columns as f32;
+            let keys_width = k(76.0);
+            let rows = home.keys.len().div_ceil(columns);
+            // Down each column in turn, so the text reads in order; a row is one line in both.
+            let top = block.height;
+            let mut bottom = top;
+            for (index, key) in home.keys.iter().enumerate() {
+                let (column, row) = (index / rows, index % rows);
+                if row == 0 {
+                    block.height = top;
+                }
+                let (x, y) = (column as f32 * (width + gutter), block.height + row_gap);
+                let keys = contained(&key.keys, 64);
+                let keys = fonts.fitted(&keys, strong, keys_width - k(8.0));
+                let action = contained(&key.action, MAX_ENGINE_NAME);
+                let action = fonts.fitted(&action, text, (width - keys_width).max(1.0));
+                let height = block.text(keys, (x, y), Tone::Text);
+                let height = height.max(block.text(action, (x + keys_width, y), Tone::Muted));
+                block.height = y + height;
+                bottom = bottom.max(block.height);
+            }
+            block.height = bottom;
+        }
+        HomeSection::Recent => {
+            for visit in &home.recent {
+                let y = block.height + row_gap;
+                let address = contained(&readable_url(&visit.url), 1000);
+                let title = contained(visit.title.trim(), MAX_ENGINE_NAME);
+                let (name, rest) = match title.is_empty() {
+                    true => (address, None),
+                    false => (title, Some(address)),
+                };
+                let name = fonts.fitted(&name, text, inner * 0.6);
+                let after = name.width + k(12.0);
+                let row = block.link(name, (0.0, y), &visit.url);
+                if let Some(rest) = rest.filter(|_| inner - after >= k(48.0)) {
+                    let rest = fonts.fitted(&rest, text, inner - after);
+                    block.text(rest, (after, y), Tone::Dim);
+                }
+                block.height = y + row;
+            }
+        }
+        HomeSection::Engines => {
+            let column = k(76.0);
+            let width = (inner - column).max(1.0);
+            for engine in &home.engines {
+                let y = block.height + row_gap;
+                let name = contained(&engine.name, MAX_ENGINE_NAME);
+                let name = fonts.fitted(&name, strong, k(64.0));
+                let tone = match engine.available {
+                    true => Tone::Muted,
+                    false => Tone::Error,
+                };
+                let detail = contained(&engine.detail, MAX_ENGINE_DETAIL);
+                let detail = fonts.wrapped(&detail, text, width);
+                let row = block.text(name, (0.0, y), Tone::Text);
+                block.height = y + row.max(block.text(detail, (column, y), tone));
+            }
+        }
+    }
+    Some(block)
 }
 
 /// The label naming `tab`'s engine ([`TabSnapshot::engine_label`]), if it fits whole in
