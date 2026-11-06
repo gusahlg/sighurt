@@ -2748,20 +2748,37 @@ fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
     }
 }
 
-/// sig://config in the terminal: drawn as graphics, typed into in INSERT MODE, and Ctrl+S saves
-/// the file (the key press is the deliberate action a write needs). Needs the Wasm engine: run
-/// with `--features frontend-tui,engine-demo,engine-wasm`.
+/// sig://config in the terminal: drawn as graphics, Enter in INSERT MODE runs the editor on the
+/// configuration (here `[pages.config] editor`, a script that appends a line to the file it is
+/// given), and the file changes. Needs the Wasm engine: run with
+/// `--features frontend-tui,engine-demo,engine-wasm`.
 #[cfg(feature = "engine-wasm")]
 #[test]
-fn sig_config_is_edited_and_saved_in_the_terminal() {
-    let mut term = Terminal::start_with("config-page", &["sig://config"], KITTY_REPLIES);
+fn sig_config_runs_the_editor_in_the_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+    let scripts = std::env::temp_dir().join(format!("sig-tui-editor-{}", std::process::id()));
+    fs::create_dir_all(&scripts).unwrap();
+    let editor = scripts.join("editor");
+    fs::write(
+        &editor,
+        "#!/bin/sh\necho '# edited in sig://config' >> \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    let pages = format!(
+        "[pages.config]\neditor = {:?}",
+        editor.display().to_string()
+    );
+    let mut term = Terminal::start_in("config-page", &["sig://config"], KITTY_REPLIES, &pages);
     let path = term.dir.join("config/sighurt/config.toml");
-    let before = fs::read_to_string(&path).unwrap();
     let shown = term.wait(0, Duration::from_secs(20), |got| {
         image(got, 80, 22, 800, 440)
     });
     assert!(shown, "sig://config did not show\n{}", term.context());
-
+    assert!(
+        !fs::read_to_string(&path).unwrap().contains("# edited"),
+        "nothing runs before Enter"
+    );
     let since = term.got.len();
     term.type_bytes(&kitty_keys("\x1b"));
     let insert = term.wait(since, Duration::from_secs(10), |got| {
@@ -2772,22 +2789,20 @@ fn sig_config_is_edited_and_saved_in_the_terminal() {
         "Escape did not show INSERT MODE\n{}",
         term.context()
     );
-    // At the top of the file, a comment and Enter, then Ctrl+S (kitty: `s` with Control).
-    term.type_bytes(&kitty_keys("# typed here\r"));
-    term.type_bytes(b"\x1b[115;5u\x1b[115;5:3u");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut now = before.clone();
-    while Instant::now() < deadline && now == before {
-        thread::sleep(Duration::from_millis(100));
-        now = fs::read_to_string(&path).unwrap();
+    term.type_bytes(&kitty_keys("\r"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !fs::read_to_string(&path)
+        .unwrap()
+        .contains("# edited in sig://config")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the editor did not run\n{}",
+            term.context()
+        );
+        term.wait(term.got.len(), Duration::from_millis(100), |_| false);
     }
-    assert_eq!(
-        now,
-        format!("# typed here\n{before}"),
-        "Ctrl+S did not save the typed line\n{}",
-        term.context()
-    );
-
+    // INSERT left as this tree's keymap leaves it on this page, then q.
     let since = term.got.len();
     term.type_bytes(&kitty_keys("\x1b"));
     let left = term.wait(since, Duration::from_secs(10), insert_mode_left);
@@ -2795,4 +2810,5 @@ fn sig_config_is_edited_and_saved_in_the_terminal() {
     term.type_bytes(&kitty_keys("q"));
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
+    let _ = fs::remove_dir_all(&scripts);
 }

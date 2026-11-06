@@ -60,14 +60,15 @@
 #               Ctrl+C gets the shell back; nvim (if on PATH) follows a resize (its &columns and
 #               &lines) and writes a file with i, Escape and :wq; closing the tab, navigating
 #               away, reloading, quitting and SIGTERM each leave no program and no zombie, and
-#               20 open-and-close cycles no descriptor in sig; sig://terminal/config runs $VISUAL
-#               on the configuration; with the setting off, Enter starts nothing and the page
-#               says how to turn it on (it differs from the start page)
-#   config-page sig://config on a configuration linked from another directory: Escape (INSERT),
-#               a valid change typed and Ctrl+S: the linked file changes and stays linked, the
-#               chrome takes the new tab colour and the core the new [commands] alias; an invalid
-#               line is refused with the file unchanged; a file changed behind the page is
-#               refused as stale, and after "Read the file again" a save keeps both changes
+#               20 open-and-close cycles no descriptor in sig; with the setting off, Enter starts
+#               nothing and the page says how to turn it on
+#   config-page sig://config runs the editor on the configuration ($VISUAL a script that appends
+#               a line): nothing starts on opening it or on a click; Enter runs it, the file
+#               changes, the editor is reaped and the file read again (a new alias works); a
+#               linked file is written where the link leads and read again (the new tab colour);
+#               an invalid edit keeps the configuration, with the notice and the problem on the
+#               page; with [pages.config] enabled = false or no editor found, the page says so
+#               and nothing starts; nvim, if on PATH, writes the file with :normal and :wq
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
 #               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
@@ -1110,98 +1111,162 @@ PY
   ;;
 
 config-page)
-  # The configuration is a link into another directory, as a dotfiles repository makes it: the
-  # file watch sees nothing there, so what applies after a save is the page's own reload.
-  mkdir -p "$out/dotfiles"
-  cat > "$out/dotfiles/sig.toml" <<'CONF'
-version = 1
+  # sig://config runs the user's editor on the configuration. $VISUAL is a script that appends
+  # what ~/append holds to the file it is given, so no real editor is needed; nvim, if there is
+  # one, runs once at the end. The programs carry a marker in their environment.
+  home=$out/home
+  mkdir -p "$home" "$out/dotfiles" "$out/emptybin"
+  printf '#!/bin/sh\ncat "$HOME/append" >> "$1"\n' > "$home/editor"
+  chmod +x "$home/editor"
+  base='version = 1
 [engines]
 default = "demo"
 [routing.demo]
-schemes = ["demo"]
-CONF
-  ln -sf ../../dotfiles/sig.toml "$out/config/sighurt/config.toml"
-  file=$out/dotfiles/sig.toml
-  tabs_count() { diag "len(d['tabs'])"; }
-  # save: Ctrl+S, and the time the page needs to hear back.
-  save() { key -M ctrl s -m ctrl; sleep 1.5; }
-  # violet SHOT: 0 if the top of the window (the tabs) has the colour #7c3aed somewhere.
-  violet() {
+schemes = ["demo"]'
+  start_editor() { # start_editor [ENV=VALUE ...] URL: sig with the editor's environment
+    env HOME="$home" VISUAL="$home/editor" PAGETERM_MARK="$out" "$@" &
+    sig_pid=$!
+    sleep 2
+  }
+  sig_args=("$tdir/debug/sig-headless-e2e" --diagnostics "$out/diag.json")
+  programs() {
+    python3 - "$out" "$sig_pid" <<'PY'
+import os, sys
+mark, sig = ('PAGETERM_MARK=' + sys.argv[1]).encode(), sys.argv[2]
+live = zombies = 0
+for p in filter(str.isdigit, os.listdir('/proc')):
+    try:
+        state, ppid = open(f'/proc/{p}/stat').read().rsplit(')', 1)[1].split()[:2]
+        env = open(f'/proc/{p}/environ', 'rb').read().split(b'\0') if state != 'Z' else []
+    except OSError:
+        continue
+    zombies += state == 'Z' and ppid == sig
+    live += p != sig and mark in env
+print(live, zombies)
+PY
+  }
+  # reloaded BEFORE: 0 once the frontend read the configuration more often than BEFORE.
+  reloaded() {
+    for _ in $(seq 50); do
+      [[ $(diag "c['config_reloads']") -gt $1 ]] && return 0
+      sleep 0.1
+    done
+    return 1
+  }
+  # colour SHOT RRGGBB [MIN]: 0 if the page area has at least MIN (200) pixels of that colour.
+  colour() {
     grim -t ppm "$out/$1.ppm"
-    python3 - "$out/$1.ppm" <<'PY'
+    python3 - "$out/$1.ppm" "$2" "${3:-200}" <<'PY'
 import re, sys
 data = open(sys.argv[1], 'rb').read()
 m = re.match(rb'P6\s+(\d+)\s+(\d+)\s+\d+\s', data)
-w, pixels = int(m[1]), data[m.end():]
-n = sum(1 for y in range(40) for x in range(0, w, 2)
-        if all(abs(a - b) <= 6 for a, b in zip(pixels[3 * (y * w + x):3 * (y * w + x) + 3], (0x7c, 0x3a, 0xed))))
-print(0 if n > 100 else 1, f"{n} violet pixels in the tabs")
+w, px = int(m[1]), data[m.end():]
+want = bytes.fromhex(sys.argv[2])
+n = sum(1 for i in range(0, len(px) - 2, 3) if all(abs(px[i + k] - want[k]) < 30 for k in range(3)))
+print(0 if n > int(sys.argv[3]) else 1, f'{n} pixels of #{sys.argv[2]}')
 PY
   }
-  start_sig sig://config
-  sleep 2
-  check "sig://config opens in the Wasm engine" \
-    "$(diag "0 if [x['engine'] for x in t if x['role']=='view' and x['shown']]==['wasm'] else 1")" "$(tabs_now)"
-  shot 01-config 0.5
+  edit_in_page() { key -k Escape; key -k Return; sleep 2; key -k Escape; }
+
+  # A plain file.
+  printf '%s\n' "$base" > "$out/config/sighurt/config.toml"
+  printf '[commands]\ncfgtest = "tab.new demo://pattern"\n' > "$home/append"
+  start_editor "${sig_args[@]}" sig://config >> "$out/sig.log" 2>&1
+  click 640 400
+  shot 01-start 0.5
+  check "sig://config opens in the Wasm engine and starts nothing, nor on a click" \
+    "$([[ $(diag "[x['engine'] for x in t if x['role']=='view' and x['shown']]") == "['wasm']" && $(programs) == '0 0' ]]; echo $?)" \
+    "programs $(programs)"
   reloads=$(diag "c['config_reloads']")
-  key -k Escape
-  check "Escape: INSERT MODE" "$(diag "0 if d['keymap_indicator']=='INSERT MODE' else 1")" "$(diag "d['keymap_indicator']")"
-  key -M ctrl -k End -m ctrl
-  key -k Return; wtype '[commands]'; key -k Return
-  wtype 'cfgtest = "tab.new demo://pattern"'; key -k Return
-  wtype '[ui.colors]'; key -k Return
-  wtype 'tab = "#7c3aed"'
-  sleep 1
-  shot 02-typed
-  save
-  shot 03-saved
-  check "Ctrl+S writes the linked file" "$(grep -q '^cfgtest = "tab.new demo://pattern"$' "$file"; echo $?)" \
-    "$(tr '\n' '|' < "$file")"
-  check "and the link stays a link" "$([[ -L $out/config/sighurt/config.toml ]]; echo $?)" \
-    "$(ls -l "$out/config/sighurt/config.toml" | sed 's/.* -> /-> /')"
-  check "the frontend reloaded it, though its watch can't see the file" \
-    "$(diag "0 if c['config_reloads']>$reloads else 1")" "$(diag "c['config_reloads']") reloads, $reloads before"
-  colour=$(violet 03-saved)
-  check "the chrome takes the new tab colour" "${colour%% *}" "${colour#* }"
-  key -k Escape
+  edit_in_page
+  check "Enter runs the editor on the file, which changed" \
+    "$(grep -q '^cfgtest = "tab.new demo://pattern"$' "$out/config/sighurt/config.toml"; echo $?)" \
+    "$(tail -2 "$out/config/sighurt/config.toml" | tr '\n' '|')"
+  check "the editor ended and was reaped" "$([[ $(programs) == '0 0' ]]; echo $?)" "programs $(programs)"
+  check "the configuration was read again" "$(reloaded "$reloads"; echo $?)" \
+    "$(diag "c['config_reloads']") reloads, $reloads before"
+  shot 02-ended 0.5
   key ':'; wtype cfgtest; key -k Return
   sleep 1
-  check "the core takes the new alias: :cfgtest opens a tab" "$([[ $(tabs_count) == 2 ]]; echo $?)" "$(tabs_now)"
-  key -M alt 1 -m alt
-  sleep 0.5
-  before=$(md5sum < "$file")
-  key -k Escape
-  key -M ctrl -k End -m ctrl
-  key -k Return; wtype 'zoom = 99'
-  save
-  shot 04-invalid-refused
-  check "an invalid save is refused and the file stays" "$([[ $(md5sum < "$file") == "$before" ]]; echo $?)" \
-    "$(tail -1 "$file")"
-  # Take the line back: select it to its start, delete it and the line break.
-  key -M shift -k Home -m shift; key -k BackSpace; key -k BackSpace
-  # The page saved no line break at the end.
-  printf '\n# written elsewhere\n' >> "$file"
-  key -k Return; wtype '# mine'
-  save
-  shot 05-stale-refused
-  check "a file changed behind the page is refused as stale" \
-    "$(grep -q '^# written elsewhere$' "$file" && ! grep -q '^# mine$' "$file"; echo $?)" "$(tail -2 "$file" | tr '\n' '|')"
-  # "Read the file again", left of Save at the header's right: the window is 1280 wide, Save
-  # 70 and the button 170 wide, 12 and 6 apart; the header starts at the page's top.
-  page_h=$(diag "[x['height'] for x in t if x['role']=='view' and x['shown']][0]")
-  top=$((layout_h - 20 - page_h))
-  click $((1280 - 12 - 70 - 6 - 85)) $((top + 16))
-  sleep 1
-  shot 06-read-again
-  key -M ctrl -k End -m ctrl
-  key -k Return; wtype '# mine'
-  save
-  shot 07-saved-over-both
-  check "after reading it again, a save keeps both changes" \
-    "$(grep -q '^# written elsewhere$' "$file" && grep -q '^# mine$' "$file"; echo $?)" "$(tail -3 "$file" | tr '\n' '|')"
-  key -k Escape
+  check "the new alias works: :cfgtest opens a tab" "$([[ $(diag "len(d['tabs'])") == 2 ]]; echo $?)" "$(tabs_now)"
   key q
   wait "$sig_pid"
+
+  # A file linked from elsewhere, which the watch can't see: the editor's end reads it again.
+  printf '%s\n' "$base" > "$out/dotfiles/sig.toml"
+  ln -sf ../../dotfiles/sig.toml "$out/config/sighurt/config.toml"
+  printf '[ui.colors]\ntab = "#7c3aed"\n' > "$home/append"
+  start_editor "${sig_args[@]}" sig://config >> "$out/sig.log" 2>&1
+  reloads=$(diag "c['config_reloads']")
+  edit_in_page
+  check "a linked file: the editor writes where the link leads, and it stays a link" \
+    "$(grep -q '^tab = "#7c3aed"$' "$out/dotfiles/sig.toml" && [[ -L $out/config/sighurt/config.toml ]]; echo $?)" \
+    "$(tail -1 "$out/dotfiles/sig.toml")"
+  check "and it is read again when the editor ends" "$(reloaded "$reloads"; echo $?)" \
+    "$(diag "c['config_reloads']") reloads, $reloads before"
+  found=$(colour 03-linked 7c3aed 100)
+  check "the chrome takes the new tab colour" "${found%% *}" "${found#* }"
+
+  # An invalid edit keeps the configuration, with the notice and the problems on the page.
+  printf 'zoom = 99\n' > "$home/append"
+  edit_in_page
+  sleep 0.5
+  check "an invalid edit keeps the configuration in use and says why" \
+    "$(diag "0 if d['status']=='notice' else 1")" "status $(diag "d['status']")"
+  found=$(colour 04-invalid ffb060)
+  check "and the page lists the problem" "${found%% *}" "${found#* }"
+  found=$(colour 04-invalid 7c3aed 100)
+  check "the tab colour stays" "${found%% *}" "${found#* }"
+  key q
+  wait "$sig_pid"
+
+  # Off: nothing starts, and the page says so.
+  printf '%s\n[pages.config]\nenabled = false\n' "$base" > "$out/dotfiles/sig.toml"
+  start_editor "${sig_args[@]}" sig://config >> "$out/sig.log" 2>&1
+  edit_in_page
+  check "with [pages.config] enabled = false nothing starts" \
+    "$([[ $(programs) == '0 0' && $(tail -1 "$out/dotfiles/sig.toml") == 'enabled = false' ]]; echo $?)" "programs $(programs)"
+  found=$(colour 05-off ffb060)
+  check "and the page says how to turn it on" "${found%% *}" "${found#* }"
+  key q
+  wait "$sig_pid"
+
+  # No editor: neither $VISUAL nor $EDITOR, and none of nvim, vim, vi and nano on PATH.
+  printf '%s\n' "$base" > "$out/dotfiles/sig.toml"
+  env -u VISUAL -u EDITOR HOME="$home" PATH="$out/emptybin" PAGETERM_MARK="$out" \
+    "${sig_args[@]}" sig://config >> "$out/sig.log" 2>&1 &
+  sig_pid=$!
+  sleep 2
+  found=$(colour 06-no-editor ffb060)
+  check "with no editor the page says so" "${found%% *}" "${found#* }"
+  edit_in_page
+  check "and nothing starts" "$([[ $(programs) == '0 0' ]]; echo $?)" "programs $(programs)"
+  key q
+  wait "$sig_pid"
+
+  # A real editor, driven with : commands only (Escape leaves INSERT on this page here).
+  if command -v nvim >/dev/null; then
+    env -u VISUAL HOME="$home" EDITOR="nvim -u NONE -i NONE" PAGETERM_MARK="$out" \
+      "${sig_args[@]}" sig://config >> "$out/sig.log" 2>&1 &
+    sig_pid=$!
+    sleep 2
+    reloads=$(diag "c['config_reloads']")
+    key -k Escape; key -k Return
+    sleep 2.5
+    shot 07-nvim 0.5
+    wtype ':normal Go# written by nvim'; key -k Return
+    wtype ':wq'; key -k Return
+    sleep 2
+    check "nvim: :normal and :wq write the file" \
+      "$(grep -q '^# written by nvim$' "$out/dotfiles/sig.toml"; echo $?)" "$(tail -1 "$out/dotfiles/sig.toml")"
+    check "and it is read again when nvim ends" "$(reloaded "$reloads"; echo $?)" \
+      "$(diag "c['config_reloads']") reloads, $reloads before"
+    key -k Escape
+    key q
+    wait "$sig_pid"
+  else
+    echo "SKIP $scenario: nvim is not on PATH"
+  fi
   ;;
 
 terminal-page)
@@ -1210,9 +1275,6 @@ terminal-page)
   # checks count them, and sig's zombies, from /proc.
   home=$out/home
   mkdir -p "$home"
-  # An "editor" for sig://terminal/config: appends a line to the file it is given.
-  printf '#!/bin/sh\necho "# edited in sig://terminal/config" >> "$1"\n' > "$home/editor"
-  chmod +x "$home/editor"
   terminal_config() { # terminal_config true|false
     cat > "$out/config/sighurt/config.toml" <<CONF
 version = 1
@@ -1227,7 +1289,7 @@ CONF
   }
   terminal_config true
   start_term() {
-    HOME=$home VISUAL=$home/editor PAGETERM_MARK=$out ENV=/dev/null PS1='$ ' \
+    HOME=$home PAGETERM_MARK=$out ENV=/dev/null PS1='$ ' \
       "$tdir/debug/sig-headless-e2e" --diagnostics "$out/diag.json" "$@" >> "$out/sig.log" 2>&1 &
     sig_pid=$!
     sleep 2
@@ -1412,14 +1474,6 @@ PY
   key -k Escape
   enter
   check "and Enter after the reload starts one" "$(until_programs '1 0'; echo $?)" "programs $(programs)"
-  normal
-  command_line 'tab.new sig://terminal/config'
-  key -k Escape
-  enter
-  sleep 2
-  check "sig://terminal/config runs \$VISUAL on the configuration" \
-    "$(grep -q 'edited in sig://terminal/config' "$out/config/sighurt/config.toml"; echo $?)" \
-    "$(tail -1 "$out/config/sighurt/config.toml")"
   normal
   key q
   wait "$sig_pid"
