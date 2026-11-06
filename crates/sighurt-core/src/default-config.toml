@@ -352,7 +352,8 @@ help = "tab.new sig://help"
 # a process group of their own, or that ignore the hangup, can outlive it, as in any terminal).
 enabled = false
 # The program sig://terminal runs, with its arguments, without a shell in between; without
-# it, $SHELL, or /bin/sh.
+# it, $SHELL, or /bin/sh. A program named without a directory is found in PATH's absolute
+# directories (see [pages.config] editor).
 # command = "/usr/bin/fish --login"
 
 [pages.config]
@@ -365,8 +366,9 @@ enabled = false
 enabled = true
 # The editor, with its arguments, without a shell in between; the file's path is added as its
 # last argument. Without it, $VISUAL, then $EDITOR, then the first of nvim, vim, vi and nano
-# found in PATH's absolute directories: a relative or empty entry (the current directory) is
-# never searched, since sig's current directory is wherever it was started.
+# found in PATH's absolute directories. A program named without a directory, here or in
+# those variables, is found the same way: a relative or empty PATH entry (the current
+# directory) is never searched, since the program gets all your rights.
 # editor = "nvim -u NONE"
 
 # ── Terminal ─────────────────────────────────────────────────────────────────────────────

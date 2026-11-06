@@ -152,13 +152,17 @@ pub fn editor(
     }
     let path = var("PATH")?;
     EDITORS.iter().find_map(|name| {
-        std::env::split_paths(&path)
-            // Never the current directory, nor one relative to it (see above).
-            .filter(|dir| dir.is_absolute())
-            .map(|dir| dir.join(name))
-            .find(|file| is_executable(file))
-            .map(|file| (vec![file.into_os_string()], EditorFrom::Path))
+        on_path(OsStr::new(name), &path).map(|file| (vec![file.into_os_string()], EditorFrom::Path))
     })
+}
+
+/// The executable file called `name` in the first absolute directory of `path` (a `PATH`) that
+/// has one. Never the current directory, nor one relative to it (see [`editor`]).
+fn on_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|file| is_executable(file))
 }
 
 fn is_executable(file: &Path) -> bool {
@@ -196,7 +200,8 @@ pub struct Exec {
 
 /// What runs for `program`. `launch.command` is split at white space with no shell and no
 /// quoting; the editor is [`editor`]'s, with the configuration file as an argument of its own;
-/// `vars` is `sig`'s environment. The working directory is `HOME` (`/` without one), and the
+/// `vars` is `sig`'s environment. A program named without a directory is found in the absolute
+/// directories of `PATH`, or the launch fails saying so. The working directory is `HOME` (`/` without one), and the
 /// directory of the configuration file for `EditConfig`, which fails without a file or an
 /// editor.
 pub fn exec(
@@ -239,6 +244,20 @@ pub fn exec(
             (argv, cwd)
         }
     };
+    // A program named without a directory is looked up here, by the rule of `editor`: left to
+    // the child's `execvp`, a relative or empty `PATH` entry would be searched too.
+    let mut argv = argv;
+    if !argv[0].as_encoded_bytes().contains(&b'/') {
+        let found = var("PATH").and_then(|path| on_path(&argv[0], &path));
+        argv[0] = found
+            .ok_or_else(|| {
+                format!(
+                    "{} is not in a directory of PATH (only absolute ones are searched).",
+                    argv[0].to_string_lossy()
+                )
+            })?
+            .into_os_string();
+    }
     Ok(Exec {
         argv,
         cwd,
@@ -885,8 +904,8 @@ mod tests {
         let shell = run(PtyProgram::Shell, None, &[]);
         assert_eq!(shell.argv, ["/bin/zsh"]);
         assert_eq!(shell.cwd, Path::new("/home/u"));
-        let configured = run(PtyProgram::Shell, Some(" fish  -l "), &[]);
-        assert_eq!(configured.argv, ["fish", "-l"]);
+        let configured = run(PtyProgram::Shell, Some(" /usr/bin/fish  -l "), &[]);
+        assert_eq!(configured.argv, ["/usr/bin/fish", "-l"]);
         let blank = run(PtyProgram::Shell, Some("  "), &[]);
         assert_eq!(blank.argv, ["/bin/zsh"]);
         let none = Launch {
@@ -910,13 +929,16 @@ mod tests {
                 editor: None,
                 config: Some(spaced),
             },
-            vars(&[("EDITOR", "nano"), ("VISUAL", "nvim -u NONE")]),
+            vars(&[("EDITOR", "/bin/nano"), ("VISUAL", "/bin/nvim -u NONE")]),
         )
         .unwrap();
-        assert_eq!(edit.argv, ["nvim", "-u", "NONE", spaced.to_str().unwrap()]);
+        assert_eq!(
+            edit.argv,
+            ["/bin/nvim", "-u", "NONE", spaced.to_str().unwrap()]
+        );
         assert_eq!(edit.cwd, Path::new("/home/u/my config/sighurt"));
-        let editor = run(PtyProgram::EditConfig, None, &[("EDITOR", "nano")]);
-        assert_eq!(editor.argv, ["nano", config.to_str().unwrap()]);
+        let editor = run(PtyProgram::EditConfig, None, &[("EDITOR", "/bin/nano")]);
+        assert_eq!(editor.argv, ["/bin/nano", config.to_str().unwrap()]);
         assert!(exec(PtyProgram::EditConfig, none, vars(&[])).is_err());
     }
 
@@ -1025,12 +1047,50 @@ mod tests {
         );
         // The file is the last argument, whatever the editor's own.
         let launch = Launch {
-            editor: Some("nvim -u NONE"),
+            editor: Some("/bin/nvim -u NONE"),
             ..launch
         };
         let edit = exec(PtyProgram::EditConfig, launch, Vec::new()).unwrap();
-        assert_eq!(edit.argv, ["nvim", "-u", "NONE", "/c/config.toml"]);
+        assert_eq!(edit.argv, ["/bin/nvim", "-u", "NONE", "/c/config.toml"]);
         assert_eq!(edit.cwd, Path::new("/c"));
+    }
+
+    #[test]
+    fn a_program_named_without_a_directory_is_found_in_absolute_path_directories_only() {
+        let bin = programs(&["fish", "ed"]);
+        let path = |entries: &str| vec![(OsString::from("PATH"), OsString::from(entries))];
+        let absolute = bin.path().to_str().unwrap().to_owned();
+        let shell = |vars| {
+            let launch = Launch {
+                command: Some("fish -l"),
+                editor: None,
+                config: None,
+            };
+            exec(PtyProgram::Shell, launch, vars)
+        };
+        // The name becomes the file found; a relative or empty entry before it is skipped.
+        let found = shell(path(&format!(".::bin:{absolute}"))).unwrap();
+        assert_eq!(
+            found.argv,
+            [bin.path().join("fish").as_os_str(), "-l".as_ref()]
+        );
+        // The editor named by the setting or the environment goes the same way.
+        let launch = Launch {
+            command: None,
+            editor: Some("ed -s"),
+            config: Some(Path::new("/c/config.toml")),
+        };
+        let edit = exec(PtyProgram::EditConfig, launch, path(&absolute)).unwrap();
+        assert_eq!(edit.argv[0], bin.path().join("ed").as_os_str());
+        // Nowhere absolute: the launch fails and says why; nothing is left to `execvp`.
+        for entries in [".", "", "bin:./x"] {
+            let error = shell(path(entries)).unwrap_err();
+            assert!(
+                error.starts_with("fish is not in a directory of PATH"),
+                "{error}"
+            );
+        }
+        assert!(shell(Vec::new()).is_err(), "no PATH at all");
     }
 
     #[test]

@@ -4621,3 +4621,43 @@ Newest last. Each entry says what was decided and why.
     resolved for the start screen and again at Enter, so a PATH changed in between runs
     something else than shown; a GUI editor (`code --wait`) opens outside the page.
 
+143. **An outside review of the day's changes before 1.0.0: seven findings, all fixed**
+    (6 November 2026; [reviews-1.0.0-astra.md](reviews-1.0.0-astra.md); branches `fixcore`
+    and `fixfront`, merged fd7b369 and 4842971). It found no way for a web page to reach the
+    editor or the shell, and confirmed the grant split and the spawn. (1, high) A held key
+    could start a program without a fresh press: Enter held across `:wq` restarted the
+    editor, and a key bound to `tab.select 2` then `page.send-key enter` started a loaded
+    config page from another tab. The core now keeps a separate, stricter *launch
+    activation* per view (`View::launch`) beside the general one, which is unchanged: only a
+    fresh physical press delivered to, or whose own `page.send-key` goes to, the view and
+    document that had the keyboard at the press, or a pointer press in the page, sets it,
+    and only while that document runs no program; `PtyOpen` needs it and uses it up; repeats
+    never set or renew it. A `page.send-key` run by a repeat reaches the page as a repeat,
+    and the terminal page starts only on a press record. (2) The terminal frontend delivered
+    input to an internal page it was not drawing (text mode, no graphics), so an editor could
+    start and be typed into unseen: `Frontend::page_input` takes `page`, and while the page
+    is not drawn the terminal gives it no key, text, paste or pointer event but releases; a
+    running program keeps running and gets input again with graphics. (3) Home's keys ignored
+    the input hold: while it is on, keys and `page.send-key` for a page the chrome draws are
+    dropped like those for a view, the address line still types, and
+    `BrowserEvent::ChromePagePress` (a press in home's rows) lifts it. (4) The reload after
+    an editor's end could stay pending until unrelated input: both frontends take
+    `take_config_edited` in the same work pass as the completion. (5) The editor's search
+    skipped relative `PATH` entries silently: it is now the stated rule (the program gets the
+    user's rights, and sig's current directory is arbitrary), and a program named without a
+    directory in `[pages.config] editor`, `[pages.terminal] command`, `$VISUAL` or `$EDITOR`
+    is looked up by sig the same way instead of by the child's `execvp`. (6) Home is redrawn
+    once when the history read after startup arrives. (7) A configuration file that cannot be
+    read is a problem on the editor page. *Also found by the fix lane*: a program ignoring
+    SIGHUP outlived sig when it had been cancelled within the two seconds before quit;
+    shutdown now waits for cancelled programs too. Each has a test that fails without its
+    fix (`crates/sighurt-core/tests/pages.rs`, the seeded
+    `fuzz_a_program_starts_only_after_a_fresh_press_or_a_click_in_its_page`, the guest's
+    tests, tui.rs `sig_config_gets_no_input_where_it_is_not_drawn`,
+    `an_editors_end_reads_a_linked_configuration_with_no_more_input` and
+    `home_lists_the_visits_read_after_it_was_drawn`, headless.sh `config-page`, the
+    runtime's pty, page_info and session tests). *Known, left*: repeats still renew the
+    general activation, so a page gets a fresh one on every repeat of a key held in it (new
+    tabs, the clipboard and file choosers stay one per activation); views the terminal does
+    not draw other than sig's own pages (a text-mode view without page text) still get keys.
+

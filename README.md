@@ -368,8 +368,9 @@ tabs = "left"
 
 `sig://config` runs your editor on the file, in a terminal on the page: `[pages.config] editor`
 if you set it, else `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `vim`, `vi` and `nano`
-found in an absolute directory of `PATH` (a relative or empty entry, the current directory, is
-never searched). The page says which editor and which file before anything starts, and Enter
+found in an absolute directory of `PATH`. An editor or shell named without a directory is found
+the same way: a relative or empty `PATH` entry (the current directory) is never searched. The
+page says which editor and which file before anything starts, and Enter
 starts it; keys reach it in the keymap's INSERT mode (`sig://help/keys` lists the keys that enter
 and leave it there). When the editor ends, `sig` reads the file again, a file linked from
 elsewhere (a dotfiles repository) included: what changed applies at once where the setting
