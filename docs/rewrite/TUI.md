@@ -445,6 +445,22 @@ Where it differs from the sketches in §2–§3:
   in text mode whose engine declares `semantics`, and stops asking, and drops the view's page,
   when it is hidden or the mode changes. An engine without them gets the page-rows message "No
   page text from this engine …" (the keys in it are the example configuration's, decision 116).
+- **`sig://home`** (6 November 2026). The page rows of a home tab show home in every mode
+  (graphics or text, kitty, sixel or none), drawn as cells by `sighurt-tui`'s `home`: what
+  `sighurt_runtime::home` says (the version and configuration file, the internal pages this build
+  and configuration open, the keymap's keys for a few commands, the pages visited last, the
+  engines) as a small document that text mode's own layout, drawing and navigation handle, so
+  it is sanitized and wrapped like a page and the keys' columns end in an ellipsis when too
+  wide. Rows too few for all of it leave out whole sections, Engines first, then Recently
+  visited, then Keys; what is still too tall scrolls. A left click on a link runs `page.open
+  <url>`; so does Enter on the link Tab or Shift+Tab focused (the same `text::Nav` keys as text
+  mode: they reach home as the core's `Effect::ChromeInput`, since a key sent to a page the
+  chrome draws goes to the chrome, `page.send-key` included). It is laid out again only when
+  the session builds home anew (`Session::home_generation`) or the rows change size. Home is
+  drawn once a hidden view's picture may go (decision 133): until then the rows keep the
+  picture, then they are blanked (the grid learns they are blank, `Grid::blanked`, so home's
+  text is written again after the blank) and home is drawn; going back to that tab shows its
+  picture again as any tab switch does.
 - **Keys.** The keymap runs first. What it leaves for the page, including `page.send-key
   ArrowDown` from the built-in `j`, reaches `Frontend::page_input` (new in `sighurt-runtime`:
   called for each `EngineCommand::Input` before the engine, `true` keeps it from the engine), and

@@ -76,6 +76,9 @@ required-features = ["frontend-tui", "engine-demo"]
 sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird" }
 # The argument tests' temporary files.
 tempfile = "3"
+# tests/tui.rs reads the screen sig draws (sig://home's rows), with the terminal emulator the
+# terminal page already uses.
+vt100 = "0.16"
 # The `virtual-pointer` example, a test helper that keeps one pointer plugged into a private
 # compositor.
 wayland-client.workspace = true

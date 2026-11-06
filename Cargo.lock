@@ -10437,6 +10437,7 @@ dependencies = [
  "signal-hook-registry",
  "smithay-client-toolkit",
  "tempfile",
+ "vt100",
  "wayland-client 0.31.15",
 ]
 
