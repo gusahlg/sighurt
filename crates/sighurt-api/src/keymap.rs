@@ -45,7 +45,9 @@
 //! a tab to close) and must not put them in its indicator or log them.
 //!
 //! [`Chord`] is one keystroke of the configuration's syntax, for keymaps to match key events
-//! with.
+//! with. [`UrlPattern`] is an address pattern of the configuration's syntax, for keymaps that
+//! bind keys for some addresses: both of the workspace's keymaps match addresses with it, so
+//! the rule is one.
 //!
 //! Must not own: the presses taken (the core's), where the keyboard is, or what a command does.
 
@@ -530,6 +532,174 @@ impl fmt::Display for Chord {
     }
 }
 
+/// The longest [`UrlPattern`], in bytes.
+pub const MAX_URL_PATTERN: usize = 2048;
+
+/// An address pattern for bindings that apply on some addresses: `scheme://host`, optionally
+/// followed by a path (`sig://terminal`, `https://*.example.com/docs`). No regular expressions.
+///
+/// It matches an address ([`TabInfo::url`], the committed one) whose scheme and host are the
+/// pattern's, ASCII case aside, and whose path starts with the pattern's path at a segment
+/// boundary: `sig://terminal` matches `sig://terminal` and `sig://terminal/config`, never
+/// `sig://terminal-x` or `https://sig/terminal`; `https://a.org/docs` matches `/docs` and
+/// `/docs/x`, not `/docsx`. A host `*.example.com` matches the hosts under example.com at any
+/// depth and not example.com itself, as `[routing.<engine>] hosts` does. The address's
+/// userinfo, port, query and fragment don't count. A pattern is printable ASCII: write a
+/// non-ASCII host in its `xn--` form and a path as the address has it, percent-encoded.
+///
+/// Of several patterns that match, [`UrlPattern::most_specific`] picks the one with the most
+/// specific host (an exact host before any wildcard, a longer wildcard before a shorter one),
+/// then the longest path. Compared and printed in its normal form: scheme and host in lower
+/// case, a path of `/` dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UrlPattern {
+    scheme: String,
+    /// The host, or for `*.example.com` the suffix `example.com`.
+    host: String,
+    wildcard: bool,
+    /// Empty, or starting with "/" and longer than it.
+    path: String,
+}
+
+/// An address split as [`UrlPattern`] compares it: scheme, host and path, the host in lower
+/// case. `None` for an address with no `//` authority (`about:blank`, `data:`).
+fn address_parts(address: &str) -> Option<(&str, String, &str)> {
+    let (scheme, rest) = address.split_once(':')?;
+    let rest = rest.strip_prefix("//")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, rest) = rest.split_at(end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match host.strip_prefix('[') {
+        Some(inner) => &host[..inner.find(']').map_or(host.len(), |end| end + 2)],
+        None => host.split(':').next().unwrap_or_default(),
+    };
+    let path = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    Some((scheme, host.to_ascii_lowercase(), path))
+}
+
+impl UrlPattern {
+    /// Whether `address` is one of the pattern's.
+    pub fn matches(&self, address: &str) -> bool {
+        let Some((scheme, host, path)) = address_parts(address) else {
+            return false;
+        };
+        let host_matches = match self.wildcard {
+            true => host
+                .strip_suffix(&self.host)
+                .is_some_and(|under| under.len() > 1 && under.ends_with('.')),
+            false => host == self.host,
+        };
+        let path_matches = path.strip_prefix(&self.path).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with('/') || self.path.ends_with('/')
+        });
+        scheme.eq_ignore_ascii_case(&self.scheme) && host_matches && path_matches
+    }
+
+    /// What goes with the most specific of `patterns` that matches `address`, by the order the
+    /// type describes; `None` if none does. Equal patterns are equally specific, and then the
+    /// first wins.
+    pub fn most_specific<'a, T>(
+        patterns: impl IntoIterator<Item = (&'a UrlPattern, T)>,
+        address: &str,
+    ) -> Option<T> {
+        let mut best: Option<((usize, usize), T)> = None;
+        for (pattern, item) in patterns {
+            if !pattern.matches(address) {
+                continue;
+            }
+            let host = match pattern.wildcard {
+                true => pattern.host.len(),
+                false => usize::MAX,
+            };
+            let rank = (host, pattern.path.len());
+            if best.as_ref().is_none_or(|(best, _)| rank > *best) {
+                best = Some((rank, item));
+            }
+        }
+        best.map(|(_, item)| item)
+    }
+}
+
+impl FromStr for UrlPattern {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        if text.len() > MAX_URL_PATTERN {
+            return Err(format!(
+                "an address pattern is at most {MAX_URL_PATTERN} bytes"
+            ));
+        }
+        if let Some(c) = text.chars().find(|c| !c.is_ascii_graphic()) {
+            return Err(format!(
+                "{c:?} in an address pattern (write it as the address has it: a host in its \
+                 xn-- form, a path percent-encoded)"
+            ));
+        }
+        let shape = "an address pattern is scheme://host and an optional path, such as \
+                     \"sig://terminal\" or \"https://*.example.com/docs\"";
+        let (scheme, rest) = text.split_once("://").ok_or_else(|| shape.to_owned())?;
+        let scheme_ok = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+        if !scheme_ok {
+            return Err(format!("{scheme:?} is not a URL scheme; {shape}"));
+        }
+        let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        if host.is_empty() {
+            return Err(format!("the pattern names no host; {shape}"));
+        }
+        // An IPv6 address is in brackets, colons and all.
+        let ipv6 = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'));
+        let (checked, banned) = match ipv6 {
+            Some(inner) => (inner, "@?#[]"),
+            None => (host, "@:?#[]"),
+        };
+        if let Some(c) = checked.chars().find(|c| banned.contains(*c)) {
+            return Err(format!(
+                "{c:?} in the host: a pattern has no user, port, query or fragment"
+            ));
+        }
+        let (wildcard, host) = match host.strip_prefix("*.") {
+            Some(suffix) if !suffix.is_empty() => (true, suffix),
+            Some(_) => return Err("\"*.\" needs a domain after it".into()),
+            None => (false, host),
+        };
+        if host.contains('*') {
+            return Err(
+                "\"*\" is only for the start of a host, as \"*.example.com\": hosts under it"
+                    .into(),
+            );
+        }
+        if let Some(c) = path.chars().find(|c| "?#*".contains(*c)) {
+            return Err(format!(
+                "{c:?} in the path: a pattern matches a path's start, with no query, fragment \
+                 or wildcard"
+            ));
+        }
+        Ok(Self {
+            scheme: scheme.to_ascii_lowercase(),
+            host: host.to_ascii_lowercase(),
+            wildcard,
+            path: match path {
+                "/" => String::new(),
+                path => path.to_owned(),
+            },
+        })
+    }
+}
+
+impl fmt::Display for UrlPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let star = if self.wildcard { "*." } else { "" };
+        write!(f, "{}://{star}{}{}", self.scheme, self.host, self.path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +879,127 @@ mod tests {
             ("code:KeyJ", false),
         ] {
             assert_eq!(chord(text).types(), types, "{text}");
+        }
+    }
+
+    fn pattern(text: &str) -> UrlPattern {
+        text.parse().unwrap_or_else(|e| panic!("{text:?}: {e}"))
+    }
+
+    #[test]
+    fn url_patterns_match_scheme_host_and_a_path_prefix() {
+        let terminal = pattern("sig://terminal");
+        for address in [
+            "sig://terminal",
+            "sig://terminal/",
+            "sig://terminal/config",
+            "SIG://Terminal/x?y#z",
+            "sig://user@terminal:9/a",
+        ] {
+            assert!(terminal.matches(address), "{address}");
+        }
+        for address in [
+            "sig://terminal-x",
+            "sig://terminalx/",
+            "https://sig/terminal",
+            "sig://config",
+            "sig:terminal",
+            "about:blank",
+            "",
+            "terminal",
+        ] {
+            assert!(!terminal.matches(address), "{address}");
+        }
+        let docs = pattern("https://Example.ORG/docs");
+        assert_eq!(docs.to_string(), "https://example.org/docs");
+        assert!(docs.matches("https://example.org/docs"));
+        assert!(docs.matches("https://example.org/docs/a?b"));
+        assert!(docs.matches("https://example.org/docs#x"));
+        assert!(!docs.matches("https://example.org/docsx"));
+        assert!(
+            !docs.matches("https://example.org/Docs"),
+            "paths keep their case"
+        );
+        assert!(!docs.matches("https://example.org/"));
+        assert!(!docs.matches("http://example.org/docs"));
+        let slash = pattern("https://example.org/docs/");
+        assert!(slash.matches("https://example.org/docs/x"));
+        assert!(!slash.matches("https://example.org/docs"));
+        // A path of "/" is no path.
+        assert_eq!(
+            pattern("https://example.org/"),
+            pattern("https://EXAMPLE.org")
+        );
+        // IPv6 hosts keep their brackets.
+        let local = pattern("http://[::1]/a");
+        assert!(local.matches("http://[::1]:8080/a/b"));
+        assert!(!local.matches("http://[::2]/a"));
+    }
+
+    #[test]
+    fn a_wildcard_host_is_the_hosts_under_it() {
+        let under = pattern("https://*.Example.com");
+        assert_eq!(under.to_string(), "https://*.example.com");
+        assert!(under.matches("https://a.example.com/"));
+        assert!(under.matches("https://a.b.EXAMPLE.com/x"));
+        assert!(!under.matches("https://example.com/"));
+        assert!(!under.matches("https://.example.com/"));
+        assert!(!under.matches("https://badexample.com/"));
+    }
+
+    #[test]
+    fn the_most_specific_pattern_wins() {
+        let patterns = [
+            "https://*.example.com",
+            "https://*.a.example.com",
+            "https://b.a.example.com",
+            "https://b.a.example.com/docs",
+            "https://b.a.example.com/docs/deep",
+        ]
+        .map(pattern);
+        let pick = |address: &str| UrlPattern::most_specific(patterns.iter().zip(0..), address);
+        assert_eq!(pick("https://b.a.example.com/docs/deep/x"), Some(4));
+        assert_eq!(pick("https://b.a.example.com/docs/x"), Some(3));
+        assert_eq!(pick("https://b.a.example.com/"), Some(2));
+        assert_eq!(pick("https://c.a.example.com/docs"), Some(1));
+        assert_eq!(pick("https://c.example.com/"), Some(0));
+        assert_eq!(pick("https://example.com/"), None);
+        // An exact host beats a wildcard with a longer path.
+        let both = [pattern("https://*.a.org/x/y/z"), pattern("https://w.a.org")];
+        assert_eq!(
+            UrlPattern::most_specific(both.iter().zip(0..), "https://w.a.org/x/y/z"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn bad_url_patterns_say_why() {
+        let long = format!("https://a.org/{}", "x".repeat(MAX_URL_PATTERN));
+        for (text, error) in [
+            ("terminal", "scheme://host"),
+            ("sig:terminal", "scheme://host"),
+            ("://terminal", "not a URL scheme"),
+            ("1x://a", "not a URL scheme"),
+            ("sig://", "no host"),
+            ("https:///docs", "no host"),
+            ("https://a.org:8080", "port"),
+            ("https://me@a.org", "user"),
+            ("https://a.org?q", "query"),
+            ("https://a.org/x?q", "query"),
+            ("https://a.org/x#f", "fragment"),
+            ("https://*.", "a domain after it"),
+            ("https://a.*.org", "only for the start"),
+            ("https://*a.org", "only for the start"),
+            ("https://a.org/*", "wildcard"),
+            ("https://bücher.de", "xn--"),
+            ("https://a.org/a b", "' '"),
+            (long.as_str(), "at most 2048 bytes"),
+        ] {
+            let result = text.parse::<UrlPattern>();
+            assert!(
+                result.as_ref().is_err_and(|e| e.contains(error)),
+                "{text:?}: {result:?}"
+            );
         }
     }
 
