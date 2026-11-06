@@ -4513,3 +4513,39 @@ Newest last. Each entry says what was decided and why.
     seeded `fuzz_pages`, the engine's `tests/runtime.rs`, the terminal's unit tests). Also:
     the terminal's home page no longer claims sig's pages are not shown in the terminal, and
     "no such page" in both frontends points at `sig://help`.
+
+140. **Bindings for some addresses; the terminal pages leave INSERT on `ctrl-escape` or `f12`**
+    (6 November 2026, branch `keys`, merged 056a4dc; the user: "I am having issues leaving
+    insert mode when in the terminal. Maybe making it be ctrl-escape would make more sense
+    maybe? Can you also make sure this is not really hard-coded. I want the configuration to
+    have control over the bindings, add in a way for the configuration to set url-specific
+    bindings so that this binding change can live in the configuration entirely"). This
+    amends decision 138's *Keys*. `sighurt_api::keymap::UrlPattern` is the one address rule
+    both keymaps use: `scheme://host` and an optional path prefix at a segment boundary,
+    scheme and host ASCII case-insensitive, `*.` for the hosts under a domain as `[routing]
+    hosts`, printable ASCII, at most 2 KiB, matched against the shown tab's committed address
+    (never one loading, never a link). Of several matches the most specific wins: an exact
+    host, then a longer wildcard, then the longer path. *The example configuration* gets
+    `table::SITES`: a site's table for a mode replaces that mode's general table while the
+    page has the keyboard, so a site can take a binding away. `lib.rs` names no page;
+    `TabInfo::internal` stays in the API and neither keymap reads it. `sig://terminal` and
+    `sig://config` get `INSERT_PROGRAM`: Escape goes to the program, `ctrl-escape` (the user's
+    choice) or `f12` returns to NORMAL; `ctrl-\ ctrl-n` is gone (AltGr on Nordic layouts).
+    `ctrl-escape` arrives in the window and through the kitty protocol (`CSI 27;5u`); a
+    legacy terminal, and tmux by default (the user's setup), send it as a plain ESC byte, so
+    there it is Escape and reaches the program, and `f12` (`CSI 24~` everywhere, any layout,
+    no AltGr) is the way out. The terminal page's hint points at sig://help/keys instead of
+    naming a key. *The `bindings` keymap* reads `[keys.url."<pattern>"]` and
+    `[tui.keys.url."<pattern>"]`: with page focus on a matching address the most specific
+    table comes before `[keys.page]` and `[keys]` of its layer. At most 64 tables; bad or
+    duplicate patterns are load errors; there is no unbinding. Both keymaps' `describe` list
+    site bindings "on <pattern>". A page that commits a matching address gets those bindings,
+    which grants nothing. *The terminal's parser* now also reads xterm's modified-key form
+    (`CSI 27;modifiers;code~`, which tmux sends with `extended-keys always` in its xterm
+    format); it dropped every such key before (7d53b5d). *Verified*: sighurt-api's pattern
+    tests and `fuzz_url_patterns_parse_and_match`; the example crate's terminal-page and
+    committed-address tests and its seeded test with random addresses; five core tests in
+    keys.rs and the configuration's seeded test with `keys.url` tables; tui.rs
+    `sig_terminal_runs_a_shell_in_the_terminal_frontend` (Escape reaches the shell, kitty
+    ctrl-escape and f12 leave INSERT); headless.sh `terminal-page` 27/27; faults.sh
+    `terminal` 9/9; the parser's `xterms_modified_key_form_is_the_key_with_its_modifiers`.
