@@ -106,31 +106,10 @@ pub enum Service {
 /// What an internal page asks for ([`Service::Page`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PageRequest {
-    /// Facts about the browser, for the help page: answered with [`ServiceReply::Text`] in the
-    /// form [`PageInfo`] documents. Never the configuration's text ([`Self::ConfigRead`]).
+    /// Facts about the browser, for the help page and the start screens of the pages that run
+    /// a program: answered with [`ServiceReply::Text`] in the form [`PageInfo`] documents.
+    /// Never the configuration's text.
     Info(PageInfo),
-    /// The user's configuration file as it is, and where it is: [`ServiceReply::Text`] in the
-    /// form `sighurt_runtime::page_config` documents (`file|new|read-only <path>`, `target
-    /// <resolved target>`, then the text). A missing file is answered with what a new one
-    /// would start as.
-    ConfigRead,
-    /// Whether `text` is a valid configuration for this build: [`ServiceReply::Text`] in the
-    /// form `sighurt_runtime::page_config` documents (`valid` and `notice <line> <text>` lines,
-    /// or `invalid` and `problem <line> <text>` lines). Nothing is written.
-    ConfigCheck {
-        /// The configuration to check.
-        text: String,
-    },
-    /// Replace the user's configuration file with `text`, if it still holds `replaces` (what
-    /// the page read), and reload it: [`ServiceReply::Text`] in the form
-    /// `sighurt_runtime::page_config` documents (`saved` and its `restart …`/`notice …` lines,
-    /// or `stale`, `invalid` or `refused` with a message).
-    ConfigWrite {
-        /// The new file.
-        text: String,
-        /// What the page read, which the file must still hold.
-        replaces: String,
-    },
     /// Start `program` on a new pseudo-terminal of `cols` by `rows` cells: answered with
     /// [`ServiceReply::Pty`], the session, once the program runs. The browser builds the
     /// program's arguments, environment and working directory; the page only chooses from this
@@ -157,10 +136,16 @@ impl PageRequest {
     /// The grant a page needs for this request.
     pub fn grant(&self) -> PageGrant {
         match self {
+            Self::Info(PageInfo::Editor) => PageGrant::Editor,
             Self::Info(_) => PageGrant::Info,
-            Self::ConfigRead | Self::ConfigCheck { .. } => PageGrant::ConfigRead,
-            Self::ConfigWrite { .. } => PageGrant::ConfigWrite,
-            Self::PtyOpen { .. } => PageGrant::Pty,
+            Self::PtyOpen {
+                program: PtyProgram::Shell,
+                ..
+            } => PageGrant::Shell,
+            Self::PtyOpen {
+                program: PtyProgram::EditConfig,
+                ..
+            } => PageGrant::Editor,
         }
     }
 }
@@ -195,11 +180,19 @@ pub enum PageInfo {
     /// `ui.chrome`, `ui.renderer`, `session.restore`, `history.remember`, `pages.terminal`,
     /// `tui.mode`, `tui.graphics`).
     Settings,
+    /// What [`PtyProgram::EditConfig`] would run now, for `sig://config`'s start screen:
+    /// `key, value` records: `enabled` (`yes`/`no`, `[pages.config] enabled`), `editor` (the
+    /// command line, its words separated by spaces; empty when no editor was found), `from`
+    /// (`setting`, `VISUAL`, `EDITOR`, `PATH` or `none`), `file` (the configuration file),
+    /// `new` (`yes` when the file does not exist yet), then a `problem` record for each
+    /// problem of the file as it is (none when it is valid or new). Needs
+    /// [`PageGrant::Editor`], not [`PageGrant::Info`].
+    Editor,
 }
 
 impl PageInfo {
     /// Every kind, in a fixed order.
-    pub const ALL: [PageInfo; 7] = [
+    pub const ALL: [PageInfo; 8] = [
         Self::About,
         Self::Engines,
         Self::Commands,
@@ -207,6 +200,7 @@ impl PageInfo {
         Self::Keys,
         Self::Paths,
         Self::Settings,
+        Self::Editor,
     ];
 
     /// Its name in the `sig` import module's `request` (`info:<name>`).
@@ -219,6 +213,7 @@ impl PageInfo {
             Self::Keys => "keys",
             Self::Paths => "paths",
             Self::Settings => "settings",
+            Self::Editor => "editor",
         }
     }
 
@@ -234,25 +229,25 @@ pub enum PtyProgram {
     /// The user's shell: `[pages.terminal] command`, else `$SHELL`, else `/bin/sh`, in the home
     /// directory.
     Shell,
-    /// The user's editor (`$VISUAL`, else `$EDITOR`) on the configuration file, in its
-    /// directory.
+    /// The user's editor on the configuration file, in its directory: `[pages.config] editor`,
+    /// else `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `vim`, `vi` and `nano` found
+    /// on `PATH`.
     EditConfig,
 }
 
 /// What one internal page may ask for, per operation. Each page is given a fixed set at build
-/// time (the `PAGES` table of `sighurt-pages`: help has `Info`; config the configuration's;
-/// terminal `Pty`); the Wasm engine checks it at every `sig` host function and the core again
-/// from its record of the view's page.
+/// time (the `PAGES` table of `sighurt-pages`: help has `Info`, config `Editor`, terminal
+/// `Shell`); the Wasm engine checks it at every `sig` host function and the core again from
+/// its record of the view's page. A terminal's program is the page's grant, not its choice:
+/// `sig://config` and `sig://terminal` run the same module, and each may start only its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PageGrant {
     /// [`PageRequest::Info`].
     Info,
-    /// [`PageRequest::ConfigRead`] and [`PageRequest::ConfigCheck`].
-    ConfigRead,
-    /// [`PageRequest::ConfigWrite`].
-    ConfigWrite,
-    /// [`PageRequest::PtyOpen`].
-    Pty,
+    /// [`PageRequest::PtyOpen`] of [`PtyProgram::Shell`].
+    Shell,
+    /// [`PageRequest::PtyOpen`] of [`PtyProgram::EditConfig`], and [`PageInfo::Editor`].
+    Editor,
     /// [`Service::ClipboardWrite`], under its usual rule (a click or key press in the page).
     Clipboard,
 }

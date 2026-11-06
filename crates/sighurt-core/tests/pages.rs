@@ -23,8 +23,8 @@ use sighurt_core::tabs::Content;
 use sighurt_core::{update, BrowserEvent, BrowserState, Effect, Environment, OpenRequest};
 
 const GRANTS_HELP: &[PageGrant] = &[PageGrant::Info];
-const GRANTS_TERMINAL: &[PageGrant] = &[PageGrant::Pty];
-const GRANTS_CONFIG: &[PageGrant] = &[PageGrant::ConfigRead, PageGrant::ConfigWrite];
+const GRANTS_TERMINAL: &[PageGrant] = &[PageGrant::Shell];
+const GRANTS_CONFIG: &[PageGrant] = &[PageGrant::Editor];
 
 /// A build with Servo, the Wasm engine and the three pages.
 fn environment() -> Environment {
@@ -222,6 +222,14 @@ impl Harness {
 fn pty_open() -> Service {
     Service::Page(PageRequest::PtyOpen {
         program: PtyProgram::Shell,
+        cols: 80,
+        rows: 24,
+    })
+}
+
+fn editor_open() -> Service {
+    Service::Page(PageRequest::PtyOpen {
+        program: PtyProgram::EditConfig,
         cols: 80,
         rows: 24,
     })
@@ -517,10 +525,18 @@ fn info_is_the_help_pages_and_no_one_elses() {
     assert_eq!(answer(&effects, id), Some(&Err(ServiceError::Denied)));
     h.command("tab.select 1");
     h.click(help);
-    for service in [pty_open(), Service::Page(PageRequest::ConfigRead)] {
+    let editor_info = Service::Page(PageRequest::Info(PageInfo::Editor));
+    for service in [pty_open(), editor_open(), editor_info.clone()] {
         let (id, effects) = h.ask(help, Some("sig://help"), service);
         assert_eq!(answer(&effects, id), Some(&Err(ServiceError::Denied)));
     }
+    // What the editor is: sig://config's to ask, not the help page's.
+    h.command("tab.new sig://config");
+    let config = h.shown();
+    let (id, effects) = h.ask(config, Some("sig://config"), editor_info);
+    assert!(performs(&effects, id));
+    let (id, effects) = h.ask(config, Some("sig://config"), info());
+    assert_eq!(answer(&effects, id), Some(&Err(ServiceError::Denied)));
 }
 
 #[test]
@@ -658,31 +674,97 @@ fn a_terminal_ends_with_its_document_tab_history_entry_setting_and_quit() {
 }
 
 #[test]
-fn writing_the_configuration_needs_the_front_and_the_users_action() {
-    let write = || {
-        Service::Page(PageRequest::ConfigWrite {
-            text: "version = 1".into(),
-            replaces: String::new(),
-        })
-    };
-    let mut h = Harness::start("", &["sig://config"]);
-    let view = h.shown();
-    let (id, effects) = h.ask(view, Some("sig://config"), write());
+fn sig_config_starts_only_the_editor_and_sig_terminal_only_the_shell() {
+    let on = "[pages.terminal]\nenabled = true";
+    // sig://config may ask for the editor, and the click it used is gone after.
+    let mut h = Harness::start(on, &["sig://config"]);
+    let config = h.shown();
+    h.click(config);
+    // The shell is not its program: refused, without using up the click.
+    let (id, effects) = h.ask(config, Some("sig://config"), pty_open());
     assert_eq!(answer(&effects, id), Some(&Err(ServiceError::Denied)));
-    let (id, effects) = h.ask(
-        view,
-        Some("sig://config"),
-        Service::Page(PageRequest::ConfigRead),
+    let (id, effects) = h.ask(config, Some("sig://config"), editor_open());
+    assert!(performs(&effects, id), "the click still counts");
+    // sig://terminal may ask for the shell, never the editor.
+    let mut h = Harness::start(on, &["sig://terminal"]);
+    let terminal = h.shown();
+    h.click(terminal);
+    let (id, effects) = h.ask(terminal, Some("sig://terminal"), editor_open());
+    assert_eq!(answer(&effects, id), Some(&Err(ServiceError::Denied)));
+    let (id, effects) = h.ask(terminal, Some("sig://terminal"), pty_open());
+    assert!(performs(&effects, id), "the click still counts");
+}
+
+#[test]
+fn the_editor_is_on_by_default_and_has_its_own_setting() {
+    // On by default, while the shell is off: each page has its own setting.
+    let mut h = Harness::start("", &["sig://config", "sig://terminal"]);
+    h.command("tab.select 1");
+    let config = h.shown();
+    h.click(config);
+    let (id, effects) = h.ask(config, Some("sig://config"), editor_open());
+    assert!(performs(&effects, id), "on by default");
+    h.command("tab.select 2");
+    let terminal = h.shown();
+    h.click(terminal);
+    let (id, effects) = h.ask(terminal, Some("sig://terminal"), pty_open());
+    assert_eq!(
+        answer(&effects, id),
+        Some(&Err(ServiceError::Denied)),
+        "the shell is off"
     );
-    assert!(performs(&effects, id), "reading needs no click");
-    h.click(view);
-    let (id, effects) = h.ask(view, Some("sig://config"), write());
-    assert!(performs(&effects, id));
-    // From a background tab: no.
-    h.click(view);
-    h.command("tab.new https://a.test/");
-    let (id, effects) = h.ask(view, Some("sig://config"), write());
+    // Off: refused.
+    let mut h = Harness::start("[pages.config]\nenabled = false", &["sig://config"]);
+    let config = h.shown();
+    h.click(config);
+    let (id, effects) = h.ask(config, Some("sig://config"), editor_open());
     assert_eq!(answer(&effects, id), Some(&Err(ServiceError::Denied)));
+    // Turned off while the editor runs: it ends. The shell's setting doesn't end it.
+    let mut h = Harness::start("", &["sig://config"]);
+    let config = h.shown();
+    h.click(config);
+    let (id, effects) = h.ask(config, Some("sig://config"), editor_open());
+    assert!(performs(&effects, id));
+    h.done(id, Ok(ServiceReply::Pty(PtySession::next())));
+    let parse = |text: &str| Config::parse(Some(text), &environment()).unwrap();
+    let shell_off = parse("version = 1\n[pages.terminal]\nenabled = false");
+    let effects = h.apply(BrowserEvent::ConfigReloaded(Ok(Box::new(shell_off))));
+    assert!(!cancels(&effects, id));
+    let editor_off = parse("version = 1\n[pages.config]\nenabled = false");
+    let effects = h.apply(BrowserEvent::ConfigReloaded(Ok(Box::new(editor_off))));
+    assert!(cancels(&effects, id));
+    // And the editor's setting doesn't end a shell.
+    let mut h = Harness::start("[pages.terminal]\nenabled = true", &["sig://terminal"]);
+    let terminal = h.shown();
+    h.click(terminal);
+    let (id, effects) = h.ask(terminal, Some("sig://terminal"), pty_open());
+    assert!(performs(&effects, id));
+    h.done(id, Ok(ServiceReply::Pty(PtySession::next())));
+    let editor_off =
+        parse("version = 1\n[pages.terminal]\nenabled = true\n[pages.config]\nenabled = false");
+    let effects = h.apply(BrowserEvent::ConfigReloaded(Ok(Box::new(editor_off))));
+    assert!(!cancels(&effects, id));
+}
+
+#[test]
+fn shells_and_editors_share_the_eight() {
+    let mut h = Harness::start("[pages.terminal]\nenabled = true", &[]);
+    let mut started = Vec::new();
+    for i in 0..9 {
+        let (url, service) = match i % 2 {
+            0 => ("sig://config", editor_open()),
+            _ => ("sig://terminal", pty_open()),
+        };
+        h.command(&format!("tab.new {url}"));
+        let view = h.shown();
+        h.click(view);
+        started.push(h.ask(view, Some(url), service));
+    }
+    for (id, effects) in &started[..8] {
+        assert!(performs(effects, *id));
+    }
+    let (ninth, effects) = &started[8];
+    assert_eq!(answer(effects, *ninth), Some(&Err(ServiceError::Denied)));
 }
 
 // ── The configuration's commands ─────────────────────────────────────────────────────────────
@@ -970,13 +1052,6 @@ fn a_key_the_chrome_got_does_not_repeat_into_the_tab_it_opened() {
     assert!(!delivered(&h.apply(enter(ButtonState::Released, false))));
 }
 
-fn config_write() -> Service {
-    Service::Page(PageRequest::ConfigWrite {
-        text: "version = 1".into(),
-        replaces: String::new(),
-    })
-}
-
 fn window_focus(focus: FocusEvent) -> BrowserEvent {
     BrowserEvent::Keyboard {
         event: InputEvent {
@@ -988,10 +1063,10 @@ fn window_focus(focus: FocusEvent) -> BrowserEvent {
 }
 
 #[test]
-fn an_unfocused_window_writes_no_configuration_and_opens_no_terminal() {
+fn an_unfocused_window_opens_no_terminal_and_no_editor() {
     let on = "[pages.terminal]\nenabled = true";
     for (url, service) in [
-        ("sig://config", config_write()),
+        ("sig://config", editor_open()),
         ("sig://terminal", pty_open()),
     ] {
         let mut h = Harness::start(on, &[url]);

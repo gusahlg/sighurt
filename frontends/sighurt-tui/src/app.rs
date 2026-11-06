@@ -805,8 +805,8 @@ impl App {
             self.signals.push(libc::SIGHUP as u8);
         }
         self.handle_signals();
-        // The file changed, or sig://config wrote it: the watch misses a linked target.
-        if std::mem::take(&mut self.config_changed) | self.session.take_config_written() {
+        // The file changed, or sig://config's editor ended: the watch misses a linked target.
+        if std::mem::take(&mut self.config_changed) | self.session.take_config_edited() {
             self.reload_config();
         }
         if self
@@ -1914,7 +1914,7 @@ impl App {
                 if config.restore_session() && !self.session.core().config().restore_session() {
                     self.session.session_changed();
                 }
-                // The configuration in use already (sig://config wrote it): the core says
+                // The configuration in use already (nothing changed, or the watch saw it): the core says
                 // nothing about it again, so what it said when it took it stays shown.
                 let same = config == *self.session.core().config();
                 let settings = *config.tui();

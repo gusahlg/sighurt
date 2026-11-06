@@ -79,8 +79,8 @@ use sighurt_api::input::{
 use sighurt_api::keymap::{Browser, KeyBinding, KeyContext, KeymapKind, TabInfo};
 use sighurt_api::semantic::SemanticAction;
 use sighurt_api::services::{
-    PageGrant, PageRequest, Permission, Service, ServiceError, ServiceReply, ServiceRequest,
-    ServiceResult,
+    PageGrant, PageRequest, Permission, PtyProgram, Service, ServiceError, ServiceReply,
+    ServiceRequest, ServiceResult,
 };
 use sighurt_api::settings::Table;
 use url::Url;
@@ -2736,10 +2736,7 @@ impl BrowserState {
                 let page = v.page.clone();
                 let asking = (view, document, page.as_deref());
                 let allowed = self.page_allowed(asking, &origin, grant, &service);
-                let deliberate = matches!(
-                    service,
-                    Service::Page(PageRequest::PtyOpen { .. } | PageRequest::ConfigWrite { .. })
-                );
+                let deliberate = matches!(service, Service::Page(PageRequest::PtyOpen { .. }));
                 if allowed && deliberate {
                     // Only the page in front, with the keyboard, in a window that has it, after
                     // the user acted in it.
@@ -2756,13 +2753,14 @@ impl BrowserState {
         if !allowed {
             return fx.push(refuse(ServiceError::Denied));
         }
-        if let Service::Page(PageRequest::PtyOpen { .. }) = service {
+        if let Service::Page(PageRequest::PtyOpen { program, .. }) = service {
             let state = PtyState::Opening;
             self.ptys.insert(
                 id,
                 Pty {
                     view,
                     document,
+                    program,
                     state,
                 },
             );
@@ -2788,7 +2786,8 @@ impl BrowserState {
 
     /// Whether `document` of `view`, whose recorded internal page is `page`, may have an
     /// internal page's request needing `grant`, asked as `origin`: it must be that page, asking as itself, with
-    /// the grant; a terminal also needs `[pages] terminal` and room under the limits (one per
+    /// the grant; a terminal also needs its program's setting (`[pages.terminal] enabled` for
+    /// the shell, `[pages.config] enabled` for the editor) and room under the limits (one per
     /// document, [`permissions::MAX_PTYS`] in all). Being in front and the activation used up
     /// are the caller's to check.
     fn page_allowed(
@@ -2806,8 +2805,8 @@ impl BrowserState {
             return false;
         }
         match service {
-            Service::Page(PageRequest::PtyOpen { .. }) => {
-                self.config.pages().terminal && self.ptys.room(view, document)
+            Service::Page(PageRequest::PtyOpen { program, .. }) => {
+                program_enabled(self.config.pages(), *program) && self.ptys.room(view, document)
             }
             _ => true,
         }
@@ -3287,6 +3286,14 @@ impl BrowserState {
 
 /// Whether `kind` is typing: a key press or repeat, or text. A key's release always goes where
 /// its press went.
+/// Whether the page that runs `program` may run it now: its setting.
+fn program_enabled(pages: &crate::config::PagesConfig, program: PtyProgram) -> bool {
+    match program {
+        PtyProgram::Shell => pages.terminal,
+        PtyProgram::EditConfig => pages.config,
+    }
+}
+
 fn is_typing(kind: &InputKind) -> bool {
     match kind {
         InputKind::Key(key) => key.state == ButtonState::Pressed,
@@ -3298,15 +3305,16 @@ fn is_typing(kind: &InputKind) -> bool {
 impl BrowserState {
     /// Closes every terminal that may not go on: its view is closed or gone, its document was
     /// replaced (a reload, a navigation), its page became a history entry (the tab left it), or
-    /// `[pages.terminal] enabled` is off. A tab in the background keeps its terminal.
+    /// its program's setting is off (`[pages.terminal] enabled` for the shell, `[pages.config]
+    /// enabled` for the editor). A tab in the background keeps its terminal.
     fn settle_ptys(&mut self, fx: &mut Fx) {
-        let (views, tabs, enabled) = (&self.views, &self.tabs, self.config.pages().terminal);
+        let (views, tabs, pages) = (&self.views, &self.tabs, self.config.pages());
         let ended = |pty: &Pty| {
             let Some(view) = views.get(&pty.view).filter(|v| !v.closing) else {
                 return true;
             };
             let current = tabs.iter().any(|tab| tab.current_view() == Some(pty.view));
-            !enabled || view.document != Some(pty.document) || !current
+            !program_enabled(pages, pty.program) || view.document != Some(pty.document) || !current
         };
         for request in self.ptys.close(ended) {
             fx.push(Effect::CancelService(request));

@@ -23,12 +23,14 @@
 //! - Downloads are limited to one per [`DOWNLOAD_INTERVAL`] per tab.
 //! - What only Sighurt's own pages may ask for (`Service::Page`) is granted from the core's own
 //!   record of the view's page and that page's grants, never from the request's origin, which
-//!   must be the page's own (`sig://<name>`) as well. A terminal (`PtyOpen`) and writing the
-//!   configuration (`ConfigWrite`) need the page shown in the selected tab, with the keyboard,
-//!   and a click or key press in it, which they use up. A terminal also needs
-//!   `[pages.terminal] enabled`, no other terminal of the document, and fewer than [`MAX_PTYS`]
-//!   in all. The core tracks each terminal ([`Ptys`]): opening, open, closing, closed, the
-//!   allowance kept until it is closed (the runtime says the program was reaped).
+//!   must be the page's own (`sig://<name>`) as well. A terminal (`PtyOpen`) needs the page's
+//!   grant for its program (`sig://terminal` the shell, `sig://config` the editor), the page
+//!   shown in the selected tab, with the keyboard, and a click or key press in it, which it
+//!   uses up (a missing grant is refused first, so it uses up nothing). It also needs its
+//!   page's setting (`[pages.terminal] enabled` for the shell, `[pages.config] enabled` for the
+//!   editor), no other terminal of the document, and fewer than [`MAX_PTYS`] in all, shells
+//!   and editors together. The core tracks each terminal ([`Ptys`]): opening, open, closing,
+//!   closed, the allowance kept until it is closed (the runtime says the program was reaped).
 //!
 //! A request that fits none of this is refused. Requests are bounded per view
 //! ([`MAX_PENDING_REQUESTS`]).
@@ -39,7 +41,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use sighurt_api::ids::{DocumentGeneration, PtySession, RequestId, ViewId};
-use sighurt_api::services::{DownloadSource, PageGrant, Permission, Service};
+use sighurt_api::services::{DownloadSource, PageGrant, Permission, PtyProgram, Service};
 
 use crate::tabs::MAX_URL;
 
@@ -237,6 +239,8 @@ pub(crate) struct Pty {
     pub view: ViewId,
     /// The document it belongs to: it ends with it.
     pub document: DocumentGeneration,
+    /// What runs: its page's setting keeps it going.
+    pub program: PtyProgram,
     pub state: PtyState,
 }
 

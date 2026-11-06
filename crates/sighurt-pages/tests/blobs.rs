@@ -36,3 +36,14 @@ fn help_is_built_and_names_are_unique() {
         assert!(!page.grants.is_empty());
     }
 }
+
+#[test]
+fn config_and_terminal_share_the_terminal_and_each_starts_only_its_own_program() {
+    use sighurt_api::services::PageGrant;
+    let page = |name: &str| *PAGES.iter().find(|page| page.name == name).unwrap();
+    let (config, terminal) = (page("config"), page("terminal"));
+    assert_eq!(config.title, "Configuration");
+    assert_eq!(config.wasm, terminal.wasm);
+    assert_eq!(config.grants, [PageGrant::Editor]);
+    assert_eq!(terminal.grants, [PageGrant::Shell]);
+}

@@ -1,10 +1,12 @@
 //! What `sig://help` is told about the browser ([`PageRequest::Info`]): the facts of this build,
 //! this configuration and this run, as the text records `sighurt_api::services::PageInfo`
-//! documents (one per line, fields separated by tabs).
+//! documents (one per line, fields separated by tabs). And what `sig://config` is told before
+//! it starts the editor ([`PageInfo::Editor`]): which editor, which file, and the file's
+//! problems.
 //!
 //! Generated from the browser itself (the command table, the keymap's `describe`, the build's
 //! engines, the configuration in use), so the help page can't go stale. Never the
-//! configuration's text, which only `sig://config` may read.
+//! configuration's text.
 //!
 //! Must not own: deciding who may ask (the core), or how the page shows it.
 //!
@@ -111,6 +113,7 @@ pub fn info(kind: PageInfo, core: &BrowserState, paths: &Paths) -> String {
                     "pages.terminal.enabled",
                     &config.pages().terminal.to_string(),
                 ),
+                pair("pages.config.enabled", &config.pages().config.to_string()),
                 pair(
                     "tui.mode",
                     match tui.mode {
@@ -129,6 +132,33 @@ pub fn info(kind: PageInfo, core: &BrowserState, paths: &Paths) -> String {
                     },
                 ),
             ]
+        }
+        PageInfo::Editor => {
+            let pages = config.pages();
+            let vars: Vec<_> = std::env::vars_os().collect();
+            let (line, from) = match crate::pty::editor(pages.editor.as_deref(), &vars) {
+                Some((argv, from)) => {
+                    let words: Vec<_> = argv.iter().map(|w| w.to_string_lossy()).collect();
+                    (words.join(" "), from.name())
+                }
+                None => (String::new(), "none"),
+            };
+            let mut records = vec![
+                pair("enabled", yes(pages.config)),
+                pair("editor", &line),
+                pair("from", from),
+            ];
+            if let Some(file) = &paths.config {
+                let new = !file.exists();
+                records.push(pair("file", &file.display().to_string()));
+                records.push(pair("new", yes(new)));
+                if let Err(persistence::LoadError::Config(error)) =
+                    persistence::load_config(Some(file.as_path()), env)
+                {
+                    records.extend(error.problems().iter().map(|p| pair("problem", p)));
+                }
+            }
+            records
         }
     };
     let mut text = String::new();
@@ -222,5 +252,31 @@ mod tests {
         assert!(engines.contains("servo\tyes\tyes\t"), "{engines}");
         assert!(engines.contains("wasm\tyes\tno\t"), "{engines}");
         assert_eq!(field_of("a\tb\nc"), "a b c");
+    }
+
+    #[test]
+    fn the_editor_is_named_with_its_file_and_the_files_problems() {
+        let env = core().environment().clone();
+        let config = "version = 1\n[pages.config]\neditor = \"/usr/bin/hx --vsplit\"";
+        let core = BrowserState::new(Config::parse(Some(config), &env).unwrap(), env);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let paths = Paths {
+            config: Some(file.clone()),
+            session: None,
+        };
+        let answer = info(PageInfo::Editor, &core, &paths);
+        let shown = file.display().to_string();
+        assert_eq!(
+            answer,
+            format!(
+                "enabled\tyes\neditor\t/usr/bin/hx --vsplit\nfrom\tsetting\nfile\t{shown}\nnew\tyes\n"
+            )
+        );
+        std::fs::write(&file, "version = 1\nzoom = 99\n").unwrap();
+        let answer = info(PageInfo::Editor, &core, &paths);
+        assert!(answer.contains("new\tno\nproblem\t"), "{answer}");
+        assert!(answer.contains("zoom"), "{answer}");
+        assert!(info(PageInfo::Settings, &core, &paths).contains("pages.config.enabled\ttrue"));
     }
 }

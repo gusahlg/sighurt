@@ -1,10 +1,13 @@
-//! The programs of `sig://terminal`: opening a pseudo-terminal, starting the program on its
-//! slave side, ending and reaping it.
+//! The programs of `sig://terminal` (the user's shell) and `sig://config` (the user's editor on
+//! the configuration file): opening a pseudo-terminal, starting the program on its slave side,
+//! ending and reaping it.
 //!
-//! The core has authorised a `PtyOpen` (the page's grant, `[pages.terminal] enabled`, a
-//! deliberate action in the shown page, the limits) before anything here runs. [`exec`] builds
-//! what runs from a closed choice the guest made ([`PtyProgram`]): the guest never names a
-//! program, an argument, a directory or a variable. [`Ptys::open`] opens the pty with its size
+//! The core has authorised a `PtyOpen` (the page's grant for that program, its page's setting,
+//! a deliberate action in the shown page, the limits) before anything here runs. [`exec`]
+//! builds what runs from a closed choice ([`PtyProgram`]): the guest never names a program, an
+//! argument, a directory or a variable. The editor is [`editor`]'s choice, made before the fork;
+//! a missing configuration directory is made first ([`prepare`]), and the end of an editor is
+//! reported as such ([`Ptys::ended`]), for the session to read the file again. [`Ptys::open`] opens the pty with its size
 //! set, starts the program as the leader of a new session with the slave as its controlling
 //! terminal, and hands the master to the Wasm engine under a new [`PtySession`], which the
 //! answer carries; nothing here keeps a copy of it. Every descriptor is close-on-exec from its creation, so no other child of
@@ -63,8 +66,12 @@ pub const GRACE: Duration = Duration::from_secs(2);
 /// How long [`Ptys::shutdown`] waits past [`GRACE`] for killed programs to be reaped before it
 /// gives up on them (a process stuck in the kernel cannot die until it leaves it).
 const REAP_WAIT: Duration = Duration::from_secs(1);
-/// The editor when neither `VISUAL` nor `EDITOR` names one.
-const EDITOR: &str = "vi";
+/// The editors looked for on `PATH`, in order, when neither the configuration nor `VISUAL` or
+/// `EDITOR` names one.
+pub const EDITORS: [&str; 4] = ["nvim", "vim", "vi", "nano"];
+/// What `sig://config` says when it has no editor.
+pub const NO_EDITOR: &str = "No editor found: set [pages.config] editor, or $VISUAL or $EDITOR, \
+                             or install nvim, vim, vi or nano.";
 /// The shell when neither the configuration nor `SHELL` names one.
 const SHELL: &str = "/bin/sh";
 
@@ -73,8 +80,101 @@ const SHELL: &str = "/bin/sh";
 pub struct Launch<'a> {
     /// `[pages.terminal] command`, if set: the shell to run instead of `$SHELL`.
     pub command: Option<&'a str>,
+    /// `[pages.config] editor`, if set: the editor to run instead of `$VISUAL` and the rest.
+    pub editor: Option<&'a str>,
     /// The configuration file, for [`PtyProgram::EditConfig`].
     pub config: Option<&'a Path>,
+}
+
+/// Where the editor [`editor`] found comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorFrom {
+    /// `[pages.config] editor`.
+    Setting,
+    /// `$VISUAL`.
+    Visual,
+    /// `$EDITOR`.
+    Editor,
+    /// The first of [`EDITORS`] on `PATH`.
+    Path,
+}
+
+impl EditorFrom {
+    /// Its name in `PageInfo::Editor`'s `from` record.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Setting => "setting",
+            Self::Visual => "VISUAL",
+            Self::Editor => "EDITOR",
+            Self::Path => "PATH",
+        }
+    }
+}
+
+/// The editor `sig://config` runs, without the file: `setting` (`[pages.config] editor`), else
+/// `$VISUAL`, else `$EDITOR`, each split at white space with no shell and no quoting; else the
+/// full path of the first of [`EDITORS`] found as an executable file in a directory of
+/// `$PATH`. `None` when there is none. `vars` is `sig`'s environment.
+pub fn editor(
+    setting: Option<&str>,
+    vars: &[(OsString, OsString)],
+) -> Option<(Vec<OsString>, EditorFrom)> {
+    let var = |name: &str| {
+        vars.iter()
+            .find(|(key, value)| key == name && !value.is_empty())
+            .map(|(_, value)| value.clone())
+    };
+    let words = |line: &OsStr| -> Option<Vec<OsString>> {
+        let words: Vec<_> = line
+            .to_string_lossy()
+            .split_whitespace()
+            .map(OsString::from)
+            .collect();
+        (!words.is_empty()).then_some(words)
+    };
+    let named = [
+        (setting.map(OsString::from), EditorFrom::Setting),
+        (var("VISUAL"), EditorFrom::Visual),
+        (var("EDITOR"), EditorFrom::Editor),
+    ];
+    if let Some(found) = named
+        .into_iter()
+        .find_map(|(line, from)| Some((words(&line?)?, from)))
+    {
+        return Some(found);
+    }
+    let path = var("PATH")?;
+    EDITORS.iter().find_map(|name| {
+        std::env::split_paths(&path)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(name))
+            .find(|file| is_executable(file))
+            .map(|file| (vec![file.into_os_string()], EditorFrom::Path))
+    })
+}
+
+fn is_executable(file: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(file).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Makes ready what `program` needs before it starts: for the editor, the configuration's
+/// directory, created (mode 0700) when it is missing. The file itself is the editor's to make.
+pub fn prepare(program: PtyProgram, launch: Launch<'_>) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let Some(dir) = launch
+        .config
+        .filter(|_| program == PtyProgram::EditConfig)
+        .and_then(Path::parent)
+        .filter(|dir| !dir.as_os_str().is_empty() && !dir.exists())
+    else {
+        return Ok(());
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))
 }
 
 /// A program ready to start: its argument vector, working directory and whole environment.
@@ -87,8 +187,10 @@ pub struct Exec {
 }
 
 /// What runs for `program`. `launch.command` is split at white space with no shell and no
-/// quoting; `vars` is `sig`'s environment. The working directory is `HOME` (`/` without one),
-/// and the directory of the configuration file for `EditConfig`, which fails without one.
+/// quoting; the editor is [`editor`]'s, with the configuration file as an argument of its own;
+/// `vars` is `sig`'s environment. The working directory is `HOME` (`/` without one), and the
+/// directory of the configuration file for `EditConfig`, which fails without a file or an
+/// editor.
 pub fn exec(
     program: PtyProgram,
     launch: Launch<'_>,
@@ -120,11 +222,7 @@ pub fn exec(
             let config = launch
                 .config
                 .ok_or("this build has no configuration file")?;
-            let mut argv = var("VISUAL")
-                .or_else(|| var("EDITOR"))
-                .map(|line| words(&line))
-                .filter(|argv| !argv.is_empty())
-                .unwrap_or_else(|| vec![EDITOR.into()]);
+            let (mut argv, _) = editor(launch.editor, &vars).ok_or(NO_EDITOR)?;
             argv.push(config.as_os_str().to_owned());
             let cwd = config
                 .parent()
@@ -189,6 +287,8 @@ type Ended = Arc<Mutex<Vec<(RequestId, Option<i32>)>>>;
 pub struct Ptys {
     live: Arc<AtomicUsize>,
     sessions: HashMap<RequestId, Session>,
+    /// What each program [`Ptys::open`] started is, until [`Ptys::ended`] reports it.
+    programs: HashMap<RequestId, PtyProgram>,
     ended: Ended,
     /// Wakes the owner loop when a program has ended.
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -209,6 +309,7 @@ impl Ptys {
         Self {
             live: Arc::default(),
             sessions: HashMap::new(),
+            programs: HashMap::new(),
             ended: Ended::default(),
             wake,
         }
@@ -230,13 +331,9 @@ impl Ptys {
         #[cfg(feature = "engine-wasm")]
         {
             let exec = exec(program, launch, std::env::vars_os()).map_err(ServiceError::Failed)?;
-            self.open_exec(
-                request,
-                &exec,
-                cols,
-                rows,
-                sighurt_engine_wasm::pty::hand_over,
-            )
+            prepare(program, launch).map_err(ServiceError::Failed)?;
+            let deliver = sighurt_engine_wasm::pty::hand_over;
+            self.open_exec(request, program, &exec, (cols, rows), deliver)
         }
         #[cfg(not(feature = "engine-wasm"))]
         {
@@ -245,13 +342,14 @@ impl Ptys {
         }
     }
 
-    /// [`Ptys::open`] for a prepared program, giving the master to `deliver`.
+    /// [`Ptys::open`] for `program`, prepared as `exec`, on a terminal of `(cols, rows)`,
+    /// giving the master to `deliver`.
     fn open_exec(
         &mut self,
         request: RequestId,
+        program: PtyProgram,
         exec: &Exec,
-        cols: u16,
-        rows: u16,
+        (cols, rows): (u16, u16),
         deliver: impl FnOnce(PtySession, OwnedFd),
     ) -> ServiceResult {
         if self.sessions.contains_key(&request) {
@@ -263,6 +361,7 @@ impl Ptys {
         let pty = session.pty;
         deliver(pty, master);
         self.sessions.insert(request, session);
+        self.programs.insert(request, program);
         Ok(ServiceReply::Pty(pty))
     }
 
@@ -273,13 +372,18 @@ impl Ptys {
     }
 
     /// The programs that ended and were reaped since the last call, with their exit status
-    /// (`None` when a signal ended them), whether they ended by themselves or were cancelled.
-    pub fn ended(&mut self) -> Vec<(RequestId, Option<i32>)> {
+    /// (`None` when a signal ended them) and what they were, whether they ended by themselves
+    /// or were cancelled.
+    pub fn ended(&mut self) -> Vec<(RequestId, Option<i32>, PtyProgram)> {
         let ended = std::mem::take(&mut *self.ended.lock().unwrap_or_else(PoisonError::into_inner));
-        for (request, _) in &ended {
-            self.sessions.remove(request);
-        }
         ended
+            .into_iter()
+            .map(|(request, status)| {
+                self.sessions.remove(&request);
+                let program = self.programs.remove(&request).unwrap_or(PtyProgram::Shell);
+                (request, status, program)
+            })
+            .collect()
     }
 
     /// Ends every program and waits until they are reaped, at most [`GRACE`] and a second: for
@@ -620,6 +724,7 @@ mod tests {
     fn sh(script: &str, vars: &[(OsString, OsString)]) -> Exec {
         let no_config = Launch {
             command: None,
+            editor: None,
             config: None,
         };
         let mut exec = exec(PtyProgram::Shell, no_config, vars.iter().cloned()).unwrap();
@@ -644,7 +749,9 @@ mod tests {
         exec: &Exec,
         masters: &mut Vec<OwnedFd>,
     ) -> ServiceResult {
-        ptys.open_exec(request, exec, 80, 24, |_, master| masters.push(master))
+        ptys.open_exec(request, PtyProgram::Shell, exec, (80, 24), |_, master| {
+            masters.push(master)
+        })
     }
 
     /// The number a shell shows for an exit: the code, or 128 plus the signal.
@@ -657,6 +764,18 @@ mod tests {
 
     /// The ends `ptys` reports within `limit`, at least `count` of them.
     fn ends(ptys: &mut Ptys, count: usize, limit: Duration) -> Vec<(RequestId, Option<i32>)> {
+        let ends = ends_of(ptys, count, limit);
+        ends.into_iter()
+            .map(|(request, status, _)| (request, status))
+            .collect()
+    }
+
+    /// [`ends`] with what each program was.
+    fn ends_of(
+        ptys: &mut Ptys,
+        count: usize,
+        limit: Duration,
+    ) -> Vec<(RequestId, Option<i32>, PtyProgram)> {
         let deadline = Instant::now() + limit;
         let mut ends = Vec::new();
         while ends.len() < count {
@@ -739,6 +858,7 @@ mod tests {
         let run = |program, command, extra: &[(&str, &str)]| {
             let launch = Launch {
                 command,
+                editor: None,
                 config: Some(config),
             };
             exec(program, launch, vars(extra)).unwrap()
@@ -752,6 +872,7 @@ mod tests {
         assert_eq!(blank.argv, ["/bin/zsh"]);
         let none = Launch {
             command: None,
+            editor: None,
             config: None,
         };
         let bare = exec(PtyProgram::Shell, none, Vec::new()).unwrap();
@@ -767,6 +888,7 @@ mod tests {
             PtyProgram::EditConfig,
             Launch {
                 command: Some("fish"),
+                editor: None,
                 config: Some(spaced),
             },
             vars(&[("EDITOR", "nano"), ("VISUAL", "nvim -u NONE")]),
@@ -776,9 +898,129 @@ mod tests {
         assert_eq!(edit.cwd, Path::new("/home/u/my config/sighurt"));
         let editor = run(PtyProgram::EditConfig, None, &[("EDITOR", "nano")]);
         assert_eq!(editor.argv, ["nano", config.to_str().unwrap()]);
-        let vi = run(PtyProgram::EditConfig, None, &[("VISUAL", "")]);
-        assert_eq!(vi.argv, ["vi", config.to_str().unwrap()]);
         assert!(exec(PtyProgram::EditConfig, none, vars(&[])).is_err());
+    }
+
+    /// A directory of fake programs: executables `names`, and `vi.txt`, which is not one.
+    fn programs(names: &[&str]) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for name in names {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.path().join("vim"), "not executable").unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_editor_is_the_setting_then_visual_then_editor_then_one_on_path() {
+        let bin = programs(&["nano", "vi"]);
+        let more = programs(&["nvim"]);
+        let path = std::env::join_paths([bin.path(), more.path()]).unwrap();
+        let vars = |extra: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            let mut vars = vec![(OsString::from("PATH"), path.clone())];
+            vars.extend(extra.iter().map(|(k, v)| (k.into(), v.into())));
+            vars
+        };
+        let found = |setting, extra: &[(&str, &str)]| editor(setting, &vars(extra));
+        let words = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        let all = [("VISUAL", "code --wait"), ("EDITOR", "nano -w")];
+        assert_eq!(
+            found(Some("hx  --vsplit"), &all),
+            Some((words(&["hx", "--vsplit"]), EditorFrom::Setting))
+        );
+        assert_eq!(
+            found(None, &all),
+            Some((words(&["code", "--wait"]), EditorFrom::Visual))
+        );
+        assert_eq!(
+            found(Some("  "), &[("VISUAL", ""), ("EDITOR", "nano -w")]),
+            Some((words(&["nano", "-w"]), EditorFrom::Editor)),
+            "blank ones don't count"
+        );
+        // On PATH: nvim first, though its directory comes later; vim is not executable.
+        let nvim = more.path().join("nvim").into_os_string();
+        assert_eq!(found(None, &[]), Some((vec![nvim], EditorFrom::Path)));
+        let only = programs(&["nano", "vi"]);
+        let vars = vec![(OsString::from("PATH"), only.path().into())];
+        let vi = only.path().join("vi").into_os_string();
+        assert_eq!(editor(None, &vars), Some((vec![vi], EditorFrom::Path)));
+        // None at all.
+        let empty = programs(&[]);
+        let vars = vec![(OsString::from("PATH"), empty.path().into())];
+        assert_eq!(editor(None, &vars), None);
+        assert_eq!(editor(None, &[]), None);
+        let launch = Launch {
+            command: None,
+            editor: None,
+            config: Some(Path::new("/c/config.toml")),
+        };
+        assert_eq!(
+            exec(PtyProgram::EditConfig, launch, vars),
+            Err(NO_EDITOR.into())
+        );
+        // The file is the last argument, whatever the editor's own.
+        let launch = Launch {
+            editor: Some("nvim -u NONE"),
+            ..launch
+        };
+        let edit = exec(PtyProgram::EditConfig, launch, Vec::new()).unwrap();
+        assert_eq!(edit.argv, ["nvim", "-u", "NONE", "/c/config.toml"]);
+        assert_eq!(edit.cwd, Path::new("/c"));
+    }
+
+    #[test]
+    fn a_missing_configuration_directory_is_made_private_and_the_file_left_to_the_editor() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("config/sighurt/config.toml");
+        let launch = Launch {
+            command: None,
+            editor: None,
+            config: Some(file.as_path()),
+        };
+        prepare(PtyProgram::Shell, launch).unwrap();
+        assert!(!file.parent().unwrap().exists(), "only for the editor");
+        prepare(PtyProgram::EditConfig, launch).unwrap();
+        let dir = file.parent().unwrap();
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(!file.exists());
+        // An existing directory is left as it is.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare(PtyProgram::EditConfig, launch).unwrap();
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn an_editors_end_is_reported_as_the_editors() {
+        let _serial = serial();
+        let (_home, vars) = home();
+        let mut ptys = ptys();
+        let mut masters = Vec::new();
+        let (shell, edit) = (RequestId::next(), RequestId::next());
+        open(&mut ptys, shell, &sh("exit 0", &vars), &mut masters).unwrap();
+        let deliver = |_, master| masters.push(master);
+        ptys.open_exec(
+            edit,
+            PtyProgram::EditConfig,
+            &sh("exit 0", &vars),
+            (80, 24),
+            deliver,
+        )
+        .unwrap();
+        let mut ended = ends_of(&mut ptys, 2, Duration::from_secs(5));
+        ended.sort_by_key(|(request, ..)| *request != shell);
+        assert_eq!(
+            ended,
+            [
+                (shell, Some(0), PtyProgram::Shell),
+                (edit, Some(0), PtyProgram::EditConfig)
+            ]
+        );
     }
 
     #[test]
@@ -975,7 +1217,7 @@ mod tests {
         let started = Instant::now();
         ptys.shutdown();
         assert!(started.elapsed() < GRACE, "{:?}", started.elapsed());
-        assert_eq!(ptys.ended(), [(request, None)]);
+        assert_eq!(ptys.ended(), [(request, None, PtyProgram::Shell)]);
         assert!(gone(pid));
         assert_eq!(ptys.live(), 0);
     }
@@ -1030,7 +1272,7 @@ mod tests {
         let ends = ptys.ended();
         assert_eq!(ends.len(), 3);
         assert!(
-            ends.iter().all(|(_, status)| status.is_none()),
+            ends.iter().all(|(_, status, _)| status.is_none()),
             "killed: {ends:?}"
         );
         assert_eq!(ptys.live(), 0);

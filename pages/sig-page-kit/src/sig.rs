@@ -6,14 +6,9 @@
 #[repr(u32)]
 pub enum Kind {
     /// Facts about the browser: the payload names them (`about`, `engines`, `commands`,
-    /// `user-commands`, `keys`, `paths`, `settings`).
+    /// `user-commands`, `keys`, `paths`, `settings`, and `editor` for `sig://config`).
     Info = 1,
-    /// The configuration file's text.
-    ConfigRead = 2,
-    /// The problems of a configuration, one per line.
-    ConfigCheck = 3,
-    /// Replacing the configuration file.
-    ConfigWrite = 4,
+    // 2, 3 and 4 were the configuration editor's: reserved, never reused.
     /// Putting text on the clipboard.
     ClipboardCopy = 5,
 }
@@ -82,25 +77,6 @@ impl Request {
     /// Facts named `what` (`"commands"`, `"keys"`, ...).
     pub fn info(what: &str) -> Option<Self> {
         Self::new(Kind::Info, what.as_bytes())
-    }
-
-    /// The configuration file.
-    pub fn config_read() -> Option<Self> {
-        Self::new(Kind::ConfigRead, &[])
-    }
-
-    /// The problems of `text` as a configuration.
-    pub fn config_check(text: &str) -> Option<Self> {
-        Self::new(Kind::ConfigCheck, text.as_bytes())
-    }
-
-    /// Replacing the configuration file with `text`, if it still holds `replaces`.
-    pub fn config_write(text: &str, replaces: &str) -> Option<Self> {
-        let mut payload = Vec::with_capacity(4 + replaces.len() + text.len());
-        payload.extend_from_slice(&(replaces.len() as u32).to_le_bytes());
-        payload.extend_from_slice(replaces.as_bytes());
-        payload.extend_from_slice(text.as_bytes());
-        Self::new(Kind::ConfigWrite, &payload)
     }
 
     /// Putting `text` on the clipboard. Needs a click or key press in the page in the last 5 s.

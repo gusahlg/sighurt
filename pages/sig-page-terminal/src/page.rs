@@ -41,6 +41,8 @@ const MAX_INPUT_PER_FRAME: usize = 256;
 struct Page {
     app: App<sig::Pty>,
     face: Option<(&'static str, Metrics)>,
+    /// `sig://config`'s question about the editor, until the browser answers.
+    asking: Option<sig::Request>,
 }
 
 thread_local! {
@@ -111,6 +113,7 @@ pub extern "C" fn start_app() {
         *page.borrow_mut() = Some(Page {
             app: App::new(program),
             face: None,
+            asking: None,
         });
     });
 }
@@ -133,6 +136,20 @@ pub extern "C" fn on_frame(_dt_ms: u32) {
                 break;
             };
             page.app.input(&mut Browser, &input);
+        }
+        if page.app.take_wants_info() {
+            page.asking = sig::Request::info("editor");
+        }
+        if let Some(asking) = &page.asking {
+            match asking.poll() {
+                sig::Poll::Waiting => {}
+                sig::Poll::Done(text) => {
+                    page.app.editor_info(&text);
+                    page.asking = None;
+                }
+                // The page then says the rule instead of the editor it found.
+                sig::Poll::Failed(_) | sig::Poll::Gone => page.asking = None,
+            }
         }
         let (width, height) = canvas_dimensions();
         page.app.frame(metrics.fit(width, height));
