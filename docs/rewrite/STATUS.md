@@ -9,10 +9,13 @@ log with what was decided instead.
 
 ## Where things stand
 
-**Latest release: 0.10.0** (31 October 2026, decision 120): the configuration extension (116),
-copy and paste everywhere, and three opt-in engines (CEF 117, Ladybird 118, NetSurf 119). The
-snapshot below predates some of the decisions that amend it (Servo is 0.7, the modal keymap is
-now the example configuration); the decisions log is current.
+**Latest release: 1.0.0** (6 November 2026, decision 144): find in page, visited pages and
+completion, fullscreen, the tab commands, strict modes, a terminal picture that is never
+blanked, sig's own pages (`sig://help`, `sig://config` running your editor, `sig://terminal`),
+configured commands, bindings for some addresses, and a home page with links in both
+frontends. Before it: 0.10.0 (31 October 2026, decision 120). The snapshot below predates some
+of the decisions that amend it (Servo is 0.7, the modal keymap is now the example
+configuration); the decisions log is current.
 
 `sig` (`sighurt-browser`) is the rewrite's browser, on Wayland, with its engines compiled in and
 no IPC: Servo 0.5 (the default engine for the web, presenting GL straight into its page
@@ -40,46 +43,6 @@ and the line chrome. The old `sighurt-ipc`, `sig-wasm` and GPUI chrome are gone 
   move a tab only when the user pressed them, a Wasm app's downloads go through the browser,
   WebKit is opened on first use and its processes end with the last WPE page, retained views are
   bounded by cost, and `shell.nix` pins the Rust toolchain; every suite was run again.
-
-### Paused on 5 November 2026 (evening): towards 0.11.0, two lanes left to merge
-
-The user asked on 5 November to finish the second run and release it as 0.11.0 ("When
-everything is done and tested push a new release: 0.11.0"), and during the day for strict
-modes, a terminal picture that never flickers, more reliability work, a `help` command, more
-`sig://` pages, the configuration editable in the browser, and a `sig://terminal`.
-
-**Landed on `config-ext`** (local; `origin/config-ext` is still c096c75 of 4 November):
-decisions 126–135 (find in page, visited pages and completion, fullscreen, terminal images
-that are never blanked, strict modes, the third optimization and reliability pass), and the
-internal pages, whose decisions are **not written yet**: the infrastructure, `sig://help` and
-its sections, `[commands]` aliases with the default `help`, the example configuration's `?`,
-F1 and `d` (branch `pages0`, merged f0def28), and `sig://config` (branch `pagecfg`, merged
-0d040bf). The design is [pages-2026-11-05.md](pages-2026-11-05.md), its amendments A1–A10
-binding ([reviews-pages-astra.md](reviews-pages-astra.md)). An outside review of the
-implementation is [reviews-pages-impl-astra.md](reviews-pages-impl-astra.md): five findings,
-none letting a web page reach an internal page.
-
-**On branches, committed, not merged, not pushed:**
-- `pagefix` (worktree `../sighurt-wt-pagefix`): the review's findings 1, 2 and 5 (a held
-  key's repeats neither lift the input hold nor follow a new page; writing the configuration
-  and starting a terminal need the window focused; the terminal's command line stays open on
-  a command that doesn't parse). Its verification had not finished when the day ended.
-- `pageterm` (worktree `../sighurt-wt-pageterm`): `sig://terminal` (the runtime's `pty`, the
-  engine's `pty`, the guest, the example keymap's rule for it, headless.sh `terminal-page`,
-  faults.sh `terminal`, tui.rs) and the review's findings 3 and 4. It ships only if the
-  verification holds; it is off by default (`[pages.terminal] enabled`).
-- `claude-md-wip`: the CLAUDE.md update for the pages (one commit on f9e2649); check it
-  against what merged before taking it.
-
-**Next, in order:** merge `pagefix`, then `pageterm`; the CI-level check; write the pages'
-decisions (136 and on: infrastructure and help, configured commands, `sig://config`,
-`sig://terminal`, the review's fixes) and take the CLAUDE.md update; the full release
-verification (the pre-commit list with Servo and WPE, headless.sh, the chromes' headless.sh,
-the host suite, engines.sh, cef.sh, Ladybird, NetSurf, real-terminals.sh, coexist.sh, soak.sh,
-faults.sh); the version 0.10.0 → 0.11.0 and the release decision; fast-forward `rewrite` and
-`main`, push `main`, `rewrite` and `config-ext`, and delete the stale `origin/find` and
-`origin/hist`. Still owed from 0.10.0: the louise-pc benchmark against 0.9.0 (the machine was
-unreachable on 4 and 5 November).
 
 ### Paused on 23 October 2026: the terminal in tmux, Servo text, persistent logins
 
@@ -4355,7 +4318,7 @@ Newest last. Each entry says what was decided and why.
     `graphics_mode_gives_a_focused_field_keys_and_pastes_only_in_insert` and the text-mode
     test, headless.sh `example`, the workspace tests; `coexist.sh` and engines.sh `showcase`
     were changed to enter INSERT before typing and are run in the release verification
-    (the 0.11.0 release decision). *Not stopped*: a middle-click paste of the primary selection is a mouse
+    (decision 144). *Not stopped*: a middle-click paste of the primary selection is a mouse
     action and still reaches the page in NORMAL.
 
 135. **A third optimization and reliability pass** (5 November 2026, branch `opt3`; the user:
@@ -4660,4 +4623,55 @@ Newest last. Each entry says what was decided and why.
     general activation, so a page gets a fresh one on every repeat of a key held in it (new
     tabs, the clipboard and file choosers stay one per activation); views the terminal does
     not draw other than sig's own pages (a text-mode view without page text) still get keys.
+
+144. **Sighurt 1.0.0** (6 November 2026; the user on 5 November: "When everything is done and
+    tested push a new release", and on 6 November: "the next version should be called 1.0.0
+    because these are some really big steps and the browser is feeling more and more
+    finished"; decision 120 had left 1.0.0 for a later session). Since 0.10.0: sixel frames
+    that show in Rio and under tmux (121), a code-reading bug hunt across every layer (122),
+    one network policy for Wasm guests (123), a lighter owner loop (124) and the render
+    framework with the CPU, wgpu and Vulkan backends (125);
+    seeded random-input tests of every parser, the soak and fault suites, and three measured
+    optimization and reliability passes (126–128, 135); the tab commands, the keymap's hovered
+    link and `location.focus <text>` (129); find in page in every engine that has it and in
+    text mode (130); visited pages and inline completion (131); window and element fullscreen
+    (132); terminal images written sixel over sixel and never blanked (133); the example
+    configuration's strict modes (134); sig's own pages as Wasm guests with the privileged
+    `sig` module, `sig://help`, and configured commands (136); `sig://terminal` (138) and
+    `sig://config` running the user's editor (142, which replaced 137's editor page a day
+    after it was written); bindings for some addresses in both keymaps, with `ctrl-escape` or
+    `f12` leaving INSERT on the terminal pages (140); `sig://home` rebuilt with links in both
+    frontends (141); and three outside reviews (the pages' design, their implementation, the
+    day's changes) with every finding fixed (139, 143, the amendments of 136). *Verified* on
+    commit 6ddfec1, this desktop (RTX 3070; logs in
+    `/data/sig-builds/test-out/release-0.11.0/final/`): CLAUDE.md's whole pre-commit list
+    with Servo, WPE WebKit, every feature and NetSurf (formatting; the four clippy lines; the
+    workspace tests 1 327 passed; the browser, runtime and window tests 118; the terminal's
+    218 and, end to end with the pages, 56; the all-features tests 172, linked three at a
+    time; the Servo and WPE adapters' 66); the renderers' tests on the GPU; headless.sh 250
+    of 250; the chromes' headless.sh 35 of 35; the host's compositor suite; faults.sh 109 of
+    109; soak.sh 207 of 207 over 10 minutes (RSS 97.6 to 98.8 MiB across 13 cycles); the
+    Wasm, Servo and WPE compositor suites; engines.sh 337 of 337; cef.sh 31 of 31; Ladybird's
+    page and find checks 14 of 14; NetSurf's 16 of 16; coexist.sh, every engine in one
+    process, 95 of 95; real-terminals.sh 20 of 21. The one failure is Rio 0.5.28's own: in
+    `rio-tmux-sixel` 2 of 691 screenshots of a still page showed it blank for a frame while
+    tmux's output wrote nothing on the page rows, the artifact of Rio's Vulkan renderer that
+    decision 133 records; the same binary run again showed 0 of 649 with Vulkan and 0 of 695
+    with Rio's CPU renderer (`RIO_USE_CPU=1`), each run 7 of 7. *Found on the way*: the
+    all-features test binaries linked in parallel passed the 9 G cap (now `-j 3`); the
+    terminal test harness retried a write to a dead `sig` for ever, which held the machine's
+    lock for over two hours once (it now gives up after 30 s with the logs; what killed that
+    `sig` was not found, and a megabyte of random keys into the all-engines build, 300
+    open-and-close cycles of a help tab, and a terminal closed under a Servo page all came
+    out clean). *Known, left*: repeats renew the general activation (143); views the
+    terminal does not draw other than sig's own pages still get keys (143); Rio 0.5.28 loses
+    its Vulkan device on pane redraws and shows the empty frame above (133; `[renderer]
+    use-cpu = true` in Rio's configuration avoids both); `sig://terminal` has no scrollback,
+    mouse reporting or clipboard (138); exec to `main` takes about 15 ms in the nix-shell
+    (135); the louise-pc benchmark against 0.9.0 is still owed from 0.10.0 (the machine was
+    unreachable on 4 to 6 November). `sighurt-sdk` keeps 0.7.0 (the guest ABI's `"oxide"`
+    module did not change; the `sig` module is not part of it). Work: Claude Fable 5.1
+    (orchestration, integration, the pages' and bindings' decisions), Claude Opus 5.5 (the
+    implementation and fix lanes), Claude Sonnet 5.5 (the help page's content), GPT-6 Astra
+    (the three reviews), and the deep-design agent (the pages' design review).
 
