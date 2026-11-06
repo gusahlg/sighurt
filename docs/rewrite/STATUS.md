@@ -4549,3 +4549,37 @@ Newest last. Each entry says what was decided and why.
     `sig_terminal_runs_a_shell_in_the_terminal_frontend` (Escape reaches the shell, kitty
     ctrl-escape and f12 leave INSERT); headless.sh `terminal-page` 27/27; faults.sh
     `terminal` 9/9; the parser's `xterms_modified_key_form_is_the_key_with_its_modifiers`.
+
+141. **`sig://home` is the chrome's own page in both frontends, built from the browser**
+    (6 November 2026, branch `home`, merged 45d1e30; the user: "Currently sig://home is
+    totally empty on the TUI frontend … make it be displayed properly and also consider
+    reworking it a bit to include links to the other pages and other actually useful stuff").
+    Home stays engine-less (decision 136): it is instant, and works without the Wasm engine
+    and without graphics. `sighurt_runtime::home` builds what it says from the browser
+    itself, so it cannot go stale: the version and the configuration file, the internal
+    pages this build and configuration open (Help, its Keys and Commands sections,
+    Configuration, Terminal, which names its setting while off), the active keymap's keys
+    for a fixed list of commands (from `Keymap::describe`, never hardcoded keys), the 8 pages
+    visited last (`History::recent`, only while `[history] remember` is on), and the engines.
+    `Session::home` builds it once and again only when the configuration is reloaded, the
+    visits change or an engine fails (`home_builds`); the window fills `HomeInfo` only while
+    the active tab is home. *The window*: the standard chrome's card shows the sections;
+    links are hit-tested (underlined under the pointer, the hand cursor, a release on the
+    link the press began on runs `page.open` through `ChromeAction::Command`); when the page
+    area is short whole sections go, Engines first, then Recently visited, then Keys. The
+    line chrome lists the same as plain lines. Four golden images change or are new
+    (`home-100`, `font-18-home-100`, `home-tall-100`, the line chrome's `home-100`).
+    *The terminal*: home is a synthetic document that text mode's own layout, drawing and
+    navigation handle, drawn in the page rows in every mode; a click, or Tab and Enter,
+    follows a link. For that, `page.send-key` on a page the chrome draws is now
+    `Effect::ChromeInput`, as the keys passed to it already were. Home is drawn only once a
+    hidden view's picture may go (decision 133), in the same write as the deletion or the
+    blank, and blanking rows now tells the grid, so text written after a blank is not lost.
+    *Measured*: an idle home tab builds and paints nothing (headless `home`: builds, paints
+    and snapshots unchanged over 2 s; the terminal writes no byte in 0.8 s). *Verified*: the
+    runtime's `home` and `history` tests and the session's cache test, the chromes' link,
+    section-dropping and containment tests (the seeded one included), the terminal's layout
+    tests at 80x22, 40x8 and 20x3, tui.rs (home in kitty, sixel and no-graphics modes; a
+    picture tab, a home tab and back in kitty and sixel; a click and Tab then Enter on a
+    link), headless.sh `home`. *Not there*: find in page and `--dump` do not cover home.
+
