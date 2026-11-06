@@ -194,6 +194,12 @@ forward = "page.forward"
 # the page has the keyboard, and ctrl-l redraws the page wherever the keyboard is (in NORMAL,
 # or while the address line has it). In text mode a field's editor opens only in INSERT.
 #
+# On sig://terminal (and the addresses under it) and sig://config, which run a program in a
+# terminal, INSERT gives Escape to the program like every other key, and ctrl-escape or f12
+# leaves it. A terminal with legacy keys, and tmux by default, sends ctrl-escape as a plain
+# escape, which then goes to the program: use f12 there. These are bindings of the example
+# configuration for those addresses (SITES in its table.rs), not of the browser.
+#
 #   [keys]                                # everywhere
 #   "ctrl-t" = "tab.new"
 #   "ctrl-w" = "tab.close"
@@ -210,6 +216,21 @@ forward = "page.forward"
 #
 #   [keys.location]                       # only while the address bar has focus
 #   "alt-enter" = "page.open https://example.com"
+#
+#   [keys.url."https://*.example.com"]    # only on these addresses, while the page has focus
+#   "ctrl-r" = "page.reload"
+#
+# [keys.url."<address>"] binds keys for some addresses. The address is "scheme://host" and an
+# optional path: "sig://terminal", "https://docs.example.com/guide", or "https://*.example.com"
+# for the hosts under example.com (not example.com itself). Its bindings apply while the page
+# has the keyboard and the tab shows an address with that scheme and host, case aside, whose
+# path starts with that path at a "/": "sig://terminal" is also sig://terminal/config, never
+# sig://terminal-x or https://sig/terminal. The address is the one the tab shows, not one
+# loading. They win over [keys.page] and [keys]. Of the tables that match, only the most
+# specific applies: an exact host before a *., a longer *. before a shorter one, then the
+# longer path. At most 64 tables, each address at most 2048 bytes, written as the address has
+# it (a non-ASCII host in its xn-- form). A table here adds and overrides bindings; there is no
+# way to unbind a key of [keys] for an address.
 #
 # A keystroke is modifiers and a key, joined by "-". Modifiers: ctrl, alt, shift, super and
 # altgr. The key is a character ("t", "+", "å"), a key name (enter, escape, tab, space,
@@ -358,8 +379,9 @@ enabled = false
 #   default-keys = false
 #
 # A [tui.keys] you write applies only in the terminal, over [keys], when the keymap is
-# bindings. It does not apply in the window. [tui.keys.page] and [tui.keys.location] are
-# the same contexts as [keys.page] and [keys.location]. A keystroke that types a character
+# bindings. It does not apply in the window. [tui.keys.page], [tui.keys.location] and
+# [tui.keys.url."<address>"] are the same contexts as [keys.page], [keys.location] and
+# [keys.url."<address>"], and like every [tui.keys] binding win over all of [keys]. A keystroke that types a character
 # (no modifier but shift) does not run while you type in a text field of the page or in the
 # terminal's line, the same as in [keys]. A ctrl- or alt- binding still runs.
 #

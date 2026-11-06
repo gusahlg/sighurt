@@ -57,13 +57,15 @@
 #               (the pixels of the first rows); stty size is the grid that fits the page, and
 #               follows a resize of the output; exit ends it, Enter starts it again; 20 s of
 #               `yes` keep sig's memory bounded, another tab responsive and the view alive, and
-#               Ctrl+C gets the shell back; nvim (if on PATH) follows a resize (its &columns and
+#               Ctrl+C gets the shell back; Escape in INSERT goes to the program, and the
+#               example configuration's ctrl-escape and f12 for this page leave INSERT; nvim (if on PATH) follows a resize (its &columns and
 #               &lines) and writes a file with i, Escape and :wq; closing the tab, navigating
 #               away, reloading, quitting and SIGTERM each leave no program and no zombie, and
 #               20 open-and-close cycles no descriptor in sig; sig://terminal/config runs $VISUAL
 #               on the configuration; with the setting off, Enter starts nothing and the page
 #               says how to turn it on (it differs from the start page)
-#   config-page sig://config on a configuration linked from another directory: Escape (INSERT),
+#   config-page sig://config on a configuration linked from another directory: Escape (INSERT;
+#               ctrl-escape leaves it on this page),
 #               a valid change typed and Ctrl+S: the linked file changes and stays linked, the
 #               chrome takes the new tab colour and the core the new [commands] alias; an invalid
 #               line is refused with the file unchanged; a file changed behind the page is
@@ -1163,7 +1165,7 @@ PY
     "$(diag "0 if c['config_reloads']>$reloads else 1")" "$(diag "c['config_reloads']") reloads, $reloads before"
   colour=$(violet 03-saved)
   check "the chrome takes the new tab colour" "${colour%% *}" "${colour#* }"
-  key -k Escape
+  key -M ctrl -k Escape -m ctrl
   key ':'; wtype cfgtest; key -k Return
   sleep 1
   check "the core takes the new alias: :cfgtest opens a tab" "$([[ $(tabs_count) == 2 ]]; echo $?)" "$(tabs_now)"
@@ -1199,7 +1201,7 @@ PY
   shot 07-saved-over-both
   check "after reading it again, a save keeps both changes" \
     "$(grep -q '^# written elsewhere$' "$file" && grep -q '^# mine$' "$file"; echo $?)" "$(tail -3 "$file" | tr '\n' '|')"
-  key -k Escape
+  key -M ctrl -k Escape -m ctrl
   key q
   wait "$sig_pid"
   ;;
@@ -1259,7 +1261,7 @@ PY
   }
   enter() { key -k Return; }
   type_line() { wtype "$1"; sleep 0.2; enter; }
-  normal() { wtype -M ctrl '\' -m ctrl; wtype -M ctrl n -m ctrl; sleep 0.3; } # ctrl-\ ctrl-n
+  normal() { wtype -M ctrl -k Escape -m ctrl; sleep 0.3; } # ctrl-escape: INSERT to NORMAL on this page
   command_line() { key ':'; wtype "$1"; sleep 0.2; enter; sleep 1.5; }
   view() { diag "[(x['width'], x['height']) for x in t if x['role']=='view' and x['shown']][0]"; }
   rss() { awk '/VmRSS/ {print $2}' "/proc/$sig_pid/status"; }
@@ -1327,6 +1329,7 @@ PY
   type_line 'yes'
   sleep 5
   normal
+  check "ctrl-escape leaves INSERT" "$(diag "0 if d['keymap_indicator'] is None else 1")" "$(diag "d['keymap_indicator']")"
   command_line 'tab.new demo://pattern'
   check "another tab is responsive during an output flood" "$(shows_tab 2)" "$(tabs_now)"
   # K (tab.previous), with the Shift a keyboard sends: wtype's own `K` has none.
@@ -1375,7 +1378,12 @@ PY
     echo "SKIP $scenario: nvim is not on PATH"
   fi
 
-  normal
+  # Escape in INSERT is the program's on this page, and f12 leaves INSERT too.
+  key -k Escape
+  check "Escape in INSERT goes to the program: the mode stays" \
+    "$(diag "0 if d['keymap_indicator']=='INSERT MODE' else 1")" "$(diag "d['keymap_indicator']")"
+  key -k F12
+  check "f12 leaves INSERT" "$(diag "0 if d['keymap_indicator'] is None else 1")" "$(diag "d['keymap_indicator']")"
   key x
   check "closing the tab ends the shell, reaped" "$(until_programs '0 0'; echo $?)" "programs $(programs)"
   # 20 cycles of opening the page, starting the shell and closing the tab: sig's descriptors

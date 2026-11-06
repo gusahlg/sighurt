@@ -1,9 +1,12 @@
 //! Seeded random key sequences through the example configuration, in both modes and both
 //! frontends, with the page's keyboard, a page field's and the chrome's, as the core calls it
-//! (repeats only of a press it took). What decision 134 promises holds for every sequence:
-//! while the page has the keyboard, NORMAL never passes a key to the page (a command that runs
-//! and then passes the press, `:`, moves the keyboard to the line first), and INSERT passes
-//! every key but an unmodified Escape. `tools/fuzz/mod.rs` describes the environment variables.
+//! (repeats only of a press it took), on web pages and on the sites with tables of their own.
+//! What decision 134 promises holds for every sequence on every address: while the page has
+//! the keyboard, NORMAL never passes a key to the page (a command that runs and then passes the
+//! press, `:`, moves the keyboard to the line first), and INSERT passes every key but its leave
+//! keys for that address: an unmodified Escape, or on a site with its own INSERT that table's
+//! keys (`ctrl-escape` and `f12` on the terminal pages). `tools/fuzz/mod.rs` describes the
+//! environment variables.
 
 #[path = "../../../tools/fuzz/mod.rs"]
 mod fuzz;
@@ -14,8 +17,8 @@ use fuzz::{iterations, run, Rng};
 use sighurt_api::commands::Command;
 use sighurt_api::ids::TabId;
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
-use sighurt_api::keymap::{Browser, Frontend, KeyAction, KeyContext, TabInfo};
-use sighurt_config_example::KIND;
+use sighurt_api::keymap::{Browser, Chord, Frontend, KeyAction, KeyContext, TabInfo, UrlPattern};
+use sighurt_config_example::{table, Binding, KIND};
 
 const LIMIT: Duration = Duration::from_secs(2);
 
@@ -26,6 +29,39 @@ struct Fake {
     fullscreen: bool,
     link: Option<&'static str>,
     context: KeyContext,
+    /// The shown tab's committed address (every tab's).
+    url: Option<&'static str>,
+}
+
+/// Addresses on and around the sites.
+const URLS: &[Option<&str>] = &[
+    Some("https://example.com/"),
+    Some("sig://terminal"),
+    Some("sig://terminal/config"),
+    Some("SIG://Terminal"),
+    Some("sig://config"),
+    Some("sig://terminal-x"),
+    Some("https://sig/terminal"),
+    Some("sig://help"),
+    None,
+];
+
+/// INSERT's table on `url`: the most specific site's that has one, else the general one.
+fn insert_table(url: Option<&str>) -> &'static [Binding] {
+    let sites = table::SITES
+        .iter()
+        .filter_map(|site| Some((site.url.parse::<UrlPattern>().ok()?, site.insert?)));
+    let sites: Vec<_> = sites.collect();
+    url.and_then(|url| UrlPattern::most_specific(sites.iter().map(|(p, t)| (p, *t)), url))
+        .unwrap_or(table::INSERT)
+}
+
+/// Whether `key` is the first keystroke of a binding of `table`.
+fn leaves(table: &[Binding], key: &KeyEvent) -> bool {
+    table.iter().any(|binding| {
+        let first = binding.keys.split_whitespace().next().unwrap();
+        first.parse::<Chord>().unwrap().matches(key)
+    })
 }
 
 impl Browser for Fake {
@@ -46,7 +82,7 @@ impl Browser for Fake {
             TabInfo::new(
                 TabId::next(),
                 Some("Title"),
-                Some("https://example.com/"),
+                self.url,
                 false,
                 Some("servo"),
                 1.0,
@@ -73,6 +109,8 @@ const NAMED: &[&str] = &[
     "End",
     "F5",
     "F11",
+    "F12",
+    "F12",
     "Delete",
     "Insert",
     "Shift",
@@ -153,6 +191,7 @@ fn fuzz_the_example_modes_under_random_keys() {
             fullscreen: false,
             link: None,
             context: KeyContext::new(KeyboardFocus::Page, false),
+            url: *case.rng.pick(URLS),
         };
         // The last press the keymap took, which the core then sends repeats of.
         let mut taken: Option<KeyEvent> = None;
@@ -175,6 +214,9 @@ fn fuzz_the_example_modes_under_random_keys() {
             if rng.one_in(30) {
                 keymap.reset();
             }
+            if rng.one_in(12) {
+                browser.url = *rng.pick(URLS);
+            }
             browser.active = rng.below(browser.tabs);
             let key = match taken.as_ref().filter(|_| rng.one_in(3)) {
                 Some(press) => KeyEvent {
@@ -187,8 +229,9 @@ fn fuzz_the_example_modes_under_random_keys() {
             let context = browser.context;
             case.note(|| {
                 format!(
-                    "{} {:?} fullscreen {} {key:?}",
+                    "{} {:?} {:?} fullscreen {} {key:?}",
                     if insert { "INSERT" } else { "NORMAL" },
+                    browser.url,
                     context,
                     browser.fullscreen
                 )
@@ -210,11 +253,16 @@ fn fuzz_the_example_modes_under_random_keys() {
                     _ => {}
                 },
                 (true, true) if !key.repeat && !matches!(action, KeyAction::Pass) => {
-                    assert!(unmodified_escape(&key), "INSERT took {key:?}: {action:?}");
+                    let table = insert_table(browser.url);
+                    assert!(
+                        leaves(table, &key),
+                        "INSERT took {key:?} on {:?}: {action:?}",
+                        browser.url
+                    );
                     assert!(
                         matches!(action, KeyAction::Take)
                             || action == KeyAction::Run(Command::PageExitFullscreen),
-                        "INSERT's Escape did {action:?}"
+                        "INSERT's leave key did {action:?}"
                     );
                 }
                 _ => {}

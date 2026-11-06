@@ -4,9 +4,10 @@
 use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::TabId;
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
+use sighurt_api::keymap::UrlPattern;
 use sighurt_api::keymap::{Browser, Chord, Frontend, KeyAction, KeyContext, Keymap, TabInfo};
 use sighurt_api::settings::{Table, Value};
-use sighurt_config_example::{bindings, table, Action, Mode, KIND, MAX_KEYS};
+use sighurt_config_example::{bindings, table, tables, Action, Mode, KIND, MAX_KEYS};
 
 const PAGE: KeyContext = KeyContext::new(KeyboardFocus::Page, false);
 const FIELD: KeyContext = KeyContext::new(KeyboardFocus::Page, true);
@@ -39,8 +40,6 @@ struct Fake {
     link: Option<&'static str>,
     /// Whether every tab's page holds an element fullscreen.
     fullscreen: bool,
-    /// Every tab's internal page.
-    internal: Option<&'static str>,
 }
 
 impl Fake {
@@ -51,7 +50,6 @@ impl Fake {
             active: 0,
             link: None,
             fullscreen: false,
-            internal: None,
         }
     }
     fn tabs(urls: usize, active: usize) -> Self {
@@ -61,7 +59,6 @@ impl Fake {
             active,
             link: None,
             fullscreen: false,
-            internal: None,
         }
     }
 }
@@ -81,21 +78,18 @@ impl Browser for Fake {
     }
     fn tab(&self, index: usize) -> Option<TabInfo<'_>> {
         let url = *self.urls.get(index)?;
-        Some(
-            TabInfo::new(
-                TabId::next(),
-                None,
-                url,
-                false,
-                None,
-                1.0,
-                false,
-                false,
-                self.link,
-                self.fullscreen,
-            )
-            .with_internal(self.internal),
-        )
+        Some(TabInfo::new(
+            TabId::next(),
+            None,
+            url,
+            false,
+            None,
+            1.0,
+            false,
+            false,
+            self.link,
+            self.fullscreen,
+        ))
     }
 }
 
@@ -214,12 +208,9 @@ fn the_table_is_valid_in_both_frontends() {
                     .unwrap_or_else(|e| panic!("{text:?}: {e}"));
             }
         }
-        // No binding is the same keys as, or the start of, another in its mode.
-        for (mode, tab) in [
-            ("normal", table::NORMAL),
-            ("insert", table::INSERT),
-            ("insert on the terminal page", table::INSERT_TERMINAL),
-        ] {
+        // No binding is the same keys as, or the start of, another in its table.
+        for (mode, site, tab) in tables() {
+            let mode = format!("{mode:?} {site:?}");
             let chords = |keys: &str| -> Vec<Chord> {
                 keys.split_whitespace()
                     .map(|k| k.parse().unwrap())
@@ -240,8 +231,16 @@ fn the_table_is_valid_in_both_frontends() {
             }
         }
     }
-    // The constructor parses every command.
+    // The constructor parses every command and every site's pattern, and no two sites have the
+    // same pattern.
     let _ = example();
+    let patterns: Vec<UrlPattern> = table::SITES
+        .iter()
+        .map(|site| site.url.parse().unwrap())
+        .collect();
+    for (i, pattern) in patterns.iter().enumerate() {
+        assert!(!patterns[i + 1..].contains(pattern), "{pattern} twice");
+    }
     // Its table takes no settings.
     let commands = CommandSet::ANY;
     assert_eq!((KIND.check)(&Table::new(), &commands), Vec::<String>::new());
@@ -311,64 +310,140 @@ fn escape_toggles_insert_and_the_indicator() {
     ));
 }
 
+/// A browser in `frontend` whose tab shows `url`.
+fn at(url: &'static str, frontend: Frontend) -> Fake {
+    Fake {
+        urls: vec![Some(url)],
+        ..Fake::new(frontend)
+    }
+}
+
+fn ctrl_escape() -> KeyEvent {
+    KeyEvent {
+        modifiers: CTRL,
+        ..escape()
+    }
+}
+
+fn f12() -> KeyEvent {
+    named("F12", 88)
+}
+
 #[test]
-fn on_the_terminal_page_escape_is_the_programs_and_ctrl_backslash_ctrl_n_leaves_insert() {
+fn on_the_terminal_pages_escape_is_the_programs_and_ctrl_escape_or_f12_leaves_insert() {
     let mut keymap = example();
-    let terminal = Fake {
-        internal: Some("terminal"),
-        ..Fake::new(Frontend::Gui)
-    };
-    // Escape enters INSERT there as everywhere.
-    assert_eq!(keymap.press(&escape(), PAGE, &terminal), KeyAction::Take);
-    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
-    // Then it is the program's, in both frontends and with a field or not.
-    let term = Fake {
-        internal: Some("terminal"),
-        ..Fake::new(Frontend::Terminal)
-    };
-    for browser in [&terminal, &term] {
-        for context in [PAGE, FIELD] {
-            assert_eq!(keymap.press(&escape(), context, browser), KeyAction::Pass);
+    for url in ["sig://terminal", "sig://terminal/config", "sig://config"] {
+        for frontend in [Frontend::Gui, Frontend::Terminal] {
+            let page = at(url, frontend);
+            for leave in [ctrl_escape(), f12()] {
+                // Escape enters INSERT there as everywhere.
+                assert_eq!(
+                    keymap.press(&escape(), PAGE, &page),
+                    KeyAction::Take,
+                    "{url}"
+                );
+                assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+                assert!(keymap.page_takes_text());
+                // Then it is the program's, with a field or not, as every other key.
+                for context in [PAGE, FIELD] {
+                    for key in [
+                        escape(),
+                        shifted(escape()),
+                        typed('x'),
+                        ctrl('c'),
+                        ctrl('\\'),
+                    ] {
+                        assert_eq!(
+                            keymap.press(&key, context, &page),
+                            KeyAction::Pass,
+                            "{key:?}"
+                        );
+                    }
+                }
+                assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+                // In the address line the line has every key, as on any page.
+                assert_eq!(keymap.press(&leave, CHROME, &page), KeyAction::Pass);
+                assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+                assert_eq!(
+                    keymap.press(&leave, PAGE, &page),
+                    KeyAction::Take,
+                    "{leave:?}"
+                );
+                assert_eq!(keymap.indicator(), None, "{url} {frontend:?} {leave:?}");
+                assert!(!keymap.page_takes_text());
+                // NORMAL there is NORMAL: keys are commands, and nothing reaches the program.
+                assert_eq!(
+                    keymap.press(&typed('j'), PAGE, &page),
+                    run("page.send-key down")
+                );
+                assert_eq!(keymap.press(&typed('z'), PAGE, &page), KeyAction::Take);
+                assert_eq!(keymap.press(&ctrl_escape(), PAGE, &page), KeyAction::Take);
+                assert_eq!(keymap.press(&f12(), PAGE, &page), KeyAction::Take);
+                assert_eq!(keymap.indicator(), None);
+            }
         }
     }
-    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
-    // ctrl-\ starts the way out and ctrl-n ends it; neither reaches the program.
-    assert_eq!(keymap.press(&ctrl('\\'), PAGE, &terminal), KeyAction::Take);
-    assert_eq!(keymap.press(&ctrl('n'), PAGE, &terminal), KeyAction::Take);
-    assert_eq!(keymap.indicator(), None);
-    // A ctrl-\ another key follows is dropped; that key reaches the program.
-    keymap.press(&escape(), PAGE, &terminal);
-    assert_eq!(keymap.press(&ctrl('\\'), PAGE, &terminal), KeyAction::Take);
-    assert_eq!(keymap.press(&typed('x'), PAGE, &terminal), KeyAction::Pass);
-    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
-    // In the address line the line has every key, as on any page.
-    assert_eq!(keymap.press(&escape(), CHROME, &terminal), KeyAction::Pass);
-    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
-    keymap.press(&ctrl('\\'), PAGE, &terminal);
-    keymap.press(&ctrl('n'), PAGE, &terminal);
 
-    // Everywhere else decision 134 stands: Escape leaves INSERT, and the chord is the page's.
-    let web = Fake::new(Frontend::Gui);
-    let help = Fake {
-        internal: Some("help"),
-        ..Fake::new(Frontend::Gui)
-    };
-    for browser in [&web, &help] {
-        assert_eq!(keymap.press(&escape(), PAGE, browser), KeyAction::Take);
-        assert_eq!(keymap.press(&ctrl('\\'), PAGE, browser), KeyAction::Pass);
-        assert_eq!(keymap.press(&ctrl('n'), PAGE, browser), KeyAction::Pass);
+    // Everywhere else decision 134 stands: Escape leaves INSERT, and ctrl-escape and f12 are
+    // the page's.
+    for url in [
+        "https://example.com/",
+        "sig://help",
+        "sig://terminal-x",
+        "https://sig/terminal",
+        "sig://configuration",
+    ] {
+        let page = at(url, Frontend::Gui);
+        assert_eq!(keymap.press(&escape(), PAGE, &page), KeyAction::Take);
+        assert_eq!(
+            keymap.press(&ctrl_escape(), PAGE, &page),
+            KeyAction::Pass,
+            "{url}"
+        );
+        assert_eq!(keymap.press(&f12(), PAGE, &page), KeyAction::Pass, "{url}");
         assert_eq!(keymap.indicator(), Some("INSERT MODE"));
-        assert_eq!(keymap.press(&escape(), PAGE, browser), KeyAction::Take);
+        assert_eq!(
+            keymap.press(&escape(), PAGE, &page),
+            KeyAction::Take,
+            "{url}"
+        );
         assert_eq!(keymap.indicator(), None);
     }
-    // The page's address does not make it the terminal: only the core's record does.
-    let lookalike = Fake {
-        urls: vec![Some("sig://terminal")],
-        ..Fake::new(Frontend::Gui)
-    };
-    keymap.press(&escape(), PAGE, &lookalike);
-    assert_eq!(keymap.press(&escape(), PAGE, &lookalike), KeyAction::Take);
+    // A tab with no address yet has the general tables.
+    let blank = Fake::tabs(1, 0);
+    keymap.press(&escape(), PAGE, &blank);
+    assert_eq!(keymap.press(&escape(), PAGE, &blank), KeyAction::Take);
     assert_eq!(keymap.indicator(), None);
+}
+
+#[test]
+fn the_site_is_the_shown_tabs_committed_address() {
+    let mut keymap = example();
+    // Two tabs: a web page and the terminal page. What counts is the tab shown.
+    let mut b = Fake::new(Frontend::Gui);
+    b.urls = vec![Some("https://example.com/"), Some("sig://terminal")];
+    b.active = 1;
+    keymap.press(&escape(), PAGE, &b);
+    assert_eq!(keymap.press(&escape(), PAGE, &b), KeyAction::Pass);
+    b.active = 0;
+    assert_eq!(keymap.press(&escape(), PAGE, &b), KeyAction::Take);
+    assert_eq!(keymap.indicator(), None);
+    // The link under the pointer is not the address.
+    let hovering = Fake {
+        link: Some("sig://terminal"),
+        ..at("https://example.com/", Frontend::Gui)
+    };
+    keymap.press(&escape(), PAGE, &hovering);
+    assert_eq!(keymap.press(&escape(), PAGE, &hovering), KeyAction::Take);
+    // An unfinished sequence of one page does not leave INSERT on another: there is none in
+    // INSERT, and the mode is the browser's, kept across tabs.
+    keymap.press(&escape(), PAGE, &at("sig://terminal", Frontend::Gui));
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
+    assert_eq!(
+        keymap.press(&f12(), PAGE, &at("https://example.com/", Frontend::Gui)),
+        KeyAction::Pass
+    );
+    assert_eq!(keymap.indicator(), Some("INSERT MODE"));
 }
 
 #[test]
@@ -660,19 +735,24 @@ fn describe_lists_every_binding_of_the_frontend_by_mode() {
         assert!(described
             .iter()
             .any(|b| b.mode == "INSERT" && b.keys == "escape"));
-        let leave = find("ctrl-\\ ctrl-n");
-        assert_eq!(
-            (
-                leave.mode.as_str(),
-                leave.action.as_str(),
-                leave.applies.as_str()
-            ),
-            ("INSERT", "NORMAL mode", "on sig://terminal")
-        );
+        // Each site's bindings with its address, from the table.
+        for site in table::SITES {
+            for keys in ["ctrl-escape", "f12"] {
+                let applies = format!("on {}", site.url);
+                assert!(
+                    described
+                        .iter()
+                        .any(|b| (b.mode.as_str(), b.keys.as_str(), b.action.as_str())
+                            == ("INSERT", keys, "NORMAL mode")
+                            && b.applies == applies),
+                    "{keys} {applies}"
+                );
+            }
+        }
         assert_eq!(find("escape").applies, "in the page");
         assert!(described.iter().any(|b| b.mode == "INSERT"
             && b.keys == "escape"
-            && b.applies == "in the page, except on sig://terminal"));
+            && b.applies == "in the page, except on sig://terminal, sig://config"));
         let terminal_only = described.iter().any(|b| b.keys == "ctrl-c");
         assert_eq!(terminal_only, frontend == Frontend::Terminal);
     }

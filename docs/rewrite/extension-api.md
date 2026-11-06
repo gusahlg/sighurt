@@ -199,6 +199,7 @@ In this table:
 | `[input] scroll-speed` **new** | 0.1–10 | `1.0` | core | core | live |
 | `[input.buttons] back`, `forward` **new** | a command, or `""` for none | `"page.back"`, `"page.forward"` | core | core | live |
 | `[keys]`, `[keys.page]`, `[keys.location]` | as today | none | the `bindings` keymap | its check | live |
+| `[keys.url."<pattern>"]` **new** | key bindings for the addresses a `UrlPattern` matches (§1.7), at most 64 | none | the `bindings` keymap | its check | live |
 | `[keymap.<k>]` **new** | the keymap's own | — | keymap `<k>` | its check | live |
 | `[ui] chrome` **new** | a chrome of the build | `"standard"` | executable | core | restart |
 | `[ui] font` **new** | a family name, 1–128 bytes | the first installed family of decision 20's list | chrome | core | live |
@@ -418,6 +419,23 @@ Checks:
 
 - `bindings` reads `[keys]` as today. Any other keymap `k` reads `[keymap.k]`, and
   `[keymap.bindings]` is an error that points to `[keys]`.
+- **Bindings for some addresses.** `[keys.url."<pattern>"]` (and `[tui.keys.url."<pattern>"]`
+  in the terminal's layer) holds `key = "command"` pairs for the addresses the pattern matches,
+  as `keymap::UrlPattern` (§2.3) reads it: `scheme://host` and an optional path, the scheme and
+  host compared ASCII case aside, the path as a prefix at a segment boundary
+  (`"sig://terminal"` matches `sig://terminal/config`, never `sig://terminal-x` or
+  `https://sig/terminal`), `*.example.com` for the hosts under example.com and not
+  example.com itself (as `[routing] hosts`). It matches the shown tab's committed address
+  (`TabInfo::url`), never one loading or a hovered link. While the page has the keyboard on a
+  matching address, the most specific matching table's bindings (an exact host before any
+  wildcard, a longer wildcard before a shorter one, then the longer path) are searched before
+  `[keys.page]` and `[keys]` of the same layer; a less specific match adds nothing, and
+  `[tui.keys]` stays over all of `[keys]`. The typing rule is `[keys]`'s. A bad or duplicate
+  pattern (after case is folded), more than 64 tables in one key table, or a pattern over
+  2 KiB is an error when the configuration loads. There is no unbinding: a table adds and
+  overrides. The example configuration (`extensions/sighurt-config-example`, `table::SITES`)
+  matches the same way, with tables that replace a mode's general table rather than add to it,
+  which is how its INSERT gives Escape to the program on `sig://terminal` and `sig://config`.
 - Switching applies live. The new keymap starts in its first mode.
 - The core's record of taken presses carries over the switch, so a key held during it still has
   its release taken.
@@ -737,6 +755,26 @@ impl Chord {
 
 /// Whether `key` is a modifier, lock or dead key. Sequences leave these out.
 pub fn is_modifier(key: &KeyEvent) -> bool;
+
+/// An address pattern: `scheme://host` and an optional path ("sig://terminal",
+/// "https://*.example.com/docs"), printable ASCII, at most `MAX_URL_PATTERN` (2048) bytes.
+/// Compared and printed in its normal form (scheme and host in lower case, a path of "/"
+/// dropped).
+pub struct UrlPattern { /* private */ }
+impl FromStr for UrlPattern { type Err = String; }
+impl Display for UrlPattern {}
+impl UrlPattern {
+    /// Scheme and host equal (ASCII case aside; `*.` the hosts under it), and the address's
+    /// path starts with the pattern's at a segment boundary. Userinfo, port, query and
+    /// fragment don't count.
+    pub fn matches(&self, address: &str) -> bool;
+    /// What goes with the most specific matching pattern: an exact host before any wildcard,
+    /// a longer wildcard before a shorter one, then the longer path; the first of equals.
+    pub fn most_specific<'a, T>(
+        patterns: impl IntoIterator<Item = (&'a UrlPattern, T)>,
+        address: &str,
+    ) -> Option<T>;
+}
 ```
 
 **What the core guarantees around any keymap.** A keymap can't break these:
@@ -766,7 +804,11 @@ pub fn is_modifier(key: &KeyEvent) -> bool;
 8. **`TabInfo::internal` is the core's record.** It names the internal page a tab shows
    (`help` for `sig://help`), taken from the view the core opened for that page, never from an
    address a page or engine reports, so a keymap may treat Sighurt's own pages differently
-   (pages-2026-11-05.md, decision 5) without a page being able to pose as one.
+   (pages-2026-11-05.md, decision 5) without a page being able to pose as one. Neither of the
+   workspace's keymaps reads it any more: their bindings for addresses match `TabInfo::url`
+   with `UrlPattern`, which is configuration rather than code, and an address is a page's to
+   report. That is safe because a binding for an address only gives keys to, or takes them
+   from, the page that shows it; it grants nothing.
 
 **Listing bindings.** `Keymap::describe(frontend) -> Vec<KeyBinding>` lists what a keymap binds
 in a frontend, as data (mode, keys as the configuration writes them, action, where it applies),
@@ -1998,3 +2040,17 @@ finding was checked against the plan and the code before it was acted on.
   gains `commands`, the configured names, which the standard chrome's and the line chrome's
   command lines parse with. `input::TextInputEvent` gains `paste`. The example configuration
   binds `?` and `f1` (also from the address line) to `help` and `d` to `tab.close`.
+
+- **Bindings for some addresses** (6 November 2026; the user: "make sure this is not really
+  hard-coded. I want the configuration to have control over the bindings, add in a way for the
+  configuration to set url-specific bindings"). `keymap::UrlPattern` (with `MAX_URL_PATTERN`)
+  is new: an address pattern that parses (`FromStr`, errors that say why), prints in its normal
+  form, `matches` an address, and picks the `most_specific` of several (§2.3). The `bindings`
+  keymap reads `[keys.url."<pattern>"]` and `[tui.keys.url."<pattern>"]` with it (§1.7), and
+  `Bindings::find` takes the address. The example configuration's `table::SITES` gives a mode's
+  table for an address in place of the general one (`table::Site`, `lib::tables`); its
+  `INSERT_TERMINAL` and the `TabInfo::internal == Some("terminal")` test are gone, and on
+  `sig://terminal` and `sig://config` INSERT passes Escape and leaves on `ctrl-escape` or
+  `f12` (`table::INSERT_PROGRAM`; `ctrl-escape` is a plain Escape in a terminal with legacy
+  keys, and in tmux by default). `TabInfo::internal` stays. `describe` lists a site's bindings
+  "on <pattern>" in both keymaps.

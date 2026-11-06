@@ -1,5 +1,17 @@
 //! The binding tables: what each key does in NORMAL and INSERT, and where it applies. Owns the
 //! data and nothing else; matching keys and the modes' behaviour are `lib.rs`'s.
+//!
+//! [`NORMAL`] and [`INSERT`] are the modes' general tables. [`SITES`] is where bindings for
+//! some addresses go: a [`Site`] names an address pattern (`sighurt_api::keymap::UrlPattern`:
+//! `scheme://host` and an optional path, matched against the shown tab's committed address)
+//! and, for each mode it changes, a table that **replaces** that mode's general table while
+//! the page has the keyboard on a matching address. So a site can take a general binding away
+//! (INSERT's Escape on the terminal pages) as well as add one; a mode it leaves `None` keeps
+//! the general table. Of the sites that match and have a table for the mode, the most specific
+//! pattern wins (an exact host before a `*.` wildcard, a longer wildcard before a shorter one,
+//! then the longer path). While the address line or the find field has the keyboard, the
+//! general NORMAL table's `Always` bindings apply on every address, as on any page. To bind
+//! keys for a site, add a `Site` here.
 
 use sighurt_api::commands::Command;
 use sighurt_api::keymap::Browser;
@@ -161,13 +173,46 @@ pub const NORMAL: &[Binding] = &[
 /// INSERT: only Escape; every other key reaches the page.
 pub const INSERT: &[Binding] = &[bind("escape", ExitFullscreenOr(Mode::Normal), Page, Both)];
 
-/// INSERT on `sig://terminal` (the tab's internal page is `terminal`), in place of [`INSERT`]:
-/// Escape is the program's (nvim needs it), so it reaches the page like every other key, and
-/// `ctrl-\ ctrl-n`, nvim's own way out of its terminal mode, leaves INSERT. Everywhere else
-/// [`INSERT`] stands.
-pub const INSERT_TERMINAL: &[Binding] = &[bind(
-    "ctrl-\\ ctrl-n",
-    Action::Mode(Mode::Normal),
-    Page,
-    Both,
-)];
+/// Bindings for the addresses `url` matches, in place of a mode's general table.
+#[derive(Clone, Copy, Debug)]
+pub struct Site {
+    /// The address pattern, as `sighurt_api::keymap::UrlPattern` reads it.
+    pub url: &'static str,
+    /// NORMAL's table there, or `None` for [`NORMAL`].
+    pub normal: Option<&'static [Binding]>,
+    /// INSERT's table there, or `None` for [`INSERT`].
+    pub insert: Option<&'static [Binding]>,
+}
+
+/// The sites with bindings of their own: the pages that run a program in a terminal,
+/// `sig://terminal` (and `sig://terminal/…`) and `sig://config`, whose INSERT is
+/// [`INSERT_PROGRAM`]. NORMAL is unchanged there.
+pub const SITES: &[Site] = &[
+    Site {
+        url: "sig://terminal",
+        normal: None,
+        insert: Some(INSERT_PROGRAM),
+    },
+    Site {
+        url: "sig://config",
+        normal: None,
+        insert: Some(INSERT_PROGRAM),
+    },
+];
+
+/// INSERT on a page that runs a program in a terminal: every key reaches the program, Escape
+/// included (nvim needs it), and `ctrl-escape` or `f12` leaves INSERT.
+///
+/// `ctrl-escape` is the chosen key. It works in the window, and in a terminal that speaks the
+/// kitty keyboard protocol, which `sig --tui` asks for: Ctrl+Escape arrives as `CSI 27;5u`
+/// (so does tmux's with `extended-keys always` and `extended-keys-format csi-u`). A terminal
+/// with legacy key encoding sends Ctrl+Escape as a plain `ESC` byte, and so does tmux by
+/// default (sig asks for no `modifyOtherKeys`): sig cannot tell it from Escape, so there it is
+/// Escape, it reaches the program, and `ctrl-escape` never fires. xterm's `modifyOtherKeys`
+/// form, `CSI 27;5;27~`, is not read at all. `f12` is the key for those terminals: every
+/// terminal and tmux send it (`CSI 24~`), it is the same key on every layout and needs no
+/// AltGr, and shells and nvim bind nothing to it.
+pub const INSERT_PROGRAM: &[Binding] = &[
+    bind("ctrl-escape", Action::Mode(Mode::Normal), Page, Both),
+    bind("f12", Action::Mode(Mode::Normal), Page, Both),
+];
