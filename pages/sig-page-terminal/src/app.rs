@@ -285,9 +285,8 @@ impl<P: Terminal> App<P> {
             Line::new("Press Enter to start.", ACCENT).bold(),
             Line::new("", FOREGROUND),
             Line::new(
-                "With sig's example keymap, keys reach the program in INSERT mode, which Escape \
-                 enters. On this page Escape then goes to the program; ctrl-\\ ctrl-n leaves \
-                 INSERT.",
+                "With sig's example keymap, keys reach the program in INSERT mode. \
+                 sig://help/keys lists the keys that enter and leave it on this page.",
                 MUTED,
             ),
             Line::new(other, MUTED),

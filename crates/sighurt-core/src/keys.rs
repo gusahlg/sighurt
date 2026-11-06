@@ -6,7 +6,11 @@
 //! sits over `[keys]` and applies only there. `[keys]` applies everywhere, `[keys.page]` while
 //! the page has focus and `[keys.location]` while the chrome (the address bar) has; a binding
 //! of the focused part wins over a global one in the same layer, and a higher layer wins over
-//! a lower one. Keystrokes are `sighurt_api::keymap::Chord`s, matched as that type says: by
+//! a lower one. `[keys.url."<pattern>"]` (up to [`MAX_SITES`] of them, and `[tui.keys.url…]` in
+//! the terminal's layer) binds keys for the addresses a `sighurt_api::keymap::UrlPattern`
+//! matches: while the page has the keyboard and the shown tab's committed address matches, the
+//! most specific matching table's bindings win over `[keys.page]` and `[keys]` of its layer
+//! (only that one table: a less specific match adds nothing). Keystrokes are `sighurt_api::keymap::Chord`s, matched as that type says: by
 //! the layout's meaning unless they name a physical key, and AltGr never Ctrl+Alt. While the
 //! user types, in the address bar or a page's text field, a binding that would type a character
 //! (no modifier but Shift) lets the key type, and the search continues with the other bindings.
@@ -26,7 +30,7 @@ use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::SeatId;
 use sighurt_api::input::{ButtonState, KeyCode, KeyEvent, KeyboardFocus};
 use sighurt_api::keymap::{
-    Browser, Chord, Frontend, KeyAction, KeyBinding, KeyContext, Keymap, KeymapKind,
+    Browser, Chord, Frontend, KeyAction, KeyBinding, KeyContext, Keymap, KeymapKind, UrlPattern,
 };
 use sighurt_api::settings::{Table, Value};
 
@@ -64,6 +68,9 @@ pub(crate) fn combine(tui: Table, user: Table) -> Table {
     ])
 }
 
+/// The most `[keys.url."<pattern>"]` tables in one key table.
+pub const MAX_SITES: usize = 64;
+
 fn new() -> Box<dyn Keymap> {
     Box::new(Bindings::default())
 }
@@ -74,6 +81,9 @@ pub struct Bindings {
     global: Vec<Binding>,
     page: Vec<Binding>,
     location: Vec<Binding>,
+    /// `[keys.url."<pattern>"]`: bindings while the page has the keyboard on the addresses the
+    /// pattern matches.
+    sites: Vec<(UrlPattern, Vec<Binding>)>,
     /// Layers under this one, in the order they are searched. Empty when the table is a
     /// single layer.
     below: Vec<Bindings>,
@@ -108,6 +118,9 @@ impl Bindings {
                     commands,
                     problems,
                 ),
+                Value::Table(table) if key == "url" => {
+                    bindings.sites = sites(table, section, commands, problems);
+                }
                 Value::Table(table) => {
                     let nested = format!("[{section}.{key}]");
                     let list = match key.as_str() {
@@ -115,8 +128,8 @@ impl Bindings {
                         "location" => &mut bindings.location,
                         other => {
                             problems.push(format!(
-                                "[{section}.{other}]: unknown context (use [{section}.page] or \
-                                 [{section}.location])"
+                                "[{section}.{other}]: unknown context (use [{section}.page], \
+                                 [{section}.location] or [{section}.url.\"<address>\"])"
                             ));
                             continue;
                         }
@@ -158,27 +171,47 @@ impl Bindings {
     }
 
     fn is_empty(&self) -> bool {
-        self.global.is_empty() && self.page.is_empty() && self.location.is_empty()
+        self.global.is_empty()
+            && self.page.is_empty()
+            && self.location.is_empty()
+            && self.sites.is_empty()
     }
 
-    /// The command bound to `event` while `focus` has the keyboard. `typing` says the focused
-    /// part is a text field, where keystrokes that type characters are left to it. A binding
-    /// that does not fire is skipped, including one in a layer under this one.
-    pub fn find(&self, focus: KeyboardFocus, typing: bool, event: &KeyEvent) -> Option<&Command> {
-        self.find_here(focus, typing, event).or_else(|| {
+    /// The command bound to `event` while `focus` has the keyboard, with `address` the shown
+    /// tab's committed address. `typing` says the focused part is a text field, where
+    /// keystrokes that type characters are left to it. A binding that does not fire is
+    /// skipped, including one in a layer under this one.
+    pub fn find(
+        &self,
+        focus: KeyboardFocus,
+        typing: bool,
+        address: Option<&str>,
+        event: &KeyEvent,
+    ) -> Option<&Command> {
+        self.find_here(focus, typing, address, event).or_else(|| {
             self.below
                 .iter()
-                .find_map(|layer| layer.find(focus, typing, event))
+                .find_map(|layer| layer.find(focus, typing, address, event))
         })
     }
 
-    fn find_here(&self, focus: KeyboardFocus, typing: bool, event: &KeyEvent) -> Option<&Command> {
-        let context = match focus {
-            KeyboardFocus::Page => &self.page,
-            KeyboardFocus::Chrome => &self.location,
+    fn find_here(
+        &self,
+        focus: KeyboardFocus,
+        typing: bool,
+        address: Option<&str>,
+        event: &KeyEvent,
+    ) -> Option<&Command> {
+        let (site, context) = match focus {
+            KeyboardFocus::Page => {
+                let sites = self.sites.iter().map(|(pattern, list)| (pattern, list));
+                let site = address.and_then(|address| UrlPattern::most_specific(sites, address));
+                (site.map(Vec::as_slice).unwrap_or_default(), &self.page)
+            }
+            KeyboardFocus::Chrome => (&[][..], &self.location),
         };
-        context
-            .iter()
+        site.iter()
+            .chain(context)
             .chain(&self.global)
             .find(|binding| !(typing && binding.chord.types()) && binding.chord.matches(event))
             .map(|binding| &binding.command)
@@ -201,36 +234,91 @@ impl Keymap for Bindings {
         *self = Bindings::from_settings(settings);
     }
 
-    fn press(&mut self, key: &KeyEvent, context: KeyContext, _browser: &dyn Browser) -> KeyAction {
-        match self.find(context.focus, context.typing, key) {
+    fn press(&mut self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> KeyAction {
+        let tab = browser.tab(browser.active_tab());
+        let address = tab.and_then(|tab| tab.url);
+        match self.find(context.focus, context.typing, address, key) {
             Some(command) => KeyAction::Run(command.clone()),
             None => KeyAction::Pass,
         }
     }
 
-    /// Every binding, the layer searched first first: `[keys]` everywhere, then `[keys.page]`
-    /// and `[keys.location]`. A binding a higher layer hides is still listed.
+    /// Every binding, the layer searched first first: `[keys]` everywhere, then `[keys.page]`,
+    /// `[keys.location]` and each `[keys.url."<pattern>"]` ("on <pattern>"). A binding a higher
+    /// layer hides is still listed.
     fn describe(&self, _frontend: Frontend) -> Vec<KeyBinding> {
         let mut found = Vec::new();
         for layer in std::iter::once(self).chain(&self.below) {
+            let sites = layer
+                .sites
+                .iter()
+                .map(|(pattern, list)| (list, format!("on {pattern}")));
             let lists = [
-                (&layer.global, ""),
-                (&layer.page, "in the page"),
-                (&layer.location, "in the address line"),
+                (&layer.global, String::new()),
+                (&layer.page, "in the page".to_owned()),
+                (&layer.location, "in the address line".to_owned()),
             ];
-            for (list, applies) in lists {
+            for (list, applies) in lists.into_iter().chain(sites) {
                 found.extend(list.iter().map(|binding| {
                     KeyBinding::new(
                         "",
                         binding.text.clone(),
                         binding.command.to_string(),
-                        applies,
+                        applies.clone(),
                     )
                 }));
             }
         }
         found
     }
+}
+
+/// `[<section>.url]`: a table of key bindings per address pattern, at most [`MAX_SITES`], no
+/// two with the same pattern.
+fn sites(
+    table: &Table,
+    section: &str,
+    commands: &CommandSet<'_>,
+    problems: &mut Vec<String>,
+) -> Vec<(UrlPattern, Vec<Binding>)> {
+    if table.len() > MAX_SITES {
+        problems.push(format!(
+            "[{section}.url] has {} addresses; at most {MAX_SITES}",
+            table.len()
+        ));
+    }
+    let mut sites: Vec<(UrlPattern, Vec<Binding>)> = Vec::new();
+    for (text, value) in table {
+        let head = format!("[{section}.url.{text:?}]");
+        let pattern = match text.parse::<UrlPattern>() {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                problems.push(format!("{head}: {error}"));
+                continue;
+            }
+        };
+        if sites.iter().any(|(other, _)| *other == pattern) {
+            problems.push(format!(
+                "{head}: another [{section}.url] table has the same address pattern ({pattern})"
+            ));
+            continue;
+        }
+        let Some(keys) = value.as_table() else {
+            problems.push(format!(
+                "[{section}.url] {text:?}: expected a table of keys, written {head}"
+            ));
+            continue;
+        };
+        let mut list = Vec::new();
+        for (key, value) in keys {
+            match value.as_str() {
+                Some(command) => add(&mut list, &head, key, command, commands, problems),
+                None => problems.push(format!("{head} {key:?}: expected a command in quotes")),
+            }
+        }
+        sites.push((pattern, list));
+    }
+    sites
 }
 
 /// Parses one binding into `list`, or says what is wrong with it.
@@ -498,20 +586,20 @@ mod tests {
         .unwrap();
         let ctrl_l = press(38, character("l"), CTRL, NONE);
         assert_eq!(
-            bindings.find(KeyboardFocus::Page, false, &ctrl_l),
+            bindings.find(KeyboardFocus::Page, false, None, &ctrl_l),
             Some(&Command::PageReload)
         );
         assert_eq!(
-            bindings.find(KeyboardFocus::Chrome, true, &ctrl_l),
+            bindings.find(KeyboardFocus::Chrome, true, None, &ctrl_l),
             Some(&Command::LocationFocus(None))
         );
         let j = press(36, character("j"), NONE, NONE);
         assert_eq!(
-            bindings.find(KeyboardFocus::Page, false, &j),
+            bindings.find(KeyboardFocus::Page, false, None, &j),
             Some(&Command::TabNext)
         );
-        assert_eq!(bindings.find(KeyboardFocus::Page, true, &j), None);
-        assert_eq!(bindings.find(KeyboardFocus::Chrome, true, &j), None);
+        assert_eq!(bindings.find(KeyboardFocus::Page, true, None, &j), None);
+        assert_eq!(bindings.find(KeyboardFocus::Chrome, true, None, &j), None);
     }
 
     #[test]
@@ -538,27 +626,27 @@ mod tests {
         bindings.configure(&settings);
         let j = press(36, character("j"), NONE, NONE);
         assert_eq!(
-            bindings.find(KeyboardFocus::Page, false, &j),
+            bindings.find(KeyboardFocus::Page, false, None, &j),
             Some(&Command::TabClose(None))
         );
         // j would type, so it is left alone, in every layer.
-        assert_eq!(bindings.find(KeyboardFocus::Page, true, &j), None);
-        assert_eq!(bindings.find(KeyboardFocus::Chrome, true, &j), None);
+        assert_eq!(bindings.find(KeyboardFocus::Page, true, None, &j), None);
+        assert_eq!(bindings.find(KeyboardFocus::Chrome, true, None, &j), None);
         // A modifier in a lower layer still fires while a character binding is suppressed.
         let ctrl_d = press(32, character("d"), CTRL, NONE);
         assert_eq!(
-            bindings.find(KeyboardFocus::Page, true, &ctrl_d),
+            bindings.find(KeyboardFocus::Page, true, None, &ctrl_d),
             Some(&Command::PageReload)
         );
         // A global binding in the higher layer beats a page binding under it.
         let ctrl_t = press(20, character("t"), CTRL, NONE);
         assert_eq!(
-            bindings.find(KeyboardFocus::Page, false, &ctrl_t),
+            bindings.find(KeyboardFocus::Page, false, None, &ctrl_t),
             Some(&Command::BrowserQuit)
         );
         let q = press(KEY_Q, character("q"), NONE, NONE);
         assert_eq!(
-            bindings.find(KeyboardFocus::Page, false, &q),
+            bindings.find(KeyboardFocus::Page, false, None, &q),
             Some(&Command::BrowserQuit)
         );
     }
@@ -593,6 +681,208 @@ mod tests {
                 "{part:?} not in {problems:#?}"
             );
         }
+    }
+
+    const ESCAPE: u32 = 1;
+
+    fn escape(modifiers: Modifiers) -> KeyEvent {
+        press(ESCAPE, Key::Named("Escape".into()), modifiers, NONE)
+    }
+
+    #[test]
+    fn site_tables_win_in_the_page_on_their_addresses() {
+        let bindings = bindings(
+            r#"
+            "ctrl-escape" = "tab.new"
+            "f12" = "browser.quit"
+            [page]
+            "ctrl-escape" = "page.reload"
+            [url."sig://terminal"]
+            "ctrl-escape" = "page.back"
+            "j" = "tab.next"
+            [url."https://*.example.com"]
+            "ctrl-escape" = "page.forward"
+            [url."https://docs.example.com/guide"]
+            "ctrl-escape" = "page.stop"
+            "#,
+        )
+        .unwrap();
+        let ctrl_escape = escape(CTRL);
+        let find = |focus, address| bindings.find(focus, false, address, &ctrl_escape);
+        let page = KeyboardFocus::Page;
+        // The site's binding beats [keys.page] and [keys] on its addresses only.
+        for address in ["sig://terminal", "sig://terminal/config", "SIG://TERMINAL"] {
+            assert_eq!(
+                find(page, Some(address)),
+                Some(&Command::PageBack),
+                "{address}"
+            );
+        }
+        for address in [
+            Some("sig://terminal-x"),
+            Some("https://sig/terminal"),
+            Some("sig://config"),
+            None,
+        ] {
+            assert_eq!(
+                find(page, address),
+                Some(&Command::PageReload),
+                "{address:?}"
+            );
+        }
+        // The most specific table that matches, and only it.
+        assert_eq!(
+            find(page, Some("https://docs.example.com/guide/x")),
+            Some(&Command::PageStop)
+        );
+        assert_eq!(
+            find(page, Some("https://docs.example.com/guidance")),
+            Some(&Command::PageForward)
+        );
+        assert_eq!(
+            find(page, Some("https://a.b.example.com/")),
+            Some(&Command::PageForward)
+        );
+        assert_eq!(
+            find(page, Some("https://example.com/")),
+            Some(&Command::PageReload)
+        );
+        // A key the site's table doesn't bind falls to [keys.page] and [keys].
+        let f12 = press(88, Key::Named("F12".into()), NONE, NONE);
+        assert_eq!(
+            bindings.find(page, false, Some("sig://terminal"), &f12),
+            Some(&Command::BrowserQuit)
+        );
+        // Only while the page has the keyboard.
+        assert_eq!(
+            find(KeyboardFocus::Chrome, Some("sig://terminal")),
+            Some(&Command::TabNew(None))
+        );
+        // A keystroke that types is left to a text field there too.
+        let j = press(36, character("j"), NONE, NONE);
+        assert_eq!(
+            bindings.find(page, false, Some("sig://terminal"), &j),
+            Some(&Command::TabNext)
+        );
+        assert_eq!(bindings.find(page, true, Some("sig://terminal"), &j), None);
+    }
+
+    #[test]
+    fn the_keymap_takes_the_address_from_the_shown_tabs_committed_one() {
+        let text = "[url.\"sig://terminal\"]\n\"ctrl-escape\" = \"page.back\"";
+        let mut keymap = Bindings::default();
+        keymap.configure(&table(text));
+        let ctrl_escape = escape(CTRL);
+        let at = |url| UrlBrowser { url, link: None };
+        assert_eq!(
+            keymap.press(&ctrl_escape, PAGE, &at(Some("sig://terminal"))),
+            KeyAction::Run(Command::PageBack)
+        );
+        for browser in [
+            at(Some("https://example.com/")),
+            at(None),
+            UrlBrowser {
+                url: Some("https://example.com/"),
+                link: Some("sig://terminal"),
+            },
+        ] {
+            assert_eq!(keymap.press(&ctrl_escape, PAGE, &browser), KeyAction::Pass);
+        }
+        // Listed with its address.
+        assert_eq!(
+            keymap.describe(Frontend::Gui),
+            [KeyBinding::new(
+                "",
+                "ctrl-escape",
+                "page.back",
+                "on sig://terminal"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_terminal_layer_has_site_tables_of_its_own() {
+        let settings = combine(
+            table("[url.\"sig://terminal\"]\n\"f12\" = \"tab.close\""),
+            table(
+                "\"f12\" = \"browser.quit\"\n[url.\"sig://terminal\"]\n\"f12\" = \
+                 \"page.back\"\n\"f11\" = \"page.forward\"",
+            ),
+        );
+        let mut bindings = Bindings::default();
+        bindings.configure(&settings);
+        let key = |name: &str, code| press(code, Key::Named(name.into()), NONE, NONE);
+        let find =
+            |event: &KeyEvent, address| bindings.find(KeyboardFocus::Page, false, address, event);
+        assert_eq!(
+            find(&key("F12", 88), Some("sig://terminal")),
+            Some(&Command::TabClose(None))
+        );
+        assert_eq!(find(&key("F12", 88), None), Some(&Command::BrowserQuit));
+        assert_eq!(
+            find(&key("F11", 87), Some("sig://terminal")),
+            Some(&Command::PageForward)
+        );
+        let described = bindings.describe(Frontend::Terminal);
+        assert_eq!(described.len(), 4);
+        assert!(described.iter().all(|b| b.keys == "f12" || b.keys == "f11"));
+    }
+
+    #[test]
+    fn bad_site_tables_are_reported() {
+        let problems = bindings(
+            r#"
+            [url."terminal"]
+            "f12" = "tab.new"
+            [url."https://a.org:8080"]
+            "f12" = "tab.new"
+            [url."sig://Terminal"]
+            "f12" = "tab.new"
+            [url."SIG://terminal/"]
+            "f12" = "tab.new"
+            [url."sig://config"]
+            "f12" = "tab.nwe"
+            "f11" = 1
+            "ctrl-escape" = "page.back"
+            "ctrl-Escape" = "page.back"
+            "#,
+        )
+        .unwrap_err();
+        let expected = [
+            "[keys.url.\"terminal\"]: an address pattern is scheme://host",
+            "[keys.url.\"https://a.org:8080\"]: ':' in the host",
+            "another [keys.url] table has the same address pattern (sig://terminal)",
+            "[keys.url.\"sig://config\"] \"f12\" = \"tab.nwe\": unknown command",
+            "[keys.url.\"sig://config\"] \"f11\": expected a command in quotes",
+            "are the same keystroke",
+        ];
+        assert_eq!(problems.len(), expected.len(), "{problems:#?}");
+        for part in expected {
+            assert!(
+                problems.iter().any(|p| p.contains(part)),
+                "{part:?} not in {problems:#?}"
+            );
+        }
+        // A string where the tables are, and a table of tables.
+        let wrong = bindings("url = \"sig://terminal\"").unwrap_err();
+        assert!(wrong[0].contains("[keys] \"url\""), "{wrong:?}");
+        let wrong = bindings("[url]\n\"sig://terminal\" = \"tab.new\"").unwrap_err();
+        assert!(wrong[0].contains("expected a table of keys"), "{wrong:?}");
+    }
+
+    #[test]
+    fn site_tables_are_bounded() {
+        let mut text = String::new();
+        for i in 0..=MAX_SITES {
+            text.push_str(&format!(
+                "[url.\"https://site{i}.example\"]\n\"f12\" = \"tab.new\"\n"
+            ));
+        }
+        let problems = bindings(&text).unwrap_err();
+        assert_eq!(problems, ["[keys.url] has 65 addresses; at most 64"]);
+        let long = format!("https://a.org/{}", "x".repeat(2048));
+        let problems = bindings(&format!("[url.{long:?}]\n\"f12\" = \"tab.new\"")).unwrap_err();
+        assert!(problems[0].contains("at most 2048 bytes"), "{problems:?}");
     }
 
     #[test]
@@ -750,7 +1040,48 @@ mod tests {
         assert_eq!(handle(&empty_up), KeyOutcome::Consumed);
     }
 
-    /// A browser with nothing to read. `bindings` never looks.
+    /// A browser with one tab, showing `url` with the pointer over `link`.
+    struct UrlBrowser {
+        url: Option<&'static str>,
+        link: Option<&'static str>,
+    }
+
+    impl Browser for UrlBrowser {
+        fn frontend(&self) -> Frontend {
+            Frontend::Gui
+        }
+
+        fn context(&self) -> KeyContext {
+            PAGE
+        }
+
+        fn tab_count(&self) -> usize {
+            1
+        }
+
+        fn active_tab(&self) -> usize {
+            0
+        }
+
+        fn tab(&self, index: usize) -> Option<sighurt_api::keymap::TabInfo<'_>> {
+            (index == 0).then(|| {
+                sighurt_api::keymap::TabInfo::new(
+                    sighurt_api::ids::TabId::next(),
+                    None,
+                    self.url,
+                    true,
+                    None,
+                    1.0,
+                    false,
+                    false,
+                    self.link,
+                    false,
+                )
+            })
+        }
+    }
+
+    /// A browser with no tab.
     struct NoneBrowser;
 
     impl Browser for NoneBrowser {

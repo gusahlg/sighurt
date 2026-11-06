@@ -2739,8 +2739,9 @@ fn sig_pages_need_graphics_and_say_so() {
 }
 
 /// sig://terminal in the terminal frontend with graphics: the page shows, Escape and Enter start
-/// the shell, typed keys reach it, `ctrl-\ ctrl-n` leaves INSERT, and `q` quits sig with the
-/// shell ended. Needs the Wasm engine: run with `--features frontend-tui,engine-demo,engine-wasm`.
+/// the shell, typed keys reach it, Escape in INSERT is the shell's, the example configuration's
+/// `ctrl-escape` (kitty's `CSI 27;5u`) and `f12` (`CSI 24~`) leave INSERT, and `q` quits sig
+/// with the shell ended. Needs the Wasm engine: run with `--features frontend-tui,engine-demo,engine-wasm`.
 #[cfg(feature = "engine-wasm")]
 #[test]
 fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
@@ -2770,14 +2771,40 @@ fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
     let pid = fs::read_to_string(home.join("pid")).unwrap();
     let shell = Path::new("/proc").join(pid.trim());
     assert!(shell.exists(), "the shell is not running");
-    // ctrl-\ ctrl-n, then q in NORMAL.
-    term.type_bytes(b"\x1b[92;5u\x1b[92;5:3u\x1b[110;5u\x1b[110;5:3u");
+    // Escape is the shell's: INSERT stays, and the shell still reads the next line once
+    // Ctrl+C has dropped what the Escape began.
+    term.type_bytes(&kitty_keys("\x1b"));
+    thread::sleep(Duration::from_millis(300));
+    term.type_bytes(b"\x1b[99;5u\x1b[99;5:3u");
+    thread::sleep(Duration::from_secs(1));
+    term.type_bytes(&kitty_keys("echo esc > ~/esc.txt\r"));
+    let start = Instant::now();
+    while fs::read_to_string(home.join("esc.txt")).ok().as_deref() != Some("esc\n") {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "after Escape, INSERT no longer gave the shell the keys\n{}",
+            term.context()
+        );
+        term.wait(term.got.len(), Duration::from_millis(100), |_| false);
+    }
+    // ctrl-escape leaves INSERT; Escape enters it again, and f12 leaves it.
+    term.type_bytes(b"\x1b[27;5u\x1b[27;5:3u");
     let left = term.wait(term.got.len(), Duration::from_secs(10), insert_mode_left);
+    assert!(left, "ctrl-escape did not leave INSERT\n{}", term.context());
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("\x1b"));
+    let insert = term.wait(since, Duration::from_secs(10), |got| {
+        shows(got, "INSERT MODE")
+    });
     assert!(
-        left,
-        "ctrl-\\ ctrl-n did not leave INSERT\n{}",
+        insert,
+        "Escape did not enter INSERT again\n{}",
         term.context()
     );
+    term.type_bytes(b"\x1b[24~\x1b[24;1:3~");
+    let left = term.wait(term.got.len(), Duration::from_secs(10), insert_mode_left);
+    assert!(left, "f12 did not leave INSERT\n{}", term.context());
+    // Then q in NORMAL.
     term.type_bytes(&kitty_keys("q"));
     let status = term.exit();
     assert!(
@@ -2836,10 +2863,16 @@ fn sig_config_is_edited_and_saved_in_the_terminal() {
         term.context()
     );
 
+    // On sig://config INSERT gives Escape to the page; the example configuration's
+    // ctrl-escape leaves it.
     let since = term.got.len();
-    term.type_bytes(&kitty_keys("\x1b"));
+    term.type_bytes(b"\x1b[27;5u\x1b[27;5:3u");
     let left = term.wait(since, Duration::from_secs(10), insert_mode_left);
-    assert!(left, "Escape did not leave INSERT MODE\n{}", term.context());
+    assert!(
+        left,
+        "ctrl-escape did not leave INSERT MODE\n{}",
+        term.context()
+    );
     term.type_bytes(&kitty_keys("q"));
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
