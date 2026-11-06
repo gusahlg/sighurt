@@ -150,7 +150,7 @@ impl HomePage {
     }
 
     /// The address of the focused link.
-    fn focused_url(&self) -> Option<String> {
+    pub(crate) fn focused_url(&self) -> Option<String> {
         let node = self.doc.items.get(self.view.focused_item?)?.node;
         let (_, url) = self.links.iter().find(|(link, _)| *link == node)?;
         Some(url.clone())

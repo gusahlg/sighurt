@@ -41,6 +41,18 @@ const SIXEL_REPLIES: &[u8] = b"\x1b[6;20;10t\x1b[?62;4c";
 /// [`REPLIES`] after a `q` the user typed while the terminal had not answered yet.
 const Q_THEN_REPLIES: &[u8] = b"q\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c";
 
+/// The history file a test's `sig` starts with.
+#[derive(Clone, Copy)]
+enum Seed<'a> {
+    /// None.
+    None,
+    /// One that holds this.
+    File(&'a str),
+    /// A named pipe: `sig`'s reader waits on it until the test writes the file
+    /// ([`Terminal::feed_history`]).
+    Pipe,
+}
+
 /// `sig --tui` on the slave side of a pty, and the fake terminal on the master side.
 struct Terminal {
     master: OwnedFd,
@@ -70,12 +82,12 @@ impl Terminal {
 
     /// [`Self::start_with`] with `tui` more lines in the configuration's `[tui]` table.
     fn start_in(name: &str, args: &[&str], replies: &'static [u8], tui: &str) -> Self {
-        Self::start_seeded(name, args, replies, tui, None)
+        Self::start_seeded(name, args, replies, tui, Seed::None)
     }
 
     /// [`Self::start_in`] with `TERM=tmux-256color`, as in a tmux pane.
     fn start_in_tmux(name: &str, args: &[&str], replies: &'static [u8], tui: &str) -> Self {
-        Self::start_as(name, args, replies, tui, None, "tmux-256color", false)
+        Self::start_as(name, args, replies, tui, Seed::None, "tmux-256color", false)
     }
 
     /// [`Self::start_in`] with `history` as the history file (`state/sighurt/history.toml`).
@@ -84,7 +96,7 @@ impl Terminal {
         args: &[&str],
         replies: &'static [u8],
         tui: &str,
-        history: Option<&str>,
+        history: Seed<'_>,
     ) -> Self {
         Self::start_as(name, args, replies, tui, history, "xterm-kitty", false)
     }
@@ -92,7 +104,7 @@ impl Terminal {
     /// [`Self::start`] with the pty as `sig`'s controlling terminal, in a session of its own, as
     /// in a terminal emulator: closing the master then sends it `SIGHUP`.
     fn start_controlling(name: &str, args: &[&str]) -> Self {
-        Self::start_as(name, args, REPLIES, "", None, "xterm-kitty", true)
+        Self::start_as(name, args, REPLIES, "", Seed::None, "xterm-kitty", true)
     }
 
     /// [`Self::start_seeded`] with `TERM` set to `term`, and the pty as the controlling terminal
@@ -102,7 +114,7 @@ impl Terminal {
         args: &[&str],
         replies: &'static [u8],
         tui: &str,
-        history: Option<&str>,
+        history: Seed<'_>,
         term: &str,
         controlling: bool,
     ) -> Self {
@@ -111,9 +123,21 @@ impl Terminal {
         fs::create_dir_all(dir.join("config/sighurt")).unwrap();
         // A home of its own: whatever sig starts (sig://terminal's shell) never sees the user's.
         fs::create_dir_all(dir.join("home")).unwrap();
-        if let Some(history) = history {
+        if !matches!(history, Seed::None) {
             fs::create_dir_all(dir.join("state/sighurt")).unwrap();
-            fs::write(dir.join("state/sighurt/history.toml"), history).unwrap();
+        }
+        let history_file = dir.join("state/sighurt/history.toml");
+        match history {
+            Seed::None => {}
+            Seed::File(text) => fs::write(&history_file, text).unwrap(),
+            Seed::Pipe => rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &history_file,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                0,
+            )
+            .unwrap(),
         }
         fs::write(
             dir.join("config/sighurt/config.toml"),
@@ -263,6 +287,18 @@ impl Terminal {
                 Err(error) => panic!("writing to the pty: {error}"),
             }
         }
+    }
+
+    /// Writes `text` into the history file made with [`Seed::Pipe`], which `sig`'s reader is
+    /// waiting on, and closes it.
+    fn feed_history(&self, text: &str) {
+        let pipe = rustix::fs::open(
+            self.dir.join("state/sighurt/history.toml"),
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("sig is reading the history");
+        assert_eq!(rustix::io::write(&pipe, text.as_bytes()), Ok(text.len()));
     }
 
     /// Resizes the pty and tells `sig`, as a terminal emulator does.
@@ -1062,8 +1098,13 @@ fn the_address_line_completes_from_the_history() {
     let history = format!(
         "version = 1\n[[visits]]\nurl = \"{URL}\"\ntitle = \"Example\"\nlast = {now}\ncount = 2\n"
     );
-    let mut term =
-        Terminal::start_seeded("history", &["demo://pattern"], REPLIES, "", Some(&history));
+    let mut term = Terminal::start_seeded(
+        "history",
+        &["demo://pattern"],
+        REPLIES,
+        "",
+        Seed::File(&history),
+    );
     let shown = term.wait(0, Duration::from_secs(15), |got| {
         image(got, 80, 22, 800, 440)
     });
@@ -2891,6 +2932,336 @@ fn sig_config_runs_the_editor_in_the_terminal() {
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
     let _ = fs::remove_dir_all(&scripts);
+}
+
+/// A directory of scripts for a test, made anew.
+fn scripts(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("sig-tui-{name}-scripts-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Writes the executable script `name` in `dir` and returns its path.
+fn script(dir: &Path, name: &str, text: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    fs::write(&path, text).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Reads `sig`'s output until `path` exists or `timeout`. Returns whether it does.
+fn wait_for_file(term: &mut Terminal, path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() && Instant::now() < deadline {
+        term.wait(term.got.len(), Duration::from_millis(100), |_| false);
+    }
+    path.exists()
+}
+
+/// The legacy keys of f12, which leaves INSERT on sig://config.
+const F12: &[u8] = b"\x1b[24~";
+/// A bracketed paste of "pasted".
+const PASTE: &[u8] = b"\x1b[200~pasted\x1b[201~";
+
+/// sig://config where the terminal does not draw it, with no graphics and in text mode: the
+/// page rows say how to see it (in text mode the key from the keymap), and Escape, Enter,
+/// typing, a paste and a click start nothing and leave the file as it was. With graphics (`m`)
+/// Enter starts the editor and typing reaches it; back in text mode typing does not, while it
+/// keeps running, and with graphics again it does. Needs the Wasm engine: run with
+/// `--features frontend-tui,engine-demo,engine-wasm`.
+#[cfg(feature = "engine-wasm")]
+#[test]
+fn sig_config_gets_no_input_where_it_is_not_drawn() {
+    let dir = scripts("config-undrawn");
+    let (started, input) = (dir.join("started"), dir.join("input"));
+    // The editor says it started, then puts what it reads, byte by byte, in `input`.
+    let editor = script(
+        &dir,
+        "editor",
+        &format!("#!/bin/sh\necho $$ > {started:?}\nstty raw -echo\nexec cat >> {input:?}\n"),
+    );
+    let pages = format!(
+        "[pages.config]\neditor = {:?}",
+        editor.display().to_string()
+    );
+    // What the page gets while it is not drawn: INSERT, Enter, typing, a paste, a click.
+    let try_everything = |term: &mut Terminal| {
+        term.type_bytes(b"\x1b");
+        let insert = term.wait(term.got.len(), Duration::from_secs(5), |got| {
+            shows(got, "INSERT MODE")
+        });
+        assert!(insert, "Escape did not enter INSERT\n{}", term.context());
+        term.type_bytes(b"\r");
+        thread::sleep(Duration::from_millis(300));
+        term.type_bytes(b"abc\r");
+        term.type_bytes(PASTE);
+        term.type_bytes(&left_click(40, 12));
+        term.type_bytes(b"\r");
+        term.wait(term.got.len(), Duration::from_secs(2), |_| false);
+        term.type_bytes(F12);
+        let left = term.wait(term.got.len(), Duration::from_secs(5), insert_mode_left);
+        assert!(left, "f12 did not leave INSERT\n{}", term.context());
+    };
+
+    // No graphics.
+    let mut term = Terminal::start_in(
+        "config-nographics",
+        &["sig://config"],
+        NO_GRAPHICS_REPLIES,
+        &pages,
+    );
+    let config = term.dir.join("config/sighurt/config.toml");
+    let before = fs::read_to_string(&config).unwrap();
+    let said = term.wait(0, Duration::from_secs(20), |got| {
+        shows(got, "need graphics")
+    });
+    assert!(said, "no message\n{}", term.context());
+    assert!(shows(&term.got, "get no input here"), "{}", term.context());
+    try_everything(&mut term);
+    assert!(!started.exists(), "the editor started\n{}", term.context());
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        before,
+        "the file changed"
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+
+    // Text mode, then graphics.
+    let tui = format!("mode = \"text\"\n{pages}");
+    let mut term = Terminal::start_in("config-text", &["sig://config"], REPLIES, &tui);
+    let config = term.dir.join("config/sighurt/config.toml");
+    let before = fs::read_to_string(&config).unwrap();
+    let said = term.wait(0, Duration::from_secs(20), |got| {
+        screen(got, 80, 24)
+            .iter()
+            .any(|row| row.contains("have no text and get no input here: m shows graphics"))
+    });
+    assert!(said, "no message naming m\n{}", term.context());
+    try_everything(&mut term);
+    assert!(!started.exists(), "the editor started\n{}", term.context());
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        before,
+        "the file changed"
+    );
+    // With graphics, Enter starts it and typing reaches it.
+    let since = term.got.len();
+    term.type_bytes(b"m");
+    let drawn = term.wait(since, Duration::from_secs(10), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(drawn, "m did not show graphics\n{}", term.context());
+    term.type_bytes(b"\x1b");
+    thread::sleep(Duration::from_millis(300));
+    term.type_bytes(b"\r");
+    assert!(
+        wait_for_file(&mut term, &started, Duration::from_secs(10)),
+        "with graphics Enter did not start the editor\n{}",
+        term.context()
+    );
+    let pid = fs::read_to_string(&started).unwrap();
+    let program = Path::new("/proc").join(pid.trim());
+    // Typed until it reads them: stty may not have made it raw yet.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&input)
+        .unwrap_or_default()
+        .contains("xyz")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the editor did not get the keys\n{}",
+            term.context()
+        );
+        term.type_bytes(b"xyz");
+        term.wait(term.got.len(), Duration::from_millis(500), |_| false);
+    }
+    // Text mode again: the editor runs on and gets nothing.
+    term.type_bytes(F12);
+    term.wait(term.got.len(), Duration::from_secs(5), insert_mode_left);
+    let since = term.got.len();
+    term.type_bytes(b"m");
+    let text = term.wait(since, Duration::from_secs(10), |got| shows(got, "TEXT"));
+    assert!(text, "m did not show text\n{}", term.context());
+    term.type_bytes(b"\x1b");
+    term.wait(term.got.len(), Duration::from_millis(500), |_| false);
+    term.type_bytes(b"QQQ");
+    term.type_bytes(PASTE);
+    term.wait(term.got.len(), Duration::from_secs(2), |_| false);
+    let got = fs::read_to_string(&input).unwrap_or_default();
+    assert!(
+        !got.contains('Q') && !got.contains("pasted"),
+        "typed into it while not drawn: {got:?}"
+    );
+    assert!(program.exists(), "the editor stopped running");
+    // Graphics again: it gets the keys.
+    term.type_bytes(F12);
+    term.wait(term.got.len(), Duration::from_secs(5), insert_mode_left);
+    let since = term.got.len();
+    term.type_bytes(b"m");
+    let drawn = term.wait(since, Duration::from_secs(10), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(drawn, "m did not show graphics again\n{}", term.context());
+    term.type_bytes(b"\x1b");
+    term.wait(term.got.len(), Duration::from_millis(500), |_| false);
+    term.type_bytes(b"ok");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&input)
+        .unwrap_or_default()
+        .contains("ok")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the editor did not get keys again\n{}",
+            term.context()
+        );
+        term.wait(term.got.len(), Duration::from_millis(100), |_| false);
+    }
+    assert!(!fs::read_to_string(&input).unwrap().contains('Q'));
+    term.type_bytes(F12);
+    term.wait(term.got.len(), Duration::from_secs(5), insert_mode_left);
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+    term.assert_restored();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// sig://config's editor ending reads a linked configuration again, which the watch can't see,
+/// with no further input: the editor writes the file when it is told to hang up (its tab closed
+/// from another), ignores it, and is killed 2 s later, when nothing else is due; a single report
+/// some seconds after that has the reload. Needs the Wasm engine: run with
+/// `--features frontend-tui,engine-demo,engine-wasm`.
+#[cfg(feature = "engine-wasm")]
+#[test]
+fn an_editors_end_reads_a_linked_configuration_with_no_more_input() {
+    let dir = scripts("config-linked");
+    let started = dir.join("started");
+    let editor = script(
+        &dir,
+        "editor",
+        &format!(
+            "#!/bin/sh\ntrap 'printf \"[commands]\\nmarked = \\\"tab.new\\\"\\n\" >> \"$1\"' HUP\n\
+             echo $$ > {started:?}\nwhile :; do sleep 0.2; done\n"
+        ),
+    );
+    let pages = format!(
+        "[pages.config]\neditor = {:?}",
+        editor.display().to_string()
+    );
+    let mut term = Terminal::start_in("config-linked", &["sig://config"], KITTY_REPLIES, &pages);
+    let shown = term.wait(0, Duration::from_secs(20), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "sig://config did not show\n{}", term.context());
+    // The file becomes a link to one elsewhere, with the same text.
+    let link = term.dir.join("config/sighurt/config.toml");
+    let target = term.dir.join("dotfiles/sig.toml");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::copy(&link, &target).unwrap();
+    let new = link.with_extension("new");
+    std::os::unix::fs::symlink(&target, &new).unwrap();
+    fs::rename(&new, &link).unwrap();
+    term.wait(term.got.len(), Duration::from_secs(1), |_| false);
+    let reloads = |report: &str| {
+        report_value(report, "config_reloads")
+            .parse::<u64>()
+            .unwrap()
+    };
+    let before = reloads(&term.report_until(|r| r.contains("config_reloads")));
+    term.type_bytes(&kitty_keys("\x1b"));
+    term.wait(term.got.len(), Duration::from_secs(5), |got| {
+        shows(got, "INSERT MODE")
+    });
+    term.type_bytes(&kitty_keys("\r"));
+    assert!(
+        wait_for_file(&mut term, &started, Duration::from_secs(10)),
+        "the editor did not start\n{}",
+        term.context()
+    );
+    let pid = fs::read_to_string(&started).unwrap();
+    let program = Path::new("/proc").join(pid.trim());
+    term.type_bytes(b"\x1b[27;5u\x1b[27;5:3u");
+    let left = term.wait(term.got.len(), Duration::from_secs(10), insert_mode_left);
+    assert!(left, "ctrl-escape did not leave INSERT\n{}", term.context());
+    // Another tab, home, and the page's tab closed from it: no view is left to wake sig.
+    let since = term.got.len();
+    term.type_bytes(&kitty_keys("t"));
+    let home = term.wait(since, Duration::from_secs(10), |got| shows(got, "Sighurt"));
+    assert!(home, "home did not show\n{}", term.context());
+    term.type_bytes(&kitty_keys("\x1b"));
+    term.wait(term.got.len(), Duration::from_millis(300), |_| false);
+    term.type_bytes(&kitty_keys(":tab.close 1\r"));
+    term.wait(term.got.len(), Duration::from_millis(300), |_| false);
+    assert_eq!(term.tabs(), (1, 1), "{}", term.context());
+    // No more input: the editor is killed 2 s after the hang-up, and then nothing is due.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while program.exists() {
+        assert!(Instant::now() < deadline, "the editor was not ended");
+        term.wait(term.got.len(), Duration::from_millis(100), |_| false);
+    }
+    term.wait(term.got.len(), Duration::from_secs(2), |_| false);
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains("marked = \"tab.new\""),
+        "the editor did not write where the link leads"
+    );
+    // One report: asking for it wakes the loop, so a second one would see a reload that only
+    // that wake did.
+    let report = term.report_until(|r| r.contains("config_reloads"));
+    assert!(
+        reloads(&report) > before,
+        "the editor ended but the file was not read again ({before} reloads before)\n{}",
+        term.context()
+    );
+    term.type_bytes(&kitty_keys("q"));
+    assert!(term.exit().success(), "{}", term.context());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// sig://home drawn before the history file has been read: once it has, with no input, home
+/// lists the visits. The file is a named pipe the test writes only after home is drawn.
+#[test]
+fn home_lists_the_visits_read_after_it_was_drawn() {
+    let mut term = Terminal::start_seeded(
+        "home-history",
+        &["sig://home"],
+        KITTY_REPLIES,
+        "",
+        Seed::Pipe,
+    );
+    term.resize(80, 40);
+    let listed = |got: &[u8], text: &str| screen(got, 80, 40).iter().any(|row| row.contains(text));
+    let shown = term.wait(0, Duration::from_secs(15), |got| listed(got, "KEYS"));
+    assert!(shown, "home is not shown\n{}", term.context());
+    term.wait(term.got.len(), Duration::from_millis(500), |_| false);
+    assert!(!listed(&term.got, "RECENTLY VISITED"), "{}", term.context());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    term.feed_history(&format!(
+        "version = 1\n[[visits]]\nurl = \"https://www.example.com/seen\"\ntitle = \"Seen\"\n\
+         last = {now}\ncount = 1\n"
+    ));
+    let visits = term.wait(0, Duration::from_secs(5), |got| {
+        listed(got, "RECENTLY VISITED")
+    });
+    assert!(
+        visits,
+        "home did not list the visits read\n{}",
+        term.context()
+    );
+    // Then idle again.
+    term.wait(term.got.len(), Duration::from_millis(800), |_| false);
+    let idle = term.got.len();
+    term.wait(idle, Duration::from_millis(800), |_| false);
+    assert_eq!(term.got.len(), idle, "an idle home writes");
+    term.type_bytes(&kitty_keys("q"));
+    assert!(term.exit().success(), "{}", term.context());
 }
 
 /// The screen a terminal of `cols`×`rows` shows after `bytes`, as lines of text.

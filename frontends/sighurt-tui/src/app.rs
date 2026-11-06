@@ -59,7 +59,8 @@
 //! to text mode's field editor while it is open, else to the page's text field only while the
 //! core offers the host one (`Frontend::page_text_input`, which is `None` while the keymap gives
 //! the page no text); text mode opens a field's editor only while the keymap gives the page
-//! text, and shows a notice otherwise.
+//! text, and shows a notice otherwise. sig's own pages (`sig://config`) have no text: while the
+//! page rows don't show their pixels, they get no input but releases ([`Tui::page_input`]).
 //!
 //! Page frames (TUI.md §2 and §8.6): a permit only for the shown view, only when its engine has
 //! a new frame, at most `[tui] fps` a second (in text mode at most [`TEXT_FPS`], and only when
@@ -214,13 +215,13 @@ fn is_home(url: &str) -> bool {
     name.is_some_and(|name| name.eq_ignore_ascii_case("home"))
 }
 /// The page rows' message for one of sig's own pages (`sig://help`) where no image can show:
-/// they are drawn, with no text to show instead.
+/// they are drawn, with no text to show instead, and while they are not drawn they get no input
+/// ([`Tui::page_input`]).
 const PAGE_NEEDS_GRAPHICS: &str =
-    "sig's own pages, such as sig://help, are drawn: they need graphics, which this terminal \
-     can't show";
-/// The page rows' message for one of sig's own pages in text mode.
-const PAGE_HAS_NO_TEXT: &str =
-    "sig's own pages, such as sig://help, are drawn and have no text: m shows graphics";
+    "sig's pages need graphics (kitty, sixel or sig --gui) and get no input here";
+/// The page rows' message for one of sig's own pages in text mode, before the keys that show
+/// graphics ([`App::graphics_keys`]).
+const PAGE_HAS_NO_TEXT: &str = "sig's pages have no text and get no input here:";
 /// The most characters of an address the page rows' loading message shows.
 const MESSAGE_URL: usize = 256;
 /// The chromes the window has, by name. The terminal ignores `[ui] chrome` and `[chrome.*]`,
@@ -812,8 +813,8 @@ impl App {
             self.signals.push(libc::SIGHUP as u8);
         }
         self.handle_signals();
-        // The file changed, or sig://config's editor ended: the watch misses a linked target.
-        if std::mem::take(&mut self.config_changed) | self.session.take_config_edited() {
+        // The watch saw the file change.
+        if std::mem::take(&mut self.config_changed) {
             self.reload_config();
         }
         if self
@@ -833,6 +834,12 @@ impl App {
             let mut worked = self.drain_input();
             worked |= self.deliver_clipboard_failures();
             worked |= self.session.service_completions(&mut self.tui);
+            // sig://config's editor ended, which the watch misses for a linked target: read
+            // the file in this pass, since nothing may wake the loop again.
+            if self.session.take_config_edited() {
+                self.reload_config();
+                worked = true;
+            }
             worked |= self.send_metrics();
             self.tui.active_url = active_url(self.session.core());
             worked |= self.session.pump(&mut self.tui);
@@ -1651,8 +1658,9 @@ impl App {
         self.tui.home.draw(&mut self.tui.grid, area);
     }
 
-    /// The mouse over the page rows while they show home: the wheel scrolls it and a left press
-    /// on a link opens its address. `None` when home is not shown or the mouse is elsewhere.
+    /// The mouse over the page rows while they show home: the wheel scrolls it, a left press
+    /// queues `BrowserEvent::ChromePagePress`, and one on a link opens its address. `None` when
+    /// home is not shown or the mouse is elsewhere.
     fn home_mouse(&mut self, mouse: &MouseEvent) -> Option<Option<BrowserEvent>> {
         let page = self.tui.page;
         let inside =
@@ -1677,6 +1685,11 @@ impl App {
             return Some(None);
         }
         self.tui.chrome_dirty = true;
+        // The user took the page, on a link or not (it lifts the input hold): before the link's
+        // command, which the caller queues after this.
+        self.session
+            .queue_mut()
+            .push_back(BrowserEvent::ChromePagePress);
         let url = self.tui.home.click(mouse.column, mouse.row - page.row);
         Some(url.map(|url| BrowserEvent::Command(Command::PageOpen(url))))
     }
@@ -1723,7 +1736,9 @@ impl App {
             Kind::Internal => Some(error.unwrap_or_else(|| NO_SUCH_PAGE.into())),
             // sig's own pages are drawn: they have no text mode.
             Kind::Page if self.tui.text_mode && self.tui.images_possible() => {
-                Some(error.unwrap_or_else(|| PAGE_HAS_NO_TEXT.into()))
+                Some(error.unwrap_or_else(|| {
+                    format!("{PAGE_HAS_NO_TEXT} {} shows graphics", self.graphics_keys())
+                }))
             }
             Kind::Page if !self.tui.images_possible() => {
                 Some(error.unwrap_or_else(|| PAGE_NEEDS_GRAPHICS.into()))
@@ -1750,6 +1765,19 @@ impl App {
                 .into()
             })),
         }
+    }
+
+    /// The keys the keymap in use binds to showing graphics (`chrome.toggle-mode` or
+    /// `chrome.graphics-mode`), its first mode's first; the command to type in the address
+    /// line when it binds none.
+    fn graphics_keys(&self) -> String {
+        let shows = |action: &str| matches!(action, "chrome.toggle-mode" | "chrome.graphics-mode");
+        self.session
+            .core()
+            .describe_keys()
+            .into_iter()
+            .find(|binding| shows(&binding.action))
+            .map_or_else(|| ":chrome.graphics-mode".into(), |binding| binding.keys)
     }
 
     /// Whether the shown view has a frame for this layout, so the page rows are not empty.
@@ -2939,14 +2967,35 @@ impl Frontend for Tui {
 
     /// In text mode the shown page's keys scroll, focus and activate its text; nothing reaches
     /// the engine (TUI.md §8.11).
+    ///
+    /// sig's own pages are drawn. While the page rows show a message instead (text mode, a
+    /// terminal without graphics or a page area too big for an image), nothing reaches them that
+    /// could start a program or type into one: no key press or repeat, whether typed or made by
+    /// `page.send-key`, no text or paste, and no pointer motion, press or scroll. A program
+    /// already running keeps running and gets input again once graphics show the page. Key and
+    /// button releases still go, so nothing stays held in the page.
     fn page_input(
         &mut self,
         view: ViewId,
         event: &InputEvent,
         activation: Option<Instant>,
         takes_text: bool,
+        page: bool,
         queue: &mut VecDeque<BrowserEvent>,
     ) -> bool {
+        if page && !self.graphics {
+            let release = matches!(
+                &event.kind,
+                InputKind::Key(KeyEvent {
+                    state: ButtonState::Released,
+                    ..
+                }) | InputKind::Pointer(PointerEvent::Button {
+                    state: ButtonState::Released,
+                    ..
+                })
+            );
+            return !release;
+        }
         let InputKind::Key(key) = &event.kind else {
             return false;
         };
@@ -4314,6 +4363,164 @@ schemes = [\"demo\"]
         app.motion_due = Some(Instant::now());
         assert!(app.drain_input());
         assert!(app.motion.is_none());
+    }
+
+    /// Home that came to the front by itself (a page's tab closed itself) gets no keys until
+    /// the user takes it: in INSERT, Tab is dropped, and after a left press in its rows off any link
+    /// (`BrowserEvent::ChromePagePress`) Tab focuses its first link.
+    #[cfg(feature = "engine-demo")]
+    #[test]
+    fn a_press_in_home_off_its_links_lifts_the_input_hold() {
+        use sighurt_api::events::{EngineEvent, OpenDisposition};
+        let mut held = demo_app();
+        let app = &mut held.app;
+        app.session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: vec![OpenRequest {
+                input: "demo://pattern".into(),
+                engine: Some("demo".into()),
+            }],
+        });
+        let document = settle_document(app);
+        let command = |app: &mut App, text: &str| {
+            let command = text.parse::<Command>().expect("command");
+            app.session
+                .queue_mut()
+                .push_back(BrowserEvent::Command(command));
+            app.run_core();
+        };
+        command(app, "tab.new");
+        command(app, "tab.select 1");
+        // INSERT, where the keymap gives the page every key.
+        let seat = app.tui.seat;
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            let key = KeyEvent {
+                code: KeyCode(1),
+                state,
+                ..named("Escape")
+            };
+            let event = InputEvent {
+                seat,
+                kind: InputKind::Key(key),
+            };
+            let at = Instant::now();
+            app.session
+                .queue_mut()
+                .push_back(BrowserEvent::Keyboard { event, at });
+            app.run_core();
+        }
+        // A click in the page, which opens a tab of its own; that tab closes itself.
+        let first = app.session.shown_view().expect("shown").0;
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            let event = InputEvent {
+                seat,
+                kind: InputKind::Pointer(PointerEvent::Button {
+                    button: PointerButton::Left,
+                    state,
+                    position: SurfacePoint { x: 10.0, y: 10.0 },
+                    modifiers: Modifiers::default(),
+                }),
+            };
+            let at = Instant::now();
+            let queue = app.session.queue_mut();
+            queue.push_back(BrowserEvent::Pointer {
+                view: first,
+                event,
+                at,
+            });
+            app.run_core();
+        }
+        let engine = |app: &mut App, event| {
+            app.session.queue_mut().push_back(BrowserEvent::Engine {
+                engine: "demo".into(),
+                event,
+                at: Instant::now(),
+            });
+            app.run_core();
+        };
+        engine(
+            app,
+            EngineEvent::OpenRequested {
+                view: first,
+                document,
+                url: "demo://pattern".into(),
+                disposition: OpenDisposition::NewView,
+            },
+        );
+        let tabs = app.session.core().tabs().len();
+        assert_eq!(tabs, 3, "{}", page_debug(app));
+        let popup = app
+            .session
+            .core()
+            .tabs()
+            .position(|tab| matches!(tab.content, Content::Blank))
+            .expect("the page's new tab, loading")
+            + 1;
+        command(app, &format!("tab.select {popup}"));
+        let popup_document = settle_document(app);
+        let popup = app.session.shown_view().expect("shown").0;
+        assert_ne!(popup, first);
+        engine(
+            app,
+            EngineEvent::CloseRequested {
+                view: popup,
+                document: popup_document,
+            },
+        );
+        let home = app.shows_home();
+        assert!(home, "{}", page_debug(app));
+        let notice = app.tui.notice.clone().unwrap_or_default();
+        assert!(notice.contains("came to the front by itself"), "{notice:?}");
+        for _ in 0..50 {
+            app.write();
+            if app.tui.home_drawn {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.tui.home_drawn, "home is not drawn");
+        let tab = |app: &mut App| {
+            let key = KeyEvent {
+                code: KeyCode(15),
+                ..named("Tab")
+            };
+            for state in [ButtonState::Pressed, ButtonState::Released] {
+                let event = InputEvent {
+                    seat,
+                    kind: InputKind::Key(KeyEvent {
+                        state,
+                        ..key.clone()
+                    }),
+                };
+                let at = Instant::now();
+                app.session
+                    .queue_mut()
+                    .push_back(BrowserEvent::Keyboard { event, at });
+                app.run_core();
+            }
+        };
+        tab(app);
+        assert_eq!(app.tui.home.focused_url(), None, "Tab reached home");
+        // The heading's row: no link there.
+        let page = app.tui.page;
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            app.event(TermEvent::Mouse(MouseEvent {
+                column: page.cols - 1,
+                row: page.row,
+                button: Some(PointerButton::Left),
+                state,
+                modifiers: Modifiers::default(),
+                motion: false,
+                wheel: None,
+            }));
+            app.run_core();
+        }
+        assert_eq!(app.tui.home.focused_url(), None, "a link was pressed");
+        tab(app);
+        assert!(
+            app.tui.home.focused_url().is_some(),
+            "Tab did not reach home after the press"
+        );
     }
 
     #[cfg(feature = "engine-demo")]

@@ -71,7 +71,8 @@ const REAP_WAIT: Duration = Duration::from_secs(1);
 pub const EDITORS: [&str; 4] = ["nvim", "vim", "vi", "nano"];
 /// What `sig://config` says when it has no editor.
 pub const NO_EDITOR: &str = "No editor found: set [pages.config] editor, or $VISUAL or $EDITOR, \
-                             or install nvim, vim, vi or nano.";
+                             or install nvim, vim, vi or nano in a directory of PATH (only \
+                             absolute ones are searched).";
 /// The shell when neither the configuration nor `SHELL` names one.
 const SHELL: &str = "/bin/sh";
 
@@ -115,6 +116,12 @@ impl EditorFrom {
 /// `$VISUAL`, else `$EDITOR`, each split at white space with no shell and no quoting; else the
 /// full path of the first of [`EDITORS`] found as an executable file in a directory of
 /// `$PATH`. `None` when there is none. `vars` is `sig`'s environment.
+///
+/// Only absolute `PATH` directories are searched: a relative entry, and an empty one (which a
+/// shell takes as the current directory), are skipped, never resolved. `sig`'s current
+/// directory is wherever it was started, and the program found gets all the user's rights, so a
+/// file that happens to be named `nvim` there must not become the editor. With `PATH=.` no
+/// editor is found, and [`NO_EDITOR`] says only absolute directories are searched.
 pub fn editor(
     setting: Option<&str>,
     vars: &[(OsString, OsString)],
@@ -146,6 +153,7 @@ pub fn editor(
     let path = var("PATH")?;
     EDITORS.iter().find_map(|name| {
         std::env::split_paths(&path)
+            // Never the current directory, nor one relative to it (see above).
             .filter(|dir| dir.is_absolute())
             .map(|dir| dir.join(name))
             .find(|file| is_executable(file))
@@ -287,6 +295,10 @@ type Ended = Arc<Mutex<Vec<(RequestId, Option<i32>)>>>;
 pub struct Ptys {
     live: Arc<AtomicUsize>,
     sessions: HashMap<RequestId, Session>,
+    /// How the programs [`Ptys::cancel`] ended will have ended, until [`Ptys::ended`] reports
+    /// them: [`Ptys::shutdown`] waits for these too, or a program that ignores SIGHUP would
+    /// outlive `sig`, its watcher gone before the SIGKILL.
+    cancelled: HashMap<RequestId, Arc<Exit>>,
     /// What each program [`Ptys::open`] started is, until [`Ptys::ended`] reports it.
     programs: HashMap<RequestId, PtyProgram>,
     ended: Ended,
@@ -309,6 +321,7 @@ impl Ptys {
         Self {
             live: Arc::default(),
             sessions: HashMap::new(),
+            cancelled: HashMap::new(),
             programs: HashMap::new(),
             ended: Ended::default(),
             wake,
@@ -368,7 +381,11 @@ impl Ptys {
     /// Ends the program `request` started, if it is one of these, without waiting: SIGHUP, then
     /// SIGKILL after [`GRACE`]. Whether it was one. Its end comes through [`Ptys::ended`].
     pub fn cancel(&mut self, request: RequestId) -> bool {
-        self.sessions.remove(&request).is_some()
+        let Some(session) = self.sessions.remove(&request) else {
+            return false;
+        };
+        self.cancelled.insert(request, Arc::clone(&session.exit));
+        true
     }
 
     /// The programs that ended and were reaped since the last call, with their exit status
@@ -380,19 +397,21 @@ impl Ptys {
             .into_iter()
             .map(|(request, status)| {
                 self.sessions.remove(&request);
+                self.cancelled.remove(&request);
                 let program = self.programs.remove(&request).unwrap_or(PtyProgram::Shell);
                 (request, status, program)
             })
             .collect()
     }
 
-    /// Ends every program and waits until they are reaped, at most [`GRACE`] and a second: for
-    /// quitting, before the engines shut down.
+    /// Ends every program and waits until they are reaped, those cancelled before included, at
+    /// most [`GRACE`] and a second: for quitting, before the engines shut down.
     pub fn shutdown(&mut self) {
         let exits: Vec<_> = self
             .sessions
             .drain()
             .map(|(_, session)| session.exit.clone())
+            .chain(self.cancelled.drain().map(|(_, exit)| exit))
             .collect();
         let deadline = Instant::now() + GRACE + REAP_WAIT;
         for exit in exits {
@@ -915,6 +934,49 @@ mod tests {
     }
 
     #[test]
+    fn only_absolute_path_directories_are_searched_for_an_editor() {
+        // A relative entry that leads to an editor: the current directory's parents up to the
+        // root, then the directory's own path.
+        let here = programs(&["nvim"]);
+        let mut relative = PathBuf::new();
+        for _ in std::env::current_dir().unwrap().components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(here.path().strip_prefix("/").unwrap());
+        assert!(relative.is_relative() && is_executable(&relative.join("nvim")));
+        let bin = programs(&["nano"]);
+        let path = |entries: &[&Path]| {
+            vec![(
+                OsString::from("PATH"),
+                std::env::join_paths(entries).unwrap(),
+            )]
+        };
+        let nano = || {
+            Some((
+                vec![bin.path().join("nano").into_os_string()],
+                EditorFrom::Path,
+            ))
+        };
+        // nvim comes before nano, but not from a relative or empty entry.
+        assert_eq!(editor(None, &path(&[&relative, bin.path()])), nano());
+        assert_eq!(editor(None, &path(&[Path::new("."), bin.path()])), nano());
+        assert_eq!(editor(None, &path(&[Path::new(""), bin.path()])), nano());
+        assert_eq!(editor(None, &path(&[&relative])), None);
+        assert_eq!(editor(None, &path(&[Path::new(".")])), None);
+        // And the page says why.
+        let launch = Launch {
+            command: None,
+            editor: None,
+            config: Some(Path::new("/c/config.toml")),
+        };
+        let refused = exec(PtyProgram::EditConfig, launch, path(&[&relative])).unwrap_err();
+        assert!(
+            refused.contains("only absolute ones are searched"),
+            "{refused}"
+        );
+    }
+
+    #[test]
     fn the_editor_is_the_setting_then_visual_then_editor_then_one_on_path() {
         let bin = programs(&["nano", "vi"]);
         let more = programs(&["nvim"]);
@@ -1247,6 +1309,31 @@ mod tests {
         ends.sort_by_key(|(request, _)| requests.iter().position(|r| r == request));
         assert_eq!(ends.iter().map(|(r, _)| *r).collect::<Vec<_>>(), requests);
         assert_eq!(ptys.live(), 0);
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_cancelled_program_that_ignores_sighup() {
+        let _serial = serial();
+        let (_home, vars) = home();
+        let mut ptys = ptys();
+        let mut masters = Vec::new();
+        let script = sh(
+            "trap '' HUP TERM; echo pid=$$; while :; do sleep 1; done",
+            &vars,
+        );
+        let request = RequestId::next();
+        open(&mut ptys, request, &script, &mut masters).unwrap();
+        read_until(&masters[0], "pid=", Duration::from_secs(10));
+        // Cancelled (the tab closed, or the core ending it at quit), then shut down at once:
+        // the watcher's SIGKILL is waited for.
+        assert!(ptys.cancel(request));
+        let started = Instant::now();
+        ptys.shutdown();
+        assert!(started.elapsed() >= GRACE - Duration::from_millis(200));
+        assert_eq!(ptys.live(), 0, "reaped before shutdown returned");
+        let ends = ptys.ended();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].1, None, "killed: {ends:?}");
     }
 
     #[test]
