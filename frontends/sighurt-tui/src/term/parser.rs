@@ -847,6 +847,17 @@ impl Parser {
                     self.disarm();
                 }
                 Some(201) => {}
+                // xterm's modifyOtherKeys form, `CSI 27 ; modifiers ; code ~` (tmux sends it
+                // with `extended-keys always` in its xterm format): the same key as
+                // `CSI code ; modifiers u`.
+                Some(27) => {
+                    let mut key = Csi::new();
+                    key.params = vec![
+                        csi.params.get(2).cloned().unwrap_or_default(),
+                        csi.params.get(1).cloned().unwrap_or_default(),
+                    ];
+                    self.emit_kitty(&key, alt, out);
+                }
                 Some(number) => {
                     if let Some(name) = tilde_key(number) {
                         let modifiers = csi_modifiers(&csi);
@@ -1736,6 +1747,17 @@ mod tests {
         assert_eq!(ctrl_i[0].code, KeyCode(23), "KEY_I, not Tab");
         assert!(ctrl_i[0].text.is_none());
         assert!(!ctrl_i[0].ambiguous);
+    }
+
+    #[test]
+    fn xterms_modified_key_form_is_the_key_with_its_modifiers() {
+        let escape = keys_of(b"\x1b[27;5;27~");
+        assert_eq!(escape[0].key, Key::Named("Escape".into()));
+        assert!(escape[0].modifiers.control && !escape[0].modifiers.shift);
+        let ctrl_i = keys_of(b"\x1b[27;5;105~");
+        assert_eq!(ctrl_i[0].key, Key::Character("i".into()));
+        assert!(ctrl_i[0].modifiers.control);
+        assert!(keys_of(b"\x1b[27~").is_empty(), "no code, no key");
     }
 
     #[test]
