@@ -42,6 +42,7 @@ members = [
     "pages/sig-page-kit",
     "pages/sig-page-help",
     "pages/sig-page-config",
+    "pages/sig-page-terminal",
     # Guest SDK and example guests.
     "sdk/sighurt-sdk",
     "examples/hello-sighurt",

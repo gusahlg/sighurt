@@ -1,0 +1,20 @@
+[package]
+name = "sig-page-terminal"
+description = "sig://terminal: a terminal emulator in Sighurt's Wasm sandbox, for a program the browser starts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+# The page is the cdylib; the rlib lets `cargo test` run its logic on the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sighurt-sdk = { path = "../../sdk/sighurt-sdk" }
+sig-page-kit = { path = "../sig-page-kit" }
+# The terminal emulator (parser and screen), pure Rust, MIT. It reads the program's output, which
+# is untrusted, inside the sandbox.
+vt100 = "0.16"

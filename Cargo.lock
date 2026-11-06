@@ -10408,6 +10408,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sig-page-terminal"
+version = "0.10.0"
+dependencies = [
+ "sig-page-kit",
+ "sighurt-sdk",
+ "vt100",
+]
+
+[[package]]
 name = "sighurt-api"
 version = "0.10.0"
 
@@ -10543,6 +10552,7 @@ dependencies = [
  "reqwest",
  "rfd",
  "rodio",
+ "rustix 1.1.5",
  "screenshots",
  "serde",
  "serde_json",
@@ -12772,6 +12782,17 @@ name = "void"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
+
+[[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
 
 [[package]]
 name = "vte"

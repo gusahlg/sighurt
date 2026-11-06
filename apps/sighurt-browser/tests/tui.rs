@@ -107,6 +107,8 @@ impl Terminal {
         let dir = std::env::temp_dir().join(format!("sig-tui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("config/sighurt")).unwrap();
+        // A home of its own: whatever sig starts (sig://terminal's shell) never sees the user's.
+        fs::create_dir_all(dir.join("home")).unwrap();
         if let Some(history) = history {
             fs::create_dir_all(dir.join("state/sighurt")).unwrap();
             fs::write(dir.join("state/sighurt/history.toml"), history).unwrap();
@@ -149,6 +151,7 @@ impl Terminal {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CACHE_HOME", dir.join("cache"))
+            .env("HOME", dir.join("home"))
             .env("TERM", term)
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("DISPLAY")
@@ -2685,6 +2688,64 @@ fn sig_pages_need_graphics_and_say_so() {
     );
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
+}
+
+/// sig://terminal in the terminal frontend with graphics: the page shows, Escape and Enter start
+/// the shell, typed keys reach it, `ctrl-\ ctrl-n` leaves INSERT, and `q` quits sig with the
+/// shell ended. Needs the Wasm engine: run with `--features frontend-tui,engine-demo,engine-wasm`.
+#[cfg(feature = "engine-wasm")]
+#[test]
+fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
+    let pages = "[pages.terminal]\nenabled = true\ncommand = \"/bin/sh\"";
+    let mut term = Terminal::start_in("terminal-page", &["sig://terminal"], KITTY_REPLIES, pages);
+    let home = term.dir.join("home");
+    let shown = term.wait(0, Duration::from_secs(20), |got| {
+        image(got, 80, 22, 800, 440)
+    });
+    assert!(shown, "the page did not show\n{}", term.context());
+    term.type_bytes(&kitty_keys("\x1b"));
+    term.wait(term.got.len(), Duration::from_secs(5), |got| {
+        shows(got, "INSERT MODE")
+    });
+    term.type_bytes(&kitty_keys("\r"));
+    thread::sleep(Duration::from_secs(2));
+    term.type_bytes(&kitty_keys("echo $$ > ~/pid; echo hi > ~/hi.txt\r"));
+    let start = Instant::now();
+    while fs::read_to_string(home.join("hi.txt")).ok().as_deref() != Some("hi\n") {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the shell did not get the keys\n{}",
+            term.context()
+        );
+        term.wait(term.got.len(), Duration::from_millis(100), |_| false);
+    }
+    let pid = fs::read_to_string(home.join("pid")).unwrap();
+    let shell = Path::new("/proc").join(pid.trim());
+    assert!(shell.exists(), "the shell is not running");
+    // ctrl-\ ctrl-n, then q in NORMAL.
+    term.type_bytes(b"\x1b[92;5u\x1b[92;5:3u\x1b[110;5u\x1b[110;5:3u");
+    let left = term.wait(term.got.len(), Duration::from_secs(10), insert_mode_left);
+    assert!(
+        left,
+        "ctrl-\\ ctrl-n did not leave INSERT\n{}",
+        term.context()
+    );
+    term.type_bytes(&kitty_keys("q"));
+    let status = term.exit();
+    assert!(
+        status.success(),
+        "sig exited with {status:?}\n{}",
+        term.context()
+    );
+    term.assert_restored();
+    let start = Instant::now();
+    while shell.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the shell outlived sig"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// sig://config in the terminal: drawn as graphics, typed into in INSERT MODE, and Ctrl+S saves

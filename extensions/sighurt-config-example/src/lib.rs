@@ -13,7 +13,12 @@
 //!   input method, no paste. The indicator is empty, or the keys of an unfinished sequence.
 //! - **INSERT**: every key reaches the page, and no binding listens, the `Always` ones neither;
 //!   the one key taken is an unmodified Escape. Text and pastes reach the page. The indicator is
-//!   `INSERT MODE`.
+//!   `INSERT MODE`. On `sig://terminal` (the tab's [`TabInfo::internal`] is `terminal`) Escape
+//!   reaches the page too, for the program there, and `ctrl-\ ctrl-n` leaves INSERT
+//!   ([`table::INSERT_TERMINAL`]); a `ctrl-\` that another key follows is dropped, as any
+//!   unfinished sequence.
+//!
+//! [`TabInfo::internal`]: sighurt_api::keymap::TabInfo::internal
 //! - **Escape** switches mode, except while the page shown holds an element fullscreen (a
 //!   video): then it runs `page.exit-fullscreen` and the mode stays.
 //! - **The address line and the find field.** The modes are the page's: while the chrome has
@@ -83,6 +88,7 @@ pub fn bindings(frontend: Frontend) -> impl Iterator<Item = (&'static str, &'sta
     table::NORMAL
         .iter()
         .chain(table::INSERT)
+        .chain(table::INSERT_TERMINAL)
         .filter(move |binding| exists_in(binding.frontend, frontend))
         .map(|binding| (binding.keys, &binding.action))
 }
@@ -160,6 +166,8 @@ enum Found<'a> {
 pub struct Example {
     normal: Vec<Parsed>,
     insert: Vec<Parsed>,
+    /// INSERT on `sig://terminal`.
+    insert_terminal: Vec<Parsed>,
     mode: Mode,
     /// The keys of an unfinished sequence, at most `MAX_KEYS - 1`.
     pending: Vec<KeyEvent>,
@@ -180,6 +188,7 @@ impl Example {
         Self {
             normal: parse(table::NORMAL),
             insert: parse(table::INSERT),
+            insert_terminal: parse(table::INSERT_TERMINAL),
             mode: Mode::Normal,
             pending: Vec::new(),
             held: None,
@@ -187,12 +196,20 @@ impl Example {
         }
     }
 
-    /// What `keys` are in the bindings that apply now.
-    fn find(&self, keys: &[KeyEvent], context: KeyContext, frontend: Frontend) -> Found<'_> {
+    /// What `keys` are in the bindings that apply now; `terminal` is whether the tab shown is
+    /// `sig://terminal`.
+    fn find(
+        &self,
+        keys: &[KeyEvent],
+        context: KeyContext,
+        frontend: Frontend,
+        terminal: bool,
+    ) -> Found<'_> {
         let chrome = context.focus == KeyboardFocus::Chrome;
         // The modes are the page's: the line keeps NORMAL's few bindings in both.
         let table = match (chrome, self.mode) {
             (true, _) | (false, Mode::Normal) => &self.normal,
+            (false, Mode::Insert) if terminal => &self.insert_terminal,
             (false, Mode::Insert) => &self.insert,
         };
         let applies = |binding: &&Parsed| {
@@ -258,13 +275,17 @@ impl Keymap for Example {
         }
         self.held = None;
         let frontend = browser.frontend();
+        // From the core's record of the view, never from an address.
+        let terminal = browser
+            .tab(browser.active_tab())
+            .is_some_and(|tab| tab.internal == Some("terminal"));
         let mut keys = std::mem::take(&mut self.pending);
         keys.push(key.clone());
         // Keys that continue no sequence drop it, and the last starts afresh.
-        let mut found = self.find(&keys, context, frontend);
+        let mut found = self.find(&keys, context, frontend, terminal);
         if matches!(found, Found::None) && keys.len() > 1 {
             keys.drain(..keys.len() - 1);
-            found = self.find(&keys, context, frontend);
+            found = self.find(&keys, context, frontend, terminal);
         }
         let action = match found {
             Found::Complete(binding) => Some(binding.action.clone()),
@@ -322,9 +343,18 @@ impl Keymap for Example {
     }
 
     fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
-        let modes = [("NORMAL", table::NORMAL), ("INSERT", table::INSERT)];
+        // INSERT's Escape is not sig://terminal's, where the program has it.
+        let modes = [
+            ("NORMAL", table::NORMAL, None),
+            (
+                "INSERT",
+                table::INSERT,
+                Some("in the page, except on sig://terminal"),
+            ),
+            ("INSERT", table::INSERT_TERMINAL, Some("on sig://terminal")),
+        ];
         let mut found = Vec::new();
-        for (mode, table) in modes {
+        for (mode, table, page) in modes {
             for binding in table.iter().filter(|b| exists_in(b.frontend, frontend)) {
                 let action = match binding.action {
                     Action::Run(text) | Action::RunThenPass(text) => text.to_owned(),
@@ -339,7 +369,7 @@ impl Keymap for Example {
                     Action::Custom(_) => describe_custom(binding.keys).to_owned(),
                 };
                 let applies = match binding.scope {
-                    Scope::Page => "in the page",
+                    Scope::Page => page.unwrap_or("in the page"),
                     Scope::NoField => "in the page, not in a text field",
                     Scope::Always => "also in the address line",
                 };

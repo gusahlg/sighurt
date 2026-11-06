@@ -7,16 +7,19 @@
 
 mod common;
 
+use std::io::Read;
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use common::{committed_url, example, guest, is_frame_ready, metrics, Host};
 use sighurt_api::engine::{EngineCommand, EngineRuntime, PresentOutcome};
 use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition};
 use sighurt_api::geometry::SurfacePoint;
-use sighurt_api::ids::{NavigationId, ViewId};
+use sighurt_api::ids::{NavigationId, PtySession, RequestId, ViewId};
 use sighurt_api::input::{
     ButtonState, InputKind, Key, KeyCode, KeyEvent, Modifiers, PointerButton, PointerEvent,
 };
+use sighurt_api::services::{PageRequest, Service, ServiceReply};
 use sighurt_engine_wasm::SandboxPolicy;
 
 const SECS: Duration = Duration::from_secs(1);
@@ -1799,5 +1802,135 @@ fn a_download_from_an_unchanged_frame_reaches_the_browser() {
     host.until(
         5 * SECS,
         |e| matches!(e, EngineEvent::ServiceRequested(request) if request.view == view),
+    );
+}
+
+/// An internal page (`sig://terminal`, with info and terminal grants) running `wat`.
+fn internal_page(wat: &str) -> Host {
+    use sighurt_api::services::PageGrant;
+    let wasm: &'static [u8] = Box::leak(wat::parse_str(wat).unwrap().into_boxed_slice());
+    Host::with_pages(vec![sighurt_engine_wasm::pages::InternalPage {
+        name: "terminal",
+        title: "a page",
+        wasm,
+        grants: &[PageGrant::Info, PageGrant::Pty],
+    }])
+}
+
+/// Never draws. Asks for info on its third frame and withdraws it on its tenth; opens a
+/// terminal on its twelfth and closes it once it runs.
+const ASKS_WITHOUT_DRAWING: &str = r#"
+(module
+  (import "sig" "request" (func $request (param i32 i32 i32) (result i32)))
+  (import "sig" "cancel" (func $cancel (param i32) (result i32)))
+  (import "sig" "pty_open" (func $open (param i32 i32 i32) (result i32)))
+  (import "sig" "pty_status" (func $status (param i32) (result i32)))
+  (import "sig" "pty_close" (func $close (param i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "about")
+  (global $frame (mut i32) (i32.const 0))
+  (global $id (mut i32) (i32.const 0))
+  (global $pty (mut i32) (i32.const 0))
+  (func (export "start_app"))
+  (func (export "on_frame") (param i32)
+    (global.set $frame (i32.add (global.get $frame) (i32.const 1)))
+    (if (i32.eq (global.get $frame) (i32.const 3))
+      (then (global.set $id (call $request (i32.const 1) (i32.const 0) (i32.const 5)))))
+    (if (i32.eq (global.get $frame) (i32.const 10))
+      (then (drop (call $cancel (global.get $id)))))
+    (if (i32.eq (global.get $frame) (i32.const 12))
+      (then (global.set $pty (call $open (i32.const 0) (i32.const 80) (i32.const 24)))))
+    (if (i32.ne (global.get $pty) (i32.const 0))
+      (then (if (i32.eq (call $status (global.get $pty)) (i32.const 1))
+        (then (drop (call $close (global.get $pty)))
+              (global.set $pty (i32.const 0))))))))
+"#;
+
+/// Answers the terminal `request` asked for, handing over one end of a socket pair as its
+/// master; returns the other end.
+fn hand_over_a_master(host: &mut Host, view: ViewId, request: RequestId) -> UnixStream {
+    let (master, program) = UnixStream::pair().unwrap();
+    let session = PtySession::next();
+    sighurt_engine_wasm::pty::hand_over(session, master.into());
+    let result = Ok(ServiceReply::Pty(session));
+    host.command(
+        view,
+        EngineCommand::ResolveServiceRequest { request, result },
+    );
+    program
+}
+
+/// Whether the other end of the master reads end of file within a second.
+fn hung_up(program: &mut UnixStream) -> bool {
+    program
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    matches!(program.read(&mut [0u8; 16]), Ok(0))
+}
+
+#[test]
+fn an_internal_pages_requests_reach_the_browser_without_a_new_frame() {
+    let mut host = internal_page(ASKS_WITHOUT_DRAWING);
+    let (view, _) = host.open(400, 300, 120);
+    host.navigate(view, "sig://terminal");
+    let asked = |events: &[EngineEvent], pty: bool| -> Option<RequestId> {
+        events.iter().find_map(|event| match event {
+            EngineEvent::ServiceRequested(request)
+                if matches!(request.service, Service::Page(PageRequest::PtyOpen { .. })) == pty =>
+            {
+                Some(request.id)
+            }
+            _ => None,
+        })
+    };
+    let events = host.until(5 * SECS, |e| matches!(e, EngineEvent::ServiceRequested(_)));
+    let info = asked(&events, false).expect("the request on the third frame");
+    let cancelled = |id: RequestId| move |e: &EngineEvent| matches!(e, EngineEvent::ServiceCancelled { request, .. } if *request == id);
+    host.until(5 * SECS, cancelled(info));
+    let events = host.until(5 * SECS, |e| matches!(e, EngineEvent::ServiceRequested(_)));
+    let open = asked(&events, true).expect("the terminal on the twelfth frame");
+    let mut program = hand_over_a_master(&mut host, view, open);
+    // The guest sees it run and closes it: the browser is told, and the master is closed.
+    host.until(5 * SECS, cancelled(open));
+    assert!(hung_up(&mut program), "the master is still open");
+    // Not one frame was drawn all along.
+    assert!(!host
+        .take()
+        .iter()
+        .any(|event| matches!(event, EngineEvent::FrameReady { .. })));
+}
+
+/// Opens a terminal on its second frame and traps once it runs.
+const TRAPS_WITH_A_TERMINAL: &str = r#"
+(module
+  (import "sig" "pty_open" (func $open (param i32 i32 i32) (result i32)))
+  (import "sig" "pty_status" (func $status (param i32) (result i32)))
+  (global $frame (mut i32) (i32.const 0))
+  (global $pty (mut i32) (i32.const 0))
+  (func (export "start_app"))
+  (func (export "on_frame") (param i32)
+    (global.set $frame (i32.add (global.get $frame) (i32.const 1)))
+    (if (i32.eq (global.get $frame) (i32.const 2))
+      (then (global.set $pty (call $open (i32.const 0) (i32.const 80) (i32.const 24)))))
+    (if (i32.ne (global.get $pty) (i32.const 0))
+      (then (if (i32.eq (call $status (global.get $pty)) (i32.const 1))
+        (then unreachable))))))
+"#;
+
+#[test]
+fn a_guest_trap_closes_its_terminals_master_at_once() {
+    let mut host = internal_page(TRAPS_WITH_A_TERMINAL);
+    let (view, _) = host.open(400, 300, 120);
+    host.navigate(view, "sig://terminal");
+    let events = host.until(5 * SECS, |e| matches!(e, EngineEvent::ServiceRequested(_)));
+    let Some(EngineEvent::ServiceRequested(request)) = events.last() else {
+        panic!("{events:#?}");
+    };
+    let mut program = hand_over_a_master(&mut host, view, request.id);
+    host.until(5 * SECS, failed(view));
+    // The view stays open, and no answer will come: the master is closed all the same.
+    assert!(
+        hung_up(&mut program),
+        "a failed document kept its terminal's master"
     );
 }

@@ -259,6 +259,33 @@ impl Internal {
         format!("sig://{}", self.page.name)
     }
 
+    /// Whether the guest asked for or withdrew something the browser has not been told of yet
+    /// ([`Internal::report`]): a request, a terminal to open, a request or terminal it gave up.
+    /// The worker reports a step that leaves any, as it does a navigation, even when the frame
+    /// stayed the same.
+    pub fn unreported(&self) -> bool {
+        let state = self.lock();
+        !state.withdrawn.is_empty()
+            || state.requests.values().any(|asked| asked.service.is_some())
+            || state
+                .terminals
+                .values()
+                .any(|terminal| terminal.open.is_some())
+    }
+
+    /// The guest ended (a trap, a limit): drops every request, every terminal with its master
+    /// (which hangs the program's terminal up) and the queued input, at once, rather than when a
+    /// later answer arrives, which the browser sends no more for a document that failed. The
+    /// browser cancels the document's requests itself, so nothing is reported.
+    pub fn revoke(&self) {
+        let mut state = self.lock();
+        state.requests.clear();
+        state.terminals.clear();
+        state.withdrawn.clear();
+        state.input.clear();
+        state.input_bytes = 0;
+    }
+
     /// Tells the browser what the guest asked for and withdrew since the last call.
     pub fn report(&self, view: ViewId, document: DocumentGeneration, out: &mut Outbox) {
         let origin = self.origin();
@@ -344,7 +371,9 @@ impl Internal {
                 }
             }
             Ok(ServiceReply::PtyEnded { status }) => {
-                terminal.pty = None;
+                // The terminal stays until the page has read what the program wrote last (it
+                // reads its end) or closes it: the program's end comes from the runtime, and
+                // may come before the page has read its output.
                 terminal.status = match status {
                     Some(code) => pty_status::EXITED + (code & 0xff),
                     None => pty_status::SIGNALLED,

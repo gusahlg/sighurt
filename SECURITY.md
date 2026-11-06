@@ -81,6 +81,16 @@ Engines report what pages do as events, and the browser core decides. Everything
 - Password fields go to the input method marked sensitive and hidden, without their text.
 - The diagnostics and the logs hold no clipboard contents, credentials or page data.
 
+### `sig://terminal` is a shell with your full rights
+
+`sig://terminal` runs a program as you: your shell, or your editor on `sig`'s configuration (`sig://terminal/config`). The program has your full rights, as in any terminal: your files, your credentials, your agent sockets, your shell's startup files. Sighurt's Wasm sandbox contains the page's terminal emulator, the code that reads what the program prints; it does not contain the program. The page is off unless the configuration turns it on (`[pages.terminal] enabled = true`).
+
+- **What runs is the browser's choice.** The page chooses only between the shell and the editor. `sig` builds the command (`[pages.terminal] command`, else `$SHELL`, else `/bin/sh`; `$VISUAL`, else `$EDITOR`, else `vi`, with the configuration file as an argument of its own, never through a shell), its environment and its directory. A program starts only after Enter in the page itself while its tab is shown. Web pages and Wasm apps can't open the page or reach a terminal.
+- **The program gets the terminal and nothing else of `sig`'s**: the terminal on descriptors 0 to 2 (every other descriptor of `sig`'s is close-on-exec), default signal handling, an empty signal mask and a session of its own. Its environment drops `sig`'s own variables and those describing the terminal `sig` runs in; that is hygiene, not isolation.
+- **The emulator reflects nothing.** It answers only queries with fixed answers (device attributes, status, cursor position) and never sends back what the program sent (no title report, no clipboard access). A paste has ESC and the other control characters removed (tabs and line breaks stay), so it can't type keys or end a bracketed paste early.
+- **Ending it.** Closing the tab, navigating away, reloading and quitting send SIGHUP to the program's process group and SIGKILL after 2 seconds, and `sig` reaps the program: no child of `sig` is left. Jobs the shell put in process groups of their own, programs that ignore SIGHUP after `disown`, and detached sessions get the terminal's hang-up and may survive it, as in any terminal. At most eight terminals run at once.
+- **A flood waits.** The program's output is held in a queue of 1 MiB; a program that writes faster than the page reads waits in its `write`.
+
 ### WASM engine
 
 1. **No WASI**: guests run in Wasmtime with no filesystem, environment or socket access.

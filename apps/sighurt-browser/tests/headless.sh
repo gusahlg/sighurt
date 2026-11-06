@@ -51,6 +51,18 @@
 #               switches section (push_state: the session holds sig://help/keys); ? opens it again
 #               and d closes that tab; demo://open-sig asks to open sig://help in its view and in a
 #               new tab when clicked, and gets neither
+#   terminal-page  sig://terminal with [pages.terminal] on, /bin/sh as the shell and a
+#               private home: nothing starts on opening it or on a click, a shell on Enter in
+#               INSERT; typed text reaches the shell (a file it writes) and `echo hi` shows hi
+#               (the pixels of the first rows); stty size is the grid that fits the page, and
+#               follows a resize of the output; exit ends it, Enter starts it again; 20 s of
+#               `yes` keep sig's memory bounded, another tab responsive and the view alive, and
+#               Ctrl+C gets the shell back; nvim (if on PATH) follows a resize (its &columns and
+#               &lines) and writes a file with i, Escape and :wq; closing the tab, navigating
+#               away, reloading, quitting and SIGTERM each leave no program and no zombie, and
+#               20 open-and-close cycles no descriptor in sig; sig://terminal/config runs $VISUAL
+#               on the configuration; with the setting off, Enter starts nothing and the page
+#               says how to turn it on (it differs from the start page)
 #   config-page sig://config on a configuration linked from another directory: Escape (INSERT),
 #               a valid change typed and Ctrl+S: the linked file changes and stays linked, the
 #               chrome takes the new tab colour and the core the new [commands] alias; an invalid
@@ -74,7 +86,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen pages config-page renderers)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen pages config-page terminal-page renderers)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (with other features); this link keeps the binary these
   # runs use. It is made under the same hold of the machine's lock as the build, so no other
@@ -1188,6 +1200,262 @@ PY
   check "after reading it again, a save keeps both changes" \
     "$(grep -q '^# written elsewhere$' "$file" && grep -q '^# mine$' "$file"; echo $?)" "$(tail -3 "$file" | tr '\n' '|')"
   key -k Escape
+  key q
+  wait "$sig_pid"
+  ;;
+
+terminal-page)
+  # sig://terminal with [pages.terminal] on and /bin/sh as the shell, in a private home. The
+  # page's programs carry a marker in their environment (sig passes its environment on), so the
+  # checks count them, and sig's zombies, from /proc.
+  home=$out/home
+  mkdir -p "$home"
+  # An "editor" for sig://terminal/config: appends a line to the file it is given.
+  printf '#!/bin/sh\necho "# edited in sig://terminal/config" >> "$1"\n' > "$home/editor"
+  chmod +x "$home/editor"
+  terminal_config() { # terminal_config true|false
+    cat > "$out/config/sighurt/config.toml" <<CONF
+version = 1
+[engines]
+default = "demo"
+[routing.demo]
+schemes = ["demo"]
+[pages.terminal]
+enabled = $1
+command = "/bin/sh"
+CONF
+  }
+  terminal_config true
+  start_term() {
+    HOME=$home VISUAL=$home/editor PAGETERM_MARK=$out ENV=/dev/null PS1='$ ' \
+      "$tdir/debug/sig-headless-e2e" --diagnostics "$out/diag.json" "$@" >> "$out/sig.log" 2>&1 &
+    sig_pid=$!
+    sleep 2
+  }
+  # programs: "LIVE ZOMBIES": the marked processes alive, and sig's children that are zombies.
+  programs() {
+    python3 - "$out" "$sig_pid" <<'PY'
+import os, sys
+mark, sig = ('PAGETERM_MARK=' + sys.argv[1]).encode(), sys.argv[2]
+live = zombies = 0
+for p in filter(str.isdigit, os.listdir('/proc')):
+    try:
+        state, ppid = open(f'/proc/{p}/stat').read().rsplit(')', 1)[1].split()[:2]
+        env = open(f'/proc/{p}/environ', 'rb').read().split(b'\0') if state != 'Z' else []
+    except OSError:
+        continue
+    zombies += state == 'Z' and ppid == sig
+    live += p != sig and mark in env
+print(live, zombies)
+PY
+  }
+  # until_programs "LIVE ZOMBIES" [SECONDS]: 0 once programs says so, else 1.
+  until_programs() {
+    for _ in $(seq $((${2:-5} * 10))); do
+      [[ $(programs) == "$1" ]] && return 0
+      sleep 0.1
+    done
+    return 1
+  }
+  enter() { key -k Return; }
+  type_line() { wtype "$1"; sleep 0.2; enter; }
+  normal() { wtype -M ctrl '\' -m ctrl; wtype -M ctrl n -m ctrl; sleep 0.3; } # ctrl-\ ctrl-n
+  command_line() { key ':'; wtype "$1"; sleep 0.2; enter; sleep 1.5; }
+  view() { diag "[(x['width'], x['height']) for x in t if x['role']=='view' and x['shown']][0]"; }
+  rss() { awk '/VmRSS/ {print $2}' "/proc/$sig_pid/status"; }
+
+  start_term sig://terminal
+  click 640 400
+  shot 01-start 1
+  check "sig://terminal opens and starts nothing by itself, nor on a click" \
+    "$([[ $(diag "[x['engine'] for x in t if x['role']=='view' and x['shown']]") == "['wasm']" && $(programs) == "0 0" ]]; echo $?)" \
+    "programs $(programs)"
+  key -k Escape
+  enter
+  check "Enter in INSERT starts the shell" "$(until_programs '1 0'; echo $?)" "programs $(programs)"
+  type_line 'echo hi > ~/hi.txt; stty size > ~/size1.txt'
+  sleep 1
+  check "typed text reaches the shell" "$([[ $(cat "$home/hi.txt" 2>/dev/null) == hi ]]; echo $?)" \
+    "hi.txt: $(cat "$home/hi.txt" 2>/dev/null)"
+  type_line 'clear; echo hi'
+  shot 02-echo-hi 1
+  # The page's first row reads "hi" and nothing else, the second the prompt: light pixels
+  # where those characters are, none further right.
+  page_h=$(diag "[x['height'] for x in t if x['role']=='view' and x['shown']][0]")
+  top=$((layout_h - 20 - page_h))
+  grim -t ppm "$out/02-echo-hi.ppm"
+  seen=$(python3 - "$out/02-echo-hi.ppm" "$top" <<'PY'
+import re, sys
+data = open(sys.argv[1], 'rb').read()
+m = re.match(rb'P6\s+(\d+)\s+(\d+)\s+\d+\s', data)
+w, px, top = int(m[1]), data[m.end():], int(sys.argv[2])
+def light(x0, x1, row):
+    n = 0
+    for y in range(top + 18 * row, top + 18 * row + 18):
+        for x in range(x0, x1):
+            r, g, b = px[3 * (y * w + x):3 * (y * w + x) + 3]
+            n += min(r, g, b) > 140
+    return n
+hi, rest, prompt = light(0, 19, 0), light(24, 600, 0), light(0, 10, 1)
+print(0 if hi > 15 and rest == 0 and prompt > 5 else 1, f'light pixels: "hi" {hi}, rest of the row {rest}, prompt {prompt}')
+PY
+)
+  check "echo hi shows hi" "${seen%% *}" "${seen#* }"
+  read -r rows cols < "$home/size1.txt" || rows=0 cols=0
+  size=$(view 2>/dev/null || echo '[0, 0]')
+  # A cell is 18 pixels high (15 pixels times 1.2, the canvas's line box) and about 9 wide.
+  fits=$(python3 -c "w, h = $size; print(0 if $rows == h // 18 and 7 * $cols <= w <= 11 * ($cols + 1) else 1)" 2>/dev/null || echo 1)
+  check "stty size is the grid that fits the page" "$fits" "stty $rows $cols, page $size"
+  step "resize the output to 1000x700"
+  swaymsg -q output HEADLESS-1 resolution 1000x700
+  sleep 1.5
+  type_line 'stty size > ~/size2.txt'
+  sleep 1
+  read -r rows2 cols2 < "$home/size2.txt" || rows2=0 cols2=0
+  size2=$(view 2>/dev/null || echo '[0, 0]')
+  fits=$(python3 -c "(w, h), (w0, h0) = $size2, $size; print(0 if $rows2 == h // 18 and 0 < $cols2 < $cols and abs($cols2 / $cols - w / w0) < 0.03 else 1)" 2>/dev/null || echo 1)
+  check "a resize of the window is followed" "$fits" "stty $rows2 $cols2, page $size2 (was $rows $cols, $size)"
+  swaymsg -q output HEADLESS-1 resolution ${layout_w}x${layout_h}
+  sleep 1
+  type_line 'exit'
+  check "exit ends the shell, reaped" "$(until_programs '0 0'; echo $?)" "programs $(programs)"
+  shot 03-exited 1
+
+  enter
+  check "Enter starts it again" "$(until_programs '1 0'; echo $?)" "programs $(programs)"
+  before=$(rss)
+  type_line 'yes'
+  sleep 5
+  normal
+  command_line 'tab.new demo://pattern'
+  check "another tab is responsive during an output flood" "$(shows_tab 2)" "$(tabs_now)"
+  # K (tab.previous), with the Shift a keyboard sends: wtype's own `K` has none.
+  key -M shift k -m shift
+  sleep 0.5
+  key -k Escape
+  sleep 15
+  peak=$(rss)
+  wtype -M ctrl c -m ctrl
+  sleep 1
+  type_line 'echo ok > ~/ok.txt'
+  sleep 1.5
+  check "after 20 s of yes and Ctrl+C the shell answers" \
+    "$([[ $(cat "$home/ok.txt" 2>/dev/null) == ok ]]; echo $?)" "ok.txt: $(cat "$home/ok.txt" 2>/dev/null)"
+  check "the flood kept sig's memory bounded (under 64 MB more)" \
+    "$([[ $((peak - before)) -lt 65536 ]]; echo $?)" "VmRSS $before kB, then $peak kB"
+  check "and the view alive" \
+    "$([[ $(diag "[x['engine'] for x in t if x['role']=='view' and x['shown']]") == "['wasm']" ]]; echo $?)" "$(tabs_now)"
+  shot 04-after-flood 1
+
+  if command -v nvim >/dev/null; then
+    type_line 'nvim -u NONE -i NONE ~/n.txt'
+    sleep 2.5
+    shot 05-nvim 0.5
+    key i
+    wtype 'written in sig'
+    sleep 0.3
+    key -k Escape
+    step "resize the output to 1000x700 under nvim"
+    swaymsg -q output HEADLESS-1 resolution 1000x700
+    sleep 1.5
+    shot 05-nvim-resized 0.5
+    wtype ":call writefile([&columns . ' ' . &lines], expand('~/nvsize.txt'))"
+    enter
+    sleep 0.5
+    check "nvim follows the resize" "$([[ $(cat "$home/nvsize.txt" 2>/dev/null) == "$cols2 $rows2" ]]; echo $?)" \
+      "nvim $(cat "$home/nvsize.txt" 2>/dev/null), stty at that size $cols2 $rows2"
+    swaymsg -q output HEADLESS-1 resolution ${layout_w}x${layout_h}
+    sleep 1
+    wtype ':wq'
+    enter
+    sleep 1.5
+    check "nvim: insert, Escape and :wq write the file" \
+      "$([[ $(cat "$home/n.txt" 2>/dev/null) == 'written in sig' ]]; echo $?)" "n.txt: $(cat "$home/n.txt" 2>/dev/null)"
+  else
+    echo "SKIP $scenario: nvim is not on PATH"
+  fi
+
+  normal
+  key x
+  check "closing the tab ends the shell, reaped" "$(until_programs '0 0'; echo $?)" "programs $(programs)"
+  # 20 cycles of opening the page, starting the shell and closing the tab: sig's descriptors
+  # after them are what they were after the first.
+  missed=0
+  for i in $(seq 20); do
+    command_line 'tab.new sig://terminal'
+    key -k Escape
+    enter
+    until_programs '1 0' || missed=$((missed + 1))
+    normal
+    key x
+    until_programs '0 0' || missed=$((missed + 1))
+    [[ $i == 1 ]] && fds1=$(ls "/proc/$sig_pid/fd" | wc -l)
+  done
+  fds20=$(ls "/proc/$sig_pid/fd" | wc -l)
+  check "20 open-and-close cycles: every shell started and reaped, no descriptor left in sig" \
+    "$([[ $missed == 0 && $fds20 -le $fds1 ]]; echo $?)" "$missed missed; descriptors $fds1 after one, $fds20 after twenty"
+  command_line 'tab.new sig://terminal'
+  key -k Escape
+  enter
+  until_programs '1 0'
+  normal
+  command_line 'page.open demo://pattern'
+  check "navigating away ends the shell, reaped" "$(until_programs '0 0'; echo $?)" "programs $(programs)"
+  key x
+  command_line 'tab.new sig://terminal'
+  key -k Escape
+  enter
+  until_programs '1 0'
+  normal
+  key r
+  check "reloading ends the shell, reaped" "$(until_programs '0 0'; echo $?)" "programs $(programs)"
+  key -k Escape
+  enter
+  check "and Enter after the reload starts one" "$(until_programs '1 0'; echo $?)" "programs $(programs)"
+  normal
+  command_line 'tab.new sig://terminal/config'
+  key -k Escape
+  enter
+  sleep 2
+  check "sig://terminal/config runs \$VISUAL on the configuration" \
+    "$(grep -q 'edited in sig://terminal/config' "$out/config/sighurt/config.toml"; echo $?)" \
+    "$(tail -1 "$out/config/sighurt/config.toml")"
+  normal
+  key q
+  wait "$sig_pid"
+  check "quitting ends the shell" "$(until_programs '0 0'; echo $?)" "programs $(programs)"
+
+  start_term sig://terminal
+  key -k Escape
+  enter
+  until_programs '1 0'
+  kill -TERM "$sig_pid"
+  wait "$sig_pid"
+  check "SIGTERM to sig ends the shell" "$(until_programs '0 0'; echo $?)" "programs $(programs)"
+
+  terminal_config false
+  start_term sig://terminal
+  key -k Escape
+  enter
+  sleep 1.5
+  check "with [pages.terminal] off nothing starts" "$([[ $(programs) == '0 0' ]]; echo $?)" "programs $(programs)"
+  shot 06-off 0.5
+  # The instructions are in the page's warning colour, #ffb060, which the start page doesn't use.
+  grim -t ppm "$out/06-off.ppm"
+  warned=$(python3 - "$out/06-off.ppm" "$out/02-echo-hi.ppm" <<'PY'
+import re, sys
+def orange(path):
+    data = open(path, 'rb').read()
+    m = re.match(rb'P6\s+\d+\s+\d+\s+\d+\s', data)
+    px = data[m.end():]
+    return sum(1 for i in range(0, len(px) - 2, 3)
+               if abs(px[i] - 255) < 30 and abs(px[i + 1] - 176) < 30 and abs(px[i + 2] - 96) < 30)
+n = orange(sys.argv[1])
+print(0 if n > 200 else 1, f'{n} pixels of the warning colour')
+PY
+)
+  check "and the page says how to turn it on" "${warned%% *}" "${warned#* }"
+  normal
   key q
   wait "$sig_pid"
   ;;

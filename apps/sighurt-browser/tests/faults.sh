@@ -32,6 +32,11 @@
 #               message, having saved the session, without spinning
 #   signals     SIGTERM, SIGINT and SIGHUP while pages load: the session saved, status 0 within
 #               5 s, no thread or child process left
+#   terminal    sig://terminal ([pages.terminal] on, /bin/sh, a private home): 100 cycles of
+#               opening the page, starting the shell and closing the tab, each shell started,
+#               ended and reaped, and sig's descriptors and threads not grown; then the shell
+#               ends with sig on ctrl-q, SIGKILL (the kernel's hang-up), SIGTERM, SIGINT, SIGHUP
+#               and the compositor killed
 #   crash       demo://crash failing while tabs switch and the window resizes, next to
 #               demo://slow: the failure names its tab, the other tabs keep working, F5 recovers
 #   flood       200 tab.new in about a second, then 1000 resizes: no placement errors, buffers
@@ -48,7 +53,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: faults.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(dirs lock writes session config compositor signals crash flood)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(dirs lock writes session config compositor signals terminal crash flood)
   mkdir -p "$out"
   tdir=$(realpath -m "${CARGO_TARGET_DIR:-target}")
   link="ln -f $tdir/debug/sig $tdir/debug/sig-faults"
@@ -449,6 +454,94 @@ signals)
     verdict "SIG$signal: the session was saved" "$(ses "$d" "len(s['tabs'])==3 and url(1)=='demo://slow?again', (len(s['tabs']), url(1))")"
     left=$(for p in $children; do kill -0 "$p" 2>/dev/null && echo "$p"; done)
     check "SIG$signal: no process left" "$([[ ! -e /proc/$sig_pid && -z $left ]]; echo $?)" "children before: ${children:-none}; left: ${left:-none}"
+  done
+  ;;
+
+terminal)
+  # sig://terminal's program ends with sig however sig ends, and 100 times opening the page,
+  # starting the shell and closing the tab leave no program, no zombie and nothing grown. The
+  # programs carry a marker in their environment; a home of their own per run.
+  term_config() {
+    printf '%s\n[pages.terminal]\nenabled = true\ncommand = "/bin/sh"\n' "$CONFIG" > "$1/config/sighurt/config.toml"
+  }
+  start_term() {
+    local d=$1
+    shift
+    private "$d"
+    term_config "$d"
+    mkdir -p "$d/home"
+    launch=(env "HOME=$d/home" "PAGETERM_MARK=$d" ENV=/dev/null)
+    start_sig "$d" "$@"
+    launch=()
+  }
+  # programs DIR: "LIVE ZOMBIES", DIR's marked processes alive and sig's zombie children.
+  programs() {
+    python3 - "$1" "$sig_pid" <<'PY'
+import os, sys
+mark, sig = ('PAGETERM_MARK=' + sys.argv[1]).encode(), sys.argv[2]
+live = zombies = 0
+for p in filter(str.isdigit, os.listdir('/proc')):
+    try:
+        state, ppid = open(f'/proc/{p}/stat').read().rsplit(')', 1)[1].split()[:2]
+        env = open(f'/proc/{p}/environ', 'rb').read().split(b'\0') if state != 'Z' else []
+    except OSError:
+        continue
+    zombies += state == 'Z' and ppid == sig
+    live += p != sig and mark in env
+print(live, zombies)
+PY
+  }
+  until_programs() { # until_programs DIR "LIVE ZOMBIES" [SECONDS]
+    for _ in $(seq $((${3:-5} * 10))); do
+      [[ $(programs "$1") == "$2" ]] && return 0
+      sleep 0.1
+    done
+    return 1
+  }
+
+  d=$out/cycles
+  start_term "$d" sig://terminal
+  key -k Return
+  check "a shell starts" "$(until_programs "$d" '1 0'; echo $?)" "programs $(programs "$d")"
+  step "100 cycles"
+  read -r _ _ fds0 threads0 <<< "$(proc "$sig_pid")"
+  missed=0
+  for i in $(seq 100); do
+    cmd 'tab.new sig://terminal'
+    sleep 0.5
+    key -k Return
+    until_programs "$d" '2 0' 10 || { missed=$((missed + 1)); step "cycle $i: no second shell ($(programs "$d"))"; }
+    key -M ctrl w -m ctrl
+    until_programs "$d" '1 0' 10 || { missed=$((missed + 1)); step "cycle $i: not ended ($(programs "$d"))"; }
+    # The first 10 cycles warm up (fonts, the compiled guest).
+    [[ $i == 10 ]] && read -r _ _ fds0 threads0 <<< "$(proc "$sig_pid")"
+  done
+  read -r rss hwm fds threads <<< "$(proc "$sig_pid")"
+  check "100 cycles of open, start and close: each shell started and ended, reaped" \
+    "$([[ $missed == 0 && $(programs "$d") == '1 0' ]]; echo $?)" "$missed missed; programs $(programs "$d")"
+  check "and nothing grew from cycle 10 to 100" "$([[ $fds -le $fds0 && $threads -le $threads0 ]]; echo $?)" \
+    "descriptors $fds0 -> $fds, threads $threads0 -> $threads, VmRSS $rss kB, VmHWM $hwm kB"
+  quit; code=$status
+  check "ctrl-q quits and the shell ends" "$([[ $code == 0 ]] && until_programs "$d" '0 0'; echo $?)" \
+    "exit status $code, programs $(programs "$d")"
+
+  # Last: killing the compositor ends this sway.
+  for how in KILL TERM INT HUP compositor; do
+    d=$out/$how
+    start_term "$d" sig://terminal
+    key -k Return
+    until_programs "$d" '1 0'
+    if [[ $how == compositor ]]; then
+      step "kill -KILL sway"
+      kill -KILL "$SIG_SWAY_PID"
+    else
+      step "kill -$how sig"
+      kill "-$how" "$sig_pid"
+    fi
+    exited "$sig_pid" 5
+    # SIGKILL: sig does nothing; the kernel hangs the terminal up when sig's descriptors close.
+    check "$how: the shell does not outlive sig" "$(until_programs "$d" '0 0'; echo $?)" \
+      "exit status $status, programs $(programs "$d")"
   done
   ;;
 
