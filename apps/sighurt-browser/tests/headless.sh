@@ -63,6 +63,11 @@
 #               20 open-and-close cycles no descriptor in sig; sig://terminal/config runs $VISUAL
 #               on the configuration; with the setting off, Enter starts nothing and the page
 #               says how to turn it on (it differs from the start page)
+#   home        sig://home, which the chrome draws: idle it builds nothing again and paints
+#               nothing; the pointer over the Help link underlines it (the link cursor goes with
+#               that state; the compositor's cursor itself isn't observable here), and a click on
+#               it opens sig://help in that tab (the Wasm engine's view shows, the session holds
+#               the address)
 #   config-page sig://config on a configuration linked from another directory: Escape (INSERT),
 #               a valid change typed and Ctrl+S: the linked file changes and stays linked, the
 #               chrome takes the new tab colour and the core the new [commands] alias; an invalid
@@ -86,7 +91,7 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT [SCENARIO ...]}")
   shift
   scenarios=("$@")
-  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen pages config-page terminal-page renderers)
+  [[ ${#scenarios[@]} == 0 ]] && scenarios=(main config close disconnect example settings history fullscreen pages home config-page terminal-page renderers)
   mkdir -p "$out"
   # Other builds replace target/debug/sig (with other features); this link keeps the binary these
   # runs use. It is made under the same hold of the machine's lock as the build, so no other
@@ -1105,6 +1110,68 @@ PY
     "$([[ $(tabs_count) == 3 && $(shown_engine) == "['demo']" && $(diag "d['status']") == notice ]]; echo $?)" \
     "$(tabs_now) $(shown_engine), status $(diag "d['status']")"
   shot 03-refused 0.5
+  key q
+  wait "$sig_pid"
+  ;;
+
+home)
+  cat > "$out/config/sighurt/config.toml" <<'CONF'
+version = 1
+[engines]
+default = "demo"
+[routing.demo]
+schemes = ["demo"]
+CONF
+  start_sig
+  shot 01-home 1
+  check "home is drawn by the chrome, no engine view" \
+    "$(diag "0 if [x for x in t if x['role']=='page' and x['shown']] and not [x for x in t if x['role']=='view'] else 1")" \
+    "$(diag "[(x['role'], x['shown']) for x in t]")"
+  before=$(diag "c['home_builds'], c['chrome_paints'], c['snapshots']")
+  sleep 2
+  after=$(diag "c['home_builds'], c['chrome_paints'], c['snapshots']")
+  check "an idle home tab builds and paints nothing again" "$([[ $before == "$after" ]]; echo $?)" \
+    "(home builds, chrome paints, snapshots) $before, then $after"
+  # links SHOT: the first link's text (the accent, #60a5fa, in the card's left half), and how
+  # long the longest run of link-coloured pixels on one row is (an underline is one).
+  links() {
+    grim -t ppm "$out/$1.ppm"
+    python3 - "$out/$1.ppm" <<'PY'
+import re, sys
+data = open(sys.argv[1], 'rb').read()
+m = re.match(rb'P6\s+(\d+)\s+(\d+)\s+\d+\s', data)
+w, h, px = int(m[1]), int(m[2]), data[m.end():]
+link = lambda x, y: abs(px[3*(y*w+x)] - 0x60) < 40 and abs(px[3*(y*w+x)+1] - 0xa5) < 40 and px[3*(y*w+x)+2] > 0xc0
+found = [(x, y) for y in range(h) for x in range(0, w // 2) if link(x, y)]
+if not found:
+    print("0 0 0"); sys.exit()
+top = min(y for _, y in found)
+left = min(x for x, y in found if y < top + 12)
+run = best = 0
+for y in range(h):
+    run = 0
+    for x in range(w // 2):
+        run = run + 1 if link(x, y) else 0
+        best = max(best, run)
+print(left, top, best)
+PY
+  }
+  read -r x y run < <(links 02-links)
+  check "the home page shows links in the accent colour" "$([[ $x -gt 0 ]]; echo $?)" "first link at $x,$y"
+  point $((x + 8)) $((y + 6))
+  sleep 0.5
+  read -r _ _ hovered < <(links 03-hover)
+  check "the pointer over a link underlines it" "$([[ $hovered -gt $((run + 10)) ]]; echo $?)" \
+    "longest link-coloured run $run, then $hovered"
+  click $((x + 8)) $((y + 6))
+  sleep 3
+  check "a click on Help opens sig://help in that tab" \
+    "$(diag "0 if len(d['tabs'])==1 and [x['engine'] for x in t if x['role']=='view' and x['shown']]==['wasm'] else 1")" \
+    "$(tabs_now) $(diag "[x['engine'] for x in t if x['role']=='view']")"
+  shot 04-help 0.5
+  check "the session holds its address" \
+    "$(grep -q '"sig://help"' "$out/state/sighurt/session.toml"; echo $?)" \
+    "$(grep -o 'sig://[^"]*' "$out/state/sighurt/session.toml" | tr '\n' ' ')"
   key q
   wait "$sig_pid"
   ;;
