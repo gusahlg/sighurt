@@ -35,6 +35,9 @@
 //! surface is only unmapped then). Step 1 before 2 is the presenter's promise, made by calling
 //! the unsafe [`TargetLease::gl_handles`].
 //!
+//! A lease also reports the refresh rate of the output its window is on
+//! ([`TargetLease::refresh_mhz`]), kept up to date by the host.
+//!
 //! Must not own: what is drawn, or moving live views between windows.
 
 use std::cell::{RefCell, RefMut};
@@ -114,6 +117,8 @@ pub(crate) struct Target {
     pub stats: PresentStats,
     pub shm: Option<Swapchain<ShmBuffer>>,
     pub cursor: Cursor,
+    /// The refresh rate (mHz) of the output the window is on, if known.
+    pub refresh_mhz: Option<u32>,
     /// False once the lease is gone; the host then forgets the target.
     pub leased: bool,
 }
@@ -148,6 +153,7 @@ impl Target {
             stats: PresentStats::default(),
             shm: (mode == PresentMode::Shm).then(Swapchain::new),
             cursor: Cursor::Default,
+            refresh_mhz: None,
             leased: true,
         }
     }
@@ -271,6 +277,13 @@ impl TargetLease {
     /// The current metrics. Empty until the first placement that gives the target room.
     pub fn metrics(&self) -> Metrics {
         self.target.borrow().metrics
+    }
+
+    /// The refresh rate, in mHz, of the output the target's window is on: the highest current
+    /// mode among the outputs its root surface has entered. `None` until the compositor has
+    /// said, or when no output is known.
+    pub fn refresh_mhz(&self) -> Option<u32> {
+        self.target.borrow().refresh_mhz
     }
 
     /// The Wayland display and the target's `wl_surface`, as raw-window-handle handles, for a
@@ -606,7 +619,7 @@ impl Host {
             WindowRect::default(),
             w.scale.effective(viewport.is_some()),
         );
-        let target = Target::new(
+        let mut target = Target::new(
             window,
             view,
             mode,
@@ -615,6 +628,7 @@ impl Host {
             viewport,
             metrics,
         );
+        target.refresh_mhz = w.refresh_mhz;
         let id = target.id;
         w.targets.push(id);
         self.surfaces.insert(
