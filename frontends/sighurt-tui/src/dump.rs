@@ -521,10 +521,8 @@ fn write_nonblocking(
             Ok(_) | Err(Errno::INTR) => {}
             Err(error) => return Err(format!("cannot wait for stdout: {error}")),
         }
-        if fds[1].revents().contains(PollFlags::IN) {
-            if signals.take().contains(&Request::Quit) {
-                return Err("interrupted".into());
-            }
+        if fds[1].revents().contains(PollFlags::IN) && signals.take().contains(&Request::Quit) {
+            return Err("interrupted".into());
         }
         // Hung up or in error: the write says which.
         if fds[0].revents().is_empty() {

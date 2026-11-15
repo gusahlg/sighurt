@@ -334,6 +334,11 @@ fn install_signal_handlers() -> std::io::Result<Signals> {
     Ok(Signals::none())
 }
 
+// With no frontend every arm of the frontend's match is unreachable, and so is what follows it.
+#[cfg_attr(
+    not(any(feature = "frontend-gui", feature = "frontend-tui")),
+    allow(unreachable_code, unused_variables)
+)]
 fn main() -> ExitCode {
     #[cfg(feature = "engine-wpe")]
     {
@@ -379,7 +384,8 @@ fn main() -> ExitCode {
     // The core applies this on top of the configuration, including every reload. It has to be
     // set on this thread: that is the thread that reads the configuration.
     sighurt_core::set_starting_engine(args.engine);
-    let result = match frontend {
+    // Typed: a build with no frontend has only unreachable arms.
+    let result: Result<ExitCode, String> = match frontend {
         #[cfg(feature = "frontend-gui")]
         Choice::Gui => {
             let options = sighurt_gui::Options {

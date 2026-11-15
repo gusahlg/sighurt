@@ -12,7 +12,9 @@
 //!
 //! Must not own: any policy. Everything here is plumbing around raw pointers.
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::c_void;
+#[cfg(target_os = "linux")]
+use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
