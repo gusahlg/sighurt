@@ -71,7 +71,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::input::PointerButton;
-use sighurt_api::keymap::KeymapKind;
+use sighurt_api::keymap::{Frontend as KeyFrontend, Keys};
 use sighurt_api::settings::{Table, Value};
 
 use crate::commands::ZOOM_STEPS;
@@ -279,10 +279,10 @@ pub struct Config {
     /// `[engines.<engine>]` of each engine that has one.
     engines: BTreeMap<String, EngineSettings>,
     routes: Vec<EngineRoutes>,
-    /// The keymap that reads the keyboard.
-    pub(crate) keymap: KeymapKind,
-    /// Its table: `[keys]` for `bindings`, `[keymap.<name>]` for another.
-    pub(crate) keymap_settings: Table,
+    /// `[input] keymap`: what the keys start from, `example` or `bindings`.
+    keymap: String,
+    /// The keys the engine runs: that starting point with the key tables applied over it.
+    pub(crate) keys: Keys,
     scroll_speed: f64,
     /// `[input.buttons]`: the side buttons bound to commands.
     buttons: Vec<(PointerButton, Command)>,
@@ -619,7 +619,6 @@ impl Config {
         let notices = engine_notices(&user, env);
         // Before the built-in file fills these in: only a value the user's file wrote counts.
         let from_user = UserKeyChoice {
-            keymap: user.input.keymap.clone(),
             set_default_keys: user.tui.contains_key("default-keys"),
         };
         let user_keys = take_keys(&mut user.tui);
@@ -754,9 +753,16 @@ impl Config {
         &self.tui
     }
 
-    /// `[input] keymap`: the name of the keymap that reads the keyboard.
+    /// `[input] keymap`: what the keys start from: `example` (the experience, the default) or
+    /// `bindings` (no experience at all).
     pub fn keymap_name(&self) -> &str {
-        self.keymap.name
+        &self.keymap
+    }
+
+    /// The keys the key engine runs: the starting point `[input] keymap` names, with
+    /// `[keys]` and `[tui.keys]` applied over it.
+    pub fn keys(&self) -> &Keys {
+        &self.keys
     }
 
     /// The built-in commands `[commands]` runs for `name`, if it defines it.
@@ -1021,8 +1027,6 @@ fn engine_notices(user: &Raw, env: &Environment) -> Vec<String> {
 /// What the user's file said about keys, captured before the built-in file fills it in.
 #[derive(Default)]
 struct UserKeyChoice {
-    /// The keymap the user's file named. `None` when there is no user file, or it names none.
-    keymap: Option<String>,
     /// Whether the user's file sets `[tui] default-keys`.
     set_default_keys: bool,
 }
@@ -1030,7 +1034,7 @@ struct UserKeyChoice {
 /// Checks everything in `raw` and turns it into a [`Config`] for a build with what `env`
 /// lists, unless it or reading it (`problems`) found a problem. `builtin_keys` is the default
 /// file's `[tui.keys]`, checked and not installed. `user_tui_keys` is the user's, when they
-/// wrote one. `from_user` is what that file said about the keymap and `[tui] default-keys`.
+/// wrote one. `from_user` is what that file said about `[tui] default-keys`.
 fn validate(
     raw: Raw,
     builtin_keys: Option<toml::Table>,
@@ -1188,9 +1192,8 @@ fn validate(
     let names: Vec<String> = custom.keys().cloned().collect();
     let commands = running_commands(env, &ui.chrome).with_custom(&names);
     let terminal = CommandSet::new("terminal", TERMINAL_CHROME_COMMANDS).with_custom(&names);
-    let user_wrote_tui_keys = user_tui_keys.is_some();
     // The built-in file no longer ships a key table. One that appears is still checked, and
-    // not installed: the example configuration owns the default keys.
+    // not installed: the experience owns the default keys.
     let _ = read_keys(builtin_keys, &terminal, &mut problems);
     let user_tui_keys = read_keys(user_tui_keys, &terminal, &mut problems);
     let chrome_settings = check_chromes(raw.chrome, env, &mut problems, &mut notices);
@@ -1214,37 +1217,14 @@ fn validate(
             Some((button, command.ok()?))
         })
         .collect();
-    let keymaps = KeyTables {
+    let key_tables = KeyTables {
         selected: raw.input.keymap,
         keys: raw.keys,
         tables: raw.keymap,
     };
-    let (keymap, selected) = keymaps.check(
-        env,
-        &commands,
-        &mut problems,
-        &mut notices,
-        from_user.keymap.as_deref(),
-    );
-    let keymap_settings = if keymap == keys::KIND {
-        let on_terminal = env.frontend == Frontend::Terminal;
-        keys::combine(
-            if on_terminal {
-                user_tui_keys
-            } else {
-                Table::new()
-            },
-            selected,
-        )
-    } else {
-        if env.frontend == Frontend::Terminal && user_wrote_tui_keys {
-            notices.push(format!(
-                "[tui.keys] is not used: [input] keymap is {:?}, which reads [keymap.{}]",
-                keymap.name, keymap.name
-            ));
-        }
-        selected
-    };
+    let (keymap, keys) =
+        key_tables.check(env, &commands, user_tui_keys, &mut problems, &mut notices);
+    notices.extend(env.notices.iter().cloned());
     let pages = PagesConfig {
         terminal: raw.pages.terminal.enabled.unwrap_or(false),
         terminal_command: raw.pages.terminal.command.filter(|command| {
@@ -1287,7 +1267,7 @@ fn validate(
         engines,
         routes,
         keymap,
-        keymap_settings,
+        keys,
         scroll_speed,
         buttons,
         chrome: ui.chrome,
@@ -1430,17 +1410,16 @@ fn running_commands<'a>(env: &'a Environment, chrome: &'a str) -> CommandSet<'a>
     }
 }
 
-/// `[tui.keys]` as settings, checked against the terminal chrome. An absent table is empty.
+/// `[tui.keys]` read, against the terminal chrome, as bindings for the terminal only. An
+/// absent table is empty.
 fn read_keys(
     table: Option<toml::Table>,
     commands: &CommandSet<'_>,
     problems: &mut Vec<String>,
-) -> Table {
+) -> keys::Tables {
     let settings = settings(table.unwrap_or_default(), "[tui.keys]", problems);
-    let mut found = Vec::new();
-    let _ = keys::Tables::from_table(&settings, "tui.keys", commands, &mut found);
-    problems.extend(found);
-    settings
+    let terminal = Some(KeyFrontend::Terminal);
+    keys::Tables::from_table(&settings, "tui.keys", commands, terminal, problems)
 }
 
 /// `[tui]`, key by key, so one bad value does not hide the others. A bad value keeps the
@@ -1743,7 +1722,10 @@ fn prefixed(section: &str, problems: Vec<String>) -> impl Iterator<Item = String
         .map(move |problem| format!("{section} {problem}"))
 }
 
-/// The keymap tables of a file: `[input] keymap`, `[keys]` and `[keymap.<name>]`.
+/// What `[input] keymap` may name: where the keys start from.
+pub const KEYMAPS: [&str; 2] = ["example", "bindings"];
+
+/// The key tables of a file: `[input] keymap`, `[keys]` and `[keymap.<name>]`.
 struct KeyTables {
     selected: Option<String>,
     keys: Option<toml::Table>,
@@ -1751,83 +1733,49 @@ struct KeyTables {
 }
 
 impl KeyTables {
-    /// The keymap `[input] keymap` names and its table. Every key table is checked, the
-    /// selected keymap's even when the file has none, and the others although no keymap reads
-    /// them, so switching to them later is safe.
+    /// The starting point `[input] keymap` names and the keys the engine runs: that starting
+    /// point (`example`, the experience the build has, [`Environment::keys`]; `bindings`, no
+    /// experience at all, `Keys::plain`) with `[keys]` and then `tui` applied over it, each
+    /// entry one `bind` or `unbind`, and the result checked whole (`Keys::check`) against the
+    /// running frontend's commands. A `[keymap.<name>]` table is for no keymap any more and
+    /// gets a notice.
     fn check(
         self,
         env: &Environment,
         commands: &CommandSet<'_>,
+        tui: keys::Tables,
         problems: &mut Vec<String>,
         notices: &mut Vec<String>,
-        user_keymap: Option<&str>,
-    ) -> (KeymapKind, Table) {
-        let bindings = keys::KIND;
-        let has = list(std::iter::once(bindings.name).chain(env.keymaps.iter().map(|k| k.name)));
-        let mut name = self.selected.unwrap_or_else(|| bindings.name.into());
-        let found = env.keymaps.iter().find(|kind| kind.name == name).copied();
-        // A keymap the user's file names and this build lacks is an error, as `[engines]
-        // default` is. The built-in file's value is not: a build without that keymap uses
-        // bindings. The core has no logger, so that fallback is silent, the same way the
-        // built-in default engine is not checked (decision 82 (3)).
-        let kind = match found {
-            Some(kind) => kind,
-            None if name == bindings.name => bindings,
-            None if user_keymap == Some(name.as_str()) => {
+    ) -> (String, Keys) {
+        let name = self.selected.unwrap_or_else(|| KEYMAPS[0].into());
+        let mut keys = match name.as_str() {
+            "example" => env.keys.clone(),
+            "bindings" => Keys::plain(),
+            other => {
                 problems.push(format!(
-                    "[input] keymap: this build has no keymap {name:?} (it has: {has})"
+                    "[input] keymap: {other:?} is not where keys start from (it is \"example\", \
+                     the experience, or \"bindings\", no experience at all)"
                 ));
-                bindings
-            }
-            None => {
-                name = bindings.name.to_owned();
-                bindings
+                Keys::plain()
             }
         };
-        let reads = match name == bindings.name {
-            true => "[keys]".to_owned(),
-            false => format!("[keymap.{name}]"),
-        };
-        let unused = |table: &str| {
-            format!("{table} is not used: [input] keymap is {name:?}, which reads {reads}")
-        };
-
-        let keys_given = self.keys.is_some();
-        let keys = settings(self.keys.unwrap_or_default(), "[keys]", problems);
-        problems.extend((bindings.check)(&keys, commands));
-        if keys_given && kind != bindings {
-            notices.push(unused("[keys]"));
+        for table_name in self.tables.keys() {
+            notices.push(format!(
+                "[keymap.{table_name}] is for a keymap this build doesn't have (it has: {}); it \
+                 was not checked. Keys are bound in [keys] over the keymap's starting point",
+                KEYMAPS.join(", ")
+            ));
         }
-        let mut selected = (kind == bindings).then_some(keys);
-        for (table_name, table) in self.tables {
-            let section = format!("[keymap.{table_name}]");
-            if table_name == bindings.name {
-                problems.push(format!(
-                    "{section}: the bindings keymap reads [keys], [keys.page] and [keys.location]"
-                ));
-                continue;
-            }
-            let Some(other) = env.keymaps.iter().find(|kind| kind.name == table_name) else {
-                notices.push(format!(
-                    "{section} is for a keymap this build doesn't have (it has: {has}); it was \
-                     not checked"
-                ));
-                continue;
-            };
-            let table = settings(table, &section, problems);
-            problems.extend(prefixed(&section, (other.check)(&table, commands)));
-            match *other == kind {
-                true => selected = Some(table),
-                false => notices.push(unused(&section)),
-            }
+        let user = settings(self.keys.unwrap_or_default(), "[keys]", problems);
+        let user = keys::Tables::from_table(&user, "keys", commands, None, problems);
+        let before = problems.len();
+        user.apply(&mut keys, problems);
+        tui.apply(&mut keys, problems);
+        if problems.len() == before {
+            let found = keys.check(commands, env.frontend);
+            problems.extend(found.into_iter().map(|problem| format!("keys: {problem}")));
         }
-        // A keymap the file selects without a table of its own still says what it misses.
-        let selected = selected.unwrap_or_else(|| {
-            let section = format!("[keymap.{}]", kind.name);
-            problems.extend(prefixed(&section, (kind.check)(&Table::new(), commands)));
-            Table::new()
-        });
-        (kind, selected)
+        (name, keys)
     }
 }
 
@@ -2046,21 +1994,26 @@ mod tests {
     use super::*;
     use crate::state::{ChromeChecks, Frontend};
 
-    /// A keymap of the build besides `bindings`: its table maps keys to commands.
-    const FAKE: KeymapKind = KeymapKind {
-        name: "fake",
-        check: |table, commands| {
-            let problem = |(key, value): (&String, &Value)| match value.as_str() {
-                Some(command) => commands
-                    .parse(command)
-                    .err()
-                    .map(|e| format!("{key:?}: {e}")),
-                None => Some(format!("{key:?}: expected a command, not {}", value.kind())),
-            };
-            table.iter().filter_map(problem).collect()
-        },
-        new: || Box::new(keys::Bindings::default()),
-    };
+    /// The experience of the build: `normal` (no page text, takes what it doesn't bind) and
+    /// `insert`, binding nothing.
+    fn experience() -> Keys {
+        use sighurt_api::keymap::{Fallback, Mode};
+        Keys {
+            modes: vec![
+                Mode::new("normal")
+                    .page_text(false)
+                    .unmatched(Fallback::Take),
+                Mode::new("insert").indicator("INSERT"),
+            ],
+            initial: "normal".into(),
+            line: Vec::new(),
+        }
+    }
+
+    /// Whether `keys` binds `text` in `frontend`, as the help page lists it.
+    fn binds(keys: &Keys, frontend: Frontend, text: &str) -> bool {
+        keys.describe(frontend).iter().any(|b| b.keys == text)
+    }
 
     /// The standard chrome as the core sees it, with no options yet.
     const STANDARD: ChromeChecks = ChromeChecks {
@@ -2090,7 +2043,7 @@ mod tests {
     ];
 
     /// A build with three engines (Servo honoring its settings, Wasm only `storage`, the demo
-    /// engine none), the fake keymap, the standard chrome and its colors, for a user whose
+    /// engine none), its experience, the standard chrome and its colors, for a user whose
     /// home is /home/me.
     fn env() -> Environment {
         let engines =
@@ -2111,7 +2064,8 @@ mod tests {
             engines: engines.into(),
             engine_settings: settings.map(|(e, s)| (e.to_owned(), s)).into(),
             home_dir: Some("/home/me".into()),
-            keymaps: vec![FAKE],
+            keys: experience(),
+            notices: Vec::new(),
             chromes: vec![STANDARD],
             color_names: &COLORS,
             renderers: RENDERERS,
@@ -2171,8 +2125,8 @@ mod tests {
         let wasm = config.routes().iter().find(|r| r.engine == "wasm").unwrap();
         assert_eq!(wasm.extensions, ["wasm"]);
         assert!(wasm.origins.is_empty());
-        assert_eq!(config.keymap, keys::KIND);
-        assert!(config.keymap_settings.is_empty(), "no default bindings");
+        assert_eq!(config.keymap_name(), "example");
+        assert_eq!(config.keys(), &experience(), "the file binds nothing");
         assert_eq!(config.tui(), &TuiConfig::default());
         assert_eq!(config.chrome(), DEFAULT_CHROME);
         assert_eq!(
@@ -2193,9 +2147,9 @@ mod tests {
         for frontend in [Frontend::Gui, Frontend::Terminal] {
             let env = Environment { frontend, ..env() };
             let config = Config::parse(None, &env).unwrap();
-            assert_eq!(config.keymap, keys::KIND);
-            assert!(
-                config.keymap_settings.is_empty(),
+            assert_eq!(
+                config.keys(),
+                &experience(),
                 "{frontend:?} installs bindings"
             );
             assert!(config.notices().is_empty());
@@ -2206,25 +2160,23 @@ mod tests {
             "version = 1\n[tui.keys]\n\"m\" = \"chrome.toggle-mode\"\n[keys]\n\"j\" = \"tab.next\"",
         )
         .unwrap();
-        assert_eq!(window.keymap_settings.len(), 1);
-        assert_eq!(window.keymap_settings["j"].as_str(), Some("tab.next"));
+        assert!(binds(window.keys(), Frontend::Gui, "j"));
+        assert!(!binds(window.keys(), Frontend::Gui, "m"));
+        assert!(binds(window.keys(), Frontend::Terminal, "m"));
     }
 
     #[test]
-    fn the_builtin_keymap_falls_back_when_the_build_lacks_it() {
+    fn a_build_without_an_experience_starts_from_none() {
+        // `example` is the build's experience (experience-2026-11-15.md, §1.5): one without
+        // any (`Environment::default`) has `Keys::plain`, and naming it is no error.
         let config = Config::parse(None, &Environment::default()).unwrap();
-        assert_eq!(config.keymap, keys::KIND);
-        assert!(config.keymap_settings.is_empty());
+        assert_eq!(config.keys(), &Keys::plain());
         assert!(config.notices().is_empty());
-        let error = Config::parse(
+        let named = Config::parse(
             Some("version = 1\n[input]\nkeymap = \"example\"\n"),
             &Environment::default(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.problems,
-            ["[input] keymap: this build has no keymap \"example\" (it has: bindings)"]
         );
+        assert_eq!(named.unwrap().keys(), &Keys::plain());
     }
 
     #[test]
@@ -2232,12 +2184,12 @@ mod tests {
         let builtin = Config::parse(None, &env()).unwrap();
         assert!(builtin.tui().default_keys);
         assert!(builtin.notices().is_empty());
-        assert!(builtin.keymap_settings.is_empty());
+        assert_eq!(builtin.keys(), &experience());
         let said = "[tui] default-keys has no effect since 0.10: the terminal's default keys are \
                     the example configuration's";
         let off = parse("version = 1\n[tui]\ndefault-keys = false\n").unwrap();
         assert!(!off.tui().default_keys);
-        assert!(off.keymap_settings.is_empty());
+        assert_eq!(off.keys(), &experience());
         assert_eq!(off.notices(), [said]);
         let on = parse("version = 1\n[tui]\ndefault-keys = true\n").unwrap();
         assert!(on.tui().default_keys);
@@ -2246,7 +2198,7 @@ mod tests {
         let keys =
             parse("version = 1\n[tui]\ndefault-keys = false\n[keys]\n\"j\" = \"tab.next\"\n")
                 .unwrap();
-        assert_eq!(keys.keymap_settings["j"].as_str(), Some("tab.next"));
+        assert!(binds(keys.keys(), Frontend::Gui, "j"));
         assert_eq!(keys.notices(), [said]);
     }
 
@@ -2270,8 +2222,8 @@ mod tests {
         let config = parse(&format!("version = 1\n{examples}")).unwrap();
         assert_eq!(config.colors()["selection"], "#60a5fa55");
         assert_eq!(config.chrome(), "standard");
-        assert_eq!(config.keymap, keys::KIND);
-        assert!(!config.keymap_settings.is_empty());
+        assert_eq!(config.keymap_name(), "example");
+        assert_ne!(config.keys(), &experience());
         let enabled = "version = 1\n[engines]\nenabled = [\"servo\", \"wasm\"]\n";
         assert!(!parse(enabled).unwrap().is_enabled("demo"));
         let origins = "version = 1\n[routing.wasm]\norigins = [\"http://localhost:8080\"]\n";
@@ -2527,7 +2479,7 @@ mod tests {
             "##,
         )
         .unwrap();
-        assert!(!config.keymap_settings.is_empty());
+        assert!(binds(config.keys(), Frontend::Gui, "ctrl-t"));
         assert_eq!(config.colors()["bg"], "#000000");
         assert_eq!(config.font(), Some("Inter"));
         assert!(parse("version = 1\n[ui]\ncolors = 3").is_err());
@@ -2539,52 +2491,69 @@ mod tests {
 
     // ── Keymaps, chromes and notices ──────────────────────────────────────────────────────
 
+    // `[input] keymap` names where the keys start from, and `[keys]` applies over either
+    // (experience-2026-11-15.md, §1.5): what these tests checked of keymaps that read their own
+    // tables changed on purpose.
+
     #[test]
-    fn the_selected_keymap_reads_its_own_table() {
-        let config =
-            parse("version = 1\n[input]\nkeymap = \"fake\"\n[keymap.fake]\n\"x\" = \"tab.new\"")
-                .unwrap();
-        assert_eq!(config.keymap, FAKE);
-        assert_eq!(
-            config.keymap_settings,
-            Table::from([("x".into(), Value::String("tab.new".into()))])
-        );
-        assert_eq!(config.notices(), [] as [String; 0]);
+    fn the_keymap_is_where_the_keys_start_from() {
+        let example = parse("version = 1\n[input]\nkeymap = \"example\"").unwrap();
+        assert_eq!(example.keys(), &experience());
         // Saying so is the same as saying nothing.
-        assert_eq!(
-            parse("version = 1\n[input]\nkeymap = \"bindings\""),
-            parse("version = 1")
+        assert_eq!(Ok(example), parse("version = 1"));
+        let bindings = parse("version = 1\n[input]\nkeymap = \"bindings\"").unwrap();
+        assert_eq!(bindings.keymap_name(), "bindings");
+        assert_eq!(bindings.keys(), &Keys::plain());
+        // [keys] over each.
+        let table = "[keys]\n\"ctrl-t\" = \"tab.new\"\n[keys.mode.normal]\n\"x\" = false";
+        let example = parse(&format!("version = 1\n{table}")).unwrap();
+        assert!(binds(example.keys(), Frontend::Gui, "ctrl-t"));
+        assert_eq!(example.notices(), [] as [String; 0]);
+        let on_plain = format!("version = 1\n[input]\nkeymap = \"bindings\"\n{table}");
+        assert_problem(
+            &on_plain,
+            "[keys.mode.normal]: there is no mode \"normal\" (the modes are default)",
         );
     }
 
     #[test]
-    fn an_unknown_keymap_is_an_error_that_lists_the_builds() {
+    fn an_unknown_keymap_is_an_error_that_names_the_two() {
         assert_problem(
             "version = 1\n[input]\nkeymap = \"modl\"",
-            "[input] keymap: this build has no keymap \"modl\" (it has: bindings, fake)",
+            "[input] keymap: \"modl\" is not where keys start from (it is \"example\", the \
+             experience, or \"bindings\", no experience at all)",
         );
     }
 
     #[test]
-    fn keymap_bindings_points_to_keys() {
-        assert_problem(
-            "version = 1\n[keymap.bindings]\n\"ctrl-t\" = \"tab.new\"",
-            "[keymap.bindings]: the bindings keymap reads [keys], [keys.page] and [keys.location]",
-        );
+    fn a_keymaps_own_table_gets_a_notice() {
+        for name in ["bindings", "example", "fake"] {
+            assert_eq!(
+                notices(&format!(
+                    "version = 1\n[keymap.{name}]\n\"x\" = \"tab.nope\""
+                )),
+                [format!(
+                    "[keymap.{name}] is for a keymap this build doesn't have (it has: example, \
+                     bindings); it was not checked. Keys are bound in [keys] over the keymap's \
+                     starting point"
+                )]
+            );
+        }
     }
 
     #[test]
-    fn a_keymaps_problems_are_prefixed_and_in_the_one_list() {
+    fn key_problems_are_in_the_one_list() {
         let problems = problems(
-            "version = 1\nhome = \"nope\"\n[input]\nkeymap = \"fake\"\n[keymap.fake]\n\
-             \"x\" = \"tab.nope\"\n\"y\" = 3\n[keys]\n\"ctrl-t\" = \"tab.nwe\"",
+            "version = 1\nhome = \"nope\"\n[keys]\n\"ctrl-t\" = \"tab.nwe\"\n\
+             \"y\" = 3\n\"g\" = \"tab.new\"\n\"g g\" = \"tab.close\"\n\
+             [keys.mode.visual]\n\"v\" = \"tab.new\"",
         );
         let expected = [
             "home:",
-            "[keymap.fake] \"x\": unknown command \"tab.nope\"",
-            "[keymap.fake] \"y\": expected a command, not a whole number",
-            // An unused table is still checked.
             "[keys] \"ctrl-t\" = \"tab.nwe\": unknown command",
+            "[keys] \"y\": expected a command in quotes, or false to unbind the key",
+            "[keys] \"g\" is the start of \"g g\": one table can't bind both",
+            "[keys.mode.visual]: there is no mode \"visual\" (the modes are normal, insert)",
         ];
         for part in expected {
             assert!(
@@ -2593,20 +2562,75 @@ mod tests {
             );
         }
         assert_eq!(problems.len(), expected.len(), "{problems:#?}");
+        // What only the whole keys can say: a mode switch to a mode there is none of.
+        assert_eq!(
+            key_problems("[keys.mode.normal]\n\"i\" = \"input.mode visual\""),
+            ["keys: mode normal: \"i\" runs input.mode visual, but there is no mode \"visual\""]
+        );
+    }
+
+    fn key_problems(table: &str) -> Vec<String> {
+        problems(&format!("version = 1\n{table}"))
     }
 
     #[test]
-    fn a_key_table_nobody_reads_gets_a_notice() {
-        let keys = "version = 1\n[input]\nkeymap = \"fake\"\n[keys]\n\"ctrl-t\" = \"tab.new\"";
+    fn the_tables_apply_in_order_and_sequences_and_false_work() {
+        let config = parse(
+            r#"
+            version = 1
+            [keys]
+            "ctrl-r" = "page.reload"
+            "g t" = "tab.next"
+            [keys.page]
+            "ctrl-r" = "page.stop"
+            [keys.mode.insert]
+            "ctrl-r" = false
+            [keys.url."https://a.test"]
+            "ctrl-r" = "page.back"
+            [keys.mode.normal.url."https://a.test"]
+            "ctrl-r" = "page.forward"
+            [tui.keys]
+            "ctrl-r" = "tab.new"
+            "#,
+        )
+        .unwrap();
+        let keys = config.keys();
+        let row = |frontend, mode: &str, applies: &str| {
+            keys.describe(frontend)
+                .into_iter()
+                .find(|b| b.keys == "ctrl-r" && b.mode == mode && b.applies.starts_with(applies))
+                .map(|b| b.action)
+        };
+        // [keys.page] replaced [keys] in the modes; the line keeps [keys]'s.
         assert_eq!(
-            notices(keys),
-            ["[keys] is not used: [input] keymap is \"fake\", which reads [keymap.fake]"]
+            row(Frontend::Gui, "NORMAL", "in the page").as_deref(),
+            Some("page.stop")
         );
-        let fake = "version = 1\n[keymap.fake]\n\"x\" = \"tab.new\"";
         assert_eq!(
-            notices(fake),
-            ["[keymap.fake] is not used: [input] keymap is \"bindings\", which reads [keys]"]
+            row(Frontend::Gui, "", "in the address line").as_deref(),
+            Some("page.reload")
         );
+        // `false` unbound it in insert, where only the address's binding is left.
+        assert_eq!(row(Frontend::Gui, "INSERT", "in the page"), None);
+        assert_eq!(
+            row(Frontend::Gui, "INSERT", "on https://a.test").as_deref(),
+            Some("page.back")
+        );
+        // The mode's table for the address replaced the general one there, in normal only.
+        assert_eq!(
+            row(Frontend::Gui, "NORMAL", "on https://a.test").as_deref(),
+            Some("page.forward")
+        );
+        // [tui.keys] binds in the terminal only, beside [keys]'s.
+        assert!(keys
+            .describe(Frontend::Gui)
+            .iter()
+            .all(|b| b.action != "tab.new"));
+        assert!(keys
+            .describe(Frontend::Terminal)
+            .iter()
+            .any(|b| b.action == "tab.new"));
+        assert!(binds(keys, Frontend::Gui, "g t"));
     }
 
     #[test]
@@ -2632,8 +2656,9 @@ mod tests {
                 "[engines] enabled: this build has no engine \"wpe\" (it has: demo, servo, wasm)",
                 "[chrome.line] is for a chrome this build doesn't have (it has: standard); it \
                  was not checked",
-                "[keymap.modl] is for a keymap this build doesn't have (it has: bindings, fake); \
-                 it was not checked",
+                "[keymap.modl] is for a keymap this build doesn't have (it has: example, \
+                 bindings); it was not checked. Keys are bound in [keys] over the keymap's \
+                 starting point",
             ]
         );
         // The built-in file's tables stay silent: it routes wasm in every build.
@@ -2729,14 +2754,14 @@ mod tests {
         let parse = |user: &str| Config::parse(Some(&format!("version = 1\n{user}")), &env);
         let tables = "[keys]\n\"ctrl-b\" = \"chrome.toggle-tab\"\n\
                       [input.buttons]\nforward = \"chrome.toggle-tab\"\n\
-                      [keymap.fake]\nx = \"chrome.toggle-tab\"\n";
+                      [keys.mode.normal]\nx = \"chrome.toggle-tab\"\n";
         let lacks = "the standard chrome has no command chrome.toggle-tab; it has \
                      chrome.toggle-tabs";
         let problems = parse(tables).unwrap_err().problems;
         let expected = [
             format!("[keys] \"ctrl-b\" = \"chrome.toggle-tab\": {lacks}"),
             format!("[input.buttons] forward = \"chrome.toggle-tab\": {lacks}"),
-            format!("[keymap.fake] \"x\": {lacks}"),
+            format!("[keys.mode.normal] \"x\" = \"chrome.toggle-tab\": {lacks}"),
         ];
         assert_eq!(problems.len(), 3, "{problems:#?}");
         for problem in expected {
@@ -2817,8 +2842,8 @@ mod tests {
             "[keys] ctrl-t: dates are not settings",
         );
         assert_problem(
-            "version = 1\n[keymap.fake]\nx = [{ at = 1979-05-27 }]",
-            "[keymap.fake] x: dates are not settings",
+            "version = 1\n[keys.mode.normal]\nx = [{ at = 1979-05-27 }]",
+            "[keys] mode: dates are not settings",
         );
         assert_problem(
             "version = 1\n[ui]\nfont = 1979-05-27",

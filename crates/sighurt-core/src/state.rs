@@ -77,7 +77,7 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus,
     PointerButton, PointerEvent, ScrollDelta, TextInputState,
 };
-use sighurt_api::keymap::{Browser, KeyBinding, KeyContext, KeymapKind, TabInfo};
+use sighurt_api::keymap::{Browser, KeyBinding, KeyContext, Keys, TabInfo};
 use sighurt_api::semantic::SemanticAction;
 use sighurt_api::services::{
     PageGrant, PageRequest, Permission, PtyProgram, Service, ServiceError, ServiceReply,
@@ -125,9 +125,13 @@ pub struct Environment {
     pub engine_settings: BTreeMap<String, &'static [&'static str]>,
     /// The user's home directory, for `~/` in typed addresses and `[downloads] directory`.
     pub home_dir: Option<PathBuf>,
-    /// The build's keymaps besides `bindings` ([`crate::keys::KIND`]), which the core always
-    /// has.
-    pub keymaps: Vec<KeymapKind>,
+    /// The experience's keys: what `[input] keymap = "example"` starts from, the
+    /// configuration compiled into `sig`, which `sig` checked whole (`Keys::check`) and which
+    /// the configuration's `[keys]` are applied over. [`Keys::plain`] when left out.
+    pub keys: Keys,
+    /// What `sig` has to say about the build at the start and with every configuration it
+    /// loads, such as an experience it could not use. One line each.
+    pub notices: Vec<String>,
     /// The build's chromes, as the core checks them.
     pub chromes: Vec<ChromeChecks>,
     /// The color names `[ui.colors]` takes: the chrome's (`sighurt_ui::Colors::NAMES`).
@@ -1038,7 +1042,7 @@ impl BrowserState {
     /// A browser with no tabs yet, using `config`. [`BrowserEvent::Start`] opens them.
     pub fn new(config: Config, env: Environment) -> Self {
         Self {
-            keys: KeyState::new(config.keymap, &config.keymap_settings),
+            keys: KeyState::new(config.keys.clone()),
             buttons: HashSet::new(),
             seat: SeatId::next(),
             indicator: None,
@@ -1264,7 +1268,7 @@ impl BrowserState {
         if config == self.config {
             return;
         }
-        self.keys.configure(config.keymap, &config.keymap_settings);
+        self.keys.configure(config.keys.clone());
         let mut notices = config.notices().to_vec();
         if config.chrome() != self.chrome {
             notices.push(format!(

@@ -11,32 +11,12 @@ use sighurt_api::input::{
     ButtonState, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers,
     TextInputState, TextPurpose,
 };
-use sighurt_api::keymap::KeymapKind;
 use sighurt_core::config::{
     Config, GraphicsProtocol, TuiConfig, TuiMode, DEFAULT_CONFIG, TERMINAL_CHROME_COMMANDS,
 };
-use sighurt_core::keys::Bindings;
 use sighurt_core::tabs::Content;
 use sighurt_core::{
     update, BrowserEvent, BrowserState, ChromeChecks, Effect, Environment, Frontend, OpenRequest,
-};
-
-/// A keymap whose table maps keys to commands, so `[keymap.fake]` is checked like a real one.
-const FAKE: KeymapKind = KeymapKind {
-    name: "fake",
-    check: |table, commands| {
-        table
-            .iter()
-            .filter_map(|(key, value)| match value.as_str() {
-                Some(command) => commands
-                    .parse(command)
-                    .err()
-                    .map(|e| format!("{key:?}: {e}")),
-                None => Some(format!("{key:?}: expected a command, not {}", value.kind())),
-            })
-            .collect()
-    },
-    new: || Box::new(Bindings::default()),
 };
 
 struct FakeView {
@@ -67,7 +47,6 @@ fn environment(frontend: Frontend) -> Environment {
     Environment {
         engines: [("servo".into(), servo)].into(),
         frontend,
-        keymaps: vec![FAKE],
         chromes: vec![chrome("standard", &["toggle-tabs"])],
         ..Environment::default()
     }
@@ -501,7 +480,7 @@ fn tui_keys_win_over_keys_and_apply_only_in_the_terminal() {
 fn chrome_commands_are_checked_against_the_running_frontend() {
     let tables = "[keys]\n\"c\" = \"chrome.toggle-tabs\"\n\"m\" = \"chrome.toggle-mode\"\n\
                   [input.buttons]\nforward = \"chrome.toggle-mode\"\n\
-                  [keymap.fake]\n\"x\" = \"chrome.toggle-mode\"\n\
+                  [keys.mode.default]\n\"x\" = \"chrome.toggle-mode\"\n\
                   [tui.keys]\n\"g\" = \"chrome.toggle-tabs\"\n";
     let window = problems(Frontend::Gui, tables);
     assert!(
@@ -512,7 +491,7 @@ fn chrome_commands_are_checked_against_the_running_frontend() {
         "{window:#?}"
     );
     assert!(window.iter().any(|p| p.contains("[input.buttons] forward")));
-    assert!(window.iter().any(|p| p.contains("[keymap.fake]")));
+    assert!(window.iter().any(|p| p.contains("[keys.mode.default]")));
     assert!(
         window
             .iter()
@@ -554,16 +533,21 @@ fn chrome_commands_are_checked_against_the_running_frontend() {
     )
     .is_ok());
 
-    let unused = "[input]\nkeymap = \"fake\"\n[tui.keys]\n\"m\" = \"chrome.refresh\"\n";
-    assert_eq!(
-        parse(Frontend::Terminal, unused).unwrap().notices(),
-        ["[tui.keys] is not used: [input] keymap is \"fake\", which reads [keymap.fake]"]
-    );
-    assert_eq!(
-        parse(Frontend::Gui, unused).unwrap().notices(),
-        [] as [String; 0],
-        "the window ignores [tui.keys] without saying so"
-    );
+    // [tui.keys] applies over either starting point now (experience-2026-11-15.md, §1.5), in
+    // the terminal only, and the window ignores it without saying so.
+    let over = "[input]\nkeymap = \"example\"\n[tui.keys]\n\"m\" = \"chrome.refresh\"\n";
+    for frontend in [Frontend::Terminal, Frontend::Gui] {
+        let config = parse(frontend, over).unwrap();
+        assert_eq!(config.notices(), [] as [String; 0]);
+        let bound = |frontend| {
+            config
+                .keys()
+                .describe(frontend)
+                .iter()
+                .any(|b| b.keys == "m")
+        };
+        assert!(bound(Frontend::Terminal) && !bound(Frontend::Gui));
+    }
 }
 
 #[test]

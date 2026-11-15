@@ -335,7 +335,7 @@ mod tests {
                 .iter()
                 .map(|p| ((*p).to_owned(), grants))
                 .collect::<BTreeMap<_, _>>(),
-            keymaps: vec![sighurt_config_example::KIND],
+            keys: sighurt_config_example::keys(),
             frontend: Frontend::Terminal,
             ..Environment::default()
         }

@@ -1,140 +1,56 @@
 //! Keys: the key engine ([`Engine`]), which is driven by a `sighurt_api::keymap::Keys` value
 //! and nothing else; the configuration's key tables (`[keys]`, `[tui.keys]`) read as the
-//! operations that change such a value ([`Bindings`]); and the core's record of the presses
+//! operations that change such a value ([`Tables`]); and the core's record of the presses
 //! taken ([`KeyState`]).
 //!
 //! The engine keeps the tables, the current mode, an unfinished sequence with where it began
-//! (the table, the shown tab and its committed address), and which single-key binding the key
-//! now held ran. For a fresh press it looks the keys up in the line's table while the chrome
-//! has the keyboard, else in the current mode's (`Keys::resolve`: the typing rule, then the
-//! most specific binding the keys could be); a complete binding acts, a start waits (no
+//! (the table, the shown tab's place and its committed address), and which single-key binding
+//! the key now held ran. For a fresh press it looks the keys up in the line's table while the
+//! chrome has the keyboard, else in the current mode's (`Keys::resolve`: the typing rule, then
+//! the most specific binding the keys could be); a complete binding acts, a start waits (no
 //! timeout, ever), and nothing, or a tombstone, falls to the table's `unmatched` (in the line
 //! always "pass"). A key that continues no sequence drops it and starts afresh; a sequence is
 //! dropped, and the key starts afresh, when the table, the shown tab or its committed address
-//! changed since its first key. Modifier and dead keys are looked up alone and never join,
-//! continue or drop a sequence. A repeat of a taken press runs again only if, looked up alone
-//! now, it is the single-key binding its press ran, and that binding is a plain `Run` with no
-//! `input.mode` in it. The indicator is the mode's, then the unfinished sequence's keys as the
-//! bindings spell them, never event text.
+//! changed since its first key, and on `input.mode`, a context change, a reset or a reload.
+//! Modifier and dead keys are looked up alone and never join, continue or drop a sequence. A
+//! repeat of a taken press runs again only if, looked up alone now, it is the single-key binding
+//! its press ran, and that binding is a plain `Run` with no `input.mode` in it. The indicator is
+//! the mode's, then the unfinished sequence's keys as the bindings spell them, never event
+//! text. A reload keeps the mode if the new keys have it, else their initial one.
 //!
-//! `[keys]` binds in every mode and the line, `[keys.page]` in every mode, `[keys.location]` in
-//! the line, `[keys.url."<pattern>"]` (up to [`MAX_SITES`]) in every mode on those addresses;
-//! `[tui.keys]` does the same in the terminal only. Each entry is one `bind` on the value the
-//! configuration starts from, applied after it, in that order.
+//! Each entry of a key table is one `bind` (a command in quotes) or `unbind` (`false`) on the
+//! keys the configuration starts from, in this order: `[keys]` (every mode and the line),
+//! `[keys.page]` (every mode), `[keys.location]` (the line), `[keys.mode.<name>]` (that mode),
+//! `[keys.url."<pattern>"]` (every mode, on those addresses), `[keys.mode.<name>.url."…"]`
+//! (that mode, on those addresses); `[tui.keys]` and its tables do the same in the terminal
+//! only, after them. Keys may be sequences; within one table a key that is, or starts, another
+//! is a problem.
 //!
-//! [`KeyState`] keeps the guarantees of `sighurt_api::keymap` for any keymap: a press taken
-//! also takes its release and its auto-repeats, so the page or the address bar never sees half a
-//! keystroke; only a fresh press asks the keymap, so a key held down before a modifier joined it
-//! keeps repeating where its press went.
+//! [`KeyState`] keeps the guarantees of `sighurt_api::keymap`: a press taken also takes its
+//! release and its auto-repeats, so the page or the address bar never sees half a keystroke;
+//! only a fresh press asks the engine, so a key held down before a modifier joined it keeps
+//! repeating where its press went.
 //!
 //! Must not own: what a command does ([`crate::commands`]) or where the keyboard is
 //! ([`crate::state`]).
 
 use std::collections::HashSet;
-use std::fmt;
 
 use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::SeatId;
 use sighurt_api::input::{ButtonState, KeyCode, KeyEvent, KeyboardFocus};
 use sighurt_api::keymap::{
-    is_modifier, Action, Binding, Browser, Chord, Fallback, Found, Frontend, KeyAction, KeyBinding,
-    KeyContext, KeySeq, KeyTable, Keymap, KeymapKind, Keys, Outcome, Situation, UrlPattern, When,
+    is_modifier, Action, Binding, Browser, Fallback, Found, Frontend, KeyAction, KeyBinding,
+    KeyContext, KeySeq, KeyTable, Keymap, Keys, Outcome, Situation, UrlPattern, When,
 };
 use sighurt_api::settings::{Table, Value};
 
-/// The `bindings` keymap: no experience at all (`Keys::plain`), and the key tables over it.
-pub const KIND: KeymapKind = KeymapKind {
-    name: "bindings",
-    check,
-    new,
-};
-
-fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
-    let mut problems = Vec::new();
-    Tables::from_table(table, "keys", commands, &mut problems);
-    problems
-}
-
-/// The two layers of a terminal `bindings` table, highest priority first. A checked `[keys]`
-/// table cannot have these names: they are unknown contexts there.
-pub(crate) const LAYER_TUI: &str = "tui";
-/// The user's `[keys]`, under [`LAYER_TUI`].
-pub(crate) const LAYER_USER: &str = "user";
-
-/// One key table, or the two layers when both have bindings. An empty layer is left out, so
-/// a single table stays a single table.
-pub(crate) fn combine(tui: Table, user: Table) -> Table {
-    if tui.is_empty() || user.is_empty() {
-        return [tui, user]
-            .into_iter()
-            .find(|table| !table.is_empty())
-            .unwrap_or_default();
-    }
-    Table::from([
-        (LAYER_TUI.to_owned(), Value::Table(tui)),
-        (LAYER_USER.to_owned(), Value::Table(user)),
-    ])
-}
-
-/// The most `[keys.url."<pattern>"]` tables in one key table.
+/// The most `[keys.url."<pattern>"]` tables in one key table (and in each
+/// `[keys.mode.<name>.url]`).
 pub const MAX_SITES: usize = 64;
 
-fn new() -> Box<dyn Keymap> {
-    Box::new(Bindings::default())
-}
-
-/// The `bindings` keymap: `Keys::plain` and the key tables it is configured with.
-#[derive(Clone, Debug)]
-pub struct Bindings {
-    keymap: Configured,
-    /// Whether its table has a `[tui.keys]` layer: it runs in the terminal.
-    terminal: bool,
-}
-
-impl Default for Bindings {
-    fn default() -> Self {
-        Self {
-            keymap: Configured::new(Keys::plain()),
-            terminal: false,
-        }
-    }
-}
-
-impl PartialEq for Bindings {
-    fn eq(&self, other: &Self) -> bool {
-        self.keymap.engine.keys() == other.keymap.engine.keys()
-    }
-}
-
-impl Keymap for Bindings {
-    fn configure(&mut self, settings: &Table) {
-        self.terminal = layered(settings).is_some();
-        self.keymap.configure(settings);
-    }
-
-    fn press(&mut self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> KeyAction {
-        self.keymap.press(key, context, browser)
-    }
-
-    fn context(&mut self, context: KeyContext) {
-        self.keymap.context(context);
-    }
-
-    fn reset(&mut self) {
-        self.keymap.reset();
-    }
-
-    fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
-        self.keymap.describe(frontend)
-    }
-
-    fn keys(&self) -> Option<Keys> {
-        self.keymap.keys()
-    }
-}
-
 /// Where one entry of a key table binds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Target {
     /// Every mode and the line: `[keys]`.
     Everywhere,
@@ -142,212 +58,275 @@ enum Target {
     Modes,
     /// The line: `[keys.location]`.
     Line,
+    /// One mode: `[keys.mode.<name>]`, `[keys.mode.<name>.url."<pattern>"]`.
+    Mode(String),
 }
 
-/// A key table read as the operations it stands for, in the order they apply.
+/// One entry: its keys and condition, and the action, or `None` to unbind (`false`).
+#[derive(Clone, Debug, PartialEq)]
+struct Entry {
+    keys: KeySeq,
+    when: When,
+    action: Option<Action>,
+}
+
+/// A key table of the configuration (`[keys]` or `[tui.keys]`, with the tables under it) read
+/// as the operations it stands for, in the order they apply: `[keys]`, `[keys.page]`,
+/// `[keys.location]`, each `[keys.mode.<name>]`, each `[keys.url."<pattern>"]`, then each
+/// `[keys.mode.<name>.url."<pattern>"]`. A value is a command in quotes, or `false` to
+/// unbind; keys may be sequences. Within one table, a key that is another, or the start of
+/// another, is a problem (a TOML table has no order).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Tables {
-    ops: Vec<(Target, Binding)>,
+    ops: Vec<(Target, Entry)>,
 }
 
 impl Tables {
     /// Reads a key table (`section` is `keys` or `tui.keys`), with its commands parsed by
-    /// `commands`, adding what is wrong with it to `problems`.
+    /// `commands`, its bindings applying only in `frontend` if it names one, adding what is
+    /// wrong with it to `problems`.
     pub(crate) fn from_table(
         keys: &Table,
         section: &str,
         commands: &CommandSet<'_>,
+        frontend: Option<Frontend>,
         problems: &mut Vec<String>,
     ) -> Self {
+        let mut reader = Reader {
+            commands,
+            frontend,
+            problems,
+        };
+        let when = |url: Option<UrlPattern>| When {
+            frontend,
+            url,
+            field: None,
+        };
         let mut global = Vec::new();
         let mut page = Vec::new();
         let mut location = Vec::new();
+        let mut modes = Vec::new();
         let mut sites = Vec::new();
+        let mut mode_sites = Vec::new();
         let head = format!("[{section}]");
         for (key, value) in keys {
-            match value {
-                Value::String(command) => {
-                    add(&mut global, &head, key, command, None, commands, problems)
+            match (key.as_str(), value) {
+                ("url", Value::Table(table)) => {
+                    sites = reader.sites(table, &format!("{section}.url"));
                 }
-                Value::Table(table) if key == "url" => {
-                    sites = read_sites(table, section, commands, problems);
+                ("mode", Value::Table(table)) => {
+                    for (name, value) in table {
+                        let nested = format!("[{section}.mode.{name}]");
+                        let Some(table) = value.as_table() else {
+                            reader.problems.push(format!(
+                                "[{section}.mode] {name:?}: expected a table of keys, written \
+                                 {nested}"
+                            ));
+                            continue;
+                        };
+                        let mut list = Vec::new();
+                        for (key, value) in table {
+                            match (key.as_str(), value) {
+                                ("url", Value::Table(urls)) => {
+                                    let found =
+                                        reader.sites(urls, &format!("{section}.mode.{name}.url"));
+                                    mode_sites.push((name.clone(), found));
+                                }
+                                _ => reader.entry(&mut list, &nested, key, value, when(None)),
+                            }
+                        }
+                        modes.push((name.clone(), list));
+                    }
                 }
-                Value::Table(table) => {
+                ("page" | "location", Value::Table(table)) => {
                     let nested = format!("[{section}.{key}]");
                     let list = match key.as_str() {
                         "page" => &mut page,
-                        "location" => &mut location,
-                        other => {
-                            problems.push(format!(
-                                "[{section}.{other}]: unknown context (use [{section}.page], \
-                                 [{section}.location] or [{section}.url.\"<address>\"])"
-                            ));
-                            continue;
-                        }
+                        _ => &mut location,
                     };
                     for (key, value) in table {
-                        match value.as_str() {
-                            Some(command) => {
-                                add(list, &nested, key, command, None, commands, problems)
-                            }
-                            None => problems
-                                .push(format!("{nested} {key:?}: expected a command in quotes")),
-                        }
+                        reader.entry(list, &nested, key, value, when(None));
                     }
                 }
-                _ => problems.push(format!(
-                    "[{section}] {key:?}: expected a command in quotes, or a [{section}.page] or \
-                     [{section}.location] table"
+                (other, Value::Table(_)) => reader.problems.push(format!(
+                    "[{section}.{other}]: unknown context (use [{section}.page], \
+                     [{section}.location], [{section}.mode.<name>] or \
+                     [{section}.url.\"<address>\"])"
                 )),
+                (key, value) => reader.entry(&mut global, &head, key, value, when(None)),
             }
         }
-        let ops = (global.into_iter().map(|b| (Target::Everywhere, b)))
-            .chain(page.into_iter().map(|b| (Target::Modes, b)))
-            .chain(location.into_iter().map(|b| (Target::Line, b)))
-            .chain(sites.into_iter().map(|b| (Target::Modes, b)));
-        Self { ops: ops.collect() }
+        let mut ops = Vec::new();
+        ops.extend(global.into_iter().map(|e| (Target::Everywhere, e)));
+        ops.extend(page.into_iter().map(|e| (Target::Modes, e)));
+        ops.extend(location.into_iter().map(|e| (Target::Line, e)));
+        for (name, list) in modes {
+            ops.extend(list.into_iter().map(|e| (Target::Mode(name.clone()), e)));
+        }
+        ops.extend(sites.into_iter().map(|e| (Target::Modes, e)));
+        for (name, list) in mode_sites {
+            ops.extend(list.into_iter().map(|e| (Target::Mode(name.clone()), e)));
+        }
+        Self { ops }
     }
 
-    /// The bindings `settings` describes: one key table, or `[tui.keys]` over `[keys]`, the
-    /// terminal's applying in the terminal only.
-    fn from_settings(settings: &Table) -> Self {
-        let mut problems = Vec::new();
-        let bindings = match layered(settings) {
-            Some([tui, user]) => {
-                let mut all = Self::from_table(user, "keys", &CommandSet::ANY, &mut problems);
-                let tui = Self::from_table(tui, "tui.keys", &CommandSet::ANY, &mut problems);
-                all.ops
-                    .extend(tui.ops.into_iter().map(|(target, mut binding)| {
-                        binding.when.frontend = Some(Frontend::Terminal);
-                        (target, binding)
-                    }));
-                all
-            }
-            None => Self::from_table(settings, "keys", &CommandSet::ANY, &mut problems),
-        };
-        // Each layer was checked when the configuration loaded.
-        debug_assert!(problems.is_empty(), "{problems:?}");
-        bindings
-    }
-
-    /// Binds each entry in `keys`, in order.
-    pub(crate) fn apply(&self, keys: &mut Keys) {
-        for (target, binding) in &self.ops {
-            if matches!(target, Target::Everywhere | Target::Line) {
-                sighurt_api::keymap::bind(&mut keys.line, binding.clone());
-            }
-            if matches!(target, Target::Everywhere | Target::Modes) {
-                for mode in &mut keys.modes {
-                    sighurt_api::keymap::bind(&mut mode.bindings, binding.clone());
+    /// Binds and unbinds each entry in `keys`, in order. A mode `keys` has none of is a
+    /// problem.
+    pub(crate) fn apply(&self, keys: &mut Keys, problems: &mut Vec<String>) {
+        for (target, entry) in &self.ops {
+            let apply = |bindings: &mut Vec<Binding>| match &entry.action {
+                Some(action) => sighurt_api::keymap::bind(
+                    bindings,
+                    Binding {
+                        keys: entry.keys.clone(),
+                        when: entry.when.clone(),
+                        action: action.clone(),
+                    },
+                ),
+                None => {
+                    sighurt_api::keymap::unbind(bindings, entry.keys.clone(), entry.when.clone())
                 }
+            };
+            match target {
+                Target::Line => apply(&mut keys.line),
+                Target::Everywhere => {
+                    apply(&mut keys.line);
+                    keys.modes
+                        .iter_mut()
+                        .for_each(|mode| apply(&mut mode.bindings));
+                }
+                Target::Modes => keys
+                    .modes
+                    .iter_mut()
+                    .for_each(|mode| apply(&mut mode.bindings)),
+                Target::Mode(name) => match keys.modes.iter_mut().find(|m| m.name == *name) {
+                    Some(mode) => apply(&mut mode.bindings),
+                    None => {
+                        let names: Vec<&str> = keys.modes.iter().map(|m| m.name.as_str()).collect();
+                        let problem = format!(
+                            "[keys.mode.{name}]: there is no mode {name:?} (the modes are {})",
+                            names.join(", ")
+                        );
+                        if !problems.contains(&problem) {
+                            problems.push(problem);
+                        }
+                    }
+                },
             }
         }
     }
 }
 
-/// The two layers, when `settings` is the table [`combine`] builds for them.
-fn layered(settings: &Table) -> Option<[&Table; 2]> {
-    if settings.len() != 2 {
-        return None;
-    }
-    Some([
-        settings.get(LAYER_TUI)?.as_table()?,
-        settings.get(LAYER_USER)?.as_table()?,
-    ])
+/// What reading a key table needs at hand.
+struct Reader<'a, 'p> {
+    commands: &'a CommandSet<'a>,
+    frontend: Option<Frontend>,
+    problems: &'p mut Vec<String>,
 }
 
-/// `[<section>.url]`: a table of key bindings per address pattern, at most [`MAX_SITES`], no
-/// two with the same pattern.
-fn read_sites(
-    table: &Table,
-    section: &str,
-    commands: &CommandSet<'_>,
-    problems: &mut Vec<String>,
-) -> Vec<Binding> {
-    if table.len() > MAX_SITES {
-        problems.push(format!(
-            "[{section}.url] has {} addresses; at most {MAX_SITES}",
-            table.len()
-        ));
-    }
-    let mut patterns: Vec<UrlPattern> = Vec::new();
-    let mut found = Vec::new();
-    for (text, value) in table {
-        let head = format!("[{section}.url.{text:?}]");
-        let pattern = match text.parse::<UrlPattern>() {
-            Ok(pattern) => pattern,
-            Err(error) => {
-                problems.push(format!("{head}: {error}"));
+impl Reader<'_, '_> {
+    /// `[<section>]`: a table of key tables per address pattern, at most [`MAX_SITES`], no two
+    /// with the same pattern.
+    fn sites(&mut self, table: &Table, section: &str) -> Vec<Entry> {
+        if table.len() > MAX_SITES {
+            self.problems.push(format!(
+                "[{section}] has {} addresses; at most {MAX_SITES}",
+                table.len()
+            ));
+        }
+        let mut patterns: Vec<UrlPattern> = Vec::new();
+        let mut found = Vec::new();
+        for (text, value) in table {
+            let head = format!("[{section}.{text:?}]");
+            let pattern = match text.parse::<UrlPattern>() {
+                Ok(pattern) => pattern,
+                Err(error) => {
+                    self.problems.push(format!("{head}: {error}"));
+                    continue;
+                }
+            };
+            if patterns.contains(&pattern) {
+                self.problems.push(format!(
+                    "{head}: another [{section}] table has the same address pattern ({pattern})"
+                ));
                 continue;
             }
-        };
-        if patterns.contains(&pattern) {
-            problems.push(format!(
-                "{head}: another [{section}.url] table has the same address pattern ({pattern})"
-            ));
-            continue;
-        }
-        patterns.push(pattern.clone());
-        let Some(keys) = value.as_table() else {
-            problems.push(format!(
-                "[{section}.url] {text:?}: expected a table of keys, written {head}"
-            ));
-            continue;
-        };
-        let mut list = Vec::new();
-        for (key, value) in keys {
-            match value.as_str() {
-                Some(command) => add(
-                    &mut list,
-                    &head,
-                    key,
-                    command,
-                    Some(&pattern),
-                    commands,
-                    problems,
-                ),
-                None => problems.push(format!("{head} {key:?}: expected a command in quotes")),
+            patterns.push(pattern.clone());
+            let Some(keys) = value.as_table() else {
+                self.problems.push(format!(
+                    "[{section}] {text:?}: expected a table of keys, written {head}"
+                ));
+                continue;
+            };
+            let when = When {
+                frontend: self.frontend,
+                url: Some(pattern),
+                field: None,
+            };
+            let mut list = Vec::new();
+            for (key, value) in keys {
+                self.entry(&mut list, &head, key, value, when.clone());
             }
+            found.extend(list);
         }
-        found.extend(list);
+        found
     }
-    found
-}
 
-/// Parses one binding into `list`, for the addresses `url` matches, or says what is wrong with
-/// it.
-fn add(
-    list: &mut Vec<Binding>,
-    section: &str,
-    text: &str,
-    command: &str,
-    url: Option<&UrlPattern>,
-    commands: &CommandSet<'_>,
-    problems: &mut Vec<String>,
-) {
-    let chord = match text.parse::<Chord>() {
-        Ok(chord) => chord,
-        Err(error) => return problems.push(format!("{section} {text:?}: {error}")),
-    };
-    let command = match commands.parse(command) {
-        Ok(command) => command,
-        Err(error) => return problems.push(format!("{section} {text:?} = {command:?}: {error}")),
-    };
-    let keys = KeySeq::from(chord.clone());
-    if let Some(same) = list.iter().find(|binding| binding.keys == keys) {
-        return problems.push(format!(
-            "{section} {text:?} and {:?} are the same keystroke ({chord})",
-            same.keys.to_string()
-        ));
+    /// Reads one entry into `list`, or says what is wrong with it.
+    fn entry(
+        &mut self,
+        list: &mut Vec<Entry>,
+        section: &str,
+        text: &str,
+        value: &Value,
+        when: When,
+    ) {
+        let keys = match text.parse::<KeySeq>() {
+            Ok(keys) => keys,
+            Err(error) => return self.problems.push(format!("{section} {text:?}: {error}")),
+        };
+        let action = match value {
+            Value::String(command) => match self.commands.parse(command) {
+                Ok(command) => Some(Action::Run(vec![command])),
+                Err(error) => {
+                    return self
+                        .problems
+                        .push(format!("{section} {text:?} = {command:?}: {error}"))
+                }
+            },
+            Value::Boolean(false) => None,
+            _ => {
+                return self.problems.push(format!(
+                    "{section} {text:?}: expected a command in quotes, or false to unbind the key"
+                ))
+            }
+        };
+        if let Some(same) = list.iter().find(|entry| entry.keys == keys) {
+            let chords: Vec<String> = keys.chords().iter().map(ToString::to_string).collect();
+            let what = match chords.len() {
+                1 => "keystroke",
+                _ => "keys",
+            };
+            return self.problems.push(format!(
+                "{section} {text:?} and {:?} are the same {what} ({})",
+                same.keys.to_string(),
+                chords.join(" ")
+            ));
+        }
+        let start = list
+            .iter()
+            .find(|entry| entry.keys.starts_with(&keys) || keys.starts_with(&entry.keys));
+        if let Some(other) = start {
+            let (short, long) = match keys.chords().len() < other.keys.chords().len() {
+                true => (text.to_owned(), other.keys.to_string()),
+                false => (other.keys.to_string(), text.to_owned()),
+            };
+            return self.problems.push(format!(
+                "{section} {short:?} is the start of {long:?}: one table can't bind both"
+            ));
+        }
+        list.push(Entry { keys, when, action });
     }
-    list.push(Binding {
-        keys: text.parse().expect("one keystroke is a sequence"),
-        when: When {
-            url: url.cloned(),
-            ..When::default()
-        },
-        action: Action::Run(vec![command]),
-    });
 }
 
 /// A table of the engine's [`Keys`]: the line's, or a mode's by its index.
@@ -703,7 +682,11 @@ impl Configured {
 impl Keymap for Configured {
     fn configure(&mut self, settings: &Table) {
         let mut keys = self.base.clone();
-        Tables::from_settings(settings).apply(&mut keys);
+        let mut problems = Vec::new();
+        let tables = Tables::from_table(settings, "keys", &CommandSet::ANY, None, &mut problems);
+        tables.apply(&mut keys, &mut problems);
+        // Its table was checked when the configuration loaded.
+        debug_assert!(problems.is_empty(), "{problems:?}");
         self.engine.configure(keys);
     }
 
@@ -779,73 +762,29 @@ pub(crate) enum KeyOutcome {
     Deliver,
 }
 
-/// What reads the keys: the engine, for a keymap that is a [`Keys`] value
-/// (`Keymap::keys`), or a keymap of its own behind the trait.
-#[allow(clippy::large_enum_variant)] // One per browser.
-enum Reader {
-    Engine(Engine),
-    Keymap(Box<dyn Keymap>),
-}
-
-/// The reader a keymap of `kind` configured with `settings` comes to.
-fn reader(kind: KeymapKind, settings: &Table) -> Reader {
-    let mut keymap = (kind.new)();
-    keymap.configure(settings);
-    match keymap.keys() {
-        Some(keys) => Reader::Engine(Engine::new(keys)),
-        None => Reader::Keymap(keymap),
-    }
-}
-
-/// The keymap in use, and the presses taken whose releases the core owes nobody, per seat.
+/// The key engine, and the presses taken whose releases the core owes nobody, per seat.
+#[derive(Debug)]
 pub(crate) struct KeyState {
-    kind: KeymapKind,
-    reader: Reader,
-    /// The context the keymap was last told of.
+    engine: Engine,
+    /// The context the engine was last told of.
     context: Option<KeyContext>,
     taken: HashSet<(SeatId, KeyCode)>,
 }
 
-impl fmt::Debug for KeyState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KeyState")
-            .field("keymap", &self.kind)
-            .field("context", &self.context)
-            .field("taken", &self.taken)
-            .finish()
-    }
-}
-
 impl KeyState {
-    /// A new keymap of `kind`, configured with `settings`.
-    pub(crate) fn new(kind: KeymapKind, settings: &Table) -> Self {
+    /// The engine for `keys`, in their initial mode.
+    pub(crate) fn new(keys: Keys) -> Self {
         Self {
-            kind,
-            reader: reader(kind, settings),
+            engine: Engine::new(keys),
             context: None,
             taken: HashSet::new(),
         }
     }
 
-    /// Applies a reloaded configuration: a keymap of the same kind is configured again and
-    /// keeps its state (the engine its mode, if the new keys have it); another kind replaces
-    /// it. Taken presses stay taken either way.
-    pub(crate) fn configure(&mut self, kind: KeymapKind, settings: &Table) {
-        if kind != self.kind {
-            self.kind = kind;
-            self.reader = reader(kind, settings);
-            self.context = None;
-            return;
-        }
-        if let Reader::Keymap(keymap) = &mut self.reader {
-            return keymap.configure(settings);
-        }
-        match (&mut self.reader, reader(kind, settings)) {
-            (Reader::Engine(engine), Reader::Engine(fresh)) => {
-                engine.configure(fresh.keys().clone())
-            }
-            (reader, fresh) => *reader = fresh,
-        }
+    /// Takes reloaded keys into use: the mode stays if they have it (`Engine::configure`).
+    /// Taken presses stay taken.
+    pub(crate) fn configure(&mut self, keys: Keys) {
+        self.engine.configure(keys);
     }
 
     /// Decides what happens to `event`, a key event from `seat` in `context`. `browser` is what
@@ -868,16 +807,7 @@ impl KeyState {
             }
             // A repeat of a press that was taken may run again, but never passes.
             ButtonState::Pressed if event.repeat => {
-                let commands = match &mut self.reader {
-                    Reader::Engine(engine) => engine.repeat(event, context, browser),
-                    Reader::Keymap(keymap) => match keymap.press(event, context, browser) {
-                        KeyAction::Run(command) | KeyAction::RunThenPass(command) => {
-                            Some(vec![command])
-                        }
-                        KeyAction::RunAll(commands) => Some(commands),
-                        KeyAction::Pass | KeyAction::Take => None,
-                    },
-                };
+                let commands = self.engine.repeat(event, context, browser);
                 return match commands.filter(|commands| !commands.is_empty()) {
                     Some(commands) => KeyOutcome::Run {
                         commands,
@@ -888,19 +818,7 @@ impl KeyState {
             }
             ButtonState::Pressed => {}
         }
-        let outcome = match &mut self.reader {
-            Reader::Engine(engine) => engine.press(event, context, browser),
-            Reader::Keymap(keymap) => match keymap.press(event, context, browser) {
-                KeyAction::Pass => Outcome::pass(),
-                KeyAction::Take => Outcome::take(),
-                KeyAction::Run(command) => Outcome::run(vec![command]),
-                KeyAction::RunThenPass(command) => Outcome {
-                    commands: vec![command],
-                    pass: true,
-                },
-                KeyAction::RunAll(commands) => Outcome::run(commands),
-            },
-        };
+        let outcome = self.engine.press(event, context, browser);
         match outcome.pass {
             true => _ = self.taken.remove(&key),
             false => _ = self.taken.insert(key),
@@ -922,22 +840,16 @@ impl KeyState {
     }
 
     /// `input.mode <name>`: switches the engine's mode. `false`, changing nothing, when there
-    /// is no such mode (or the keymap is not the engine's).
+    /// is no such mode.
     pub(crate) fn set_mode(&mut self, name: &str) -> bool {
-        match &mut self.reader {
-            Reader::Engine(engine) => engine.set_mode(name),
-            Reader::Keymap(_) => false,
-        }
+        self.engine.set_mode(name)
     }
 
     /// Tells the keymap the context, if it changed since it was last told.
     pub(crate) fn set_context(&mut self, context: KeyContext) {
         if self.context != Some(context) {
             self.context = Some(context);
-            match &mut self.reader {
-                Reader::Engine(engine) => engine.context_changed(),
-                Reader::Keymap(keymap) => keymap.context(context),
-            }
+            self.engine.context_changed();
         }
     }
 
@@ -945,34 +857,22 @@ impl KeyState {
     /// drops what it waits for.
     pub(crate) fn forget(&mut self, seat: SeatId) {
         self.taken.retain(|(held, _)| *held != seat);
-        match &mut self.reader {
-            Reader::Engine(engine) => engine.reset(),
-            Reader::Keymap(keymap) => keymap.reset(),
-        }
+        self.engine.reset();
     }
 
     /// What the keymap says about itself, for the chrome.
     pub(crate) fn indicator(&self) -> Option<&str> {
-        match &self.reader {
-            Reader::Engine(engine) => engine.indicator(),
-            Reader::Keymap(keymap) => keymap.indicator(),
-        }
+        self.engine.indicator()
     }
 
     /// Whether the keymap lets text that is not a key press reach the page now.
     pub(crate) fn page_takes_text(&self) -> bool {
-        match &self.reader {
-            Reader::Engine(engine) => engine.page_text(),
-            Reader::Keymap(keymap) => keymap.page_takes_text(),
-        }
+        self.engine.page_text()
     }
 
-    /// The keymap's bindings in `frontend` ([`Keymap::describe`]).
+    /// The engine's bindings in `frontend` (`Keys::describe`).
     pub(crate) fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
-        match &self.reader {
-            Reader::Engine(engine) => engine.describe(frontend),
-            Reader::Keymap(keymap) => keymap.describe(frontend),
-        }
+        self.engine.describe(frontend)
     }
 }
 
@@ -1025,21 +925,85 @@ mod tests {
         table
     }
 
+    /// `[keys]` written as `text`, read over no experience: the keys, or every problem.
     fn bindings(text: &str) -> Result<Bindings, Vec<String>> {
         let mut problems = Vec::new();
         let commands = CommandSet::new("standard", &[]);
-        let read = Tables::from_table(&table(text), "keys", &commands, &mut problems);
-        let mut keys = Keys::plain();
-        read.apply(&mut keys);
+        let read = Tables::from_table(&table(text), "keys", &commands, None, &mut problems);
         let mut bindings = Bindings::default();
-        bindings.keymap.engine.configure(keys);
+        read.apply(&mut bindings.keys, &mut problems);
         problems.is_empty().then_some(bindings).ok_or(problems)
     }
 
+    /// `[tui.keys]` and `[keys]` together, as one value for [`Bindings::configure`].
+    fn combine(tui: Table, user: Table) -> (Table, Table) {
+        (tui, user)
+    }
+
+    /// What these tests drive: `Keys::plain` with key tables applied over it, as
+    /// `[input] keymap = "bindings"` makes it, looked up as the engine looks keys up.
+    #[derive(Debug, PartialEq)]
+    struct Bindings {
+        keys: Keys,
+        /// Whether a `[tui.keys]` layer was read: lookups are in the terminal.
+        terminal: bool,
+    }
+
+    impl Default for Bindings {
+        fn default() -> Self {
+            Self {
+                keys: Keys::plain(),
+                terminal: false,
+            }
+        }
+    }
+
+    /// A key table, or `[tui.keys]` with `[keys]`.
+    trait Layers {
+        fn layers(&self) -> (Option<&Table>, &Table);
+    }
+
+    impl Layers for Table {
+        fn layers(&self) -> (Option<&Table>, &Table) {
+            (None, self)
+        }
+    }
+
+    impl Layers for (Table, Table) {
+        fn layers(&self) -> (Option<&Table>, &Table) {
+            (Some(&self.0), &self.1)
+        }
+    }
+
     impl Bindings {
+        fn configure(&mut self, settings: &impl Layers) {
+            let (tui, user) = settings.layers();
+            let mut problems = Vec::new();
+            let mut keys = Keys::plain();
+            Tables::from_table(user, "keys", &CommandSet::ANY, None, &mut problems)
+                .apply(&mut keys, &mut problems);
+            if let Some(tui) = tui {
+                let terminal = Some(Frontend::Terminal);
+                Tables::from_table(tui, "tui.keys", &CommandSet::ANY, terminal, &mut problems)
+                    .apply(&mut keys, &mut problems);
+            }
+            assert_eq!(problems, Vec::<String>::new());
+            self.keys = keys;
+            self.terminal = tui.is_some();
+        }
+
+        /// What `event` comes to, pressed afresh with the page's keyboard.
+        fn press(&self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> Outcome {
+            Engine::new(self.keys.clone()).press(key, context, browser)
+        }
+
+        fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
+            self.keys.describe(frontend)
+        }
+
         /// What `event` runs while `focus` has the keyboard, typing or not, on `address`, as
-        /// the engine looks it up (`Keys::resolve`): in the terminal when the table has a
-        /// `[tui.keys]` layer. The `bindings` keymap's own matcher had this interface.
+        /// the engine looks it up (`Keys::resolve`): in the terminal when a `[tui.keys]` layer
+        /// was read. The `bindings` keymap's own matcher had this interface.
         fn find(
             &self,
             focus: KeyboardFocus,
@@ -1047,7 +1011,6 @@ mod tests {
             address: Option<&str>,
             event: &KeyEvent,
         ) -> Option<&Command> {
-            let keys = self.keymap.engine.keys();
             let table = match focus {
                 KeyboardFocus::Chrome => KeyTable::Line,
                 KeyboardFocus::Page => KeyTable::Mode(sighurt_api::keymap::PLAIN_MODE),
@@ -1060,7 +1023,10 @@ mod tests {
                 context: KeyContext::new(focus, typing),
                 address,
             };
-            match keys.resolve(table, std::slice::from_ref(event), &situation) {
+            match self
+                .keys
+                .resolve(table, std::slice::from_ref(event), &situation)
+            {
                 Found::Complete(Binding {
                     action: Action::Run(commands),
                     ..
@@ -1070,10 +1036,9 @@ mod tests {
         }
     }
 
-    /// The `bindings` keymap with `[keys]` written as `text`.
+    /// The key state with `[keys]` written as `text`.
     fn keys(text: &str) -> KeyState {
-        assert!(bindings(text).is_ok());
-        KeyState::new(KIND, &table(text))
+        KeyState::new(bindings(text).unwrap().keys)
     }
 
     const PAGE: KeyContext = KeyContext::new(KeyboardFocus::Page, false);
@@ -1166,6 +1131,7 @@ mod tests {
             "ctrl-T" = "tab.new"
             "ctrl-shift-t" = "tab.close"
             "g g" = "location.focus"
+            "g" = "tab.next"
             "ctrl-q" = "chrome.toggle-tabs"
             "x" = 1
             [sidebar]
@@ -1176,7 +1142,9 @@ mod tests {
         let expected = [
             "unknown command \"tab.nwe\"",
             "are the same keystroke",
-            "not supported",
+            // Sequences are keys since the key engine (experience-2026-11-15.md, §1.5); in one
+            // table a key can't be the start of another.
+            "\"g\" is the start of \"g g\"",
             "the standard chrome has no command chrome.toggle-tabs",
             "expected a command",
             "unknown context",
@@ -1283,7 +1251,7 @@ mod tests {
         let at = |url| UrlBrowser { url, link: None };
         assert_eq!(
             keymap.press(&ctrl_escape, PAGE, &at(Some("sig://terminal"))),
-            KeyAction::Run(Command::PageBack)
+            Outcome::run(vec![Command::PageBack])
         );
         for browser in [
             at(Some("https://example.com/")),
@@ -1293,7 +1261,7 @@ mod tests {
                 link: Some("sig://terminal"),
             },
         ] {
-            assert_eq!(keymap.press(&ctrl_escape, PAGE, &browser), KeyAction::Pass);
+            assert_eq!(keymap.press(&ctrl_escape, PAGE, &browser), Outcome::pass());
         }
         // Listed with its address.
         assert_eq!(
@@ -1401,7 +1369,7 @@ mod tests {
         let ctrl_q = press(KEY_Q, character("q"), CTRL, NONE);
         assert_eq!(
             keymap.press(&ctrl_q, PAGE, &NoneBrowser),
-            KeyAction::Run(Command::BrowserQuit)
+            Outcome::run(vec![Command::BrowserQuit])
         );
         assert_eq!(
             keymap.press(
@@ -1409,7 +1377,7 @@ mod tests {
                 PAGE,
                 &NoneBrowser
             ),
-            KeyAction::Pass
+            Outcome::pass()
         );
     }
 
@@ -1508,31 +1476,20 @@ mod tests {
         );
     }
 
-    /// A keymap with no table: `a` runs two commands, `e` runs none.
-    struct Fixed;
-
-    impl Keymap for Fixed {
-        fn configure(&mut self, _: &Table) {}
-
-        fn press(&mut self, key: &KeyEvent, _: KeyContext, _: &dyn Browser) -> KeyAction {
-            match &key.key {
-                Key::Character(text) if text == "a" => {
-                    KeyAction::RunAll(vec![Command::TabNew(None), Command::PageReload])
-                }
-                Key::Character(text) if text == "e" => KeyAction::RunAll(Vec::new()),
-                _ => KeyAction::Pass,
-            }
-        }
-    }
-
     #[test]
     fn run_all_runs_again_on_repeat_and_an_empty_one_is_taken() {
-        let kind = KeymapKind {
-            name: "fixed",
-            check: |_, _| Vec::new(),
-            new: || Box::new(Fixed),
+        // `a` runs two commands, `e` runs none.
+        let mut fixed = Keys::plain();
+        let run = |keys: &str, commands: Vec<Command>| Binding {
+            keys: keys.parse().unwrap(),
+            when: When::default(),
+            action: Action::Run(commands),
         };
-        let mut keys = KeyState::new(kind, &Table::new());
+        fixed.modes[0].bindings = vec![
+            run("a", vec![Command::TabNew(None), Command::PageReload]),
+            run("e", Vec::new()),
+        ];
+        let mut keys = KeyState::new(fixed);
         let seat = SeatId::next();
         let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser);
         let commands = vec![Command::TabNew(None), Command::PageReload];

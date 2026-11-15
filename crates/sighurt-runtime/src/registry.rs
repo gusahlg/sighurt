@@ -21,8 +21,9 @@
 //! configuration that enables it, then logs through that one. The frontend's start function
 //! calls [`claim_logger`] and, when it wins, Servo's `setup_logging`.
 //!
-//! The keymaps of the build are listed here ([`KEYMAPS`]), as engines are: compiled in, chosen
-//! by `[input] keymap`. Chromes are the frontend's.
+//! The experience compiled into the build (`sighurt-config-example`) is taken apart here
+//! ([`experience`]): its keys go to the core in its [`Environment`], checked whole, and an
+//! experience with any problem is not used. Chromes are the frontend's.
 //!
 //! What each engine supports, and which settings of `[engines.<name>]` it honors, is the
 //! build's [`crate::engines::descriptors`], so every frontend's [`Environment`] says the same
@@ -45,8 +46,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use sighurt_api::commands::CommandSet;
 use sighurt_api::engine::{EngineCapabilities, EngineRuntime, EngineWaker, PumpStatus};
-use sighurt_api::keymap::KeymapKind;
+use sighurt_api::keymap::Keys;
 use sighurt_core::config::{Config, EngineSettings};
 use sighurt_core::{ChromeChecks, Environment, Frontend};
 use tempfile::TempDir;
@@ -209,9 +211,25 @@ pub fn claim_logger() -> bool {
     LOGGER.swap(true, Ordering::SeqCst)
 }
 
-/// The keymaps compiled into this build besides the core's own `bindings`: the example
-/// configuration, which the built-in configuration selects.
-pub const KEYMAPS: &[KeymapKind] = &[sighurt_config_example::KIND];
+/// The experience's keys, as the core gets them ([`Environment::keys`]), and what `sig` says
+/// about them ([`Environment::notices`]). Keys with any problem `Keys::check` finds on its own
+/// (bounds, modes, a mode switch to no mode, a binding that starts another) are not used at all:
+/// none are, with a notice naming the problems. What depends on the configuration file (its
+/// `[commands]`, its chrome) is checked when the file loads.
+pub fn experience() -> (Keys, Vec<String>) {
+    let keys = sighurt_config_example::keys();
+    let problems = keys.check(&CommandSet::ANY, Frontend::Gui);
+    match problems.is_empty() {
+        true => (keys, Vec::new()),
+        false => (
+            Keys::plain(),
+            vec![format!(
+                "The configuration compiled into sig has problems, so its keys are not used: {}",
+                problems.join("; ")
+            )],
+        ),
+    }
+}
 
 /// What a runtime is started with.
 // Only the Wasm engine needs a scratch directory, and the demo engine reads nothing.
@@ -405,7 +423,7 @@ impl<T: 'static, P: 'static> Registry<T, P> {
     }
 
     /// What the core checks configurations against: the build's engines, with what each
-    /// supports and which settings it honors, its keymaps, and the chromes and color names the
+    /// supports and which settings it honors, the experience's keys, and the chromes and color names the
     /// frontend passes.
     pub fn environment(
         &self,
@@ -418,6 +436,7 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             .map(|desc| desc.name.to_owned())
             .collect();
         let engines = self.engines.iter();
+        let (keys, notices) = experience();
         Environment {
             engines: engines
                 .clone()
@@ -426,7 +445,8 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             web_engines,
             engine_settings: engines.map(|e| (e.name.into(), e.honors)).collect(),
             home_dir: dirs::home_dir(),
-            keymaps: KEYMAPS.to_vec(),
+            keys,
+            notices,
             chromes,
             color_names,
             renderers: sighurt_core::config::RENDERERS,
@@ -820,11 +840,17 @@ mod tests {
     }
 
     #[test]
-    fn keymaps_follow_the_build() {
+    fn the_experience_follows_the_build() {
         let registry = Registry::<(), ()>::new(Vec::new());
         let env = registry.environment(Vec::new(), &[]);
         assert!(env.engines.is_empty());
-        assert_eq!(env.keymaps, KEYMAPS.to_vec());
+        // Equal but for the custom actions, which are new functions on every call.
+        let described = |keys: &Keys| keys.describe(Frontend::Gui);
+        assert_eq!(
+            described(&env.keys),
+            described(&sighurt_config_example::keys())
+        );
+        assert!(env.notices.is_empty(), "{:?}", env.notices);
         assert!(env.chromes.is_empty());
     }
 

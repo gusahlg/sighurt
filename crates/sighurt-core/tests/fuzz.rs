@@ -17,15 +17,29 @@ use sighurt_api::ids::SeatId;
 use sighurt_api::input::{
     ButtonState, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers,
 };
-use sighurt_api::keymap::KeymapKind;
 use sighurt_core::config::{Config, DEFAULT_CONFIG, RENDERERS};
 use sighurt_core::session::{Session, SessionSegment, SessionTab, MAX_TABS, VERSION};
 use sighurt_core::tabs::{MAX_TEXT, MAX_URL};
 use sighurt_core::{
-    keys, router, update, BrowserEvent, BrowserState, ChromeChecks, Environment, OpenRequest,
+    router, update, BrowserEvent, BrowserState, ChromeChecks, Environment, OpenRequest,
 };
 
 const LIMIT: Duration = Duration::from_secs(2);
+
+/// An experience with the two modes the default file's examples name.
+fn experience() -> sighurt_api::keymap::Keys {
+    use sighurt_api::keymap::{Fallback, Keys, Mode};
+    Keys {
+        modes: vec![
+            Mode::new("normal")
+                .page_text(false)
+                .unmatched(Fallback::Take),
+            Mode::new("insert"),
+        ],
+        initial: "normal".into(),
+        line: Vec::new(),
+    }
+}
 
 const COLORS: [&str; 11] = [
     "bg",
@@ -67,10 +81,7 @@ fn env() -> Environment {
         engines: engines.into(),
         engine_settings: settings.map(|(e, s)| (e.to_owned(), s)).into(),
         home_dir: Some("/home/me".into()),
-        keymaps: vec![KeymapKind {
-            name: "example",
-            ..keys::KIND
-        }],
+        keys: experience(),
         chromes: vec![ChromeChecks {
             name: "standard",
             check: |table| {

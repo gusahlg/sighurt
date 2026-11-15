@@ -44,7 +44,6 @@ fn environment() -> Environment {
         ]
         .map(|(name, grants)| (name.to_owned(), grants))
         .into(),
-        keymaps: vec![modes::KIND],
         ..Environment::default()
     }
 }
@@ -54,8 +53,7 @@ fn environment() -> Environment {
 /// (docs/rewrite/experience-2026-11-15.md, §1.1 and §1.2).
 mod modes {
     use sighurt_api::commands::Command;
-    use sighurt_api::keymap::{Action, Binding, Fallback, KeymapKind, Keys, Mode, When};
-    use sighurt_core::keys::Configured;
+    use sighurt_api::keymap::{Action, Binding, Fallback, Keys, Mode, When};
 
     fn bind(keys: &str, action: Action) -> Binding {
         Binding {
@@ -117,12 +115,6 @@ mod modes {
             line: vec![bind("f6", run(&["input.mode insert"]))],
         }
     }
-
-    pub const KIND: KeymapKind = KeymapKind {
-        name: "modes",
-        check: |_, _| Vec::new(),
-        new: || Box::new(Configured::new(keys())),
-    };
 }
 
 struct Harness {
@@ -146,8 +138,25 @@ impl Harness {
         }
     }
 
+    /// A build whose experience is `modes`, started on `urls`.
+    fn start_modes(urls: &[&str]) -> Self {
+        let env = Environment {
+            keys: modes::keys(),
+            ..environment()
+        };
+        let mut harness = Self::with("", env);
+        harness.open(urls);
+        harness
+    }
+
     fn start(config: &str, urls: &[&str]) -> Self {
         let mut harness = Self::new(config);
+        harness.open(urls);
+        harness
+    }
+
+    fn open(&mut self, urls: &[&str]) {
+        let harness = self;
         harness.apply(BrowserEvent::Start {
             session: None,
             open: urls
@@ -158,7 +167,6 @@ impl Harness {
                 })
                 .collect(),
         });
-        harness
     }
 
     /// Applies `event` and everything the fake engines answer, returning every effect.
@@ -1482,7 +1490,6 @@ fn a_click_in_home_takes_it_after_it_came_to_the_front_by_itself() {
 
 // ── Modes as commands (docs/rewrite/experience-2026-11-15.md, §1.1, §1.2) ────────────────────
 
-const MODES: &str = "[input]\nkeymap = \"modes\"";
 const ESCAPE: (u32, &str) = (1, "Escape");
 
 /// `key` pressed and released on `seat`; the press's effects.
@@ -1496,7 +1503,7 @@ fn tap(h: &mut Harness, seat: SeatId, key: (u32, &str)) -> Vec<Effect> {
 fn a_mode_switch_alone_gives_a_held_page_no_typing() {
     // Review finding 1: a page closes its tab, and the tab behind it comes to the front by
     // itself. Escape switches to insert, as `KeyAction::Take` did, and keeps the hold.
-    let mut h = Harness::start(MODES, &["https://a.test/"]);
+    let mut h = Harness::start_modes(&["https://a.test/"]);
     let (first, popup) = popup_in_front(&mut h);
     popup_closes(&mut h, popup);
     assert_eq!(h.shown(), first);
@@ -1517,7 +1524,7 @@ fn a_mode_switch_alone_gives_a_held_page_no_typing() {
 #[test]
 fn input_mode_runs_in_its_place_and_drops_an_unfinished_sequence() {
     // Review finding 7.
-    let mut h = Harness::start(MODES, &["https://a.test/"]);
+    let mut h = Harness::start_modes(&["https://a.test/"]);
     let view = h.shown();
     let seat = SeatId::next();
     // resize, then normal, in one list: normal.
@@ -1562,7 +1569,7 @@ fn input_mode_runs_in_its_place_and_drops_an_unfinished_sequence() {
 fn a_held_mode_switch_never_runs_again() {
     // Review finding 3: a mode switch is held quietly, so a mouse command's mode change is not
     // undone by the key still held.
-    let mut h = Harness::start(MODES, &["https://a.test/"]);
+    let mut h = Harness::start_modes(&["https://a.test/"]);
     let seat = SeatId::next();
     h.key(seat, (65, "F7"), ButtonState::Pressed, false);
     assert_eq!(h.state.keymap_indicator(), Some("RESIZE"));
@@ -1579,7 +1586,7 @@ fn a_key_that_passes_after_its_commands_lands_as_the_same_press() {
     // Review finding 6: F2 selects the configuration page, then passes. Enter-like keys reach
     // the page they land in as the press they were, never as a fresh press made there, so it
     // starts no program; its release follows it.
-    let mut h = Harness::start(MODES, &["https://a.test/", "sig://config"]);
+    let mut h = Harness::start_modes(&["https://a.test/", "sig://config"]);
     h.command("tab.select 2");
     let view = h.shown();
     h.command("tab.select 1");
@@ -1602,7 +1609,7 @@ fn a_key_that_passes_after_its_commands_lands_as_the_same_press() {
 fn a_sequence_belongs_to_the_tab_and_address_it_began_on() {
     // Review finding 5: `g` on a.test starts `g x`; with b.test selected since, `z` does not
     // complete b.test's `g z`, which did not apply when `g` was pressed.
-    let mut h = Harness::start(MODES, &["https://a.test/", "https://b.test/"]);
+    let mut h = Harness::start_modes(&["https://a.test/", "https://b.test/"]);
     h.command("tab.select 1");
     let seat = SeatId::next();
     tap(&mut h, seat, (34, "g"));
