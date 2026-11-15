@@ -292,6 +292,15 @@ impl DocumentEventHandler {
         !self.pending_input_events.borrow().is_empty()
     }
 
+    /// SIGHURT-PATCH: whether a pending input event is anything but a mouse move (a key, a
+    /// wheel, a button): the input whose rendering update the script thread brings forward.
+    pub(crate) fn has_pending_input_besides_mouse_moves(&self) -> bool {
+        self.pending_input_events
+            .borrow()
+            .iter()
+            .any(|event| !matches!(event.event.event, InputEvent::MouseMove(..)))
+    }
+
     pub(crate) fn alternate_action_keyboard_modifier_active(&self) -> bool {
         #[cfg(target_os = "macos")]
         {

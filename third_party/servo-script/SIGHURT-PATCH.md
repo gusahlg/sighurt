@@ -28,13 +28,18 @@ frame (scrolling, typing) was capped at 50 frames/s whatever the display's rate:
 wheel scrolling ran at 49.6 frames/s with a 20.1 ms median frame interval in a 60 Hz headless
 sway (research note `window_frontend_and_engines_latency.md`, 6 Nov 2026).
 
-- While a fully active document has pending input, the update is scheduled
-  `INPUT_RENDERING_DELAY` (4 ms) after the last one, or at once if that has passed, and a timer
-  already scheduled later (the 20 ms one) is cancelled first.
-- Without pending input the 20 ms and 30 ms delays are upstream's.
+- While a fully active document has a pending input event other than a mouse move (a key, a
+  wheel, a button; `DocumentEventHandler::has_pending_input_besides_mouse_moves`, added in
+  `dom/document/document_event_handler.rs`), the update is scheduled `INPUT_RENDERING_DELAY`
+  (4 ms) after the last one, or at once if that has passed, and a timer already scheduled later
+  (the 20 ms one) is cancelled first.
+- Otherwise, mouse moves alone included, the 20 ms and 30 ms delays are upstream's. With mouse
+  moves too, a pointer moving over an animated page cost 35 % of a core instead of 29 % at the
+  same 56 frames/s (the `css-animation` workload, 3 rounds): updates every 4 ms that no display
+  shows.
 
-Servo already coalesces pending mouse moves and wheel events, so a pointer flood makes at most
-one update per 4 ms. The host paces painting by frame callbacks, so faster updates show up only
-as far as the display allows.
+Servo coalesces pending wheel events, so a wheel flood makes at most one update per 4 ms. The
+host paces painting by frame callbacks, so faster updates show up only as far as the display
+allows.
 
 Changing this crate rebuilds servo-script and everything above it.

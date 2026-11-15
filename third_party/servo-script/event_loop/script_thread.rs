@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-/// SIGHURT-PATCH: the longest "update the rendering" waits after the last one while input is
-/// pending: 250 updates a second at most, above any display's refresh rate the host paces
-/// frames to.
+/// SIGHURT-PATCH: the longest "update the rendering" waits after the last one while a key,
+/// wheel or button event is pending: 250 updates a second at most, above any display's refresh
+/// rate the host paces frames to.
 const INPUT_RENDERING_DELAY: Duration = Duration::from_millis(4);
 
 use background_hang_monitor_api::{
@@ -1313,14 +1313,18 @@ impl ScriptThread {
         //
         // TODO: Should either of these delays be reduced to also reduce update latency?
         //
-        // SIGHURT-PATCH: pending input (wheel, keys, pointer) is processed only in "update the
-        // rendering", so the 20 ms below capped scrolling and typing at 50 frames/s on any
-        // display. With input pending, the update comes at most `INPUT_RENDERING_DELAY` after
-        // the last one, and a later timer already scheduled for another reason is brought
-        // forward. Servo coalesces pending mouse moves and wheel events, so a pointer flood
-        // still makes at most one update per that delay. Without input nothing changes.
+        // SIGHURT-PATCH: pending input is processed only in "update the rendering", so the
+        // 20 ms below capped scrolling and typing at 50 frames/s on any display. With a key,
+        // wheel or button event pending, the update comes at most `INPUT_RENDERING_DELAY`
+        // after the last one, and a later timer already scheduled for another reason is
+        // brought forward. Mouse moves alone keep upstream's delay: a moving pointer would
+        // otherwise make an update every 4 ms, more than any display shows. Servo coalesces
+        // pending wheel events, so a wheel flood still makes at most one update per that delay.
         let pending_input = self.documents.borrow().iter().any(|(_, document)| {
-            document.is_fully_active() && document.event_handler().has_pending_input_events()
+            document.is_fully_active() &&
+                document
+                    .event_handler()
+                    .has_pending_input_besides_mouse_moves()
         });
         if pending_input {
             let since_last = self
