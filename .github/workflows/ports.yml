@@ -1,0 +1,78 @@
+name: Ports
+
+# The terminal-only `sig` on macOS and Windows (docs/rewrite/PORTING.md): no window, no Servo,
+# no WPE WebKit, Ladybird or NetSurf (Linux only), and no `sig://terminal` programs. macOS
+# checks and tests it with the demo and Wasm engines; Windows checks it with the demo engine
+# (the Wasm engine needs FFmpeg, which the runner does not have) and tests only the crates
+# that have nothing platform-specific. On Windows `sig --tui` and `--dump` say the terminal is
+# unsupported there; what runs is the rest of `sig`.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (terminal only)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Wasm engine's video (ffmpeg-next) finds FFmpeg with pkg-config.
+      - name: Install system dependencies
+        run: brew install ffmpeg pkgconf
+
+      # The compiler of nix/nixpkgs.nix and of the workspace's rust-version, as in ci.yml.
+      # sig's own pages (sighurt-pages) are built for wasm32 by a nested cargo.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check sig (terminal, demo and Wasm engines)
+        run: >
+          cargo check --locked -p sighurt-browser --no-default-features
+          --features frontend-tui,engine-demo,engine-wasm
+
+      # The unit tests and tests/tui.rs (sig --tui in a pty against the demo engine); not the
+      # examples, which are the window's.
+      - name: Test sig (terminal, demo engine)
+        run: >
+          cargo test --locked -p sighurt-browser --no-default-features
+          --features frontend-tui,engine-demo --bins --tests
+
+      # Not the chromes' and renderers' tests: their golden images are drawn with Linux's fonts.
+      - name: Test the platform-neutral crates
+        run: >
+          cargo test --locked -p sighurt-api -p sighurt-core -p sighurt-config-example
+          -p sighurt-semantic
+
+  windows:
+    name: Windows (terminal only, check)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # aws-lc-sys (rustls' provider in sig) assembles with NASM on x86_64 Windows.
+      - uses: ilammy/setup-nasm@v1
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check sig (terminal, demo engine)
+        run: >
+          cargo check --locked -p sighurt-browser --no-default-features
+          --features frontend-tui,engine-demo
+
+      - name: Test the crates with nothing platform-specific
+        run: cargo test --locked -p sighurt-api -p sighurt-semantic
