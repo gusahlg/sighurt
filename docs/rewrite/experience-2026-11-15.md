@@ -150,8 +150,8 @@ events of a later part, designed when something needs it.
 ### 1.2 What the engine does with a key (`sighurt_core::keys`)
 
 The engine keeps: the tables, the current mode, an unfinished sequence with where it began
-(the table, the shown tab and its committed address), and which single-key binding the key now
-held ran (for repeats). `KeyState` keeps what it keeps today (the presses taken,
+(the table, the shown tab by its identity, `TabInfo::id`, never its place in the strip, and its
+committed address), and which single-key binding the key now held ran (for repeats). `KeyState` keeps what it keeps today (the presses taken,
 per seat) and guarantees 1 to 4 unchanged.
 
 For a fresh press:
@@ -167,10 +167,15 @@ For a fresh press:
    the *most specific* decides (§1.4): if it is complete it runs; if it is a start, the engine
    waits for the next key and shows the keys in the indicator. No timeout, ever. If none could
    be and the sequence was longer than one key, the sequence is dropped and its last key starts
-   afresh (today's rule). **A sequence belongs to where it began** (finding 5): if the table,
-   the shown tab or its committed address is not what it was at the sequence's first key, the
+   afresh (today's rule). **A sequence belongs to where it began** (finding 5): one document
+   of one tab, in one table. The core tells the engine at once when what is shown changes
+   (another tab, or another view or document in the tab: a tab closed and another in its
+   place, leaving the tab and coming back, a reload), and the sequence is dropped then; and if
+   at the next key the table, the shown tab (by identity) or its committed address (a
+   same-document navigation changes it) is not what it was at the sequence's first key, the
    sequence is dropped and this key starts afresh, so a binding that did not apply then never
-   inherits earlier keys. `input.mode`, a reload, `context` and `reset` drop it too.
+   inherits earlier keys. `input.mode`, a reload of the configuration, `context` and `reset`
+   drop it too.
 4. **No binding, or `Unbound`:** the table's `unmatched` decides (in `line` it is always
    `Pass`: every key no binding has is the line's own).
 5. **`Custom`** is called once, with the `Browser` view of the state before the press.
@@ -187,7 +192,8 @@ were taken and are not replayed.
 
 **Repeats** (finding 3) are matched again, never replayed from a cache: a repeat of a taken
 press runs only if, looked up alone now, it is the same single-key binding its press ran, that
-binding is a plain `Run`, and then without any `input.mode` in it. Everything else taken is
+binding is a plain `Run`, and then without any `input.mode` in it, looking through
+`[commands]` aliases to the commands they run. Everything else taken is
 held quietly. So releasing Ctrl while A repeats stops `ctrl-a` (the `bindings` rule), and mode
 switches and `Custom` actions never repeat (the example's rule).
 

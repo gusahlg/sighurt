@@ -194,16 +194,24 @@ Rio's Vulkan renderer with this pacing, the 25 s tab storm and tmux's redraws in
 page that changed meanwhile would come back as its old picture. tmux 3.8 hands the pane none of
 the outer terminal's replies (they arrive as keys), so whether that terminal shows kitty images
 can't be asked through tmux; the setting says so, and `auto` stays sixel. Each frame is
-`a=T,U=1` (a virtual placement) into one image id per `sig` (1 to 255, from the process id; not
-31), every APC in its own passthrough string with its ESCs doubled, and no cursor movement; the
-page rows hold kitty's Unicode placeholder cells (U+10EEEE with a row and a column diacritic on
-every cell, the id as a 256-colour foreground), written once per layout in a synchronized update
+`a=T,U=1` (a virtual placement) into one image id per `sig`, every APC in its own passthrough
+string with its ESCs doubled, and no cursor movement. The id is one of 65 535 (never 31, the
+probe's), claimed for the process's life by a `flock` on
+`$XDG_RUNTIME_DIR/sighurt-kitty-images/<n>.lock`, starting from the process id's place among 1 to 255: no two `sig`s of one user on one
+machine share it, in one terminal or not (a `sig` on another machine over ssh, another user's, or
+another program can still pick the same id; without a runtime directory the id is the process
+id's, unclaimed). The page rows hold kitty's Unicode placeholder cells (U+10EEEE with a row and a
+column diacritic on every cell, the id's low byte as a 256-colour foreground and, above 255, its
+high byte as a third diacritic: tmux turns a truecolour foreground into 256 colours when it does
+not know the outer terminal has truecolour, so only 8 bits of colour are safe), written once per
+layout in a synchronized update
 after the image. tmux keeps and redraws those cells like text: no image stack, no replay, no
 re-encode, and a pane redraw sends the outer terminal text, not images. The picture is written
 over as a sixel is (`Protocol::written_over`: the same hold, the same skip of a frame whose bytes
 are the picture's); text on the page rows (a message, home, text mode) blanks the cells first,
-since text alone would leave the image around it. A clear and leaving delete the image
-(`a=d,d=A`, through tmux). A resize that cuts a passthrough string ends it (`ESC \`) and the
+since text alone would leave the image around it. A clear and leaving delete that image by its
+id and nothing else (`a=d,d=I,i=<id>`, through tmux: `d=A` deletes no virtual placement, and
+would delete other programs' placements in the outer terminal). A resize that cuts a passthrough string ends it (`ESC \`) and the
 upload. Page rows wider or taller than the 297 diacritics fall back to sixel. Measured as above:
 one input from idle to the whole image accepted, 22.5 ms (sixel through tmux 29.9 ms); a drag,
 24.0 ms median, 37.6 ms p90 at 30 frames a second; real-terminals.sh's `rio-tmux-kitty`

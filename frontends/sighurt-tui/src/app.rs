@@ -292,13 +292,76 @@ impl Protocol {
     }
 }
 
-/// The kitty image id a `sig` with process id `pid` uses through tmux: 1 to 255, not 31 (the
-/// probe's).
-fn tmux_image_id(pid: u32) -> u32 {
-    match 1 + pid % 254 {
-        31 => 255,
-        id => id,
+/// The kitty image id this `sig` uses through tmux, and the lock that keeps it its own.
+#[derive(Debug)]
+struct TmuxImage {
+    id: u32,
+    /// The locked file that claims the id, held until the process ends.
+    _claim: Option<std::fs::File>,
+}
+
+/// The most lock files one `sig` tries for its kitty image id through tmux.
+const MAX_TMUX_CLAIMS: usize = 1024;
+
+/// The numbers [`kitty::tmux_image_id`] takes, in the order a `sig` with process id `pid` tries
+/// them: from its own place among 1 to 255 (ids whose cells need no third diacritic) round to
+/// it, then 256 and up; never 31, the probe's.
+fn tmux_image_numbers(pid: u32) -> impl Iterator<Item = u16> {
+    let start = u16::try_from(1 + pid % 255).expect("1 to 255");
+    (start..=255)
+        .chain(1..start)
+        .chain(256..=u16::MAX)
+        .filter(|&number| number != 31)
+}
+
+/// Where `sig`s claim their kitty image ids through tmux: a directory of the user's own in
+/// `$XDG_RUNTIME_DIR`, made if it is not there. `None` without one.
+fn tmux_claims() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = dirs::runtime_dir()?.join("sighurt-kitty-images");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
+    Some(dir)
+}
+
+/// Claims the kitty image id a `sig` with process id `pid` uses through tmux, for as long as it
+/// runs: the first of [`tmux_image_numbers`] whose file in `dir` (`<number>.lock`) it can lock
+/// (`flock`, which the kernel lets go when the process ends, crashed or not). So no two `sig`s
+/// of one user on one machine share an id, whichever terminal they are in. Without `dir`, or
+/// when no lock is taken in [`MAX_TMUX_CLAIMS`] tries, the first number's id, unclaimed.
+fn claim_tmux_image(dir: Option<&std::path::Path>, pid: u32) -> TmuxImage {
+    use std::os::unix::fs::OpenOptionsExt;
+    let id = |number| kitty::tmux_image_id(number).expect("not 0");
+    let mut numbers = tmux_image_numbers(pid);
+    let first = numbers.next().expect("there are numbers");
+    let unclaimed = TmuxImage {
+        id: id(first),
+        _claim: None,
+    };
+    let Some(dir) = dir else {
+        return unclaimed;
+    };
+    for number in std::iter::once(first).chain(numbers).take(MAX_TMUX_CLAIMS) {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(dir.join(format!("{number}.lock")));
+        let Ok(file) = file else {
+            return unclaimed;
+        };
+        if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
+            return TmuxImage {
+                id: id(number),
+                _claim: Some(file),
+            };
+        }
     }
+    unclaimed
 }
 
 /// One write that has not finished leaving the output buffer.
@@ -392,10 +455,11 @@ struct Tui {
     /// tmux's `allow-passthrough` for this pane, asked once when `[tui] graphics = "kitty"`
     /// first wants it inside tmux. `None` until then, and outside tmux.
     passthrough: Option<Passthrough>,
-    /// The kitty image id this `sig` uses through tmux (1 to 255: the placeholder cells carry
-    /// it as a 256-colour foreground). One image for the page rows, written over, as a sixel
-    /// is; from the process id, so two `sig`s in one terminal's panes rarely share it.
-    tmux_image: u32,
+    /// The kitty image id this `sig` uses through tmux ([`kitty::tmux_image_id`]: the
+    /// placeholder cells carry it), claimed the first time it is needed ([`claim_tmux_image`]),
+    /// so no other `sig` of the user's shares it. One image for the page rows, written over, as
+    /// a sixel is.
+    tmux_image: Option<TmuxImage>,
     /// A kitty image may be stored in the terminal outside tmux: a clear, a protocol change
     /// and leaving delete it.
     tmux_stored: bool,
@@ -726,7 +790,7 @@ impl App {
             placed: None,
             stale: false,
             passthrough: None,
-            tmux_image: tmux_image_id(std::process::id()),
+            tmux_image: None,
             tmux_stored: false,
             tmux_span: None,
             held_deletes: Vec::new(),
@@ -1567,7 +1631,7 @@ impl App {
                 out.extend_from_slice(kitty::DELETE_ALL);
             }
             if std::mem::take(&mut self.tui.tmux_stored) {
-                out.extend(kitty::wrap_tmux(kitty::DELETE_ALL));
+                out.extend(self.tui.tmux_delete());
             }
             let size = self.tui.terminal.size();
             self.tui.grid = Grid::new(size.cols, size.rows);
@@ -1988,6 +2052,10 @@ impl App {
         // terminal uploads each image to its GPU, and Rio lost its Vulkan device while tabs
         // were switched at key repeat (decision 133). The loop wakes for it ([`App::timeout`]).
         let held = self.tui.holding() && self.tui.drop_due().is_some_and(|at| at > now);
+        let tmux_image = match self.tui.protocol {
+            Protocol::KittyTmux => self.tui.tmux_image(),
+            _ => 0,
+        };
         let Some(pixels) = self.tui.targets.get_mut(&target) else {
             return;
         };
@@ -2020,7 +2088,6 @@ impl App {
         // image is in the outer terminal by then, and the cells appear at once). The page's
         // later frames go into the same image and touch no cell.
         let mut suffix = Vec::new();
-        let tmux_image = self.tui.tmux_image;
         if protocol == Protocol::KittyTmux && !replaces {
             match kitty::placeholders(tmux_image, place) {
                 Ok(cells) => {
@@ -2291,6 +2358,22 @@ impl Tui {
             end.extend(kitty::wrap_tmux(KITTY_UPLOAD_END));
             let _ = self.terminal.write_frame(&end);
         }
+    }
+
+    /// The kitty image id this `sig` uses through tmux, claimed the first time it is asked for.
+    fn tmux_image(&mut self) -> u32 {
+        self.tmux_image
+            .get_or_insert_with(|| claim_tmux_image(tmux_claims().as_deref(), std::process::id()))
+            .id
+    }
+
+    /// What deletes this `sig`'s image through tmux and nothing else: the image and all its
+    /// placements, the virtual one included, by its id (`d=I`), in tmux's passthrough. Nothing
+    /// before an id was claimed.
+    fn tmux_delete(&self) -> Vec<u8> {
+        self.tmux_image
+            .as_ref()
+            .map_or_else(Vec::new, |image| kitty::wrap_tmux(&kitty::delete(image.id)))
     }
 
     /// Drops the image a shown view left on the page, once the last image's frame interval is
@@ -2812,9 +2895,8 @@ impl Tui {
                 }
             }
             if std::mem::take(&mut self.tmux_stored) {
-                let _ = self
-                    .terminal
-                    .write_frame(&kitty::wrap_tmux(kitty::DELETE_ALL));
+                let delete = self.tmux_delete();
+                let _ = self.terminal.write_frame(&delete);
             }
         }
         let _ = self.terminal.restore();
@@ -3821,10 +3903,57 @@ mod tests {
         assert_eq!(choose_protocol(Auto, None, true, true), Protocol::Sixel);
         assert_eq!(choose_protocol(Sixel, None, true, true), Protocol::Sixel);
         assert_eq!(choose_protocol(Kitty, None, true, false), Protocol::None);
-        assert_ne!(tmux_image_id(30), 31);
-        for pid in [0, 1, 253, 254, 255, 1_000_000, u32::MAX] {
-            assert!((1..=255).contains(&tmux_image_id(pid)));
+    }
+
+    #[test]
+    fn tmux_image_numbers_start_at_the_pids_place_and_skip_the_probes() {
+        for pid in [0, 1, 29, 30, 253, 254, 255, 1_000_000, u32::MAX] {
+            let numbers: Vec<u16> = tmux_image_numbers(pid).collect();
+            assert!((1..=255).contains(&numbers[0]), "{pid}");
+            assert!(!numbers.contains(&31));
+            assert!(!numbers.contains(&0));
+            // Every number once, the 255 that need no third diacritic first.
+            assert_eq!(numbers.len(), usize::from(u16::MAX) - 1);
+            assert!(numbers[..254].iter().all(|&n| n < 256));
+            let unique: HashSet<u16> = numbers.iter().copied().collect();
+            assert_eq!(unique.len(), numbers.len());
         }
+        assert_eq!(tmux_image_numbers(29).next(), Some(30));
+        assert_eq!(tmux_image_numbers(30).next(), Some(32));
+    }
+
+    #[test]
+    fn two_sigs_never_claim_the_same_tmux_image() {
+        let dir = std::env::temp_dir().join(format!("sighurt-tui-claims-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let first = claim_tmux_image(Some(&dir), 6);
+        assert_eq!(first.id, 7);
+        assert!(first._claim.is_some());
+        // Another `sig` whose process id gives the same place takes the next number.
+        let second = claim_tmux_image(Some(&dir), 6 + 255);
+        assert_eq!(second.id, 8);
+        // Once the first has ended, its id is free again.
+        drop(first);
+        assert_eq!(claim_tmux_image(Some(&dir), 6).id, 7);
+        drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+        // With nowhere to claim, the process id's place, unclaimed.
+        let unclaimed = claim_tmux_image(None, 6);
+        assert_eq!((unclaimed.id, unclaimed._claim.is_none()), (7, true));
+    }
+
+    #[test]
+    fn the_cleanup_through_tmux_deletes_sigs_image_by_id_and_nothing_else() {
+        let (_master, mut tui) = on_pty();
+        assert_eq!(tui.tmux_delete(), Vec::<u8>::new());
+        tui.tmux_image = Some(TmuxImage {
+            id: kitty::tmux_image_id(0x0207).unwrap(),
+            _claim: None,
+        });
+        assert_eq!(
+            tui.tmux_delete(),
+            b"\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=33554439,q=2\x1b\x1b\\\x1b\\"
+        );
     }
 
     fn bare_tui(terminal: Terminal) -> Tui {
@@ -3839,7 +3968,7 @@ mod tests {
             placed: None,
             stale: false,
             passthrough: None,
-            tmux_image: tmux_image_id(std::process::id()),
+            tmux_image: None,
             tmux_stored: false,
             tmux_span: None,
             held_deletes: Vec::new(),

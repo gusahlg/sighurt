@@ -4,17 +4,21 @@
 //! taken ([`KeyState`]).
 //!
 //! The engine keeps the tables, the current mode, an unfinished sequence with where it began
-//! (the table, the shown tab's place and its committed address), and which single-key binding
-//! the key now held ran. For a fresh press it looks the keys up in the line's table while the
+//! (the table, the shown tab by its `TabId` and its committed address), and which single-key
+//! binding the key now held ran. For a fresh press it looks the keys up in the line's table while the
 //! chrome has the keyboard, else in the current mode's (`Keys::resolve`: the typing rule, then
 //! the most specific binding the keys could be); a complete binding acts, a start waits (no
 //! timeout, ever), and nothing, or a tombstone, falls to the table's `unmatched` (in the line
 //! always "pass"). A key that continues no sequence drops it and starts afresh; a sequence is
 //! dropped, and the key starts afresh, when the table, the shown tab or its committed address
-//! changed since its first key, and on `input.mode`, a context change, a reset or a reload.
+//! changed since its first key, and on `input.mode`, a context change, a reset or a reload. The
+//! core also drops it at once when what is shown changes ([`Engine::shown_changed`]: another
+//! tab, or another view or document in the tab), so a sequence belongs to one document of one
+//! tab: closing a tab and leaving and coming back end it, as a reload does.
 //! Modifier and dead keys are looked up alone and never join, continue or drop a sequence. A
 //! repeat of a taken press runs again only if, looked up alone now, it is the single-key binding
-//! its press ran, and that binding is a plain `Run` with no `input.mode` in it. The indicator is
+//! its press ran, and that binding is a plain `Run` with no `input.mode` in it, the commands of
+//! `[commands]` aliases included ([`KeyState`] looks through them). The indicator is
 //! the mode's, then the unfinished sequence's keys as the bindings spell them, never event
 //! text. A reload keeps the mode if the new keys have it, else their initial one.
 //!
@@ -34,10 +38,10 @@
 //! Must not own: what a command does ([`crate::commands`]) or where the keyboard is
 //! ([`crate::state`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use sighurt_api::commands::{Command, CommandSet};
-use sighurt_api::ids::SeatId;
+use sighurt_api::ids::{DocumentGeneration, SeatId, TabId, ViewId};
 use sighurt_api::input::{ButtonState, KeyCode, KeyEvent, KeyboardFocus};
 use sighurt_api::keymap::{
     is_modifier, Action, Binding, Browser, Fallback, Found, Frontend, KeyBinding, KeyContext,
@@ -344,8 +348,8 @@ struct Pending {
     /// The keys as the binding they start spells them, for the indicator.
     shown: String,
     place: Place,
-    /// The shown tab's index in the tab strip, and its committed address.
-    tab: usize,
+    /// The shown tab, and its committed address.
+    tab: Option<TabId>,
     address: Option<String>,
 }
 
@@ -433,6 +437,12 @@ impl Engine {
         if self.pending.take().is_some() {
             self.show();
         }
+    }
+
+    /// What is shown changed between presses (another tab, or another view or document in the
+    /// shown tab): an unfinished sequence is dropped.
+    pub fn shown_changed(&mut self) {
+        self.context_changed();
     }
 
     /// The window lost the keyboard: an unfinished sequence and a held key's binding are
@@ -533,7 +543,7 @@ impl Engine {
             };
         }
         self.held = None;
-        let tab_id = browser.active_tab();
+        let tab_id = tab.map(|tab| tab.id);
         // A sequence belongs to where it began.
         let mut typed = match self.pending.take() {
             Some(p) if p.place == place && p.tab == tab_id && p.address.as_deref() == address => {
@@ -617,17 +627,17 @@ fn index_of(keys: &Keys, name: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Whether a held key repeats `binding`: a plain `Run` of commands with no `input.mode`.
+/// Whether a held key repeats `binding`: a plain `Run` of commands with no `input.mode` (the
+/// core looks through `[commands]` aliases too, [`KeyState::handle`]).
 fn repeats(binding: &Binding) -> bool {
     match &binding.action {
-        Action::Run(commands) => {
-            !commands.is_empty()
-                && !commands
-                    .iter()
-                    .any(|command| matches!(command, Command::InputMode(_)))
-        }
+        Action::Run(commands) => !commands.is_empty() && !commands.iter().any(is_mode_switch),
         _ => false,
     }
+}
+
+fn is_mode_switch(command: &Command) -> bool {
+    matches!(command, Command::InputMode(_))
 }
 
 /// What `binding` does now.
@@ -661,12 +671,17 @@ pub(crate) enum KeyOutcome {
     Deliver,
 }
 
+/// What is shown: the shown tab, and the view and document it shows.
+pub(crate) type Shown = (Option<TabId>, Option<ViewId>, Option<DocumentGeneration>);
+
 /// The key engine, and the presses taken whose releases the core owes nobody, per seat.
 #[derive(Debug)]
 pub(crate) struct KeyState {
     engine: Engine,
     /// The context the engine was last told of.
     context: Option<KeyContext>,
+    /// What the engine was last told is shown.
+    shown: Option<Shown>,
     taken: HashSet<(SeatId, KeyCode)>,
 }
 
@@ -676,6 +691,7 @@ impl KeyState {
         Self {
             engine: Engine::new(keys),
             context: None,
+            shown: None,
             taken: HashSet::new(),
         }
     }
@@ -687,13 +703,16 @@ impl KeyState {
     }
 
     /// Decides what happens to `event`, a key event from `seat` in `context`. `browser` is what
-    /// the browser shows before this press.
+    /// the browser shows before this press; `aliases` are the configuration's `[commands]`,
+    /// which a repeat looks through: a repeat whose binding runs `input.mode`, itself or through
+    /// an alias, runs nothing.
     pub(crate) fn handle(
         &mut self,
         context: KeyContext,
         seat: SeatId,
         event: &KeyEvent,
         browser: &dyn Browser,
+        aliases: &BTreeMap<String, Vec<Command>>,
     ) -> KeyOutcome {
         let key = (seat, event.code);
         match event.state {
@@ -707,7 +726,16 @@ impl KeyState {
             // A repeat of a press that was taken may run again, but never passes.
             ButtonState::Pressed if event.repeat => {
                 let commands = self.engine.repeat(event, context, browser);
-                return match commands.filter(|commands| !commands.is_empty()) {
+                let switches = |commands: &Vec<Command>| {
+                    commands.iter().any(|command| match command {
+                        Command::Custom(name) => aliases
+                            .get(name)
+                            .is_some_and(|run| run.iter().any(is_mode_switch)),
+                        command => is_mode_switch(command),
+                    })
+                };
+                return match commands.filter(|commands| !commands.is_empty() && !switches(commands))
+                {
                     Some(commands) => KeyOutcome::Run {
                         commands,
                         pass: false,
@@ -749,6 +777,15 @@ impl KeyState {
         if self.context != Some(context) {
             self.context = Some(context);
             self.engine.context_changed();
+        }
+    }
+
+    /// Tells the engine what is shown, if that changed since it was last told: an unfinished
+    /// sequence ends with the tab, view or document it began in.
+    pub(crate) fn set_shown(&mut self, shown: Shown) {
+        if self.shown != Some(shown) {
+            self.shown = Some(shown);
+            self.engine.shown_changed();
         }
     }
 
@@ -1284,7 +1321,8 @@ mod tests {
     fn consumed_presses_consume_their_releases() {
         let mut keys = keys(r#""ctrl-a" = "tab.new""#);
         let seat = SeatId::next();
-        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser);
+        let mut handle =
+            |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser, &BTreeMap::new());
         let down = press(KEY_A, character("a"), CTRL, NONE);
         let repeat = KeyEvent {
             repeat: true,
@@ -1328,7 +1366,8 @@ mod tests {
     fn a_held_key_never_turns_into_a_shortcut() {
         let mut keys = keys(r#""ctrl-r" = "page.reload""#);
         let seat = SeatId::next();
-        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser);
+        let mut handle =
+            |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser, &BTreeMap::new());
         // R goes down and repeats, and Ctrl goes down while it does.
         let r = press(KEY_R, character("r"), NONE, NONE);
         assert_eq!(handle(&r), KeyOutcome::Deliver);
@@ -1367,10 +1406,10 @@ mod tests {
             modifiers: NONE,
             ..down.clone()
         };
-        keys.handle(PAGE, seat, &down, &NoneBrowser);
+        keys.handle(PAGE, seat, &down, &NoneBrowser, &BTreeMap::new());
         keys.forget(seat);
         assert_eq!(
-            keys.handle(PAGE, seat, &up, &NoneBrowser),
+            keys.handle(PAGE, seat, &up, &NoneBrowser, &BTreeMap::new()),
             KeyOutcome::Deliver
         );
     }
@@ -1390,7 +1429,8 @@ mod tests {
         ];
         let mut keys = KeyState::new(fixed);
         let seat = SeatId::next();
-        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser);
+        let mut handle =
+            |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser, &BTreeMap::new());
         let commands = vec![Command::TabNew(None), Command::PageReload];
         let down = press(KEY_A, character("a"), NONE, NONE);
         let repeat = KeyEvent {
@@ -1428,6 +1468,118 @@ mod tests {
         assert_eq!(handle(&empty), KeyOutcome::Consumed);
         assert_eq!(handle(&empty_repeat), KeyOutcome::Consumed);
         assert_eq!(handle(&empty_up), KeyOutcome::Consumed);
+    }
+
+    #[test]
+    fn a_sequence_belongs_to_one_tab_and_what_it_shows() {
+        let mut keys = Keys::plain();
+        keys.modes[0].bindings = vec![Binding {
+            keys: "g g".parse().unwrap(),
+            when: When::default(),
+            action: Action::Run(vec![Command::PageZoomIn]),
+        }];
+        let mut engine = Engine::new(keys);
+        let g = press(34, character("g"), NONE, NONE);
+        let (first, second) = (TabBrowser(TabId::next()), TabBrowser(TabId::next()));
+        assert_eq!(engine.press(&g, PAGE, &first), Outcome::take());
+        // Another tab in its place, at the same index and address: the sequence starts afresh.
+        assert_eq!(engine.press(&g, PAGE, &second), Outcome::take());
+        assert_eq!(
+            engine.press(&g, PAGE, &second),
+            Outcome::run(vec![Command::PageZoomIn])
+        );
+        // The core says what is shown changed (another document, or away and back).
+        assert_eq!(engine.press(&g, PAGE, &first), Outcome::take());
+        engine.shown_changed();
+        assert_eq!(engine.indicator(), None);
+        assert_eq!(engine.press(&g, PAGE, &first), Outcome::take());
+    }
+
+    #[test]
+    fn a_held_key_never_switches_modes_again_through_an_alias() {
+        let mut fixed = Keys::plain();
+        fixed
+            .modes
+            .push(sighurt_api::keymap::Mode::new("other").indicator("OTHER"));
+        fixed.modes[0].bindings = vec![
+            Binding {
+                keys: "a".parse().unwrap(),
+                when: When::default(),
+                action: Action::Run(vec![Command::Custom("other".into())]),
+            },
+            Binding {
+                keys: "e".parse().unwrap(),
+                when: When::default(),
+                action: Action::Run(vec![Command::Custom("reload".into())]),
+            },
+        ];
+        let aliases = BTreeMap::from([
+            ("other".to_owned(), vec![Command::InputMode("other".into())]),
+            ("reload".to_owned(), vec![Command::PageReload]),
+        ]);
+        let mut keys = KeyState::new(fixed);
+        let seat = SeatId::next();
+        let mut handle = |event: &KeyEvent| keys.handle(PAGE, seat, event, &NoneBrowser, &aliases);
+        let repeat = |event: &KeyEvent| KeyEvent {
+            repeat: true,
+            ..event.clone()
+        };
+        let a = press(KEY_A, character("a"), NONE, NONE);
+        let alias = vec![Command::Custom("other".into())];
+        assert_eq!(
+            handle(&a),
+            KeyOutcome::Run {
+                commands: alias,
+                pass: false
+            }
+        );
+        assert_eq!(handle(&repeat(&a)), KeyOutcome::Consumed);
+        // An alias that switches no mode repeats as its commands would.
+        let e = press(18, character("e"), NONE, NONE);
+        let reload = KeyOutcome::Run {
+            commands: vec![Command::Custom("reload".into())],
+            pass: false,
+        };
+        assert_eq!(handle(&e), reload);
+        assert_eq!(handle(&repeat(&e)), reload);
+    }
+
+    /// A browser with one tab, `0`, showing https://example.com/.
+    struct TabBrowser(TabId);
+
+    impl Browser for TabBrowser {
+        fn frontend(&self) -> Frontend {
+            Frontend::Gui
+        }
+
+        fn context(&self) -> KeyContext {
+            PAGE
+        }
+
+        fn tab_count(&self) -> usize {
+            1
+        }
+
+        fn active_tab(&self) -> usize {
+            0
+        }
+
+        fn tab(&self, index: usize) -> Option<sighurt_api::keymap::TabInfo<'_>> {
+            (index == 0).then(|| {
+                sighurt_api::keymap::TabInfo::new(
+                    self.0,
+                    None,
+                    Some("https://example.com/"),
+                    false,
+                    None,
+                    1.0,
+                    false,
+                    false,
+                    None,
+                    false,
+                )
+            })
+        }
     }
 
     /// A browser with one tab, showing `url` with the pointer over `link`.
