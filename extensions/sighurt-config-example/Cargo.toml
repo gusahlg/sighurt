@@ -1,15 +1,17 @@
 [package]
 name = "sighurt-config-example"
-description = "Sighurt's example configuration: vim-style keys for both frontends, written in Rust against the keymap API"
+description = "The configuration compiled into Sighurt: the default experience, and how to change it in Rust"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# A configuration needs the keymap API and nothing else (docs/rewrite/config-extension.md, §3).
+# A configuration needs the SDK and nothing else (docs/rewrite/experience-2026-11-15.md, §2).
 [dependencies]
+sighurt-config = { path = "../../sdk/sighurt-config" }
+
+# Its tests drive the experience on the core's key engine.
+[dev-dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
-# Until the configuration is written against sighurt-config: the core's key engine runs its
-# tables.
 sighurt-core = { path = "../../crates/sighurt-core" }

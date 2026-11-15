@@ -1,63 +1,58 @@
-//! Keymaps: what a key press does, as a small trait other crates can implement.
+//! Keys: the data the core's key engine is configured with ([`Keys`]: modes, the line's
+//! table, bindings with their keys, conditions and actions), the operations that change it
+//! ([`bind`], [`unbind`]), and the view of the browser a computed action reads ([`Browser`])
+//! (docs/rewrite/experience-2026-11-15.md, §1). There is one engine, in the core, and no
+//! trait to implement: the default experience is a `Keys` value built with the SDK
+//! (`sighurt-config`), a configuration in Rust changes that value, and the configuration file's
+//! `[keys]` tables are applied to it by the same operations.
 //!
-//! The core holds one keymap, the one the configuration's `[input] keymap` names, and asks it
-//! about each fresh key press: pass it on to whatever has the keyboard, take it, or run a
-//! command. The default keymap, `bindings`, reads `[keys]`; another keymap reads its own table,
-//! `[keymap.<name>]`, which its kind's check validates when the configuration loads. Keymaps are
-//! compiled into `sig` and listed in its registry, as engines are; nothing is loaded at run
-//! time.
-//!
-//! What the core guarantees around any keymap:
+//! What the engine guarantees, whatever the keys:
 //!
 //! 1. A taken press takes its release and its repeats, and a passed press passes them, so no
-//!    keymap can leave the page or the chrome with half a keystroke. The keymap decides only
-//!    about fresh presses and about repeats of presses it took.
-//! 2. Only a fresh press starts anything: a key held from before goes where its press went,
-//!    without asking the keymap.
-//! 3. [`KeyAction::RunThenPass`] runs the command first, then routes the press by the focus as
-//!    it is after the command; the press counts as passed, so its release follows it.
-//! 4. The context is the core's: [`Keymap::context`] when the keyboard moves between page and
-//!    chrome or a text field takes or loses it, [`Keymap::reset`] when the window loses the
-//!    keyboard.
-//! 5. The keymap runs inside the core's update: it does no I/O, reads no clock and starts no
-//!    thread. It sees what the user types, passwords included, and keeps no more of it than an
-//!    unfinished sequence and never logs it.
-//! 6. A changed [`Keymap::indicator`] redraws the chrome.
+//!    configuration can leave the page or the chrome with half a keystroke. Only fresh presses
+//!    and repeats of presses it took are looked up.
+//! 2. Only a fresh press starts anything: a key held from before goes where its press went.
+//! 3. An action that passes ([`Action::RunThenPass`], or an [`Outcome`] with `pass`) runs its
+//!    commands first, then the press goes by the focus as it is after them, as a key no binding
+//!    took: through the core's fullscreen-Escape guard, as the same press; its release follows
+//!    it. Of a sequence only the last key can pass.
+//! 4. The context is the core's: an unfinished sequence is dropped when the keyboard moves
+//!    between page and chrome or a text field takes or loses it, when the window loses the
+//!    keyboard, on `input.mode`, on a reload, and when the shown tab or its committed address is
+//!    no longer what it was at the sequence's first key.
+//! 5. A [`Custom`] action and a [`Fallback::Custom`] run inside the core's update: they do no
+//!    I/O, read no clock, start no thread and log nothing. They see what the user types,
+//!    passwords included, and keep none of it.
+//! 6. A changed indicator (the mode's [`Mode::indicator`], then an unfinished sequence's keys as
+//!    the bindings spell them, never event text) redraws the chrome.
 //! 7. The [`Browser`] view a press comes with is read-only and lasts that one call: it is built
 //!    from the state before the press is applied. It carries no clock, handle or engine type.
-//! 8. A [`KeyAction::RunAll`] runs whole, in order, in the update of its press. Commands that
+//! 8. An action's commands run whole, in order, in the update of its press. Commands that
 //!    change the tab list change the numbering the later ones see (`tab.close 3` renumbers tab
-//!    4), as typing them one after another would, so a keymap closing several tabs by number
-//!    closes the highest first.
-//! 9. [`Keymap::page_takes_text`] is asked after every update: while it says `false`, text that
-//!    is not a key press (an input method's, a terminal's paste) does not reach the page, and
-//!    the host enables no input method for the page's fields.
+//!    4), as typing them one after another would, so closing several tabs by number closes the
+//!    highest first. `input.mode` runs in its place; alone it never gives a page that came to
+//!    the front by itself its typing back.
+//! 9. [`Mode::page_text`]: while the current mode says `false`, text that is not a key press
+//!    (an input method's, a terminal's paste) does not reach the page, and the host enables no
+//!    input method for the page's fields.
 //! 10. [`TabInfo::internal`] names the internal page a tab shows (`sig://help` is `help`) from
-//!     the core's own record of the view, never from an address a page or engine reports, so a
-//!     keymap may treat a page of the browser's own differently.
+//!     the core's own record of the view, never from an address a page or engine reports. A
+//!     [`UrlPattern`] condition selects shortcuts and grants nothing: it ignores the port, and
+//!     titles and addresses are page data, passed on only as a command's operand.
 //!
-//! [`Keymap::describe`] lists what a keymap binds, as data, for the help page.
+//! [`Keys::describe`] lists the bindings, as data, for the help page.
 //!
-//! A keymap is the browser's configuration in Rust (docs/rewrite/config-extension.md): it reads
-//! what the browser shows through [`Browser`], defines its own actions as commands computed from
-//! it, and shows its state in both frontends' chromes through [`Keymap::indicator`]. Titles,
-//! addresses and links are page data: a keymap may compute with them (an address to copy,
-//! a tab to close) and must not put them in its indicator or log them.
+//! [`Chord`] is one keystroke of the configuration's syntax and [`KeySeq`] up to four of them;
+//! [`UrlPattern`] is an address pattern of the configuration's syntax.
 //!
-//! [`Chord`] is one keystroke of the configuration's syntax, for keymaps to match key events
-//! with. [`UrlPattern`] is an address pattern of the configuration's syntax, for keymaps that
-//! bind keys for some addresses: both of the workspace's keymaps match addresses with it, so
-//! the rule is one.
-//!
-//! Must not own: the presses taken (the core's), where the keyboard is, or what a command does.
+//! Must not own: the current mode, an unfinished sequence or the presses taken (the core's),
+//! where the keyboard is, or what a command does.
 
 use std::fmt;
 use std::str::FromStr;
 
-use crate::commands::{Command, CommandSet};
 use crate::ids::TabId;
 use crate::input::{Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
-use crate::settings::Table;
 
 mod keys;
 
@@ -94,12 +89,12 @@ pub enum Frontend {
     Terminal,
 }
 
-/// What a keymap may read of the browser while it decides one key press. Borrowed from the core
-/// for that call only (guarantee 7).
+/// What a computed action may read of the browser while it decides one key press. Borrowed from
+/// the core for that call only (guarantee 7).
 pub trait Browser {
     /// The frontend that runs the browser.
     fn frontend(&self) -> Frontend;
-    /// The same context [`Keymap::press`] is given.
+    /// Where the keyboard is, and whether that part takes typed text.
     fn context(&self) -> KeyContext;
     /// How many tabs there are.
     fn tab_count(&self) -> usize;
@@ -110,7 +105,7 @@ pub trait Browser {
     fn tab(&self, index: usize) -> Option<TabInfo<'_>>;
 }
 
-/// One tab, as a keymap sees it.
+/// One tab, as a computed action sees it.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TabInfo<'a> {
@@ -178,12 +173,12 @@ impl<'a> TabInfo<'a> {
     }
 }
 
-/// One binding a keymap has, as [`Keymap::describe`] lists it for a help page.
+/// One binding, as [`Keys::describe`] lists it for a help page.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyBinding {
-    /// The mode it applies in, as the keymap names its modes ("NORMAL"); empty for a keymap
-    /// without modes.
+    /// The mode it applies in, its name in capitals ("NORMAL"); empty for keys with one mode,
+    /// and for a binding of the line alone.
     pub mode: String,
     /// Its keystrokes as the configuration writes them, separated by spaces ("y y", "ctrl-o").
     pub keys: String,
@@ -211,116 +206,6 @@ impl KeyBinding {
         }
     }
 }
-
-/// What the browser does with a key press. Compared by what it does: `RunAll` of one command
-/// is `Run`, and of none is `Take`.
-#[derive(Clone, Debug)]
-pub enum KeyAction {
-    /// Not the browser's: the press, its repeats and its release go to whatever has focus.
-    Pass,
-    /// Taken, and nothing runs: part of a sequence, or a change of mode.
-    Take,
-    /// Taken, and the command runs.
-    Run(Command),
-    /// The command runs, then the press goes to whatever has focus now, as if passed, so `:`
-    /// can focus the command line and type itself into it.
-    RunThenPass(Command),
-    /// Taken, and these commands run in order in this update (guarantee 8). Empty is `Take`.
-    RunAll(Vec<Command>),
-}
-
-impl KeyAction {
-    /// The commands it runs, and whether the press then passes.
-    fn effect(&self) -> (&[Command], bool) {
-        match self {
-            Self::Pass => (&[], true),
-            Self::Take => (&[], false),
-            Self::Run(command) => (std::slice::from_ref(command), false),
-            Self::RunThenPass(command) => (std::slice::from_ref(command), true),
-            Self::RunAll(commands) => (commands, false),
-        }
-    }
-}
-
-impl PartialEq for KeyAction {
-    fn eq(&self, other: &Self) -> bool {
-        self.effect() == other.effect()
-    }
-}
-
-impl Eq for KeyAction {}
-
-/// A keymap: turns key presses into [`KeyAction`]s.
-pub trait Keymap {
-    /// Applies its table (`[keys]` for `bindings`, `[keymap.<name>]` otherwise), which its
-    /// kind's check accepted. Called before anything else, and after every reload that keeps
-    /// this keymap.
-    fn configure(&mut self, settings: &Table);
-
-    /// A fresh key press, or an auto-repeat (`key.repeat`) of a press this keymap took.
-    /// Releases never come here. For a repeat, `Pass` counts as `Take`, `RunThenPass` as `Run`
-    /// and `RunAll` as itself. `browser` is what the browser shows, before this press.
-    fn press(&mut self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> KeyAction;
-
-    /// The context changed between presses: the keyboard moved between page and chrome, or a
-    /// text field took or lost it.
-    fn context(&mut self, _context: KeyContext) {}
-
-    /// The window lost the keyboard: drop an unfinished sequence.
-    fn reset(&mut self) {}
-
-    /// What the chrome shows about the keymap ("NORMAL", "NORMAL g"). The executable passes on
-    /// at most 64 characters of one line.
-    fn indicator(&self) -> Option<&str> {
-        None
-    }
-
-    /// Whether the page may be given text that is not a key press: an input method's text, a
-    /// terminal's paste (guarantee 9). `false` in a mode whose keys are only commands, so
-    /// nothing the user types reaches the page there. Key presses are [`Self::press`]'s.
-    fn page_takes_text(&self) -> bool {
-        true
-    }
-
-    /// The bindings it has in `frontend`, in the order a reader should see them, for the help
-    /// page. Empty by default: a keymap that can't list its bindings lists none.
-    fn describe(&self, _frontend: Frontend) -> Vec<KeyBinding> {
-        Vec::new()
-    }
-
-    /// The [`Keys`] value this keymap is, if it is one: the core then runs it on its own key
-    /// engine, which carries out `input.mode`. `None` by default.
-    fn keys(&self) -> Option<Keys> {
-        None
-    }
-}
-
-/// A keymap a build can offer. Each keymap crate exports one, as `KIND`. Compared and printed
-/// by its name.
-#[derive(Clone, Copy)]
-pub struct KeymapKind {
-    /// Its name in the configuration's `[input] keymap`.
-    pub name: &'static str,
-    /// Everything wrong with its table, one line each; empty if the table is valid. Commands
-    /// are parsed with `commands`, so chrome actions are checked too.
-    pub check: fn(&Table, &CommandSet<'_>) -> Vec<String>,
-    /// A new keymap, which the core configures before using it.
-    pub new: fn() -> Box<dyn Keymap>,
-}
-
-impl fmt::Debug for KeymapKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "KeymapKind({})", self.name)
-    }
-}
-
-impl PartialEq for KeymapKind {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-
-impl Eq for KeymapKind {}
 
 /// The W3C names of the modifiers and locks.
 const MODIFIER_NAMES: [&str; 15] = [

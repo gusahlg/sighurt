@@ -40,8 +40,8 @@ use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::SeatId;
 use sighurt_api::input::{ButtonState, KeyCode, KeyEvent, KeyboardFocus};
 use sighurt_api::keymap::{
-    is_modifier, Action, Binding, Browser, Fallback, Found, Frontend, KeyAction, KeyBinding,
-    KeyContext, KeySeq, KeyTable, Keymap, Keys, Outcome, Situation, UrlPattern, When,
+    is_modifier, Action, Binding, Browser, Fallback, Found, Frontend, KeyBinding, KeyContext,
+    KeySeq, KeyTable, Keys, Outcome, Situation, UrlPattern, When,
 };
 use sighurt_api::settings::{Table, Value};
 
@@ -506,13 +506,8 @@ impl Engine {
     }
 
     /// A fresh press in `context`; `browser` is what the browser shows before it. What it comes
-    /// to, and whether that was a custom action's.
-    fn decide(
-        &mut self,
-        key: &KeyEvent,
-        context: KeyContext,
-        browser: &dyn Browser,
-    ) -> (Outcome, bool) {
+    /// to: commands to run, and whether the key then passes.
+    pub fn press(&mut self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> Outcome {
         let tab = browser.tab(browser.active_tab());
         let address = tab.and_then(|tab| tab.url);
         let situation = Situation {
@@ -534,7 +529,7 @@ impl Engine {
                     });
                     act(&binding, browser)
                 }
-                _ => (self.unmatched(place, key, browser), false),
+                _ => self.unmatched(place, key, browser),
             };
         }
         self.held = None;
@@ -574,17 +569,12 @@ impl Engine {
                     tab: tab_id,
                     address: address.map(str::to_owned),
                 });
-                (Outcome::take(), false)
+                Outcome::take()
             }
-            Found::Unbound(_) | Found::None => (self.unmatched(place, key, browser), false),
+            Found::Unbound(_) | Found::None => self.unmatched(place, key, browser),
         };
         self.show();
         outcome
-    }
-
-    /// A fresh press in `context`; `browser` is what the browser shows before it.
-    pub fn press(&mut self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> Outcome {
-        self.decide(key, context, browser).0
     }
 
     /// An auto-repeat of a press that was taken: the commands to run again, if, looked up alone
@@ -640,108 +630,17 @@ fn repeats(binding: &Binding) -> bool {
     }
 }
 
-/// What `binding` does now, and whether it was a custom action.
-fn act(binding: &Binding, browser: &dyn Browser) -> (Outcome, bool) {
+/// What `binding` does now.
+fn act(binding: &Binding, browser: &dyn Browser) -> Outcome {
     match &binding.action {
-        Action::Run(commands) => (Outcome::run(commands.clone()), false),
-        Action::RunThenPass(commands) => (
-            Outcome {
-                commands: commands.clone(),
-                pass: true,
-            },
-            false,
-        ),
-        Action::Custom(custom) => ((custom.run)(browser), true),
-        Action::Unbound => (Outcome::take(), false),
-    }
-}
-
-/// The engine behind the `Keymap` trait, for a configuration that starts from `base` and
-/// applies the key tables it is configured with over it.
-#[derive(Clone, Debug)]
-pub struct Configured {
-    base: Keys,
-    engine: Engine,
-}
-
-impl Configured {
-    /// The engine for `base` and no key table.
-    pub fn new(base: Keys) -> Self {
-        Self {
-            engine: Engine::new(base.clone()),
-            base,
-        }
-    }
-
-    /// The engine.
-    pub fn engine(&self) -> &Engine {
-        &self.engine
-    }
-}
-
-impl Keymap for Configured {
-    fn configure(&mut self, settings: &Table) {
-        let mut keys = self.base.clone();
-        let mut problems = Vec::new();
-        let tables = Tables::from_table(settings, "keys", &CommandSet::ANY, None, &mut problems);
-        tables.apply(&mut keys, &mut problems);
-        // Its table was checked when the configuration loaded.
-        debug_assert!(problems.is_empty(), "{problems:?}");
-        self.engine.configure(keys);
-    }
-
-    fn press(&mut self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> KeyAction {
-        if key.repeat {
-            return match self.engine.repeat(key, context, browser) {
-                Some(mut commands) if commands.len() == 1 => KeyAction::Run(commands.remove(0)),
-                Some(commands) => KeyAction::RunAll(commands),
-                None => KeyAction::Take,
-            };
-        }
-        let (outcome, custom) = self.engine.decide(key, context, browser);
-        let switches = !outcome.commands.is_empty()
-            && outcome
-                .commands
-                .iter()
-                .all(|command| matches!(command, Command::InputMode(_)));
-        let mut rest = Vec::new();
-        for command in outcome.commands {
-            match command {
-                Command::InputMode(name) => _ = self.engine.set_mode(&name),
-                command => rest.push(command),
-            }
-        }
-        match (outcome.pass, rest.len()) {
-            (true, 0) => KeyAction::Pass,
-            (false, 0) if switches || !custom => KeyAction::Take,
-            (true, 1) => KeyAction::RunThenPass(rest.remove(0)),
-            (false, 1) if !custom => KeyAction::Run(rest.remove(0)),
-            (_, _) => KeyAction::RunAll(rest),
-        }
-    }
-
-    fn context(&mut self, _context: KeyContext) {
-        self.engine.context_changed();
-    }
-
-    fn reset(&mut self) {
-        self.engine.reset();
-    }
-
-    fn indicator(&self) -> Option<&str> {
-        self.engine.indicator()
-    }
-
-    fn page_takes_text(&self) -> bool {
-        self.engine.page_text()
-    }
-
-    fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
-        self.engine.describe(frontend)
-    }
-
-    fn keys(&self) -> Option<Keys> {
-        Some(self.engine.keys().clone())
+        Action::Run(commands) => Outcome::run(commands.clone()),
+        Action::RunThenPass(commands) => Outcome {
+            commands: commands.clone(),
+            pass: true,
+        },
+        Action::Custom(custom) => (custom.run)(browser),
+        // `Keys::resolve` never completes on a tombstone.
+        Action::Unbound => Outcome::take(),
     }
 }
 

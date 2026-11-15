@@ -1,8 +1,8 @@
 //! What `sig://home` says, for every frontend: the build's version and configuration file, the
-//! internal pages this build and configuration can open, a few keys of the keymap in use, the
+//! internal pages this build and configuration can open, a few keys of the key engine, the
 //! pages visited last and the engines.
 //!
-//! Built only from the browser itself (the core's configuration and environment, the keymap's
+//! Built only from the browser itself (the core's configuration and environment, the keys'
 //! `describe`, the history, the registry's engines), so it can't go stale; every part is bounded
 //! in count and length ([`MAX_PAGES`], [`MAX_KEYS`], [`MAX_RECENT`] and the `MAX_*` lengths).
 //! [`crate::session::Session::home`] keeps the last one built and builds again only when its
@@ -335,7 +335,7 @@ mod tests {
                 .iter()
                 .map(|p| ((*p).to_owned(), grants))
                 .collect::<BTreeMap<_, _>>(),
-            keys: sighurt_config_example::keys(),
+            keys: crate::registry::experience().0,
             frontend: Frontend::Terminal,
             ..Environment::default()
         }
@@ -422,7 +422,7 @@ mod tests {
                 .find(|key| key.action == action)
                 .map(|key| key.keys.as_str())
         };
-        // What sighurt-config-example's table binds in NORMAL, nothing written here.
+        // What the default experience binds in normal, nothing written here.
         assert_eq!(of("Address or search"), Some("o, ctrl-o"));
         assert_eq!(of("INSERT mode"), Some("escape"));
         assert_eq!(of("Back to NORMAL mode"), Some("escape"));

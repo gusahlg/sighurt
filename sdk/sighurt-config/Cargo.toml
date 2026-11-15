@@ -1,0 +1,14 @@
+[package]
+name = "sighurt-config"
+description = "What a Sighurt configuration is written against: the experience (keys, modes, sequences, custom actions) as data, and the default experience built with it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Apache-2.0 like sighurt-sdk, so configurations written against it may be licensed freely.
+license = "Apache-2.0"
+authors.workspace = true
+
+# A configuration needs the keymap data and the command vocabulary, nothing else
+# (docs/rewrite/experience-2026-11-15.md, §2).
+[dependencies]
+sighurt-api = { path = "../../crates/sighurt-api" }

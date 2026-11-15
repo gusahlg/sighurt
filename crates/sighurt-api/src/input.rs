@@ -487,7 +487,7 @@ pub enum FocusEvent {
 }
 
 /// Which part of the window has the keyboard: the logical focus the core keeps, which the
-/// chrome follows and keymaps see (`keymap::KeyContext`).
+/// chrome follows and the key engine sees (`keymap::KeyContext`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum KeyboardFocus {
     /// The active tab's page, or the page the chrome draws in its place.

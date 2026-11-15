@@ -157,7 +157,7 @@ impl PageRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PageInfo {
     /// `key, value` records: `version` (sig's version), `license`, `authors`, `frontend`
-    /// (`window` or `terminal`), `keymap` (the active keymap's name), `chrome`, `renderer`.
+    /// (`window` or `terminal`), `keymap` (where the keys start from: `example` or `bindings`), `chrome`, `renderer`.
     About,
     /// One record per engine of this build, in descriptor order: `name, enabled, default, web,
     /// capabilities` (`yes`/`no` for the three flags; capabilities a space-separated list of
@@ -169,8 +169,8 @@ pub enum PageInfo {
     /// One record per `[commands]` entry of the configuration: `name, commands` (the commands
     /// it runs, as the configuration writes them, separated by ` ; `).
     UserCommands,
-    /// The active keymap's bindings for the running frontend
-    /// ([`crate::keymap::Keymap::describe`]): `mode, keys, action, applies`.
+    /// The key engine's bindings for the running frontend
+    /// ([`crate::keymap::Keys::describe`]): `mode, keys, action, applies`.
     Keys,
     /// `name, path` records: `config` (the configuration file), `config-dir`, `state-dir`,
     /// `session`, `history`, `downloads`. A path the build has none of is left out.
