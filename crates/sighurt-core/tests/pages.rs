@@ -44,8 +44,85 @@ fn environment() -> Environment {
         ]
         .map(|(name, grants)| (name.to_owned(), grants))
         .into(),
+        keymaps: vec![modes::KIND],
         ..Environment::default()
     }
+}
+
+/// `modes`: keys with three modes, run on the core's key engine (`input.mode`), for what the
+/// engine and the core do with mode switches and keys that pass after their commands
+/// (docs/rewrite/experience-2026-11-15.md, §1.1 and §1.2).
+mod modes {
+    use sighurt_api::commands::Command;
+    use sighurt_api::keymap::{Action, Binding, Fallback, KeymapKind, Keys, Mode, When};
+    use sighurt_core::keys::Configured;
+
+    fn bind(keys: &str, action: Action) -> Binding {
+        Binding {
+            keys: keys.parse().unwrap(),
+            when: When::default(),
+            action,
+        }
+    }
+
+    fn bind_on(url: &str, keys: &str, action: Action) -> Binding {
+        Binding {
+            when: When {
+                url: Some(url.parse().unwrap()),
+                ..When::default()
+            },
+            ..bind(keys, action)
+        }
+    }
+
+    fn commands(list: &[&str]) -> Vec<Command> {
+        list.iter().map(|text| text.parse().unwrap()).collect()
+    }
+
+    fn run(list: &[&str]) -> Action {
+        Action::Run(commands(list))
+    }
+
+    fn pass(list: &[&str]) -> Action {
+        Action::RunThenPass(commands(list))
+    }
+
+    /// `normal` (the initial mode, takes what it doesn't bind), `insert` and `resize`; the line
+    /// switches to insert on F6.
+    pub fn keys() -> Keys {
+        let mut normal = Mode::new("normal")
+            .page_text(false)
+            .unmatched(Fallback::Take);
+        normal.bindings = vec![
+            bind("escape", run(&["input.mode insert"])),
+            bind("f2", pass(&["tab.select 2"])),
+            bind("f4", run(&["input.mode resize", "input.mode normal"])),
+            bind("f5", pass(&["input.mode insert"])),
+            bind("f7", run(&["input.mode resize"])),
+            bind("g g", run(&["page.zoom-in"])),
+            bind_on("https://a.test", "g x", run(&["page.zoom-in"])),
+            bind_on("https://b.test", "g z", run(&["tab.close"])),
+        ];
+        let mut insert = Mode::new("insert").indicator("INSERT");
+        insert.bindings = vec![
+            bind("escape", run(&["input.mode normal"])),
+            bind("f5", run(&["tab.new"])),
+        ];
+        let resize = Mode::new("resize")
+            .indicator("RESIZE")
+            .unmatched(Fallback::Take);
+        Keys {
+            modes: vec![normal, insert, resize],
+            initial: "normal".into(),
+            line: vec![bind("f6", run(&["input.mode insert"]))],
+        }
+    }
+
+    pub const KIND: KeymapKind = KeymapKind {
+        name: "modes",
+        check: |_, _| Vec::new(),
+        new: || Box::new(Configured::new(keys())),
+    };
 }
 
 struct Harness {
@@ -1401,4 +1478,140 @@ fn a_click_in_home_takes_it_after_it_came_to_the_front_by_itself() {
     h.apply(BrowserEvent::ChromePagePress);
     let effects = h.key(seat, TAB, ButtonState::Pressed, false);
     assert_eq!(chrome_keys(&effects), [(ButtonState::Pressed, false)]);
+}
+
+// ── Modes as commands (docs/rewrite/experience-2026-11-15.md, §1.1, §1.2) ────────────────────
+
+const MODES: &str = "[input]\nkeymap = \"modes\"";
+const ESCAPE: (u32, &str) = (1, "Escape");
+
+/// `key` pressed and released on `seat`; the press's effects.
+fn tap(h: &mut Harness, seat: SeatId, key: (u32, &str)) -> Vec<Effect> {
+    let effects = h.key(seat, key, ButtonState::Pressed, false);
+    h.key(seat, key, ButtonState::Released, false);
+    effects
+}
+
+#[test]
+fn a_mode_switch_alone_gives_a_held_page_no_typing() {
+    // Review finding 1: a page closes its tab, and the tab behind it comes to the front by
+    // itself. Escape switches to insert, as `KeyAction::Take` did, and keeps the hold.
+    let mut h = Harness::start(MODES, &["https://a.test/"]);
+    let (first, popup) = popup_in_front(&mut h);
+    popup_closes(&mut h, popup);
+    assert_eq!(h.shown(), first);
+    let seat = SeatId::next();
+    tap(&mut h, seat, ESCAPE);
+    assert_eq!(h.state.keymap_indicator(), Some("INSERT"));
+    assert!(h.state.page_takes_text());
+    assert!(!delivered_to(&tap(&mut h, seat, (30, "a")), first), "held");
+    // Typed in the command line, alone, it keeps the hold too.
+    h.command("input.mode normal");
+    h.command("input.mode insert");
+    assert!(!delivered_to(&tap(&mut h, seat, (48, "b")), first), "held");
+    // A list with another command in it is the user taking the page.
+    h.command("page.zoom-in");
+    assert!(delivered_to(&tap(&mut h, seat, (46, "c")), first));
+}
+
+#[test]
+fn input_mode_runs_in_its_place_and_drops_an_unfinished_sequence() {
+    // Review finding 7.
+    let mut h = Harness::start(MODES, &["https://a.test/"]);
+    let view = h.shown();
+    let seat = SeatId::next();
+    // resize, then normal, in one list: normal.
+    tap(&mut h, seat, (62, "F4"));
+    assert_eq!(h.state.keymap_indicator(), None);
+    assert!(!h.state.page_takes_text());
+    // `g` waits for `g g`; a mode switch from the command line, to the mode already set, drops
+    // it although the keyboard did not move.
+    tap(&mut h, seat, (34, "g"));
+    assert_eq!(h.state.keymap_indicator(), Some("g"));
+    h.command("input.mode normal");
+    assert_eq!(h.state.keymap_indicator(), None);
+    let zoom = |h: &Harness| h.state.tabs().nth(h.state.active()).unwrap().zoom;
+    let before = zoom(&h);
+    tap(&mut h, seat, (34, "g"));
+    assert_eq!(zoom(&h), before, "the first g of a new sequence");
+    tap(&mut h, seat, (34, "g"));
+    assert!(zoom(&h) > before);
+    // A mode no mode has is a notice, and the mode stays.
+    h.command("input.mode resize");
+    let effects = h.command("input.mode visual");
+    assert!(notices(&effects).iter().any(|n| n.contains("\"visual\"")));
+    assert_eq!(h.state.keymap_indicator(), Some("RESIZE"));
+    h.command("input.mode normal");
+    // With pass, the key is delivered after the switch and never matched in the new mode:
+    // insert's F5 would open a tab.
+    let tabs = h.state.tabs().len();
+    let effects = tap(&mut h, seat, (63, "F5"));
+    assert_eq!(h.state.keymap_indicator(), Some("INSERT"));
+    assert!(delivered_to(&effects, view), "F5 reached the page");
+    assert_eq!(h.state.tabs().len(), tabs);
+    // Bound in the line, it changes the page's mode and the line keeps the keyboard.
+    tap(&mut h, seat, ESCAPE);
+    h.command("location.focus");
+    let effects = tap(&mut h, seat, (64, "F6"));
+    assert_eq!(h.state.keymap_indicator(), Some("INSERT"));
+    assert_eq!(h.state.focus(), KeyboardFocus::Chrome);
+    assert!(!effects.iter().any(|e| matches!(e, Effect::Focus(_))));
+}
+
+#[test]
+fn a_held_mode_switch_never_runs_again() {
+    // Review finding 3: a mode switch is held quietly, so a mouse command's mode change is not
+    // undone by the key still held.
+    let mut h = Harness::start(MODES, &["https://a.test/"]);
+    let seat = SeatId::next();
+    h.key(seat, (65, "F7"), ButtonState::Pressed, false);
+    assert_eq!(h.state.keymap_indicator(), Some("RESIZE"));
+    h.command("input.mode insert");
+    for _ in 0..3 {
+        h.key(seat, (65, "F7"), ButtonState::Pressed, true);
+    }
+    assert_eq!(h.state.keymap_indicator(), Some("INSERT"));
+    h.key(seat, (65, "F7"), ButtonState::Released, false);
+}
+
+#[test]
+fn a_key_that_passes_after_its_commands_lands_as_the_same_press() {
+    // Review finding 6: F2 selects the configuration page, then passes. Enter-like keys reach
+    // the page they land in as the press they were, never as a fresh press made there, so it
+    // starts no program; its release follows it.
+    let mut h = Harness::start(MODES, &["https://a.test/", "sig://config"]);
+    h.command("tab.select 2");
+    let view = h.shown();
+    h.command("tab.select 1");
+    let seat = SeatId::next();
+    let f2 = (60, "F2");
+    let effects = h.key(seat, f2, ButtonState::Pressed, false);
+    assert_eq!(h.shown(), view);
+    assert!(
+        delivered_to(&effects, view),
+        "F2 reached the page it selected"
+    );
+    assert_eq!(starts(&mut h, view), None);
+    assert!(delivered_to(
+        &h.key(seat, f2, ButtonState::Released, false),
+        view
+    ));
+}
+
+#[test]
+fn a_sequence_belongs_to_the_tab_and_address_it_began_on() {
+    // Review finding 5: `g` on a.test starts `g x`; with b.test selected since, `z` does not
+    // complete b.test's `g z`, which did not apply when `g` was pressed.
+    let mut h = Harness::start(MODES, &["https://a.test/", "https://b.test/"]);
+    h.command("tab.select 1");
+    let seat = SeatId::next();
+    tap(&mut h, seat, (34, "g"));
+    assert_eq!(h.state.keymap_indicator(), Some("g"));
+    h.command("tab.select 2");
+    tap(&mut h, seat, (44, "z"));
+    assert_eq!(h.state.tabs().len(), 2, "z started afresh: nothing ran");
+    // Typed on b.test from its start, it does.
+    tap(&mut h, seat, (34, "g"));
+    tap(&mut h, seat, (44, "z"));
+    assert_eq!(h.state.tabs().len(), 1);
 }

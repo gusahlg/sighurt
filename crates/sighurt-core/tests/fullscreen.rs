@@ -47,6 +47,31 @@ impl Keymap for Watching {
     }
 }
 
+/// A keymap on the core's key engine whose Escape runs `commands` and then passes
+/// (`RunThenPass`; with none, it is `pass("escape")`): delivered as a key no binding took is,
+/// through the core's fullscreen guard.
+fn passing(name: &'static str, commands: &'static [&'static str]) -> KeymapKind {
+    fn keys(commands: &[&str]) -> sighurt_api::keymap::Keys {
+        let mut keys = sighurt_api::keymap::Keys::plain();
+        keys.modes[0].bindings = vec![sighurt_api::keymap::Binding {
+            keys: "escape".parse().unwrap(),
+            when: Default::default(),
+            action: sighurt_api::keymap::Action::RunThenPass(
+                commands.iter().map(|c| c.parse().unwrap()).collect(),
+            ),
+        }];
+        keys
+    }
+    KeymapKind {
+        name,
+        check: |_, _| Vec::new(),
+        new: match commands {
+            [] => || Box::new(sighurt_core::keys::Configured::new(keys(&[]))),
+            _ => || Box::new(sighurt_core::keys::Configured::new(keys(&["page.zoom-in"]))),
+        },
+    }
+}
+
 struct Harness {
     state: BrowserState,
     now: Instant,
@@ -67,7 +92,11 @@ fn environment(frontend: Frontend) -> Environment {
             ("plain".into(), EngineCapabilities::default()),
         ]
         .into(),
-        keymaps: vec![WATCHING],
+        keymaps: vec![
+            WATCHING,
+            passing("pass", &[]),
+            passing("pass-after", &["page.zoom-in"]),
+        ],
         frontend,
         ..Environment::default()
     }
@@ -774,4 +803,26 @@ fn a_refused_fullscreen_shows_and_takes_back_nothing() {
     let effects = h.page_says(true);
     assert!(notices(&effects).is_empty() && withdrawn(&effects).is_empty());
     assert!(withdrawn(&h.page_says(false)).is_empty());
+}
+
+#[test]
+fn an_escape_that_passes_after_its_commands_still_leaves_a_pages_fullscreen() {
+    // Review finding 6: `pass("escape")`, and Escape passing after a command, are delivered as
+    // a key no binding took: the core's guard leaves the page's fullscreen and takes the
+    // press's release.
+    for keymap in ["pass", "pass-after"] {
+        let mut h = Harness::start(Frontend::Gui, keymap, &["https://a.test/"]);
+        let view = h.shown();
+        h.enter_page_fullscreen();
+        let press = escape(Modifiers::default());
+        let effects = h.key(press.clone());
+        assert_eq!(exits(&effects, view), 1, "{keymap}");
+        assert!(!delivered(&effects, view), "{keymap}");
+        assert_eq!(h.fullscreen().page, None);
+        let release = with_state(&press, ButtonState::Released, false);
+        assert!(!delivered(&h.key(release.clone()), view), "{keymap}");
+        // Out of fullscreen it reaches the page, press and release.
+        assert!(delivered(&h.key(press), view), "{keymap}");
+        assert!(delivered(&h.key(release), view), "{keymap}");
+    }
 }

@@ -154,7 +154,10 @@ pub fn keys() -> Keys {
             let Some(table) = table else {
                 continue;
             };
-            for binding in general.iter().filter(|b| !table.iter().any(|t| t.keys == b.keys)) {
+            for binding in general
+                .iter()
+                .filter(|b| !table.iter().any(|t| t.keys == b.keys))
+            {
                 let when = When {
                     url: Some(url.clone()),
                     ..When::default()

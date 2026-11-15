@@ -111,6 +111,20 @@ impl BrowserState {
         if self.tabs.is_empty() {
             return;
         }
+        match command {
+            // A mode switch alone never gives a page that came to the front by itself its
+            // typing back (docs/rewrite/experience-2026-11-15.md, §1.1).
+            Command::InputMode(name) => return self.input_mode(&name, fx),
+            // Each of its commands in its place, so its mode switches lift no hold either.
+            Command::Custom(name) => {
+                for command in self.expand(&name, fx) {
+                    self.run_command(command, fx);
+                    self.settle_engines(fx);
+                }
+                return;
+            }
+            _ => {}
+        }
         // Running a command is the user taking the browser back: the page shown may have typing.
         self.release_input();
         let (active, count) = (self.active, self.tabs.len());
@@ -251,18 +265,22 @@ impl BrowserState {
                 fx.push(Effect::ChromeCommand(action));
                 None
             }
-            // The keymap behind the `Keymap` trait switches its own modes for now.
-            Command::InputMode(_) => None,
-            Command::Custom(name) => {
-                for command in self.expand(&name, fx) {
-                    self.run_command(command, fx);
-                    self.settle_engines(fx);
-                }
-                None
-            }
+            Command::InputMode(_) | Command::Custom(_) => unreachable!("handled above"),
         };
         if let Some(focus) = focus {
             self.move_focus(focus, fx);
+        }
+    }
+
+    /// `input.mode <name>`: the key engine switches to the mode, at once; it moves no focus and
+    /// closes no editor. A name no mode has (a custom action's, or one typed) is a notice and
+    /// changes nothing.
+    pub(crate) fn input_mode(&mut self, name: &str, fx: &mut Fx) {
+        if !self.keys.set_mode(name) {
+            fx.push(Effect::Notice {
+                tab: None,
+                message: format!("There is no key mode {name:?}."),
+            });
         }
     }
 

@@ -62,9 +62,9 @@ use crate::settings::Table;
 mod keys;
 
 pub use keys::{
-    bind, unbind, Action, Binding, Custom, CustomFn, Fallback, FallbackFn, Found, KeySeq,
-    KeyTable, Keys, Mode, Outcome, Situation, When, LINE, MAX_ACTION_COMMANDS, MAX_BINDINGS,
-    MAX_INDICATOR, MAX_KEYS, MAX_MODES, PLAIN_MODE,
+    bind, unbind, Action, Binding, Custom, CustomFn, Fallback, FallbackFn, Found, KeySeq, KeyTable,
+    Keys, Mode, Outcome, Situation, When, LINE, MAX_ACTION_COMMANDS, MAX_BINDINGS, MAX_INDICATOR,
+    MAX_KEYS, MAX_MODES, PLAIN_MODE,
 };
 
 /// What a key press happens in.
@@ -286,6 +286,12 @@ pub trait Keymap {
     /// page. Empty by default: a keymap that can't list its bindings lists none.
     fn describe(&self, _frontend: Frontend) -> Vec<KeyBinding> {
         Vec::new()
+    }
+
+    /// The [`Keys`] value this keymap is, if it is one: the core then runs it on its own key
+    /// engine, which carries out `input.mode`. `None` by default.
+    fn keys(&self) -> Option<Keys> {
+        None
     }
 }
 

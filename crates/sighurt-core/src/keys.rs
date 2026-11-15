@@ -37,9 +37,8 @@ use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::SeatId;
 use sighurt_api::input::{ButtonState, KeyCode, KeyEvent, KeyboardFocus};
 use sighurt_api::keymap::{
-    is_modifier, Action, Binding, Browser, Chord, Fallback, Found, Frontend, KeyAction,
-    KeyBinding, KeyContext, KeySeq, KeyTable, Keymap, KeymapKind, Keys, Outcome, Situation,
-    UrlPattern, When,
+    is_modifier, Action, Binding, Browser, Chord, Fallback, Found, Frontend, KeyAction, KeyBinding,
+    KeyContext, KeySeq, KeyTable, Keymap, KeymapKind, Keys, Outcome, Situation, UrlPattern, When,
 };
 use sighurt_api::settings::{Table, Value};
 
@@ -128,6 +127,10 @@ impl Keymap for Bindings {
     fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
         self.keymap.describe(frontend)
     }
+
+    fn keys(&self) -> Option<Keys> {
+        self.keymap.keys()
+    }
 }
 
 /// Where one entry of a key table binds.
@@ -163,15 +166,9 @@ impl Tables {
         let head = format!("[{section}]");
         for (key, value) in keys {
             match value {
-                Value::String(command) => add(
-                    &mut global,
-                    &head,
-                    key,
-                    command,
-                    None,
-                    commands,
-                    problems,
-                ),
+                Value::String(command) => {
+                    add(&mut global, &head, key, command, None, commands, problems)
+                }
                 Value::Table(table) if key == "url" => {
                     sites = read_sites(table, section, commands, problems);
                 }
@@ -219,10 +216,11 @@ impl Tables {
             Some([tui, user]) => {
                 let mut all = Self::from_table(user, "keys", &CommandSet::ANY, &mut problems);
                 let tui = Self::from_table(tui, "tui.keys", &CommandSet::ANY, &mut problems);
-                all.ops.extend(tui.ops.into_iter().map(|(target, mut binding)| {
-                    binding.when.frontend = Some(Frontend::Terminal);
-                    (target, binding)
-                }));
+                all.ops
+                    .extend(tui.ops.into_iter().map(|(target, mut binding)| {
+                        binding.when.frontend = Some(Frontend::Terminal);
+                        (target, binding)
+                    }));
                 all
             }
             None => Self::from_table(settings, "keys", &CommandSet::ANY, &mut problems),
@@ -712,9 +710,7 @@ impl Keymap for Configured {
     fn press(&mut self, key: &KeyEvent, context: KeyContext, browser: &dyn Browser) -> KeyAction {
         if key.repeat {
             return match self.engine.repeat(key, context, browser) {
-                Some(mut commands) if commands.len() == 1 => {
-                    KeyAction::Run(commands.remove(0))
-                }
+                Some(mut commands) if commands.len() == 1 => KeyAction::Run(commands.remove(0)),
                 Some(commands) => KeyAction::RunAll(commands),
                 None => KeyAction::Take,
             };
@@ -760,25 +756,51 @@ impl Keymap for Configured {
     fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
         self.engine.describe(frontend)
     }
+
+    fn keys(&self) -> Option<Keys> {
+        Some(self.engine.keys().clone())
+    }
 }
 
 /// What to do with one key event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum KeyOutcome {
-    /// Run the commands, in order. The key goes nowhere else.
-    Run(Vec<Command>),
-    /// Run the command, then deliver the key to whatever has focus after it.
-    RunThenDeliver(Command),
-    /// A press the keymap took, or the release or auto-repeat of one: drop it.
+    /// Run the commands, in order (there is at least one); then, with `pass`, deliver the key
+    /// to whatever has the keyboard after them, as a key no binding took is delivered.
+    Run {
+        /// The commands.
+        commands: Vec<Command>,
+        /// Whether the key is delivered after them.
+        pass: bool,
+    },
+    /// A press that was taken, or the release or auto-repeat of one: drop it.
     Consumed,
     /// Not the browser's: deliver it to whatever has focus.
     Deliver,
 }
 
+/// What reads the keys: the engine, for a keymap that is a [`Keys`] value
+/// (`Keymap::keys`), or a keymap of its own behind the trait.
+#[allow(clippy::large_enum_variant)] // One per browser.
+enum Reader {
+    Engine(Engine),
+    Keymap(Box<dyn Keymap>),
+}
+
+/// The reader a keymap of `kind` configured with `settings` comes to.
+fn reader(kind: KeymapKind, settings: &Table) -> Reader {
+    let mut keymap = (kind.new)();
+    keymap.configure(settings);
+    match keymap.keys() {
+        Some(keys) => Reader::Engine(Engine::new(keys)),
+        None => Reader::Keymap(keymap),
+    }
+}
+
 /// The keymap in use, and the presses taken whose releases the core owes nobody, per seat.
 pub(crate) struct KeyState {
     kind: KeymapKind,
-    keymap: Box<dyn Keymap>,
+    reader: Reader,
     /// The context the keymap was last told of.
     context: Option<KeyContext>,
     taken: HashSet<(SeatId, KeyCode)>,
@@ -797,25 +819,33 @@ impl fmt::Debug for KeyState {
 impl KeyState {
     /// A new keymap of `kind`, configured with `settings`.
     pub(crate) fn new(kind: KeymapKind, settings: &Table) -> Self {
-        let mut keymap = (kind.new)();
-        keymap.configure(settings);
         Self {
             kind,
-            keymap,
+            reader: reader(kind, settings),
             context: None,
             taken: HashSet::new(),
         }
     }
 
     /// Applies a reloaded configuration: a keymap of the same kind is configured again and
-    /// keeps its state; another kind replaces it. Taken presses stay taken either way.
+    /// keeps its state (the engine its mode, if the new keys have it); another kind replaces
+    /// it. Taken presses stay taken either way.
     pub(crate) fn configure(&mut self, kind: KeymapKind, settings: &Table) {
         if kind != self.kind {
             self.kind = kind;
-            self.keymap = (kind.new)();
+            self.reader = reader(kind, settings);
             self.context = None;
+            return;
         }
-        self.keymap.configure(settings);
+        if let Reader::Keymap(keymap) = &mut self.reader {
+            return keymap.configure(settings);
+        }
+        match (&mut self.reader, reader(kind, settings)) {
+            (Reader::Engine(engine), Reader::Engine(fresh)) => {
+                engine.configure(fresh.keys().clone())
+            }
+            (reader, fresh) => *reader = fresh,
+        }
     }
 
     /// Decides what happens to `event`, a key event from `seat` in `context`. `browser` is what
@@ -829,54 +859,58 @@ impl KeyState {
     ) -> KeyOutcome {
         let key = (seat, event.code);
         match event.state {
-            ButtonState::Released if self.taken.remove(&key) => KeyOutcome::Consumed,
-            ButtonState::Released => KeyOutcome::Deliver,
+            ButtonState::Released if self.taken.remove(&key) => return KeyOutcome::Consumed,
+            ButtonState::Released => return KeyOutcome::Deliver,
             // Passed, or held since before (R held, then Ctrl): only a fresh press asks the
             // keymap, so its repeats and release go where its press went.
             ButtonState::Pressed if event.repeat && !self.taken.contains(&key) => {
-                KeyOutcome::Deliver
+                return KeyOutcome::Deliver
             }
-            // A repeat of a press the keymap took may run again, but never passes. `Pass`
-            // counts as `Take`, `RunThenPass` as `Run`, and an empty `RunAll` as `Take`.
+            // A repeat of a press that was taken may run again, but never passes.
             ButtonState::Pressed if event.repeat => {
-                match self.keymap.press(event, context, browser) {
-                    KeyAction::Run(command) | KeyAction::RunThenPass(command) => {
-                        KeyOutcome::Run(vec![command])
-                    }
-                    KeyAction::RunAll(commands) if !commands.is_empty() => {
-                        KeyOutcome::Run(commands)
-                    }
-                    KeyAction::Pass | KeyAction::Take | KeyAction::RunAll(_) => {
-                        KeyOutcome::Consumed
-                    }
-                }
+                let commands = match &mut self.reader {
+                    Reader::Engine(engine) => engine.repeat(event, context, browser),
+                    Reader::Keymap(keymap) => match keymap.press(event, context, browser) {
+                        KeyAction::Run(command) | KeyAction::RunThenPass(command) => {
+                            Some(vec![command])
+                        }
+                        KeyAction::RunAll(commands) => Some(commands),
+                        KeyAction::Pass | KeyAction::Take => None,
+                    },
+                };
+                return match commands.filter(|commands| !commands.is_empty()) {
+                    Some(commands) => KeyOutcome::Run {
+                        commands,
+                        pass: false,
+                    },
+                    None => KeyOutcome::Consumed,
+                };
             }
-            ButtonState::Pressed => match self.keymap.press(event, context, browser) {
-                KeyAction::Pass => {
-                    self.taken.remove(&key);
-                    KeyOutcome::Deliver
-                }
-                KeyAction::Take => {
-                    self.taken.insert(key);
-                    KeyOutcome::Consumed
-                }
-                KeyAction::Run(command) => {
-                    self.taken.insert(key);
-                    KeyOutcome::Run(vec![command])
-                }
-                KeyAction::RunThenPass(command) => {
-                    self.taken.remove(&key);
-                    KeyOutcome::RunThenDeliver(command)
-                }
-                // Empty is `Take`: the key is consumed and nothing runs.
-                KeyAction::RunAll(commands) if commands.is_empty() => {
-                    self.taken.insert(key);
-                    KeyOutcome::Consumed
-                }
-                KeyAction::RunAll(commands) => {
-                    self.taken.insert(key);
-                    KeyOutcome::Run(commands)
-                }
+            ButtonState::Pressed => {}
+        }
+        let outcome = match &mut self.reader {
+            Reader::Engine(engine) => engine.press(event, context, browser),
+            Reader::Keymap(keymap) => match keymap.press(event, context, browser) {
+                KeyAction::Pass => Outcome::pass(),
+                KeyAction::Take => Outcome::take(),
+                KeyAction::Run(command) => Outcome::run(vec![command]),
+                KeyAction::RunThenPass(command) => Outcome {
+                    commands: vec![command],
+                    pass: true,
+                },
+                KeyAction::RunAll(commands) => Outcome::run(commands),
+            },
+        };
+        match outcome.pass {
+            true => _ = self.taken.remove(&key),
+            false => _ = self.taken.insert(key),
+        }
+        match (outcome.commands.is_empty(), outcome.pass) {
+            (true, true) => KeyOutcome::Deliver,
+            (true, false) => KeyOutcome::Consumed,
+            (false, pass) => KeyOutcome::Run {
+                commands: outcome.commands,
+                pass,
             },
         }
     }
@@ -887,11 +921,23 @@ impl KeyState {
         self.taken.insert((seat, code));
     }
 
+    /// `input.mode <name>`: switches the engine's mode. `false`, changing nothing, when there
+    /// is no such mode (or the keymap is not the engine's).
+    pub(crate) fn set_mode(&mut self, name: &str) -> bool {
+        match &mut self.reader {
+            Reader::Engine(engine) => engine.set_mode(name),
+            Reader::Keymap(_) => false,
+        }
+    }
+
     /// Tells the keymap the context, if it changed since it was last told.
     pub(crate) fn set_context(&mut self, context: KeyContext) {
         if self.context != Some(context) {
             self.context = Some(context);
-            self.keymap.context(context);
+            match &mut self.reader {
+                Reader::Engine(engine) => engine.context_changed(),
+                Reader::Keymap(keymap) => keymap.context(context),
+            }
         }
     }
 
@@ -899,22 +945,34 @@ impl KeyState {
     /// drops what it waits for.
     pub(crate) fn forget(&mut self, seat: SeatId) {
         self.taken.retain(|(held, _)| *held != seat);
-        self.keymap.reset();
+        match &mut self.reader {
+            Reader::Engine(engine) => engine.reset(),
+            Reader::Keymap(keymap) => keymap.reset(),
+        }
     }
 
     /// What the keymap says about itself, for the chrome.
     pub(crate) fn indicator(&self) -> Option<&str> {
-        self.keymap.indicator()
+        match &self.reader {
+            Reader::Engine(engine) => engine.indicator(),
+            Reader::Keymap(keymap) => keymap.indicator(),
+        }
     }
 
     /// Whether the keymap lets text that is not a key press reach the page now.
     pub(crate) fn page_takes_text(&self) -> bool {
-        self.keymap.page_takes_text()
+        match &self.reader {
+            Reader::Engine(engine) => engine.page_text(),
+            Reader::Keymap(keymap) => keymap.page_takes_text(),
+        }
     }
 
     /// The keymap's bindings in `frontend` ([`Keymap::describe`]).
     pub(crate) fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
-        self.keymap.describe(frontend)
+        match &self.reader {
+            Reader::Engine(engine) => engine.describe(frontend),
+            Reader::Keymap(keymap) => keymap.describe(frontend),
+        }
     }
 }
 
@@ -1369,10 +1427,19 @@ mod tests {
             state: ButtonState::Released,
             ..down.clone()
         };
-        assert_eq!(handle(&down), KeyOutcome::Run(vec![Command::TabNew(None)]));
+        assert_eq!(
+            handle(&down),
+            KeyOutcome::Run {
+                commands: vec![Command::TabNew(None)],
+                pass: false
+            }
+        );
         assert_eq!(
             handle(&repeat),
-            KeyOutcome::Run(vec![Command::TabNew(None)])
+            KeyOutcome::Run {
+                commands: vec![Command::TabNew(None)],
+                pass: false
+            }
         );
         // Ctrl was let go while A repeats: still the browser's.
         let bare_repeat = KeyEvent {
@@ -1414,7 +1481,13 @@ mod tests {
             modifiers: CTRL,
             ..r
         };
-        assert_eq!(handle(&ctrl_r), KeyOutcome::Run(vec![Command::PageReload]));
+        assert_eq!(
+            handle(&ctrl_r),
+            KeyOutcome::Run {
+                commands: vec![Command::PageReload],
+                pass: false
+            }
+        );
     }
 
     #[test]
@@ -1472,8 +1545,20 @@ mod tests {
             state: ButtonState::Released,
             ..down.clone()
         };
-        assert_eq!(handle(&down), KeyOutcome::Run(commands.clone()));
-        assert_eq!(handle(&repeat), KeyOutcome::Run(commands));
+        assert_eq!(
+            handle(&down),
+            KeyOutcome::Run {
+                commands: commands.clone(),
+                pass: false
+            }
+        );
+        assert_eq!(
+            handle(&repeat),
+            KeyOutcome::Run {
+                commands,
+                pass: false
+            }
+        );
         assert_eq!(handle(&up), KeyOutcome::Consumed);
         let empty = press(18, character("e"), NONE, NONE);
         let empty_repeat = KeyEvent {

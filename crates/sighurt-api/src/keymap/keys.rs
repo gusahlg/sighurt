@@ -106,7 +106,10 @@ impl KeySeq {
     /// Whether the keys typed so far could be these: as many or fewer, each matching.
     fn could_be(&self, typed: &[KeyEvent]) -> bool {
         typed.len() <= self.chords.len()
-            && typed.iter().zip(&self.chords).all(|(key, c)| c.matches(key))
+            && typed
+                .iter()
+                .zip(&self.chords)
+                .all(|(key, c)| c.matches(key))
     }
 }
 
@@ -122,7 +125,9 @@ impl From<Chord> for KeySeq {
 /// Whether `chord` names a modifier, a lock or Compose: never a key of a sequence.
 fn names_modifier(chord: &Chord) -> bool {
     match &chord.key {
-        ChordKey::Named(name) => super::MODIFIER_NAMES.contains(&name.as_str()) || name == "Compose",
+        ChordKey::Named(name) => {
+            super::MODIFIER_NAMES.contains(&name.as_str()) || name == "Compose"
+        }
         ChordKey::Character(_) | ChordKey::Code(_) => false,
     }
 }
@@ -667,8 +672,7 @@ impl Keys {
         if typed.is_empty() {
             return Found::None;
         }
-        let applies =
-            |b: &Binding| b.when.holds(situation) && !(typing && b.keys.first().types());
+        let applies = |b: &Binding| b.when.holds(situation) && !(typing && b.keys.first().types());
         let rank = |i: usize| (bindings[i].when.specificity(), i);
         let tombstone = |b: &Binding| matches!(b.action, Action::Unbound);
         let masked = |i: usize| {
@@ -982,7 +986,10 @@ mod tests {
         // Finding 8: the default Space is stated for "outside fields"; a plain bind replaces
         // it, and a plain unbind removes it, without the user knowing that condition.
         let mut table = vec![binding("space", field(false), run("page.send-key space"))];
-        bind(&mut table, binding("space", When::default(), run("tab.next")));
+        bind(
+            &mut table,
+            binding("space", When::default(), run("tab.next")),
+        );
         assert_eq!(table, [binding("space", When::default(), run("tab.next"))]);
         let mut table = vec![binding("space", field(false), run("page.send-key space"))];
         unbind(&mut table, keys("space"), When::default());
@@ -990,13 +997,19 @@ mod tests {
         // A generic ctrl-l replaces the default's terminal-only one.
         let terminal = frontend(Frontend::Terminal);
         let mut table = vec![binding("ctrl-l", terminal.clone(), run("chrome.refresh"))];
-        bind(&mut table, binding("ctrl-l", When::default(), run("page.reload")));
+        bind(
+            &mut table,
+            binding("ctrl-l", When::default(), run("page.reload")),
+        );
         assert_eq!(table.len(), 1);
         assert_eq!(table[0].when, When::default());
         // A narrower bind leaves the broader one: `in_window().bind("q", ...)` keeps the
         // general q for the terminal.
         let mut table = vec![binding("q", When::default(), run("browser.quit"))];
-        bind(&mut table, binding("q", frontend(Frontend::Gui), run("tab.close")));
+        bind(
+            &mut table,
+            binding("q", frontend(Frontend::Gui), run("tab.close")),
+        );
         assert_eq!(table.len(), 2);
         let s = at(PAGE, None);
         let terminal = Situation {
@@ -1041,7 +1054,10 @@ mod tests {
         assert_eq!(table, [binding("g", When::default(), run("tab.close"))]);
         // And `y y`, `y f` are no starts of one another.
         let mut table = vec![binding("y y", When::default(), run("tab.new"))];
-        bind(&mut table, binding("y f", When::default(), run("tab.close")));
+        bind(
+            &mut table,
+            binding("y f", When::default(), run("tab.close")),
+        );
         assert_eq!(table.len(), 2);
     }
 
@@ -1050,7 +1066,8 @@ mod tests {
         let mut k = two_modes();
         let escape = || binding("escape", When::default(), run("input.mode normal"));
         k.bind(INSERT, escape()).unwrap();
-        k.unbind(INSERT, keys("escape"), on("sig://terminal")).unwrap();
+        k.unbind(INSERT, keys("escape"), on("sig://terminal"))
+            .unwrap();
         k.bind(
             INSERT,
             binding("f12", on("sig://terminal"), run("input.mode normal")),
@@ -1084,10 +1101,7 @@ mod tests {
             does(&k, INSERT, &[plain("Escape")], &s("https://a.test/x")),
             "tab.new"
         );
-        assert_eq!(
-            does(&k, INSERT, &[plain("F12")], &terminal),
-            "NORMAL mode"
-        );
+        assert_eq!(does(&k, INSERT, &[plain("F12")], &terminal), "NORMAL mode");
     }
 
     #[test]
@@ -1146,11 +1160,18 @@ mod tests {
         // `[tui.keys] ctrl-r = chrome.refresh`, in the terminal on a.test: the address wins.
         let mut k = Keys::plain();
         let table = KeyTable::Mode(PLAIN_MODE);
-        k.bind(table, binding("ctrl-r", on("https://a.test"), run("page.reload")))
-            .unwrap();
         k.bind(
             table,
-            binding("ctrl-r", frontend(Frontend::Terminal), run("chrome.refresh")),
+            binding("ctrl-r", on("https://a.test"), run("page.reload")),
+        )
+        .unwrap();
+        k.bind(
+            table,
+            binding(
+                "ctrl-r",
+                frontend(Frontend::Terminal),
+                run("chrome.refresh"),
+            ),
         )
         .unwrap();
         let terminal = |address| Situation {
@@ -1198,12 +1219,18 @@ mod tests {
         ));
         // A tombstone masks a less specific binding of its keys, not a more specific one.
         let mut k = two_modes();
-        k.bind(INSERT, binding("escape", When::default(), run("input.mode normal")))
-            .unwrap();
+        k.bind(
+            INSERT,
+            binding("escape", When::default(), run("input.mode normal")),
+        )
+        .unwrap();
         k.unbind(INSERT, keys("escape"), on("https://*.a.test"))
             .unwrap();
-        k.bind(INSERT, binding("escape", on("https://w.a.test"), run("tab.new")))
-            .unwrap();
+        k.bind(
+            INSERT,
+            binding("escape", on("https://w.a.test"), run("tab.new")),
+        )
+        .unwrap();
         let escape = |url| does(&k, INSERT, &[plain("Escape")], &at(PAGE, Some(url)));
         assert_eq!(escape("https://v.a.test/"), "none");
         assert_eq!(escape("https://w.a.test/"), "tab.new");
@@ -1220,7 +1247,10 @@ mod tests {
                 .unwrap();
         }
         // Strict NORMAL gives the page no text: `j` is a command even in a field.
-        assert_eq!(does(&k, NORMAL, &[plain("j")], &at(FIELD, None)), "tab.next");
+        assert_eq!(
+            does(&k, NORMAL, &[plain("j")], &at(FIELD, None)),
+            "tab.next"
+        );
         // INSERT gives it text: in a field, `j` types; outside one it runs.
         assert_eq!(does(&k, INSERT, &[plain("j")], &at(FIELD, None)), "none");
         assert_eq!(does(&k, INSERT, &[plain("j")], &at(PAGE, None)), "tab.next");
@@ -1233,8 +1263,11 @@ mod tests {
             }
         }
         // The rule looks at the first keystroke: `ctrl-k a` is no typing at its start.
-        k.bind(INSERT, binding("ctrl-k a", When::default(), run("tab.close")))
-            .unwrap();
+        k.bind(
+            INSERT,
+            binding("ctrl-k a", When::default(), run("tab.close")),
+        )
+        .unwrap();
         assert_eq!(
             does(&k, INSERT, &[ctrl("k")], &at(FIELD, None)),
             "waits for ctrl-k a"
@@ -1244,17 +1277,17 @@ mod tests {
     #[test]
     fn sequences_wait_and_complete() {
         let mut k = two_modes();
-        k.bind(NORMAL, binding("y y", When::default(), run("tab.duplicate")))
-            .unwrap();
+        k.bind(
+            NORMAL,
+            binding("y y", When::default(), run("tab.duplicate")),
+        )
+        .unwrap();
         k.bind(NORMAL, binding("y f", When::default(), run("tab.close")))
             .unwrap();
         let s = at(PAGE, None);
         // Of two starts, the one defined later says so; either waits.
         assert_eq!(does(&k, NORMAL, &[plain("y")], &s), "waits for y f");
-        assert_eq!(
-            does(&k, NORMAL, &[plain("y"), plain("f")], &s),
-            "tab.close"
-        );
+        assert_eq!(does(&k, NORMAL, &[plain("y"), plain("f")], &s), "tab.close");
         assert_eq!(does(&k, NORMAL, &[plain("y"), plain("z")], &s), "none");
         assert_eq!(does(&k, NORMAL, &[], &s), "none");
         assert_eq!(does(&k, KeyTable::Mode("nope"), &[plain("y")], &s), "none");
@@ -1284,7 +1317,11 @@ mod tests {
         normal.push(binding("h", When::default(), run("help")));
         normal.push(binding("t", When::default(), run("chrome.toggle-tab")));
         // The terminal's chrome commands are checked only where they can run.
-        normal.push(binding("m", frontend(Frontend::Terminal), run("chrome.refresh")));
+        normal.push(binding(
+            "m",
+            frontend(Frontend::Terminal),
+            run("chrome.refresh"),
+        ));
         let problems = ok(&k);
         let expected = [
             "the initial mode \"visual\" is not one of the modes",
@@ -1310,10 +1347,13 @@ mod tests {
         k.bind(NORMAL, binding("h", When::default(), run("help")))
             .unwrap();
         let help = ["help".to_owned()];
-        assert!(k.check(&commands.with_custom(&help), Frontend::Gui).is_empty());
+        assert!(k
+            .check(&commands.with_custom(&help), Frontend::Gui)
+            .is_empty());
         // Bounds.
         let mut k = Keys::plain();
-        k.modes.extend((0..MAX_MODES).map(|i| Mode::new(format!("m{i}"))));
+        k.modes
+            .extend((0..MAX_MODES).map(|i| Mode::new(format!("m{i}"))));
         assert!(ok(&k)[0].contains("there must be 1 to 16"));
         let none = Keys {
             modes: Vec::new(),
@@ -1323,17 +1363,30 @@ mod tests {
         assert!(ok(&none)[0].contains("there are 0 modes"));
         let mut k = Keys::plain();
         let many = vec![command("tab.new"); MAX_ACTION_COMMANDS + 1];
-        k.line.push(binding("ctrl-a", When::default(), Action::Run(many)));
+        k.line
+            .push(binding("ctrl-a", When::default(), Action::Run(many)));
         k.line.extend((0..MAX_BINDINGS).map(|i| {
-            binding(&format!("ctrl-{}", i % 9 + 1), on(&format!("https://s{i}.test")), run("tab.new"))
+            binding(
+                &format!("ctrl-{}", i % 9 + 1),
+                on(&format!("https://s{i}.test")),
+                run("tab.new"),
+            )
         }));
         let problems = ok(&k);
         assert!(problems.iter().any(|p| p.contains("runs 65 commands")));
         assert!(problems.iter().any(|p| p.contains("1025 bindings")));
         // A hand-built command that can't be written back is caught too.
         let mut k = Keys::plain();
-        k.line.push(binding("ctrl-a", When::default(), Action::Run(vec![Command::PageOpen(String::new())])));
-        assert!(ok(&k)[0].contains("page.open needs an argument"), "{:?}", ok(&k));
+        k.line.push(binding(
+            "ctrl-a",
+            When::default(),
+            Action::Run(vec![Command::PageOpen(String::new())]),
+        ));
+        assert!(
+            ok(&k)[0].contains("page.open needs an argument"),
+            "{:?}",
+            ok(&k)
+        );
     }
 
     #[test]
@@ -1344,46 +1397,90 @@ mod tests {
             k.bind(table, binding("f1", When::default(), run("help")))
                 .unwrap();
         }
-        k.bind(NORMAL, binding("j", When::default(), run("page.send-key down")))
-            .unwrap();
-        k.bind(NORMAL, binding("space", field(false), run("page.send-key space")))
-            .unwrap();
         k.bind(
             NORMAL,
-            binding("y y", When::default(), Action::Custom(Custom::new("copy the page's address", |_| Outcome::take()))),
+            binding("j", When::default(), run("page.send-key down")),
         )
         .unwrap();
-        k.bind(NORMAL, binding("ctrl-c", frontend(Frontend::Terminal), run("browser.quit")))
-            .unwrap();
-        k.bind(NORMAL, binding(":", When::default(), Action::RunThenPass(vec![command("location.focus")])))
-            .unwrap();
-        k.bind(NORMAL, binding("z", When::default(), Action::Run(Vec::new())))
-            .unwrap();
-        k.bind(INSERT, binding("escape", When::default(), run("input.mode normal")))
-            .unwrap();
+        k.bind(
+            NORMAL,
+            binding("space", field(false), run("page.send-key space")),
+        )
+        .unwrap();
+        k.bind(
+            NORMAL,
+            binding(
+                "y y",
+                When::default(),
+                Action::Custom(Custom::new("copy the page's address", |_| Outcome::take())),
+            ),
+        )
+        .unwrap();
+        k.bind(
+            NORMAL,
+            binding("ctrl-c", frontend(Frontend::Terminal), run("browser.quit")),
+        )
+        .unwrap();
+        k.bind(
+            NORMAL,
+            binding(
+                ":",
+                When::default(),
+                Action::RunThenPass(vec![command("location.focus")]),
+            ),
+        )
+        .unwrap();
+        k.bind(
+            NORMAL,
+            binding("z", When::default(), Action::Run(Vec::new())),
+        )
+        .unwrap();
+        k.bind(
+            INSERT,
+            binding("escape", When::default(), run("input.mode normal")),
+        )
+        .unwrap();
         for site in ["sig://terminal", "sig://config"] {
             k.unbind(INSERT, keys("escape"), on(site)).unwrap();
             k.bind(INSERT, binding("f12", on(site), run("input.mode normal")))
                 .unwrap();
         }
-        k.bind(KeyTable::Line, binding("ctrl-r", When::default(), run("page.reload")))
-            .unwrap();
+        k.bind(
+            KeyTable::Line,
+            binding("ctrl-r", When::default(), run("page.reload")),
+        )
+        .unwrap();
         let rows: Vec<(String, String, String, String)> = k
             .describe(Frontend::Gui)
             .into_iter()
             .map(|b| (b.mode, b.keys, b.action, b.applies))
             .collect();
         let row = |m: &str, keys: &str, action: &str, applies: &str| {
-            (m.to_owned(), keys.to_owned(), action.to_owned(), applies.to_owned())
+            (
+                m.to_owned(),
+                keys.to_owned(),
+                action.to_owned(),
+                applies.to_owned(),
+            )
         };
         assert_eq!(
             rows,
             [
                 row("NORMAL", "f1", "help", "also in the address line"),
                 row("NORMAL", "j", "page.send-key ArrowDown", "in the page"),
-                row("NORMAL", "space", "page.send-key space", "in the page, not in a text field"),
+                row(
+                    "NORMAL",
+                    "space",
+                    "page.send-key space",
+                    "in the page, not in a text field"
+                ),
                 row("NORMAL", "y y", "copy the page's address", "in the page"),
-                row("NORMAL", ":", "location.focus, then pass to the page", "in the page"),
+                row(
+                    "NORMAL",
+                    ":",
+                    "location.focus, then pass to the page",
+                    "in the page"
+                ),
                 row("NORMAL", "z", "nothing", "in the page"),
                 row(
                     "INSERT",
@@ -1403,7 +1500,10 @@ mod tests {
             .any(|b| b.keys == "ctrl-c"));
         let mut plain = Keys::plain();
         plain
-            .bind(KeyTable::Mode(PLAIN_MODE), binding("ctrl-t", When::default(), run("tab.new")))
+            .bind(
+                KeyTable::Mode(PLAIN_MODE),
+                binding("ctrl-t", When::default(), run("tab.new")),
+            )
             .unwrap();
         assert_eq!(plain.describe(Frontend::Gui)[0].mode, "");
     }
