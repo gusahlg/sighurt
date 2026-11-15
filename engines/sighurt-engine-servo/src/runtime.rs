@@ -1641,6 +1641,15 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
         // A console window that closed while the loop slept: the summary has no page text.
         self.delegate.flush_console_logs(now);
         if self.servo.is_some() && self.failed.is_none() {
+            // A smooth scroll that no frame stepped for a while steps now, and the runtime is
+            // pumped again at that time; with none in flight, no deadline.
+            for view in self.views.values_mut() {
+                let step = view.scroll.fallback(now);
+                view.send(step);
+                if let Some(due) = view.scroll.deadline() {
+                    deadline = Some(deadline.map_or(due, |d| d.min(due)));
+                }
+            }
             // With a backlog, what Servo has next waits in its own channels.
             if self.events.len() < MAX_EVENTS_PER_PUMP {
                 self.spin();
@@ -1742,6 +1751,9 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
         let view = self.views.get_mut(&id).expect("present checked the view");
         match view.target.deliver(&context, permit) {
             Ok(swap) => {
+                // A smooth scroll in flight takes its next step for the next frame.
+                let step = view.scroll.frame(Instant::now());
+                view.send(step);
                 self.account_frame(id, size, paint, swap);
                 if spun && !self.events.is_empty() {
                     self.waker.wake();

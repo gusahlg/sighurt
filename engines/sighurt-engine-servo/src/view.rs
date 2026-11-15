@@ -1,5 +1,6 @@
 //! One Servo view: its WebView, presentation target and rendering context, with its visibility,
-//! focus, zoom, current metrics, navigations, held keys, input-method state, pending service
+//! focus, zoom, current metrics, navigations, held keys, the wheel notches still scrolling,
+//! input-method state, pending service
 //! requests, the navigations its pages asked the browser about and the pop-ups it opened.
 //!
 //! The WebView is made once the view has room (non-empty metrics, so a GL context can exist)
@@ -40,7 +41,7 @@ use sighurt_api::input::InputEvent;
 use url::Url;
 
 use crate::delegate::{Delegate, PageNavigation};
-use crate::input::{Composition, Keys};
+use crate::input::{Composition, Keys, SmoothScroll};
 use crate::navigation::{Navigator, Request};
 use crate::presentation::{physical, FrameDriver, Readbacks};
 use crate::semantic::Semantics;
@@ -113,6 +114,8 @@ pub(crate) struct View<T: ServoTarget> {
     pub loading: bool,
     pub keys: Keys,
     pub composition: Composition,
+    /// The wheel notches still playing out.
+    pub scroll: SmoothScroll,
     /// Servo's input-method request for the focused field, while there is one.
     pub ime: Option<EmbedderControlId>,
     pub requests: Vec<(RequestId, Pending)>,
@@ -170,6 +173,7 @@ impl<T: ServoTarget> View<T> {
             loading: false,
             keys: Keys::default(),
             composition: Composition::default(),
+            scroll: SmoothScroll::default(),
             ime: None,
             requests: Vec::new(),
             asked: Vec::new(),
@@ -355,6 +359,9 @@ impl<T: ServoTarget> View<T> {
                 self.frame_requested = false;
             }
         } else {
+            // A smooth scroll in flight ends where it was going before Servo throttles the view.
+            let rest = self.scroll.finish();
+            self.send(rest);
             if let Some(webview) = &self.webview {
                 webview.hide();
             }
@@ -380,13 +387,24 @@ impl<T: ServoTarget> View<T> {
         use sighurt_api::input::{FocusEvent, InputKind};
         match &event.kind {
             InputKind::Pointer(pointer) => {
-                use sighurt_api::input::PointerEvent;
+                use sighurt_api::input::{PointerEvent, ScrollDelta};
                 // Servo takes a click's modifiers from the keys it was sent (`crate::input`).
                 let mut events = match pointer {
                     PointerEvent::Button { modifiers, .. } => self.keys.sync_modifiers(*modifiers),
                     _ => Vec::new(),
                 };
-                events.push(crate::input::pointer(pointer, &self.metrics));
+                let event = crate::input::pointer(pointer, &self.metrics);
+                match (pointer, &event) {
+                    // A notch plays out as a smooth scroll; touchpad pixels go as they come.
+                    (
+                        PointerEvent::Scroll {
+                            delta: ScrollDelta::Wheel { .. },
+                            ..
+                        },
+                        servo::InputEvent::Wheel(wheel),
+                    ) => events.extend(self.scroll.add(wheel, Instant::now())),
+                    _ => events.push(event),
+                }
                 events
             }
             InputKind::Key(key) => self.keys.key(key).into_iter().collect(),
