@@ -43,6 +43,10 @@ pkgs.mkShell ({
   hardeningDisable = [ "fortify" ];
   # nixpkgs' rustc has no bundled rust-lld; link wasm guests with lld's wasm-ld.
   CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER = "wasm-ld";
+  # The standard library's sources, with their vendored dependencies: tools/cross-check builds
+  # std from them for the macOS and Windows targets the pin's rustc has no std for
+  # (docs/rewrite/PORTING.md). Read by that script only.
+  SIGHURT_RUST_LIB_SRC = "${pkgs.rustPlatform.rustLibSrc}";
   LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs
     + pkgs.lib.optionalString hasWpe ":${wpe.prefix}/lib";
