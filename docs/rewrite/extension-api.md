@@ -2069,3 +2069,29 @@ finding was checked against the plan and the code before it was acted on.
   `home-tall-100` is new. The line chrome lists the same as plain lines (its `home-100`
   changes). In the core, `page.send-key` on a page the chrome draws (`sig://home`) is
   `Effect::ChromeInput`, as the keys passed to it are.
+
+- **The key engine and the experience** (15 November 2026; the user: "a fully programmable
+  browser experience"; design in `experience-2026-11-15.md`, Parts 1 to 3; Parts 4 and 5 stay
+  proposals). Removed: the `Keymap` trait, `KeymapKind` and `KeyAction`; the `bindings` keymap's
+  matcher and the example keymap's matcher; `KEYMAPS` in `sighurt-runtime`'s registry and
+  `Environment::keymaps`; the per-keymap checks; `[keymap.<name>]` tables (one now gets a
+  notice); and the example crate's `table` and `actions` modules. New: one key engine in the core
+  (`sighurt_core::keys::Engine`), driven by `sighurt_api::keymap::Keys` (`Mode`, `Fallback`,
+  `Binding`, `KeySeq` of 1 to 4 keystrokes, `When`, `Action::{Run, RunThenPass, Custom,
+  Unbound}`, `Keys::check`, `resolve`, `describe`, `bind`, `unbind`); the crate `sdk/sighurt-config`
+  (`Experience`, `KeysBuilder`, the table handles, `custom`, `prelude`, and the default experience
+  in `defaults`); `sighurt-config-example`'s `configure() -> Experience`; `registry::experience`,
+  which gives the core its keys in `Environment::keys` and, for an experience with a problem,
+  runs the default with a notice; the command `input.mode <name>` (`input` is now a command area,
+  so no `[commands]` alias may be called that); and in the configuration file `[keys.mode.<name>]`,
+  `[keys.mode.<name>.url."<pattern>"]`, sequences of up to 4 keystrokes and `false` to unbind.
+  `[input] keymap` is `example` (the experience compiled into `sig`) or `bindings` (no
+  experience); any other value is an error. Changed on purpose: (a) a site's table no longer
+  replaces a mode's general table (decision 140); bindings layer, and unbinding removes what a
+  site must not have, so `sig://terminal` and `sig://config` unbind Escape in INSERT and bind
+  `ctrl-escape` and `f12` to `input.mode normal`, with the same behaviour; (b) every matching
+  `[keys.url]` table contributes, most specific first, where only the most specific applied;
+  (c) `[tui.keys]` wins over the same table of `[keys]`, no longer over all of it, and a
+  `[keys.url]` binding for the address shown wins over a `[tui.keys]` binding with no address;
+  (d) `[keys]` applies under `keymap = "example"`, where it was ignored with a notice. Every
+  default key behaves as before in both frontends.
