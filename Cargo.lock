@@ -10447,6 +10447,7 @@ name = "sighurt-config-example"
 version = "1.0.0"
 dependencies = [
  "sighurt-api",
+ "sighurt-core",
 ]
 
 [[package]]

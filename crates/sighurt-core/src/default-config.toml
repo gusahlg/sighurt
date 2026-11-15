@@ -251,7 +251,8 @@ forward = "page.forward"
 # page.open-in <engine> [url], page.switch-engine, page.reload, page.stop, page.back,
 # page.forward, page.zoom-in, page.zoom-out, page.zoom-reset, page.send-key <key>,
 # page.find [text], page.find-next, page.find-previous, page.find-stop,
-# page.exit-fullscreen, clipboard.copy <text>, location.focus [text], history.clear,
+# page.exit-fullscreen, clipboard.copy <text>, location.focus [text], input.mode <name>,
+# history.clear,
 # browser.home, browser.fullscreen, browser.quit, site.forget [host], the chrome's own,
 # chrome.<action>, and the ones [commands] below defines, such as help. Tabs count from 1.
 #

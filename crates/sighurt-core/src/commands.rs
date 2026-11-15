@@ -251,6 +251,8 @@ impl BrowserState {
                 fx.push(Effect::ChromeCommand(action));
                 None
             }
+            // The keymap behind the `Keymap` trait switches its own modes for now.
+            Command::InputMode(_) => None,
             Command::Custom(name) => {
                 for command in self.expand(&name, fx) {
                     self.run_command(command, fx);

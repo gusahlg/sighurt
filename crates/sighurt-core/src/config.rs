@@ -1438,7 +1438,7 @@ fn read_keys(
 ) -> Table {
     let settings = settings(table.unwrap_or_default(), "[tui.keys]", problems);
     let mut found = Vec::new();
-    let _ = keys::Bindings::from_table(&settings, "tui.keys", commands, &mut found);
+    let _ = keys::Tables::from_table(&settings, "tui.keys", commands, &mut found);
     problems.extend(found);
     settings
 }
