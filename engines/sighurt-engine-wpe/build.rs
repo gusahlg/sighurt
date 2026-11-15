@@ -3,7 +3,8 @@
 //! `PKG_CONFIG_PATH`, which ten of Servo's build scripts track (docs/rewrite/WPE.md, "Why not
 //! PKG_CONFIG_PATH"). Without it, the build stops with what to do: `sig`'s default features
 //! include this engine. The library isn't linked: its path goes to the crate as
-//! `SIGHURT_WPE_LIBRARY`, which `ffi::load` opens when the runtime first starts.
+//! `SIGHURT_WPE_LIBRARY`, which `ffi::load` opens when the runtime first starts. WPE WebKit
+//! exists on Linux only: for any other target the build stops at once.
 
 const MISSING: [&str; 3] = [
     "WPE WebKit 2.52 is not installed on this machine, and the WPE engine (feature engine-wpe, \
@@ -12,10 +13,17 @@ const MISSING: [&str; 3] = [
      it with `nix/build-wpewebkit.sh --pull louise-pc`; then build inside shell.nix (tools/cargo \
      does), which sets SIGHURT_WPE_PKG_CONFIG_PATH. See docs/rewrite/WPE.md.",
     "Or build sig without WPE: `cargo build -p sighurt-browser --no-default-features --features \
-     engine-servo,engine-wasm`.",
+     frontend-gui,frontend-tui,engine-servo,engine-wasm`.",
 ];
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!(
+            "cargo::error=WPE WebKit (feature engine-wpe) is Linux-only: \
+             build sig for this system without it (docs/rewrite/PORTING.md)"
+        );
+        return;
+    }
     println!("cargo:rerun-if-env-changed=SIGHURT_WPE_PKG_CONFIG_PATH");
     let Ok(path) = std::env::var("SIGHURT_WPE_PKG_CONFIG_PATH") else {
         return missing("SIGHURT_WPE_PKG_CONFIG_PATH is not set");

@@ -8,6 +8,10 @@
 //!
 //! Each test is bounded: a watchdog kills `sig`'s process group after [`LIMIT`], and dropping
 //! the pty kills it too, so nothing is left running.
+//!
+//! Unix only: ptys and process groups.
+
+#![cfg(unix)]
 
 use std::fs;
 use std::os::fd::OwnedFd;

@@ -16,7 +16,7 @@ engine-wasm = ["sighurt-runtime/engine-wasm", "dep:sighurt-engine-wasm"]
 # WebKit presents into the terminal's CPU target: shared-memory frames, one copy each.
 engine-wpe = ["sighurt-runtime/engine-wpe", "dep:sighurt-engine-wpe"]
 engine-ladybird = ["sighurt-runtime/engine-ladybird", "dep:sighurt-engine-ladybird"]
-# Chromium into the terminal's CPU target; it needs a display connection (docs/rewrite/CEF.md).
+# Chromium into the terminal's CPU target, with no display connection (docs/rewrite/CEF.md).
 engine-cef = ["sighurt-runtime/engine-cef", "dep:sighurt-engine-cef"]
 engine-demo = ["sighurt-runtime/engine-demo", "dep:sighurt-engine-demo"]
 engine-netsurf = ["sighurt-runtime/engine-netsurf", "dep:sighurt-engine-netsurf"]

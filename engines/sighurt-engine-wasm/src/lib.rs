@@ -11,8 +11,9 @@
 //! capabilities registered in [`capabilities`], with no WASI. Their drawing is painted on the
 //! CPU (`raster.rs`) into a [`Frame`] the host lends through a [`CpuTarget`]. Both live in
 //! [`sighurt_api::present`](sighurt_api::present) and are re-exported here. `sig` gives each
-//! view a `sighurt_wayland::TargetLease` of an SHM target, which implements [`CpuTarget`] in
-//! `sighurt-wayland`.
+//! view a `sighurt_wayland::TargetLease` of an SHM target in the window, which implements
+//! [`CpuTarget`] in `sighurt-wayland`, and the terminal's CPU target in the terminal. Which pixels
+//! a frame changed go to the target through [`sighurt_api::present::damage`].
 //!
 //! Being in-process makes this cooperative, not a sandbox: Wasmtime isolates a guest's memory
 //! and the linker limits what it can call, but a bug in the engine or a host function is a bug
@@ -41,6 +42,12 @@ pub mod net;
 pub mod pages;
 pub mod permissions;
 mod pool;
+/// The master side of `sig://terminal`. Linux only, as the runtime's programs are: elsewhere a
+/// module of the same shape that never gets a master (`pty_unsupported.rs`).
+#[cfg(target_os = "linux")]
+pub mod pty;
+#[cfg(not(target_os = "linux"))]
+#[path = "pty_unsupported.rs"]
 pub mod pty;
 mod raster;
 pub mod rtc;

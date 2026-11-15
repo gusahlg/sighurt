@@ -7,6 +7,9 @@
 //! copy `nix/build-cef.sh` installs. Everything else CEF offers is reached through the vtables of
 //! the objects it hands over ([`crate::capi`]).
 //!
+//! The bindings and their API hash are Linux's ([`API_HASH`]), and so is the distribution
+//! `nix/build-cef.sh` installs: on any other system [`load`] refuses, with the reason.
+//!
 //! Must not own: any policy. Everything here is plumbing around raw pointers.
 
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -56,8 +59,18 @@ pub struct Api {
 
 static API: OnceLock<Api> = OnceLock::new();
 
+/// Refuses: this adapter is built against Linux's CEF (`libcef.so`, the API hash for linux, a
+/// helper executable and the multi-threaded message loop). Windows needs `libcef.dll` and its
+/// own hash; macOS a framework in an app bundle and the message loop on the main thread
+/// (docs/rewrite/PORTING.md).
+#[cfg(not(target_os = "linux"))]
+pub fn load(_dist: &Path) -> Result<&'static Api, String> {
+    Err("the CEF engine is built for Linux's CEF only; this system has none in sig".into())
+}
+
 /// Opens `dist/libcef.so`, checks that it is the API version the bindings were made for, and
 /// remembers its entry points. Idempotent.
+#[cfg(target_os = "linux")]
 pub fn load(dist: &Path) -> Result<&'static Api, String> {
     if let Some(api) = API.get() {
         return Ok(api);
@@ -109,6 +122,7 @@ pub fn load(dist: &Path) -> Result<&'static Api, String> {
 ///
 /// # Safety
 /// `F` is a function pointer type with the signature of the symbol.
+#[cfg(target_os = "linux")]
 unsafe fn cast<F: Copy>(address: *mut c_void) -> F {
     // SAFETY: by the contract above; function and data pointers have the same size on Linux.
     unsafe { std::mem::transmute_copy::<*mut c_void, F>(&address) }

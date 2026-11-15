@@ -7,7 +7,9 @@
 //! `{state_dir}/sighurt`) are mode 0700. An existing directory that is wider is tightened to
 //! 0700; a profile is created only by an engine that keeps one; shared XDG parents are not
 //! changed. Files this module writes, including
-//! `session.toml` and `history.toml`, are mode 0600. The configuration file is never written
+//! `session.toml` and `history.toml`, are mode 0600. Systems without mode bits (Windows) get
+//! neither: the files take their directory's access list, which in the user's profile is the
+//! user's (docs/rewrite/PORTING.md). The configuration file is never written
 //! here: the user's editor writes it (`sig://config` runs it).
 //!
 //! The core parses and validates the configuration, against what the build has (its engines,
@@ -17,8 +19,9 @@
 //! storage or `[session] restore = false`. Only a missing file means the built-in
 //! configuration. A reload that fails, or finds the file missing, keeps the configuration in
 //! use ([`load_config`]).
-//! The configuration's directory is watched with inotify, so a saved file (written in place or
-//! renamed over the old one) or a deleted one is read again; nothing polls.
+//! On Linux the configuration's directory is watched with inotify, so a saved file (written in
+//! place or renamed over the old one) or a deleted one is read again; nothing polls. Other
+//! systems have no watch yet ([`ConfigWatch::new`] says so) and read the file at startup only.
 //!
 //! Sessions are written atomically (a temporary file in the same directory, synced, then renamed
 //! over the old one) by a thread of their own, which writes only the latest snapshot it has been
@@ -38,11 +41,17 @@
 //! Must not own: parsing or validating the configuration's contents (the core), or deciding what
 //! a reload changes.
 
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
+#[cfg(target_os = "linux")]
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -50,6 +59,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
 use rustix::fs::inotify;
 use sighurt_core::config::{Config, ConfigError};
 use sighurt_core::session::Session;
@@ -114,7 +124,11 @@ pub(crate) fn secure_private_dir(dir: &Path) -> io::Result<()> {
             fs::create_dir_all(parent)?;
         }
     }
-    let created = match fs::DirBuilder::new().mode(0o700).create(dir) {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    let created = match builder.create(dir) {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(error),
@@ -126,6 +140,16 @@ pub(crate) fn secure_private_dir(dir: &Path) -> io::Result<()> {
             dir.display()
         )));
     }
+    #[cfg(not(unix))]
+    let _ = created;
+    #[cfg(unix)]
+    tighten(dir, &meta, created)?;
+    Ok(())
+}
+
+/// Sets `dir` to 0700 when it was just `created` or is wider than that.
+#[cfg(unix)]
+fn tighten(dir: &Path, meta: &fs::Metadata, created: bool) -> io::Result<()> {
     let perms = meta.permissions().mode() & 0o7777;
     // 0o7077 is setuid, setgid, sticky and group/other: wider than owner rwx. Narrower stays.
     if (created || (perms & 0o7077) != 0) && perms != 0o700 {
@@ -203,14 +227,21 @@ fn shown(path: Option<&Path>) -> String {
     )
 }
 
-/// Watches the configuration file's directory for the file being written, replaced or deleted.
+/// Watches the configuration file's directory for the file being written, replaced or deleted:
+/// inotify, on Linux only.
 pub struct ConfigWatch {
+    #[cfg(target_os = "linux")]
     fd: OwnedFd,
+    #[cfg(target_os = "linux")]
     name: OsString,
+    /// Nothing can be watched here: a watch is never made.
+    #[cfg(not(target_os = "linux"))]
+    never: std::convert::Infallible,
 }
 
 impl ConfigWatch {
     /// Watches `path`, whose directory must exist.
+    #[cfg(target_os = "linux")]
     pub fn new(path: &Path) -> io::Result<Self> {
         let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(io::Error::other("the configuration has no directory"));
@@ -229,7 +260,18 @@ impl ConfigWatch {
         })
     }
 
+    /// Fails: watching needs inotify, which this system does not have. The configuration is
+    /// read at startup only.
+    #[cfg(not(target_os = "linux"))]
+    pub fn new(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "watching the configuration needs inotify, which only Linux has",
+        ))
+    }
+
     /// Reads every pending event; whether one was about the configuration file.
+    #[cfg(target_os = "linux")]
     pub fn changed(&self) -> bool {
         let mut buffer = [MaybeUninit::<u8>::uninit(); 4096];
         let mut reader = inotify::Reader::new(&self.fd, &mut buffer);
@@ -240,12 +282,22 @@ impl ConfigWatch {
         }
         changed
     }
+
+    /// Never called: there is no watch here.
+    #[cfg(not(target_os = "linux"))]
+    pub fn changed(&self) -> bool {
+        match self.never {}
+    }
 }
 
+#[cfg(unix)]
 impl AsFd for ConfigWatch {
     /// The descriptor to wait on.
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
+        #[cfg(target_os = "linux")]
+        return self.fd.as_fd();
+        #[cfg(not(target_os = "linux"))]
+        match self.never {}
     }
 }
 
@@ -349,11 +401,10 @@ fn lock_session(path: &Path) -> io::Result<fs::File> {
         .parent()
         .ok_or_else(|| io::Error::other("no directory"))?;
     secure_private_dir(dir)?;
-    let lock = fs::OpenOptions::new()
+    let lock = private_file()
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
         .open(lock_path(path))?;
     let mut elsewhere = OWNED_ELSEWHERE
         .lock()
@@ -396,6 +447,15 @@ pub(crate) fn remove_temporaries(path: &Path) {
     }
 }
 
+/// Options that create a file at mode 0600 (where there are modes).
+fn private_file() -> fs::OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+}
+
 /// Writes `text` to `path` atomically: readers see the old file or the new one, whole.
 pub fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
     let dir = path
@@ -406,22 +466,27 @@ pub fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
     temporary.push(format!(".{}.tmp", std::process::id()));
     let temporary = PathBuf::from(temporary);
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
+        let mut file = private_file()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(&temporary)?;
-        let mut permissions = file.metadata()?.permissions();
-        if (permissions.mode() & 0o777) != 0o600 {
-            permissions.set_mode(0o600);
-            file.set_permissions(permissions)?;
+        #[cfg(unix)]
+        {
+            let mut permissions = file.metadata()?.permissions();
+            if (permissions.mode() & 0o777) != 0o600 {
+                permissions.set_mode(0o600);
+                file.set_permissions(permissions)?;
+            }
         }
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
-        // The rename itself is durable once the directory is.
-        fs::File::open(dir)?.sync_all()
+        // The rename itself is durable once the directory is. Windows opens no directory as a
+        // file; what makes its rename durable there is unverified (docs/rewrite/PORTING.md).
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);

@@ -1,10 +1,19 @@
 //! Finds the shim library (`libsighurt-ladybird-shim.so`) and hands its path to the crate. It
 //! links nothing: the engine opens the library when its runtime first starts. A missing library is
 //! not a build error: the runtime says so when it starts (build it with nix/build-ladybird-shim.sh).
+//! Linux only, as built here (nixpkgs' Ladybird, eventfds and pidfds): for any other target the
+//! build stops at once.
 
 use std::path::PathBuf;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!(
+            "cargo::error=The Ladybird engine (feature engine-ladybird) is Linux-only: \
+             build sig for this system without it (docs/rewrite/PORTING.md)"
+        );
+        return;
+    }
     println!("cargo:rerun-if-env-changed=SIGHURT_LADYBIRD_SHIM");
     println!("cargo:rerun-if-changed=build.rs");
     let name = "lib/libsighurt-ladybird-shim.so";

@@ -55,6 +55,7 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::OFlags;
 use rustix::io::Errno;
+#[cfg(not(target_vendor = "apple"))]
 use rustix::pipe::PipeFlags;
 use rustix::pty::OpenptFlags;
 use rustix::termios::{
@@ -203,8 +204,7 @@ impl Session {
                 "a terminal session is already active",
             ));
         }
-        let (winch_read, winch_write) =
-            rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+        let (winch_read, winch_write) = winch_pipe()?;
         let original_flags = rustix::fs::fcntl_getfl(&fd)?;
         let raw_flags = original_flags | OFlags::NONBLOCK;
         rustix::fs::fcntl_setfl(&fd, raw_flags)?;
@@ -697,7 +697,28 @@ pub fn restore_before_forced_exit() {
     }
 }
 
+/// The `SIGWINCH` pipe: close-on-exec and non-blocking.
+#[cfg(not(target_vendor = "apple"))]
+fn winch_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    Ok(rustix::pipe::pipe_with(
+        PipeFlags::CLOEXEC | PipeFlags::NONBLOCK,
+    )?)
+}
+
+/// The `SIGWINCH` pipe: close-on-exec and non-blocking. macOS has no `pipe2`, so a child forked
+/// by another thread between the two steps would inherit it.
+#[cfg(target_vendor = "apple")]
+fn winch_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (read, write) = rustix::pipe::pipe()?;
+    for end in [&read, &write] {
+        rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)?;
+        rustix::io::ioctl_fionbio(end, true)?;
+    }
+    Ok((read, write))
+}
+
 /// Open a pseudoterminal. The master is first, the slave second.
+#[cfg(not(target_vendor = "apple"))]
 pub fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     let flags = OpenptFlags::RDWR | OpenptFlags::CLOEXEC | OpenptFlags::NOCTTY;
     let master = rustix::pty::openpt(flags)?;
@@ -707,13 +728,31 @@ pub fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((master, slave))
 }
 
+/// Open a pseudoterminal. The master is first, the slave second. macOS has neither
+/// `O_CLOEXEC` for `posix_openpt` nor `TIOCGPTPEER`: the master is marked close-on-exec after it
+/// opens, and the slave is opened by name.
+#[cfg(target_vendor = "apple")]
+pub fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
+    let master = rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::pty::grantpt(&master)?;
+    rustix::pty::unlockpt(&master)?;
+    let name = rustix::pty::ptsname(&master, Vec::new())?;
+    let slave = rustix::fs::open(
+        name.as_c_str(),
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    Ok((master, slave))
+}
+
 /// Termios fields the restoration tests compare. `Termios` is not `PartialEq`.
 pub fn termios_matches(left: &Termios, right: &Termios) -> bool {
     if left.input_modes != right.input_modes
         || left.output_modes != right.output_modes
         || left.control_modes != right.control_modes
         || left.local_modes != right.local_modes
-        || left.line_discipline != right.line_discipline
+        || !same_line_discipline(left, right)
         || left.input_speed() != right.input_speed()
         || left.output_speed() != right.output_speed()
     {
@@ -727,6 +766,7 @@ pub fn termios_matches(left: &Termios, right: &Termios) -> bool {
         SpecialCodeIndex::VEOF,
         SpecialCodeIndex::VTIME,
         SpecialCodeIndex::VMIN,
+        #[cfg(not(target_vendor = "apple"))]
         SpecialCodeIndex::VSWTC,
         SpecialCodeIndex::VSTART,
         SpecialCodeIndex::VSTOP,
@@ -743,10 +783,29 @@ pub fn termios_matches(left: &Termios, right: &Termios) -> bool {
         .all(|index| left.special_codes[*index] == right.special_codes[*index])
 }
 
+/// Whether the line disciplines match. macOS's termios has no such field.
+fn same_line_discipline(left: &Termios, right: &Termios) -> bool {
+    #[cfg(not(target_vendor = "apple"))]
+    return left.line_discipline == right.line_discipline;
+    #[cfg(target_vendor = "apple")]
+    {
+        let _ = (left, right);
+        true
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
 fn current_tid() -> i32 {
     // `gettid` does not fail. A thread id is a positive pid.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) };
     tid as i32
+}
+
+/// The thread's Mach port: unique among the process's live threads, and never 0.
+#[cfg(target_vendor = "apple")]
+fn current_tid() -> i32 {
+    let port = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+    port as i32
 }
 
 fn load_state() -> Option<&'static Shared> {
@@ -1195,13 +1254,25 @@ extern "C" fn handle_winch(_signal: libc::c_int) {
 }
 
 fn errno_raw() -> libc::c_int {
-    unsafe { *libc::__errno_location() }
+    unsafe { *errno_location() }
 }
 
 fn set_errno_raw(saved: libc::c_int) {
     unsafe {
-        *libc::__errno_location() = saved;
+        *errno_location() = saved;
     }
+}
+
+/// This thread's `errno`.
+#[cfg(not(target_vendor = "apple"))]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+/// This thread's `errno`.
+#[cfg(target_vendor = "apple")]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
 }
 
 /// One byte on the `SIGWINCH` pipe. Async-signal-safe: a `write` of one byte.
@@ -1361,7 +1432,12 @@ fn delivered_by_kill(info: *mut libc::siginfo_t) -> bool {
         return false;
     }
     let code = unsafe { (*info).si_code };
-    code == libc::SI_USER || code == libc::SI_TKILL
+    #[cfg(not(target_vendor = "apple"))]
+    return code == libc::SI_USER || code == libc::SI_TKILL;
+    // macOS has no `tkill`, and the libc crate no `SI_USER` there: `<sys/signal.h>` defines it
+    // as 0x10001.
+    #[cfg(target_vendor = "apple")]
+    return code == 0x10001;
 }
 
 /// Current disposition, without changing it. `false` if the read fails.
