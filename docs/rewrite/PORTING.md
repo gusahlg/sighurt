@@ -152,9 +152,16 @@ then.
 
 ## Verified and assumed
 
-Verified on this machine (commands in the matrix above and in the branch's report): the cells
-marked clean; every Linux build, test and end-to-end run listed in CLAUDE.md's pre-commit block
-without Servo, the terminal tests, `headless.sh`, and the default-feature check.
+Verified on this machine, on the `port` branch (15 November 2026): the cells marked clean above;
+on Linux, `cargo fmt --all -- --check`, both pre-commit clippy lines and both test lines of
+CLAUDE.md without Servo (1 328 workspace tests passed, none failed), clippy of the terminal-only
+`sig` (`frontend-tui,engine-demo,engine-wasm`, all targets) and of `sig` with no frontend,
+`cargo test -p sighurt-browser --no-default-features --features frontend-tui,engine-demo` (6 unit
+tests and the 44 pty tests of `tests/tui.rs`), `cargo test -p sighurt-tui --features
+engine-demo,engine-wasm`, `cargo check` of `sig` with no feature, with `frontend-gui,engine-demo`,
+with CEF, Ladybird and the Vulkan renderer, and with NetSurf, `apps/sighurt-browser/tests/headless.sh`
+in a private sway (250 PASS, 0 FAIL, SIGTERM quitting through `Signals` among them), and
+`cargo check -p sighurt-browser` with its default features (Servo and WPE WebKit).
 
 Assumed, from reading and not from a run: that any of it works on a Mac or a Windows machine;
 the Apple constants and calls named above; that `/usr/bin/open` takes a URL as `xdg-open` does;
