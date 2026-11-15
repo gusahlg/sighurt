@@ -1,19 +1,28 @@
 //! Kitty graphics protocol encoder.
 //!
 //! Owns: the escape sequences that show one CPU frame in a rectangle of cells,
-//! and the bytes that delete that image. Must not own: the terminal, the grid,
-//! or when a frame is allowed. The caller writes the bytes through the
-//! terminal's bounded output.
+//! the bytes that delete that image, and, for tmux, the passthrough wrapping and
+//! the Unicode placeholder cells. Must not own: the terminal, the grid, or when a
+//! frame is allowed. The caller writes the bytes through the terminal's bounded
+//! output.
 //!
 //! The frame is [`sighurt_api::present::Frame`]: premultiplied B, G, R, A, top
 //! row first. The encoder un-premultiplies into straight RGBA (`f=32`),
-//! zlib-compresses it (`o=z`) and splits the base64 into chunks of
+//! zlib-compresses it at the fastest level (`o=z`) and splits the base64 into chunks of
 //! [`CHUNK_BYTES`]. The first chunk places the image (`a=T`) so it scales to
 //! the cell rectangle (`c`, `r`); later chunks finish the transmit (`m=1` then
 //! `m=0`). `q=2` asks the terminal not to reply. The cursor is saved, moved to
 //! the cell origin, and restored; `C=1` keeps the placement from moving it.
 //! Transmitting again with the same image id replaces the pixels. Hide the
 //! image with [`delete`] (`a=d,d=I`).
+//!
+//! Inside tmux, [`encode_tmux`] sends the same chunks as a virtual placement
+//! (`U=1`, no cursor movement), each APC wrapped on its own in tmux's DCS
+//! passthrough ([`wrap_tmux`]: `ESC P tmux ;`, every ESC doubled, `ESC \`). The
+//! image is then shown by cells that hold U+10EEEE, a row and a column
+//! diacritic, and the image id as a 256-colour foreground ([`placeholders`]);
+//! tmux redraws those cells like text, so the image follows the pane. Ids are
+//! 1 to 255 in that mode.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -47,7 +56,7 @@ pub struct CellRect {
 /// Why a frame was not encoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The image id was 0. Kitty treats 0 as "no id".
+    /// The image id was 0, which kitty treats as "no id", or, for tmux, above 255.
     ImageId,
     /// The frame or the cell rectangle has a zero side.
     Empty,
@@ -58,6 +67,13 @@ pub enum Error {
     },
     /// `stride` or `pixels` does not cover the frame.
     BadFrame(&'static str),
+    /// A placeholder rectangle is wider or taller than [`MAX_PLACEHOLDER_CELLS`].
+    TooManyCells {
+        /// Columns asked for.
+        columns: u16,
+        /// Rows asked for.
+        rows: u16,
+    },
     /// The escape sequences would exceed the caller's cap.
     TooLarge {
         /// Bytes the encode would have produced.
@@ -70,12 +86,16 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ImageId => write!(f, "kitty image id 0 is not a stored image"),
+            Self::ImageId => write!(f, "kitty image id is 0, or above 255 for tmux"),
             Self::Empty => write!(f, "kitty frame or cell rectangle is empty"),
             Self::TooManyPixels { pixels } => {
                 write!(f, "kitty frame has {pixels} pixels, above {MAX_PIXELS}")
             }
             Self::BadFrame(reason) => write!(f, "kitty frame is incomplete: {reason}"),
+            Self::TooManyCells { columns, rows } => write!(
+                f,
+                "kitty placeholders are {columns} by {rows} cells, above {MAX_PLACEHOLDER_CELLS}"
+            ),
             Self::TooLarge { bytes, max } => {
                 write!(f, "kitty encode is {bytes} bytes, above the cap of {max}")
             }
@@ -104,12 +124,37 @@ pub fn encode(
     })
 }
 
+/// [`encode`] for use inside tmux: a virtual placement (`U=1`) with no cursor movement, every
+/// APC wrapped in tmux's DCS passthrough. The image is shown by [`placeholders`].
+///
+/// Same validation, chunking and streaming as [`encode`], through the same thread-local encoder.
+/// `max_bytes` bounds the wrapped output. `image_id` must be 1 to 255, because the placeholder
+/// cells carry it in a 256-colour foreground; anything else is [`Error::ImageId`].
+pub fn encode_tmux(
+    frame: &Frame<'_>,
+    image_id: u32,
+    place: CellRect,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Error> {
+    LOCAL.with(|encoder| {
+        encoder
+            .borrow_mut()
+            .encode_tmux(frame, image_id, place, max_bytes)
+    })
+}
+
 thread_local! {
     static LOCAL: RefCell<Encoder> = RefCell::new(Encoder::new());
 }
 
 /// RGBA rows converted per write into the compressor. Kept across frames.
 const ROW_CHUNK: usize = 12 * 1024;
+/// zlib's level: the fastest. A 1920×1040 page took 3.0 ms to compress at level 1 and 15.9 ms
+/// at the default level 6 (miniz_oxide, release, this desktop, 15 November 2026), for 1.85
+/// times the bytes (222 KB of base64 against 120 KB), which a terminal on the same machine
+/// parses in a fraction of a millisecond; the encode runs on the owner thread, where it held
+/// back input.
+const LEVEL: Compression = Compression::fast();
 /// `ZlibEncoder`'s own buffer. Counted in [`Encoder::scratch_bytes`].
 const ZLIB_SCRATCH: usize = 32 * 1024;
 
@@ -126,7 +171,7 @@ impl Encoder {
     /// An encoder with empty scratch buffers.
     pub fn new() -> Self {
         Self {
-            zlib: ZlibEncoder::new(Sink::new(), Compression::default()),
+            zlib: ZlibEncoder::new(Sink::new(), LEVEL),
             row: Vec::with_capacity(ROW_CHUNK),
             clean: true,
         }
@@ -148,6 +193,31 @@ impl Encoder {
         place: CellRect,
         max_bytes: usize,
     ) -> Result<Vec<u8>, Error> {
+        self.run(false, frame, image_id, place, max_bytes)
+    }
+
+    /// [`encode_tmux`] on this encoder's buffers.
+    pub fn encode_tmux(
+        &mut self,
+        frame: &Frame<'_>,
+        image_id: u32,
+        place: CellRect,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
+        if image_id > MAX_TMUX_IMAGE_ID {
+            return Err(Error::ImageId);
+        }
+        self.run(true, frame, image_id, place, max_bytes)
+    }
+
+    fn run(
+        &mut self,
+        tmux: bool,
+        frame: &Frame<'_>,
+        image_id: u32,
+        place: CellRect,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, Error> {
         validate(frame, image_id, place)?;
         if !self.clean {
             self.recreate();
@@ -157,7 +227,7 @@ impl Encoder {
         let height = frame.size.height;
         self.zlib
             .get_mut()
-            .begin(width, height, image_id, place, max_bytes);
+            .begin_mode(tmux, width, height, image_id, place, max_bytes);
         if self.zlib.get_mut().over {
             let produced = self.zlib.get_mut().produced;
             self.recreate();
@@ -252,7 +322,7 @@ impl Encoder {
             held.clear();
             (b64, held)
         };
-        self.zlib = ZlibEncoder::new(Sink::with_scratch(b64, held, false), Compression::default());
+        self.zlib = ZlibEncoder::new(Sink::with_scratch(b64, held, false), LEVEL);
         self.clean = true;
     }
 }
@@ -310,6 +380,8 @@ struct Sink {
     image_id: u32,
     columns: u16,
     rows: u16,
+    /// Virtual placement, each APC in tmux's passthrough, no cursor movement.
+    tmux: bool,
 }
 
 impl Sink {
@@ -334,6 +406,7 @@ impl Sink {
             image_id: 0,
             columns: 0,
             rows: 0,
+            tmux: false,
         }
     }
 
@@ -341,7 +414,21 @@ impl Sink {
         self.out.capacity() + self.b64.capacity() + self.held.capacity()
     }
 
+    #[cfg(test)]
     fn begin(&mut self, width: u32, height: u32, image_id: u32, place: CellRect, max: usize) {
+        self.begin_mode(false, width, height, image_id, place, max);
+    }
+
+    fn begin_mode(
+        &mut self,
+        tmux: bool,
+        width: u32,
+        height: u32,
+        image_id: u32,
+        place: CellRect,
+        max: usize,
+    ) {
+        self.tmux = tmux;
         self.out.clear();
         self.max = max;
         self.produced = 0;
@@ -356,6 +443,9 @@ impl Sink {
         self.image_id = image_id;
         self.columns = place.columns;
         self.rows = place.rows;
+        if tmux {
+            return;
+        }
         let cursor = cursor_to(place.column, place.row);
         if cursor.len() > max {
             self.produced = cursor.len();
@@ -500,27 +590,49 @@ impl Sink {
         let more_flag = if more { "1" } else { "0" };
         let control = if self.first {
             self.first = false;
-            format!(
-                "a=T,f=32,o=z,t=d,s={},v={},i={},c={},r={},C=1,q=2,m={more_flag}",
-                self.width, self.height, self.image_id, self.columns, self.rows
-            )
+            if self.tmux {
+                format!(
+                    "a=T,U=1,f=32,o=z,t=d,s={},v={},i={},c={},r={},q=2,m={more_flag}",
+                    self.width, self.height, self.image_id, self.columns, self.rows
+                )
+            } else {
+                format!(
+                    "a=T,f=32,o=z,t=d,s={},v={},i={},c={},r={},C=1,q=2,m={more_flag}",
+                    self.width, self.height, self.image_id, self.columns, self.rows
+                )
+            }
         } else {
             format!("q=2,m={more_flag}")
         };
-        // `ESC _ G` + control + `;` + payload + `ESC \`, and `ESC [ u` on the last chunk.
+        // `ESC _ G` + control + `;` + payload + `ESC \`, and `ESC [ u` on the last chunk. In
+        // tmux the two ESC bytes are doubled and `ESC P tmux ;` and `ESC \` go around it.
         let add = 3 + control.len() + 1 + b64.len() + 2;
-        let tail = if more { 0 } else { 3 };
-        if self.out.len() + add + tail > self.max {
-            self.produced = self.out.len() + add + tail;
+        let (wrap, tail) = if self.tmux {
+            (TMUX_OPEN.len() + 2 + TMUX_CLOSE.len(), 0)
+        } else {
+            (0, if more { 0 } else { 3 })
+        };
+        if self.out.len() + add + wrap + tail > self.max {
+            self.produced = self.out.len() + add + wrap + tail;
             self.over = true;
             return;
         }
-        self.out.extend_from_slice(b"\x1b_G");
+        if self.tmux {
+            self.out.extend_from_slice(TMUX_OPEN);
+            self.out.extend_from_slice(b"\x1b\x1b_G");
+        } else {
+            self.out.extend_from_slice(b"\x1b_G");
+        }
         self.out.extend_from_slice(control.as_bytes());
         self.out.push(b';');
         self.out.extend_from_slice(b64);
-        self.out.extend_from_slice(b"\x1b\\");
-        if !more {
+        if self.tmux {
+            self.out.extend_from_slice(b"\x1b\x1b\\");
+            self.out.extend_from_slice(TMUX_CLOSE);
+        } else {
+            self.out.extend_from_slice(b"\x1b\\");
+        }
+        if !more && !self.tmux {
             self.out.extend_from_slice(b"\x1b[u");
         }
         self.produced = self.out.len();
@@ -553,6 +665,369 @@ impl Write for Sink {
 /// Delete the image `image_id` and its placements (`a=d,d=I`). `q=2` suppresses the reply.
 pub fn delete(image_id: u32) -> Vec<u8> {
     format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\").into_bytes()
+}
+
+/// What opens tmux's passthrough: `ESC P tmux ;`.
+const TMUX_OPEN: &[u8] = b"\x1bPtmux;";
+/// What closes it: the string terminator `ESC \`.
+const TMUX_CLOSE: &[u8] = b"\x1b\\";
+
+/// The largest image id [`encode_tmux`] and [`placeholders`] take: the id is a 256-colour foreground.
+const MAX_TMUX_IMAGE_ID: u32 = 255;
+
+/// Wrap one escape sequence in tmux's DCS passthrough: `ESC P tmux ;`, the sequence with every
+/// ESC doubled, then `ESC \`.
+pub fn wrap_tmux(sequence: &[u8]) -> Vec<u8> {
+    let escapes = sequence.iter().filter(|byte| **byte == 0x1b).count();
+    let mut out = Vec::with_capacity(TMUX_OPEN.len() + sequence.len() + escapes + TMUX_CLOSE.len());
+    out.extend_from_slice(TMUX_OPEN);
+    for &byte in sequence {
+        if byte == 0x1b {
+            out.push(0x1b);
+        }
+        out.push(byte);
+    }
+    out.extend_from_slice(TMUX_CLOSE);
+    out
+}
+
+/// How many rows or columns the placeholder diacritics can number.
+pub const MAX_PLACEHOLDER_CELLS: u16 = 297;
+
+/// Kitty's `rowcolumn-diacritics.txt`: the n-th entry stands for row or column n.
+const DIACRITICS: [char; 297] = [
+    '\u{0305}',
+    '\u{030D}',
+    '\u{030E}',
+    '\u{0310}',
+    '\u{0312}',
+    '\u{033D}',
+    '\u{033E}',
+    '\u{033F}',
+    '\u{0346}',
+    '\u{034A}',
+    '\u{034B}',
+    '\u{034C}',
+    '\u{0350}',
+    '\u{0351}',
+    '\u{0352}',
+    '\u{0357}',
+    '\u{035B}',
+    '\u{0363}',
+    '\u{0364}',
+    '\u{0365}',
+    '\u{0366}',
+    '\u{0367}',
+    '\u{0368}',
+    '\u{0369}',
+    '\u{036A}',
+    '\u{036B}',
+    '\u{036C}',
+    '\u{036D}',
+    '\u{036E}',
+    '\u{036F}',
+    '\u{0483}',
+    '\u{0484}',
+    '\u{0485}',
+    '\u{0486}',
+    '\u{0487}',
+    '\u{0592}',
+    '\u{0593}',
+    '\u{0594}',
+    '\u{0595}',
+    '\u{0597}',
+    '\u{0598}',
+    '\u{0599}',
+    '\u{059C}',
+    '\u{059D}',
+    '\u{059E}',
+    '\u{059F}',
+    '\u{05A0}',
+    '\u{05A1}',
+    '\u{05A8}',
+    '\u{05A9}',
+    '\u{05AB}',
+    '\u{05AC}',
+    '\u{05AF}',
+    '\u{05C4}',
+    '\u{0610}',
+    '\u{0611}',
+    '\u{0612}',
+    '\u{0613}',
+    '\u{0614}',
+    '\u{0615}',
+    '\u{0616}',
+    '\u{0617}',
+    '\u{0657}',
+    '\u{0658}',
+    '\u{0659}',
+    '\u{065A}',
+    '\u{065B}',
+    '\u{065D}',
+    '\u{065E}',
+    '\u{06D6}',
+    '\u{06D7}',
+    '\u{06D8}',
+    '\u{06D9}',
+    '\u{06DA}',
+    '\u{06DB}',
+    '\u{06DC}',
+    '\u{06DF}',
+    '\u{06E0}',
+    '\u{06E1}',
+    '\u{06E2}',
+    '\u{06E4}',
+    '\u{06E7}',
+    '\u{06E8}',
+    '\u{06EB}',
+    '\u{06EC}',
+    '\u{0730}',
+    '\u{0732}',
+    '\u{0733}',
+    '\u{0735}',
+    '\u{0736}',
+    '\u{073A}',
+    '\u{073D}',
+    '\u{073F}',
+    '\u{0740}',
+    '\u{0741}',
+    '\u{0743}',
+    '\u{0745}',
+    '\u{0747}',
+    '\u{0749}',
+    '\u{074A}',
+    '\u{07EB}',
+    '\u{07EC}',
+    '\u{07ED}',
+    '\u{07EE}',
+    '\u{07EF}',
+    '\u{07F0}',
+    '\u{07F1}',
+    '\u{07F3}',
+    '\u{0816}',
+    '\u{0817}',
+    '\u{0818}',
+    '\u{0819}',
+    '\u{081B}',
+    '\u{081C}',
+    '\u{081D}',
+    '\u{081E}',
+    '\u{081F}',
+    '\u{0820}',
+    '\u{0821}',
+    '\u{0822}',
+    '\u{0823}',
+    '\u{0825}',
+    '\u{0826}',
+    '\u{0827}',
+    '\u{0829}',
+    '\u{082A}',
+    '\u{082B}',
+    '\u{082C}',
+    '\u{082D}',
+    '\u{0951}',
+    '\u{0953}',
+    '\u{0954}',
+    '\u{0F82}',
+    '\u{0F83}',
+    '\u{0F86}',
+    '\u{0F87}',
+    '\u{135D}',
+    '\u{135E}',
+    '\u{135F}',
+    '\u{17DD}',
+    '\u{193A}',
+    '\u{1A17}',
+    '\u{1A75}',
+    '\u{1A76}',
+    '\u{1A77}',
+    '\u{1A78}',
+    '\u{1A79}',
+    '\u{1A7A}',
+    '\u{1A7B}',
+    '\u{1A7C}',
+    '\u{1B6B}',
+    '\u{1B6D}',
+    '\u{1B6E}',
+    '\u{1B6F}',
+    '\u{1B70}',
+    '\u{1B71}',
+    '\u{1B72}',
+    '\u{1B73}',
+    '\u{1CD0}',
+    '\u{1CD1}',
+    '\u{1CD2}',
+    '\u{1CDA}',
+    '\u{1CDB}',
+    '\u{1CE0}',
+    '\u{1DC0}',
+    '\u{1DC1}',
+    '\u{1DC3}',
+    '\u{1DC4}',
+    '\u{1DC5}',
+    '\u{1DC6}',
+    '\u{1DC7}',
+    '\u{1DC8}',
+    '\u{1DC9}',
+    '\u{1DCB}',
+    '\u{1DCC}',
+    '\u{1DD1}',
+    '\u{1DD2}',
+    '\u{1DD3}',
+    '\u{1DD4}',
+    '\u{1DD5}',
+    '\u{1DD6}',
+    '\u{1DD7}',
+    '\u{1DD8}',
+    '\u{1DD9}',
+    '\u{1DDA}',
+    '\u{1DDB}',
+    '\u{1DDC}',
+    '\u{1DDD}',
+    '\u{1DDE}',
+    '\u{1DDF}',
+    '\u{1DE0}',
+    '\u{1DE1}',
+    '\u{1DE2}',
+    '\u{1DE3}',
+    '\u{1DE4}',
+    '\u{1DE5}',
+    '\u{1DE6}',
+    '\u{1DFE}',
+    '\u{20D0}',
+    '\u{20D1}',
+    '\u{20D4}',
+    '\u{20D5}',
+    '\u{20D6}',
+    '\u{20D7}',
+    '\u{20DB}',
+    '\u{20DC}',
+    '\u{20E1}',
+    '\u{20E7}',
+    '\u{20E9}',
+    '\u{20F0}',
+    '\u{2CEF}',
+    '\u{2CF0}',
+    '\u{2CF1}',
+    '\u{2DE0}',
+    '\u{2DE1}',
+    '\u{2DE2}',
+    '\u{2DE3}',
+    '\u{2DE4}',
+    '\u{2DE5}',
+    '\u{2DE6}',
+    '\u{2DE7}',
+    '\u{2DE8}',
+    '\u{2DE9}',
+    '\u{2DEA}',
+    '\u{2DEB}',
+    '\u{2DEC}',
+    '\u{2DED}',
+    '\u{2DEE}',
+    '\u{2DEF}',
+    '\u{2DF0}',
+    '\u{2DF1}',
+    '\u{2DF2}',
+    '\u{2DF3}',
+    '\u{2DF4}',
+    '\u{2DF5}',
+    '\u{2DF6}',
+    '\u{2DF7}',
+    '\u{2DF8}',
+    '\u{2DF9}',
+    '\u{2DFA}',
+    '\u{2DFB}',
+    '\u{2DFC}',
+    '\u{2DFD}',
+    '\u{2DFE}',
+    '\u{2DFF}',
+    '\u{A66F}',
+    '\u{A67C}',
+    '\u{A67D}',
+    '\u{A6F0}',
+    '\u{A6F1}',
+    '\u{A8E0}',
+    '\u{A8E1}',
+    '\u{A8E2}',
+    '\u{A8E3}',
+    '\u{A8E4}',
+    '\u{A8E5}',
+    '\u{A8E6}',
+    '\u{A8E7}',
+    '\u{A8E8}',
+    '\u{A8E9}',
+    '\u{A8EA}',
+    '\u{A8EB}',
+    '\u{A8EC}',
+    '\u{A8ED}',
+    '\u{A8EE}',
+    '\u{A8EF}',
+    '\u{A8F0}',
+    '\u{A8F1}',
+    '\u{AAB0}',
+    '\u{AAB2}',
+    '\u{AAB3}',
+    '\u{AAB7}',
+    '\u{AAB8}',
+    '\u{AABE}',
+    '\u{AABF}',
+    '\u{AAC1}',
+    '\u{FE20}',
+    '\u{FE21}',
+    '\u{FE22}',
+    '\u{FE23}',
+    '\u{FE24}',
+    '\u{FE25}',
+    '\u{FE26}',
+    '\u{10A0F}',
+    '\u{10A38}',
+    '\u{1D185}',
+    '\u{1D186}',
+    '\u{1D187}',
+    '\u{1D188}',
+    '\u{1D189}',
+    '\u{1D1AA}',
+    '\u{1D1AB}',
+    '\u{1D1AC}',
+    '\u{1D1AD}',
+    '\u{1D242}',
+    '\u{1D243}',
+    '\u{1D244}',
+];
+
+/// The cells that show image `image_id` over `place`, for an image sent by [`encode_tmux`].
+///
+/// Each row is a cursor move to its first cell and `place.columns` cells of U+10EEEE with a row
+/// and a column diacritic, drawn in the foreground colour `image_id`. Both diacritics are written
+/// on every cell, so a cell tmux redraws alone still names its place. `image_id` must be 1 to 255.
+pub fn placeholders(image_id: u32, place: CellRect) -> Result<Vec<u8>, Error> {
+    if image_id == 0 || image_id > MAX_TMUX_IMAGE_ID {
+        return Err(Error::ImageId);
+    }
+    if place.columns == 0 || place.rows == 0 {
+        return Err(Error::Empty);
+    }
+    if place.columns > MAX_PLACEHOLDER_CELLS || place.rows > MAX_PLACEHOLDER_CELLS {
+        return Err(Error::TooManyCells {
+            columns: place.columns,
+            rows: place.rows,
+        });
+    }
+    let mut text = String::new();
+    text.push_str("\x1b[0m");
+    text.push_str(&format!("\x1b[38;5;{image_id}m"));
+    for row in 0..place.rows {
+        let line = u32::from(place.row) + u32::from(row) + 1;
+        let column = u32::from(place.column) + 1;
+        text.push_str(&format!("\x1b[{line};{column}H"));
+        for cell in 0..place.columns {
+            text.push('\u{10EEEE}');
+            text.push(DIACRITICS[usize::from(row)]);
+            text.push(DIACRITICS[usize::from(cell)]);
+        }
+    }
+    text.push_str("\x1b[0m");
+    Ok(text.into_bytes())
 }
 
 /// Delete every image and placement on the screen (`a=d,d=A`), as a full redraw does before it
@@ -623,7 +1098,7 @@ fn straight(channel: u8, alpha: u8) -> u8 {
 
 #[cfg(test)]
 fn zlib(bytes: &[u8]) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = ZlibEncoder::new(Vec::new(), LEVEL);
     encoder
         .write_all(bytes)
         .expect("zlib encode into a vec does not fail");
@@ -1150,6 +1625,186 @@ mod tests {
             "{parts:?}"
         );
         assert!(parts.last().unwrap().0.contains("m=0"));
+    }
+
+    fn unwrap_tmux(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            rest = rest.strip_prefix(b"\x1bPtmux;").expect("passthrough opens");
+            let mut at = 0;
+            loop {
+                match rest[at] {
+                    0x1b if rest[at + 1] == 0x1b => {
+                        out.push(0x1b);
+                        at += 2;
+                    }
+                    0x1b => break,
+                    byte => {
+                        out.push(byte);
+                        at += 1;
+                    }
+                }
+            }
+            assert_eq!(&rest[at..at + 2], b"\x1b\\", "passthrough closes");
+            rest = &rest[at + 2..];
+        }
+        out
+    }
+
+    fn tmux_place() -> CellRect {
+        CellRect {
+            column: 2,
+            row: 3,
+            columns: 4,
+            rows: 5,
+        }
+    }
+
+    #[test]
+    fn tmux_round_trip_matches_the_plain_chunks() {
+        let mut pixels = Vec::new();
+        for index in 0..(64 * 64) {
+            let byte = noise(index);
+            pixels.extend_from_slice(&[byte, byte.wrapping_add(3), byte.wrapping_add(7), 255]);
+        }
+        let frame = frame_of(&mut pixels, 64, 64);
+        let plain = encode(&frame, 7, tmux_place(), 8 * 1024 * 1024).expect("plain");
+        let wrapped = encode_tmux(&frame, 7, tmux_place(), 8 * 1024 * 1024).expect("tmux");
+        assert!(wrapped.starts_with(b"\x1bPtmux;\x1b\x1b_G"));
+        assert!(wrapped.ends_with(b"\x1b\x1b\\\x1b\\"));
+        let inner = unwrap_tmux(&wrapped);
+        assert!(
+            !inner.windows(2).any(|w| w == b"\x1b["),
+            "no cursor sequences"
+        );
+        assert_payloads_fit(&inner);
+        let parts = payloads(&inner);
+        assert!(parts.len() > 1);
+        let first = &parts[0].0;
+        assert!(first.starts_with("a=T,U=1,f=32,o=z,t=d,"), "{first}");
+        assert!(!first.contains("C=1"), "{first}");
+        for needle in ["s=64", "v=64", "i=7", "c=4", "r=5", "q=2", "m=1"] {
+            assert!(first.contains(needle), "{first}");
+        }
+        for (control, _) in &parts[1..parts.len() - 1] {
+            assert_eq!(control, "q=2,m=1");
+        }
+        assert_eq!(parts.last().unwrap().0, "q=2,m=0");
+        assert_eq!(rgba_of(&inner), rgba_of(&plain));
+        let joined = |bytes: &[u8]| {
+            let mut all = Vec::new();
+            for (_, payload) in payloads(bytes) {
+                all.extend_from_slice(&payload);
+            }
+            all
+        };
+        assert_eq!(joined(&inner), joined(&plain));
+        assert_eq!(parts.len(), payloads(&plain).len(), "same chunk boundaries");
+    }
+
+    #[test]
+    fn tmux_cap_counts_the_wrapper() {
+        let mut pixels = vec![0, 0, 128, 128, 0, 255, 0, 255];
+        let frame = frame_of(&mut pixels, 2, 1);
+        let produced = encode_tmux(&frame, 7, tmux_place(), 1 << 20).expect("tmux");
+        assert!(encode_tmux(&frame, 7, tmux_place(), produced.len()).is_ok());
+        let err = encode_tmux(&frame, 7, tmux_place(), produced.len() - 1).expect_err("cap");
+        assert!(matches!(err, Error::TooLarge { .. }), "{err}");
+        assert_eq!(
+            encode_tmux(&frame, 7, tmux_place(), produced.len()).expect("again"),
+            produced
+        );
+    }
+
+    #[test]
+    fn tmux_image_ids_are_one_to_255() {
+        let mut pixels = vec![0, 0, 255, 255];
+        let frame = frame_of(&mut pixels, 1, 1);
+        for id in [0, 256] {
+            assert_eq!(
+                encode_tmux(&frame, id, tmux_place(), 1 << 20),
+                Err(Error::ImageId)
+            );
+            assert_eq!(placeholders(id, tmux_place()), Err(Error::ImageId));
+        }
+        assert!(encode_tmux(&frame, 255, tmux_place(), 1 << 20).is_ok());
+        assert!(placeholders(255, tmux_place()).is_ok());
+    }
+
+    #[test]
+    fn wrap_tmux_doubles_every_escape() {
+        assert_eq!(
+            wrap_tmux(b"\x1b_Ga=d,d=A,q=2\x1b\\"),
+            b"\x1bPtmux;\x1b\x1b_Ga=d,d=A,q=2\x1b\x1b\\\x1b\\"
+        );
+    }
+
+    #[test]
+    fn placeholders_name_every_cell() {
+        let place = CellRect {
+            column: 0,
+            row: 1,
+            columns: 2,
+            rows: 2,
+        };
+        let cell = |r: usize, c: usize| format!("\u{10EEEE}{}{}", DIACRITICS[r], DIACRITICS[c]);
+        let expected = format!(
+            "\x1b[0m\x1b[38;5;7m\x1b[2;1H{}{}\x1b[3;1H{}{}\x1b[0m",
+            cell(0, 0),
+            cell(0, 1),
+            cell(1, 0),
+            cell(1, 1)
+        );
+        assert_eq!(placeholders(7, place).unwrap(), expected.into_bytes());
+    }
+
+    #[test]
+    fn placeholders_refuse_empty_and_too_many_cells() {
+        let place = |columns, rows| CellRect {
+            column: 0,
+            row: 0,
+            columns,
+            rows,
+        };
+        assert_eq!(placeholders(1, place(0, 1)), Err(Error::Empty));
+        assert_eq!(
+            placeholders(1, place(298, 1)),
+            Err(Error::TooManyCells {
+                columns: 298,
+                rows: 1
+            })
+        );
+        assert!(matches!(
+            placeholders(1, place(1, 298)),
+            Err(Error::TooManyCells { .. })
+        ));
+        assert!(placeholders(1, place(297, 1)).is_ok());
+    }
+
+    #[test]
+    fn diacritics_match_kittys_table() {
+        let path =
+            "/nix/store/vijk67v4x4jjwa93v148jacvbfilncf5-source/gen/rowcolumn-diacritics.txt";
+        assert_eq!(DIACRITICS.len(), usize::from(MAX_PLACEHOLDER_CELLS));
+        assert_eq!(DIACRITICS[0], '\u{305}');
+        assert_eq!(DIACRITICS[296], '\u{1D244}');
+        let mut sorted = DIACRITICS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), DIACRITICS.len(), "all distinct");
+        // The authoritative file, where this machine has it.
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let listed: Vec<char> = text
+                .lines()
+                .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+                .map(|line| {
+                    let hex = line.split(';').next().unwrap().trim();
+                    char::from_u32(u32::from_str_radix(hex, 16).unwrap()).unwrap()
+                })
+                .collect();
+            assert_eq!(listed, DIACRITICS);
+        }
     }
 
     /// Release timing of [`encode`] at the terminal's page size. Not part of the default

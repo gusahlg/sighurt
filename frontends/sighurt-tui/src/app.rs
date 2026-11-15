@@ -63,10 +63,12 @@
 //! page rows don't show their pixels, they get no input but releases ([`Tui::page_input`]).
 //!
 //! Page frames (TUI.md §2 and §8.6): a permit only for the shown view, only when its engine has
-//! a new frame, at most `[tui] fps` a second (in text mode at most [`TEXT_FPS`], and only when
+//! a new frame, at most `[tui] fps` a second (sixel at most 5), or `[tui] input-fps` for
+//! [`INPUT_WINDOW`] after the user's last key, mouse event or paste, so the frame that answers
+//! input is not held to the page's own pace (in text mode at most [`TEXT_FPS`], and only when
 //! that engine gives page text), and only once every byte written before has left the output
 //! buffer: nothing is written while any is waiting, so at most one encoded frame is ever
-//! pending and no write is cut short. The engine paints into its view's [`TermTarget`] and the
+//! pending, no write is cut short, and a terminal (or tmux) slower than the pace sets it. The engine paints into its view's [`TermTarget`] and the
 //! frame is encoded as a kitty or sixel image over the page rows. Text mode takes the frame and
 //! does not encode it, so switching back to graphics shows the latest one. A resize is a new
 //! layout epoch: output queued for the old layout is discarded, and a kitty upload the cut
@@ -145,6 +147,7 @@ use crate::input::{
 use crate::kitty::{self, CellRect};
 use crate::sixel;
 use crate::target::{TargetHandle, TermPermit, TermTarget};
+use crate::term::tmux::{self, Passthrough};
 use crate::term::{
     clipboard, ClipboardReply, MouseEvent, TermEvent, TermSize, Terminal, Wheel, PROBE_DEADLINE,
     SYNC_BEGIN, SYNC_END,
@@ -169,6 +172,10 @@ const TEXT_FPS: u32 = 2;
 /// came a moment after the upload (decision 133); a page's own frames, which replace each
 /// other at `[tui] fps`, did not do that.
 const MIN_IMAGE_LIFE: Duration = Duration::from_millis(250);
+/// How long after the user's last key, mouse event or paste page frames come at `[tui]
+/// input-fps` rather than `[tui] fps`. Long enough for what an input sets off (a smooth
+/// scroll, a menu that opens) to be drawn at that pace too.
+const INPUT_WINDOW: Duration = Duration::from_secs(1);
 /// An empty last chunk. Ends a kitty image upload a resize cut after its `m=1`.
 const KITTY_UPLOAD_END: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
 /// The least time between two pointer motions handed to the core. Terminals report motion
@@ -269,8 +276,28 @@ enum Protocol {
     None,
     /// Kitty graphics protocol.
     Kitty,
-    /// Sixel. Full frame, at most 5 a second.
+    /// Sixel. Full frame, the page's own at most 5 a second.
     Sixel,
+    /// Kitty graphics through tmux's passthrough (`allow-passthrough all`), shown by Unicode
+    /// placeholder cells in the page rows that tmux keeps and redraws like text: one image in
+    /// the outer terminal, written over like a sixel, never re-encoded by tmux.
+    KittyTmux,
+}
+
+impl Protocol {
+    /// One picture on the page rows, which the next is written over (kitty deletes by id).
+    fn written_over(self) -> bool {
+        matches!(self, Self::Sixel | Self::KittyTmux)
+    }
+}
+
+/// The kitty image id a `sig` with process id `pid` uses through tmux: 1 to 255, not 31 (the
+/// probe's).
+fn tmux_image_id(pid: u32) -> u32 {
+    match 1 + pid % 254 {
+        31 => 255,
+        id => id,
+    }
 }
 
 /// One write that has not finished leaving the output buffer.
@@ -279,6 +306,8 @@ struct Outbound {
     len: usize,
     /// A chunked kitty upload in that write, if it has an `m=1` chunk.
     kitty: Option<ChunkedSpan>,
+    /// Where a kitty image through tmux sits in that write.
+    tmux: Option<(usize, usize)>,
 }
 
 /// Where a kitty upload that started with `m=1` sits in a write.
@@ -330,6 +359,10 @@ struct Pixels {
     ready: bool,
     /// The terminal shows this view's frame for the current layout.
     on_screen: bool,
+    /// The page rows show a picture of this view's, perhaps older than its latest frame
+    /// (`on_screen` goes false when a newer frame is presented, before it is written). Hiding
+    /// the view holds that picture for [`Tui::drop_due`] like any other.
+    on_rows: bool,
     permits: u64,
     presented: u64,
     dropped: u64,
@@ -347,19 +380,35 @@ struct Tui {
     graphics: bool,
     /// The protocol [`Self::relayout`] chose for this layout.
     protocol: Protocol,
-    /// The sixel on the page rows: where it was written, for which layout, and a fingerprint
-    /// of its bytes. `None` once the rows were blanked, cleared or drawn as text.
-    sixel_placed: Option<(CellRect, LayoutEpoch, u64)>,
-    /// The sixel on the page rows is a view's that is no longer shown. The first write once
+    /// The picture on the page rows that the next one is written over (a sixel, or a kitty
+    /// image through tmux and its placeholder cells): where it was written, for which layout,
+    /// and a fingerprint of its bytes. `None` once the rows were blanked, cleared or drawn as
+    /// text.
+    placed: Option<(CellRect, LayoutEpoch, u64)>,
+    /// The picture on the page rows is a view's that is no longer shown. The first write once
     /// [`Self::drop_due`] has passed puts the shown view's frame over it, or blanks the rows.
-    sixel_stale: bool,
+    stale: bool,
+    /// tmux's `allow-passthrough` for this pane, asked once when `[tui] graphics = "kitty"`
+    /// first wants it inside tmux. `None` until then, and outside tmux.
+    passthrough: Option<Passthrough>,
+    /// The kitty image id this `sig` uses through tmux (1 to 255: the placeholder cells carry
+    /// it as a 256-colour foreground). One image for the page rows, written over, as a sixel
+    /// is; from the process id, so two `sig`s in one terminal's panes rarely share it.
+    tmux_image: u32,
+    /// A kitty image may be stored in the terminal outside tmux: a clear, a protocol change
+    /// and leaving delete it.
+    tmux_stored: bool,
+    /// Where the kitty image through tmux sits in the write being made, for
+    /// [`Self::note_outbound`]: a resize that cuts it ends tmux's passthrough string.
+    tmux_span: Option<(usize, usize)>,
     /// Kitty images of views no longer shown, deleted once [`Self::drop_due`] has passed.
     held_deletes: Vec<u32>,
-    /// The end of the last image's frame interval: the next image is not written before it.
-    /// A frame sent again (a tab shown) counts.
-    image_due: Option<Instant>,
-    /// When the last image was written.
+    /// When the last image was written. The next is not written before its frame interval
+    /// has passed ([`Self::image_due`]); a frame sent again (a tab shown) counts.
     image_written: Option<Instant>,
+    /// When the user last pressed a key, used the mouse or pasted: the frame interval is
+    /// `[tui] input-fps`'s for [`INPUT_WINDOW`] after it ([`Self::interval`]).
+    input_at: Option<Instant>,
     /// The page rows.
     page: PageArea,
     /// The page rows show pages as text.
@@ -428,8 +477,9 @@ struct Tui {
     notice_first: Option<Instant>,
     /// The shown page has a text field: a paste goes there.
     page_text: bool,
-    /// The earliest time the next page frame may be presented.
-    next_frame: Option<Instant>,
+    /// When the last page frame was presented. The next is not presented before its frame
+    /// interval has passed ([`Self::next_frame`]).
+    presented_at: Option<Instant>,
     /// The OSC 52 read waiting for the terminal's answer, if there is one.
     outstanding: Option<PendingRead>,
     /// Reads that failed before a query was sent. The next pass answers them.
@@ -678,11 +728,15 @@ impl App {
             settings,
             graphics: false,
             protocol: Protocol::None,
-            sixel_placed: None,
-            sixel_stale: false,
+            placed: None,
+            stale: false,
+            passthrough: None,
+            tmux_image: tmux_image_id(std::process::id()),
+            tmux_stored: false,
+            tmux_span: None,
             held_deletes: Vec::new(),
-            image_due: None,
             image_written: None,
+            input_at: None,
             text_mode: false,
             typing_told: None,
             mode_override: None,
@@ -715,7 +769,7 @@ impl App {
             notice: None,
             notice_first: None,
             page_text: false,
-            next_frame: None,
+            presented_at: None,
             outstanding: None,
             failed_reads: Vec::new(),
             clipboard_out: None,
@@ -935,13 +989,13 @@ impl App {
         // wakes the loop for.
         let frame = self
             .tui
-            .next_frame
+            .next_frame(now)
             .filter(|_| self.frame_waiting() && self.tui.terminal.pending_len() == 0);
         // A frame the engine already gave, or a hidden view's image, waits for the image
         // interval. Only a time still to come: one that has passed was handled in the pass.
         let image = match self.tui.holding() {
             true => self.tui.drop_due(),
-            false => self.tui.image_due.filter(|_| self.image_waiting()),
+            false => self.tui.image_due(now).filter(|_| self.image_waiting()),
         };
         let image = image.filter(|&at| at > now && self.tui.terminal.pending_len() == 0);
         let escape = self.tui.terminal.poll_timeout().map(|wait| now + wait);
@@ -993,13 +1047,17 @@ impl App {
             })
     }
 
-    /// The shown view's frame goes over the hidden view's sixel in this write: it is waiting,
-    /// its time has come, and it is for the place and layout of the sixel on the page rows.
-    fn sixel_replaces_now(&self) -> bool {
-        self.tui.protocol == Protocol::Sixel
-            && self.tui.image_due.is_none_or(|at| at <= Instant::now())
+    /// The shown view's frame goes over the hidden view's picture (a sixel, or the kitty image
+    /// through tmux) in this write: it is waiting, its time has come, and it is for the place
+    /// and layout of the picture on the page rows.
+    fn replaces_now(&self) -> bool {
+        self.tui.protocol.written_over()
+            && self
+                .tui
+                .image_due(Instant::now())
+                .is_none_or(|at| at <= Instant::now())
             && self.tui.drop_due().is_none_or(|at| at <= Instant::now())
-            && self.tui.sixel_placed.is_some_and(|(at, epoch, _)| {
+            && self.tui.placed.is_some_and(|(at, epoch, _)| {
                 at == page_place(self.tui.page) && epoch == self.tui.metrics.epoch()
             })
             && self.image_waiting()
@@ -1098,6 +1156,12 @@ impl App {
     /// order is kept (a drag's last motion before its release).
     fn event(&mut self, event: TermEvent) {
         let now = Instant::now();
+        if matches!(
+            event,
+            TermEvent::Key(_) | TermEvent::Mouse(_) | TermEvent::Paste(_)
+        ) {
+            self.tui.input_at = Some(now);
+        }
         if let TermEvent::Mouse(mouse) = &event {
             if mouse.motion && mouse.wheel.is_none() {
                 if self.motion_due.is_some_and(|due| due > now) {
@@ -1508,15 +1572,19 @@ impl App {
             if self.tui.terminal.capabilities().kitty_graphics_ok == Some(true) {
                 out.extend_from_slice(kitty::DELETE_ALL);
             }
+            if std::mem::take(&mut self.tui.tmux_stored) {
+                out.extend(kitty::wrap_tmux(kitty::DELETE_ALL));
+            }
             let size = self.tui.terminal.size();
             self.tui.grid = Grid::new(size.cols, size.rows);
             self.tui.cursor_shown = false;
             self.tui.chrome_dirty = true;
             for pixels in self.tui.targets.values_mut() {
                 pixels.on_screen = false;
+                pixels.on_rows = false;
             }
-            self.tui.forget_sixel();
-            self.tui.sixel_stale = false;
+            self.tui.forget_placed();
+            self.tui.stale = false;
             // Deleted with all the others.
             self.tui.held_deletes.clear();
         }
@@ -1537,8 +1605,8 @@ impl App {
             // The shown view's frame goes over a hidden view's sixel in this write if it can
             // (no blank: under tmux a blank is a black flash); otherwise the rows are blanked
             // now, before the chrome.
-            if self.tui.sixel_stale && !self.sixel_replaces_now() {
-                self.tui.sixel_stale = false;
+            if self.tui.stale && !self.replaces_now() {
+                self.tui.stale = false;
                 self.tui.blank_placed(&mut out);
             }
         }
@@ -1548,7 +1616,7 @@ impl App {
         self.frame(&mut out);
         // The frame did not go over it after all (it failed, or was not presented): the next
         // pass blanks the rows, and draws the chrome again for its cursor.
-        if due && std::mem::take(&mut self.tui.sixel_stale) {
+        if due && std::mem::take(&mut self.tui.stale) {
             let mut blank = std::mem::take(&mut self.tui.control);
             self.tui.blank_placed(&mut blank);
             self.tui.control = blank;
@@ -1598,8 +1666,13 @@ impl App {
             self.draw_home(area);
         }
         if message.is_some() || self.tui.text_mode || self.tui.home_drawn {
-            // The page rows hold text now, not the picture.
-            self.tui.forget_sixel();
+            // The page rows hold text now, not the picture. Through tmux the picture is its
+            // placeholder cells, which only spaces take away; a sixel goes when text is written
+            // on it.
+            if self.tui.protocol == Protocol::KittyTmux && self.tui.placed.is_some() {
+                self.tui.blank_placed(out);
+            }
+            self.tui.forget_placed();
         }
         let mut cursor = area.cursor;
         if self.tui.text_mode {
@@ -1874,7 +1947,6 @@ impl App {
             return;
         };
         let metrics = self.tui.metrics;
-        let interval = frame_interval(self.tui.settings, self.tui.pace_sixel(), self.tui.text_mode);
         let protocol = self.tui.protocol;
         let (cell_width, cell_height) = {
             let size = self.tui.terminal.size();
@@ -1885,11 +1957,13 @@ impl App {
             self.tui.text_mode,
             self.tui.semantic_on.contains(&view),
         );
+        let now = Instant::now();
+        let frame_due = self.tui.next_frame(now).is_none_or(|at| at <= now);
+        let image_later = self.tui.image_due(now).is_some_and(|at| at > now);
         let Some(pixels) = self.tui.targets.get_mut(&target).filter(|_| takes) else {
             return;
         };
-        let now = Instant::now();
-        if pixels.ready && self.tui.next_frame.is_none_or(|at| at <= now) {
+        if pixels.ready && frame_due {
             pixels.ready = false;
             pixels.permits += 1;
             let permit = TermPermit {
@@ -1904,7 +1978,7 @@ impl App {
                 Some(Ok(PresentOutcome::Submitted)) => {
                     pixels.presented += 1;
                     pixels.on_screen = false;
-                    self.tui.next_frame = Some(now + interval);
+                    self.tui.presented_at = Some(now);
                 }
                 Some(Ok(PresentOutcome::NotReady | PresentOutcome::Unchanged)) => {}
                 // The session counted and logged it.
@@ -1927,7 +2001,7 @@ impl App {
         if pixels.on_screen || !self.tui.graphics {
             return;
         }
-        if held || self.tui.image_due.is_some_and(|at| at > now) {
+        if held || image_later {
             return;
         }
         let page = self.tui.page;
@@ -1937,7 +2011,7 @@ impl App {
         // shows the rows black until the new image has arrived: a flicker on every frame.
         // tmux keeps the images written over each other (at most 20 in all, the oldest
         // freed) and draws them in order when it redraws the pane, the newest last.
-        let placed = self.tui.sixel_placed;
+        let placed = self.tui.placed;
         let replaces = placed.is_some_and(|(at, epoch, _)| at == place && epoch == metrics.epoch());
         // The blank and its synchronized update sit outside the encoder, so the image
         // itself still has to fit in what remains of the output cap.
@@ -1947,9 +2021,33 @@ impl App {
             blank_page(&mut prefix, page);
             prefix.extend_from_slice(SYNC_END);
         }
+        // Through tmux, a new layout's image is followed by its placeholder cells, which show
+        // it: written once, over every page cell, in a synchronized update after the image (the
+        // image is in the outer terminal by then, and the cells appear at once). The page's
+        // later frames go into the same image and touch no cell.
+        let mut suffix = Vec::new();
+        let tmux_image = self.tui.tmux_image;
+        if protocol == Protocol::KittyTmux && !replaces {
+            match kitty::placeholders(tmux_image, place) {
+                Ok(cells) => {
+                    suffix.extend_from_slice(SYNC_BEGIN);
+                    suffix.extend(cells);
+                    suffix.extend_from_slice(SYNC_END);
+                }
+                Err(error) => {
+                    let diag = self.session.diagnostics_mut();
+                    diag.counters.frames_dropped += 1;
+                    diag.error(format!("a page frame was not sent: {error}"));
+                    pixels.dropped += 1;
+                    pixels.on_screen = true;
+                    return;
+                }
+            }
+        }
         let max = OUTPUT_CAP
             .saturating_sub(out.len())
-            .saturating_sub(prefix.len());
+            .saturating_sub(prefix.len())
+            .saturating_sub(suffix.len());
         let image = pixels.image;
         let Some(encoded) = pixels
             .handle
@@ -1959,6 +2057,9 @@ impl App {
                 }
                 Protocol::Sixel => sixel::encode(frame, place, cell_width, cell_height, max)
                     .map_err(|e| e.to_string()),
+                Protocol::KittyTmux => {
+                    kitty::encode_tmux(frame, tmux_image, place, max).map_err(|e| e.to_string())
+                }
                 Protocol::None => Err("no graphics protocol".into()),
             })
         else {
@@ -1969,7 +2070,7 @@ impl App {
         match encoded {
             Ok(bytes) => {
                 diag.counters.encoded_bytes += bytes.len() as u64;
-                if protocol == Protocol::Sixel {
+                if protocol.written_over() {
                     let print = fingerprint(&bytes);
                     // The same picture is on the page rows already: nothing to send.
                     let same = replaces && placed.is_some_and(|(.., sent)| sent == print);
@@ -1983,21 +2084,29 @@ impl App {
                         // save inside the sixel restores the position after the spaces,
                         // not the grid's cursor.
                         out.extend_from_slice(&prefix);
+                        let start = out.len();
                         out.extend(bytes);
+                        if protocol == Protocol::KittyTmux {
+                            self.tui.tmux_span = Some((start, out.len()));
+                            self.tui.tmux_stored = true;
+                        }
+                        out.extend_from_slice(&suffix);
                         self.tui.grid.forget_cursor();
                         self.tui.grid.forget_pen();
-                        self.tui.sixel_placed = Some((place, metrics.epoch(), print));
-                        self.tui.image_due = Some(now + interval);
+                        self.tui.placed = Some((place, metrics.epoch(), print));
                         self.tui.image_written = Some(now);
                     }
-                    // A hidden view's sixel is under this one, or was this very picture.
-                    self.tui.sixel_stale = false;
+                    // A hidden view's picture is under this one, or was this very picture.
+                    self.tui.stale = false;
                 } else {
                     out.extend(bytes);
-                    self.tui.image_due = Some(now + interval);
                     self.tui.image_written = Some(now);
                 }
                 pixels.on_screen = true;
+                // The page rows show this view's picture now, and no other's.
+                for (&id, pixels) in self.tui.targets.iter_mut() {
+                    pixels.on_rows = id == target;
+                }
             }
             Err(error) => {
                 diag.counters.frames_dropped += 1;
@@ -2086,31 +2195,49 @@ impl Tui {
         }
         self.settings = settings;
         self.relayout();
-        // After relayout, so a switch onto sixel picks up the 5 fps cap, and text mode its own.
-        let interval = frame_interval(self.settings, self.pace_sixel(), self.text_mode);
-        self.next_frame = self.next_frame.map(|at| at.min(Instant::now() + interval));
-        self.image_due = self.image_due.map(|at| at.min(Instant::now() + interval));
     }
 
     /// The page rows hold no sixel: blanked, cleared or drawn as text, so tmux keeps none.
-    fn forget_sixel(&mut self) {
-        self.sixel_placed = None;
+    fn forget_placed(&mut self) {
+        self.placed = None;
     }
 
     /// A hidden view's image is waiting to be deleted or written over.
     fn holding(&self) -> bool {
-        self.sixel_stale || !self.held_deletes.is_empty()
+        self.stale || !self.held_deletes.is_empty()
     }
 
     /// When a hidden view's image may be deleted or written over: the last image has been on
     /// the screen for its frame interval, and for at least [`MIN_IMAGE_LIFE`].
     fn drop_due(&self) -> Option<Instant> {
-        let interval = frame_interval(self.settings, self.pace_sixel(), self.text_mode);
+        let interval = self.interval(Instant::now());
         self.image_written
             .map(|at| at + interval.max(MIN_IMAGE_LIFE))
     }
 
-    /// Sixel frames are capped at 5 fps. Text mode on a sixel terminal is not.
+    /// The time between two page frames, and between two images, as of `now`: `[tui]
+    /// input-fps`'s while the user gave input in the last [`INPUT_WINDOW`], otherwise `[tui]
+    /// fps`'s (sixel at most 5 a second); text mode at most [`TEXT_FPS`]. Taken anew at each
+    /// decision, so a key pressed while a page animates shortens the wait for the frame that
+    /// answers it, and the settings apply at once.
+    fn interval(&self, now: Instant) -> Duration {
+        let input = self
+            .input_at
+            .is_some_and(|at| now.saturating_duration_since(at) < INPUT_WINDOW);
+        frame_interval(self.settings, self.pace_sixel(), self.text_mode, input)
+    }
+
+    /// The earliest time the next page frame may be presented.
+    fn next_frame(&self, now: Instant) -> Option<Instant> {
+        self.presented_at.map(|at| at + self.interval(now))
+    }
+
+    /// The end of the last image's frame interval: the next image is not written before it.
+    fn image_due(&self, now: Instant) -> Option<Instant> {
+        self.image_written.map(|at| at + self.interval(now))
+    }
+
+    /// The page's own sixel frames are capped at 5 fps. Text mode on a sixel terminal is not.
     fn pace_sixel(&self) -> bool {
         self.graphics && self.protocol == Protocol::Sixel
     }
@@ -2132,23 +2259,43 @@ impl Tui {
     /// upload from one the terminal has not started.
     fn note_outbound(&mut self, frame: &[u8]) {
         let pending = self.terminal.pending_len();
+        let tmux = self.tmux_span.take();
         // A queued terminator from an earlier sequence makes `pending` not a suffix of `frame`.
         self.outbound = (pending > 0 && pending <= frame.len()).then(|| Outbound {
             len: frame.len(),
-            kitty: chunked_kitty_span(frame),
+            // Through tmux the chunks are tmux's passthrough strings, never bare APCs.
+            kitty: if tmux.is_some() {
+                None
+            } else {
+                chunked_kitty_span(frame)
+            },
+            tmux,
         });
     }
 
     /// Drop output queued for the layout being replaced. If the bytes already accepted began a
     /// chunked kitty upload and did not finish it, end it with an empty `m=0` chunk.
+    ///
+    /// Through tmux, a cut inside the image's passthrough strings leaves tmux reading one: it is
+    /// ended (`ESC \`), and so is the upload, inside a passthrough string of its own. Both are
+    /// harmless where nothing was cut short.
     fn discard_for_resize(&mut self) {
-        let tail = self.outbound.take().is_some_and(|out| {
+        let (tail, tmux_cut) = self.outbound.take().map_or((false, false), |out| {
             let sent = out.len.saturating_sub(self.terminal.pending_len());
-            out.kitty.is_some_and(|span| span.cut(sent))
+            let tail = out.kitty.is_some_and(|span| span.cut(sent));
+            let tmux_cut = out
+                .tmux
+                .is_some_and(|(start, end)| sent > start && sent < end);
+            (tail, tmux_cut)
         });
         self.terminal.discard_pending();
         if tail {
             let _ = self.terminal.write_frame(KITTY_UPLOAD_END);
+        }
+        if tmux_cut {
+            let mut end = b"\x1b\\".to_vec();
+            end.extend(kitty::wrap_tmux(KITTY_UPLOAD_END));
+            let _ = self.terminal.write_frame(&end);
         }
     }
 
@@ -2158,7 +2305,7 @@ impl Tui {
     fn drop_placed(&mut self, image: u32) {
         match self.protocol {
             Protocol::Kitty => self.held_deletes.push(image),
-            Protocol::Sixel => self.sixel_stale = true,
+            Protocol::Sixel | Protocol::KittyTmux => self.stale = true,
             Protocol::None => {}
         }
     }
@@ -2167,7 +2314,10 @@ impl Tui {
     /// there and the terminal shows no picture.
     fn blank_placed(&mut self, out: &mut Vec<u8>) {
         blank_page(out, self.page);
-        self.forget_sixel();
+        self.forget_placed();
+        for pixels in self.targets.values_mut() {
+            pixels.on_rows = false;
+        }
         self.grid.forget_cursor();
         self.grid.forget_pen();
         // The rows are blank on the terminal now: what the grid holds there (home's text) is
@@ -2199,14 +2349,25 @@ impl Tui {
             let caps = self.terminal.capabilities();
             (caps.kitty_graphics_ok, caps.sixel)
         };
-        let protocol = choose_protocol(self.settings.graphics, kitty_ok, sixel_ok);
+        let size = self.terminal.size();
+        let page = page_area(size);
+        // Kitty graphics through tmux need `[tui] graphics = "kitty"`, tmux passing them on
+        // (`allow-passthrough all`) and page rows the placeholder cells can number.
+        // Rows the diacritics can't number get sixel.
+        let mut asked = self.settings.graphics;
+        let tmux_kitty =
+            asked == GraphicsProtocol::Kitty && self.tmux_passthrough() == Passthrough::All;
+        let numbered =
+            page.cols <= kitty::MAX_PLACEHOLDER_CELLS && page.rows <= kitty::MAX_PLACEHOLDER_CELLS;
+        if tmux_kitty && !numbered {
+            asked = GraphicsProtocol::Sixel;
+        }
+        let protocol = choose_protocol(asked, kitty_ok, sixel_ok, tmux_kitty && numbered);
         // Sixel has no id to delete, and a kitty image would be the wrong picture.
         if protocol != self.protocol && self.graphics {
             self.clear = true;
         }
         self.protocol = protocol;
-        let size = self.terminal.size();
-        let page = page_area(size);
         let width = u32::from(page.cols) * u32::from(size.cell_width);
         let height = u32::from(page.rows) * u32::from(size.cell_height);
         let fits = u64::from(width) * u64::from(height) <= kitty::MAX_PIXELS;
@@ -2263,6 +2424,35 @@ impl Tui {
         }
         self.page = page;
         self.chrome_dirty = true;
+    }
+
+    /// tmux's `allow-passthrough` for this pane, asked the first time `[tui] graphics = "kitty"`
+    /// wants it inside tmux; [`Passthrough::Off`] outside tmux. When it is not `all`, a notice
+    /// says why the page is not kitty graphics.
+    fn tmux_passthrough(&mut self) -> Passthrough {
+        if let Some(passthrough) = self.passthrough {
+            return passthrough;
+        }
+        let inside = tmux::inside(
+            std::env::var_os("TERM").as_deref(),
+            std::env::var_os("TMUX").as_deref(),
+        );
+        if !inside {
+            return Passthrough::Off;
+        }
+        let passthrough = tmux::passthrough();
+        self.passthrough = Some(passthrough);
+        if passthrough != Passthrough::All {
+            let set = match passthrough {
+                Passthrough::On => "on, which drops images while the window is not shown",
+                _ => "off",
+            };
+            self.show_notice(format!(
+                "tmux's allow-passthrough is {set}: kitty graphics need \"set -g \
+                 allow-passthrough all\" in tmux.conf and a restart of sig"
+            ));
+        }
+        passthrough
     }
 
     /// Clears the screen and draws the chrome and the shown page again.
@@ -2621,11 +2811,16 @@ impl Tui {
                         let _ = self.terminal.write_frame(kitty::DELETE_ALL);
                     }
                     // The alternate screen's images are not dropped by leaving it.
-                    Protocol::Sixel => {
+                    Protocol::Sixel | Protocol::KittyTmux => {
                         let _ = self.terminal.write_frame(b"\x1b[H\x1b[2J");
                     }
                     Protocol::None => {}
                 }
+            }
+            if std::mem::take(&mut self.tmux_stored) {
+                let _ = self
+                    .terminal
+                    .write_frame(&kitty::wrap_tmux(kitty::DELETE_ALL));
             }
         }
         let _ = self.terminal.restore();
@@ -2730,6 +2925,7 @@ impl Frontend for Tui {
                 handle,
                 ready: false,
                 on_screen: false,
+                on_rows: false,
                 permits: 0,
                 presented: 0,
                 dropped: 0,
@@ -2762,7 +2958,7 @@ impl Frontend for Tui {
         }
         self.views.retain(|_, &mut kept| kept != target);
         if let Some(pixels) = self.targets.remove(&target) {
-            if self.protocol == Protocol::Kitty || pixels.on_screen {
+            if self.protocol == Protocol::Kitty || pixels.on_screen || pixels.on_rows {
                 self.drop_placed(pixels.image);
             }
         }
@@ -2941,14 +3137,19 @@ impl Frontend for Tui {
         let placed = self
             .targets
             .get(&target)
-            .map(|pixels| (pixels.image, pixels.on_screen));
-        let Some((image, on_screen)) = placed else {
+            .map(|pixels| (pixels.image, pixels.on_screen || pixels.on_rows));
+        let Some((image, on_rows)) = placed else {
             return;
         };
-        if !visible && on_screen {
+        // Its picture may still be on the rows when a newer frame was presented and not yet
+        // written: held all the same.
+        if !visible && on_rows {
             self.drop_placed(image);
         }
         if let Some(pixels) = self.targets.get_mut(&target) {
+            if !visible {
+                pixels.on_rows = false;
+            }
             pixels.on_screen = false;
             pixels.ready &= visible;
         }
@@ -3126,10 +3327,16 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn frame_interval(settings: TuiConfig, sixel: bool, text: bool) -> Duration {
-    let mut fps = match sixel {
-        true => settings.fps.clamp(1, 5),
-        false => settings.fps.max(1),
+/// The time between two page frames. `input`: the user gave input in the last
+/// [`INPUT_WINDOW`], so frames come at `[tui] input-fps`, whatever the protocol: the frame that
+/// answers a key, a scroll or a drag is not held back by the page's own pace. Otherwise
+/// `[tui] fps`, at most 5 a second for sixel (tmux decodes and encodes each sixel again).
+/// Text mode reads no pixels and takes at most [`TEXT_FPS`] either way.
+fn frame_interval(settings: TuiConfig, sixel: bool, text: bool, input: bool) -> Duration {
+    let mut fps = match (input, sixel) {
+        (true, _) => settings.input_fps.max(1),
+        (false, true) => settings.fps.clamp(1, 5),
+        (false, false) => settings.fps.max(1),
     };
     if text {
         fps = fps.min(TEXT_FPS);
@@ -3199,9 +3406,19 @@ fn chunked_kitty_span(frame: &[u8]) -> Option<ChunkedSpan> {
     })
 }
 
-/// Kitty where the terminal answered the graphics query and `[tui] graphics` allows it,
-/// otherwise sixel where DA1 lists it and the setting allows it, otherwise none.
-fn choose_protocol(graphics: GraphicsProtocol, kitty_ok: Option<bool>, sixel: bool) -> Protocol {
+/// Kitty where the terminal answered the graphics query and `[tui] graphics` allows it, kitty
+/// through tmux where `[tui] graphics = "kitty"` asks for it and tmux passes it on
+/// (`tmux_kitty`: tmux hands the pane none of the terminal's replies, so nothing else can
+/// tell), otherwise sixel where DA1 lists it and the setting allows it, otherwise none.
+fn choose_protocol(
+    graphics: GraphicsProtocol,
+    kitty_ok: Option<bool>,
+    sixel: bool,
+    tmux_kitty: bool,
+) -> Protocol {
+    if graphics == GraphicsProtocol::Kitty && tmux_kitty {
+        return Protocol::KittyTmux;
+    }
     if matches!(graphics, GraphicsProtocol::Auto | GraphicsProtocol::Kitty)
         && kitty_ok == Some(true)
     {
@@ -3351,6 +3568,7 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
     let graphics = match (tui.graphics, tui.protocol) {
         (true, Protocol::Sixel) => "sixel",
         (true, Protocol::Kitty) => "kitty",
+        (true, Protocol::KittyTmux) => "kitty-tmux",
         _ => "none",
     };
     // What the top line shows of the keymap's mode, as the window's report has it.
@@ -3439,39 +3657,81 @@ mod tests {
             fps,
             ..TuiConfig::default()
         };
+        let ms = Duration::from_millis;
+        assert_eq!(frame_interval(fps(10), false, false, false), ms(100));
         assert_eq!(
-            frame_interval(fps(10), false, false),
-            Duration::from_millis(100)
+            frame_interval(fps(0), false, false, false),
+            Duration::from_secs(1)
         );
-        assert_eq!(frame_interval(fps(0), false, false), Duration::from_secs(1));
+        // The page's own sixel frames are capped at 5 a second.
+        assert_eq!(frame_interval(fps(10), true, false, false), ms(200));
+        assert_eq!(frame_interval(fps(5), true, false, false), ms(200));
+        assert_eq!(frame_interval(fps(4), true, false, false), ms(250));
         assert_eq!(
-            frame_interval(fps(10), true, false),
-            Duration::from_millis(200)
+            frame_interval(fps(0), true, false, false),
+            Duration::from_secs(1)
         );
-        assert_eq!(
-            frame_interval(fps(5), true, false),
-            Duration::from_millis(200)
-        );
-        assert_eq!(
-            frame_interval(fps(4), true, false),
-            Duration::from_millis(250)
-        );
-        assert_eq!(frame_interval(fps(0), true, false), Duration::from_secs(1));
         // Text mode is at most TEXT_FPS, and still at most the sixel cap.
+        assert_eq!(frame_interval(fps(10), false, true, false), ms(500));
+        assert_eq!(frame_interval(fps(2), false, true, false), ms(500));
         assert_eq!(
-            frame_interval(fps(10), false, true),
-            Duration::from_millis(500)
+            frame_interval(fps(1), false, true, false),
+            Duration::from_secs(1)
         );
         assert_eq!(
-            frame_interval(fps(2), false, true),
-            Duration::from_millis(500)
+            frame_interval(fps(0), false, true, false),
+            Duration::from_secs(1)
         );
-        assert_eq!(frame_interval(fps(1), false, true), Duration::from_secs(1));
-        assert_eq!(frame_interval(fps(0), false, true), Duration::from_secs(1));
+        assert_eq!(frame_interval(fps(10), true, true, false), ms(500));
+    }
+
+    #[test]
+    fn input_paces_frames_by_input_fps_for_kitty_and_sixel() {
+        let config = |fps, input_fps| TuiConfig {
+            fps,
+            input_fps,
+            ..TuiConfig::default()
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(TuiConfig::default().input_fps, 30);
+        // Sixel is not held to 5 a second while the user gives input.
         assert_eq!(
-            frame_interval(fps(10), true, true),
-            Duration::from_millis(500)
+            frame_interval(config(10, 30), true, false, true),
+            Duration::from_secs(1) / 30
         );
+        assert_eq!(frame_interval(config(10, 50), false, false, true), ms(20));
+        // input-fps below fps slows input's frames: it is the rate, not a floor.
+        assert_eq!(frame_interval(config(30, 10), false, false, true), ms(100));
+        assert_eq!(
+            frame_interval(config(10, 0), true, false, true),
+            Duration::from_secs(1)
+        );
+        // Text mode reads no pixels: TEXT_FPS either way.
+        assert_eq!(frame_interval(config(10, 30), true, true, true), ms(500));
+    }
+
+    #[test]
+    fn the_interval_follows_the_last_input_and_a_hidden_image_is_held_as_long() {
+        let (_master, mut tui) = on_pty();
+        tui.graphics = true;
+        tui.protocol = Protocol::Sixel;
+        let now = Instant::now();
+        assert_eq!(tui.interval(now), Duration::from_millis(200));
+        tui.input_at = Some(now);
+        assert_eq!(tui.interval(now), Duration::from_secs(1) / 30);
+        assert_eq!(
+            tui.interval(now + INPUT_WINDOW - Duration::from_millis(1)),
+            Duration::from_secs(1) / 30
+        );
+        assert_eq!(tui.interval(now + INPUT_WINDOW), Duration::from_millis(200));
+        // A frame presented before the key may be followed at input-fps's pace.
+        tui.presented_at = Some(now);
+        tui.image_written = Some(now);
+        assert_eq!(tui.next_frame(now), Some(now + Duration::from_secs(1) / 30));
+        assert_eq!(tui.image_due(now), Some(now + Duration::from_secs(1) / 30));
+        // A hidden tab's image still stays up MIN_IMAGE_LIFE (decision 133).
+        let held = tui.drop_due().unwrap();
+        assert!(held >= now + MIN_IMAGE_LIFE, "{:?}", held - now);
     }
 
     #[test]
@@ -3535,18 +3795,42 @@ mod tests {
     #[test]
     fn graphics_protocol_follows_the_terminal_and_the_setting() {
         use GraphicsProtocol::{Auto, Kitty, None as NoGraphics, Sixel};
-        assert_eq!(choose_protocol(Auto, Some(true), true), Protocol::Kitty);
-        assert_eq!(choose_protocol(Auto, Some(false), true), Protocol::Sixel);
-        assert_eq!(choose_protocol(Auto, None, true), Protocol::Sixel);
-        assert_eq!(choose_protocol(Auto, None, false), Protocol::None);
-        assert_eq!(choose_protocol(Kitty, Some(true), true), Protocol::Kitty);
-        assert_eq!(choose_protocol(Kitty, None, true), Protocol::None);
-        assert_eq!(choose_protocol(Sixel, Some(true), true), Protocol::Sixel);
-        assert_eq!(choose_protocol(Sixel, None, false), Protocol::None);
         assert_eq!(
-            choose_protocol(NoGraphics, Some(true), true),
+            choose_protocol(Auto, Some(true), true, false),
+            Protocol::Kitty
+        );
+        assert_eq!(
+            choose_protocol(Auto, Some(false), true, false),
+            Protocol::Sixel
+        );
+        assert_eq!(choose_protocol(Auto, None, true, false), Protocol::Sixel);
+        assert_eq!(choose_protocol(Auto, None, false, false), Protocol::None);
+        assert_eq!(
+            choose_protocol(Kitty, Some(true), true, false),
+            Protocol::Kitty
+        );
+        assert_eq!(choose_protocol(Kitty, None, true, false), Protocol::None);
+        assert_eq!(
+            choose_protocol(Sixel, Some(true), true, false),
+            Protocol::Sixel
+        );
+        assert_eq!(choose_protocol(Sixel, None, false, false), Protocol::None);
+        assert_eq!(
+            choose_protocol(NoGraphics, Some(true), true, false),
             Protocol::None
         );
+        // Through tmux only when asked for by name and tmux passes it on.
+        assert_eq!(
+            choose_protocol(Kitty, None, true, true),
+            Protocol::KittyTmux
+        );
+        assert_eq!(choose_protocol(Auto, None, true, true), Protocol::Sixel);
+        assert_eq!(choose_protocol(Sixel, None, true, true), Protocol::Sixel);
+        assert_eq!(choose_protocol(Kitty, None, true, false), Protocol::None);
+        assert_ne!(tmux_image_id(30), 31);
+        for pid in [0, 1, 253, 254, 255, 1_000_000, u32::MAX] {
+            assert!((1..=255).contains(&tmux_image_id(pid)));
+        }
     }
 
     fn bare_tui(terminal: Terminal) -> Tui {
@@ -3558,11 +3842,15 @@ mod tests {
             settings: TuiConfig::default(),
             graphics: false,
             protocol: Protocol::None,
-            sixel_placed: None,
-            sixel_stale: false,
+            placed: None,
+            stale: false,
+            passthrough: None,
+            tmux_image: tmux_image_id(std::process::id()),
+            tmux_stored: false,
+            tmux_span: None,
             held_deletes: Vec::new(),
-            image_due: None,
             image_written: None,
+            input_at: None,
             page: page_area(size),
             text_mode: false,
             typing_told: None,
@@ -3595,7 +3883,7 @@ mod tests {
             notice: None,
             notice_first: None,
             page_text: false,
-            next_frame: None,
+            presented_at: None,
             outstanding: None,
             failed_reads: Vec::new(),
             clipboard_out: None,

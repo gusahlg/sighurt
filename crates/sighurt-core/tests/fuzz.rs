@@ -152,6 +152,7 @@ forward = "page.forward"
 mode = "text"
 graphics = "kitty"
 fps = 30
+input-fps = 60
 mouse = false
 [tui.keys]
 "m" = "chrome.toggle-mode"
@@ -243,6 +244,7 @@ const KEYS: &[&str] = &[
     "mode",
     "graphics",
     "fps",
+    "input-fps",
     "mouse",
     "default-keys",
     "chrome",
@@ -477,6 +479,11 @@ fn check_config(config: &Config) {
         (1..=60).contains(&config.tui().fps),
         "fps {}",
         config.tui().fps
+    );
+    assert!(
+        (1..=60).contains(&config.tui().input_fps),
+        "input-fps {}",
+        config.tui().input_fps
     );
     assert!(RENDERERS.contains(&config.renderer()));
     assert!(config.is_enabled(config.default_engine()));

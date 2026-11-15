@@ -222,6 +222,9 @@ pub struct TuiConfig {
     pub graphics: GraphicsProtocol,
     /// `fps`: page frames a second in graphics mode, from 1 to 60.
     pub fps: u32,
+    /// `input-fps`: page frames a second in graphics mode for a second after the user's last
+    /// key, mouse event or paste, from 1 to 60.
+    pub input_fps: u32,
     /// `mouse`: whether the terminal's mouse is sent to the page.
     pub mouse: bool,
     /// `default-keys`: accepted, and ignored since 0.10. The terminal's default keys are the
@@ -235,6 +238,7 @@ impl Default for TuiConfig {
             mode: TuiMode::Auto,
             graphics: GraphicsProtocol::Auto,
             fps: 10,
+            input_fps: 30,
             mouse: true,
             default_keys: true,
         }
@@ -1473,6 +1477,12 @@ fn check_tui(table: toml::Table, problems: &mut Vec<String>) -> TuiConfig {
                     "[tui] fps: expected a whole number from 1 to 60, not {value}"
                 )),
             },
+            "input-fps" => match value.as_integer() {
+                Some(fps @ 1..=60) => checked.input_fps = fps as u32,
+                _ => problems.push(format!(
+                    "[tui] input-fps: expected a whole number from 1 to 60, not {value}"
+                )),
+            },
             "mouse" => match value.as_bool() {
                 Some(mouse) => checked.mouse = mouse,
                 None => problems.push(format!("[tui] mouse: expected true or false, not {value}")),
@@ -1487,8 +1497,8 @@ fn check_tui(table: toml::Table, problems: &mut Vec<String>) -> TuiConfig {
                 "[tui] keys: expected a [tui.keys] table, not {value}"
             )),
             other => problems.push(format!(
-                "[tui] {other}: unknown key ([tui] has mode, graphics, fps, mouse, default-keys \
-                 and [tui.keys])"
+                "[tui] {other}: unknown key ([tui] has mode, graphics, fps, input-fps, mouse, \
+                 default-keys and [tui.keys])"
             )),
         }
     }

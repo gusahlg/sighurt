@@ -164,6 +164,57 @@ during the `still` steps under tmux, 2–11 of 200 on the animation with Rio alo
 forced; Rio alone picks kitty graphics, which show no such frames. A synchronized update around
 the image made Rio lose its device.
 
+**Input-driven pacing** (15 November 2026, branch `tuispeed`; amends decision 110's "at most
+5 a second" for sixel and the fixed rate above). For a second after the user's last key, mouse
+event or paste (`INPUT_WINDOW`), page frames and images come at `[tui] input-fps` (30 by
+default, 1 to 60), kitty and sixel alike; otherwise at `[tui] fps`, the page's own frames as
+sixel at most 5 a second. The interval is taken anew at each decision from the last frame's
+time, so a key pressed while a page animates shortens the wait for the frame that answers it.
+Nothing ticks for it: the window's end only lengthens the next wait. A frame still waits until
+the terminal (or tmux) has taken every byte of the one before, so a terminal slower than the
+pace sets it. What decision 133 holds stays: a hidden tab's picture is deleted or written over
+only once the last image has been up for at least `MIN_IMAGE_LIFE` (250 ms), which a tab storm
+is paced by whatever the input rate; and since frames now follow each other 33 ms apart, a
+view's picture counts as on the rows (`on_rows`) also when a newer frame of it was presented
+and not yet written, so hiding it then holds it too (before, such a picture could be written
+over one frame interval after it came). Measured (this desktop, 15 November 2026, Rio 0.5.28 on
+its CPU renderer in a private headless sway at 1920×1080, a 1911×980 page of `demo://resize`, a
+drag step every 16 ms for 6 s injected into the pty, release builds; the 6 November research
+harness): images 200 ms apart before, 33 ms after, sixel through tmux and alone; input to the
+whole next image accepted by Rio, median and p90, 99.7 and 179.7 ms before, 18.0 and 31.5 ms
+after through tmux (sixel alone 103.5/183.5 → 18.4/31.8; kitty at `fps` 10, 50.0/90.3 →
+18.9/32.1). One input from idle is unchanged (sixel through tmux about 30 ms, tmux's own
+decode and encode). real-terminals.sh's `rio-tmux-sixel`, `rio-sixel` and `rio-kitty` pass on
+Rio's Vulkan renderer with this pacing, the 25 s tab storm and tmux's redraws included.
+
+**Kitty graphics through tmux** (same branch). With `[tui] graphics = "kitty"` in a tmux pane
+(`TERM` tmux's and `$TMUX` set), `sig` asks that tmux for the pane's `allow-passthrough`
+(`tmux show -Apv`, the `tmux` of an absolute `PATH` directory, at most a second, once). Only
+`all` is taken: with `on`, tmux drops what a pane passes while its window is not shown, so a
+page that changed meanwhile would come back as its old picture. tmux 3.8 hands the pane none of
+the outer terminal's replies (they arrive as keys), so whether that terminal shows kitty images
+can't be asked through tmux; the setting says so, and `auto` stays sixel. Each frame is
+`a=T,U=1` (a virtual placement) into one image id per `sig` (1 to 255, from the process id; not
+31), every APC in its own passthrough string with its ESCs doubled, and no cursor movement; the
+page rows hold kitty's Unicode placeholder cells (U+10EEEE with a row and a column diacritic on
+every cell, the id as a 256-colour foreground), written once per layout in a synchronized update
+after the image. tmux keeps and redraws those cells like text: no image stack, no replay, no
+re-encode, and a pane redraw sends the outer terminal text, not images. The picture is written
+over as a sixel is (`Protocol::written_over`: the same hold, the same skip of a frame whose bytes
+are the picture's); text on the page rows (a message, home, text mode) blanks the cells first,
+since text alone would leave the image around it. A clear and leaving delete the image
+(`a=d,d=A`, through tmux). A resize that cuts a passthrough string ends it (`ESC \`) and the
+upload. Page rows wider or taller than the 297 diacritics fall back to sixel. Measured as above:
+one input from idle to the whole image accepted, 22.5 ms (sixel through tmux 29.9 ms); a drag,
+24.0 ms median, 37.6 ms p90 at 30 frames a second; real-terminals.sh's `rio-tmux-kitty`
+(`still`, `flicker`, `idle`, the tab storm and 20 tmux redraws with two resizes) passes on Rio's
+Vulkan renderer (decision 133 saw those redraws kill it with a sixel shown; in this run
+`rio-tmux-sixel` lived through them too, so that is not yet evidence that placeholders avoid
+it). Kitty
+frames are compressed at zlib's fastest level: 3.0 ms against 15.9 ms at level 6 for a real
+1920×1040 page, 1.85 times the bytes; through tmux's passthrough those bytes cost a few
+milliseconds back, and on pages that level 6 shrinks far more (the demo's) more than that.
+
 ## 3. The semantic interface (`sighurt_api::semantic`)
 
 ```rust

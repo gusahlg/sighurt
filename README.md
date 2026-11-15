@@ -153,9 +153,15 @@ top; status and notices below) and the page between them in one of two modes:
 
 - **Graphics**: the page's pixels as kitty graphics, up to `[tui] fps` frames a second (10 by
   default), in a terminal that speaks the kitty graphics protocol (kitty, Rio, ghostty,
-  WezTerm), or as sixel, at most 5 a second, where the terminal has sixel but not kitty
-  graphics: inside tmux 3.4 or later, foot, xterm with sixel. A page a tab switch shows counts
-  against that rate too, so holding the tab-switch key never floods the terminal with images.
+  WezTerm), or as sixel, the page's own frames at most 5 a second, where the terminal has
+  sixel but not kitty graphics: inside tmux 3.4 or later, foot, xterm with sixel. For a second
+  after each key, mouse event or paste, frames come at `[tui] input-fps` (30 by default) with
+  either protocol, so typing and scrolling are not held to the page's pace. Inside tmux, with
+  `[tui] graphics = "kitty"` and `set -g allow-passthrough all` in tmux.conf, a terminal with
+  kitty graphics and Unicode placeholders (kitty, Rio, ghostty) gets kitty images through
+  tmux's passthrough instead of sixel, which tmux does not decode and encode again. A page a
+  tab switch shows counts against that rate too, so holding the tab-switch key never floods
+  the terminal with images.
   Each frame goes over the one before, and a new page's first frame over the old page, so the
   page is not blanked while you type, scroll, reload or follow a link.
 - **Text**: the page's content reflowed into terminal lines, with links and controls you can
@@ -168,7 +174,7 @@ top; status and notices below) and the page between them in one of two modes:
 
 `[tui] mode = "auto"` (the default), `"text"` or `"graphics"` chooses the start; the `[tui]`
 table of the [built-in configuration](crates/sighurt-core/src/default-config.toml) also has
-`graphics` (`auto`, `kitty`, `sixel`, `none`), `fps`, `mouse` and `default-keys` (which does
+`graphics` (`auto`, `kitty`, `sixel`, `none`), `fps`, `input-fps`, `mouse` and `default-keys` (which does
 nothing since 0.10: the terminal's default keys are the example configuration's). The mouse
 clicks and scrolls the page (in text mode the wheel scrolls three lines and a click activates
 the link or control under it). Logs, and anything else written to stderr, go to

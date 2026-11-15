@@ -379,9 +379,18 @@ enabled = true
 # mode: "auto" (the default) follows the terminal, graphics where it can show them and text
 # otherwise; "text" is reflowed text; "graphics" is the page's pixels.
 # graphics: "auto" (the default) picks kitty where the terminal speaks it, otherwise sixel,
-# otherwise text; or "kitty", "sixel", or "none" (text only).
-# fps: how many frames of the page graphics mode shows a second, a whole number from 1 to 60.
-# The default is 10. Sixel is sent at most 5 a second, whatever this says.
+# otherwise text; or "kitty", "sixel", or "none" (text only). Inside tmux, "auto" is sixel
+# (tmux tells sig nothing of the terminal outside it); "kitty" sends kitty graphics through
+# tmux's passthrough, shown by Unicode placeholders, when tmux.conf has
+# `set -g allow-passthrough all` (sig asks tmux when it starts) and the terminal outside has
+# kitty graphics with placeholders (kitty, Rio, ghostty). tmux then keeps no image and encodes
+# none again, so frames reach the terminal sooner than sixel's.
+# fps: how many frames of the page graphics mode shows a second when you are not using the
+# page (it animates or loads), a whole number from 1 to 60. The default is 10. Sixel is sent
+# at most 5 a second, whatever this says.
+# input-fps: the same for a second after each key you press, mouse event or paste, so the
+# page answers typing, scrolling and dragging at this pace, sixel too; from 1 to 60, the
+# default 30. A frame still waits until the terminal has taken the one before.
 # mouse: whether the terminal's mouse reports clicks and scrolling to the page. The default
 # is true.
 # default-keys: accepted, and it has no effect since 0.10. The terminal's default keys are
@@ -392,6 +401,7 @@ enabled = true
 #   mode = "text"
 #   graphics = "kitty"
 #   fps = 30
+#   input-fps = 60
 #   mouse = false
 #   default-keys = false
 #
@@ -414,6 +424,7 @@ enabled = true
 mode = "auto"
 graphics = "auto"
 fps = 10
+input-fps = 30
 mouse = true
 default-keys = true
 

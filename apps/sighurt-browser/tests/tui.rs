@@ -118,6 +118,24 @@ impl Terminal {
         term: &str,
         controlling: bool,
     ) -> Self {
+        Self::start_env(name, args, replies, tui, history, term, controlling, |_| {
+            Vec::new()
+        })
+    }
+
+    /// [`Self::start_as`] with more environment variables, which `env` makes from the test's
+    /// directory.
+    #[allow(clippy::too_many_arguments)]
+    fn start_env(
+        name: &str,
+        args: &[&str],
+        replies: &'static [u8],
+        tui: &str,
+        history: Seed<'_>,
+        term: &str,
+        controlling: bool,
+        env: impl FnOnce(&Path) -> Vec<(String, std::ffi::OsString)>,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!("sig-tui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("config/sighurt")).unwrap();
@@ -154,6 +172,7 @@ impl Terminal {
         let original = tcgetattr(&slave).unwrap();
         let stderr = fs::File::create(dir.join("stderr")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_sig"));
+        command.env_remove("TMUX").envs(env(&dir));
         if controlling {
             // SAFETY: setsid(2) and ioctl(2) only, between fork and exec. The session's id is
             // the child's pid, which the watchdog kills as a process group.
@@ -1900,6 +1919,146 @@ fn a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced()
     assert!(term.running(), "{}", term.context());
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
+}
+
+/// A page's own sixel frames come at most 5 a second; while the user types, scrolls or drags,
+/// at `[tui] input-fps` (30 by default): the frame that answers input is not held to the
+/// page's pace. A second after the last input the page's pace is back.
+#[test]
+fn sixel_frames_follow_input_at_input_fps_and_the_page_at_five() {
+    let mut term = Terminal::start_in(
+        "sixel-input",
+        &["demo://animation"],
+        SIXEL_REPLIES,
+        SIXEL_KEYS,
+    );
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        !sixel_spans(got).is_empty()
+    });
+    assert!(shown, "no sixel\n{}", term.context());
+    let count = |term: &mut Terminal, keys: bool| {
+        let from = term.got.len();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            if keys {
+                // Bound to nothing: it goes to the page, and it is the user's input.
+                term.type_bytes(b"x");
+            }
+            term.wait(term.got.len(), Duration::from_millis(30), |_| false);
+        }
+        (sixel_spans(&term.got[from..]).len(), started.elapsed())
+    };
+    let (idle, lasted) = count(&mut term, false);
+    let most = (lasted.as_millis() / 200 + 2) as usize;
+    assert!(
+        idle <= most,
+        "{idle} sixels in {lasted:?} of a page animating on its own, more than {most}\n{}",
+        term.context()
+    );
+    let (typing, lasted) = count(&mut term, true);
+    assert!(
+        typing >= 2 * most,
+        "{typing} sixels in {lasted:?} of typing, not more than twice the page's own {most}\n{}",
+        term.context()
+    );
+    assert!(
+        typing as u128 <= lasted.as_millis() / 33 + 2,
+        "{typing} sixels in {lasted:?} of typing, faster than input-fps\n{}",
+        term.context()
+    );
+    // A second after the last key, the page's own pace again.
+    term.wait(term.got.len(), Duration::from_millis(1200), |_| false);
+    let (after, lasted) = count(&mut term, false);
+    let most = (lasted.as_millis() / 200 + 2) as usize;
+    assert!(
+        after <= most,
+        "{after} sixels in {lasted:?} after the input stopped, more than {most}\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// `[tui] graphics = "kitty"` in a tmux pane whose tmux says `allow-passthrough all` (a `tmux`
+/// of the test's own on `PATH`): kitty images through tmux's passthrough, one image written over
+/// by the page's frames, shown by placeholder cells written once for the layout. No bare kitty
+/// APC reaches tmux (it would take it as the pane's title), and nothing is written on the page
+/// rows between frames.
+#[test]
+fn kitty_graphics_go_through_tmux_passthrough_with_placeholders() {
+    let mut term = Terminal::start_env(
+        "tmux-kitty",
+        &["demo://animation"],
+        SIXEL_REPLIES,
+        &format!("graphics = \"kitty\"\n{SIXEL_KEYS}"),
+        Seed::None,
+        "tmux-256color",
+        false,
+        |dir| {
+            let bin = dir.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            let tmux = bin.join("tmux");
+            fs::write(&tmux, "#!/bin/sh\necho all\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![bin];
+            paths.extend(std::env::split_paths(&path));
+            vec![
+                ("TMUX".into(), "/tmp/tmux-test/default,1,0".into()),
+                ("PATH".into(), std::env::join_paths(paths).unwrap()),
+            ]
+        },
+    );
+    let opening = b"\x1bPtmux;\x1b\x1b_Ga=T,U=1,f=32,o=z,t=d,s=800,v=440,";
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        got.windows(opening.len()).filter(|w| *w == opening).count() >= 4
+    });
+    assert!(
+        shown,
+        "fewer than 4 kitty images through tmux\n{}",
+        term.context()
+    );
+    let placeholder = "\u{10EEEE}".as_bytes();
+    let cells = term.got.windows(4).filter(|w| *w == placeholder).count();
+    assert_eq!(cells, 80 * 22, "placeholder cells\n{}", term.context());
+    // Only the passthrough's doubled ESC before `_G`: no APC of its own.
+    for (at, window) in term.got.windows(3).enumerate() {
+        if window == b"\x1b_G" {
+            assert!(
+                at > 0 && term.got[at - 1] == 0x1b,
+                "a bare kitty APC at byte {at}\n{}",
+                term.context()
+            );
+        }
+    }
+    assert!(
+        !sixel_image(&term.got),
+        "a sixel was sent\n{}",
+        term.context()
+    );
+    // After the placeholders, frames go into the same image and nothing goes on the rows.
+    let first = term
+        .got
+        .windows(placeholder.len())
+        .rposition(|w| w == placeholder)
+        .unwrap();
+    let next = term.got[first..]
+        .windows(opening.len())
+        .position(|w| w == opening)
+        .map(|at| first + at);
+    let next =
+        next.unwrap_or_else(|| panic!("no frame after the placeholders\n{}", term.context()));
+    let after = &term.got[next..];
+    assert!(
+        page_row_writes(after, 2, 23).is_empty(),
+        "page rows written after the placeholders\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+    let json = fs::read_to_string(term.dir.join("diag.json")).unwrap_or_default();
+    assert!(json.contains("graphics=kitty-tmux"), "{json}");
 }
 
 /// Inside tmux (TERM) too, a page that keeps changing has its sixels written over each other
