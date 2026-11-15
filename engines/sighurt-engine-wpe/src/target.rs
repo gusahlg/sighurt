@@ -61,6 +61,10 @@ pub trait WpeTarget: seal::Sealed + Host<Self::Permit> + 'static {
     /// offscreen permit is the [`CpuTarget`]'s.
     type Permit;
 
+    /// The refresh rate (mHz) of the output the target's window is on, when known. A CPU target
+    /// is on no output.
+    fn refresh_mhz(&self) -> Option<u32>;
+
     /// Metrics when the view opens. Later ones arrive as `SetMetrics`.
     fn metrics(&self) -> Metrics;
 
@@ -125,6 +129,10 @@ impl Host<FramePermit> for TargetLease {
 impl WpeTarget for TargetLease {
     type Permit = FramePermit;
 
+    fn refresh_mhz(&self) -> Option<u32> {
+        TargetLease::refresh_mhz(self)
+    }
+
     fn metrics(&self) -> Metrics {
         TargetLease::metrics(self)
     }
@@ -185,6 +193,10 @@ impl<C: CpuTarget + 'static> Host<C::Permit> for Offscreen<C> {
 
 impl<C: CpuTarget + 'static> WpeTarget for Offscreen<C> {
     type Permit = C::Permit;
+
+    fn refresh_mhz(&self) -> Option<u32> {
+        None
+    }
 
     fn metrics(&self) -> Metrics {
         self.0.metrics()

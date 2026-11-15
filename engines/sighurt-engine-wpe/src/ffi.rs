@@ -67,6 +67,8 @@ instance!(
     WPEDisplay,
     WPEView,
     WPEToplevel,
+    WPEScreen,
+    WPEScreenSyncObserver,
     WPEClipboard,
     WPEInputMethodContext
 );
@@ -90,6 +92,38 @@ pub struct WPEDisplayClass {
         Option<unsafe extern "C" fn(*mut WPEDisplay, *mut WPEView) -> *mut WPEInputMethodContext>,
     pub create_toplevel: Option<unsafe extern "C" fn(*mut WPEDisplay, c_uint) -> *mut WPEToplevel>,
     pub create_gamepad_manager: Option<unsafe extern "C" fn(*mut WPEDisplay) -> gpointer>,
+    pub padding: [gpointer; 32],
+}
+
+#[repr(C)]
+pub struct WPEToplevelClass {
+    pub parent_class: GObjectClass,
+    pub set_title: Option<unsafe extern "C" fn(*mut WPEToplevel, *const c_char)>,
+    pub get_screen: Option<unsafe extern "C" fn(*mut WPEToplevel) -> *mut WPEScreen>,
+    pub resize: Option<unsafe extern "C" fn(*mut WPEToplevel, c_int, c_int) -> gboolean>,
+    pub set_fullscreen: Option<unsafe extern "C" fn(*mut WPEToplevel, gboolean) -> gboolean>,
+    pub set_maximized: Option<unsafe extern "C" fn(*mut WPEToplevel, gboolean) -> gboolean>,
+    pub set_minimized: Option<unsafe extern "C" fn(*mut WPEToplevel) -> gboolean>,
+    pub get_preferred_buffer_formats:
+        Option<unsafe extern "C" fn(*mut WPEToplevel) -> *mut WPEBufferFormats>,
+    pub padding: [gpointer; 32],
+}
+
+#[repr(C)]
+pub struct WPEScreenClass {
+    pub parent_class: GObjectClass,
+    pub invalidate: Option<unsafe extern "C" fn(*mut WPEScreen)>,
+    pub get_sync_observer:
+        Option<unsafe extern "C" fn(*mut WPEScreen) -> *mut WPEScreenSyncObserver>,
+    pub padding: [gpointer; 32],
+}
+
+#[repr(C)]
+pub struct WPEScreenSyncObserverClass {
+    pub parent_class: GObjectClass,
+    pub start: Option<unsafe extern "C" fn(*mut WPEScreenSyncObserver)>,
+    pub stop: Option<unsafe extern "C" fn(*mut WPEScreenSyncObserver)>,
+    pub sync: Option<unsafe extern "C" fn(*mut WPEScreenSyncObserver)>,
     pub padding: [gpointer; 32],
 }
 
@@ -325,6 +359,13 @@ functions! {
     pub fn wpe_display_get_type() -> GType;
     pub fn wpe_display_set_primary(display: *mut WPEDisplay);
     pub fn wpe_display_connect(display: *mut WPEDisplay, error: *mut *mut GError) -> gboolean;
+
+    // WPEScreen
+    pub fn wpe_screen_get_type() -> GType;
+    pub fn wpe_screen_sync_observer_get_type() -> GType;
+    pub fn wpe_screen_set_size(screen: *mut WPEScreen, width: c_int, height: c_int);
+    pub fn wpe_screen_set_physical_size(screen: *mut WPEScreen, width: c_int, height: c_int);
+    pub fn wpe_screen_set_refresh_rate(screen: *mut WPEScreen, refresh_rate: c_int);
 
     // WPEView
     pub fn wpe_view_get_type() -> GType;

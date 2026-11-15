@@ -26,6 +26,12 @@
 //! frame. A close request (the compositor's close button, a key binding) is reported as
 //! [`HostEvent::CloseRequested`]; the browser decides whether to close.
 //!
+//! The window also records the refresh rate of the output it is on: the highest current-mode
+//! rate (mHz) among the outputs its root surface has entered (`wl_surface.enter` and `leave`),
+//! or none. It is kept on every target of the window ([`TargetLease::refresh_mhz`]) so a
+//! presenter that drives a page's animations (WPE WebKit's vblank source) can follow the
+//! output; the host paces nothing with it.
+//!
 //! Must not own: chrome content, or a repaint when a page animates.
 
 use std::num::NonZeroU32;
@@ -151,6 +157,10 @@ pub(crate) struct Window {
     pub transaction: Option<Transaction>,
     /// Whether the children must be restacked at the next root commit.
     pub restack: bool,
+    /// The outputs the root surface has entered.
+    entered: Vec<WlOutput>,
+    /// The highest refresh rate (mHz) among `entered`, as their current modes say.
+    pub refresh_mhz: Option<u32>,
     color: [u8; 3],
     fractional: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
@@ -351,6 +361,8 @@ impl Host {
                 text_input: None,
                 transaction: None,
                 restack: false,
+                entered: Vec::new(),
+                refresh_mhz: None,
                 color: options.background,
                 fractional,
                 viewport,
@@ -436,6 +448,41 @@ impl Host {
         if let Some(w) = self.windows.get_mut(&window) {
             change(&mut w.scale);
             self.report_configuration(window);
+        }
+    }
+
+    /// Recomputes `window`'s refresh rate from the outputs it has entered and gives it to each
+    /// of its targets.
+    pub(crate) fn update_refresh(&mut self, window: WindowId) {
+        let Some(w) = self.windows.get_mut(&window) else {
+            return;
+        };
+        let rate = w
+            .entered
+            .iter()
+            .filter_map(|output| self.outputs.info(output))
+            .flat_map(|info| info.modes)
+            .filter(|mode| mode.current && mode.refresh_rate > 0)
+            .map(|mode| mode.refresh_rate as u32)
+            .max();
+        w.refresh_mhz = rate;
+        for id in &w.targets {
+            if let Some(target) = self.targets.get(id) {
+                target.borrow_mut().refresh_mhz = rate;
+            }
+        }
+    }
+
+    /// Updates every window that is on `output` (its mode changed).
+    pub(crate) fn output_mode_changed(&mut self, output: &WlOutput) {
+        let windows: Vec<WindowId> = self
+            .windows
+            .values()
+            .filter(|w| w.entered.contains(output))
+            .map(|w| w.id)
+            .collect();
+        for window in windows {
+            self.update_refresh(window);
         }
     }
 
@@ -608,18 +655,32 @@ impl CompositorHandler for Host {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &WlSurface,
-        _: &WlOutput,
+        surface: &WlSurface,
+        output: &WlOutput,
     ) {
+        if let Some(SurfaceOwner::Root(window)) = self.surfaces.get(&surface.id()).copied() {
+            if let Some(w) = self.windows.get_mut(&window) {
+                if !w.entered.contains(output) {
+                    w.entered.push(output.clone());
+                }
+            }
+            self.update_refresh(window);
+        }
     }
 
     fn surface_leave(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &WlSurface,
-        _: &WlOutput,
+        surface: &WlSurface,
+        output: &WlOutput,
     ) {
+        if let Some(SurfaceOwner::Root(window)) = self.surfaces.get(&surface.id()).copied() {
+            if let Some(w) = self.windows.get_mut(&window) {
+                w.entered.retain(|o| o != output);
+            }
+            self.update_refresh(window);
+        }
     }
 }
 
