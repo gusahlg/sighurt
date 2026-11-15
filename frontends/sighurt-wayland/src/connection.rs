@@ -27,7 +27,9 @@
 //!    [`HostEvent::WindowConfigured`] with [`Host::apply_placement`]; forward
 //!    [`HostEvent::MetricsChanged`] to the target's presenter and input to its owner;
 //!    [`Host::invalidate`] targets with something new; hand out [`Host::permits`] (or
-//!    [`Host::fill_permits`] into a reused list).
+//!    [`Host::fill_permits`] into a reused list). [`Host::flush_requests`] sends the frames
+//!    presented so far at once, without waiting for the end of the iteration, and
+//!    [`Host::take_presentations`] gives the presented frames' latencies for diagnostics.
 //! 3. End the iteration with [`Host::flush`], which commits finished layout transactions,
 //!    forgets retired targets and flushes the connection.
 //!
@@ -42,7 +44,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
@@ -114,6 +116,8 @@ pub struct Host {
     pub(crate) clipboard: Clipboard,
     pub(crate) events: VecDeque<HostEvent>,
     pub(crate) presentation_clock: Option<u32>,
+    /// Presented frames' submission-to-display times since the frontend last took them.
+    pub(crate) presentations: Vec<(TargetId, Duration)>,
     // Ids walked by `fill_permits`, kept so that pass does not allocate the list.
     pub(crate) permit_ids: Vec<TargetId>,
     lost: bool,
@@ -491,6 +495,7 @@ impl Host {
             clipboard: Clipboard::default(),
             events: VecDeque::new(),
             presentation_clock: None,
+            presentations: Vec::new(),
             permit_ids: Vec::new(),
             lost: false,
         };
@@ -536,6 +541,20 @@ impl Host {
         self.complete_transactions();
         // A failure shows up at the next dispatch, which reports ConnectionLost.
         let _ = self.conn.flush();
+    }
+
+    /// Sends the requests made so far (a commit) to the compositor now, without ending the
+    /// iteration: what [`Host::flush`] does last, alone.
+    pub fn flush_requests(&mut self) {
+        // A failure shows up at the next dispatch, which reports ConnectionLost.
+        let _ = self.conn.flush();
+    }
+
+    /// Moves the submission-to-display times of the frames presented since the last call into
+    /// `into`, oldest first: only for a compositor whose presentation clock is
+    /// `CLOCK_MONOTONIC`.
+    pub fn take_presentations(&mut self, into: &mut Vec<(TargetId, Duration)>) {
+        into.append(&mut self.presentations);
     }
 
     /// Whether the connection is gone.
@@ -716,7 +735,9 @@ impl OutputHandler for Host {
     }
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.output_mode_changed(&output);
+    }
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
 }
 

@@ -8,17 +8,20 @@
 //! What WebKit learns back goes through `wpe_view_buffer_rendered` (it may render the next frame)
 //! and `wpe_view_buffer_released` (it may reuse the buffer), which the engine calls. The display
 //! also gives WebKit the clipboard ([`crate::clipboard`]) and each view's input-method context
-//! ([`crate::ime`]).
+//! ([`crate::ime`]), and its one [`Screen`] (listed by the display, and the screen of every
+//! view's [`Toplevel`]) with the output's refresh rate, so WebKit paces animations at that
+//! rate ([`crate::screen`]). Each view has its own `Toplevel`, which carries the view's size,
+//! scale and activity and answers `get_screen`; the host places views, so it does no more.
 //!
 //! Must not own: Wayland objects, presentation, or any browser state. A view's callbacks run
 //! inside WebKit's code on the owner thread; they queue and return.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::{c_char, c_uint, CStr, CString};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 
-use glib::ffi::{gboolean, GError, GFALSE, GTRUE};
+use glib::ffi::{gboolean, gpointer, GError, GFALSE, GTRUE};
 use glib::prelude::*;
 use glib::subclass::prelude::*;
 use glib::translate::*;
@@ -26,11 +29,18 @@ use glib::translate::*;
 use crate::clipboard::{Clipboard, ClipboardSink, WpeClipboard};
 use crate::ffi;
 use crate::ime::{Ime, InputMethod, WpeInputMethodContext};
+use crate::screen::Screen;
 
 glib::wrapper! {
     /// WebKit's `WPEDisplay`, the abstract parent of [`Display`].
     pub struct WpeDisplay(Object<ffi::WPEDisplay, ffi::WPEDisplayClass>);
     match fn { type_ => || ffi::wpe_display_get_type(), }
+}
+
+glib::wrapper! {
+    /// WebKit's `WPEToplevel`, the parent of [`Toplevel`].
+    pub struct WpeToplevel(Object<ffi::WPEToplevel, ffi::WPEToplevelClass>);
+    match fn { type_ => || ffi::wpe_toplevel_get_type(), }
 }
 
 glib::wrapper! {
@@ -51,6 +61,10 @@ pub trait DisplayImpl: ObjectImpl + ObjectSubclass<Type: IsA<WpeDisplay>> {
     fn clipboard(&self) -> *mut ffi::WPEClipboard;
     /// An input-method context for `view` (transfer full).
     fn input_method(&self, view: *mut ffi::WPEView) -> *mut ffi::WPEInputMethodContext;
+    /// How many screens the display has.
+    fn n_screens(&self) -> c_uint;
+    /// Screen `index` (transfer none), or null.
+    fn screen(&self, index: c_uint) -> *mut ffi::WPEScreen;
 }
 
 unsafe impl<T: DisplayImpl> IsSubclassable<T> for WpeDisplay {
@@ -63,6 +77,8 @@ unsafe impl<T: DisplayImpl> IsSubclassable<T> for WpeDisplay {
         klass.get_drm_device = Some(display_drm_device::<T>);
         klass.get_clipboard = Some(display_clipboard::<T>);
         klass.create_input_method_context = Some(display_input_method::<T>);
+        klass.get_n_screens = Some(display_n_screens::<T>);
+        klass.get_screen = Some(display_screen::<T>);
     }
 }
 
@@ -104,6 +120,39 @@ unsafe extern "C" fn display_input_method<T: DisplayImpl>(
 ) -> *mut ffi::WPEInputMethodContext {
     let instance = unsafe { &*(display as *mut T::Instance) };
     instance.imp().input_method(view)
+}
+
+unsafe extern "C" fn display_n_screens<T: DisplayImpl>(display: *mut ffi::WPEDisplay) -> c_uint {
+    let instance = unsafe { &*(display as *mut T::Instance) };
+    instance.imp().n_screens()
+}
+
+unsafe extern "C" fn display_screen<T: DisplayImpl>(
+    display: *mut ffi::WPEDisplay,
+    index: c_uint,
+) -> gpointer {
+    let instance = unsafe { &*(display as *mut T::Instance) };
+    instance.imp().screen(index).cast()
+}
+
+/// The `WPEToplevel` virtual methods a subclass provides.
+pub trait ToplevelImpl: ObjectImpl + ObjectSubclass<Type: IsA<WpeToplevel>> {
+    /// The screen the toplevel is on (transfer none), or null.
+    fn screen(&self) -> *mut ffi::WPEScreen;
+}
+
+unsafe impl<T: ToplevelImpl> IsSubclassable<T> for WpeToplevel {
+    fn class_init(class: &mut glib::Class<Self>) {
+        Self::parent_class_init::<T>(class);
+        class.as_mut().get_screen = Some(toplevel_screen::<T>);
+    }
+}
+
+unsafe extern "C" fn toplevel_screen<T: ToplevelImpl>(
+    toplevel: *mut ffi::WPEToplevel,
+) -> *mut ffi::WPEScreen {
+    let instance = unsafe { &*(toplevel as *mut T::Instance) };
+    instance.imp().screen()
 }
 
 /// The `WPEView` virtual methods a subclass provides.
@@ -235,6 +284,7 @@ mod imp {
         pub device: Cell<Option<NonNull<ffi::WPEDRMDevice>>>,
         pub clipboard: RefCell<Option<ClipboardSink>>,
         pub clipboard_object: glib::WeakRef<Clipboard>,
+        pub screen: OnceCell<Screen>,
     }
 
     #[glib::object_subclass]
@@ -246,6 +296,9 @@ mod imp {
 
     impl ObjectImpl for Display {
         fn dispose(&self) {
+            if let Some(screen) = self.screen.get() {
+                screen.shutdown();
+            }
             if let Some(device) = self.device.take() {
                 unsafe { ffi::wpe_drm_device_unref(device.as_ptr()) };
             }
@@ -260,12 +313,12 @@ mod imp {
                 .build();
             // One toplevel per view: the host places views, so WebKit's toplevels only carry
             // the view's size, scale and activity.
-            let toplevel =
-                glib::Object::builder_with_type(unsafe { from_glib(ffi::wpe_toplevel_get_type()) })
-                    .property("display", display.upcast_ref::<WpeDisplay>())
-                    .property("max-views", 1u32)
-                    .build();
-            let toplevel_ptr: *mut ffi::WPEToplevel = toplevel.as_ptr().cast();
+            let toplevel: super::Toplevel = glib::Object::builder()
+                .property("display", display.upcast_ref::<WpeDisplay>())
+                .property("max-views", 1u32)
+                .build();
+            toplevel.imp().screen.replace(self.screen.get().cloned());
+            let toplevel_ptr = toplevel.upcast_ref::<WpeToplevel>().to_glib_none().0;
             unsafe {
                 ffi::wpe_toplevel_state_changed(toplevel_ptr, ffi::WPE_TOPLEVEL_STATE_ACTIVE);
                 ffi::wpe_view_set_toplevel(view.as_ptr(), toplevel_ptr);
@@ -317,6 +370,17 @@ mod imp {
             clipboard.upcast::<WpeClipboard>().into_glib_ptr()
         }
 
+        fn n_screens(&self) -> c_uint {
+            self.screen.get().map_or(0, |_| 1)
+        }
+
+        fn screen(&self, index: c_uint) -> *mut ffi::WPEScreen {
+            match (index, self.screen.get()) {
+                (0, Some(screen)) => screen.as_ptr(),
+                _ => ptr::null_mut(),
+            }
+        }
+
         fn input_method(&self, view: *mut ffi::WPEView) -> *mut ffi::WPEInputMethodContext {
             let view: WpeView = unsafe { from_glib_none(view) };
             let context = InputMethod::new(&view);
@@ -324,6 +388,29 @@ mod imp {
                 view.imp().input_method.set(Some(&context));
             }
             context.upcast::<WpeInputMethodContext>().into_glib_ptr()
+        }
+    }
+
+    #[derive(Default)]
+    pub struct Toplevel {
+        pub screen: RefCell<Option<Screen>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Toplevel {
+        const NAME: &'static str = "SighurtWPEToplevel";
+        type Type = super::Toplevel;
+        type ParentType = WpeToplevel;
+    }
+
+    impl ObjectImpl for Toplevel {}
+
+    impl ToplevelImpl for Toplevel {
+        fn screen(&self) -> *mut ffi::WPEScreen {
+            self.screen
+                .borrow()
+                .as_ref()
+                .map_or(ptr::null_mut(), Screen::as_ptr)
         }
     }
 
@@ -366,6 +453,11 @@ glib::wrapper! {
 }
 
 glib::wrapper! {
+    /// Sighurt's `WPEToplevel`: one per view, on the display's screen.
+    pub struct Toplevel(ObjectSubclass<imp::Toplevel>) @extends WpeToplevel;
+}
+
+glib::wrapper! {
     /// Sighurt's `WPEView`: one per `WebKitWebView`.
     pub struct View(ObjectSubclass<imp::View>) @extends WpeView;
 }
@@ -373,9 +465,16 @@ glib::wrapper! {
 impl Display {
     /// The display, connected and made primary (WebKit's web processes learn the DRM device
     /// from the primary display), with DMA-BUF support or, with `None`, shared memory only.
-    /// The clipboard reports to `clipboard`.
-    pub fn new(dmabuf: Option<Dmabuf>, clipboard: ClipboardSink) -> Result<Self, glib::Error> {
+    /// The clipboard reports to `clipboard`. The display's one screen refreshes at `mhz` and is
+    /// `size` logical pixels (what pages read as `screen.*`).
+    pub fn new(
+        dmabuf: Option<Dmabuf>,
+        clipboard: ClipboardSink,
+        mhz: u32,
+        size: (i32, i32),
+    ) -> Result<Self, glib::Error> {
         let display: Self = glib::Object::new();
+        let _ = display.imp().screen.set(Screen::new(mhz, size));
         display.imp().dmabuf.replace(dmabuf);
         display.imp().clipboard.replace(Some(clipboard));
         let raw = display.as_ptr();
@@ -389,6 +488,11 @@ impl Display {
 
     pub fn as_ptr(&self) -> *mut ffi::WPEDisplay {
         self.upcast_ref::<WpeDisplay>().to_glib_none().0
+    }
+
+    /// The display's screen.
+    pub fn screen(&self) -> &Screen {
+        self.imp().screen.get().expect("made with the display")
     }
 
     /// The clipboard WebKit uses, once it asked for it.

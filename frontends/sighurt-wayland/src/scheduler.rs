@@ -23,7 +23,9 @@
 //! There is no fixed tick: an idle browser sleeps, the chrome never repaints because a page
 //! animated, and a page is never pumped because the caret blinked. Submissions and
 //! presentation feedback (`wp_presentation`) are recorded separately; a submission is not
-//! evidence that anything was displayed.
+//! evidence that anything was displayed. Each presented frame's submission-to-display time is
+//! also kept, at most [`MAX_PRESENTATION_SAMPLES`] between two [`Host::take_presentations`], for
+//! the frontend's diagnostics.
 //!
 //! Must not own: rendering, or engine pumping (the application loop does).
 
@@ -211,6 +213,10 @@ pub(crate) fn monotonic_ns() -> u64 {
         .saturating_add(now.tv_nsec as u64)
 }
 
+/// The most presentation samples kept until the frontend takes them; later ones are dropped
+/// (each loop iteration takes them, so only a stalled loop reaches this).
+pub(crate) const MAX_PRESENTATION_SAMPLES: usize = 256;
+
 /// `CLOCK_MONOTONIC`'s id in `wp_presentation.clock_id`.
 const CLOCK_MONOTONIC: u32 = 1;
 
@@ -255,8 +261,11 @@ impl Dispatch<WpPresentationFeedback, FeedbackData> for Host {
                     let secs = (u128::from(tv_sec_hi) << 32) | u128::from(tv_sec_lo);
                     let shown = secs * 1_000_000_000 + u128::from(tv_nsec);
                     let latency = shown.saturating_sub(submitted);
-                    target.stats.last_latency =
-                        Some(Duration::from_nanos(latency.min(u64::MAX as u128) as u64));
+                    let latency = Duration::from_nanos(latency.min(u64::MAX as u128) as u64);
+                    target.stats.last_latency = Some(latency);
+                    if host.presentations.len() < MAX_PRESENTATION_SAMPLES {
+                        host.presentations.push((data.target, latency));
+                    }
                 }
             }
             wp_presentation_feedback::Event::Discarded => target.stats.discarded += 1,

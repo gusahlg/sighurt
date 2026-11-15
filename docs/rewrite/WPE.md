@@ -570,7 +570,8 @@ hidden, and showing maps it with its last frame.
 The chrome strip was painted twice (first configure and resize) during every animation, never
 because the page animated. On River, WebKit's compositor followed the 120 Hz frame callbacks while
 the page's `requestAnimationFrame` ran at 60 Hz: WebKit's vblank timer assumes 60 Hz because the
-display provides no `WPEScreen` with the output's refresh rate (limitation 1 below).
+display provides no `WPEScreen` with the output's refresh rate. The engine fixed that (the
+section "Screen and vblank" below).
 
 **Memory**, proportional set size of the process and WebKit's processes, two views (the
 animation shown): 250 MiB on the desktop (web process 193, network process 24, Sighurt's process
@@ -601,9 +602,9 @@ table.
 
 ## Limitations and open problems
 
-1. **`requestAnimationFrame` runs at 60 Hz on faster outputs**: the display has no `WPEScreen`, so
-   WebKit's vblank timer uses 60 Hz. A screen with the output's refresh rate (and a
-   `WPEScreenSyncObserver` fed by the host's frame callbacks) fixes it.
+1. **`requestAnimationFrame` ran at 60 Hz on faster outputs** (fixed in the engine: "Screen and
+   vblank" below): the prototype's display had no `WPEScreen`, so WebKit's vblank timer used
+   60 Hz.
 2. **Not implemented in the prototype**: input methods, the clipboard, popups and context menus,
    `window.open` and navigation policy, downloads and permission requests, the back-forward list,
    cursor images, pointer lock, touch, accessibility. `sighurt-engine-wpe` does the first six
@@ -653,7 +654,8 @@ tools/heavy tools/headless-sway --renderer gles2  -- engines/sighurt-engine-wpe/
 | `runtime` | `WpeRuntime` (`EngineRuntime`), `WpeConfig`, `Diagnostics`, `CAPABILITIES`; one per process |
 | `view` | a view's state (`Page`), WebKit's signals turned into notes, the requests a view made |
 | `navigation` | ids, documents, history and history effects from WebKit's back-forward list (pure, unit-tested) |
-| `platform` | Sighurt's `WPEDisplay` and `WPEView` (GObject subclasses) |
+| `platform` | Sighurt's `WPEDisplay`, `WPEView` and `WPEToplevel` (GObject subclasses) |
+| `screen` | Sighurt's one `WPEScreen` and its `WPEScreenSyncObserver` (a vblank thread that ticks only while WebKit has a callback registered) |
 | `clipboard` | Sighurt's `WPEClipboard`: page data never stays in WebKit, reads go through the browser |
 | `ime` | Sighurt's `WPEInputMethodContext`, between WebKit's editor and the host's text input |
 | `present` | the presenter on the host's connection: DMA-BUF imports, the SHM fallback |
@@ -670,6 +672,49 @@ library finds its own dependencies through its RPATH). The lockfile gained only 
 (and lost `wpe-engine`); `log` and, for the tests, `smithay-client-toolkit` were already in it.
 
 ## What the engine adds to the prototype
+
+**Screen and vblank** (`screen.rs`, `platform.rs`). WebKit 2.52 paces rendering and
+`requestAnimationFrame` per screen: `DisplayVBlankMonitor::create(displayID)` takes the
+`WPEScreen` of the page's display id (the id of its view's `wpe_view_get_screen`, which is its
+toplevel's `get_screen`) and needs a `WPEScreenSyncObserver` from it, which it calls once per
+vblank; with no screen it falls back to `DisplayVBlankMonitorTimer`, 60 Hz. The platform now
+implements `WPEDisplay.get_n_screens`/`get_screen` (one screen, id 1, listed from the start,
+because `ScreenManager` reads the display's screens once), a `WPEToplevel` subclass per view
+whose only override is `get_screen`, and the observer: one thread, created at WebKit's first
+`start`, that every period waits on a condition variable and then runs the base class's `sync`
+(all registered callbacks), parked again at `stop`. `stop` does not join: WebKit calls it with
+its monitor's lock held and a tick may be waiting for that lock; the thread is joined at
+`WpeRuntime::shutdown`, before the display goes (and in the observer's `dispose`). While no page
+animates WebKit removes its callback and nothing ticks (`Diagnostics::vblank`: starts, stops,
+ticks, running). `get_sync_observer` returns a new reference each time, because WebKit adopts
+what it gets although the header says transfer none.
+
+The rate comes from the host: `sighurt-wayland` records, for each window, the highest current-mode
+refresh rate (mHz) among the outputs its root surface has entered, keeps it on all the window's
+targets and updates it on enter, leave and output mode changes (`TargetLease::refresh_mhz`). The
+runtime reads it when it opens a view, at each `SetMetrics` and each present (a read of the
+lease), and gives the screen the highest among its views, `wpe_screen_set_refresh_rate` (WebKit's
+nominal rate of pages that start after) and the observer's period (every tick reads it). Default
+before an output is known, and on a CPU target (no output): 60 000 mHz. Measured in a private
+sway (`tests/raf.rs`, an ignored test; headless output mode set with
+`swaymsg output HEADLESS-1 mode --custom 1280x800@120Hz`, which sway's headless backend accepts):
+`requestAnimationFrame` callback intervals from `performance.now()` over 5 s, median / p95 / mean:
+120 Hz output, before 16 / 17 ms (60 Hz); after 9 / 9 / 8.55 ms (584 callbacks, about 117 per
+second; `performance.now()` is rounded to a millisecond); 60 Hz output, after 17 / 17 / 16.7 ms.
+With the animation stopped the observer was stopped (starts 1, stops 1, no tick in 3 s).
+
+What pages see in `screen.*` (the page's `screenInfo()` in `tests/pages/raf.html`). Before, with no
+screen: `width`/`height` and `availWidth`/`availHeight` were the view's size (1280x760 in the
+test), `availLeft`/`availTop` and `screenX`/`screenY` 0, colour depth 24. The screen's properties
+reach WebKit's web processes only when they start (the `ScreenManager` does not watch the screen's
+properties, only its addition and removal), so a live resize could not be followed. The screen is
+therefore made with the first view's size, or 1280x720 when that view has no room yet, and
+`set_size` keeps the UI-process copy current; the page in the test saw 1280x720. Position is 0,0,
+scale 1 and the physical size is the size at 96 dpi (`size * 25.4 / 96`), never zero:
+`collectScreenProperties` divides the pixel diagonal by the physical one, and a dpi of 96 is what
+a page without screen data effectively got. Nothing of the real monitor leaks: no resolution,
+position, physical size or count, only the refresh rate, which animation pacing needs (and which a
+page can measure with `requestAnimationFrame` anyway).
 
 **Navigation.** WebKit's GLib API gives navigations no ids. What it does give, in WebKit 2.52
 (observed in probe runs of every case; the engine's notes record WebKit's address and a snapshot
@@ -780,8 +825,8 @@ Platform view (`WPEWebViewPlatform.cpp`) an element entering fullscreen emits `e
 and then asks the view's toplevel (`wpe_toplevel_fullscreen`); WebKit's transition completes when
 the toplevel's state gains `WPE_TOPLEVEL_STATE_FULLSCREEN`, and leaving (`leave-fullscreen`)
 completes when it loses it; the toplevel losing it while an element is fullscreen asks the page
-to leave (`requestExitFullScreen`). The engine's toplevels are plain `WPEToplevel`s with no
-`set_fullscreen`, so the adapter does it: the signals (left unhandled) become notes, and taking a
+to leave (`requestExitFullScreen`). The engine's toplevels (`platform::Toplevel`, a `WPEToplevel` that
+only adds `get_screen`) have no `set_fullscreen`, so the adapter does it: the signals (left unhandled) become notes, and taking a
 note in sets or clears the bit (`wpe_toplevel_state_changed`, the other bits kept) and reports
 `FullscreenChanged` for the document shown, once per entry. `ExitFullscreen` clears the bit;
 WebKit's page leaves and `leave-fullscreen` reports it. A new document, a crashed web process and
@@ -951,8 +996,11 @@ whole of `engines.sh`, 217 checks, passes with them):
 
 ## Limitations and open problems (the engine)
 
-1. **`requestAnimationFrame` at 60 Hz on faster outputs** (the proof's limitation 1): no
-   `WPEScreen` with the output's refresh rate; the host doesn't report it to engines yet.
+1. **Animation pacing is the output's nominal rate, not its vblank** (the proof's limitation 1,
+   fixed otherwise: "Screen and vblank"): a page started before the host knew its output's
+   rate keeps the 60 Hz WebKit was told then (pages started later follow the output), a window
+   on two outputs gets the faster one's rate, and the rate is the output's current mode, not
+   the phase of its vblank.
 2. **Navigation ids** in the races listed above; the page's own loads have no
    `NavigationStarted`.
 3. **Paste** shows the page an empty paste before the real one; the clipboard acts for the view

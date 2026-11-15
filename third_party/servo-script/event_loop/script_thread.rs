@@ -30,6 +30,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+/// SIGHURT-PATCH: the longest "update the rendering" waits after the last one while a key,
+/// wheel or button event is pending: 250 updates a second at most, above any display's refresh
+/// rate the host paces frames to.
+const INPUT_RENDERING_DELAY: Duration = Duration::from_millis(4);
+
 use background_hang_monitor_api::{
     BackgroundHangMonitor, BackgroundHangMonitorExitSignal, BackgroundHangMonitorRegister,
     HangAnnotation, MonitoredComponentId, MonitoredComponentType,
@@ -1307,6 +1312,32 @@ impl ScriptThread {
         // slow down rAFs that don't change the DOM.
         //
         // TODO: Should either of these delays be reduced to also reduce update latency?
+        //
+        // SIGHURT-PATCH: pending input is processed only in "update the rendering", so the
+        // 20 ms below capped scrolling and typing at 50 frames/s on any display. With a key,
+        // wheel or button event pending, the update comes at most `INPUT_RENDERING_DELAY`
+        // after the last one, and a later timer already scheduled for another reason is
+        // brought forward. Mouse moves alone keep upstream's delay: a moving pointer would
+        // otherwise make an update every 4 ms, more than any display shows. Servo coalesces
+        // pending wheel events, so a wheel flood still makes at most one update per that delay.
+        let pending_input = self.documents.borrow().iter().any(|(_, document)| {
+            document.is_fully_active() &&
+                document
+                    .event_handler()
+                    .has_pending_input_besides_mouse_moves()
+        });
+        if pending_input {
+            let since_last = self
+                .last_render_opportunity_time
+                .get()
+                .map(|last| Instant::now() - last)
+                .unwrap_or(Duration::MAX);
+            self.cancel_scheduled_update_the_rendering();
+            self.schedule_update_the_rendering_timer_if_necessary(
+                INPUT_RENDERING_DELAY.saturating_sub(since_last),
+            );
+            return;
+        }
         let animation_delay = if running_animations && !needs_rendering_update {
             // 30 milliseconds (33 FPS) is used here as the rendering isn't changing
             // so it isn't a problem to slow down rAF callback calls. In addition, this allows

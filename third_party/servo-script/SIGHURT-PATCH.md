@@ -3,7 +3,11 @@
 This directory is the crates.io source of servo-script 0.7.0 (the version in `Cargo.lock`),
 with its MPL-2.0 notices. The workspace uses it through `[patch.crates-io]`.
 
-The patch is in `dom/webgl/webglbuffer.rs` only. Loading github.com in Servo panicked the
+The patch has two parts.
+
+## WebGL buffer bookkeeping (`dom/webgl/webglbuffer.rs`)
+
+Loading github.com in Servo panicked the
 script thread there (`assertion failed: self.is_deleted()`, then `refcount underflowed`, then
 a panic across the mozjs FFI boundary, which aborts the process). The buffer's attached
 counter (VAO attribute and element-array references) can get out of balance on some WebGL
@@ -13,4 +17,29 @@ call sequences, and the code asserted instead of tolerating it.
 - `increment_attached_counter` and `decrement_attached_counter` saturate instead of panicking.
 
 A page's WebGL bookkeeping error then costs at most a leaked or early-deleted GL buffer, never
-the browser. Changing this crate rebuilds servo-script and everything above it.
+the browser.
+
+## Input-driven rendering updates (`event_loop/script_thread.rs`)
+
+The script thread processes pending input events (wheel, keys, pointer) only inside "update the
+rendering", and `maybe_schedule_rendering_opportunity_after_ipc_message` schedules that at most
+every 20 ms (upstream's comment asks whether the delay should be reduced). Every input-driven
+frame (scrolling, typing) was capped at 50 frames/s whatever the display's rate: continuous
+wheel scrolling ran at 49.6 frames/s with a 20.1 ms median frame interval in a 60 Hz headless
+sway (research note `window_frontend_and_engines_latency.md`, 6 Nov 2026).
+
+- While a fully active document has a pending input event other than a mouse move (a key, a
+  wheel, a button; `DocumentEventHandler::has_pending_input_besides_mouse_moves`, added in
+  `dom/document/document_event_handler.rs`), the update is scheduled `INPUT_RENDERING_DELAY`
+  (4 ms) after the last one, or at once if that has passed, and a timer already scheduled later
+  (the 20 ms one) is cancelled first.
+- Otherwise, mouse moves alone included, the 20 ms and 30 ms delays are upstream's. With mouse
+  moves too, a pointer moving over an animated page cost 35 % of a core instead of 29 % at the
+  same 56 frames/s (the `css-animation` workload, 3 rounds): updates every 4 ms that no display
+  shows.
+
+Servo coalesces pending wheel events, so a wheel flood makes at most one update per 4 ms. The
+host paces painting by frame callbacks, so faster updates show up only as far as the display
+allows.
+
+Changing this crate rebuilds servo-script and everything above it.

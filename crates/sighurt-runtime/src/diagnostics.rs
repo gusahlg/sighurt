@@ -27,7 +27,10 @@
 //!   `mode=hardware|software gl="<GL_RENDERER>"`); a `first-frame` line for a navigation
 //!   started in the active tab, at the view's first frame after it; a `chrome` line per chrome
 //!   frame, whose `draw_ms` is the whole of it, `scene_ms` the chrome's drawing and `render_ms`
-//!   the renderer's; and a `chrome-renderer` line when the window starts its renderer;
+//!   the renderer's; a `presented` line per frame the compositor reported displayed, with its
+//!   target's role (and engine) and `latency_ms` from submission to display (the window only;
+//!   a compositor whose presentation clock is `CLOCK_MONOTONIC`); and a `chrome-renderer` line
+//!   when the window starts its renderer;
 //! - on SIGUSR1 and at exit (at exit only with `SIG_DIAG=1`), a `counters` line (cumulative
 //!   counts, as bench/ takes them), a `peaks` line (queue depths, longest calls), one line
 //!   per target and engine, and a `chrome-renderer` line with what the renderer counted;
@@ -144,6 +147,12 @@ pub struct Counters {
     /// Page frames a frontend dropped before they were shown: the encode didn't fit, or the
     /// reader was behind. Distinct from `page_frames_presented`, which counts submissions.
     pub frames_dropped: u64,
+    /// Frames (page and chrome) the compositor reported displayed with a time it could be
+    /// compared on (`wp_presentation` on `CLOCK_MONOTONIC`).
+    pub presentations_timed: u64,
+    /// Microseconds from submission to display of those frames, all together: divided by
+    /// `presentations_timed`, the mean.
+    pub presentation_us: u64,
 }
 
 /// The largest values seen since `sig` started: queue depths and the longest calls.
@@ -171,6 +180,8 @@ pub struct Peaks {
     pub max_retiring_generations: u64,
     /// The most bytes of SHM buffers all targets held together.
     pub max_buffer_bytes: u64,
+    /// The longest a frame took from submission to display, in microseconds.
+    pub max_presentation_us: u64,
 }
 
 /// One target, as the host and `sig` see it.
@@ -583,6 +594,26 @@ impl Diagnostics {
         self.counters.chrome_unchanged += 1;
         let p = &mut self.peaks;
         p.max_chrome_scene_us = p.max_chrome_scene_us.max(micros(scene));
+    }
+
+    /// The compositor displayed a frame of a target `role` (the chrome's surface name, or
+    /// "view" with its `engine`) `latency` after it was submitted. With `SIG_DIAG=1`, a
+    /// `presented` line.
+    pub fn presented(&mut self, role: &str, engine: Option<&str>, latency: Duration) {
+        self.counters.presentations_timed += 1;
+        self.counters.presentation_us += micros(latency);
+        let p = &mut self.peaks;
+        p.max_presentation_us = p.max_presentation_us.max(micros(latency));
+        if self.lines {
+            let ms = latency.as_secs_f64() * 1e3;
+            match engine {
+                Some(engine) => self.line(
+                    "presented",
+                    format_args!("role={role} engine={engine} latency_ms={ms:.3}"),
+                ),
+                None => self.line("presented", format_args!("role={role} latency_ms={ms:.3}")),
+            }
+        }
     }
 
     /// An engine pump took `took` and reported `events`.
