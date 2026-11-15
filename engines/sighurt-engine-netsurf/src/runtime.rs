@@ -50,7 +50,6 @@ use sighurt_api::services::{
     ClipboardData, DownloadSource, PickMode, Selection, Service, ServiceReply, ServiceRequest,
     ServiceResult,
 };
-use sighurt_wayland::TargetLease;
 
 use crate::ffi::{self, Handle, LinkAt};
 use crate::input::{self, KeyAction, Pointer, PointerAction};
@@ -134,7 +133,7 @@ struct View<T: CpuTarget> {
 }
 
 /// NetSurf as an engine runtime.
-pub struct NetSurfRuntime<T: CpuTarget = TargetLease> {
+pub struct NetSurfRuntime<T: CpuTarget> {
     views: BTreeMap<ViewId, View<T>>,
     /// The C side's view numbers (`ViewId::serial`) back to ids.
     ids: HashMap<u64, ViewId>,

@@ -13,7 +13,8 @@
 //! - [`engine`]: the [`EngineRuntime`](engine::EngineRuntime) trait engines implement, what the
 //!   host tells an engine, and the waker engines use to ask for attention.
 //! - [`events`]: what an engine reports back.
-//! - [`present`]: the shape of a frame painted on the CPU, which every frontend can show.
+//! - [`present`]: the shape of a frame painted on the CPU, which every frontend can show, and
+//!   the pixels a painter reports it changed.
 //! - [`semantic`]: a document's content as structure, and actions on it, for frontends that
 //!   show text instead of pixels.
 //! - [`services`]: privileged requests (clipboard, downloads, file pickers, external URLs,

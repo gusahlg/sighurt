@@ -10474,7 +10474,6 @@ name = "sighurt-engine-demo"
 version = "1.0.0"
 dependencies = [
  "sighurt-api",
- "sighurt-wayland",
 ]
 
 [[package]]
@@ -10494,7 +10493,6 @@ dependencies = [
  "libc",
  "log",
  "sighurt-api",
- "sighurt-wayland",
 ]
 
 [[package]]
@@ -10590,9 +10588,7 @@ name = "sighurt-gui"
 version = "1.0.0"
 dependencies = [
  "calloop",
- "libc",
  "log",
- "rustix 1.1.5",
  "sighurt-api",
  "sighurt-chrome-line",
  "sighurt-core",

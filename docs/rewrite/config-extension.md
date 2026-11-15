@@ -397,7 +397,7 @@ terminal with no bindings is told by the README and by the `default-keys` notice
 
 ## 4.2 Is the example the default of the built `sig`?
 
-Yes, in every build, including `--no-default-features --features engine-demo`: it is a plain
+Yes, in every build, including `--no-default-features --features frontend-gui,engine-demo`: it is a plain
 dependency of sighurt-runtime, like the core's `bindings`. Nothing is gained by a feature: a
 browser needs default keys, the crate is small, and the headless and pty tests rely on `t`,
 `x`, `q`. A user who writes their own configuration crate replaces one line in `KEYMAPS` (or,

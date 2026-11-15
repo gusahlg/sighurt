@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# `cargo check` for another platform's target with the pinned compiler, through tools/heavy
+# (docs/rewrite/PORTING.md). The pin's rustc has a standard library only for Linux, wasm32 and
+# BPF, so this builds std for the target from the shell's SIGHURT_RUST_LIB_SRC
+# (-Zbuild-std; RUSTC_BOOTSTRAP=1 allows that flag on the stable compiler). Nothing is linked,
+# so no foreign linker is needed.
+#
+# C is not compiled for the target: there is no macOS or Windows SDK here. The TLS libraries'
+# build scripts (ring, and aws-lc-sys, whose Rust bindings for each target ship pregenerated)
+# are overridden (cargo's `links` overrides): their C is not built and their Rust is checked.
+# Any other build script that compiles C, runs bindgen or asks pkg-config for the target fails,
+# and the crates behind it go unchecked; PORTING.md lists which.
+#
+# Its artifacts go to $CARGO_TARGET_DIR/cross (target/cross by default), apart from the
+# ordinary builds: RUSTC_BOOTSTRAP changes what some build scripts emit.
+#
+#   tools/cross-check aarch64-apple-darwin -p sighurt-core -p sighurt-tui
+#   tools/cross-check x86_64-pc-windows-msvc -p sighurt-browser --no-default-features --features frontend-tui,engine-demo
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+if [[ $# -lt 1 || $1 == -* ]]; then
+  echo "usage: tools/cross-check TARGET [cargo check arguments]" >&2
+  exit 2
+fi
+target=$1
+shift
+# aws-lc-sys picks its pregenerated bindings by a cfg named after the target.
+cfg=${target//-/_}
+overrides=(
+  --config "target.$target.ring_core_0_17_14_.rustc-link-lib=[]"
+  --config "target.$target.aws_lc_0_45_0.rustc-cfg=[\"$cfg\"]"
+  # aws-lc-rs passes its sys crate's header directory on; nothing reads it in a check.
+  --config "target.$target.aws_lc_0_45_0.include=\"unbuilt\""
+)
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target}/cross"
+export SIG_WHAT="${SIG_WHAT:-cross-check $target $*}"
+# shellcheck disable=SC2016 # expanded inside the nix-shell, where the variable is set
+exec "$repo/tools/heavy" bash -c '
+  exec env RUSTC_BOOTSTRAP=1 __CARGO_TESTS_ONLY_SRC_ROOT="$SIGHURT_RUST_LIB_SRC" \
+    cargo check -Zbuild-std=std,panic_abort "$@"' cross-check \
+  "${overrides[@]}" --target "$target" "$@"

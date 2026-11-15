@@ -472,7 +472,7 @@ BSD notices), `engines/sighurt-engine-cef/helper/` (`sig-cef-helper`, built into
 `nix/build-cef.sh`), registration in `sighurt-runtime` (descriptor `cef`, `cef_config`, registry
 variant), `sighurt-gui` (Wayland SHM targets), `sighurt-tui` (its CPU target) and the feature
 `engine-cef` on `sighurt-browser`, `-runtime`, `-gui`, `-tui` (in no default set; build with
-`--no-default-features --features engine-cef,engine-demo`). `sig`'s `main`, the core and the
+`--no-default-features --features frontend-gui,engine-cef,engine-demo`). `sig`'s `main`, the core and the
 runtime have no CEF code beyond that registration.
 
 | Module | Owns |

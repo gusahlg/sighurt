@@ -1,9 +1,10 @@
 //! A demo engine that exists to test the host, the chrome and the engine contract without
-//! building Servo (`sig` with `--no-default-features --features engine-demo`).
+//! building Servo (`sig` with `--no-default-features --features frontend-gui,engine-demo`).
 //!
 //! Implements `sighurt_api::engine::EngineRuntime` with CPU drawing through a
-//! [`CpuTarget`](sighurt_api::present::CpuTarget) ([`DemoRuntime`]). `sig` binds the default,
-//! the Wayland host's shared-memory target lease. Its pages, by URL ([`Page`]):
+//! [`CpuTarget`](sighurt_api::present::CpuTarget) ([`DemoRuntime`]). `sig` binds it to the
+//! Wayland host's shared-memory target lease, or to the terminal's CPU target. Its pages, by URL
+//! ([`Page`]):
 //!
 //! - `demo:pattern`: a static pattern. It paints once per size and then does nothing while idle.
 //! - `demo:animation`: an animation paced by the host's frame callbacks: after each presented
@@ -71,7 +72,6 @@ use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, RequestId,
 use sighurt_api::input::{ButtonState, InputKind, Key, PointerEvent, TextInputState, TextPurpose};
 use sighurt_api::present::CpuTarget;
 use sighurt_api::semantic::{NodeId, NodeKind, SemanticAction, SemanticNode, SemanticSnapshot};
-use sighurt_wayland::TargetLease;
 
 /// The engine's name in the configuration and the registry.
 pub const NAME: &str = "demo";
@@ -360,8 +360,9 @@ impl<T: CpuTarget> View<T> {
 
 /// The demo engine's runtime: every demo view of the browser.
 ///
-/// Views present into `T`. The default is the Wayland host's shared-memory [`TargetLease`].
-pub struct DemoRuntime<T: CpuTarget = TargetLease> {
+/// Views present into `T`: the Wayland host's shared-memory target lease in the window, the
+/// terminal's CPU target in the terminal.
+pub struct DemoRuntime<T: CpuTarget> {
     views: BTreeMap<ViewId, View<T>>,
     /// Events not handed over yet, in order.
     queue: Vec<EngineEvent>,

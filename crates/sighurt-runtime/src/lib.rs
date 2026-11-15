@@ -17,10 +17,17 @@ pub mod history;
 pub mod home;
 pub mod page_info;
 pub mod persistence;
+/// The programs of `sig://terminal` and `sig://config`. Linux only for now: elsewhere a module of
+/// the same shape refuses to start them (`pty_unsupported.rs`, docs/rewrite/PORTING.md).
+#[cfg(target_os = "linux")]
+pub mod pty;
+#[cfg(not(target_os = "linux"))]
+#[path = "pty_unsupported.rs"]
 pub mod pty;
 pub mod registry;
 pub mod services;
 pub mod session;
+pub mod signals;
 pub mod view;
 
 pub use session::exit_now;

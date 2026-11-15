@@ -49,9 +49,20 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 /// CLOCK_MONOTONIC in seconds: the clock of the `t=` field, which bench/ compares with its own.
+#[cfg(unix)]
 pub fn monotonic() -> f64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     now.tv_sec as f64 + now.tv_nsec as f64 / 1e9
+}
+
+/// Seconds since the first call: systems without CLOCK_MONOTONIC have no clock bench/ shares.
+#[cfg(not(unix))]
+pub fn monotonic() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
 }
 
 /// Cumulative counts since `sig` started, never reset.

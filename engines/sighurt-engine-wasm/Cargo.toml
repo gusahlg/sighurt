@@ -16,9 +16,6 @@ screen-capture = ["dep:screenshots"]
 
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
-# The example and the compositor test mount views on the host's SHM lease. The lease
-# implements `CpuTarget` in sighurt-wayland.
-sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
 wasmtime.workspace = true
 tiny-skia.workspace = true
 # Shaping, font fallback and glyph rasterization for guest text.
@@ -63,6 +60,9 @@ coremidi = "0.7"
 
 [dev-dependencies]
 wat = "1"
+# The example and the compositor test mount views on the host's SHM lease. The lease
+# implements `CpuTarget` in sighurt-wayland.
+sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
 # A pty standing in for the runtime's in the `pty` tests.
 rustix = { workspace = true, features = ["pty"] }
 # The `wasm-view` example's event loop.

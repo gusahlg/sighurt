@@ -38,7 +38,7 @@ distributed.
  WPE WebKit attaches its DMA-BUFs to it, the Wasm engine paints into shared memory. Servo, WPE
  and Wasm show a page without a routine CPU readback (WPE copies once a frame only where the
  compositor has no DMA-BUF support, and says so). CEF paints Chromium's windowless OnPaint frames
- on the CPU and needs a Wayland or X11 display to do it. Ladybird copies one frame into shared
+ on the CPU, with headless ozone and SwiftShader, so it opens no display connection. Ladybird copies one frame into shared
  memory. NetSurf paints on the CPU into the same shared memory. In the terminal the engines paint
  into CPU frames, which the frontend encodes as kitty graphics, or it shows the page's text.
  Text mode and `sig --dump` need an engine that gives the page's text; CEF, Ladybird and NetSurf
@@ -114,13 +114,13 @@ configuration decides which of them are used.
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `frontend-gui` | yes | the Wayland window (`--gui`) |
+| `frontend-gui` | yes | the Wayland window (`--gui`), and with it sighurt-wayland, sighurt-ui and the renderers; the chrome and renderer features turn it on |
 | `frontend-tui` | yes | the terminal frontend (`--tui`, `--dump`) |
 | `engine-servo` | yes | Servo, the engine `servo` |
 | `engine-wasm` | yes | the Wasm engine, `wasm` |
 | `engine-wpe` | yes | WPE WebKit, `wpe` (needs the WPE prefix below) |
 | `engine-demo` | no | the demo engine, `demo` |
-| `engine-cef` | no | Chromium through CEF 150.0.22, the engine `cef` (needs the CEF prefix below, and a display to run) |
+| `engine-cef` | no | Chromium through CEF 150.0.22, the engine `cef` (needs the CEF prefix below to run) |
 | `engine-ladybird` | no | Ladybird (LibWeb), the engine `ladybird` (needs the shim below) |
 | `engine-netsurf` | no | NetSurf 3.11, the engine `netsurf` (GPL-2.0-only; your own use; never a default) |
 | `chrome-line` | no | the line chrome, `[ui] chrome = "line"` |
@@ -129,12 +129,19 @@ configuration decides which of them are used.
 
 ```bash
 cargo build -p sighurt-browser --features chrome-line                     # the default engines, plus the line chrome
-cargo build -p sighurt-browser --no-default-features --features engine-servo,engine-wasm   # no WPE
-cargo build -p sighurt-browser --no-default-features --features engine-demo                # no Servo
-cargo build -p sighurt-browser --no-default-features --features engine-cef,engine-demo
-cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
-cargo build -p sighurt-browser --no-default-features --features engine-netsurf,engine-demo,frontend-tui
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,frontend-tui,engine-servo,engine-wasm   # no WPE
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-demo                # no Servo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-cef,engine-demo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-ladybird,engine-demo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-netsurf,engine-demo,frontend-tui
+cargo build -p sighurt-browser --no-default-features --features frontend-tui,engine-wasm,engine-demo   # the terminal only: no Wayland crate
 ```
+
+macOS and Windows have no window, no WPE WebKit, Ladybird or NetSurf, and no `sig://terminal`
+programs yet. A terminal-only `sig` with the demo engine passes `cargo check` for both (from
+Linux, without their SDKs, so the Wasm engine's C dependencies are not checked); nothing has run
+there, and on Windows `--tui` and `--dump` refuse. What is checked, and what a port still needs,
+is in [docs/rewrite/PORTING.md](docs/rewrite/PORTING.md).
 
 `engine-cef`, `engine-ladybird` and `engine-netsurf` are in no default feature set. A table for
 one of them in a build that lacks it is a notice, and `sig` goes on. None of the three has the
@@ -168,8 +175,7 @@ top; status and notices below) and the page between them in one of two modes:
   move to and activate. It works in any terminal, and is the mode `auto` picks where the
   terminal can't show images. It needs an engine with the `semantics` capability: Servo, WPE
   WebKit and the demo engine have it. The Wasm engine, CEF, Ladybird and NetSurf show a message
-  saying they have no page text. CEF's graphics in the terminal also need a Wayland or X11
-  display; without one the tab says the engine needs a display and nothing crashes. `m` switches
+  saying they have no page text. CEF's graphics in the terminal need no display. `m` switches
   mode.
 
 `[tui] mode = "auto"` (the default), `"text"` or `"graphics"` chooses the start; the `[tui]`
@@ -238,14 +244,15 @@ from the prefix [`nix/build-cef.sh`](nix/build-cef.sh) installs at
 `/data/sig-builds/deps/cef-150.0.22` (`SIGHURT_CEF_PREFIX`, [`nix/cef.nix`](nix/cef.nix)).
 Chromium's renderer, GPU and network processes are the helper `sig-cef-helper`. CEF's own UI
 thread runs the browser-process loop (`multi_threaded_message_loop`); frames are Chromium's
-windowless OnPaint buffers, copied on the CPU. Chromium needs a Wayland or X11 display even
-then, including in the terminal. It has no page text, so text mode and `sig --dump` do not use
+windowless OnPaint buffers, copied on the CPU. Chromium runs with headless ozone and
+SwiftShader: it opens no display connection, in the window or the terminal, and renders nothing
+on the GPU. It has no page text, so text mode and `sig --dump` do not use
 it. It also has no find-in-page, accessibility tree or site-data controls, and the build has no
 proprietary codecs.
 
 ```bash
 nix/build-cef.sh
-cargo build -p sighurt-browser --no-default-features --features engine-cef,engine-demo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-cef,engine-demo
 ```
 
 The crate is `AGPL-3.0-or-later`. CEF and Chromium are BSD; the notices are in
@@ -267,7 +274,7 @@ has no page text, so text mode and `sig --dump` do not use it.
 tools/remote tools/heavy nix/build-ladybird-patched.sh
 nix/pull-ladybird-patched.sh
 nix/build-ladybird-shim.sh
-cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-ladybird,engine-demo
 ```
 
 The crate and the shim are `AGPL-3.0-or-later`. Ladybird itself is BSD-2-Clause and is loaded at
@@ -288,7 +295,7 @@ it. JavaScript (Duktape) is off by default, and it has no flexbox, grid or gradi
 `[engines.netsurf] user-agent` and keeps no profile directory yet.
 
 ```bash
-cargo build -p sighurt-browser --no-default-features --features engine-netsurf,engine-demo,frontend-tui
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-netsurf,engine-demo,frontend-tui
 ```
 
 On NixOS that build belongs inside `nix-shell` (or `tools/cargo`): the crate's build script

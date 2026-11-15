@@ -334,16 +334,24 @@ impl Reporter {
     }
 }
 
-/// Hands `url` to the desktop's default handler (`xdg-open`), without waiting for it.
+/// The program that hands a URL to the desktop's default handler: `xdg-open`, or on macOS
+/// `/usr/bin/open` (unverified there: docs/rewrite/PORTING.md). Windows has none here yet.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+const OPENER: &str = "xdg-open";
+#[cfg(target_vendor = "apple")]
+const OPENER: &str = "/usr/bin/open";
+
+/// Hands `url` to the desktop's default handler ([`OPENER`]), without waiting for it.
+#[cfg(unix)]
 fn open_external(url: &str) -> ServiceResult {
     // A parsed URL starts with its scheme, so it can't be taken for an option.
     let url = url::Url::parse(url).map_err(|e| ServiceError::Failed(e.to_string()))?;
-    let child = std::process::Command::new("xdg-open")
+    let child = std::process::Command::new(OPENER)
         .arg(url.as_str())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| ServiceError::Failed(format!("cannot run xdg-open: {e}")))?;
+        .map_err(|e| ServiceError::Failed(format!("cannot run {OPENER}: {e}")))?;
     // Reap it when it exits, off the owner thread.
     let _ = std::thread::Builder::new()
         .name("sighurt-xdg-open".into())
@@ -352,6 +360,13 @@ fn open_external(url: &str) -> ServiceResult {
             let _ = child.wait();
         });
     Ok(ServiceReply::Done)
+}
+
+/// No external handler here: Windows would need `ShellExecuteW`, which this build does not
+/// call (docs/rewrite/PORTING.md).
+#[cfg(not(unix))]
+fn open_external(_url: &str) -> ServiceResult {
+    Err(ServiceError::Unsupported)
 }
 
 /// The download folder: `configured`, else the desktop's, else `~/Downloads`; never the home

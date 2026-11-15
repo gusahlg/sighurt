@@ -6,7 +6,7 @@
 # Run it here, in the repository:
 #
 #   bench/rewrite/build.sh HEAD                          # sig's default features
-#   bench/rewrite/build.sh 1a2b3c4 --features engine-demo
+#   bench/rewrite/build.sh 1a2b3c4 --features frontend-gui,engine-demo
 #   bench/remote --no-sync tail -f ~/sighurt-bench/logs/latest.log
 #
 # It uploads `git archive <rev>` to louise-pc and builds it there, detached (bench/remote

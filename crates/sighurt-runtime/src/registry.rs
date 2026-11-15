@@ -236,11 +236,18 @@ impl Launch<'_> {
     /// and deleted at the end of shutdown.
     pub fn scratch(&mut self) -> Result<PathBuf, String> {
         if self.scratch.is_none() {
-            use std::os::unix::fs::PermissionsExt;
             let base = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
-            let dir = tempfile::Builder::new()
-                .prefix(&format!("sighurt-{}-", self.name))
-                .permissions(std::fs::Permissions::from_mode(0o700))
+            let prefix = format!("sighurt-{}-", self.name);
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(&prefix);
+            // Without mode bits (Windows) the directory takes the temporary directory's access
+            // list, which is the user's own.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let dir = builder
                 .tempdir_in(&base)
                 .map_err(|e| format!("cannot make a directory in {}: {e}", base.display()))?;
             *self.scratch = Some(dir);

@@ -1194,9 +1194,9 @@ fn arm_shutdown_bound(bound: Duration, status: i32) -> ShutdownBound {
             // SAFETY: write(2) of a fixed string. Not the log: the owner may hold that lock.
             unsafe {
                 libc::write(
-                    libc::STDERR_FILENO,
+                    STDERR,
                     message.as_ptr().cast::<libc::c_void>(),
-                    message.len(),
+                    message.len() as _,
                 );
             }
             end_without_destructors(status);
@@ -1206,6 +1206,12 @@ fn arm_shutdown_bound(bound: Duration, status: i32) -> ShutdownBound {
     }
     ShutdownBound { done }
 }
+
+/// Descriptor 2, which the C library's `write` takes (Windows' CRT numbers it the same).
+#[cfg(unix)]
+const STDERR: libc::c_int = libc::STDERR_FILENO;
+#[cfg(not(unix))]
+const STDERR: libc::c_int = 2;
 
 fn process_status(code: &ExitCode) -> i32 {
     if *code == ExitCode::SUCCESS {

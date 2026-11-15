@@ -1,17 +1,20 @@
-//! Which pixels of an SHM buffer a painter says it changed.
+//! Which pixels of a CPU frame a painter says it changed.
 //!
-//! [`CpuTarget::submit`](sighurt_api::present::CpuTarget::submit) lends a
-//! [`Frame`](sighurt_api::present::Frame) and has no place to name the changed pixels. The host
-//! calls [`begin_paint`] with the buffer's age around that callback. The painter reads
-//! [`buffer_age`] and, when it knows the difference from what the buffer still holds,
-//! [`report_damage`]. [`end_paint`] returns those rectangles. No report, or an empty one, means
-//! the whole buffer, so chrome, the demo engine and the tests submit exactly as before.
+//! [`CpuTarget::submit`](super::CpuTarget::submit) lends a [`Frame`](super::Frame) and has no
+//! place to name the changed pixels. A target that can use them (the Wayland host's
+//! shared-memory lease) calls [`begin_paint`] with the buffer's age around that callback. The
+//! painter reads [`buffer_age`] and, when it knows the difference from what the buffer still
+//! holds, [`report_damage`]. [`end_paint`] returns those rectangles. No report, or an empty one,
+//! means the whole buffer, so chrome, the demo engine and the tests submit exactly as before. A
+//! target that never calls [`begin_paint`] (the terminal's) gets no report: [`buffer_age`] is
+//! `None` for its painters.
 //!
 //! The age is how many frames ago this buffer was last submitted: 0 is a new or undefined
 //! buffer, 1 still holds the previous frame, 2 the frame before that.
 //!
 //! Owns: the report for the paint that is in progress on this thread. Must not own: which
-//! pixels actually changed, or the `damage_buffer` request (the frame's submit does that).
+//! pixels actually changed, or what a target does with the report (the Wayland host's
+//! `damage_buffer` request is its submit's).
 
 use std::cell::RefCell;
 

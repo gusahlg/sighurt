@@ -8,6 +8,9 @@
 //! The unpacked tree and object files go under `$SIGHURT_NETSURF_BUILD`, else
 //! `/data/sig-builds/netsurf` (the HDD, to keep the SSD free) when `/data/sig-builds` exists,
 //! else in cargo's `OUT_DIR`.
+//!
+//! Linux only, as built here (the sources and libraries come from nixpkgs, the frontend is
+//! POSIX C): for any other target the build stops at once.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +44,13 @@ const SHARED_LIBS: &[&str] = &[
 ];
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!(
+            "cargo::error=The NetSurf engine (feature engine-netsurf) is Linux-only: \
+             build sig for this system without it (docs/rewrite/PORTING.md)"
+        );
+        return;
+    }
     for var in [
         "SIGHURT_NETSURF_SRC",
         "SIGHURT_NETSURF_PKG_CONFIG_PATH",
