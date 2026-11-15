@@ -379,7 +379,12 @@ enabled = true
 # mode: "auto" (the default) follows the terminal, graphics where it can show them and text
 # otherwise; "text" is reflowed text; "graphics" is the page's pixels.
 # graphics: "auto" (the default) picks kitty where the terminal speaks it, otherwise sixel,
-# otherwise text; or "kitty", "sixel", or "none" (text only).
+# otherwise text; or "kitty", "sixel", or "none" (text only). Inside tmux, "auto" is sixel
+# (tmux tells sig nothing of the terminal outside it); "kitty" sends kitty graphics through
+# tmux's passthrough, shown by Unicode placeholders, when tmux.conf has
+# `set -g allow-passthrough all` (sig asks tmux when it starts) and the terminal outside has
+# kitty graphics with placeholders (kitty, Rio, ghostty). tmux then keeps no image and encodes
+# none again, so frames reach the terminal sooner than sixel's.
 # fps: how many frames of the page graphics mode shows a second when you are not using the
 # page (it animates or loads), a whole number from 1 to 60. The default is 10. Sixel is sent
 # at most 5 a second, whatever this says.
