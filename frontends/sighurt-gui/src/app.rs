@@ -166,6 +166,9 @@ struct Gui {
     /// permit: a bounded one-shot retry, so a renderer that keeps putting frames off can't
     /// spin the loop (RENDER.md §14.4).
     deferred: Vec<(TargetId, Instant)>,
+    /// Presented frames' submission-to-display times taken from the host, reused each
+    /// iteration.
+    presentations: Vec<(TargetId, Duration)>,
     /// The chrome's surfaces as targets, and their leases by name.
     chrome_targets: ChromeTargets,
     leases: BTreeMap<SurfaceName, TargetLease>,
@@ -903,6 +906,7 @@ impl App {
             render_history: RenderHistory::default(),
             rebound: BTreeSet::new(),
             deferred: Vec::new(),
+            presentations: Vec::new(),
             render_fail: match std::env::var("SIG_RENDER_FAIL").as_deref() {
                 Ok("device") => Some(RenderFail::Device),
                 Ok("surface") => Some(RenderFail::Surface),
@@ -983,6 +987,7 @@ impl App {
     fn iterate(&mut self) -> bool {
         self.session.diagnostics_mut().counters.iterations += 1;
         self.handle_signals();
+        self.record_presentations();
         // The watch saw the file change.
         if std::mem::take(&mut self.config_changed) {
             self.reload_config();
@@ -1301,10 +1306,31 @@ impl App {
         }
         self.permits = permits;
         if worked {
+            // What was committed goes to the compositor now, not after the iteration's later
+            // passes (a Servo paint, a GLib turn). Servo's own swaps flush themselves.
+            self.gui.host.flush_requests();
             // Buffers are allocated while presenting, so this sees every peak.
             self.record_buffers();
         }
         worked
+    }
+
+    /// Counts the frames the compositor displayed since the last iteration, with their
+    /// submission-to-display times (a `presented` line each with `SIG_DIAG=1`).
+    fn record_presentations(&mut self) {
+        let mut presentations = std::mem::take(&mut self.gui.presentations);
+        self.gui.host.take_presentations(&mut presentations);
+        for (target, latency) in presentations.drain(..) {
+            let (role, engine) = match (self.gui.surface_of(target), self.session.view_of(target)) {
+                (Some(surface), _) => (surface, None),
+                (None, Some(view)) => ("view", Some(self.session.view_report(view).0)),
+                (None, None) => ("retiring", None),
+            };
+            self.session
+                .diagnostics_mut()
+                .presented(role, engine.as_deref(), latency);
+        }
+        self.gui.presentations = presentations;
     }
 
     /// Samples each target's buffer peaks into the reused scratch list.
