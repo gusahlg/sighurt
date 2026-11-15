@@ -122,10 +122,10 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
 /// The `log` target of the timing lines: `RUST_LOG=sighurt_engine_wpe::timing=debug`.
 pub const TIMING: &str = "sighurt_engine_wpe::timing";
 
-/// The most clipboard text a page reads.
 /// The screen's size (logical pixels) when the first view opens before it has any room.
 const FALLBACK_SCREEN: (i32, i32) = (1280, 720);
 
+/// The most clipboard text a page reads.
 const CLIPBOARD_LIMIT: usize = 4 << 20;
 
 /// Whether a WPE runtime was started in this process: WebKit's UI-process state is global and
