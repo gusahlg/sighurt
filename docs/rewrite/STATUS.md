@@ -4767,3 +4767,22 @@ Newest last. Each entry says what was decided and why.
     Opus 5.5 (the four lanes' design and code), Claude Sonnet 5.5 (the kitty encoder's tmux
     forms, the WPE screen, the speed report's draft, documentation passes), GPT-6 Astra (the
     design review).
+150. **An outside review of the round: six probes of the key engine failed, all fixed** (15
+    November 2026; GPT-6 Astra, `reviews-round-2026-11-15-astra.md`; its usage limit cut the
+    review off before the other lanes, so that part is owed). Astra wrote 56 tests against
+    decision 148's rules; six failed, three defects. (1) An unfinished sequence survived its
+    tab being replaced, left and come back to, or reloaded: it was held to the tab's place
+    and address. It now belongs to one document of one tab (`TabId`, and the core tells the
+    engine when the shown tab, view or document changes), and to the committed address as
+    before. (2) A `[commands]` alias of `input.mode` ran again on a held key: repeats now
+    look through aliases. (3) An alias or a mouse button naming a mode that does not exist
+    passed the load: every `input.mode` the configuration writes is checked. In the
+    terminal's kitty-through-tmux (145): leaving and clearing sent `d=A`, which does not
+    delete virtual placements and deletes other programs' visible ones; it now deletes
+    `sig`'s own image by id. Two `sig`s in one terminal could share an image id (the pid
+    modulo 254): each now claims its id with a lock file under the runtime directory, and
+    placeholder cells carry 16 bits of id. *Evidence*: the 56 probes are
+    `crates/sighurt-core/tests/probes.rs`, all passing unchanged; the CI lines without Servo
+    on the fix branch (1 427 and 119 tests); the terminal's tests. *Not shown*: the third
+    diacritic of an id above 255 in a real kitty under tmux; another machine's `sig` over ssh
+    in the same terminal can still share an id.
