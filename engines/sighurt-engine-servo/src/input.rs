@@ -104,7 +104,11 @@ impl SmoothScroll {
         let previous = self.run.take();
         let in_flight = previous.is_some();
         let (x, y, stepped) = previous.map_or((0.0, 0.0, now), |run| {
-            (run.total.0 - run.sent.0, run.total.1 - run.sent.1, run.stepped)
+            (
+                run.total.0 - run.sent.0,
+                run.total.1 - run.sent.1,
+                run.stepped,
+            )
         });
         self.run = Some(Run {
             start: now,
@@ -726,7 +730,10 @@ mod tests {
         let mut scroll = SmoothScroll::default();
         let start = Instant::now();
         let first = dy(scroll.add(&notch(-75.0), start));
-        assert!(first < 0.0 && first > -75.0, "the first step moves at once: {first}");
+        assert!(
+            first < 0.0 && first > -75.0,
+            "the first step moves at once: {first}"
+        );
         let (rest, frames) = play(&mut scroll, start, Duration::from_micros(16_667));
         assert_eq!(first + rest.iter().sum::<f64>(), -75.0);
         // 120 ms at 60 Hz: about 7 frames, slowing down.
