@@ -11,8 +11,13 @@
 //! little-endian (B, G, R, A in memory), rows top to bottom. An engine that renders another way
 //! (a GL readback is RGBA, bottom row first) converts while it copies into the frame.
 //!
+//! A painter that knows which pixels it changed says so through [`damage`], for a target that
+//! can use it.
+//!
 //! Owns: the CPU frame's shape. Must not own: buffers, their lifetimes or how a frontend shows
 //! them.
+
+pub mod damage;
 
 use crate::geometry::{BufferSize, Metrics};
 use crate::ids::LayoutEpoch;

@@ -8,14 +8,14 @@
 //! frame too. An empty diff is as well: a Wayland commit with no damage is easy to read as
 //! "the previous frame", and the buffer would then show pixels the guest replaced.
 //!
-//! Owns: the rectangles. Must not own: painting them ([`crate::raster`]) or sending them
-//! ([`sighurt_wayland`]).
+//! Owns: the rectangles. Must not own: painting them ([`crate::raster`]) or sending them (the
+//! target's submit, which [`sighurt_api::present::damage`] reports them to).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use sighurt_wayland::DamageRect;
+use sighurt_api::present::damage::DamageRect;
 
 use crate::capabilities::DecodedImage;
 use crate::draw::DrawOp;

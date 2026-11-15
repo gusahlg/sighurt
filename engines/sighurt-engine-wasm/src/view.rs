@@ -851,7 +851,7 @@ impl View {
 
     /// Paints the view's frame into `frame`, which has the size of its metrics.
     ///
-    /// Inside a host paint ([`sighurt_wayland::buffer_age`]), only the pixels that differ from
+    /// Inside a host paint ([`sighurt_api::present::damage::buffer_age`]), only the pixels that differ from
     /// the frame that buffer still holds are painted and reported. Age 0 (a new, abandoned or
     /// resized buffer) and an unknown age (the terminal, a target that does not track age)
     /// paint every pixel and damage the whole buffer. So does a diff that cannot be bounded,
@@ -883,7 +883,7 @@ impl View {
             let current = painted.snap();
             damage::diff(previous.as_ref(), &current)
         };
-        let age = sighurt_wayland::buffer_age();
+        let age = sighurt_api::present::damage::buffer_age();
         if let Some(age) = age {
             let region = damage::region_for_age(&this, &self.damage_history, age, painted.buffer);
             if let Some(rects) = damage::partial_rects(&region, painted.buffer) {
@@ -892,7 +892,7 @@ impl View {
                 raster::paint(frame, &scene)?;
             }
             let (pixels, rects) = damage::reported(&region, painted.buffer);
-            sighurt_wayland::report_damage(&rects);
+            sighurt_api::present::damage::report_damage(&rects);
             damage::diag(pixels, painted.buffer, rects.len(), age);
         } else {
             raster::paint(frame, &scene)?;

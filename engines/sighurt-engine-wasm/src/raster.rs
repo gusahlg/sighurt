@@ -186,7 +186,7 @@ fn paint_in_bands(frame: Frame<'_>, scene: &Scene<'_>, count: u32) -> Result<(),
 pub fn paint_regions(
     frame: Frame<'_>,
     scene: &Scene<'_>,
-    rects: &[sighurt_wayland::DamageRect],
+    rects: &[sighurt_api::present::damage::DamageRect],
 ) -> Result<(), String> {
     let BufferSize { width, height } = frame.size;
     let len = frame.stride * height as usize;
@@ -227,7 +227,7 @@ pub fn paint_regions(
 
 /// `rect` clipped to the buffer: its origin and its size. `None` when nothing remains.
 fn rect_in_buffer(
-    rect: sighurt_wayland::DamageRect,
+    rect: sighurt_api::present::damage::DamageRect,
     width: u32,
     height: u32,
 ) -> Option<(i32, i32, u32, u32)> {

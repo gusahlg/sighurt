@@ -9,4 +9,3 @@ authors.workspace = true
 
 [dependencies]
 sighurt-api = { path = "../../crates/sighurt-api" }
-sighurt-wayland = { path = "../../frontends/sighurt-wayland" }

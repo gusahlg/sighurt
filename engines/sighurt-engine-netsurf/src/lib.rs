@@ -23,9 +23,6 @@ use sighurt_api::engine::{EngineCapabilities, SiteDataKinds};
 
 pub use runtime::{NetSurfConfig, NetSurfRuntime};
 
-/// The Wayland host's shared-memory target. The runtime paints through it.
-pub use sighurt_wayland::TargetLease;
-
 /// The engine's name in the configuration and the registry.
 pub const NAME: &str = "netsurf";
 
