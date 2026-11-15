@@ -116,6 +116,11 @@ url = "2"
 opt-level = 3
 debug = false
 
+# The terminal frontend encodes every page frame (sixel, kitty) on the CPU: unoptimized, a
+# sixel frame takes 8 to 9 times as long (research of 6 November 2026).
+[profile.dev.package.sighurt-tui]
+opt-level = 3
+
 # surfman 0.14.0 with one change: context creation does not mutate the process
 # environment. See third_party/surfman/SIGHURT-PATCH.md.
 # servo-net 0.7.0 with crash-safe cookie and HSTS commits. See
