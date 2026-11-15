@@ -31,6 +31,7 @@ mod output;
 mod parser;
 mod probe;
 mod session;
+pub(crate) mod tmux;
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
