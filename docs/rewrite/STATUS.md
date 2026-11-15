@@ -4675,3 +4675,95 @@ Newest last. Each entry says what was decided and why.
     implementation and fix lanes), Claude Sonnet 5.5 (the help page's content), GPT-6 Astra
     (the three reviews), and the deep-design agent (the pages' design review).
 
+145. **The terminal's frames follow input; kitty graphics may go through tmux** (15 November
+    2026, lane `tuispeed`; amends 110's "at most 5 a second"; 133 holds unchanged). For a
+    second after the user's last key, mouse event or paste, page frames and images come at
+    `[tui] input-fps` (30 by default, 1 to 60), sixel and kitty alike; otherwise `[tui] fps`,
+    the page's own sixel frames at most 5 a second. A frame still waits until the terminal
+    has taken the one before, and nothing ticks. A hidden tab's picture is replaced only
+    after 250 ms, now also when its newer frame was presented and not yet written. With
+    `[tui] graphics = "kitty"` in a tmux pane whose `allow-passthrough` is `all`, frames go
+    into one kitty image through tmux's passthrough, shown by placeholder cells written once
+    per layout; `auto` in tmux stays sixel, since tmux hands the pane no replies. Kitty frames
+    are compressed at zlib's level 1. Dev builds optimize `sighurt-tui` (the user, 15
+    November: its encoders are 8 to 9 times slower unoptimized). *Why*: the user's input
+    delay; the cap's one recorded reason, a 93 ms debug encode, is gone (research of 6
+    November, `reports/`). *Evidence* (this desktop, Rio 0.5.28 CPU renderer in a private
+    sway, 1911×980 page of the demo engine, release builds, a drag step every 16 ms for 6 s,
+    input to the whole next image, median / p90): sixel through tmux 99.7 / 179.7 ms to 18.0 /
+    31.5 ms; sixel alone 103.5 / 183.5 to 18.4 / 31.8; kitty alone 50.0 / 90.3 to 18.9 / 32.1;
+    kitty through tmux 24.0 / 37.6. `real-terminals.sh` on Rio's Vulkan renderer: its four
+    scenarios with no failed check. *Not shown*: Rio's Vulkan renderer at 30 frames a second
+    for longer than 25 s; real Servo or WebKit pages; text mode's scrolling.
+146. **Input renders at once in Servo, a wheel notch scrolls smoothly, WebKit follows the
+    display** (15 November 2026, lane `guispeed`). (a) Servo 0.7's script thread handled input
+    only in "update the rendering", at most every 20 ms: the vendored servo-script (now the
+    third vendored crate, `third_party/servo-script/SIGHURT-PATCH.md`) schedules it 4 ms after
+    the last one while a key, wheel or button event waits; mouse moves alone keep 20 ms (with
+    them, a pointer over an animated page cost 36 % of a core instead of 30). (b) The Servo
+    adapter plays a wheel notch out over 120 ms, one step per presented frame or after 25 ms
+    without one, nothing when no scroll is in flight; touchpad deltas pass unchanged. Pages
+    see about seven wheel events a notch, as from a touchpad; there is no setting to turn it
+    off yet. (c) WPE WebKit gets a `WPEScreen` at the refresh rate of the output the window
+    is on, and a sync observer that ticks only while WebKit asks; a page's `screen.width` and
+    `height` are now the first view's size and do not follow it. (d) The window flushes after
+    submitting and reports each frame's submission-to-display time in diagnostics.
+    *Evidence* (this desktop, headless gles2 sway, 1280×800, release, 3 rounds): Servo
+    continuous wheel 49.5 to 56.7 frames a second at 60 Hz and 49.3 to 109.8 at 120 Hz; a
+    page with a busy script 32.6 to 50.5; single notches 4.0 to 25.3; WebKit at 120 Hz 62.1
+    to 117.6; typing unchanged; idle unchanged (no frames, no pumps); `engines.sh` 337 of
+    337. *Cost*: about 33 % of a core while scrolling in Servo, against 10. *Not shown*: the
+    user's own 120 Hz desktop; real sites (inconclusive).
+147. **The groundwork for macOS and Windows** (15 November 2026, lane `port`; the user: make
+    Sighurt platform-agnostic; amends 2 and 89, which made Wayland and Linux the only
+    platform). `frontend-gui` is a real feature that makes `sighurt-gui` optional (`chrome-
+    line` and the renderers imply it): a terminal-only `sig` links no Sighurt Wayland crate.
+    The CPU damage report is `sighurt_api::present::damage`, and the CPU engines no longer
+    depend on sighurt-wayland. Process signals reach the frontends as
+    `sighurt_runtime::signals::Signals`. What only Linux has (the configuration watch, the
+    pages' programs, CEF's loader, WPE WebKit, Ladybird, NetSurf, `--exclude-libs`) is behind
+    `cfg` and refuses elsewhere with its reason; nothing pretends. `tools/cross-check` checks
+    macOS and Windows targets with the pinned rustc (`-Zbuild-std`); `ports.yml` is a CI job
+    for both. *Evidence*: the terminal-only `sig` with the demo engine passes `cargo check`
+    for aarch64-apple-darwin and x86_64-pc-windows-msvc; on Linux nothing changed (the
+    checks of decision 149). *Not shown*: nothing has run on either system; `ports.yml` has
+    never run; the Wasm engine's C dependencies, Servo and a window there are not attempted
+    (`docs/rewrite/PORTING.md`).
+148. **One key engine, and the Experience** (15 November 2026, lane `experience`; the user's
+    "fully programmable browser experience"; design `experience-2026-11-15.md`, reviewed by
+    GPT-6 Astra, `reviews-experience-astra.md`, 16 findings all taken in; amends 116 and 140,
+    keeps 134). `sighurt_core::keys::Engine` runs a `sighurt_api::keymap::Keys` value (modes,
+    the line's table, bindings with a `KeySeq`, a `When` and an `Action`) and nothing else:
+    the `Keymap` trait, `KeymapKind`, `KeyAction`, `KEYMAPS` and both old matchers are gone,
+    and a `[keymap.<name>]` table gets a notice. The default keys are written with the SDK
+    `sighurt-config` (`Experience::default()`, `empty()`), using only its public names;
+    `sighurt-config-example::configure()` is the configuration compiled into `sig`, and one
+    with any problem is not used (the default is, with a notice). `[input] keymap` names a
+    starting point (`example`, or `bindings`: no experience), and the `[keys]` tables are bind
+    and unbind operations over it: sequences, `false` to unbind, `[keys.mode.<name>]` and
+    `[keys.mode.<name>.url."…"]` are new. Binding replaces a binding of the same keys as
+    narrow as itself; of those that apply the most specific wins (address, then a stated
+    field or frontend, then the later one). New command `input.mode <name>`; it alone never
+    lifts the hold on a page whose tab came to the front by itself. *Amends 140*: a site's
+    bindings layer over the mode's, a site takes one away with an `Unbound` tombstone, and
+    every matching `[keys.url]` table contributes. *Amends 116*: `[tui.keys]` wins over the
+    same table of `[keys]`, not over a `[keys.url]` binding for the address shown; `[keys]`
+    applies under `example`. *Given up*: a keymap as an arbitrary state machine (counts,
+    hint labels); none existed. *Evidence*: the example crate's 21 tests and its fuzz test
+    passed unchanged against the engine before the old code was removed; tests for review
+    findings 1, 3, 5, 6 and 7 in `crates/sighurt-core/tests`; decision 149's checks.
+    *Proposals only*: the interface as components and configurations as Wasm modules
+    (the design's Parts 4 and 5). *Open*: `sighurt-config` is Apache-2.0 over the AGPL
+    `sighurt-api`, so only a configuration's own source is free of the AGPL.
+149. **The four lanes together** (15 November 2026, `config-ext` at b6e87ce, this desktop;
+    logs in `/data/sig-builds/test-out/round-1115/`). Passed: formatting; the four clippy
+    lines, Servo, WPE WebKit and every feature included; the workspace tests; the browser,
+    runtime and window tests with the demo and Wasm engines and with every feature (three
+    links at a time); the terminal's end-to-end tests; the Servo and WPE adapters' tests;
+    `headless.sh` 250 of 250; the chromes' `headless.sh` 35 of 35; `engines.sh` 337 of 337.
+    *Not run on the merged tree*: `real-terminals.sh` (run on the terminal lane's branch),
+    soak, faults, cef.sh, Ladybird, NetSurf, coexist. Not a release: the version stays
+    1.0.0. Work: Claude Fable 5.2 (the Experience design, orchestration, integration), Claude
+    Opus 5.5 (the four lanes' design and code), Claude Sonnet 5.5 (the kitty encoder's tmux
+    forms, the WPE screen, the speed report's draft, documentation passes), GPT-6 Astra (the
+    design review).
