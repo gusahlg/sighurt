@@ -210,8 +210,8 @@ inferred from a mode's properties, and a mode added later gets nothing). By the 
 
 **Binding is replacing** (finding 8). `bind` and `unbind` in a table, with a `when` W, first
 remove from that table every binding with the same address condition as W whose keys are the
-same, a start of the new keys, or started by them, unless its `field` or `frontend` condition
-excludes W's. Then the new binding is added (for `unbind` with no address: nothing is added,
+same, a start of the new keys, or started by them, and whose `field` and `frontend` conditions
+are W's or narrower (W leaves the condition unstated, or states the same). Then the new binding is added (for `unbind` with no address: nothing is added,
 the removal is the unbinding; with an address: the tombstone). So:
 
 - `normal.bind("space", "tab.next")` replaces the default Space although that one is stated
