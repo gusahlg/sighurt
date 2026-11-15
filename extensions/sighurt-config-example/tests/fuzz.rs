@@ -8,17 +8,18 @@
 //! keys (`ctrl-escape` and `f12` on the terminal pages). `tools/fuzz/mod.rs` describes the
 //! environment variables.
 
+mod engine;
 #[path = "../../../tools/fuzz/mod.rs"]
 mod fuzz;
 
 use std::time::Duration;
 
+use engine::{example, KeyAction};
 use fuzz::{iterations, run, Rng};
 use sighurt_api::commands::Command;
 use sighurt_api::ids::TabId;
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
-use sighurt_api::keymap::{Browser, Chord, Frontend, KeyAction, KeyContext, TabInfo, UrlPattern};
-use sighurt_config_example::{table, Binding, KIND};
+use sighurt_api::keymap::{Browser, Chord, Frontend, KeyContext, TabInfo, UrlPattern};
 
 const LIMIT: Duration = Duration::from_secs(2);
 
@@ -46,22 +47,20 @@ const URLS: &[Option<&str>] = &[
     None,
 ];
 
-/// INSERT's table on `url`: the most specific site's that has one, else the general one.
-fn insert_table(url: Option<&str>) -> &'static [Binding] {
-    let sites = table::SITES
-        .iter()
-        .filter_map(|site| Some((site.url.parse::<UrlPattern>().ok()?, site.insert?)));
-    let sites: Vec<_> = sites.collect();
-    url.and_then(|url| UrlPattern::most_specific(sites.iter().map(|(p, t)| (p, *t)), url))
-        .unwrap_or(table::INSERT)
-}
+/// The addresses whose insert mode leaves on ctrl-escape and f12 instead of Escape.
+const SITES: [&str; 2] = ["sig://terminal", "sig://config"];
 
-/// Whether `key` is the first keystroke of a binding of `table`.
-fn leaves(table: &[Binding], key: &KeyEvent) -> bool {
-    table.iter().any(|binding| {
-        let first = binding.keys.split_whitespace().next().unwrap();
-        first.parse::<Chord>().unwrap().matches(key)
-    })
+/// Whether `key` leaves insert on `url`: the leave keys of the most specific site that matches,
+/// else Escape.
+fn leaves(url: Option<&str>, key: &KeyEvent) -> bool {
+    let patterns: Vec<UrlPattern> = SITES.iter().map(|site| site.parse().unwrap()).collect();
+    let site = url.and_then(|url| UrlPattern::most_specific(patterns.iter().map(|p| (p, ())), url));
+    let keys: &[&str] = match site {
+        Some(()) => &["ctrl-escape", "f12"],
+        None => &["escape"],
+    };
+    keys.iter()
+        .any(|text| text.parse::<Chord>().unwrap().matches(key))
 }
 
 impl Browser for Fake {
@@ -182,8 +181,7 @@ fn fuzz_the_example_modes_under_random_keys() {
     // Presses checked in each mode with the page's keyboard: both must happen.
     let (mut normal, mut insert_checked) = (0, 0);
     run("fuzz_example_modes", iterations(100), LIMIT, |case| {
-        let mut keymap = (KIND.new)();
-        keymap.configure(&Default::default());
+        let mut keymap = example();
         let mut browser = Fake {
             frontend: *case.rng.pick(&[Frontend::Gui, Frontend::Terminal]),
             tabs: case.rng.range(1, 12),
@@ -253,9 +251,8 @@ fn fuzz_the_example_modes_under_random_keys() {
                     _ => {}
                 },
                 (true, true) if !key.repeat && !matches!(action, KeyAction::Pass) => {
-                    let table = insert_table(browser.url);
                     assert!(
-                        leaves(table, &key),
+                        leaves(browser.url, &key),
                         "INSERT took {key:?} on {:?}: {action:?}",
                         browser.url
                     );

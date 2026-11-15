@@ -10443,10 +10443,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sighurt-config"
+version = "1.0.0"
+dependencies = [
+ "sighurt-api",
+]
+
+[[package]]
 name = "sighurt-config-example"
 version = "1.0.0"
 dependencies = [
  "sighurt-api",
+ "sighurt-config",
+ "sighurt-core",
 ]
 
 [[package]]
@@ -10673,6 +10682,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sighurt-api",
+ "sighurt-config",
  "sighurt-config-example",
  "sighurt-core",
  "sighurt-engine-cef",

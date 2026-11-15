@@ -1,7 +1,7 @@
 //! Settings: the values of one implementation's own table of the configuration.
 //!
-//! The core reads the configuration file and hands a keymap or a chrome its own table
-//! (`[keys]`, `[keymap.<name>]`, `[chrome.<name>]`) as these values: first to the
+//! The core reads the configuration file and hands a chrome its own table (`[chrome.<name>]`)
+//! as these values, and reads its own key tables (`[keys]`) from them: first to the
 //! implementation's check, then, once the whole file is valid, to the implementation itself. An
 //! implementation never sees the rest of the file, and doesn't depend on the TOML crate the
 //! core reads it with.

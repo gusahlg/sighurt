@@ -77,7 +77,7 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, KeyboardFocus,
     PointerButton, PointerEvent, ScrollDelta, TextInputState,
 };
-use sighurt_api::keymap::{Browser, KeyBinding, KeyContext, KeymapKind, TabInfo};
+use sighurt_api::keymap::{Browser, KeyBinding, KeyContext, Keys, TabInfo};
 use sighurt_api::semantic::SemanticAction;
 use sighurt_api::services::{
     PageGrant, PageRequest, Permission, PtyProgram, Service, ServiceError, ServiceReply,
@@ -125,9 +125,13 @@ pub struct Environment {
     pub engine_settings: BTreeMap<String, &'static [&'static str]>,
     /// The user's home directory, for `~/` in typed addresses and `[downloads] directory`.
     pub home_dir: Option<PathBuf>,
-    /// The build's keymaps besides `bindings` ([`crate::keys::KIND`]), which the core always
-    /// has.
-    pub keymaps: Vec<KeymapKind>,
+    /// The experience's keys: what `[input] keymap = "example"` starts from, the
+    /// configuration compiled into `sig`, which `sig` checked whole (`Keys::check`) and which
+    /// the configuration's `[keys]` are applied over. [`Keys::plain`] when left out.
+    pub keys: Keys,
+    /// What `sig` has to say about the build at the start and with every configuration it
+    /// loads, such as an experience it could not use. One line each.
+    pub notices: Vec<String>,
     /// The build's chromes, as the core checks them.
     pub chromes: Vec<ChromeChecks>,
     /// The color names `[ui.colors]` takes: the chrome's (`sighurt_ui::Colors::NAMES`).
@@ -573,7 +577,7 @@ pub struct BrowserState {
     /// Every view the core has opened and not seen closed.
     pub(crate) views: BTreeMap<ViewId, View>,
     /// The keymap and the presses it took.
-    keys: KeyState,
+    pub(crate) keys: KeyState,
     /// The side buttons `[input.buttons]` took, whose releases the core owes nobody.
     buttons: HashSet<(SeatId, PointerButton)>,
     /// The seat whose keyboard the core heard last: the one `page.send-key` presses keys on.
@@ -1038,7 +1042,7 @@ impl BrowserState {
     /// A browser with no tabs yet, using `config`. [`BrowserEvent::Start`] opens them.
     pub fn new(config: Config, env: Environment) -> Self {
         Self {
-            keys: KeyState::new(config.keymap, &config.keymap_settings),
+            keys: KeyState::new(config.keys.clone()),
             buttons: HashSet::new(),
             seat: SeatId::next(),
             indicator: None,
@@ -1264,7 +1268,7 @@ impl BrowserState {
         if config == self.config {
             return;
         }
-        self.keys.configure(config.keymap, &config.keymap_settings);
+        self.keys.configure(config.keys.clone());
         let mut notices = config.notices().to_vec();
         if config.chrome() != self.chrome {
             notices.push(format!(
@@ -2935,65 +2939,35 @@ impl BrowserState {
                     };
                     self.keys.handle(context, event.seat, key, &browser)
                 };
-                match outcome {
+                let (commands, pass) = match outcome {
+                    KeyOutcome::Consumed => return,
+                    KeyOutcome::Deliver => (Vec::new(), true),
+                    KeyOutcome::Run { commands, pass } => (commands, pass),
+                };
+                if !commands.is_empty() {
                     // Only a fresh press is the user taking the page shown: a repeat lifts no
                     // hold, so while one is on it runs nothing.
-                    KeyOutcome::Run(_) if key.repeat && self.input_held() => return,
-                    KeyOutcome::Run(commands) => {
-                        // `settle` runs once, after this press. When several commands run, tell
-                        // the engines which view is shown after each one, so a later
-                        // `page.send-key` follows that view's focus and visibility, as when the
-                        // commands run one by one. One command is left entirely to `settle`. A
-                        // command of `[commands]` runs its built-in commands here, in its place.
-                        self.release_input();
-                        let mut expanded = Vec::new();
-                        for command in commands {
-                            match command {
-                                Command::Custom(name) => expanded.extend(self.expand(&name, fx)),
-                                command => expanded.push(command),
-                            }
-                        }
-                        let commands = expanded;
-                        let between = commands.len() > 1;
-                        for command in commands {
-                            // A command before this one that moved the keyboard to another
-                            // page, or away and back, keeps the press from starting a program.
-                            origin = origin.filter(|&o| Some(o) == self.keyboard_document());
-                            self.key_ran(&command, origin, at);
-                            match command {
-                                // A repeat sends a repeat, so the page can tell it from a press.
-                                Command::PageSendKey(sent) => self.send_key(&sent, key.repeat, fx),
-                                command => self.run_command(command, fx),
-                            }
-                            if between {
-                                self.settle_engines(fx);
-                            }
-                        }
-                        // Its repeats follow where its own commands moved the keyboard.
-                        self.pressed
-                            .insert((event.seat, key.code), self.focused_view());
+                    if key.repeat && self.input_held() {
                         return;
                     }
-                    KeyOutcome::Consumed => return,
-                    // The one guarantee a configuration cannot remove: while the page shown
-                    // holds an element fullscreen, an unmodified Escape press that the keymap
-                    // let through leaves it, and its repeats and release are taken with it
-                    // (`KeyState`). A press the page got before fullscreen began is not taken:
-                    // only a fresh press counts.
-                    KeyOutcome::Deliver if self.escape_leaves_fullscreen(key) => {
-                        self.keys.take(event.seat, key.code);
-                        self.run_command(Command::PageExitFullscreen, fx);
+                    origin = self.run_key_commands(commands, key, origin, at, fx);
+                    // Its repeats and release follow where its own commands moved the keyboard.
+                    self.pressed
+                        .insert((event.seat, key.code), self.focused_view());
+                    if !pass {
                         return;
                     }
-                    // The press goes where the keyboard is after the command.
-                    KeyOutcome::RunThenDeliver(command) => {
-                        self.key_ran(&command, origin, at);
-                        self.run_command(command, fx);
-                        self.pressed
-                            .insert((event.seat, key.code), self.focused_view());
-                        origin = origin.filter(|&o| Some(o) == self.keyboard_document());
-                    }
-                    KeyOutcome::Deliver => {}
+                }
+                // One delivery path for a key no binding took and a key that passes after its
+                // commands: by the focus as it is now, as the same press. The one guarantee a
+                // configuration cannot remove: while the page shown holds an element
+                // fullscreen, an unmodified Escape press that would reach it leaves it, and its
+                // repeats and release are taken with it (`KeyState`). A press the page got
+                // before fullscreen began is not taken: only a fresh press counts.
+                if self.escape_leaves_fullscreen(key) {
+                    self.keys.take(event.seat, key.code);
+                    self.run_command(Command::PageExitFullscreen, fx);
+                    return;
                 }
             }
             InputKind::Focus(FocusEvent::Deactivated) => {
@@ -3044,6 +3018,55 @@ impl BrowserState {
             }
             None => fx.push(Effect::ChromeInput(event)),
         }
+    }
+
+    /// Runs the commands a key press came to, in order, through one runner: a command of
+    /// `[commands]` runs its built-in commands in its place, `input.mode` switches the mode at
+    /// once, and `page.send-key` sends a repeat for a repeat. The list gives a page that came
+    /// to the front by itself its typing back only if it runs some command other than
+    /// `input.mode`. Returns `origin`, the page and document the press was made in, if it
+    /// still has the keyboard: what the press may still let start a program.
+    fn run_key_commands(
+        &mut self,
+        commands: Vec<Command>,
+        key: &KeyEvent,
+        mut origin: Option<(ViewId, DocumentGeneration)>,
+        at: Instant,
+        fx: &mut Fx,
+    ) -> Option<(ViewId, DocumentGeneration)> {
+        let mut expanded = Vec::new();
+        for command in commands {
+            match command {
+                Command::Custom(name) => expanded.extend(self.expand(&name, fx)),
+                command => expanded.push(command),
+            }
+        }
+        if expanded
+            .iter()
+            .any(|command| !matches!(command, Command::InputMode(_)))
+        {
+            self.release_input();
+        }
+        // `settle` runs once, after this press. When several commands run, tell the engines
+        // which view is shown after each one, so a later `page.send-key` follows that view's
+        // focus and visibility, as when the commands run one by one. One command is left
+        // entirely to `settle`.
+        let between = expanded.len() > 1;
+        for command in expanded {
+            // A command before this one that moved the keyboard to another page, or away and
+            // back, keeps the press from starting a program.
+            origin = origin.filter(|&o| Some(o) == self.keyboard_document());
+            self.key_ran(&command, origin, at);
+            match command {
+                // A repeat sends a repeat, so the page can tell it from a press.
+                Command::PageSendKey(sent) => self.send_key(&sent, key.repeat, fx),
+                command => self.run_command(command, fx),
+            }
+            if between {
+                self.settle_engines(fx);
+            }
+        }
+        origin.filter(|&o| Some(o) == self.keyboard_document())
     }
 
     /// The view that has the keyboard and its document, if the page has it and it committed one.

@@ -1,13 +1,35 @@
-//! The example configuration driven as the core drives it: through `KIND` and the `Keymap` trait,
-//! with a fake `Browser`.
+//! The compiled-in configuration's experience (the default, unchanged) driven as the core
+//! drives it, on the core's key engine (`engine`), with a fake `Browser`. These were the
+//! example keymap's tests behind the `Keymap` trait, ported with their assertions
+//! (docs/rewrite/experience-2026-11-15.md, §3); where they read the keymap's static tables
+//! they read the experience's `Keys`.
 
+mod engine;
+
+use engine::{example, keys, Example, KeyAction};
 use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::ids::TabId;
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
-use sighurt_api::keymap::UrlPattern;
-use sighurt_api::keymap::{Browser, Chord, Frontend, KeyAction, KeyContext, Keymap, TabInfo};
-use sighurt_api::settings::{Table, Value};
-use sighurt_config_example::{bindings, table, tables, Action, Mode, KIND, MAX_KEYS};
+use sighurt_api::keymap::{Action, Browser, Frontend, KeyContext, TabInfo, MAX_KEYS};
+
+/// The addresses whose insert mode gives Escape to the program they run.
+const SITES: [&str; 2] = ["sig://terminal", "sig://config"];
+
+/// Every binding of the experience's modes that exists in `frontend`, as `(keys, action)`; a
+/// site's once per site (tombstones are not bindings).
+fn bindings(frontend: Frontend) -> Vec<(String, Action)> {
+    let keys = keys();
+    let mut found = Vec::new();
+    for mode in &keys.modes {
+        for binding in &mode.bindings {
+            let here = binding.when.frontend.is_none_or(|f| f == frontend);
+            if here && binding.action != Action::Unbound {
+                found.push((binding.keys.to_string(), binding.action.clone()));
+            }
+        }
+    }
+    found
+}
 
 const PAGE: KeyContext = KeyContext::new(KeyboardFocus::Page, false);
 const FIELD: KeyContext = KeyContext::new(KeyboardFocus::Page, true);
@@ -171,18 +193,7 @@ fn navigation() -> [(KeyEvent, &'static str); 13] {
     ]
 }
 
-fn example() -> Box<dyn Keymap> {
-    let mut keymap = (KIND.new)();
-    keymap.configure(&Table::new());
-    keymap
-}
-
-fn press(
-    keymap: &mut Box<dyn Keymap>,
-    keys: &str,
-    context: KeyContext,
-    browser: &Fake,
-) -> Vec<KeyAction> {
+fn press(keymap: &mut Example, keys: &str, context: KeyContext, browser: &Fake) -> Vec<KeyAction> {
     keys.chars()
         .map(|c| keymap.press(&typed(c), context, browser))
         .collect()
@@ -190,67 +201,25 @@ fn press(
 
 #[test]
 fn the_table_is_valid_in_both_frontends() {
+    // The experience as `sig` checks it: with the configuration's `help`, in each frontend.
+    let keys = keys();
+    let custom = ["help".to_owned()];
     for frontend in [Frontend::Gui, Frontend::Terminal] {
-        let all: Vec<_> = bindings(frontend).collect();
-        for (keys, action) in &all {
-            let words: Vec<&str> = keys.split_whitespace().collect();
-            assert!((1..=MAX_KEYS).contains(&words.len()), "{keys}");
-            for word in words {
-                word.parse::<Chord>()
-                    .unwrap_or_else(|e| panic!("{keys:?}: {e}"));
-            }
-            // Built-in commands, and `help` of the built-in configuration's `[commands]`.
-            if let Action::Run(text) | Action::RunThenPass(text) = action {
-                let custom = ["help".to_owned()];
-                CommandSet::ANY
-                    .with_custom(&custom)
-                    .parse(text)
-                    .unwrap_or_else(|e| panic!("{text:?}: {e}"));
-            }
-        }
-        // No binding is the same keys as, or the start of, another in its table.
-        for (mode, site, tab) in tables() {
-            let mode = format!("{mode:?} {site:?}");
-            let chords = |keys: &str| -> Vec<Chord> {
-                keys.split_whitespace()
-                    .map(|k| k.parse().unwrap())
-                    .collect()
-            };
-            let here: Vec<_> = tab
-                .iter()
-                .filter(|b| all.iter().any(|(k, _)| *k == b.keys))
-                .map(|b| (b.keys, chords(b.keys)))
-                .collect();
-            for (i, (a_text, a)) in here.iter().enumerate() {
-                for (b_text, b) in &here[i + 1..] {
-                    assert!(
-                        !a.starts_with(b) && !b.starts_with(a),
-                        "{mode}: {a_text:?} and {b_text:?}"
-                    );
-                }
-            }
+        let set = CommandSet::ANY.with_custom(&custom);
+        assert_eq!(
+            keys.check(&set, frontend),
+            Vec::<String>::new(),
+            "{frontend:?}"
+        );
+        for (text, _) in bindings(frontend) {
+            let words = text.split_whitespace().count();
+            assert!((1..=MAX_KEYS).contains(&words), "{text}");
         }
     }
-    // The constructor parses every command and every site's pattern, and no two sites have the
-    // same pattern.
-    let _ = example();
-    let patterns: Vec<UrlPattern> = table::SITES
-        .iter()
-        .map(|site| site.url.parse().unwrap())
-        .collect();
-    for (i, pattern) in patterns.iter().enumerate() {
-        assert!(!patterns[i + 1..].contains(pattern), "{pattern} twice");
+    // Each site once.
+    for (i, site) in SITES.iter().enumerate() {
+        assert!(!SITES[i + 1..].contains(site), "{site} twice");
     }
-    // Its table takes no settings.
-    let commands = CommandSet::ANY;
-    assert_eq!((KIND.check)(&Table::new(), &commands), Vec::<String>::new());
-    let mut table = Table::new();
-    table.insert("j".into(), Value::String("page.reload".into()));
-    let problems = (KIND.check)(&table, &commands);
-    assert_eq!(problems.len(), 1);
-    assert!(problems[0].starts_with(
-        "[keymap.example] takes no settings; the example configuration's bindings are in its crate"
-    ));
 }
 
 #[test]
@@ -301,13 +270,19 @@ fn escape_toggles_insert_and_the_indicator() {
     );
     // The mode is the browser's, and survives a reload.
     keymap.press(&escape(), PAGE, &b);
-    keymap.configure(&Table::new());
+    keymap.configure();
     assert_eq!(keymap.indicator(), Some("INSERT MODE"));
-    assert_eq!(table::INSERT.len(), 1);
-    assert!(matches!(
-        table::INSERT[0].action,
-        Action::ExitFullscreenOr(Mode::Normal)
-    ));
+    // Insert binds Escape alone, on every address but the sites'.
+    let keys = keys();
+    let insert = keys.mode("insert").unwrap();
+    let general: Vec<_> = insert
+        .bindings
+        .iter()
+        .filter(|b| b.when.url.is_none())
+        .collect();
+    assert_eq!(general.len(), 1);
+    assert_eq!(general[0].keys.to_string(), "escape");
+    assert!(matches!(general[0].action, Action::Custom(_)));
 }
 
 /// A browser in `frontend` whose tab shows `url`.
@@ -650,7 +625,8 @@ fn terminal_bindings_exist_only_in_the_terminal() {
     }
     let gui_chrome = |keys: Frontend| {
         bindings(keys)
-            .filter(|(_, a)| matches!(a, Action::Run(t) if t.starts_with("chrome.")))
+            .into_iter()
+            .filter(|(_, a)| matches!(a, Action::Run(c) if matches!(c[..], [Command::Chrome(_)])))
             .count()
     };
     assert_eq!(gui_chrome(Frontend::Gui), 0);
@@ -718,7 +694,7 @@ fn describe_lists_every_binding_of_the_frontend_by_mode() {
     let keymap = example();
     for frontend in [Frontend::Gui, Frontend::Terminal] {
         let described = keymap.describe(frontend);
-        assert_eq!(described.len(), bindings(frontend).count());
+        assert_eq!(described.len(), bindings(frontend).len());
         let find = |keys: &str| {
             described
                 .iter()
@@ -736,9 +712,9 @@ fn describe_lists_every_binding_of_the_frontend_by_mode() {
             .iter()
             .any(|b| b.mode == "INSERT" && b.keys == "escape"));
         // Each site's bindings with its address, from the table.
-        for site in table::SITES {
+        for site in SITES {
             for keys in ["ctrl-escape", "f12"] {
-                let applies = format!("on {}", site.url);
+                let applies = format!("on {site}");
                 assert!(
                     described
                         .iter()

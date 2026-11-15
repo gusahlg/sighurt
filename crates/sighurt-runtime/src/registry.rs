@@ -21,8 +21,9 @@
 //! configuration that enables it, then logs through that one. The frontend's start function
 //! calls [`claim_logger`] and, when it wins, Servo's `setup_logging`.
 //!
-//! The keymaps of the build are listed here ([`KEYMAPS`]), as engines are: compiled in, chosen
-//! by `[input] keymap`. Chromes are the frontend's.
+//! The experience compiled into the build (`sighurt-config-example`) is taken apart here
+//! ([`experience`]): its keys go to the core in its [`Environment`], checked whole, and an
+//! experience with any problem is not used. Chromes are the frontend's.
 //!
 //! What each engine supports, and which settings of `[engines.<name>]` it honors, is the
 //! build's [`crate::engines::descriptors`], so every frontend's [`Environment`] says the same
@@ -45,8 +46,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use sighurt_api::commands::CommandSet;
 use sighurt_api::engine::{EngineCapabilities, EngineRuntime, EngineWaker, PumpStatus};
-use sighurt_api::keymap::KeymapKind;
+use sighurt_api::keymap::Keys;
 use sighurt_core::config::{Config, EngineSettings};
 use sighurt_core::{ChromeChecks, Environment, Frontend};
 use tempfile::TempDir;
@@ -209,9 +211,26 @@ pub fn claim_logger() -> bool {
     LOGGER.swap(true, Ordering::SeqCst)
 }
 
-/// The keymaps compiled into this build besides the core's own `bindings`: the example
-/// configuration, which the built-in configuration selects.
-pub const KEYMAPS: &[KeymapKind] = &[sighurt_config_example::KIND];
+/// The experience's keys, as the core gets them ([`Environment::keys`]), and what `sig` says
+/// about them ([`Environment::notices`]): those of the configuration compiled into `sig`
+/// (`sighurt_config_example::configure`). An experience with any problem, noted while it was
+/// written or found by `Keys::check` on its own (bounds, modes, a mode switch to no mode, a
+/// binding that starts another), is not used at all: the default experience is, with a notice
+/// naming the problems. What depends on the configuration file (its `[commands]`, its chrome)
+/// is checked when the file loads.
+pub fn experience() -> (Keys, Vec<String>) {
+    let (keys, mut problems) = sighurt_config_example::configure().finish();
+    problems.extend(keys.check(&CommandSet::ANY, Frontend::Gui));
+    if problems.is_empty() {
+        return (keys, Vec::new());
+    }
+    let (default, _) = sighurt_config::Experience::default().finish();
+    let notice = format!(
+        "The configuration compiled into sig has problems, so sig uses its default keys: {}",
+        problems.join("; ")
+    );
+    (default, vec![notice])
+}
 
 /// What a runtime is started with.
 // Only the Wasm engine needs a scratch directory, and the demo engine reads nothing.
@@ -412,7 +431,7 @@ impl<T: 'static, P: 'static> Registry<T, P> {
     }
 
     /// What the core checks configurations against: the build's engines, with what each
-    /// supports and which settings it honors, its keymaps, and the chromes and color names the
+    /// supports and which settings it honors, the experience's keys, and the chromes and color names the
     /// frontend passes.
     pub fn environment(
         &self,
@@ -425,6 +444,7 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             .map(|desc| desc.name.to_owned())
             .collect();
         let engines = self.engines.iter();
+        let (keys, notices) = experience();
         Environment {
             engines: engines
                 .clone()
@@ -433,7 +453,8 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             web_engines,
             engine_settings: engines.map(|e| (e.name.into(), e.honors)).collect(),
             home_dir: dirs::home_dir(),
-            keymaps: KEYMAPS.to_vec(),
+            keys,
+            notices,
             chromes,
             color_names,
             renderers: sighurt_core::config::RENDERERS,
@@ -827,42 +848,59 @@ mod tests {
     }
 
     #[test]
-    fn keymaps_follow_the_build() {
+    fn the_experience_follows_the_build() {
         let registry = Registry::<(), ()>::new(Vec::new());
         let env = registry.environment(Vec::new(), &[]);
         assert!(env.engines.is_empty());
-        assert_eq!(env.keymaps, KEYMAPS.to_vec());
+        // Equal but for the custom actions, which are new functions on every call.
+        let described = |keys: &Keys| keys.describe(Frontend::Gui);
+        let (default, _) = sighurt_config::Experience::default().finish();
+        assert_eq!(
+            described(&env.keys),
+            described(&default),
+            "it changes nothing as it ships"
+        );
+        assert!(env.notices.is_empty(), "{:?}", env.notices);
         assert!(env.chromes.is_empty());
     }
 
     #[test]
-    fn the_examples_terminal_chrome_commands_exist() {
+    fn the_experiences_terminal_chrome_commands_exist() {
         use sighurt_api::commands::Command;
-        use sighurt_api::keymap::Frontend;
-        use sighurt_config_example::Action;
+        use sighurt_api::keymap::{Action, Frontend};
         use sighurt_core::config::TERMINAL_CHROME_COMMANDS;
-        let mut checked = 0;
-        for (keys, action) in sighurt_config_example::bindings(Frontend::Terminal) {
-            let (Action::Run(text) | Action::RunThenPass(text)) = action else {
-                continue;
-            };
-            if let Ok(Command::Chrome(name)) = text.parse() {
-                assert!(
-                    TERMINAL_CHROME_COMMANDS.contains(&name.as_str()),
-                    "{keys}: {text}"
-                );
-                checked += 1;
-            }
-        }
+        let (keys, _) = experience();
+        let tables = keys
+            .modes
+            .iter()
+            .map(|mode| &mode.bindings)
+            .chain([&keys.line]);
+        let bindings: Vec<_> = tables.flatten().collect();
+        let chrome = |frontend: Frontend| -> Vec<String> {
+            let here = bindings
+                .iter()
+                .filter(move |b| b.when.frontend.is_none_or(|f| f == frontend));
+            let commands = here.flat_map(|b| match &b.action {
+                Action::Run(c) | Action::RunThenPass(c) => c.clone(),
+                _ => Vec::new(),
+            });
+            commands
+                .filter_map(|command| match command {
+                    Command::Chrome(name) => Some(name),
+                    _ => None,
+                })
+                .collect()
+        };
+        let terminal = chrome(Frontend::Terminal);
         assert!(
-            checked >= 2,
-            "the example binds the terminal's chrome commands"
+            terminal.len() >= 2,
+            "the experience binds the terminal's chrome commands"
         );
-        // The window's chrome commands depend on the chrome; the example binds none of them.
-        let window = sighurt_config_example::bindings(Frontend::Gui).filter(|(_, action)| {
-            matches!(action, Action::Run(text) | Action::RunThenPass(text) if text.starts_with("chrome."))
-        });
-        assert_eq!(window.count(), 0);
+        for name in terminal {
+            assert!(TERMINAL_CHROME_COMMANDS.contains(&name.as_str()), "{name}");
+        }
+        // The window's chrome commands depend on the chrome; the experience binds none of them.
+        assert_eq!(chrome(Frontend::Gui), Vec::<String>::new());
     }
 
     #[cfg(feature = "engine-servo")]

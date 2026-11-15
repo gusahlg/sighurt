@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use sighurt_api::commands::Command;
 use sighurt_api::engine::{EngineCapabilities, EngineCommand};
 use sighurt_api::events::EngineEvent;
 use sighurt_api::geometry::SurfacePoint;
@@ -12,7 +13,7 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyCode, KeyEvent, Modifiers,
     PointerButton, PointerEvent,
 };
-use sighurt_api::keymap::{Browser, KeyAction, KeyContext, Keymap, KeymapKind};
+use sighurt_api::keymap::{Action, Binding, Browser, Custom, Keys, Outcome};
 use sighurt_core::config::Config;
 use sighurt_core::fullscreen::FullscreenState;
 use sighurt_core::tabs::Content;
@@ -20,31 +21,39 @@ use sighurt_core::{
     update, BrowserEvent, BrowserState, Effect, Environment, Frontend, OpenRequest,
 };
 
-/// A keymap that runs `page.exit-fullscreen` on Escape while the tab shown says it is
-/// fullscreen, as the example configuration does, and records what it was shown.
-const WATCHING: KeymapKind = KeymapKind {
-    name: "watching",
-    check: |_, _| Vec::new(),
-    new: || Box::new(Watching),
-};
-
-struct Watching;
-
-impl Keymap for Watching {
-    fn configure(&mut self, _: &sighurt_api::settings::Table) {}
-
-    fn press(&mut self, key: &KeyEvent, _: KeyContext, browser: &dyn Browser) -> KeyAction {
+/// Keys whose Escape runs `page.exit-fullscreen` while the tab shown says it is fullscreen,
+/// as the experience does, and is taken otherwise: a custom action reading the view.
+fn watching() -> Keys {
+    let leave = |browser: &dyn Browser| {
         let fullscreen = browser
             .tab(browser.active_tab())
             .is_some_and(|tab| tab.fullscreen);
-        match &key.key {
-            Key::Named(name) if name == "Escape" && fullscreen => {
-                KeyAction::Run("page.exit-fullscreen".parse().unwrap())
-            }
-            Key::Named(name) if name == "Escape" => KeyAction::Take,
-            _ => KeyAction::Pass,
+        match fullscreen {
+            true => Outcome::run(vec![Command::PageExitFullscreen]),
+            false => Outcome::take(),
         }
-    }
+    };
+    escape_keys(Action::Custom(Custom::new("leave fullscreen", leave)))
+}
+
+/// Keys whose Escape runs `commands` and then passes (`RunThenPass`; with none, it is
+/// `pass("escape")`): delivered as a key no binding took is, through the core's fullscreen
+/// guard.
+fn passing(commands: &[&str]) -> Keys {
+    escape_keys(Action::RunThenPass(
+        commands.iter().map(|c| c.parse().unwrap()).collect(),
+    ))
+}
+
+/// One mode that passes every key, and Escape bound to `action`.
+fn escape_keys(action: Action) -> Keys {
+    let mut keys = Keys::plain();
+    keys.modes[0].bindings = vec![Binding {
+        keys: "escape".parse().unwrap(),
+        when: Default::default(),
+        action,
+    }];
+    keys
 }
 
 struct Harness {
@@ -55,7 +64,7 @@ struct Harness {
     seat: SeatId,
 }
 
-fn environment(frontend: Frontend) -> Environment {
+fn environment(frontend: Frontend, keys: Keys) -> Environment {
     let servo = EngineCapabilities {
         history_traversal: true,
         fullscreen: true,
@@ -67,17 +76,24 @@ fn environment(frontend: Frontend) -> Environment {
             ("plain".into(), EngineCapabilities::default()),
         ]
         .into(),
-        keymaps: vec![WATCHING],
+        keys,
         frontend,
         ..Environment::default()
     }
 }
 
 impl Harness {
-    /// A browser in `frontend` with the `bindings` keymap and `keys` as its `[keys]`, showing
-    /// a tab for each of `urls`, the first selected.
+    /// A browser in `frontend` with the `bindings` keymap, or the experience `keymap` names
+    /// (`watching`, `pass`, `pass-after`), showing a tab for each of `urls`, the first
+    /// selected.
     fn start(frontend: Frontend, keymap: &str, urls: &[&str]) -> Self {
-        let env = environment(frontend);
+        let (keymap, keys) = match keymap {
+            "watching" => ("example", watching()),
+            "pass" => ("example", passing(&[])),
+            "pass-after" => ("example", passing(&["page.zoom-in"])),
+            other => (other, Keys::plain()),
+        };
+        let env = environment(frontend, keys);
         let text = format!("version = 1\n[input]\nkeymap = \"{keymap}\"\n");
         let config = Config::parse(Some(&text), &env).unwrap();
         let mut h = Self {
@@ -774,4 +790,26 @@ fn a_refused_fullscreen_shows_and_takes_back_nothing() {
     let effects = h.page_says(true);
     assert!(notices(&effects).is_empty() && withdrawn(&effects).is_empty());
     assert!(withdrawn(&h.page_says(false)).is_empty());
+}
+
+#[test]
+fn an_escape_that_passes_after_its_commands_still_leaves_a_pages_fullscreen() {
+    // Review finding 6: `pass("escape")`, and Escape passing after a command, are delivered as
+    // a key no binding took: the core's guard leaves the page's fullscreen and takes the
+    // press's release.
+    for keymap in ["pass", "pass-after"] {
+        let mut h = Harness::start(Frontend::Gui, keymap, &["https://a.test/"]);
+        let view = h.shown();
+        h.enter_page_fullscreen();
+        let press = escape(Modifiers::default());
+        let effects = h.key(press.clone());
+        assert_eq!(exits(&effects, view), 1, "{keymap}");
+        assert!(!delivered(&effects, view), "{keymap}");
+        assert_eq!(h.fullscreen().page, None);
+        let release = with_state(&press, ButtonState::Released, false);
+        assert!(!delivered(&h.key(release.clone()), view), "{keymap}");
+        // Out of fullscreen it reaches the page, press and release.
+        assert!(delivered(&h.key(press), view), "{keymap}");
+        assert!(delivered(&h.key(release), view), "{keymap}");
+    }
 }

@@ -66,8 +66,8 @@ struct Harness {
     seat: SeatId,
 }
 
-/// A build with every engine (Servo honoring its settings, Wasm `storage`), the test keymap
-/// `script`, and two chromes with no options: the standard one with the command
+/// A build with every engine (Servo honoring its settings, Wasm `storage`), no experience
+/// (its keys are `Keys::plain`, as `bindings` has them), and two chromes with no options: the standard one with the command
 /// `chrome.toggle-tabs`, and the line chrome with none.
 fn environment() -> Environment {
     let chrome = |name, commands| ChromeChecks {
@@ -90,7 +90,6 @@ fn environment() -> Environment {
     Environment {
         engines: engines(&["servo", "wasm", "demo"]),
         engine_settings: settings.map(|(e, s)| (e.to_owned(), s)).into(),
-        keymaps: vec![script::KIND],
         chromes: vec![chrome("standard", &["toggle-tabs"]), chrome("line", &[])],
         renderers: sighurt_core::config::RENDERERS,
         ..Environment::default()
@@ -3047,173 +3046,96 @@ fn a_failed_page_says_so_when_it_is_shown_again() {
 
 // ── Keymaps, tabs by id and configuration notices ──────────────────────────────────────────
 
-/// `script`, a keymap for these tests. `[keymap.script]` says what a press of a key that types
-/// a character does: `"take"` takes a fresh press and passes its repeats, `"run <command>"`
-/// runs the command, `"then <command>"` runs it and passes the press on, `"all <commands>"`
-/// runs those commands (separated by `;`) in order, `"close-titled <title>"` closes the tab
-/// whose own title it read, and `"copy-link"` copies the link the pointer is over in the
-/// selected tab, or takes the key when there is none. It counts the presses it is asked about, and shows the count
-/// as its indicator. What the core tells it goes into a log of the thread, so each test sees
-/// its own.
+/// `script`: keys for these tests, as the build's experience (`Environment::keys`), the
+/// starting point of `[input] keymap = "example"`. They were a keymap of their own, behind the
+/// `Keymap` trait the key engine replaced (docs/rewrite/experience-2026-11-15.md, §1.6); what
+/// they did is now a binding of a `Keys` value: `Run(vec![])` takes a press, `RunThenPass` runs
+/// and passes it on, a `Custom` reads the browser view, a mode without page text mutes it.
 mod script {
-    use std::cell::RefCell;
     use std::num::NonZeroUsize;
 
     use sighurt_api::commands::{Command, CommandSet};
-    use sighurt_api::input::{Key, KeyEvent};
-    use sighurt_api::keymap::{Browser, KeyAction, KeyContext, Keymap, KeymapKind};
-    use sighurt_api::settings::Table;
+    use sighurt_api::keymap::{Action, Binding, Browser, Custom, Keys, Mode, Outcome, When};
+    use sighurt_core::Environment;
 
-    thread_local! {
-        static LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// What the core told this thread's keymaps since the last call.
-    pub fn log() -> Vec<String> {
-        LOG.with(|log| log.take())
-    }
-
-    fn note(line: String) {
-        LOG.with(|log| log.borrow_mut().push(line));
-    }
-
-    pub const KIND: KeymapKind = KeymapKind {
-        name: "script",
-        check,
-        new: || Box::<Script>::default(),
-    };
-
-    enum Rule {
-        Take,
-        /// Taken, and the page takes text no more, or again.
-        Mute,
-        Run(Command),
-        Then(Command),
-        All(Vec<Command>),
-        CloseTitled(String),
-        CopyLink,
-    }
-
-    fn rule(text: &str, commands: &CommandSet<'_>) -> Result<Rule, String> {
-        if let Some(rest) = text.strip_prefix("all ") {
-            let mut found = Vec::new();
-            for part in rest.split(';') {
-                let part = part.trim();
-                if part.is_empty() {
-                    return Err("all: expected commands separated by ';'".into());
-                }
-                found.push(commands.parse(part)?);
-            }
-            return Ok(Rule::All(found));
-        }
-        if let Some(title) = text.strip_prefix("close-titled ") {
-            return match title.is_empty() {
-                true => Err("close-titled: expected a title".into()),
-                false => Ok(Rule::CloseTitled(title.to_owned())),
-            };
-        }
-        match text.split_once(' ') {
-            None if text == "take" => Ok(Rule::Take),
-            None if text == "mute" => Ok(Rule::Mute),
-            None if text == "copy-link" => Ok(Rule::CopyLink),
-            Some(("run", command)) => commands.parse(command).map(Rule::Run),
-            Some(("then", command)) => commands.parse(command).map(Rule::Then),
-            _ => Err(format!(
-                "{text:?}: expected take, mute, run, then, all, close-titled or copy-link"
-            )),
+    pub fn bind(keys: &str, action: Action) -> Binding {
+        Binding {
+            keys: keys.parse().unwrap(),
+            when: When::default(),
+            action,
         }
     }
 
-    /// `tab.close` of the tab whose own title is `title`, or a taken key when none has it.
-    fn close_titled(browser: &dyn Browser, title: &str) -> KeyAction {
+    fn commands(list: &[&str]) -> Vec<Command> {
+        let custom = ["help".to_owned()];
+        let set = CommandSet::ANY.with_custom(&custom);
+        list.iter().map(|text| set.parse(text).unwrap()).collect()
+    }
+
+    pub fn run(list: &[&str]) -> Action {
+        Action::Run(commands(list))
+    }
+
+    pub fn then(list: &[&str]) -> Action {
+        Action::RunThenPass(commands(list))
+    }
+
+    pub fn custom(f: fn(&dyn Browser) -> Outcome) -> Action {
+        Action::Custom(Custom::new("a test's action", f))
+    }
+
+    /// One mode, `script`, that passes what it doesn't bind, with `bindings`.
+    pub fn keys(bindings: Vec<Binding>) -> Keys {
+        let mut mode = Mode::new("script");
+        mode.bindings = bindings;
+        Keys {
+            modes: vec![mode],
+            initial: "script".into(),
+            line: Vec::new(),
+        }
+    }
+
+    /// The test build, with `keys` as its experience.
+    pub fn env(keys: Keys) -> Environment {
+        Environment {
+            keys,
+            ..super::environment()
+        }
+    }
+
+    /// `tab.close` of the tab whose own title is "Gone", or a taken key when none has it.
+    pub fn close_gone(browser: &dyn Browser) -> Outcome {
         let found = (0..browser.tab_count())
-            .find(|&index| browser.tab(index).and_then(|tab| tab.title) == Some(title));
-        match found {
-            Some(index) => KeyAction::Run(Command::TabClose(Some(
-                NonZeroUsize::new(index + 1).expect("tab numbers start at 1"),
-            ))),
-            None => KeyAction::Take,
-        }
+            .find(|&index| browser.tab(index).and_then(|tab| tab.title) == Some("Gone"));
+        Outcome::run(
+            found
+                .map(|index| Command::TabClose(NonZeroUsize::new(index + 1)))
+                .into_iter()
+                .collect(),
+        )
     }
 
-    fn check(table: &Table, commands: &CommandSet<'_>) -> Vec<String> {
-        let problem = |text: Option<&str>| match text {
-            Some(text) => rule(text, commands).err(),
-            None => Some("expected a string".into()),
-        };
-        let problems = table
-            .iter()
-            .map(|(key, value)| (key, problem(value.as_str())));
-        problems
-            .filter_map(|(key, problem)| problem.map(|p| format!("{key:?}: {p}")))
-            .collect()
+    /// Copies the link the pointer is over in the selected tab, or takes the key.
+    pub fn copy_link(browser: &dyn Browser) -> Outcome {
+        let tab = browser.tab(browser.active_tab());
+        let link = tab.and_then(|tab| tab.link);
+        Outcome::run(
+            link.map(|link| Command::ClipboardCopy(link.into()))
+                .into_iter()
+                .collect(),
+        )
     }
+}
 
-    #[derive(Default)]
-    struct Script {
-        rules: Vec<(String, Rule)>,
-        presses: usize,
-        indicator: String,
-        muted: bool,
-    }
-
-    impl Keymap for Script {
-        fn configure(&mut self, settings: &Table) {
-            note(format!("configure after {} presses", self.presses));
-            let rule = |text: Option<&str>| rule(text.unwrap(), &CommandSet::ANY).unwrap();
-            let rules = settings
-                .iter()
-                .map(|(key, text)| (key.clone(), rule(text.as_str())));
-            self.rules = rules.collect();
-        }
-
-        fn press(
-            &mut self,
-            key: &KeyEvent,
-            _context: KeyContext,
-            browser: &dyn Browser,
-        ) -> KeyAction {
-            self.presses += 1;
-            self.indicator = self.presses.to_string();
-            let Key::Character(text) = &key.key else {
-                return KeyAction::Pass;
-            };
-            match self.rules.iter().find(|(typed, _)| typed == text) {
-                Some((_, Rule::Take)) if !key.repeat => KeyAction::Take,
-                Some((_, Rule::Mute)) => {
-                    self.muted ^= !key.repeat;
-                    KeyAction::Take
-                }
-                Some((_, Rule::Run(command))) => KeyAction::Run(command.clone()),
-                Some((_, Rule::Then(command))) => KeyAction::RunThenPass(command.clone()),
-                Some((_, Rule::All(commands))) => KeyAction::RunAll(commands.clone()),
-                Some((_, Rule::CloseTitled(title))) => close_titled(browser, title),
-                Some((_, Rule::CopyLink)) => {
-                    let tab = browser.tab(browser.active_tab());
-                    match tab.and_then(|tab| tab.link) {
-                        Some(link) => KeyAction::Run(Command::ClipboardCopy(link.into())),
-                        None => KeyAction::Take,
-                    }
-                }
-                _ => KeyAction::Pass,
-            }
-        }
-
-        fn context(&mut self, context: KeyContext) {
-            note(format!("{:?} typing {}", context.focus, context.typing));
-        }
-
-        fn reset(&mut self) {
-            note("reset".into());
-        }
-
-        fn indicator(&self) -> Option<&str> {
-            (self.presses > 0).then_some(self.indicator.as_str())
-        }
-
-        fn page_takes_text(&self) -> bool {
-            !self.muted
-        }
+impl Harness {
+    /// Starts with `keys` as the build's experience, `config` and a tab for each of `urls`.
+    fn start_keys(keys: sighurt_api::keymap::Keys, config: &str, urls: &[&str]) -> Self {
+        let mut harness = Self::with_env(config, script::env(keys));
+        harness.apply(BrowserEvent::Start {
+            session: None,
+            open: urls.iter().map(|url| open(url)).collect(),
+        });
+        harness
     }
 }
 
@@ -3231,8 +3153,8 @@ fn delivers(effects: &[Effect], view: ViewId) -> bool {
 
 #[test]
 fn a_taken_press_takes_its_release_whatever_the_keymap_says() {
-    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\"t\" = \"take\"";
-    let mut b = Harness::start(config, &["https://a.test/"]);
+    let keys = script::keys(vec![script::bind("t", script::run(&[]))]);
+    let mut b = Harness::start_keys(keys, "", &["https://a.test/"]);
     let view = b.shown();
     // The keymap takes the press, then passes its repeat: the repeat and the release are
     // still taken.
@@ -3253,8 +3175,8 @@ fn a_taken_press_takes_its_release_whatever_the_keymap_says() {
 
 #[test]
 fn run_then_pass_delivers_to_the_new_focus() {
-    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\":\" = \"then location.focus\"";
-    let mut b = Harness::start(config, &["https://a.test/"]);
+    let keys = script::keys(vec![script::bind(":", script::then(&["location.focus"]))]);
+    let mut b = Harness::start_keys(keys, "", &["https://a.test/"]);
     let view = b.shown();
     let colon = typed(":");
     let effects = b.key(colon.clone());
@@ -3278,17 +3200,23 @@ fn run_then_pass_delivers_to_the_new_focus() {
 }
 
 #[test]
-fn the_keymap_hears_context_changes() {
-    let mut b = Harness::start("[input]\nkeymap = \"script\"", &["https://a.test/"]);
+fn an_unfinished_sequence_ends_when_the_context_changes() {
+    // The key engine drops the sequence itself (experience-2026-11-15.md, §1.2) where the
+    // trait's keymap was told of the context and of a reset.
+    let keys = script::keys(vec![script::bind("g g", script::run(&["tab.new"]))]);
+    let mut b = Harness::start_keys(keys, "", &["https://a.test/"]);
     let view = b.shown();
-    assert_eq!(
-        script::log(),
-        ["configure after 0 presses", "Page typing false"]
-    );
+    let g = typed("g");
+    let started = |b: &mut Harness| {
+        b.key(g.clone());
+        b.key(release(&g));
+        assert_eq!(b.state.keymap_indicator(), Some("g"));
+    };
+    started(&mut b);
     b.apply(command("location.focus"));
-    assert_eq!(script::log(), ["Chrome typing true"]);
+    assert_eq!(b.state.keymap_indicator(), None);
     b.apply(command("tab.select 1"));
-    assert_eq!(script::log(), ["Page typing false"]);
+    started(&mut b);
     b.engine(EngineEvent::TextInputChanged {
         view,
         state: Some(TextInputState {
@@ -3298,10 +3226,12 @@ fn the_keymap_hears_context_changes() {
             multiline: false,
         }),
     });
-    assert_eq!(script::log(), ["Page typing true"]);
-    // Nothing changed: the keymap is told nothing.
+    assert_eq!(b.state.keymap_indicator(), None);
+    b.engine(EngineEvent::TextInputChanged { view, state: None });
+    started(&mut b);
+    // Nothing changed: the sequence stays.
     b.apply(command("page.zoom-in"));
-    assert_eq!(script::log(), [] as [String; 0]);
+    assert_eq!(b.state.keymap_indicator(), Some("g"));
     b.update(BrowserEvent::Keyboard {
         event: InputEvent {
             seat: b.seat,
@@ -3309,13 +3239,32 @@ fn the_keymap_hears_context_changes() {
         },
         at: b.now,
     });
-    assert_eq!(script::log(), ["reset"]);
+    assert_eq!(b.state.keymap_indicator(), None);
 }
 
 #[test]
 fn a_keymap_that_gives_the_page_no_text_gets_it_no_input_method_and_no_text() {
-    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\"m\" = \"mute\"";
-    let mut b = Harness::start(config, &["https://a.test/"]);
+    // Ctrl+M switches between a mode that gives the page text and one that doesn't (a letter
+    // would type into the page's field in the mode that gives it text: the typing rule).
+    let ctrl_m = || {
+        press(
+            30,
+            "m",
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+        )
+    };
+    use sighurt_api::keymap::Mode;
+    let mut keys = script::keys(vec![script::bind(
+        "ctrl-m",
+        script::run(&["input.mode mute"]),
+    )]);
+    let mut mute = Mode::new("mute").page_text(false);
+    mute.bindings = vec![script::bind("ctrl-m", script::run(&["input.mode script"]))];
+    keys.modes.push(mute);
+    let mut b = Harness::start_keys(keys, "", &["https://a.test/"]);
     let view = b.shown();
     let field = TextInputState {
         caret: SurfaceRect::default(),
@@ -3343,7 +3292,7 @@ fn a_keymap_that_gives_the_page_no_text_gets_it_no_input_method_and_no_text() {
     assert!(delivers(&commit(&mut b), view));
     // The keymap stops giving the page text: the host's input method lets go of the field, and
     // a commit or paste that comes anyway reaches nobody.
-    let effects = b.key(typed("m"));
+    let effects = b.key(ctrl_m());
     assert!(
         effects.contains(&Effect::PageTextInput(None)),
         "{effects:?}"
@@ -3361,14 +3310,14 @@ fn a_keymap_that_gives_the_page_no_text_gets_it_no_input_method_and_no_text() {
     // Key presses are the keymap's to decide: one it passes still reaches the page.
     assert!(delivers(&b.key(typed("u")), view));
     // Given text again, the field the page has is offered at once.
-    let effects = b.key(typed("m"));
+    let effects = b.key(ctrl_m());
     assert!(
         effects.contains(&Effect::PageTextInput(Some(field))),
         "{effects:?}"
     );
     assert!(delivers(&commit(&mut b), view));
     // The chrome's text is the chrome's whatever the keymap says of the page.
-    b.key(typed("m"));
+    b.key(ctrl_m());
     b.apply(command("location.focus"));
     assert!(commit(&mut b)
         .iter()
@@ -3377,9 +3326,10 @@ fn a_keymap_that_gives_the_page_no_text_gets_it_no_input_method_and_no_text() {
 
 #[test]
 fn a_keymap_reads_the_tabs_it_decides_with() {
-    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\"x\" = \"close-titled Gone\"";
-    let mut b = Harness::start(
-        config,
+    let keys = script::keys(vec![script::bind("x", script::custom(script::close_gone))]);
+    let mut b = Harness::start_keys(
+        keys,
+        "",
         &["https://a.test/", "https://b.test/", "https://c.test/"],
     );
     let views: Vec<_> = (0..3)
@@ -3402,8 +3352,8 @@ fn a_keymap_reads_the_tabs_it_decides_with() {
 
 #[test]
 fn a_keymap_reads_the_hovered_link() {
-    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\"y\" = \"copy-link\"";
-    let mut b = Harness::start(config, &["https://a.test/"]);
+    let keys = script::keys(vec![script::bind("y", script::custom(script::copy_link))]);
+    let mut b = Harness::start_keys(keys, "", &["https://a.test/"]);
     let view = b.shown();
     let copied = |effects: &[Effect]| {
         effects.iter().find_map(|e| match e {
@@ -3447,10 +3397,10 @@ fn a_keymap_reads_the_hovered_link() {
 
 #[test]
 fn run_all_runs_in_order_in_one_update() {
-    let config =
-        "[input]\nkeymap = \"script\"\n[keymap.script]\n\"x\" = \"all tab.close 3; tab.close 2\"";
-    let mut b = Harness::start(
-        config,
+    let close = script::run(&["tab.close 3", "tab.close 2"]);
+    let mut b = Harness::start_keys(
+        script::keys(vec![script::bind("x", close)]),
+        "",
         &[
             "https://a.test/",
             "https://b.test/",
@@ -3516,12 +3466,9 @@ fn a_run_all_shows_and_focuses_a_tab_before_sending_it_a_key() {
     }
 
     let urls = ["https://a.test/", "https://b.test/"];
-    let config = "\
-[input]
-keymap = \"script\"
-[keymap.script]
-\"x\" = \"all tab.select 2; page.send-key enter; tab.select 1\"";
-    let mut together = Harness::start(config, &urls);
+    let three = script::run(&["tab.select 2", "page.send-key enter", "tab.select 1"]);
+    let keys = script::keys(vec![script::bind("x", three)]);
+    let mut together = Harness::start_keys(keys, "", &urls);
     let together_views = tab_views(&together);
     let combined = together.key(typed("x"));
 
@@ -3589,45 +3536,57 @@ fn clipboard_copy_is_an_effect() {
 
 #[test]
 fn a_changed_indicator_redraws_the_chrome() {
-    let mut b = Harness::start("[input]\nkeymap = \"script\"", &["https://a.test/"]);
+    let keys = script::keys(vec![script::bind("a a", script::run(&["tab.new"]))]);
+    let mut b = Harness::start_keys(keys, "", &["https://a.test/"]);
     assert_eq!(b.state.keymap_indicator(), None);
     let effects = b.key(typed("a"));
     assert!(effects.contains(&Effect::RedrawChrome));
-    assert_eq!(b.state.keymap_indicator(), Some("1"));
-    // A release isn't the keymap's, and changes nothing the chrome shows.
+    assert_eq!(b.state.keymap_indicator(), Some("a"));
+    // A release isn't the engine's, and changes nothing the chrome shows.
     assert!(!b.key(release(&typed("a"))).contains(&Effect::RedrawChrome));
 }
 
 #[test]
-fn a_reload_that_keeps_the_keymap_configures_it_and_keeps_its_state() {
-    let script = |key| {
-        format!("version = 1\n[input]\nkeymap = \"script\"\n[keymap.script]\n\"{key}\" = \"run tab.new\"")
-    };
-    let mut b = Harness::start(&script("x")[12..], &["sig://home"]);
+fn a_reload_keeps_the_mode_and_applies_the_new_tables() {
+    // A reload keeps the engine's mode when the new keys have it (experience-2026-11-15.md,
+    // §1.2), as the trait's keymap kept its state.
+    use sighurt_api::keymap::Mode;
+    let mut keys = script::keys(vec![script::bind("s", script::run(&["input.mode two"]))]);
+    keys.modes[0].indicator = "ONE".into();
+    keys.modes.push(Mode::new("two").indicator("TWO"));
+    let table = |key| format!("[keys]\n\"{key}\" = \"page.zoom-in\"");
+    let mut b = Harness::start_keys(keys.clone(), &table("x"), &["https://a.test/"]);
+    let zoom = |b: &Harness| b.active().zoom;
     b.key(typed("x"));
-    assert_eq!(b.state.tabs().len(), 2);
-    script::log();
-    let reloaded = Config::parse(Some(&script("y")), &environment());
+    let once = zoom(&b);
+    assert!(once > 1.0);
+    b.key(typed("s"));
+    assert_eq!(b.state.keymap_indicator(), Some("TWO"));
+    let reloaded = Config::parse(
+        Some(&format!("version = 1\n{}", table("y"))),
+        &script::env(keys),
+    );
     b.update(config_reloaded(reloaded));
-    assert_eq!(script::log(), ["configure after 1 presses"]);
+    assert_eq!(b.state.keymap_indicator(), Some("TWO"), "the mode stays");
     b.key(typed("x"));
+    assert_eq!(zoom(&b), once, "x is no longer bound");
     b.key(typed("y"));
-    assert_eq!(b.state.tabs().len(), 3, "the new table applies");
-    assert_eq!(b.state.keymap_indicator(), Some("3"), "the count goes on");
+    assert!(zoom(&b) > once, "the new table applies");
 }
 
 #[test]
-fn a_switch_replaces_the_keymap_and_a_held_keys_release_is_still_taken() {
-    let config = "[input]\nkeymap = \"script\"\n[keymap.script]\n\"x\" = \"run page.reload\"";
-    let mut b = Harness::start(config, &["https://a.test/"]);
+fn a_switch_of_starting_point_keeps_a_held_keys_release_taken() {
+    let mut keys = script::keys(vec![script::bind("x", script::run(&["page.reload"]))]);
+    keys.modes[0].indicator = "SCRIPT".into();
+    let mut b = Harness::start_keys(keys.clone(), "", &["https://a.test/"]);
     let view = b.shown();
     let x = typed("x");
     b.key(x.clone());
-    assert_eq!(b.state.keymap_indicator(), Some("1"));
-    // x is held while the configuration goes back to the bindings keymap.
+    assert_eq!(b.state.keymap_indicator(), Some("SCRIPT"));
+    // x is held while the configuration goes to no experience at all.
     let bindings = Config::parse(
-        Some("version = 1\n[keys]\n\"x\" = \"tab.new\""),
-        &environment(),
+        Some("version = 1\n[input]\nkeymap = \"bindings\"\n[keys]\n\"x\" = \"tab.new\""),
+        &script::env(keys),
     );
     let effects = b.update(config_reloaded(bindings));
     assert!(effects.contains(&Effect::RedrawChrome));
@@ -3636,7 +3595,7 @@ fn a_switch_replaces_the_keymap_and_a_held_keys_release_is_still_taken() {
         !delivers(&b.key(release(&x)), view),
         "the release stays taken"
     );
-    // The new keymap reads [keys].
+    // The new keys are [keys] over no experience.
     b.key(x);
     assert_eq!(b.state.tabs().len(), 2);
 }
@@ -3687,7 +3646,9 @@ fn configuration_notices_are_shown_at_start_and_on_reload() {
         Some(reloaded),
         &environment(),
     )));
-    let unused = "[keymap.script] is not used: [input] keymap is \"bindings\", which reads [keys]";
+    let unused = "[keymap.script] is for a keymap this build doesn't have (it has: example, \
+                  bindings); it was not checked. Keys are bound in [keys] over the keymap's \
+                  starting point";
     assert_eq!(notices(&effects), [format!("{missing}\n{unused}")]);
 }
 

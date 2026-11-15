@@ -41,8 +41,10 @@ sighurt-engine-wpe = { path = "../../engines/sighurt-engine-wpe", optional = tru
 sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird", optional = true }
 sighurt-engine-netsurf = { path = "../../engines/sighurt-engine-netsurf", optional = true }
 sighurt-engine-cef = { path = "../../engines/sighurt-engine-cef", optional = true }
-# The example configuration, the built-in keymap of every build (docs/rewrite/config-extension.md).
+# The configuration compiled into sig, and the default experience it falls back to
+# (docs/rewrite/experience-2026-11-15.md, §2).
 sighurt-config-example = { path = "../../extensions/sighurt-config-example" }
+sighurt-config = { path = "../../sdk/sighurt-config" }
 # The configuration watch (inotify) and CLOCK_MONOTONIC for the diagnostics lines.
 rustix = { workspace = true, features = ["event", "fs", "process", "pty", "termios"] }
 # `_exit` after an engine that could not shut down (decision 54).

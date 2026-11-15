@@ -30,7 +30,7 @@ distributed.
   ├── sighurt-tui       the terminal frontend: terminal I/O, the chrome as text, pages as
   │                     kitty graphics or reflowed text, `sig --dump`
   ├── sighurt-runtime   configuration and session files, the engine registry, effects, services
-  ├── sighurt-core      tabs, commands, keymaps, routing, history across engines, permissions
+  ├── sighurt-core      tabs, commands, the key engine, routing, history across engines, permissions
   └── engines           servo · wpe · wasm · demo, and cef · ladybird · netsurf when enabled
 
  In the GUI, one Wayland window: the chrome's surfaces and one page surface per engine view, which the
@@ -47,8 +47,9 @@ distributed.
 
 The core is ordinary Rust (`update(state, event) -> effects`) with no I/O; engines report facts as
 events and never change browser state. Keys, the chrome, the engines' routing and settings are
-all configuration, and the keymap and the chrome are small traits you can implement yourself
-([below](#writing-your-own-keymap-or-chrome)).
+all configuration. The keys, modes and actions are a configuration in Rust that you can edit, and
+the chrome is a small trait you can implement yourself
+([below](#writing-your-own-experience-or-chrome)).
 
 This is the `rewrite` branch. The design is
 [`sighurt-rewrite-plan.md`](./sighurt-rewrite-plan.md); what has been built, tested and decided
@@ -109,8 +110,9 @@ is a search. `sig` restores the tabs it had when it last quit, beside the ones y
 
 ### Choosing what is compiled in
 
-Cargo features of `sighurt-browser` decide which engines, keymaps and chromes `sig` has; the
-configuration decides which of them are used.
+Cargo features of `sighurt-browser` decide which engines and chromes `sig` has; the
+configuration decides which of them are used. The keys are not a feature: they are the
+configuration in Rust that `sig` is built with ([below](#writing-your-own-experience-or-chrome)).
 
 | Feature | Default | What it adds |
 |---|---|---|
@@ -147,7 +149,7 @@ is in [docs/rewrite/PORTING.md](docs/rewrite/PORTING.md).
 one of them in a build that lacks it is a notice, and `sig` goes on. None of the three has the
 `semantics` capability, so text mode and `sig --dump` do not use them.
 
-The `example` and `bindings` keymaps and the `standard` chrome are in every build. A build without
+The `standard` chrome is in every build. A build without
 `frontend-tui` has no terminal frontend: `--tui` and `--dump` are errors there.
 
 ### In the terminal
@@ -325,7 +327,7 @@ key is optional.
 
 - Your file goes over the built-in one: `[routing.*]` tables merge field by field, `[engines]`,
   `[input]`, `[input.buttons]`, `[downloads]`, `[session]` and `[history]` key by key, and `[keywords]`,
-  `[engines.*]`, `[keys]`, `[keymap.*]`, `[ui]` and `[chrome.*]` are yours alone.
+  `[engines.*]`, `[keys]` (with its sub-tables), `[ui]` and `[chrome.*]` are yours alone.
 - The whole file is checked at once and every problem is reported together. A file with a
   problem is not used. At startup `sig` doesn't start: it prints the file and the problems and
   exits, since the built-in configuration in its place would drop what the file sets (an
@@ -333,11 +335,11 @@ key is optional.
   leaves the configuration in use as it was, and the status line says so. Without a file `sig`
   starts with the built-in configuration; a file deleted or moved away while it runs leaves the
   configuration in use as it is until the file is back.
-- A table for an engine, keymap or chrome that this build doesn't have is not a problem: `sig`
+- A table for an engine or chrome that this build doesn't have is not a problem: `sig`
   says so and goes on, so one file serves several builds. The routing rules of an engine the
   build lacks are left out, so what they claim opens in the default engine. `[engines] default`
   must name an engine the build has.
-- `sig` reads the file again whenever it is saved. The keymap and its bindings, the mouse's
+- `sig` reads the file again whenever it is saved. The keys and their bindings, the mouse's
   buttons, scrolling, colors, fonts and the chrome's options, the home page, search, keywords,
   zoom, routing and the download folder apply at once; pages already open stay in their engine.
   `[ui] chrome`, `[ui] renderer` and the engines' own settings apply when `sig` starts again.
@@ -384,7 +386,7 @@ if you set it, else `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `vim`, 
 found in an absolute directory of `PATH`. An editor or shell named without a directory is found
 the same way: a relative or empty `PATH` entry (the current directory) is never searched. The
 page says which editor and which file before anything starts, and Enter
-starts it; keys reach it in the keymap's INSERT mode (`sig://help/keys` lists the keys that enter
+starts it; keys reach it in the INSERT mode (`sig://help/keys` lists the keys that enter
 and leave it there). When the editor ends, `sig` reads the file again, a file linked from
 elsewhere (a dotfiles repository) included: what changed applies at once where the setting
 allows it, and a file with a problem keeps the configuration in use, with a notice and the
@@ -419,11 +421,10 @@ In the terminal frontend the page needs graphics, like every `sig://` page.
 | `[routing.<engine>] extensions` | file extensions it opens from `file:` URLs, and from `origins` | Wasm: `wasm` |
 | `[routing.<engine>] origins` | web servers (`scheme://host[:port]`) whose files with those extensions it opens | none |
 | `[routing.<engine>] hosts` | hosts it opens: `"docs.example.com"`, an IP address, or `"*.example.com"` (hosts under it, not itself) | none |
-| `[input] keymap` | the keymap: `example` (the example configuration's keys, in both frontends), `bindings` (reads `[keys]`), or one compiled in | `"example"` |
+| `[input] keymap` | where the keys start: `example` (the experience compiled into `sig`, in both frontends) or `bindings` (no experience: one mode, `default`, that passes every key and gives the page text); `[keys]` applies to both | `"example"` |
 | `[input] scroll-speed` | how far a wheel notch or a swipe scrolls a page, 0.1 to 10 | `1.0` |
 | `[input.buttons]` | `back`, `forward`: the mouse's side buttons, a command or `""` | `page.back`, `page.forward` |
-| `[keys]`, `[keys.page]`, `[keys.location]`, `[keys.url."<address>"]` | the `bindings` keymap: everywhere, while the page has the keyboard, while the address line has it, while the page has it on those addresses | none |
-| `[keymap.<name>]` | another keymap's own table | — |
+| `[keys]`, `[keys.page]`, `[keys.location]`, `[keys.mode.<name>]`, `[keys.url."<address>"]`, `[keys.mode.<name>.url."<address>"]`, and `[tui.keys]` with the same tables | bind and unbind keys over the experience: in every mode and the address line, in every mode, in the address line, in one mode, on those addresses, in one mode on those addresses; the `[tui.keys]` ones in the terminal only | none |
 | `[ui] chrome` | the chrome that draws the window (at the next start) | `"standard"` |
 | `[ui] renderer` | what renders the chrome (at the next start): `"auto"`, `"cpu"`, `"wgpu"` (the GPU through Vulkan; a surface it can't present on, or a GPU that fails, gives the chrome back to the CPU) or `"vulkan"` (Vulkan directly, in a `sig` built with `render-vulkan`); one this build lacks gives a notice and `"auto"` is used, which is the CPU until wgpu is measured at least as good | `"auto"` |
 | `[ui] font`, `font-size` | the chrome's font family, and its size in logical pixels (9 to 32) | an installed sans-serif, 14 |
@@ -491,7 +492,7 @@ enabled, in the build's order, wrapping around. That order is `servo`, `wpe`, th
 engine and the demo engine are not in the cycle. It chooses the engine the way `page.open-in`
 does. With fewer than two such engines, or a page that isn't http, https or a file, it shows a
 notice and the page stays. Clicking the engine's name at the right end of the address field, or
-at the end of the line chrome, runs it. The example configuration binds it to `e` in both
+at the end of the line chrome, runs it. The default keys bind it to `e` in both
 frontends; with `keymap = "bindings"` nothing is bound until you bind it.
 
 Links follow the routing too. When you click a link to an address the routing gives another
@@ -525,6 +526,7 @@ command, typed into the address line) all run them.
 | `location.focus [text]` | focus the address line with its text selected; with text, the line holds that text instead (`location.focus :` opens the command line) |
 | `history.clear` | forget the pages you visited: the history file is emptied at once (in a `sig` that doesn't own it, only its own memory, and it says so) |
 | `browser.fullscreen` | put the window in [fullscreen](#fullscreen), or take it out (and a page's with it); not in the terminal |
+| `input.mode <name>` | switch the key [mode](#keys) at once (`normal`, `insert`, or a mode of your own); it moves no focus |
 | `clipboard.copy <text>` | put the text on the clipboard |
 | `browser.home` | open the home page in the active tab |
 | `browser.quit` | quit, saving the tabs |
@@ -551,7 +553,7 @@ reading = ["page.zoom-reset", "page.zoom-in", "page.zoom-in"]
 ### Sighurt's own pages
 
 `sig://help` is what a new user needs: the modes and the keys to know, then sections on the
-keys (the active keymap's, as it lists them), the commands (built-in and yours), the
+keys (the bindings in effect, as the key engine lists them), the commands (built-in and yours), the
 configuration (its path, the main tables, what is in effect), these pages, this build's engines,
 the terminal frontend, and the version, license and credits. `sig://help/keys`,
 `sig://help/commands`, `sig://help/config`, `sig://help/pages`, `sig://help/engines`,
@@ -564,7 +566,7 @@ editor and your shell with all your rights.
 engine draws it, so it works without the wasm engine and in a terminal without graphics. It says
 what this build is (its version, the configuration file), links to the pages above that this
 build and configuration open (`sig://terminal` says when it is off and which setting turns it
-on), the keys of your keymap for the common commands (taken from the keymap, so they are always
+on), the keys for the common commands (taken from the bindings in effect, so they are always
 yours), the pages you visited last (while `[history] remember` is on) and the engines. A click
 on a link opens it in that tab; in the terminal Tab and Shift+Tab move between the links and
 Enter follows one, as in text mode, and the arrows scroll. When there is not room for all of it,
@@ -582,8 +584,9 @@ checks itself.
 
 ### Keys
 
-The default keys are the example configuration's (`extensions/sighurt-config-example`, the
-default `[input] keymap = "example"`), the same in the window and the terminal. It has two modes,
+The default keys are the experience compiled into `sig` (`extensions/sighurt-config-example`, which
+returns the default experience of `sdk/sighurt-config`; the default `[input] keymap = "example"`),
+the same in the window and the terminal. One key engine in the core runs them. They are two modes,
 and the separation is clean:
 
 - **NORMAL** (the mode it starts in) never types into a page. While the page has the keyboard
@@ -599,7 +602,8 @@ and the separation is clean:
   and `sig://config`, INSERT gives `Escape` to the program too, and `ctrl-escape` or `f12`
   returns to NORMAL. In a terminal with legacy keys, tmux among them by default, `ctrl-escape`
   arrives as a plain `Escape` and goes to the program: use `f12` there. These are bindings of the
-  example configuration for those addresses (`SITES` in its `table.rs`), not of the browser.
+  experience for those addresses (it unbinds `Escape` in INSERT there and binds `ctrl-escape` and
+  `f12` to `input.mode normal`), not of the browser.
 
 The mouse is not typing: clicks reach the page in both modes and leave the mode as it is. While
 the address line or the find field has the keyboard, typing goes there in either mode, and only
@@ -637,10 +641,11 @@ the keys marked "from the address line too" run their commands.
 | terminal only: `m` | `chrome.toggle-mode` (text or graphics) |
 | terminal only: `ctrl-l` | `chrome.refresh` (draw the page again; from the address line too) |
 
-`y y`, `y f` and `c o` are written in Rust in the example, against the keymap API's read-only view of the
-tabs. With `[input] keymap = "bindings"` nothing is bound until you bind it in `[keys]` (and
-`[tui.keys]`, over it, in the terminal). The tab strip, the toolbar and the address line work
-without any keys. With the `bindings` keymap:
+`y y`, `y f` and `c o` are sequences, and what they run is computed in Rust from the key engine's read-only view of the
+tabs. Your `[keys]` tables change the keys above without a rebuild: each binding replaces only the
+key it names, and every other key stays. With `[input] keymap = "bindings"` the experience is not
+used: nothing is bound until you bind it in `[keys]` (and `[tui.keys]`, over it, in the terminal).
+The tab strip, the toolbar and the address line work without any keys. For example:
 
 ```toml
 [keys]                        # everywhere
@@ -655,18 +660,38 @@ without any keys. With the `bindings` keymap:
 [keys.location]               # while the address line has it
 "alt-enter" = "page.open https://example.com"
 
-[keys.url."https://*.example.com"]  # while the page has it, on these addresses
+[keys.mode.normal]            # in one mode
+"g g" = "page.send-key home"  # a sequence of up to 4 keystrokes
+"x" = false                   # false unbinds: x does nothing here
+
+[keys.url."https://*.example.com"]  # in every mode, on these addresses
 "ctrl-r" = "page.reload"
+
+[keys.mode.insert.url."sig://terminal"]  # in one mode, on these addresses
+"escape" = "input.mode normal"
 ```
 
-`[keys.url."<address>"]` binds keys for some addresses, over `[keys.page]` and `[keys]`, while
-the page has the keyboard. The address is `scheme://host` and an optional path: it matches the
+The tables apply in this order, each over the last and over the experience: `[keys]` (every mode
+and the address line), `[keys.page]` (every mode), `[keys.location]` (the address line),
+`[keys.mode.<name>]`, `[keys.url."<address>"]`, `[keys.mode.<name>.url."<address>"]`, then `[tui.keys]`
+and the same tables under it, for the terminal only. A value is a command in quotes, or `false`.
+A binding replaces: it removes the bindings of its table for the same address whose keys are the
+same, a start of the new keys or started by them (so binding `g` drops `g g`), and whose field and
+frontend conditions are the new one's or narrower. In one table a key that is the start of
+another is an error. A binding for an address does not touch one without an address, and the
+reverse.
+
+`[keys.url."<address>"]` binds keys for some addresses, in every mode. The address is `scheme://host` and an optional path: it matches the
 tab's address (the one it shows, not one loading) when the scheme and the host are the same, case
 aside, and the path starts with the given one at a `/`, so `"sig://terminal"` is also
 `sig://terminal/config` and never `sig://terminal-x`. `*.example.com` is the hosts under
-example.com, not example.com itself. Of the tables that match, only the most specific applies: an
-exact host before a `*.`, a longer `*.` before a shorter one, then the longer path. At most 64
-tables; `[tui.keys.url."<address>"]` is the terminal's, over all of `[keys]`.
+example.com, not example.com itself. Every table that matches contributes. When a key is pressed the
+most specific binding wins: the more specific address (an exact host before a `*.`, a longer `*.`
+before a shorter one, then the longer path; any address before none), then one that states a
+field condition before one that doesn't, then one that states the frontend, then the one defined
+later. A `false` masks only the less specific bindings of exactly its keys. At most 64 address
+tables. A `[tui.keys]` binding wins over the same table of `[keys]`, but a `[keys.url]` binding for
+the address shown wins over a `[tui.keys]` binding with no address.
 
 A keystroke is modifiers (`ctrl`, `alt`, `shift`, `super`, `altgr`) and a key, joined by `-`. The
 key is a character as your layout types it (`"ctrl-+"`, `"ctrl-å"`), a key name (`enter`,
@@ -675,10 +700,9 @@ or `code:` and a W3C key code for a physical key. AltGr is never Ctrl+Alt. While
 address line or a page's text field, a keystroke that types a character types it instead of
 running its command. A key the browser takes never reaches the page, release included.
 
-`[keys]` while `example` is selected gets a notice, and so does `[keymap.example]` with any key in
-it: the example takes no settings. To change the keys, copy
-[`sighurt-config-example`](extensions/sighurt-config-example/) (its bindings are tables in
-`table.rs`: one per mode, and in `SITES` those for some addresses) and put your copy in `KEYMAPS`, as below.
+A `[keymap.<name>]` table gets a notice and changes nothing: there are no keymaps to choose among.
+To change more than bindings can say (a mode of your own, an action computed from the tabs), edit the
+experience in Rust, as [below](#writing-your-own-experience-or-chrome).
 
 ### Find in page
 
@@ -724,7 +748,7 @@ is fullscreen. Escape leaves it.` `Escape` (`page.exit-fullscreen`) leaves it, a
 selecting another tab, a new page, the window losing the keyboard, or `f11`, which leaves the
 window's fullscreen too; the window returns to what you had chosen at once, whatever the page does,
 and the notice goes (a newer one stays).
-An unmodified `Escape` that the keymap lets through always leaves a page's fullscreen: no
+An unmodified `Escape` that the key engine lets through always leaves a page's fullscreen: no
 configuration removes that. Servo, WPE WebKit, CEF and the demo engine (`demo:fullscreen`) have
 element fullscreen; Ladybird, NetSurf and Wasm apps don't. In the terminal there is no window
 fullscreen (`browser.fullscreen` says so), and a page's fullscreen is the notice alone: the page
@@ -754,8 +778,8 @@ enabled = true
 ```
 
 The page starts nothing by itself: it says what will run, and Enter starts it, pressed afresh in
-that page (a held Enter repeating, or a key pressed in another tab, starts nothing). With the example
-keymap, keys reach the program in INSERT mode, which Escape enters; on these pages Escape then goes
+that page (a held Enter repeating, or a key pressed in another tab, starts nothing). With the default
+keys, keys reach the program in INSERT mode, which Escape enters; on these pages Escape then goes
 to the program (nvim needs it), and `ctrl-escape` or `f12` leaves INSERT ([Keys](#keys): `f12`
 where the terminal sends `ctrl-escape` as `Escape`). Pastes reach the program with
 control characters removed, bracketed when the program asks. When the program ends, the page says
@@ -774,69 +798,69 @@ The `standard` chrome is a tab strip, a toolbar with back, forward, reload and t
 and a status strip; `[chrome.standard]` moves the tabs to a list on the left or hides them, shows
 the status over the page only while there is something to say, drops the buttons or makes it
 compact. The address line is also the command line (`:`) and the find field (`/`). The line chrome (feature `chrome-line`, `[ui] chrome = "line"`) is one line at the top or
-the bottom of the window: the tab's place (`[2/5]`), the keymap's mode, the address and the status;
+the bottom of the window: the tab's place (`[2/5]`), the key mode, the address and the status;
 tabs are reached by keys and commands. Both name the engine a page runs in (`servo`, `wpe`,
 `wasm`, `cef`, `ladybird`, `netsurf`), small and muted: the standard chrome in each tab and at the address bar's right end, the
 line chrome at the line's end; `sig:` pages have none, and `engine-label = false` turns it off.
 Every chrome shows what pages say (titles, status text, addresses) contained to one line, and
 `sig`'s own notices whenever there are any.
 
-## Writing your own keymap or chrome
+## Writing your own experience or chrome
 
-A keymap and a chrome are each one small trait, and the defaults go through them too. Yours is a
-crate compiled into `sig`: there is no plugin loading. The API has no stability promise yet;
+The keys, the modes and what a key computes are the experience: Rust that changes one value, and
+the defaults are written with the same API. A chrome is one small trait. Both are compiled into
+`sig`: there is no plugin loading. The API has no stability promise yet;
 [`docs/rewrite/extension-api.md`](./docs/rewrite/extension-api.md) is its design, with a changelog
-of breaking changes.
+of breaking changes, and [`docs/rewrite/experience-2026-11-15.md`](./docs/rewrite/experience-2026-11-15.md)
+is the design of the experience.
 
-**A keymap** implements `sighurt_api::keymap::Keymap` and depends on `sighurt-api` alone. The core
-asks it about each fresh key press, with the context (does the page or the chrome have the
-keyboard, does it take typed text), and it answers `Pass`, `Take`, `Run(command)` or
-`RunThenPass(command)`. The core does the rest: a taken press takes its release and repeats, a
-held key never turns into a shortcut halfway, and the keymap is told when the context changes or
-the window loses the keyboard. A keymap's table, `[keymap.<name>]`, is checked by its kind when the
-configuration loads, so a wrong file is refused with your messages. A keymap that runs one command
-for one key:
+**A configuration in Rust.** `extensions/sighurt-config-example` is the configuration compiled
+into `sig`. Its `configure()` returns `Experience::default()`, the default experience of
+[`sighurt-config`](sdk/sighurt-config/) (Apache-2.0, depending on `sighurt-api` alone). Edit it, or
+point the build at a copy of the crate, and change that value with the SDK. A binding replaces only
+what it binds, so changing one key keeps the rest. The crate's comments show each kind of change:
 
 ```rust
-use sighurt_api::commands::{Command, CommandSet};
-use sighurt_api::input::KeyEvent;
-use sighurt_api::keymap::{Chord, KeyAction, KeyContext, Keymap, KeymapKind};
-use sighurt_api::settings::{Table, Value};
+use sighurt_config::prelude::*;
 
-/// `[keymap.one]`: `key = "ctrl-n"` runs `run = "tab.next"`; every other key passes.
-#[derive(Default)]
-struct One(Option<(Chord, Command)>);
+pub fn configure() -> Experience {
+    let mut sig = Experience::default();
 
-fn read(settings: &Table, commands: &CommandSet<'_>) -> Result<(Chord, Command), String> {
-    let text = |name| settings.get(name).and_then(Value::as_str).ok_or(format!("{name}: missing"));
-    let key = text("key")?.parse().map_err(|e| format!("key: {e}"))?;
-    let run = commands.parse(text("run")?).map_err(|e| format!("run: {e}"))?;
-    Ok((key, run))
-}
+    // Bind a key and unbind another; every other key stays.
+    sig.keys.normal().bind("e", "page.switch-engine").unbind("x");
 
-impl Keymap for One {
-    fn configure(&mut self, settings: &Table) {
-        self.0 = read(settings, &CommandSet::ANY).ok();
+    // A mode of your own, entered with a key and left with Escape.
+    sig.keys.add_mode(Mode::new("zoom").indicator("ZOOM").unmatched(Fallback::Take));
+    sig.keys.normal().bind("z", "input.mode zoom");
+    sig.keys.mode("zoom")
+        .bind("i", "page.zoom-in")
+        .bind("o", "page.zoom-out")
+        .bind("escape", "input.mode normal");
+
+    // An action computed from what the browser shows.
+    fn duplicate_left(browser: &dyn Browser) -> Outcome {
+        let commands = match browser.active_tab() {
+            0 => vec![Command::TabDuplicate],
+            _ => vec![Command::TabDuplicate, "tab.move left".parse().unwrap()],
+        };
+        Outcome::run(commands)
     }
+    sig.keys.normal().bind("D", custom("duplicate the tab", duplicate_left));
 
-    fn press(&mut self, key: &KeyEvent, _context: KeyContext) -> KeyAction {
-        match &self.0 {
-            Some((chord, run)) if chord.matches(key) => KeyAction::Run(run.clone()),
-            _ => KeyAction::Pass,
-        }
-    }
+    sig
 }
-
-pub const KIND: KeymapKind = KeymapKind {
-    name: "one",
-    check: |settings, commands| read(settings, commands).err().into_iter().collect(),
-    new: || Box::<One>::default(),
-};
 ```
+
+`sig` takes the experience apart when it starts: its keys go to the core. An experience with any
+problem (a bad key or command, a mode that doesn't exist, a key that starts another) is not used:
+`sig` says what is wrong and runs the default experience. The configuration file's `[keys]` tables
+then apply over it. `Experience::empty()` starts from nothing, as `[input] keymap = "bindings"`
+does. The tests of `sighurt-config`, `sighurt-config-example` and `sighurt-core` use the API from
+outside.
 
 **A chrome** implements `sighurt_ui::extension::Chrome`: it handles events (its configuration, the
 window's size, a snapshot of the browser's state whenever something it could show changes, focus,
-pointer input on its surfaces, keys the keymap passed, pasted text, its own commands), returns
+pointer input on its surfaces, keys the key engine passed, pasted text, its own commands), returns
 actions (run a command, select or close a tab by its id, move the keyboard, copy, paste, repaint a
 surface), lays out up to 8 named surfaces with their input areas and the page's rectangle, and
 draws a surface as a scene with a `Pen` (rectangles, rounded and bordered ones, paths, shaped text,
@@ -845,29 +869,29 @@ in window coordinates), which the renderer `[ui] renderer` chose renders. Its ki
 shares with its renderer. sighurt-ui's text, editing and drawing helpers (`Fonts`, `TextEditor`,
 `Pen`) are there to use.
 
-To add either to `sig`: a feature in `apps/sighurt-browser/Cargo.toml` and the kind in the list in
-`crates/sighurt-runtime/src/registry.rs` (`KEYMAPS`) or `frontends/sighurt-gui/src/chrome.rs` (`CHROMES`):
+To add a chrome to `sig`: a feature in `apps/sighurt-browser/Cargo.toml` and the kind in the list in
+`frontends/sighurt-gui/src/chrome.rs` (`CHROMES`):
 
 ```toml
 [features]
-keymap-one = ["dep:sighurt-keymap-one"]
+chrome-one = ["dep:sighurt-chrome-one"]
 
 [dependencies]
-sighurt-keymap-one = { path = "../sighurt-keymap-one", optional = true }
+sighurt-chrome-one = { path = "../sighurt-chrome-one", optional = true }
 ```
 
 ```rust
-pub const KEYMAPS: &[KeymapKind] = &[
-    sighurt_config_example::KIND,
-    #[cfg(feature = "keymap-one")]
-    sighurt_keymap_one::KIND,
+pub const CHROMES: &[ChromeKind] = &[
+    sighurt_ui::standard::KIND,
+    #[cfg(feature = "chrome-one")]
+    sighurt_chrome_one::KIND,
 ];
 ```
 
-Then `[input] keymap = "one"` with `[keymap.one] key = "ctrl-n"` and `run = "tab.next"`. The
-worked examples are [`sighurt-config-example`](extensions/sighurt-config-example/) and
-[`sighurt-chrome-line`](extensions/sighurt-chrome-line/); `crates/sighurt-api/tests/keymap.rs` and
-`ui/sighurt-ui/tests/extension.rs` implement both traits from outside their crates.
+Then `[ui] chrome = "one"`. The worked examples are
+[`sighurt-config-example`](extensions/sighurt-config-example/) (the experience) and
+[`sighurt-chrome-line`](extensions/sighurt-chrome-line/) (a chrome); `crates/sighurt-api/tests/keymap.rs`
+and `ui/sighurt-ui/tests/extension.rs` use the key engine's data and the chrome trait from outside their crates.
 
 ## Crates
 
@@ -878,12 +902,13 @@ worked examples are [`sighurt-config-example`](extensions/sighurt-config-example
 | [`sighurt-gui`](frontends/sighurt-gui/) | the Wayland frontend: the event loop, the chrome's surfaces, engines bound to Wayland targets, the clipboard |
 | [`sighurt-tui`](frontends/sighurt-tui/) | the terminal frontend: terminal I/O, the cell grid, the chrome as text, pages as kitty graphics or reflowed text, `sig --dump` |
 | [`sighurt-semantic`](engines/sighurt-semantic/) | the DOM extraction script and bounded parser that give text mode a page's content (used by the Servo and WPE adapters) |
-| [`sighurt-core`](crates/sighurt-core/) | browser state and policy: tabs, commands, the `bindings` keymap, routing, history across engines, permissions, configuration; no I/O |
-| [`sighurt-api`](crates/sighurt-api/) | the contract between them: ids, geometry, input, the engine trait and its events, services, commands, the keymap API |
+| [`sighurt-core`](crates/sighurt-core/) | browser state and policy: tabs, commands, the key engine, routing, history across engines, permissions, configuration; no I/O |
+| [`sighurt-api`](crates/sighurt-api/) | the contract between them: ids, geometry, input, the engine trait and its events, services, commands, the data of the key engine |
 | [`sighurt-wayland`](frontends/sighurt-wayland/) | the Wayland host: window, surfaces, targets, scaling, input, clipboard, shared-memory buffers, frame scheduling |
 | [`sighurt-ui`](ui/sighurt-ui/) | the standard chrome, the chrome API and its helpers |
 | [`sighurt-chrome-line`](extensions/sighurt-chrome-line/) | the line chrome |
-| [`sighurt-config-example`](extensions/sighurt-config-example/) | the example configuration: the default keymap, in Rust |
+| [`sighurt-config`](sdk/sighurt-config/) | the SDK for the experience: `Experience`, `KeysBuilder`, table handles and the default experience (Apache-2.0) |
+| [`sighurt-config-example`](extensions/sighurt-config-example/) | the configuration compiled into `sig`: the default experience, which you edit |
 | [`sighurt-engine-servo`](engines/sighurt-engine-servo/) | the Servo engine |
 | [`sighurt-engine-wpe`](engines/sighurt-engine-wpe/) | the WPE WebKit engine |
 | [`sighurt-engine-wasm`](engines/sighurt-engine-wasm/) | the Wasm engine |

@@ -159,7 +159,7 @@ fn start<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
     );
     b.heading(2, "NORMAL and INSERT");
     b.para(
-        "The default keymap has two modes. In NORMAL mode, which sig starts in, keys are commands \
+        "The default keys have two modes. In NORMAL mode, which sig starts in, keys are commands \
          and none of them reaches the page: j and k scroll, t opens a tab, o opens the address \
          line. Escape switches to INSERT mode, where every key goes to the page, so you can type \
          into a form. Escape in INSERT returns to NORMAL, except on sig://terminal and \
@@ -203,7 +203,7 @@ fn start<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
         },
     ];
     b.table(&cols, &keys);
-    b.para("These are the example keymap's bindings, which are your keys unless you chose another keymap. The Keys section lists every binding of the keymap you are running.");
+    b.para("These are your keys: the default experience with the changes your configuration makes. The Keys section lists every binding in effect.");
     b.link("All keys \u{2192}", "sig://help/keys");
     b.link("All commands \u{2192}", "sig://help/commands");
     b.link("The configuration \u{2192}", "sig://help/config");
@@ -213,8 +213,8 @@ fn keys<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>, d: &Data) {
     let keymap = d.about.value("keymap").unwrap_or("?");
     let frontend = d.about.value("frontend").unwrap_or("?");
     b.para(&format!(
-        "The bindings of the {keymap} keymap in this {frontend} frontend, as the keymap reports \
-         them. A key sequence such as y y is typed one key after the other. Applies says where \
+        "The bindings in effect in this {frontend} frontend (the [input] keymap setting is {keymap}), \
+         as the key engine lists them. A key sequence such as y y is typed one key after the other. Applies says where \
          a binding works (for example only when a page, not a text field, has the keyboard)."
     ));
     let Some(rows) = rows(b, &d.keys, 3) else {
@@ -344,7 +344,7 @@ fn config<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>, d: &Data) {
         "You can also edit the file from here: sig://config runs your editor on it, in a \
          terminal on the page ([pages.config] editor, else $VISUAL, else $EDITOR, else the first \
          of nvim, vim, vi and nano found). Press Enter there to start it; keys reach it in the \
-         keymap's INSERT mode. When the editor ends, sig reads the file again, a file linked \
+         INSERT mode. When the editor ends, sig reads the file again, a file linked \
          from elsewhere included; a mistake keeps the previous configuration, and the page lists \
          the problems. The editor runs with your full rights, as in any terminal.",
     );
@@ -359,8 +359,11 @@ fn config<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>, d: &Data) {
             "[routing.<engine>]",
             "Rules sending addresses to an engine by scheme, extension, origin or host",
         ),
-        ("[input]", "The keymap, and what mouse buttons do"),
-        ("[keys]", "Key bindings, for the bindings keymap"),
+        ("[input]", "Where the keys start, and what mouse buttons do"),
+        (
+            "[keys]",
+            "Bind and unbind keys, over the default experience",
+        ),
         ("[ui]", "The chrome and the renderer"),
         ("[commands]", "Commands of your own"),
         (
@@ -431,7 +434,7 @@ fn pages<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
     b.heading(2, "sig://home");
     b.para(
         "The home page, drawn by the chrome in the window and in the terminal, with no engine: \
-         links to these pages, the keys of your keymap for the common commands, the pages you \
+         links to these pages, the keys you have for the common commands, the pages you \
          visited last and the engines. The home setting chooses what new tabs open.",
     );
     b.link("sig://home", "sig://home");

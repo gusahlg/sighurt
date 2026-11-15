@@ -35,13 +35,16 @@ members = [
     "engines/sighurt-engine-ladybird",
     # Needs the CEF prefix of nix/build-cef.sh to run, not to build (docs/rewrite/CEF.md).
     "engines/sighurt-engine-cef",
-    # Keymaps, compiled into `sig` through sighurt-browser's features.
+    # The configuration compiled into `sig`: the experience, through sighurt-config.
     "extensions/sighurt-config-example",
     # Sighurt's internal pages (sig://help and the rest): Wasm guests built into sig by
     # crates/sighurt-pages, and their shared kit (docs/rewrite/pages-2026-11-05.md).
     "pages/sig-page-kit",
     "pages/sig-page-help",
     "pages/sig-page-terminal",
+    # What a configuration is written against, and the default experience through it
+    # (docs/rewrite/experience-2026-11-15.md, §2).
+    "sdk/sighurt-config",
     # Guest SDK and example guests.
     "sdk/sighurt-sdk",
     "examples/hello-sighurt",
