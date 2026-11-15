@@ -20,9 +20,13 @@
 //! (`U=1`, no cursor movement), each APC wrapped on its own in tmux's DCS
 //! passthrough ([`wrap_tmux`]: `ESC P tmux ;`, every ESC doubled, `ESC \`). The
 //! image is then shown by cells that hold U+10EEEE, a row and a column
-//! diacritic, and the image id as a 256-colour foreground ([`placeholders`]);
-//! tmux redraws those cells like text, so the image follows the pane. Ids are
-//! 1 to 255 in that mode.
+//! diacritic, and the image id's low byte as a 256-colour foreground and its
+//! high byte as a third diacritic ([`placeholders`]); tmux redraws those cells
+//! like text, so the image follows the pane. In that mode an id is what
+//! [`tmux_image_id`] gives: 65 535 of them. Such an image is deleted by its id
+//! alone ([`delete`] in [`wrap_tmux`]): `d=A` never deletes a virtual
+//! placement, and would delete the ordinary placements other programs in the
+//! outer terminal show.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -56,7 +60,8 @@ pub struct CellRect {
 /// Why a frame was not encoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The image id was 0, which kitty treats as "no id", or, for tmux, above 255.
+    /// The image id was 0, which kitty treats as "no id", or, for tmux, not one placeholder
+    /// cells can name ([`tmux_image_id`]).
     ImageId,
     /// The frame or the cell rectangle has a zero side.
     Empty,
@@ -86,7 +91,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ImageId => write!(f, "kitty image id is 0, or above 255 for tmux"),
+            Self::ImageId => write!(f, "kitty image id is 0, or not one tmux's cells can name"),
             Self::Empty => write!(f, "kitty frame or cell rectangle is empty"),
             Self::TooManyPixels { pixels } => {
                 write!(f, "kitty frame has {pixels} pixels, above {MAX_PIXELS}")
@@ -128,8 +133,9 @@ pub fn encode(
 /// APC wrapped in tmux's DCS passthrough. The image is shown by [`placeholders`].
 ///
 /// Same validation, chunking and streaming as [`encode`], through the same thread-local encoder.
-/// `max_bytes` bounds the wrapped output. `image_id` must be 1 to 255, because the placeholder
-/// cells carry it in a 256-colour foreground; anything else is [`Error::ImageId`].
+/// `max_bytes` bounds the wrapped output. `image_id` must be one [`tmux_image_id`] gives,
+/// because the placeholder cells carry it (a 256-colour foreground and a third diacritic);
+/// anything else is [`Error::ImageId`].
 pub fn encode_tmux(
     frame: &Frame<'_>,
     image_id: u32,
@@ -204,7 +210,7 @@ impl Encoder {
         place: CellRect,
         max_bytes: usize,
     ) -> Result<Vec<u8>, Error> {
-        if image_id > MAX_TMUX_IMAGE_ID {
+        if !names_tmux_image(image_id) {
             return Err(Error::ImageId);
         }
         self.run(true, frame, image_id, place, max_bytes)
@@ -672,8 +678,20 @@ const TMUX_OPEN: &[u8] = b"\x1bPtmux;";
 /// What closes it: the string terminator `ESC \`.
 const TMUX_CLOSE: &[u8] = b"\x1b\\";
 
-/// The largest image id [`encode_tmux`] and [`placeholders`] take: the id is a 256-colour foreground.
-const MAX_TMUX_IMAGE_ID: u32 = 255;
+/// The image id placeholder cells name with the number `number` (1 to 65 535): its low byte
+/// is the cells' 256-colour foreground, its high byte their third diacritic, which kitty reads
+/// as the id's most significant byte. Under 256 the id is the number, and the cells carry no
+/// third diacritic. A truecolour foreground would carry 24 bits, but tmux turns it into one of
+/// 256 colours when it does not know the outer terminal has truecolour.
+pub fn tmux_image_id(number: u16) -> Option<u32> {
+    let [high, low] = number.to_be_bytes();
+    (number != 0).then_some(u32::from(low) | u32::from(high) << 24)
+}
+
+/// Whether placeholder cells can name `image_id`: one [`tmux_image_id`] gives.
+fn names_tmux_image(image_id: u32) -> bool {
+    image_id != 0 && image_id & 0x00ff_ff00 == 0
+}
 
 /// Wrap one escape sequence in tmux's DCS passthrough: `ESC P tmux ;`, the sequence with every
 /// ESC doubled, then `ESC \`.
@@ -998,10 +1016,12 @@ const DIACRITICS: [char; 297] = [
 /// The cells that show image `image_id` over `place`, for an image sent by [`encode_tmux`].
 ///
 /// Each row is a cursor move to its first cell and `place.columns` cells of U+10EEEE with a row
-/// and a column diacritic, drawn in the foreground colour `image_id`. Both diacritics are written
-/// on every cell, so a cell tmux redraws alone still names its place. `image_id` must be 1 to 255.
+/// and a column diacritic, drawn in the foreground colour of `image_id`'s low byte, with a third
+/// diacritic for its high byte when that is not 0. Every diacritic is written on every cell, so
+/// a cell tmux redraws alone still names its place and its image. `image_id` is one
+/// [`tmux_image_id`] gives.
 pub fn placeholders(image_id: u32, place: CellRect) -> Result<Vec<u8>, Error> {
-    if image_id == 0 || image_id > MAX_TMUX_IMAGE_ID {
+    if !names_tmux_image(image_id) {
         return Err(Error::ImageId);
     }
     if place.columns == 0 || place.rows == 0 {
@@ -1015,7 +1035,8 @@ pub fn placeholders(image_id: u32, place: CellRect) -> Result<Vec<u8>, Error> {
     }
     let mut text = String::new();
     text.push_str("\x1b[0m");
-    text.push_str(&format!("\x1b[38;5;{image_id}m"));
+    text.push_str(&format!("\x1b[38;5;{}m", image_id & 0xff));
+    let high = (image_id >> 24 != 0).then(|| DIACRITICS[(image_id >> 24) as usize]);
     for row in 0..place.rows {
         let line = u32::from(place.row) + u32::from(row) + 1;
         let column = u32::from(place.column) + 1;
@@ -1024,14 +1045,17 @@ pub fn placeholders(image_id: u32, place: CellRect) -> Result<Vec<u8>, Error> {
             text.push('\u{10EEEE}');
             text.push(DIACRITICS[usize::from(row)]);
             text.push(DIACRITICS[usize::from(cell)]);
+            text.extend(high);
         }
     }
     text.push_str("\x1b[0m");
     Ok(text.into_bytes())
 }
 
-/// Delete every image and placement on the screen (`a=d,d=A`), as a full redraw does before it
-/// sends what is shown again.
+/// Delete every placement visible on the screen and the images only they used (`a=d,d=A`), as
+/// a full redraw does before it sends what is shown again, outside tmux, where the screen is
+/// `sig`'s alone. Never through tmux: it deletes no virtual placement (`U=1`), and deletes
+/// other programs' placements in the outer terminal.
 pub const DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
 
 /// Premultiplied BGRA in `src` becomes straight RGBA in `dst`. Lengths match
@@ -1718,18 +1742,57 @@ mod tests {
     }
 
     #[test]
-    fn tmux_image_ids_are_one_to_255() {
+    fn tmux_image_ids_are_those_cells_can_name() {
+        assert_eq!(tmux_image_id(0), None);
+        assert_eq!(tmux_image_id(7), Some(7));
+        assert_eq!(tmux_image_id(255), Some(255));
+        assert_eq!(tmux_image_id(256), Some(1 << 24));
+        assert_eq!(tmux_image_id(0x0207), Some(2 << 24 | 7));
+        assert_eq!(tmux_image_id(u16::MAX), Some(0xff00_00ff));
         let mut pixels = vec![0, 0, 255, 255];
         let frame = frame_of(&mut pixels, 1, 1);
-        for id in [0, 256] {
+        for id in [0, 256, 1 << 8 | 1, 1 << 16] {
             assert_eq!(
                 encode_tmux(&frame, id, tmux_place(), 1 << 20),
                 Err(Error::ImageId)
             );
             assert_eq!(placeholders(id, tmux_place()), Err(Error::ImageId));
         }
-        assert!(encode_tmux(&frame, 255, tmux_place(), 1 << 20).is_ok());
-        assert!(placeholders(255, tmux_place()).is_ok());
+        for number in [1, 255, 256, u16::MAX] {
+            let id = tmux_image_id(number).unwrap();
+            assert!(encode_tmux(&frame, id, tmux_place(), 1 << 20).is_ok());
+            assert!(placeholders(id, tmux_place()).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_high_image_id_is_a_third_diacritic_on_every_cell() {
+        let place = CellRect {
+            column: 0,
+            row: 0,
+            columns: 2,
+            rows: 1,
+        };
+        let cell = |c: usize| {
+            format!(
+                "\u{10EEEE}{}{}{}",
+                DIACRITICS[0], DIACRITICS[c], DIACRITICS[2]
+            )
+        };
+        let expected = format!("\x1b[0m\x1b[38;5;7m\x1b[1;1H{}{}\x1b[0m", cell(0), cell(1));
+        assert_eq!(
+            placeholders(2 << 24 | 7, place).unwrap(),
+            expected.into_bytes()
+        );
+    }
+
+    #[test]
+    fn the_image_through_tmux_is_deleted_by_its_id_alone() {
+        let id = tmux_image_id(0x0207).unwrap();
+        assert_eq!(
+            wrap_tmux(&delete(id)),
+            b"\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=33554439,q=2\x1b\x1b\\\x1b\\"
+        );
     }
 
     #[test]
