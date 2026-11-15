@@ -1,6 +1,6 @@
 # Sighurt — CLAUDE.md
 
-Sighurt (binary `sig`) is a small, configurable browser with two frontends in one binary: a Wayland GUI (a host with interchangeable content engines compiled in, and browser chrome drawn independently of them) and a terminal frontend (`sighurt-tui`; `docs/rewrite/TUI.md`, decisions 89–98) that shows the same engines' pages as kitty or sixel graphics or as reflowed text from a semantic snapshot of the page (text mode needs an engine with the `semantics` capability: Servo, WPE WebKit and the demo engine; CEF, Ladybird and NetSurf are opt-in and have none), and `sig --dump URL`, which prints a page as text with no terminal or window. `main` picks the frontend: `--gui`/`--tui`, else the terminal when stdout is one and `TERM` isn't `dumb`, else the window. It is being rewritten on the `rewrite` branch.
+Sighurt (binary `sig`) is a small, configurable browser with two frontends in one binary: a Wayland GUI (a host with interchangeable content engines compiled in, and browser chrome drawn independently of them) and a terminal frontend (`sighurt-tui`; `docs/rewrite/TUI.md`, decisions 89–98) that shows the same engines' pages as kitty or sixel graphics or as reflowed text from a semantic snapshot of the page (text mode needs an engine with the `semantics` capability: Servo, WPE WebKit and the demo engine; CEF, Ladybird and NetSurf are opt-in and have none), and `sig --dump URL`, which prints a page as text with no terminal or window. `main` picks the frontend: `--gui`/`--tui`, else the terminal when stdout is one and `TERM` isn't `dumb`, else the window. Each frontend is a feature of `sig` (`frontend-gui`, `frontend-tui`, both default); a terminal-only `sig` links no Wayland crate. Linux is the platform; for macOS and Windows only the groundwork exists (a terminal-only `sig` with the demo engine passes `cargo check` for both; nothing has run there, and Windows has no terminal backend), and `docs/rewrite/PORTING.md` says what is checked and what a port still needs. It is being rewritten on the `rewrite` branch.
 
 - **The specification is `sighurt-rewrite-plan.md`.** Read the sections your task touches before you start. README, DOCS, SECURITY and CONTRIBUTING describe the rewrite as it is; where any document disagrees with the plan, the plan wins, as amended by the decisions in STATUS. `docs/rewrite/extension-api.md` is the design of the configuration and of the keymap and chrome APIs, and `docs/rewrite/WPE.md` of the WPE WebKit engine.
 - **The tracker is `docs/rewrite/STATUS.md`**: milestones M0–M7 with their pass criteria, and the log of decisions already made. Don't reopen a logged decision without new evidence. Record new decisions there, and tick a pass criterion only with evidence (a test, a measurement, a run) that you name.
@@ -42,7 +42,7 @@ The user's machines are shared with another Claude session. Breaking these rules
 - **The chrome draws scenes; a renderer renders them.** A chrome records each surface with sighurt-render's `Pen` (window-logical, no pixels); the backend `[ui] renderer` names (`auto`, `cpu`, `wgpu`, `vulkan`; a default `sig` has `cpu` and `wgpu`, and `auto` picks `cpu` until wgpu is measured at worst equal, RENDER.md §14.5) renders it. The CPU backend draws with tiny-skia and cosmic-text into shared-memory buffers, and commits nothing when a surface's scene and metrics are those of its last frame. The wgpu backend (Vulkan only, never wgpu's GL backend, which would share Servo's EGL display) binds each chrome target's native surface when the target is made, keeps it across hides, and renders and presents once per frame permit through a MAILBOX swapchain; a lost surface is bound again once, then (and on a device failure) the CPU backend replaces it for the whole window, every chrome target made again in shared memory (RENDER.md §14.4, §15). The Vulkan backend (`vulkan`, ash 0.38, opt-in, never `auto`'s) does the same with its own swapchains, the shared WGSL compiled to SPIR-V by naga in `build.rs`, and one frame in flight per backend. One font system, loaded once, is shared by the chrome and the backend. GPUI is gone.
 - **Servo presents GL straight into its subsurface** (`WindowRenderingContext` on surfman). The normal display path never reads page pixels back to the CPU.
 - **WPE WebKit attaches its DMA-BUFs to its subsurface** (the WPE Platform API; WebKit's UI-process half runs on the owner thread, its pages in WebKit's own web processes). Where the compositor has no DMA-BUF, it falls back to shared memory with one copy per frame, counted and reported as the fallback.
-- **CEF presents CPU frames from Chromium's `OnPaint`** (dirty rectangles into a staging buffer, then the whole frame into the host's lease). `libcef.so` is `dlopen`ed when the runtime first starts, from the prefix `nix/build-cef.sh` installs (`SIGHURT_CEF_PREFIX`, `nix/cef.nix`, `/data/sig-builds/deps/cef-150.0.22`). Chromium's renderer, GPU and network processes are `sig-cef-helper`. CEF's UI thread runs its multi-threaded message loop; callbacks only queue events and wake the owner. Chromium needs a Wayland or X11 display even windowless, so the runtime refuses to start when the session has neither `WAYLAND_DISPLAY` nor `DISPLAY` (in the terminal, only with a display). No `semantics`, so no text mode and no `--dump`.
+- **CEF presents CPU frames from Chromium's `OnPaint`** (dirty rectangles into a staging buffer, then the whole frame into the host's lease). `libcef.so` is `dlopen`ed when the runtime first starts, from the prefix `nix/build-cef.sh` installs (`SIGHURT_CEF_PREFIX`, `nix/cef.nix`, `/data/sig-builds/deps/cef-150.0.22`). Chromium's renderer, GPU and network processes are `sig-cef-helper`. CEF's UI thread runs its multi-threaded message loop; callbacks only queue events and wake the owner. Chromium runs with headless ozone and SwiftShader, so it opens no display connection, in the window or the terminal, and renders nothing on the GPU. No `semantics`, so no text mode and no `--dump`.
 - **Ladybird presents by copying one frame** from its backing store into the host's CPU target. A C++ shim (`nix/build-ladybird-shim.sh`, against the patched Ladybird of `nix/ladybird.nix` and `nix/ladybird/*.patch`) is `dlopen`ed when the first page opens. The patched package is built on louise-pc and brought here by `nix/pull-ladybird-patched.sh`. Ladybird's pages run in its own helper processes. No `semantics`.
 - **NetSurf 3.11 paints on the CPU** into the host's shared-memory target. `build.rs` compiles the NetSurf core and this crate's C frontend and links them statically. The crate is `GPL-2.0-only` (decision 119): never a default feature, and a `sig` built with it must not be distributed. No `semantics`.
 - **The core is ordinary Rust**: roughly `update(state, event) -> Vec<Effect>`, with no I/O. Engines report facts as events and never change browser state; the executable carries out the effects.
@@ -72,7 +72,7 @@ sighurt/
 
 | Crate | Modules | Project dependencies |
 |---|---|---|
-| `sighurt-api` | `ids`, `geometry`, `input`, `engine`, `events`, `services`, `commands`, `settings`, `keymap` | None, and no third-party crates |
+| `sighurt-api` | `ids`, `geometry`, `input`, `engine`, `events`, `present` (the CPU frame, and `damage`: the pixels a painter reports it changed), `semantic`, `services`, `commands`, `settings`, `keymap` | None, and no third-party crates |
 | `sighurt-core` | `state`, `tabs`, `navigation`, `router`, `commands`, `keys`, `permissions`, `fullscreen` (the window's and a page's fullscreen: policy only), `config`, `session` | api |
 | `sighurt-wayland` | `connection`, `window`, `targets`, `placement`, `scale`, `input`, `text_input`, `clipboard`, `scheduler`, `shm` | api |
 | `sighurt-ui` | `state`, `layout`, `hit_test`, `text_edit`, `text` (sighurt-render's, re-exported), `chrome`, `paint` (the standard chrome's scenes), `accessibility`, `extension` (the chrome API), `standard` (the standard chrome through it) | api, render (it draws scenes, never pixels) |
@@ -83,18 +83,18 @@ sighurt/
 | `sighurt-config-example` | `lib` (the example configuration, the default keymap `example`: modes and key sequences), `table` (its bindings, in Rust), `actions` (what it computes from the browser view) | api |
 | `sighurt-engine-servo` | `runtime`, `view`, `delegate`, `presentation`, `offscreen` (the terminal's GL context), `input`, `navigation`, `semantic` (page text) | api, wayland, semantic; Servo 0.7 |
 | `sighurt-engine-wpe` | `runtime`, `view`, `navigation`, `platform` (its `WPEDisplay` and `WPEView`), `present`, `input`, `ime`, `clipboard`, `glib_loop` (WebKit's GLib context in the owner loop), `ffi` | api, wayland; WPE WebKit 2.52 |
-| `sighurt-engine-wasm` | `adapter` (`WasmRuntime`), `view`, `navigation`, `engine` (Wasmtime, limits), `live` and `pool` (guest threads), `capabilities` (host functions), `draw` and `raster` (CPU drawing), `wayland` (its `CpuTarget` for the host's SHM lease), `pages` (internal pages and the privileged `sig` import module only they get), `pty` (a terminal's master, handed over once by session id), and a module per guest subsystem | api, wayland |
-| `sighurt-engine-demo` | `lib` (the runtime and its pages: static pattern, animation, slow frame, resize, failed navigation, crash, find in page, element fullscreen asked and unasked), `paint` | api, wayland |
+| `sighurt-engine-wasm` | `adapter` (`WasmRuntime`), `view`, `navigation`, `engine` (Wasmtime, limits), `live` and `pool` (guest threads), `capabilities` (host functions), `draw` and `raster` (CPU drawing), `wayland` (its `CpuTarget` for the host's SHM lease), `pages` (internal pages and the privileged `sig` import module only they get), `pty` (a terminal's master, handed over once by session id; Linux only, `pty_unsupported.rs` elsewhere), and a module per guest subsystem | api |
+| `sighurt-engine-demo` | `lib` (the runtime and its pages: static pattern, animation, slow frame, resize, failed navigation, crash, find in page, element fullscreen asked and unasked), `paint` | api |
 | `sighurt-engine-cef` | `capi` (generated C API layouts), `ffi` (`dlopen` of `libcef.so`), `handlers` (per-view client; callbacks only queue), `shared` (event queue, geometry, staged frame), `nav` (navigation events), `find` (find in page: operations as UI-thread tasks, results stamped with the search they answer), `actions`, `keys`, `edit`, `present`, `runtime` (`CefRuntime<T: CpuTarget>`) | api; CEF 150.0.22, `dlopen`, not linked |
 | `sighurt-engine-ladybird` | `ffi` (`dlopen` of the shim), `runtime` (`LadybirdRuntime<T: CpuTarget>`), `waiter` (polls the shim's loop fd and wakes the owner) | api; Ladybird through the shim, `dlopen`, not linked |
-| `sighurt-engine-netsurf` | `ffi` (the C frontend), `input`, `runtime` (`NetSurfRuntime`), `watcher` (descriptor watcher). The C core and frontend are `csrc/`, built by `build.rs` | api, wayland; NetSurf 3.11, linked statically. `GPL-2.0-only` |
+| `sighurt-engine-netsurf` | `ffi` (the C frontend), `input`, `runtime` (`NetSurfRuntime`), `watcher` (descriptor watcher). The C core and frontend are `csrc/`, built by `build.rs` | api; NetSurf 3.11, linked statically. `GPL-2.0-only`; Linux only |
 | `sighurt-semantic` | `extract` (the DOM extraction script), `parse` (its bounded JSON parser), `action` (action scripts), `world` | api; shared by the Servo and WPE adapters |
 | `sighurt-tui` | `app` (the owner loop and its `Frontend`), `term` (terminal I/O, parser, capability probe), `grid`, `chrome` (the terminal chrome), `input`, `kitty` and `sixel` (graphics encoders), `target` (the page's CPU target), `engines` (compiled-in engines bound to it), `text` and `textmode` (reflowing a semantic snapshot, and `textmode::find`, text mode's own search), `sanitize`, `dump` (`sig --dump`); binary `sighurt-tui-worker` | api, core, runtime; engines optional (never wayland or ui) |
-| `sighurt-runtime` | `session` (the core, effects, pumps, presenting, shutdown), `frontend` (the `Frontend` trait, with the find hook and the line and find fields), `registry`, `engines` (descriptors), `view`, `services`, `persistence`, `history` (visited pages, their file, completing from them), `home` (what `sig://home` says, for both frontends: pages, the keymap's keys, recent visits, engines), `page_info` and `pty` (what the internal pages ask for: the browser's facts, and the programs of `sig://terminal` and `sig://config`), `diagnostics` | api, core; engines optional, and `sighurt-pages` with `engine-wasm` (never wayland or ui types in its own code) |
+| `sighurt-runtime` | `session` (the core, effects, pumps, presenting, shutdown), `frontend` (the `Frontend` trait, with the find hook and the line and find fields), `registry`, `engines` (descriptors), `view`, `services`, `persistence`, `history` (visited pages, their file, completing from them), `home` (what `sig://home` says, for both frontends: pages, the keymap's keys, recent visits, engines), `page_info` and `pty` (what the internal pages ask for: the browser's facts, and the programs of `sig://terminal` and `sig://config`; Linux only, `pty_unsupported.rs` elsewhere), `signals` (quit and report requests: Unix's signal pipe, none elsewhere), `diagnostics` | api, core; engines optional, and `sighurt-pages` with `engine-wasm` (never wayland or ui types in its own code) |
 | `sighurt-pages` | `lib` (`PAGES`: each internal page's name, title, grants and embedded module); `build.rs` builds every `pages/sig-page-*` guest but the kit for wasm32 with a nested cargo (`--release --locked --offline` into `$OUT_DIR`), or takes them from `SIGHURT_PAGES_PREBUILT=<dir>` | api |
 | `sig-page-kit`, `sig-page-help`, `sig-page-terminal` (`pages/`) | The guests of `sig://help` and of `sig://terminal` and `sig://config` (one module, two pages: the shell, and the user's editor on the configuration file), and their shared kit (the `sig` imports, requests, ordered input, UI pieces). `cdylib`s for wasm32; their logic also builds and tests on the host | sdk (and the kit); nothing native |
 | `sighurt-gui` | `app` (the owner loop), `chrome`, `render` (the renderers, `RENDERERS`, and `[ui] renderer`), `engines` (engines bound to Wayland targets) | api, core, runtime, wayland, ui, render; engines and renderers optional |
-| `sighurt-browser` | `main` | runtime, gui; engines optional |
+| `sighurt-browser` | `main` | runtime; gui (`frontend-gui`), tui (`frontend-tui`) and engines optional |
 | `sighurt-sdk` | The guest-side Wasm API | None: independent of every native crate |
 
 - `sighurt-core` compiles and tests without GPUI, Wayland, Servo, Wasmtime or a graphics driver.
@@ -115,20 +115,21 @@ sighurt/
 # needs the nix-shell's SIGHURT_NETSURF_* variables, so it is not in this list.
 tools/cargo check -p sighurt-api -p sighurt-core -p sighurt-wayland -p sighurt-ui -p sighurt-render -p sighurt-render-wgpu -p sighurt-render-vulkan -p sighurt-engine-demo -p sighurt-chrome-line -p sighurt-config-example -p sighurt-engine-cef -p sighurt-engine-ladybird
 tools/cargo check -p sighurt-browser --no-default-features
+tools/cargo check -p sighurt-browser --no-default-features --features frontend-tui,engine-demo,engine-wasm   # the terminal only: no Wayland crate
 tools/cargo test -p sighurt-api -p sighurt-core
 tools/cargo clippy -p <crate> --all-targets -- -D warnings
 tools/cargo fmt -p <crate>
 
 # sig with only the demo engine, for host and chrome work; run it in a private compositor
 # (tools/heavy outside: headless-sway replaces XDG_RUNTIME_DIR, which tools/heavy needs)
-tools/cargo build -p sighurt-browser --no-default-features --features engine-demo
+tools/cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-demo
 tools/heavy tools/headless-sway -- target/debug/sig
 # sig's unit tests, and its end-to-end tests in a private headless sway (builds sig with the
 # demo and Wasm engines, render-wgpu and render-vulkan; prints PASS or FAIL per check, screenshots and
 # logs in OUT; its `renderers` scenario runs cpu, wgpu, vulkan and their fallbacks in a gles2
 # sway);
 # the chromes' end-to-end tests (the line chrome, the standard chrome's options)
-tools/cargo test -p sighurt-browser -p sighurt-engine-demo --no-default-features --features engine-demo
+tools/cargo test -p sighurt-browser -p sighurt-engine-demo --no-default-features --features frontend-gui,engine-demo
 apps/sighurt-browser/tests/headless.sh OUT
 ui/sighurt-ui/tests/headless.sh OUT
 # Reliability: a soak of the demo and Wasm engines (default 10 minutes; RSS, fds, threads and
@@ -159,7 +160,7 @@ frontends/sighurt-tui/tests/real-terminals.sh [--no-build] OUT [rio|kitty]
 # Anything that builds Servo or WPE WebKit (sig's default features, sighurt-engine-servo,
 # sighurt-engine-wpe, the experiments). WPE WebKit needs its prefix (nix/build-wpewebkit.sh,
 # docs/rewrite/WPE.md); without it, build sig with --no-default-features --features
-# engine-servo,engine-wasm
+# frontend-gui,frontend-tui,engine-servo,engine-wasm
 SIG_WHAT="servo build" tools/cargo build -p sighurt-browser
 SIG_WHAT="servo build" tools/cargo clippy -p sighurt-engine-servo -p sighurt-engine-wpe -p sighurt-browser --all-targets -- -D warnings
 # The same on louise-pc
@@ -197,10 +198,10 @@ engines/sighurt-engine-wpe/tests/headless.sh
 
 # CEF (Chromium through CEF 150.0.22). The crate compiles without the prefix. Running it needs
 # nix/build-cef.sh (prefix /data/sig-builds/deps/cef-150.0.22, SIGHURT_CEF_PREFIX, nix/cef.nix),
-# the helper sig-cef-helper, and a display (Wayland or X11), including in the terminal.
+# the helper sig-cef-helper; Chromium runs with headless ozone and opens no display.
 # offscreen.sh starts Chromium in a private sway; cef.sh is sig with the cef and demo engines.
 nix/build-cef.sh
-tools/cargo build -p sighurt-browser --no-default-features --features engine-cef,engine-demo
+tools/cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-cef,engine-demo
 tools/cargo test -p sighurt-engine-cef --lib
 engines/sighurt-engine-cef/tests/offscreen.sh
 apps/sighurt-browser/tests/cef.sh [OUT]
@@ -212,7 +213,7 @@ apps/sighurt-browser/tests/cef.sh [OUT]
 tools/remote tools/heavy nix/build-ladybird-patched.sh
 nix/pull-ladybird-patched.sh
 tools/heavy nix/build-ladybird-shim.sh
-tools/cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
+tools/cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-ladybird,engine-demo
 tools/heavy tools/headless-sway -- engines/sighurt-engine-ladybird/tests/sig-shot.sh OUT [URL]
 
 # NetSurf 3.11. GPL-2.0-only: engine-netsurf is never a default feature, and a sig built with
@@ -220,13 +221,21 @@ tools/heavy tools/headless-sway -- engines/sighurt-engine-ladybird/tests/sig-sho
 # SIGHURT_NETSURF_* variables (tools/cargo enters that shell) and compiles the C core. CI
 # excludes the crate. headless.sh builds sig with the netsurf and demo engines and runs in a
 # private sway (its build line still names keymap-modal; that feature is gone, decision 116).
-tools/cargo build -p sighurt-browser --no-default-features --features engine-netsurf,engine-demo,frontend-tui
+tools/cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-netsurf,engine-demo,frontend-tui
 engines/sighurt-engine-netsurf/tests/headless.sh OUT
 
 # Every engine of an --all-features sig in one process (Servo, so the heavy lock and a free
 # desktop; the WPE, CEF and Ladybird prefixes, and NetSurf's sources). OUT must be under
 # /data/sig-builds/test-out/.
 apps/sighurt-browser/tests/coexist.sh [--build] OUT
+
+# macOS and Windows (docs/rewrite/PORTING.md): `cargo check` for their targets with the pin's
+# rustc, std built from source (-Zbuild-std); nothing linked, no C compiled for the target (a
+# build script that needs the SDK fails). Artifacts in $CARGO_TARGET_DIR/cross. The window,
+# Servo, WPE WebKit, Ladybird and NetSurf are Linux's; the Wasm engine's C dependencies need
+# the SDK. .github/workflows/ports.yml checks and tests the terminal-only sig on real runners.
+tools/cross-check aarch64-apple-darwin -p sighurt-browser --no-default-features --features frontend-tui,engine-demo
+tools/cross-check x86_64-pc-windows-msvc -p sighurt-browser --no-default-features --features frontend-tui,engine-demo
 
 # Before a commit: everything but Servo, WPE WebKit and NetSurf (what CI runs), then the rest.
 # CEF and Ladybird compile without their prefixes and stay in the workspace commands. NetSurf's
@@ -278,7 +287,7 @@ SIG_WHAT="servo build" tools/cargo test -p sighurt-browser -p sighurt-runtime -p
 - Adding an engine: a crate `sighurt-engine-<name>` depending on `sighurt-api`, and on `sighurt-wayland` only when it names the host's target types. CEF and Ladybird present through `CpuTarget` and do not depend on wayland; the frontends bind them to a shared-memory lease or the terminal's CPU target. The crate exports `CAPABILITIES`. A feature `engine-<name>` goes on `sighurt-browser`, `sighurt-runtime`, `sighurt-gui` and `sighurt-tui` (in no default set unless the user has decided otherwise). Its descriptor is in `sighurt-runtime`'s `engines` (name, `web` so `page.switch-engine` cycles it, capabilities, the `[engines.<name>]` settings it honors). Each frontend starts it: `sighurt-gui`'s `engines` (`PresentMode::Shm` for a CPU engine) and `sighurt-tui`'s `engines`. The demo engine is the smallest complete one. An engine whose build needs a prefix CI does not have is excluded from CI's workspace commands: WPE WebKit's build script stops without its prefix, and NetSurf's compiles the C core from the nix-shell's sources. CEF and Ladybird only `dlopen` at run time, so a missing prefix is a warning and the crates stay in those commands.
 - **Servo** is pinned at 0.7 with surfman 0.14 (`webgl` enabled; multiprocess compiled but off). Two of its crates are vendored with small patches in `third_party/` through `[patch.crates-io]`, each with a `SIGHURT-PATCH.md`: surfman (no environment writes, decision 102) and servo-net (the crash-safe, private profile writer, decision 113); changing either rebuilds Servo. Read the 0.7 sources in `~/.cargo/registry/src/`, not a newer upstream. One runtime per process; its API calls and GL presentation stay on the owner thread. The adapter never calls `process::exit` or `_exit` and never installs panic hooks, logging or a TLS provider: the executable owns process-wide setup. The crate is `AGPL-3.0-or-later AND MPL-2.0`; files adapted from Servo keep their MPL notices. What 0.7 changed for the adapter is in `engines/sighurt-engine-servo/SERVO-0.7.md`.
 - **WPE WebKit** is 2.52.6, built from source into a prefix (`nix/build-wpewebkit.sh`; the build script finds it through `SIGHURT_WPE_PKG_CONFIG_PATH`, never `PKG_CONFIG_PATH`, which would rebuild Servo). One runtime per process, on the owner thread; its GLib context runs inside the owner loop. JavaScriptCore stays off signals in `sig`'s process (decision 66), and `sig` sets `JSC_SIGNAL_FOR_GC=12` at the start of `main`, since its default is SIGUSR1, `sig`'s diagnostics signal (decision 78). `sig` is linked with `-Wl,--exclude-libs,ALL` so WebKit can't bind to the C libraries linked into it (decision 65). WebKit's library is not linked: the engine opens it (`ffi::load`) when its runtime first starts, so a session without WPE pages maps none of it (decision 84); call `ffi` only after that.
-- **CEF** is 150.0.22 (`nix/cef.nix`, prefix `/data/sig-builds/deps/cef-150.0.22`). The crate is `AGPL-3.0-or-later`; the CEF and Chromium BSD notices live in `engines/sighurt-engine-cef/README.md`. `libcef.so` is `dlopen`ed, never linked, so the crate compiles with no prefix. The feature `engine-cef` is in no default set. Chromium needs a display. No `semantics`.
+- **CEF** is 150.0.22 (`nix/cef.nix`, prefix `/data/sig-builds/deps/cef-150.0.22`). The crate is `AGPL-3.0-or-later`; the CEF and Chromium BSD notices live in `engines/sighurt-engine-cef/README.md`. `libcef.so` is `dlopen`ed, never linked, so the crate compiles with no prefix (on macOS and Windows too, where `ffi::load` refuses: the bindings are Linux's). The feature `engine-cef` is in no default set. Chromium runs with headless ozone: no display. No `semantics`.
 - **Ladybird** is nixpkgs' package plus `nix/ladybird/0001-navigation-hold-and-download-view.patch` (LibWebView: hold a user-activated navigation, and name the view a download belongs to), approved by the user on 31 October 2026 (decision 118). The shim is `dlopen`ed; the crate compiles without it. `engine-ladybird` is in no default set. Ladybird is BSD-2-Clause; the shim and the crate are AGPL. No `semantics`.
 - **NetSurf** (`sighurt-engine-netsurf`, `docs/rewrite/NETSURF.md`) is NetSurf 3.11's core with a frontend of ours in C, built by `build.rs` from the nixpkgs tarball into `/data/sig-builds/netsurf` (or `$SIGHURT_NETSURF_BUILD`), and linked statically. It is `GPL-2.0-only`, so `engine-netsurf` is in **no** default feature set and a `sig` built with it is for personal use and must not be distributed. One runtime per process, on the owner thread; it never ticks (its deadline and its fetchers' descriptors reach the owner loop through `pump` and a watcher thread). Its patches (no certificate exceptions, no page-planted credentials, failed loads fail, `file:` only from `file:` pages) are in `build.rs` and are security rules: keep them. Process-wide effects that are NetSurf's own and not moved into `main`: `SIGPIPE` ignored (already the case in Rust), `curl_global_init`, and `setlocale` patched out. GPL-2.0-only and AGPL-3.0-or-later cannot both cover one program that is conveyed; personal use of a binary given to no one is the user's decision (119). CI excludes the crate: its build script stops without the nix-shell's `SIGHURT_NETSURF_*` variables. No `semantics`.
 
@@ -430,14 +439,15 @@ The engine has no widget kit: guests draw their own UI with the canvas API and p
 - `sighurt-api`, `-core`, `-wayland`, `-ui`, `-render`, `-engine-demo`: `tools/cargo check`, `test` and `clippy -- -D warnings` on the crate (`sighurt-render` with and without `--features gpu`).
 - `sighurt-render-wgpu`: `tools/cargo clippy -p sighurt-render-wgpu --all-targets -- -D warnings`, `tools/heavy cargo test -p sighurt-render-wgpu` (the comparison with the CPU backend needs a GPU), and `apps/sighurt-browser/tests/headless.sh OUT renderers` (a gles2 sway). wgpu stays Vulkan-only (`default-features = false, features = ["vulkan", "wgsl"]`): never its GL backend in `sig`'s process.
 - `sighurt-render-vulkan`: the same, with `-p sighurt-render-vulkan` (its tests also hold the SPIR-V's vertex inputs against `VERTEX_ATTRIBUTES`); `SIG_VULKAN_VALIDATION=1` turns the Khronos validation layer on (the `renderers` scenario does, and fails on a validation error). A change to the CPU backend or a chrome's drawing must keep the golden images (`ui/sighurt-ui/tests/golden`, `extensions/sighurt-chrome-line/tests/golden`) pixel for pixel, or say why.
-- `sighurt-browser`, `sighurt-runtime`, `sighurt-gui`: `tools/cargo check -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features`, plus `--features engine-demo`, plus the feature sets your change touches (`--all-features` covers them all). `sighurt-runtime`'s own code never names a `sighurt_wayland` or `sighurt_ui` type.
+- `sighurt-browser`, `sighurt-runtime`, `sighurt-gui`: `tools/cargo check -p sighurt-browser -p sighurt-runtime -p sighurt-gui --no-default-features`, plus `--features frontend-gui,engine-demo` and `--features frontend-tui,engine-demo`, plus the feature sets your change touches (`--all-features` covers them all). `sighurt-runtime`'s own code never names a `sighurt_wayland` or `sighurt_ui` type.
 - `sighurt-engine-servo`, `sighurt-engine-wpe`, or anything built with them: `SIG_WHAT="servo build" tools/cargo check -p <crate>` (and `-p sighurt-browser` with its default features), on louise-pc when the desktop is busy.
-- `sighurt-engine-cef`, `sighurt-engine-ladybird`: `tools/cargo check -p <crate>` compiles with no prefix. Running them needs the prefix or the shim, and for CEF a display, under `tools/headless-sway`.
+- `sighurt-engine-cef`, `sighurt-engine-ladybird`: `tools/cargo check -p <crate>` compiles with no prefix. Running them needs the prefix or the shim; the window's tests run under `tools/headless-sway`.
 - `sighurt-engine-netsurf`: `tools/cargo check -p sighurt-engine-netsurf` (the nix-shell provides the sources). The crate is `GPL-2.0-only`; do not distribute a `sig` built with it.
 - Keymap or chrome change: its crate's tests (they use the API from outside), and `apps/sighurt-browser/tests/headless.sh` or `ui/sighurt-ui/tests/headless.sh`.
 - WASM engine change: `tools/cargo build -p sighurt-engine-wasm`.
 - SDK change: `tools/cargo build -p sighurt-sdk --target wasm32-unknown-unknown`.
 - Example change: `tools/cargo build --target wasm32-unknown-unknown --release -p <example>`.
+- Portability: a change to `sighurt-api`, `-core`, `-runtime`, `-tui`, `-ui`, `-render*`, the demo or CEF engine, or `main` keeps the two `tools/cross-check` lines above clean. Unix-only code goes behind `cfg` with an honest refusal elsewhere (as `pty_unsupported.rs`, `ConfigWatch::new`, `sighurt_tui::run`), never a stub that pretends to work.
 - Wayland behavior: run it under `tools/headless-sway`, never on the user's desktop.
 - Host functions: confirm registration in `register_host_functions` (or a `register_*_functions` it calls) and an SDK wrapper with a doc comment.
 - Commands: confirm there is no hardcoded key handler.
