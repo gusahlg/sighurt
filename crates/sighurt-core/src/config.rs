@@ -1211,14 +1211,14 @@ fn validate(
         (PointerButton::Back, "back", raw.input.buttons.back),
         (PointerButton::Forward, "forward", raw.input.buttons.forward),
     ];
-    let buttons = buttons
+    let buttons: Vec<(PointerButton, &str, Command)> = buttons
         .into_iter()
         .filter_map(|(button, name, text)| {
             let text = text.filter(|text| !text.trim().is_empty())?;
             let command = commands.parse(&text).map_err(|e| {
                 problems.push(format!("[input.buttons] {name} = {text:?}: {e}"));
             });
-            Some((button, command.ok()?))
+            Some((button, name, command.ok()?))
         })
         .collect();
     let key_tables = KeyTables {
@@ -1228,6 +1228,33 @@ fn validate(
     };
     let (keymap, keys) =
         key_tables.check(env, &commands, user_tui_keys, &mut problems, &mut notices);
+    // Every `input.mode` written in the configuration names a mode of the keys it ends with: the
+    // key tables' were checked with them (`Keys::check`), and so are the commands of
+    // `[commands]`, used or not, and the buttons'.
+    let missing_mode = |command: &Command| match command {
+        Command::InputMode(name) if keys.mode(name).is_none() => Some(name.clone()),
+        _ => None,
+    };
+    for (alias, run) in &custom {
+        for command in run {
+            if let Some(mode) = missing_mode(command) {
+                problems.push(format!(
+                    "[commands] {alias} runs {command}, but there is no mode {mode:?}"
+                ));
+            }
+        }
+    }
+    for (_, name, command) in &buttons {
+        if let Some(mode) = missing_mode(command) {
+            problems.push(format!(
+                "[input.buttons] {name} = \"{command}\": there is no mode {mode:?}"
+            ));
+        }
+    }
+    let buttons = buttons
+        .into_iter()
+        .map(|(button, _, command)| (button, command))
+        .collect();
     notices.extend(env.notices.iter().cloned());
     let pages = PagesConfig {
         terminal: raw.pages.terminal.enabled.unwrap_or(false),
@@ -2576,6 +2603,17 @@ mod tests {
         assert_eq!(
             key_problems("[keys.mode.normal]\n\"i\" = \"input.mode visual\""),
             ["keys: mode normal: \"i\" runs input.mode visual, but there is no mode \"visual\""]
+        );
+        // And wherever else a command is written: an alias, used or not, and a button.
+        assert_eq!(
+            key_problems(
+                "[commands]\nleave = [\"page.reload\", \"input.mode visual\"]\n\
+                 [input.buttons]\nback = \"input.mode visual\"\nforward = \"input.mode insert\""
+            ),
+            [
+                "[commands] leave runs input.mode visual, but there is no mode \"visual\"",
+                "[input.buttons] back = \"input.mode visual\": there is no mode \"visual\""
+            ]
         );
     }
 
