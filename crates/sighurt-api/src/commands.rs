@@ -90,6 +90,12 @@ pub enum Command {
     /// `text`, the line holds `text` instead, the caret at its end (`location.focus :` opens
     /// the command line). The text is kept as given (trimmed, never empty).
     LocationFocus(Option<String>),
+    /// `input.mode <name>`: switch the key engine to the mode named, at once, in its place
+    /// among the commands it runs with. The name is 1 to 32 lower-case letters, digits and
+    /// dashes; whether a mode has it is checked when the configuration loads, and a name no
+    /// mode has is a notice when the command runs. It moves no focus, and alone it never gives
+    /// a page that came to the front by itself its typing back.
+    InputMode(String),
     /// `page.find [text]`: find `text` in the page shown, from where it is, wrapping around;
     /// without text, open the chrome's find field. The text is kept as given (trimmed, never
     /// empty), at most [`MAX_FIND`] bytes. Upper case in it makes the search case-sensitive.
@@ -130,7 +136,7 @@ pub enum Command {
 
 impl Command {
     /// Every command name. The chrome's commands, `chrome.<action>`, depend on the chrome.
-    pub const NAMES: [&'static str; 32] = [
+    pub const NAMES: [&'static str; 33] = [
         "tab.new",
         "tab.duplicate",
         "tab.move",
@@ -157,6 +163,7 @@ impl Command {
         "page.find-stop",
         "page.exit-fullscreen",
         "location.focus",
+        "input.mode",
         "history.clear",
         "browser.home",
         "browser.fullscreen",
@@ -195,6 +202,7 @@ impl Command {
             Self::PageFindStop => "page.find-stop",
             Self::PageExitFullscreen => "page.exit-fullscreen",
             Self::LocationFocus(_) => "location.focus",
+            Self::InputMode(_) => "input.mode",
             Self::HistoryClear => "history.clear",
             Self::BrowserHome => "browser.home",
             Self::BrowserFullscreen => "browser.fullscreen",
@@ -209,10 +217,11 @@ impl Command {
 
 /// The areas of the built-in commands (`tab.new` is in `tab`). None of them is a name of
 /// `[commands]`, so `chrome` alone stays the unknown command it always was.
-pub const AREAS: [&str; 8] = [
+pub const AREAS: [&str; 9] = [
     "tab",
     "page",
     "location",
+    "input",
     "history",
     "browser",
     "site",
@@ -247,7 +256,7 @@ const fn doc(name: &'static str, argument: &'static str, description: &'static s
 }
 
 /// Every built-in command, in [`Command::NAMES`] order, with what it does.
-pub const DOCS: [CommandDoc; 32] = [
+pub const DOCS: [CommandDoc; 33] = [
     doc(
         "tab.new",
         "[address]",
@@ -314,6 +323,11 @@ pub const DOCS: [CommandDoc; 32] = [
         "[text]",
         "Focus the address line, or put the text in it (: opens the command line)",
     ),
+    doc(
+        "input.mode",
+        "<name>",
+        "Switch the keys to the mode named (normal, insert, ...)",
+    ),
     doc("history.clear", "", "Forget every page visited"),
     doc("browser.home", "", "Open the home page in this tab"),
     doc(
@@ -374,6 +388,13 @@ impl FromStr for Command {
                         .parse()
                         .map(|n| Self::TabMove(TabMove::To(n)))
                         .map_err(|_| CommandError::InvalidTabMove(n.to_owned())),
+                };
+            }
+            "input.mode" => {
+                let name = required("input.mode")?;
+                return match is_mode_name(name) {
+                    true => Ok(Self::InputMode(name.to_owned())),
+                    false => Err(CommandError::InvalidMode(name.to_owned())),
                 };
             }
             "page.find" if argument.is_empty() => return Ok(Self::PageFind(None)),
@@ -453,7 +474,8 @@ impl fmt::Display for Command {
             | Self::ClipboardCopy(input)
             | Self::PageFind(Some(input))
             | Self::TabNew(Some(input))
-            | Self::LocationFocus(Some(input)) => write!(f, " {input}"),
+            | Self::LocationFocus(Some(input))
+            | Self::InputMode(input) => write!(f, " {input}"),
             Self::TabMove(to) => write!(f, " {to}"),
             Self::PageOpenIn { engine, address } => match address {
                 Some(address) => write!(f, " {engine} {address}"),
@@ -514,6 +536,8 @@ pub enum CommandError {
     InvalidKey(String),
     /// `page.open-in`'s engine is not an engine's name.
     InvalidEngine(String),
+    /// `input.mode`'s argument is not a mode's name.
+    InvalidMode(String),
     /// A `chrome.<action>` command whose action isn't 1 to 32 lower-case letters, digits and
     /// dashes, or that has an argument: chrome commands take none.
     InvalidChromeAction(String),
@@ -542,6 +566,10 @@ impl fmt::Display for CommandError {
                 "{name:?} is not an engine's name (lower-case letters, digits and dashes, \
                  starting with a letter)"
             ),
+            Self::InvalidMode(name) => write!(
+                f,
+                "{name:?} is not a mode's name (1 to 32 lower-case letters, digits and dashes)"
+            ),
             Self::InvalidChromeAction(text) => write!(
                 f,
                 "{text:?} is not a chrome command (chrome.<action>, in lower-case letters, \
@@ -562,6 +590,14 @@ fn is_action(action: &str) -> bool {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     };
     action.len() <= 32 && action.split('-').all(words)
+}
+
+/// Whether `name` can name a key mode: 1 to 32 lower-case ASCII letters, digits and dashes.
+pub fn is_mode_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Whether `name` can name an engine: lower-case ASCII letters, digits and dashes, starting
@@ -829,6 +865,8 @@ mod tests {
             "location.focus",
             "location.focus :",
             "location.focus /",
+            "input.mode insert",
+            "input.mode resize-2",
             "tab.new demo://pattern",
             "tab.new rust borrow checker",
             "tab.duplicate",
@@ -913,6 +951,27 @@ mod tests {
             parse("location.focus  :"),
             Ok(Command::LocationFocus(Some(":".into())))
         );
+    }
+
+    #[test]
+    fn input_mode_names_a_mode() {
+        assert_eq!(
+            parse(" input.mode  normal "),
+            Ok(Command::InputMode("normal".into()))
+        );
+        assert_eq!(
+            parse("input.mode"),
+            Err(CommandError::MissingArgument("input.mode"))
+        );
+        for bad in ["Normal", "a b", "x_y", &"m".repeat(33)] {
+            assert_eq!(
+                parse(&format!("input.mode {bad}")),
+                Err(CommandError::InvalidMode(bad.to_owned())),
+                "{bad}"
+            );
+        }
+        // `input` is an area: no command of `[commands]` is called that.
+        assert!(!is_custom_name("input"));
     }
 
     #[test]

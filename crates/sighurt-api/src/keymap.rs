@@ -59,6 +59,14 @@ use crate::ids::TabId;
 use crate::input::{Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
 use crate::settings::Table;
 
+mod keys;
+
+pub use keys::{
+    bind, unbind, Action, Binding, Custom, CustomFn, Fallback, FallbackFn, Found, KeySeq,
+    KeyTable, Keys, Mode, Outcome, Situation, When, LINE, MAX_ACTION_COMMANDS, MAX_BINDINGS,
+    MAX_INDICATOR, MAX_KEYS, MAX_MODES, PLAIN_MODE,
+};
+
 /// What a key press happens in.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -77,7 +85,7 @@ impl KeyContext {
 }
 
 /// Which frontend runs the browser.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Frontend {
     /// The Wayland window. The default, so a caller that doesn't say keeps the window's checks.
     #[default]
@@ -204,8 +212,9 @@ impl KeyBinding {
     }
 }
 
-/// What the browser does with a key press.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What the browser does with a key press. Compared by what it does: `RunAll` of one command
+/// is `Run`, and of none is `Take`.
+#[derive(Clone, Debug)]
 pub enum KeyAction {
     /// Not the browser's: the press, its repeats and its release go to whatever has focus.
     Pass,
@@ -219,6 +228,27 @@ pub enum KeyAction {
     /// Taken, and these commands run in order in this update (guarantee 8). Empty is `Take`.
     RunAll(Vec<Command>),
 }
+
+impl KeyAction {
+    /// The commands it runs, and whether the press then passes.
+    fn effect(&self) -> (&[Command], bool) {
+        match self {
+            Self::Pass => (&[], true),
+            Self::Take => (&[], false),
+            Self::Run(command) => (std::slice::from_ref(command), false),
+            Self::RunThenPass(command) => (std::slice::from_ref(command), true),
+            Self::RunAll(commands) => (commands, false),
+        }
+    }
+}
+
+impl PartialEq for KeyAction {
+    fn eq(&self, other: &Self) -> bool {
+        self.effect() == other.effect()
+    }
+}
+
+impl Eq for KeyAction {}
 
 /// A keymap: turns key presses into [`KeyAction`]s.
 pub trait Keymap {
@@ -286,29 +316,31 @@ impl PartialEq for KeymapKind {
 
 impl Eq for KeymapKind {}
 
+/// The W3C names of the modifiers and locks.
+const MODIFIER_NAMES: [&str; 15] = [
+    "Shift",
+    "Control",
+    "Alt",
+    "AltGraph",
+    "Meta",
+    "Super",
+    "Hyper",
+    "Fn",
+    "FnLock",
+    "CapsLock",
+    "NumLock",
+    "ScrollLock",
+    "Symbol",
+    "SymbolLock",
+    "ModeChange",
+];
+
 /// Whether `key` is a modifier, a lock, or a key that only starts or advances a composition (a
 /// dead key, Compose). Sequences leave these out.
 pub fn is_modifier(key: &KeyEvent) -> bool {
-    const NAMES: [&str; 15] = [
-        "Shift",
-        "Control",
-        "Alt",
-        "AltGraph",
-        "Meta",
-        "Super",
-        "Hyper",
-        "Fn",
-        "FnLock",
-        "CapsLock",
-        "NumLock",
-        "ScrollLock",
-        "Symbol",
-        "SymbolLock",
-        "ModeChange",
-    ];
     match &key.key {
         Key::Dead(_) => true,
-        Key::Named(name) => name == "Compose" || NAMES.contains(&name.as_str()),
+        Key::Named(name) => name == "Compose" || MODIFIER_NAMES.contains(&name.as_str()),
         Key::Character(_) | Key::Unidentified => false,
     }
 }
@@ -597,6 +629,17 @@ impl UrlPattern {
         scheme.eq_ignore_ascii_case(&self.scheme) && host_matches && path_matches
     }
 
+    /// How specific it is, the more specific the greater, by the order the type describes:
+    /// the host (an exact one above every wildcard, a longer wildcard above a shorter), then
+    /// the path's length.
+    pub(crate) fn specificity(&self) -> (usize, usize) {
+        let host = match self.wildcard {
+            true => self.host.len(),
+            false => usize::MAX,
+        };
+        (host, self.path.len())
+    }
+
     /// What goes with the most specific of `patterns` that matches `address`, by the order the
     /// type describes; `None` if none does. Equal patterns are equally specific, and then the
     /// first wins.
@@ -609,11 +652,7 @@ impl UrlPattern {
             if !pattern.matches(address) {
                 continue;
             }
-            let host = match pattern.wildcard {
-                true => pattern.host.len(),
-                false => usize::MAX,
-            };
-            let rank = (host, pattern.path.len());
+            let rank = pattern.specificity();
             if best.as_ref().is_none_or(|(best, _)| rank > *best) {
                 best = Some((rank, item));
             }
