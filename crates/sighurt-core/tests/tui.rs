@@ -359,9 +359,11 @@ fn the_tui_table_parses_and_reports_every_invalid_value() {
         assert_eq!(config.tui().mode, TuiMode::Auto);
         assert_eq!(config.tui().graphics, GraphicsProtocol::Auto);
         assert_eq!(config.tui().fps, 10);
+        assert_eq!(config.tui().input_fps, 30);
         assert!(config.tui().mouse && config.tui().default_keys);
-        let config = parse(frontend, "[tui]\nfps = 30\n").unwrap();
+        let config = parse(frontend, "[tui]\nfps = 30\ninput-fps = 60\n").unwrap();
         assert_eq!(config.tui().fps, 30);
+        assert_eq!(config.tui().input_fps, 60);
         assert_eq!(config.tui().mode, TuiMode::Auto);
         assert!(config.tui().mouse);
         let config = parse(
@@ -376,6 +378,7 @@ fn the_tui_table_parses_and_reports_every_invalid_value() {
                 mode: TuiMode::Text,
                 graphics: GraphicsProtocol::Sixel,
                 fps: 10,
+                input_fps: 30,
                 mouse: false,
                 default_keys: false,
             }
@@ -383,17 +386,18 @@ fn the_tui_table_parses_and_reports_every_invalid_value() {
     }
     let found = problems(
         Frontend::Gui,
-        "[tui]\nmode = \"GUI\"\ngraphics = \"Kitty\"\nfps = 0\nmouse = \"yes\"\n\
+        "[tui]\nmode = \"GUI\"\ngraphics = \"Kitty\"\nfps = 0\ninput-fps = 61\nmouse = \"yes\"\n\
          default-keys = 1\nkeys = \"nope\"\nextra = 1\n",
     );
     let expected = [
         "[tui] mode: expected \"auto\", \"text\" or \"graphics\", not \"GUI\"",
         "[tui] graphics: expected \"auto\", \"kitty\", \"sixel\" or \"none\", not \"Kitty\"",
         "[tui] fps: expected a whole number from 1 to 60, not 0",
+        "[tui] input-fps: expected a whole number from 1 to 60, not 61",
         "[tui] mouse: expected true or false, not \"yes\"",
         "[tui] default-keys: expected true or false, not 1",
         "[tui] keys: expected a [tui.keys] table, not \"nope\"",
-        "[tui] extra: unknown key ([tui] has mode, graphics, fps, mouse, default-keys and [tui.keys])",
+        "[tui] extra: unknown key ([tui] has mode, graphics, fps, input-fps, mouse, default-keys and [tui.keys])",
     ];
     assert_eq!(found.len(), expected.len(), "{found:#?}");
     for part in expected {

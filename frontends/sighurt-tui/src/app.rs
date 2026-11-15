@@ -63,10 +63,12 @@
 //! page rows don't show their pixels, they get no input but releases ([`Tui::page_input`]).
 //!
 //! Page frames (TUI.md §2 and §8.6): a permit only for the shown view, only when its engine has
-//! a new frame, at most `[tui] fps` a second (in text mode at most [`TEXT_FPS`], and only when
+//! a new frame, at most `[tui] fps` a second (sixel at most 5), or `[tui] input-fps` for
+//! [`INPUT_WINDOW`] after the user's last key, mouse event or paste, so the frame that answers
+//! input is not held to the page's own pace (in text mode at most [`TEXT_FPS`], and only when
 //! that engine gives page text), and only once every byte written before has left the output
 //! buffer: nothing is written while any is waiting, so at most one encoded frame is ever
-//! pending and no write is cut short. The engine paints into its view's [`TermTarget`] and the
+//! pending, no write is cut short, and a terminal (or tmux) slower than the pace sets it. The engine paints into its view's [`TermTarget`] and the
 //! frame is encoded as a kitty or sixel image over the page rows. Text mode takes the frame and
 //! does not encode it, so switching back to graphics shows the latest one. A resize is a new
 //! layout epoch: output queued for the old layout is discarded, and a kitty upload the cut
@@ -169,6 +171,10 @@ const TEXT_FPS: u32 = 2;
 /// came a moment after the upload (decision 133); a page's own frames, which replace each
 /// other at `[tui] fps`, did not do that.
 const MIN_IMAGE_LIFE: Duration = Duration::from_millis(250);
+/// How long after the user's last key, mouse event or paste page frames come at `[tui]
+/// input-fps` rather than `[tui] fps`. Long enough for what an input sets off (a smooth
+/// scroll, a menu that opens) to be drawn at that pace too.
+const INPUT_WINDOW: Duration = Duration::from_secs(1);
 /// An empty last chunk. Ends a kitty image upload a resize cut after its `m=1`.
 const KITTY_UPLOAD_END: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
 /// The least time between two pointer motions handed to the core. Terminals report motion
@@ -269,7 +275,7 @@ enum Protocol {
     None,
     /// Kitty graphics protocol.
     Kitty,
-    /// Sixel. Full frame, at most 5 a second.
+    /// Sixel. Full frame, the page's own at most 5 a second.
     Sixel,
 }
 
@@ -330,6 +336,10 @@ struct Pixels {
     ready: bool,
     /// The terminal shows this view's frame for the current layout.
     on_screen: bool,
+    /// The page rows show a picture of this view's, perhaps older than its latest frame
+    /// (`on_screen` goes false when a newer frame is presented, before it is written). Hiding
+    /// the view holds that picture for [`Tui::drop_due`] like any other.
+    on_rows: bool,
     permits: u64,
     presented: u64,
     dropped: u64,
@@ -355,11 +365,12 @@ struct Tui {
     sixel_stale: bool,
     /// Kitty images of views no longer shown, deleted once [`Self::drop_due`] has passed.
     held_deletes: Vec<u32>,
-    /// The end of the last image's frame interval: the next image is not written before it.
-    /// A frame sent again (a tab shown) counts.
-    image_due: Option<Instant>,
-    /// When the last image was written.
+    /// When the last image was written. The next is not written before its frame interval
+    /// has passed ([`Self::image_due`]); a frame sent again (a tab shown) counts.
     image_written: Option<Instant>,
+    /// When the user last pressed a key, used the mouse or pasted: the frame interval is
+    /// `[tui] input-fps`'s for [`INPUT_WINDOW`] after it ([`Self::interval`]).
+    input_at: Option<Instant>,
     /// The page rows.
     page: PageArea,
     /// The page rows show pages as text.
@@ -428,8 +439,9 @@ struct Tui {
     notice_first: Option<Instant>,
     /// The shown page has a text field: a paste goes there.
     page_text: bool,
-    /// The earliest time the next page frame may be presented.
-    next_frame: Option<Instant>,
+    /// When the last page frame was presented. The next is not presented before its frame
+    /// interval has passed ([`Self::next_frame`]).
+    presented_at: Option<Instant>,
     /// The OSC 52 read waiting for the terminal's answer, if there is one.
     outstanding: Option<PendingRead>,
     /// Reads that failed before a query was sent. The next pass answers them.
@@ -681,8 +693,8 @@ impl App {
             sixel_placed: None,
             sixel_stale: false,
             held_deletes: Vec::new(),
-            image_due: None,
             image_written: None,
+            input_at: None,
             text_mode: false,
             typing_told: None,
             mode_override: None,
@@ -715,7 +727,7 @@ impl App {
             notice: None,
             notice_first: None,
             page_text: false,
-            next_frame: None,
+            presented_at: None,
             outstanding: None,
             failed_reads: Vec::new(),
             clipboard_out: None,
@@ -935,13 +947,13 @@ impl App {
         // wakes the loop for.
         let frame = self
             .tui
-            .next_frame
+            .next_frame(now)
             .filter(|_| self.frame_waiting() && self.tui.terminal.pending_len() == 0);
         // A frame the engine already gave, or a hidden view's image, waits for the image
         // interval. Only a time still to come: one that has passed was handled in the pass.
         let image = match self.tui.holding() {
             true => self.tui.drop_due(),
-            false => self.tui.image_due.filter(|_| self.image_waiting()),
+            false => self.tui.image_due(now).filter(|_| self.image_waiting()),
         };
         let image = image.filter(|&at| at > now && self.tui.terminal.pending_len() == 0);
         let escape = self.tui.terminal.poll_timeout().map(|wait| now + wait);
@@ -997,7 +1009,10 @@ impl App {
     /// its time has come, and it is for the place and layout of the sixel on the page rows.
     fn sixel_replaces_now(&self) -> bool {
         self.tui.protocol == Protocol::Sixel
-            && self.tui.image_due.is_none_or(|at| at <= Instant::now())
+            && self
+                .tui
+                .image_due(Instant::now())
+                .is_none_or(|at| at <= Instant::now())
             && self.tui.drop_due().is_none_or(|at| at <= Instant::now())
             && self.tui.sixel_placed.is_some_and(|(at, epoch, _)| {
                 at == page_place(self.tui.page) && epoch == self.tui.metrics.epoch()
@@ -1098,6 +1113,12 @@ impl App {
     /// order is kept (a drag's last motion before its release).
     fn event(&mut self, event: TermEvent) {
         let now = Instant::now();
+        if matches!(
+            event,
+            TermEvent::Key(_) | TermEvent::Mouse(_) | TermEvent::Paste(_)
+        ) {
+            self.tui.input_at = Some(now);
+        }
         if let TermEvent::Mouse(mouse) = &event {
             if mouse.motion && mouse.wheel.is_none() {
                 if self.motion_due.is_some_and(|due| due > now) {
@@ -1514,6 +1535,7 @@ impl App {
             self.tui.chrome_dirty = true;
             for pixels in self.tui.targets.values_mut() {
                 pixels.on_screen = false;
+                pixels.on_rows = false;
             }
             self.tui.forget_sixel();
             self.tui.sixel_stale = false;
@@ -1874,7 +1896,6 @@ impl App {
             return;
         };
         let metrics = self.tui.metrics;
-        let interval = frame_interval(self.tui.settings, self.tui.pace_sixel(), self.tui.text_mode);
         let protocol = self.tui.protocol;
         let (cell_width, cell_height) = {
             let size = self.tui.terminal.size();
@@ -1885,11 +1906,13 @@ impl App {
             self.tui.text_mode,
             self.tui.semantic_on.contains(&view),
         );
+        let now = Instant::now();
+        let frame_due = self.tui.next_frame(now).is_none_or(|at| at <= now);
+        let image_later = self.tui.image_due(now).is_some_and(|at| at > now);
         let Some(pixels) = self.tui.targets.get_mut(&target).filter(|_| takes) else {
             return;
         };
-        let now = Instant::now();
-        if pixels.ready && self.tui.next_frame.is_none_or(|at| at <= now) {
+        if pixels.ready && frame_due {
             pixels.ready = false;
             pixels.permits += 1;
             let permit = TermPermit {
@@ -1904,7 +1927,7 @@ impl App {
                 Some(Ok(PresentOutcome::Submitted)) => {
                     pixels.presented += 1;
                     pixels.on_screen = false;
-                    self.tui.next_frame = Some(now + interval);
+                    self.tui.presented_at = Some(now);
                 }
                 Some(Ok(PresentOutcome::NotReady | PresentOutcome::Unchanged)) => {}
                 // The session counted and logged it.
@@ -1927,7 +1950,7 @@ impl App {
         if pixels.on_screen || !self.tui.graphics {
             return;
         }
-        if held || self.tui.image_due.is_some_and(|at| at > now) {
+        if held || image_later {
             return;
         }
         let page = self.tui.page;
@@ -1987,17 +2010,19 @@ impl App {
                         self.tui.grid.forget_cursor();
                         self.tui.grid.forget_pen();
                         self.tui.sixel_placed = Some((place, metrics.epoch(), print));
-                        self.tui.image_due = Some(now + interval);
                         self.tui.image_written = Some(now);
                     }
                     // A hidden view's sixel is under this one, or was this very picture.
                     self.tui.sixel_stale = false;
                 } else {
                     out.extend(bytes);
-                    self.tui.image_due = Some(now + interval);
                     self.tui.image_written = Some(now);
                 }
                 pixels.on_screen = true;
+                // The page rows show this view's picture now, and no other's.
+                for (&id, pixels) in self.tui.targets.iter_mut() {
+                    pixels.on_rows = id == target;
+                }
             }
             Err(error) => {
                 diag.counters.frames_dropped += 1;
@@ -2086,10 +2111,6 @@ impl Tui {
         }
         self.settings = settings;
         self.relayout();
-        // After relayout, so a switch onto sixel picks up the 5 fps cap, and text mode its own.
-        let interval = frame_interval(self.settings, self.pace_sixel(), self.text_mode);
-        self.next_frame = self.next_frame.map(|at| at.min(Instant::now() + interval));
-        self.image_due = self.image_due.map(|at| at.min(Instant::now() + interval));
     }
 
     /// The page rows hold no sixel: blanked, cleared or drawn as text, so tmux keeps none.
@@ -2105,12 +2126,34 @@ impl Tui {
     /// When a hidden view's image may be deleted or written over: the last image has been on
     /// the screen for its frame interval, and for at least [`MIN_IMAGE_LIFE`].
     fn drop_due(&self) -> Option<Instant> {
-        let interval = frame_interval(self.settings, self.pace_sixel(), self.text_mode);
+        let interval = self.interval(Instant::now());
         self.image_written
             .map(|at| at + interval.max(MIN_IMAGE_LIFE))
     }
 
-    /// Sixel frames are capped at 5 fps. Text mode on a sixel terminal is not.
+    /// The time between two page frames, and between two images, as of `now`: `[tui]
+    /// input-fps`'s while the user gave input in the last [`INPUT_WINDOW`], otherwise `[tui]
+    /// fps`'s (sixel at most 5 a second); text mode at most [`TEXT_FPS`]. Taken anew at each
+    /// decision, so a key pressed while a page animates shortens the wait for the frame that
+    /// answers it, and the settings apply at once.
+    fn interval(&self, now: Instant) -> Duration {
+        let input = self
+            .input_at
+            .is_some_and(|at| now.saturating_duration_since(at) < INPUT_WINDOW);
+        frame_interval(self.settings, self.pace_sixel(), self.text_mode, input)
+    }
+
+    /// The earliest time the next page frame may be presented.
+    fn next_frame(&self, now: Instant) -> Option<Instant> {
+        self.presented_at.map(|at| at + self.interval(now))
+    }
+
+    /// The end of the last image's frame interval: the next image is not written before it.
+    fn image_due(&self, now: Instant) -> Option<Instant> {
+        self.image_written.map(|at| at + self.interval(now))
+    }
+
+    /// The page's own sixel frames are capped at 5 fps. Text mode on a sixel terminal is not.
     fn pace_sixel(&self) -> bool {
         self.graphics && self.protocol == Protocol::Sixel
     }
@@ -2168,6 +2211,9 @@ impl Tui {
     fn blank_placed(&mut self, out: &mut Vec<u8>) {
         blank_page(out, self.page);
         self.forget_sixel();
+        for pixels in self.targets.values_mut() {
+            pixels.on_rows = false;
+        }
         self.grid.forget_cursor();
         self.grid.forget_pen();
         // The rows are blank on the terminal now: what the grid holds there (home's text) is
@@ -2730,6 +2776,7 @@ impl Frontend for Tui {
                 handle,
                 ready: false,
                 on_screen: false,
+                on_rows: false,
                 permits: 0,
                 presented: 0,
                 dropped: 0,
@@ -2762,7 +2809,7 @@ impl Frontend for Tui {
         }
         self.views.retain(|_, &mut kept| kept != target);
         if let Some(pixels) = self.targets.remove(&target) {
-            if self.protocol == Protocol::Kitty || pixels.on_screen {
+            if self.protocol == Protocol::Kitty || pixels.on_screen || pixels.on_rows {
                 self.drop_placed(pixels.image);
             }
         }
@@ -2941,14 +2988,19 @@ impl Frontend for Tui {
         let placed = self
             .targets
             .get(&target)
-            .map(|pixels| (pixels.image, pixels.on_screen));
-        let Some((image, on_screen)) = placed else {
+            .map(|pixels| (pixels.image, pixels.on_screen || pixels.on_rows));
+        let Some((image, on_rows)) = placed else {
             return;
         };
-        if !visible && on_screen {
+        // Its picture may still be on the rows when a newer frame was presented and not yet
+        // written: held all the same.
+        if !visible && on_rows {
             self.drop_placed(image);
         }
         if let Some(pixels) = self.targets.get_mut(&target) {
+            if !visible {
+                pixels.on_rows = false;
+            }
             pixels.on_screen = false;
             pixels.ready &= visible;
         }
@@ -3126,10 +3178,16 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn frame_interval(settings: TuiConfig, sixel: bool, text: bool) -> Duration {
-    let mut fps = match sixel {
-        true => settings.fps.clamp(1, 5),
-        false => settings.fps.max(1),
+/// The time between two page frames. `input`: the user gave input in the last
+/// [`INPUT_WINDOW`], so frames come at `[tui] input-fps`, whatever the protocol: the frame that
+/// answers a key, a scroll or a drag is not held back by the page's own pace. Otherwise
+/// `[tui] fps`, at most 5 a second for sixel (tmux decodes and encodes each sixel again).
+/// Text mode reads no pixels and takes at most [`TEXT_FPS`] either way.
+fn frame_interval(settings: TuiConfig, sixel: bool, text: bool, input: bool) -> Duration {
+    let mut fps = match (input, sixel) {
+        (true, _) => settings.input_fps.max(1),
+        (false, true) => settings.fps.clamp(1, 5),
+        (false, false) => settings.fps.max(1),
     };
     if text {
         fps = fps.min(TEXT_FPS);
@@ -3439,39 +3497,81 @@ mod tests {
             fps,
             ..TuiConfig::default()
         };
+        let ms = Duration::from_millis;
+        assert_eq!(frame_interval(fps(10), false, false, false), ms(100));
         assert_eq!(
-            frame_interval(fps(10), false, false),
-            Duration::from_millis(100)
+            frame_interval(fps(0), false, false, false),
+            Duration::from_secs(1)
         );
-        assert_eq!(frame_interval(fps(0), false, false), Duration::from_secs(1));
+        // The page's own sixel frames are capped at 5 a second.
+        assert_eq!(frame_interval(fps(10), true, false, false), ms(200));
+        assert_eq!(frame_interval(fps(5), true, false, false), ms(200));
+        assert_eq!(frame_interval(fps(4), true, false, false), ms(250));
         assert_eq!(
-            frame_interval(fps(10), true, false),
-            Duration::from_millis(200)
+            frame_interval(fps(0), true, false, false),
+            Duration::from_secs(1)
         );
-        assert_eq!(
-            frame_interval(fps(5), true, false),
-            Duration::from_millis(200)
-        );
-        assert_eq!(
-            frame_interval(fps(4), true, false),
-            Duration::from_millis(250)
-        );
-        assert_eq!(frame_interval(fps(0), true, false), Duration::from_secs(1));
         // Text mode is at most TEXT_FPS, and still at most the sixel cap.
+        assert_eq!(frame_interval(fps(10), false, true, false), ms(500));
+        assert_eq!(frame_interval(fps(2), false, true, false), ms(500));
         assert_eq!(
-            frame_interval(fps(10), false, true),
-            Duration::from_millis(500)
+            frame_interval(fps(1), false, true, false),
+            Duration::from_secs(1)
         );
         assert_eq!(
-            frame_interval(fps(2), false, true),
-            Duration::from_millis(500)
+            frame_interval(fps(0), false, true, false),
+            Duration::from_secs(1)
         );
-        assert_eq!(frame_interval(fps(1), false, true), Duration::from_secs(1));
-        assert_eq!(frame_interval(fps(0), false, true), Duration::from_secs(1));
+        assert_eq!(frame_interval(fps(10), true, true, false), ms(500));
+    }
+
+    #[test]
+    fn input_paces_frames_by_input_fps_for_kitty_and_sixel() {
+        let config = |fps, input_fps| TuiConfig {
+            fps,
+            input_fps,
+            ..TuiConfig::default()
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(TuiConfig::default().input_fps, 30);
+        // Sixel is not held to 5 a second while the user gives input.
         assert_eq!(
-            frame_interval(fps(10), true, true),
-            Duration::from_millis(500)
+            frame_interval(config(10, 30), true, false, true),
+            Duration::from_secs(1) / 30
         );
+        assert_eq!(frame_interval(config(10, 50), false, false, true), ms(20));
+        // input-fps below fps slows input's frames: it is the rate, not a floor.
+        assert_eq!(frame_interval(config(30, 10), false, false, true), ms(100));
+        assert_eq!(
+            frame_interval(config(10, 0), true, false, true),
+            Duration::from_secs(1)
+        );
+        // Text mode reads no pixels: TEXT_FPS either way.
+        assert_eq!(frame_interval(config(10, 30), true, true, true), ms(500));
+    }
+
+    #[test]
+    fn the_interval_follows_the_last_input_and_a_hidden_image_is_held_as_long() {
+        let (_master, mut tui) = on_pty();
+        tui.graphics = true;
+        tui.protocol = Protocol::Sixel;
+        let now = Instant::now();
+        assert_eq!(tui.interval(now), Duration::from_millis(200));
+        tui.input_at = Some(now);
+        assert_eq!(tui.interval(now), Duration::from_secs(1) / 30);
+        assert_eq!(
+            tui.interval(now + INPUT_WINDOW - Duration::from_millis(1)),
+            Duration::from_secs(1) / 30
+        );
+        assert_eq!(tui.interval(now + INPUT_WINDOW), Duration::from_millis(200));
+        // A frame presented before the key may be followed at input-fps's pace.
+        tui.presented_at = Some(now);
+        tui.image_written = Some(now);
+        assert_eq!(tui.next_frame(now), Some(now + Duration::from_secs(1) / 30));
+        assert_eq!(tui.image_due(now), Some(now + Duration::from_secs(1) / 30));
+        // A hidden tab's image still stays up MIN_IMAGE_LIFE (decision 133).
+        let held = tui.drop_due().unwrap();
+        assert!(held >= now + MIN_IMAGE_LIFE, "{:?}", held - now);
     }
 
     #[test]
@@ -3561,8 +3661,8 @@ mod tests {
             sixel_placed: None,
             sixel_stale: false,
             held_deletes: Vec::new(),
-            image_due: None,
             image_written: None,
+            input_at: None,
             page: page_area(size),
             text_mode: false,
             typing_told: None,
@@ -3595,7 +3695,7 @@ mod tests {
             notice: None,
             notice_first: None,
             page_text: false,
-            next_frame: None,
+            presented_at: None,
             outstanding: None,
             failed_reads: Vec::new(),
             clipboard_out: None,

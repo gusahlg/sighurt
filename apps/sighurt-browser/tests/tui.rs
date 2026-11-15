@@ -1902,6 +1902,64 @@ fn a_tab_switch_writes_over_the_hidden_tabs_sixel_and_a_storm_of_them_is_paced()
     assert!(term.exit().success(), "{}", term.context());
 }
 
+/// A page's own sixel frames come at most 5 a second; while the user types, scrolls or drags,
+/// at `[tui] input-fps` (30 by default): the frame that answers input is not held to the
+/// page's pace. A second after the last input the page's pace is back.
+#[test]
+fn sixel_frames_follow_input_at_input_fps_and_the_page_at_five() {
+    let mut term = Terminal::start_in(
+        "sixel-input",
+        &["demo://animation"],
+        SIXEL_REPLIES,
+        SIXEL_KEYS,
+    );
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        !sixel_spans(got).is_empty()
+    });
+    assert!(shown, "no sixel\n{}", term.context());
+    let count = |term: &mut Terminal, keys: bool| {
+        let from = term.got.len();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            if keys {
+                // Bound to nothing: it goes to the page, and it is the user's input.
+                term.type_bytes(b"x");
+            }
+            term.wait(term.got.len(), Duration::from_millis(30), |_| false);
+        }
+        (sixel_spans(&term.got[from..]).len(), started.elapsed())
+    };
+    let (idle, lasted) = count(&mut term, false);
+    let most = (lasted.as_millis() / 200 + 2) as usize;
+    assert!(
+        idle <= most,
+        "{idle} sixels in {lasted:?} of a page animating on its own, more than {most}\n{}",
+        term.context()
+    );
+    let (typing, lasted) = count(&mut term, true);
+    assert!(
+        typing >= 2 * most,
+        "{typing} sixels in {lasted:?} of typing, not more than twice the page's own {most}\n{}",
+        term.context()
+    );
+    assert!(
+        typing as u128 <= lasted.as_millis() / 33 + 2,
+        "{typing} sixels in {lasted:?} of typing, faster than input-fps\n{}",
+        term.context()
+    );
+    // A second after the last key, the page's own pace again.
+    term.wait(term.got.len(), Duration::from_millis(1200), |_| false);
+    let (after, lasted) = count(&mut term, false);
+    let most = (lasted.as_millis() / 200 + 2) as usize;
+    assert!(
+        after <= most,
+        "{after} sixels in {lasted:?} after the input stopped, more than {most}\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
 /// Inside tmux (TERM) too, a page that keeps changing has its sixels written over each other
 /// with no blank: a blank every few frames would be a blink each time, and spaces over a sixel
 /// Rio shows are what loses Rio its GPU device (decision 133).

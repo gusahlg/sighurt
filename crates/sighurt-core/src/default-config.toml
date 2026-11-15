@@ -380,8 +380,12 @@ enabled = true
 # otherwise; "text" is reflowed text; "graphics" is the page's pixels.
 # graphics: "auto" (the default) picks kitty where the terminal speaks it, otherwise sixel,
 # otherwise text; or "kitty", "sixel", or "none" (text only).
-# fps: how many frames of the page graphics mode shows a second, a whole number from 1 to 60.
-# The default is 10. Sixel is sent at most 5 a second, whatever this says.
+# fps: how many frames of the page graphics mode shows a second when you are not using the
+# page (it animates or loads), a whole number from 1 to 60. The default is 10. Sixel is sent
+# at most 5 a second, whatever this says.
+# input-fps: the same for a second after each key you press, mouse event or paste, so the
+# page answers typing, scrolling and dragging at this pace, sixel too; from 1 to 60, the
+# default 30. A frame still waits until the terminal has taken the one before.
 # mouse: whether the terminal's mouse reports clicks and scrolling to the page. The default
 # is true.
 # default-keys: accepted, and it has no effect since 0.10. The terminal's default keys are
@@ -392,6 +396,7 @@ enabled = true
 #   mode = "text"
 #   graphics = "kitty"
 #   fps = 30
+#   input-fps = 60
 #   mouse = false
 #   default-keys = false
 #
@@ -414,6 +419,7 @@ enabled = true
 mode = "auto"
 graphics = "auto"
 fps = 10
+input-fps = 30
 mouse = true
 default-keys = true
 
