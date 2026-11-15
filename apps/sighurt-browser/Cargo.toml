@@ -1,6 +1,6 @@
 [package]
 name = "sighurt-browser"
-description = "Sighurt, a small Wayland browser with compiled-in content engines: the `sig` executable"
+description = "Sighurt, a small browser for Wayland and the terminal with compiled-in content engines: the `sig` executable"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,59 +12,65 @@ name = "sig"
 path = "src/main.rs"
 
 [features]
-# The engines compiled into `sig`: this line is the list. Edit it to choose the engines of a
-# default build; `--no-default-features --features engine-demo` picks them for one build.
-# Which compiled engines may open pages is runtime configuration. WPE WebKit needs the prefix
-# nix/build-wpewebkit.sh installs (docs/rewrite/WPE.md); without it, build with
-# `--no-default-features --features engine-servo,engine-wasm`.
+# The frontends and engines compiled into `sig`: this line is the list. Edit it to choose those
+# of a default build; `--no-default-features --features frontend-gui,engine-demo` picks them for
+# one build. Which compiled engines may open pages is runtime configuration. WPE WebKit needs
+# the prefix nix/build-wpewebkit.sh installs (docs/rewrite/WPE.md); without it, build with
+# `--no-default-features --features frontend-gui,frontend-tui,engine-servo,engine-wasm`.
+# Off Linux there is no window and no WPE WebKit: `--no-default-features --features
+# frontend-tui,engine-wasm,engine-demo` (docs/rewrite/PORTING.md).
 default = ["frontend-gui", "frontend-tui", "engine-servo", "engine-wasm", "engine-wpe", "render-wgpu"]
-# Empty, and not what enables the GUI. `--no-default-features` is a GUI with no engines, and
-# the headless builds name engine features without this one, so sighurt-gui is an unconditional
-# dependency: an empty feature cannot both enable an optional dependency and stay on when
-# default features are off.
-frontend-gui = []
-# The terminal frontend. Off in the headless GUI builds, which name engine features only.
+# The Wayland window: sighurt-gui, and with it sighurt-wayland, sighurt-ui and the chrome's
+# renderers. Without it, sig is the terminal frontend alone (with `frontend-tui`) and links no
+# Wayland crate. The window's own builds name it with their engines:
+# `--no-default-features --features frontend-gui,engine-demo`. The chrome and renderer features
+# below are the window's and turn it on.
+frontend-gui = ["dep:sighurt-gui"]
+# The terminal frontend, and `--dump`.
 frontend-tui = ["dep:sighurt-tui"]
-engine-servo = ["sighurt-gui/engine-servo", "sighurt-tui?/engine-servo", "dep:sighurt-engine-servo"]
-engine-wasm = ["sighurt-gui/engine-wasm", "sighurt-tui?/engine-wasm"]
-engine-wpe = ["sighurt-gui/engine-wpe", "sighurt-tui?/engine-wpe"]
+engine-servo = ["sighurt-gui?/engine-servo", "sighurt-tui?/engine-servo", "dep:sighurt-engine-servo"]
+engine-wasm = ["sighurt-gui?/engine-wasm", "sighurt-tui?/engine-wasm"]
+# Linux only (its crate refuses to build elsewhere).
+engine-wpe = ["sighurt-gui?/engine-wpe", "sighurt-tui?/engine-wpe"]
 # Ladybird (docs/rewrite/LADYBIRD.md): not in `default`; needs the shim of nix/build-ladybird-shim.sh
-# at run time, and nothing at build time.
-engine-ladybird = ["sighurt-gui/engine-ladybird", "sighurt-tui?/engine-ladybird"]
+# at run time, and nothing at build time. Linux only.
+engine-ladybird = ["sighurt-gui?/engine-ladybird", "sighurt-tui?/engine-ladybird"]
 # Chromium (docs/rewrite/CEF.md): in no default feature set; needs nix/build-cef.sh.
-engine-cef = ["sighurt-gui/engine-cef", "sighurt-tui?/engine-cef"]
-engine-demo = ["sighurt-gui/engine-demo", "sighurt-tui?/engine-demo"]
+engine-cef = ["sighurt-gui?/engine-cef", "sighurt-tui?/engine-cef"]
+engine-demo = ["sighurt-gui?/engine-demo", "sighurt-tui?/engine-demo"]
 # NetSurf (docs/rewrite/NETSURF.md). GPL-2.0-only: never a default feature, and a sig
-# built with it is for personal use and must not be distributed.
-engine-netsurf = ["sighurt-gui/engine-netsurf", "sighurt-tui?/engine-netsurf"]
+# built with it is for personal use and must not be distributed. Linux only.
+engine-netsurf = ["sighurt-gui?/engine-netsurf", "sighurt-tui?/engine-netsurf"]
 # Chromes besides sighurt-ui's `standard`, chosen by `[ui] chrome`.
-chrome-line = ["sighurt-gui/chrome-line"]
+chrome-line = ["frontend-gui", "sighurt-gui/chrome-line"]
 # The chrome's wgpu renderer (Vulkan), chosen by `[ui] renderer = "wgpu"`; `auto` stays on the
 # CPU renderer until measured (docs/rewrite/RENDER.md §14.5).
-render-wgpu = ["sighurt-gui/render-wgpu"]
+render-wgpu = ["frontend-gui", "sighurt-gui/render-wgpu"]
 # The chrome's Vulkan renderer on ash, `[ui] renderer = "vulkan"`: in no default set, never
 # chosen by `auto` (RENDER.md §14.13).
-render-vulkan = ["sighurt-gui/render-vulkan"]
+render-vulkan = ["frontend-gui", "sighurt-gui/render-vulkan"]
 
 [dependencies]
 sighurt-core = { path = "../../crates/sighurt-core" }
 # The frontends share it; main names its startup-configuration error for the exit status.
 sighurt-runtime = { path = "../../crates/sighurt-runtime" }
-# The Wayland frontend. Not optional: see `frontend-gui` above.
-sighurt-gui = { path = "../../frontends/sighurt-gui" }
-# The terminal frontend. Optional: the headless GUI builds leave `frontend-tui` off.
+# The Wayland frontend (`frontend-gui`).
+sighurt-gui = { path = "../../frontends/sighurt-gui", optional = true }
+# The terminal frontend (`frontend-tui`). The headless window builds leave it off.
 sighurt-tui = { path = "../../frontends/sighurt-tui", optional = true, default-features = false }
 # The panic hook asks Servo whether it caught the panic (decision 26). Linking the engine
 # itself is sighurt-gui's.
 sighurt-engine-servo = { path = "../../engines/sighurt-engine-servo", optional = true }
+log = "0.4"
+# `sig` installs the TLS provider before anything builds a TLS configuration (decision 26).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
 # The self-pipe for signals.
+[target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 # SIGUSR1 (diagnostics), SIGTERM and SIGINT (a clean quit), each handled by writing to a pipe.
 signal-hook-registry = "1.4"
 libc = "0.2"
-log = "0.4"
-# `sig` installs the TLS provider before anything builds a TLS configuration (decision 26).
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
 # `sig --tui` in a pty, with a fake terminal on the other side (tests/tui.rs).
 [[test]]
@@ -72,13 +78,16 @@ name = "tui"
 required-features = ["frontend-tui", "engine-demo"]
 
 [dev-dependencies]
-# The Ladybird test of tests/tui.rs asks whether the shim is there.
-sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird" }
 # The argument tests' temporary files.
 tempfile = "3"
 # tests/tui.rs reads the screen sig draws (sig://home's rows), with the terminal emulator the
 # terminal page already uses.
 vt100 = "0.16"
+
+# Linux's: the Ladybird engine builds nowhere else, and the example needs libwayland.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The Ladybird test of tests/tui.rs asks whether the shim is there.
+sighurt-engine-ladybird = { path = "../../engines/sighurt-engine-ladybird" }
 # The `virtual-pointer` example, a test helper that keeps one pointer plugged into a private
 # compositor.
 wayland-client.workspace = true

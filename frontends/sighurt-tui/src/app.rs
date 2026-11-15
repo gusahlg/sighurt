@@ -132,6 +132,7 @@ use sighurt_runtime::history;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
 use sighurt_runtime::services::{Clipboard, Services, MAX_CLIPBOARD};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
+use sighurt_runtime::signals::{Request, Signals};
 use sighurt_runtime::view::ViewEntry;
 
 use crate::chrome::{
@@ -457,7 +458,7 @@ struct App {
     input: VecDeque<TermEvent>,
     readable: bool,
     config_changed: bool,
-    signals: Vec<u8>,
+    signals: Vec<Request>,
     /// The terminal's write source, enabled only while bytes are waiting.
     writable: Option<RegistrationToken>,
     /// The latest pointer motion not yet handled, held until `motion_due`.
@@ -471,7 +472,7 @@ struct App {
 ///
 /// Stdout must be a terminal. Stderr goes to [`log_path`] before anything else happens, and
 /// comes back if this fails, so the caller can say why.
-pub fn run(options: Options, signals: OwnedFd) -> Result<ExitCode, String> {
+pub fn run(options: Options, signals: Signals) -> Result<ExitCode, String> {
     if !std::io::stdout().is_terminal() {
         return Err("the terminal frontend needs a terminal on stdout".into());
     }
@@ -483,7 +484,7 @@ pub fn run(options: Options, signals: OwnedFd) -> Result<ExitCode, String> {
     result
 }
 
-fn run_redirected(options: Options, signals: OwnedFd) -> Result<ExitCode, String> {
+fn run_redirected(options: Options, signals: Signals) -> Result<ExitCode, String> {
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|e| format!("cannot create the event loop: {e}"))?;
     let handle = event_loop.handle();
@@ -546,17 +547,11 @@ pub(crate) fn redirect_stderr(path: &Path) -> Result<OwnedFd, String> {
 
 /// Adds the signal pipe, the terminal, its resize pipe, its write source (disabled) and the
 /// configuration watch to the loop.
-fn watch(handle: &LoopHandle<'static, App>, signals: OwnedFd, app: &mut App) -> Result<(), String> {
+fn watch(handle: &LoopHandle<'static, App>, signals: Signals, app: &mut App) -> Result<(), String> {
     let source = Generic::new(signals, Interest::READ, Mode::Level);
     handle
-        .insert_source(source, |_, fd, app| {
-            let mut bytes = [0u8; 16];
-            while let Ok(n) = rustix::io::read(&*fd, &mut bytes) {
-                if n == 0 {
-                    break;
-                }
-                app.signals.extend_from_slice(&bytes[..n]);
-            }
+        .insert_source(source, |_, signals, app| {
+            app.signals.extend(signals.take());
             Ok(PostAction::Continue)
         })
         .map_err(|e| e.error.to_string())?;
@@ -810,7 +805,7 @@ impl App {
             self.resumed();
         }
         if self.tui.terminal.take_hangup() {
-            self.signals.push(libc::SIGHUP as u8);
+            self.signals.push(Request::Quit);
         }
         self.handle_signals();
         // The watch saw the file change.
@@ -1029,18 +1024,17 @@ impl App {
     }
 
     fn handle_signals(&mut self) {
-        for signal in std::mem::take(&mut self.signals) {
-            match i32::from(signal) {
-                libc::SIGUSR1 => report(&self.tui, &mut self.session, false),
-                // SIGHUP from `sig`'s pipe before the terminal's handler is installed, from
-                // that handler's flag after.
-                libc::SIGTERM | libc::SIGINT | libc::SIGHUP => {
+        for request in std::mem::take(&mut self.signals) {
+            match request {
+                Request::Report => report(&self.tui, &mut self.session, false),
+                // SIGHUP comes as a quit from `sig`'s pipe before the terminal's handler is
+                // installed, and from that handler's flag after.
+                Request::Quit => {
                     self.session
                         .queue_mut()
                         .push_back(BrowserEvent::Command(Command::BrowserQuit));
                     self.run_core();
                 }
-                _ => {}
             }
         }
     }

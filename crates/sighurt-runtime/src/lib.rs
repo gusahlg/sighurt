@@ -21,6 +21,7 @@ pub mod pty;
 pub mod registry;
 pub mod services;
 pub mod session;
+pub mod signals;
 pub mod view;
 
 pub use session::exit_now;

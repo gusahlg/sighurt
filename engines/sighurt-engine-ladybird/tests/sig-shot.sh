@@ -4,7 +4,7 @@
 #
 #   tools/heavy tools/headless-sway -- engines/sighurt-engine-ladybird/tests/sig-shot.sh OUT [URL]
 #
-# Build first: tools/cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
+# Build first: tools/cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-ladybird,engine-demo
 # (CARGO_TARGET_DIR as you built it; SIG_BIN overrides the binary.) OUT gets shot.png and sig.log.
 # MODE=find: find in page through sig (:page.find, next, previous, no match, stop), read from
 # sig's diagnostics (each tab's search: found, current, total, never its text).

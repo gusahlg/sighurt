@@ -571,7 +571,7 @@ architecture; the order is not negotiable (each step rests on the one before). B
    attachment` file and a `.zip` link), `launch_url`, file chooser. Accept: tests with the
    services' fake host (as the Servo and WPE tests do) for each request and its cancellation
    when the view closes; no clipboard content in logs.
-10. **`sig` end to end.** `sig --no-default-features --features engine-netsurf,engine-demo` in a
+10. **`sig` end to end.** `sig --no-default-features --features frontend-gui,engine-netsurf,engine-demo` in a
     private compositor: `apps/sighurt-browser/tests/engines.sh` gains a NetSurf block (page
     renders, link click, typing, resize, scale 2, a second tab). Accept: the script prints PASS
     for each check. Also `sig --dump` and the TUI's text mode are not available (no

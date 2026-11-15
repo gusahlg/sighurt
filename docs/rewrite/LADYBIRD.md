@@ -409,7 +409,7 @@ Built and checked on this desktop (nixpkgs pin `4975466d`, Ladybird rev `b90af89
 | Shim C ABI, custom event loop (M1) | done | `shim/{loop,shim}.cpp`; `tests/loop_probe.c` (no Rust) waits on `lb_loop_fd()` only: title, commit, finish, a frame, the ABI probe, 0 wakeups in 1 s idle; exported symbols are only `lb_*` |
 | Crate `sighurt-engine-ladybird`, `impl EngineRuntime` (M2, M3) | done for the scope below | `tests/headless.rs`: events in order, frames with the page's colour, fragment vs document navigation, history back, a click on a link (hover status, a page-started navigation with its own id), resize, hidden, idle (6 pumps, 2 loop wakes in 6 s), close, shutdown; `clippy -D warnings` clean |
 | ABI-skew guard | done | `ffi::check_abi` and its unit test; the build script's flag check |
-| Wiring: feature `engine-ladybird` on `sighurt-browser`, `-runtime`, `-gui`, `-tui` (not in any default) | done | `tools/cargo check -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo` and with `frontend-tui`; clippy `-D warnings` over browser, runtime, gui, tui with the feature; runtime's descriptor test (24 passed); a build without the feature is unchanged |
+| Wiring: feature `engine-ladybird` on `sighurt-browser`, `-runtime`, `-gui`, `-tui` (not in any default) | done | `tools/cargo check -p sighurt-browser --no-default-features --features frontend-gui,engine-ladybird,engine-demo` and with `frontend-tui`; clippy `-D warnings` over browser, runtime, gui, tui with the feature; runtime's descriptor test (24 passed); a build without the feature is unchanged |
 | Reaping only Ladybird's own helpers | done | `tests/headless.rs`: a non-Ladybird zombie child (`sleep 0.2`) stays waitable after a SIGKILLed WebContent was reaped by Ladybird |
 | Services and text input | done | `tests/services.rs`; `sig-shot.sh MODE=typing` |
 | `sig` shows https://example.com/ in Ladybird | done | `tests/sig-shot.sh` in `tools/headless-sway`: `--engine ladybird`, `[routing.ladybird] hosts`, and `page.open-in ladybird` from a demo page (a bound key); screenshots show the page, tab label `ladybird`, title "Example Domain"; sig's diagnostics: `frame engine=ladybird ... readback_bytes=0`; sig and every Ladybird helper process exit cleanly |
@@ -697,7 +697,7 @@ would be a bad trade.
 SIG_REMOTE_DEST=repos/sighurt-wt-ladybird tools/remote tools/heavy nix/build-ladybird-patched.sh
 nix/pull-ladybird-patched.sh
 tools/heavy nix/build-ladybird-shim.sh
-tools/cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
+tools/cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-ladybird,engine-demo
 tools/heavy tools/headless-sway -- engines/sighurt-engine-ladybird/tests/sig-shot.sh OUT [URL]
 #   MODE=route | open-in | typing | links selects [routing.ladybird] or page.open-in; screenshots in OUT
 tools/heavy cargo test -p sighurt-engine-ladybird --test headless -- --nocapture

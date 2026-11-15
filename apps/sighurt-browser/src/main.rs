@@ -12,10 +12,12 @@
 //! (`keep_webkit_off_sigusr1`). The one forced exit is the runtime's, after an engine that could
 //! not shut down (decision 54), and the frontend is asked to clean up first.
 //!
-//! Two frontends drive one session machinery: the Wayland window ([`sighurt_gui::run`]) and,
-//! with the `frontend-tui` feature, the terminal (`sighurt_tui::run`). `--gui` and `--tui` pick
-//! one; without either, `sig` opens in the terminal when stdout is one and `TERM` isn't `dumb`,
-//! and in a window otherwise (decision 89).
+//! Two frontends drive one session machinery: with the `frontend-gui` feature the Wayland window
+//! (`sighurt_gui::run`) and with `frontend-tui` the terminal (`sighurt_tui::run`). `--gui` and
+//! `--tui` pick one; without either, `sig` opens in the terminal when stdout is one and `TERM`
+//! isn't `dumb`, and in a window otherwise (decision 89). A build with one frontend says so when
+//! asked for the other. The signals are Unix's: elsewhere no handler is installed and the
+//! frontends get `Signals::none` (docs/rewrite/PORTING.md).
 //! `--dump URL` needs neither: it prints the page as text from a session with no terminal
 //! (`sighurt_tui::dump`).
 //!
@@ -24,14 +26,13 @@
 //!
 //! Sighurt is based on Oxide by Nikhil Ranjan (<https://github.com/niklabh/oxide>).
 
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use sighurt_core::config::DEFAULT_CONFIG;
 use sighurt_core::router;
 use sighurt_core::OpenRequest;
+use sighurt_runtime::signals::Signals;
 
 const USAGE: &str = "\
 Usage: sig [OPTIONS] [URL|PATH ...]
@@ -212,22 +213,33 @@ fn open_request(arg: &str) -> OpenRequest {
 
 /// The frontend to run (decision 89): the one asked for, else the terminal when stdout is one
 /// (`terminal`) and `term` (`TERM`) names a terminal that isn't `dumb`, else the window. The
-/// terminal needs the `frontend-tui` feature and a terminal; asking for it without either is an
-/// error saying which.
+/// terminal needs the `frontend-tui` feature and a terminal, the window the `frontend-gui`
+/// feature; asking for one without what it needs is an error saying which.
 fn choose(asked: Option<Choice>, terminal: bool, term: Option<&str>) -> Result<Choice, String> {
-    let built = cfg!(feature = "frontend-tui");
+    let (gui, tui) = (
+        cfg!(feature = "frontend-gui"),
+        cfg!(feature = "frontend-tui"),
+    );
+    let no_gui = "this sig was built without the window (feature frontend-gui)";
     match asked {
-        Some(Choice::Tui) if !built => {
+        Some(Choice::Gui) if !gui => Err(no_gui.into()),
+        Some(Choice::Tui) if !tui => {
             Err("this sig was built without the terminal frontend (feature frontend-tui)".into())
         }
         Some(Choice::Tui) if !terminal => {
             Err("--tui needs a terminal, and stdout isn't one".into())
         }
         Some(choice) => Ok(choice),
-        None if built && terminal && term.is_some_and(|t| !t.is_empty() && t != "dumb") => {
+        None if tui && terminal && term.is_some_and(|t| !t.is_empty() && t != "dumb") => {
             Ok(Choice::Tui)
         }
-        None => Ok(Choice::Gui),
+        None if gui => Ok(Choice::Gui),
+        None if tui => Err(format!(
+            "{no_gui}; run it in a terminal (stdout one, and TERM set and not dumb)"
+        )),
+        None => {
+            Err("this sig was built with no frontend (features frontend-gui, frontend-tui)".into())
+        }
     }
 }
 
@@ -276,11 +288,12 @@ fn webkit_environment() {
 
 /// The signals `sig` handles, and the pipe their handlers write the signal number to. SIGXFSZ
 /// gets a handler that does nothing: the write that went over the limit then fails with EFBIG.
-fn install_signal_handlers() -> std::io::Result<OwnedFd> {
-    use rustix::pipe::{pipe_with, PipeFlags};
+#[cfg(unix)]
+fn install_signal_handlers() -> std::io::Result<Signals> {
+    use std::sync::Arc;
     // SAFETY: the action does nothing.
     unsafe { signal_hook_registry::register(libc::SIGXFSZ, || {})? };
-    let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+    let (read, write) = signal_pipe()?;
     let write = Arc::new(write);
     for signal in [libc::SIGUSR1, libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         let write = Arc::clone(&write);
@@ -293,7 +306,32 @@ fn install_signal_handlers() -> std::io::Result<OwnedFd> {
             })?;
         }
     }
-    Ok(read)
+    Ok(Signals::from_pipe(read))
+}
+
+/// A close-on-exec, non-blocking pipe.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn signal_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use rustix::pipe::{pipe_with, PipeFlags};
+    Ok(pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?)
+}
+
+/// A close-on-exec, non-blocking pipe. macOS has no `pipe2`; nothing can fork between the two
+/// steps, since `main` makes it before any thread starts.
+#[cfg(target_vendor = "apple")]
+fn signal_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    let (read, write) = rustix::pipe::pipe()?;
+    for end in [&read, &write] {
+        rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)?;
+        rustix::io::ioctl_fionbio(end, true)?;
+    }
+    Ok((read, write))
+}
+
+/// No signal reaches the loop here (see the module documentation).
+#[cfg(not(unix))]
+fn install_signal_handlers() -> std::io::Result<Signals> {
+    Ok(Signals::none())
 }
 
 fn main() -> ExitCode {
@@ -308,7 +346,13 @@ fn main() -> ExitCode {
     };
     let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let term = std::env::var("TERM").ok();
-    let frontend = match choose(args.frontend, terminal, term.as_deref()) {
+    // `--dump` runs neither frontend (parse_args refuses it with --gui or --tui), so a build
+    // without the window can dump with stdout redirected.
+    let chosen = match args.dump {
+        Some(_) => Ok(Choice::Tui),
+        None => choose(args.frontend, terminal, term.as_deref()),
+    };
+    let frontend = match chosen {
         Ok(frontend) => frontend,
         Err(error) => {
             eprintln!("sig: {error}");
@@ -336,6 +380,7 @@ fn main() -> ExitCode {
     // set on this thread: that is the thread that reads the configuration.
     sighurt_core::set_starting_engine(args.engine);
     let result = match frontend {
+        #[cfg(feature = "frontend-gui")]
         Choice::Gui => {
             let options = sighurt_gui::Options {
                 open: args.open,
@@ -357,6 +402,8 @@ fn main() -> ExitCode {
             };
             sighurt_tui::run(options, signals)
         }
+        #[cfg(not(feature = "frontend-gui"))]
+        Choice::Gui => unreachable!("`choose` refuses the window without frontend-gui"),
         #[cfg(not(feature = "frontend-tui"))]
         Choice::Tui => unreachable!("`choose` refuses the terminal without frontend-tui"),
     };
@@ -382,7 +429,7 @@ fn failed(error: &str) -> ExitCode {
 /// is `--engine`; without it, the engine the routing names when that one gives page text, else
 /// one that does (WPE WebKit first).
 #[cfg(feature = "frontend-tui")]
-fn run_dump(dump: Dump, engine: Option<String>, signals: OwnedFd) -> ExitCode {
+fn run_dump(dump: Dump, engine: Option<String>, signals: Signals) -> ExitCode {
     let mut open = dump.open;
     open.engine = engine;
     let options = sighurt_tui::DumpOptions {
@@ -397,7 +444,7 @@ fn run_dump(dump: Dump, engine: Option<String>, signals: OwnedFd) -> ExitCode {
 }
 
 #[cfg(not(feature = "frontend-tui"))]
-fn run_dump(_: Dump, _: Option<String>, _: OwnedFd) -> ExitCode {
+fn run_dump(_: Dump, _: Option<String>, _: Signals) -> ExitCode {
     eprintln!("sig: this sig was built without the terminal frontend (feature frontend-tui)");
     ExitCode::from(2)
 }
@@ -488,22 +535,26 @@ mod tests {
 
     #[test]
     fn a_terminal_runs_the_terminal_frontend_unless_dumb() {
-        let tui = if cfg!(feature = "frontend-tui") {
-            Choice::Tui
-        } else {
-            Choice::Gui
-        };
-        assert_eq!(choose(None, true, Some("xterm-kitty")), Ok(tui));
-        assert_eq!(choose(None, true, Some("dumb")), Ok(Choice::Gui));
-        assert_eq!(choose(None, true, None), Ok(Choice::Gui));
-        assert_eq!(choose(None, false, Some("xterm-kitty")), Ok(Choice::Gui));
-        assert_eq!(
-            choose(Some(Choice::Gui), true, Some("xterm")),
-            Ok(Choice::Gui)
+        let (gui, built) = (
+            cfg!(feature = "frontend-gui"),
+            cfg!(feature = "frontend-tui"),
         );
+        // The window where one is built; an error saying it isn't otherwise.
+        let window = |chosen: Result<Choice, String>| match gui {
+            true => assert_eq!(chosen, Ok(Choice::Gui)),
+            false => assert!(chosen.unwrap_err().contains("frontend-gui")),
+        };
+        match built {
+            true => assert_eq!(choose(None, true, Some("xterm-kitty")), Ok(Choice::Tui)),
+            false => window(choose(None, true, Some("xterm-kitty"))),
+        }
+        window(choose(None, true, Some("dumb")));
+        window(choose(None, true, None));
+        window(choose(None, false, Some("xterm-kitty")));
+        window(choose(Some(Choice::Gui), true, Some("xterm")));
         let asked = choose(Some(Choice::Tui), false, Some("xterm"));
         assert!(asked.is_err());
-        if cfg!(feature = "frontend-tui") {
+        if built {
             assert_eq!(
                 choose(Some(Choice::Tui), true, Some("dumb")),
                 Ok(Choice::Tui)

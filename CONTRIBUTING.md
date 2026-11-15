@@ -7,11 +7,11 @@ Sighurt is meant to stay small. Before adding a feature, check whether it belong
 See [Build and run](./README.md#build-and-run) for the prerequisites (`nix-shell` on NixOS, and the WPE WebKit prefix for `sig`'s default features). The opt-in engines are documented there too: CEF needs `nix/build-cef.sh`, Ladybird needs the patched package and `nix/build-ladybird-shim.sh`, and NetSurf builds inside `nix-shell`.
 
 ```bash
-cargo build -p sighurt-browser --no-default-features --features engine-demo   # quick: no Servo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-demo   # quick: no Servo
 cargo build -p sighurt-browser                                                # Servo, WPE WebKit, Wasm
-cargo build -p sighurt-browser --no-default-features --features engine-cef,engine-demo
-cargo build -p sighurt-browser --no-default-features --features engine-ladybird,engine-demo
-cargo build -p sighurt-browser --no-default-features --features engine-netsurf,engine-demo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-cef,engine-demo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-ladybird,engine-demo
+cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-netsurf,engine-demo
 cargo build --target wasm32-unknown-unknown --release -p hello-sighurt
 target/debug/sig target/wasm32-unknown-unknown/release/hello_sighurt.wasm
 ```

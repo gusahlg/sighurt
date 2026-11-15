@@ -78,7 +78,6 @@
 //! to the chrome and the engines.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -105,6 +104,7 @@ use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
 use sighurt_runtime::services::{Clipboard, Services};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
+use sighurt_runtime::signals::{Request, Signals};
 use sighurt_runtime::view::ViewEntry;
 use sighurt_ui::extension::{
     contained, Chrome, ChromeAction, ChromeEvent, Completion, SurfaceName, TextField,
@@ -237,7 +237,7 @@ struct App {
     gui: Gui,
     session: Session<Gui>,
     config_changed: bool,
-    signals: Vec<u8>,
+    signals: Vec<Request>,
     /// Permits for this pass. Reused so a steady frame does not allocate the list.
     permits: Vec<FramePermit>,
     /// Host events for this pass. Reused, like the permits.
@@ -252,7 +252,7 @@ struct App {
 }
 
 /// Runs the Wayland frontend until it quits.
-pub fn run(options: Options, signals: OwnedFd) -> Result<ExitCode, String> {
+pub fn run(options: Options, signals: Signals) -> Result<ExitCode, String> {
     let mut event_loop: EventLoop<'static, App> =
         EventLoop::try_new().map_err(|e| format!("cannot create the event loop: {e}"))?;
     let handle = event_loop.handle();
@@ -289,17 +289,11 @@ pub fn run(options: Options, signals: OwnedFd) -> Result<ExitCode, String> {
 }
 
 /// Adds the signal pipe and the configuration watch to the loop.
-fn watch(handle: &LoopHandle<'static, App>, signals: OwnedFd, paths: &Paths) -> Result<(), String> {
+fn watch(handle: &LoopHandle<'static, App>, signals: Signals, paths: &Paths) -> Result<(), String> {
     let source = Generic::new(signals, Interest::READ, Mode::Level);
     handle
-        .insert_source(source, |_, fd, app| {
-            let mut bytes = [0u8; 16];
-            while let Ok(n) = rustix::io::read(&*fd, &mut bytes) {
-                if n == 0 {
-                    break;
-                }
-                app.signals.extend_from_slice(&bytes[..n]);
-            }
+        .insert_source(source, |_, signals, app| {
+            app.signals.extend(signals.take());
             Ok(PostAction::Continue)
         })
         .map_err(|e| e.error.to_string())?;
@@ -1097,16 +1091,15 @@ impl App {
     }
 
     fn handle_signals(&mut self) {
-        for signal in std::mem::take(&mut self.signals) {
-            match i32::from(signal) {
-                libc::SIGUSR1 => report(&self.gui, &mut self.session, false),
-                libc::SIGTERM | libc::SIGINT | libc::SIGHUP => {
+        for request in std::mem::take(&mut self.signals) {
+            match request {
+                Request::Report => report(&self.gui, &mut self.session, false),
+                Request::Quit => {
                     self.session.queue_mut().push_back(BrowserEvent::Command(
                         sighurt_api::commands::Command::BrowserQuit,
                     ));
                     self.session.run_core(&mut self.gui);
                 }
-                _ => {}
             }
         }
     }

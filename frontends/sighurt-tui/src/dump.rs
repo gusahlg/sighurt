@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::IsTerminal;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
@@ -37,6 +37,7 @@ use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::persistence::{self, Paths};
 use sighurt_runtime::services::{Clipboard, Services};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
+use sighurt_runtime::signals::{Request, Signals};
 use sighurt_runtime::view::ViewEntry;
 
 use crate::app::{chrome_checks, error_line, log_path, redirect_stderr, COLOR_NAMES};
@@ -191,9 +192,9 @@ impl Frontend for Headless {
 
 /// Opens `options.open`, waits for the page and prints it to stdout. Returns the exit code: 0
 /// printed, 2 timed out. A page that fails to load, or a build with no engine that gives page
-/// text, is an error for the caller to print. `signals` is `sig`'s signal pipe: SIGTERM, SIGINT
-/// and SIGHUP end the dump.
-pub fn run(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
+/// text, is an error for the caller to print. `signals` are `sig`'s: a request to quit (SIGTERM,
+/// SIGINT or SIGHUP) ends the dump.
+pub fn run(options: DumpOptions, signals: &Signals) -> Result<ExitCode, String> {
     // Library and engine logging goes to the log file when stderr is a terminal.
     let saved = match std::io::stderr().is_terminal() {
         true => Some(redirect_stderr(&log_path())?),
@@ -271,7 +272,7 @@ fn engine_with_text(
         .ok_or_else(|| "this sig has no engine that gives page text (WPE WebKit does)".into())
 }
 
-fn dump(options: DumpOptions, signals: &OwnedFd) -> Result<ExitCode, String> {
+fn dump(options: DumpOptions, signals: &Signals) -> Result<ExitCode, String> {
     let paths = Paths {
         config: Paths::from_env().config,
         session: None,
@@ -428,7 +429,7 @@ fn stats(snapshot: &SemanticSnapshot) -> String {
 /// Writes `bytes` to stdout without ever blocking on it. Gives up at `deadline`
 /// (`Ok(false)`) or on SIGTERM, SIGINT and SIGHUP. `deadline` is the dump's one timeout, not a
 /// fresh one for the write.
-fn write_out(bytes: &[u8], signals: &OwnedFd, deadline: Instant) -> Result<bool, String> {
+fn write_out(bytes: &[u8], signals: &Signals, deadline: Instant) -> Result<bool, String> {
     let stdout = std::io::stdout();
     write_fd(stdout.as_fd(), bytes, signals, deadline)
 }
@@ -440,7 +441,7 @@ fn write_out(bytes: &[u8], signals: &OwnedFd, deadline: Instant) -> Result<bool,
 fn write_fd(
     fd: BorrowedFd<'_>,
     bytes: &[u8],
-    signals: &OwnedFd,
+    signals: &Signals,
     deadline: Instant,
 ) -> Result<bool, String> {
     if bytes.is_empty() {
@@ -500,7 +501,7 @@ impl Drop for RestoreFlags<'_> {
 fn write_nonblocking(
     fd: BorrowedFd<'_>,
     bytes: &[u8],
-    signals: &OwnedFd,
+    signals: &Signals,
     deadline: Instant,
 ) -> Result<bool, String> {
     const CHUNK: usize = 4096;
@@ -521,8 +522,7 @@ fn write_nonblocking(
             Err(error) => return Err(format!("cannot wait for stdout: {error}")),
         }
         if fds[1].revents().contains(PollFlags::IN) {
-            let mut byte = [0u8; 1];
-            if rustix::io::read(signals, &mut byte).is_ok_and(|n| n > 0) && is_quit(byte[0]) {
+            if signals.take().contains(&Request::Quit) {
                 return Err("interrupted".into());
             }
         }
@@ -543,11 +543,6 @@ fn write_nonblocking(
         }
     }
     Ok(true)
-}
-
-/// Whether the byte `sig`'s signal pipe carries is a request to quit.
-fn is_quit(byte: u8) -> bool {
-    [libc::SIGTERM as u8, libc::SIGINT as u8, libc::SIGHUP as u8].contains(&byte)
 }
 
 /// Where a document is on its way to being printed: which one the snapshot count was taken at
@@ -664,7 +659,7 @@ fn wait(
     headless: &mut Headless,
     wake: &Wake,
     options: &DumpOptions,
-    signals: &OwnedFd,
+    signals: &Signals,
     deadline: Instant,
 ) -> Result<Option<Box<SemanticSnapshot>>, String> {
     let mut asked = HashSet::new();
@@ -672,8 +667,7 @@ fn wait(
     // When the load of the shown document ended.
     let mut loaded_at: Option<Instant> = None;
     loop {
-        let mut byte = [0u8; 1];
-        if rustix::io::read(signals, &mut byte).is_ok_and(|n| n > 0) && is_quit(byte[0]) {
+        if signals.take().contains(&Request::Quit) {
             return Err("interrupted".into());
         }
         for request in std::mem::take(&mut headless.reads) {
@@ -769,6 +763,7 @@ fn wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::OwnedFd;
 
     #[test]
     fn a_snapshot_counts_only_for_its_document_after_the_load_ended() {
@@ -965,9 +960,11 @@ mod tests {
         rustix::fs::fcntl_setfl(writer, flags).unwrap();
     }
 
-    fn signal_pipe() -> (OwnedFd, std::io::PipeWriter) {
+    fn signal_pipe() -> (Signals, std::io::PipeWriter) {
         let (read, write) = std::io::pipe().unwrap();
-        (read.into(), write)
+        let read = OwnedFd::from(read);
+        rustix::io::ioctl_fionbio(&read, true).unwrap();
+        (Signals::from_pipe(read), write)
     }
 
     #[test]

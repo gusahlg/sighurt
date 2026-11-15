@@ -45,7 +45,4 @@ sighurt-engine-netsurf = { path = "../../engines/sighurt-engine-netsurf", option
 sighurt-chrome-line = { path = "../../extensions/sighurt-chrome-line", optional = true }
 # The owner loop.
 calloop.workspace = true
-# The signal pipe.
-rustix.workspace = true
-libc = "0.2"
 log = "0.4"

@@ -17,7 +17,7 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/data/sig-builds/targets/cef}
 if [[ ${1:-} != --inside ]]; then
   out=${1:-/data/sig-builds/test-out/cef/e2e}
   SIG_WHAT="cef: sig build for cef.sh" tools/cargo build -p sighurt-browser \
-    --no-default-features --features engine-cef,engine-demo --bins --example virtual-pointer || exit 1
+    --no-default-features --features frontend-gui,engine-cef,engine-demo --bins --example virtual-pointer || exit 1
   SIG_WHAT="cef.sh" SIG_MEM=8G tools/heavy tools/headless-sway --renderer pixman -- \
     engines/sighurt-engine-wpe/tests/private-bus "$0" --inside "$out"
   exit $?

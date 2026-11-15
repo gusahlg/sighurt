@@ -877,7 +877,7 @@ WebKit opens what `[routing.wpe] hosts` gives it and what `page.open-in wpe` ask
   `GST_PLUGIN_SYSTEM_PATH_1_0` is missing (no `https:`, no media).
 - **The build**: without the prefix, the engine's build script stops the build with what to do
   (`nix/build-wpewebkit.sh`, or `--pull louise-pc`, and the feature set without WPE:
-  `--no-default-features --features engine-servo,engine-wasm`) as `cargo::error` lines.
+  `--no-default-features --features frontend-gui,frontend-tui,engine-servo,engine-wasm`) as `cargo::error` lines.
   `sig`'s own build script links it with `-Wl,--exclude-libs,ALL` (decision 65). WebKit isn't
   linked: the engine opens it when the runtime first starts (decision 84), so a session that
   opens no WPE page maps none of it.
