@@ -360,7 +360,10 @@ fn config<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>, d: &Data) {
             "Rules sending addresses to an engine by scheme, extension, origin or host",
         ),
         ("[input]", "Where the keys start, and what mouse buttons do"),
-        ("[keys]", "Bind and unbind keys, over the default experience"),
+        (
+            "[keys]",
+            "Bind and unbind keys, over the default experience",
+        ),
         ("[ui]", "The chrome and the renderer"),
         ("[commands]", "Commands of your own"),
         (
