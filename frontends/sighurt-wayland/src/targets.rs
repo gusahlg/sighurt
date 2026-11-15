@@ -784,6 +784,15 @@ mod tests {
         (Rc::new(RefCell::new(t)), conn, queue)
     }
 
+    #[test]
+    fn a_lease_reports_the_refresh_rate_the_host_gave_its_target() {
+        let (target, conn, _queue) = target(PresentMode::Native);
+        let lease = TargetLease::new(Rc::clone(&target), conn);
+        assert_eq!(lease.refresh_mhz(), None);
+        target.borrow_mut().refresh_mhz = Some(120_000);
+        assert_eq!(lease.refresh_mhz(), Some(120_000));
+    }
+
     fn permit(target: &Rc<RefCell<Target>>, outcome: PresentOutcome) -> FramePermit {
         let (id, metrics) = {
             let t = target.borrow();

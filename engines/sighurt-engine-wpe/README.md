@@ -51,8 +51,9 @@ own too; WebKit's thread code takes the signal from it all the same.
 ## How it maps onto WebKit 2.52
 
 - **Embedding**: the WPE Platform API, with Sighurt's own `WPEDisplay` and `WPEView` (GObject
-  subclasses in Rust) and WebKit's stock `WPEToplevel`; also the display's clipboard and each
-  view's input-method context.
+  subclasses in Rust), a `WPEToplevel` per view and the display's one `WPEScreen` with a vblank
+  observer at the output's refresh rate (animations follow the output; nothing ticks while no page
+  animates); also the display's clipboard and each view's input-method context.
 - **Presentation**: WebKit's DMA-BUFs attached to the view's subsurface as `wl_buffer`s, no CPU
   copy; where the compositor has no DMA-BUF (or with `force_shm`), shared memory with one copy per
   frame, logged and counted. Frames are paced by the host's permits and frame callbacks. A CPU

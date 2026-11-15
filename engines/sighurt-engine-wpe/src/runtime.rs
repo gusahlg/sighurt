@@ -40,6 +40,10 @@
 //! never starts ends with `NavigationFailed`: refused, stopped, or gone nowhere (see
 //! [`crate::navigation`]).
 //!
+//! WebKit paces animations with the display's screen ([`crate::screen`]): the runtime gives it
+//! the refresh rate of the outputs the views' windows are on (the lease's, 60 Hz without one)
+//! and ends its vblank thread at shutdown, before the display is dropped.
+//!
 //! Semantics stay off until `SetSemantics`. While on, the extraction script runs in the isolated
 //! world `sighurt` after a commit, when loading ends, after an action, and at least 250 ms after
 //! that world's `MutationObserver` posts a change. An extraction is stamped with the document at
@@ -94,6 +98,7 @@ use crate::input::Input;
 use crate::navigation::Commit;
 use crate::platform::{Buffer, Call, Display, View};
 use crate::present::{self, BufferKey, PresentStats, Wayland};
+use crate::screen::{VblankStats, DEFAULT_REFRESH_MHZ};
 use crate::semantic::{self, Tag};
 use crate::target::WpeTarget;
 use crate::view::{self, Answer, Note, Page, RequestKind, Shared, Shown, TextInput};
@@ -118,6 +123,9 @@ pub const CAPABILITIES: EngineCapabilities = EngineCapabilities {
 pub const TIMING: &str = "sighurt_engine_wpe::timing";
 
 /// The most clipboard text a page reads.
+/// The screen's size (logical pixels) when the first view opens before it has any room.
+const FALLBACK_SCREEN: (i32, i32) = (1280, 720);
+
 const CLIPBOARD_LIMIT: usize = 4 << 20;
 
 /// Whether a WPE runtime was started in this process: WebKit's UI-process state is global and
@@ -192,6 +200,8 @@ pub struct Diagnostics {
     /// makes a context, on the same thread, and restores it.
     pub libgl_always_software: Option<String>,
     pub dri_prime: Option<String>,
+    /// The vblank observer WebKit paces animations with (see [`crate::screen`]).
+    pub vblank: VblankStats,
 }
 
 impl Diagnostics {
@@ -257,6 +267,8 @@ pub struct WpeRuntime<T: WpeTarget = TargetLease> {
     total_copy: Duration,
     libgl_always_software: Option<String>,
     dri_prime: Option<String>,
+    /// The refresh rate (mHz) the display's screen has been given.
+    refresh_mhz: u32,
     scripts: Vec<(ViewId, Result<String, String>)>,
     /// The view whose page last got a click or key press: the one the clipboard acts for.
     last_input: Option<ViewId>,
@@ -304,6 +316,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
             total_copy: Duration::ZERO,
             libgl_always_software: None,
             dri_prime: None,
+            refresh_mhz: DEFAULT_REFRESH_MHZ,
             scripts: Vec::new(),
             last_input: None,
             profile,
@@ -342,6 +355,9 @@ impl<T: WpeTarget> WpeRuntime<T> {
             offscreen: platform.is_some_and(|p| p.wayland.is_none()),
             libgl_always_software: self.libgl_always_software.clone(),
             dri_prime: self.dri_prime.clone(),
+            vblank: platform
+                .map(|p| p.display.screen().stats())
+                .unwrap_or_default(),
         }
     }
 
@@ -383,7 +399,12 @@ impl<T: WpeTarget> WpeRuntime<T> {
     /// Makes the display and network session from the first view. A Wayland `display` also makes
     /// the presenter on that connection. `None` is the CPU path: `Display::new` with no DMA-BUF
     /// device, so WebKit's frames are shared memory and nothing here connects to Wayland.
-    fn platform(&mut self, display: Option<NonNull<c_void>>) -> Result<&mut Platform, EngineError> {
+    fn platform(
+        &mut self,
+        display: Option<NonNull<c_void>>,
+        mhz: u32,
+        screen: (i32, i32),
+    ) -> Result<&mut Platform, EngineError> {
         if self.platform.is_none() {
             let runtime = |e: String| EngineError::Runtime(e);
             let (wayland, dmabuf) = match display {
@@ -428,7 +449,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
                 }
             });
             let wpe_display =
-                Display::new(dmabuf, clipboard).map_err(|e| runtime(e.to_string()))?;
+                Display::new(dmabuf, clipboard, mhz, screen).map_err(|e| runtime(e.to_string()))?;
             let session = network_session(self.profile.as_deref());
             let downloads = view::connect_downloads(&session, &self.inbox);
             match (wayland.is_some(), transport) {
@@ -466,6 +487,25 @@ impl<T: WpeTarget> WpeRuntime<T> {
 
     fn push(&mut self, event: EngineEvent) {
         push(&mut self.events, event);
+    }
+
+    /// Gives the display's screen the highest refresh rate among the views' outputs, when it
+    /// changed: WebKit paces animations at the screen's rate. A view on no known output
+    /// leaves it as it was.
+    fn sync_refresh(&mut self) {
+        let Some(platform) = self.platform.as_ref() else {
+            return;
+        };
+        let rate = self
+            .pages
+            .values()
+            .filter_map(|p| p.target.refresh_mhz())
+            .max();
+        if let Some(mhz) = rate.filter(|&mhz| mhz != self.refresh_mhz) {
+            log::debug!("wpe: the screen's refresh rate is {mhz} mHz");
+            platform.display.screen().set_refresh_mhz(mhz);
+            self.refresh_mhz = mhz;
+        }
     }
 
     /// Turns what WebKit's callbacks recorded into events and view state.
@@ -1034,6 +1074,9 @@ impl<T: WpeTarget> WpeRuntime<T> {
         page.buffer = metrics.buffer();
         let size = metrics.rect().size();
         let (width, height) = (size.width as i32, size.height as i32);
+        if let Some(platform) = self.platform.as_ref() {
+            platform.display.screen().set_size((width, height));
+        }
         unsafe {
             let toplevel = toplevel(page.wpe());
             ffi::wpe_toplevel_scale_changed(toplevel, metrics.scale().factor());
@@ -1871,7 +1914,15 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
         }
         let display = target.wayland_display()?;
         let inbox = Rc::clone(&self.inbox);
-        let platform = self.platform(display)?;
+        // The screen WebKit's pages see (before the first page starts): the output's rate, and
+        // the view's size, or a stand-in until the first placement gives it room.
+        let size = target.metrics().rect().size();
+        let screen = match (size.width as i32, size.height as i32) {
+            (w, h) if w > 0 && h > 0 => (w, h),
+            _ => FALLBACK_SCREEN,
+        };
+        let mhz = target.refresh_mhz().unwrap_or(DEFAULT_REFRESH_MHZ);
+        let platform = self.platform(display, mhz, screen)?;
         let slot = match platform.wayland.is_some() {
             true => Some(
                 target
@@ -1949,6 +2000,7 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
             },
         );
         self.apply_metrics(view, metrics);
+        self.sync_refresh();
         let wpe = self.pages[&view].wpe();
         unsafe {
             match options.visible {
@@ -2228,6 +2280,7 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
     fn present(&mut self, view: ViewId, permit: T::Permit) -> Result<PresentOutcome, EngineError> {
         self.alive()?;
         let start = Instant::now();
+        self.sync_refresh();
         self.release_buffers();
         self.alive()?;
         let page = self
@@ -2294,6 +2347,8 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
             .as_ref()
             .is_some_and(|platform| platform.wayland.is_none());
         if let Some(platform) = self.platform.as_mut() {
+            // No tick after this: the observer's thread ends before the display goes.
+            platform.display.screen().shutdown();
             for (object, handler) in platform.handlers.drain(..) {
                 object.disconnect(handler);
             }

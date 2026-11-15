@@ -17,7 +17,7 @@
 //! only when that present holds a permit. WebKit's GLib main context runs inside the owner loop
 //! ([`glib_loop`]); input is translated in [`input`] and [`ime`]; the clipboard is the browser's
 //! ([`clipboard`]); navigations and history come from WebKit's back-forward list
-//! ([`navigation`]); each view's WebKit objects and signals are in [`view`]. The executable needs
+//! ([`navigation`]); animations follow the output's refresh rate ([`screen`]); each view's WebKit objects and signals are in [`view`]. The executable needs
 //! WPE WebKit 2.52 from `nix/build-wpewebkit.sh` (docs/rewrite/WPE.md).
 //!
 //! Must not own: browser policy, surfaces or the event loop; like every engine, it reports facts
@@ -32,6 +32,7 @@ pub mod navigation;
 pub mod platform;
 pub mod present;
 pub mod runtime;
+pub mod screen;
 pub mod semantic;
 pub mod target;
 pub mod view;
