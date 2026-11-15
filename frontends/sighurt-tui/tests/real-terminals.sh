@@ -187,6 +187,7 @@ case $terminal in
     else
       printf 'set -g default-terminal tmux-256color\nset -g mouse on\n' > "$out/tmux.conf"
     fi
+    chmod u+w "$out/tmux.conf"
     [[ $terminal == rio-tmux-kitty ]] && printf '\nset -g allow-passthrough all\n' >> "$out/tmux.conf"
     tmux_args=(-L "$tmux_name" -f "$out/tmux.conf")
     tmux() { command tmux "${tmux_args[@]}" "$@"; }

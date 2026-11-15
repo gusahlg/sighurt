@@ -8,7 +8,7 @@
 //!
 //! The frame is [`sighurt_api::present::Frame`]: premultiplied B, G, R, A, top
 //! row first. The encoder un-premultiplies into straight RGBA (`f=32`),
-//! zlib-compresses it (`o=z`) and splits the base64 into chunks of
+//! zlib-compresses it at the fastest level (`o=z`) and splits the base64 into chunks of
 //! [`CHUNK_BYTES`]. The first chunk places the image (`a=T`) so it scales to
 //! the cell rectangle (`c`, `r`); later chunks finish the transmit (`m=1` then
 //! `m=0`). `q=2` asks the terminal not to reply. The cursor is saved, moved to
@@ -149,6 +149,12 @@ thread_local! {
 
 /// RGBA rows converted per write into the compressor. Kept across frames.
 const ROW_CHUNK: usize = 12 * 1024;
+/// zlib's level: the fastest. A 1920×1040 page took 3.0 ms to compress at level 1 and 15.9 ms
+/// at the default level 6 (miniz_oxide, release, this desktop, 15 November 2026), for 1.85
+/// times the bytes (222 KB of base64 against 120 KB), which a terminal on the same machine
+/// parses in a fraction of a millisecond; the encode runs on the owner thread, where it held
+/// back input.
+const LEVEL: Compression = Compression::fast();
 /// `ZlibEncoder`'s own buffer. Counted in [`Encoder::scratch_bytes`].
 const ZLIB_SCRATCH: usize = 32 * 1024;
 
@@ -165,7 +171,7 @@ impl Encoder {
     /// An encoder with empty scratch buffers.
     pub fn new() -> Self {
         Self {
-            zlib: ZlibEncoder::new(Sink::new(), Compression::default()),
+            zlib: ZlibEncoder::new(Sink::new(), LEVEL),
             row: Vec::with_capacity(ROW_CHUNK),
             clean: true,
         }
@@ -316,7 +322,7 @@ impl Encoder {
             held.clear();
             (b64, held)
         };
-        self.zlib = ZlibEncoder::new(Sink::with_scratch(b64, held, false), Compression::default());
+        self.zlib = ZlibEncoder::new(Sink::with_scratch(b64, held, false), LEVEL);
         self.clean = true;
     }
 }
@@ -1092,7 +1098,7 @@ fn straight(channel: u8, alpha: u8) -> u8 {
 
 #[cfg(test)]
 fn zlib(bytes: &[u8]) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = ZlibEncoder::new(Vec::new(), LEVEL);
     encoder
         .write_all(bytes)
         .expect("zlib encode into a vec does not fail");
