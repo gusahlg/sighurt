@@ -18,8 +18,10 @@
 //!    it. Of a sequence only the last key can pass.
 //! 4. The context is the core's: an unfinished sequence is dropped when the keyboard moves
 //!    between page and chrome or a text field takes or loses it, when the window loses the
-//!    keyboard, on `input.mode`, on a reload, and when the shown tab or its committed address is
-//!    no longer what it was at the sequence's first key.
+//!    keyboard, on `input.mode`, on a reload, when another tab, view or document is shown
+//!    (closing the tab, leaving it and coming back, a reload of the page: a sequence belongs to
+//!    one document of one tab, [`TabInfo::id`] and not its place), and when the committed
+//!    address is no longer what it was at the sequence's first key.
 //! 5. A [`Custom`] action and a [`Fallback::Custom`] run inside the core's update: they do no
 //!    I/O, read no clock, start no thread and log nothing. They see what the user types,
 //!    passwords included, and keep none of it.

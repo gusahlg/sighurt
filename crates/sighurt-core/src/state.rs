@@ -2937,7 +2937,9 @@ impl BrowserState {
                         env: &self.env,
                         fullscreen: self.page_fullscreen(),
                     };
-                    self.keys.handle(context, event.seat, key, &browser)
+                    let aliases = self.config.commands();
+                    self.keys
+                        .handle(context, event.seat, key, &browser, aliases)
                 };
                 let (commands, pass) = match outcome {
                     KeyOutcome::Consumed => return,
@@ -3361,8 +3363,9 @@ impl BrowserState {
     /// Brings the engines, the host and the keymap in line with the state after an update: the
     /// active tab loads a record it shows, only its view is visible and has the keyboard (when
     /// the page has it), at the tab's zoom, the host knows the page's cursor and text field (if
-    /// the keymap gives the page text), and the keymap knows the context; a changed keymap
-    /// indicator redraws the chrome.
+    /// the keymap gives the page text), and the keymap knows the context and what is shown (the
+    /// tab, its view and document: an unfinished sequence ends when that changes); a changed
+    /// keymap indicator redraws the chrome.
     fn settle(&mut self, fx: &mut Fx) {
         self.settle_fullscreen(fx);
         self.settle_ptys(fx);
@@ -3382,6 +3385,9 @@ impl BrowserState {
             fx.push(Effect::PageTextInput(text_input));
         }
         self.keys.set_context(self.key_context());
+        let tab = self.tabs.get(self.active).map(|tab| tab.id);
+        self.keys
+            .set_shown((tab, shown, shown.and_then(|id| self.views[&id].document())));
         if self.keys.indicator() != self.indicator.as_deref() {
             self.indicator = self.keys.indicator().map(str::to_owned);
             fx.chrome = true;

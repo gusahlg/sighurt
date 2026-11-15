@@ -6,9 +6,8 @@
 
 mod engine;
 
-use engine::{example, keys, Example, KeyAction};
+use engine::{example, keys, tab_id, Example, KeyAction};
 use sighurt_api::commands::{Command, CommandSet};
-use sighurt_api::ids::TabId;
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
 use sighurt_api::keymap::{Action, Browser, Frontend, KeyContext, TabInfo, MAX_KEYS};
 
@@ -101,7 +100,7 @@ impl Browser for Fake {
     fn tab(&self, index: usize) -> Option<TabInfo<'_>> {
         let url = *self.urls.get(index)?;
         Some(TabInfo::new(
-            TabId::next(),
+            tab_id(index),
             None,
             url,
             false,

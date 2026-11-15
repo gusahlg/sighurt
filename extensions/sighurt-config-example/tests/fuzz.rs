@@ -14,10 +14,9 @@ mod fuzz;
 
 use std::time::Duration;
 
-use engine::{example, KeyAction};
+use engine::{example, tab_id, KeyAction};
 use fuzz::{iterations, run, Rng};
 use sighurt_api::commands::Command;
-use sighurt_api::ids::TabId;
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers};
 use sighurt_api::keymap::{Browser, Chord, Frontend, KeyContext, TabInfo, UrlPattern};
 
@@ -79,7 +78,7 @@ impl Browser for Fake {
     fn tab(&self, index: usize) -> Option<TabInfo<'_>> {
         (index < self.tabs).then(|| {
             TabInfo::new(
-                TabId::next(),
+                tab_id(index),
                 Some("Title"),
                 self.url,
                 false,
@@ -212,10 +211,16 @@ fn fuzz_the_example_modes_under_random_keys() {
             if rng.one_in(30) {
                 keymap.reset();
             }
+            // The core tells the engine when what is shown changes: a new document (here, at
+            // another address) or another tab.
+            let shown = (browser.url, browser.active);
             if rng.one_in(12) {
                 browser.url = *rng.pick(URLS);
             }
             browser.active = rng.below(browser.tabs);
+            if (browser.url, browser.active) != shown {
+                keymap.shown();
+            }
             let key = match taken.as_ref().filter(|_| rng.one_in(3)) {
                 Some(press) => KeyEvent {
                     repeat: true,

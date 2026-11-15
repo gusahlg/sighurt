@@ -2,11 +2,16 @@
 //! core's key engine (`sighurt_core::keys::Engine`), a press's `input.mode` carried out in its
 //! place as the core does, and what the press came to named as the `Keymap` trait the engine
 //! replaced named it, so these tests read as they did (docs/rewrite/experience-2026-11-15.md,
-//! §3: ported, not rewritten).
+//! §3: ported, not rewritten). A fake browser's tabs have the identities [`tab_id`] gives, the
+//! same for the same tab every time it is asked, as the core's are: the engine ties a sequence
+//! to the tab it began in.
 
 #![allow(dead_code)]
 
+use std::sync::LazyLock;
+
 use sighurt_api::commands::Command;
+use sighurt_api::ids::TabId;
 use sighurt_api::input::KeyEvent;
 use sighurt_api::keymap::{Browser, Frontend, KeyBinding, KeyContext, Keys, Outcome};
 use sighurt_core::keys::Engine;
@@ -43,6 +48,16 @@ impl PartialEq for KeyAction {
     fn eq(&self, other: &Self) -> bool {
         self.effect() == other.effect()
     }
+}
+
+/// The most tabs a fake browser has.
+pub const MAX_TABS: usize = 64;
+
+/// The identity of a fake browser's tab `index`: the same on every call.
+pub fn tab_id(index: usize) -> TabId {
+    static IDS: LazyLock<Vec<TabId>> =
+        LazyLock::new(|| (0..MAX_TABS).map(|_| TabId::next()).collect());
+    IDS[index]
 }
 
 /// The experience `sighurt_config_example::configure` returns, on the engine.
@@ -116,6 +131,12 @@ impl Example {
 
     pub fn context(&mut self, _context: KeyContext) {
         self.engine.context_changed();
+    }
+
+    /// What is shown changed (another tab, or a new document in it), as the core tells the
+    /// engine.
+    pub fn shown(&mut self) {
+        self.engine.shown_changed();
     }
 
     pub fn reset(&mut self) {
