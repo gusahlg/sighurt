@@ -4902,3 +4902,31 @@ Newest last. Each entry says what was decided and why.
     attaching while another stays attached (no focus change); tmux's 5 s DCS timer. The
     review's remark on the measurements stands: 145 and 146 show the rate caps removed, not
     the time from an input to its visible result.
+156. **WebKit's screen observer ticks in the owner's main context; WebKit is told 60 Hz**
+    (16 November 2026; amends 146; findings 1 and 7 to 10 of review B, all real). (1)
+    WebKit 2.52.6's `WPEScreenSyncObserver` calls callbacks it copied under its lock after
+    releasing it, with the monitor's raw `this`, and monitors die with their
+    `WebProcessPool` on the main thread whenever its last reference goes; no thread of ours
+    can wait that out (`stop()` runs under the monitor's lock and inside sync), so 146's
+    ticker thread could call freed objects. The observer now ticks as one-shot GLib
+    timeouts in the owner's main context, where monitors are destroyed: a sync and a
+    destruction cannot overlap. Ticks wait for the owner loop, to about 1 ms. (7) The
+    lease's refresh rate is read at every pump, so an output change needs no frame. WebKit
+    is told 60 Hz whatever the output, and the observer ticks at the output's real rate:
+    146's 120 Hz result came from a stale rate (the old code 8.6 ms median on a 120 Hz
+    output; an honest 120 Hz screen 16.7 ms, since WebKit's near-60 preference, not
+    switchable in 2.52.6, halves pages told 120). The cost: WebKit's half-speed throttling
+    is half the output's rate, not 30. The orchestrator chose this over honest metadata at
+    60 Hz, for the user's wish for speed; it is the user's to reverse. (8, 9) With
+    `smooth-scroll` on, each step is bounded by its notch's total, and a wheel event for
+    another point waits, at most 500 ms, until Servo has answered the one before (Servo
+    merges pending wheel events and keeps the newer point). (10) Native presentation
+    latency counts from just before the swap or commit, and an impossible ordering counts
+    as invalid (`PresentStats::invalid_latency`), not as zero. *Evidence*:
+    `callbacks_run_only_in_the_owners_dispatch` (fails against the thread: 14 ticks while
+    the owner slept); `raf.rs`: 8 rounds of last-view close and reopen while animating, and
+    the output changed 60, 120, 60 Hz with nothing painting (the observer follows, rAF at
+    about 8.3 and 16.7 ms); the smooth-scroll unit tests (125 % failed before); engines.sh
+    `wpe servo` 126/0. *Not shown*: a real 120 or 144 Hz monitor; two real scroll
+    containers under smooth scroll; that the churn run proves the race gone (the design
+    argument and the threading test do that).
