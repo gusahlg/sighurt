@@ -1412,10 +1412,14 @@ impl App {
         let rendering = Instant::now();
         let rendered = match self.gui.injected_failure() {
             Some(error) => Err(error),
-            None => self
-                .gui
-                .backend
-                .render(key, &metrics, &scene, Output::Native),
+            // The backend presents inside `render`, after drawing; the mark is taken before it
+            // starts, so the latency includes the render. A frame it puts off clears the mark.
+            None => {
+                permit.submitting();
+                self.gui
+                    .backend
+                    .render(key, &metrics, &scene, Output::Native)
+            }
         };
         let diag = self.session.diagnostics_mut();
         match rendered {

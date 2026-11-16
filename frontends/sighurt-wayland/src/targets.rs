@@ -470,6 +470,21 @@ impl FramePermit {
         self.outcome = Some(outcome);
     }
 
+    /// Marks the time a native presenter is about to submit this permit's frame, so the
+    /// presentation latency counts from just before its swap or present and not from when the
+    /// permit is dropped. Call it immediately before the operation that commits. The first mark
+    /// before a swap wins; a permit that ends without a swap clears it.
+    pub fn submitting(&self) {
+        if let Some(submitted) = &self.target.borrow().gl_feedback {
+            let _ = submitted.compare_exchange(
+                0,
+                crate::scheduler::monotonic_ns(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     pub(crate) fn target_mut(&self) -> RefMut<'_, Target> {
         self.target.borrow_mut()
     }
@@ -575,10 +590,19 @@ impl Drop for FramePermit {
             target.stats.submissions += 1;
             target.presented = Some(self.metrics.epoch());
             // This swap committed the feedback requested with an earlier permit, perhaps one
-            // that came back unused: its frame was submitted now.
+            // that came back unused. The presenter's mark from before the swap stands; a
+            // presenter that made none is timed now, after the swap.
             if let Some(submitted) = target.gl_feedback.take() {
-                submitted.store(crate::scheduler::monotonic_ns(), Ordering::Relaxed);
+                let _ = submitted.compare_exchange(
+                    0,
+                    crate::scheduler::monotonic_ns(),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
             }
+        } else if let Some(submitted) = &target.gl_feedback {
+            // No swap happened: a mark made before it is stale for the swap that comes later.
+            submitted.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -837,10 +861,34 @@ mod tests {
         assert_eq!(submitted.load(Ordering::Relaxed), 0);
         let before = crate::scheduler::monotonic_ns();
         drop(permit(&target, PresentOutcome::Submitted));
-        assert!(submitted.load(Ordering::Relaxed) >= before);
+        assert!(
+            submitted.load(Ordering::Relaxed) >= before,
+            "without a mark the drop times it"
+        );
         assert!(
             target.borrow().gl_feedback.is_none(),
             "that swap carried it"
         );
+    }
+
+    #[test]
+    fn a_mark_before_the_swap_is_kept_by_the_drop() {
+        let (target, _conn, _queue) = target(PresentMode::Native);
+        let submitted = Arc::new(AtomicU64::new(0));
+        target.borrow_mut().gl_feedback = Some(Arc::clone(&submitted));
+        let swapping = permit(&target, PresentOutcome::Submitted);
+        swapping.submitting();
+        let marked = submitted.load(Ordering::Relaxed);
+        assert!(marked > 0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        drop(swapping);
+        assert_eq!(submitted.load(Ordering::Relaxed), marked);
+        // A mark followed by a permit that did not swap is cleared.
+        let again = Arc::new(AtomicU64::new(0));
+        target.borrow_mut().gl_feedback = Some(Arc::clone(&again));
+        let unused = permit(&target, PresentOutcome::Unchanged);
+        unused.submitting();
+        drop(unused);
+        assert_eq!(again.load(Ordering::Relaxed), 0);
     }
 }
