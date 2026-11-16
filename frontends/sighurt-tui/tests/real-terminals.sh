@@ -199,10 +199,19 @@ case $terminal in
 esac
 term_pid=$!
 
+# Whether process $1 catches SIGUSR1 (bit 9 of SigCgt in /proc/PID/status).
+caught_usr1() {
+  local mask
+  mask=$(awk '/^SigCgt:/ {print $2}' "/proc/$1/status" 2>/dev/null) || return 1
+  [[ -n $mask ]] && (( (16#$mask >> 9) & 1 ))
+}
 # Signals this run's sig, by the pid the shell recorded, for a fresh diagnostics report.
 report() {
   local pid
   pid=$(cat "$pidfile" 2>/dev/null) || return 1
+  # SIGUSR1's default action ends a process: until sig's main has installed its handler (the
+  # bit for signal 10 in SigCgt), a report request would kill it.
+  caught_usr1 "$pid" || return 1
   rm -f "$diag"
   kill -USR1 "$pid" 2>/dev/null || return 1
   for _ in $(seq 40); do

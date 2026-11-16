@@ -47,8 +47,25 @@ def verdict(value):
     print(0 if ok else 1, detail)
 
 
+def catches_usr1(pid):
+    """Whether `pid` has a SIGUSR1 handler yet: before sig's main installs it, the signal's
+    default action would end sig."""
+    try:
+        with open(f"/proc/{pid}/status") as status:
+            for line in status:
+                if line.startswith("SigCgt:"):
+                    return (int(line.split()[1], 16) >> (signal.SIGUSR1 - 1)) & 1 == 1
+    except OSError:
+        pass
+    return False
+
+
 def diag(pid, path, expr):
     before = os.stat(path).st_mtime_ns if os.path.exists(path) else 0
+    for _ in range(500):
+        if catches_usr1(pid):
+            break
+        time.sleep(0.02)
     os.kill(int(pid), signal.SIGUSR1)
     for _ in range(100):
         if os.path.exists(path) and os.stat(path).st_mtime_ns != before:
