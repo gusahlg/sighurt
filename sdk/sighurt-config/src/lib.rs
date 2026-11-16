@@ -1,8 +1,9 @@
 //! `sighurt-config`: what a Sighurt configuration is written against
 //! (docs/rewrite/experience-2026-11-15.md, §2).
 //!
-//! An [`Experience`] is data: today its keys ([`KeysBuilder`], a `sighurt_api::keymap::Keys`
-//! value with the problems found while it was written). The default experience is
+//! An [`Experience`] is data: its keys ([`KeysBuilder`], a `sighurt_api::keymap::Keys` value
+//! with the problems found while it was written) and its interface ([`ui::UiBuilder`], the
+//! window's and the terminal's trees of components, `sighurt_api::ui::Interface`). The default experience is
 //! [`Experience::default`], written in [`defaults`] with nothing but this crate's public API,
 //! and a configuration changes it with the same calls:
 //!
@@ -50,29 +51,37 @@
 #![warn(missing_docs)]
 
 pub mod defaults;
+pub mod ui;
 
 use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::keymap::{
     bind, unbind, Action, Binding, Browser, Custom, Frontend, KeySeq, Keys, Mode, Outcome,
     UrlPattern, When, LINE,
 };
+use sighurt_api::ui::Interface;
+
+use crate::ui::UiBuilder;
 
 /// What a configuration imports.
 pub mod prelude {
+    pub use crate::ui::UiBuilder;
     pub use crate::{custom, Experience, IntoAction, KeysBuilder, Tables};
     pub use sighurt_api::commands::{Command, SentKey};
     pub use sighurt_api::input::KeyEvent;
     pub use sighurt_api::keymap::{
         Action, Browser, Custom, Fallback, Frontend, Mode, Outcome, TabInfo, PLAIN_MODE,
     };
+    pub use sighurt_api::ui::{Anchor, Button, Interface, Kind, Node, Side};
 }
 
-/// The experience a configuration describes: its keys now, its interface and events later.
+/// The experience a configuration describes: its keys and its interface now, its events later.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct Experience {
     /// The keys: modes, the line's table, and the bindings of each.
     pub keys: KeysBuilder,
+    /// The interface: where the window's components go, and the terminal's lines ([`ui`]).
+    pub ui: UiBuilder,
 }
 
 impl Default for Experience {
@@ -84,19 +93,26 @@ impl Default for Experience {
 
 impl Experience {
     /// No experience at all: one mode that passes every key and gives the page text, binding
-    /// nothing (`Keys::plain`).
+    /// nothing (`Keys::plain`), and the standard interface.
     pub fn empty() -> Self {
         Self {
             keys: KeysBuilder {
                 keys: Keys::plain(),
                 problems: Vec::new(),
             },
+            ui: UiBuilder::default(),
         }
     }
 
     /// The keys, and every problem noted while they were written.
     pub fn finish(self) -> (Keys, Vec<String>) {
         (self.keys.keys, self.keys.problems)
+    }
+
+    /// The interface, and every problem applying it found, its check's among them
+    /// ([`UiBuilder::finish`]).
+    pub fn interface(&self) -> (Interface, Vec<String>) {
+        self.ui.finish()
     }
 }
 

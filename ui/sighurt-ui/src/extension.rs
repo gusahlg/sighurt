@@ -85,6 +85,7 @@ use sighurt_api::input::{
     FocusEvent, KeyEvent, KeyboardFocus, PointerEvent, TextInputEvent, TextInputState,
 };
 use sighurt_api::settings::Table;
+use sighurt_api::ui::Interface;
 
 use sighurt_render::Pen;
 
@@ -118,8 +119,9 @@ pub trait Chrome {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChromeEvent {
-    /// The shared look (`[ui]`) and the chrome's own `[chrome.<name>]`, which its kind's check
-    /// accepted. Comes first of all, and after every valid reload of the configuration.
+    /// The shared look (`[ui]`, with the interface's trees) and the chrome's own
+    /// `[chrome.<name>]`, which its kind's check accepted. Comes first of all, and after every
+    /// valid reload of the configuration.
     Configure {
         /// `[ui]`.
         theme: Theme,
@@ -450,15 +452,19 @@ pub struct Theme {
     pub font: Option<String>,
     /// `[ui] font-size`, in logical pixels.
     pub font_size: u16,
+    /// The interface: the window's tree, which the standard chrome lays out, and its density.
+    /// One that passes `Interface::check`. A chrome of its own may ignore it.
+    pub interface: Interface,
 }
 
 impl Default for Theme {
-    /// The default colors and size, and no font named.
+    /// The default colors and size, no font named, and the standard interface.
     fn default() -> Self {
         Self {
             colors: Colors::default(),
             font: None,
             font_size: DEFAULT_FONT_SIZE,
+            interface: Interface::standard(),
         }
     }
 }

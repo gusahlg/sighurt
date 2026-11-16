@@ -1,6 +1,7 @@
 //! The standard chrome, `[ui] chrome = "standard"`: sighurt-ui's [`Model`] and its drawing
 //! ([`crate::paint`]) behind the chrome API ([`crate::extension`]), as any other chrome would
-//! be. Every build has it, and it is the default.
+//! be. It lays out the interface's window tree (`Theme::interface`). Every build has it, and it
+//! is the default.
 //!
 //! Its surfaces, bottom to top: [`PAGE`] while it draws the page area (`sig://home`, errors),
 //! [`TABS`] while the tabs are on the left, [`CHROME`] (the tab strip when the tabs are at the
@@ -13,7 +14,8 @@
 //! the whole window. Otherwise it lists none.
 //!
 //! `[chrome.standard]` takes `tabs` (`"top"`, `"left"` or `"hidden"`), `status` (`"strip"` or
-//! `"overlay"`), `buttons`, `compact` and `engine-label` (true or false); its one command is
+//! `"overlay"`), `buttons`, `compact` and `engine-label` (true or false), which its check
+//! validates and the core applies to the tree before `[ui.layout]`; its one command is
 //! `chrome.toggle-tabs`. `[ui] font` and `font-size` set its text.
 //!
 //! Must not own: anything the model doesn't; this is only the adapter.
@@ -27,7 +29,7 @@ use crate::extension::{
     Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout, ChromeSurface, InputArea,
     SurfaceName,
 };
-use crate::layout::{LayoutOptions, Show, Status, Tabs};
+use crate::layout::{Arrangement, LayoutOptions, Show, Status, Tabs};
 use crate::{Colors, Fonts};
 
 /// The standard chrome, for the registry.
@@ -144,18 +146,17 @@ fn layout_of(model: &Model) -> ChromeLayout {
 impl Chrome for Standard {
     fn handle(&mut self, event: ChromeEvent) -> Vec<ChromeAction> {
         let mut actions = match event {
-            ChromeEvent::Configure { theme, settings } => {
-                let mut options = LayoutOptions {
+            // `[chrome.standard]` is in the tree already: the core applied it as operations,
+            // with `[ui.layout]` after it (`sighurt_core::interface`).
+            ChromeEvent::Configure { theme, .. } => {
+                let arrangement = Arrangement {
+                    tree: theme.interface.window,
+                    density: theme.interface.density,
                     font_size: theme.font_size,
-                    ..LayoutOptions::default()
                 };
-                for (key, value) in &settings {
-                    // The kind's check accepted the table.
-                    let _ = option(key, value, &mut options);
-                }
                 self.model.set_colors(theme.colors);
                 self.model.set_font(theme.font.as_deref());
-                self.model.set_options(options)
+                self.model.set_options(arrangement)
             }
             ChromeEvent::Resize(size) => self.model.resize(size),
             ChromeEvent::Snapshot(snapshot) => self.model.set_snapshot(snapshot),
