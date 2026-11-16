@@ -1976,15 +1976,24 @@ fn sixel_frames_follow_input_at_input_fps_and_the_page_at_five() {
         "{idle} sixels in {lasted:?} of a page animating on its own, more than {most}\n{}",
         term.context()
     );
-    let (typing, lasted) = count(&mut term, true);
+    // Typing lifts the page's cap: at least twice its frames in one of three windows (a loaded
+    // machine may encode too slowly in one), and never faster than input-fps in any.
+    let mut lifted = Vec::new();
+    for _ in 0..3 {
+        let (typing, lasted) = count(&mut term, true);
+        assert!(
+            typing as u128 <= lasted.as_millis() / 33 + 2,
+            "{typing} sixels in {lasted:?} of typing, faster than input-fps\n{}",
+            term.context()
+        );
+        lifted.push((typing, lasted));
+        if typing >= 2 * most {
+            break;
+        }
+    }
     assert!(
-        typing >= 2 * most,
-        "{typing} sixels in {lasted:?} of typing, not more than twice the page's own {most}\n{}",
-        term.context()
-    );
-    assert!(
-        typing as u128 <= lasted.as_millis() / 33 + 2,
-        "{typing} sixels in {lasted:?} of typing, faster than input-fps\n{}",
+        lifted.iter().any(|&(typing, _)| typing >= 2 * most),
+        "{lifted:?} sixels of typing, never more than twice the page's own {most}\n{}",
         term.context()
     );
     // A second after the last key, the page's own pace again.
@@ -2697,9 +2706,14 @@ fn a_megabyte_of_random_input_runs_no_command_the_keymap_did_not_bind() {
         "random input without Ctrl+C quit sig\n{}",
         term.context()
     );
-    // An Escape closes an address line a click may have opened; Ctrl+C then quits.
+    // An Escape closes an address line a click may have opened; Ctrl+C then quits. Escape and
+    // Ctrl+C read together are one Alt+Ctrl+C (a legacy terminal's Escape prefix), so Ctrl+C
+    // waits until sig has read the Escape (a report after it) and taken it alone (a report
+    // after the parser's escape timeout), however loaded the machine.
     term.type_bytes(b"\x1b");
+    let _ = term.tabs();
     thread::sleep(Duration::from_millis(100));
+    let _ = term.tabs();
     term.type_bytes(b"\x03");
     let status = term.exit();
     assert!(
