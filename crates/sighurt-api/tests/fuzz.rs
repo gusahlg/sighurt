@@ -11,7 +11,7 @@ use std::time::Duration;
 use fuzz::{iterations, run, Rng};
 use sighurt_api::commands::{Command, CommandSet, SentKey, TabMove, MAX_FIND};
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, Modifiers};
-use sighurt_api::keymap::{Chord, UrlPattern};
+use sighurt_api::keymap::{Chord, KeySeq, UrlPattern};
 
 const LIMIT: Duration = Duration::from_secs(2);
 
@@ -434,4 +434,97 @@ fn every_name_round_trips_with_arguments() {
 fn a_letter_whose_lower_case_is_two_characters_round_trips() {
     let chord: Chord = "İ".parse().unwrap();
     assert_eq!(chord.to_string().parse::<Chord>(), Ok(chord));
+}
+
+/// A keystroke that parses as one chord and is one word (no whitespace).
+fn one_word_chord(rng: &mut Rng) -> Option<(String, Chord)> {
+    let text = keystroke(rng);
+    if text.is_empty() || text.split_whitespace().count() != 1 || text.trim() != text {
+        return None;
+    }
+    let chord = text.parse::<Chord>().ok()?;
+    Some((text, chord))
+}
+
+#[test]
+fn fuzz_key_sequences_parse_count_and_round_trip() {
+    run("fuzz_key_sequences", iterations(100), LIMIT, |case| {
+        // 0 to 6 keystrokes: the empty and 5+ ones must be refused, 1 to 4 parse (a modifier
+        // key may not be one of several).
+        let wanted = case.rng.range(0, 6);
+        let mut words = Vec::new();
+        let mut chords = Vec::new();
+        while words.len() < wanted {
+            if let Some((text, chord)) = one_word_chord(&mut case.rng) {
+                words.push(text);
+                chords.push(chord);
+            }
+        }
+        let mut text = String::new();
+        for (i, word) in words.iter().enumerate() {
+            if i > 0 {
+                text.push_str(case.rng.pick(&[" ", "  ", "\t", " \n ", "\u{a0}"]));
+            }
+            text.push_str(word);
+        }
+        if case.rng.one_in(4) {
+            text = format!(" {text} ");
+        }
+        case.note(|| format!("{text:?} ({wanted} keystrokes)"));
+        let parsed = text.parse::<KeySeq>();
+        if wanted == 0 || wanted > 4 {
+            assert!(parsed.is_err(), "{wanted} keystrokes must be refused");
+            return;
+        }
+        match parsed {
+            Ok(seq) => {
+                assert_eq!(seq.chords(), &chords[..], "the chords, in order");
+                let shown = seq.to_string();
+                case.note(|| format!("{text:?} parsed, shown as {shown:?}"));
+                let again = shown.parse::<KeySeq>().expect("the display parses");
+                assert_eq!(again, seq, "round trip");
+                assert_eq!(again.to_string(), shown, "display is stable");
+                assert_eq!(seq.written(wanted), shown);
+                for n in 1..=wanted {
+                    let prefix: KeySeq = seq.written(n).parse().expect("a prefix parses");
+                    assert!(seq.starts_with(&prefix));
+                    assert_eq!(prefix.chords().len(), n);
+                }
+            }
+            Err(error) => {
+                // The only reason left is a modifier among several keystrokes.
+                assert!(wanted > 1, "one valid keystroke must parse: {error}");
+                assert!(error.contains("modifier"), "unexpected refusal: {error}");
+            }
+        }
+    });
+}
+
+#[test]
+fn fuzz_key_sequences_garbage_never_panics() {
+    run(
+        "fuzz_key_sequences_garbage",
+        iterations(100),
+        LIMIT,
+        |case| {
+            let mut text = if case.rng.one_in(2) {
+                case.rng.string(40)
+            } else {
+                let n = case.rng.range(0, 8);
+                (0..n)
+                    .map(|_| keystroke(&mut case.rng))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            if case.rng.one_in(3) {
+                text = case.rng.mutate(&text);
+            }
+            case.note(|| format!("{text:?}"));
+            if let Ok(seq) = text.parse::<KeySeq>() {
+                let n = seq.chords().len();
+                assert!((1..=4).contains(&n), "{n} keystrokes accepted");
+                assert_eq!(seq.to_string().parse::<KeySeq>().as_ref(), Ok(&seq));
+            }
+        },
+    );
 }
