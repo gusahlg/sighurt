@@ -95,6 +95,7 @@ impl Deliver<FramePermit> for TargetLease {
         permit: FramePermit,
     ) -> Result<Duration, String> {
         let start = Instant::now();
+        permit.submitting();
         surface.swap();
         let swap = start.elapsed();
         permit.finish(PresentOutcome::Submitted);

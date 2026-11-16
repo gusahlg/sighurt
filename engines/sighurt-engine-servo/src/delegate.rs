@@ -31,8 +31,9 @@ use std::time::{Duration, Instant};
 
 use servo::{
     ClipboardDelegate, ConsoleLogLevel, CreateNewWebViewRequest, Cursor, EmbedderControl,
-    EmbedderControlId, LoadStatus, NavigationRequest, PermissionRequest, ServoDelegate, ServoError,
-    StringRequest, TraversalId, WebView, WebViewDelegate, WebViewId,
+    EmbedderControlId, InputEventId, InputEventResult, LoadStatus, NavigationRequest,
+    PermissionRequest, ServoDelegate, ServoError, StringRequest, TraversalId, WebView,
+    WebViewDelegate, WebViewId,
 };
 use url::Url;
 
@@ -66,6 +67,9 @@ pub(crate) enum Note {
     Stopped,
     /// An element of the page entered (`true`) or left element fullscreen.
     Fullscreen(bool),
+    /// Servo handled the input event with this id, which `WebView::notify_input_event` returned
+    /// (merged events are reported with the one they merged into, in order).
+    InputHandled(InputEventId),
     /// A script this runtime evaluated finished. The string is its value, or a short error
     /// with no snapshot body.
     Semantic(crate::semantic::Tag, Result<String, String>),
@@ -338,6 +342,15 @@ impl WebViewDelegate for Delegate {
 
     fn notify_traversal_complete(&self, webview: WebView, traversal: TraversalId) {
         self.note(&webview, Note::TraversalComplete(traversal));
+    }
+
+    fn notify_input_event_handled(
+        &self,
+        webview: WebView,
+        event: InputEventId,
+        _result: InputEventResult,
+    ) {
+        self.note(&webview, Note::InputHandled(event));
     }
 
     fn notify_closed(&self, webview: WebView) {

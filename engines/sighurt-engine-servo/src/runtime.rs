@@ -559,7 +559,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
         let Some(view) = self.views.get_mut(&id) else {
             return;
         };
-        let Some(webview) = &view.webview else {
+        let Some(webview) = view.webview.clone() else {
             return;
         };
         let wanted = view.focused && view.visible && view.active;
@@ -975,6 +975,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
                     push(events, left);
                 }
             }
+            Note::InputHandled(event) => view.scroll.handled(event, Instant::now()),
             Note::Closed => {
                 if let Some(document) = view.document() {
                     push(events, EngineEvent::CloseRequested { view: id, document });
@@ -1651,8 +1652,16 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
         // A console window that closed while the loop slept: the summary has no page text.
         self.delegate.flush_console_logs(now);
         if self.servo.is_some() && self.failed.is_none() {
-            // A smooth scroll that no frame stepped for a while steps now, and the runtime is
-            // pumped again at that time; with none in flight, no deadline.
+            // With a backlog, what Servo has next waits in its own channels.
+            if self.events.len() < MAX_EVENTS_PER_PUMP {
+                self.spin();
+            }
+            self.release_closing();
+            let now = Instant::now();
+            // A smooth scroll that no frame stepped for a while, or that waited for Servo to
+            // answer a wheel event for another point (the answers came with the spin), steps
+            // now; the runtime is pumped again at the next step's time, and with nothing in
+            // flight, no deadline.
             for view in self.views.values_mut() {
                 let step = view.scroll.fallback(now);
                 view.send(step);
@@ -1660,12 +1669,6 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                     deadline = Some(deadline.map_or(due, |d| d.min(due)));
                 }
             }
-            // With a backlog, what Servo has next waits in its own channels.
-            if self.events.len() < MAX_EVENTS_PER_PUMP {
-                self.spin();
-            }
-            self.release_closing();
-            let now = Instant::now();
             for view in self.views.values_mut() {
                 if let Some(given_up) = view.send_queued(now) {
                     push(&mut self.events, cancelled(view.id, given_up));

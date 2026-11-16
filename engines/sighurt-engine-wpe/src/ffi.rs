@@ -276,6 +276,10 @@ pub const WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE: c_int = 1
 /// `SOUP_STATUS_NO_CONTENT`: a response that keeps the current document.
 pub const HTTP_NO_CONTENT: c_uint = 204;
 
+/// `WPEScreenSyncObserverSyncFunc`: called on every sync of the observer it was added to.
+pub type WPEScreenSyncObserverSyncFunc =
+    Option<unsafe extern "C" fn(*mut WPEScreenSyncObserver, gpointer)>;
+
 pub type GAsyncReadyCallback =
     Option<unsafe extern "C" fn(*mut GObject, *mut GAsyncResult, gpointer)>;
 
@@ -363,9 +367,16 @@ functions! {
     // WPEScreen
     pub fn wpe_screen_get_type() -> GType;
     pub fn wpe_screen_sync_observer_get_type() -> GType;
+    pub fn wpe_screen_sync_observer_add_callback(
+        observer: *mut WPEScreenSyncObserver,
+        sync: WPEScreenSyncObserverSyncFunc,
+        data: gpointer,
+        destroy: GDestroyNotify,
+    ) -> c_uint;
+    pub fn wpe_screen_sync_observer_remove_callback(observer: *mut WPEScreenSyncObserver, id: c_uint);
     pub fn wpe_screen_set_size(screen: *mut WPEScreen, width: c_int, height: c_int);
     pub fn wpe_screen_set_physical_size(screen: *mut WPEScreen, width: c_int, height: c_int);
-    pub fn wpe_screen_set_refresh_rate(screen: *mut WPEScreen, refresh_rate: c_int);
+    pub fn wpe_screen_get_refresh_rate(screen: *mut WPEScreen) -> c_int;
 
     // WPEView
     pub fn wpe_view_get_type() -> GType;

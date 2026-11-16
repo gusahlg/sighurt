@@ -1,31 +1,59 @@
 //! The one `WPEScreen` Sighurt's display offers, and the vblank source WebKit's page animations
-//! follow: a `WPEScreenSyncObserver` that ticks at the screen's refresh period, but only while
-//! WebKit has a callback registered with it.
+//! follow: a `WPEScreenSyncObserver` that ticks at the refresh period of the output the window
+//! is on, but only while WebKit has a callback registered with it.
 //!
 //! WebKit paces `requestAnimationFrame` and its rendering with a per-screen vblank monitor
 //! (`DisplayVBlankMonitorWPE`). Without a `WPEScreen` WebKit falls back to a 60 Hz sleeping
-//! thread of its own, whatever the output is. The screen here carries the refresh rate of the
-//! output the window is on (the host reports it through the target lease, and the runtime sets
-//! it with [`Screen::set_refresh_mhz`]); its observer is the same kind of timer as WebKit's
-//! fallback, at that rate: a thread that wakes once per period and runs the observer's `sync`
-//! (every registered callback). It exists for the runtime's life but runs only between WebKit's
-//! `start` (the first callback added) and `stop` (the last removed): no callback, no tick. The
-//! engine contract forbids unconditional ticks, and this keeps to it. [`VblankStats`] counts
-//! starts, stops and ticks.
+//! thread of its own, whatever the output is. The observer here ticks at the output's rate (the
+//! host reports it through the target lease, and the runtime sets it with
+//! [`Screen::set_refresh_mhz`] whenever it changes), running the observer's `sync` (every
+//! registered callback) once per period between WebKit's `start` (the first callback added) and
+//! `stop` (the last removed): no callback, no tick. The engine contract forbids unconditional
+//! ticks, and this keeps to it. [`VblankStats`] counts starts, stops and ticks.
+//!
+//! **WebKit is told 60 Hz whatever the output's rate** (the screen's `refresh-rate`,
+//! [`NOMINAL_MHZ`]), and the ticks carry the real rate. WebKit reads a screen's rate once, when
+//! it makes the display link of the screen's id (`DisplayLink::m_displayNominalFramesPerSecond`;
+//! `displayPropertiesChanged` is a FIXME in 2.52.6), and a page updates at the rate nearest 60
+//! that divides it (`PreferPageRenderingUpdatesNear60FPSEnabled`, on by default and not in 2.52.6's
+//! feature list, so it can't be turned off): told 120 Hz, a page takes every other tick, and a
+//! display link made at 120 Hz on a window that then moves to a 60 Hz output gives its pages
+//! 30. Told 60, every tick is one rendering update, so pages follow the output's rate (60, 120,
+//! 144) and a rate change needs nothing of WebKit's; the cost is that WebKit's half-speed
+//! throttling (low power, a hidden frame) is half the output's rate rather than 30. Before
+//! this was deliberate, it held by accident (the screen's rate reached WebKit only after its
+//! display link was made) and broke when it didn't (Astra's review B, 16 November 2026).
+//!
+//! **The ticks run on the owner thread, from GLib's main context, not on a thread of ours.**
+//! WebKit's `sync` copies each callback's function and raw user data under the observer's lock,
+//! releases it and then calls them; the WPE monitor's user data is its raw `this`, and the
+//! monitor's `invalidate` removes its callback without waiting for a `sync` that already copied
+//! it. A display link, and its monitor, is destroyed with its `WebProcessPool` on WebKit's main
+//! thread, whenever the pool's last reference goes (which the last view's close starts, and
+//! which may finish in a later GLib dispatch). A `sync` on another thread can therefore call a
+//! freed monitor, and nothing an observer does in `stop` can wait it out: WebKit calls `stop`
+//! with the monitor's lock held, which the running callback takes too, and from inside `sync`
+//! itself (a display link stops when it fired with no observers). WebKit's own DRM observer has
+//! the same race. Here every tick is a one-shot GLib timeout on the main context the screen was
+//! made on (the owner's, which WebKit's UI process runs on), dispatched only by the owner's
+//! [`crate::glib_loop::GlibLoop`], so a `sync` and the destruction of any monitor are never at
+//! the same time: callbacks are copied and called within one dispatch, and no callback a
+//! monitor registers destroys another monitor. WebKit's display link code says it is called off
+//! the main thread (an `ASSERT`, compiled out of the release build), but what it does there
+//! (send `DisplayDidRefresh` to the web process, under the display link's own lock) works on any
+//! thread. The cost is that a tick waits for the owner loop, which pumps WebKit's context at its
+//! deadlines, to within a millisecond (GLib's timeouts).
+//!
+//! Shutdown is explicit: [`Screen::shutdown`] removes the timeout, and nothing ticks after it.
 //!
 //! The ticks are WebKit's pacing, not the compositor's: frames still reach the compositor only
 //! on the host's permits. This is the nominal rate of the output, not its vblank phase.
 //!
-//! Shutdown is explicit: [`Screen::shutdown`] ends and joins the thread, and the runtime calls
-//! it before it drops the display (`WpeRuntime::shutdown`). `stop` never waits for the thread:
-//! WebKit calls it with its monitor's lock held, and a tick may be waiting for that lock.
-//!
 //! Must not own: the view's state, presentation or any Wayland object.
 
 use std::cell::OnceCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use glib::prelude::*;
@@ -36,6 +64,9 @@ use crate::ffi;
 
 /// The refresh rate, in mHz, until a window says otherwise.
 pub const DEFAULT_REFRESH_MHZ: u32 = 60_000;
+
+/// The rate WebKit is told the screen has, in mHz, whatever the output's (module docs).
+pub const NOMINAL_MHZ: u32 = 60_000;
 
 glib::wrapper! {
     /// WebKit's `WPEScreen`, the abstract parent of [`Screen`].
@@ -49,7 +80,7 @@ glib::wrapper! {
     match fn { type_ => || ffi::wpe_screen_sync_observer_get_type(), }
 }
 
-/// What the observer's thread has done, for diagnostics and tests.
+/// What the observer has done, for diagnostics and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VblankStats {
     /// Times WebKit started the observer (its first callback was added).
@@ -62,86 +93,40 @@ pub struct VblankStats {
     pub running: bool,
 }
 
-/// What the observer's thread and its owner share.
+/// When the observer ticks.
 #[derive(Default)]
-pub struct Shared {
-    control: Mutex<Control>,
-    wake: Condvar,
-    /// The tick period, in nanoseconds; read again for every tick.
-    period_ns: AtomicU64,
-    starts: AtomicU64,
-    stops: AtomicU64,
-    ticks: AtomicU64,
-    running: AtomicBool,
-}
-
-#[derive(Default)]
-pub struct Control {
+struct Control {
     running: bool,
-    quit: bool,
+    /// Ended ([`Screen::shutdown`]): never ticks or starts again.
+    ended: bool,
+    /// When the next tick is due, while running.
+    next: Option<Instant>,
+    /// The one-shot timeout of that tick; `None` while a tick runs.
+    source: Option<glib::Source>,
 }
 
-impl Shared {
-    fn control(&self) -> MutexGuard<'_, Control> {
-        self.control.lock().unwrap_or_else(|e| e.into_inner())
+/// The observer, for its timeout's closure, which `glib` requires to be `Send`.
+struct ObserverRef(SyncObserver);
+
+// SAFETY: the closure runs only where its source is dispatched, the owner thread that iterates
+// the observer's main context, and is dropped there or wherever the source is destroyed; a
+// GObject's reference count is atomic, and the observer's state is behind a mutex.
+unsafe impl Send for ObserverRef {}
+
+impl ObserverRef {
+    /// Through the whole wrapper, so the closure captures it and not just its field.
+    fn tick(&self) {
+        self.0.imp().tick();
     }
 }
 
-/// The observer's address, for its thread.
-struct ObserverPtr(*mut ffi::WPEScreenSyncObserver);
-
-// SAFETY: the thread only calls the observer class's `sync`, which WebKit documents as called
-// from a secondary thread (its callbacks are guarded by the observer's own lock). The thread
-// never outlives the object: `Screen::shutdown` and the observer's `dispose` join it first.
-unsafe impl Send for ObserverPtr {}
-
-fn period(mhz: u32) -> u64 {
-    1_000_000_000_000 / u64::from(mhz.max(1))
+fn period(mhz: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000_000 / u64::from(mhz.max(1)))
 }
 
-/// Runs `sync` once per period while started, parked otherwise, until `quit`.
-fn ticker(shared: &Shared, observer: &ObserverPtr) {
-    let mut control = shared.control();
-    loop {
-        while !control.running && !control.quit {
-            control = shared.wake.wait(control).unwrap_or_else(|e| e.into_inner());
-        }
-        if control.quit {
-            return;
-        }
-        let mut next =
-            Instant::now() + Duration::from_nanos(shared.period_ns.load(Ordering::Relaxed));
-        while control.running && !control.quit {
-            let now = Instant::now();
-            if now < next {
-                control = shared
-                    .wake
-                    .wait_timeout(control, next - now)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
-                continue;
-            }
-            drop(control);
-            // SAFETY: see `ObserverPtr`. The class is the observer's own; its `sync` is the
-            // base's (this type does not override it) and runs every registered callback.
-            unsafe {
-                let class = (*observer.0.cast::<glib::gobject_ffi::GTypeInstance>()).g_class
-                    as *const ffi::WPEScreenSyncObserverClass;
-                if let Some(sync) = (*class).sync {
-                    sync(observer.0);
-                }
-            }
-            shared.ticks.fetch_add(1, Ordering::Relaxed);
-            control = shared.control();
-            let period = Duration::from_nanos(shared.period_ns.load(Ordering::Relaxed));
-            next += period;
-            // Never a burst to catch up after a slow tick.
-            let now = Instant::now();
-            if next < now {
-                next = now + period;
-            }
-        }
-    }
+/// `wait` rounded up to GLib's milliseconds, so a timeout never fires before it is due.
+fn whole_millis(wait: Duration) -> Duration {
+    Duration::from_millis(wait.as_micros().div_ceil(1_000) as u64)
 }
 
 /// The `WPEScreenSyncObserver` virtual methods a subclass provides.
@@ -200,19 +185,26 @@ mod imp {
     use super::*;
 
     pub struct SyncObserver {
-        pub shared: Arc<Shared>,
-        pub thread: Mutex<Option<JoinHandle<()>>>,
+        /// The tick period, read again for every tick.
+        pub period_ns: AtomicU64,
+        /// The main context the ticks are dispatched from: the thread-default context of the
+        /// thread that made the observer (the owner's, GLib's default one, in the runtime).
+        context: glib::MainContext,
+        control: Mutex<Control>,
+        pub starts: AtomicU64,
+        pub stops: AtomicU64,
+        pub ticks: AtomicU64,
     }
 
     impl Default for SyncObserver {
         fn default() -> Self {
-            let shared = Shared::default();
-            shared
-                .period_ns
-                .store(period(DEFAULT_REFRESH_MHZ), Ordering::Relaxed);
             Self {
-                shared: Arc::new(shared),
-                thread: Mutex::new(None),
+                period_ns: AtomicU64::new(period(DEFAULT_REFRESH_MHZ).as_nanos() as u64),
+                context: glib::MainContext::ref_thread_default(),
+                control: Mutex::default(),
+                starts: AtomicU64::new(0),
+                stops: AtomicU64::new(0),
+                ticks: AtomicU64::new(0),
             }
         }
     }
@@ -231,43 +223,115 @@ mod imp {
     }
 
     impl SyncObserver {
-        /// Ends the thread and waits for it.
+        fn control(&self) -> MutexGuard<'_, Control> {
+            self.control.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn period(&self) -> Duration {
+            Duration::from_nanos(self.period_ns.load(Ordering::Relaxed))
+        }
+
+        pub fn running(&self) -> bool {
+            self.control().running
+        }
+
+        /// A one-shot timeout on the observer's context that ticks at `at`.
+        fn arm(&self, at: Instant) -> glib::Source {
+            let wait = whole_millis(at.saturating_duration_since(Instant::now()));
+            let observer = ObserverRef(self.obj().clone());
+            let source = glib::timeout_source_new(
+                wait,
+                Some("sighurt-vblank"),
+                glib::Priority::DEFAULT,
+                move || {
+                    observer.tick();
+                    glib::ControlFlow::Break
+                },
+            );
+            source.attach(Some(&self.context));
+            source
+        }
+
+        /// One tick: every registered callback, then the next tick's timeout while still
+        /// running. Runs in the dispatch of the timeout `arm` made.
+        pub(super) fn tick(&self) {
+            {
+                let mut control = self.control();
+                // This timeout ends with this dispatch.
+                control.source = None;
+                if !control.running || control.ended {
+                    return;
+                }
+            }
+            // SAFETY: a live observer of this class. Its `sync` is the base's (this type does
+            // not override it) and runs every registered callback; no lock of ours is held, as
+            // a callback may stop or start the observer.
+            unsafe {
+                let observer = self.obj();
+                let observer = observer.as_ptr();
+                let class = (*observer.cast::<glib::gobject_ffi::GTypeInstance>()).g_class
+                    as *const ffi::WPEScreenSyncObserverClass;
+                if let Some(sync) = (*class).sync {
+                    sync(observer);
+                }
+            }
+            self.ticks.fetch_add(1, Ordering::Relaxed);
+            let mut control = self.control();
+            // A callback that stopped and started the observer again armed it already.
+            if control.running && !control.ended && control.source.is_none() {
+                let now = Instant::now();
+                let period = self.period();
+                let mut next = control.next.unwrap_or(now) + period;
+                // Never a burst to catch up after a slow tick.
+                if next < now {
+                    next = now + period;
+                }
+                control.next = Some(next);
+                control.source = Some(self.arm(next));
+            }
+        }
+
+        /// Never ticks again: the timeout is removed.
         pub fn end(&self) {
-            self.shared.control().quit = true;
-            self.shared.wake.notify_all();
-            let handle = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
-            if let Some(handle) = handle {
-                let _ = handle.join();
+            let source = {
+                let mut control = self.control();
+                control.ended = true;
+                control.running = false;
+                control.source.take()
+            };
+            if let Some(source) = source {
+                source.destroy();
             }
         }
     }
 
     impl SyncObserverImpl for SyncObserver {
         fn start(&self) {
-            self.shared.starts.fetch_add(1, Ordering::Relaxed);
-            self.shared.running.store(true, Ordering::Relaxed);
+            self.starts.fetch_add(1, Ordering::Relaxed);
             log::debug!("wpe: vblank observer started");
-            {
-                let mut thread = self.thread.lock().unwrap_or_else(|e| e.into_inner());
-                if thread.is_none() && !self.shared.control().quit {
-                    let shared = Arc::clone(&self.shared);
-                    let observer = ObserverPtr(self.obj().as_ptr().cast());
-                    *thread = std::thread::Builder::new()
-                        .name("sighurt-vblank".into())
-                        .spawn(move || ticker(&shared, &observer))
-                        .ok();
-                }
+            let mut control = self.control();
+            if control.ended {
+                return;
             }
-            self.shared.control().running = true;
-            self.shared.wake.notify_all();
+            control.running = true;
+            if control.source.is_none() {
+                let next = Instant::now() + self.period();
+                control.next = Some(next);
+                control.source = Some(self.arm(next));
+            }
         }
 
         fn stop(&self) {
-            self.shared.stops.fetch_add(1, Ordering::Relaxed);
-            self.shared.running.store(false, Ordering::Relaxed);
+            self.stops.fetch_add(1, Ordering::Relaxed);
             log::debug!("wpe: vblank observer stopped");
-            self.shared.control().running = false;
-            self.shared.wake.notify_all();
+            let source = {
+                let mut control = self.control();
+                control.running = false;
+                control.source.take()
+            };
+            if let Some(source) = source {
+                source.destroy();
+            }
         }
     }
 
@@ -305,7 +369,8 @@ glib::wrapper! {
 }
 
 glib::wrapper! {
-    /// Sighurt's `WPEScreen`: the output the windows are on, as far as pages may know it.
+    /// Sighurt's `WPEScreen`: the output the windows are on, as far as pages may know it, at
+    /// 60 Hz as far as WebKit knows.
     pub struct Screen(ObjectSubclass<imp::Screen>) @extends WpeScreen;
 }
 
@@ -316,7 +381,8 @@ impl SyncObserver {
 }
 
 impl Screen {
-    /// A screen whose rect is `size` (logical pixels) at 96 dpi, refreshing at `mhz`.
+    /// A screen whose rect is `size` (logical pixels) at 96 dpi, whose observer ticks at `mhz`
+    /// from the calling thread's default main context.
     pub fn new(mhz: u32, size: (i32, i32)) -> Self {
         let screen: Self = glib::Object::builder()
             .property("id", 1u32)
@@ -327,15 +393,10 @@ impl Screen {
             .property("physical-width", millimetres(size.0))
             .property("physical-height", millimetres(size.1))
             .property("scale", 1.0f64)
-            .property("refresh-rate", mhz as i32)
+            .property("refresh-rate", NOMINAL_MHZ as i32)
             .build();
-        let observer: SyncObserver = glib::Object::new();
-        observer
-            .imp()
-            .shared
-            .period_ns
-            .store(period(mhz), Ordering::Relaxed);
-        let _ = screen.imp().observer.set(observer);
+        let _ = screen.imp().observer.set(glib::Object::new());
+        screen.set_refresh_mhz(mhz);
         screen
     }
 
@@ -350,17 +411,25 @@ impl Screen {
             .expect("set when the screen is made")
     }
 
-    /// The refresh rate, in mHz: WebKit's nominal rate for pages that start after this, and
-    /// the observer's tick period from its next tick.
+    /// The observer's tick rate from its next tick, in mHz (clamped to 1 to 1000 Hz): the
+    /// output's rate. WebKit's own idea of the rate stays [`NOMINAL_MHZ`].
     pub fn set_refresh_mhz(&self, mhz: u32) {
         let mhz = mhz.clamp(1_000, 1_000_000);
-        // SAFETY: a live screen.
-        unsafe { ffi::wpe_screen_set_refresh_rate(self.as_ptr(), mhz as i32) };
         self.observer()
             .imp()
-            .shared
             .period_ns
-            .store(period(mhz), Ordering::Relaxed);
+            .store(period(mhz).as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// The observer's tick rate, in mHz.
+    pub fn refresh_mhz(&self) -> u32 {
+        let ns = self
+            .observer()
+            .imp()
+            .period_ns
+            .load(Ordering::Relaxed)
+            .max(1);
+        (1_000_000_000_000 / u128::from(ns)) as u32
     }
 
     /// Sets the rect (logical pixels, at 96 dpi). Pages already started keep what they were
@@ -379,16 +448,16 @@ impl Screen {
 
     /// The observer's counters.
     pub fn stats(&self) -> VblankStats {
-        let shared = &self.observer().imp().shared;
+        let observer = self.observer().imp();
         VblankStats {
-            starts: shared.starts.load(Ordering::Relaxed),
-            stops: shared.stops.load(Ordering::Relaxed),
-            ticks: shared.ticks.load(Ordering::Relaxed),
-            running: shared.running.load(Ordering::Relaxed),
+            starts: observer.starts.load(Ordering::Relaxed),
+            stops: observer.stops.load(Ordering::Relaxed),
+            ticks: observer.ticks.load(Ordering::Relaxed),
+            running: observer.running(),
         }
     }
 
-    /// Ends the observer's thread and waits for it. Nothing ticks after this.
+    /// Ends the observer: its timeout is removed, and nothing ticks after this.
     pub fn shutdown(&self) {
         self.observer().imp().end();
     }
@@ -401,18 +470,104 @@ fn millimetres(pixels: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+    use std::sync::Arc;
+    use std::thread::ThreadId;
+
     use super::*;
 
     #[test]
     fn the_period_follows_the_rate() {
-        assert_eq!(period(60_000), 16_666_666);
-        assert_eq!(period(120_000), 8_333_333);
-        assert_eq!(period(0), 1_000_000_000_000);
+        assert_eq!(period(60_000), Duration::from_nanos(16_666_666));
+        assert_eq!(period(120_000), Duration::from_nanos(8_333_333));
+        assert_eq!(period(0), Duration::from_secs(1_000));
+        assert_eq!(
+            whole_millis(Duration::from_micros(16_667)),
+            Duration::from_millis(17)
+        );
+        assert_eq!(whole_millis(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]
     fn physical_size_is_never_zero() {
         assert_eq!(millimetres(0), millimetres(1));
         assert!(millimetres(1280) > 300);
+    }
+
+    /// Where a callback ran, for the test below.
+    #[derive(Default)]
+    struct Calls(Mutex<Vec<ThreadId>>);
+
+    unsafe extern "C" fn record(_: *mut ffi::WPEScreenSyncObserver, data: glib::ffi::gpointer) {
+        let calls = unsafe { &*(data as *const Calls) };
+        calls.0.lock().unwrap().push(std::thread::current().id());
+    }
+
+    /// Runs `context` for `total`, sleeping a millisecond whenever nothing was ready.
+    fn run(context: &glib::MainContext, total: Duration) {
+        let end = Instant::now() + total;
+        while Instant::now() < end {
+            if !context.iteration(false) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// The callbacks WebKit registers run only on the thread that runs the screen's main
+    /// context, inside its dispatch: never while that thread is elsewhere (where WebKit destroys
+    /// the monitors those callbacks point to), and never after the callback was removed or the
+    /// screen shut down. Starting again after a stop resumes the ticks.
+    #[test]
+    fn callbacks_run_only_in_the_owners_dispatch() {
+        ffi::load().expect("WPE WebKit's library");
+        let context = glib::MainContext::new();
+        let _owner = context.acquire().unwrap();
+        context
+            .with_thread_default(|| {
+                let screen = Screen::new(250_000, (800, 600));
+                assert_eq!(screen.refresh_mhz(), 250_000);
+                let nominal = unsafe { ffi::wpe_screen_get_refresh_rate(screen.as_ptr()) };
+                assert_eq!(nominal, NOMINAL_MHZ as i32, "WebKit is told 60 Hz");
+                let observer = screen.observer().as_ptr();
+                let calls = Arc::new(Calls::default());
+                let data = Arc::as_ptr(&calls) as *mut c_void;
+                let add = || unsafe {
+                    ffi::wpe_screen_sync_observer_add_callback(observer, Some(record), data, None)
+                };
+                let count = || calls.0.lock().unwrap().len();
+
+                let id = add();
+                assert!(screen.stats().running);
+                // A thread of the observer's own would tick here, while the owner sleeps.
+                std::thread::sleep(Duration::from_millis(60));
+                assert_eq!(count(), 0, "no tick outside the owner's dispatch");
+                run(&context, Duration::from_millis(60));
+                let ticked = count();
+                assert!(ticked > 3, "it ticks at the screen's rate: {ticked}");
+                let me = std::thread::current().id();
+                assert!(calls.0.lock().unwrap().iter().all(|t| *t == me));
+
+                // The last callback removed: stopped, and nothing more runs.
+                unsafe { ffi::wpe_screen_sync_observer_remove_callback(observer, id) };
+                assert!(!screen.stats().running);
+                run(&context, Duration::from_millis(40));
+                assert_eq!(count(), ticked, "no tick after the callback was removed");
+
+                // Another view's display link starts it again.
+                let id = add();
+                run(&context, Duration::from_millis(40));
+                assert!(count() > ticked, "it resumes");
+                let stats = screen.stats();
+                assert_eq!((stats.starts, stats.stops), (2, 1));
+
+                // Shut down with a callback still registered: nothing more runs.
+                screen.shutdown();
+                let after = count();
+                run(&context, Duration::from_millis(40));
+                assert_eq!(count(), after, "no tick after shutdown");
+                unsafe { ffi::wpe_screen_sync_observer_remove_callback(observer, id) };
+                drop(screen);
+            })
+            .unwrap();
     }
 }

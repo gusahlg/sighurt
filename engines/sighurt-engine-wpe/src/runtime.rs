@@ -40,9 +40,11 @@
 //! never starts ends with `NavigationFailed`: refused, stopped, or gone nowhere (see
 //! [`crate::navigation`]).
 //!
-//! WebKit paces animations with the display's screen ([`crate::screen`]): the runtime gives it
-//! the refresh rate of the outputs the views' windows are on (the lease's, 60 Hz without one)
-//! and ends its vblank thread at shutdown, before the display is dropped.
+//! WebKit paces animations with the display's screen ([`crate::screen`]): the runtime gives its
+//! observer the refresh rate of the outputs the views' windows are on (the lease's, 60 Hz
+//! without one), read again at every pump before WebKit's context runs, so a window that moved
+//! to another output changes the rate whether or not anything paints; the observer ticks in the
+//! owner's GLib dispatch, and the runtime ends it at shutdown, before the display is dropped.
 //!
 //! Semantics stay off until `SetSemantics`. While on, the extraction script runs in the isolated
 //! world `sighurt` after a commit, when loading ends, after an action, and at least 250 ms after
@@ -202,6 +204,8 @@ pub struct Diagnostics {
     pub dri_prime: Option<String>,
     /// The vblank observer WebKit paces animations with (see [`crate::screen`]).
     pub vblank: VblankStats,
+    /// The rate it ticks at (mHz): the output's. WebKit is told 60 Hz ([`crate::screen`]).
+    pub refresh_mhz: Option<u32>,
 }
 
 impl Diagnostics {
@@ -358,6 +362,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
             vblank: platform
                 .map(|p| p.display.screen().stats())
                 .unwrap_or_default(),
+            refresh_mhz: platform.map(|p| p.display.screen().refresh_mhz()),
         }
     }
 
@@ -491,7 +496,9 @@ impl<T: WpeTarget> WpeRuntime<T> {
 
     /// Gives the display's screen the highest refresh rate among the views' outputs, when it
     /// changed: WebKit paces animations at the screen's rate. A view on no known output
-    /// leaves it as it was.
+    /// leaves it as it was. Called at every pump, before WebKit's context runs, and when a
+    /// view opens or presents: the host changes the lease's rate when the window enters another
+    /// output, which needs no frame.
     fn sync_refresh(&mut self) {
         let Some(platform) = self.platform.as_ref() else {
             return;
@@ -1313,6 +1320,7 @@ impl<T: WpeTarget> WpeRuntime<T> {
         let surface = &page.slot.as_ref().expect("a Wayland view").surface;
         surface.attach(Some(&wl_buffer), 0, 0);
         present::damage(surface, if copied { &[] } else { &damage }, size);
+        T::submitting(&permit);
         surface.commit();
         page.presented = Some(epoch);
         page.reshow = false;
@@ -2240,6 +2248,7 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
         }
         let mut next = None;
         if self.failed.is_none() {
+            self.sync_refresh();
             self.release_buffers();
             next = self.glib.as_mut().and_then(GlibLoop::iterate);
             self.handle_notes();
@@ -2347,7 +2356,7 @@ impl<T: WpeTarget> EngineRuntime for WpeRuntime<T> {
             .as_ref()
             .is_some_and(|platform| platform.wayland.is_none());
         if let Some(platform) = self.platform.as_mut() {
-            // No tick after this: the observer's thread ends before the display goes.
+            // No tick after this: the observer's timeout goes before the display does.
             platform.display.screen().shutdown();
             for (object, handler) in platform.handlers.drain(..) {
                 object.disconnect(handler);

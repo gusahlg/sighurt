@@ -16,8 +16,11 @@ call sequences, and the code asserted instead of tolerating it.
 - `DroppableWebGLBuffer::delete` returns when the buffer is not deleted instead of asserting.
 - `increment_attached_counter` and `decrement_attached_counter` saturate instead of panicking.
 
-A page's WebGL bookkeeping error then costs at most a leaked or early-deleted GL buffer, never
-the browser.
+This is a guard, not a fix of the imbalance. What it was shown to do: the assertions and the
+panic no longer happen on github.com, so the script thread survives. What was not shown: that
+the buffer's ownership is right afterwards, or that what goes wrong is bounded (a buffer leaked
+or deleted early, or something else). The call sequence that unbalances the counter has not been
+found or reproduced in isolation.
 
 ## Input-driven rendering updates (`event_loop/script_thread.rs`)
 

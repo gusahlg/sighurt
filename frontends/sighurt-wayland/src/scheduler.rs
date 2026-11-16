@@ -165,9 +165,20 @@ pub struct PresentStats {
     /// Layouts whose grace period ended without this target's frame, so it was unmapped until
     /// its frame came (the slow-resize fallback).
     pub late: u64,
-    /// From submission to display, for the last presented frame, when the compositor's
-    /// presentation clock is `CLOCK_MONOTONIC`.
+    /// Frames whose reported display time came before their submission time, an impossible
+    /// ordering (a wrong clock or a mark taken too late). Their latency is not recorded.
+    pub invalid_latency: u64,
+    /// From just before the commit or swap that submitted a frame (`FramePermit::submitting`
+    /// for a native presenter) to the compositor's presentation time, for the last presented
+    /// frame, when the presentation clock is `CLOCK_MONOTONIC`.
     pub last_latency: Option<Duration>,
+}
+
+/// The time from `submitted_ns` to `shown_ns` (both `CLOCK_MONOTONIC` nanoseconds), or `None`
+/// when the frame is shown before it was submitted, which no real frame is.
+fn latency(shown_ns: u128, submitted_ns: u128) -> Option<Duration> {
+    let diff = shown_ns.checked_sub(submitted_ns)?;
+    Some(Duration::from_nanos(diff.min(u64::MAX as u128) as u64))
 }
 
 /// A frame callback's target and sequence number.
@@ -197,8 +208,9 @@ impl Dispatch<WlCallback, FrameData> for Host {
 }
 
 /// A presentation feedback's target and when its frame was submitted, in nanoseconds of
-/// `CLOCK_MONOTONIC`: 0 until the commit that carries it is made (a GL target's request waits
-/// for the presenter's swap, which may come with a later permit).
+/// `CLOCK_MONOTONIC`: the time just before the commit or swap that carries it, and 0 until the
+/// presenter marks it (a GL target's request waits for the presenter's swap, which may come
+/// with a later permit).
 #[derive(Clone, Debug)]
 pub(crate) struct FeedbackData {
     pub target: TargetId,
@@ -260,11 +272,14 @@ impl Dispatch<WpPresentationFeedback, FeedbackData> for Host {
                 if host.presentation_clock == Some(CLOCK_MONOTONIC) && submitted > 0 {
                     let secs = (u128::from(tv_sec_hi) << 32) | u128::from(tv_sec_lo);
                     let shown = secs * 1_000_000_000 + u128::from(tv_nsec);
-                    let latency = shown.saturating_sub(submitted);
-                    let latency = Duration::from_nanos(latency.min(u64::MAX as u128) as u64);
-                    target.stats.last_latency = Some(latency);
-                    if host.presentations.len() < MAX_PRESENTATION_SAMPLES {
-                        host.presentations.push((data.target, latency));
+                    match latency(shown, submitted) {
+                        Some(latency) => {
+                            target.stats.last_latency = Some(latency);
+                            if host.presentations.len() < MAX_PRESENTATION_SAMPLES {
+                                host.presentations.push((data.target, latency));
+                            }
+                        }
+                        None => target.stats.invalid_latency += 1,
                     }
                 }
             }
@@ -283,6 +298,13 @@ mod tests {
         assert!(clock.can_present(true));
         clock.issue();
         clock.finished(outcome);
+    }
+
+    #[test]
+    fn a_frame_shown_before_its_submission_has_no_latency() {
+        assert_eq!(latency(1_000, 2_000), None);
+        assert_eq!(latency(2_000, 2_000), Some(Duration::ZERO));
+        assert_eq!(latency(5_000, 2_000), Some(Duration::from_nanos(3_000)));
     }
 
     #[test]
