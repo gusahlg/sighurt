@@ -2095,3 +2095,26 @@ finding was checked against the plan and the code before it was acted on.
   `[keys.url]` binding for the address shown wins over a `[tui.keys]` binding with no address;
   (d) `[keys]` applies under `keymap = "example"`, where it was ignored with a notice. Every
   default key behaves as before in both frontends.
+
+- **The interface as a layout tree** (16 November 2026; `interface-2026-11-16.md` and its
+  "Review and rulings"). New: `sighurt_api::ui` (`Interface` with a `window` and a `terminal`
+  tree and a `density`; `Node::{Column, Row, Overlay, Leaf}`; the components `TabBar`,
+  `AddressBar`, `StatusBar`, `CommandLine`, `Summary`, `PageView` with `PageSlot::MAIN`, and
+  `Label` with an `id`, which no frontend shows yet; `Node::check`; the structural operations
+  `place`, `position`, `remove`, `overlay` and `get_mut`, applied together and checked once by
+  `Interface::change` and `Node::change`; the presets `Interface::standard`, `Node::standard`,
+  `Node::terminal`); `Theme::interface`, which `ChromeEvent::Configure` carries;
+  `sighurt_ui::layout::Layout::from_tree` with `Arrangement`, `Sizing` and the ownership map
+  (`Layout::surfaces`, `surface_of`, `surface`), `tabs_vertical`, `status_layer` and `edges`;
+  `Model::new` and `Model::set_options` take anything that is `Into<Arrangement>`
+  (`LayoutOptions` is); the SDK's `Experience::ui` (`sighurt_config::ui::UiBuilder`) and
+  `Experience::interface`; `Environment::interface` and `Config::interface` in the core;
+  `[ui.layout]` and `[tui.layout]`. The standard chrome takes its layout from
+  `Theme::interface` and no longer from `[chrome.standard]` (the core applies that table to the
+  tree, while the standard chrome is chosen, before `[ui.layout]`). Its damage, its text
+  field's surface and its hit testing follow the ownership map; a pointer event hits only the
+  controls of the surface it arrived on. Every placement of before lays out exactly as it did
+  (`trees_lay_out_as_the_options_did`, all 36 golden images unchanged); tabs on the right or at
+  the bottom, a full-height sidebar and the toolbar at the bottom are new, with golden images of
+  their own. Unchanged: `ChromeKind`, `CHROMES`, `[ui] chrome`, the line chrome and
+  `[chrome.line]`.
