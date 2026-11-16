@@ -255,11 +255,11 @@ then.
 The Ports workflow (`.github/workflows/ports.yml`) on GitHub's hosted runners, `port2` branch,
 16 November 2026. Runs are at `https://github.com/gusahlg/sighurt/actions/runs/<id>`.
 
-**Windows (`windows-latest`), verified.** Run 43838694058, job "Windows (terminal only)", both
-steps green, 723 tests (and green in runs 43824448752, 43826803295, 43830229164 and
-43835363647 before it). Its first attempt failed one timing test whose bound is 700 ms on a
-shared runner (`services::tests::quitting_deletes_a_download_its_server_keeps_waiting`); the
-second passed.
+**Windows (`windows-latest`), verified.** Run 43848358624 (the branch's last commit), job
+"Windows (terminal only)", both steps green: 723 tests passed, none failed (green also in runs
+43824448752, 43826803295, 43830229164, 43835363647 and 43838694058). Run 43838694058's first
+attempt failed one timing test whose bound is 700 ms on a shared runner
+(`services::tests::quitting_deletes_a_download_its_server_keeps_waiting`); its second passed.
 
 - `cargo test -p sighurt-browser --no-default-features --features frontend-tui,engine-demo --bins
   --tests`: `sig`'s 6 unit tests and `tests/console.rs`'s 3. In a ConPTY pseudoconsole of 80×24,
@@ -273,8 +273,8 @@ second passed.
   runtime (the access-list and replace test, the signal queue, the download names among them),
   semantic and tui (its console unit tests among them), all passing.
 
-**macOS (`macos-latest`, Apple Silicon), verified.** Run 43838694058, job "macOS (terminal
-only)", every step green, 880 tests:
+**macOS (`macos-latest`, Apple Silicon), verified.** Run 43848358624, job "macOS (terminal
+only)", every step green: 879 tests passed, none failed (all green also in run 43838694058):
 
 - `tests/tui.rs` with the demo engine (46 tests: `sig --tui` and `--dump` in a pty with a fake
   terminal: kitty and sixel frames, keys, the address line, text mode, find, the clipboard,
