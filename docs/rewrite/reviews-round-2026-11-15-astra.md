@@ -545,3 +545,166 @@ The design choices I would change are:
 I found no new unconditional idle tick, unbounded frame accumulation, or normal Servo GPU-to-CPU page copy in the reviewed speed paths. The terminal output cap and pending-output gate prevent an indefinitely non-reading terminal from accumulating page frames or triggering frame-deadline polling. They provide backpressure only as far as the PTY/tmux reader, however—not proof that the terminal has displayed anything.
 
 The WebGL bookkeeping patch predates this review range. Its guards suppress the observed assertions; they do not establish correct buffer ownership or a bounded leak. The claim in [SIGHURT-PATCH.md:19](third_party/servo-script/SIGHURT-PATCH.md:19) is stronger than the demonstrated result. I would retain explicit diagnostics and a reproducer until the attachment imbalance itself is fixed.
+
+## Review C: portability, the round's direction, and the Wasm configuration questions, 16 November 2026
+
+GPT-6 Astra, read-only, on `config-ext` at 4a0a8d7: BEFORE the lanes of 16 November were merged (the terminal on macOS and Windows, decision 151; the interface, 152; the fixes of 155 to 157). Several findings describe code that those lanes had already replaced; the triage is in STATUS.md.
+
+**I would not release 1.1.0 from this foundation yet.** The immediate blockers are native execution, terminal lifecycle correctness, Windows persistence guarantees, and the configuration SDK’s licensing boundary. These are source-level findings; I ran no builds or tests.
+
+1. **High — The Darwin fatal-signal test can swallow SIGSEGV and leave the browser running with a restored terminal.**  
+   [session.rs:1395](frontends/sighurt-tui/src/term/session.rs:1395), [session.rs:1437](frontends/sighurt-tui/src/term/session.rs:1437).
+
+   `0x10001` is the correct Darwin header value for `SI_USER`. The mistake is assuming Darwin reliably supplies that value for `kill`/`raise` of these signals. Apple Silicon’s signal delivery assigns `SEGV_ACCERR` for SIGSEGV and `BUS_ADRALN` for SIGBUS by signal number. Rust’s previous stack-overflow handler can reset the disposition to default and return. Your handler then restores the terminal and returns, expecting a faulting instruction to execute again. After `kill -SEGV PID`, there is no faulting instruction: execution continues.
+
+   **Fix:** On Darwin, when the chained handler returns with the disposition now default, restore and re-raise. Preserve the separate path for a handler that actually recovers and remains installed. Verify external `kill`, `raise`, `pthread_kill`, a real memory fault, stack overflow, and a recoverable Wasmtime trap. Replacing the constant with another guessed value will not fix this. This conclusion follows from [Apple’s delivery implementation](https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/dev/arm/unix_signal.c) and [the pinned Rust handler](https://raw.githubusercontent.com/rust-lang/rust/1.98.1/library/std/src/sys/pal/unix/stack_overflow.rs).
+
+2. **High — The advertised macOS test job cannot compile its harness; after that is fixed, its profile isolation is still wrong.**  
+   [ports.yml:46](.github/workflows/ports.yml:46), [tests/tui.rs:155](apps/sighurt-browser/tests/tui.rs:155), [tests/tui.rs:199](apps/sighurt-browser/tests/tui.rs:199), [tests/tui.rs:2298](apps/sighurt-browser/tests/tui.rs:2298).
+
+   The harness calls `rustix::fs::mknodat`; the locked rustix version excludes that function on Apple targets. `#[cfg(unix)]` is insufficient.
+
+   Independently, the harness writes configuration and history under its temporary `config/` and `state/` directories, then sets XDG variables. `dirs` on macOS ignores those variables and uses `HOME/Library/Application Support`; `state_dir()` is absent. Consequently, the child reads different configuration and state from those the test prepared.
+
+   The dump helper is worse: it does not replace `HOME`. On a developer’s Mac it can read the real Sighurt configuration. `Paths::from_env()` also creates or tightens real profile directories, even though dump subsequently disables session persistence.
+
+   **Fix:** Use a portable FIFO helper, such as an Apple `mkfifo` implementation. Centralize test profile isolation around the platform’s actual directory resolution, or inject explicit profile roots. Apply it to every subprocess helper, including dump. Assert the child’s resolved paths before testing behavior.
+
+3. **High before Windows support ships — “Make private” silently succeeds without establishing privacy.**  
+   [persistence.rs:121](crates/sighurt-runtime/src/persistence.rs:121), [persistence.rs:450](crates/sighurt-runtime/src/persistence.rs:450).
+
+   On Windows, `secure_private_dir` verifies that a directory exists and returns success. It neither checks nor tightens its DACL. `private_file` similarly adds no protection. A profile beneath a broadly accessible inherited ACL therefore stores session/history/profile material with those permissions while the security helper reports success.
+
+   **Fix:** Implement and verify a Windows ACL policy for newly created and existing profile directories and files. Until then, return an explicit unsupported/error result from the security operation; do not present directory creation as successful security enforcement. Treat replacement-file ACLs, concurrent readers, sharing violations and crash durability as separate persistence acceptance tests.
+
+4. **Medium — Unsupported configuration features become silent or misleading behavior at the frontend.**  
+   [app.rs:703](frontends/sighurt-tui/src/app.rs:703), [registry.rs:201](crates/sighurt-runtime/src/registry.rs:201), [pty_unsupported.rs:58](crates/sighurt-runtime/src/pty_unsupported.rs:58), [terminal/app.rs:414](pages/sig-page-terminal/src/app.rs:414).
+
+   On macOS, editing the configuration does nothing until restart. The watch failure is logged at `info`; the default filter is `warn`. The claimed explanatory refusal is normally invisible.
+
+   Similarly, the unsupported PTY module reports `editor() == None`. `sig://config` consequently tells a Mac user to install or configure an editor—even when one is configured. That cannot repair the actual limitation.
+
+   **Fix:** Carry capability failures through to user-visible notices and page information. Distinguish “no editor found” from “this build cannot launch editors.” Add a real watcher handling both in-place writes and file replacement; until then, state the restart requirement visibly.
+
+5. **Medium — A working Windows console backend will still fail ordinary automatic startup without `TERM`.**  
+   [main.rs:233](apps/sighurt-browser/src/main.rs:233).
+
+   Start the terminal-only build from a normal Windows console with `TERM` unset. Even after the backend exists, `sig` rejects the terminal and reports the missing GUI. Explicit `--tui` bypasses this condition, so testing only that command misses the defect.
+
+   **Fix:** Make automatic frontend selection use a platform capability check. On Windows, console-handle detection and successful console-mode negotiation should decide; requiring a Unix environment convention is wrong. Cover redirected standard handles separately.
+
+6. **Medium — The tmux image-ID collision fix does not operate on macOS.**  
+   [app.rs:319](frontends/sighurt-tui/src/app.rs:319), [app.rs:335](frontends/sighurt-tui/src/app.rs:335).
+
+   `dirs::runtime_dir()` always returns `None` on macOS. Every process therefore takes the unclaimed PID-derived fallback. Two Sighurt processes whose PIDs are congruent modulo 255 can use the same kitty image ID in one terminal, overwriting or deleting each other’s image. The merged fix’s uniqueness guarantee does not survive the port.
+
+   **Fix:** Provide a private per-user claim directory on macOS and retain the lock for the image’s lifetime. Failure to obtain a claim must not silently preserve a uniqueness guarantee the program no longer has. Test simultaneous instances in real tmux/kitty.
+
+7. **Medium, pre-existing — Terminal initialization does not restore every mutation on failure.**  
+   [session.rs:208](frontends/sighurt-tui/src/term/session.rs:208).
+
+   `O_NONBLOCK` is set before `tcgetattr`. If `tcgetattr` fails, `?` returns before a rollback guard exists. Passing a duplicated non-terminal descriptor, or losing the terminal during initialization, can leave the shared open-file description nonblocking.
+
+   **Fix:** Obtain all original state before changing anything, then arm a rollback guard before the first mutation. This is especially relevant to the Windows implementation: copying the current sequencing would reproduce the same class of defect across two separate console handles.
+
+8. **Medium, pre-existing — A full signal pipe can lose the only quit request.**  
+   [main.rs:301](apps/sighurt-browser/src/main.rs:301), [signals.rs:55](crates/sighurt-runtime/src/signals.rs:55).
+
+   The comment claiming that a full pipe already contains “the same signal” is false. Fill it with SIGUSR1 notifications while the owner is delayed, then send SIGTERM: the termination byte can be discarded, leaving only report requests. Moving the pipe into `Signals` preserves this defect.
+
+   **Fix:** Store pending request classes in signal-safe atomic flags and use the pipe only to wake the owner. Drain/coalesce reports, preserve quit independently, and use a race-safe consume/recheck protocol. Use the same conceptual separation for Windows control events.
+
+9. **Medium — The portability evidence is narrower than several claims, and the missing coverage includes precisely the dangerous code.**  
+   [PORTING.md:49](docs/rewrite/PORTING.md:49), [PORTING.md:99](docs/rewrite/PORTING.md:99), [PORTING.md:128](docs/rewrite/PORTING.md:128), [cross-check:29](tools/cross-check:29).
+
+   Concrete corrections needed:
+
+   - Overriding TLS build scripts and running `cargo check` establishes neither native C compatibility nor linking. “Those crates build normally” is unsupported, even with “unverified” appended.
+   - The macOS workflow checks demo+Wasm but links/tests the browser with **demo only**. It does not establish a runnable Wasm-enabled browser.
+   - The terminal’s own restoration/fault suite is omitted. Enabling it exposes unguarded Linux `gettid`/`SYS_tkill` at [tests/pty.rs:1286](frontends/sighurt-tui/tests/pty.rs:1286). The Windows worker binary also has unconditional Unix descriptor imports at [worker.rs:8](frontends/sighurt-tui/src/bin/worker.rs:8).
+   - The Windows parser is **not** already compiled: [lib.rs:33](frontends/sighurt-tui/src/lib.rs:33) excludes the terminal module and substitutes only escape constants.
+   - Terminal-only does not universally mean Wayland-free. Enabling Servo still reaches the unconditional dependency at [Servo Cargo.toml:14](engines/sighurt-engine-servo/Cargo.toml:14).
+
+   **Fix:** Report separate states for Rust checking, native linking, automated execution and real-terminal validation, always naming the feature set. Make native session/fault tests part of the port gate. The existing upfront admission that nothing ran is honest; the stronger statements elsewhere undermine it.
+
+10. **Low — “Nothing changes on Linux” excludes an actual build-interface change.**  
+    [Cargo.toml:28](apps/sighurt-browser/Cargo.toml:28), [PORTING.md:14](docs/rewrite/PORTING.md:14).
+
+    A previously working `--no-default-features --features engine-demo` GUI recipe now builds without a frontend and refuses to run.
+
+    **Fix:** Keep the explicit frontend feature—it is the right boundary—but document the migration and audit external packaging/examples for the old recipe. Default-feature Linux behavior and custom-build compatibility are different claims.
+
+For the macOS substitutions themselves, I found no comparable source-level defect in `__error`, the Mach-thread identity used for equality, `FIONBIO`, or the `grantpt`/`unlockpt`/`ptsname`/open sequence. Rustix’s Apple `ptsname` implementation uses reentrant storage or its ioctl fallback. The post-open CLOEXEC window still needs controlled process-spawning assumptions. None of this establishes working PTY behavior without native execution.
+
+**The Windows console lane needs the following acceptance criteria before it can replace the refusal stub.**
+
+- **Restore exact original state, including partial startup.** Capture separate input/output modes and any code pages or cursor state you change. Disable line input and echo; explicitly decide Ctrl+C handling and Quick Edit behavior. Enable the required VT modes and check every result. Restore on ordinary return, initialization error, owner panic, output failure and forced shutdown. `Drop` alone does not cover process-exit APIs.
+
+  A console control handler runs on another thread. For `CTRL_CLOSE_EVENT`, merely queuing Quit and returning `TRUE` is insufficient: Windows then terminates the process. Wake the owner and coordinate bounded cleanup before returning, with an emergency restoration path. Hard termination cannot be guaranteed recoverable. [Microsoft’s handler contract](https://learn.microsoft.com/en-us/windows/console/handlerroutine).
+
+- **Choose one input-consumption model deliberately.** `ENABLE_VIRTUAL_TERMINAL_INPUT` supplies sequences through `ReadFile`/`ReadConsole`; resize records are consumed through `ReadConsoleInput`. A byte reader does not automatically deliver `WINDOW_BUFFER_SIZE_EVENT`, and competing readers can steal each other’s input. A record-based implementation must translate events and terminal replies correctly rather than assuming it receives the existing Unix byte stream. Test non-ASCII input, surrogate pairs, AltGr, repeats, paste, escape sequences and protocol replies. [Microsoft’s mode definitions](https://learn.microsoft.com/en-us/windows/console/setconsolemode).
+
+- **Resize must wake an idle browser and recompute the visible viewport.** Re-query dimensions, distinguish the visible `srWindow` from the screen buffer/scrollback size, and handle tiny windows and resize bursts. Invalidate cell/pixel geometry, page bounds and pending output consistently. A resize notification is not itself a complete new rendering configuration. [Console geometry](https://learn.microsoft.com/en-us/windows/console/getconsolescreenbufferinfo).
+
+- **Preserve the owner loop’s general wake path.** [app.rs:605](frontends/sighurt-tui/src/app.rs:605) already has a shared ping for engines and services. Calloop’s Windows `Generic` source accepts sockets, but its **Ping has an IOCP implementation**. The document’s statement does not justify replacing the entire owner loop.
+
+  My first implementation would bridge console input through a bounded queue and that wake mechanism. Ensure engine frames, service completions, configuration changes, persistence failures, output progress and control events all wake it. Prove that a page updates and Quit completes while no keyboard input occurs. Do not substitute periodic polling or allow a blocked console write to freeze the owner.
+
+**On the round’s direction: the central key-engine decision is sound; the sequencing of subsequent work is not.**
+
+I would keep the data-driven matcher, command-based mode changes and ordinary binding replacement. They address actual composition problems. I would also accept the chosen single precedence rule rather than reopen the earlier review’s preferred layered rule. The price is an explicit compatibility change: a site-specific common binding can now defeat a generic terminal binding. Ship an executable migration example and an effective-binding explanation showing why a rule wins. A list of configured bindings is insufficient for debugging this model.
+
+I would not restore arbitrary stateful keymaps merely because the previous trait allowed them. There was no implemented counts/hints capability to preserve. Adding a reducer framework now would increase the release surface without resolving the current blockers. Keep lifecycle and held-key regressions as permanent tests; the already-fixed sequence and alias defects show why transition tests matter more than matcher-only examples.
+
+**The layout proposal underestimates behavioral work.** The claims at [interface design:120](docs/rewrite/interface-2026-11-16.md:120) and [interface design:179](docs/rewrite/interface-2026-11-16.md:179) are too strong. One `Model` and a fixed surface-name pool do not make focus, IME, completion, damage or live replacement automatically correct.
+
+Concrete failure: reload a tree while an address completion popup or IME composition is active, moving its bar to the bottom. The editor can survive correctly while its popup anchor, IME rectangle, damage coordinates or captured pointer target still describe the old placement. Reusing a surface name does not solve stale geometry or outstanding target lifetimes.
+
+I would require an explicit layout-change transaction covering geometry, surface/target reconciliation, input regions, capture, popup/IME positioning and repaint. Keep the old layout as an oracle for existing configurations, then test these transitions separately. “Pixel identity by construction” and a two-day completion estimate are unjustified when the design explicitly omitted reading the owner integration and text editor at [interface design:20](docs/rewrite/interface-2026-11-16.md:20).
+
+For 1.1.0, I would defer computed custom labels, deletion of the line-chrome crate/registry, and any general custom-widget or display-list facility. Deliver arrangement of existing compound components first. Removing old implementation names is cleanup, not a release prerequisite.
+
+**The speed work needs an evidence freeze before more tuning.** The terminal latency improvement is useful evidence for the measured demo workload. It does not establish behavior under sustained real-engine output, text scrolling or slow terminals. The Servo changes also have a substantial measured CPU cost. Before retaining all of that policy, measure input latency, frame delivery, CPU and idle wakeups on representative pages and the actual high-refresh desktop.
+
+I would leave synthetic wheel smoothing disabled, as HEAD now does at [input.rs:14](engines/sighurt-engine-servo/src/input.rs:14), and remove it from the release’s required work. Subdividing a notch changes the DOM wheel-event stream. A page that counts wheel events or applies per-event behavior can behave differently even when total scroll distance matches. More frames alone do not validate that tradeoff.
+
+The three Wasm configuration questions to settle **before extending the public configuration model further** are:
+
+1. **What exactly is the stable boundary, and what compatibility does a compiled module receive?**
+
+   **My answer:** A small, independently versioned wire contract, separate from Rust’s internal API. Define serialized configuration, distinct binding/fallback invocation payloads, bounded resolved command results, and callback handles containing a module generation and index. Specify ownership, allocation, byte limits and version rejection. Neither `Arc<dyn Fn>`, borrowed `Browser` references, `usize`, nor incidental Rust enum layout belongs on that boundary.
+
+   Validate dynamic results against the same command, mode and capability rules as static configuration. Guest results must not manufacture trusted user-activation authority. Compile/load the module away from the owner thread, then install keys and layout together as one validated generation. Retain the previous generation on failure; invalidate pending sequences and callback references without losing ownership of held-key releases.
+
+   Prove this first with a module built outside the browser workspace and with compatibility fixtures from an older SDK. Do not make the configuration host depend on the page engine’s FFmpeg/video stack.
+
+2. **What authority and execution budget does configuration code have, and who builds it?**
+
+   **My answer:** Treat it as explicitly selected local automation with constrained runtime capabilities. “No network imports” is not a confidentiality boundary when returned commands can open URLs. Give it minimal, bounded snapshots; exclude fallback key events while a text field owns typing, including `key` and `code`, not just `text`.
+
+   Bound guest memory, fuel, execution time, serialized input/output, command count and host-side decoding. Fuel does not bound host serialization. A timeout checked only after a synchronous callback returns cannot stop an infinite callback. Use actual interruption, and keep host calls bounded. [Wasmtime’s interruption mechanisms](https://docs.wasmtime.dev/examples-interrupting-wasm.html).
+
+   Also decide state honestly: Wasm globals and memory can mutate without any imports. I would permit bounded state within one module generation, reset on reload, and avoid claiming enforced purity. That does not require a general stateful keymap framework.
+
+   **Do not run Cargo automatically inside the browser.** [experience design:417](docs/rewrite/experience-2026-11-15.md:417) would execute build scripts and dependencies as native user code before the Wasm sandbox exists. Use an explicit external build/watch tool with pinned SDK and lockfile; the browser watches the completed artifact. Cargo explicitly executes package build scripts during compilation. [Cargo build-script contract](https://doc.rust-lang.org/cargo/reference/build-scripts.html).
+
+   On callback failure, consume the triggering key, report the failure, prevent repeated traps from monopolizing input, and provide a recovery route that does not depend on the broken configuration.
+
+3. **Can users distribute independently licensed configuration modules, and what licensing makes that promise true?**
+
+   **My answer:** The current Apache-2.0 label does not establish that promise.
+
+   [SDK Cargo.toml:7](sdk/sighurt-config/Cargo.toml:7) claims freely licensed configurations while directly depending on AGPL `sighurt-api`; [lib.rs:54](sdk/sighurt-config/src/lib.rs:54) uses and re-exports that API. Apache-licensed original SDK source can coexist with this dependency, but that does not grant permission to distribute a linked configuration artifact under arbitrary terms. Apache/GPL compatibility permits incorporation into the copyleft work; it does not erase the copyleft dependency. [Apache’s compatibility explanation](https://www.apache.org/licenses/GPL-compatibility.html), [the repository’s AGPL terms](LICENSE:210).
+
+   I would extract the guest ABI, necessary command/schema types and builder/default implementation into a genuinely permissive dependency chain, after checking ownership and obtaining permission for any relicensing. Keep the host adapter AGPL. If unrestricted independently authored plugins are intended, settle an explicit rights-holder-approved plugin/linking permission as necessary; do not assume the Wasm boundary settles derivative-work questions. The [GNU FAQ](https://www.gnu.org/licenses/gpl-faq.en.html) considers both communication mechanism and semantics.
+
+   Resolve this before publishing the SDK. Otherwise the project risks advertising a freedom its distributed dependency graph does not provide.
+
+**The order I would follow to a release I could trust is:**
+
+1. **Define “macOS and Windows support” precisely.** Name architectures, minimum systems, terminal hosts, usable web engine and supported services. Terminal-only support is a possible milestone; it does not fulfill a promise of native windows. A demo engine and internal Wasm pages do not establish a working web browser.
+2. **Fix the native harness and lifecycle defects, then prove one real web engine on each platform.** Render an actual page, enter text, navigate, resize, save/reopen a session and quit cleanly. This is the major feasibility risk; resolve it before another broad UI rewrite.
+3. **Settle the three module questions and build the smallest separately compiled configuration prototype.** Include compatibility rejection, trap handling and failed reload. Remove the SDK’s AGPL dependency ambiguity before promising public reuse.
+4. **Implement the bounded layout model and atomic experience reload.** Preserve existing layouts with the oracle, then exercise focus, IME, capture, tiny-window and reload transitions. Defer structural cleanup and new custom primitives.
+5. **Complete the services required by the declared platform contract.** Configuration watching, private/durable persistence, external URL handling and editor/program support need either working implementations or accurate visible capability refusals.
+6. **Freeze the release candidate and validate the merged, packaged product.** Run native lifecycle/fault suites, real-terminal sessions, sustained real-engine workloads and Linux regression coverage. Test fresh installs and upgrades on machines without the development environment. Further optimization and extra engine ports wait until those gates pass.
