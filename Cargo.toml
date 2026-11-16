@@ -102,6 +102,9 @@ calloop = "0.14"
 xkbcommon = "0.8"
 # Pipes and clocks for the Wayland host; already in the graph through smithay-client-toolkit.
 rustix = { version = "1", features = ["pipe", "time"] }
+# Windows' system calls (the console, ConPTY, files, the shell), at the version already in the
+# graph. Each crate names the features it uses, and depends on it for Windows only.
+windows-sys = "0.61"
 # `swash` rasterizes glyphs (SwashCache, Buffer::draw), which the chrome painter needs.
 cosmic-text = { version = "0.14", default-features = false, features = ["std", "swash", "fontconfig"] }
 tiny-skia = "0.11"

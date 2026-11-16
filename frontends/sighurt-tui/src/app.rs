@@ -103,14 +103,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
-use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use calloop::generic::Generic;
 use calloop::ping::make_ping;
-use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
+use calloop::{EventLoop, LoopHandle, RegistrationToken};
 use sighurt_api::commands::{Command, CommandSet, MAX_FIND};
 use sighurt_api::engine::{EngineCommand, EngineWaker, FindCommand, PresentOutcome};
 use sighurt_api::events::Cursor;
@@ -131,7 +129,7 @@ use sighurt_core::{
 use sighurt_runtime::diagnostics::{Diagnostics, FindReport, Report, TabReport, TargetReport};
 use sighurt_runtime::frontend::Frontend;
 use sighurt_runtime::history;
-use sighurt_runtime::persistence::{self, ConfigWatch, Paths};
+use sighurt_runtime::persistence::{self, Paths};
 use sighurt_runtime::services::{Clipboard, Services, MAX_CLIPBOARD};
 use sighurt_runtime::session::{Session, SHUTDOWN_BOUND};
 use sighurt_runtime::signals::{Request, Signals};
@@ -317,13 +315,14 @@ fn tmux_image_numbers(pid: u32) -> impl Iterator<Item = u16> {
 /// Where `sig`s claim their kitty image ids through tmux: a directory of the user's own in
 /// `$XDG_RUNTIME_DIR`, made if it is not there. `None` without one.
 fn tmux_claims() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
     let dir = dirs::runtime_dir()?.join("sighurt-kitty-images");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .ok()?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(&dir).ok()?;
     Some(dir)
 }
 
@@ -333,6 +332,7 @@ fn tmux_claims() -> Option<std::path::PathBuf> {
 /// of one user on one machine share an id, whichever terminal they are in. Without `dir`, or
 /// when no lock is taken in [`MAX_TMUX_CLAIMS`] tries, the first number's id, unclaimed.
 fn claim_tmux_image(dir: Option<&std::path::Path>, pid: u32) -> TmuxImage {
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let id = |number| kitty::tmux_image_id(number).expect("not 0");
     let mut numbers = tmux_image_numbers(pid);
@@ -345,16 +345,15 @@ fn claim_tmux_image(dir: Option<&std::path::Path>, pid: u32) -> TmuxImage {
         return unclaimed;
     };
     for number in std::iter::once(first).chain(numbers).take(MAX_TMUX_CLAIMS) {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(dir.join(format!("{number}.lock")));
-        let Ok(file) = file else {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let Ok(file) = options.open(dir.join(format!("{number}.lock"))) else {
             return unclaimed;
         };
-        if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
+        // `flock` on Unix, as before; an exclusive lock of the file on Windows.
+        if file.try_lock().is_ok() {
             return TmuxImage {
                 id: id(number),
                 _claim: Some(file),
@@ -593,7 +592,7 @@ pub fn run(options: Options, signals: Signals) -> Result<ExitCode, String> {
     let saved = redirect_stderr(&log_path())?;
     let result = run_redirected(options, signals);
     if result.is_err() {
-        let _ = rustix::stdio::dup2_stderr(&saved);
+        crate::sys::restore_stderr(&saved);
     }
     result
 }
@@ -635,8 +634,8 @@ fn run_redirected(options: Options, signals: Signals) -> Result<ExitCode, String
     Ok(code)
 }
 
-/// Points fd 2 at `path`, creating its directory. Returns the previous stderr.
-pub(crate) fn redirect_stderr(path: &Path) -> Result<OwnedFd, String> {
+/// Points stderr at `path`, creating its directory. Returns the previous stderr.
+pub(crate) fn redirect_stderr(path: &Path) -> Result<crate::sys::SavedStderr, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -646,11 +645,8 @@ pub(crate) fn redirect_stderr(path: &Path) -> Result<OwnedFd, String> {
         .append(true)
         .open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    let saved = std::io::stderr()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|e| format!("cannot keep stderr: {e}"))?;
-    rustix::stdio::dup2_stderr(&file).map_err(|e| format!("cannot redirect stderr: {e}"))?;
+    let saved =
+        crate::sys::point_stderr_at(&file).map_err(|e| format!("cannot redirect stderr: {e}"))?;
     let _ = writeln!(
         std::io::stderr(),
         "---- sig --tui, pid {} ----",
@@ -662,58 +658,20 @@ pub(crate) fn redirect_stderr(path: &Path) -> Result<OwnedFd, String> {
 /// Adds the signal pipe, the terminal, its resize pipe, its write source (disabled) and the
 /// configuration watch to the loop.
 fn watch(handle: &LoopHandle<'static, App>, signals: Signals, app: &mut App) -> Result<(), String> {
-    let source = Generic::new(signals, Interest::READ, Mode::Level);
-    handle
-        .insert_source(source, |_, signals, app| {
-            app.signals.extend(signals.take());
-            Ok(PostAction::Continue)
-        })
-        .map_err(|e| e.error.to_string())?;
-    let terminal = &app.tui.terminal;
-    let fds = [
-        terminal.try_clone_fd(),
-        terminal.winch_fd().try_clone_to_owned(),
-    ];
-    for fd in fds {
-        let fd = fd.map_err(|e| format!("cannot watch the terminal: {e}"))?;
-        handle
-            .insert_source(
-                Generic::new(fd, Interest::READ, Mode::Level),
-                |_, _, app| {
-                    app.readable = true;
-                    Ok(PostAction::Continue)
-                },
-            )
-            .map_err(|e| e.error.to_string())?;
-    }
-    let fd = terminal
-        .try_clone_fd()
-        .map_err(|e| format!("cannot watch the terminal: {e}"))?;
-    // Draining happens in `iterate`; waking is all this does.
-    let token = handle
-        .insert_source(Generic::new(fd, Interest::WRITE, Mode::Level), |_, _, _| {
-            Ok(PostAction::Continue)
-        })
-        .map_err(|e| e.error.to_string())?;
-    handle.disable(&token).map_err(|e| e.to_string())?;
+    crate::sys::insert_signals(handle, signals, |app: &mut App, requests| {
+        app.signals.extend(requests)
+    })?;
+    let token = app
+        .tui
+        .terminal
+        .insert_sources(handle, |app: &mut App| app.readable = true)?;
     app.writable = Some(token);
     let Some(config) = &app.session.paths().config else {
         return Ok(());
     };
-    match ConfigWatch::new(config) {
-        Ok(watch) => {
-            let source = Generic::new(watch, Interest::READ, Mode::Level);
-            handle
-                .insert_source(source, |_, watch, app| {
-                    app.config_changed |= watch.changed();
-                    Ok(PostAction::Continue)
-                })
-                .map_err(|e| e.error.to_string())?;
-        }
-        // No directory yet: the file is read at startup only.
-        Err(error) => log::info!("not watching {}: {error}", config.display()),
-    }
-    Ok(())
+    crate::sys::insert_config_watch(handle, config, |app: &mut App, changed| {
+        app.config_changed |= changed
+    })
 }
 
 /// The window's chromes, accepted with whatever tables they have (see [`WINDOW_CHROMES`]).
@@ -734,11 +692,7 @@ pub(crate) fn chrome_checks() -> Vec<ChromeChecks> {
 
 impl App {
     fn new(ping: calloop::ping::Ping, options: Options) -> Result<Self, String> {
-        let fd = std::io::stdout()
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(|e| format!("cannot use stdout: {e}"))?;
-        let mut terminal = Terminal::enter_with(fd, OUTPUT_CAP)
+        let mut terminal = Terminal::enter_stdout(OUTPUT_CAP)
             .map_err(|e| format!("cannot take the terminal: {e}"))?;
         terminal
             .probe(PROBE_DEADLINE)
@@ -3426,7 +3380,7 @@ fn takes_frames(graphics: bool, text_mode: bool, semantics: bool) -> bool {
     graphics || (text_mode && semantics)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 /// Whether `sent` bytes of `frame` already began a chunked kitty upload and have not finished it.
 fn resize_discard_tail(frame: &[u8], sent: usize) -> bool {
     chunked_kitty_span(frame).is_some_and(|span| span.cut(sent))
@@ -3670,7 +3624,8 @@ fn report(tui: &Tui, session: &mut Session<Tui>, at_exit: bool) {
     session.diagnostics_mut().report(&report, at_exit);
 }
 
-#[cfg(test)]
+// The terminal in these tests is a pty (Unix's).
+#[cfg(all(test, unix))]
 mod tests {
     use sighurt_api::input::{KeyCode, Modifiers};
 
@@ -4778,8 +4733,10 @@ schemes = [\"demo\"]
 
     /// Home that came to the front by itself (a page's tab closed itself) gets no keys until
     /// the user takes it: in INSERT, Tab is dropped, and after a left press in its rows off any link
-    /// (`BrowserEvent::ChromePagePress`) Tab focuses its first link.
-    #[cfg(feature = "engine-demo")]
+    /// (`BrowserEvent::ChromePagePress`) Tab focuses its first link. Home's links are sig's own
+    /// pages, which need the Wasm engine: with the demo engine alone home has none (this failed
+    /// that way on Linux as on macOS, run 43830229164).
+    #[cfg(all(feature = "engine-demo", feature = "engine-wasm"))]
     #[test]
     fn a_press_in_home_off_its_links_lifts_the_input_hold() {
         use sighurt_api::events::{EngineEvent, OpenDisposition};
@@ -4930,7 +4887,8 @@ schemes = [\"demo\"]
         tab(app);
         assert!(
             app.tui.home.focused_url().is_some(),
-            "Tab did not reach home after the press"
+            "Tab did not reach home after the press: {}",
+            page_debug(app)
         );
     }
 
