@@ -63,20 +63,24 @@
 //! page rows don't show their pixels, they get no input but releases ([`Tui::page_input`]).
 //!
 //! Page frames (TUI.md §2 and §8.6): a permit only for the shown view, only when its engine has
-//! a new frame, at most `[tui] fps` a second (sixel at most 5), or `[tui] input-fps` for
-//! [`INPUT_WINDOW`] after the user's last key, mouse event or paste, so the frame that answers
-//! input is not held to the page's own pace (in text mode at most [`TEXT_FPS`], and only when
+//! a new frame, at most `[tui] fps` a second (sixel at most 5), or `[tui] input-fps` (never
+//! slower) for [`INPUT_WINDOW`] after the last input that reached the page (a key, mouse event
+//! or paste the page got, not one the address line took) or a tab brought to the front, so
+//! the frame that answers it is not held to the page's own pace (in text mode at most
+//! [`TEXT_FPS`], and only when
 //! that engine gives page text), and only once every byte written before has left the output
 //! buffer: nothing is written while any is waiting, so at most one encoded frame is ever
 //! pending, no write is cut short, and a terminal (or tmux) slower than the pace sets it. The engine paints into its view's [`TermTarget`] and the
 //! frame is encoded as a kitty or sixel image over the page rows. Text mode takes the frame and
 //! does not encode it, so switching back to graphics shows the latest one. A resize is a new
 //! layout epoch: output queued for the old layout is discarded, and a kitty upload the cut
-//! interrupted is ended with an empty `m=0` chunk. Bytes the kernel already accepted cannot be
-//! unsent. At most one image is written per frame interval, a frame sent again for a tab just
-//! shown included, and a hidden or closed view's image is deleted or written over only once the
-//! last image has been up for its interval and at least [`MIN_IMAGE_LIFE`] (Rio frees an
-//! image's GPU texture at once, and lost its device when that came a moment after the upload);
+//! interrupted is ended with an empty `m=0` chunk (through tmux inside the cut passthrough;
+//! the output layer's abort, which a second resize does not undo). Bytes the kernel already
+//! accepted cannot be unsent. At most one image is written per frame interval, a frame sent
+//! again for a tab just shown included, and a hidden or closed view's image is deleted or
+//! written over only once the last image has been up for its interval and at least
+//! [`MIN_IMAGE_LIFE`], counted from when its last byte left the output (Rio frees an image's
+//! GPU texture at once, and lost its device when that came a moment after the upload);
 //! the loop wakes when that time comes. Kitty then deletes it by id; a sixel, which has no id,
 //! is written over: with the shown view's frame when it has one for this place and layout.
 //! While the shown view has no frame yet (a new document's view, another engine's, a tab not
@@ -168,13 +172,15 @@ const OUTPUT_CAP: usize = 16 * 1024 * 1024;
 /// keeps drawing and graphics shows the latest one, not so it can be read back at `[tui] fps`.
 const TEXT_FPS: u32 = 2;
 /// The least time an image stays on the screen before a tab switch deletes it or writes over
-/// it. Rio 0.5.28 frees an image's GPU texture at once, and lost its Vulkan device when that
-/// came a moment after the upload (decision 133); a page's own frames, which replace each
-/// other at `[tui] fps`, did not do that.
+/// it, from when its last byte left the output. Rio 0.5.28 frees an image's GPU texture at
+/// once, and lost its Vulkan device when that came a moment after the upload (decision 133);
+/// a page's own frames, which replace each other at `[tui] fps`, did not do that. A
+/// mitigation, not a guarantee: the pty (or tmux) taking the bytes is not the terminal having
+/// drawn them, and a terminal that stalls can still get the upload and the delete together.
 const MIN_IMAGE_LIFE: Duration = Duration::from_millis(250);
-/// How long after the user's last key, mouse event or paste page frames come at `[tui]
-/// input-fps` rather than `[tui] fps`. Long enough for what an input sets off (a smooth
-/// scroll, a menu that opens) to be drawn at that pace too.
+/// How long after the last input the page got (or a tab brought to the front) page frames
+/// come at `[tui] input-fps` rather than `[tui] fps`. Long enough for what an input sets off
+/// (a smooth scroll, a menu that opens) to be drawn at that pace too.
 const INPUT_WINDOW: Duration = Duration::from_secs(1);
 /// An empty last chunk. Ends a kitty image upload a resize cut after its `m=1`.
 const KITTY_UPLOAD_END: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
@@ -313,55 +319,78 @@ fn tmux_image_numbers(pid: u32) -> impl Iterator<Item = u16> {
         .filter(|&number| number != 31)
 }
 
-/// Where `sig`s claim their kitty image ids through tmux: a directory of the user's own in
-/// `$XDG_RUNTIME_DIR`, made if it is not there. `None` without one.
+/// Where `sig`s claim their kitty image ids through tmux: `sighurt-kitty-images` in
+/// `$XDG_RUNTIME_DIR`, else `sighurt-kitty-images-<uid>` in the temporary directory, made if it
+/// is not there, and used only when it is the user's own private directory ([`private_dir`]):
+/// anyone else who could make or open those files could hold an id this `sig` thinks it has.
+/// `None` when neither is.
 fn tmux_claims() -> Option<std::path::PathBuf> {
+    let runtime = dirs::runtime_dir().map(|dir| dir.join("sighurt-kitty-images"));
     #[cfg(unix)]
-    use std::os::unix::fs::DirBuilderExt;
-    let dir = dirs::runtime_dir()?.join("sighurt-kitty-images");
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
+    let fallback = {
+        let uid = rustix::process::geteuid().as_raw();
+        Some(std::env::temp_dir().join(format!("sighurt-kitty-images-{uid}")))
+    };
+    #[cfg(not(unix))]
+    let fallback = None;
+    runtime
+        .into_iter()
+        .chain(fallback)
+        .find(|dir| private_dir(dir))
+}
+
+/// Makes `dir` (mode 0700) if it is not there, and says whether it is a directory, not a
+/// symbolic link, owned by this user and closed to everyone else.
+fn private_dir(dir: &std::path::Path) -> bool {
     #[cfg(unix)]
-    builder.mode(0o700);
-    builder.create(&dir).ok()?;
-    Some(dir)
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        if let Err(error) = builder.create(dir) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return false;
+            }
+        }
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return false;
+        };
+        meta.is_dir()
+            && meta.uid() == rustix::process::geteuid().as_raw()
+            && meta.mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).is_ok() && dir.is_dir()
+    }
 }
 
 /// Claims the kitty image id a `sig` with process id `pid` uses through tmux, for as long as it
 /// runs: the first of [`tmux_image_numbers`] whose file in `dir` (`<number>.lock`) it can lock
 /// (`flock`, which the kernel lets go when the process ends, crashed or not). So no two `sig`s
-/// of one user on one machine share an id, whichever terminal they are in. Without `dir`, or
-/// when no lock is taken in [`MAX_TMUX_CLAIMS`] tries, the first number's id, unclaimed.
-fn claim_tmux_image(dir: Option<&std::path::Path>, pid: u32) -> TmuxImage {
+/// of one user on one machine share an id, whichever terminal they are in. The files stay:
+/// removing one on the way out could let two `sig`s lock two files of one name. `None` without
+/// `dir`, when a file can't be opened or when no lock is taken in [`MAX_TMUX_CLAIMS`] tries:
+/// an id not claimed is never used (another `sig` could be drawing with it).
+fn claim_tmux_image(dir: Option<&std::path::Path>, pid: u32) -> Option<TmuxImage> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    let id = |number| kitty::tmux_image_id(number).expect("not 0");
-    let mut numbers = tmux_image_numbers(pid);
-    let first = numbers.next().expect("there are numbers");
-    let unclaimed = TmuxImage {
-        id: id(first),
-        _claim: None,
-    };
-    let Some(dir) = dir else {
-        return unclaimed;
-    };
-    for number in std::iter::once(first).chain(numbers).take(MAX_TMUX_CLAIMS) {
+    let dir = dir?;
+    for number in tmux_image_numbers(pid).take(MAX_TMUX_CLAIMS) {
         let mut options = std::fs::OpenOptions::new();
         options.create(true).truncate(false).write(true);
         #[cfg(unix)]
         options.mode(0o600);
-        let Ok(file) = options.open(dir.join(format!("{number}.lock"))) else {
-            return unclaimed;
-        };
+        let file = options.open(dir.join(format!("{number}.lock"))).ok()?;
         // `flock` on Unix, as before; an exclusive lock of the file on Windows.
         if file.try_lock().is_ok() {
-            return TmuxImage {
-                id: id(number),
+            return Some(TmuxImage {
+                id: kitty::tmux_image_id(number).expect("not 0"),
                 _claim: Some(file),
-            };
+            });
         }
     }
-    unclaimed
+    None
 }
 
 /// One write that has not finished leaving the output buffer.
@@ -459,10 +488,16 @@ struct Tui {
     /// first wants it inside tmux. `None` until then, and outside tmux.
     passthrough: Option<Passthrough>,
     /// The kitty image id this `sig` uses through tmux ([`kitty::tmux_image_id`]: the
-    /// placeholder cells carry it), claimed the first time it is needed ([`claim_tmux_image`]),
-    /// so no other `sig` of the user's shares it. One image for the page rows, written over, as
-    /// a sixel is.
+    /// placeholder cells carry it), claimed when kitty graphics through tmux are first chosen
+    /// ([`claim_tmux_image`]), so no other `sig` of the user's shares it. One image for the
+    /// page rows, written over, as a sixel is. Without a claim there are no kitty graphics
+    /// through tmux ([`Self::tmux_claimed`]).
     tmux_image: Option<TmuxImage>,
+    /// The claim was tried and none was had: said once, and not tried again.
+    tmux_unclaimed: bool,
+    /// The terminal may have lost the image through tmux (a client attached): the next frame
+    /// is sent even when it is the picture already sent.
+    resend: bool,
     /// A kitty image may be stored in the terminal outside tmux: a clear, a protocol change
     /// and leaving delete it.
     tmux_stored: bool,
@@ -471,11 +506,15 @@ struct Tui {
     tmux_span: Option<(usize, usize)>,
     /// Kitty images of views no longer shown, deleted once [`Self::drop_due`] has passed.
     held_deletes: Vec<u32>,
-    /// When the last image was written. The next is not written before its frame interval
-    /// has passed ([`Self::image_due`]); a frame sent again (a tab shown) counts.
+    /// When the last image's last byte was taken by the terminal (tmux, or the pty of the
+    /// terminal). The next is not written before its frame interval has passed
+    /// ([`Self::image_due`]); a frame sent again (a tab shown) counts.
     image_written: Option<Instant>,
-    /// When the user last pressed a key, used the mouse or pasted: the frame interval is
-    /// `[tui] input-fps`'s for [`INPUT_WINDOW`] after it ([`Self::interval`]).
+    /// An image is in the output still: [`Self::image_written`] is set once it has left.
+    image_queued: bool,
+    /// When the user last gave the page input (a key, a mouse event or a paste it gets) or
+    /// brought a tab to the front: the frame interval is `[tui] input-fps`'s for
+    /// [`INPUT_WINDOW`] after it ([`Self::interval`]). Typing in the address line is not.
     input_at: Option<Instant>,
     /// The page rows.
     page: PageArea,
@@ -751,10 +790,13 @@ impl App {
             stale: false,
             passthrough: None,
             tmux_image: None,
+            tmux_unclaimed: false,
+            resend: false,
             tmux_stored: false,
             tmux_span: None,
             held_deletes: Vec::new(),
             image_written: None,
+            image_queued: false,
             input_at: None,
             text_mode: false,
             typing_told: None,
@@ -946,6 +988,7 @@ impl App {
         if let Err(error) = self.tui.terminal.write_frame(&[]) {
             self.fail(format!("writing to the terminal failed: {error}"));
         }
+        self.tui.note_drained();
         busy && !self.session.has_quit()
     }
 
@@ -1126,7 +1169,7 @@ impl App {
     fn resumed(&mut self) {
         // The span belonged to the screen `SIGCONT` already left.
         self.tui.outbound = None;
-        self.tui.terminal.discard_pending();
+        self.tui.abort_output();
         self.tui.mouse_on = true;
         let settings = self.tui.settings;
         self.tui.adopt(settings);
@@ -1174,12 +1217,6 @@ impl App {
     /// order is kept (a drag's last motion before its release).
     fn event(&mut self, event: TermEvent) {
         let now = Instant::now();
-        if matches!(
-            event,
-            TermEvent::Key(_) | TermEvent::Mouse(_) | TermEvent::Paste(_)
-        ) {
-            self.tui.input_at = Some(now);
-        }
         if let TermEvent::Mouse(mouse) = &event {
             if mouse.motion && mouse.wheel.is_none() {
                 if self.motion_due.is_some_and(|due| due > now) {
@@ -1215,6 +1252,9 @@ impl App {
         if event == TermEvent::Focus(false) {
             self.tui.release_pointer(None);
         }
+        if event == TermEvent::Focus(true) {
+            self.tui.focus_in();
+        }
         let event = match event {
             TermEvent::Clipboard(data) => {
                 if let Some((request, result)) = self.tui.clipboard_reply(data) {
@@ -1225,7 +1265,7 @@ impl App {
             TermEvent::Resize(_) => {
                 // The queued bytes are the old layout's. A kitty upload already begun is ended
                 // so the terminal does not wait for the rest of it.
-                self.tui.discard_for_resize();
+                self.tui.abort_output();
                 self.tui.relayout();
                 return self.tui.redraw_all();
             }
@@ -1564,6 +1604,7 @@ impl App {
         if let Err(error) = self.tui.terminal.write_frame(&[]) {
             self.fail(format!("writing to the terminal failed: {error}"));
         }
+        self.tui.note_drained();
         if self.tui.terminal.pending_len() == 0 {
             self.tui.outbound = None;
         }
@@ -1648,6 +1689,7 @@ impl App {
             self.fail(format!("writing to the terminal failed: {error}"));
         }
         self.tui.note_outbound(&out);
+        self.tui.note_drained();
         true
     }
 
@@ -2094,7 +2136,9 @@ impl App {
                 if protocol.written_over() {
                     let print = fingerprint(&bytes);
                     // The same picture is on the page rows already: nothing to send.
-                    let same = replaces && placed.is_some_and(|(.., sent)| sent == print);
+                    let same = replaces
+                        && !self.tui.resend
+                        && placed.is_some_and(|(.., sent)| sent == print);
                     if !same {
                         // When the rows held another layout's image (or none), spaces first:
                         // they update tmux's grid, which drops what it stored there. The
@@ -2115,13 +2159,14 @@ impl App {
                         self.tui.grid.forget_cursor();
                         self.tui.grid.forget_pen();
                         self.tui.placed = Some((place, metrics.epoch(), print));
-                        self.tui.image_written = Some(now);
+                        self.tui.image_queued = true;
+                        self.tui.resend = false;
                     }
                     // A hidden view's picture is under this one, or was this very picture.
                     self.tui.stale = false;
                 } else {
                     out.extend(bytes);
-                    self.tui.image_written = Some(now);
+                    self.tui.image_queued = true;
                 }
                 pixels.on_screen = true;
                 // The page rows show this view's picture now, and no other's.
@@ -2207,7 +2252,7 @@ impl Tui {
         if layout == self.layout {
             return;
         }
-        self.discard_for_resize();
+        self.abort_output();
         self.layout = layout;
         self.relayout();
         self.redraw_all();
@@ -2244,11 +2289,15 @@ impl Tui {
     }
 
     /// When a hidden view's image may be deleted or written over: the last image has been on
-    /// the screen for its frame interval, and for at least [`MIN_IMAGE_LIFE`].
+    /// the screen for its frame interval, and for at least [`MIN_IMAGE_LIFE`], counted from
+    /// when its last byte left the output (not yet while it is still there).
     fn drop_due(&self) -> Option<Instant> {
-        let interval = self.interval(Instant::now());
-        self.image_written
-            .map(|at| at + interval.max(MIN_IMAGE_LIFE))
+        let now = Instant::now();
+        let life = self.interval(now).max(MIN_IMAGE_LIFE);
+        if self.image_queued {
+            return Some(now + life);
+        }
+        self.image_written.map(|at| at + life)
     }
 
     /// The time between two page frames, and between two images, as of `now`: `[tui]
@@ -2270,6 +2319,9 @@ impl Tui {
 
     /// The end of the last image's frame interval: the next image is not written before it.
     fn image_due(&self, now: Instant) -> Option<Instant> {
+        if self.image_queued {
+            return Some(now + self.interval(now));
+        }
         self.image_written.map(|at| at + self.interval(now))
     }
 
@@ -2309,37 +2361,88 @@ impl Tui {
         });
     }
 
-    /// Drop output queued for the layout being replaced. If the bytes already accepted began a
-    /// chunked kitty upload and did not finish it, end it with an empty `m=0` chunk.
-    ///
-    /// Through tmux, a cut inside the image's passthrough strings leaves tmux reading one: it is
-    /// ended (`ESC \`), and so is the upload, inside a passthrough string of its own. Both are
-    /// harmless where nothing was cut short.
-    fn discard_for_resize(&mut self) {
-        let (tail, tmux_cut) = self.outbound.take().map_or((false, false), |out| {
+    /// Drops output queued for the layout (or the screen) being left, through the one abort
+    /// path ([`Terminal::abort`]): what the bytes already accepted left open is ended, a kitty
+    /// transfer through tmux inside its passthrough with the upload's end. Two cuts need
+    /// more, kept through later aborts: a plain kitty upload cut after its `m=1` gets an empty
+    /// `m=0` chunk, and so does a transfer through tmux long enough for several passthroughs
+    /// ([`kitty::TMUX_PASSTHROUGH_MAX`]), which may be cut between two of them.
+    fn abort_output(&mut self) {
+        let extra = self.outbound.take().map_or_else(Vec::new, |out| {
             let sent = out.len.saturating_sub(self.terminal.pending_len());
-            let tail = out.kitty.is_some_and(|span| span.cut(sent));
-            let tmux_cut = out
-                .tmux
-                .is_some_and(|(start, end)| sent > start && sent < end);
-            (tail, tmux_cut)
+            let tmux_cut = out.tmux.is_some_and(|(start, end)| {
+                end - start > kitty::TMUX_PASSTHROUGH_MAX && sent > start && sent < end
+            });
+            if out.kitty.is_some_and(|span| span.cut(sent)) {
+                KITTY_UPLOAD_END.to_vec()
+            } else if tmux_cut {
+                kitty::wrap_tmux(KITTY_UPLOAD_END)
+            } else {
+                Vec::new()
+            }
         });
-        self.terminal.discard_pending();
-        if tail {
-            let _ = self.terminal.write_frame(KITTY_UPLOAD_END);
+        self.terminal.abort(&extra);
+    }
+
+    /// The terminal said it has the focus again. Through tmux that is also how a client that
+    /// attached shows (tmux tells the pane's focus when a client attaches or detaches, whatever
+    /// `focus-events` says): it draws the placeholder cells it stores, but that terminal never
+    /// got the image. So the shown page's frame is sent again, even when it is the picture
+    /// already sent. A client attached while another stays attached gives no focus change, and
+    /// stays without the image until the page draws again or `chrome.refresh`.
+    fn focus_in(&mut self) {
+        if self.protocol != Protocol::KittyTmux || !self.graphics || self.placed.is_none() {
+            return;
         }
-        if tmux_cut {
-            let mut end = b"\x1b\\".to_vec();
-            end.extend(kitty::wrap_tmux(KITTY_UPLOAD_END));
-            let _ = self.terminal.write_frame(&end);
+        self.resend = true;
+        let shown = self
+            .shown_view
+            .and_then(|view| self.views.get(&view).copied());
+        if let Some(pixels) = shown.and_then(|target| self.targets.get_mut(&target)) {
+            pixels.on_screen = false;
         }
     }
 
-    /// The kitty image id this `sig` uses through tmux, claimed the first time it is asked for.
-    fn tmux_image(&mut self) -> u32 {
-        self.tmux_image
-            .get_or_insert_with(|| claim_tmux_image(tmux_claims().as_deref(), std::process::id()))
-            .id
+    /// Kitty graphics through tmux have an image id that is this `sig`'s alone: claimed now if
+    /// it was not, and `false` (with a notice, once) when none can be claimed.
+    fn tmux_claimed(&mut self) -> bool {
+        if self.tmux_image.is_some() {
+            return true;
+        }
+        if self.tmux_unclaimed {
+            return false;
+        }
+        match claim_tmux_image(tmux_claims().as_deref(), std::process::id()) {
+            Some(image) => {
+                self.tmux_image = Some(image);
+                true
+            }
+            None => {
+                self.tmux_unclaimed = true;
+                self.show_notice(
+                    "kitty graphics through tmux need an image id no other sig uses, claimed \
+                     in a private directory ($XDG_RUNTIME_DIR, else the temporary one), and \
+                     none could be claimed: the page is not kitty graphics"
+                        .to_owned(),
+                );
+                false
+            }
+        }
+    }
+
+    /// When the last image has left the output, the time it did: the image's life (and
+    /// [`MIN_IMAGE_LIFE`]) starts there, not when it was encoded.
+    fn note_drained(&mut self) {
+        if self.image_queued && self.terminal.pending_len() == 0 {
+            self.image_queued = false;
+            self.image_written = Some(Instant::now());
+        }
+    }
+
+    /// The kitty image id this `sig` uses through tmux: claimed when that protocol was chosen
+    /// ([`Self::tmux_claimed`]).
+    fn tmux_image(&self) -> u32 {
+        self.tmux_image.as_ref().map_or(0, |image| image.id)
     }
 
     /// What deletes this `sig`'s image through tmux and nothing else: the image and all its
@@ -2407,8 +2510,9 @@ impl Tui {
         // (`allow-passthrough all`) and page rows the placeholder cells can number.
         // Rows the diacritics can't number get sixel.
         let mut asked = self.settings.graphics;
-        let tmux_kitty =
-            asked == GraphicsProtocol::Kitty && self.tmux_passthrough() == Passthrough::All;
+        let tmux_kitty = asked == GraphicsProtocol::Kitty
+            && self.tmux_passthrough() == Passthrough::All
+            && self.tmux_claimed();
         let numbered =
             page.cols <= kitty::MAX_PLACEHOLDER_CELLS && page.rows <= kitty::MAX_PLACEHOLDER_CELLS;
         if tmux_kitty && !numbered {
@@ -2855,8 +2959,7 @@ impl Tui {
     fn leave(&mut self) {
         if !self.left {
             self.left = true;
-            self.outbound = None;
-            self.terminal.discard_pending();
+            self.abort_output();
             if self.graphics {
                 match self.protocol {
                     Protocol::Kitty => {
@@ -3172,6 +3275,11 @@ impl Frontend for Tui {
     /// is; a hidden view's image is deleted.
     fn show(&mut self, view: ViewId, visible: bool) {
         if visible {
+            // A tab brought to the front changes what the page rows show, as input does. Not
+            // the view shown at startup, before any frame: nothing was asked of it.
+            if self.presented_at.is_some() {
+                self.input_at = Some(Instant::now());
+            }
             self.shown_view = Some(view);
             // Its search began in the other mode: it ends now that its tab is shown.
             if self.orphaned.remove(&view) {
@@ -3248,6 +3356,9 @@ impl Frontend for Tui {
             );
             return !release;
         }
+        // Input that reaches the page (or moves its text): its frames come at `[tui]
+        // input-fps` for a while. A key the chrome took (the address line) did not.
+        self.input_at = Some(Instant::now());
         let InputKind::Key(key) = &event.kind else {
             return false;
         };
@@ -3372,16 +3483,21 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// The time between two page frames. `input`: the user gave input in the last
+/// The time between two page frames. `input`: the user gave the page input in the last
 /// [`INPUT_WINDOW`], so frames come at `[tui] input-fps`, whatever the protocol: the frame that
 /// answers a key, a scroll or a drag is not held back by the page's own pace. Otherwise
 /// `[tui] fps`, at most 5 a second for sixel (tmux decodes and encodes each sixel again).
-/// Text mode reads no pixels and takes at most [`TEXT_FPS`] either way.
+/// Input never slows frames: an `input-fps` below that is the page's rate, so a wait computed
+/// in the input window is never longer than the one after it, and the window's end needs no
+/// wake of its own. Text mode reads no pixels and takes at most [`TEXT_FPS`] either way.
 fn frame_interval(settings: TuiConfig, sixel: bool, text: bool, input: bool) -> Duration {
-    let mut fps = match (input, sixel) {
-        (true, _) => settings.input_fps.max(1),
-        (false, true) => settings.fps.clamp(1, 5),
-        (false, false) => settings.fps.max(1),
+    let page = match sixel {
+        true => settings.fps.clamp(1, 5),
+        false => settings.fps.max(1),
+    };
+    let mut fps = match input {
+        true => settings.input_fps.max(page),
+        false => page,
     };
     if text {
         fps = fps.min(TEXT_FPS);
@@ -3817,12 +3933,17 @@ mod tests {
             Duration::from_secs(1) / 30
         );
         assert_eq!(frame_interval(config(10, 50), false, false, true), ms(20));
-        // input-fps below fps slows input's frames: it is the rate, not a floor.
-        assert_eq!(frame_interval(config(30, 10), false, false, true), ms(100));
+        // Finding 11 of review B: input-fps below fps used to slow input's frames, and that
+        // slower wait outlasted the input window. Input never slows frames now.
         assert_eq!(
-            frame_interval(config(10, 0), true, false, true),
-            Duration::from_secs(1)
+            frame_interval(config(30, 10), false, false, true),
+            Duration::from_secs(1) / 30
         );
+        assert_eq!(
+            frame_interval(config(10, 1), false, false, true),
+            frame_interval(config(10, 1), false, false, false)
+        );
+        assert_eq!(frame_interval(config(10, 0), true, false, true), ms(200));
         // Text mode reads no pixels: TEXT_FPS either way.
         assert_eq!(frame_interval(config(10, 30), true, true, true), ms(500));
     }
@@ -3849,6 +3970,83 @@ mod tests {
         // A hidden tab's image still stays up MIN_IMAGE_LIFE (decision 133).
         let held = tui.drop_due().unwrap();
         assert!(held >= now + MIN_IMAGE_LIFE, "{:?}", held - now);
+    }
+
+    /// Finding 11 of review B: `fps = 60`, `input-fps = 1`, input at 0 and a frame at 0.9 s
+    /// gave a wait until 1.9 s, past the input window's end at 1 s. A wait taken during the
+    /// window is never longer than the one after it now.
+    #[test]
+    fn a_wait_taken_in_the_input_window_does_not_outlast_it() {
+        let (_master, mut tui) = on_pty();
+        tui.graphics = true;
+        tui.protocol = Protocol::KittyTmux;
+        tui.settings.fps = 60;
+        tui.settings.input_fps = 1;
+        let start = Instant::now();
+        tui.input_at = Some(start);
+        tui.presented_at = Some(start + Duration::from_millis(900));
+        let during = tui.next_frame(start + Duration::from_millis(900)).unwrap();
+        let after = tui.next_frame(start + INPUT_WINDOW).unwrap();
+        assert!(
+            during <= after,
+            "{:?} after {:?}",
+            during - start,
+            after - start
+        );
+        assert_eq!(
+            after,
+            start + Duration::from_millis(900) + Duration::from_secs(1) / 60
+        );
+    }
+
+    /// Finding 4 of review B: the 250 ms hold started when the image was encoded, so an
+    /// upload that drained slowly could be deleted as soon as its last byte left. It starts
+    /// when that byte has left the output now.
+    #[cfg(unix)]
+    #[test]
+    fn an_images_hold_starts_when_its_last_byte_has_left() {
+        let (master, mut tui) = on_pty();
+        rustix::io::ioctl_fionbio(&master, true).expect("non-blocking");
+        // The image before was written long ago; this one fills the pty and waits.
+        tui.image_written = Some(Instant::now() - Duration::from_secs(10));
+        tui.terminal
+            .write_frame(&vec![b'x'; 200 * 1024])
+            .expect("write");
+        assert!(tui.terminal.pending_len() > 0, "the pty is full");
+        tui.image_queued = true;
+        tui.note_drained();
+        let due = tui.drop_due().expect("held");
+        assert!(due > Instant::now() + MIN_IMAGE_LIFE - Duration::from_millis(50));
+        // The terminal reads it all; only then does the image's life start.
+        let mut buf = vec![0u8; 1 << 16];
+        let started = Instant::now();
+        while tui.terminal.pending_len() > 0 {
+            assert!(started.elapsed() < Duration::from_secs(10), "never drained");
+            let _ = rustix::io::read(&master, &mut buf);
+            tui.terminal.write_frame(&[]).expect("drain");
+        }
+        let drained = Instant::now();
+        tui.note_drained();
+        assert!(!tui.image_queued);
+        assert!(tui.drop_due().expect("held") >= drained + MIN_IMAGE_LIFE);
+    }
+
+    /// Finding 6 of review B: a focus in through tmux (a client attached) sends the picture
+    /// again, even unchanged; nothing else does that, and nothing does it outside tmux.
+    #[test]
+    fn a_focus_in_through_tmux_resends_the_picture() {
+        let (_master, mut tui) = on_pty();
+        tui.graphics = true;
+        tui.protocol = Protocol::KittyTmux;
+        tui.focus_in();
+        assert!(!tui.resend, "nothing placed yet");
+        tui.placed = Some((page_place(tui.page), tui.metrics.epoch(), 7));
+        tui.focus_in();
+        assert!(tui.resend);
+        tui.resend = false;
+        tui.protocol = Protocol::Sixel;
+        tui.focus_in();
+        assert!(!tui.resend, "tmux keeps its sixels");
     }
 
     #[test]
@@ -3967,20 +4165,48 @@ mod tests {
     fn two_sigs_never_claim_the_same_tmux_image() {
         let dir = std::env::temp_dir().join(format!("sighurt-tui-claims-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
-        let first = claim_tmux_image(Some(&dir), 6);
+        let first = claim_tmux_image(Some(&dir), 6).expect("claimed");
         assert_eq!(first.id, 7);
         assert!(first._claim.is_some());
         // Another `sig` whose process id gives the same place takes the next number.
-        let second = claim_tmux_image(Some(&dir), 6 + 255);
+        let second = claim_tmux_image(Some(&dir), 6 + 255).expect("claimed");
         assert_eq!(second.id, 8);
         // Once the first has ended, its id is free again.
         drop(first);
-        assert_eq!(claim_tmux_image(Some(&dir), 6).id, 7);
+        assert_eq!(claim_tmux_image(Some(&dir), 6).unwrap().id, 7);
         drop(second);
         let _ = std::fs::remove_dir_all(&dir);
-        // With nowhere to claim, the process id's place, unclaimed.
-        let unclaimed = claim_tmux_image(None, 6);
-        assert_eq!((unclaimed.id, unclaimed._claim.is_none()), (7, true));
+        // Finding 5 of review B: with nowhere to claim, or a file that can't be opened, no id
+        // at all, where an unclaimed one used to be used.
+        assert!(claim_tmux_image(None, 6).is_none());
+        assert!(claim_tmux_image(Some(&dir.join("missing")), 6).is_none());
+    }
+
+    /// The claim directory is used only when it is the user's own and closed to others.
+    #[cfg(unix)]
+    #[test]
+    fn claims_are_made_only_in_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("sighurt-tui-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        let made = base.join("made");
+        assert!(private_dir(&made));
+        assert_eq!(
+            std::fs::metadata(&made).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!private_dir(&open));
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&made, &link).unwrap();
+        assert!(!private_dir(&link));
+        let file = base.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!private_dir(&file));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -4012,10 +4238,13 @@ mod tests {
             stale: false,
             passthrough: None,
             tmux_image: None,
+            tmux_unclaimed: false,
+            resend: false,
             tmux_stored: false,
             tmux_span: None,
             held_deletes: Vec::new(),
             image_written: None,
+            image_queued: false,
             input_at: None,
             page: page_area(size, &layout),
             text_mode: false,

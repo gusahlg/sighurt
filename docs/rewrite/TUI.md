@@ -194,13 +194,31 @@ Rio's Vulkan renderer with this pacing, the 25 s tab storm and tmux's redraws in
 page that changed meanwhile would come back as its old picture. tmux 3.8 hands the pane none of
 the outer terminal's replies (they arrive as keys), so whether that terminal shows kitty images
 can't be asked through tmux; the setting says so, and `auto` stays sixel. Each frame is
-`a=T,U=1` (a virtual placement) into one image id per `sig`, every APC in its own passthrough
-string with its ESCs doubled, and no cursor movement. The id is one of 65 535 (never 31, the
-probe's), claimed for the process's life by a `flock` on
-`$XDG_RUNTIME_DIR/sighurt-kitty-images/<n>.lock`, starting from the process id's place among 1 to 255: no two `sig`s of one user on one
-machine share it, in one terminal or not (a `sig` on another machine over ssh, another user's, or
-another program can still pick the same id; without a runtime directory the id is the process
-id's, unclaimed). The page rows hold kitty's Unicode placeholder cells (U+10EEEE with a row and a
+`a=T,U=1` (a virtual placement) into one image id per `sig`, all the frame's chunks in one
+passthrough string with their ESCs doubled, and no cursor movement. tmux hands a passthrough to
+the outer terminal in one write when it reads its end (`screen_write_rawstring`, one
+`tty_add`), so a transfer reaches the terminal whole: `sig`s in two panes never interleave
+their chunks, and an exiting one's delete never comes inside another's upload (the kitty
+protocol wants one upload finished before the next command). tmux 3.8 drops a sequence longer
+than `input-buffer-size` (1 MiB by default, also its least) less a byte; a transfer longer than
+`kitty::TMUX_PASSTHROUGH_MAX` (1 MiB less 4 KiB) is split into as few strings as fit, each
+of whole chunks, and only between those can another pane's graphics come in (not shown: a
+cross-process lock would end where the pty took the bytes, not where tmux read them). tmux
+also ends a DCS that has not finished within 5 s of its start (its ground timer), as it
+always did for each chunk's. The id is one of 65 535 (never 31, the probe's), claimed for the
+process's life by a `flock` on `<n>.lock` in `$XDG_RUNTIME_DIR/sighurt-kitty-images`, else in
+`sighurt-kitty-images-<uid>` in the temporary directory, each used only when it is a directory
+of the user's own with mode 0700 and not a link; starting from the process id's place among 1
+to 255: no two `sig`s of one user on one machine share it, in one terminal or not (a `sig` on
+another machine over ssh, another user's, or another program can still pick the same id).
+Without a claim (no such directory, a file that does not open, 1 024 ids taken) there are no
+kitty graphics through tmux: sixel, with a notice. tmux tells the pane its focus when a client
+attaches or detaches, whatever `focus-events` says (`server_client_set_session`), and `sig`
+reports focus (`?1004`): on a focus in, the shown page's picture is sent again even when it is
+unchanged, since tmux redraws the placeholder cells for a terminal that never got the image. A
+client that attaches while another stays attached changes no focus; that terminal shows no
+picture until the page draws again or `chrome.refresh`.
+The page rows hold kitty's Unicode placeholder cells (U+10EEEE with a row and a
 column diacritic on every cell, the id's low byte as a 256-colour foreground and, above 255, its
 high byte as a third diacritic: tmux turns a truecolour foreground into 256 colours when it does
 not know the outer terminal has truecolour, so only 8 bits of colour are safe), written once per
@@ -211,8 +229,14 @@ over as a sixel is (`Protocol::written_over`: the same hold, the same skip of a 
 are the picture's); text on the page rows (a message, home, text mode) blanks the cells first,
 since text alone would leave the image around it. A clear and leaving delete that image by its
 id and nothing else (`a=d,d=I,i=<id>`, through tmux: `d=A` deletes no virtual placement, and
-would delete other programs' placements in the outer terminal). A resize that cuts a passthrough string ends it (`ESC \`) and the
-upload. Page rows wider or taller than the 297 diacritics fall back to sixel. Measured as above:
+would delete other programs' placements in the outer terminal). The output layer models tmux's
+parser, passthrough included (a doubled ESC is content; `CAN` is content in a DCS), and the
+outer terminal's behind it. A resize, leaving or a fatal signal that cuts a passthrough ends it
+in place: `CAN` (which tmux keeps whether or not an ESC before it landed), an `ST` for the
+outer terminal's open string, an empty `m=0` chunk for the upload, then the passthrough's own
+`ST`, so tmux hands the outer terminal the cut content and its end at once. What an abort
+leaves to write is kept by a later one (a second resize under backpressure used to drop it).
+Page rows wider or taller than the 297 diacritics fall back to sixel. Measured as above:
 one input from idle to the whole image accepted, 22.5 ms (sixel through tmux 29.9 ms); a drag,
 24.0 ms median, 37.6 ms p90 at 30 frames a second; real-terminals.sh's `rio-tmux-kitty`
 (`still`, `flicker`, `idle`, the tab storm and 20 tmux redraws with two resizes) passes on Rio's

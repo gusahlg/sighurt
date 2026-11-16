@@ -340,10 +340,19 @@ impl Terminal {
         self.session.output_cap()
     }
 
-    /// Drop bytes not yet written. Only after a resume: `SIGCONT` already sent [`ENTER`], so
-    /// the tail of a sequence cut off by the suspension would show as text.
+    /// Drop bytes not yet written (a resize, leaving, a resume: `SIGCONT` already sent
+    /// [`ENTER`], so the tail of a sequence cut off by the suspension would show as text), and
+    /// end what the written ones left open: inside tmux the passthrough too, and the kitty
+    /// upload a cut one began. Then `extra`. What this leaves queued is written whole: a
+    /// later abort keeps it. The one abort path, as the fatal-signal restore's terminator is
+    /// the same.
+    pub fn abort(&mut self, extra: &[u8]) {
+        self.session.abort(extra);
+    }
+
+    /// [`Self::abort`] with nothing to add.
     pub fn discard_pending(&mut self) {
-        self.session.discard_pending();
+        self.abort(&[]);
     }
 
     /// Bytes still waiting in the output cap.

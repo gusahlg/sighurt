@@ -434,13 +434,23 @@ enabled = true
 # tmux's passthrough, shown by Unicode placeholders, when tmux.conf has
 # `set -g allow-passthrough all` (sig asks tmux when it starts) and the terminal outside has
 # kitty graphics with placeholders (kitty, Rio, ghostty). tmux then keeps no image and encodes
-# none again, so frames reach the terminal sooner than sixel's.
+# none again, so frames reach the terminal sooner than sixel's. Each frame goes to the
+# terminal in one passthrough, so several sigs in panes of one tmux don't mix their uploads;
+# a frame over about 1 MiB (tmux's input-buffer-size) is split, and another pane's image can
+# then come in between its parts and spoil that frame (the next one replaces it). The image
+# id is claimed in a directory of your own ($XDG_RUNTIME_DIR, else the temporary directory);
+# when none can be, the page is sixel and a notice says so. When a terminal attaches to the
+# tmux session, sig sends the picture again on the focus change tmux reports; a terminal
+# that attaches while another stays attached gets no focus change, and shows no picture
+# until the page draws again or chrome.refresh.
 # fps: how many frames of the page graphics mode shows a second when you are not using the
 # page (it animates or loads), a whole number from 1 to 60. The default is 10. Sixel is sent
 # at most 5 a second, whatever this says.
-# input-fps: the same for a second after each key you press, mouse event or paste, so the
-# page answers typing, scrolling and dragging at this pace, sixel too; from 1 to 60, the
-# default 30. A frame still waits until the terminal has taken the one before.
+# input-fps: the same for a second after each key, mouse event or paste the page gets (not
+# one the address line takes) and after a tab is brought to the front, so the page answers
+# typing, scrolling and dragging at this pace, sixel too; from 1 to 60, the default 30. Below
+# fps it changes nothing: input never slows the page. A frame still waits until the terminal
+# has taken the one before.
 # mouse: whether the terminal's mouse reports clicks and scrolling to the page. The default
 # is true.
 # default-keys: accepted, and it has no effect since 0.10. The terminal's default keys are
