@@ -10,7 +10,7 @@
 # OUT must be under /data/sig-builds/test-out/ (every XDG directory of the run is under it: the
 # user's own configuration, session and profile are never touched). --build builds sig with
 # --all-features first (it takes the heavy lock; Servo builds only when the desktop is free).
-# Uses target/debug/sig, which must be built with every engine (SIG_BIN overrides it).
+# Uses $CARGO_TARGET_DIR/debug/sig (default target/debug/sig), which must be built with every engine (SIG_BIN overrides it).
 #
 # Checks: every tab loads in its engine (diagnostics, session titles); each tab's screenshot
 # shows its page when selected; switching back and forth; typing into one engine's field in
@@ -22,14 +22,19 @@
 set -u
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
+tdir=$(realpath -m "${CARGO_TARGET_DIR:-target}")
 if [[ ${1:-} != --inside ]]; then
   build=0
   [[ ${1:-} == --build ]] && { build=1; shift; }
   out=$(realpath -m "${1:?usage: coexist.sh [--build] OUT}")
   [[ $out == /data/sig-builds/test-out/?* ]] || { echo "coexist.sh: OUT must be under /data/sig-builds/test-out/" >&2; exit 2; }
   if [[ $build == 1 ]]; then
-    SIG_WHAT="servo build: sig --all-features for coexist.sh" tools/cargo build -p sighurt-browser \
-      --all-features --bins --example virtual-pointer || exit 1
+    # Other builds replace debug/sig; the run uses this link, made under the same hold of the
+    # machine's lock as the build.
+    SIG_WHAT="servo build: sig --all-features for coexist.sh" tools/heavy bash -c "cargo build -p sighurt-browser \
+      --all-features --bins --example virtual-pointer \
+      && ln -f $(printf '%q' "$tdir/debug/sig") $(printf '%q' "$tdir/debug/sig-coexist")" || exit 1
+    export SIG_BIN=${SIG_BIN:-$tdir/debug/sig-coexist}
     SIG_WHAT="build the example guests for coexist.sh" tools/cargo build --target wasm32-unknown-unknown \
       --release -p gradient-demo || exit 1
   fi
@@ -50,8 +55,8 @@ export XDG_CONFIG_HOME=$out/config XDG_STATE_HOME=$out/state XDG_DATA_HOME=$out/
 export XDG_CACHE_HOME=$out/cache XDG_DOWNLOAD_DIR=$out/downloads HOME=$out/home
 export FONTCONFIG_FILE=${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}
 export SIG_DIAG=1 RUST_LOG=${RUST_LOG:-warn}
-sig=${SIG_BIN:-target/debug/sig}
-vptr=target/debug/examples/virtual-pointer
+sig=${SIG_BIN:-$tdir/debug/sig}
+vptr=$tdir/debug/examples/virtual-pointer
 probe=apps/sighurt-browser/tests/probe.py
 session=$out/state/sighurt/session.toml
 scenario=coexist
@@ -73,8 +78,8 @@ typed_log() { cat "$out"/server-*.log 2>/dev/null | grep -o ' GET /typed/.*' | s
 
 wasm=
 for g in gradient_demo hello_sighurt; do
-  [[ -z $wasm && -f target/wasm32-unknown-unknown/release/$g.wasm ]] && {
-    cp "target/wasm32-unknown-unknown/release/$g.wasm" "$out/guests/guest.wasm"
+  [[ -z $wasm && -f $tdir/wasm32-unknown-unknown/release/$g.wasm ]] && {
+    cp "$tdir/wasm32-unknown-unknown/release/$g.wasm" "$out/guests/guest.wasm"
     wasm=$out/guests/guest.wasm
   }
 done
@@ -187,7 +192,7 @@ HELPERS='WPEWebProcess|WPENetworkProcess|WebKitWebProcess|libexec/(\.)?(WebConte
 engines=(servo wpe ladybird cef netsurf wasm demo)
 args=("$(url 1)" "$(url 2)" "$(url 3)" "$(url 4)" "$(url 5)" "${wasm:-}" demo://pattern)
 if [[ -z $wasm ]]; then
-  note "no example guest under target/wasm32-unknown-unknown/release: the Wasm tab is skipped"
+  note "no example guest under $tdir/wasm32-unknown-unknown/release: the Wasm tab is skipped"
   engines=(servo wpe ladybird cef netsurf demo)
   args=("$(url 1)" "$(url 2)" "$(url 3)" "$(url 4)" "$(url 5)" demo://pattern)
 fi

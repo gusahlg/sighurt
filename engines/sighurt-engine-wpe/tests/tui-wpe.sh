@@ -8,6 +8,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
+tdir=$(realpath -m "${CARGO_TARGET_DIR:-target}")
 SIG_WHAT="servo build" tools/cargo build -p sighurt-browser --bin sig
 out=${1:-/tmp/sighurt-wpe-tui}
 rm -rf "$out"
@@ -15,4 +16,4 @@ mkdir -p "$out"
 # The build took the heavy lock and dropped it. The run needs the nix-shell environment.
 exec env -u WAYLAND_DISPLAY -u DISPLAY \
   tools/heavy engines/sighurt-engine-wpe/tests/private-bus \
-  timeout 360 python3 -I engines/sighurt-engine-wpe/tests/tui-wpe.py "$repo/target/debug/sig" "$out"
+  timeout 360 python3 -I engines/sighurt-engine-wpe/tests/tui-wpe.py "$tdir/debug/sig" "$out"

@@ -707,10 +707,21 @@ impl Keys {
     /// that no mode has as well. The action is the commands as written (one `input.mode
     /// <name>` alone reads `<NAME> mode`), a custom action's description, "pass to the page"
     /// or "nothing"; where it applies is said from its condition. Tombstones are not listed:
-    /// a binding they mask on some addresses says "except on" them.
+    /// a binding they mask on some addresses says "except on" them. A binding for both
+    /// frontends that one of `frontend`'s own (a tombstone too) hides wherever it applies is
+    /// not listed: the frontend's own wins there.
     pub fn describe(&self, frontend: Frontend) -> Vec<KeyBinding> {
         let exists = |b: &&Binding| {
             b.when.frontend.is_none_or(|f| f == frontend) && !matches!(b.action, Action::Unbound)
+        };
+        let hidden = |table: &[Binding], b: &Binding| {
+            b.when.frontend.is_none()
+                && table.iter().any(|other| {
+                    other.when.frontend == Some(frontend)
+                        && other.keys == b.keys
+                        && other.when.url == b.when.url
+                        && other.when.field == b.when.field
+                })
         };
         let label = |mode: &Mode| match self.modes.len() {
             1 => String::new(),
@@ -729,6 +740,9 @@ impl Keys {
         let mut shown_in_mode: Vec<&Binding> = Vec::new();
         for mode in &self.modes {
             for binding in mode.bindings.iter().filter(exists) {
+                if hidden(&mode.bindings, binding) {
+                    continue;
+                }
                 let mut applies = match (&binding.when.url, binding.when.field) {
                     (Some(url), None) => format!("on {url}"),
                     (Some(url), Some(false)) => format!("on {url}, not in a text field"),
@@ -775,6 +789,7 @@ impl Keys {
             .line
             .iter()
             .filter(exists)
+            .filter(|l| !hidden(&self.line, l))
             .filter(|l| !l.keys.first().types())
             .filter(|l| !shown_in_mode.iter().any(|shown| std::ptr::eq(*shown, *l)));
         for binding in line_only {
@@ -1506,5 +1521,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(plain.describe(Frontend::Gui)[0].mode, "");
+    }
+
+    /// `[tui.keys] o = false` over a binding of `o` for both frontends, and `[tui.keys] x = …`
+    /// over one of `x`: in the terminal the general bindings never fire, so the help page and
+    /// `sig://home` there must not list them; the window keeps them.
+    #[test]
+    fn describe_leaves_out_what_a_frontends_own_binding_hides() {
+        let mut k = two_modes();
+        k.bind(NORMAL, binding("o", When::default(), run("location.focus")))
+            .unwrap();
+        k.bind(NORMAL, binding("x", When::default(), run("tab.close")))
+            .unwrap();
+        k.unbind(NORMAL, keys("o"), frontend(Frontend::Terminal))
+            .unwrap();
+        k.bind(
+            NORMAL,
+            binding("x", frontend(Frontend::Terminal), run("tab.new")),
+        )
+        .unwrap();
+        let rows = |f: Frontend| -> Vec<(String, String)> {
+            k.describe(f)
+                .into_iter()
+                .filter(|b| b.mode == "NORMAL")
+                .map(|b| (b.keys, b.action))
+                .collect()
+        };
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            rows(Frontend::Terminal),
+            [pair("x", "tab.new")],
+            "the terminal's own bindings"
+        );
+        assert_eq!(
+            rows(Frontend::Gui),
+            [pair("o", "location.focus"), pair("x", "tab.close")]
+        );
+        // What resolve does agrees: in the terminal `o` is nothing and `x` is the terminal's.
+        let terminal = Situation {
+            frontend: Frontend::Terminal,
+            ..at(PAGE, None)
+        };
+        assert!(matches!(
+            k.resolve(NORMAL, &[plain("o")], &terminal),
+            Found::Unbound(_)
+        ));
+        assert_eq!(does(&k, NORMAL, &[plain("x")], &terminal), "tab.new");
     }
 }

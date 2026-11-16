@@ -16,8 +16,11 @@ export SIGHURT_CEF_PREFIX=${SIGHURT_CEF_PREFIX:-/data/sig-builds/deps/cef-150.0.
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/data/sig-builds/targets/cef}
 if [[ ${1:-} != --inside ]]; then
   out=${1:-/data/sig-builds/test-out/cef/e2e}
-  SIG_WHAT="cef: sig build for cef.sh" tools/cargo build -p sighurt-browser \
-    --no-default-features --features frontend-gui,engine-cef,engine-demo --bins --example virtual-pointer || exit 1
+  # Other builds replace debug/sig; this link, made under the same hold of the machine's lock
+  # as the build, is the binary the run uses.
+  SIG_WHAT="cef: sig build for cef.sh" tools/heavy bash -c "cargo build -p sighurt-browser \
+    --no-default-features --features frontend-gui,engine-cef,engine-demo --bins --example virtual-pointer \
+    && ln -f $(printf '%q' "$CARGO_TARGET_DIR/debug/sig") $(printf '%q' "$CARGO_TARGET_DIR/debug/sig-cef")" || exit 1
   SIG_WHAT="cef.sh" SIG_MEM=8G tools/heavy tools/headless-sway --renderer pixman -- \
     engines/sighurt-engine-wpe/tests/private-bus "$0" --inside "$out"
   exit $?
@@ -33,7 +36,7 @@ export XDG_CONFIG_HOME=$out/config XDG_STATE_HOME=$out/state XDG_DATA_HOME=$out/
 export XDG_CACHE_HOME=$out/cache XDG_DOWNLOAD_DIR=$out/downloads
 export SIG_DIAG=1 RUST_LOG=${RUST_LOG:-warn}
 export PATH="$(nix-build nix/nixpkgs.nix -A wl-clipboard --no-out-link 2>/dev/null)/bin:$PATH"
-sig=$CARGO_TARGET_DIR/debug/sig
+sig=$CARGO_TARGET_DIR/debug/sig-cef
 vptr=$CARGO_TARGET_DIR/debug/examples/virtual-pointer
 probe=apps/sighurt-browser/tests/probe.py
 session=$out/state/sighurt/session.toml

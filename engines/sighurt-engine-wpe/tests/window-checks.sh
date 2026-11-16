@@ -19,6 +19,7 @@
 set -u
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
+tdir=$(realpath -m "${CARGO_TARGET_DIR:-target}")
 [[ -n ${WAYLAND_DISPLAY:-} && ${XDG_RUNTIME_DIR:-} == /tmp/sighl.* ]] || {
   echo "window-checks.sh: run me inside tools/headless-sway" >&2
   exit 2
@@ -30,7 +31,7 @@ out=${1:?usage: window-checks.sh OUT [--shm]}
 shift
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
-bin=target/debug/examples/wpe-window
+bin=$tdir/debug/examples/wpe-window
 pages=engines/sighurt-engine-wpe/tests/pages
 renderer=${SIG_SWAY_RENDERER:-unknown}
 export PATH="$(nix-build nix/nixpkgs.nix -A wl-clipboard --no-out-link)/bin:$PATH"
@@ -48,7 +49,7 @@ trap '' PIPE
 mkfifo "$XDG_RUNTIME_DIR/pointer"
 wtype -s 900000 ' ' &
 keyboard=$!
-target/debug/examples/virtual-pointer < "$XDG_RUNTIME_DIR/pointer" &
+"$tdir/debug/examples/virtual-pointer" < "$XDG_RUNTIME_DIR/pointer" &
 pointer=$!
 trap 'kill "$keyboard" "$pointer" ${pid:-} 2> /dev/null' EXIT
 exec 3> "$XDG_RUNTIME_DIR/pointer"

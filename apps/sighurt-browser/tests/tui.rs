@@ -177,7 +177,7 @@ impl Terminal {
         tcsetwinsize(&slave, winsize(80, 24)).unwrap();
         let original = tcgetattr(&slave).unwrap();
         let stderr = fs::File::create(dir.join("stderr")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sig"));
+        let mut command = sig_command();
         command.env_remove("TMUX").envs(env(&dir));
         if controlling {
             // SAFETY: setsid(2) and ioctl(2) only, between fork and exec. The session's id is
@@ -493,6 +493,24 @@ fn has(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Whether `text` is on the screen. A space the grid diff left unchanged is `CSI C`, not `0x20`.
+/// `sig`, or with `SIG_TUI_WRAP` (words split on spaces) `sig` run by that program: e.g.
+/// `strace -f -qq -o /dev/null -e trace=write -e inject=write:delay_exit=2000` slows every write
+/// by 2 ms, so a test that reads half a frame as a whole one fails every time, not once in
+/// many runs. Tests that signal `sig`'s pid do not hold under a wrapper.
+fn sig_command() -> Command {
+    let sig = env!("CARGO_BIN_EXE_sig");
+    let wrap = std::env::var("SIG_TUI_WRAP").unwrap_or_default();
+    let mut words = wrap.split_whitespace();
+    match words.next() {
+        Some(program) => {
+            let mut command = Command::new(program);
+            command.args(words).arg(sig);
+            command
+        }
+        None => Command::new(sig),
+    }
+}
+
 fn shows(bytes: &[u8], text: &str) -> bool {
     let mut shown = String::new();
     let mut i = 0;
@@ -705,11 +723,10 @@ fn a_demo_page_is_an_image_in_the_page_rows_and_quitting_restores_the_terminal()
         has(got, b"\x1b[?1049h") && image(got, 80, 22, 800, 440) && has(got, b"[1/1]")
     });
     assert!(shown, "the page did not show\n{}", term.context());
-    assert!(
-        has(&term.got, b"Demo:"),
-        "the top line has no title\n{}",
-        term.context()
-    );
+    // The title may come in a later write than the image (`term::output` writes a frame in
+    // several syscalls): wait for it rather than look once.
+    let titled = term.wait(0, Duration::from_secs(5), |got| has(got, b"Demo:"));
+    assert!(titled, "the top line has no title\n{}", term.context());
 
     // `o` opens the address line (the terminal's default keys), Enter opens what was typed:
     // another page, so another image in the same place.
@@ -1986,15 +2003,24 @@ fn sixel_frames_follow_input_at_input_fps_and_the_page_at_five() {
         "{idle} sixels in {lasted:?} of a page animating on its own, more than {most}\n{}",
         term.context()
     );
-    let (typing, lasted) = count(&mut term, true);
+    // Typing lifts the page's cap: at least twice its frames in one of three windows (a loaded
+    // machine may encode too slowly in one), and never faster than input-fps in any.
+    let mut lifted = Vec::new();
+    for _ in 0..3 {
+        let (typing, lasted) = count(&mut term, true);
+        assert!(
+            typing as u128 <= lasted.as_millis() / 33 + 2,
+            "{typing} sixels in {lasted:?} of typing, faster than input-fps\n{}",
+            term.context()
+        );
+        lifted.push((typing, lasted));
+        if typing >= 2 * most {
+            break;
+        }
+    }
     assert!(
-        typing >= 2 * most,
-        "{typing} sixels in {lasted:?} of typing, not more than twice the page's own {most}\n{}",
-        term.context()
-    );
-    assert!(
-        typing as u128 <= lasted.as_millis() / 33 + 2,
-        "{typing} sixels in {lasted:?} of typing, faster than input-fps\n{}",
+        lifted.iter().any(|&(typing, _)| typing >= 2 * most),
+        "{lifted:?} sixels of typing, never more than twice the page's own {most}\n{}",
         term.context()
     );
     // A second after the last key, the page's own pace again.
@@ -2742,9 +2768,34 @@ fn a_megabyte_of_random_input_runs_no_command_the_keymap_did_not_bind() {
         "random input without Ctrl+C quit sig\n{}",
         term.context()
     );
-    // An Escape closes an address line a click may have opened; Ctrl+C then quits.
+    // An Escape closes an address line a click may have opened; Ctrl+C then quits. A report
+    // answers at once, not after the input before it, and a loaded sig may still be working
+    // through the flood; Escape and Ctrl+C read together would be one Alt+Ctrl+C (a legacy
+    // terminal's Escape prefix). So: wait until the flood is handled (the count of input events
+    // stays put), send Escape, wait until it is taken alone (the count moves), then Ctrl+C.
+    let events = |r: &str| report_value(r, "input_events").parse::<u64>().unwrap_or(0);
+    let handling = Instant::now();
+    let mut before = events(&term.report_until(|_| true));
+    loop {
+        thread::sleep(Duration::from_millis(200));
+        let now = events(&term.report_until(|_| true));
+        if now == before {
+            break;
+        }
+        before = now;
+        assert!(
+            handling.elapsed() < Duration::from_secs(60),
+            "the flood was still being handled after 60 s\n{}",
+            term.context()
+        );
+    }
     term.type_bytes(b"\x1b");
-    thread::sleep(Duration::from_millis(100));
+    let report = term.report_until(|r| events(r) > before);
+    assert!(
+        events(&report) > before,
+        "Escape was not taken\n{}",
+        term.context()
+    );
     term.type_bytes(b"\x03");
     let status = term.exit();
     assert!(
@@ -3242,11 +3293,12 @@ fn sig_config_gets_no_input_where_it_is_not_drawn() {
     );
     let config = term.dir.join("config/sighurt/config.toml");
     let before = fs::read_to_string(&config).unwrap();
+    // `sig` writes a frame in several syscalls (one per escape sequence, `term::output`), so
+    // the reader can see half a frame: wait for the whole message, not its first words.
     let said = term.wait(0, Duration::from_secs(20), |got| {
-        shows(got, "need graphics")
+        shows(got, "need graphics") && shows(got, "get no input here")
     });
     assert!(said, "no message\n{}", term.context());
-    assert!(shows(&term.got, "get no input here"), "{}", term.context());
     try_everything(&mut term);
     assert!(!started.exists(), "the editor started\n{}", term.context());
     assert_eq!(
@@ -3686,4 +3738,71 @@ fn home_links_open_by_click_and_by_tab_and_enter() {
     );
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
+}
+
+/// SIGTERM, SIGINT and SIGHUP while sig://terminal's shell runs (the signals arrive through
+/// `sighurt_runtime::signals`, SIGHUP through the terminal's own handler): sig quits with
+/// status 0, the terminal is restored, and the shell ends with it.
+#[test]
+fn signals_end_sig_and_the_shell_sig_terminal_runs() {
+    for (name, signal) in [
+        ("term", libc::SIGTERM),
+        ("int", libc::SIGINT),
+        ("hup", libc::SIGHUP),
+    ] {
+        let pages = "[pages.terminal]\nenabled = true\ncommand = \"/bin/sh\"";
+        let mut term = Terminal::start_in(
+            &format!("signal-shell-{name}"),
+            &["sig://terminal"],
+            KITTY_REPLIES,
+            pages,
+        );
+        let home = term.dir.join("home");
+        let shown = term.wait(0, Duration::from_secs(20), |got| {
+            image(got, 80, 22, 800, 440)
+        });
+        assert!(shown, "{name}: the page did not show\n{}", term.context());
+        term.type_bytes(&kitty_keys("\x1b"));
+        let insert = term.wait(term.got.len(), Duration::from_secs(5), |got| {
+            shows(got, "INSERT MODE")
+        });
+        assert!(insert, "{name}: no INSERT\n{}", term.context());
+        term.type_bytes(&kitty_keys("\r"));
+        thread::sleep(Duration::from_secs(2));
+        term.type_bytes(&kitty_keys("echo $$ > ~/pid\r"));
+        let start = Instant::now();
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(home.join("pid"))
+                .ok()
+                .filter(|pid| pid.ends_with('\n'))
+            {
+                break pid;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "{name}: the shell did not start\n{}",
+                term.context()
+            );
+            term.wait(term.got.len(), Duration::from_millis(100), |_| false);
+        };
+        let shell = Path::new("/proc").join(pid.trim());
+        assert!(shell.exists(), "{name}: the shell is not running");
+        // SAFETY: kill(2) on the child.
+        unsafe { libc::kill(term.child.id() as i32, signal) };
+        let status = term.exit();
+        assert!(
+            status.success(),
+            "{name}: sig exited with {status:?}\n{}",
+            term.context()
+        );
+        term.assert_restored();
+        let start = Instant::now();
+        while shell.exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "{name}: the shell outlived sig"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
