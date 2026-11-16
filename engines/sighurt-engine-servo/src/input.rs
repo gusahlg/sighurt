@@ -11,7 +11,8 @@
 //! Servo's composition events ([`Composition`]), never also key text. Smooth scrolling and
 //! wheel notches become wheel deltas in device pixels.
 //!
-//! Servo 0.7 has no smooth scrolling: a notch was one 60-pixel jump. [`SmoothScroll`] plays a
+//! Servo 0.7 has no smooth scrolling: a notch was one 60-pixel jump, which stays the default.
+//! With `[engines.servo] smooth-scroll = true`, [`SmoothScroll`] plays a
 //! notch out over [`SMOOTH_DURATION`] as a run of smaller pixel wheel events: one when the notch
 //! comes, then one after each frame the view presents (so the display's rate paces it), or after
 //! [`SMOOTH_FALLBACK`] without a frame (the runtime pumps at that deadline). Nothing steps when
@@ -66,20 +67,13 @@ const FRAME_MAX: Duration = Duration::from_millis(33);
 /// Wheel notches played out as a run of smaller wheel events, one per frame of the view.
 #[derive(Debug)]
 pub(crate) struct SmoothScroll {
+    /// `[engines.servo] smooth-scroll`. Off, no run is ever made: [`Self::add`] is not called
+    /// (the view sends the notch as it is), so nothing steps and nothing is due.
+    enabled: bool,
     run: Option<Run>,
     /// The view's latest frame, and the interval between its last two while a run lasted.
     last_frame: Option<Instant>,
     interval: Duration,
-}
-
-impl Default for SmoothScroll {
-    fn default() -> Self {
-        Self {
-            run: None,
-            last_frame: None,
-            interval: FRAME_GUESS,
-        }
-    }
 }
 
 /// One smooth scroll in flight. Deltas are Servo's device pixels with its wheel sign.
@@ -97,6 +91,20 @@ struct Run {
 }
 
 impl SmoothScroll {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            run: None,
+            last_frame: None,
+            interval: FRAME_GUESS,
+        }
+    }
+
+    /// Whether wheel notches are played out ([`Self::add`]) or sent as they are.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Adds the notch `wheel` (a [`pointer`] wheel event) at `now`. What a run in flight has
     /// not scrolled yet joins the new one, which starts again from `now` and steps at the
     /// view's next frame; a new run steps at once, so the page moves with the notch.
@@ -727,7 +735,7 @@ mod tests {
 
     #[test]
     fn a_notch_plays_out_over_frames_and_scrolls_exactly_its_delta() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let start = Instant::now();
         let first = dy(scroll.add(&notch(-75.0), start));
         assert!(
@@ -745,7 +753,7 @@ mod tests {
 
     #[test]
     fn a_faster_display_gets_more_steps() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let start = Instant::now();
         let first = dy(scroll.add(&notch(-60.0), start));
         let (rest, frames) = play(&mut scroll, start, Duration::from_micros(8_333));
@@ -755,7 +763,7 @@ mod tests {
 
     #[test]
     fn without_frames_the_run_steps_at_its_fallback() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let start = Instant::now();
         let mut sent = dy(scroll.add(&notch(-60.0), start));
         assert!(scroll.fallback(start + Duration::from_millis(1)).is_none());
@@ -771,7 +779,7 @@ mod tests {
 
     #[test]
     fn a_notch_during_a_run_adds_what_is_left_and_waits_for_a_frame() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let start = Instant::now();
         let frame = Duration::from_micros(16_667);
         let mut sent = dy(scroll.add(&notch(-60.0), start));
@@ -783,11 +791,25 @@ mod tests {
 
     #[test]
     fn finishing_sends_the_rest_at_once() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let first = dy(scroll.add(&notch(60.0), Instant::now()));
         assert_eq!(first + dy(scroll.finish()), 60.0);
         assert!(scroll.deadline().is_none());
         assert!(scroll.finish().is_none());
+    }
+
+    #[test]
+    fn with_smooth_scrolling_off_nothing_is_ever_due() {
+        let mut scroll = SmoothScroll::new(false);
+        assert!(!scroll.enabled());
+        assert!(SmoothScroll::new(true).enabled());
+        // The view never calls `add` while it is off, so no run exists to step.
+        let now = Instant::now();
+        assert!(scroll.deadline().is_none());
+        assert!(scroll.frame(now).is_none());
+        assert!(scroll.fallback(now + Duration::from_secs(1)).is_none());
+        assert!(scroll.finish().is_none());
+        assert!(scroll.deadline().is_none());
     }
 
     fn key_event(code: u32, key: Key, state: ButtonState, modifiers: Modifiers) -> KeyEvent {

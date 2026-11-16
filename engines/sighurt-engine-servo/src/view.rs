@@ -153,7 +153,7 @@ pub(crate) struct View<T: ServoTarget> {
 }
 
 impl<T: ServoTarget> View<T> {
-    pub fn new(id: ViewId, options: ViewOptions, target: T) -> Self {
+    pub fn new(id: ViewId, options: ViewOptions, target: T, smooth_scroll: bool) -> Self {
         Self {
             id,
             metrics: target.metrics(),
@@ -173,7 +173,7 @@ impl<T: ServoTarget> View<T> {
             loading: false,
             keys: Keys::default(),
             composition: Composition::default(),
-            scroll: SmoothScroll::default(),
+            scroll: SmoothScroll::new(smooth_scroll),
             ime: None,
             requests: Vec::new(),
             asked: Vec::new(),
@@ -395,14 +395,17 @@ impl<T: ServoTarget> View<T> {
                 };
                 let event = crate::input::pointer(pointer, &self.metrics);
                 match (pointer, &event) {
-                    // A notch plays out as a smooth scroll; touchpad pixels go as they come.
+                    // With smooth scrolling on, a notch plays out as a run of events; touchpad
+                    // pixels, and every wheel event with it off, go as they come.
                     (
                         PointerEvent::Scroll {
                             delta: ScrollDelta::Wheel { .. },
                             ..
                         },
                         servo::InputEvent::Wheel(wheel),
-                    ) => events.extend(self.scroll.add(wheel, Instant::now())),
+                    ) if self.scroll.enabled() => {
+                        events.extend(self.scroll.add(wheel, Instant::now()))
+                    }
                     _ => events.push(event),
                 }
                 events

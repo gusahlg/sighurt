@@ -164,6 +164,10 @@ pub struct ServoConfig {
     /// `--enable-experimental-web-platform-features`. `false` is Servo's own default.
     /// Applied after Sighurt's baseline preferences and before [`Self::preferences`].
     pub experimental_features: bool,
+    /// Play a wheel notch out as a run of smaller pixel wheel events
+    /// ([`SmoothScroll`](crate::input::SmoothScroll)). `false`, the default: a notch is one
+    /// wheel event, as Servo 0.7 takes it.
+    pub smooth_scroll: bool,
     /// Servo preference overrides, applied last, so one feature can be turned on or off on
     /// its own. Names are Servo 0.7 `Preferences` fields. The core rejects an unknown name
     /// or a value of the wrong type before this is built.
@@ -319,6 +323,8 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// (this batch also queued a title or a frame) would otherwise commit too soon.
     history_hold: HashMap<WebViewId, Instant>,
     readbacks: Readbacks,
+    /// [`ServoConfig::smooth_scroll`], for the views opened.
+    smooth_scroll: bool,
     gl: Option<GlInfo>,
     /// Set from the first offscreen context. Stays `None` on the Wayland path.
     offscreen_adapter: Option<OffscreenAdapter>,
@@ -387,6 +393,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             held: Vec::new(),
             history_hold: HashMap::new(),
             readbacks,
+            smooth_scroll: config.smooth_scroll,
             gl: None,
             offscreen_adapter: None,
             egl: None,
@@ -1393,7 +1400,8 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
                 message: "this view is open already".into(),
             });
         }
-        self.views.insert(view, View::new(view, options, target));
+        self.views
+            .insert(view, View::new(view, options, target, self.smooth_scroll));
         if let Err(message) = self.start(view) {
             if let Some(v) = self.views.remove(&view) {
                 // Nothing was made from the lease, or the context would have been kept.
@@ -2235,6 +2243,11 @@ mod tests {
             ..ServoConfig::default()
         };
         assert_eq!(preferences(&config).user_agent, "FromPref");
+    }
+
+    #[test]
+    fn smooth_scrolling_is_off_unless_configured() {
+        assert!(!ServoConfig::default().smooth_scroll);
     }
 
     #[test]

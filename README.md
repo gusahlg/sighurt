@@ -360,6 +360,7 @@ hosts = ["app.example.com"]                            # these sites open in Chr
 
 [engines.servo]
 storage = "ephemeral"                                  # keep no cookies or site data
+smooth-scroll = true                                   # Servo: play a wheel notch out smoothly (off by default)
 
 [keys]
 "ctrl-t" = "tab.new"
