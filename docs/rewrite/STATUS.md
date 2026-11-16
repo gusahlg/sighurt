@@ -4877,3 +4877,28 @@ Newest last. Each entry says what was decided and why.
     (`only_the_users_own_presses_ask_the_clipboard`,
     `nothing_starts_on_a_click_or_the_wheel`), `tui.rs` 52/52. *Left out*: pixel sizes in
     the pty's window size, the title, the bell, underline styles and colours.
+155. **The terminal's output layer models tmux; a kitty transfer through tmux is one
+    passthrough** (16 November 2026; amends 145 and 150; findings 2 to 6 and 11 of the
+    outside review of the speed work, `reviews-round-2026-11-15-astra.md`, review B; all six
+    were real). `Wire` tracks tmux 3.8's parser (a DCS whose `ESC` is the first of a pair and
+    whose `CAN` is content; the `ESC P tmux;` passthrough) and, behind it, the outer
+    terminal's parser on the passthrough's content. Every abort (resize, leave, a dropped
+    frame, the fatal-signal and suspend restore) goes through `Output::abort` and
+    `terminator`: a cut passthrough is ended in place, and what an abort leaves is kept by
+    later ones. Each syscall publishes a state whose terminator fits any prefix the kernel
+    accepts. A frame's kitty transfer through tmux is one passthrough, split only past
+    tmux's 1 MiB input buffer. The 250 ms image hold counts from the image's last byte
+    leaving the output (a mitigation, not a guarantee). No unclaimed image id is used:
+    claims go in `$XDG_RUNTIME_DIR`, else in a verified private directory in the temporary
+    one, and otherwise the page is sixel with a notice. A focus-in through tmux (tmux reports
+    one on client attach whatever `focus-events` says) sends the picture again. `input-fps`
+    is never below the page's rate, and only input the page gets, or a tab brought to the
+    front, raises the frame rate (typing in the address line no longer does). *Evidence*:
+    the output layer's unit tests and two fuzz tests against reference tmux, VT500 and
+    strict parsers (400 000 cases); three pty tests that fail on e6dd05a and pass now;
+    `real-terminals.sh` `rio-tmux-kitty`, every check, on Rio's Vulkan renderer; both
+    cross-checks. *Not shown*: two `sig`s in two panes of a real tmux; a real detach and
+    attach; transfers over 1 MiB (still interleavable at their splits); a second client
+    attaching while another stays attached (no focus change); tmux's 5 s DCS timer. The
+    review's remark on the measurements stands: 145 and 146 show the rate caps removed, not
+    the time from an input to its visible result.
