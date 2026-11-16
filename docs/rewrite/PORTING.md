@@ -11,21 +11,27 @@ GitHub's hosted runners (`.github/workflows/ports.yml`). A window on either is n
 
 ## What runs where
 
-What GitHub's `macos-latest` (Apple Silicon) and `windows-latest` (x86_64) runners prove, run
-by run, is in [Verified and assumed](#verified-and-assumed). "Proven" means a test on that
-runner drives the real `sig`; "built" means it compiles and links there and nothing tests it.
+What GitHub's `macos-latest` (Apple Silicon) and `windows-latest` (x86_64) runners show, run
+by run, is in [Verified and assumed](#verified-and-assumed). Four kinds of evidence are kept
+apart, each for a named feature set ([below](#evidence-by-feature-set)): *checked* is `cargo
+check` for the target on this Linux machine (`tools/cross-check`: nothing linked, no C
+compiled); *links* is built for the target on its runner; *tested* is tests run on the runner,
+driving the real `sig` with a fake terminal on a pty (macOS) or in a ConPTY pseudoconsole
+(Windows); *tried* is a real terminal emulator, which only Linux has had (Rio and kitty,
+`frontends/sighurt-tui/tests/real-terminals.sh`). "Proven" in this table means tested;
+"built" means it links on the runner and nothing tests it.
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | `sig --tui` (the terminal frontend) | yes | proven: `tests/tui.rs` in a pty, demo and Wasm engines | proven: `tests/console.rs` in a pseudoconsole (ConPTY), demo engine |
 | `sig --dump URL` | yes | proven (`tests/tui.rs`) | proven (`tests/console.rs`) |
 | Demo engine | yes | proven | proven |
-| Wasm engine, sig's own pages (`sig://help`, home's links) | yes | proven (FFmpeg 7 from Homebrew) | not built: FFmpeg and Wasmtime's C helpers need vcpkg and the MSVC SDK set up |
-| `sig://terminal`, `sig://config` programs | yes | refused, saying so (`pty_unsupported.rs`) | refused, saying so |
-| Configuration watch | inotify | kqueue (`EVFILT_VNODE`), proven by its unit test | none: read at startup (`ConfigWatch::new` says so) |
+| Wasm engine, sig's own pages (`sig://help`, home's links) | yes | proven by `tests/tui.rs` (FFmpeg 7 from Homebrew); `sig`'s own unit tests are run with the demo engine only | not built: FFmpeg and Wasmtime's C helpers need vcpkg and the MSVC SDK set up |
+| `sig://terminal`, `sig://config` programs | yes | refused, saying so (`pty_unsupported.rs`): `sig://config` says this `sig` starts no programs there, not that an editor is missing (the page's unit test; no run of the page on macOS shows it) | no pages: no Wasm engine |
+| Configuration watch | inotify | kqueue (`EVFILT_VNODE`), proven by its unit test | none: read at startup, and a notice says so when `sig --tui` starts (`tests/console.rs`) |
 | Quit and report requests | signals | signals (SIGUSR1 report; SIGTERM, SIGINT, SIGHUP quit) | console control handler: Ctrl+Break and closing the console quit; Ctrl+C is a key in the terminal and a quit in `--dump`; no report |
-| Restoring the terminal on a crash | panic, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV | the same, proven by `frontends/sighurt-tui/tests/pty.rs` | a panic only: a native crash leaves the console's modes as they were |
-| Private files | 0700 directories, 0600 files | the same | a protected access list (the user and SYSTEM) on directories `sig` creates; files inherit it |
+| Restoring the terminal on a crash | panic, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV | the same code; `frontends/sighurt-tui/tests/pty.rs` tests a panic, SIGABRT (sent, and chained), a SIGSEGV fault and `kill -SEGV`; SIGBUS, SIGFPE, SIGILL, a stack overflow and a recovered Wasmtime trap are not tested there | a panic only: a native crash leaves the console's modes as they were |
+| Private files | 0700 directories, 0600 files | the same | a protected access list (the user and SYSTEM) on Sighurt's directories, given to an existing one whose list is wider and read back; files made in them inherit it (unit test on the runner) |
 | External addresses | `xdg-open` | `/usr/bin/open` (built, not tested) | `ShellExecuteW`, http, https and mailto only (built, not tested) |
 | The window, Servo, WPE WebKit, CEF, Ladybird, NetSurf | yes | no | no |
 
@@ -69,7 +75,8 @@ the chrome, text mode and the owner loop are Unix's, and only the session is new
 - **`--dump`** writes the page from a thread of its own and waits for it with the dump's
   deadline: Windows has no non-blocking write to a pipe or a console.
 - **Starting it**: a console has no `TERM`, so on Windows a console on stdout is the terminal
-  unless `TERM` is `dumb`. Windows Terminal has sixel (1.22 and later) and no kitty graphics; a
+  unless `TERM` is `dumb`. With no configuration watch, `sig --tui` says at start that the
+  configuration is read at startup only. Windows Terminal has sixel (1.22 and later) and no kitty graphics; a
   console that answers no image protocol, as ConPTY's does in the tests, gets text mode.
 - **Files**: sessions and history are replaced with `MoveFileExW` (replace, write-through),
   retried five times over about 150 ms on a sharing, access or lock violation (an indexer or a
@@ -77,8 +84,10 @@ the chrome, text mode and the owner loop are Unix's, and only the session is new
   `sig` creates gets a protected access list granting full control to the user and to SYSTEM,
   inherited by what is made in it. That is the 0700/0600 rule as far as Windows has one: no
   other ordinary user can read the files and the profile's inherited entries are cut; unlike
-  0600, SYSTEM can read them, an administrator can take ownership, and a directory that already
-  exists is not changed. Download names also lose what Windows refuses (`\ / : * ? " < > |`,
+  0600, SYSTEM can read them and an administrator can take ownership. A directory that already
+  exists gets the list when its own is wider (not protected, letting anyone else in, or not
+  inherited by files), as Unix tightens a wider one to 0700, and the list is read back after it
+  is set; files already in it keep entries of their own. Download names also lose what Windows refuses (`\ / : * ? " < > |`,
   trailing dots and spaces) and device names (`CON`, `NUL`, `COM1`…) get a `_` in front.
 - **External addresses** go to `ShellExecuteW` on a thread of its own, and only http, https and
   mailto: for a `file:` address or a path that call would start a program.
@@ -114,9 +123,13 @@ The Unix session ran on macOS as written, apart from what the first runs found:
 
 The `port` branch's changes, as they were made; three rows are superseded by the terminal on
 Windows above (the signals, the terminal off Unix, `open_external` on Windows) and one by the
-macOS configuration watch. Nothing changes on Linux: `sig`'s default features, the frontend
-choice in `main`, every setting and every command are what they were. The changes are features
-and `cfg`:
+macOS configuration watch (and Windows' missing watch is now a notice, not only a log line).
+On Linux `sig`'s default features, the frontend choice in `main`, every setting and every
+command are what they were. One build recipe is not: the window is now the feature
+`frontend-gui`, so a build with `--no-default-features` has to name it. The 1.0 recipe
+`--no-default-features --features engine-demo` now builds a `sig` with no frontend, which says
+so and exits; add `frontend-gui` (`chrome-line`, `render-wgpu` and `render-vulkan` turn it on).
+The changes are features and `cfg`:
 
 | Change | Where | What it does |
 |---|---|---|
@@ -150,13 +163,19 @@ There is no macOS or Windows SDK here, so C for those targets cannot be compiled
 libraries' build scripts are overridden (`links` overrides for `ring` and `aws-lc-sys`, whose Rust
 bindings per target ship pregenerated): their C is not built, their Rust is checked. Any other
 build script that compiles C, runs bindgen or asks pkg-config for the target fails, and what
-depends on it goes unchecked. That is a limit of this machine, not of the code: on a Mac or a
-Windows machine with its SDK those crates build normally (unverified).
+depends on it goes unchecked. That is a limit of this machine. Checking the Rust of the TLS
+crates says nothing about their C or about linking: that they build on the systems themselves
+is shown only by the runners. On `macos-latest` the terminal-only `sig` links with the demo
+engine and with the Wasm engine (ring, aws-lc-sys, FFmpeg 7, Wasmtime's C helpers, zstd,
+mozjpeg); on `windows-latest` it links with the demo engine (aws-lc-sys assembled with NASM),
+and the Wasm engine's C has not been tried.
 
 ## The matrix
 
 Each cell is `tools/cross-check <target>` on the crate (libraries only; `sig` as noted), on the
-`port` branch. "Clean" means no error and no warning from Sighurt's code.
+`port` branch: checked, nothing linked. "Clean" means no error and no warning from Sighurt's
+code. The two Windows cells marked † describe the `port` branch: since `port2` the console
+session (`term/console.rs`) is compiled for Windows, and `--tui` and `--dump` run there.
 
 | Crate (features) | aarch64-apple-darwin | x86_64-pc-windows-msvc |
 |---|---|---|
@@ -165,8 +184,8 @@ Each cell is `tools/cross-check <target>` on the crate (libraries only; `sig` as
 | sighurt-render-wgpu, sighurt-render-vulkan | clean (they compile; both bind Wayland surfaces only) | clean (same) |
 | sighurt-engine-demo, sighurt-engine-cef | clean (CEF's loader refuses at run time) | clean (same) |
 | sighurt-runtime (no engines) | clean | clean |
-| sighurt-tui (lib; none, and `engine-demo`) | clean | clean (terminal I/O compiled out) |
-| `sig`, `--no-default-features --features frontend-tui,engine-demo` | **clean** | **clean** (`--tui` and `--dump` refuse) |
+| sighurt-tui (lib; none, and `engine-demo`) | clean | clean (terminal I/O compiled out †) |
+| `sig`, `--no-default-features --features frontend-tui,engine-demo` | **clean** | **clean** (`--tui` and `--dump` refuse †) |
 | `sig`, `--no-default-features` (no frontend) | clean | clean |
 | sighurt-engine-wasm (so `sig` with `engine-wasm`) | stopped by build scripts that compile C for the target: `ffmpeg-sys-next` (and its pkg-config), `wasmtime` and `wasmtime-internal-jit-debug` (Wasmtime's C helpers), `zstd-sys`, `mozjpeg-sys`, `objc_exception` | stopped the same way: `ffmpeg-sys-next`, `wasmtime`, `wasmtime-internal-jit-debug`, `wasmtime-internal-fiber`, `ittapi-sys`, `zstd-sys`, `mozjpeg-sys` |
 | sighurt-wayland (so sighurt-gui) | fails: smithay-client-toolkit uses `pipe2`, and wayland-client needs libwayland | fails: wayland-sys is Unix-only |
@@ -189,10 +208,28 @@ tools/cross-check <target> -p sighurt-wayland
 tools/cross-check <target> -p sighurt-engine-ladybird      # and -p sighurt-engine-netsurf
 ```
 
-The terminal-only `sig` on Linux links no Sighurt Wayland crate (sighurt-wayland, sighurt-gui,
-sighurt-ui, the renderers), checked with `cargo tree`. With the Wasm engine it still pulls
-`wayland-client` in through its file picker (`rfd`'s XDG portal backend, `ashpd`, a Linux-only dependency); with the demo
-engine alone it has none.
+The terminal-only `sig` on Linux with the demo engine links no Sighurt Wayland crate
+(sighurt-wayland, sighurt-gui, sighurt-ui, the renderers), checked with `cargo tree`. With the
+Wasm engine it still pulls `wayland-client` in through its file picker (`rfd`'s XDG portal
+backend, `ashpd`, a Linux-only dependency). With `engine-servo` it links sighurt-wayland
+itself: the Servo adapter depends on it unconditionally. "Terminal-only" names the frontend,
+not the dependency graph.
+
+## Evidence by feature set
+
+| `sig` built with `--no-default-features --features …` | Linux | macOS | Windows |
+|---|---|---|---|
+| `frontend-tui,engine-demo` | tested (here, CLAUDE.md's lines) | checked; links; tested (`tests/tui.rs`, `sig`'s unit tests) | checked; links; tested (`tests/console.rs`, `sig`'s unit tests) |
+| `frontend-tui,engine-demo,engine-wasm` | tested (here) | not checked here (the Wasm engine's C); links; tested (`tests/tui.rs` only) | not built |
+| none (no frontend) | checked | checked | checked |
+| `frontend-gui,…`, `engine-servo`, `engine-wpe`, `engine-ladybird`, `engine-netsurf` | tested (CI's and CLAUDE.md's lines) | no (Linux only) | no (Linux only) |
+| default features (with `engine-demo`) | tested; tried in Rio and kitty (`real-terminals.sh`) | no | no |
+
+The crates' own tests on the runners (`cargo test -p sighurt-api -p sighurt-core -p
+sighurt-runtime -p sighurt-config -p sighurt-config-example -p sighurt-semantic -p sighurt-tui
+--features sighurt-tui/engine-demo`) are tested on both, `frontends/sighurt-tui/tests/pty.rs`
+(the session's restoration and its faults) on macOS only: it is Unix's. Nothing on macOS or
+Windows has been tried in a real terminal.
 
 ## What a port still needs
 
