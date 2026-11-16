@@ -13,8 +13,10 @@
 //! current user and to LocalSystem only, and the files written in it take that list. That is
 //! equivalent to 0700/0600 in that no other ordinary user can read it and nothing is inherited
 //! from the profile; it is not equivalent in that LocalSystem has access and an administrator
-//! can take ownership. A directory that already exists is left as it is on Windows (not
-//! tightened). The configuration file is never written
+//! can take ownership. A directory that already exists gets the same list when its own is wider
+//! (not protected, or letting anyone else in, or not inherited by files), as a wider one is
+//! tightened to 0700 on Unix; files already in it keep entries of their own. The configuration
+//! file is never written
 //! here: the user's editor writes it (`sig://config` runs it).
 //!
 //! The core parses and validates the configuration, against what the build has (its engines,
@@ -127,9 +129,9 @@ fn secure_quietly(dir: &Path) {
 
 /// Creates `dir` at mode 0700, or tightens a wider existing directory to 0700. A narrower
 /// existing directory is left as it is. Parents are created with the process umask and not
-/// chmodded. On Windows a directory this call creates gets a protected access list for the
-/// current user and LocalSystem (see the module documentation); an existing one is not
-/// changed.
+/// chmodded. On Windows a directory this call creates, or an existing one whose access list is
+/// wider, gets a protected access list for the current user and LocalSystem, which is then read
+/// back (see the module documentation).
 pub(crate) fn secure_private_dir(dir: &Path) -> io::Result<()> {
     if let Some(parent) = dir.parent() {
         if !parent.as_os_str().is_empty() {
@@ -156,10 +158,17 @@ pub(crate) fn secure_private_dir(dir: &Path) -> io::Result<()> {
     let _ = created;
     #[cfg(unix)]
     tighten(dir, &meta, created)?;
-    // An existing directory is left as it is on Windows: only one this call made gets the list.
+    // Windows' 0700: the list is given to a directory this call made, and to an existing one
+    // whose list is wider, then read back.
     #[cfg(windows)]
-    if created {
+    if created || !windows_acl::is_owner_only(dir)? {
         windows_acl::make_owner_only(dir)?;
+        if !windows_acl::is_owner_only(dir)? {
+            return Err(io::Error::other(format!(
+                "{} did not take its private access list",
+                dir.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -657,11 +666,14 @@ mod windows_acl {
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+        AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER,
+        ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+        TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -711,26 +723,159 @@ mod windows_acl {
             }
             // SAFETY: filled in by the call above; the SID it points to is in the buffer.
             let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-            let mut text: *mut u16 = core::ptr::null_mut();
-            // SAFETY: a valid SID and out pointer.
-            if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let _free = Local(text.cast());
-            let mut len = 0;
-            // SAFETY: NUL-terminated by the call.
-            while unsafe { *text.add(len) } != 0 {
-                len += 1;
-            }
-            // SAFETY: `len` units were just read.
-            let units = unsafe { core::slice::from_raw_parts(text, len) };
-            Ok(std::ffi::OsString::from_wide(units)
-                .to_string_lossy()
-                .into_owned())
+            // SAFETY: the SID is in `buffer`, which lives through the call.
+            unsafe { sid_text(sid) }
         })();
         // SAFETY: opened above.
         unsafe { CloseHandle(token) };
         result
+    }
+
+    /// `sid` as a string (`S-1-5-...`). Safety: `sid` points to a valid SID.
+    unsafe fn sid_text(sid: PSID) -> io::Result<String> {
+        let mut text: *mut u16 = core::ptr::null_mut();
+        // SAFETY: a valid SID (the caller's promise) and out pointer.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _free = Local(text.cast());
+        let mut len = 0;
+        // SAFETY: NUL-terminated by the call.
+        while unsafe { *text.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` units were just read.
+        let units = unsafe { core::slice::from_raw_parts(text, len) };
+        Ok(std::ffi::OsString::from_wide(units)
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    /// LocalSystem's SID.
+    const SYSTEM: &str = "S-1-5-18";
+    /// `ACCESS_ALLOWED_ACE_TYPE` (winnt.h).
+    const ALLOWED: u8 = 0;
+
+    /// One entry of an access list: its type, its flags and whom it is for.
+    pub(super) struct Entry {
+        pub(super) kind: u8,
+        pub(super) flags: u8,
+        pub(super) sid: String,
+    }
+
+    /// The access list of `path`: whether it is protected (inherits nothing from the parent),
+    /// and its entries; `None` for a null list, which lets everyone in. An entry other than an
+    /// allowing one has an empty `sid`.
+    pub(super) fn entries(path: &Path) -> io::Result<(bool, Option<Vec<Entry>>)> {
+        let name = wide(path);
+        let mut acl: *mut ACL = core::ptr::null_mut();
+        let mut descriptor = core::ptr::null_mut();
+        // SAFETY: NUL-terminated name and valid out pointers; the owner, group and SACL are not
+        // asked for.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut acl,
+                core::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        // The list is inside the descriptor, freed last.
+        let _free = Local(descriptor);
+        let (mut control, mut revision) = (0u16, 0u32);
+        // SAFETY: the descriptor was just returned.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let protected = control & SE_DACL_PROTECTED != 0;
+        if acl.is_null() {
+            return Ok((protected, None));
+        }
+        let mut size = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: `size` is the structure this class fills in.
+        if unsafe {
+            GetAclInformation(
+                acl,
+                core::ptr::from_mut(&mut size).cast(),
+                core::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut found = Vec::new();
+        for index in 0..size.AceCount {
+            let mut ace = core::ptr::null_mut();
+            // SAFETY: `index` is below the list's count.
+            if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: every entry starts with its header.
+            let header = unsafe { *ace.cast::<ACE_HEADER>() };
+            let sid = match header.AceType {
+                // SAFETY: an allowing entry is an ACCESS_ALLOWED_ACE, its SID at `SidStart`.
+                ALLOWED => unsafe {
+                    sid_text(
+                        core::ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart)
+                            .cast(),
+                    )?
+                },
+                _ => String::new(),
+            };
+            found.push(Entry {
+                kind: header.AceType,
+                flags: header.AceFlags,
+                sid,
+            });
+        }
+        Ok((protected, Some(found)))
+    }
+
+    /// Whether `dir` has the list [`make_owner_only`] gives, or a narrower one: protected, and
+    /// only entries that allow the current user or LocalSystem in and are inherited by files and
+    /// subdirectories (so what is made in it takes them).
+    pub(super) fn is_owner_only(dir: &Path) -> io::Result<bool> {
+        let user = current_user_sid()?;
+        let inherited = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        Ok(match entries(dir)? {
+            (true, Some(entries)) => {
+                !entries.is_empty()
+                    && entries.iter().all(|entry| {
+                        entry.kind == ALLOWED
+                            && entry.flags & inherited == inherited
+                            && (entry.sid == user || entry.sid == SYSTEM)
+                    })
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether only the current user and LocalSystem are let into `file`, as a file made in a
+    /// directory [`is_owner_only`] accepts is.
+    #[cfg(test)]
+    pub(super) fn only_owner_in(file: &Path) -> io::Result<bool> {
+        let user = current_user_sid()?;
+        Ok(match entries(file)? {
+            (_, Some(entries)) => {
+                !entries.is_empty()
+                    && entries.iter().all(|entry| {
+                        entry.kind == ALLOWED && (entry.sid == user || entry.sid == SYSTEM)
+                    })
+            }
+            (_, None) => false,
+        })
     }
 
     /// Gives `dir` a protected access list: full control, inherited by files and
@@ -1114,11 +1259,25 @@ mod tests {
         // SAFETY: allocated by GetNamedSecurityInfoW.
         unsafe { LocalFree(descriptor) };
 
+        assert!(windows_acl::is_owner_only(&dir).unwrap());
+
         let path = dir.join("session.toml");
         write_atomically(&path, "one").unwrap();
         write_atomically(&path, "two").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");
         assert_eq!(names(&dir), ["session.toml"]);
+        // The file replaced into place took the directory's list (finding 3 of review C).
+        assert!(windows_acl::only_owner_in(&path).unwrap());
+
+        // An existing directory, with the temporary directory's inherited list (the user,
+        // SYSTEM and the administrators), is made private too, and so is what is written in it.
+        let existing = parent.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        assert!(!windows_acl::is_owner_only(&existing).unwrap());
+        let path = existing.join("history.toml");
+        write_atomically(&path, "visits").unwrap();
+        assert!(windows_acl::is_owner_only(&existing).unwrap());
+        assert!(windows_acl::only_owner_in(&path).unwrap());
     }
 
     #[test]
