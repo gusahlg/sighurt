@@ -707,11 +707,10 @@ fn a_demo_page_is_an_image_in_the_page_rows_and_quitting_restores_the_terminal()
         has(got, b"\x1b[?1049h") && image(got, 80, 22, 800, 440) && has(got, b"[1/1]")
     });
     assert!(shown, "the page did not show\n{}", term.context());
-    assert!(
-        has(&term.got, b"Demo:"),
-        "the top line has no title\n{}",
-        term.context()
-    );
+    // The title may come in a later write than the image (`term::output` writes a frame in
+    // several syscalls): wait for it rather than look once.
+    let titled = term.wait(0, Duration::from_secs(5), |got| has(got, b"Demo:"));
+    assert!(titled, "the top line has no title\n{}", term.context());
 
     // `o` opens the address line (the terminal's default keys), Enter opens what was typed:
     // another page, so another image in the same place.
@@ -3195,11 +3194,12 @@ fn sig_config_gets_no_input_where_it_is_not_drawn() {
     );
     let config = term.dir.join("config/sighurt/config.toml");
     let before = fs::read_to_string(&config).unwrap();
+    // `sig` writes a frame in several syscalls (one per escape sequence, `term::output`), so
+    // the reader can see half a frame: wait for the whole message, not its first words.
     let said = term.wait(0, Duration::from_secs(20), |got| {
-        shows(got, "need graphics")
+        shows(got, "need graphics") && shows(got, "get no input here")
     });
     assert!(said, "no message\n{}", term.context());
-    assert!(shows(&term.got, "get no input here"), "{}", term.context());
     try_everything(&mut term);
     assert!(!started.exists(), "the editor started\n{}", term.context());
     assert_eq!(
