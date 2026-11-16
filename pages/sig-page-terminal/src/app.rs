@@ -15,18 +15,46 @@
 //! when the editor ends, so the file's problems show), and the same screen comes back when the
 //! editor ends, since an editor leaves nothing on the terminal worth keeping.
 //!
+//! The pointer: while the program asked for the mouse ([`crate::mouse`]) its presses, releases,
+//! motion and wheel are the program's, except with Shift held, which is always the user's (as in
+//! xterm). Otherwise the left button selects text (a drag; a double click a word, a triple
+//! click a line), which becomes the primary selection when the button goes up, the middle
+//! button pastes the primary selection, and the wheel looks back through the history on the
+//! main screen, or sends the arrow keys on the alternate screen (so `less` and `man` scroll, as
+//! xterm's alternate scroll does). Shift+Page Up and Shift+Page Down page through the history;
+//! typing returns to the live screen. Ctrl+Shift+C copies the selection to the clipboard,
+//! Ctrl+Shift+V pastes the clipboard and Shift+Insert the primary selection: through the
+//! browser's clipboard service, whose rule for any page holds (a click or key press in the page
+//! in the last 5 s, which a read uses up), so nothing the program prints can read or write a
+//! clipboard (OSC 52 is not honoured). Selections and copies are bounded
+//! ([`MAX_SELECTION_LINES`], [`MAX_COPY`]).
+//!
 //! Owns: the page's logic. Must not own: the `sig` calls (`crate::page` gives them through
 //! [`Host`] and [`Terminal`]) or the drawing ([`crate::draw`]).
 
-use sig_page_kit::sig::{Input, InputKind, Program, Status};
+use sig_page_kit::sig::modifiers::{ALT, ALT_GRAPH, CONTROL, SHIFT, SUPER};
+use sig_page_kit::sig::{buttons, Input, InputKind, Program, Status};
 
-use crate::draw::{self, Line, Metrics, Op};
+use crate::draw::{self, Line, Metrics, Op, Overlay};
 use crate::keys::{self, Modes};
+use crate::mouse::{self, Button, Event, Held};
 use crate::paste;
 use crate::term::Term;
 
-/// Most bytes of output one frame parses.
+/// Most bytes of output one frame parses (graphics data counts less: [`Term::feed`]).
 pub const MAX_OUTPUT_PER_FRAME: usize = 64 * 1024;
+/// Most bytes of output one frame reads, graphics data included.
+pub const MAX_READ_PER_FRAME: usize = 1 << 20;
+/// Most lines a selection copies.
+pub const MAX_SELECTION_LINES: i64 = 2000;
+/// Most bytes one copy puts on a clipboard.
+pub const MAX_COPY: usize = 1 << 20;
+/// Most wheel steps one record makes.
+const MAX_WHEEL_STEPS: i32 = 50;
+/// Two presses at most this far apart (milliseconds) in one cell are a double click.
+const DOUBLE_CLICK_MS: u64 = 400;
+/// Characters a double click takes as part of a word, besides letters and digits.
+const WORD_CHARACTERS: &str = "@-./_~?&=%+#:";
 /// Most bytes of input held for the program while its queue in the browser is full; more is
 /// dropped, as keys typed into a program that reads nothing.
 const MAX_PENDING: usize = 64 * 1024;
@@ -107,6 +135,51 @@ impl EditorInfo {
     }
 }
 
+/// What the page asks the browser's clipboard to do ([`App::take_asks`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// Put `text` on the clipboard, or make it the primary selection.
+    Copy { text: String, primary: bool },
+    /// The text of the clipboard or the primary selection, for [`App::pasted`].
+    Paste { primary: bool },
+}
+
+/// How a selection grows: by cells, words or lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    Cell,
+    Word,
+    Line,
+}
+
+/// Selected text, from where the button went down (`anchor`) to where it is (`head`), as lines
+/// of the screen's content and columns, both included; `range` is the two in order, grown to
+/// whole words or lines, `None` while nothing is selected (a click that has not moved).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Selection {
+    alt: bool,
+    epoch: u64,
+    unit: Unit,
+    anchor: (i64, u16),
+    head: (i64, u16),
+    range: Option<((i64, u16), (i64, u16))>,
+}
+
+/// The pointer as the program's reports need it.
+#[derive(Default)]
+struct Pointer {
+    /// Buttons whose press was reported, a bit each.
+    reported: u8,
+    /// The cell the last report was for.
+    cell: Option<(u16, u16)>,
+    /// Wheel distance not yet a whole step.
+    wheel: f32,
+    /// The left button is down for a selection.
+    selecting: bool,
+    /// The last press: when, where, and how many in a row.
+    last: Option<(u64, (u16, u16), u8)>,
+}
+
 pub struct App<P> {
     program: Program,
     phase: Phase<P>,
@@ -119,6 +192,14 @@ pub struct App<P> {
     size: (u16, u16),
     pending: Vec<u8>,
     dirty: bool,
+    metrics: Option<Metrics>,
+    /// Milliseconds since the page started.
+    clock: u64,
+    selection: Option<Selection>,
+    pointer: Pointer,
+    asks: Vec<Ask>,
+    /// The history's length when last read.
+    history: usize,
 }
 
 impl<P: Terminal> App<P> {
@@ -132,7 +213,45 @@ impl<P: Terminal> App<P> {
             size: (80, 24),
             pending: Vec::new(),
             dirty: true,
+            metrics: None,
+            clock: 0,
+            selection: None,
+            pointer: Pointer::default(),
+            asks: Vec::new(),
+            history: 0,
         }
+    }
+
+    /// The face's cell, once measured.
+    pub fn set_metrics(&mut self, m: Metrics) {
+        if self.metrics != Some(m) {
+            self.metrics = Some(m);
+            self.term.set_cell(m.cell_w, m.cell_h);
+            self.dirty = true;
+        }
+    }
+
+    /// `ms` milliseconds passed.
+    pub fn advance_clock(&mut self, ms: u32) {
+        self.clock += u64::from(ms);
+    }
+
+    /// What the page asks the clipboard, since the last call.
+    pub fn take_asks(&mut self) -> Vec<Ask> {
+        std::mem::take(&mut self.asks)
+    }
+
+    /// The text of a clipboard the page asked for ([`Ask::Paste`]): pasted into the program.
+    pub fn pasted(&mut self, text: &str) {
+        if matches!(self.phase, Phase::Running(_)) {
+            let bytes = paste::paste(text, self.term.screen().bracketed_paste());
+            self.typed(&bytes);
+        }
+    }
+
+    /// The PNG of image `key`, to draw it.
+    pub fn png(&self, key: u64) -> Option<&[u8]> {
+        self.term.graphics().png(key)
     }
 
     /// Whether the page should ask the browser what the editor is, since the last call: at the
@@ -164,6 +283,9 @@ impl<P: Terminal> App<P> {
             }
             Phase::Opening(_) => {}
             Phase::Running(_) => {
+                if self.page_key(input) {
+                    return;
+                }
                 let screen = self.term.screen();
                 let bytes = match input.kind {
                     InputKind::Press | InputKind::Repeat => {
@@ -174,12 +296,329 @@ impl<P: Terminal> App<P> {
                     }
                     InputKind::Paste => Some(paste::paste(&input.text, screen.bracketed_paste())),
                     InputKind::Commit => Some(paste::commit(&input.text)),
+                    _ => None,
                 };
                 if let Some(bytes) = bytes {
-                    self.send(&bytes);
+                    self.typed(&bytes);
                 }
             }
         }
+        if matches!(
+            input.kind,
+            InputKind::PointerPress
+                | InputKind::PointerRelease
+                | InputKind::Motion
+                | InputKind::Wheel
+        ) {
+            self.pointer_input(input);
+        }
+    }
+
+    /// The page's own keys while a program runs: copying, pasting and paging through the
+    /// history. Whether the key was one.
+    fn page_key(&mut self, input: &Input) -> bool {
+        if !matches!(input.kind, InputKind::Press | InputKind::Repeat) {
+            return false;
+        }
+        let held = input.modifiers & (SHIFT | CONTROL | ALT | SUPER | ALT_GRAPH);
+        let key = input.key.to_ascii_lowercase();
+        let alt_screen = self.term.screen().alternate_screen();
+        match (held, key.as_str()) {
+            (m, "c") if m == CONTROL | SHIFT => {
+                if input.kind == InputKind::Press {
+                    if let Some(text) = self.selected_text() {
+                        self.asks.push(Ask::Copy {
+                            text,
+                            primary: false,
+                        });
+                    }
+                }
+                true
+            }
+            (m, "v") if m == CONTROL | SHIFT => {
+                if input.kind == InputKind::Press {
+                    self.asks.push(Ask::Paste { primary: false });
+                }
+                true
+            }
+            (SHIFT, "insert") => {
+                if input.kind == InputKind::Press {
+                    self.asks.push(Ask::Paste { primary: true });
+                }
+                true
+            }
+            (SHIFT, "pageup" | "pagedown") if !alt_screen => {
+                let page = self.size.1.saturating_sub(1).max(1) as isize;
+                let lines = if key == "pageup" { page } else { -page };
+                if self.term.scroll_view(lines) {
+                    self.dirty = true;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Bytes the user typed or pasted, for the program: the view returns to the live screen and
+    /// a selection goes, as in any terminal.
+    fn typed(&mut self, bytes: &[u8]) {
+        let view = self.term.view();
+        if view > 0 {
+            self.term.scroll_view(-(view as isize));
+            self.dirty = true;
+        }
+        if self.selection.take().is_some() {
+            self.dirty = true;
+        }
+        self.send(bytes);
+    }
+
+    /// The cell under a pointer record, within the grid.
+    fn cell_at(&self, input: &Input) -> Option<(u16, u16)> {
+        let m = self.metrics?;
+        let (cols, rows) = self.size;
+        let col = (input.x / m.cell_w).floor().clamp(0.0, f32::from(cols - 1)) as u16;
+        let row = (input.y / m.cell_h).floor().clamp(0.0, f32::from(rows - 1)) as u16;
+        Some((col, row))
+    }
+
+    fn pointer_input(&mut self, input: &Input) {
+        // The screen is shown while a program runs and after it ended (but the editor's page
+        // shows its own screen then).
+        let shown = match &self.phase {
+            Phase::Running(_) => true,
+            Phase::Ended(..) => self.program == Program::Shell,
+            _ => false,
+        };
+        let Some(cell) = self.cell_at(input).filter(|_| shown) else {
+            return;
+        };
+        let running = matches!(self.phase, Phase::Running(_));
+        let screen = self.term.screen();
+        let (mode, encoding) = (
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+        );
+        let alt_screen = screen.alternate_screen();
+        let held = Held {
+            shift: input.has(SHIFT),
+            alt: input.has(ALT),
+            control: input.has(CONTROL),
+        };
+        let wants_mouse = running && mode != vt100::MouseProtocolMode::None;
+        let report = wants_mouse && !held.shift;
+        let button = match input.code {
+            buttons::LEFT => Button::Left,
+            buttons::MIDDLE => Button::Middle,
+            buttons::RIGHT => Button::Right,
+            _ => Button::None,
+        };
+        let bit = match button {
+            Button::Left => 1,
+            Button::Middle => 2,
+            Button::Right => 4,
+            _ => 0,
+        };
+        let send = |app: &mut Self, event, button, cell: (u16, u16)| {
+            if let Some(bytes) = mouse::encode(mode, encoding, event, button, cell.0, cell.1, held)
+            {
+                app.send(&bytes);
+            }
+        };
+        match input.kind {
+            InputKind::PointerPress if bit != 0 => {
+                if report {
+                    self.pointer.reported |= bit;
+                    self.pointer.cell = Some(cell);
+                    send(self, Event::Press, button, cell);
+                    return;
+                }
+                match button {
+                    Button::Left => self.select_start(cell),
+                    Button::Middle if running => self.asks.push(Ask::Paste { primary: true }),
+                    _ => {}
+                }
+            }
+            InputKind::PointerRelease if bit != 0 => {
+                if self.pointer.reported & bit != 0 {
+                    self.pointer.reported &= !bit;
+                    send(self, Event::Release, button, cell);
+                } else if button == Button::Left && self.pointer.selecting {
+                    self.pointer.selecting = false;
+                    self.select_to(cell);
+                    if let Some(text) = self.selected_text() {
+                        self.asks.push(Ask::Copy {
+                            text,
+                            primary: true,
+                        });
+                    }
+                }
+            }
+            InputKind::Motion => {
+                let reported = self.pointer.reported;
+                if reported != 0 || (report && mode == vt100::MouseProtocolMode::AnyMotion) {
+                    if self.pointer.cell != Some(cell) {
+                        self.pointer.cell = Some(cell);
+                        let button = match reported {
+                            0 => Button::None,
+                            r if r & 1 != 0 => Button::Left,
+                            r if r & 2 != 0 => Button::Middle,
+                            _ => Button::Right,
+                        };
+                        send(self, Event::Motion, button, cell);
+                    }
+                } else if self.pointer.selecting {
+                    self.select_to(cell);
+                }
+            }
+            InputKind::Wheel => {
+                let m = self.metrics.expect("a cell was measured");
+                // A notch, or three lines' worth of a touchpad's pixels, is one step.
+                let units = match input.code {
+                    1 => input.dy,
+                    _ => input.dy / (3.0 * m.cell_h),
+                };
+                self.pointer.wheel += units;
+                let steps =
+                    (self.pointer.wheel.trunc() as i32).clamp(-MAX_WHEEL_STEPS, MAX_WHEEL_STEPS);
+                self.pointer.wheel -= self.pointer.wheel.trunc();
+                if steps == 0 {
+                    return;
+                }
+                let down = steps > 0;
+                for _ in 0..steps.unsigned_abs() {
+                    if report {
+                        let wheel = if down {
+                            Button::WheelDown
+                        } else {
+                            Button::WheelUp
+                        };
+                        send(self, Event::Press, wheel, cell);
+                    } else if alt_screen && running {
+                        let modes = Modes {
+                            application_cursor: self.term.screen().application_cursor(),
+                        };
+                        let arrow = if down { "ArrowDown" } else { "ArrowUp" };
+                        let bytes = keys::encode(arrow, "", 0, modes).unwrap_or_default();
+                        self.send(&bytes.repeat(3));
+                    } else if !alt_screen && self.term.scroll_view(if down { -3 } else { 3 }) {
+                        self.dirty = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The line of the screen's content at `row` of the page.
+    fn line_at(&self, row: u16) -> i64 {
+        self.term.top_line() + i64::from(row)
+    }
+
+    fn select_start(&mut self, cell: (u16, u16)) {
+        let now = self.clock;
+        let clicks = match self.pointer.last {
+            Some((at, last, n)) if last == cell && now.saturating_sub(at) <= DOUBLE_CLICK_MS => {
+                n % 3 + 1
+            }
+            _ => 1,
+        };
+        self.pointer.last = Some((now, cell, clicks));
+        self.pointer.selecting = true;
+        let unit = match clicks {
+            1 => Unit::Cell,
+            2 => Unit::Word,
+            _ => Unit::Line,
+        };
+        let at = (self.line_at(cell.1), cell.0);
+        let mut selection = Selection {
+            alt: self.term.screen().alternate_screen(),
+            epoch: self.term.epoch(),
+            unit,
+            anchor: at,
+            head: at,
+            range: None,
+        };
+        selection.range = self.grow(&selection);
+        self.selection = Some(selection);
+        self.dirty = true;
+    }
+
+    fn select_to(&mut self, cell: (u16, u16)) {
+        let head = (self.line_at(cell.1), cell.0);
+        let Some(mut selection) = self.selection.filter(|s| s.head != head) else {
+            return;
+        };
+        selection.head = head;
+        selection.range = self.grow(&selection);
+        self.selection = Some(selection);
+        self.dirty = true;
+    }
+
+    /// The selection's first and last cells, ordered and grown to its unit.
+    fn grow(&mut self, s: &Selection) -> Option<((i64, u16), (i64, u16))> {
+        let (mut start, mut end) = if s.anchor <= s.head {
+            (s.anchor, s.head)
+        } else {
+            (s.head, s.anchor)
+        };
+        match s.unit {
+            Unit::Cell if start == end => return None,
+            Unit::Cell => {}
+            Unit::Word => {
+                start.1 = self.word_edge(start, false);
+                end.1 = self.word_edge(end, true);
+            }
+            Unit::Line => {
+                start.1 = 0;
+                end.1 = self.size.0.saturating_sub(1);
+            }
+        }
+        Some((start, end))
+    }
+
+    /// The selection still standing: on this screen and with its text still there.
+    fn selection(&self) -> Option<Selection> {
+        self.selection.filter(|s| {
+            s.alt == self.term.screen().alternate_screen() && s.epoch == self.term.epoch()
+        })
+    }
+
+    /// Where the word at `at` starts (or ends, if `forward`).
+    fn word_edge(&mut self, at: (i64, u16), forward: bool) -> u16 {
+        let cols = self.size.0;
+        let text = self
+            .term
+            .text((at.0, 0), (at.0, cols), 4 * usize::from(cols) + 16);
+        let chars: Vec<char> = text.chars().collect();
+        let word = |c: char| c.is_alphanumeric() || WORD_CHARACTERS.contains(c);
+        let at_col = usize::from(at.1);
+        if !chars.get(at_col).copied().is_some_and(word) {
+            return at.1;
+        }
+        let mut col = at_col;
+        if forward {
+            while chars.get(col + 1).copied().is_some_and(word) {
+                col += 1;
+            }
+        } else {
+            while col > 0 && chars.get(col - 1).copied().is_some_and(word) {
+                col -= 1;
+            }
+        }
+        col as u16
+    }
+
+    /// The selection's text, bounded.
+    fn selected_text(&mut self) -> Option<String> {
+        let (start, end) = self.selection()?.range?;
+        let start = if end.0 - start.0 >= MAX_SELECTION_LINES {
+            (end.0 - MAX_SELECTION_LINES + 1, 0)
+        } else {
+            start
+        };
+        let text = self.term.text(start, (end.0, end.1 + 1), MAX_COPY);
+        (!text.is_empty()).then_some(text)
     }
 
     fn start(&mut self, host: &mut impl Host<Pty = P>) {
@@ -242,6 +681,9 @@ impl<P: Terminal> App<P> {
             },
             Phase::Running(pty) => {
                 let ended = self.read(&pty);
+                if self.term.busy() && self.term.step() {
+                    self.dirty = true;
+                }
                 let status = pty.status();
                 if ended || !matches!(status, Status::Running | Status::Opening) {
                     self.dirty = true;
@@ -259,19 +701,28 @@ impl<P: Terminal> App<P> {
             other => other,
         };
         self.flush();
+        if self.selection.is_some() && self.selection().is_none() {
+            self.selection = None;
+            self.dirty = true;
+        }
+        if self.dirty {
+            self.history = self.term.history();
+        }
     }
 
-    /// Reads and parses up to [`MAX_OUTPUT_PER_FRAME`] bytes; whether the output has ended.
+    /// Reads and parses up to [`MAX_OUTPUT_PER_FRAME`] bytes' worth (and at most
+    /// [`MAX_READ_PER_FRAME`] bytes); whether the output has ended.
     fn read(&mut self, pty: &P) -> bool {
         let mut buf = vec![0u8; 16 * 1024];
-        let mut total = 0;
-        while total < MAX_OUTPUT_PER_FRAME {
+        let (mut cost, mut total) = (0, 0);
+        while cost < MAX_OUTPUT_PER_FRAME && total < MAX_READ_PER_FRAME {
             match pty.read(&mut buf) {
                 None => return true,
                 Some(0) => break,
                 Some(n) => {
                     total += n;
-                    let replies = self.term.feed(&buf[..n]);
+                    let (replies, spent) = self.term.feed(&buf[..n]);
+                    cost += spent;
                     self.dirty = true;
                     if !replies.is_empty() {
                         let room = MAX_PENDING.saturating_sub(self.pending.len());
@@ -290,12 +741,16 @@ impl<P: Terminal> App<P> {
         match &self.phase {
             Phase::Start { refused } => draw::page(&self.start_page(*refused, None), m, cols),
             Phase::Opening(_) => Vec::new(),
-            Phase::Running(_) => draw::screen(self.term.screen(), m),
+            Phase::Running(_) => draw::screen(self.term.screen(), m, &self.overlay(m)),
             Phase::Ended(how, _) if self.program == Program::EditConfig => {
                 draw::page(&self.start_page(false, Some(*how)), m, cols)
             }
             Phase::Ended(how, _) => {
-                let mut ops = draw::screen(self.term.screen(), m);
+                let overlay = Overlay {
+                    cursor: None,
+                    ..self.overlay(m)
+                };
+                let mut ops = draw::screen(self.term.screen(), m, &overlay);
                 let said = match how {
                     End::Exited(code) => format!("The program exited with status {code}."),
                     End::Signalled => "A signal ended the program.".into(),
@@ -320,6 +775,25 @@ impl<P: Terminal> App<P> {
                 });
                 ops
             }
+        }
+    }
+
+    /// What is drawn with the screen: the selection, the cursor's shape, the images and how far
+    /// back the view is.
+    fn overlay(&self, m: Metrics) -> Overlay {
+        let top = self.term.top_line();
+        let selection = self
+            .selection()
+            .and_then(|s| s.range)
+            .map(|(start, end)| ((start.0 - top, start.1), (end.0 - top, end.1 + 1)));
+        let view = self.term.view();
+        let (below, above) = draw::images(self.term.graphics(), top, self.term.screen(), m);
+        Overlay {
+            selection,
+            cursor: (view == 0).then(|| self.term.cursor_shape()),
+            below,
+            above,
+            scrolled_back: (view > 0).then_some((view, self.history)),
         }
     }
 
@@ -352,8 +826,10 @@ impl<P: Terminal> App<P> {
             MUTED,
         ));
         lines.push(Line::new(
-            "Limits: no scrollback, no mouse, and a program in a background tab gets its output \
-             read once a second.",
+            "Select text with the mouse (Shift with it when the program takes the mouse); \
+             Ctrl+Shift+C copies, Ctrl+Shift+V pastes, Shift+Page Up looks back. Programs may \
+             show images (kitty's graphics protocol and sixel). A program in a background tab \
+             gets its output read once a second.",
             MUTED,
         ));
         if refused {
@@ -579,9 +1055,9 @@ mod tests {
         Input {
             kind: InputKind::Press,
             modifiers,
-            code: 0,
             key: key.into(),
             text: text.into(),
+            ..Input::default()
         }
     }
 
@@ -596,10 +1072,8 @@ mod tests {
     fn paste_of(text: &str) -> Input {
         Input {
             kind: InputKind::Paste,
-            modifiers: 0,
-            code: 0,
-            key: String::new(),
             text: text.into(),
+            ..Input::default()
         }
     }
 
@@ -615,7 +1089,7 @@ mod tests {
             .into_iter()
             .filter_map(|op| match op {
                 Op::Text { text, .. } => Some(text),
-                Op::Fill { .. } => None,
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -623,6 +1097,7 @@ mod tests {
 
     fn running(browser: &mut Browser) -> App<Pty> {
         let mut app = App::new(Program::Shell);
+        app.set_metrics(M);
         app.frame((40, 10));
         app.input(browser, &press("Enter", "\r", 0));
         app.frame((40, 10));
@@ -712,7 +1187,7 @@ mod tests {
             .output
             .extend_from_slice(b"\x1b[c\x1b[?1h");
         app.frame((40, 10));
-        assert_eq!(browser.pty.0.borrow().input, b"\x1b[?62;22c");
+        assert_eq!(browser.pty.0.borrow().input, b"\x1b[?62;4;22c");
         app.input(&mut browser, &press("ArrowUp", "", 0));
         assert!(browser.pty.0.borrow().input.ends_with(b"\x1bOA"));
     }
@@ -782,6 +1257,256 @@ mod tests {
             matches!(app.phase, Phase::Opening(_)),
             "refused: a terminal still held"
         );
+    }
+
+    /// A pointer record of `kind` for `code` at cell (`col`, `row`) of [`M`]'s cells.
+    fn pointer(kind: InputKind, code: u32, col: u16, row: u16, modifiers: u8) -> Input {
+        Input {
+            kind,
+            code,
+            modifiers,
+            x: f32::from(col) * M.cell_w + 1.0,
+            y: f32::from(row) * M.cell_h + 1.0,
+            ..Input::default()
+        }
+    }
+
+    /// `notches` of a wheel (positive down).
+    fn wheel(notches: f32) -> Input {
+        Input {
+            dy: notches,
+            ..pointer(InputKind::Wheel, 1, 1, 1, 0)
+        }
+    }
+
+    fn output(browser: &Browser, app: &mut App<Pty>, bytes: &[u8]) {
+        browser.pty.0.borrow_mut().output.extend_from_slice(bytes);
+        app.frame((40, 10));
+    }
+
+    fn typed(browser: &Browser) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut browser.pty.0.borrow_mut().input)).into_owned()
+    }
+
+    #[test]
+    fn nothing_starts_on_a_click_or_the_wheel() {
+        let mut browser = Browser::default();
+        let mut app = App::<Pty>::new(Program::Shell);
+        app.set_metrics(M);
+        app.frame((40, 10));
+        for button in [buttons::LEFT, buttons::MIDDLE, buttons::RIGHT] {
+            app.input(
+                &mut browser,
+                &pointer(InputKind::PointerPress, button, 1, 1, 0),
+            );
+            app.input(
+                &mut browser,
+                &pointer(InputKind::PointerRelease, button, 1, 1, 0),
+            );
+        }
+        app.input(&mut browser, &wheel(1.0));
+        assert!(browser.opened.is_empty());
+        assert!(app.take_asks().is_empty(), "no paste on the start screen");
+    }
+
+    #[test]
+    fn a_drag_selects_and_copies_to_the_primary_selection() {
+        use InputKind::{Motion, PointerPress, PointerRelease};
+        let mut browser = Browser::default();
+        let mut app = running(&mut browser);
+        output(&browser, &mut app, b"hello world\r\nsecond line");
+        // A click alone selects nothing.
+        app.input(&mut browser, &pointer(PointerPress, buttons::LEFT, 0, 0, 0));
+        app.input(
+            &mut browser,
+            &pointer(PointerRelease, buttons::LEFT, 0, 0, 0),
+        );
+        assert!(app.take_asks().is_empty());
+        app.advance_clock(1000);
+        app.input(&mut browser, &pointer(PointerPress, buttons::LEFT, 6, 0, 0));
+        app.input(&mut browser, &pointer(Motion, 1, 3, 1, 0));
+        app.input(
+            &mut browser,
+            &pointer(PointerRelease, buttons::LEFT, 3, 1, 0),
+        );
+        let copy = |text: &str, primary| Ask::Copy {
+            text: text.into(),
+            primary,
+        };
+        assert_eq!(app.take_asks(), [copy("world\nseco", true)]);
+        assert!(typed(&browser).is_empty(), "the program gets nothing");
+        // Selected cells are drawn inverse.
+        assert!(app
+            .ops(M)
+            .iter()
+            .any(|op| matches!(op, Op::Fill { x, y, color, .. }
+            if *x == 36.0 && *y == 0.0 && *color == draw::FOREGROUND)));
+        // Ctrl+Shift+C puts it on the clipboard; typing ends it.
+        app.input(&mut browser, &press("C", "", CONTROL | SHIFT));
+        assert_eq!(app.take_asks(), [copy("world\nseco", false)]);
+        assert!(typed(&browser).is_empty(), "not a Ctrl+C");
+        app.input(&mut browser, &press("x", "x", 0));
+        app.input(&mut browser, &press("C", "", CONTROL | SHIFT));
+        assert!(app.take_asks().is_empty());
+        assert_eq!(typed(&browser), "x");
+    }
+
+    #[test]
+    fn double_and_triple_clicks_select_a_word_and_a_line() {
+        use InputKind::{PointerPress, PointerRelease};
+        let mut browser = Browser::default();
+        let mut app = running(&mut browser);
+        output(&browser, &mut app, b"ls ~/my-dir/a.txt now");
+        let click = |app: &mut App<Pty>, browser: &mut Browser| {
+            app.input(browser, &pointer(PointerPress, buttons::LEFT, 8, 0, 0));
+            app.input(browser, &pointer(PointerRelease, buttons::LEFT, 8, 0, 0));
+            app.advance_clock(100);
+        };
+        click(&mut app, &mut browser);
+        click(&mut app, &mut browser);
+        let copied = |app: &mut App<Pty>| match app.take_asks().pop() {
+            Some(Ask::Copy { text, .. }) => text,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(copied(&mut app), "~/my-dir/a.txt");
+        click(&mut app, &mut browser);
+        assert_eq!(copied(&mut app), "ls ~/my-dir/a.txt now");
+    }
+
+    #[test]
+    fn the_program_gets_the_mouse_when_it_asks_but_shift_is_the_users() {
+        use InputKind::{Motion, PointerPress, PointerRelease};
+        let mut browser = Browser::default();
+        let mut app = running(&mut browser);
+        output(&browser, &mut app, b"\x1b[?1002h\x1b[?1006h");
+        app.input(&mut browser, &pointer(PointerPress, buttons::LEFT, 2, 1, 0));
+        app.input(&mut browser, &pointer(Motion, 1, 2, 1, 0));
+        app.input(&mut browser, &pointer(Motion, 1, 5, 3, 0));
+        app.input(
+            &mut browser,
+            &pointer(PointerRelease, buttons::LEFT, 5, 3, 0),
+        );
+        assert_eq!(
+            typed(&browser),
+            "\x1b[<0;3;2M\x1b[<32;6;4M\x1b[<0;6;4m",
+            "motion within a cell is not reported again"
+        );
+        app.input(&mut browser, &wheel(-1.0));
+        app.input(&mut browser, &wheel(2.0));
+        assert_eq!(typed(&browser), "\x1b[<64;2;2M\x1b[<65;2;2M\x1b[<65;2;2M");
+        // Motion with no button is not reported in mode 1002.
+        app.input(&mut browser, &pointer(Motion, 0, 9, 9, 0));
+        assert!(typed(&browser).is_empty());
+        // With Shift, the pointer selects and the program hears nothing.
+        output(&browser, &mut app, b"\x1b[Hselect me");
+        app.input(
+            &mut browser,
+            &pointer(PointerPress, buttons::LEFT, 0, 0, SHIFT),
+        );
+        app.input(&mut browser, &pointer(Motion, 1, 5, 0, SHIFT));
+        app.input(
+            &mut browser,
+            &pointer(PointerRelease, buttons::LEFT, 5, 0, SHIFT),
+        );
+        assert!(typed(&browser).is_empty());
+        assert!(
+            matches!(&app.take_asks()[..], [Ask::Copy { text, primary: true }] if text == "select")
+        );
+        // The original encoding, after the program switched SGR off.
+        output(&browser, &mut app, b"\x1b[?1006l\x1b[?1000h");
+        app.input(
+            &mut browser,
+            &pointer(PointerPress, buttons::RIGHT, 0, 0, 0),
+        );
+        assert_eq!(typed(&browser), "\x1b[M\"!!");
+    }
+
+    #[test]
+    fn the_wheel_and_shift_page_up_look_back_and_typing_returns() {
+        let mut browser = Browser::default();
+        let mut app = running(&mut browser);
+        let lines: Vec<u8> = (0..40)
+            .flat_map(|i| format!("{i}\r\n").into_bytes())
+            .collect();
+        output(&browser, &mut app, &lines);
+        app.input(&mut browser, &wheel(-1.0));
+        assert_eq!(app.term.view(), 3);
+        app.frame((40, 10));
+        let tag = app
+            .ops(M)
+            .into_iter()
+            .any(|op| matches!(op, Op::Text { text, .. } if text.starts_with("3/")));
+        assert!(tag, "the view says how far back it is");
+        app.input(&mut browser, &press("PageUp", "", SHIFT));
+        assert_eq!(app.term.view(), 12);
+        app.input(&mut browser, &press("PageDown", "", SHIFT));
+        assert_eq!(app.term.view(), 3);
+        assert!(typed(&browser).is_empty());
+        // Output keeps the view still; typing returns to the live screen.
+        output(&browser, &mut app, b"more\r\n");
+        assert_eq!(app.term.view(), 4);
+        app.input(&mut browser, &press("a", "a", 0));
+        assert_eq!(app.term.view(), 0);
+        // On the alternate screen the wheel is arrow keys, Shift+Page Up the program's.
+        output(&browser, &mut app, b"\x1b[?1049h");
+        typed(&browser);
+        app.input(&mut browser, &wheel(1.0));
+        app.input(&mut browser, &press("PageUp", "", SHIFT));
+        assert_eq!(typed(&browser), "\x1b[B\x1b[B\x1b[B\x1b[5;2~");
+    }
+
+    #[test]
+    fn pastes_come_from_the_browsers_clipboard() {
+        let mut browser = Browser::default();
+        let mut app = running(&mut browser);
+        app.input(&mut browser, &press("V", "", CONTROL | SHIFT));
+        app.input(&mut browser, &press("Insert", "", SHIFT));
+        app.input(
+            &mut browser,
+            &pointer(InputKind::PointerPress, buttons::MIDDLE, 0, 0, 0),
+        );
+        assert_eq!(
+            app.take_asks(),
+            [
+                Ask::Paste { primary: false },
+                Ask::Paste { primary: true },
+                Ask::Paste { primary: true }
+            ]
+        );
+        assert!(typed(&browser).is_empty());
+        output(&browser, &mut app, b"\x1b[?2004h");
+        app.pasted("echo \x1b[201~hi\n");
+        assert_eq!(typed(&browser), "\x1b[200~echo [201~hi\r\x1b[201~");
+    }
+
+    #[test]
+    fn images_are_drawn_where_they_are_placed_and_scroll_with_the_view() {
+        let mut browser = Browser::default();
+        let mut app = running(&mut browser);
+        output(
+            &browser,
+            &mut app,
+            b"\r\n\x1b_Ga=T,f=24,s=2,v=2,i=1,z=-1;AAAAAAAAAAAAAAAA\x1b\\",
+        );
+        let image = |app: &App<Pty>| {
+            app.ops(M).into_iter().find_map(|op| match op {
+                Op::Image { rect, .. } => Some(rect),
+                _ => None,
+            })
+        };
+        for _ in 0..10 {
+            app.frame((40, 10));
+        }
+        assert_eq!(image(&app), Some([0.0, 12.0, 2.0, 2.0]));
+        // Below the text: before the first text drawn.
+        let lines: Vec<u8> = (0..12)
+            .flat_map(|i| format!("{i}\r\n").into_bytes())
+            .collect();
+        output(&browser, &mut app, &lines);
+        assert_eq!(image(&app), None, "scrolled off the page");
+        app.input(&mut browser, &wheel(-2.0));
+        app.frame((40, 10));
+        assert!(image(&app).is_some(), "back in view");
     }
 
     /// What the browser answers about the editor, as `PageInfo::Editor` documents it.

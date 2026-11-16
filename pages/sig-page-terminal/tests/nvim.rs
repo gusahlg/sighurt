@@ -8,13 +8,13 @@ use sig_page_terminal::term::Term;
 #[test]
 fn nvims_screen_is_what_it_drew() {
     let mut term = Term::new(24, 80);
-    let replies = term.feed(include_bytes!("nvim-startup.bin"));
+    let (replies, _) = term.feed(include_bytes!("nvim-startup.bin"));
     // nvim waits for DA1 (and asks for the device status), twice in this capture: both
     // answered, and nothing else.
     let replies = String::from_utf8(replies).unwrap();
-    assert!(replies.contains("\x1b[?62;22c") && replies.contains("\x1b[0n"));
+    assert!(replies.contains("\x1b[?62;4;22c") && replies.contains("\x1b[0n"));
     assert_eq!(
-        replies.replace("\x1b[?62;22c", "").replace("\x1b[0n", ""),
+        replies.replace("\x1b[?62;4;22c", "").replace("\x1b[0n", ""),
         ""
     );
     let screen = term.screen();

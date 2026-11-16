@@ -9,17 +9,25 @@
 //! untrusted, draws the screen on the canvas, and turns keys and pastes into the program's
 //! input. Nothing starts until the user presses Enter in the page.
 //!
-//! The logic is plain Rust, tested on the host: keys ([`keys`]), pastes ([`paste`]), the
-//! emulator and its query answers ([`term`]), drawing ([`draw`]) and the page's states
-//! ([`app`]). `page`, compiled only for wasm32, is the thin layer of `sig` and canvas calls.
+//! The logic is plain Rust, tested on the host: keys ([`keys`]), pastes ([`paste`]), mouse
+//! reports ([`mouse`]), the emulator with its history and query answers ([`term`]), the
+//! pre-scan of the output for graphics ([`scan`]), images ([`graphics`], decoding sixel with
+//! [`sixel`] and making PNGs with [`png`]), drawing ([`draw`]) and the page's states, selection
+//! and clipboard ([`app`]). `page`, compiled only for wasm32, is the thin layer of `sig` and
+//! canvas calls.
 //!
 //! Must not own: what runs (the runtime's), who may have a terminal (the core's), or the bytes on
 //! the way (the Wasm engine's `pty`).
 
 pub mod app;
 pub mod draw;
+pub mod graphics;
 pub mod keys;
+pub mod mouse;
 pub mod paste;
+pub mod png;
+pub mod scan;
+pub mod sixel;
 pub mod term;
 
 #[cfg(target_arch = "wasm32")]
