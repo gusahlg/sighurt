@@ -360,8 +360,9 @@ impl<T: ServoTarget> View<T> {
             }
         } else {
             // A smooth scroll in flight ends where it was going before Servo throttles the view.
-            let rest = self.scroll.finish();
-            self.send(rest);
+            while let Some(rest) = self.scroll.finish() {
+                self.send([rest]);
+            }
             if let Some(webview) = &self.webview {
                 webview.hide();
             }

@@ -883,6 +883,8 @@ impl<T: ServoTarget> ServoRuntime<T> {
                         view.requests.clear();
                         view.asked.clear();
                         view.reloading = false;
+                        // A scroll in flight was the old document's.
+                        view.scroll.clear();
                         for popup in view.popups.drain(..) {
                             self.owners.remove(&popup.id());
                         }
