@@ -30,6 +30,7 @@
 pub mod commands;
 pub mod config;
 pub mod fullscreen;
+pub mod interface;
 pub mod keys;
 pub mod navigation;
 pub mod permissions;

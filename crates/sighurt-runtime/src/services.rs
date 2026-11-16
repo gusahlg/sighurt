@@ -335,7 +335,7 @@ impl Reporter {
 }
 
 /// The program that hands a URL to the desktop's default handler: `xdg-open`, or on macOS
-/// `/usr/bin/open` (unverified there: docs/rewrite/PORTING.md). Windows has none here yet.
+/// `/usr/bin/open` (unverified there: docs/rewrite/PORTING.md). Windows uses `ShellExecuteW`.
 #[cfg(all(unix, not(target_vendor = "apple")))]
 const OPENER: &str = "xdg-open";
 #[cfg(target_vendor = "apple")]
@@ -362,9 +362,59 @@ fn open_external(url: &str) -> ServiceResult {
     Ok(ServiceReply::Done)
 }
 
-/// No external handler here: Windows would need `ShellExecuteW`, which this build does not
-/// call (docs/rewrite/PORTING.md).
-#[cfg(not(unix))]
+/// Hands `url` to the shell's default handler with `ShellExecuteW`, on a thread of its own
+/// (it can block). Only `http`, `https` and `mailto` get there: for a `file:` URL or a path the
+/// call would run a program. The core has refused the dangerous schemes already; this is the
+/// narrower rule of the one system call that would act on any of them.
+#[cfg(windows)]
+fn open_external(url: &str) -> ServiceResult {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let url = url::Url::parse(url).map_err(|e| ServiceError::Failed(e.to_string()))?;
+    if !matches!(url.scheme(), "http" | "https" | "mailto") {
+        return Err(ServiceError::Failed(format!(
+            "cannot open a {} address outside the browser",
+            url.scheme()
+        )));
+    }
+    let wide = |text: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain([0])
+            .collect()
+    };
+    let (verb, target) = (wide("open"), wide(url.as_str()));
+    std::thread::Builder::new()
+        .name("sighurt-shell-open".into())
+        .spawn(move || {
+            // SAFETY: both strings are NUL-terminated and live through the call; the rest is
+            // null (no window, no parameters, the default directory).
+            let result = unsafe {
+                ShellExecuteW(
+                    core::ptr::null_mut(),
+                    verb.as_ptr(),
+                    target.as_ptr(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    SW_SHOWNORMAL,
+                )
+            };
+            // A result above 32 is success; below, an error code.
+            if (result as usize) <= 32 {
+                log::warn!(
+                    "the shell could not open an external address (code {})",
+                    result as usize
+                );
+            }
+        })
+        .map_err(|e| ServiceError::Failed(format!("cannot start the shell: {e}")))?;
+    Ok(ServiceReply::Done)
+}
+
+/// No external handler on other systems.
+#[cfg(not(any(unix, windows)))]
 fn open_external(_url: &str) -> ServiceResult {
     Err(ServiceError::Unsupported)
 }
@@ -454,9 +504,49 @@ fn save(
 /// cut at a character and keeping a short extension, so ` (n)` still fits in a file system's
 /// 255.
 fn sanitize(name: &str) -> String {
+    let clean = sanitize_generic(name);
+    if cfg!(windows) {
+        windows_safe(&clean)
+    } else {
+        clean
+    }
+}
+
+/// What Windows adds to the rules of [`sanitize`]: the characters it forbids in a name become
+/// `_`, a name does not end in a dot or a space, and a device name (`CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`-`COM9`, `LPT1`-`LPT9`, in any case and with any extension) gets a `_` in front. Applied
+/// to a name [`sanitize_generic`] made; the result is at most [`MAX_NAME`] bytes and stays as it
+/// is if cleaned again. Compiled everywhere, used only on Windows.
+fn windows_safe(name: &str) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .collect();
+    let stem = replaced.split('.').next().unwrap_or_default().trim_end();
+    let upper = stem.to_ascii_uppercase();
+    let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
+    let named = if device {
+        format!("_{replaced}")
+    } else {
+        replaced
+    };
+    let kept = cut(&named, MAX_NAME).trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+    if kept.is_empty() {
+        "download".to_string()
+    } else {
+        kept.to_string()
+    }
+}
+
+fn sanitize_generic(name: &str) -> String {
     let name: String = name
         .chars()
-        .filter(|&c| !c.is_control() && !is_format(c))
+        .filter(|&c| {
+            !c.is_control() && !is_format(c) && !(cfg!(target_vendor = "apple") && not_for_apfs(c))
+        })
         .collect();
     let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
     match last.trim_matches(|c: char| c == '.' || c.is_whitespace()) {
@@ -486,6 +576,18 @@ fn cut(text: &str, max: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// Whether macOS's file system may refuse `c` in a name (`EILSEQ`): Unicode noncharacters
+/// (U+FDD0..U+FDEF and the last two code points of each plane), private-use characters, and
+/// everything above plane 3 (planes 4 to 13 have no characters, 14 holds tags and variation
+/// selectors, 15 and 16 are private use). APFS refused an unassigned U+8A15E on GitHub's
+/// macos-latest (run 43826803295), and an unassigned U+D7FF too (run 43830229164), which only
+/// Unicode's tables tell: `create_unique` falls back to an ASCII name for those. Dropped from
+/// names on Apple systems only.
+fn not_for_apfs(c: char) -> bool {
+    let c = c as u32;
+    matches!(c, 0xfdd0..=0xfdef | 0xe000..=0xf8ff | 0x4_0000..=0x10_ffff) || c & 0xfffe == 0xfffe
 }
 
 /// Whether `c` is a Unicode format character (general category Cf, Unicode 16).
@@ -519,6 +621,22 @@ fn filename_from_url(url: &str) -> String {
 /// side by side never share a file. Finding the number takes a logarithmic number of looks,
 /// not one for each name in use.
 fn create_unique(dir: &Path, name: &str) -> io::Result<(PathBuf, File)> {
+    match create_unique_as(dir, name) {
+        // The file system refuses a character of the name (APFS: one Unicode has not
+        // assigned, which only its tables tell): every character but ASCII's becomes `_`.
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+            let ascii: String = name
+                .chars()
+                .map(|c| if c.is_ascii() { c } else { '_' })
+                .collect();
+            create_unique_as(dir, &ascii)
+        }
+        found => found,
+    }
+}
+
+fn create_unique_as(dir: &Path, name: &str) -> io::Result<(PathBuf, File)> {
     let stem = Path::new(name)
         .file_stem()
         .unwrap_or_default()
@@ -809,6 +927,46 @@ mod tests {
             "hello.txt",
         );
         assert!(last.ends_with("hello (2).txt"), "{last}");
+    }
+
+    #[test]
+    fn the_characters_apfs_may_refuse_are_recognised() {
+        for c in [
+            '\u{fdd0}',
+            '\u{fffe}',
+            '\u{ffff}',
+            '\u{1fffe}',
+            '\u{10ffff}',
+            '\u{e000}',
+            '\u{f0000}',
+        ] {
+            assert!(not_for_apfs(c), "{c:?}");
+        }
+        for c in ['a', 'é', '😀', '\u{fffd}', '\u{10000}', '\u{fdcf}'] {
+            assert!(!not_for_apfs(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn windows_file_names_are_plain_names() {
+        for (given, saved) in [
+            ("a:b*c?.txt", "a_b_c_.txt"),
+            ("say \"hi\"<1>|2", "say _hi__1__2"),
+            ("con", "_con"),
+            ("CON.txt", "_CON.txt"),
+            ("Lpt9.tar.gz", "_Lpt9.tar.gz"),
+            ("nul ", "_nul"),
+            ("com0", "com0"),
+            ("console.txt", "console.txt"),
+            ("report.", "report"),
+            ("a. . ", "a"),
+        ] {
+            let clean = windows_safe(&sanitize_generic(given));
+            assert_eq!(clean, saved, "{given:?}");
+            assert_eq!(windows_safe(&clean), clean, "idempotent: {given:?}");
+        }
+        let long = windows_safe(&format!("con.{}", "x".repeat(300)));
+        assert!(long.len() <= MAX_NAME && long.starts_with("_con."));
     }
 
     #[test]

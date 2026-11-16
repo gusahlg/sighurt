@@ -48,9 +48,9 @@
 //! snapshot change it shows, a configuration change or a layout change: a static chrome needs
 //! no tick, and a page animating never repaints it. The caret is steady, so no timer runs.
 //!
-//! `[chrome.standard]` arranges it ([`LayoutOptions`]): its one command, `chrome.toggle-tabs`
-//! ([`Model::command`]), hides the tabs or shows them again, and the tab list on the left
-//! scrolls with the wheel by whole rows.
+//! The interface's window tree arranges it ([`Arrangement`]): its one command,
+//! `chrome.toggle-tabs` ([`Model::command`]), hides the tabs or shows them again, and a tab
+//! list scrolls with the wheel by whole rows.
 //!
 //! Must not own: key binding policy (the core resolves bindings before the chrome sees a key),
 //! or the mouse's side buttons (the core's, through `[input.buttons]`).
@@ -66,25 +66,19 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, Key, KeyEvent, KeyboardFocus, PointerButton, PointerEvent,
     ScrollDelta, TextInputEvent, TextInputState, TextPurpose,
 };
+use sighurt_api::keymap::Frontend;
+use sighurt_api::ui::{Component, Kind, Node, Side};
 
 use crate::extension::{contained, readable_url, ChromeAction, Completion, SurfaceName, TextField};
 use crate::hit_test::{hit_test, Target};
-use crate::layout::{Layout, LayoutOptions, Tabs};
+use crate::layout::{Arrangement, Layout, Sizing};
 use crate::state::{
     is_home, ChromeState, FindField, HomeInfo, Snapshot, TabContent, TabSnapshot,
     MAX_ENGINE_DETAIL, MAX_ENGINE_NAME, MAX_MESSAGE, MAX_STATUS, NO_SUCH_PAGE,
 };
 use crate::text::{Fonts, ShapedText, TextStyle};
 
-/// The surface at the top, with the tab strip (when the tabs are at the top) and the toolbar:
-/// [`Layout::chrome`].
-pub const CHROME: SurfaceName = "chrome";
-/// The tab list's surface, while the tabs are on the left: [`Layout::tab_list`].
-pub const TABS: SurfaceName = "tabs";
-/// The status line's surface, a strip or an overlay: [`Layout::status`].
-pub const STATUS: SurfaceName = "status";
-/// The page area's surface, while the chrome draws a page there: [`Layout::page`].
-pub const PAGE: SurfaceName = "page";
+pub use crate::layout::{CHROME, PAGE, STATUS, TABS};
 
 /// Space between the address field's border and its text.
 const ADDRESS_PADDING: f32 = 12.0;
@@ -427,29 +421,40 @@ pub struct Model {
     fonts: Fonts,
     colors: Colors,
     /// As configured; [`Model::command`] can hide or show the tabs on top of it.
-    options: LayoutOptions,
+    arrangement: Arrangement,
     snapshot: Snapshot,
     state: ChromeState,
     layout: Layout,
     damage: Damage,
     /// What the executable was last told, so only changes are reported.
-    text_input: Option<TextInputState>,
+    text_input: Option<TextField>,
+    /// The surface the pointer event being handled came on, when it is one of the layout's.
+    receiving: Option<SurfaceName>,
     cursor: Cursor,
 }
 
 impl Model {
     /// A chrome with `fonts` and `colors`, for a window of no size yet: call
     /// [`Model::resize`] and [`Model::set_snapshot`] before painting.
-    pub fn new(fonts: Fonts, colors: Colors, options: LayoutOptions) -> Self {
+    pub fn new(fonts: Fonts, colors: Colors, arrangement: impl Into<Arrangement>) -> Self {
+        let arrangement = arrangement.into();
+        let layout = Layout::from_tree(
+            LogicalSize::default(),
+            &[],
+            &arrangement.tree,
+            arrangement.sizing(),
+            0,
+        );
         Self {
             fonts,
             colors,
-            options,
+            arrangement,
             snapshot: Snapshot::default(),
             state: ChromeState::default(),
-            layout: Layout::new(LogicalSize::default(), &[], options, 0),
+            layout,
             damage: Damage::ALL,
             text_input: None,
+            receiving: None,
             cursor: Cursor::Default,
         }
     }
@@ -493,8 +498,8 @@ impl Model {
 
     /// Changes what the layout includes and how big it is, as when the configuration is
     /// reloaded. Tabs hidden or shown by `chrome.toggle-tabs` stay so.
-    pub fn set_options(&mut self, options: LayoutOptions) -> Vec<ChromeAction> {
-        self.options = options;
+    pub fn set_options(&mut self, arrangement: impl Into<Arrangement>) -> Vec<ChromeAction> {
+        self.arrangement = arrangement.into();
         self.relayout(self.layout.window);
         self.finish(Vec::new())
     }
@@ -553,11 +558,18 @@ impl Model {
                 || active(&old) != active(new)
                 || old.keymap != new.keymap
                 || old.find != new.find;
-            let at_top = self.layout.options.tabs == Tabs::Top;
-            self.damage.chrome |= toolbar || tabs && at_top;
-            self.damage.tabs |= tabs && !at_top;
-            self.damage.status |= old.status != new.status;
+            let status = old.status != new.status;
             let page = internal_page(&old) != internal_page(new);
+            let (damage, layout) = (&mut self.damage, &self.layout);
+            for (kind, changed) in [
+                (Kind::AddressBar, toolbar),
+                (Kind::TabBar, tabs),
+                (Kind::StatusBar, status),
+            ] {
+                if changed {
+                    mark(damage, layout, kind);
+                }
+            }
             self.damage.page |= page;
             if page {
                 // Its links may be gone: the pointer's next move finds the one under it.
@@ -621,7 +633,7 @@ impl Model {
             self.state.address.set_text(text);
             self.state.address.select_all();
             self.clear_error();
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
         self.finish(Vec::new())
     }
@@ -634,13 +646,13 @@ impl Model {
             self.state.selecting = false;
             // A held engine button sinks; losing the window cancels that, so it has to be drawn
             // again.
-            self.damage.chrome |= self.state.label_pressed;
+            self.mark_if(Kind::AddressBar, self.state.label_pressed);
             self.state.label_pressed = false;
             self.state.link_pressed = None;
         }
         // Only the focused address line looks different: its caret and selection show while
         // the window is active.
-        self.damage.chrome |= self.state.focused;
+        self.mark_if(Kind::AddressBar, self.state.focused);
         self.finish(Vec::new())
     }
 
@@ -648,6 +660,12 @@ impl Model {
     /// status line or the page area while the chrome draws it), with the event's positions
     /// local to it. The wheel scrolls the tab list.
     pub fn pointer(&mut self, surface: WindowRect, event: &PointerEvent) -> Vec<ChromeAction> {
+        let layout = &self.layout;
+        let listed = layout.surfaces.iter().find(|s| s.rect == surface);
+        self.receiving = match listed {
+            Some(listed) => Some(listed.name),
+            None => (surface == layout.page).then_some(PAGE),
+        };
         let mut actions = Vec::new();
         match *event {
             PointerEvent::Enter { position } | PointerEvent::Motion { position, .. } => {
@@ -726,26 +744,32 @@ impl Model {
     pub fn completions(&mut self, request: RequestId, matches: &[Completion]) -> Vec<ChromeAction> {
         let state = &mut self.state;
         if state.completion.answer(request, matches, &state.address) {
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
         self.finish(Vec::new())
     }
 
-    /// The options as configured, with the tabs hidden or shown by `chrome.toggle-tabs`.
-    fn shown_options(&self) -> LayoutOptions {
-        let mut options = self.options;
+    /// The tree as configured, with the tabs hidden or shown at the top by
+    /// `chrome.toggle-tabs`.
+    fn shown_tree(&self) -> Node {
+        let mut tree = self.arrangement.tree.clone();
         if self.state.tabs_toggled {
-            options.tabs = match options.tabs {
-                Tabs::Hidden => Tabs::Top,
-                Tabs::Top | Tabs::Left => Tabs::Hidden,
-            };
+            // Neither can fail on a tree that passed the check: the window's trees have one
+            // address bar or command line, and a tab bar fits at the top of any.
+            let shown = tree.has(Kind::TabBar);
+            let _ = tree.change(Frontend::Gui, |tree| match shown {
+                true => tree.remove(Kind::TabBar),
+                false => tree.place(Component::new(Kind::TabBar), Side::Top),
+            });
         }
-        options
+        tree
     }
 
     fn relayout(&mut self, window: LogicalSize) {
         let tabs: Vec<_> = self.snapshot.tabs.iter().map(|tab| tab.id).collect();
-        let layout = Layout::new(window, &tabs, self.shown_options(), self.state.first_row);
+        let tree = self.shown_tree();
+        let sizing = self.arrangement.sizing();
+        let layout = Layout::from_tree(window, &tabs, &tree, sizing, self.state.first_row);
         self.state.first_row = layout.first_row;
         if layout == self.layout {
             return;
@@ -753,15 +777,16 @@ impl Model {
         let old = std::mem::replace(&mut self.layout, layout);
         let new = &self.layout;
         // Anything but the tabs moving moves every surface's contents.
-        let resized = old.window != new.window
-            || old.options != new.options
-            || old.tab_list != new.tab_list
-            || old.status != new.status
-            || old.page != new.page;
+        let still = |layout: &Layout| Layout {
+            tabs: Vec::new(),
+            new_tab: WindowRect::default(),
+            first_row: 0,
+            rows: 0,
+            ..layout.clone()
+        };
+        let resized = still(&old) != still(new);
         let tabs_moved = old.tabs != new.tabs || old.new_tab != new.new_tab;
-        let at_top = new.options.tabs == Tabs::Top;
-        self.damage.chrome |= tabs_moved && at_top;
-        self.damage.tabs |= tabs_moved && !at_top;
+        self.mark_if(Kind::TabBar, tabs_moved);
         if resized {
             self.damage = Damage::ALL;
         }
@@ -820,7 +845,9 @@ impl Model {
         self.state.address_tab = tab;
         if switched {
             self.state.paste = None;
-            self.damage.chrome |= self.state.completion.clear();
+            if self.state.completion.clear() {
+                mark(&mut self.damage, &self.layout, Kind::AddressBar);
+            }
         }
         let opened = self.state.opened.as_deref();
         let settled = opened.is_some_and(|from| switched || !loading || from != url);
@@ -833,7 +860,7 @@ impl Model {
         if (switched || settled || !editing) && (editor.text() != shown || editing) {
             self.state.address.set_text(&shown);
             self.clear_error();
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
     }
 
@@ -843,7 +870,7 @@ impl Model {
         let shown = readable_url(url);
         if self.state.address.is_modified() || self.state.address.text() != shown {
             self.state.address.set_text(&shown);
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
         self.state.opened = None;
         self.clear_error();
@@ -854,14 +881,14 @@ impl Model {
     fn close_find(&mut self) {
         if let Some(field) = self.state.find.take() {
             self.state.address = field.address;
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
     }
 
     fn clear_error(&mut self) {
         if self.state.command_error.take().is_some() {
-            self.damage.chrome = true;
-            self.damage.status = true;
+            self.mark(Kind::AddressBar);
+            self.mark(Kind::StatusBar);
         }
     }
 
@@ -871,7 +898,7 @@ impl Model {
         let before = self.state.address.clone();
         self.state.address.select_all();
         self.edited(&before);
-        self.damage.chrome |= !self.state.focused;
+        self.mark_if(Kind::AddressBar, !self.state.focused);
         self.state.focused = true;
     }
 
@@ -897,7 +924,7 @@ impl Model {
             self.state.focused = false;
             self.state.selecting = false;
             self.state.address.clear_preedit();
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
     }
 
@@ -905,7 +932,7 @@ impl Model {
     /// (not the line opened last) and drops a command error.
     fn edited(&mut self, before: &crate::text_edit::TextEditor) {
         if self.state.address != *before {
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
             if self.state.address.text() != before.text() {
                 self.state.opened = None;
                 self.clear_error();
@@ -995,8 +1022,8 @@ impl Model {
                 }
                 Err(error) => {
                     self.state.command_error = Some(format!(":{}: {error}", command.trim()));
-                    self.damage.chrome = true;
-                    self.damage.status = true;
+                    self.mark(Kind::AddressBar);
+                    self.mark(Kind::StatusBar);
                 }
             }
         } else if line.is_empty() {
@@ -1016,9 +1043,10 @@ impl Model {
         let over = self.on_engine_label(point);
         if over != self.state.label_hover {
             self.state.label_hover = over;
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
-        let target = hit_test(&self.layout, point).filter(|&target| self.enabled(target));
+        let target =
+            hit_test(&self.layout, point).filter(|&t| self.enabled(t) && self.on_receiving(t));
         self.set_hover(target.filter(|_| !over));
         if self.state.selecting {
             let offset = self.address_offset(point.x as f32);
@@ -1030,7 +1058,8 @@ impl Model {
 
     /// The address of the link at `point` on the page the chrome draws, if one is there.
     fn link_at(&mut self, point: WindowPoint) -> Option<String> {
-        if !self.layout.page.contains(point) {
+        let on_page = self.receiving.is_none_or(|surface| surface == PAGE);
+        if !on_page || !self.layout.page.contains(point) {
             return None;
         }
         let (x, y) = (point.x as f32, point.y as f32);
@@ -1053,7 +1082,7 @@ impl Model {
     /// The pointer is not over the engine button any more.
     fn leave_label(&mut self) {
         if std::mem::take(&mut self.state.label_hover) {
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
     }
 
@@ -1068,14 +1097,28 @@ impl Model {
 
     /// Marks the surface `target` is drawn on for repainting.
     fn damage_target(&mut self, target: Target) {
-        let in_list = matches!(
-            target,
-            Target::Tab(_) | Target::CloseTab(_) | Target::NewTab
-        ) && self.layout.options.tabs == Tabs::Left;
-        match in_list {
-            true => self.damage.tabs = true,
-            false => self.damage.chrome = true,
+        self.mark(owner(target));
+    }
+
+    /// Marks the surface the layout puts `kind` on for repainting: the ownership map is the
+    /// one place that says where a component is drawn. Tabs that aren't shown mark the tabs'
+    /// surface, as before trees, which lists nothing then.
+    fn mark(&mut self, kind: Kind) {
+        mark(&mut self.damage, &self.layout, kind);
+    }
+
+    /// [`Model::mark`], if `changed`.
+    fn mark_if(&mut self, kind: Kind, changed: bool) {
+        if changed {
+            self.mark(kind);
         }
+    }
+
+    /// Whether `target` is drawn on the surface the pointer event came on: a covered control
+    /// on another surface is never hit through this one.
+    fn on_receiving(&self, target: Target) -> bool {
+        let owner = self.layout.surface_of(owner(target));
+        self.receiving.is_none() || owner == self.receiving
     }
 
     fn press(&mut self, point: WindowPoint, extend: bool, actions: &mut Vec<ChromeAction>) {
@@ -1084,12 +1127,13 @@ impl Model {
             // release runs nothing.
             self.state.label_pressed = !self.engine_busy();
             self.state.pressed = None;
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
             return;
         }
         self.state.label_pressed = false;
         self.state.link_pressed = self.link_at(point);
-        let target = hit_test(&self.layout, point).filter(|&target| self.enabled(target));
+        let target =
+            hit_test(&self.layout, point).filter(|&t| self.enabled(t) && self.on_receiving(t));
         self.state.pressed = target;
         match target {
             // The first click selects everything, ready to type over; later ones place the
@@ -1119,7 +1163,7 @@ impl Model {
         self.state.selecting = false;
         let on_label = std::mem::take(&mut self.state.label_pressed);
         if on_label {
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
             if self.on_engine_label(point) && !self.engine_busy() {
                 actions.push(ChromeAction::Command(Command::PageSwitchEngine));
             }
@@ -1133,7 +1177,8 @@ impl Model {
             return;
         }
         let pressed = self.state.pressed.take();
-        let target = hit_test(&self.layout, point).filter(|&target| self.enabled(target));
+        let target =
+            hit_test(&self.layout, point).filter(|&t| self.enabled(t) && self.on_receiving(t));
         if pressed.is_none() || pressed != target {
             return;
         }
@@ -1156,6 +1201,10 @@ impl Model {
     /// around it. Half-open, like the chrome's other rectangles. The button is not a hover
     /// [`Target`]; see [`ChromeState::label_hover`].
     fn on_engine_label(&mut self, point: WindowPoint) -> bool {
+        let editor = Some(self.editor_surface());
+        if self.receiving.is_some() && self.receiving != editor {
+            return false;
+        }
         let point = (point.x as f32, point.y as f32);
         let button = self.address_view().engine;
         button.is_some_and(|button| button.contains(point))
@@ -1217,13 +1266,13 @@ impl Model {
             self.state.address.reset_scroll();
         }
         if self.state.address.scroll() != before {
-            self.damage.chrome = true;
+            self.mark(Kind::AddressBar);
         }
 
-        let text_input = self.state.focused.then(|| self.text_input_state());
-        if text_input != self.text_input {
-            self.text_input = text_input.clone();
-            let field = text_input.map(|state| TextField::new(CHROME, state));
+        let surface = self.editor_surface();
+        let field = (self.state.focused).then(|| TextField::new(surface, self.text_input_state()));
+        if field != self.text_input {
+            self.text_input = field.clone();
             actions.push(ChromeAction::TextInput(field));
         }
         let idle_button = self.address_view().engine.map(|button| !button.busy);
@@ -1244,14 +1293,18 @@ impl Model {
 
     fn text_input_state(&mut self) -> TextInputState {
         let view = self.address_view();
-        let chrome = self.layout.chrome;
+        let surface = self.editor_surface();
+        let chrome = self
+            .layout
+            .surface(surface)
+            .map_or(self.layout.chrome, |s| s.rect);
         let x = view.caret.unwrap_or(view.x) - chrome.x as f32;
         TextInputState {
             caret: SurfaceRect {
                 x: x.round() as i32,
                 y: view.y as i32 - chrome.y,
                 width: CARET_WIDTH as u32,
-                height: self.layout.options.text(TextStyle::SM).line_height.into(),
+                height: self.layout.sizing.text(TextStyle::SM).line_height.into(),
             },
             surrounding: Some(self.state.address.surrounding()),
             purpose: match self.state.find {
@@ -1262,22 +1315,28 @@ impl Model {
         }
     }
 
+    /// The surface the editor (the address line) is drawn on, from the ownership map.
+    fn editor_surface(&self) -> SurfaceName {
+        self.layout.surface_of(Kind::AddressBar).unwrap_or(CHROME)
+    }
+
     /// The address line as drawn now.
     pub(crate) fn address_view(&mut self) -> AddressView {
         let editor = &self.state.address;
         let display = editor.display();
-        let options = self.layout.options;
-        let style = options.text(TextStyle::SM);
+        let sizing = self.layout.sizing;
+        let bar = self.layout.address_bar.clone().unwrap_or_default();
+        let style = sizing.text(TextStyle::SM);
         let shaped = self.fonts.line(&display.text, style);
         let field = self.layout.address;
-        let padding = options.scaled(ADDRESS_PADDING);
+        let padding = sizing.scaled(ADDRESS_PADDING);
         let right = field.x as f32 + field.width as f32 - padding;
         // The keymap's indicator ("NORMAL") takes up to a third of the field, on its right.
         let indicator = self
             .snapshot
             .keymap
             .as_deref()
-            .filter(|text| !text.is_empty());
+            .filter(|text| bar.indicator && !text.is_empty());
         let indicator = indicator.map(|text| {
             let shaped = self.fonts.fitted(text, style, field.width as f32 / 3.0);
             let x = right - shaped.width;
@@ -1287,8 +1346,8 @@ impl Model {
         // The engine of the active tab's page as a button, before the indicator, if it fits in a
         // third of the field, while the line isn't being edited.
         let active = self.snapshot.active().filter(|_| !self.state.focused);
-        let engine = active.and_then(|tab| {
-            engine_button_text(&mut self.fonts, options, tab, field.width as f32 / 3.0)
+        let engine = active.filter(|_| bar.engine_button).and_then(|tab| {
+            engine_button_text(&mut self.fonts, sizing, tab, field.width as f32 / 3.0)
         });
         let find_right = engine
             .as_ref()
@@ -1299,7 +1358,7 @@ impl Model {
             .snapshot
             .find
             .as_ref()
-            .filter(|_| finding || !self.state.focused);
+            .filter(|_| bar.find_state && (finding || !self.state.focused));
         let engine_name = self.snapshot.active().and_then(TabSnapshot::engine_label);
         let find = find
             .map(|find| find.indicator(engine_name.as_deref()))
@@ -1315,15 +1374,15 @@ impl Model {
         let prompt = finding.then(|| (self.fonts.line(FIND_PROMPT, style), left));
         let text_left = prompt
             .as_ref()
-            .map_or(left, |(shaped, x)| x + shaped.width + options.scaled(4.0));
+            .map_or(left, |(shaped, x)| x + shaped.width + sizing.scaled(4.0));
         let clip = (text_left, text_right.max(text_left));
         let x = clip.0 - editor.scroll();
         // On a whole logical pixel, as the input method's caret rectangle is.
         let y =
             field.y as f32 + ((field.height as f32 - f32::from(style.line_height)) / 2.0).floor();
         let engine = engine.map(|text| {
-            let k = |px| options.scaled(px);
-            let label_line = f32::from(options.text(LABEL).line_height);
+            let k = |px| sizing.scaled(px);
+            let label_line = f32::from(sizing.text(LABEL).line_height);
             let height = (field.height as f32 - 2.0 * k(BUTTON_MARGIN)).max(label_line + 2.0);
             let top = field.y as f32 + ((field.height as f32 - height) / 2.0).floor();
             let width = text.width.ceil();
@@ -1389,8 +1448,8 @@ impl Model {
     /// The page the chrome draws in the page area, laid out, if it draws one.
     pub(crate) fn page_layout(&mut self) -> Option<PageLayout> {
         let page = self.layout.page;
-        let options = self.layout.options;
-        let (k, style) = (|px| options.scaled(px), |style| options.text(style));
+        let sizing = self.layout.sizing;
+        let (k, style) = (|px| sizing.scaled(px), |style| sizing.text(style));
         let card_width = (page.width as f32 - k(32.0)).min(k(560.0));
         if card_width < k(80.0) || page.height == 0 {
             return None;
@@ -1415,7 +1474,7 @@ impl Model {
             InternalPage::Home(home) => {
                 // The room the card's text has without leaving the page area.
                 let room = page.height as f32 - k(32.0) - k(40.0);
-                let block = home_page(fonts, options, home, inner, room);
+                let block = home_page(fonts, sizing, home, inner, room);
                 texts.extend(block.texts);
                 links = block.links;
                 y += block.height;
@@ -1460,14 +1519,8 @@ impl Model {
 
 /// The home page's text, `inner` wide: its heading and hint, then the sections that fit in
 /// `room` (see [`DROPPED_FIRST`]). An empty section is not shown.
-fn home_page(
-    fonts: &mut Fonts,
-    options: LayoutOptions,
-    home: &HomeInfo,
-    inner: f32,
-    room: f32,
-) -> Block {
-    let (k, style) = (|px| options.scaled(px), |style| options.text(style));
+fn home_page(fonts: &mut Fonts, sizing: Sizing, home: &HomeInfo, inner: f32, room: f32) -> Block {
+    let (k, style) = (|px| sizing.scaled(px), |style| sizing.text(style));
     let mut top = Block::default();
     let heading = fonts.line("Sighurt", style(TextStyle::HEADING));
     let heading_width = heading.width;
@@ -1503,7 +1556,7 @@ fn home_page(
         HomeSection::Engines,
     ]
     .into_iter()
-    .filter_map(|section| Some((section, home_section(fonts, options, home, section, inner)?)))
+    .filter_map(|section| Some((section, home_section(fonts, sizing, home, section, inner)?)))
     .collect();
     let gap = k(16.0);
     let height = |sections: &[(HomeSection, Block)]| {
@@ -1524,12 +1577,12 @@ fn home_page(
 /// One section of the home page, `inner` wide: its label and rows. `None` when it has none.
 fn home_section(
     fonts: &mut Fonts,
-    options: LayoutOptions,
+    sizing: Sizing,
     home: &HomeInfo,
     section: HomeSection,
     inner: f32,
 ) -> Option<Block> {
-    let (k, style) = (|px| options.scaled(px), |style| options.text(style));
+    let (k, style) = (|px| sizing.scaled(px), |style| sizing.text(style));
     let (name, rows) = match section {
         HomeSection::Pages => ("PAGES", home.pages.len()),
         HomeSection::Keys => ("KEYS", home.keys.len()),
@@ -1627,16 +1680,16 @@ fn home_section(
 }
 
 /// The label naming `tab`'s engine ([`TabSnapshot::engine_label`]), if it fits whole in
-/// `width`: none when `options` leave it out or the tab names no engine. A cut engine name says
-/// little, so a label that doesn't fit gives its room back to the text beside it.
+/// `width`: none when the tab names no engine. A cut engine name says little, so a label that
+/// doesn't fit gives its room back to the text beside it.
 pub(crate) fn engine_label(
     fonts: &mut Fonts,
-    options: LayoutOptions,
+    sizing: Sizing,
     tab: &TabSnapshot,
     width: f32,
 ) -> Option<Rc<ShapedText>> {
-    let text = tab.engine_label().filter(|_| options.engine_label)?;
-    let shaped = fonts.line(&text, options.text(LABEL));
+    let text = tab.engine_label()?;
+    let shaped = fonts.line(&text, sizing.text(LABEL));
     (shaped.width <= width).then_some(shaped)
 }
 
@@ -1649,21 +1702,21 @@ pub(crate) struct ButtonText {
 }
 
 /// The engine button's text for `tab` ([`TabSnapshot::engine_label`], and while switching the
-/// engine it switches to), if the button fits whole in `width`: none when `options` leave the
-/// label out or the tab names no engine.
+/// engine it switches to), if the button fits whole in `width`: none when the tab names no
+/// engine.
 pub(crate) fn engine_button_text(
     fonts: &mut Fonts,
-    options: LayoutOptions,
+    sizing: Sizing,
     tab: &TabSnapshot,
     width: f32,
 ) -> Option<ButtonText> {
-    let text = tab.engine_label().filter(|_| options.engine_label)?;
-    let style = options.text(LABEL);
+    let text = tab.engine_label()?;
+    let style = sizing.text(LABEL);
     let name = fonts.line(&text, style);
     let target = tab
         .switching_label()
         .map(|target| fonts.line(&format!("{target}\u{2026}"), style));
-    let k = |px| options.scaled(px);
+    let k = |px| sizing.scaled(px);
     let mut total = 2.0 * k(BUTTON_PAD) + name.width + k(BUTTON_GAP) + k(BUTTON_ICON);
     if let Some(target) = &target {
         total += k(BUTTON_GAP) + target.width;
@@ -1677,13 +1730,8 @@ pub(crate) fn engine_button_text(
 
 /// Where a line in the label's style starts so that its baseline is that of a line in `style`
 /// starting at `top`.
-pub(crate) fn label_top(
-    fonts: &mut Fonts,
-    options: LayoutOptions,
-    style: TextStyle,
-    top: f32,
-) -> f32 {
-    top + fonts.baseline(style) - fonts.baseline(options.text(LABEL))
+pub(crate) fn label_top(fonts: &mut Fonts, sizing: Sizing, style: TextStyle, top: f32) -> f32 {
+    top + fonts.baseline(style) - fonts.baseline(sizing.text(LABEL))
 }
 
 /// The page the chrome draws for the active tab, if it draws one.
@@ -1700,6 +1748,27 @@ pub(crate) fn internal_page(snapshot: &Snapshot) -> Option<InternalPage<'_>> {
             message,
         }),
         TabContent::Blank | TabContent::Engine => None,
+    }
+}
+
+/// Marks in `damage` the surface `layout` puts `kind` on ([`Model::mark`]).
+fn mark(damage: &mut Damage, layout: &Layout, kind: Kind) {
+    match layout.surface_of(kind) {
+        Some(CHROME) => damage.chrome = true,
+        Some(TABS) => damage.tabs = true,
+        Some(STATUS) => damage.status = true,
+        Some(PAGE) => damage.page = true,
+        Some(_) => {}
+        None if kind == Kind::TabBar => damage.tabs = true,
+        None => {}
+    }
+}
+
+/// The component `target` is part of.
+fn owner(target: Target) -> Kind {
+    match target {
+        Target::Tab(_) | Target::CloseTab(_) | Target::NewTab => Kind::TabBar,
+        Target::Back | Target::Forward | Target::ReloadOrStop | Target::Address => Kind::AddressBar,
     }
 }
 

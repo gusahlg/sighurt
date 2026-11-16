@@ -42,6 +42,10 @@ rustix = { workspace = true, features = ["event", "fs", "process", "pty", "stdio
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 
+# The console (term/console.rs), stderr's handle (sys.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading"] }
+
 [[bin]]
 name = "sighurt-tui-worker"
 path = "src/bin/worker.rs"

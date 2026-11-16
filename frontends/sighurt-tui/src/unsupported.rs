@@ -1,7 +1,5 @@
-//! The terminal frontend and `--dump` on a system without a Unix terminal (Windows): both refuse,
-//! saying so. A port needs a console backend (`SetConsoleMode` with VT input and output, resize
-//! from `WINDOW_BUFFER_SIZE_EVENT` records, a console control handler in place of the signals)
-//! and an owner loop that waits on console handles (docs/rewrite/PORTING.md).
+//! The terminal frontend and `--dump` on a system with neither a Unix terminal nor a Windows
+//! console: both refuse, saying so (docs/rewrite/PORTING.md).
 //!
 //! Owns: the refusal and the options' shapes. Must not own: anything that runs.
 
@@ -14,7 +12,7 @@ use sighurt_runtime::signals::Signals;
 
 /// Why nothing runs.
 const UNSUPPORTED: &str =
-    "the terminal frontend needs a Unix terminal; this system has none in sig";
+    "the terminal frontend needs a Unix terminal or a Windows console; this system has neither";
 
 /// What `sig` asks the terminal frontend for, as on Unix.
 pub struct Options {
@@ -39,7 +37,7 @@ pub fn run(_options: Options, _signals: Signals) -> Result<ExitCode, String> {
     Err(UNSUPPORTED.into())
 }
 
-/// Refuses: `--dump` writes through the terminal frontend's Unix I/O.
+/// Refuses: `--dump` runs on the terminal frontend's I/O.
 pub fn dump(_options: DumpOptions, _signals: &Signals) -> Result<ExitCode, String> {
     Err(UNSUPPORTED.into())
 }

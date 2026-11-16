@@ -19,6 +19,7 @@ use sighurt_ui::extension::{
     completion_suffix, contained, Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout,
     ChromeSurface, Completion, InputArea, SurfaceName, TextField, Theme,
 };
+use sighurt_ui::layout::{LayoutOptions, Status, Tabs};
 use sighurt_ui::standard::{self, Standard};
 use sighurt_ui::{Fonts, Pen, Snapshot, TabContent};
 
@@ -190,11 +191,42 @@ fn the_standard_kind() {
     );
 }
 
+/// The look with `[chrome.standard]` `settings` as the window's tree, as `sig` hands it over
+/// (the core turns the table into the tree), at `font_size`.
+fn themed(settings: &Table, font_size: u16) -> Theme {
+    let mut options = LayoutOptions::default();
+    for (key, value) in settings {
+        match (key.as_str(), value) {
+            ("tabs", Value::String(tabs)) => {
+                options.tabs = match tabs.as_str() {
+                    "left" => Tabs::Left,
+                    "hidden" => Tabs::Hidden,
+                    _ => Tabs::Top,
+                }
+            }
+            ("status", Value::String(status)) => {
+                options.status = match status.as_str() {
+                    "overlay" => Status::Overlay,
+                    _ => Status::Strip,
+                }
+            }
+            ("buttons", Value::Boolean(on)) => options.buttons = *on,
+            ("compact", Value::Boolean(on)) => options.compact = *on,
+            ("engine-label", Value::Boolean(on)) => options.engine_label = *on,
+            other => panic!("not an option: {other:?}"),
+        }
+    }
+    let mut theme = Theme::default();
+    theme.font_size = font_size;
+    theme.interface.window = options.tree();
+    theme.interface.density = options.density();
+    theme
+}
+
 /// The standard chrome configured with `[chrome.standard]` `settings` and `[ui] font-size`.
 fn standard_with(settings: Table, font_size: u16, width: u32, height: u32) -> Box<dyn Chrome> {
     let mut chrome: Box<dyn Chrome> = Box::new(Standard::new(fonts()));
-    let mut theme = Theme::default();
-    theme.font_size = font_size;
+    let theme = themed(&settings, font_size);
     chrome.handle(ChromeEvent::Configure { theme, settings });
     chrome.handle(ChromeEvent::Resize(LogicalSize { width, height }));
     chrome
@@ -596,9 +628,10 @@ fn the_engine_label_through_the_trait() {
     let mut chrome = standard_with(Table::new(), 14, 800, 600);
     chrome.handle(ChromeEvent::Snapshot(with(&["servo", "wpe"])));
     let reconfigure = |chrome: &mut dyn Chrome, on: bool| {
+        let settings = switches([("engine-label", on)]);
         chrome.handle(ChromeEvent::Configure {
-            theme: Theme::default(),
-            settings: switches([("engine-label", on)]),
+            theme: themed(&settings, 14),
+            settings,
         })
     };
     let actions = reconfigure(&mut *chrome, false);

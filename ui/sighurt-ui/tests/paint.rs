@@ -16,12 +16,15 @@ use sighurt_api::input::{
     ButtonState, FocusEvent, Key, KeyCode, KeyEvent, KeyboardFocus, Modifiers, PointerButton,
     PointerEvent, Preedit, TextInputEvent,
 };
+use sighurt_api::keymap::Frontend;
+use sighurt_api::ui::{Component, Density, Kind, Node, Side};
 use sighurt_render::{Backend, RenderError, RenderOutcome};
 use sighurt_ui::accessibility::NodeId;
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::extension::{ChromeAction, Completion};
+use sighurt_ui::hit_test::Target;
 use sighurt_ui::layout::{Status, Tabs};
-use sighurt_ui::{Colors, FindSnapshot, LayoutOptions, Model, TabContent};
+use sighurt_ui::{Arrangement, Colors, FindSnapshot, LayoutOptions, Model, TabContent};
 use tiny_skia::{IntSize, Pixmap};
 
 fn key(key: Key, text: Option<&str>) -> KeyEvent {
@@ -263,6 +266,91 @@ fn golden_options() {
         },
     );
     golden("tabs-left-125", &paint(&mut chrome, TABS, 150));
+}
+
+/// A tree for the window: the standard one with `change` made, at 14 px.
+fn tree(change: impl FnOnce(&mut Node)) -> Arrangement {
+    let mut tree = Node::standard();
+    change(&mut tree);
+    assert_eq!(tree.check(Frontend::Gui), Vec::<String>::new());
+    Arrangement {
+        tree,
+        density: Density::Normal,
+        font_size: 14,
+    }
+}
+
+/// Placements the options never had, each one operation (or one tree) away: tabs in a list on
+/// the right, tabs in a strip at the bottom, a full-height sidebar, the toolbar at the bottom
+/// with a new-tab button. Each separator is on the edge that faces the page.
+#[test]
+fn golden_placements() {
+    let colors = Colors::default();
+    let place = |kind, side| tree(move |t: &mut Node| t.position(kind, side));
+    let mut chrome = arranged(
+        700,
+        400,
+        three_tabs(),
+        colors,
+        place(Kind::TabBar, Side::Right),
+    );
+    assert!(chrome.layout().tabs_vertical);
+    assert_eq!(chrome.layout().tab_list.x, 700 - 220);
+    golden("tabs-right-125", &paint(&mut chrome, TABS, 150));
+
+    let mut chrome = arranged(
+        700,
+        400,
+        three_tabs(),
+        colors,
+        place(Kind::TabBar, Side::Bottom),
+    );
+    let strip = chrome.layout().tab_strip;
+    assert_eq!((strip.y, strip.height), (400 - 20 - 40, 40));
+    golden("tabs-bottom-125", &paint(&mut chrome, TABS, 150));
+
+    let sidebar = tree(|t| {
+        *t = Node::Row(vec![
+            Node::Leaf(Component::new(Kind::TabBar)),
+            Node::Column(vec![
+                Node::Leaf(Component::new(Kind::AddressBar)),
+                Node::Leaf(Component::new(Kind::PageView)),
+                Node::Leaf(Component::new(Kind::StatusBar)),
+            ]),
+        ])
+    });
+    let mut chrome = arranged(700, 400, three_tabs(), colors, sidebar);
+    let layout = chrome.layout().clone();
+    assert_eq!(layout.tab_list.height, 400, "the full height");
+    assert_eq!((layout.chrome.x, layout.status.x), (220, 220));
+    golden("sidebar-tabs-100", &paint(&mut chrome, TABS, 120));
+    golden("sidebar-chrome-100", &paint(&mut chrome, CHROME, 120));
+
+    let mut chrome = arranged(
+        700,
+        400,
+        three_tabs(),
+        colors,
+        place(Kind::AddressBar, Side::Bottom),
+    );
+    // The toolbar's surface is at the bottom: positions are its own.
+    let surface = chrome.layout().chrome;
+    assert_eq!((surface.y, surface.height), (400 - 20 - 44, 44));
+    let button = chrome.layout().reload;
+    let position = SurfacePoint {
+        x: f64::from(button.x - surface.x) + f64::from(button.width) / 2.0,
+        y: f64::from(button.y - surface.y) + f64::from(button.height) / 2.0,
+    };
+    let modifiers = Modifiers::default();
+    chrome.pointer(
+        surface,
+        &PointerEvent::Motion {
+            position,
+            modifiers,
+        },
+    );
+    assert_eq!(chrome.state().hover, Some(Target::ReloadOrStop));
+    golden("toolbar-bottom-125", &paint(&mut chrome, CHROME, 150));
 }
 
 /// `[ui] font-size = 18`: the strip, toolbar and text 18/14 as big, and the home page's text.

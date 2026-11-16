@@ -34,9 +34,9 @@ use glib::translate::{from_glib, from_glib_full, from_glib_none, ToGlibPtr};
 use sighurt_api::engine::EngineWaker;
 use sighurt_engine_wpe::clipboard::{ClipboardCall, ClipboardSink};
 use sighurt_engine_wpe::ffi;
-use sighurt_engine_wpe::screen::DEFAULT_REFRESH_MHZ;
 use sighurt_engine_wpe::glib_loop::GlibLoop;
 use sighurt_engine_wpe::platform::{Buffer, Call, Display, View};
+use sighurt_engine_wpe::screen::DEFAULT_REFRESH_MHZ;
 
 /// `WebKitLoadEvent::WEBKIT_LOAD_FINISHED` (WebKitWebView.h: STARTED, REDIRECTED, COMMITTED, FINISHED).
 const LOAD_FINISHED: u32 = 3;

@@ -2,7 +2,9 @@
 //! with a [`Pen`], which the backend the frontend chose renders.
 //!
 //! Each surface is drawn whole, so a buffer that last held an older frame (or garbage) comes
-//! out complete: the tab strip and the toolbar on [`CHROME`], the tab list on [`TABS`], the
+//! out complete: the components of its run where the layout put them (the tab strip and the
+//! toolbar on [`CHROME`](crate::layout::CHROME), the tab list on
+//! [`TABS`](crate::layout::TABS) in the standard looks), the
 //! status line on [`STATUS`] (a strip, or an overlay with a background and border of its own,
 //! since it lies over the page), and a page the chrome draws itself on [`PAGE`]. Drawing by
 //! surface rather than by rectangle keeps the overlay out of the page area's buffer below it.
@@ -24,11 +26,11 @@ use sighurt_render::Pen;
 
 use crate::chrome::{
     engine_label, label_top, Colors, EngineButton, Model, Rgba, Tone, BUTTON_ICON, CARET_WIDTH,
-    CHROME, PAGE, STATUS, TABS,
+    PAGE, STATUS,
 };
 use crate::extension::SurfaceName;
 use crate::hit_test::Target;
-use crate::layout::{LayoutOptions, Status, TabLayout};
+use crate::layout::{Anchor, Edge, Kind, Sizing, TabLayout};
 use crate::state::TabSnapshot;
 use crate::text::TextStyle;
 
@@ -59,40 +61,54 @@ fn link_color(colors: &Colors) -> Rgba {
     }
 }
 
-/// Draws all of `chrome`'s `surface` ([`CHROME`], [`TABS`], [`STATUS`] or [`PAGE`]) with `pen`.
+/// Draws all of `chrome`'s `surface` (one its layout names, or [`PAGE`]) with `pen`.
 /// A surface the chrome doesn't have gets its background. The chrome is opaque.
 pub fn draw(pen: &mut Pen, chrome: &mut Model, surface: SurfaceName) {
     let colors = *chrome.colors();
     let layout = chrome.layout().clone();
-    let overlay = surface == STATUS && layout.options.status == Status::Overlay;
+    let overlay = surface == STATUS && layout.status_layer.is_some();
     let background = if overlay { colors.surface } else { colors.bg };
     pen.clear(Rgba {
         a: 255,
         ..background
     });
-    match surface {
-        CHROME => {
-            if !layout.tab_strip.size().is_empty() {
-                draw_tab_strip(pen, chrome, &colors);
-            }
-            if !layout.toolbar.size().is_empty() {
-                draw_toolbar(pen, chrome, &colors);
-            }
+    if surface == PAGE {
+        if chrome.draws_page() {
+            draw_page(pen, chrome, &colors);
         }
-        TABS => draw_tab_list(pen, chrome, &colors),
-        STATUS => draw_status(pen, chrome, &colors),
-        PAGE if chrome.draws_page() => draw_page(pen, chrome, &colors),
-        _ => {}
+        return;
     }
+    let kinds = layout.surface(surface).map(|s| s.kinds.clone());
+    for kind in kinds.unwrap_or_default() {
+        match kind {
+            Kind::TabBar if layout.tabs_vertical => draw_tab_list(pen, chrome, &colors),
+            Kind::TabBar if !layout.tab_strip.size().is_empty() => {
+                draw_tab_strip(pen, chrome, &colors)
+            }
+            Kind::AddressBar if !layout.toolbar.size().is_empty() => {
+                draw_toolbar(pen, chrome, &colors)
+            }
+            Kind::StatusBar => draw_status(pen, chrome, &colors),
+            _ => {}
+        }
+    }
+}
+
+/// The separator line along `edge` of `rect`.
+fn separator(pen: &mut Pen, rect: WindowRect, edge: Edge, colors: &Colors) {
+    let [x, y, w, h] = rect_f(rect);
+    let line = match edge {
+        Edge::Top => [x, y, w, 1.0],
+        Edge::Bottom => [x, y + h - 1.0, w, 1.0],
+        Edge::Left => [x, y, 1.0, h],
+        Edge::Right => [x + w - 1.0, y, 1.0, h],
+    };
+    pen.fill(line, colors.border);
 }
 
 fn draw_tab_strip(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     let layout = chrome.layout().clone();
-    let strip = rect_f(layout.tab_strip);
-    pen.fill(
-        [strip[0], strip[1] + strip[3] - 1.0, strip[2], 1.0],
-        colors.border,
-    );
+    separator(pen, layout.tab_strip, layout.edges.tabs, colors);
     draw_tabs(pen, chrome, colors);
     let [x, y, w, h] = rect_f(layout.new_tab);
     if w > 0.0 {
@@ -100,12 +116,11 @@ fn draw_tab_strip(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     }
 }
 
-/// The tab list on the left: rows, then the new-tab button as the last row, and a line along
-/// its right edge.
+/// The tab list: rows, then the new-tab button as the last row, and a line along the edge that
+/// faces the page.
 fn draw_tab_list(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     let layout = chrome.layout().clone();
-    let [x, y, w, h] = rect_f(layout.tab_list);
-    pen.fill([x + w - 1.0, y, 1.0, h], colors.border);
+    separator(pen, layout.tab_list, layout.edges.tabs, colors);
     draw_tabs(pen, chrome, colors);
     let [x, y, _, h] = rect_f(layout.new_tab);
     if !layout.new_tab.size().is_empty() {
@@ -131,8 +146,9 @@ fn draw_tab(
     place: &TabLayout,
     colors: &Colors,
 ) {
-    let options = chrome.layout().options;
-    let k = |px| options.scaled(px);
+    let sizing = chrome.layout().sizing;
+    let labelled = chrome.layout().tab_bar.is_some_and(|bar| bar.engine_label);
+    let k = |px| sizing.scaled(px);
     let hover = chrome.state().hover;
     let rect = rect_f(place.rect);
     if tab.active {
@@ -154,17 +170,20 @@ fn draw_tab(
                 true => colors.text,
                 false => colors.text_dim,
             };
-            cross(pen, options, (x + w / 2.0, y + h / 2.0), 3.5, color);
+            cross(pen, sizing, (x + w / 2.0, y + h / 2.0), 3.5, color);
             x - k(4.0)
         }
         None => rect[0] + rect[2] - k(12.0),
     };
     // The engine's name at the right end, if it fits in half the room, whatever the title: the
     // title is cut before it.
-    let style = options.text(TextStyle::SM);
+    let style = sizing.text(TextStyle::SM);
     let title = tab.display_title();
     let room = (right - left).max(0.0);
-    let label = engine_label(chrome.fonts(), options, tab, room / 2.0 - k(8.0));
+    let label = match labelled {
+        true => engine_label(chrome.fonts(), sizing, tab, room / 2.0 - k(8.0)),
+        false => None,
+    };
     let label = label.map(|label| (right - label.width, label));
     if let Some((x, _)) = &label {
         right = x - k(8.0);
@@ -181,7 +200,7 @@ fn draw_tab(
     let clip = [left, rect[1], (right - left).max(0.0), rect[3]];
     pen.text(&text, (left, top), color, clip);
     if let Some((x, label)) = label {
-        let at = (x, label_top(chrome.fonts(), options, style, top));
+        let at = (x, label_top(chrome.fonts(), sizing, style, top));
         let clip = [x, rect[1], label.width, rect[3]];
         pen.text(&label, at, colors.text_muted, clip);
     }
@@ -189,13 +208,13 @@ fn draw_tab(
 
 /// The new-tab button's +, centred at `(cx, cy)`.
 fn plus(pen: &mut Pen, chrome: &Model, (cx, cy): (f32, f32), colors: &Colors) {
-    let options = chrome.layout().options;
+    let sizing = chrome.layout().sizing;
     let color = match chrome.state().hover == Some(Target::NewTab) {
         true => colors.text,
         false => colors.text_muted,
     };
-    let arm = options.scaled(5.0);
-    pen.stroke(options.scaled(1.5), color, |path| {
+    let arm = sizing.scaled(5.0);
+    pen.stroke(sizing.scaled(1.5), color, |path| {
         path.move_to(cx - arm, cy);
         path.line_to(cx + arm, cy);
         path.move_to(cx, cy - arm);
@@ -205,9 +224,9 @@ fn plus(pen: &mut Pen, chrome: &Model, (cx, cy): (f32, f32), colors: &Colors) {
 
 /// An × of two strokes, `size` logical pixels (at the default font size) from the centre to
 /// each end.
-fn cross(pen: &mut Pen, options: LayoutOptions, (cx, cy): (f32, f32), size: f32, color: Rgba) {
-    let size = options.scaled(size);
-    pen.stroke(options.scaled(1.5), color, |path| {
+fn cross(pen: &mut Pen, sizing: Sizing, (cx, cy): (f32, f32), size: f32, color: Rgba) {
+    let size = sizing.scaled(size);
+    pen.stroke(sizing.scaled(1.5), color, |path| {
         path.move_to(cx - size, cy - size);
         path.line_to(cx + size, cy + size);
         path.move_to(cx + size, cy - size);
@@ -217,10 +236,9 @@ fn cross(pen: &mut Pen, options: LayoutOptions, (cx, cy): (f32, f32), size: f32,
 
 fn draw_toolbar(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     let layout = chrome.layout().clone();
-    let options = layout.options;
-    let k = |px| options.scaled(px);
-    let bar = rect_f(layout.toolbar);
-    pen.fill([bar[0], bar[1] + bar[3] - 1.0, bar[2], 1.0], colors.border);
+    let sizing = layout.sizing;
+    let k = |px| sizing.scaled(px);
+    separator(pen, layout.toolbar, layout.edges.toolbar, colors);
     let snapshot = chrome.snapshot();
     let loading = snapshot.active().is_some_and(|tab| tab.loading);
     let buttons = [
@@ -257,16 +275,16 @@ fn draw_toolbar(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
                 path.line_to(cx + k(4.5), cy);
                 path.close();
             }),
-            _ if loading => cross(pen, options, (cx, cy), 4.0, color),
-            _ => reload_icon(pen, options, (cx, cy), color),
+            _ if loading => cross(pen, sizing, (cx, cy), 4.0, color),
+            _ => reload_icon(pen, sizing, (cx, cy), color),
         }
     }
     draw_address(pen, chrome, colors);
 }
 
 /// ↻: three quarters of a circle, clockwise from the right to the top, with an arrowhead.
-fn reload_icon(pen: &mut Pen, options: LayoutOptions, (cx, cy): (f32, f32), color: Rgba) {
-    let k = |px| options.scaled(px);
+fn reload_icon(pen: &mut Pen, sizing: Sizing, (cx, cy): (f32, f32), color: Rgba) {
+    let k = |px| sizing.scaled(px);
     let radius = k(5.5);
     // Control-point distance for a quarter circle.
     let c = radius * 0.552_284_8;
@@ -289,7 +307,7 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     if field.size().is_empty() {
         return;
     }
-    let options = chrome.layout().options;
+    let sizing = chrome.layout().sizing;
     let state = chrome.state();
     let focused = state.focused;
     let active = focused && state.window_active;
@@ -298,7 +316,7 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
         (None, true) => colors.focus,
         (None, false) => colors.border,
     };
-    pen.bordered(rect_f(field), options.scaled(6.0), colors.surface, border);
+    pen.bordered(rect_f(field), sizing.scaled(6.0), colors.surface, border);
 
     let view = chrome.address_view();
     let clip = [
@@ -307,7 +325,7 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
         view.clip.1 - view.clip.0,
         field.height as f32,
     ];
-    let line = f32::from(options.text(TextStyle::SM).line_height);
+    let line = f32::from(sizing.text(TextStyle::SM).line_height);
     let clipped = |(a, b): (f32, f32)| {
         let (a, b) = (a.max(view.clip.0), b.min(view.clip.1));
         (a < b).then_some([a, view.y, b - a, line])
@@ -333,7 +351,7 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
         draw_engine_button(pen, chrome, button, colors);
     }
     if let Some(preedit) = view.preedit.and_then(clipped) {
-        let underline = view.y + line - options.scaled(2.0);
+        let underline = view.y + line - sizing.scaled(2.0);
         pen.fill([preedit[0], underline, preedit[2], 1.0], colors.text);
     }
     let caret_shown = active && view.selection.is_none();
@@ -347,8 +365,8 @@ fn draw_address(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
 /// The engine button: a rounded outline that fills when the pointer is over it, sinks while
 /// held, and shows an accent fill and the engine being switched to while a switch is under way.
 fn draw_engine_button(pen: &mut Pen, chrome: &mut Model, button: &EngineButton, colors: &Colors) {
-    let options = chrome.layout().options;
-    let k = |px| options.scaled(px);
+    let sizing = chrome.layout().sizing;
+    let k = |px| sizing.scaled(px);
     let state = chrome.state();
     let over = state.label_hover && !button.busy;
     let held = over && state.label_pressed;
@@ -365,17 +383,17 @@ fn draw_engine_button(pen: &mut Pen, chrome: &mut Model, button: &EngineButton, 
     pen.text(name, (*name_x, button.text_y), text, clip);
     let cy = y + h / 2.0;
     match &button.target {
-        None => swap_icon(pen, options, (button.icon_x, cy), text),
+        None => swap_icon(pen, sizing, (button.icon_x, cy), text),
         Some((target, target_x)) => {
-            arrow(pen, options, (button.icon_x, cy), text);
+            arrow(pen, sizing, (button.icon_x, cy), text);
             pen.text(target, (*target_x, button.text_y), text, clip);
         }
     }
 }
 
 /// ⇄ in a box [`BUTTON_ICON`] wide starting at `x`: a right arrow above a left one.
-fn swap_icon(pen: &mut Pen, options: LayoutOptions, (x, cy): (f32, f32), color: Rgba) {
-    let k = |px| options.scaled(px);
+fn swap_icon(pen: &mut Pen, sizing: Sizing, (x, cy): (f32, f32), color: Rgba) {
+    let k = |px| sizing.scaled(px);
     let (w, dy, head) = (k(BUTTON_ICON), k(2.5), k(2.2));
     pen.stroke(k(1.2), color, |path| {
         for (row, right) in [(cy - dy, true), (cy + dy, false)] {
@@ -393,8 +411,8 @@ fn swap_icon(pen: &mut Pen, options: LayoutOptions, (x, cy): (f32, f32), color: 
 }
 
 /// → in a box [`BUTTON_ICON`] wide starting at `x`.
-fn arrow(pen: &mut Pen, options: LayoutOptions, (x, cy): (f32, f32), color: Rgba) {
-    let k = |px| options.scaled(px);
+fn arrow(pen: &mut Pen, sizing: Sizing, (x, cy): (f32, f32), color: Rgba) {
+    let k = |px| sizing.scaled(px);
     let (w, head) = (k(BUTTON_ICON), k(2.6));
     pen.stroke(k(1.2), color, |path| {
         path.move_to(x, cy);
@@ -405,20 +423,29 @@ fn arrow(pen: &mut Pen, options: LayoutOptions, (x, cy): (f32, f32), color: Rgba
     });
 }
 
-/// The status line: a strip with a line along its top, or an overlay over the page's corner
-/// with a line along its top and right edges.
+/// The status line: a strip with a line along the edge facing the page, or an overlay over a
+/// corner of the page with lines along its two edges inside the page.
 fn draw_status(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     let layout = chrome.layout().clone();
-    let k = |px| layout.options.scaled(px);
+    let k = |px| layout.sizing.scaled(px);
     let [x, y, w, h] = rect_f(layout.status);
-    pen.fill([x, y, w, 1.0], colors.border);
-    if layout.options.status == Status::Overlay {
-        pen.fill([x + w - 1.0, y, 1.0, h], colors.border);
+    match layout.status_layer {
+        None => separator(pen, layout.status, layout.edges.status, colors),
+        Some((anchor, _)) => {
+            let (edge, side) = match anchor {
+                Anchor::BottomLeft => (Edge::Top, Edge::Right),
+                Anchor::BottomRight => (Edge::Top, Edge::Left),
+                Anchor::TopLeft => (Edge::Bottom, Edge::Right),
+                Anchor::TopRight => (Edge::Bottom, Edge::Left),
+            };
+            separator(pen, layout.status, edge, colors);
+            separator(pen, layout.status, side, colors);
+        }
     }
     let Some((line, shade)) = chrome.status_line() else {
         return;
     };
-    let style = layout.options.text(TextStyle::XS);
+    let style = layout.sizing.text(TextStyle::XS);
     let width = (w - k(16.0)).max(0.0);
     let text = chrome.fonts().fitted(&line, style, width);
     let top = y + (h - f32::from(style.line_height)) / 2.0;
@@ -430,13 +457,8 @@ fn draw_page(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     let Some(page) = chrome.page_layout() else {
         return;
     };
-    let options = chrome.layout().options;
-    pen.bordered(
-        page.card,
-        options.scaled(8.0),
-        colors.surface,
-        colors.border,
-    );
+    let sizing = chrome.layout().sizing;
+    pen.bordered(page.card, sizing.scaled(8.0), colors.surface, colors.border);
     let clip = rect_f(chrome.layout().page);
     for text in &page.texts {
         let color = tone(colors, text.tone);
@@ -444,7 +466,7 @@ fn draw_page(pen: &mut Pen, chrome: &mut Model, colors: &Colors) {
     }
     // The link under the pointer is underlined.
     let hovered = chrome.state().link_hover.as_deref();
-    let line = options.scaled(1.0).max(1.0);
+    let line = sizing.scaled(1.0).max(1.0);
     for link in page
         .links
         .iter()

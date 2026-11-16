@@ -495,6 +495,9 @@ mod tests {
         ];
         let none = BTreeMap::new();
         for (input, url) in cases {
+            if unix_path_elsewhere(input) {
+                continue;
+            }
             assert_eq!(fixup(input, search, &none, home), url, "{input:?}");
         }
         // Without a home directory, ~ is just text.
@@ -548,8 +551,17 @@ mod tests {
             ("rust w", "https://s.test/?q=rust%20w"),
         ];
         for (input, url) in cases {
+            if unix_path_elsewhere(input) {
+                continue;
+            }
             assert_eq!(fixup(input, search, &keywords, home), url, "{input:?}");
         }
+    }
+
+    /// A Unix path off Unix: on Windows one without a drive is not absolute, and its `file:`
+    /// URL is not the one these cases name.
+    fn unix_path_elsewhere(input: &str) -> bool {
+        cfg!(not(unix)) && (input.starts_with('/') || input.starts_with("~/"))
     }
 
     #[test]

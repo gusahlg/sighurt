@@ -58,9 +58,9 @@ use rustix::io::Errno;
 #[cfg(not(target_vendor = "apple"))]
 use rustix::pipe::PipeFlags;
 use rustix::pty::OpenptFlags;
+pub use rustix::termios::Winsize;
 use rustix::termios::{
     tcflush, tcgetattr, tcsetattr, OptionalActions, QueueSelector, SpecialCodeIndex, Termios,
-    Winsize,
 };
 
 use super::modes::{startup_queries, ENTER, LEAVE};
@@ -751,7 +751,7 @@ pub fn termios_matches(left: &Termios, right: &Termios) -> bool {
     if left.input_modes != right.input_modes
         || left.output_modes != right.output_modes
         || left.control_modes != right.control_modes
-        || left.local_modes != right.local_modes
+        || local_modes(left) != local_modes(right)
         || !same_line_discipline(left, right)
         || left.input_speed() != right.input_speed()
         || left.output_speed() != right.output_speed()
@@ -781,6 +781,16 @@ pub fn termios_matches(left: &Termios, right: &Termios) -> bool {
     CODES
         .iter()
         .all(|index| left.special_codes[*index] == right.special_codes[*index])
+}
+
+/// The local modes that are settings. macOS's driver sets `PENDIN` (input to be retyped)
+/// itself whenever `ICANON` is turned on, so a restored termios has it; it is state, not a
+/// setting, and is left out there.
+fn local_modes(termios: &Termios) -> rustix::termios::LocalModes {
+    #[cfg(target_vendor = "apple")]
+    return termios.local_modes - rustix::termios::LocalModes::PENDIN;
+    #[cfg(not(target_vendor = "apple"))]
+    termios.local_modes
 }
 
 /// Whether the line disciplines match. macOS's termios has no such field.
@@ -1434,10 +1444,16 @@ fn delivered_by_kill(info: *mut libc::siginfo_t) -> bool {
     let code = unsafe { (*info).si_code };
     #[cfg(not(target_vendor = "apple"))]
     return code == libc::SI_USER || code == libc::SI_TKILL;
-    // macOS has no `tkill`, and the libc crate no `SI_USER` there: `<sys/signal.h>` defines it
-    // as 0x10001.
+    // XNU gives a `SIGSEGV` or `SIGBUS` that `kill` sent the fault codes (SEGV_MAPERR and the
+    // like), so a kill can't be told from a fault there (GitHub's macos-latest, run
+    // 43826803295: `kill -SEGV` was swallowed). Every one is treated as sent: this is reached
+    // only when the process is to die, and raising it again under `SIG_DFL` ends it with the
+    // same signal (the core shows the `raise`, not the faulting instruction).
     #[cfg(target_vendor = "apple")]
-    return code == 0x10001;
+    {
+        let _ = code;
+        true
+    }
 }
 
 /// Current disposition, without changing it. `false` if the read fails.

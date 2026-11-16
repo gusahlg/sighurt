@@ -69,7 +69,7 @@ pub fn configure(config: &Config, name: &str) -> ChromeEvent {
     }
 }
 
-/// The look every chrome shares: `config`'s `[ui]`.
+/// The look every chrome shares: `config`'s `[ui]`, with the interface's trees.
 pub fn theme(config: &Config) -> Theme {
     let mut theme = Theme::default();
     for (color, value) in config.colors() {
@@ -79,6 +79,7 @@ pub fn theme(config: &Config) -> Theme {
     }
     theme.font = config.font().map(str::to_owned);
     theme.font_size = config.font_size();
+    theme.interface = config.interface().clone();
     theme
 }
 

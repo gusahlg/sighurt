@@ -60,7 +60,7 @@ mod tests {
     use sighurt_api::geometry::LogicalSize;
 
     use super::*;
-    use crate::layout::LayoutOptions;
+    use crate::layout::Arrangement;
 
     fn point(x: f64, y: f64) -> WindowPoint {
         WindowPoint { x, y }
@@ -73,7 +73,9 @@ mod tests {
             width: 800,
             height: 600,
         };
-        let layout = Layout::new(size, &ids, LayoutOptions::default(), 0);
+        let arrangement = Arrangement::default();
+        let sizing = arrangement.sizing();
+        let layout = Layout::from_tree(size, &ids, &arrangement.tree, sizing, 0);
         let close = layout.tabs[1].close.unwrap();
         let center = |r: sighurt_api::geometry::WindowRect| {
             point(

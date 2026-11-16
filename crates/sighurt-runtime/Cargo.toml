@@ -62,3 +62,16 @@ env_logger = "0.11"
 reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "stream"], default-features = false }
 # The directory of what `storage = "ephemeral"` keeps while the process runs.
 tempfile = "3"
+
+# Windows: atomic replacement of files (`MoveFileExW`), the owner-only access list of Sighurt's
+# directories, and handing URLs to the shell (`ShellExecuteW`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
