@@ -14,6 +14,9 @@ use std::sync::Arc;
 use sighurt_api::ids::RequestId;
 use sighurt_api::services::{PtyProgram, ServiceError, ServiceResult};
 
+/// Whether this build starts programs on this system: never here.
+pub const RUNS_PROGRAMS: bool = false;
+
 /// Why no program starts here.
 pub const UNSUPPORTED: &str = "sig://terminal and sig://config run programs on Linux only, \
                                for now: this system has no terminal programs in sig";

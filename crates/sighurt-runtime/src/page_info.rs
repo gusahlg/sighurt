@@ -148,6 +148,11 @@ pub fn info(kind: PageInfo, core: &BrowserState, paths: &Paths) -> String {
                 pair("editor", &line),
                 pair("from", from),
             ];
+            // No editor is looked for where no program can start: the page says that instead
+            // of "install one".
+            if !crate::pty::RUNS_PROGRAMS {
+                records.push(pair("programs", "no"));
+            }
             if let Some(file) = &paths.config {
                 let new = !file.exists();
                 records.push(pair("file", &file.display().to_string()));
@@ -288,6 +293,25 @@ mod tests {
         assert!(answer.contains("new\tno\nproblem\t"), "{answer}");
         assert!(answer.contains("zoom"), "{answer}");
         assert!(info(PageInfo::Settings, &core, &paths).contains("pages.config.enabled\ttrue"));
+    }
+
+    /// Finding 4 of review C: where no program starts, the page is told so, and not that no
+    /// editor was found.
+    #[test]
+    fn the_editor_answer_says_whether_programs_start_here() {
+        let env = core().environment().clone();
+        let config = "version = 1\n[pages.config]\neditor = \"/usr/bin/hx\"";
+        let core = BrowserState::new(Config::parse(Some(config), &env).unwrap(), env);
+        let paths = Paths {
+            config: None,
+            session: None,
+        };
+        let answer = info(PageInfo::Editor, &core, &paths);
+        if cfg!(target_os = "linux") {
+            assert!(!answer.contains("programs\t"), "{answer}");
+        } else {
+            assert_eq!(answer, "enabled\tyes\neditor\t\nfrom\tnone\nprograms\tno\n");
+        }
     }
 
     #[test]

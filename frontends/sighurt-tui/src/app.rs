@@ -699,7 +699,7 @@ pub(crate) fn redirect_stderr(path: &Path) -> Result<crate::sys::SavedStderr, St
 }
 
 /// Adds the signal pipe, the terminal, its resize pipe, its write source (disabled) and the
-/// configuration watch to the loop.
+/// configuration watch to the loop. A system with no watch says so in a notice.
 fn watch(handle: &LoopHandle<'static, App>, signals: Signals, app: &mut App) -> Result<(), String> {
     crate::sys::insert_signals(handle, signals, |app: &mut App, requests| {
         app.signals.extend(requests)
@@ -712,9 +712,13 @@ fn watch(handle: &LoopHandle<'static, App>, signals: Signals, app: &mut App) -> 
     let Some(config) = &app.session.paths().config else {
         return Ok(());
     };
-    crate::sys::insert_config_watch(handle, config, |app: &mut App, changed| {
+    let notice = crate::sys::insert_config_watch(handle, config, |app: &mut App, changed| {
         app.config_changed |= changed
-    })
+    })?;
+    if let Some(notice) = notice {
+        app.tui.show_notice(notice);
+    }
+    Ok(())
 }
 
 /// The window's chromes, accepted with whatever tables they have (see [`WINDOW_CHROMES`]).
@@ -4180,6 +4184,18 @@ mod tests {
         // at all, where an unclaimed one used to be used.
         assert!(claim_tmux_image(None, 6).is_none());
         assert!(claim_tmux_image(Some(&dir.join("missing")), 6).is_none());
+    }
+
+    /// Finding 6 of review C: macOS has no runtime directory, and the claims go in a private
+    /// directory of the user's own temporary one (`$TMPDIR`), so an id is still claimed there.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn macos_claims_in_the_temporary_directory() {
+        assert!(dirs::runtime_dir().is_none());
+        let dir = tmux_claims().expect("a claim directory");
+        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+        let claim = claim_tmux_image(Some(&dir), std::process::id()).expect("an id");
+        assert!(claim._claim.is_some());
     }
 
     /// The claim directory is used only when it is the user's own and closed to others.

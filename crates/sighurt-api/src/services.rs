@@ -183,9 +183,10 @@ pub enum PageInfo {
     /// What [`PtyProgram::EditConfig`] would run now, for `sig://config`'s start screen:
     /// `key, value` records: `enabled` (`yes`/`no`, `[pages.config] enabled`), `editor` (the
     /// command line, its words separated by spaces; empty when no editor was found), `from`
-    /// (`setting`, `VISUAL`, `EDITOR`, `PATH` or `none`), `file` (the configuration file),
-    /// `new` (`yes` when the file does not exist yet), then a `problem` record for each
-    /// problem of the file as it is (none when it is valid or new). Needs
+    /// (`setting`, `VISUAL`, `EDITOR`, `PATH` or `none`), `programs` (`no` when this build
+    /// starts no program on this system, so no editor was looked for; left out where it does),
+    /// `file` (the configuration file), `new` (`yes` when the file does not exist yet), then a
+    /// `problem` record for each problem of the file as it is (none when it is valid or new). Needs
     /// [`PageGrant::Editor`], not [`PageGrant::Info`].
     Editor,
 }
