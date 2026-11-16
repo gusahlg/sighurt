@@ -1331,3 +1331,183 @@ fn an_edit_that_joins_the_text_around_the_cursor_moves_the_cursor_past_the_join(
     editor.left();
     assert_eq!(editor.before_cursor(), "");
 }
+
+/// One placeholder cell as a terminal would take it from `kitty::placeholders`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PlacedCell {
+    /// The 1-based screen line and column the cursor was at.
+    line: u32,
+    column: u32,
+    /// The row and column the diacritics number (0-based).
+    row: usize,
+    col: usize,
+    /// The foreground's low byte with the third diacritic as the high byte.
+    id: u32,
+}
+
+/// Reads the output of `placeholders`: SGR `0` resets, `38;5;N` sets the foreground, `CSI
+/// line;column H` moves the cursor, and U+10EEEE with two or three diacritics draws a cell and
+/// moves the cursor one column right. Anything else is a failure.
+fn decode_placeholders(bytes: &[u8], diacritics: &[char]) -> Result<Vec<PlacedCell>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+    let number = |c: char| diacritics.iter().position(|d| *d == c);
+    let mut chars = text.chars().peekable();
+    let (mut line, mut column, mut fg) = (1u32, 1u32, None::<u32>);
+    let mut cells = Vec::new();
+    let mut last_reset = false;
+    while let Some(c) = chars.next() {
+        last_reset = false;
+        match c {
+            '\x1b' => {
+                if chars.next() != Some('[') {
+                    return Err("an escape that is no CSI".into());
+                }
+                let mut body = String::new();
+                let fin = loop {
+                    match chars.next() {
+                        Some(c @ ('0'..='9' | ';')) => body.push(c),
+                        Some(c) => break c,
+                        None => return Err("a CSI that never ends".into()),
+                    }
+                };
+                match (fin, body.as_str()) {
+                    ('m', "0") => {
+                        fg = None;
+                        last_reset = true;
+                    }
+                    ('m', b) => {
+                        let n = b.strip_prefix("38;5;").ok_or(format!("SGR {b:?}"))?;
+                        fg = Some(n.parse::<u32>().map_err(|e| e.to_string())?);
+                    }
+                    ('H', b) => {
+                        let (l, c) = b.split_once(';').ok_or(format!("CUP {b:?}"))?;
+                        line = l.parse().map_err(|_| format!("CUP {b:?}"))?;
+                        column = c.parse().map_err(|_| format!("CUP {b:?}"))?;
+                    }
+                    _ => return Err(format!("CSI {body:?} {fin:?}")),
+                }
+            }
+            '\u{10EEEE}' => {
+                let mut marks = Vec::new();
+                while let Some(n) = chars.peek().and_then(|c| number(*c)) {
+                    marks.push(n);
+                    chars.next();
+                }
+                let fg = fg.ok_or("a cell with no foreground")?;
+                if !(2..=3).contains(&marks.len()) {
+                    return Err(format!("{} diacritics", marks.len()));
+                }
+                cells.push(PlacedCell {
+                    line,
+                    column,
+                    row: marks[0],
+                    col: marks[1],
+                    id: fg | (marks.get(2).copied().unwrap_or(0) as u32) << 24,
+                });
+                column += 1;
+            }
+            other => return Err(format!("unexpected {other:?}")),
+        }
+    }
+    if !last_reset {
+        return Err("does not end with a reset".into());
+    }
+    Ok(cells)
+}
+
+#[test]
+fn fuzz_kitty_placeholders_refusals_and_cells() {
+    // The diacritic table, read back from the encoder: the column diacritics of one wide row.
+    let wide = CellRect {
+        column: 0,
+        row: 0,
+        columns: kitty::MAX_PLACEHOLDER_CELLS,
+        rows: 1,
+    };
+    let bytes = kitty::placeholders(1, wide).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    let diacritics: Vec<char> = text
+        .split('\u{10EEEE}')
+        .skip(1)
+        .map(|cell| cell.chars().nth(1).unwrap())
+        .collect();
+    assert_eq!(diacritics.len(), usize::from(kitty::MAX_PLACEHOLDER_CELLS));
+    let mut sorted = diacritics.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), diacritics.len(), "diacritics are distinct");
+    // Kitty's rowcolumn-diacritics.txt starts 0305, 030D, 030E.
+    assert_eq!(&diacritics[..3], &['\u{305}', '\u{30D}', '\u{30E}']);
+
+    let max = kitty::MAX_PLACEHOLDER_CELLS;
+    let mut shown = 0usize;
+    run("fuzz_kitty_placeholders", iterations(100), LIMIT, |case| {
+        let rng = &mut case.rng;
+        let id = match rng.below(8) {
+            0 => 0,
+            1 => rng.range(1, 255) as u32,
+            2 => rng.range(256, 65535) as u32,
+            3 => rng.next_u64() as u32,
+            4 => kitty::tmux_image_id(rng.range(0, 65535) as u16).unwrap_or(0),
+            5 => (rng.range(0, 255) as u32) << 24 | rng.range(0, 255) as u32,
+            6 => 1 << rng.range(0, 31),
+            _ => rng.range(1, 255) as u32 | (rng.range(1, 255) as u32) << 24,
+        };
+        let mut side = |rng: &mut Rng| match rng.below(8) {
+            0 => 0,
+            1 => 1,
+            2 => max - 1,
+            3 => max,
+            4 => max + 1,
+            5 => u16::MAX,
+            _ => rng.range(1, 12) as u16,
+        };
+        let place = CellRect {
+            column: *rng.pick(&[0, 1, 77, u16::MAX, rng.below(65536) as u16]),
+            row: *rng.pick(&[0, 1, 40, u16::MAX, rng.below(65536) as u16]),
+            columns: side(rng),
+            rows: side(rng),
+        };
+        case.note(|| format!("id {id:#x} place {place:?}"));
+        let out = kitty::placeholders(id, place);
+        let names = id != 0 && id & 0x00ff_ff00 == 0;
+        if !names {
+            assert_eq!(out, Err(kitty::Error::ImageId));
+            return;
+        }
+        if place.columns == 0 || place.rows == 0 {
+            assert_eq!(out, Err(kitty::Error::Empty));
+            return;
+        }
+        if place.columns > max || place.rows > max {
+            assert_eq!(
+                out,
+                Err(kitty::Error::TooManyCells {
+                    columns: place.columns,
+                    rows: place.rows
+                })
+            );
+            return;
+        }
+        let bytes = out.expect("an accepted rectangle encodes");
+        let mut cells = decode_placeholders(&bytes, &diacritics).expect("decodes");
+        shown += 1;
+        let mut want = Vec::new();
+        for row in 0..place.rows {
+            for col in 0..place.columns {
+                want.push(PlacedCell {
+                    line: u32::from(place.row) + u32::from(row) + 1,
+                    column: u32::from(place.column) + u32::from(col) + 1,
+                    row: usize::from(row),
+                    col: usize::from(col),
+                    id,
+                });
+            }
+        }
+        cells.sort();
+        want.sort();
+        assert_eq!(cells.len(), want.len(), "cell count");
+        assert!(cells == want, "cells differ from the rectangle");
+    });
+    assert!(shown > 0);
+}
