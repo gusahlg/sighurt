@@ -4786,3 +4786,46 @@ Newest last. Each entry says what was decided and why.
     on the fix branch (1 427 and 119 tests); the terminal's tests. *Not shown*: the third
     diacritic of an id above 255 in a real kitty under tmux; another machine's `sig` over ssh
     in the same terminal can still share an id.
+151. **The terminal frontend runs on macOS and Windows** (16 November 2026; amends 89 and
+    147). On macOS the Unix session runs as it is. On Windows the console is put in VT mode
+    (`term/console.rs`), and two threads read and write it and wake the calloop owner loop
+    with pings, so the parser, probe, encoders, grid, chrome, text mode and owner loop are
+    Unix's; `Output` writes through a `Sink`. Ctrl+C is a key in the terminal; Ctrl+Break
+    and closing the console quit through a console control handler, and `Signals` off Unix
+    is a queue. A console with no `TERM` counts as a terminal on Windows. Private
+    directories get a protected access list (the user and SYSTEM) in place of 0700; external
+    addresses on Windows are http, https and mailto only, through `ShellExecuteW`; the
+    configuration watch is kqueue on macOS; download names are made safe for NTFS and APFS.
+    *Evidence*: Ports run 43848358624 on GitHub's hosted runners (commit cf6cc22):
+    macos-latest 879 tests, 0 failed (`tests/tui.rs` 46/46 with the demo engine and again
+    with the Wasm engine, `tests/pty.rs` 21/21); windows-latest 723 tests, 0 failed
+    (`tests/console.rs` drives the real `sig` in a ConPTY pseudoconsole: a page as text, the
+    address line, `q`, the console's modes equal before and after, `--dump`). On Linux the CI
+    lines without Servo (1 429 and 121 tests) and both `tools/cross-check` lines. *Open*:
+    `a_megabyte_of_garbage_as_the_probes_answer_is_survived` stalled in 3 of 8 macOS runs
+    with the Wasm engine and is ignored there (PORTING.md). *Not there*: the window and the
+    native engines (Linux's); the programs of `sig://terminal` and `sig://config` off Linux;
+    on Windows the Wasm engine and with it sig's own pages, a configuration watch, the
+    console restored after a native crash, a diagnostics report. *Not shown*: any real
+    terminal emulator on either system, `/usr/bin/open`, `ShellExecuteW`.
+152. **The interface is data: a layout tree per frontend** (16 November 2026;
+    `interface-2026-11-16.md` and its eleven rulings; stages 0 to 4 of the Experience's Part
+    4). `sighurt_api::ui` holds two trees (window and terminal) of compound components, one
+    whole-value `check`, and structural operations (`place`, `position`, `remove`,
+    `overlay`) applied together by `change` and checked once. The standard chrome is the
+    window tree's interpreter: `Layout::from_tree` and one component-to-surface ownership
+    map that drives drawing, damage, the text field and hit testing (a pointer event hits
+    only what its surface shows). `[chrome.standard]`, then `[ui.layout]`, then
+    `[tui.layout]` apply in that fixed order to the experience's interface
+    (`Experience::ui`), and an invalid result is a configuration problem. The terminal lays
+    out its tree (`chrome::arrange`) and takes a changed tree through the resize path. New
+    placements: tabs right or bottom, a full-height sidebar, the toolbar at the bottom. A
+    `Fixed` size in a row is capped at half the row. *Evidence*:
+    `trees_lay_out_as_the_options_did` (112 320 layouts equal field for field to the old
+    options' layout), the 36 goldens unchanged and five new ones, the review's
+    counterexample trees as `check` tests, the terminal acceptance tests of the review, the
+    CI lines without Servo (1 450 and 119 tests), `ui/sighurt-ui/tests/headless.sh` 35/35,
+    `apps/sighurt-browser/tests/headless.sh` all scenarios. *Deferred*: folding the line
+    chrome in (`ChromeKind`, `CHROMES` and `[ui] chrome` stay, ruling 4) and `Label`
+    (rejected by `check` until an interpreter shows it). *Not shown*: a tree change in a
+    real graphics terminal (placement and encoders are tested, no terminal is driven).
