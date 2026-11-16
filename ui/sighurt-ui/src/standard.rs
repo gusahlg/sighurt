@@ -22,12 +22,12 @@ use sighurt_api::geometry::WindowRect;
 use sighurt_api::settings::{Table, Value};
 use sighurt_render::Pen;
 
-use crate::chrome::{Model, CHROME, PAGE, STATUS, TABS};
+use crate::chrome::{Model, PAGE};
 use crate::extension::{
     Chrome, ChromeAction, ChromeEvent, ChromeKind, ChromeLayout, ChromeSurface, InputArea,
     SurfaceName,
 };
-use crate::layout::{LayoutOptions, Status, Tabs};
+use crate::layout::{LayoutOptions, Show, Status, Tabs};
 use crate::{Colors, Fonts};
 
 /// The standard chrome, for the registry.
@@ -98,11 +98,8 @@ impl Standard {
     fn rect(&self, surface: SurfaceName) -> Option<WindowRect> {
         let layout = self.model.layout();
         match surface {
-            CHROME => Some(layout.chrome),
-            TABS => Some(layout.tab_list),
-            STATUS => Some(layout.status),
             PAGE => Some(layout.page),
-            _ => None,
+            name => layout.surface(name).map(|surface| surface.rect),
         }
     }
 }
@@ -124,18 +121,20 @@ fn layout_of(model: &Model) -> ChromeLayout {
     if model.draws_page() {
         surfaces.push(ChromeSurface::new(PAGE, layout.page));
     }
-    if layout.options.tabs == Tabs::Left {
-        surfaces.push(ChromeSurface::new(TABS, layout.tab_list));
-    }
-    surfaces.push(ChromeSurface::new(CHROME, layout.chrome));
-    match layout.options.status {
-        Status::Strip => surfaces.push(ChromeSurface::new(STATUS, layout.status)),
-        Status::Overlay if model.status_line().is_some() => {
-            let mut overlay = ChromeSurface::new(STATUS, layout.status);
-            overlay.input = InputArea::Rects(Vec::new());
-            surfaces.push(overlay);
+    for surface in &layout.surfaces {
+        let mut listed = ChromeSurface::new(surface.name, surface.rect);
+        match surface.layer {
+            // A layer shown when needed: only while it has something to say (the status line
+            // while there is status), and then without pointer input.
+            Some(Show::WhenNeeded) => {
+                if model.status_line().is_none() {
+                    continue;
+                }
+                listed.input = InputArea::Rects(Vec::new());
+            }
+            Some(Show::Always) | None => {}
         }
-        Status::Overlay => {}
+        surfaces.push(listed);
     }
     // In fullscreen the chrome shows over the page, which keeps its size.
     let page = if fullscreen { window } else { layout.page };
@@ -205,5 +204,198 @@ impl Chrome for Standard {
 
     fn draw(&mut self, surface: SurfaceName, pen: &mut Pen) {
         crate::paint::draw(pen, &mut self.model, surface);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sighurt_api::geometry::LogicalSize;
+    use sighurt_api::ids::TabId;
+    use sighurt_api::input::KeyboardFocus;
+    use sighurt_api::keymap::Frontend;
+    use sighurt_api::ui::{Component, Kind, Node, Side};
+
+    use super::*;
+    use crate::chrome::{CHROME, STATUS, TABS};
+    use crate::layout::{Arrangement, Status, Tabs};
+    use crate::{Colors, Snapshot, TabContent, TabSnapshot};
+
+    const FONT: &[u8] =
+        include_bytes!("../../../render/sighurt-render/tests/fonts/Cantarell-Regular.ttf");
+
+    fn snapshot(home: bool, status: bool, fullscreen: bool) -> Snapshot {
+        let tab = |url: &str, content, active| TabSnapshot {
+            id: TabId::next(),
+            title: url.into(),
+            url: url.into(),
+            loading: false,
+            active,
+            content,
+            engine: None,
+            switching_to: None,
+        };
+        Snapshot {
+            tabs: vec![
+                tab("https://a.test/", TabContent::Engine, !home),
+                tab("sig://home", TabContent::Internal, home),
+            ],
+            status: status.then(|| "https://a.test/link".into()),
+            fullscreen,
+            ..Snapshot::default()
+        }
+    }
+
+    /// `layout_of` before trees, from the options.
+    fn listed_before(model: &Model, options: LayoutOptions) -> ChromeLayout {
+        let layout = model.layout();
+        let fullscreen = model.snapshot().fullscreen && !model.draws_page();
+        let window = WindowRect {
+            x: 0,
+            y: 0,
+            width: layout.window.width,
+            height: layout.window.height,
+        };
+        if fullscreen && !model.state().focused && model.status_line().is_none() {
+            return ChromeLayout::new(window, Vec::new());
+        }
+        let mut surfaces = Vec::new();
+        if model.draws_page() {
+            surfaces.push(ChromeSurface::new(PAGE, layout.page));
+        }
+        if options.tabs == Tabs::Left {
+            surfaces.push(ChromeSurface::new(TABS, layout.tab_list));
+        }
+        surfaces.push(ChromeSurface::new(CHROME, layout.chrome));
+        match options.status {
+            Status::Strip => surfaces.push(ChromeSurface::new(STATUS, layout.status)),
+            Status::Overlay if model.status_line().is_some() => {
+                let mut overlay = ChromeSurface::new(STATUS, layout.status);
+                overlay.input = InputArea::Rects(Vec::new());
+                surfaces.push(overlay);
+            }
+            Status::Overlay => {}
+        }
+        let page = if fullscreen { window } else { layout.page };
+        ChromeLayout::new(page, surfaces)
+    }
+
+    fn model(arrangement: impl Into<Arrangement>, width: u32, height: u32) -> Model {
+        let fonts = Fonts::from_data([FONT.to_vec()]);
+        let mut model = Model::new(fonts, Colors::default(), arrangement);
+        model.resize(LogicalSize { width, height });
+        model
+    }
+
+    /// Every combination of the options, in every state that changes what is listed (the page
+    /// drawn or not, status or not, fullscreen with and without the keyboard), lists the
+    /// surfaces the options listed before trees, in their order.
+    #[test]
+    fn surfaces_are_what_the_options_listed() {
+        for tabs in [Tabs::Top, Tabs::Left, Tabs::Hidden] {
+            for status in [Status::Strip, Status::Overlay] {
+                for (buttons, compact) in [(true, false), (false, true)] {
+                    let options = LayoutOptions {
+                        tabs,
+                        status,
+                        buttons,
+                        compact,
+                        ..LayoutOptions::default()
+                    };
+                    for (width, height) in [(800, 600), (300, 90), (0, 0)] {
+                        for state in 0..16 {
+                            let bit = |n: u32| state & (1 << n) != 0;
+                            let mut model = model(options, width, height);
+                            model.set_snapshot(snapshot(bit(0), bit(1), bit(2)));
+                            if bit(3) {
+                                model.set_focus(KeyboardFocus::Chrome);
+                            }
+                            let what = format!("{options:?} {width}×{height} {state:04b}");
+                            let listed = layout_of(&model);
+                            assert_eq!(listed, listed_before(&model, options), "{what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rules a tree can't break: at most 8 surfaces with names from the pool, each once;
+    /// the status line listed whenever there is status (where there is room for it); the
+    /// controls listed in fullscreen while the line has the keyboard; the page area listed
+    /// while the chrome draws it.
+    #[test]
+    fn every_placement_keeps_the_rules() {
+        let pool = [CHROME, TABS, STATUS, PAGE];
+        let window = Frontend::Gui;
+        let mut trees = Vec::new();
+        for tabs in [Side::Top, Side::Bottom, Side::Left, Side::Right] {
+            for address in [Side::Top, Side::Bottom] {
+                for overlay in [false, true] {
+                    let mut tree = Node::standard();
+                    tree.change(window, |tree| {
+                        tree.position(Kind::AddressBar, address);
+                        tree.position(Kind::TabBar, tabs);
+                        if overlay {
+                            let status = Component::new(Kind::StatusBar);
+                            let anchor = sighurt_api::ui::Anchor::BottomRight;
+                            let show = sighurt_api::ui::Show::WhenNeeded;
+                            tree.overlay(status, anchor, show);
+                        }
+                    })
+                    .unwrap();
+                    trees.push(tree);
+                }
+            }
+        }
+        for tree in trees {
+            let arrangement = Arrangement {
+                tree: tree.clone(),
+                density: Default::default(),
+                font_size: 14,
+            };
+            for state in 0..16 {
+                let bit = |n: u32| state & (1 << n) != 0;
+                let mut model = model(arrangement.clone(), 900, 700);
+                model.set_snapshot(snapshot(bit(0), bit(1), bit(2)));
+                if bit(3) {
+                    model.set_focus(KeyboardFocus::Chrome);
+                }
+                let what = format!("{tree:?} {state:04b}");
+                let listed = layout_of(&model);
+                let names: Vec<_> = listed.surfaces.iter().map(|s| s.name).collect();
+                assert!(names.len() <= 8, "{what}: {names:?}");
+                for (i, name) in names.iter().enumerate() {
+                    assert!(pool.contains(name), "{what}: {name}");
+                    assert!(!names[..i].contains(name), "{what}: {name} twice");
+                }
+                // A strip is listed but while fullscreen hides everything; an overlay while
+                // there is status.
+                let hidden = bit(2) && !bit(0) && !bit(3) && !bit(1);
+                let status = names.contains(&STATUS);
+                let expected = match tree_overlays(&tree) {
+                    true => bit(1),
+                    false => !hidden,
+                };
+                assert_eq!(status, expected, "{what}");
+                if bit(2) && bit(3) {
+                    assert!(names.contains(&CHROME), "{what}: the line in fullscreen");
+                }
+                assert_eq!(names.contains(&PAGE), bit(0), "{what}");
+                // Every surface is inside the window, and the page area too.
+                let whole = WindowRect {
+                    x: 0,
+                    y: 0,
+                    width: 900,
+                    height: 700,
+                };
+                for surface in &listed.surfaces {
+                    assert_eq!(crate::layout::intersect(surface.rect, whole), surface.rect);
+                }
+            }
+        }
+    }
+
+    fn tree_overlays(tree: &Node) -> bool {
+        tree.components().iter().any(|(_, layer)| layer.is_some())
     }
 }
