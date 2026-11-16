@@ -4949,3 +4949,33 @@ Newest last. Each entry says what was decided and why.
     same `shutdown`); another unjoined thread first touching aws-lc's generator during exit.
     A SIGTERM before `main` installs its handler (the first 0.08 s, to 0.4 s under load) is
     the default action, status 15: the time is the loader's.
+158. **The outside review of the portability work, held against the merged tree** (16
+    November 2026; review C of `reviews-round-2026-11-15-astra.md`, read on 4a0a8d7, before
+    151 to 157). Already answered by 151 and 155: finding 1 (Apple raises again a signal
+    that reaches the default action), 2 (mkfifo; every subprocess helper, `--dump`'s too,
+    gets a private HOME and the macOS directory mapping), 5 (a console without `TERM` is a
+    terminal on Windows), 6 (claims in a private directory of `$TMPDIR`; now tested on
+    macOS). Fixed: 3, an existing private directory whose access list is wider gets the
+    protected list, read back, and files take it; 4, the editor answer says `programs no`
+    where the build starts none, so `sig://config` says that instead of "install an
+    editor", and a system with no configuration watch says so in a notice; 7, entering the
+    terminal reads termios before it sets `O_NONBLOCK`; 8 (older than the round), quit and
+    report requests are a flag each, set with one lock-free store in the handler, the pipe
+    only a wake emptied before the flags are taken, so a pipe full of reports no longer
+    drops the quit; 9 and 10, PORTING.md keeps checked, links, tested and tried apart by
+    feature set, and README and PORTING say that a window build without default features
+    must name `frontend-gui`. `sighurt-config`'s licence statements now say what is true: its
+    own source is Apache-2.0, a configuration built with it is combined with the AGPL
+    `sighurt-api`, and a permissive data crate comes with separately loaded modules
+    (nothing relicensed). On GitHub's ubuntu-26.04: the pty test assumed a newline from
+    `tty` (uutils prints none), and the pty watcher published a program's exit before
+    giving back its place (a real race, fixed). *Evidence*: Ports run 43923681446 (macOS
+    927 tests, Windows 757, none failed) and CI run 43923681379, both green; the CI lines
+    here; both cross-checks. *Not shown*: a real terminal off Linux; another Windows user
+    kept out (the list is read back, nobody logs in); `sig://config`'s refusal on a Mac.
+    The review's advice on direction is not acted on here and is the user's to weigh: say
+    exactly what "macOS and Windows support" means (no web engine has run on either);
+    test a layout change during an input-method composition or an open completion; measure
+    input-to-visible latency on real pages before more speed work; for configuration
+    modules, a small versioned wire contract, no Cargo run by the browser, and the licence
+    settled first.
