@@ -430,6 +430,15 @@ fn pages<M: FnMut(&Font, &str) -> f32>(b: &mut Builder<M>) {
          the terminal emulator, not the shell.",
     );
     b.code("[pages.terminal]\nenabled = true");
+    b.para(
+        "On both pages: the wheel and Shift+Page Up look back through the lines that scrolled \
+         away, and typing returns. A drag selects text (a double click a word, a triple click \
+         a line) as the primary selection; Ctrl+Shift+C copies it, Ctrl+Shift+V pastes, and \
+         Shift+Insert or the middle button pastes the selection. A program that asks for the \
+         mouse gets it, except with Shift held. Programs can show images: kitty's graphics \
+         protocol and sixel (chafa, timg, kitten icat). A program cannot read or write your \
+         clipboard through the terminal.",
+    );
     b.link("sig://terminal", "sig://terminal");
     b.heading(2, "sig://home");
     b.para(
