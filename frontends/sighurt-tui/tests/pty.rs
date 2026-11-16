@@ -3,6 +3,11 @@
 //! Workers run in a child so a panic hook or a signal handler never lands in
 //! the test process. In-process sessions share one mutex; the tests below take
 //! it only for their own `Session`.
+//!
+//! Unix only: ptys and signals. The Windows console is tested by `apps/sighurt-browser`'s
+//! `tests/console.rs`, through ConPTY.
+
+#![cfg(unix)]
 
 use std::cell::{Cell, RefCell};
 use std::io::Read;
@@ -529,7 +534,10 @@ fn pty_golden_bytes_and_double_restore() {
         &tcgetattr(&fd).expect("restored"),
         &original
     ));
-    assert_eq!(rustix::fs::fcntl_getfl(&fd).expect("flags"), flags_before);
+    assert_eq!(
+        settable(rustix::fs::fcntl_getfl(&fd).expect("flags")),
+        settable(flags_before)
+    );
 }
 
 #[test]
@@ -716,8 +724,10 @@ fn a_stalled_reader_does_not_block_the_writer() {
 /// Bytes `n_tty` stores for a non-canonical reader: `N_TTY_BUF_SIZE - 1`.
 ///
 /// `FIONREAD` on the master reports this count, not the flip buffer behind it.
+#[cfg(target_os = "linux")]
 const READER_FULL: usize = 4095;
 
+#[cfg(target_os = "linux")]
 fn reader_queued(master: &OwnedFd) -> usize {
     let mut queued: libc::c_int = 0;
     let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::FIONREAD, &mut queued) };
@@ -729,6 +739,7 @@ fn reader_queued(master: &OwnedFd) -> usize {
 ///
 /// A refused `write` is not that signal. An atomic buffer allocation can fail
 /// while the pty is still under its memory limit, and `poll` reports that room.
+#[cfg(target_os = "linux")]
 fn slave_has_write_room(slave: &OwnedFd) -> bool {
     let mut fds = [PollFd::new(slave, PollFlags::OUT)];
     let zero = rustix::event::Timespec {
@@ -744,6 +755,8 @@ fn slave_has_write_room(slave: &OwnedFd) -> bool {
     }
 }
 
+// Linux's pty accounting: a macOS pty never refuses the test's writes in time.
+#[cfg(target_os = "linux")]
 #[test]
 fn restore_and_drop_return_when_the_reader_never_reads() {
     let _deadline = arm_deadline();
@@ -1213,6 +1226,8 @@ fn a_late_kitty_reply_is_a_resize() {
     session.restore().expect("restore");
 }
 
+// Linux's calls: gettid and tkill, the pipe's capacity, __errno_location.
+#[cfg(target_os = "linux")]
 #[test]
 fn restore_deadline_holds_under_sigwinch() {
     if std::env::var_os("SIGHURT_RESTORE_WINCH_CHILD").is_some() {
@@ -1251,6 +1266,8 @@ fn restore_deadline_holds_under_sigwinch() {
     assert!(status.success(), "child status {status:?} stderr {err}");
 }
 
+// Linux's calls: gettid and tkill, the pipe's capacity, __errno_location.
+#[cfg(target_os = "linux")]
 fn restore_deadline_child() -> ! {
     let slave = match std::io::stdout().as_fd().try_clone_to_owned() {
         Ok(fd) => fd,
@@ -1310,6 +1327,8 @@ fn restore_deadline_child() -> ! {
     unsafe { libc::_exit(0) }
 }
 
+// Linux's calls: gettid and tkill, the pipe's capacity, __errno_location.
+#[cfg(target_os = "linux")]
 #[test]
 fn full_winch_pipe_restores_errno() {
     if std::env::var_os("SIGHURT_ERRNO_CHILD").is_some() {
@@ -1347,6 +1366,8 @@ fn full_winch_pipe_restores_errno() {
     }
 }
 
+// Linux's calls: gettid and tkill, the pipe's capacity, __errno_location.
+#[cfg(target_os = "linux")]
 fn errno_child() -> ! {
     let slave = match std::io::stdout().as_fd().try_clone_to_owned() {
         Ok(fd) => fd,
@@ -1652,4 +1673,10 @@ fn sigsegv_kill_child() -> ! {
     loop {
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// File status flags without macOS's `FWASWRITTEN` (0x10000), which its kernel sets on a
+/// descriptor once it has been written and reports with the rest.
+fn settable(flags: OFlags) -> OFlags {
+    flags - OFlags::from_bits_retain(0x10000 * u32::from(cfg!(target_vendor = "apple")))
 }

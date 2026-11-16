@@ -16,8 +16,11 @@
 //! (`sighurt_gui::run`) and with `frontend-tui` the terminal (`sighurt_tui::run`). `--gui` and
 //! `--tui` pick one; without either, `sig` opens in the terminal when stdout is one and `TERM`
 //! isn't `dumb`, and in a window otherwise (decision 89). A build with one frontend says so when
-//! asked for the other. The signals are Unix's: elsewhere no handler is installed and the
-//! frontends get `Signals::none` (docs/rewrite/PORTING.md).
+//! asked for the other. On Windows a console has no `TERM`, so a console on stdout is the
+//! terminal there unless `TERM` says `dumb`. Windows has no signals: a console control handler
+//! quits cleanly for Ctrl+C, Ctrl+Break and the console closing (a second Ctrl+C or Ctrl+Break
+//! while that quit is under way ends the process at once), and nothing asks for the report there
+//! (docs/rewrite/PORTING.md).
 //! `--dump URL` needs neither: it prints the page as text from a session with no terminal
 //! (`sighurt_tui::dump`).
 //!
@@ -230,9 +233,7 @@ fn choose(asked: Option<Choice>, terminal: bool, term: Option<&str>) -> Result<C
             Err("--tui needs a terminal, and stdout isn't one".into())
         }
         Some(choice) => Ok(choice),
-        None if tui && terminal && term.is_some_and(|t| !t.is_empty() && t != "dumb") => {
-            Ok(Choice::Tui)
-        }
+        None if tui && terminal && names_a_terminal(term) => Ok(Choice::Tui),
         None if gui => Ok(Choice::Gui),
         None if tui => Err(format!(
             "{no_gui}; run it in a terminal (stdout one, and TERM set and not dumb)"
@@ -240,6 +241,15 @@ fn choose(asked: Option<Choice>, terminal: bool, term: Option<&str>) -> Result<C
         None => {
             Err("this sig was built with no frontend (features frontend-gui, frontend-tui)".into())
         }
+    }
+}
+
+/// Whether `TERM` names a terminal the frontend can use: set and not `dumb`. A Windows console
+/// sets none, so there no `TERM` is a terminal too.
+fn names_a_terminal(term: Option<&str>) -> bool {
+    match term {
+        Some(term) => !term.is_empty() && term != "dumb",
+        None => cfg!(windows),
     }
 }
 
@@ -328,8 +338,61 @@ fn signal_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)
     Ok((read, write))
 }
 
+/// The console control handler, which sends a quit for Ctrl+C, Ctrl+Break, and the console
+/// closing, the user logging off or the system shutting down. For the last three Windows ends
+/// the process when the handler returns, so it does not return: the owner loop quits and
+/// `main` returns, which ends the process with the session saved (Windows allows 5 s after a
+/// close). A second Ctrl+C or Ctrl+Break is left to the default handler, which ends the process
+/// at once.
+#[cfg(windows)]
+fn install_signal_handlers() -> std::io::Result<Signals> {
+    use sighurt_runtime::signals::{Request, Sender};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+        CTRL_SHUTDOWN_EVENT,
+    };
+
+    static SENDER: OnceLock<Sender> = OnceLock::new();
+    static QUITTING: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn handler(event: u32) -> BOOL {
+        let Some(sender) = SENDER.get() else {
+            return 0;
+        };
+        match event {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                if QUITTING.swap(true, Ordering::AcqRel) {
+                    return 0;
+                }
+                sender.send(Request::Quit);
+                1
+            }
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+                QUITTING.store(true, Ordering::Release);
+                sender.send(Request::Quit);
+                loop {
+                    std::thread::park();
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    let (sender, signals) = Signals::channel();
+    let _ = SENDER.set(sender);
+    // SAFETY: the handler only reads statics and sends on a queue; it runs on a thread of its
+    // own that Windows starts.
+    if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(signals)
+}
+
 /// No signal reaches the loop here (see the module documentation).
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn install_signal_handlers() -> std::io::Result<Signals> {
     Ok(Signals::none())
 }
@@ -475,7 +538,15 @@ mod tests {
         assert_eq!(
             inputs,
             [
-                format!("file://{}", file.display()).as_str(),
+                // Windows' drive path is `/C:/…`, with forward slashes.
+                format!(
+                    "file://{}{}",
+                    if cfg!(windows) { "/" } else { "" },
+                    file.display()
+                        .to_string()
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                )
+                .as_str(),
                 "example.com",
                 "demo:pattern"
             ]
@@ -555,7 +626,10 @@ mod tests {
             false => window(choose(None, true, Some("xterm-kitty"))),
         }
         window(choose(None, true, Some("dumb")));
-        window(choose(None, true, None));
+        match built && cfg!(windows) {
+            true => assert_eq!(choose(None, true, None), Ok(Choice::Tui)),
+            false => window(choose(None, true, None)),
+        }
         window(choose(None, false, Some("xterm-kitty")));
         window(choose(Some(Choice::Gui), true, Some("xterm")));
         let asked = choose(Some(Choice::Tui), false, Some("xterm"));

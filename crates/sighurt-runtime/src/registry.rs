@@ -22,8 +22,9 @@
 //! calls [`claim_logger`] and, when it wins, Servo's `setup_logging`.
 //!
 //! The experience compiled into the build (`sighurt-config-example`) is taken apart here
-//! ([`experience`]): its keys go to the core in its [`Environment`], checked whole, and an
-//! experience with any problem is not used. Chromes are the frontend's.
+//! ([`experience`]): its keys and interface go to the core in its [`Environment`], checked
+//! whole, and an experience with any problem is not used. Drawing the interface is the
+//! frontend's.
 //!
 //! What each engine supports, and which settings of `[engines.<name>]` it honors, is the
 //! build's [`crate::engines::descriptors`], so every frontend's [`Environment`] says the same
@@ -49,6 +50,7 @@ use std::time::Instant;
 use sighurt_api::commands::CommandSet;
 use sighurt_api::engine::{EngineCapabilities, EngineRuntime, EngineWaker, PumpStatus};
 use sighurt_api::keymap::Keys;
+use sighurt_api::ui::Interface;
 use sighurt_core::config::{Config, EngineSettings};
 use sighurt_core::{ChromeChecks, Environment, Frontend};
 use tempfile::TempDir;
@@ -211,25 +213,32 @@ pub fn claim_logger() -> bool {
     LOGGER.swap(true, Ordering::SeqCst)
 }
 
-/// The experience's keys, as the core gets them ([`Environment::keys`]), and what `sig` says
-/// about them ([`Environment::notices`]): those of the configuration compiled into `sig`
-/// (`sighurt_config_example::configure`). An experience with any problem, noted while it was
-/// written or found by `Keys::check` on its own (bounds, modes, a mode switch to no mode, a
-/// binding that starts another), is not used at all: the default experience is, with a notice
-/// naming the problems. What depends on the configuration file (its `[commands]`, its chrome)
-/// is checked when the file loads.
-pub fn experience() -> (Keys, Vec<String>) {
-    let (keys, mut problems) = sighurt_config_example::configure().finish();
+/// The experience's keys and interface, as the core gets them ([`Environment::keys`],
+/// [`Environment::interface`]), and what `sig` says about them ([`Environment::notices`]):
+/// those of the configuration compiled into `sig` (`sighurt_config_example::configure`). An
+/// experience with any problem, noted while it was written or found by `Keys::check` or
+/// `Interface::check` on its own (bounds, modes, a mode switch to no mode, a binding that
+/// starts another, a tree a frontend can't show), is not used at all: the default experience
+/// is, with a notice naming the problems. What depends on the configuration file (its
+/// `[commands]`, its layout tables) is checked when the file loads.
+pub fn experience() -> (Keys, Interface, Vec<String>) {
+    let experience = sighurt_config_example::configure();
+    let (interface, mut problems) = experience.interface();
+    let (keys, keys_problems) = experience.finish();
+    problems.extend(keys_problems);
     problems.extend(keys.check(&CommandSet::ANY, Frontend::Gui));
     if problems.is_empty() {
-        return (keys, Vec::new());
+        return (keys, interface, Vec::new());
     }
-    let (default, _) = sighurt_config::Experience::default().finish();
+    let default = sighurt_config::Experience::default();
+    let (interface, _) = default.interface();
+    let (keys, _) = default.finish();
     let notice = format!(
-        "The configuration compiled into sig has problems, so sig uses its default keys: {}",
+        "The configuration compiled into sig has problems, so sig uses its default \
+         experience: {}",
         problems.join("; ")
     );
-    (default, vec![notice])
+    (keys, interface, vec![notice])
 }
 
 /// What a runtime is started with.
@@ -431,8 +440,8 @@ impl<T: 'static, P: 'static> Registry<T, P> {
     }
 
     /// What the core checks configurations against: the build's engines, with what each
-    /// supports and which settings it honors, the experience's keys, and the chromes and color names the
-    /// frontend passes.
+    /// supports and which settings it honors, the experience's keys and interface, and the
+    /// chromes and color names the frontend passes.
     pub fn environment(
         &self,
         chromes: Vec<ChromeChecks>,
@@ -444,7 +453,7 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             .map(|desc| desc.name.to_owned())
             .collect();
         let engines = self.engines.iter();
-        let (keys, notices) = experience();
+        let (keys, interface, notices) = experience();
         Environment {
             engines: engines
                 .clone()
@@ -455,6 +464,7 @@ impl<T: 'static, P: 'static> Registry<T, P> {
             home_dir: dirs::home_dir(),
             keys,
             notices,
+            interface,
             chromes,
             color_names,
             renderers: sighurt_core::config::RENDERERS,
@@ -776,7 +786,7 @@ pub fn cef_config(mut launch: Launch<'_>) -> Result<sighurt_engine_cef::CefConfi
 
 /// Servo's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set;
-/// `experimental-features` and `preferences`, applied when Servo is built.
+/// `experimental-features`, `smooth-scroll` and `preferences`, applied when Servo is built.
 /// A persistent profile, and `{data_dir}/sighurt` above it, are mode 0700.
 #[cfg(feature = "engine-servo")]
 pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoConfig {
@@ -809,6 +819,7 @@ pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoCon
         // Times every GL call: for tests and measurements only.
         audit_gl: std::env::var_os("SIG_AUDIT_GL").is_some_and(|v| v == "1"),
         experimental_features: settings.experimental_features,
+        smooth_scroll: settings.smooth_scroll,
         preferences,
     }
 }
@@ -862,6 +873,7 @@ mod tests {
         );
         assert!(env.notices.is_empty(), "{:?}", env.notices);
         assert!(env.chromes.is_empty());
+        assert_eq!(env.interface, sighurt_api::ui::Interface::standard());
     }
 
     #[test]
@@ -869,7 +881,7 @@ mod tests {
         use sighurt_api::commands::Command;
         use sighurt_api::keymap::{Action, Frontend};
         use sighurt_core::config::TERMINAL_CHROME_COMMANDS;
-        let (keys, _) = experience();
+        let (keys, ..) = experience();
         let tables = keys
             .modes
             .iter()

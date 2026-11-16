@@ -11,17 +11,19 @@
 //! (the core), which effect runs (the runtime), engine internals, or anything of Wayland or
 //! sighurt-ui.
 //!
-//! The terminal's I/O ([`term`]), the owner loop and `--dump` are Unix's (termios, signals,
-//! descriptors polled with calloop). Elsewhere (Windows) the crate has the rest, and [`run`] and
-//! [`dump`] say the terminal is not supported there (docs/rewrite/PORTING.md).
+//! The terminal's I/O ([`term`]) is a Unix terminal (termios, signals, descriptors polled with
+//! calloop) or a Windows console in VT mode (its own input and output threads, which wake
+//! calloop with pings); the owner loop and `--dump` are the same on both, apart from what
+//! [`sys`] does for each. Elsewhere the crate has the rest, and [`run`] and [`dump`] say the
+//! terminal is not supported there (docs/rewrite/PORTING.md).
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod app;
 pub mod chrome;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod dump;
-// Bound to the terminal's target by the owner loop and `--dump`, which are Unix's.
-#[cfg_attr(not(unix), allow(dead_code))]
+// Bound to the terminal's target by the owner loop and `--dump`.
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 mod engines;
 pub mod grid;
 pub mod home;
@@ -29,11 +31,13 @@ pub mod input;
 pub mod kitty;
 pub mod sanitize;
 pub mod sixel;
+#[cfg(any(unix, windows))]
+mod sys;
 pub mod target;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod term;
-/// Without a Unix terminal: only the escape sequences the grid writes.
-#[cfg(not(unix))]
+/// Without a terminal: only the escape sequences the grid writes.
+#[cfg(not(any(unix, windows)))]
 mod term {
     #[allow(dead_code)]
     mod modes;
@@ -41,12 +45,12 @@ mod term {
 }
 pub mod text;
 pub mod textmode;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 mod unsupported;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use app::{run, Options};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use dump::{run as dump, DumpOptions};
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub use unsupported::{dump, run, DumpOptions, Options};

@@ -44,7 +44,8 @@
 //! ([`EngineSettings`]), each checked here for its form, and against what the build says that
 //! engine honors (`Environment::engine_settings`): setting what an engine can't honor is an
 //! error, never ignored. `experimental-features` turns on Servo's experimental web-platform
-//! preferences (off by default, which is Servo's own default). `preferences` then sets
+//! preferences (off by default, which is Servo's own default). `smooth-scroll` (off by default)
+//! plays Servo's wheel notches out as several small wheel events. `preferences` then sets
 //! individual Servo 0.7 preferences by field name; an unknown name or a value of the wrong
 //! type is an error. `[downloads] directory`, `[session] restore` and `[history] remember` are
 //! the executable's, checked here.
@@ -73,6 +74,7 @@ use sighurt_api::commands::{Command, CommandSet};
 use sighurt_api::input::PointerButton;
 use sighurt_api::keymap::{Frontend as KeyFrontend, Keys};
 use sighurt_api::settings::{Table, Value};
+use sighurt_api::ui::Interface;
 
 use crate::commands::ZOOM_STEPS;
 use crate::keys;
@@ -126,12 +128,13 @@ const ENGINE_SETTING_NAMES: &[&str] = &[
     "user-agent",
     "storage",
     "experimental-features",
+    "smooth-scroll",
     "preferences",
 ];
 
 /// How each setting except `preferences` is read. `preferences` is its own table, so one bad
 /// preference is its own error ([`read_preferences`]).
-const ENGINE_SETTINGS: [(&str, ReadSetting); 3] = [
+const ENGINE_SETTINGS: [(&str, ReadSetting); 4] = [
     ("user-agent", |value, settings| {
         // Printable ASCII is what an HTTP header may hold; Servo's network code unwraps the
         // parse of its user agent as a header.
@@ -167,6 +170,13 @@ const ENGINE_SETTINGS: [(&str, ReadSetting); 3] = [
             None => Err(format!("expected true or false, not {value}")),
         }
     }),
+    ("smooth-scroll", |value, settings| match value.as_bool() {
+        Some(enabled) => {
+            settings.smooth_scroll = enabled;
+            Ok(())
+        }
+        None => Err(format!("expected true or false, not {value}")),
+    }),
 ];
 
 /// A value of `[engines.<engine>.preferences]`, of that Servo preference's type.
@@ -197,6 +207,9 @@ pub struct EngineSettings {
     /// `experimental-features`: turn on the web-platform preferences Servo marks experimental.
     /// `false`, the default, is Servo's own default for that switch.
     pub experimental_features: bool,
+    /// `smooth-scroll`: play a wheel notch out as a run of smaller wheel events (Servo).
+    /// `false`, the default: a notch is one wheel event.
+    pub smooth_scroll: bool,
     /// `preferences`: Servo preference overrides by field name, applied after
     /// `experimental-features`. Empty when the file sets none.
     pub preferences: BTreeMap<String, ServoPrefValue>,
@@ -297,6 +310,8 @@ pub struct Config {
     colors: BTreeMap<String, String>,
     /// `[chrome.<name>]` of each chrome of the build that has one.
     chrome_settings: BTreeMap<String, Table>,
+    /// The interface: the experience's, with the layout tables applied.
+    interface: Interface,
     downloads: Option<PathBuf>,
     restore_session: bool,
     remember_history: bool,
@@ -730,6 +745,14 @@ impl Config {
     /// `[chrome.<chrome>]`, which `chrome`'s check accepted; `None` if the file has none.
     pub fn chrome_settings(&self, chrome: &str) -> Option<&Table> {
         self.chrome_settings.get(chrome)
+    }
+
+    /// The interface the frontends lay out: the experience's trees with `[chrome.standard]`
+    /// (while the standard chrome is chosen), `[ui.layout]` and `[tui.layout]` applied, which
+    /// pass `Interface::check` ([`crate::interface`]). The line chrome (`[ui] chrome = "line"`)
+    /// does not use the window's.
+    pub fn interface(&self) -> &Interface {
+        &self.interface
     }
 
     /// `[downloads] directory`: where downloads go, an absolute path (`~/` expanded with the
@@ -1176,8 +1199,12 @@ fn validate(
         }
     }
 
-    let ui = check_ui(raw.ui.unwrap_or_default(), env, &mut problems);
-    let tui = check_tui(raw.tui, &mut problems);
+    let mut ui_table = raw.ui.unwrap_or_default();
+    let ui_layout = layout_table(ui_table.remove("layout"), "[ui.layout]", &mut problems);
+    let mut tui_table = raw.tui;
+    let tui_layout = layout_table(tui_table.remove("layout"), "[tui.layout]", &mut problems);
+    let ui = check_ui(ui_table, env, &mut problems);
+    let tui = check_tui(tui_table, &mut problems);
     if from_user.set_default_keys {
         notices.push(
             "[tui] default-keys has no effect since 0.10: the terminal's default keys are the \
@@ -1201,6 +1228,16 @@ fn validate(
     let _ = read_keys(builtin_keys, &terminal, &mut problems);
     let user_tui_keys = read_keys(user_tui_keys, &terminal, &mut problems);
     let chrome_settings = check_chromes(raw.chrome, env, &mut problems, &mut notices);
+    let standard = chrome_settings
+        .get("standard")
+        .filter(|_| ui.chrome == "standard");
+    let interface = crate::interface::configure(
+        &env.interface,
+        standard,
+        ui_layout.as_ref(),
+        tui_layout.as_ref(),
+        &mut problems,
+    );
     let scroll_speed = raw.input.scroll_speed.unwrap_or(1.0);
     if !(0.1..=10.0).contains(&scroll_speed) {
         problems.push(format!(
@@ -1307,6 +1344,7 @@ fn validate(
         font_size: ui.font_size,
         colors: ui.colors,
         chrome_settings,
+        interface,
         downloads,
         restore_session: raw.session.restore.unwrap_or(true),
         remember_history: raw.history.remember.unwrap_or(true),
@@ -1504,7 +1542,7 @@ fn check_tui(table: toml::Table, problems: &mut Vec<String>) -> TuiConfig {
             )),
             other => problems.push(format!(
                 "[tui] {other}: unknown key ([tui] has mode, graphics, fps, input-fps, mouse, \
-                 default-keys and [tui.keys])"
+                 default-keys, [tui.keys] and [tui.layout])"
             )),
         }
     }
@@ -1816,6 +1854,21 @@ impl KeyTables {
     }
 }
 
+/// `[ui.layout]` or `[tui.layout]` (`section`), as settings, if the file has it.
+fn layout_table(
+    value: Option<toml::Value>,
+    section: &str,
+    problems: &mut Vec<String>,
+) -> Option<Table> {
+    match value? {
+        toml::Value::Table(table) => Some(settings(table, section, problems)),
+        other => {
+            problems.push(format!("{section}: expected a table, not {other}"));
+            None
+        }
+    }
+}
+
 /// `[chrome.<name>]` of each chrome of the build, checked by that chrome. A table for a chrome
 /// the build doesn't have gets a notice.
 fn check_chromes(
@@ -1988,8 +2041,8 @@ fn check_ui(ui: toml::Table, env: &Environment, problems: &mut Vec<String>) -> U
                 "[ui.keys]: key bindings are in [keys], [keys.page] and [keys.location] now".into(),
             ),
             other => problems.push(format!(
-                "[ui] {other}: unknown key ([ui] has chrome, renderer, font, font-size and \
-                 [ui.colors])"
+                "[ui] {other}: unknown key ([ui] has chrome, renderer, font, font-size, \
+                 [ui.colors] and [ui.layout])"
             )),
         }
     }
@@ -2092,6 +2145,7 @@ mod tests {
                     "user-agent",
                     "storage",
                     "experimental-features",
+                    "smooth-scroll",
                     "preferences",
                 ],
             ),
@@ -2103,6 +2157,7 @@ mod tests {
             home_dir: Some("/home/me".into()),
             keys: experience(),
             notices: Vec::new(),
+            interface: Interface::standard(),
             chromes: vec![STANDARD],
             color_names: &COLORS,
             renderers: RENDERERS,
@@ -2772,6 +2827,81 @@ mod tests {
         assert_eq!(problems.len(), expected.len(), "{problems:#?}");
     }
 
+    /// The layout tables change the experience's interface: `[chrome.standard]` while the
+    /// standard chrome is chosen (review 5: a `[chrome.line]` beside it changes nothing),
+    /// `[ui.layout]` after it, `[tui.layout]`; what the trees can't take is a problem, so a
+    /// reload keeps the configuration before it.
+    #[test]
+    fn the_layout_tables_change_the_interface() {
+        use sighurt_api::ui::{Component, Kind, Node, Side};
+        let leaf = |kind| Node::Leaf(Component::new(kind));
+        let mut left = Interface::standard();
+        left.window.position(Kind::TabBar, Side::Left);
+        let both = "version = 1\n[ui]\nchrome = \"standard\"\n[chrome.standard]\ntabs = \"left\"\n\
+                    [chrome.line]\nposition = \"bottom\"";
+        let env = Environment {
+            chromes: vec![
+                STANDARD_ACCEPTING,
+                ChromeChecks {
+                    name: "line",
+                    ..STANDARD_ACCEPTING
+                },
+            ],
+            ..env()
+        };
+        let parse = |user: &str| Config::parse(Some(user), &env);
+        assert_eq!(parse(both).unwrap().interface(), &left);
+        // Another chrome chosen: [chrome.standard] changes nothing.
+        let line = both.replace("chrome = \"standard\"", "chrome = \"line\"");
+        assert_eq!(parse(&line).unwrap().interface(), &Interface::standard());
+        let config = parse(
+            "version = 1\n[ui.layout]\ntabs = \"bottom\"\n[tui.layout]\nsummary = \"hidden\"",
+        )
+        .unwrap();
+        assert_eq!(
+            config.interface().window,
+            Node::Column(vec![
+                leaf(Kind::AddressBar),
+                leaf(Kind::PageView),
+                leaf(Kind::TabBar),
+                leaf(Kind::StatusBar),
+            ])
+        );
+        assert!(!config.interface().terminal.has(Kind::Summary));
+        let problems = parse("version = 1\n[ui.layout]\nbuttons = [\"back\", \"back\"]")
+            .unwrap_err()
+            .problems;
+        assert!(
+            problems[0].contains("the Back button twice"),
+            "{problems:?}"
+        );
+        let problems = parse("version = 1\n[ui.layout]\nline = \"top\"")
+            .unwrap_err()
+            .problems;
+        assert!(
+            problems[0].starts_with("[ui.layout] line: unknown key"),
+            "{problems:?}"
+        );
+        // The experience's interface is what the tables change.
+        let env = Environment {
+            interface: left.clone(),
+            ..env
+        };
+        assert_eq!(
+            Config::parse(Some("version = 1"), &env)
+                .unwrap()
+                .interface(),
+            &left
+        );
+    }
+
+    /// A standard chrome that takes any table, as the terminal's checks do.
+    const STANDARD_ACCEPTING: ChromeChecks = ChromeChecks {
+        name: "standard",
+        check: |_| Vec::new(),
+        commands: &[],
+    };
+
     #[test]
     fn unknown_color_names_are_errors() {
         let problems = problems(
@@ -3024,7 +3154,7 @@ mod tests {
             "[engines.servo] user-agent: expected 1 to 512 printable ASCII characters, not",
             "[engines.servo] storage: expected \"profile\" or \"ephemeral\", not \"kept\"",
             "[engines.servo] javascript: unknown key (an engine's settings are user-agent, \
-             storage, experimental-features, preferences)",
+             storage, experimental-features, smooth-scroll, preferences)",
             "[engines.wasm] user-agent: the wasm engine can't honor it (it honors: storage)",
             "[engines.demo] storage: the demo engine can't honor it (it honors: none)",
             "[engines.Servo]: \"Servo\" is not an engine name",
@@ -3087,6 +3217,7 @@ mod tests {
         .unwrap();
         let servo = config.engine_settings("servo");
         assert!(servo.experimental_features);
+        assert!(!servo.smooth_scroll);
         assert_eq!(
             servo.preferences.get("dom_adoptedstylesheet_enabled"),
             Some(&ServoPrefValue::Bool(true))
@@ -3114,7 +3245,21 @@ mod tests {
         // Left out, both stay at Servo's own default for the switch: off, and no overrides.
         let defaults = parse("version = 1").unwrap().engine_settings("servo");
         assert!(!defaults.experimental_features);
+        assert!(!defaults.smooth_scroll);
         assert!(defaults.preferences.is_empty());
+        // Smooth scrolling is its own switch, off unless the file turns it on.
+        let on = parse("version = 1\n[engines.servo]\nsmooth-scroll = true")
+            .unwrap()
+            .engine_settings("servo");
+        assert!(on.smooth_scroll && !on.experimental_features);
+        let off = parse("version = 1\n[engines.servo]\nsmooth-scroll = false")
+            .unwrap()
+            .engine_settings("servo");
+        assert_eq!(off, EngineSettings::default());
+        assert_eq!(
+            problems("version = 1\n[engines.servo]\nsmooth-scroll = \"yes\""),
+            ["[engines.servo] smooth-scroll: expected true or false, not \"yes\""]
+        );
         // `false` written out is the same settings the engines start from.
         let written = parse("version = 1\n[engines.servo]\nexperimental-features = false")
             .unwrap()
@@ -3183,6 +3328,8 @@ mod tests {
                 .map(|config| config.downloads().map(Path::to_owned))
         };
         assert_eq!(directory("~/Hämtade"), Ok(Some("/home/me/Hämtade".into())));
+        // A Unix path is absolute only on Unix.
+        #[cfg(unix)]
         assert_eq!(directory("/srv/in"), Ok(Some("/srv/in".into())));
         for bad in ["Downloads", "./x", "~", "~other/x", ""] {
             let problems = directory(bad).unwrap_err().problems;

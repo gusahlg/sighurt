@@ -1,4 +1,5 @@
-//! Seeded random-input tests for the API's parsers: commands, keystrokes and address patterns. They hold
+//! Seeded random-input tests for the API's parsers (commands, keystrokes and address patterns) and
+//! the interface's operations. They hold
 //! three things for any text: no panic, a return within the watchdog's limit, and a round
 //! trip (what parses formats to a string that parses to the same value).
 //! `SIG_FUZZ_ITERATIONS`, `SIG_FUZZ_SEED` and `SIG_FUZZ_CASE` are in `tools/fuzz/mod.rs`.
@@ -11,7 +12,8 @@ use std::time::Duration;
 use fuzz::{iterations, run, Rng};
 use sighurt_api::commands::{Command, CommandSet, SentKey, TabMove, MAX_FIND};
 use sighurt_api::input::{ButtonState, Key, KeyCode, KeyEvent, Modifiers};
-use sighurt_api::keymap::{Chord, UrlPattern};
+use sighurt_api::keymap::{Chord, Frontend, UrlPattern};
+use sighurt_api::ui::{Anchor, Button, Component, Kind, LabelText, Layer, Node, Show, Side, Size};
 
 const LIMIT: Duration = Duration::from_secs(2);
 
@@ -434,4 +436,97 @@ fn every_name_round_trips_with_arguments() {
 fn a_letter_whose_lower_case_is_two_characters_round_trips() {
     let chord: Chord = "İ".parse().unwrap();
     assert_eq!(chord.to_string().parse::<Chord>(), Ok(chord));
+}
+
+/// A random component of any kind.
+fn ui_component(rng: &mut Rng) -> Component {
+    let kind = *rng.pick(&Kind::ALL);
+    let mut component = Component::new(kind);
+    match &mut component {
+        Component::TabBar(tabs) => {
+            let fixed = Size::Fixed(rng.below(700) as u16);
+            tabs.size = *rng.pick(&[Size::Auto, fixed]);
+            tabs.new_tab = rng.one_in(2);
+        }
+        Component::AddressBar(bar) => {
+            let buttons = [Button::Back, Button::Forward, Button::Reload];
+            bar.buttons = (0..rng.below(5)).map(|_| *rng.pick(&buttons)).collect();
+        }
+        Component::Label(label) => {
+            label.text = LabelText::Fixed(rng.string(300));
+            label.size = Size::Fixed(rng.below(100) as u16);
+        }
+        _ => {}
+    }
+    component
+}
+
+/// A random tree, valid or not, `depth` levels at most.
+fn ui_tree(rng: &mut Rng, depth: usize) -> Node {
+    if depth == 0 || rng.one_in(3) {
+        return Node::Leaf(ui_component(rng));
+    }
+    let children = (0..rng.below(5)).map(|_| ui_tree(rng, depth - 1)).collect();
+    match rng.below(3) {
+        0 => Node::Column(children),
+        1 => Node::Row(children),
+        _ => Node::Overlay {
+            base: Box::new(ui_tree(rng, depth - 1)),
+            layers: (0..rng.below(4))
+                .map(|_| Layer::new(ui_component(rng), Anchor::BottomLeft, Show::WhenNeeded))
+                .collect(),
+        },
+    }
+}
+
+/// Sequences of operations never panic, whatever the tree they reach on the way; a change
+/// whose result fails the check leaves the tree as it was, and one that passes leaves a tree
+/// that passes. Checking any tree, valid or not, never panics.
+#[test]
+fn fuzz_interface_changes_are_whole() {
+    run("fuzz_interface", iterations(100), LIMIT, |case| {
+        let frontend = *case.rng.pick(&[Frontend::Gui, Frontend::Terminal]);
+        let mut tree = match frontend {
+            Frontend::Terminal => Node::terminal(),
+            Frontend::Gui => Node::standard(),
+        };
+        for _ in 0..case.rng.below(6) {
+            let before = tree.clone();
+            let mut operations = Vec::new();
+            for _ in 0..case.rng.range(1, 4) {
+                let component = ui_component(&mut case.rng);
+                let kind = *case.rng.pick(&Kind::ALL);
+                let side = *case
+                    .rng
+                    .pick(&[Side::Top, Side::Bottom, Side::Left, Side::Right]);
+                let anchor = *case.rng.pick(&[
+                    Anchor::BottomLeft,
+                    Anchor::BottomRight,
+                    Anchor::TopLeft,
+                    Anchor::TopRight,
+                ]);
+                let show = *case.rng.pick(&[Show::Always, Show::WhenNeeded]);
+                operations.push((case.rng.below(4), component, kind, side, anchor, show));
+            }
+            case.note(|| format!("{operations:?} on {before:?}"));
+            let result = tree.change(frontend, |t| {
+                for (operation, component, kind, side, anchor, show) in operations {
+                    match operation {
+                        0 => t.place(component, side),
+                        1 => t.remove(kind),
+                        2 => t.position(kind, side),
+                        _ => t.overlay(component, anchor, show),
+                    }
+                }
+            });
+            match result {
+                Ok(()) => assert_eq!(tree.check(frontend), Vec::<String>::new()),
+                Err(_) => assert_eq!(tree, before, "a refused change changed the tree"),
+            }
+        }
+        let random = ui_tree(&mut case.rng, 5);
+        case.note(|| format!("{random:?}"));
+        let _ = random.check(frontend);
+        let _ = random.chrome_surfaces();
+    });
 }

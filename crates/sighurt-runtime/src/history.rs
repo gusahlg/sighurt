@@ -971,6 +971,7 @@ fn write_jobs(path: &Path, shared: &Shared, wake: &dyn Fn()) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     const DAY: u64 = 24 * 60 * 60;
@@ -1062,6 +1063,7 @@ mod tests {
         let text = history.to_text();
         history.finish();
         assert_eq!(fs::read_to_string(file(dir.path())).unwrap(), text);
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(file(dir.path())).unwrap().permissions().mode() & 0o777,
             0o600

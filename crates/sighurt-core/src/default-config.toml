@@ -91,6 +91,10 @@ default = "servo"
 #     The flag turns the whole set on. It does not enable adopted stylesheets or web
 #     animations, and Servo has no preference for requestIdleCallback; set a preference on
 #     its own below.
+#   smooth-scroll: true plays each mouse wheel notch out over about 120 ms in Servo; pages
+#     then see several small wheel events per notch, as from a touchpad, instead of one. It
+#     costs some CPU while scrolling. false, the default, sends one wheel event per notch.
+#     servo honors it; like every [engines.<name>] setting it needs a restart.
 #   preferences: Servo preference names and values, applied after experimental-features, so one
 #     feature can be turned on or off on its own. A name is a field of Servo 0.7's Preferences.
 #     A value is a boolean, an integer or a string, of that field's type, or four numbers for
@@ -102,6 +106,7 @@ default = "servo"
 #   user-agent = "Mozilla/5.0 (X11; Linux x86_64) Sighurt"
 #   storage = "ephemeral"
 #   experimental-features = true
+#   smooth-scroll = true
 #
 #   [engines.servo.preferences]
 #   dom_adoptedstylesheet_enabled = true
@@ -461,6 +466,14 @@ enabled = true
 # The terminal's chrome commands, chrome.<action>, are chrome.toggle-mode (text or graphics),
 # chrome.text-mode, chrome.graphics-mode and chrome.refresh (draw the page again).
 #
+# [tui.layout] moves the terminal's two lines: summary = "top" (the default), "bottom" or
+# "hidden" (the line with the tab's place, title, address, engine and mode); line = "top" or
+# "bottom" (the default: the command line, with the address editor, notices and the status).
+# Two lines at the same end: the command line is the outer one.
+#
+#   [tui.layout]
+#   summary = "bottom"
+#
 #   [tui.keys]
 #   "m" = "chrome.toggle-mode"
 #   [tui.keys.page]
@@ -495,13 +508,29 @@ default-keys = true
 #   font = "DejaVu Sans"    # the chrome's text; one that isn't installed falls back
 #   font-size = 14          # 9 to 32 logical pixels; the chrome's heights follow it
 #
+# The standard chrome lays out the window's interface, a tree of components (the tabs, the
+# toolbar with the address line, the page, the status line) that the configuration compiled
+# into sig sets and these tables change, in this order: [chrome.standard], then [ui.layout].
+#
 # The standard chrome's options, in [chrome.standard], the default first: tabs = "top",
 # "left" (a list beside the page) or "hidden"; status = "strip" (below the page) or "overlay"
 # (over the page's bottom-left corner, only while there is something to say); buttons = true
 # or false (back, forward and reload before the address); compact = false or true (a lower tab
 # strip and toolbar); engine-label = true or false (the engine a page runs in, such as servo or
 # wpe, in small muted text in its tab and at the address bar's right end; sig: pages have
-# none). They apply as soon as they are loaded.
+# none). They apply as soon as they are loaded, and only while chrome = "standard".
+#
+# [ui.layout] says the same and more, after [chrome.standard], in this order whatever the
+# file's: address = "top" or "bottom" (the toolbar above or below the page); tabs = "top",
+# "bottom" (a strip), "left", "right" (a list beside the page) or "hidden"; status = "strip" or
+# "overlay"; buttons = true, false or a list of "back", "forward" and "reload", each once;
+# compact; engine-label. A layout the tree can't take is an error, and a fixed size never
+# takes the toolbar's or the status line's room.
+#
+#   [ui.layout]
+#   tabs = "right"
+#   address = "bottom"
+#   buttons = ["back", "reload"]
 #
 # A sig built with the chrome-line feature has line: the whole chrome is one line, showing the
 # tab's place ([2/5]), the keymap's mode, the address and the status; tabs are reached by keys

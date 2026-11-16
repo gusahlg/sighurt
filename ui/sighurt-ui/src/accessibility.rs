@@ -19,7 +19,6 @@ use sighurt_api::ids::TabId;
 
 use crate::chrome::{Model, Tone};
 use crate::hit_test::Target;
-use crate::layout::Tabs;
 
 /// A node's identity. It stays the same while the thing it names exists, so an assistive
 /// technology can follow a tab across tree updates.
@@ -154,9 +153,9 @@ impl Model {
         let state = self.state().clone();
         let mut nodes = Vec::new();
 
-        let tab_bounds = match layout.options.tabs {
-            Tabs::Left => layout.tab_list,
-            Tabs::Top | Tabs::Hidden => layout.tab_strip,
+        let tab_bounds = match layout.tabs_vertical {
+            true => layout.tab_list,
+            false => layout.tab_strip,
         };
         let mut tab_list = node(NodeId::TabList, Role::TabList, "Tabs", tab_bounds);
         for (tab, place) in snapshot.tabs.iter().zip(&layout.tabs) {
@@ -168,7 +167,8 @@ impl Model {
             );
             entry.states.selected = tab.active;
             entry.states.busy = tab.loading;
-            let engine = tab.engine_label().filter(|_| layout.options.engine_label);
+            let labelled = layout.tab_bar.is_some_and(|bar| bar.engine_label);
+            let engine = tab.engine_label().filter(|_| labelled);
             entry.description = engine.map(|engine| format!("Engine: {engine}"));
             if let Some(close) = place.close {
                 entry.children.push(NodeId::CloseTab(tab.id));
@@ -182,8 +182,8 @@ impl Model {
             tab_list.children.push(entry.id);
             nodes.push(entry);
         }
-        let tabs_shown = layout.options.tabs != Tabs::Hidden;
-        if tabs_shown {
+        let tabs_shown = layout.tab_bar.is_some();
+        if layout.tab_bar.is_some_and(|bar| bar.new_tab) {
             tab_list.children.push(NodeId::NewTab);
             nodes.push(node(
                 NodeId::NewTab,

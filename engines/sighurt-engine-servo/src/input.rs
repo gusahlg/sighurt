@@ -11,7 +11,8 @@
 //! Servo's composition events ([`Composition`]), never also key text. Smooth scrolling and
 //! wheel notches become wheel deltas in device pixels.
 //!
-//! Servo 0.7 has no smooth scrolling: a notch was one 60-pixel jump. [`SmoothScroll`] plays a
+//! Servo 0.7 has no smooth scrolling: a notch was one 60-pixel jump, which stays the default.
+//! With `[engines.servo] smooth-scroll = true`, [`SmoothScroll`] plays a
 //! notch out over [`SMOOTH_DURATION`] as a run of smaller pixel wheel events: one when the notch
 //! comes, then one after each frame the view presents (so the display's rate paces it), or after
 //! [`SMOOTH_FALLBACK`] without a frame (the runtime pumps at that deadline). Nothing steps when
@@ -63,23 +64,23 @@ const FRAME_GUESS: Duration = Duration::from_millis(16);
 const FRAME_MIN: Duration = Duration::from_millis(4);
 const FRAME_MAX: Duration = Duration::from_millis(33);
 
+/// The most cut-short runs [`SmoothScroll`] keeps owing their remainders.
+const MAX_OWED: usize = 4;
+
 /// Wheel notches played out as a run of smaller wheel events, one per frame of the view.
 #[derive(Debug)]
 pub(crate) struct SmoothScroll {
+    /// `[engines.servo] smooth-scroll`. Off, no run is ever made: [`Self::add`] is not called
+    /// (the view sends the notch as it is), so nothing steps and nothing is due.
+    enabled: bool,
     run: Option<Run>,
+    /// Motion a notch at another point cut short: what its run had not scrolled, still owed to
+    /// its own point. One event of it goes out before each step of `run`, at most
+    /// [`MAX_OWED`] of them (the oldest is dropped beyond that).
+    owed: Vec<((f64, f64), WebViewPoint)>,
     /// The view's latest frame, and the interval between its last two while a run lasted.
     last_frame: Option<Instant>,
     interval: Duration,
-}
-
-impl Default for SmoothScroll {
-    fn default() -> Self {
-        Self {
-            run: None,
-            last_frame: None,
-            interval: FRAME_GUESS,
-        }
-    }
 }
 
 /// One smooth scroll in flight. Deltas are Servo's device pixels with its wheel sign.
@@ -97,12 +98,41 @@ struct Run {
 }
 
 impl SmoothScroll {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            run: None,
+            owed: Vec::new(),
+            last_frame: None,
+            interval: FRAME_GUESS,
+        }
+    }
+
+    /// Whether wheel notches are played out ([`Self::add`]) or sent as they are.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Adds the notch `wheel` (a [`pointer`] wheel event) at `now`. What a run in flight has
     /// not scrolled yet joins the new one, which starts again from `now` and steps at the
-    /// view's next frame; a new run steps at once, so the page moves with the notch.
+    /// view's next frame; a new run steps at once, so the page moves with the notch. A notch
+    /// at another point than the run's does not take over its remainder: that is still owed to
+    /// the old point and goes out there, before the new run's next step.
     pub fn add(&mut self, wheel: &WheelEvent, now: Instant) -> Option<ServoInput> {
-        let previous = self.run.take();
-        let in_flight = previous.is_some();
+        let mut previous = self.run.take();
+        if let Some(run) = &previous {
+            if run.point != wheel.point {
+                let rest = (run.total.0 - run.sent.0, run.total.1 - run.sent.1);
+                if rest != (0.0, 0.0) {
+                    if self.owed.len() == MAX_OWED {
+                        self.owed.remove(0);
+                    }
+                    self.owed.push((rest, run.point));
+                }
+                previous = None;
+            }
+        }
+        let in_flight = previous.is_some() || !self.owed.is_empty();
         let (x, y, stepped) = previous.map_or((0.0, 0.0, now), |run| {
             (
                 run.total.0 - run.sent.0,
@@ -126,7 +156,13 @@ impl SmoothScroll {
 
     /// The view presented a frame at `now`: the run's next event, which the next frame shows.
     pub fn frame(&mut self, now: Instant) -> Option<ServoInput> {
-        if let (Some(_), Some(last)) = (&self.run, self.last_frame) {
+        // Only the gap between two frames of the run says how long a frame is: one that began
+        // before the run (an idle view's last frame) would shorten the look-ahead at once.
+        if let (Some(run), Some(last)) = (&self.run, self.last_frame) {
+            if last < run.start {
+                self.last_frame = Some(now);
+                return self.step(now);
+            }
             let gap = now.saturating_duration_since(last);
             if gap <= FRAME_MAX * 2 {
                 self.interval = gap.clamp(FRAME_MIN, FRAME_MAX);
@@ -153,6 +189,11 @@ impl SmoothScroll {
     /// will be shown in. The last sends what is left and ends the run.
     fn step(&mut self, now: Instant) -> Option<ServoInput> {
         let run = self.run.as_mut()?;
+        if !self.owed.is_empty() {
+            let (delta, point) = self.owed.remove(0);
+            run.stepped = now;
+            return Some(wheel(delta, point));
+        }
         let elapsed = (now + self.interval).saturating_duration_since(run.start);
         let t = elapsed.as_secs_f64() / SMOOTH_DURATION.as_secs_f64();
         let target = if t >= 1.0 {
@@ -162,6 +203,19 @@ impl SmoothScroll {
             let p = 1.0 - (1.0 - t).powi(3);
             ((run.total.0 * p).round(), (run.total.1 * p).round())
         };
+        // The look-ahead is the interval between frames, which can shorten between two steps and
+        // put the curve behind what was sent: never step back, hold instead.
+        let ahead = |target: f64, sent: f64, total: f64| {
+            if total >= 0.0 {
+                target.max(sent)
+            } else {
+                target.min(sent)
+            }
+        };
+        let target = (
+            ahead(target.0, run.sent.0, run.total.0),
+            ahead(target.1, run.sent.1, run.total.1),
+        );
         let delta = (target.0 - run.sent.0, target.1 - run.sent.1);
         run.sent = target;
         run.stepped = now;
@@ -172,11 +226,25 @@ impl SmoothScroll {
         (delta != (0.0, 0.0)).then(|| wheel(delta, point))
     }
 
-    /// What the run in flight has not scrolled yet, as one event, ending it.
+    /// What the run in flight has not scrolled yet, as one event, ending it; then, one call
+    /// each, what cut-short runs still owe their points. Call until it returns `None`.
     pub fn finish(&mut self) -> Option<ServoInput> {
-        let run = self.run.take()?;
-        let delta = (run.total.0 - run.sent.0, run.total.1 - run.sent.1);
-        (delta != (0.0, 0.0)).then(|| wheel(delta, run.point))
+        if let Some(run) = self.run.take() {
+            let delta = (run.total.0 - run.sent.0, run.total.1 - run.sent.1);
+            if delta != (0.0, 0.0) {
+                return Some(wheel(delta, run.point));
+            }
+        }
+        (!self.owed.is_empty()).then(|| {
+            let (delta, point) = self.owed.remove(0);
+            wheel(delta, point)
+        })
+    }
+
+    /// Drops the run and what it owes: the document they were meant for is gone.
+    pub fn clear(&mut self) {
+        self.run = None;
+        self.owed.clear();
     }
 }
 
@@ -727,7 +795,7 @@ mod tests {
 
     #[test]
     fn a_notch_plays_out_over_frames_and_scrolls_exactly_its_delta() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let start = Instant::now();
         let first = dy(scroll.add(&notch(-75.0), start));
         assert!(
@@ -745,7 +813,7 @@ mod tests {
 
     #[test]
     fn a_faster_display_gets_more_steps() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let start = Instant::now();
         let first = dy(scroll.add(&notch(-60.0), start));
         let (rest, frames) = play(&mut scroll, start, Duration::from_micros(8_333));
@@ -755,7 +823,7 @@ mod tests {
 
     #[test]
     fn without_frames_the_run_steps_at_its_fallback() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let start = Instant::now();
         let mut sent = dy(scroll.add(&notch(-60.0), start));
         assert!(scroll.fallback(start + Duration::from_millis(1)).is_none());
@@ -771,7 +839,7 @@ mod tests {
 
     #[test]
     fn a_notch_during_a_run_adds_what_is_left_and_waits_for_a_frame() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let start = Instant::now();
         let frame = Duration::from_micros(16_667);
         let mut sent = dy(scroll.add(&notch(-60.0), start));
@@ -783,11 +851,135 @@ mod tests {
 
     #[test]
     fn finishing_sends_the_rest_at_once() {
-        let mut scroll = SmoothScroll::default();
+        let mut scroll = SmoothScroll::new(true);
         let first = dy(scroll.add(&notch(60.0), Instant::now()));
         assert_eq!(first + dy(scroll.finish()), 60.0);
         assert!(scroll.deadline().is_none());
         assert!(scroll.finish().is_none());
+    }
+
+    fn notch_at(y: f64, point: WebViewPoint) -> WheelEvent {
+        WheelEvent::new(
+            WheelDelta {
+                x: 0.0,
+                y,
+                z: 0.0,
+                mode: WheelMode::DeltaPixel,
+            },
+            point,
+        )
+    }
+
+    fn event(input: Option<ServoInput>) -> WheelEvent {
+        match input.unwrap() {
+            ServoInput::Wheel(event) => event,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn at(x: f32, y: f32) -> WebViewPoint {
+        WebViewPoint::Device(DevicePoint::new(x, y))
+    }
+
+    #[test]
+    fn astra_review_smooth_scroll_never_reverses_a_single_notch() {
+        let mut scroll = SmoothScroll::new(true);
+        let t = Instant::now();
+        assert!(scroll.frame(t).is_none());
+        let first = event(scroll.add(&notch_at(-60.0, at(5.0, 6.0)), t + Duration::from_millis(1)));
+        assert!(first.delta.y < 0.0);
+        let next = event(scroll.frame(t + Duration::from_millis(2)));
+        assert!(
+            next.delta.y <= 0.0,
+            "one downward notch reversed by {} pixels",
+            next.delta.y
+        );
+    }
+
+    #[test]
+    fn astra_review_smooth_scroll_does_not_move_old_delta_to_a_new_target() {
+        let mut scroll = SmoothScroll::new(true);
+        let t = Instant::now();
+        let a = at(5.0, 6.0);
+        let b = at(500.0, 600.0);
+        let first = event(scroll.add(&notch_at(-60.0, a), t));
+        assert_eq!(first.point, a);
+        assert!(scroll
+            .add(&notch_at(-60.0, b), t + Duration::from_millis(10))
+            .is_none());
+        let rest = event(scroll.finish());
+        assert_eq!(rest.point, b);
+        assert!(
+            rest.delta.y >= -60.0,
+            "new target received {} pixels from a 60-pixel notch",
+            rest.delta.y
+        );
+    }
+
+    #[test]
+    fn a_cut_short_run_finishes_at_its_own_point_before_the_new_one_steps() {
+        let mut scroll = SmoothScroll::new(true);
+        let t = Instant::now();
+        let (a, b) = (at(5.0, 6.0), at(500.0, 600.0));
+        let first = event(scroll.add(&notch_at(-60.0, a), t));
+        assert!(scroll
+            .add(&notch_at(-60.0, b), t + Duration::from_millis(10))
+            .is_none());
+        let frame = Duration::from_micros(16_667);
+        let owed = event(scroll.frame(t + frame));
+        assert_eq!(owed.point, a);
+        assert_eq!(first.delta.y + owed.delta.y, -60.0);
+        let mut sent_b = 0.0;
+        let mut now = t + frame;
+        while scroll.deadline().is_some() {
+            now += frame;
+            // A step that rounds to nothing sends nothing.
+            if let Some(ServoInput::Wheel(step)) = scroll.frame(now) {
+                assert_eq!(step.point, b);
+                sent_b += step.delta.y;
+            }
+            assert!(now < t + Duration::from_secs(1), "a run ends");
+        }
+        assert_eq!(sent_b, -60.0);
+        // The same, drained by finish: each point gets exactly its notch.
+        let mut scroll = SmoothScroll::new(true);
+        let first = event(scroll.add(&notch_at(-60.0, a), t));
+        scroll.add(&notch_at(-60.0, b), t);
+        let (mut on_a, mut on_b) = (first.delta.y, 0.0);
+        while let Some(ServoInput::Wheel(w)) = scroll.finish() {
+            if w.point == a {
+                on_a += w.delta.y;
+            } else {
+                on_b += w.delta.y;
+            }
+        }
+        assert_eq!((on_a, on_b), (-60.0, -60.0));
+    }
+
+    #[test]
+    fn clearing_drops_a_run_and_what_it_owes() {
+        let mut scroll = SmoothScroll::new(true);
+        let t = Instant::now();
+        scroll.add(&notch_at(-60.0, at(1.0, 1.0)), t);
+        scroll.add(&notch_at(-60.0, at(2.0, 2.0)), t);
+        scroll.clear();
+        assert!(scroll.deadline().is_none());
+        assert!(scroll.frame(t + Duration::from_secs(1)).is_none());
+        assert!(scroll.finish().is_none());
+    }
+
+    #[test]
+    fn with_smooth_scrolling_off_nothing_is_ever_due() {
+        let mut scroll = SmoothScroll::new(false);
+        assert!(!scroll.enabled());
+        assert!(SmoothScroll::new(true).enabled());
+        // The view never calls `add` while it is off, so no run exists to step.
+        let now = Instant::now();
+        assert!(scroll.deadline().is_none());
+        assert!(scroll.frame(now).is_none());
+        assert!(scroll.fallback(now + Duration::from_secs(1)).is_none());
+        assert!(scroll.finish().is_none());
+        assert!(scroll.deadline().is_none());
     }
 
     fn key_event(code: u32, key: Key, state: ButtonState, modifiers: Modifiers) -> KeyEvent {

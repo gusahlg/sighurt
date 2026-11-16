@@ -21,6 +21,8 @@
 //!   default) sends it as a plain Escape, so F12, which every terminal sends, is the key there.
 //! - Three actions computed from the browser: `y y` copies the page's address, `y f` the link
 //!   under the pointer, `c o` closes the other tabs.
+//! - **The interface** is the standard one: tabs at the top, the toolbar, the page and the status
+//!   strip in the window; the summary line, the page and the command line in the terminal.
 //!
 //! Must not own: anything but this experience's data and its three functions, which read only
 //! the `Browser` they are given.
@@ -136,6 +138,18 @@ pub fn experience() -> Experience {
             .bind("ctrl-escape", "input.mode normal")
             .bind("f12", "input.mode normal");
     }
+
+    // The interface: in the window, the tabs at the top, the toolbar with back, forward and
+    // reload, the page, the status strip; in the terminal, the summary line, the page and the
+    // command line.
+    let ui = &mut sig.ui;
+    ui.address
+        .position(Side::Top)
+        .buttons(&[Button::Back, Button::Forward, Button::Reload]);
+    ui.tabs.position(Side::Top);
+    ui.status.strip();
+    ui.terminal.summary.position(Side::Top);
+    ui.terminal.line.position(Side::Bottom);
     sig
 }
 

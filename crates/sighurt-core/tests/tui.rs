@@ -376,7 +376,7 @@ fn the_tui_table_parses_and_reports_every_invalid_value() {
         "[tui] mouse: expected true or false, not \"yes\"",
         "[tui] default-keys: expected true or false, not 1",
         "[tui] keys: expected a [tui.keys] table, not \"nope\"",
-        "[tui] extra: unknown key ([tui] has mode, graphics, fps, input-fps, mouse, default-keys and [tui.keys])",
+        "[tui] extra: unknown key ([tui] has mode, graphics, fps, input-fps, mouse, default-keys, [tui.keys] and [tui.layout])",
     ];
     assert_eq!(found.len(), expected.len(), "{found:#?}");
     for part in expected {

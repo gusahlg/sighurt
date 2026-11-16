@@ -84,6 +84,7 @@ use sighurt_api::services::{
     ServiceRequest, ServiceResult,
 };
 use sighurt_api::settings::Table;
+use sighurt_api::ui::Interface;
 use url::Url;
 
 use crate::config::{Config, ConfigError, EngineSettings, Storage};
@@ -132,6 +133,10 @@ pub struct Environment {
     /// What `sig` has to say about the build at the start and with every configuration it
     /// loads, such as an experience it could not use. One line each.
     pub notices: Vec<String>,
+    /// The experience's interface: the window's and the terminal's trees, which `sig`
+    /// checked whole (`Interface::check`) and which `[chrome.standard]`, `[ui.layout]` and
+    /// `[tui.layout]` are applied over. The standard one when left out.
+    pub interface: Interface,
     /// The build's chromes, as the core checks them.
     pub chromes: Vec<ChromeChecks>,
     /// The color names `[ui.colors]` takes: the chrome's (`sighurt_ui::Colors::NAMES`).
