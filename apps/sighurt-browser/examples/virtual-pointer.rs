@@ -5,10 +5,11 @@
 //!
 //! ```text
 //! move X Y W H   move to (X, Y) of a W×H logical layout (the output's logical size)
-//! click [BUTTON] press and release BUTTON: left (the default), side or extra (the mouse's
-//!                back and forward buttons)
+//! click [BUTTON] press and release BUTTON: left (the default), middle, side or extra (the
+//!                mouse's back and forward buttons)
 //! press          press the left button and hold it
 //! release        release it
+//! scroll N       turn the wheel N notches (negative up, positive down)
 //! ```
 //!
 //! wlrctl creates a new virtual pointer for each command and removes it right after, so the
@@ -22,11 +23,12 @@ use std::time::Instant;
 use smithay_client_toolkit::reexports::protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 use smithay_client_toolkit::reexports::protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::wl_pointer::ButtonState;
+use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 
 const BTN_LEFT: u32 = 0x110;
+const BTN_MIDDLE: u32 = 0x112;
 const BTN_SIDE: u32 = 0x113;
 const BTN_EXTRA: u32 = 0x114;
 
@@ -73,6 +75,7 @@ fn main() -> Result<(), String> {
             ["click", button @ ..] if button.len() <= 1 => {
                 let button = match button {
                     [] | ["left"] => BTN_LEFT,
+                    ["middle"] => BTN_MIDDLE,
                     ["side"] => BTN_SIDE,
                     ["extra"] => BTN_EXTRA,
                     _ => {
@@ -91,6 +94,20 @@ fn main() -> Result<(), String> {
             }
             ["release"] => {
                 pointer.button(time(), BTN_LEFT, ButtonState::Released);
+                pointer.frame();
+            }
+            ["scroll", notches] => {
+                let Ok(notches) = notches.parse::<i32>() else {
+                    eprintln!("virtual-pointer: not a number in {line:?}");
+                    continue;
+                };
+                pointer.axis_source(AxisSource::Wheel);
+                pointer.axis_discrete(
+                    time(),
+                    Axis::VerticalScroll,
+                    15.0 * f64::from(notches),
+                    notches,
+                );
                 pointer.frame();
             }
             _ => eprintln!("virtual-pointer: unknown command {line:?}"),

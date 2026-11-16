@@ -7,13 +7,22 @@
 //! monospace face lays out cell by cell. A wide character is drawn alone at its cell, and so is
 //! every character when no monospace face was found, so columns stay true. Underlines are thin
 //! fills; inverse swaps the colours; dim mixes the colour halfway to the background; bold and
-//! italic pick the face. The cursor is a block in the text's colour with its character drawn
-//! over it in the background's.
+//! italic pick the face. Selected cells are drawn inverse. The cursor is a block in the text's
+//! colour with its character drawn over it in the background's, or the underline or bar the
+//! program asked for; it is not drawn while the view is back in the history, which a tag in the
+//! top right corner says instead.
+//!
+//! Layers, bottom up: backgrounds, images below the text (a negative z-index), text and
+//! underlines, the other images, the cursor. An image is drawn whole at a size and place that
+//! put the part shown where it belongs, clipped to that part and to the page.
 //!
 //! Owns: turning a screen into operations, and the colours. Must not own: the canvas calls
 //! (`crate::page`) or the screen (`crate::term`).
 
 use vt100::Color;
+
+use crate::graphics::Graphics;
+use crate::term::CursorShape;
 
 pub type Rgb = [u8; 3];
 
@@ -63,6 +72,28 @@ pub enum Op {
         bold: bool,
         italic: bool,
     },
+    /// Image `image` ([`Graphics::png`]) drawn into `rect` (x, y, width, height), only where it
+    /// is inside `clip`.
+    Image {
+        image: u64,
+        rect: [f32; 4],
+        clip: [f32; 4],
+    },
+}
+
+/// What is drawn with a screen besides its cells.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Overlay {
+    /// Selected cells: from (row, column) to (row, column), the end excluded; rows of the page,
+    /// perhaps outside it.
+    pub selection: Option<((i64, u16), (i64, u16))>,
+    /// The cursor's shape, `None` for no cursor.
+    pub cursor: Option<CursorShape>,
+    /// Images below the text, and above it.
+    pub below: Vec<Op>,
+    pub above: Vec<Op>,
+    /// Lines back in the history, and its length, when the view is not live.
+    pub scrolled_back: Option<(usize, usize)>,
 }
 
 /// The size of a cell and of the font in it.
@@ -117,12 +148,12 @@ struct Look {
     underline: bool,
 }
 
-fn look(cell: &vt100::Cell) -> Look {
+fn look(cell: &vt100::Cell, selected: bool) -> Look {
     let (mut fg, mut bg) = (
         rgb(cell.fgcolor(), FOREGROUND),
         rgb(cell.bgcolor(), BACKGROUND),
     );
-    if cell.inverse() {
+    if cell.inverse() != selected {
         std::mem::swap(&mut fg, &mut bg);
     }
     if cell.dim() {
@@ -137,14 +168,89 @@ fn look(cell: &vt100::Cell) -> Look {
     }
 }
 
-/// The operations that draw `screen`, after a clear to [`BACKGROUND`].
-pub fn screen(screen: &vt100::Screen, m: Metrics) -> Vec<Op> {
+/// The images of `graphics` on the page, whose first row is line `top` of `screen`'s content:
+/// those below the text and those above it.
+pub fn images(
+    graphics: &Graphics,
+    top: i64,
+    screen: &vt100::Screen,
+    m: Metrics,
+) -> (Vec<Op>, Vec<Op>) {
     let (rows, cols) = screen.size();
+    let alt = screen.alternate_screen();
+    let page = [
+        0.0,
+        0.0,
+        f32::from(cols) * m.cell_w,
+        f32::from(rows) * m.cell_h,
+    ];
+    let (mut below, mut above) = (Vec::new(), Vec::new());
+    for p in graphics.placements() {
+        let row = p.line - top;
+        let on_page = row < i64::from(rows) && row + i64::from(p.rows) > 0;
+        let (Some((width, height)), true) = (graphics.size(p.image), p.alt == alt && on_page)
+        else {
+            continue;
+        };
+        if graphics.png(p.image).is_none() {
+            continue;
+        }
+        let [sx, sy, sw, sh] = p.source.map(|v| v as f32);
+        let (w, h) = p.size.unwrap_or((sw, sh));
+        let x = f32::from(p.col) * m.cell_w + p.offset.0;
+        let y = row as f32 * m.cell_h + p.offset.1;
+        let (scale_x, scale_y) = (w / sw.max(1.0), h / sh.max(1.0));
+        let rect = [
+            x - sx * scale_x,
+            y - sy * scale_y,
+            width as f32 * scale_x,
+            height as f32 * scale_y,
+        ];
+        let clip = intersect([x, y, w, h], page);
+        if clip[2] <= 0.0 || clip[3] <= 0.0 {
+            continue;
+        }
+        let op = Op::Image {
+            image: p.image,
+            rect,
+            clip,
+        };
+        if p.z < 0 {
+            below.push(op);
+        } else {
+            above.push(op);
+        }
+    }
+    (below, above)
+}
+
+fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let x = a[0].max(b[0]);
+    let y = a[1].max(b[1]);
+    let right = (a[0] + a[2]).min(b[0] + b[2]);
+    let bottom = (a[1] + a[3]).min(b[1] + b[3]);
+    [x, y, (right - x).max(0.0), (bottom - y).max(0.0)]
+}
+
+/// The operations that draw `screen` with `overlay`, after a clear to [`BACKGROUND`].
+pub fn screen(screen: &vt100::Screen, m: Metrics, overlay: &Overlay) -> Vec<Op> {
+    let (rows, cols) = screen.size();
+    let mut back = Vec::new();
     let mut ops = Vec::new();
+    let selected = |row: u16, col: u16| {
+        overlay.selection.is_some_and(|(start, end)| {
+            let at = (i64::from(row), col);
+            start <= at && at < end
+        })
+    };
     for row in 0..rows {
         let y = f32::from(row) * m.cell_h;
         let cells: Vec<_> = (0..cols)
-            .map(|col| screen.cell(row, col).map(|cell| (cell, look(cell))))
+            .map(|col| {
+                screen
+                    .cell(row, col)
+                    .map(|cell| (cell, look(cell, selected(row, col))))
+            })
             .collect();
 
         // Backgrounds and underlines: runs of equal colour.
@@ -158,7 +264,7 @@ pub fn screen(screen: &vt100::Screen, m: Metrics) -> Vec<Op> {
                 |c: &Option<(&vt100::Cell, Look)>| c.is_some_and(|(_, l)| l.bg == first.bg);
             let end = col + cells[col..].iter().take_while(|c| same_bg(c)).count();
             if first.bg != BACKGROUND {
-                ops.push(fill(m, col, end, y, m.cell_h, first.bg));
+                back.push(fill(m, col, end, y, m.cell_h, first.bg));
             }
             col = end.max(col + 1);
         }
@@ -226,19 +332,59 @@ pub fn screen(screen: &vt100::Screen, m: Metrics) -> Vec<Op> {
         flush(&mut run, &mut ops);
     }
 
-    if !screen.hide_cursor() {
+    let mut all = back;
+    all.extend(overlay.below.iter().cloned());
+    all.append(&mut ops);
+    all.extend(overlay.above.iter().cloned());
+    let mut ops = all;
+
+    if let Some(shape) = overlay.cursor.filter(|_| !screen.hide_cursor()) {
         let (row, col) = screen.cursor_position();
         if let Some(cell) = screen.cell(row, col) {
-            let look = look(cell);
+            let look = look(cell, selected(row, col));
             let width = if cell.is_wide() { 2 } else { 1 };
             let col = usize::from(col);
             let y = f32::from(row) * m.cell_h;
-            ops.push(fill(m, col, col + width, y, m.cell_h, look.fg));
-            let contents = cell.contents();
-            if !contents.is_empty() && contents != " " {
-                ops.push(text_op(m, col, y, contents.to_string(), look.bg, look));
+            let thickness = (m.size / 7.5).max(1.0).round();
+            match shape {
+                CursorShape::Block => {
+                    ops.push(fill(m, col, col + width, y, m.cell_h, look.fg));
+                    let contents = cell.contents();
+                    if !contents.is_empty() && contents != " " {
+                        ops.push(text_op(m, col, y, contents.to_string(), look.bg, look));
+                    }
+                }
+                CursorShape::Underline => ops.push(fill(
+                    m,
+                    col,
+                    col + width,
+                    y + m.cell_h - thickness,
+                    thickness,
+                    look.fg,
+                )),
+                CursorShape::Bar => ops.push(Op::Fill {
+                    x: col as f32 * m.cell_w,
+                    y,
+                    w: thickness,
+                    h: m.cell_h,
+                    color: look.fg,
+                }),
             }
         }
+    }
+    if let Some((back, held)) = overlay.scrolled_back {
+        let tag = format!(" {back}/{held} ");
+        let width = tag.chars().count();
+        let col = usize::from(cols).saturating_sub(width);
+        ops.push(fill(m, col, col + width, 0.0, m.cell_h, ACCENT));
+        let look = Look {
+            fg: BACKGROUND,
+            bg: ACCENT,
+            bold: true,
+            italic: false,
+            underline: false,
+        };
+        ops.push(text_op(m, col, 0.0, tag, BACKGROUND, look));
     }
     ops
 }
@@ -370,11 +516,20 @@ mod tests {
         monospace: true,
     };
 
+    /// No selection, a block cursor, no images.
+    const CURSOR: Overlay = Overlay {
+        selection: None,
+        cursor: Some(CursorShape::Block),
+        below: Vec::new(),
+        above: Vec::new(),
+        scrolled_back: None,
+    };
+
     fn texts(ops: &[Op]) -> Vec<(f32, f32, &str)> {
         ops.iter()
             .filter_map(|op| match op {
                 Op::Text { x, y, text, .. } => Some((*x, *y, text.as_str())),
-                Op::Fill { .. } => None,
+                _ => None,
             })
             .collect()
     }
@@ -395,7 +550,7 @@ mod tests {
     fn rows_are_drawn_in_runs() {
         let mut term = Term::new(3, 20);
         term.feed(b"\x1b[?25lab cd  \x1b[31mred\x1b[0m e\r\n\x1b[44m  blue \x1b[0m");
-        let ops = screen(term.screen(), M);
+        let ops = screen(term.screen(), M, &CURSOR);
         // "ab cd" is one run, spaces and all; the red run starts where it starts.
         assert_eq!(
             texts(&ops),
@@ -426,7 +581,7 @@ mod tests {
     fn wide_and_non_ascii_characters_stand_alone() {
         let mut term = Term::new(2, 10);
         term.feed("\x1b[?25la日b é".as_bytes());
-        let ops = screen(term.screen(), M);
+        let ops = screen(term.screen(), M, &CURSOR);
         assert_eq!(
             texts(&ops),
             [
@@ -444,7 +599,7 @@ mod tests {
         let mut term = Term::new(1, 10);
         term.feed(b"\x1b[?25lab");
         assert_eq!(
-            texts(&screen(term.screen(), proportional)),
+            texts(&screen(term.screen(), proportional, &CURSOR)),
             [(0.0, 0.0, "a"), (6.0, 0.0, "b")]
         );
     }
@@ -453,7 +608,7 @@ mod tests {
     fn attributes() {
         let mut term = Term::new(1, 10);
         term.feed(b"\x1b[?25l\x1b[1ma\x1b[0;3mb\x1b[0;4mc\x1b[0;7md\x1b[0;2me");
-        let ops = screen(term.screen(), M);
+        let ops = screen(term.screen(), M, &CURSOR);
         let text = |i: usize| {
             ops.iter()
                 .filter(|op| matches!(op, Op::Text { .. }))
@@ -496,7 +651,7 @@ mod tests {
     fn the_cursor_is_a_block_with_its_character_over_it() {
         let mut term = Term::new(2, 10);
         term.feed(b"ab\x1b[1;2H");
-        let ops = screen(term.screen(), M);
+        let ops = screen(term.screen(), M, &CURSOR);
         let n = ops.len();
         assert_eq!(
             ops[n - 2],
@@ -512,7 +667,7 @@ mod tests {
             matches!(&ops[n - 1], Op::Text { text, color, .. } if text == "b" && *color == BACKGROUND)
         );
         term.feed(b"\x1b[?25l");
-        assert!(!screen(term.screen(), M)
+        assert!(!screen(term.screen(), M, &CURSOR)
             .iter()
             .any(|op| matches!(op, Op::Fill { .. })));
     }

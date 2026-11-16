@@ -3224,6 +3224,17 @@ impl BrowserState {
         self.page_pointer(view, event, at, fx);
     }
 
+    /// Whether `view` is an internal page whose grants start a program.
+    fn runs_program(&self, view: ViewId) -> bool {
+        let page = self.views.get(&view).and_then(|v| v.page.as_deref());
+        page.and_then(|name| self.env.pages.get(name))
+            .is_some_and(|grants| {
+                grants
+                    .iter()
+                    .any(|g| matches!(g, PageGrant::Shell | PageGrant::Editor))
+            })
+    }
+
     /// An action on a node of the shown page's content, chosen in `document`'s snapshot: one the
     /// user's input caused is their activation, as a press in the page is
     /// ([`Self::page_pointer`]), and gives the page the keyboard.
@@ -3283,10 +3294,20 @@ impl BrowserState {
 
     /// Pointer input for `view`'s page, if it is the one shown: a press there is the user's
     /// activation and gives the page the keyboard; scrolling goes `[input] scroll-speed` times
-    /// as far.
+    /// as far. While the page's input is held, a page that runs a program (`sig://terminal`,
+    /// `sig://config`) gets no motion and no wheel, which its emulator would turn into the
+    /// program's input (mouse reports, arrow keys); a press is the user taking the page, as for
+    /// any page.
     fn page_pointer(&mut self, view: ViewId, mut event: InputEvent, at: Instant, fx: &mut Fx) {
         // A target that is no longer shown gets nothing more.
         if self.shown_view() != Some(view) {
+            return;
+        }
+        let moved = matches!(
+            event.kind,
+            InputKind::Pointer(PointerEvent::Motion { .. } | PointerEvent::Scroll { .. })
+        );
+        if moved && self.input_held() && self.runs_program(view) {
             return;
         }
         match &mut event.kind {

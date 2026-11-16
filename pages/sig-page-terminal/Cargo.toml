@@ -18,3 +18,7 @@ sig-page-kit = { path = "../sig-page-kit" }
 # The terminal emulator (parser and screen), pure Rust, MIT. It reads the program's output, which
 # is untrusted, inside the sandbox.
 vt100 = "0.16"
+
+[dev-dependencies]
+# Decodes the PNGs `png.rs` writes, so its tests compare pixels exactly.
+png = "0.17"

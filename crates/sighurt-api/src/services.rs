@@ -248,7 +248,8 @@ pub enum PageGrant {
     Shell,
     /// [`PageRequest::PtyOpen`] of [`PtyProgram::EditConfig`], and [`PageInfo::Editor`].
     Editor,
-    /// [`Service::ClipboardWrite`], under its usual rule (a click or key press in the page).
+    /// [`Service::ClipboardWrite`] and [`Service::ClipboardRead`], under their usual rules (a
+    /// click or key press in the page, which a read uses up).
     Clipboard,
 }
 

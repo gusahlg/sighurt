@@ -1622,3 +1622,70 @@ fn a_sequence_belongs_to_the_tab_and_address_it_began_on() {
     tap(&mut h, seat, (44, "z"));
     assert_eq!(h.state.tabs().len(), 1);
 }
+
+/// A pointer event at the top left of `view`'s page.
+fn pointer_on(h: &mut Harness, view: ViewId, kind: PointerEvent) -> bool {
+    let at = h.now;
+    let event = InputEvent {
+        seat: SeatId::next(),
+        kind: InputKind::Pointer(kind),
+    };
+    let effects = h.apply(BrowserEvent::Pointer { view, event, at });
+    effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::Engine {
+                view: v,
+                command: EngineCommand::Input(InputEvent {
+                    kind: InputKind::Pointer(_),
+                    ..
+                }),
+            } if *v == view
+        )
+    })
+}
+
+#[test]
+fn a_held_terminal_page_gets_no_wheel_or_motion_until_a_click() {
+    use sighurt_api::input::ScrollDelta;
+    let wheel = || PointerEvent::Scroll {
+        delta: ScrollDelta::Wheel { x: 0, y: 120 },
+        position: Default::default(),
+        modifiers: Modifiers::default(),
+    };
+    let motion = || PointerEvent::Motion {
+        position: Default::default(),
+        modifiers: Modifiers::default(),
+    };
+    for page in ["sig://terminal", "sig://config"] {
+        let config = "[pages.terminal]\nenabled = true";
+        let mut h = Harness::start(config, &[page]);
+        let terminal = h.shown();
+        h.apply(BrowserEvent::Focus(KeyboardFocus::Page));
+        // Not held: the wheel and motion reach a page that runs a program.
+        assert!(pointer_on(&mut h, terminal, wheel()), "{page}");
+        // A tab the page opened closes itself: the page comes to the front by itself.
+        let (opener, popup) = popup_in_front(&mut h);
+        assert_eq!(opener, terminal);
+        popup_closes(&mut h, popup);
+        assert_eq!(h.shown(), terminal);
+        assert!(
+            !pointer_on(&mut h, terminal, wheel()),
+            "{page}: the wheel while held"
+        );
+        assert!(
+            !pointer_on(&mut h, terminal, motion()),
+            "{page}: motion while held"
+        );
+        // A click is the user taking it, and then the wheel is the page's again.
+        assert!(!h.click(terminal).is_empty());
+        assert!(pointer_on(&mut h, terminal, wheel()), "{page}");
+        assert!(pointer_on(&mut h, terminal, motion()), "{page}");
+    }
+    // Any other page held keeps its wheel, as before.
+    let mut h = Harness::start("", &["https://b.test/"]);
+    let (first, popup) = popup_in_front(&mut h);
+    popup_closes(&mut h, popup);
+    assert_eq!(h.shown(), first);
+    assert!(pointer_on(&mut h, first, wheel()));
+}

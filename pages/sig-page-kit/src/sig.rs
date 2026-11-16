@@ -11,6 +11,10 @@ pub enum Kind {
     // 2, 3 and 4 were the configuration editor's: reserved, never reused.
     /// Putting text on the clipboard.
     ClipboardCopy = 5,
+    /// The text on the clipboard or the primary selection.
+    ClipboardPaste = 6,
+    /// Making text the primary selection (what a middle click pastes).
+    PrimaryCopy = 7,
 }
 
 /// What a terminal ([`Pty::open`]) runs.
@@ -82,6 +86,18 @@ impl Request {
     /// Putting `text` on the clipboard. Needs a click or key press in the page in the last 5 s.
     pub fn clipboard_copy(text: &str) -> Option<Self> {
         Self::new(Kind::ClipboardCopy, text.as_bytes())
+    }
+
+    /// Making `text` the primary selection. The same rule as [`Request::clipboard_copy`].
+    pub fn primary_copy(text: &str) -> Option<Self> {
+        Self::new(Kind::PrimaryCopy, text.as_bytes())
+    }
+
+    /// The text on the clipboard, or on the primary selection if `primary`: the answer's text.
+    /// Needs a click or key press in the page in the last 5 s, which it uses up.
+    pub fn clipboard_paste(primary: bool) -> Option<Self> {
+        let which: &[u8] = if primary { b"primary" } else { b"clipboard" };
+        Self::new(Kind::ClipboardPaste, which)
     }
 
     /// Where it is, with the answer's text once there is one.
@@ -185,9 +201,10 @@ impl Drop for Pty {
 }
 
 /// What an input record is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InputKind {
     /// A key press.
+    #[default]
     Press,
     /// An auto-repeat of a key held down.
     Repeat,
@@ -195,6 +212,25 @@ pub enum InputKind {
     Paste,
     /// An input method's text.
     Commit,
+    /// A pointer button went down: [`Input::code`] is the button ([`buttons`]).
+    PointerPress,
+    /// A pointer button went up: [`Input::code`] is the button.
+    PointerRelease,
+    /// The pointer moved: [`Input::code`] is the buttons held, a bit each (`1 << button`).
+    Motion,
+    /// A wheel or a touchpad scrolled by [`Input::dx`] and [`Input::dy`] (positive right and
+    /// down): in notches when [`Input::code`] is 1, in canvas pixels when it is 0.
+    Wheel,
+}
+
+/// Pointer buttons, as [`Input::code`] names them.
+pub mod buttons {
+    /// The primary button.
+    pub const LEFT: u32 = 0;
+    /// The wheel button.
+    pub const MIDDLE: u32 = 1;
+    /// The secondary button.
+    pub const RIGHT: u32 = 2;
 }
 
 /// Modifier bits of an input record.
@@ -216,7 +252,7 @@ pub mod modifiers {
 }
 
 /// One record of the input queue.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Input {
     /// What it is.
     pub kind: InputKind,
@@ -229,6 +265,12 @@ pub struct Input {
     pub key: String,
     /// What the press typed, or the pasted text.
     pub text: String,
+    /// A pointer record's position, in canvas pixels.
+    pub x: f32,
+    pub y: f32,
+    /// A wheel record's distance.
+    pub dx: f32,
+    pub dy: f32,
 }
 
 impl Input {
@@ -254,19 +296,40 @@ impl Input {
             2 => InputKind::Repeat,
             3 => InputKind::Paste,
             4 => InputKind::Commit,
+            5 => InputKind::PointerPress,
+            6 => InputKind::PointerRelease,
+            7 => InputKind::Motion,
+            8 => InputKind::Wheel,
             _ => return None,
         };
         let key_len = usize::from(u16::from_le_bytes([header[2], header[3]]));
         let code = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
         let key = bytes.get(8..8 + key_len)?;
-        let text = &bytes[8 + key_len..];
-        Some(Self {
+        let rest = &bytes[8 + key_len..];
+        let mut input = Self {
             kind,
             modifiers: header[1],
             code,
             key: String::from_utf8_lossy(key).into_owned(),
-            text: String::from_utf8_lossy(text).into_owned(),
-        })
+            ..Self::default()
+        };
+        if header[0] >= 5 {
+            let floats = if kind == InputKind::Wheel { 4 } else { 2 };
+            let value = |i: usize| {
+                let b = rest.get(4 * i..4 * i + 4)?;
+                Some(f32::from_le_bytes([b[0], b[1], b[2], b[3]])).filter(|v| v.is_finite())
+            };
+            let values: Vec<f32> = (0..floats).map(value).collect::<Option<_>>()?;
+            input.x = values[0];
+            input.y = values[1];
+            if let [_, _, dx, dy] = values[..] {
+                input.dx = dx;
+                input.dy = dy;
+            }
+        } else {
+            input.text = String::from_utf8_lossy(rest).into_owned();
+        }
+        Some(input)
     }
 }
 
@@ -304,6 +367,27 @@ mod tests {
         let paste = Input::parse(&[3, 0, 0, 0, 0, 0, 0, 0, b'h', b'i']).unwrap();
         assert_eq!((paste.kind, paste.text.as_str()), (InputKind::Paste, "hi"));
         assert!(Input::parse(&[9, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        // A pointer press: the button, then x and y.
+        let mut press = vec![5, modifiers::SHIFT, 0, 0, 2, 0, 0, 0];
+        press.extend_from_slice(&12.5f32.to_le_bytes());
+        press.extend_from_slice(&30.0f32.to_le_bytes());
+        let input = Input::parse(&press).unwrap();
+        assert_eq!(input.kind, InputKind::PointerPress);
+        assert_eq!((input.code, input.x, input.y), (buttons::RIGHT, 12.5, 30.0));
+        assert!(Input::parse(&press[..12]).is_none(), "cut short");
+        // A wheel: two more for the distance.
+        let mut wheel = vec![8, 0, 0, 0, 1, 0, 0, 0];
+        for v in [1.0f32, 2.0, 0.0, -3.0] {
+            wheel.extend_from_slice(&v.to_le_bytes());
+        }
+        let input = Input::parse(&wheel).unwrap();
+        assert_eq!(
+            (input.kind, input.dy, input.code),
+            (InputKind::Wheel, -3.0, 1)
+        );
+        let mut nan = press.clone();
+        nan[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(Input::parse(&nan).is_none());
         assert!(Input::parse(&[1, 0, 9, 0, 0, 0, 0, 0, b'a']).is_none());
     }
 }

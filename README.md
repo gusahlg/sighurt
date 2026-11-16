@@ -794,10 +794,34 @@ how, and Enter starts it again. Closing the tab, navigating away, reloading or q
 program (SIGHUP, then SIGKILL after 2 seconds); jobs your shell put in the background in groups
 of their own may survive, as in any terminal.
 
-Limits: it is an xterm-like terminal (`TERM=xterm-256color`, 256 colours and true colour) without
-scrollback, mouse reporting, a title, clipboard access or images; clicks only give the page the
-keyboard. A program in a background tab has its output read once a second, so a busy one waits
-until you look. At most eight programs run at once, shells and editors together.
+It is an xterm-like terminal (`TERM=xterm-256color`, 256 colours and true colour, the cursor
+shapes a program asks for) with:
+
+- **History**: lines that scroll off the top are kept (about 25 MB of them: 10 000 lines at 80
+  columns, 4 000 at 200). The wheel and Shift+Page Up / Shift+Page Down look back through
+  them, a tag in the top right corner says how far; output keeps the view where it is, typing
+  returns to the live screen. The alternate screen (nvim, less) has none: there the wheel sends
+  the arrow keys, so `less` and `man` scroll.
+- **The mouse**: a program that asks for it (nvim's `mouse`, htop, tmux) gets clicks, drags and
+  the wheel (xterm's modes 9, 1000, 1002 and 1003; SGR, UTF-8 and the original encoding). Shift
+  with the mouse is always yours.
+- **Selection and the clipboards**: a drag selects text (a double click a word, a triple click a
+  line), which becomes the primary selection; Ctrl+Shift+C copies it to the clipboard,
+  Ctrl+Shift+V pastes the clipboard, Shift+Insert and the middle button the primary selection.
+  These go through the browser's clipboard, with its rule for any page: a click or key press in
+  the page in the last 5 seconds. A program cannot read or write a clipboard: OSC 52 is not
+  honoured (text a program prints, from a file or another machine, would otherwise replace your
+  clipboard while you type).
+- **Images**: kitty's graphics protocol (RGB, RGBA or PNG data sent in the escape code, in
+  chunks; placing, cropping, scaling to cells, z-index, deleting; the query programs detect it
+  with) and sixel, so `chafa`, `timg`, `kitten icat`, `img2sixel` and the like show pictures.
+  Images scroll with the text. Not supported: files, temporary files and shared memory (`t=f`,
+  `t=t`, `t=s`: the page reads no file), compressed data (`o=z`), animation and Unicode
+  placeholders; a program is told so and falls back where it can. Images are bounded: 4096
+  pixels a side, 24 MB each and 64 MB together, the least recently used going first.
+
+A program in a background tab has its output read once a second, so a busy one waits until you
+look. At most eight programs run at once, shells and editors together.
 
 ### Chromes
 
