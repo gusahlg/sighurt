@@ -1362,6 +1362,10 @@ fn text_mode_shows_the_page_as_text_and_tab_enter_follow_a_link_and_fill_a_field
         !got.is_empty() && !shows(got, "INSERT MODE")
     });
     assert!(left, "Escape did not leave INSERT MODE\n{}", term.context());
+    // A lone Escape is a key only once the parser's timeout has passed: a `q` sooner is Alt+q.
+    // Any output satisfies the wait above, which may come before that.
+    let since = term.got.len();
+    term.wait(since, 4 * sighurt_tui::term::ESC_TIMEOUT, |_| false);
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
     term.assert_restored();
