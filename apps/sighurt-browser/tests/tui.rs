@@ -3245,11 +3245,11 @@ fn sig_config_gets_no_input_where_it_is_not_drawn() {
     );
     let config = term.dir.join("config/sighurt/config.toml");
     let before = fs::read_to_string(&config).unwrap();
+    // The notice may come in more than one write: wait for all of it.
     let said = term.wait(0, Duration::from_secs(20), |got| {
-        shows(got, "need graphics")
+        shows(got, "need graphics") && shows(got, "get no input here")
     });
     assert!(said, "no message\n{}", term.context());
-    assert!(shows(&term.got, "get no input here"), "{}", term.context());
     try_everything(&mut term);
     assert!(!started.exists(), "the editor started\n{}", term.context());
     assert_eq!(
