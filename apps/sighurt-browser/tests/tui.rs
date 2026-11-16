@@ -175,7 +175,7 @@ impl Terminal {
         tcsetwinsize(&slave, winsize(80, 24)).unwrap();
         let original = tcgetattr(&slave).unwrap();
         let stderr = fs::File::create(dir.join("stderr")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sig"));
+        let mut command = sig_command();
         command.env_remove("TMUX").envs(env(&dir));
         if controlling {
             // SAFETY: setsid(2) and ioctl(2) only, between fork and exec. The session's id is
@@ -477,6 +477,24 @@ fn has(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Whether `text` is on the screen. A space the grid diff left unchanged is `CSI C`, not `0x20`.
+/// `sig`, or with `SIG_TUI_WRAP` (words split on spaces) `sig` run by that program: e.g.
+/// `strace -f -qq -o /dev/null -e trace=write -e inject=write:delay_exit=2000` slows every write
+/// by 2 ms, so a test that reads half a frame as a whole one fails every time, not once in
+/// many runs. Tests that signal `sig`'s pid do not hold under a wrapper.
+fn sig_command() -> Command {
+    let sig = env!("CARGO_BIN_EXE_sig");
+    let wrap = std::env::var("SIG_TUI_WRAP").unwrap_or_default();
+    let mut words = wrap.split_whitespace();
+    match words.next() {
+        Some(program) => {
+            let mut command = Command::new(program);
+            command.args(words).arg(sig);
+            command
+        }
+        None => Command::new(sig),
+    }
+}
+
 fn shows(bytes: &[u8], text: &str) -> bool {
     let mut shown = String::new();
     let mut i = 0;
