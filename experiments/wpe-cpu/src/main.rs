@@ -34,6 +34,7 @@ use glib::translate::{from_glib, from_glib_full, from_glib_none, ToGlibPtr};
 use sighurt_api::engine::EngineWaker;
 use sighurt_engine_wpe::clipboard::{ClipboardCall, ClipboardSink};
 use sighurt_engine_wpe::ffi;
+use sighurt_engine_wpe::screen::DEFAULT_REFRESH_MHZ;
 use sighurt_engine_wpe::glib_loop::GlibLoop;
 use sighurt_engine_wpe::platform::{Buffer, Call, Display, View};
 
@@ -610,7 +611,10 @@ impl Session {
         let waker = alarm.waker();
         let glib = GlibLoop::new(waker.clone()).map_err(|e| format!("glib: {e}"))?;
         let clipboard: ClipboardSink = Rc::new(|_: ClipboardCall| {});
-        let display = Display::new(None, clipboard).map_err(|e| format!("WPE display: {e}"))?;
+        // No output here: the engine's refresh rate until a window says otherwise, and a
+        // screen of the view's size.
+        let display = Display::new(None, clipboard, DEFAULT_REFRESH_MHZ, config.size)
+            .map_err(|e| format!("WPE display: {e}"))?;
         log.line("wpe-cpu: display SighurtWPEDisplay primary dmabuf=none (WPEBufferSHM)");
         let context = web_context();
         let network = network_session();
