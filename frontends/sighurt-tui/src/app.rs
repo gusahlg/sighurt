@@ -3760,6 +3760,59 @@ mod tests {
         assert_eq!(area(1, &hidden), (0, 0));
     }
 
+    /// Review 13: the page's image follows a tree change at an unchanged terminal size. The
+    /// summary moved below the page: the page keeps its size (so the engine's frame and its
+    /// metrics stay), and kitty and sixel put the image one row up, where the page is now, and
+    /// a sixel already on the rows is not taken for this place (it is blanked and written
+    /// again).
+    #[test]
+    fn the_page_image_follows_a_tree_change_at_the_same_size() {
+        use sighurt_api::geometry::BufferSize;
+        use sighurt_api::present::Frame;
+        use sighurt_api::ui::{Component, Kind};
+        let leaf = |kind| Node::Leaf(Component::new(kind));
+        let size = TermSize {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let before = page_area(size, &Node::terminal());
+        let bottom = Node::Column(vec![
+            leaf(Kind::PageView),
+            leaf(Kind::Summary),
+            leaf(Kind::CommandLine),
+        ]);
+        let after = page_area(size, &bottom);
+        assert_eq!((before.row, after.row), (1, 0));
+        assert_eq!((before.rows, before.cols), (after.rows, after.cols));
+        let (old, new) = (page_place(before), page_place(after));
+        assert_ne!(old, new, "a sixel on the old rows is not written over");
+        let mut pixels = vec![0x80u8; 8 * 8 * 4];
+        let frame = Frame {
+            pixels: &mut pixels,
+            size: BufferSize {
+                width: 8,
+                height: 8,
+            },
+            stride: 8 * 4,
+        };
+        let contains = |bytes: &[u8], what: &[u8]| bytes.windows(what.len()).any(|w| w == what);
+        let kitty_old = kitty::encode(&frame, 7, old, 1 << 20).unwrap();
+        let kitty_new = kitty::encode(&frame, 7, new, 1 << 20).unwrap();
+        assert!(contains(&kitty_old, b"\x1b[2;1H"), "kitty at the old row");
+        assert!(contains(&kitty_new, b"\x1b[H") && !contains(&kitty_new, b"\x1b[2;1H"));
+        let sixel_old = sixel::encode(&frame, old, 10, 20, 1 << 20).unwrap();
+        let sixel_new = sixel::encode(&frame, new, 10, 20, 1 << 20).unwrap();
+        assert!(contains(&sixel_old, b"\x1b[2;1H"), "sixel at the old row");
+        assert!(contains(&sixel_new, b"\x1b[H") && !contains(&sixel_new, b"\x1b[2;1H"));
+        // The summary hidden: one more row for the page (`relayout` gives text mode the
+        // new area, as a resize does).
+        let hidden = Node::Column(vec![leaf(Kind::PageView), leaf(Kind::CommandLine)]);
+        let more = page_area(size, &hidden);
+        assert_eq!((more.row, more.rows), (0, 23));
+    }
+
     #[test]
     fn frames_are_paced_by_fps() {
         let fps = |fps| TuiConfig {
@@ -4730,6 +4783,9 @@ schemes = [\"demo\"]
         app.draw_chrome(&mut out);
         assert_eq!(app.tui.page.cursor.map(|cursor| cursor.row), Some(0));
         assert_eq!((app.tui.page.row, app.tui.page.rows), (1, 23));
+        // Home's text was laid out again for the page's new height (text reflows).
+        let generation = app.session.home_generation();
+        assert!(app.tui.home.is(generation, 80, 23));
         assert!(grid_row(app, 0).starts_with('→'), "{:?}", grid_row(app, 0));
     }
 
