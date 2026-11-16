@@ -3639,3 +3639,70 @@ fn home_links_open_by_click_and_by_tab_and_enter() {
     term.type_bytes(b"q");
     assert!(term.exit().success(), "{}", term.context());
 }
+
+/// SIGTERM, SIGINT and SIGHUP while sig://terminal's shell runs (the signals arrive through
+/// `sighurt_runtime::signals`, SIGHUP through the terminal's own handler): sig quits with
+/// status 0, the terminal is restored, and the shell ends with it.
+#[test]
+fn signals_end_sig_and_the_shell_sig_terminal_runs() {
+    for (name, signal) in [
+        ("term", libc::SIGTERM),
+        ("int", libc::SIGINT),
+        ("hup", libc::SIGHUP),
+    ] {
+        let pages = "[pages.terminal]\nenabled = true\ncommand = \"/bin/sh\"";
+        let mut term = Terminal::start_in(
+            &format!("signal-shell-{name}"),
+            &["sig://terminal"],
+            KITTY_REPLIES,
+            pages,
+        );
+        let home = term.dir.join("home");
+        let shown = term.wait(0, Duration::from_secs(20), |got| {
+            image(got, 80, 22, 800, 440)
+        });
+        assert!(shown, "{name}: the page did not show\n{}", term.context());
+        term.type_bytes(&kitty_keys("\x1b"));
+        let insert = term.wait(term.got.len(), Duration::from_secs(5), |got| {
+            shows(got, "INSERT MODE")
+        });
+        assert!(insert, "{name}: no INSERT\n{}", term.context());
+        term.type_bytes(&kitty_keys("\r"));
+        thread::sleep(Duration::from_secs(2));
+        term.type_bytes(&kitty_keys("echo $$ > ~/pid\r"));
+        let start = Instant::now();
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(home.join("pid"))
+                .ok()
+                .filter(|pid| pid.ends_with('\n'))
+            {
+                break pid;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "{name}: the shell did not start\n{}",
+                term.context()
+            );
+            term.wait(term.got.len(), Duration::from_millis(100), |_| false);
+        };
+        let shell = Path::new("/proc").join(pid.trim());
+        assert!(shell.exists(), "{name}: the shell is not running");
+        // SAFETY: kill(2) on the child.
+        unsafe { libc::kill(term.child.id() as i32, signal) };
+        let status = term.exit();
+        assert!(
+            status.success(),
+            "{name}: sig exited with {status:?}\n{}",
+            term.context()
+        );
+        term.assert_restored();
+        let start = Instant::now();
+        while shell.exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "{name}: the shell outlived sig"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
