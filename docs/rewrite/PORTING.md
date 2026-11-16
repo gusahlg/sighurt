@@ -249,8 +249,9 @@ The Ports workflow (`.github/workflows/ports.yml`) on GitHub's hosted runners, `
 
 **Windows (`windows-latest`), verified.** Run 43838694058, job "Windows (terminal only)", both
 steps green, 723 tests (and green in runs 43824448752, 43826803295, 43830229164 and
-43835363647 before it). Its first attempt failed one timing test, `quitting_deletes_a_download_
-its_server_keeps_waiting`, whose bound is 700 ms on a shared runner; the second passed.
+43835363647 before it). Its first attempt failed one timing test whose bound is 700 ms on a
+shared runner (`services::tests::quitting_deletes_a_download_its_server_keeps_waiting`); the
+second passed.
 
 - `cargo test -p sighurt-browser --no-default-features --features frontend-tui,engine-demo --bins
   --tests`: `sig`'s 6 unit tests and `tests/console.rs`'s 3. In a ConPTY pseudoconsole of 80×24,
