@@ -175,6 +175,14 @@ can show is marked as not measured.
   loses to an author `position`). Servo does not generate a `::backdrop` box, so there is no
   backdrop rule and no box-shadow dim (unchecked against clicks). The manager is dropped
   before Servo in `shutdown`, because it holds a Servo clone.
+- `Servo::new` starts `Net-TLS-prewarm` (`net::connector::prewarm_tls`, in 0.5 too), which
+  seeds aws-lc's random generator for itself, and never joins it. A process that exits while
+  it still runs (about 20 ms after the build idle, much longer on a loaded machine) is
+  aborted: aws-lc-sys 0.45's exit destructor marks the generator shut down, the thread
+  write-locks its new state against itself, `pthread_rwlock_rdlock` fails with `EDEADLK`
+  and aws-lc calls `abort()`, which mozjs turns into `mozalloc_abort`'s SIGSEGV. `shutdown`
+  waits (at most 5 s) until the threads that appeared during the build hold no prewarm thread
+  and none not yet named (`src/prewarm.rs`); `tests/quit_at_launch.rs` shuts down at once.
 
 ## Lockfile
 
