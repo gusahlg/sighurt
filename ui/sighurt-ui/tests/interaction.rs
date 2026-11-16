@@ -2074,6 +2074,25 @@ fn page_texts(chrome: &mut Model) -> Vec<(String, WindowRect)> {
         .collect()
 }
 
+/// A click at window position `at` on the page area the chrome draws: a link is hit only
+/// through the surface it is drawn on.
+fn click_page(chrome: &mut Model, at: WindowPoint) -> Vec<ChromeAction> {
+    let surface = chrome.layout().page;
+    let local = WindowPoint {
+        x: at.x - f64::from(surface.x),
+        y: at.y - f64::from(surface.y),
+    };
+    let mut actions = chrome.pointer(
+        surface,
+        &button(local, PointerButton::Left, ButtonState::Pressed),
+    );
+    actions.extend(chrome.pointer(
+        surface,
+        &button(local, PointerButton::Left, ButtonState::Released),
+    ));
+    actions
+}
+
 /// The pointer moves to window position `at`, over the page area the chrome draws.
 fn hover(chrome: &mut Model, at: WindowPoint) -> Vec<ChromeAction> {
     let surface = chrome.layout().page;
@@ -2107,7 +2126,7 @@ fn home_links_open_their_page_under_the_hand() {
     let damage = home.take_damage();
     assert!(damage.page && !damage.chrome, "{damage:?}");
     assert_eq!(
-        commands(&click(&mut home, help)),
+        commands(&click_page(&mut home, help)),
         [Command::PageOpen("sig://help".into())]
     );
     // A link's description is no link.
@@ -2117,7 +2136,7 @@ fn home_links_open_their_page_under_the_hand() {
         actions.contains(&ChromeAction::Cursor(Cursor::Default)),
         "{actions:?}"
     );
-    assert!(commands(&click(&mut home, detail)).is_empty());
+    assert!(commands(&click_page(&mut home, detail)).is_empty());
     // Pressed on one link and released on another: nothing opens.
     let config = center(bounds("Configuration"));
     let surface = home.layout().page;
@@ -2142,7 +2161,7 @@ fn home_links_open_their_page_under_the_hand() {
         .find(|(n, _)| n == "Blåbärssylt och kanelbullar")
         .unwrap();
     assert_eq!(
-        commands(&click(&mut tall, center(visited.1))),
+        commands(&click_page(&mut tall, center(visited.1))),
         [Command::PageOpen("https://recept.example/sylt".into())]
     );
     // Leaving the page area ends the hover.

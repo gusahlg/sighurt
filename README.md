@@ -345,7 +345,8 @@ key is optional.
 - `sig` reads the file again whenever it is saved. The keys and their bindings, the mouse's
   buttons, scrolling, colors, fonts and the chrome's options, the home page, search, keywords,
   zoom, routing and the download folder apply at once; pages already open stay in their engine.
-  `[ui] chrome`, `[ui] renderer` and the engines' own settings apply when `sig` starts again.
+  The layout tables move the window's surfaces and the terminal's lines at once. `[ui] chrome`,
+  `[ui] renderer` and the engines' own settings apply when `sig` starts again.
 
 ```toml
 version = 1
@@ -379,7 +380,7 @@ font-size = 16
 [ui.colors]
 tab = "#7c3aed"
 
-[chrome.standard]
+[ui.layout]
 tabs = "left"
 ```
 
@@ -435,6 +436,8 @@ In the terminal frontend the page needs graphics, like every `sig://` page.
 | `[ui.colors]` | `bg`, `surface`, `hover`, `tab`, `border`, `focus`, `text`, `text_muted`, `text_dim`, `selection`, `error`: `"#rrggbb"` or `"#rrggbbaa"` | a dark theme |
 | `[chrome.standard]` | `tabs` (`"top"`, `"left"`, `"hidden"`), `status` (`"strip"`, `"overlay"`), `buttons`, `compact`, `engine-label` (the engine a page runs in, in its tab and the address bar) | top, strip, true, false, true |
 | `[chrome.line]` | `position` (`"top"`, `"bottom"`), `engine-label` (the page's engine at the line's end) | top, true |
+| `[ui.layout]` | the standard chrome's interface, after `[chrome.standard]`: `address` (`"top"`, `"bottom"`: the toolbar), `tabs` (`"top"`, `"bottom"`, `"left"`, `"right"`, `"hidden"`), `status` (`"strip"`, `"overlay"`), `buttons` (true, false, or a list of `"back"`, `"forward"`, `"reload"`), `compact`, `engine-label`; a layout the tree can't take is an error | top, top, strip, true, false, true |
+| `[tui.layout]` | the terminal's lines: `summary` (`"top"`, `"bottom"`, `"hidden"`), `line` (`"top"`, `"bottom"`); the command line stays outermost | top, bottom |
 | `[downloads] directory` | where downloads go: an absolute path or `~/…` | the desktop's download folder, else `~/Downloads` |
 | `[session] restore` | open the tabs of the last run, and save them as they change | `true` |
 | `[history] remember` | record the pages you visit, to complete what you type in the address line, and save them; `false` records nothing, drops what was read, and leaves the file as it is | `true` |
@@ -798,10 +801,12 @@ until you look. At most eight programs run at once, shells and editors together.
 
 ### Chromes
 
-The `standard` chrome is a tab strip, a toolbar with back, forward, reload and the address line,
-and a status strip; `[chrome.standard]` moves the tabs to a list on the left or hides them, shows
-the status over the page only while there is something to say, drops the buttons or makes it
-compact. The address line is also the command line (`:`) and the find field (`/`). The line chrome (feature `chrome-line`, `[ui] chrome = "line"`) is one line at the top or
+The `standard` chrome lays out the interface's window tree (`sighurt_api::ui`): by default a tab
+strip, a toolbar with back, forward, reload and the address line, the page and a status strip.
+`[ui.layout]` (or the experience: `sig.ui.tabs.position(Side::Left)`) puts the tabs in a strip at
+the bottom or a list on either side or hides them, puts the toolbar below the page, shows the
+status over the page only while there is something to say, chooses the buttons or makes it
+compact; `[chrome.standard]` says the earlier subset of that in its own words. The address line is also the command line (`:`) and the find field (`/`). The line chrome (feature `chrome-line`, `[ui] chrome = "line"`) is one line at the top or
 the bottom of the window: the tab's place (`[2/5]`), the key mode, the address and the status;
 tabs are reached by keys and commands. Both name the engine a page runs in (`servo`, `wpe`,
 `wasm`, `cef`, `ladybird`, `netsurf`), small and muted: the standard chrome in each tab and at the address bar's right end, the

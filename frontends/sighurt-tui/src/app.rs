@@ -121,6 +121,7 @@ use sighurt_api::input::{
 use sighurt_api::semantic::SemanticSnapshot;
 use sighurt_api::services::{ClipboardData, Selection, ServiceError};
 use sighurt_api::settings::Table;
+use sighurt_api::ui::Node;
 use sighurt_core::config::{GraphicsProtocol, TuiConfig, TuiMode, TERMINAL_CHROME_COMMANDS};
 use sighurt_core::tabs::{Content, Find, LoadError, TabSummary};
 use sighurt_core::{
@@ -437,6 +438,9 @@ struct Tui {
     grid: Grid,
     seat: SeatId,
     settings: TuiConfig,
+    /// The interface's terminal tree: where the summary and the command line are, and the
+    /// page's rows between them ([`crate::chrome::arrange`]).
+    layout: Node,
     /// The configuration's own commands (`[commands]`), by name, which the command line runs.
     commands: Vec<String>,
     /// The page rows show images.
@@ -718,6 +722,7 @@ impl App {
         let services = Services::new(move || services_wake.ping());
         let wake = std::sync::Arc::new(move || ping.ping());
         let settings = *config.tui();
+        let layout = config.interface().terminal.clone();
         let commands = config.commands().keys().cloned().collect();
         let mut session = Session::new(
             BrowserState::new(config, env.clone()),
@@ -739,6 +744,7 @@ impl App {
             terminal,
             seat: SeatId::next(),
             settings,
+            layout: layout.clone(),
             graphics: false,
             protocol: Protocol::None,
             placed: None,
@@ -753,13 +759,13 @@ impl App {
             text_mode: false,
             typing_told: None,
             mode_override: None,
-            text: TextPages::new(size.cols, page_area(size).rows),
+            text: TextPages::new(size.cols, page_area(size, &layout).rows),
             home: HomePage::new(),
             home_drawn: false,
             semantic_on: HashSet::new(),
             capture: PointerCapture::default(),
             releases: Vec::new(),
-            page: page_area(size),
+            page: page_area(size, &layout),
             metrics: empty_metrics(),
             metrics_due: false,
             targets: HashMap::new(),
@@ -1651,7 +1657,7 @@ impl App {
         self.session.diagnostics_mut().counters.chrome_paints += 1;
         let mut state = self.chrome_state();
         state.contain();
-        let area = state.draw(&mut self.tui.grid);
+        let area = state.draw_tree(&mut self.tui.grid, &self.tui.layout);
         self.tui.page = area;
         let message = self.page_message();
         for row in area.row..area.row + area.rows {
@@ -2148,6 +2154,7 @@ impl App {
                 // nothing about it again, so what it said when it took it stays shown.
                 let same = config == *self.session.core().config();
                 let settings = *config.tui();
+                let layout = config.interface().terminal.clone();
                 self.tui.commands = config.commands().keys().cloned().collect();
                 self.session
                     .queue_mut()
@@ -2156,6 +2163,7 @@ impl App {
                     self.tui.notice_first = None;
                     self.tui.notice = None;
                 }
+                self.tui.change_layout(layout);
                 self.tui.adopt(settings);
             }
             Err(persistence::LoadError::Config(error)) => {
@@ -2192,6 +2200,19 @@ impl App {
 }
 
 impl Tui {
+    /// Takes the interface's terminal tree. A changed one moves the page's rows even at the
+    /// same terminal size, so it goes the way a resize goes: the output queued for the old
+    /// rows is dropped, the page laid out again and everything drawn again.
+    fn change_layout(&mut self, layout: Node) {
+        if layout == self.layout {
+            return;
+        }
+        self.discard_for_resize();
+        self.layout = layout;
+        self.relayout();
+        self.redraw_all();
+    }
+
     /// Takes `[tui]`'s settings: the mouse, and the layout they imply.
     fn adopt(&mut self, settings: TuiConfig) {
         if settings.mouse != self.mouse_on {
@@ -2381,7 +2402,7 @@ impl Tui {
             (caps.kitty_graphics_ok, caps.sixel)
         };
         let size = self.terminal.size();
-        let page = page_area(size);
+        let page = page_area(size, &self.layout);
         // Kitty graphics through tmux need `[tui] graphics = "kitty"`, tmux passing them on
         // (`allow-passthrough all`) and page rows the placeholder cells can number.
         // Rows the diacritics can't number get sixel.
@@ -3275,16 +3296,10 @@ fn page_place(page: PageArea) -> CellRect {
     }
 }
 
-/// The page rows for a terminal of `size`: everything between the chrome's top and bottom
-/// lines, as [`ChromeState::draw`] leaves them.
-fn page_area(size: TermSize) -> PageArea {
-    let rows = size.rows.saturating_sub(2);
-    PageArea {
-        row: u16::from(rows > 0),
-        rows,
-        cols: size.cols,
-        cursor: None,
-    }
+/// The page rows for a terminal of `size` with the chrome's lines where `layout` puts them,
+/// as [`ChromeState::draw_tree`] leaves them.
+fn page_area(size: TermSize, layout: &Node) -> PageArea {
+    crate::chrome::arrange(layout, size.rows, size.cols).1
 }
 
 /// The core's event for what a search in a page's text found.
@@ -3675,11 +3690,82 @@ mod tests {
             cell_width: 10,
             cell_height: 20,
         };
-        assert_eq!((page_area(size(24)).row, page_area(size(24)).rows), (1, 22));
-        assert_eq!((page_area(size(2)).row, page_area(size(2)).rows), (0, 0));
+        let standard = Node::terminal();
+        let area = |rows, layout: &Node| {
+            let page = page_area(size(rows), layout);
+            (page.row, page.rows)
+        };
+        assert_eq!(area(24, &standard), (1, 22));
+        assert_eq!(area(2, &standard), (0, 0));
         let mut grid = Grid::new(80, 24);
         let drawn = ChromeState::default().draw(&mut grid);
         assert_eq!((drawn.row, drawn.rows, drawn.cols), (1, 22, 80));
+        // `[tui.layout] summary = "bottom"`: both lines below the page, and `"hidden"`: the
+        // page from the first row.
+        use sighurt_api::ui::{Component, Kind};
+        let leaf = |kind| Node::Leaf(Component::new(kind));
+        let bottom = Node::Column(vec![
+            leaf(Kind::PageView),
+            leaf(Kind::Summary),
+            leaf(Kind::CommandLine),
+        ]);
+        assert_eq!(area(24, &bottom), (0, 22));
+        let hidden = Node::Column(vec![leaf(Kind::PageView), leaf(Kind::CommandLine)]);
+        assert_eq!(area(24, &hidden), (0, 23));
+        assert_eq!(area(1, &hidden), (0, 0));
+    }
+
+    /// Review 13: the page's image follows a tree change at an unchanged terminal size. The
+    /// summary moved below the page: the page keeps its size (so the engine's frame and its
+    /// metrics stay), and kitty and sixel put the image one row up, where the page is now, and
+    /// a sixel already on the rows is not taken for this place (it is blanked and written
+    /// again).
+    #[test]
+    fn the_page_image_follows_a_tree_change_at_the_same_size() {
+        use sighurt_api::geometry::BufferSize;
+        use sighurt_api::present::Frame;
+        use sighurt_api::ui::{Component, Kind};
+        let leaf = |kind| Node::Leaf(Component::new(kind));
+        let size = TermSize {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let before = page_area(size, &Node::terminal());
+        let bottom = Node::Column(vec![
+            leaf(Kind::PageView),
+            leaf(Kind::Summary),
+            leaf(Kind::CommandLine),
+        ]);
+        let after = page_area(size, &bottom);
+        assert_eq!((before.row, after.row), (1, 0));
+        assert_eq!((before.rows, before.cols), (after.rows, after.cols));
+        let (old, new) = (page_place(before), page_place(after));
+        assert_ne!(old, new, "a sixel on the old rows is not written over");
+        let mut pixels = vec![0x80u8; 8 * 8 * 4];
+        let frame = Frame {
+            pixels: &mut pixels,
+            size: BufferSize {
+                width: 8,
+                height: 8,
+            },
+            stride: 8 * 4,
+        };
+        let contains = |bytes: &[u8], what: &[u8]| bytes.windows(what.len()).any(|w| w == what);
+        let kitty_old = kitty::encode(&frame, 7, old, 1 << 20).unwrap();
+        let kitty_new = kitty::encode(&frame, 7, new, 1 << 20).unwrap();
+        assert!(contains(&kitty_old, b"\x1b[2;1H"), "kitty at the old row");
+        assert!(contains(&kitty_new, b"\x1b[H") && !contains(&kitty_new, b"\x1b[2;1H"));
+        let sixel_old = sixel::encode(&frame, old, 10, 20, 1 << 20).unwrap();
+        let sixel_new = sixel::encode(&frame, new, 10, 20, 1 << 20).unwrap();
+        assert!(contains(&sixel_old, b"\x1b[2;1H"), "sixel at the old row");
+        assert!(contains(&sixel_new, b"\x1b[H") && !contains(&sixel_new, b"\x1b[2;1H"));
+        // The summary hidden: one more row for the page (`relayout` gives text mode the
+        // new area, as a resize does).
+        let hidden = Node::Column(vec![leaf(Kind::PageView), leaf(Kind::CommandLine)]);
+        let more = page_area(size, &hidden);
+        assert_eq!((more.row, more.rows), (0, 23));
     }
 
     #[test]
@@ -3913,11 +3999,13 @@ mod tests {
 
     fn bare_tui(terminal: Terminal) -> Tui {
         let size = terminal.size();
+        let layout = Node::terminal();
         Tui {
             terminal,
             grid: Grid::new(size.cols, size.rows),
             seat: SeatId::next(),
             settings: TuiConfig::default(),
+            layout: layout.clone(),
             graphics: false,
             protocol: Protocol::None,
             placed: None,
@@ -3929,11 +4017,11 @@ mod tests {
             held_deletes: Vec::new(),
             image_written: None,
             input_at: None,
-            page: page_area(size),
+            page: page_area(size, &layout),
             text_mode: false,
             typing_told: None,
             mode_override: None,
-            text: TextPages::new(size.cols, page_area(size).rows),
+            text: TextPages::new(size.cols, page_area(size, &layout).rows),
             home: HomePage::new(),
             home_drawn: false,
             semantic_on: HashSet::new(),
@@ -4545,6 +4633,115 @@ schemes = [\"demo\"]
                 motion_due: None,
             },
         }
+    }
+
+    /// The grid's row `row` as text, trimmed.
+    #[cfg(all(feature = "engine-demo", feature = "engine-wasm"))]
+    fn grid_row(app: &App, row: u16) -> String {
+        let grid = &app.tui.grid;
+        let text: String = (0..grid.cols())
+            .filter_map(|col| grid.cell(col, row))
+            .map(|cell| cell.grapheme.clone())
+            .collect();
+        text.trim_end().to_owned()
+    }
+
+    /// Review 13's acceptance test: a tree change at an unchanged terminal size takes the
+    /// resize path. The summary moves below the page, so the page's rows keep their number
+    /// and move up one: the output queued for the old rows is dropped, everything is drawn
+    /// again, home's text follows the page's origin and its links are hit where they are
+    /// drawn now, and the editor's cursor is on the command line wherever the tree puts it.
+    // Home's links are the internal pages, which the Wasm engine runs.
+    #[cfg(all(feature = "engine-demo", feature = "engine-wasm"))]
+    #[test]
+    fn a_tree_change_at_the_same_size_moves_the_page_and_all_on_it() {
+        use sighurt_api::ui::{Component, Kind};
+        let leaf = |kind| Node::Leaf(Component::new(kind));
+        let mut held = demo_app();
+        let app = &mut held.app;
+        app.tui.relayout();
+        app.session.queue_mut().push_back(BrowserEvent::Start {
+            session: None,
+            open: Vec::new(),
+        });
+        app.run_core();
+        for _ in 0..50 {
+            app.write();
+            if app.tui.home_drawn {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.tui.home_drawn, "{}", page_debug(app));
+        let before = app.tui.page;
+        assert_eq!((before.row, before.rows), (1, 22));
+        let home_rows: Vec<String> = (1..23).map(|row| grid_row(app, row)).collect();
+        // A link's place on the page, in page rows.
+        let link = (0..before.rows).find_map(|row| {
+            (0..before.cols).find_map(|col| app.tui.home.click(col, row).map(|url| (col, row, url)))
+        });
+        let (link_col, link_row, url) = link.expect("home has a link");
+        // Output queued for the old rows, more than the pty takes at once.
+        let _ = app.tui.terminal.write_frame(&vec![b'x'; 1 << 20]);
+
+        let bottom = Node::Column(vec![
+            leaf(Kind::PageView),
+            leaf(Kind::Summary),
+            leaf(Kind::CommandLine),
+        ]);
+        let metrics = app.tui.metrics.rect();
+        app.tui.change_layout(bottom.clone());
+        assert_eq!(
+            app.tui.terminal.pending_len(),
+            0,
+            "the old rows' output is dropped"
+        );
+        assert!(app.tui.clear, "everything is drawn again");
+        let after = app.tui.page;
+        assert_eq!((after.row, after.rows, after.cols), (0, 22, 80));
+        assert_eq!(
+            app.tui.metrics.rect(),
+            metrics,
+            "the page's pixels are the same size"
+        );
+        // The same tree again changes nothing.
+        app.tui.clear = false;
+        app.tui.change_layout(bottom);
+        assert!(!app.tui.clear);
+
+        let mut out = Vec::new();
+        app.draw_chrome(&mut out);
+        let moved: Vec<String> = (0..22).map(|row| grid_row(app, row)).collect();
+        assert_eq!(moved, home_rows, "home's text one row up");
+        assert!(
+            grid_row(app, 22).starts_with("[1/1]"),
+            "{:?}",
+            grid_row(app, 22)
+        );
+        // The link is hit where it is drawn now: the same page row, one terminal row up.
+        assert_eq!(app.tui.home.click(link_col, link_row), Some(url));
+
+        // The editor's cursor is on the command line: the last row, then the first.
+        let open = "location.focus".parse::<Command>().unwrap();
+        app.session
+            .queue_mut()
+            .push_back(BrowserEvent::Command(open));
+        app.run_core();
+        let mut out = Vec::new();
+        app.draw_chrome(&mut out);
+        assert_eq!(app.tui.page.cursor.map(|cursor| cursor.row), Some(23));
+        app.tui.change_layout(Node::Column(vec![
+            leaf(Kind::CommandLine),
+            leaf(Kind::PageView),
+        ]));
+        let mut out = Vec::new();
+        app.draw_chrome(&mut out);
+        assert_eq!(app.tui.page.cursor.map(|cursor| cursor.row), Some(0));
+        assert_eq!((app.tui.page.row, app.tui.page.rows), (1, 23));
+        // Home's text was laid out again for the page's new height (text reflows).
+        let generation = app.session.home_generation();
+        assert!(app.tui.home.is(generation, 80, 23));
+        assert!(grid_row(app, 0).starts_with('→'), "{:?}", grid_row(app, 0));
     }
 
     #[cfg(feature = "engine-demo")]

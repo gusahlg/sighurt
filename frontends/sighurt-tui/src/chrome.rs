@@ -1,4 +1,5 @@
-//! The terminal chrome: one line above the page and one line below it.
+//! The terminal chrome: the lines of the interface's terminal tree around the page, as
+//! [`arrange`] puts them (by default one line above the page and one below it).
 //!
 //! Owns: the plain data the lines are drawn from, the grapheme editor for the
 //! address and the find field, and which rows are left for the page. Must not own: tabs, the
@@ -6,8 +7,9 @@
 //! passed through [`crate::sanitize`] before it is drawn, and cut to the row's
 //! width.
 //!
-//! The top line is `[2/5] title — address · engine · MODE · keymap`, with `…`
-//! after the title while that tab is loading. The bottom line is the address
+//! The summary line (the top line by default) is `[2/5] title — address · engine · MODE ·
+//! keymap`, with `…` after the title while that tab is loading. The command line (the bottom
+//! line by default) is the address
 //! editor (prompt `→ `) or the find field (prompt `/`) while one is open,
 //! otherwise the notice, otherwise the status. What the search in the page
 //! found ("3 of 12") is right-aligned on it while there is one, after the
@@ -19,6 +21,8 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+use sighurt_api::ui::{Kind, Node};
 
 use crate::grid::{Attrs, Color, Grid};
 use crate::sanitize::sanitize;
@@ -124,46 +128,100 @@ impl ChromeState {
         }
     }
 
-    /// Draw the chrome into `grid`.
-    ///
-    /// The page area is the rows strictly between the top line and the bottom
-    /// line. A terminal with fewer than three rows has no page rows.
+    /// Draw the chrome into `grid` as the standard terminal tree puts it: the summary line at
+    /// the top, the command line at the bottom ([`ChromeState::draw_tree`]).
     pub fn draw(&self, grid: &mut Grid) -> PageArea {
+        self.draw_tree(grid, &Node::terminal())
+    }
+
+    /// Draw the chrome into `grid` as `tree` (the interface's terminal tree) puts it: each line
+    /// takes a row where the tree puts it, in tree order while rows remain, and the page gets
+    /// the rows between ([`arrange`]).
+    pub fn draw_tree(&self, grid: &mut Grid, tree: &Node) -> PageArea {
         let cols = grid.cols();
-        let rows = grid.rows();
-        if rows >= 1 {
-            grid.clear_row(0);
-            put_fitted(grid, 0, &top_line(self, cols));
-        }
-        let cursor = if rows >= 2 {
-            let row = rows - 1;
+        let (lines, mut page) = arrange(tree, grid.rows(), cols);
+        for (kind, row) in lines {
             grid.clear_row(row);
-            let (text, column, left_cols) = bottom_line(self, cols);
-            put_fitted(grid, row, &text);
-            let at_end = self
-                .address_editing
-                .as_ref()
-                .is_some_and(|editor| editor.at_end() && !editor.selected());
-            let ghost = self.address_ghost.as_deref();
-            let ghost = ghost.filter(|_| at_end && !self.finding);
-            if let (Some(ghost), Some(column)) = (ghost, column) {
-                // Within the editor's part of the line, before what the search found.
-                let room = left_cols.saturating_sub(column);
-                let ghost = fit_cols(&sanitize(ghost), room);
-                grid.put_text(column, row, &ghost, GHOST, Color::Default, Attrs::default());
+            match kind {
+                Kind::Summary => put_fitted(grid, row, &top_line(self, cols)),
+                Kind::CommandLine => page.cursor = self.command_line(grid, row, cols),
+                _ => {}
             }
-            column.map(|column| Cursor { column, row })
-        } else {
-            None
-        };
-        let page_rows = rows.saturating_sub(2);
-        PageArea {
-            row: u16::from(page_rows > 0),
-            rows: page_rows,
-            cols,
-            cursor,
+        }
+        page
+    }
+
+    /// The command line on `row`: the address editor or the find field while one is open,
+    /// else the notice, else the status, and what the search found. Returns where the cursor
+    /// is while the editor is open.
+    fn command_line(&self, grid: &mut Grid, row: u16, cols: u16) -> Option<Cursor> {
+        let (text, column, left_cols) = bottom_line(self, cols);
+        put_fitted(grid, row, &text);
+        let at_end = self
+            .address_editing
+            .as_ref()
+            .is_some_and(|editor| editor.at_end() && !editor.selected());
+        let ghost = self.address_ghost.as_deref();
+        let ghost = ghost.filter(|_| at_end && !self.finding);
+        if let (Some(ghost), Some(column)) = (ghost, column) {
+            // Within the editor's part of the line, before what the search found.
+            let room = left_cols.saturating_sub(column);
+            let ghost = fit_cols(&sanitize(ghost), room);
+            grid.put_text(column, row, &ghost, GHOST, Color::Default, Attrs::default());
+        }
+        column.map(|column| Cursor { column, row })
+    }
+}
+
+/// Where `tree` (a column of lines and the page; anything else is taken as the standard
+/// terminal tree) puts its lines in a terminal `rows` high and `cols` wide: each line its row,
+/// and the page's rows. Lines take a row each in tree order while rows remain; the page gets
+/// the rest, and none at all (at row 0) when there is no row left for it. With the standard
+/// tree that is the summary on the first row and the command line on the last, the page
+/// between, and in a terminal of one row the summary alone.
+pub fn arrange(tree: &Node, rows: u16, cols: u16) -> (Vec<(Kind, u16)>, PageArea) {
+    let standard = Node::terminal();
+    let children = match tree {
+        Node::Column(children) if children.iter().all(|c| matches!(c, Node::Leaf(_))) => children,
+        _ => match &standard {
+            Node::Column(children) => children,
+            _ => unreachable!("the terminal's tree is a column"),
+        },
+    };
+    let kinds: Vec<Kind> = children
+        .iter()
+        .filter_map(|child| match child {
+            Node::Leaf(component) => Some(component.kind()),
+            _ => None,
+        })
+        .collect();
+    let mut left = rows;
+    let mut gets = vec![0u16; kinds.len()];
+    for (i, kind) in kinds.iter().enumerate() {
+        if *kind != Kind::PageView && left > 0 {
+            gets[i] = 1;
+            left -= 1;
         }
     }
+    let mut lines = Vec::new();
+    let mut page = PageArea {
+        row: 0,
+        rows: 0,
+        cols,
+        cursor: None,
+    };
+    let mut row = 0;
+    for (i, kind) in kinds.iter().enumerate() {
+        if *kind == Kind::PageView {
+            page.rows = left;
+            page.row = if left > 0 { row } else { 0 };
+            row += left;
+        } else if gets[i] > 0 {
+            lines.push((*kind, row));
+            row += 1;
+        }
+    }
+    (lines, page)
 }
 
 /// The rows left for the page, and the terminal cursor while the address is editing.
@@ -720,6 +778,56 @@ mod tests {
         let mut grid = Grid::new(40, 5);
         state.draw(&mut grid);
         assert_eq!(row_text(&grid, 4), "/exa");
+    }
+
+    /// `[tui.layout]`: the summary at the bottom (above the command line) or hidden, at 1, 2
+    /// and 24 rows; the standard tree as before at each.
+    #[test]
+    fn the_lines_go_where_the_tree_puts_them() {
+        use sighurt_api::ui::Component;
+        let leaf = |kind| Node::Leaf(Component::new(kind));
+        let bottom = Node::Column(vec![
+            leaf(Kind::PageView),
+            leaf(Kind::Summary),
+            leaf(Kind::CommandLine),
+        ]);
+        let hidden = Node::Column(vec![leaf(Kind::PageView), leaf(Kind::CommandLine)]);
+        let state = ChromeState {
+            status: Some("ok".into()),
+            ..ChromeState::default()
+        };
+        let summary = "[0/0]  —";
+        for (tree, rows, lines, page) in [
+            (
+                Node::terminal(),
+                24,
+                vec![(0, summary), (23, "ok")],
+                (1, 22),
+            ),
+            (Node::terminal(), 2, vec![(0, summary), (1, "ok")], (0, 0)),
+            (Node::terminal(), 1, vec![(0, summary)], (0, 0)),
+            (bottom.clone(), 24, vec![(22, summary), (23, "ok")], (0, 22)),
+            (bottom.clone(), 2, vec![(0, summary), (1, "ok")], (0, 0)),
+            (bottom, 1, vec![(0, summary)], (0, 0)),
+            (hidden.clone(), 24, vec![(23, "ok")], (0, 23)),
+            (hidden.clone(), 2, vec![(1, "ok")], (0, 1)),
+            (hidden, 1, vec![(0, "ok")], (0, 0)),
+        ] {
+            let mut grid = Grid::new(30, rows);
+            let area = state.draw_tree(&mut grid, &tree);
+            let what = format!("{tree:?} at {rows} rows");
+            assert_eq!(
+                (area.row, area.rows, area.cols),
+                (page.0, page.1, 30),
+                "{what}"
+            );
+            for (row, text) in lines {
+                assert!(row_text(&grid, row).starts_with(text), "{what}: row {row}");
+            }
+            if page.1 > 0 {
+                assert_eq!(row_text(&grid, page.0), "", "{what}: the page's first row");
+            }
+        }
     }
 
     fn row_text(grid: &Grid, row: u16) -> String {

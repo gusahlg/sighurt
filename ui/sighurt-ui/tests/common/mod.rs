@@ -13,8 +13,8 @@ use sighurt_render::{
 use sighurt_ui::chrome::{CHROME, PAGE, STATUS, TABS};
 use sighurt_ui::extension::SurfaceName;
 use sighurt_ui::{
-    Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, HomeKey, HomeLink, LayoutOptions, Model,
-    Pen, Snapshot, TabContent, TabSnapshot,
+    Arrangement, Colors, EngineRow, FontSystemHandle, Fonts, HomeInfo, HomeKey, HomeLink,
+    LayoutOptions, Model, Pen, Snapshot, TabContent, TabSnapshot,
 };
 use tiny_skia::{IntSize, Pixmap};
 
@@ -54,13 +54,13 @@ pub fn chrome_with(width: u32, height: u32, snapshot: Snapshot, colors: Colors) 
     arranged(width, height, snapshot, colors, LayoutOptions::default())
 }
 
-/// A chrome with `colors`, laid out with `options`.
+/// A chrome with `colors`, laid out with `options` (or a tree).
 pub fn arranged(
     width: u32,
     height: u32,
     snapshot: Snapshot,
     colors: Colors,
-    options: LayoutOptions,
+    options: impl Into<Arrangement>,
 ) -> Model {
     let mut chrome = Model::new(fonts(), colors, options);
     chrome.resize(LogicalSize { width, height });
@@ -71,6 +71,9 @@ pub fn arranged(
 /// Where the standard chrome's `surface` is placed.
 pub fn rect_of(chrome: &Model, surface: SurfaceName) -> WindowRect {
     let layout = chrome.layout();
+    if let Some(listed) = layout.surface(surface) {
+        return listed.rect;
+    }
     match surface {
         CHROME => layout.chrome,
         TABS => layout.tab_list,
