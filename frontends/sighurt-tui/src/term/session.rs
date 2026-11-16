@@ -26,10 +26,10 @@
 //! Handlers that return save and restore `errno`, so a full self-pipe cannot
 //! replace the interrupted call's error.
 //!
-//! Those fatal writers see an exact wire classification. Every output `write`
-//! stores it *before* the syscall, as the state the terminal is in if the
-//! kernel accepts a prefix and stops: inside sequence X from its first byte
-//! until the byte that leaves X has been accepted. The classification and its
+//! Those fatal writers see a wire classification they can trust. Every output `write`
+//! stores it *before* the syscall, as a state whose terminator is right whichever
+//! prefix of that write the kernel accepts (inside tmux, its passthrough and the
+//! outer terminal behind it included; `output.rs`). The classification and its
 //! generation share one atomic, so a handler cannot observe a new generation
 //! with a stale state. After a fatal writer takes the wire it bumps that
 //! generation; the owner then drops the queue instead of resuming the tail.
@@ -224,7 +224,7 @@ impl Session {
             active: AtomicBool::new(true),
             leave_at: AtomicUsize::new(0),
             protocol_restored: AtomicBool::new(false),
-            wire_packed: AtomicU64::new(u64::from(Wire::Ground as u8)),
+            wire_packed: AtomicU64::new(u64::from(Wire::GROUND.as_u8())),
             suspend_requested: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
             hangup: AtomicBool::new(false),
@@ -421,11 +421,11 @@ impl Session {
         })
     }
 
-    /// Drop bytes not yet written. An open sequence is kept or closed.
-    /// See [`super::Terminal::discard_pending`].
-    pub fn discard_pending(&mut self) {
+    /// Drop bytes not yet written, end what the written ones left open, then `extra`.
+    /// See [`super::Terminal::abort`].
+    pub fn abort(&mut self, extra: &[u8]) {
         self.sync_wire();
-        self.output.discard_to_boundary();
+        self.output.abort(extra);
         self.publish_wire();
     }
 
@@ -587,7 +587,7 @@ impl Session {
     /// Copy a fatal writer's wire over the queue when it has taken the generation.
     fn sync_wire(&mut self) {
         let (wire, gen) = load_wire(self.shared());
-        self.output.sync_handler(wire as u8, gen);
+        self.output.sync_handler(wire.as_u8(), gen);
     }
 
     /// Publish the queue's wire unless a fatal writer has taken it.
@@ -630,7 +630,7 @@ impl Session {
     /// must not start [`LEAVE`] on top of that sequence.
     fn finish_queued(&mut self, deadline: Mono) -> bool {
         self.sync_wire();
-        let (bytes, reliable) = self.output.take_inflight();
+        let bytes = self.output.take_inflight();
         if bytes.is_empty() {
             self.publish_wire();
             return true;
@@ -645,7 +645,6 @@ impl Session {
         let done = n == bytes.len();
         if !done {
             self.output.prepend(&bytes[n..]);
-            self.output.set_reliable_prefix(reliable.saturating_sub(n));
         }
         done
     }
@@ -891,6 +890,7 @@ fn write_protocol(state: &Shared, deadline: Mono) {
     if off == 0 {
         let (wire, _) = load_wire(state);
         let term = terminator(wire);
+        let term = term.as_bytes();
         if !term.is_empty() {
             let (n, handoff) = write_tracked(state, term, Some(deadline));
             if handoff || n == 0 {
@@ -927,7 +927,7 @@ fn reenter(state: &Shared) {
     state.leave_at.store(0, Ordering::Release);
     state.active.store(true, Ordering::Release);
     if restored {
-        let _ = store_wire_keep_gen(state, Wire::Ground);
+        let _ = store_wire_keep_gen(state, Wire::GROUND);
     }
     let _ = write_tracked(state, ENTER, None);
     // Drop whatever the suspension cut off, instead of resuming that tail.
@@ -1046,7 +1046,7 @@ fn store_wire_bump(state: &Shared, wire: Wire) {
 }
 
 fn pack_wire(gen: u64, wire: Wire) -> u64 {
-    (gen << 8) | u64::from(wire as u8)
+    (gen << 8) | u64::from(wire.as_u8())
 }
 
 fn unpack_wire(packed: u64) -> (Wire, u64) {

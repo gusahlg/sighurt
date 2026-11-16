@@ -17,8 +17,14 @@
 //! image with [`delete`] (`a=d,d=I`).
 //!
 //! Inside tmux, [`encode_tmux`] sends the same chunks as a virtual placement
-//! (`U=1`, no cursor movement), each APC wrapped on its own in tmux's DCS
-//! passthrough ([`wrap_tmux`]: `ESC P tmux ;`, every ESC doubled, `ESC \`). The
+//! (`U=1`, no cursor movement), all of them in one tmux DCS passthrough
+//! (`ESC P tmux ;`, every ESC doubled, `ESC \`; [`wrap_tmux`] for one sequence). tmux
+//! hands a passthrough to the outer terminal in one piece when it reads its end, so a
+//! transfer in one passthrough reaches the terminal whole, never interleaved with another
+//! pane's (the kitty protocol needs one upload finished before the next command). tmux
+//! drops a passthrough longer than its input buffer (`input-buffer-size`, at least 1 MiB):
+//! a transfer longer than [`TMUX_PASSTHROUGH_MAX`] goes in as few as fit, and only between
+//! those can another pane's graphics come in. The
 //! image is then shown by cells that hold U+10EEEE, a row and a column
 //! diacritic, and the image id's low byte as a 256-colour foreground and its
 //! high byte as a third diacritic ([`placeholders`]); tmux redraws those cells
@@ -129,8 +135,9 @@ pub fn encode(
     })
 }
 
-/// [`encode`] for use inside tmux: a virtual placement (`U=1`) with no cursor movement, every
-/// APC wrapped in tmux's DCS passthrough. The image is shown by [`placeholders`].
+/// [`encode`] for use inside tmux: a virtual placement (`U=1`) with no cursor movement, its
+/// chunks in one tmux DCS passthrough (more only past [`TMUX_PASSTHROUGH_MAX`]). The image is
+/// shown by [`placeholders`].
 ///
 /// Same validation, chunking and streaming as [`encode`], through the same thread-local encoder.
 /// `max_bytes` bounds the wrapped output. `image_id` must be one [`tmux_image_id`] gives,
@@ -386,8 +393,11 @@ struct Sink {
     image_id: u32,
     columns: u16,
     rows: u16,
-    /// Virtual placement, each APC in tmux's passthrough, no cursor movement.
+    /// Virtual placement, the chunks in tmux's passthrough, no cursor movement.
     tmux: bool,
+    /// The bytes tmux keeps of the open passthrough (`tmux;` and the content, ESCs single),
+    /// or `None` when none is open.
+    tmux_open: Option<usize>,
 }
 
 impl Sink {
@@ -413,6 +423,7 @@ impl Sink {
             columns: 0,
             rows: 0,
             tmux: false,
+            tmux_open: None,
         }
     }
 
@@ -435,6 +446,7 @@ impl Sink {
         max: usize,
     ) {
         self.tmux = tmux;
+        self.tmux_open = None;
         self.out.clear();
         self.max = max;
         self.produced = 0;
@@ -611,20 +623,36 @@ impl Sink {
             format!("q=2,m={more_flag}")
         };
         // `ESC _ G` + control + `;` + payload + `ESC \`, and `ESC [ u` on the last chunk. In
-        // tmux the two ESC bytes are doubled and `ESC P tmux ;` and `ESC \` go around it.
+        // tmux the two ESC bytes are doubled, the first chunk opens the passthrough
+        // (`ESC P tmux ;`) and the last closes it (`ESC \`); a chunk that would take the
+        // passthrough past what tmux keeps closes it and opens another first.
         let add = 3 + control.len() + 1 + b64.len() + 2;
-        let (wrap, tail) = if self.tmux {
-            (TMUX_OPEN.len() + 2 + TMUX_CLOSE.len(), 0)
+        let (mut wrap, tail) = if self.tmux {
+            (2, if more { 0 } else { TMUX_CLOSE.len() })
         } else {
             (0, if more { 0 } else { 3 })
         };
+        let reopen = self
+            .tmux_open
+            .is_some_and(|kept| kept + add > TMUX_PASSTHROUGH_MAX);
+        if self.tmux && (self.tmux_open.is_none() || reopen) {
+            wrap += TMUX_OPEN.len() + if reopen { TMUX_CLOSE.len() } else { 0 };
+        }
         if self.out.len() + add + wrap + tail > self.max {
             self.produced = self.out.len() + add + wrap + tail;
             self.over = true;
             return;
         }
         if self.tmux {
-            self.out.extend_from_slice(TMUX_OPEN);
+            if reopen {
+                self.out.extend_from_slice(TMUX_CLOSE);
+                self.tmux_open = None;
+            }
+            if self.tmux_open.is_none() {
+                self.out.extend_from_slice(TMUX_OPEN);
+                self.tmux_open = Some(b"tmux;".len());
+            }
+            self.tmux_open = self.tmux_open.map(|kept| kept + add);
             self.out.extend_from_slice(b"\x1b\x1b_G");
         } else {
             self.out.extend_from_slice(b"\x1b_G");
@@ -634,7 +662,10 @@ impl Sink {
         self.out.extend_from_slice(b64);
         if self.tmux {
             self.out.extend_from_slice(b"\x1b\x1b\\");
-            self.out.extend_from_slice(TMUX_CLOSE);
+            if !more {
+                self.out.extend_from_slice(TMUX_CLOSE);
+                self.tmux_open = None;
+            }
         } else {
             self.out.extend_from_slice(b"\x1b\\");
         }
@@ -677,6 +708,11 @@ pub fn delete(image_id: u32) -> Vec<u8> {
 const TMUX_OPEN: &[u8] = b"\x1bPtmux;";
 /// What closes it: the string terminator `ESC \`.
 const TMUX_CLOSE: &[u8] = b"\x1b\\";
+/// The most bytes one passthrough of [`encode_tmux`] gives tmux to keep (`tmux;` and the
+/// content with its ESCs single). tmux 3.8 keeps at most `input-buffer-size` (1 MiB, which is
+/// also the least it can be set to) less one byte of a sequence and drops a longer one whole;
+/// a page less is room to spare.
+pub const TMUX_PASSTHROUGH_MAX: usize = 1024 * 1024 - 4096;
 
 /// The image id placeholder cells name with the number `number` (1 to 65 535): its low byte
 /// is the cells' 256-colour foreground, its high byte their third diacritic, which kitty reads
@@ -1725,6 +1761,77 @@ mod tests {
         };
         assert_eq!(joined(&inner), joined(&plain));
         assert_eq!(parts.len(), payloads(&plain).len(), "same chunk boundaries");
+    }
+
+    /// Finding 2 of review B: a passthrough per chunk let another pane's upload come in
+    /// between two chunks of this one. One transfer is one passthrough now, and one too long
+    /// for tmux to keep is as few as it keeps, each of them whole chunks.
+    #[test]
+    fn a_tmux_transfer_is_one_passthrough_unless_tmux_would_drop_it() {
+        let passthroughs = |bytes: &[u8]| {
+            bytes
+                .windows(TMUX_OPEN.len())
+                .filter(|w| *w == TMUX_OPEN)
+                .count()
+        };
+        let mut pixels = Vec::new();
+        for index in 0..(64 * 64) {
+            let byte = noise(index);
+            pixels.extend_from_slice(&[byte, byte.wrapping_add(3), byte.wrapping_add(7), 255]);
+        }
+        let frame = frame_of(&mut pixels, 64, 64);
+        let wrapped = encode_tmux(&frame, 7, tmux_place(), 8 * 1024 * 1024).expect("tmux");
+        assert!(payloads(&unwrap_tmux(&wrapped)).len() > 1, "several chunks");
+        assert_eq!(passthroughs(&wrapped), 1);
+
+        // Noise of 640 by 480 is more than tmux keeps of one sequence.
+        let (width, height) = (640u32, 480u32);
+        let mut pixels = Vec::new();
+        for index in 0..width * height {
+            let a = noise(index);
+            let b = noise(index.wrapping_mul(7).wrapping_add(1));
+            pixels.extend_from_slice(&[a, b, a ^ b, 255]);
+        }
+        let frame = frame_of(&mut pixels, width, height);
+        let wrapped = encode_tmux(&frame, 7, tmux_place(), 16 * 1024 * 1024).expect("tmux");
+        assert!(wrapped.len() > TMUX_PASSTHROUGH_MAX, "{}", wrapped.len());
+        let count = passthroughs(&wrapped);
+        assert!(count >= 2, "{count}");
+        let mut rest = &wrapped[..];
+        for _ in 0..count {
+            let one = unwrap_tmux_one(rest);
+            // What tmux keeps: `tmux;` and the content with its ESCs single.
+            assert!(b"tmux;".len() + one.0.len() <= TMUX_PASSTHROUGH_MAX);
+            assert!(one.0.ends_with(b"\x1b\\"), "whole chunks only");
+            rest = &rest[one.1..];
+        }
+        assert!(rest.is_empty());
+        let fewest = (wrapped.len() / TMUX_PASSTHROUGH_MAX) + 1;
+        assert!(count <= fewest + 1, "{count} for {}", wrapped.len());
+        let plain = encode(&frame, 7, tmux_place(), 16 << 20).expect("plain");
+        assert_eq!(rgba_of(&unwrap_tmux(&wrapped)), rgba_of(&plain));
+    }
+
+    /// The content of the first passthrough in `bytes`, its ESCs single, and its length.
+    fn unwrap_tmux_one(bytes: &[u8]) -> (Vec<u8>, usize) {
+        let rest = bytes.strip_prefix(TMUX_OPEN).expect("passthrough opens");
+        let mut out = Vec::new();
+        let mut at = 0;
+        loop {
+            match rest[at] {
+                0x1b if rest[at + 1] == 0x1b => {
+                    out.push(0x1b);
+                    at += 2;
+                }
+                0x1b => break,
+                byte => {
+                    out.push(byte);
+                    at += 1;
+                }
+            }
+        }
+        assert_eq!(&rest[at..at + 2], TMUX_CLOSE);
+        (out, TMUX_OPEN.len() + at + 2)
     }
 
     #[test]

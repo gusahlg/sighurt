@@ -167,11 +167,17 @@ top; status and notices below) and the page between them in one of two modes:
   default), in a terminal that speaks the kitty graphics protocol (kitty, Rio, ghostty,
   WezTerm), or as sixel, the page's own frames at most 5 a second, where the terminal has
   sixel but not kitty graphics: inside tmux 3.4 or later, foot, xterm with sixel. For a second
-  after each key, mouse event or paste, frames come at `[tui] input-fps` (30 by default) with
-  either protocol, so typing and scrolling are not held to the page's pace. Inside tmux, with
-  `[tui] graphics = "kitty"` and `set -g allow-passthrough all` in tmux.conf, a terminal with
-  kitty graphics and Unicode placeholders (kitty, Rio, ghostty) gets kitty images through
-  tmux's passthrough instead of sixel, which tmux does not decode and encode again. A page a
+  after each key, mouse event or paste the page gets (not typing in the address line), and
+  after a tab switch, frames come at `[tui] input-fps` (30 by default, never slower than
+  `fps`) with either protocol, so typing and scrolling are not held to the page's pace.
+  Inside tmux, with `[tui] graphics = "kitty"` and `set -g allow-passthrough all` in
+  tmux.conf, a terminal with kitty graphics and Unicode placeholders (kitty, Rio, ghostty)
+  gets kitty images through tmux's passthrough instead of sixel, which tmux does not decode
+  and encode again. Each frame is one passthrough, so `sig`s in several panes don't mix their
+  uploads, except for a frame over about 1 MiB (tmux's `input-buffer-size`), which is split.
+  A terminal that attaches to the session gets the picture again when tmux reports the focus
+  change; one that attaches while another stays attached waits for the page to draw again or
+  `chrome.refresh`. A page a
   tab switch shows counts against that rate too, so holding the tab-switch key never floods
   the terminal with images.
   Each frame goes over the one before, and a new page's first frame over the old page, so the

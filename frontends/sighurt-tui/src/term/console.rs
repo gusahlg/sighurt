@@ -272,7 +272,7 @@ impl Session {
             original_cp_out,
             active: AtomicBool::new(true),
             protocol_restored: AtomicBool::new(false),
-            wire: AtomicU8::new(Wire::Ground as u8),
+            wire: AtomicU8::new(Wire::GROUND.as_u8()),
             owner: unsafe { GetCurrentThreadId() },
         });
         let input_thread = {
@@ -406,9 +406,10 @@ impl Session {
             .write_frame(&*shared.writer, frame, |wire| publish(shared, wire))
     }
 
-    /// Drop bytes not yet handed to the writer. An open sequence is kept or closed.
-    pub fn discard_pending(&mut self) {
-        self.output.discard_to_boundary();
+    /// Drop bytes not yet handed to the writer, end what the written ones left open, then
+    /// `extra`.
+    pub fn abort(&mut self, extra: &[u8]) {
+        self.output.abort(extra);
         publish(&self.shared, Wire::from_u8(self.output.wire_byte()));
     }
 
@@ -610,7 +611,7 @@ fn console_mode(handle: &Handle) -> io::Result<u32> {
 /// Remembers the wire the bytes handed to the writer leave. Always `true`: no other writer
 /// takes the wire here.
 fn publish(shared: &Shared, wire: Wire) -> bool {
-    shared.wire.store(wire as u8, Ordering::Release);
+    shared.wire.store(wire.as_u8(), Ordering::Release);
     true
 }
 
@@ -620,11 +621,11 @@ fn restore_shared(shared: &Shared) -> bool {
     let deadline = Instant::now() + RESTORE_BUDGET;
     if !shared.protocol_restored.load(Ordering::Acquire) {
         let wire = Wire::from_u8(shared.wire.load(Ordering::Acquire));
-        let mut bytes = terminator(wire).to_vec();
+        let mut bytes = terminator(wire).as_bytes().to_vec();
         bytes.extend_from_slice(LEAVE);
         if shared.writer.write_last(&bytes, deadline) {
             shared.protocol_restored.store(true, Ordering::Release);
-            shared.wire.store(Wire::Ground as u8, Ordering::Release);
+            shared.wire.store(Wire::GROUND.as_u8(), Ordering::Release);
         }
     }
     if shared.active.swap(false, Ordering::AcqRel) {

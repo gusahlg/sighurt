@@ -2051,21 +2051,7 @@ fn kitty_graphics_go_through_tmux_passthrough_with_placeholders() {
         Seed::None,
         "tmux-256color",
         false,
-        |dir| {
-            let bin = dir.join("bin");
-            fs::create_dir_all(&bin).unwrap();
-            let tmux = bin.join("tmux");
-            fs::write(&tmux, "#!/bin/sh\necho all\n").unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            let mut paths = vec![bin];
-            paths.extend(std::env::split_paths(&path));
-            vec![
-                ("TMUX".into(), "/tmp/tmux-test/default,1,0".into()),
-                ("PATH".into(), std::env::join_paths(paths).unwrap()),
-            ]
-        },
+        fake_tmux,
     );
     let opening = b"\x1bPtmux;\x1b\x1b_Ga=T,U=1,f=32,o=z,t=d,s=800,v=440,";
     let shown = term.wait(0, Duration::from_secs(15), |got| {
@@ -2116,6 +2102,161 @@ fn kitty_graphics_go_through_tmux_passthrough_with_placeholders() {
     assert!(term.exit().success(), "{}", term.context());
     let json = fs::read_to_string(term.dir.join("diag.json")).unwrap_or_default();
     assert!(json.contains("graphics=kitty-tmux"), "{json}");
+}
+
+/// A tmux pane for `sig`: `$TMUX`, and a `tmux` of the test's own first on `PATH` that says
+/// `allow-passthrough` is `all`.
+fn fake_tmux(dir: &Path) -> Vec<(String, std::ffi::OsString)> {
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let tmux = bin.join("tmux");
+    fs::write(&tmux, "#!/bin/sh\necho all\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&path));
+    vec![
+        ("TMUX".into(), "/tmp/tmux-test/default,1,0".into()),
+        ("PATH".into(), std::env::join_paths(paths).unwrap()),
+    ]
+}
+
+/// Finding 2 of review B: each kitty chunk had a passthrough of its own, so another pane's
+/// upload could come in between two chunks of this one. A frame's transfer is one passthrough
+/// now: between its `ESC P tmux ;` and its end, no other.
+#[test]
+fn through_tmux_a_kitty_transfer_is_one_passthrough() {
+    let mut term = Terminal::start_env(
+        "tmux-one-pass",
+        &["demo://animation"],
+        SIXEL_REPLIES,
+        &format!("graphics = \"kitty\"\n{SIXEL_KEYS}"),
+        Seed::None,
+        "tmux-256color",
+        false,
+        fake_tmux,
+    );
+    let opening = b"\x1bPtmux;\x1b\x1b_Ga=T,U=1,";
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        got.windows(opening.len()).filter(|w| *w == opening).count() >= 3
+    });
+    assert!(shown, "fewer than 3 kitty images\n{}", term.context());
+    let starts: Vec<usize> = term
+        .got
+        .windows(opening.len())
+        .enumerate()
+        .filter(|(_, w)| *w == opening)
+        .map(|(at, _)| at)
+        .collect();
+    for &start in &starts[..starts.len() - 1] {
+        // The passthrough ends at the first ESC that is not doubled and is followed by `\`.
+        let body = &term.got[start + b"\x1bPtmux;".len()..];
+        let mut at = 0;
+        while !(body[at] == 0x1b && body[at + 1] != 0x1b) {
+            at += if body[at] == 0x1b { 2 } else { 1 };
+        }
+        assert_eq!(&body[at..at + 2], b"\x1b\\", "{}", term.context());
+        let content = &body[..at];
+        let chunks = content.windows(4).filter(|w| *w == b"\x1b\x1b_G").count();
+        assert!(
+            chunks >= 2,
+            "one passthrough of {chunks} chunks\n{}",
+            term.context()
+        );
+        assert!(
+            content.windows(b"m=0;".len()).any(|w| w == b"m=0;"),
+            "the whole transfer, its last chunk included, in one passthrough\n{}",
+            term.context()
+        );
+    }
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// Finding 6 of review B: when tmux attaches a client (another terminal), it draws the
+/// placeholder cells it stores, and that terminal never got the image. tmux tells the pane's
+/// focus when a client attaches; on a focus in, `sig` sends the shown page's picture again,
+/// even when the page has not changed.
+#[test]
+fn through_tmux_a_focus_in_sends_the_picture_again() {
+    let mut term = Terminal::start_env(
+        "tmux-focus",
+        &["demo://pattern"],
+        SIXEL_REPLIES,
+        &format!("graphics = \"kitty\"\n{SIXEL_KEYS}"),
+        Seed::None,
+        "tmux-256color",
+        false,
+        fake_tmux,
+    );
+    let opening = b"\x1bPtmux;\x1b\x1b_Ga=T,U=1,";
+    let count = |got: &[u8]| got.windows(opening.len()).filter(|w| *w == opening).count();
+    let shown = term.wait(0, Duration::from_secs(15), |got| count(got) >= 1);
+    assert!(shown, "no kitty image\n{}", term.context());
+    // The page is still: once a second has passed with no image, none comes on its own.
+    let started = Instant::now();
+    loop {
+        let from = term.got.len();
+        let more = term.wait(from, Duration::from_millis(1200), |got| count(got) > 0);
+        if !more {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{}",
+            term.context()
+        );
+    }
+    let from = term.got.len();
+    term.type_bytes(b"\x1b[I");
+    let again = term.wait(from, Duration::from_secs(5), |got| count(got) > 0);
+    assert!(
+        again,
+        "no image after the focus came back\n{}",
+        term.context()
+    );
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
+}
+
+/// Review B on input pacing: typing in the address line is not input to the page, so a page
+/// animating on its own keeps its pace (sixel: 5 a second) while the line takes keys. Keys
+/// the page gets lift it ([`sixel_frames_follow_input_at_input_fps_and_the_page_at_five`]).
+#[test]
+fn typing_in_the_address_line_leaves_the_pages_pace() {
+    let mut term = Terminal::start_in(
+        "sixel-line-typing",
+        &["demo://animation"],
+        SIXEL_REPLIES,
+        &format!("{SIXEL_KEYS}\n\"f3\" = \"location.focus\""),
+    );
+    let shown = term.wait(0, Duration::from_secs(15), |got| {
+        !sixel_spans(got).is_empty()
+    });
+    assert!(shown, "no sixel\n{}", term.context());
+    // F3 as a legacy terminal sends it: the address line opens.
+    term.type_bytes(b"\x1bOR");
+    let from = term.got.len();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        term.type_bytes(b"x");
+        term.wait(term.got.len(), Duration::from_millis(30), |_| false);
+    }
+    let lasted = started.elapsed();
+    let typed = sixel_spans(&term.got[from..]).len();
+    let most = (lasted.as_millis() / 200 + 2) as usize;
+    assert!(
+        typed <= most,
+        "{typed} sixels in {lasted:?} of typing in the line, more than the page's {most}\n{}",
+        term.context()
+    );
+    // Had F3 not opened the line, the keys would have been the page's and lifted its pace.
+    // Escape closes the line; then `q` quits.
+    term.type_bytes(b"\x1b");
+    term.wait(term.got.len(), Duration::from_millis(300), |_| false);
+    term.type_bytes(b"q");
+    assert!(term.exit().success(), "{}", term.context());
 }
 
 /// Inside tmux (TERM) too, a page that keeps changing has its sixels written over each other
