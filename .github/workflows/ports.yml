@@ -1,11 +1,9 @@
 name: Ports
 
 # The terminal-only `sig` on macOS and Windows (docs/rewrite/PORTING.md): no window, no Servo,
-# no WPE WebKit, Ladybird or NetSurf (Linux only), and no `sig://terminal` programs. macOS
-# checks and tests it with the demo and Wasm engines; Windows checks it with the demo engine
-# (the Wasm engine needs FFmpeg, which the runner does not have) and tests only the crates
-# that have nothing platform-specific. On Windows `sig --tui` and `--dump` say the terminal is
-# unsupported there; what runs is the rest of `sig`.
+# no WPE WebKit, Ladybird or NetSurf (Linux only). Each job builds and tests only the
+# terminal-only feature sets. A later step runs when an earlier one failed, so one run shows
+# every failure; a newer push to the same branch cancels the run before it.
 
 on:
   push:
@@ -13,8 +11,13 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ports-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
   macos:
@@ -22,10 +25,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      # The Wasm engine's video (ffmpeg-next) finds FFmpeg with pkg-config.
-      - name: Install system dependencies
-        run: brew install ffmpeg pkgconf
 
       # The compiler of nix/nixpkgs.nix and of the workspace's rust-version, as in ci.yml.
       # sig's own pages (sighurt-pages) are built for wasm32 by a nested cargo.
@@ -36,28 +35,45 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check sig (terminal, demo and Wasm engines)
-        run: >
-          cargo check --locked -p sighurt-browser --no-default-features
-          --features frontend-tui,engine-demo,engine-wasm
-
-      # The unit tests and tests/tui.rs (sig --tui in a pty against the demo engine); not the
-      # examples, which are the window's.
+      # The unit tests and tests/tui.rs (sig --tui and --dump in a pty against the demo
+      # engine); not the examples, which are the window's.
       - name: Test sig (terminal, demo engine)
         run: >
           cargo test --locked -p sighurt-browser --no-default-features
-          --features frontend-tui,engine-demo --bins --tests
+          --features frontend-tui,engine-demo --bins --tests --no-fail-fast
 
       # Not the chromes' and renderers' tests: their golden images are drawn with Linux's fonts.
-      - name: Test the platform-neutral crates
+      - name: Test the platform-neutral crates and the terminal frontend
+        if: ${{ !cancelled() }}
         run: >
-          cargo test --locked -p sighurt-api -p sighurt-core -p sighurt-config-example
-          -p sighurt-semantic
+          cargo test --locked -p sighurt-api -p sighurt-core -p sighurt-runtime
+          -p sighurt-config -p sighurt-config-example -p sighurt-semantic
+          -p sighurt-tui --features sighurt-tui/engine-demo --no-fail-fast
+
+      # The Wasm engine's video (ffmpeg-next 8.1) finds FFmpeg with pkg-config. Homebrew's
+      # `ffmpeg` is newer than the FFmpeg that version binds (fields and codec ids it names are
+      # gone), so the 7 series, which Homebrew keeps apart from its prefix.
+      - name: Install FFmpeg
+        if: ${{ !cancelled() }}
+        run: |
+          brew install ffmpeg@7 pkgconf
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      # tests/tui.rs again with the Wasm engine: sig's own pages (sig://help, home's links to
+      # it). The terminal pages' programs are Linux's, and so are their tests.
+      - name: Test sig (terminal, demo and Wasm engines)
+        if: ${{ !cancelled() }}
+        run: >
+          cargo test --locked -p sighurt-browser --no-default-features
+          --features frontend-tui,engine-demo,engine-wasm --test tui --no-fail-fast
 
   windows:
-    name: Windows (terminal only, check)
+    name: Windows (terminal only)
     runs-on: windows-latest
     steps:
+      # The tests' golden files are compared byte for byte: no CRLF on checkout.
+      - run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v4
 
       # aws-lc-sys (rustls' provider in sig) assembles with NASM on x86_64 Windows.
@@ -69,10 +85,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check sig (terminal, demo engine)
+      # The unit tests, and tests/console.rs: sig --tui in a pseudoconsole (ConPTY) and
+      # sig --dump into a pipe, printing what the console showed.
+      - name: Test sig (terminal, demo engine)
         run: >
-          cargo check --locked -p sighurt-browser --no-default-features
-          --features frontend-tui,engine-demo
+          cargo test --locked -p sighurt-browser --no-default-features
+          --features frontend-tui,engine-demo --bins --tests --no-fail-fast -- --nocapture
 
-      - name: Test the crates with nothing platform-specific
-        run: cargo test --locked -p sighurt-api -p sighurt-semantic
+      - name: Test the platform-neutral crates and the terminal frontend
+        if: ${{ !cancelled() }}
+        run: >
+          cargo test --locked -p sighurt-api -p sighurt-core -p sighurt-runtime
+          -p sighurt-config -p sighurt-config-example -p sighurt-semantic
+          -p sighurt-tui --features sighurt-tui/engine-demo --no-fail-fast
