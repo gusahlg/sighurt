@@ -82,6 +82,7 @@ fn environment() -> Environment {
                 "user-agent",
                 "storage",
                 "experimental-features",
+                "smooth-scroll",
                 "preferences",
             ],
         ),

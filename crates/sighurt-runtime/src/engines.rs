@@ -42,6 +42,7 @@ pub fn descriptors() -> Vec<Descriptor> {
                 "user-agent",
                 "storage",
                 "experimental-features",
+                "smooth-scroll",
                 "preferences",
             ],
         },
@@ -146,6 +147,7 @@ mod tests {
             "user-agent" => "\"Sighurt\"",
             "storage" => "\"ephemeral\"",
             "experimental-features" => "true",
+            "smooth-scroll" => "true",
             "preferences" => "{ dom_adoptedstylesheet_enabled = true }",
             other => panic!("no valid value of {other} here"),
         };
@@ -166,6 +168,7 @@ mod tests {
                 "user-agent",
                 "storage",
                 "experimental-features",
+                "smooth-scroll",
                 "preferences"
             ]
         );

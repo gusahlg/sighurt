@@ -44,7 +44,8 @@
 //! ([`EngineSettings`]), each checked here for its form, and against what the build says that
 //! engine honors (`Environment::engine_settings`): setting what an engine can't honor is an
 //! error, never ignored. `experimental-features` turns on Servo's experimental web-platform
-//! preferences (off by default, which is Servo's own default). `preferences` then sets
+//! preferences (off by default, which is Servo's own default). `smooth-scroll` (off by default)
+//! plays Servo's wheel notches out as several small wheel events. `preferences` then sets
 //! individual Servo 0.7 preferences by field name; an unknown name or a value of the wrong
 //! type is an error. `[downloads] directory`, `[session] restore` and `[history] remember` are
 //! the executable's, checked here.
@@ -126,12 +127,13 @@ const ENGINE_SETTING_NAMES: &[&str] = &[
     "user-agent",
     "storage",
     "experimental-features",
+    "smooth-scroll",
     "preferences",
 ];
 
 /// How each setting except `preferences` is read. `preferences` is its own table, so one bad
 /// preference is its own error ([`read_preferences`]).
-const ENGINE_SETTINGS: [(&str, ReadSetting); 3] = [
+const ENGINE_SETTINGS: [(&str, ReadSetting); 4] = [
     ("user-agent", |value, settings| {
         // Printable ASCII is what an HTTP header may hold; Servo's network code unwraps the
         // parse of its user agent as a header.
@@ -167,6 +169,13 @@ const ENGINE_SETTINGS: [(&str, ReadSetting); 3] = [
             None => Err(format!("expected true or false, not {value}")),
         }
     }),
+    ("smooth-scroll", |value, settings| match value.as_bool() {
+        Some(enabled) => {
+            settings.smooth_scroll = enabled;
+            Ok(())
+        }
+        None => Err(format!("expected true or false, not {value}")),
+    }),
 ];
 
 /// A value of `[engines.<engine>.preferences]`, of that Servo preference's type.
@@ -197,6 +206,9 @@ pub struct EngineSettings {
     /// `experimental-features`: turn on the web-platform preferences Servo marks experimental.
     /// `false`, the default, is Servo's own default for that switch.
     pub experimental_features: bool,
+    /// `smooth-scroll`: play a wheel notch out as a run of smaller wheel events (Servo).
+    /// `false`, the default: a notch is one wheel event.
+    pub smooth_scroll: bool,
     /// `preferences`: Servo preference overrides by field name, applied after
     /// `experimental-features`. Empty when the file sets none.
     pub preferences: BTreeMap<String, ServoPrefValue>,
@@ -2092,6 +2104,7 @@ mod tests {
                     "user-agent",
                     "storage",
                     "experimental-features",
+                    "smooth-scroll",
                     "preferences",
                 ],
             ),
@@ -3024,7 +3037,7 @@ mod tests {
             "[engines.servo] user-agent: expected 1 to 512 printable ASCII characters, not",
             "[engines.servo] storage: expected \"profile\" or \"ephemeral\", not \"kept\"",
             "[engines.servo] javascript: unknown key (an engine's settings are user-agent, \
-             storage, experimental-features, preferences)",
+             storage, experimental-features, smooth-scroll, preferences)",
             "[engines.wasm] user-agent: the wasm engine can't honor it (it honors: storage)",
             "[engines.demo] storage: the demo engine can't honor it (it honors: none)",
             "[engines.Servo]: \"Servo\" is not an engine name",
@@ -3087,6 +3100,7 @@ mod tests {
         .unwrap();
         let servo = config.engine_settings("servo");
         assert!(servo.experimental_features);
+        assert!(!servo.smooth_scroll);
         assert_eq!(
             servo.preferences.get("dom_adoptedstylesheet_enabled"),
             Some(&ServoPrefValue::Bool(true))
@@ -3114,7 +3128,21 @@ mod tests {
         // Left out, both stay at Servo's own default for the switch: off, and no overrides.
         let defaults = parse("version = 1").unwrap().engine_settings("servo");
         assert!(!defaults.experimental_features);
+        assert!(!defaults.smooth_scroll);
         assert!(defaults.preferences.is_empty());
+        // Smooth scrolling is its own switch, off unless the file turns it on.
+        let on = parse("version = 1\n[engines.servo]\nsmooth-scroll = true")
+            .unwrap()
+            .engine_settings("servo");
+        assert!(on.smooth_scroll && !on.experimental_features);
+        let off = parse("version = 1\n[engines.servo]\nsmooth-scroll = false")
+            .unwrap()
+            .engine_settings("servo");
+        assert_eq!(off, EngineSettings::default());
+        assert_eq!(
+            problems("version = 1\n[engines.servo]\nsmooth-scroll = \"yes\""),
+            ["[engines.servo] smooth-scroll: expected true or false, not \"yes\""]
+        );
         // `false` written out is the same settings the engines start from.
         let written = parse("version = 1\n[engines.servo]\nexperimental-features = false")
             .unwrap()
