@@ -1234,9 +1234,12 @@ mod tests {
             find(&key("F11", 87), Some("sig://terminal")),
             Some(&Command::PageForward)
         );
+        // The terminal's own F12 on sig://terminal hides the other one there: three, not four.
         let described = bindings.describe(Frontend::Terminal);
-        assert_eq!(described.len(), 4);
+        assert_eq!(described.len(), 3, "{described:?}");
         assert!(described.iter().all(|b| b.keys == "f12" || b.keys == "f11"));
+        assert!(!described.iter().any(|b| b.action == "page.back"));
+        assert_eq!(bindings.describe(Frontend::Gui).len(), 3);
     }
 
     #[test]
