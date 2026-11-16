@@ -226,3 +226,52 @@ Estimates are rough line counts from reading, not measured.
 | 6 | `Label` in both frontends; CLAUDE.md, README, DOCS, the extension-api changelog, STATUS decisions | A golden and a grid test for a label; cross-check lines clean | ~200 plus docs |
 
 Stages 0–4 are two days and deliver the standard chrome and the terminal on trees with every old option an operation. Stages 5–6 are a third day. In total about 2,500 changed lines over about 25 files.
+
+## Review and rulings (16 November 2026)
+
+GPT-6 Astra reviewed the design above (`reviews-interface-astra.md`, 13 findings). The rulings
+below are binding for the implementation and override the text above where they differ.
+
+1. **Mandatory parts keep their room** (finding 1). A `Fixed` size is clamped so that the
+   editor (`AddressBar` or `CommandLine`) and whatever shows status keep their natural size.
+   Two exceptions that exist today are kept and stated: a window too small for the default
+   tree clips as it does now (pixel identity), and the terminal's line shows the editor
+   before a notice while it is being edited.
+2. **Layers are passive** (finding 2). Only `StatusBar` and `Label` may be layers; never the
+   `PageView`, the editor or the `TabBar`. `check` rejects the rest.
+3. **A component-to-surface ownership map** (findings 3 and 8) is compiled from the tree and
+   is the one source for drawing dispatch, damage, the text field's surface and local
+   coordinates, and hit testing. The seven chrome names are slots, the legacy names
+   (`chrome`, `tabs`, `status`, `line`) preferences; `check` fails a tree that cannot be
+   assigned. A surface is cleared once; component painters draw only their regions.
+4. **The line chrome is not folded in for this version** (findings 4, 5, 12, 13). Stage 5 is
+   deferred: `sighurt-chrome-line`, `ChromeKind`, `CHROMES` and `[ui] chrome` stay, so
+   `chrome = "line"` selects the existing crate and native chromes remain the low-level
+   path. `chrome = "standard"` is the tree's interpreter. `CommandLine` in the window tree is
+   rejected by `check` until the line is ported as a complete slice with a presentation
+   interface (editor geometry, hit positions, the engine button while editing).
+5. **Legacy tables keep their meaning** (finding 5): `[chrome.standard]` applies only while
+   `chrome = "standard"`, as today; the canonical `[ui.layout]` and `[tui.layout]` apply
+   after it in a fixed, documented order that does not depend on the file's key order; an
+   operation that replaces the editor is atomic. The result is validated once, at the end.
+6. **The grammar is what is implemented** (finding 6). `Size` is `Auto | Fixed(u16)`; only
+   the branch holding the `PageView` fills. `check` rejects every component and parent
+   combination no interpreter lays out (a bar inside a `Row`, a `Fixed` label in the
+   terminal, and so on), each with a message naming the node. Containers measure
+   recursively; fixed siblings after the filling child are reserved before it.
+7. **Buttons**: `Back`, `Forward`, `Reload`, each at most once (finding 7).
+8. **Pixel identity is a compatibility implementation, not a by-product** (finding 9): the
+   default tree keeps the legacy surface partition, measurement order and nominal (unclipped)
+   origins; the equivalence test covers the full option matrix, font sizes 12 to 24, scroll
+   positions and tiny windows, and compares surface plans and events as well as rectangles.
+9. **`Label`** (finding 10) is evaluated by the frontend with the `Browser` view whenever the
+   core says the chrome may have changed; its output is contained and bounded (8 spans, 256
+   characters), and it repaints only when the spans differ. It stays in stage 6.
+10. **Identities for later** (finding 11): `PageView` carries a slot (`PageSlot::MAIN`, the
+    only one), page placements are compiled as a list of one, and a `Label` has an `id`;
+    operations on kinds stay for the kinds that exist once.
+11. **Order** (finding 13): the grammar and the compiled geometry and ownership first; the
+    standard chrome through it; then the configuration operations and reload; then the
+    terminal, with one pure layout result for drawing, page metrics and input mapping and
+    one complete transition path when the tree changes at an unchanged terminal size. The
+    tests the review lists are acceptance tests. The estimate above is withdrawn.
