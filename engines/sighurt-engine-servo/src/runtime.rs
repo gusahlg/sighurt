@@ -71,7 +71,8 @@
 //! Servo's request to the answer.
 //!
 //! [`EngineRuntime::shutdown`] closes in the order M1 established: the WebViews, then Servo
-//! (which spins until its constellation, WebGL and paint threads are done), then each view's
+//! (which spins until its constellation, WebGL and paint threads are done), then waits for the
+//! TLS prewarm thread Servo started and never joins ([`crate::prewarm`]), then each view's
 //! GL context, then the EGL display, then the target leases; the host releases its Wayland
 //! objects after that. After a page crash or a lost backend, Servo 0.5 never finished shutting
 //! down (its constellation waited for the dead script thread's pipelines). The runtime still
@@ -111,6 +112,7 @@ use crate::delegate::{contained, Coalescing, Delegate, Note};
 use crate::input::text_input_state;
 use crate::navigation::{Navigator, Request};
 use crate::presentation::{physical, Egl, GlInfo, OffscreenAdapter, PageSurface, Readbacks};
+use crate::prewarm::Started;
 use crate::semantic::{self, Tag};
 use crate::target::ServoTarget;
 use crate::view::{Load, Pending, View};
@@ -129,6 +131,9 @@ const MAX_ASKED: usize = 16;
 /// The most clipboard text a page reads.
 const CLIPBOARD_LIMIT: usize = 4 << 20;
 const TEXT_PLAIN: &str = "text/plain;charset=utf-8";
+/// How long shutdown waits for the threads Servo started at launch that may still seed aws-lc's
+/// random generator ([`crate::prewarm`]).
+const PREWARM_WAIT: Duration = Duration::from_secs(5);
 /// The `log` target of the timing lines (see the module documentation).
 pub const TIMING: &str = "sighurt_engine_servo::timing";
 
@@ -343,6 +348,8 @@ pub struct ServoRuntime<T: ServoTarget = TargetLease> {
     /// User styles for every WebView. Holds a `Servo` clone, so it is dropped before
     /// [`Self::servo`] in [`Self::shutdown`].
     user_content: Option<Rc<UserContentManager>>,
+    /// The threads that appeared while Servo was built: shutdown waits for its TLS prewarm.
+    started: Started,
 }
 
 impl<T: ServoTarget> ServoRuntime<T> {
@@ -361,6 +368,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             read_to_image: Rc::default(),
             gl_reads: config.audit_gl.then(Rc::default),
         };
+        let before = Started::threads();
         let servo = ServoBuilder::default()
             .opts(Opts {
                 // Page panics are `notify_crashed`, never a process exit.
@@ -371,6 +379,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             .preferences(prefs)
             .event_loop_waker(Box::new(Waker(waker.clone())))
             .build();
+        let started = Started::since(&before);
         let delegate = Rc::new(Delegate::default());
         servo.set_delegate(Rc::clone(&delegate) as _);
         // Installed before the first WebView, so each script thread copies it. Servo has no
@@ -405,6 +414,7 @@ impl<T: ServoTarget> ServoRuntime<T> {
             page_crashed: false,
             leaked: false,
             user_content: Some(user_content),
+            started,
         }
     }
 
@@ -1841,6 +1851,9 @@ impl<T: ServoTarget> EngineRuntime for ServoRuntime<T> {
         // rendering contexts. The profile writer joins during that Drop, then the lock below
         // is released.
         drop(servo);
+        // Servo never joins its TLS prewarm thread; the process must not exit while it may
+        // still seed aws-lc's random generator (`crate::prewarm`).
+        self.started.wait(PREWARM_WAIT);
         let mut contexts_leaked = false;
         let mut leases = Vec::new();
         for mut view in views {
