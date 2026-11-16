@@ -86,6 +86,10 @@ pub trait WpeTarget: seal::Sealed + Host<Self::Permit> + 'static {
     /// permit is dropped, so nothing is submitted.
     fn dismiss(permit: Self::Permit, outcome: PresentOutcome);
 
+    /// The present is about to commit `permit`'s frame: a Wayland permit's presentation latency
+    /// counts from here ([`FramePermit::submitting`]).
+    fn submitting(permit: &Self::Permit);
+
     /// Drops the target after the view's WebKit objects. A Wayland lease is retired.
     fn retire(self);
 }
@@ -160,6 +164,10 @@ impl WpeTarget for TargetLease {
         permit.finish(outcome);
     }
 
+    fn submitting(permit: &Self::Permit) {
+        permit.submitting();
+    }
+
     fn retire(self) {
         TargetLease::retire(self);
     }
@@ -219,6 +227,8 @@ impl<C: CpuTarget + 'static> WpeTarget for Offscreen<C> {
     }
 
     fn dismiss(_permit: Self::Permit, _outcome: PresentOutcome) {}
+
+    fn submitting(_permit: &Self::Permit) {}
 
     fn retire(self) {}
 }

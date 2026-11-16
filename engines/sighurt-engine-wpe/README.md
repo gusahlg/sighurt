@@ -53,7 +53,10 @@ own too; WebKit's thread code takes the signal from it all the same.
 - **Embedding**: the WPE Platform API, with Sighurt's own `WPEDisplay` and `WPEView` (GObject
   subclasses in Rust), a `WPEToplevel` per view and the display's one `WPEScreen` with a vblank
   observer at the output's refresh rate (animations follow the output; nothing ticks while no page
-  animates); also the display's clipboard and each view's input-method context.
+  animates; WebKit is told 60 Hz, so every tick is a rendering update, `src/screen.rs` says why).
+  The observer ticks in the owner's GLib dispatch, never on a thread of its own, so WebKit's
+  monitor callbacks never run while WebKit destroys their monitors; also the display's clipboard
+  and each view's input-method context.
 - **Presentation**: WebKit's DMA-BUFs attached to the view's subsurface as `wl_buffer`s, no CPU
   copy; where the compositor has no DMA-BUF (or with `force_shm`), shared memory with one copy per
   frame, logged and counted. Frames are paced by the host's permits and frame callbacks. A CPU

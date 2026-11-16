@@ -3,20 +3,22 @@
 <title>raf</title>
 <!-- Records the intervals between requestAnimationFrame callbacks (performance.now(), ms) while
      `window.measure(true)` is on; tests/raf.rs reads them with `window.report()`. Paints a moving
-     box so every frame has damage. -->
+     box so every frame has damage, until `window.still(true)`: then it asks for frames and
+     paints nothing. -->
 <style>#b { width: 40px; height: 40px; background: #36c; position: absolute; top: 60px; }</style>
 <div id="b"></div>
 <script>
-  let on = false, last = null, deltas = [], running = true, n = 0;
+  let on = false, last = null, deltas = [], running = true, n = 0, still = false;
   const frame = (t) => {
     if (on && last !== null) deltas.push(t - last);
     last = t;
-    document.getElementById("b").style.left = (n++ % 300) + "px";
+    if (!still) document.getElementById("b").style.left = (n++ % 300) + "px";
     if (running) requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
   window.measure = (v) => { on = v; last = null; deltas = []; return 0; };
   window.stop = () => { running = false; return 0; };
+  window.still = (v) => { still = v; return 0; };
   window.report = () => {
     const d = deltas.slice().sort((a, b) => a - b);
     const q = (p) => d.length ? d[Math.min(d.length - 1, Math.floor(p * d.length))] : 0;
