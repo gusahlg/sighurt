@@ -53,7 +53,7 @@
 //! (another page, a web app in a page's view, a page in an app's view) fails, whichever of
 //! Navigate, Reload or Traverse asks for it. An internal document reports what its guest asks
 //! through the `sig` module as service requests and gets the answers
-//! ([`crate::pages::Internal`]); its key presses, repeats and pastes also go to its ordered
+//! ([`crate::pages::Internal`]); its key presses, repeats, pastes and pointer events also go to its ordered
 //! input queue; a page that edits text says it has a text field, so pastes reach it.
 //!
 //! ## User activation
@@ -78,8 +78,8 @@ use sighurt_api::events::{Cursor, EngineEvent, NavigationError, OpenDisposition}
 use sighurt_api::geometry::{LogicalSize, Metrics, SurfacePoint};
 use sighurt_api::ids::{DocumentGeneration, LayoutEpoch, NavigationId, RequestId, ViewId};
 use sighurt_api::input::{
-    ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyEvent, PointerButton, PointerEvent,
-    ScrollDelta,
+    ButtonState, FocusEvent, InputEvent, InputKind, Key, KeyEvent, Modifiers, PointerButton,
+    PointerEvent, ScrollDelta,
 };
 use sighurt_api::services::{Service, ServiceRequest};
 
@@ -90,6 +90,7 @@ use crate::engine::WasmEngine;
 use crate::keys;
 use crate::live::LiveGuest;
 use crate::navigation::{HistoryEntry, NavigationStack, Place, Session};
+use crate::pages;
 use crate::permissions::{self, PendingPermission};
 use crate::raster::{self, Frame, Scene};
 use crate::runtime::Loaded;
@@ -457,7 +458,7 @@ impl View {
         jobs: &impl Jobs,
         out: &mut Outbox,
     ) {
-        let kind = match crate::pages::page_name(&url) {
+        let kind = match pages::page_name(&url) {
             Some(name) => self
                 .page
                 .engine
@@ -925,8 +926,21 @@ impl View {
     fn input(&mut self, event: InputEvent, out: &mut Outbox) {
         match event.kind {
             InputKind::Pointer(pointer) => match pointer {
-                PointerEvent::Enter { position } | PointerEvent::Motion { position, .. } => {
-                    self.pointer_moved(position, out)
+                PointerEvent::Enter { position } => self.pointer_moved(position, out),
+                PointerEvent::Motion {
+                    position,
+                    modifiers,
+                } => {
+                    self.pointer_moved(position, out);
+                    if let (Some(internal), Some(at)) = (&self.page.internal, self.canvas_pointer())
+                    {
+                        let held = lock(&self.page.input_state).mouse_buttons_down;
+                        let held = held
+                            .iter()
+                            .enumerate()
+                            .fold(0, |bits, (i, &down)| bits | (u32::from(down) << i));
+                        internal.pointer(pages::record::MOTION, modifiers, held, at, None);
+                    }
                 }
                 PointerEvent::Leave => {
                     self.pointer = None;
@@ -936,15 +950,33 @@ impl View {
                     button,
                     state,
                     position,
-                    ..
+                    modifiers,
                 } => {
                     self.pointer_moved(position, out);
-                    self.button(button, state == ButtonState::Pressed, out);
+                    self.button(button, state == ButtonState::Pressed, modifiers, out);
                 }
                 PointerEvent::Scroll {
-                    delta, position, ..
+                    delta,
+                    position,
+                    modifiers,
                 } => {
                     self.pointer_moved(position, out);
+                    if let (Some(internal), Some(at)) = (&self.page.internal, self.canvas_pointer())
+                    {
+                        let (notches, x, y) = match delta {
+                            ScrollDelta::Wheel { x, y } => (1, x as f32 / 120.0, y as f32 / 120.0),
+                            ScrollDelta::Pixels { x, y } => {
+                                (0, (x / self.zoom) as f32, (y / self.zoom) as f32)
+                            }
+                        };
+                        internal.pointer(
+                            pages::record::WHEEL,
+                            modifiers,
+                            notches,
+                            at,
+                            Some((x, y)),
+                        );
+                    }
                     self.scroll(delta);
                 }
             },
@@ -1026,7 +1058,13 @@ impl View {
         lock(&self.page.hyperlinks).at(x, y).map(str::to_string)
     }
 
-    fn button(&mut self, button: PointerButton, down: bool, out: &mut Outbox) {
+    fn button(
+        &mut self,
+        button: PointerButton,
+        down: bool,
+        modifiers: Modifiers,
+        out: &mut Outbox,
+    ) {
         // The prompt answers left clicks on it; the guest doesn't see them.
         if button == PointerButton::Left
             && (self.prompt_grab || (down && self.prompt_at_pointer(PROMPT)))
@@ -1045,6 +1083,13 @@ impl View {
             _ => return,
         };
         lock(&self.page.input_state).mouse_buttons_down[index] = down;
+        if let (Some(internal), Some(at)) = (&self.page.internal, self.canvas_pointer()) {
+            let kind = match down {
+                true => pages::record::POINTER_PRESS,
+                false => pages::record::POINTER_RELEASE,
+            };
+            internal.pointer(kind, modifiers, index as u32, at, None);
+        }
         if down {
             self.page.activation.activate();
         } else {

@@ -49,13 +49,13 @@ pub const PAGES: &[Page] = &[
         name: "config",
         title: "Configuration",
         wasm: blob!("terminal"),
-        grants: &[PageGrant::Editor],
+        grants: &[PageGrant::Editor, PageGrant::Clipboard],
     },
     Page {
         name: "terminal",
         title: "sig terminal",
         wasm: blob!("terminal"),
-        grants: &[PageGrant::Shell],
+        grants: &[PageGrant::Shell, PageGrant::Clipboard],
     },
 ];
 

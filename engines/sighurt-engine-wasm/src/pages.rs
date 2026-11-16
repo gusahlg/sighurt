@@ -35,6 +35,12 @@
 //!     and never to be given another meaning.
 //!   - `5` clipboard copy: the payload is text, put on the clipboard as `text/plain`. The
 //!     browser's rule for any page applies: a click or key press in the page in the last 5 s.
+//!   - `6` clipboard paste: the payload is `clipboard` or `primary`; the reply is the text on
+//!     that clipboard (at most [`MAX_PASTE`] bytes, lossy UTF-8). The browser's rule for any
+//!     page reading the clipboard applies: a click or key press in the page in the last 5 s,
+//!     which the read uses up.
+//!   - `7` primary copy: the payload is text, made the primary selection (what a middle click
+//!     pastes), with kind 5's rule.
 //! - `poll(id: u32) -> i32`: `0` still waiting, `1` answered, `2` failed (its message is the
 //!   reply), `-1` no such request (never made, or cancelled).
 //! - `reply(id: u32, ptr: u32, cap: u32) -> i32`: copies an answered or failed request's text
@@ -69,8 +75,8 @@
 //!
 //! ## Input
 //!
-//! Every key press, auto-repeat, paste and input method's text the view gets, in order, also
-//! goes into a queue the page reads ([`MAX_INPUT_RECORDS`] records or [`MAX_INPUT_BYTES`] bytes;
+//! Every key press, auto-repeat, paste, input method's text and pointer event the view gets, in
+//! order, also goes into a queue the page reads ([`MAX_INPUT_RECORDS`] records or [`MAX_INPUT_BYTES`] bytes;
 //! more is dropped until the page reads), which a new document starts empty. The polled `oxide`
 //! input (`key_pressed`, `text_input`) keeps working beside it.
 //!
@@ -82,7 +88,7 @@
 //!
 //! | Bytes | Field |
 //! |---|---|
-//! | 0 | kind: `1` key press, `2` auto-repeat, `3` paste (a terminal's paste, kept whole: tabs, newlines and control characters as pasted), `4` an input method's text |
+//! | 0 | kind: `1` key press, `2` auto-repeat, `3` paste (a terminal's paste, kept whole: tabs, newlines and control characters as pasted), `4` an input method's text, `5` pointer button press, `6` its release, `7` pointer motion, `8` wheel |
 //! | 1 | modifiers held: bit 0 Shift, 1 Control, 2 Alt, 3 Super, 4 AltGr, 5 Caps Lock, 6 Num Lock |
 //! | 2..4 | the key's length in bytes, `k` (u16) |
 //! | 4..8 | the key's evdev code (u32), 0 for text |
@@ -91,6 +97,14 @@
 //!
 //! A press that types text is one record holding its key and its text, delivered once. A paste
 //! or an input method's text has no key.
+//!
+//! A pointer record (kinds `5` to `8`) has no key and, for its text, little-endian `f32`s: the
+//! pointer's position in canvas pixels (x, then y), and for a wheel the distance (x, then y,
+//! positive right and down). Its code (bytes 4..8) is, for a press or release, the button (`0`
+//! left, `1` middle, `2` right; other buttons give no record), for a motion the buttons held
+//! (bit 0 left, 1 middle, 2 right), and for a wheel `1` when the distance is in notches of a
+//! wheel and `0` when it is in canvas pixels (a touchpad). A motion that follows a motion still
+//! queued replaces it, so moving the pointer never fills the queue.
 //!
 //! Owns: the `sig` functions, an internal document's requests and input queue. Must not own:
 //! deciding a request (the core), performing it (the runtime), or what the page draws.
@@ -121,6 +135,8 @@ pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 /// The most bytes of one request's payload (a configuration is at most 256 KiB, twice for a
 /// write).
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
+/// The most bytes a clipboard paste (kind `6`) asks for.
+pub const MAX_PASTE: usize = 1024 * 1024;
 
 /// Imports of the `oxide` module an internal page may not have: everything that reaches the
 /// network or the user's files and devices, loads code, or starts threads. A page importing one
@@ -339,6 +355,9 @@ impl Internal {
         {
             asked.answer = match result {
                 Ok(ServiceReply::Text(text)) => Answer::Done(text),
+                Ok(ServiceReply::Clipboard(data)) => {
+                    Answer::Done(String::from_utf8_lossy(&data.data).into_owned())
+                }
                 Ok(_) => Answer::Done(String::new()),
                 Err(error) => Answer::Failed(error.to_string()),
             };
@@ -409,15 +428,66 @@ impl Internal {
         self.queue(kind, 0, 0, "", text);
     }
 
-    fn queue(&self, kind: u8, modifiers: u8, code: u32, key: &str, text: &str) {
-        let key = &key.as_bytes()[..key.len().min(usize::from(u16::MAX))];
-        let mut record = Vec::with_capacity(8 + key.len() + text.len());
+    /// Queues a pointer event the view got (`kind` one of [`record::POINTER_PRESS`] to
+    /// [`record::WHEEL`]), at canvas position `at`, with `delta` for a wheel.
+    pub fn pointer(
+        &self,
+        kind: u8,
+        modifiers: Modifiers,
+        code: u32,
+        at: (f32, f32),
+        delta: Option<(f32, f32)>,
+    ) {
+        let mut data = Vec::with_capacity(16);
+        for value in [
+            Some(at.0),
+            Some(at.1),
+            delta.map(|d| d.0),
+            delta.map(|d| d.1),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let record = Self::record(kind, self::modifiers(modifiers), code, b"", &data);
+        if kind == record::MOTION {
+            let mut state = self.lock();
+            if let Some(last) = state
+                .input
+                .back_mut()
+                .filter(|last| last[0] == record::MOTION)
+            {
+                *last = record;
+                return;
+            }
+        }
+        self.push(record);
+    }
+
+    fn record(kind: u8, modifiers: u8, code: u32, key: &[u8], data: &[u8]) -> Vec<u8> {
+        let key = &key[..key.len().min(usize::from(u16::MAX))];
+        let mut record = Vec::with_capacity(8 + key.len() + data.len());
         record.push(kind);
         record.push(modifiers);
         record.extend_from_slice(&(key.len() as u16).to_le_bytes());
         record.extend_from_slice(&code.to_le_bytes());
         record.extend_from_slice(key);
-        record.extend_from_slice(text.as_bytes());
+        record.extend_from_slice(data);
+        record
+    }
+
+    fn queue(&self, kind: u8, modifiers: u8, code: u32, key: &str, text: &str) {
+        self.push(Self::record(
+            kind,
+            modifiers,
+            code,
+            key.as_bytes(),
+            text.as_bytes(),
+        ));
+    }
+
+    fn push(&self, record: Vec<u8>) {
         let mut state = self.lock();
         let full = state.input.len() >= MAX_INPUT_RECORDS
             || state.input_bytes + record.len() > MAX_INPUT_BYTES;
@@ -460,12 +530,31 @@ fn service(kind: Kind, payload: &[u8]) -> Option<Service> {
     let text = || String::from_utf8(payload.to_vec()).ok();
     Some(match kind {
         Kind::Info => Service::Page(PageRequest::Info(PageInfo::from_name(&text()?)?)),
-        Kind::ClipboardCopy => Service::ClipboardWrite {
-            selection: Selection::Clipboard,
+        Kind::ClipboardCopy | Kind::PrimaryCopy => Service::ClipboardWrite {
+            selection: match kind {
+                Kind::PrimaryCopy => Selection::Primary,
+                _ => Selection::Clipboard,
+            },
             items: vec![ClipboardData {
                 mime_type: "text/plain;charset=utf-8".into(),
                 data: text()?.into_bytes(),
             }],
+        },
+        Kind::ClipboardPaste => Service::ClipboardRead {
+            selection: match payload {
+                b"clipboard" => Selection::Clipboard,
+                b"primary" => Selection::Primary,
+                _ => return None,
+            },
+            mime_types: [
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "UTF8_STRING",
+                "STRING",
+            ]
+            .map(String::from)
+            .to_vec(),
+            limit: MAX_PASTE,
         },
     })
 }
@@ -716,6 +805,10 @@ pub enum Kind {
     // 2, 3 and 4 were the configuration editor's read, check and write: reserved, never reused.
     /// Putting text on the clipboard.
     ClipboardCopy = 5,
+    /// The text on the clipboard or the primary selection.
+    ClipboardPaste = 6,
+    /// Making text the primary selection.
+    PrimaryCopy = 7,
 }
 
 impl Kind {
@@ -724,6 +817,8 @@ impl Kind {
         Some(match kind {
             1 => Self::Info,
             5 => Self::ClipboardCopy,
+            6 => Self::ClipboardPaste,
+            7 => Self::PrimaryCopy,
             _ => return None,
         })
     }
@@ -747,6 +842,14 @@ pub mod record {
     pub const PASTE: u8 = 3;
     /// An input method's text.
     pub const COMMIT: u8 = 4;
+    /// A pointer button went down.
+    pub const POINTER_PRESS: u8 = 5;
+    /// A pointer button went up.
+    pub const POINTER_RELEASE: u8 = 6;
+    /// The pointer moved.
+    pub const MOTION: u8 = 7;
+    /// A wheel or touchpad scrolled.
+    pub const WHEEL: u8 = 8;
 }
 
 /// The info kinds `request` takes, by name, for the tests and the kit.
@@ -938,6 +1041,118 @@ mod tests {
         ));
         assert_eq!(Kind::from_u32(9), None);
         assert_eq!(info_names().count(), PageInfo::ALL.len());
+        // Clipboard paste: which clipboard, nothing else; primary copy.
+        let paste = service(Kind::ClipboardPaste, b"primary").unwrap();
+        assert!(matches!(
+            &paste,
+            Service::ClipboardRead { selection: Selection::Primary, limit, .. } if *limit == MAX_PASTE
+        ));
+        assert_eq!(grant(&paste), PageGrant::Clipboard);
+        assert!(matches!(
+            service(Kind::ClipboardPaste, b"clipboard"),
+            Some(Service::ClipboardRead {
+                selection: Selection::Clipboard,
+                ..
+            })
+        ));
+        assert_eq!(service(Kind::ClipboardPaste, b"secondary"), None);
+        assert!(matches!(
+            service(Kind::PrimaryCopy, b"hi"),
+            Some(Service::ClipboardWrite {
+                selection: Selection::Primary,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_paste_answer_is_its_text() {
+        let terminal = page(
+            "terminal",
+            ASKING,
+            &[PageGrant::Shell, PageGrant::Clipboard],
+        );
+        let internal = Internal::new(terminal);
+        let id = {
+            let mut state = internal.lock();
+            let id = Internal::next(&mut state);
+            let asked = Asked {
+                service: service(Kind::ClipboardPaste, b"clipboard"),
+                browser: None,
+                answer: Answer::Waiting,
+            };
+            state.requests.insert(id, asked);
+            id
+        };
+        let (view, document) = (ViewId::next(), DocumentGeneration::next());
+        let mut out = Outbox::default();
+        internal.report(view, document, &mut out);
+        let events = out.take();
+        let [EngineEvent::ServiceRequested(request)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        let data = ClipboardData {
+            mime_type: "text/plain".into(),
+            data: b"echo hi\n".to_vec(),
+        };
+        assert!(internal.resolve(
+            view,
+            request.id,
+            Ok(ServiceReply::Clipboard(data)),
+            &mut out
+        ));
+        let state = internal.lock();
+        assert!(matches!(&state.requests[&id].answer, Answer::Done(text) if text == "echo hi\n"));
+    }
+
+    #[test]
+    fn pointer_records_keep_order_and_motion_never_fills_the_queue() {
+        let internal = Internal::new(page("terminal", ASKING, &[PageGrant::Shell]));
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        internal.pointer(record::POINTER_PRESS, shift, 0, (1.5, 2.0), None);
+        for i in 0..10_000 {
+            internal.pointer(
+                record::MOTION,
+                Modifiers::default(),
+                1,
+                (i as f32, 3.0),
+                None,
+            );
+        }
+        internal.pointer(
+            record::POINTER_RELEASE,
+            Modifiers::default(),
+            0,
+            (9.0, 3.0),
+            None,
+        );
+        internal.pointer(
+            record::WHEEL,
+            Modifiers::default(),
+            1,
+            (9.0, 3.0),
+            Some((0.0, -2.0)),
+        );
+        let state = internal.lock();
+        let records: Vec<&Vec<u8>> = state.input.iter().collect();
+        assert_eq!(records.len(), 4, "one motion, the last");
+        assert_eq!(
+            records[0][..8],
+            [record::POINTER_PRESS, 1, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(&records[0][8..12], &1.5f32.to_le_bytes());
+        assert_eq!(records[1][0], record::MOTION);
+        assert_eq!(&records[1][8..12], &9999.0f32.to_le_bytes());
+        assert_eq!(records[2][0], record::POINTER_RELEASE);
+        assert_eq!(records[3].len(), 8 + 16);
+        assert_eq!(&records[3][20..24], &(-2.0f32).to_le_bytes());
+        assert_eq!(
+            state.input_bytes,
+            records.iter().map(|r| r.len()).sum::<usize>()
+        );
     }
 
     #[test]
