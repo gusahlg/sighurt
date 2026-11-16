@@ -4851,3 +4851,29 @@ Newest last. Each entry says what was decided and why.
     of a view loaded while hidden came later than 1.5 s, 1 run in 9); Rio Vulkan's empty
     frames (133) fail the `still` check now and then at 5 and at 30; the pty test that fails
     on GitHub's ubuntu runner; the macOS stall of 151.
+154. **`sig://terminal` and `sig://config`: a history, the mouse, the clipboard and images**
+    (16 November 2026; the user asked for a better terminal page and graphics in it; the
+    design is the dated addendum to `pages-2026-11-05.md`). A history of up to 10 000 lines
+    at 80 columns (about 25 MB of cells; the view stays still on output, typing returns; on
+    the alternate screen the wheel sends arrow keys). Mouse reporting (modes 9, 1000, 1002,
+    1003; SGR, UTF-8 and the original encoding; Shift with the mouse is the user's).
+    Selection, copy and paste go through the browser's clipboard service under its existing
+    rules: `sig` request kinds 6 (paste: a `ClipboardRead` that uses up the page's
+    activation, asked only on the user's own fresh press) and 7 (primary copy), and
+    `PageGrant::Clipboard` for these two pages only. Images: kitty's graphics protocol (RGB,
+    RGBA and PNG sent in the escape code, chunked; put, query, delete) and sixel, decoded in
+    the guest within bounds (a side 4096 px, an image 24 MiB, all images 64 MiB and 256,
+    1 024 placements), PNGs by the host's canvas decoder; images scroll with the text.
+    Files, shared memory, compressed data, animation and Unicode placeholders are refused
+    with a protocol error. OSC 52 is not honoured, read or write: typing renews the
+    activation, so a printed file or a remote host could replace the clipboard. Pointer
+    events reach internal pages as `sig` input records 5 to 8; no new host function. While
+    a page's input is held (139), a page that runs a program gets no wheel and no motion
+    until a click (`BrowserState::runs_program`); the launch activation (143) is unchanged.
+    *Evidence*: headless.sh `terminal-page` 33/33 (kitty and sixel pixels, wheel history,
+    SGR click reports, selection and paste through wl-copy and wl-paste) and the whole
+    suite, faults.sh `terminal` 9/9, core `pages` 33
+    (`a_held_terminal_page_gets_no_wheel_or_motion_until_a_click`), the guest's 89 tests
+    (`only_the_users_own_presses_ask_the_clipboard`,
+    `nothing_starts_on_a_click_or_the_wheel`), `tui.rs` 52/52. *Left out*: pixel sizes in
+    the pty's window size, the title, the bell, underline styles and colours.
