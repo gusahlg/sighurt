@@ -776,7 +776,7 @@ pub fn cef_config(mut launch: Launch<'_>) -> Result<sighurt_engine_cef::CefConfi
 
 /// Servo's configuration: its profile in the user's data directory, or with
 /// `storage = "ephemeral"` none, which keeps nothing; the user agent, if one is set;
-/// `experimental-features` and `preferences`, applied when Servo is built.
+/// `experimental-features`, `smooth-scroll` and `preferences`, applied when Servo is built.
 /// A persistent profile, and `{data_dir}/sighurt` above it, are mode 0700.
 #[cfg(feature = "engine-servo")]
 pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoConfig {
@@ -809,6 +809,7 @@ pub fn servo_config(settings: &EngineSettings) -> sighurt_engine_servo::ServoCon
         // Times every GL call: for tests and measurements only.
         audit_gl: std::env::var_os("SIG_AUDIT_GL").is_some_and(|v| v == "1"),
         experimental_features: settings.experimental_features,
+        smooth_scroll: settings.smooth_scroll,
         preferences,
     }
 }
