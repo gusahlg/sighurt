@@ -1215,7 +1215,11 @@ mod tests {
             assert!(!env.contains(gone), "{gone} in {env}");
         }
         assert!(lines[2].starts_with("/dev/pts/"), "{out}");
-        assert_eq!(Path::new(lines[3]), home.path().canonicalize().unwrap());
+        assert_eq!(
+            Path::new(lines[3]),
+            home.path().canonicalize().unwrap(),
+            "{out:?}"
+        );
         // What `grep`, the shell's child, inherited.
         assert!(lines[4].contains("SigIgn:\t0000000000000000"), "{out}");
         assert!(lines[4].contains("SigBlk:\t0000000000000000"), "{out}");
