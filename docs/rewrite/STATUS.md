@@ -4829,3 +4829,25 @@ Newest last. Each entry says what was decided and why.
     chrome in (`ChromeKind`, `CHROMES` and `[ui] chrome` stay, ruling 4) and `Label`
     (rejected by `check` until an interpreter shows it). *Not shown*: a tree change in a
     real graphics terminal (placement and encoders are tested, no terminal is driven).
+153. **Reliability of the round: the tests wait for what they check, and Rio's device loss
+    is not the input rate's** (16 November 2026). The one intermittent failure of 149
+    (`sig_config_gets_no_input_where_it_is_not_drawn`) was the test's: `sig` writes a frame
+    in several syscalls, and the test looked once for text that comes later in the frame.
+    The terminal's pty tests now wait for everything they check, and `SIG_TUI_WRAP` (strace
+    delaying every write) makes half-frame and load races fail every time (the old test 4 of
+    4, the fixed one 0 of 4). `Keys::describe` leaves out a binding for both frontends that
+    a frontend's own binding or tombstone hides. Test scripts follow `CARGO_TARGET_DIR`, run
+    the `sig` they built, and ask for a report only once `sig` catches SIGUSR1.
+    `experiments/wpe-cpu` compiles again (146 changed `Display::new`). Fuzz-lite gained
+    `KeySeq` round-trips, `[keys]` tables with sequences and `false`, and the kitty
+    placeholder decoder. Rio 0.5.28's Vulkan device loss (`ERROR_DEVICE_LOST`, NVRM Xid 109)
+    under tab switches with sixel through tmux does not depend on `[tui] input-fps` (5: 3
+    deaths in 973 s; 15: 2 in 490 s; 30: 2 in 820 s; none in 1 800 s of drags without tab
+    switches); Rio's CPU renderer (0 in 600 s) and kitty through tmux (0 in 600 s) do not
+    lose it. `input-fps` stays 30. *Evidence*: the CI lines (1 459, 121 and 59 tests), the
+    Servo lines (`--all-features` 178 tests), soak 207/0, faults 109/0, engines.sh 337/337
+    before the smooth-scroll merge and 147/0 of its Servo scenarios after, cef 31/0, NetSurf
+    16/0, Ladybird 18/0, both cross-checks. *Open*: coexist.sh 94/1 (Ladybird's first show
+    of a view loaded while hidden came later than 1.5 s, 1 run in 9); Rio Vulkan's empty
+    frames (133) fail the `still` check now and then at 5 and at 30; the pty test that fails
+    on GitHub's ubuntu runner; the macOS stall of 151.
