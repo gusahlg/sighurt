@@ -93,7 +93,9 @@ default = "servo"
 #     its own below.
 #   smooth-scroll: true plays each mouse wheel notch out over about 120 ms in Servo; pages
 #     then see several small wheel events per notch, as from a touchpad, instead of one. It
-#     costs some CPU while scrolling. false, the default, sends one wheel event per notch.
+#     costs some CPU while scrolling, and a notch over another element waits (up to half a
+#     second) until Servo has handled the wheel event before it. false, the default, sends
+#     one wheel event per notch.
 #     servo honors it; like every [engines.<name>] setting it needs a restart.
 #   preferences: Servo preference names and values, applied after experimental-features, so one
 #     feature can be turned on or off on its own. A name is a field of Servo 0.7's Preferences.

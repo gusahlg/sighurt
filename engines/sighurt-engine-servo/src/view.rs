@@ -359,8 +359,10 @@ impl<T: ServoTarget> View<T> {
                 self.frame_requested = false;
             }
         } else {
-            // A smooth scroll in flight ends where it was going before Servo throttles the view.
-            while let Some(rest) = self.scroll.finish() {
+            // A smooth scroll in flight ends where it was going before Servo throttles the
+            // view. What Servo may not have yet (it merges wheel events for different points)
+            // goes out later, as it answers, hidden or not.
+            while let Some(rest) = self.scroll.finish(Instant::now()) {
                 self.send([rest]);
             }
             if let Some(webview) = &self.webview {
@@ -373,11 +375,20 @@ impl<T: ServoTarget> View<T> {
         Ok(())
     }
 
-    /// Sends `events` to the page, if there is one yet.
-    pub fn send(&self, events: impl IntoIterator<Item = servo::InputEvent>) {
+    /// Sends `events` to the page, if there is one yet. Every wheel event is recorded with
+    /// [`SmoothScroll::dispatched`], which holds back events for other points until Servo
+    /// has answered.
+    pub fn send(&mut self, events: impl IntoIterator<Item = servo::InputEvent>) {
         if let Some(webview) = &self.webview {
             for event in events {
-                webview.notify_input_event(event);
+                let wheel = match &event {
+                    servo::InputEvent::Wheel(wheel) => Some(wheel.point),
+                    _ => None,
+                };
+                let id = webview.notify_input_event(event);
+                if let Some(point) = wheel {
+                    self.scroll.dispatched(id, point, Instant::now());
+                }
             }
         }
     }
