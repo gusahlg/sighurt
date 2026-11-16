@@ -4930,3 +4930,22 @@ Newest last. Each entry says what was decided and why.
     `wpe servo` 126/0. *Not shown*: a real 120 or 144 Hz monitor; two real scroll
     containers under smooth scroll; that the churn run proves the race gone (the design
     argument and the threading test do that).
+157. **Servo's shutdown waits for its TLS prewarm thread** (16 November 2026; amends 54 and
+    114; older than this round: 1.0.0 has it). `Servo::new` (0.7, as 0.5) starts
+    `Net-TLS-prewarm`, which makes its aws-lc random generator's state from jitter entropy
+    (about 20 ms idle, longer under load), and never joins it. A `sig` told to quit in that
+    window returned from `main` while the thread ran: aws-lc-sys 0.45's exit destructor
+    marked the generator shut down, the thread locked its new state against itself, its read
+    lock failed with EDEADLK, and `abort()` became mozalloc_abort's SIGSEGV (status 139).
+    Both frontends start Servo at launch (26), so both had it. The adapter notes the threads
+    that appear in `/proc/self/task` while Servo is built, and `shutdown` waits after
+    Servo's `Drop`, at most 5 s, until none is the prewarm thread or still unnamed; the leak
+    path still ends with `_exit`, and no vendored crate changed. *Evidence*: the cores of the
+    one failure in the `--all-features` terminal tests and of a loaded-loop hit (1 of 240
+    starts under 20 CPU hogs), both with the prewarm thread's stack;
+    `tests/quit_at_launch.rs` (fails without the wait, 3 of 3); a race amplified by stopping
+    the prewarm thread and lengthening exit: 35 of 100 died before, 0 of 300 after; the
+    plain loaded loop after: 0 SIGSEGV in 1 200. *Not shown*: the window frontend run (the
+    same `shutdown`); another unjoined thread first touching aws-lc's generator during exit.
+    A SIGTERM before `main` installs its handler (the first 0.08 s, to 0.4 s under load) is
+    the default action, status 15: the time is the loader's.
