@@ -33,7 +33,20 @@ jobs:
           toolchain: 1.98.1
           targets: wasm32-unknown-unknown
 
+      # The Wasm engine's video (ffmpeg-next 8.1) finds FFmpeg with pkg-config. Homebrew's
+      # `ffmpeg` is newer than the FFmpeg that version binds (fields and codec ids it names are
+      # gone), so the 7 series, which Homebrew keeps apart from its prefix. Its version keys
+      # the cache: a cached build script's output names the Cellar directory of the FFmpeg it
+      # found, and a newer bottle replaces that directory (run 43846407347).
+      - name: Install FFmpeg
+        run: |
+          brew install ffmpeg@7 pkgconf
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "FFMPEG_VERSION=$(brew list --versions ffmpeg@7 | cut -d' ' -f2)" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}
 
       # The unit tests and tests/tui.rs (sig --tui and --dump in a pty against the demo
       # engine); not the examples, which are the window's.
@@ -49,15 +62,6 @@ jobs:
           cargo test --locked -p sighurt-api -p sighurt-core -p sighurt-runtime
           -p sighurt-config -p sighurt-config-example -p sighurt-semantic
           -p sighurt-tui --features sighurt-tui/engine-demo --no-fail-fast
-
-      # The Wasm engine's video (ffmpeg-next 8.1) finds FFmpeg with pkg-config. Homebrew's
-      # `ffmpeg` is newer than the FFmpeg that version binds (fields and codec ids it names are
-      # gone), so the 7 series, which Homebrew keeps apart from its prefix.
-      - name: Install FFmpeg
-        if: ${{ !cancelled() }}
-        run: |
-          brew install ffmpeg@7 pkgconf
-          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       # tests/tui.rs again with the Wasm engine: sig's own pages (sig://help, home's links to
       # it). The terminal pages' programs are Linux's, and so are their tests.
