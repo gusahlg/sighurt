@@ -6,8 +6,8 @@
 #   tools/heavy tools/headless-sway --renderer gles2 -- engines/sighurt-engine-servo/tests/window-checks.sh OUT
 #
 # Run it on louise-pc (Servo builds there), with SWAY_UNSUPPORTED_GPU=true for sway's GLES2
-# renderer on the NVIDIA driver. Needs target/debug/examples/servo-window and m1-mixed's
-# target/debug/m1-pointer (a virtual pointer that stays plugged in). OUT receives the logs and
+# renderer on the NVIDIA driver. Needs $CARGO_TARGET_DIR/debug/examples/servo-window and m1-mixed's
+# $CARGO_TARGET_DIR/debug/m1-pointer (target/ by default) (a virtual pointer that stays plugged in). OUT receives the logs and
 # screenshots. The window covers the 1280x800 output, so window coordinates are output ones.
 # It prints PASS or FAIL per check and exits with the number of failures.
 set -u
@@ -16,7 +16,8 @@ out=$1
   echo "window-checks.sh: run me inside tools/headless-sway" >&2
   exit 2
 }
-bin=${SERVO_WINDOW:-target/debug/examples/servo-window}
+tdir=$(realpath -m "${CARGO_TARGET_DIR:-target}")
+bin=${SERVO_WINDOW:-$tdir/debug/examples/servo-window}
 pages=engines/sighurt-engine-servo/tests/pages
 m1=experiments/m1-mixed/pages
 mkdir -p "$out"
@@ -27,7 +28,7 @@ app='[app_id=sighurt-servo]'
 wtype -s 600000 ' ' &
 keyboard=$!
 mkfifo "$XDG_RUNTIME_DIR/pointer"
-target/debug/m1-pointer < "$XDG_RUNTIME_DIR/pointer" &
+"$tdir/debug/m1-pointer" < "$XDG_RUNTIME_DIR/pointer" &
 exec 3> "$XDG_RUNTIME_DIR/pointer"
 # point X Y [W H]: moves to (X, Y) of the W×H output-logical layout (default 1280×800).
 point() { echo "move $1 $2 ${3:-1280} ${4:-800}" >&3; }

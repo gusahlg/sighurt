@@ -14,7 +14,7 @@ repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
 build() {
   SIG_WHAT="servo build (m4 tests)" tools/cargo test -p sighurt-engine-servo --test "$1" --no-run 2>&1 |
-    tee /dev/stderr | grep -o "target/debug/deps/$1-[0-9a-f]*" | tail -1
+    tee /dev/stderr | grep -o "([^)]*/deps/$1-[0-9a-f]*)" | tr -d '()' | tail -1
 }
 engine=$(build engine)
 crash=$(build crash)

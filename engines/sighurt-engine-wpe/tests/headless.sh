@@ -13,7 +13,7 @@ repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
 renderer=${1:-gles2}
 bin=$(tools/cargo test -p sighurt-engine-wpe --test engine --no-run 2>&1 | tee /dev/stderr |
-  grep -o 'target/debug/deps/engine-[0-9a-f]*' | tail -1)
+  grep -o '([^)]*/deps/engine-[0-9a-f]*)' | tr -d '()' | tail -1)
 [[ -n $bin ]] || { echo "headless.sh: no test binary" >&2; exit 1; }
 export SWAY_UNSUPPORTED_GPU=true
 tools/heavy tools/headless-sway --renderer "$renderer" -- \

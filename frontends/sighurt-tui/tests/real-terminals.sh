@@ -75,6 +75,7 @@
 set -u
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
+tdir=$(realpath -m "${CARGO_TARGET_DIR:-target}")
 
 if [[ ${1:-} != --inside ]]; then
   build=1
@@ -88,9 +89,9 @@ if [[ ${1:-} != --inside ]]; then
   # process name is sig. Made under the same hold of the machine's lock as the build.
   if [[ $build == 1 ]]; then
     SIG_WHAT="servo build: sig for real-terminal tests" tools/heavy bash -c \
-      "cargo build -p sighurt-browser --features engine-demo && cp -f target/debug/sig $(printf '%q' "$out/bin/sig")" || exit 1
+      "cargo build -p sighurt-browser --features engine-demo && cp -f $(printf '%q' "$tdir/debug/sig") $(printf '%q' "$out/bin/sig")" || exit 1
   else
-    cp -f "${SIG:-target/debug/sig}" "$out/bin/sig" || exit 1
+    cp -f "${SIG:-$tdir/debug/sig}" "$out/bin/sig" || exit 1
   fi
   pkgs=$repo/nix/nixpkgs.nix
   failed=0

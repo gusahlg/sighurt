@@ -77,6 +77,7 @@
 set -u
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$repo"
+tdir=$(realpath -m "${CARGO_TARGET_DIR:-target}")
 guests=(hello-sighurt gradient-demo raf-demo timer-demo events-demo)
 
 if [[ ${1:-} != --inside ]]; then
@@ -90,7 +91,7 @@ if [[ ${1:-} != --inside ]]; then
   # Other builds replace target/debug/sig (the demo engine's tests build it with other
   # features); this link keeps the binary these runs use. It is made under the same hold of the
   # machine's lock as the build, so no other build can come between them.
-  link='ln -f target/debug/sig target/debug/sig-engines-e2e'
+  link="ln -f $(printf '%q' "$tdir/debug/sig") $(printf '%q' "$tdir/debug/sig-engines-e2e")"
   if [[ $build == 1 ]]; then
     SIG_WHAT="servo build: sig (default features) for engines.sh" tools/heavy bash -c \
       "cargo build -p sighurt-browser --features chrome-line --bins \
@@ -122,7 +123,7 @@ export XDG_CONFIG_HOME=$out/config XDG_STATE_HOME=$out/state XDG_DATA_HOME=$out/
 export XDG_CACHE_HOME=$out/cache XDG_DOWNLOAD_DIR=$out/downloads
 export SIG_DIAG=1 SIG_AUDIT_GL=1 RUST_LOG=${RUST_LOG:-warn}
 export PATH="$(nix-build nix/nixpkgs.nix -A wl-clipboard --no-out-link 2>/dev/null)/bin:$PATH"
-sig=target/debug/sig-engines-e2e
+sig=$tdir/debug/sig-engines-e2e
 probe=apps/sighurt-browser/tests/probe.py
 session=$out/state/sighurt/session.toml
 # The web server, which also serves the guests (/guests/NAME).
@@ -165,7 +166,7 @@ keymap = "bindings"
 CONF
 # The example guests, and the test guests in WAT, which Wasmtime compiles as it does binaries.
 for name in "${guests[@]}"; do
-  cp "target/wasm32-unknown-unknown/release/${name//-/_}.wasm" "$out/guests/$name.wasm"
+  cp "$tdir/wasm32-unknown-unknown/release/${name//-/_}.wasm" "$out/guests/$name.wasm"
 done
 for wat in apps/sighurt-browser/tests/guests/*.wat; do
   cp "$wat" "$out/guests/$(basename "$wat" .wat).wasm"
@@ -189,7 +190,7 @@ now() { python3 -c 'import time; print(f"{time.monotonic():.6f}")'; }
 wtype -s 3600000 ' ' &
 keyboard=$!
 mkfifo "$XDG_RUNTIME_DIR/pointer"
-target/debug/examples/virtual-pointer < "$XDG_RUNTIME_DIR/pointer" &
+"$tdir/debug/examples/virtual-pointer" < "$XDG_RUNTIME_DIR/pointer" &
 pointer_pid=$!
 exec 3> "$XDG_RUNTIME_DIR/pointer"
 # The helpers hold tools/heavy's lock with this script: they end with it, however it ends.
