@@ -24,6 +24,9 @@
 //! - [`keymap`]: the data the core's key engine runs ([`Keys`](keymap::Keys): modes,
 //!   bindings, key sequences, conditions, actions), its operations, and the keystroke syntax of
 //!   the configuration.
+//! - [`ui`]: the interface as data: the window's and the terminal's trees of components
+//!   ([`Interface`](ui::Interface)), the check every tree must pass, and the operations that
+//!   change one.
 //!
 //! This is an internal contract rebuilt with the workspace, not a stable plugin ABI. The guest
 //! SDK for Wasm apps is a separate compatibility promise. See `sighurt-rewrite-plan.md` §5–§7,
@@ -43,3 +46,4 @@ pub mod present;
 pub mod semantic;
 pub mod services;
 pub mod settings;
+pub mod ui;
