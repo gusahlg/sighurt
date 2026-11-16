@@ -540,6 +540,23 @@ fn pty_golden_bytes_and_double_restore() {
     );
 }
 
+/// Finding 7 of review C: what `enter` changes it changes only after reading everything it puts
+/// back, so a descriptor that is no terminal is refused with its flags as they were (it used to
+/// be left non-blocking, and a duplicate shares those flags).
+#[test]
+fn entering_a_pipe_fails_and_leaves_its_flags_alone() {
+    let (_read, write) = rustix::pipe::pipe().expect("pipe");
+    let kept = write.try_clone().expect("dup");
+    let before = rustix::fs::fcntl_getfl(&kept).expect("getfl");
+    assert!(!before.contains(OFlags::NONBLOCK), "{before:?}");
+    assert!(Terminal::enter(write).is_err(), "a pipe was entered");
+    let after = rustix::fs::fcntl_getfl(&kept).expect("getfl");
+    assert!(
+        !after.contains(OFlags::NONBLOCK),
+        "left non-blocking: {after:?}"
+    );
+}
+
 #[test]
 fn restore_discards_a_key_release_queued_while_raw() {
     let _deadline = arm_deadline();
