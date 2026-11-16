@@ -72,9 +72,18 @@ rustix.workspace = true
 signal-hook-registry = "1.4"
 libc = "0.2"
 
+# The console control handler (Ctrl+C, Ctrl+Break, the console closing).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Console"] }
+
 # `sig --tui` in a pty, with a fake terminal on the other side (tests/tui.rs).
 [[test]]
 name = "tui"
+required-features = ["frontend-tui", "engine-demo"]
+
+# `sig` in a Windows pseudoconsole, and `--dump` (tests/console.rs).
+[[test]]
+name = "console"
 required-features = ["frontend-tui", "engine-demo"]
 
 [dev-dependencies]
@@ -83,6 +92,10 @@ tempfile = "3"
 # tests/tui.rs reads the screen sig draws (sig://home's rows), with the terminal emulator the
 # terminal page already uses.
 vt100 = "0.16"
+
+# tests/console.rs: sig in a pseudoconsole (ConPTY).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # Linux's: the Ladybird engine builds nowhere else, and the example needs libwayland.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
