@@ -747,8 +747,8 @@ impl Config {
         self.chrome_settings.get(chrome)
     }
 
-    /// The interface the frontends lay out: the experience's trees with `[chrome.standard]`
-    /// (while the standard chrome is chosen), `[ui.layout]` and `[tui.layout]` applied, which
+    /// The interface the frontends lay out: the experience's trees with `[chrome.standard]`,
+    /// `[ui.layout]` and `[tui.layout]` applied, which
     /// pass `Interface::check` ([`crate::interface`]). The line chrome (`[ui] chrome = "line"`)
     /// does not use the window's.
     pub fn interface(&self) -> &Interface {
@@ -1228,9 +1228,9 @@ fn validate(
     let _ = read_keys(builtin_keys, &terminal, &mut problems);
     let user_tui_keys = read_keys(user_tui_keys, &terminal, &mut problems);
     let chrome_settings = check_chromes(raw.chrome, env, &mut problems, &mut notices);
-    let standard = chrome_settings
-        .get("standard")
-        .filter(|_| ui.chrome == "standard");
+    // Whatever `[ui] chrome` names: the chrome changes at the next start, and the standard one
+    // may be running until then; it alone reads the window's tree.
+    let standard = chrome_settings.get("standard");
     let interface = crate::interface::configure(
         &env.interface,
         standard,
@@ -2851,9 +2851,10 @@ mod tests {
         };
         let parse = |user: &str| Config::parse(Some(user), &env);
         assert_eq!(parse(both).unwrap().interface(), &left);
-        // Another chrome chosen: [chrome.standard] changes nothing.
+        // Another chrome named: the tree is the same, since the standard chrome runs until the
+        // next start (engines.sh, "the standard chrome stays meanwhile").
         let line = both.replace("chrome = \"standard\"", "chrome = \"line\"");
-        assert_eq!(parse(&line).unwrap().interface(), &Interface::standard());
+        assert_eq!(parse(&line).unwrap().interface(), &left);
         let config = parse(
             "version = 1\n[ui.layout]\ntabs = \"bottom\"\n[tui.layout]\nsummary = \"hidden\"",
         )

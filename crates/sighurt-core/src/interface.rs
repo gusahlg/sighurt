@@ -1,5 +1,5 @@
 //! The interface as the configuration file changes it: the experience's trees with
-//! `[chrome.standard]` (while `[ui] chrome = "standard"`, as before trees), then `[ui.layout]`
+//! `[chrome.standard]` (whatever chrome `[ui] chrome` names), then `[ui.layout]`
 //! and `[tui.layout]`, as operations of `sighurt_api::ui`, applied together and checked once
 //! (docs/rewrite/interface-2026-11-16.md, §4 and rulings 5 and 11).
 //!
@@ -8,8 +8,9 @@
 //! `compact`, `engine-label`, so a canonical setting overrides the same legacy one; then
 //! `[tui.layout]` `summary`, `line`. The result must pass `Interface::check`; one that doesn't
 //! is a problem, so the configuration is not used and a reload keeps the one before it.
-//! `[chrome.standard]` is the standard chrome's own table, which its check reads too; while
-//! another chrome is chosen it changes nothing, and `[chrome.line]` is the line chrome's alone.
+//! `[chrome.standard]` is the standard chrome's own table, which its check reads too; it applies
+//! whatever chrome is named, since a chrome changes at the next start and the standard one,
+//! the window tree's only reader, may still be running. `[chrome.line]` is the line chrome's alone.
 //!
 //! Must not own: what a tree may be (`sighurt_api::ui`'s check), or how one is shown (the
 //! frontends').
@@ -34,7 +35,7 @@ enum Setting {
 }
 
 /// `interface` (the experience's) with the layout tables applied: `standard` is
-/// `[chrome.standard]` while the standard chrome is chosen, `ui_layout` and `tui_layout` are
+/// `[chrome.standard]`, `ui_layout` and `tui_layout` are
 /// `[ui.layout]` and `[tui.layout]`. What a table says wrong, and what the result's check
 /// finds, are `problems`; the interface is then the experience's.
 pub fn configure(

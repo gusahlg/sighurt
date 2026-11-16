@@ -2111,7 +2111,7 @@ finding was checked against the plan and the code before it was acted on.
   `Experience::interface`; `Environment::interface` and `Config::interface` in the core;
   `[ui.layout]` and `[tui.layout]`. The standard chrome takes its layout from
   `Theme::interface` and no longer from `[chrome.standard]` (the core applies that table to the
-  tree, while the standard chrome is chosen, before `[ui.layout]`). Its damage, its text
+  tree, whatever chrome is named, before `[ui.layout]`). Its damage, its text
   field's surface and its hit testing follow the ownership map; a pointer event hits only the
   controls of the surface it arrived on. Every placement of before lays out exactly as it did
   (`trees_lay_out_as_the_options_did`, all 36 golden images unchanged); tabs on the right or at

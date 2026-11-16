@@ -254,6 +254,10 @@ below are binding for the implementation and override the text above where they 
    `chrome = "standard"`, as today; the canonical `[ui.layout]` and `[tui.layout]` apply
    after it in a fixed, documented order that does not depend on the file's key order; an
    operation that replaces the editor is atomic. The result is validated once, at the end.
+   *Amended 16 November 2026*: `[chrome.standard]` applies whatever chrome is named. The
+   first reading broke a reload that names another chrome: the standard chrome runs until
+   the next start and lost its table's layout at once (engines.sh, "the standard chrome
+   stays meanwhile"). Only the standard chrome reads the window's tree, so nothing else sees it.
 6. **The grammar is what is implemented** (finding 6). `Size` is `Auto | Fixed(u16)`; only
    the branch holding the `PageView` fills. `check` rejects every component and parent
    combination no interpreter lays out (a bar inside a `Row`, a `Fixed` label in the
