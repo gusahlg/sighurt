@@ -29,8 +29,12 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: coexist.sh [--build] OUT}")
   [[ $out == /data/sig-builds/test-out/?* ]] || { echo "coexist.sh: OUT must be under /data/sig-builds/test-out/" >&2; exit 2; }
   if [[ $build == 1 ]]; then
-    SIG_WHAT="servo build: sig --all-features for coexist.sh" tools/cargo build -p sighurt-browser \
-      --all-features --bins --example virtual-pointer || exit 1
+    # Other builds replace debug/sig; the run uses this link, made under the same hold of the
+    # machine's lock as the build.
+    SIG_WHAT="servo build: sig --all-features for coexist.sh" tools/heavy bash -c "cargo build -p sighurt-browser \
+      --all-features --bins --example virtual-pointer \
+      && ln -f $(printf '%q' "$tdir/debug/sig") $(printf '%q' "$tdir/debug/sig-coexist")" || exit 1
+    export SIG_BIN=${SIG_BIN:-$tdir/debug/sig-coexist}
     SIG_WHAT="build the example guests for coexist.sh" tools/cargo build --target wasm32-unknown-unknown \
       --release -p gradient-demo || exit 1
   fi

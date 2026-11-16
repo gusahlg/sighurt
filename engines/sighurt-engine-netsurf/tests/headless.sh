@@ -25,10 +25,14 @@ if [[ ${1:-} != --inside ]]; then
   out=$(realpath -m "${1:?usage: headless.sh [--no-build] OUT}")
   mkdir -p "$out/bin"
   if [[ $build == 1 ]]; then
-    SIG_WHAT="netsurf e2e build" tools/cargo build -p sighurt-browser --no-default-features \
-      --features frontend-gui,engine-netsurf,engine-demo,frontend-tui --bins --example virtual-pointer || exit 1
+    # The copy is made under the same hold of the machine's lock as the build: other builds
+    # replace debug/sig.
+    SIG_WHAT="netsurf e2e build" tools/heavy bash -c "cargo build -p sighurt-browser --no-default-features \
+      --features frontend-gui,engine-netsurf,engine-demo,frontend-tui --bins --example virtual-pointer \
+      && cp $(printf '%q ' "$CARGO_TARGET_DIR/debug/sig" "$CARGO_TARGET_DIR/debug/examples/virtual-pointer" "$out/bin/")" || exit 1
+  else
+    cp "$CARGO_TARGET_DIR/debug/sig" "$CARGO_TARGET_DIR/debug/examples/virtual-pointer" "$out/bin/"
   fi
-  cp "$CARGO_TARGET_DIR/debug/sig" "$CARGO_TARGET_DIR/debug/examples/virtual-pointer" "$out/bin/"
   SIG_WHAT="netsurf e2e" tools/heavy tools/headless-sway --size 1000x700 --renderer auto -- "$0" --inside "$out"
   exit $?
 fi
