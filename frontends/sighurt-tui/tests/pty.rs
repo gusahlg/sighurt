@@ -724,8 +724,10 @@ fn a_stalled_reader_does_not_block_the_writer() {
 /// Bytes `n_tty` stores for a non-canonical reader: `N_TTY_BUF_SIZE - 1`.
 ///
 /// `FIONREAD` on the master reports this count, not the flip buffer behind it.
+#[cfg(target_os = "linux")]
 const READER_FULL: usize = 4095;
 
+#[cfg(target_os = "linux")]
 fn reader_queued(master: &OwnedFd) -> usize {
     let mut queued: libc::c_int = 0;
     let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::FIONREAD, &mut queued) };
@@ -737,6 +739,7 @@ fn reader_queued(master: &OwnedFd) -> usize {
 ///
 /// A refused `write` is not that signal. An atomic buffer allocation can fail
 /// while the pty is still under its memory limit, and `poll` reports that room.
+#[cfg(target_os = "linux")]
 fn slave_has_write_room(slave: &OwnedFd) -> bool {
     let mut fds = [PollFd::new(slave, PollFlags::OUT)];
     let zero = rustix::event::Timespec {

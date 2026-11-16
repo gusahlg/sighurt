@@ -244,4 +244,46 @@ then.
 
 ## Verified and assumed
 
-VERIFIED-PLACEHOLDER
+The Ports workflow (`.github/workflows/ports.yml`) on GitHub's hosted runners, `port2` branch,
+16 November 2026. Runs are at `https://github.com/gusahlg/sighurt/actions/runs/<id>`.
+
+**Windows (`windows-latest`), verified.** Run 43838694058, job "Windows (terminal only)", both
+steps green, 723 tests (and green in runs 43824448752, 43826803295, 43830229164 and
+43835363647 before it). Its first attempt failed one timing test, `quitting_deletes_a_download_
+its_server_keeps_waiting`, whose bound is 700 ms on a shared runner; the second passed.
+
+- `cargo test -p sighurt-browser --no-default-features --features frontend-tui,engine-demo --bins
+  --tests`: `sig`'s 6 unit tests and `tests/console.rs`'s 3. In a ConPTY pseudoconsole of 80×24,
+  `sig demo://pattern` (no `--tui`, no `TERM`) shows the page as text, `o` opens the address
+  line with the address in it, typing `demo://resize` and Enter opens that page (its title on
+  the top line), `q` exits with 0, and the console's modes, read by a process started in the
+  same pseudoconsole, are the same before and after (`0x1f7 0x7`; run 43821547281 prints each
+  screen). `sig --dump demo://pattern --width 40` into a pipe prints the page's text, and a bad
+  address exits 1 with one `sig:` line.
+- The crates' tests: api, config, config-example, core (its unit and integration tests),
+  runtime (the access-list and replace test, the signal queue, the download names among them),
+  semantic and tui (its console unit tests among them), all passing.
+
+**macOS (`macos-latest`, Apple Silicon), verified.** Run 43838694058, job "macOS (terminal
+only)", every step green, 880 tests:
+
+- `tests/tui.rs` with the demo engine (46 tests: `sig --tui` and `--dump` in a pty with a fake
+  terminal: kitty and sixel frames, keys, the address line, text mode, find, the clipboard,
+  SIGTERM, resizes, floods and garbage) and again with the Wasm engine (48: sig's own pages and
+  home's links to them too), all passing; first all green in run 43826803295.
+- The crates' tests, `frontends/sighurt-tui/tests/pty.rs` (raw mode and its restoration after a
+  panic, SIGABRT, a SIGSEGV fault, `kill -SEGV`, SIGTSTP and SIGCONT, a forced exit) and the
+  kqueue configuration watch among them, all passing; first all green in run 43835363647.
+
+**Linux, verified** on this machine after the changes (commands in CLAUDE.md's "Before a
+commit", without Servo): `cargo fmt --all -- --check`; both clippy lines; both test lines; `cargo
+test -p sighurt-browser --no-default-features --features frontend-tui,engine-demo`; `cargo check
+-p sighurt-browser --no-default-features`, and with `frontend-gui,engine-demo`. `tools/cross-check`
+for both targets, on `sig` (`frontend-tui,engine-demo`, with its tests) and on sighurt-tui and
+sighurt-runtime with their tests: no error and no warning.
+
+**Assumed, not run:** any real terminal emulator on either system (iTerm2, kitty, Ghostty,
+WezTerm, Terminal.app; Windows Terminal, the classic console window); `/usr/bin/open` and
+`ShellExecuteW` opening an address; Intel Macs; Windows on ARM; the console's behaviour when
+Windows Terminal resizes or passes sixel through; that the access list keeps another user out
+(the test reads the list back, it does not log in as someone else); the Wasm engine on Windows.
