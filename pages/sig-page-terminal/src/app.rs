@@ -1480,6 +1480,43 @@ mod tests {
     }
 
     #[test]
+    fn only_the_users_own_presses_ask_the_clipboard() {
+        let mut browser = Browser::default();
+        let mut app = running(&mut browser);
+        // Whatever the program prints: OSC 52 reads and writes, the bytes of the paste keys,
+        // mouse reports enabled.
+        output(
+            &browser,
+            &mut app,
+            b"\x1b]52;c;?\x07\x1b]52;p;?\x1b\\\x1b]52;c;aGk=\x07\x16\x1b[2~\x1b[?1000h",
+        );
+        assert!(app.take_asks().is_empty());
+        // Held keys repeat, and a repeat is no fresh action.
+        app.input(
+            &mut browser,
+            &Input {
+                kind: InputKind::Repeat,
+                ..press("V", "", CONTROL | SHIFT)
+            },
+        );
+        app.input(
+            &mut browser,
+            &Input {
+                kind: InputKind::Repeat,
+                ..press("Insert", "", SHIFT)
+            },
+        );
+        assert!(app.take_asks().is_empty());
+        // The program has the mouse: a middle click is its own, not a paste.
+        app.input(
+            &mut browser,
+            &pointer(InputKind::PointerPress, buttons::MIDDLE, 0, 0, 0),
+        );
+        assert!(app.take_asks().is_empty());
+        assert_eq!(typed(&browser), "\x1b[M!!!");
+    }
+
+    #[test]
     fn images_are_drawn_where_they_are_placed_and_scroll_with_the_view() {
         let mut browser = Browser::default();
         let mut app = running(&mut browser);

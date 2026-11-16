@@ -44,6 +44,6 @@ fn config_and_terminal_share_the_terminal_and_each_starts_only_its_own_program()
     let (config, terminal) = (page("config"), page("terminal"));
     assert_eq!(config.title, "Configuration");
     assert_eq!(config.wasm, terminal.wasm);
-    assert_eq!(config.grants, [PageGrant::Editor]);
-    assert_eq!(terminal.grants, [PageGrant::Shell]);
+    assert_eq!(config.grants, [PageGrant::Editor, PageGrant::Clipboard]);
+    assert_eq!(terminal.grants, [PageGrant::Shell, PageGrant::Clipboard]);
 }

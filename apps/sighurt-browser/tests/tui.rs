@@ -3139,11 +3139,14 @@ const PASTE: &[u8] = b"\x1b[200~pasted\x1b[201~";
 fn sig_config_gets_no_input_where_it_is_not_drawn() {
     let dir = scripts("config-undrawn");
     let (started, input) = (dir.join("started"), dir.join("input"));
-    // The editor says it started, then puts what it reads, byte by byte, in `input`.
+    // The editor says it started, asks for the mouse (SGR reports), then puts what it reads,
+    // byte by byte, in `input`.
     let editor = script(
         &dir,
         "editor",
-        &format!("#!/bin/sh\necho $$ > {started:?}\nstty raw -echo\nexec cat >> {input:?}\n"),
+        &format!(
+            "#!/bin/sh\necho $$ > {started:?}\nprintf '\\033[?1000h\\033[?1006h'\nstty raw -echo\nexec cat >> {input:?}\n"
+        ),
     );
     let pages = format!(
         "[pages.config]\neditor = {:?}",
@@ -3241,6 +3244,21 @@ fn sig_config_gets_no_input_where_it_is_not_drawn() {
         term.type_bytes(b"xyz");
         term.wait(term.got.len(), Duration::from_millis(500), |_| false);
     }
+    // Drawn, a click is the program's: it asked for the mouse.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&input)
+        .unwrap_or_default()
+        .contains("\x1b[<0;")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the editor did not get a click\n{}",
+            term.context()
+        );
+        term.type_bytes(&left_click(40, 12));
+        term.wait(term.got.len(), Duration::from_millis(500), |_| false);
+    }
+    let reports = |text: &str| text.matches("\x1b[<").count();
     // Text mode again: the editor runs on and gets nothing.
     term.type_bytes(F12);
     term.wait(term.got.len(), Duration::from_secs(5), insert_mode_left);
@@ -3250,13 +3268,22 @@ fn sig_config_gets_no_input_where_it_is_not_drawn() {
     assert!(text, "m did not show text\n{}", term.context());
     term.type_bytes(b"\x1b");
     term.wait(term.got.len(), Duration::from_millis(500), |_| false);
+    let clicked = reports(&fs::read_to_string(&input).unwrap_or_default());
     term.type_bytes(b"QQQ");
     term.type_bytes(PASTE);
+    // Clicks, a middle click (a paste) and the wheel over the page rows.
+    term.type_bytes(&left_click(40, 12));
+    term.type_bytes(b"\x1b[<1;40;12M\x1b[<1;40;12m\x1b[<64;40;12M\x1b[<65;40;12M");
     term.wait(term.got.len(), Duration::from_secs(2), |_| false);
     let got = fs::read_to_string(&input).unwrap_or_default();
     assert!(
         !got.contains('Q') && !got.contains("pasted"),
         "typed into it while not drawn: {got:?}"
+    );
+    assert_eq!(
+        reports(&got),
+        clicked,
+        "the pointer reached it while not drawn: {got:?}"
     );
     assert!(program.exists(), "the editor stopped running");
     // Graphics again: it gets the keys.
