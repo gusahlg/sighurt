@@ -292,7 +292,16 @@ then.
 The Ports workflow (`.github/workflows/ports.yml`) on GitHub's hosted runners, `port2` branch,
 16 November 2026. Runs are at `https://github.com/gusahlg/sighurt/actions/runs/<id>`.
 
-**Windows (`windows-latest`), verified.** Run 43848358624 (the branch's last commit), job
+**After review C's fixes** (the `fixc` branch, commit 12ad86c): Ports run 43923681446, both
+jobs green, macOS 927 tests passed and Windows 757, none failed. They include the new tests:
+on both, the signal flags (`a_quit_after_a_pipe_full_of_reports_is_taken` on macOS, the queue's
+test on Windows) and the editor answer's `programs` record; on macOS `enter` refusing a pipe
+with its flags unchanged and the image-id claim with no runtime directory; on Windows the access
+list of an existing directory and of the files written in it, and the notice of the missing
+configuration watch in the ConPTY test. CI run 43923681379 (ubuntu-26.04) is green too. The
+runs below are the earlier ones.
+
+**Windows (`windows-latest`), verified.** Run 43848358624 (the branch's last commit then), job
 "Windows (terminal only)", both steps green: 723 tests passed, none failed (green also in runs
 43824448752, 43826803295, 43830229164, 43835363647 and 43838694058). Run 43838694058's first
 attempt failed one timing test whose bound is 700 ms on a shared runner
