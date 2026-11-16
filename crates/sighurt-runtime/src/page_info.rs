@@ -249,8 +249,10 @@ mod tests {
         let user = info(PageInfo::UserCommands, &core, &paths);
         assert!(user.contains("help\ttab.new sig://help"), "{user}");
         let found = info(PageInfo::Paths, &core, &paths);
+        // Beside the session, with the system's separator.
+        let history = crate::persistence::history_path("/s/sighurt/session.toml".as_ref());
         assert!(
-            found.contains("history\t/s/sighurt/history.toml"),
+            found.contains(&format!("history\t{}", history.display())),
             "{found}"
         );
         assert!(info(PageInfo::Settings, &core, &paths).contains("pages.terminal.enabled\tfalse"));
@@ -260,6 +262,8 @@ mod tests {
         assert_eq!(field_of("a\tb\nc"), "a b c");
     }
 
+    // Only where the terminal pages run programs: elsewhere no editor is chosen.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_editor_is_named_with_its_file_and_the_files_problems() {
         let env = core().environment().clone();
@@ -288,7 +292,6 @@ mod tests {
 
     #[test]
     fn a_file_that_cant_be_read_is_a_problem_and_a_missing_one_is_new() {
-        use std::os::unix::fs::PermissionsExt;
         let core = core();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("config.toml");
@@ -314,17 +317,21 @@ mod tests {
         assert_eq!(found.len(), 1, "{answer}");
         assert!(found[0].contains("cannot read"), "{answer}");
 
-        // Root reads it anyway.
-        if rustix::process::geteuid().is_root() {
-            return;
+        // A file its mode makes unreadable (modes are Unix's). Root reads it anyway.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if rustix::process::geteuid().is_root() {
+                return;
+            }
+            std::fs::write(&file, "version = 1\n").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let answer = info(PageInfo::Editor, &core, &paths);
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(answer.contains("new\tno\n"), "{answer}");
+            let found = problems(&answer);
+            assert_eq!(found.len(), 1, "{answer}");
+            assert!(found[0].contains("cannot read"), "{answer}");
         }
-        std::fs::write(&file, "version = 1\n").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let answer = info(PageInfo::Editor, &core, &paths);
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(answer.contains("new\tno\n"), "{answer}");
-        let found = problems(&answer);
-        assert_eq!(found.len(), 1, "{answer}");
-        assert!(found[0].contains("cannot read"), "{answer}");
     }
 }
