@@ -22,9 +22,33 @@
 //! stores that classification before it calls `write`.
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsFd;
 
+#[cfg(unix)]
 use rustix::io::Errno;
+
+/// Where the queue's bytes go: a non-blocking write that takes what it can now. `Ok(0)` means
+/// nothing fits yet (`EAGAIN`). On Unix, any descriptor; on Windows, the console's writer
+/// thread (`console.rs`).
+pub trait Sink {
+    /// Writes a prefix of `buf` without blocking and returns its length.
+    fn write_some(&self, buf: &[u8]) -> io::Result<usize>;
+}
+
+#[cfg(unix)]
+impl<T: AsFd> Sink for T {
+    fn write_some(&self, buf: &[u8]) -> io::Result<usize> {
+        write_partial(self, buf)
+    }
+}
+
+#[cfg(not(unix))]
+impl<S: Sink + ?Sized> Sink for &S {
+    fn write_some(&self, buf: &[u8]) -> io::Result<usize> {
+        (**self).write_some(buf)
+    }
+}
 
 /// Where a terminal parser is, given only the bytes already written.
 ///
@@ -218,6 +242,7 @@ pub struct Output {
     /// Parser state of bytes already accepted by `write`.
     wire: Wire,
     /// Last `wire_gen` applied from the signal path.
+    #[cfg_attr(not(unix), allow(dead_code))]
     seen_gen: u64,
     /// Bytes [`Self::compact`] moved. A quadratic drain moves far more than the frame.
     #[cfg(test)]
@@ -260,6 +285,8 @@ impl Output {
         self.wire.as_u8()
     }
 
+    // Only the Unix session's fatal-signal path uses it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// A signal handler moved the terminal on its own.
     ///
     /// The queued tail belonged to the sequence it aborted, so it is dropped.
@@ -276,11 +303,15 @@ impl Output {
         true
     }
 
+    // Only the Unix session's fatal-signal path uses it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// Account for `bytes` that were just written.
     pub fn advance_wire(&mut self, bytes: &[u8]) {
         self.wire = advance(self.wire, bytes);
     }
 
+    // Only the Unix session's fatal-signal path uses it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// Put `bytes` back in front of the queue. Used when a restore write stops early.
     pub fn prepend(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
@@ -350,6 +381,8 @@ impl Output {
         self.pending.extend_from_slice(term);
     }
 
+    // Only the Unix session's fatal-signal path uses it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// [`Self::discard_to_boundary`] and take those bytes. The caller writes them.
     ///
     /// The `usize` is how many leading bytes of the returned buffer are a
@@ -363,6 +396,8 @@ impl Output {
         (std::mem::take(&mut self.pending), reliable)
     }
 
+    // Only the Unix session's fatal-signal path uses it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// Mark `bytes` leading unsent bytes as a reliable prefix.
     pub fn set_reliable_prefix(&mut self, bytes: usize) {
         self.reliable = bytes.min(self.pending_len());
@@ -382,7 +417,7 @@ impl Output {
         mut publish: P,
     ) -> io::Result<bool>
     where
-        Fd: AsFd,
+        Fd: Sink,
         P: FnMut(Wire) -> bool,
     {
         if bytes.is_empty() {
@@ -431,7 +466,7 @@ impl Output {
     /// moved the wire; this stops and does not queue the rest.
     pub fn write_frame<Fd, P>(&mut self, fd: Fd, frame: &[u8], mut publish: P) -> io::Result<()>
     where
-        Fd: AsFd,
+        Fd: Sink,
         P: FnMut(Wire) -> bool,
     {
         if self.drain(&fd, &mut publish)? {
@@ -462,7 +497,7 @@ impl Output {
             return Ok(());
         }
         self.pending.extend_from_slice(frame);
-        let _ = self.drain(fd, &mut publish)?;
+        let _ = self.drain(&fd, &mut publish)?;
         Ok(())
     }
 
@@ -482,9 +517,9 @@ impl Output {
     }
 
     /// `true` when a fatal handler took the wire and the caller must stop.
-    fn drain<Fd, P>(&mut self, fd: Fd, publish: &mut P) -> io::Result<bool>
+    fn drain<Fd, P>(&mut self, fd: &Fd, publish: &mut P) -> io::Result<bool>
     where
-        Fd: AsFd,
+        Fd: Sink,
         P: FnMut(Wire) -> bool,
     {
         self.reclaim_spent();
@@ -494,7 +529,7 @@ impl Output {
             if len == 0 || !publish(announced) {
                 return Ok(true);
             }
-            let wrote = match write_partial(&fd, &self.pending[start..start + len]) {
+            let wrote = match fd.write_some(&self.pending[start..start + len]) {
                 Ok(n) => n,
                 Err(err) => {
                     let _ = publish(self.wire);
@@ -553,7 +588,7 @@ impl Output {
 
     fn write_span<Fd, P>(&mut self, fd: &Fd, buf: &[u8], publish: &mut P) -> io::Result<SpanWrite>
     where
-        Fd: AsFd,
+        Fd: Sink,
         P: FnMut(Wire) -> bool,
     {
         let mut written = 0;
@@ -567,7 +602,7 @@ impl Output {
                 });
             }
             let chunk = &rest[..len];
-            let n = match write_partial(fd, chunk) {
+            let n = match fd.write_some(chunk) {
                 Ok(n) => n,
                 Err(err) => {
                     let _ = publish(self.wire);
@@ -605,6 +640,7 @@ struct SpanWrite {
     handoff: bool,
 }
 
+#[cfg(unix)]
 fn write_partial<Fd: AsFd>(fd: Fd, buf: &[u8]) -> io::Result<usize> {
     if buf.is_empty() {
         return Ok(0);
@@ -754,10 +790,7 @@ mod tests {
         let n = frame.len();
         let mut output = Output::new(n);
         output.pending = frame;
-        let devnull = std::fs::File::options()
-            .write(true)
-            .open("/dev/null")
-            .expect("/dev/null");
+        let devnull = devnull();
         let handoff = output.drain(&devnull, &mut |_| true).expect("drain");
         assert!(!handoff);
         assert_eq!(output.pending_len(), 0);
@@ -777,18 +810,27 @@ mod tests {
     }
 
     fn devnull() -> std::fs::File {
+        let path = if cfg!(windows) { "NUL" } else { "/dev/null" };
         std::fs::File::options()
             .write(true)
-            .open("/dev/null")
-            .expect("/dev/null")
+            .open(path)
+            .expect("the null device")
+    }
+
+    /// The null device as a sink, where descriptors are not one.
+    #[cfg(not(unix))]
+    impl Sink for std::fs::File {
+        fn write_some(&self, buf: &[u8]) -> io::Result<usize> {
+            std::io::Write::write(&mut &*self, buf)
+        }
     }
 
     /// A pipe whose buffer is full, so the next write returns `EAGAIN`.
+    #[cfg(unix)]
     fn full_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
-        let (reader, writer) = rustix::pipe::pipe_with(
-            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
-        )
-        .expect("pipe");
+        // `pipe` and `fcntl`: macOS has no `pipe2`.
+        let (reader, writer) = rustix::pipe::pipe().expect("pipe");
+        rustix::io::ioctl_fionbio(&writer, true).expect("non-blocking");
         let chunk = vec![0u8; 4096];
         loop {
             match rustix::io::write(&writer, &chunk) {
@@ -820,6 +862,7 @@ mod tests {
         assert_eq!(output.reliable, 4);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_newer_reliable_write_replaces_an_unsent_one_and_a_frame_drop_keeps_it() {
         let (_reader, writer) = full_pipe();

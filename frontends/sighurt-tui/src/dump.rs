@@ -15,12 +15,16 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::IsTerminal;
+#[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd};
 use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
+#[cfg(unix)]
 use rustix::event::{PollFd, PollFlags, Timespec};
+#[cfg(unix)]
 use rustix::fs::OFlags;
+#[cfg(unix)]
 use rustix::io::Errno;
 use std::time::{Duration, Instant};
 
@@ -203,7 +207,7 @@ pub fn run(options: DumpOptions, signals: &Signals) -> Result<ExitCode, String> 
     // Every diagnostic is page data or the user's address: contained before it is printed.
     let result = dump(options, signals).map_err(|error| sanitize(&error));
     if let (Some(saved), Err(_) | Ok(ExitCode::FAILURE)) = (&saved, &result) {
-        let _ = rustix::stdio::dup2_stderr(saved);
+        crate::sys::restore_stderr(saved);
     }
     result
 }
@@ -370,7 +374,10 @@ fn dump(options: DumpOptions, signals: &Signals) -> Result<ExitCode, String> {
         }
         Err(_) => {}
     }
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    // On Windows a write that did not finish still holds stdout's lock in its thread.
+    if cfg!(unix) || matches!(written, Ok(true)) {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
     let _ = std::io::Write::flush(&mut std::io::stderr());
     session.set_quit(code);
     session.set_shutdown_bound(SHUTDOWN_BOUND);
@@ -429,11 +436,55 @@ fn stats(snapshot: &SemanticSnapshot) -> String {
 /// Writes `bytes` to stdout without ever blocking on it. Gives up at `deadline`
 /// (`Ok(false)`) or on SIGTERM, SIGINT and SIGHUP. `deadline` is the dump's one timeout, not a
 /// fresh one for the write.
+#[cfg(unix)]
 fn write_out(bytes: &[u8], signals: &Signals, deadline: Instant) -> Result<bool, String> {
     let stdout = std::io::stdout();
     write_fd(stdout.as_fd(), bytes, signals, deadline)
 }
 
+/// Writes `bytes` to stdout from a thread of its own, since Windows has no non-blocking write
+/// to a pipe or a console, and waits for it until `deadline` (`Ok(false)`) or a quit
+/// (Ctrl+C, Ctrl+Break, the console closing). A write still blocked then is left to the process's
+/// end.
+#[cfg(windows)]
+fn write_out(bytes: &[u8], signals: &Signals, deadline: Instant) -> Result<bool, String> {
+    use std::io::Write;
+    if bytes.is_empty() {
+        return Ok(true);
+    }
+    if Instant::now() >= deadline {
+        return Ok(false);
+    }
+    let (sent, written) = std::sync::mpsc::channel();
+    let bytes = bytes.to_vec();
+    std::thread::Builder::new()
+        .name("sighurt-dump-out".into())
+        .spawn(move || {
+            let mut stdout = std::io::stdout().lock();
+            let result = stdout.write_all(&bytes).and_then(|()| stdout.flush());
+            let _ = sent.send(result);
+        })
+        .map_err(|error| format!("cannot write the page: {error}"))?;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        match written.recv_timeout(left.min(Duration::from_millis(100))) {
+            Ok(Ok(())) => return Ok(true),
+            Ok(Err(error)) => return Err(format!("cannot write the page: {error}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("cannot write the page: the writer stopped".into())
+            }
+        }
+        if signals.take().contains(&Request::Quit) {
+            return Err("interrupted".into());
+        }
+    }
+}
+
+#[cfg(unix)]
 /// Writes `bytes` to `fd`. The fd is non-blocking for the loop and its previous flags are
 /// put back afterwards, including when the write fails. `EAGAIN` means poll again: another
 /// writer can fill a shared pipe after `POLLOUT` and before `write`, and a blocking write
@@ -468,6 +519,7 @@ fn write_fd(
     }
 }
 
+#[cfg(unix)]
 /// Puts `fd`'s status flags back. [`Drop`] covers a panic or an early return.
 struct RestoreFlags<'a> {
     fd: BorrowedFd<'a>,
@@ -475,6 +527,7 @@ struct RestoreFlags<'a> {
     pending: bool,
 }
 
+#[cfg(unix)]
 impl RestoreFlags<'_> {
     fn restore(&mut self) -> Result<(), String> {
         if !self.pending {
@@ -486,6 +539,7 @@ impl RestoreFlags<'_> {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RestoreFlags<'_> {
     fn drop(&mut self) {
         if self.pending {
@@ -495,6 +549,7 @@ impl Drop for RestoreFlags<'_> {
     }
 }
 
+#[cfg(unix)]
 /// `CHUNK` is `PIPE_BUF`. A pipe reports `POLLOUT` when any byte fits, so a write of that
 /// size can still return `EAGAIN`; the next try is one byte, which fits whenever `POLLOUT`
 /// is set, and `poll` blocks once the pipe is actually full.
@@ -761,6 +816,7 @@ fn wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::fd::OwnedFd;
 
     #[test]
@@ -940,6 +996,14 @@ mod tests {
         assert_eq!(pause, Duration::from_millis(40));
     }
 
+    /// File status flags without macOS's `FWASWRITTEN` (0x10000), which its kernel sets on a
+    /// descriptor once it has been written and reports with the rest.
+    #[cfg(unix)]
+    fn settable(flags: OFlags) -> OFlags {
+        flags - OFlags::from_bits_retain(0x10000 * u32::from(cfg!(target_vendor = "apple")))
+    }
+
+    #[cfg(unix)]
     /// A pipe with one byte of room: `poll` reports `POLLOUT`, and a blocking write of
     /// 4096 bytes never returns.
     fn leave_one_byte_free(reader: &OwnedFd, writer: &OwnedFd) {
@@ -958,6 +1022,7 @@ mod tests {
         rustix::fs::fcntl_setfl(writer, flags).unwrap();
     }
 
+    #[cfg(unix)]
     fn signal_pipe() -> (Signals, std::io::PipeWriter) {
         let (read, write) = std::io::pipe().unwrap();
         let read = OwnedFd::from(read);
@@ -965,6 +1030,7 @@ mod tests {
         (Signals::from_pipe(read), write)
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_4096_byte_write_hits_the_deadline_when_the_pipe_has_room_for_less() {
         let (reader, writer) = std::io::pipe().unwrap();
@@ -990,7 +1056,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("the write blocked; stdout was still blocking");
         assert!(!result.unwrap());
-        assert_eq!(after, flags);
+        assert_eq!(settable(after), settable(flags));
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "{:?}",
@@ -998,6 +1064,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn stdout_flags_are_restored_when_the_write_fails() {
         let (reader, writer) = std::io::pipe().unwrap();
@@ -1013,9 +1080,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("cannot write"), "{error}");
-        assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
+        assert_eq!(
+            settable(rustix::fs::fcntl_getfl(&writer).unwrap()),
+            settable(flags)
+        );
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_expired_deadline_writes_nothing() {
         let (reader, writer) = std::io::pipe().unwrap();

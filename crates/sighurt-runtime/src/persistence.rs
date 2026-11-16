@@ -7,9 +7,14 @@
 //! `{state_dir}/sighurt`) are mode 0700. An existing directory that is wider is tightened to
 //! 0700; a profile is created only by an engine that keeps one; shared XDG parents are not
 //! changed. Files this module writes, including
-//! `session.toml` and `history.toml`, are mode 0600. Systems without mode bits (Windows) get
-//! neither: the files take their directory's access list, which in the user's profile is the
-//! user's (docs/rewrite/PORTING.md). The configuration file is never written
+//! `session.toml` and `history.toml`, are mode 0600. On Windows, which has no mode bits, a
+//! directory that [`secure_private_dir`] creates gets a protected access list (no inheritance
+//! from its parent) that grants full control, inherited by what is created in it, to the
+//! current user and to LocalSystem only, and the files written in it take that list. That is
+//! equivalent to 0700/0600 in that no other ordinary user can read it and nothing is inherited
+//! from the profile; it is not equivalent in that LocalSystem has access and an administrator
+//! can take ownership. A directory that already exists is left as it is on Windows (not
+//! tightened). The configuration file is never written
 //! here: the user's editor writes it (`sig://config` runs it).
 //!
 //! The core parses and validates the configuration, against what the build has (its engines,
@@ -20,8 +25,13 @@
 //! configuration. A reload that fails, or finds the file missing, keeps the configuration in
 //! use ([`load_config`]).
 //! On Linux the configuration's directory is watched with inotify, so a saved file (written in
-//! place or renamed over the old one) or a deleted one is read again; nothing polls. Other
-//! systems have no watch yet ([`ConfigWatch::new`] says so) and read the file at startup only.
+//! place or renamed over the old one) or a deleted one is read again; nothing polls. On macOS
+//! kqueue watches the directory (entries added, removed or renamed) and the file itself while
+//! it exists (written, extended, deleted, renamed, attributes changed), the file's watch made
+//! again on its current inode after each directory event; besides a file event, a change is the
+//! file's identity (existence, device and inode, size, modification time) differing from the
+//! last one seen. Other systems have no watch yet ([`ConfigWatch::new`] says
+//! so) and read the file at startup only.
 //!
 //! Sessions are written atomically (a temporary file in the same directory, synced, then renamed
 //! over the old one) by a thread of their own, which writes only the latest snapshot it has been
@@ -117,7 +127,9 @@ fn secure_quietly(dir: &Path) {
 
 /// Creates `dir` at mode 0700, or tightens a wider existing directory to 0700. A narrower
 /// existing directory is left as it is. Parents are created with the process umask and not
-/// chmodded.
+/// chmodded. On Windows a directory this call creates gets a protected access list for the
+/// current user and LocalSystem (see the module documentation); an existing one is not
+/// changed.
 pub(crate) fn secure_private_dir(dir: &Path) -> io::Result<()> {
     if let Some(parent) = dir.parent() {
         if !parent.as_os_str().is_empty() {
@@ -140,10 +152,15 @@ pub(crate) fn secure_private_dir(dir: &Path) -> io::Result<()> {
             dir.display()
         )));
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = created;
     #[cfg(unix)]
     tighten(dir, &meta, created)?;
+    // An existing directory is left as it is on Windows: only one this call made gets the list.
+    #[cfg(windows)]
+    if created {
+        windows_acl::make_owner_only(dir)?;
+    }
     Ok(())
 }
 
@@ -227,15 +244,18 @@ fn shown(path: Option<&Path>) -> String {
     )
 }
 
-/// Watches the configuration file's directory for the file being written, replaced or deleted:
-/// inotify, on Linux only.
+/// Watches the configuration file for being written, replaced or deleted. On Linux: inotify on
+/// its directory. On macOS: kqueue on its directory and, while it exists, on the file itself
+/// (see [`kqueue_watch`]). Nowhere else.
 pub struct ConfigWatch {
     #[cfg(target_os = "linux")]
     fd: OwnedFd,
     #[cfg(target_os = "linux")]
     name: OsString,
+    #[cfg(target_vendor = "apple")]
+    kqueue: kqueue_watch::Watch,
     /// Nothing can be watched here: a watch is never made.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     never: std::convert::Infallible,
 }
 
@@ -260,13 +280,21 @@ impl ConfigWatch {
         })
     }
 
-    /// Fails: watching needs inotify, which this system does not have. The configuration is
-    /// read at startup only.
-    #[cfg(not(target_os = "linux"))]
+    /// Watches `path`, whose directory must exist; the file may not exist yet.
+    #[cfg(target_vendor = "apple")]
+    pub fn new(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            kqueue: kqueue_watch::Watch::new(path)?,
+        })
+    }
+
+    /// Fails: watching needs inotify or kqueue, which this system does not have. The
+    /// configuration is read at startup only.
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     pub fn new(_path: &Path) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "watching the configuration needs inotify, which only Linux has",
+            "watching the configuration needs inotify or kqueue, which only Linux and macOS have",
         ))
     }
 
@@ -283,8 +311,14 @@ impl ConfigWatch {
         changed
     }
 
+    /// Reads every pending event, without blocking; whether the file changed.
+    #[cfg(target_vendor = "apple")]
+    pub fn changed(&self) -> bool {
+        self.kqueue.changed()
+    }
+
     /// Never called: there is no watch here.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     pub fn changed(&self) -> bool {
         match self.never {}
     }
@@ -296,8 +330,174 @@ impl AsFd for ConfigWatch {
     fn as_fd(&self) -> BorrowedFd<'_> {
         #[cfg(target_os = "linux")]
         return self.fd.as_fd();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_vendor = "apple")]
+        return self.kqueue.as_fd();
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
         match self.never {}
+    }
+}
+
+/// macOS's configuration watch: one kqueue, which can be waited on like any descriptor, with
+/// a watch on the directory and one on the file. Owns the descriptors and what the file looked
+/// like at the last event; decides nothing about the file's contents.
+#[cfg(target_vendor = "apple")]
+mod kqueue_watch {
+    use std::fs::{self, File, OpenOptions};
+    use std::io;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    use rustix::event::kqueue::{kevent, kqueue, Event, EventFilter, EventFlags, VnodeEvents};
+
+    /// `udata` of the directory's events and of the file's.
+    const DIR: usize = 1;
+    const FILE: usize = 2;
+
+    /// What the file was when last looked at: none if it did not exist, else device, inode,
+    /// size and modification time (seconds and nanoseconds).
+    type Identity = Option<(u64, u64, u64, i64, i64)>;
+
+    pub(super) struct Watch {
+        kqueue: OwnedFd,
+        path: PathBuf,
+        /// Held open for its watch: closing a descriptor removes its events.
+        _dir: File,
+        state: Mutex<State>,
+    }
+
+    struct State {
+        /// The file as opened when its watch was made; none while it does not exist.
+        file: Option<File>,
+        seen: Identity,
+    }
+
+    /// Opens `path` only to watch it (`O_EVTONLY`: no read access, and it does not keep a
+    /// volume from being unmounted).
+    fn open_for_events(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EVTONLY | libc::O_CLOEXEC)
+            .open(path)
+    }
+
+    fn identity(path: &Path) -> Identity {
+        let meta = fs::metadata(path).ok()?;
+        Some((
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        ))
+    }
+
+    fn register(
+        kqueue: &OwnedFd,
+        file: &File,
+        events: VnodeEvents,
+        udata: usize,
+    ) -> io::Result<()> {
+        let event = Event::new(
+            EventFilter::Vnode {
+                vnode: file.as_raw_fd(),
+                flags: events,
+            },
+            EventFlags::ADD | EventFlags::CLEAR,
+            udata as *mut _,
+        );
+        let mut none: Vec<Event> = Vec::new();
+        // SAFETY: `file` is open and stays open as long as its event is registered: the
+        // caller keeps it in the `Watch` and a closed descriptor drops its event.
+        unsafe { kevent(kqueue, &[event], &mut none, Some(Duration::ZERO))? };
+        Ok(())
+    }
+
+    const DIR_EVENTS: VnodeEvents = VnodeEvents::WRITE;
+    fn file_events() -> VnodeEvents {
+        VnodeEvents::WRITE
+            | VnodeEvents::EXTEND
+            | VnodeEvents::DELETE
+            | VnodeEvents::RENAME
+            | VnodeEvents::ATTRIBUTES
+            | VnodeEvents::REVOKE
+    }
+
+    impl Watch {
+        pub(super) fn new(path: &Path) -> io::Result<Self> {
+            let Some(dir_path) = path.parent() else {
+                return Err(io::Error::other("the configuration has no directory"));
+            };
+            let kqueue = kqueue()?;
+            let dir = open_for_events(dir_path)?;
+            register(&kqueue, &dir, DIR_EVENTS, DIR)?;
+            let file = Self::watch_file(&kqueue, path);
+            let seen = identity(path);
+            Ok(Self {
+                kqueue,
+                path: path.to_owned(),
+                _dir: dir,
+                state: Mutex::new(State { file, seen }),
+            })
+        }
+
+        /// A watch on whatever is at `path` now; none if nothing is (or it can't be watched).
+        fn watch_file(kqueue: &OwnedFd, path: &Path) -> Option<File> {
+            let file = open_for_events(path).ok()?;
+            register(kqueue, &file, file_events(), FILE).ok()?;
+            Some(file)
+        }
+
+        pub(super) fn changed(&self) -> bool {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let (mut dir_event, mut file_event, mut file_gone) = (false, false, false);
+            let mut events: Vec<Event> = Vec::with_capacity(16);
+            loop {
+                events.clear();
+                // SAFETY: no change list, so no descriptor is named.
+                let count =
+                    match unsafe { kevent(&self.kqueue, &[], &mut events, Some(Duration::ZERO)) } {
+                        Ok(count) => count,
+                        Err(_) => break,
+                    };
+                if count == 0 {
+                    break;
+                }
+                for event in &events {
+                    match event.udata() as usize {
+                        DIR => dir_event = true,
+                        FILE => {
+                            file_event = true;
+                            if let EventFilter::Vnode { flags, .. } = event.filter() {
+                                file_gone |= flags.intersects(
+                                    VnodeEvents::DELETE | VnodeEvents::RENAME | VnodeEvents::REVOKE,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // The file's identity is compared at every call, not only after a directory event:
+            // a note may reach the queue a moment after the change that caused it, and the
+            // comparison is one `stat`. A rename over the file replaces its inode: watch the
+            // one there now, and let go of the old one (closing it removes its event).
+            let now = identity(&self.path);
+            let differs = now != state.seen;
+            if dir_event || file_gone || differs {
+                state.file = Self::watch_file(&self.kqueue, &self.path);
+            }
+            state.seen = now;
+            file_event || differs
+        }
+    }
+
+    impl AsFd for Watch {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.kqueue.as_fd()
+        }
     }
 }
 
@@ -447,6 +647,140 @@ pub(crate) fn remove_temporaries(path: &Path) {
     }
 }
 
+/// Windows' stand-in for mode 0700: an access list on a directory. Owns that and nothing else.
+#[cfg(windows)]
+mod windows_acl {
+    use std::io;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    pub(super) fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain([0]).collect()
+    }
+
+    /// Frees a `LocalAlloc`ed pointer when dropped.
+    struct Local(*mut core::ffi::c_void);
+    impl Drop for Local {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: allocated by the system for us, freed once.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    /// The current user's SID as a string (`S-1-5-21-...`), from the process token.
+    fn current_user_sid() -> io::Result<String> {
+        let mut token: HANDLE = core::ptr::null_mut();
+        // SAFETY: `token` is a valid out pointer.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = (|| {
+            let mut needed = 0u32;
+            // SAFETY: a size query: no buffer.
+            unsafe { GetTokenInformation(token, TokenUser, core::ptr::null_mut(), 0, &mut needed) };
+            if needed == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // u64 words: the TOKEN_USER in it is aligned.
+            let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+            // SAFETY: the buffer is at least `needed` bytes.
+            if unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: filled in by the call above; the SID it points to is in the buffer.
+            let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+            let mut text: *mut u16 = core::ptr::null_mut();
+            // SAFETY: a valid SID and out pointer.
+            if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let _free = Local(text.cast());
+            let mut len = 0;
+            // SAFETY: NUL-terminated by the call.
+            while unsafe { *text.add(len) } != 0 {
+                len += 1;
+            }
+            // SAFETY: `len` units were just read.
+            let units = unsafe { core::slice::from_raw_parts(text, len) };
+            Ok(std::ffi::OsString::from_wide(units)
+                .to_string_lossy()
+                .into_owned())
+        })();
+        // SAFETY: opened above.
+        unsafe { CloseHandle(token) };
+        result
+    }
+
+    /// Gives `dir` a protected access list: full control, inherited by files and
+    /// subdirectories, for the current user and LocalSystem, and for nobody else.
+    pub(super) fn make_owner_only(dir: &Path) -> io::Result<()> {
+        let sddl = format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)", current_user_sid()?);
+        let sddl: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+        let mut descriptor = core::ptr::null_mut();
+        // SAFETY: NUL-terminated string and valid out pointers (the size is not wanted).
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                core::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let _free = Local(descriptor);
+        let (mut present, mut defaulted) = (0, 0);
+        let mut acl = core::ptr::null_mut();
+        // SAFETY: the descriptor was just made; the ACL it yields lives as long as it does.
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }
+            == 0
+            || present == 0
+        {
+            return Err(io::Error::other("the access list has no DACL"));
+        }
+        let name = wide(dir);
+        // SAFETY: `name` is NUL-terminated; the owner, group and SACL are not set.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                acl,
+                core::ptr::null(),
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(())
+    }
+}
+
 /// Options that create a file at mode 0600 (where there are modes).
 fn private_file() -> fs::OpenOptions {
     #[cfg_attr(not(unix), allow(unused_mut))]
@@ -454,6 +788,57 @@ fn private_file() -> fs::OpenOptions {
     #[cfg(unix)]
     options.mode(0o600);
     options
+}
+
+/// Moves `from` over `to`, replacing it.
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// Moves `from` over `to`, replacing it, with `MoveFileExW` and write-through. Antivirus
+/// software and indexers hold files open for a moment, which fails the move with a sharing
+/// violation, access denied or a lock violation; those are tried again, up to 5 times, after
+/// 10, 20, 40 and 80 ms.
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let (from, to) = (windows_acl::wide(from), windows_acl::wide(to));
+    let mut delay = 10;
+    for attempt in 1..=5 {
+        // SAFETY: both are NUL-terminated and live through the call.
+        let moved = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        let busy = error.raw_os_error().is_some_and(|code| {
+            [
+                ERROR_SHARING_VIOLATION,
+                ERROR_ACCESS_DENIED,
+                ERROR_LOCK_VIOLATION,
+            ]
+            .contains(&(code as u32))
+        });
+        if !busy || attempt == 5 {
+            return Err(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        delay *= 2;
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// Writes `text` to `path` atomically: readers see the old file or the new one, whole.
@@ -481,7 +866,7 @@ pub fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
         }
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        replace_file(&temporary, path)?;
         // The rename itself is durable once the directory is. Windows opens no directory as a
         // file; what makes its rename durable there is unverified (docs/rewrite/PORTING.md).
         #[cfg(unix)]
@@ -654,6 +1039,7 @@ mod tests {
         assert_eq!(startup_config(Some(&path), &env), Ok(Config::default()));
     }
 
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn the_watch_sees_the_file_written_or_replaced_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
@@ -668,6 +1054,71 @@ mod tests {
         assert!(watch.changed());
         fs::remove_file(&path).unwrap();
         assert!(watch.changed());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_private_directory_has_a_protected_list_of_two_and_files_replace() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            AclSizeInformation, GetAclInformation, GetSecurityDescriptorControl,
+            ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("private");
+        secure_private_dir(&dir).unwrap();
+        let name = windows_acl::wide(&dir);
+        let mut acl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: NUL-terminated name and valid out pointers.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut acl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0);
+        let (mut control, mut revision) = (0u16, 0u32);
+        // SAFETY: the descriptor was just returned.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0, "the list is not protected");
+        let mut size = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: `size` is the structure this class fills in.
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    acl,
+                    std::ptr::from_mut(&mut size).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        assert_eq!(size.AceCount, 2);
+        // SAFETY: allocated by GetNamedSecurityInfoW.
+        unsafe { LocalFree(descriptor) };
+
+        let path = dir.join("session.toml");
+        write_atomically(&path, "one").unwrap();
+        write_atomically(&path, "two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        assert_eq!(names(&dir), ["session.toml"]);
     }
 
     #[test]
@@ -838,6 +1289,7 @@ mod tests {
         names
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_directories_are_0700_and_session_files_are_0600() {
         let root = tempfile::tempdir().unwrap();
@@ -866,6 +1318,7 @@ mod tests {
         assert_eq!(mode(&parent), 0o755);
     }
 
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }

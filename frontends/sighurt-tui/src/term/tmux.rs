@@ -92,15 +92,21 @@ fn parse(output: &[u8]) -> Passthrough {
 
 /// The first `name` in an absolute directory of `path` that is an executable file. A relative
 /// or empty entry (the current directory) is never searched.
+/// Without Unix's mode bits (Windows, which has no tmux of its own) a file is enough.
 fn find_in_path(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path?)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|file| {
-            Path::new(file)
-                .metadata()
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            Path::new(file).metadata().is_ok_and(|meta| {
+                #[cfg(unix)]
+                let runs = meta.permissions().mode() & 0o111 != 0;
+                #[cfg(not(unix))]
+                let runs = true;
+                meta.is_file() && runs
+            })
         })
 }
 
@@ -142,6 +148,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn tmux_is_found_only_in_absolute_directories() {
         let dir = std::env::temp_dir().join(format!("sig-tmux-path-{}", std::process::id()));

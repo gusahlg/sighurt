@@ -5,8 +5,11 @@
 //! [`restore_before_forced_exit`]. Must not own: the cell grid, the chrome,
 //! page pixels, browser policy, or what a key does.
 //!
-//! Register [`Terminal::fd`] with the calloop loop for readability, and
-//! [`Terminal::winch_fd`] as well once [`Terminal::install_handlers`] has run.
+//! [`Terminal::insert_sources`] registers what wakes the owner loop. On Unix
+//! that is [`Terminal::fd`] for readability, and [`Terminal::winch_fd`] as well
+//! once [`Terminal::install_handlers`] has run; on Windows it is the console
+//! session's two pings (`console.rs`: its input thread's and its writer's),
+//! and nothing below about signals applies there.
 //! The owner thread is the only writer of terminal bytes. `SIGTSTP` only sets
 //! a flag; it and `SIGCONT` wake [`Terminal::winch_fd`]. Call
 //! [`Terminal::take_resumed`] every loop turn to restore, stop, and enter
@@ -30,14 +33,20 @@ mod modes;
 mod output;
 mod parser;
 mod probe;
+#[cfg(unix)]
+mod session;
+/// The Windows console in VT mode, with the Unix session's interface.
+#[cfg(windows)]
+#[path = "console.rs"]
 mod session;
 pub(crate) mod tmux;
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::Duration;
 
-use rustix::termios::Winsize;
+use calloop::{LoopHandle, RegistrationToken};
 use sighurt_api::input::{ButtonState, KeyEvent, Modifiers, PointerButton};
 use sighurt_api::services::Selection;
 
@@ -45,13 +54,13 @@ pub use modes::{ENTER, KITTY_KEYBOARD_FLAGS, LEAVE, QUERIES};
 pub(crate) use modes::{SYNC_BEGIN, SYNC_END};
 pub use parser::{Wheel, ESC_TIMEOUT};
 pub use probe::{Caps as Capabilities, XtGetTcap, PROBE_DEADLINE};
-pub use session::{
-    open_pty, restore_before_forced_exit, termios_matches, INPUT_BYTE_BUDGET, INPUT_EVENT_CAP,
-};
+#[cfg(unix)]
+pub use session::{open_pty, termios_matches};
+pub use session::{restore_before_forced_exit, INPUT_BYTE_BUDGET, INPUT_EVENT_CAP};
 
 use parser::{Input, MouseButton, Reply};
 use probe::Caps;
-use session::Session;
+use session::{Session, Winsize};
 
 /// Cells of the terminal, and the pixel size of one cell.
 ///
@@ -138,13 +147,72 @@ pub struct Terminal {
 
 impl Terminal {
     /// Put `fd` into raw mode, non-blocking, and send [`ENTER`].
+    #[cfg(unix)]
     pub fn enter(fd: OwnedFd) -> io::Result<Self> {
         Self::wrap(Session::enter(fd)?)
     }
 
     /// [`Self::enter`] with a pending-byte cap of `cap`.
+    #[cfg(unix)]
     pub fn enter_with(fd: OwnedFd, cap: usize) -> io::Result<Self> {
         Self::wrap(Session::enter_with(fd, cap)?)
+    }
+
+    /// The terminal on stdout, entered with a pending-byte cap of `cap`: on Unix a duplicate
+    /// of stdout's descriptor ([`Self::enter_with`]); on Windows the console stdout is in.
+    pub fn enter_stdout(cap: usize) -> io::Result<Self> {
+        #[cfg(unix)]
+        return Self::enter_with(std::io::stdout().as_fd().try_clone_to_owned()?, cap);
+        #[cfg(windows)]
+        return Self::wrap(Session::enter_with(cap)?);
+    }
+
+    /// Registers what wakes the owner loop with `handle`: `readable` runs when the terminal
+    /// has input or a new size (or on Unix after `SIGCONT`, `SIGTSTP` or `SIGHUP`). Returns
+    /// the write source, registered disabled: enable it while bytes wait to go out, and it
+    /// wakes the loop when more can be written.
+    pub fn insert_sources<D: 'static>(
+        &mut self,
+        handle: &LoopHandle<'static, D>,
+        readable: fn(&mut D),
+    ) -> Result<RegistrationToken, String> {
+        let inserted = |e: calloop::InsertError<_>| e.error.to_string();
+        #[cfg(unix)]
+        let token = {
+            use calloop::generic::Generic;
+            use calloop::{Interest, Mode, PostAction};
+            let watch = |e: io::Error| format!("cannot watch the terminal: {e}");
+            for fd in [self.try_clone_fd(), self.winch_fd().try_clone_to_owned()] {
+                let source = Generic::new(fd.map_err(watch)?, Interest::READ, Mode::Level);
+                handle
+                    .insert_source(source, move |_, _, data| {
+                        readable(data);
+                        Ok(PostAction::Continue)
+                    })
+                    .map_err(inserted)?;
+            }
+            let fd = self.try_clone_fd().map_err(watch)?;
+            // Draining happens in the owner's turn; waking is all this does.
+            handle
+                .insert_source(Generic::new(fd, Interest::WRITE, Mode::Level), |_, _, _| {
+                    Ok(PostAction::Continue)
+                })
+                .map_err(inserted)?
+        };
+        #[cfg(windows)]
+        let token = {
+            let Some((input, output)) = self.session.take_wakes() else {
+                return Err("the console's sources are already registered".into());
+            };
+            handle
+                .insert_source(input, move |(), &mut (), data| readable(data))
+                .map_err(inserted)?;
+            handle
+                .insert_source(output, |(), &mut (), _| {})
+                .map_err(inserted)?
+        };
+        handle.disable(&token).map_err(|e| e.to_string())?;
+        Ok(token)
     }
 
     fn wrap(session: Session) -> io::Result<Self> {
@@ -166,16 +234,19 @@ impl Terminal {
     }
 
     /// The terminal file descriptor. Register it for readability.
+    #[cfg(unix)]
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.session.fd()
     }
 
     /// Read end of the pipe [`Self::install_handlers`] writes on `SIGWINCH`.
+    #[cfg(unix)]
     pub fn winch_fd(&self) -> BorrowedFd<'_> {
         self.session.winch_fd()
     }
 
     /// Duplicate of [`Self::fd`]. The duplicate shares non-blocking mode.
+    #[cfg(unix)]
     pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
         self.session.try_clone_fd()
     }
@@ -404,6 +475,7 @@ impl Terminal {
     }
 }
 
+#[cfg(unix)]
 impl AsFd for Terminal {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd()
@@ -449,7 +521,7 @@ fn selection_of(byte: u8) -> Option<Selection> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::fd::AsFd;
     use std::thread;

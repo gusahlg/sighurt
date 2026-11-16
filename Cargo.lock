@@ -10430,6 +10430,7 @@ dependencies = [
  "tempfile",
  "vt100",
  "wayland-client 0.31.15",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10695,6 +10696,7 @@ dependencies = [
  "tempfile",
  "toml 1.1.6+spec-1.1.0",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10732,6 +10734,7 @@ dependencies = [
  "sighurt-runtime",
  "unicode-segmentation",
  "unicode-width",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -139,11 +139,14 @@ cargo build -p sighurt-browser --no-default-features --features frontend-gui,eng
 cargo build -p sighurt-browser --no-default-features --features frontend-tui,engine-wasm,engine-demo   # the terminal only: no Wayland crate
 ```
 
-macOS and Windows have no window, no WPE WebKit, Ladybird or NetSurf, and no `sig://terminal`
-programs yet. A terminal-only `sig` with the demo engine passes `cargo check` for both (from
-Linux, without their SDKs, so the Wasm engine's C dependencies are not checked); nothing has run
-there, and on Windows `--tui` and `--dump` refuse. What is checked, and what a port still needs,
-is in [docs/rewrite/PORTING.md](docs/rewrite/PORTING.md).
+The terminal-only `sig` runs on macOS and on Windows too, tested on GitHub's runners: on macOS
+with the demo and Wasm engines (FFmpeg 7 from Homebrew), on Windows with the demo engine, in the
+console in VT mode (Windows 10 1809 or later, or Windows Terminal). Build it there with
+`cargo build -p sighurt-browser --no-default-features --features frontend-tui,engine-demo`
+(add `engine-wasm` on macOS). Neither has the window, Servo, WPE WebKit, CEF, Ladybird or
+NetSurf, or the programs of `sig://terminal` and `sig://config`; Windows has no configuration
+watch. What runs where, what was tested and what a port still needs is in
+[docs/rewrite/PORTING.md](docs/rewrite/PORTING.md).
 
 `engine-cef`, `engine-ladybird` and `engine-netsurf` are in no default feature set. A table for
 one of them in a build that lacks it is a notice, and `sig` goes on. None of the three has the

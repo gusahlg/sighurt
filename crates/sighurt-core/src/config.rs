@@ -3211,6 +3211,8 @@ mod tests {
                 .map(|config| config.downloads().map(Path::to_owned))
         };
         assert_eq!(directory("~/Hämtade"), Ok(Some("/home/me/Hämtade".into())));
+        // A Unix path is absolute only on Unix.
+        #[cfg(unix)]
         assert_eq!(directory("/srv/in"), Ok(Some("/srv/in".into())));
         for bad in ["Downloads", "./x", "~", "~other/x", ""] {
             let problems = directory(bad).unwrap_err().problems;
