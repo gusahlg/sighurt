@@ -5,7 +5,8 @@
 //! `log` logger is Servo's when Servo is compiled in and enabled, `env_logger` otherwise (the
 //! frontend's launch does that). SIGUSR1 prints the diagnostics, SIGTERM, SIGINT and SIGHUP quit
 //! cleanly (the session is saved; the terminal frontend replaces SIGHUP's handler with its own);
-//! their handlers only write to a pipe the loop reads. SIGXFSZ is caught and does nothing, so a
+//! their handlers only raise the request's flag and write to a pipe that wakes the loop.
+//! SIGXFSZ is caught and does nothing, so a
 //! write over the file size limit (`ulimit -f`) fails with EFBIG, as one to a full disk does,
 //! instead of killing `sig`; children get the default back at exec. With WPE WebKit
 //! compiled in, its JavaScriptCore suspends threads with SIGUSR2 instead of SIGUSR1
@@ -296,27 +297,34 @@ fn webkit_environment() {
     }
 }
 
-/// The signals `sig` handles, and the pipe their handlers write the signal number to. SIGXFSZ
-/// gets a handler that does nothing: the write that went over the limit then fails with EFBIG.
+/// The signals `sig` handles: each handler raises its request's flag, then writes a byte to a
+/// pipe to wake the loop (`sighurt_runtime::signals`). SIGXFSZ gets a handler that does
+/// nothing: the write that went over the limit then fails with EFBIG.
 #[cfg(unix)]
 fn install_signal_handlers() -> std::io::Result<Signals> {
+    use sighurt_runtime::signals::{request_for, Pending};
     use std::sync::Arc;
     // SAFETY: the action does nothing.
     unsafe { signal_hook_registry::register(libc::SIGXFSZ, || {})? };
     let (read, write) = signal_pipe()?;
     let write = Arc::new(write);
+    let pending = Arc::new(Pending::default());
     for signal in [libc::SIGUSR1, libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         let write = Arc::clone(&write);
-        // SAFETY: the action only calls write(2) on a non-blocking pipe, which is
-        // async-signal-safe; it allocates nothing and takes no lock. A full pipe loses the
-        // byte, and the loop already has the same signal to read.
+        let pending = Arc::clone(&pending);
+        let request = request_for(signal).expect("each of these asks for something");
+        // SAFETY: the action stores to an atomic flag (lock-free) and calls write(2) on a
+        // non-blocking pipe, both async-signal-safe; it allocates nothing and takes no lock. A
+        // full pipe loses the byte, not the request: the flag holds it, and the full pipe
+        // wakes the loop anyway.
         unsafe {
             signal_hook_registry::register(signal, move || {
+                pending.raise(request);
                 let _ = rustix::io::write(&*write, &[signal as u8]);
             })?;
         }
     }
-    Ok(Signals::from_pipe(read))
+    Ok(Signals::from_pipe(read, pending))
 }
 
 /// A close-on-exec, non-blocking pipe.
