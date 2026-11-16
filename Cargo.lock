@@ -10402,6 +10402,7 @@ dependencies = [
 name = "sig-page-terminal"
 version = "1.0.0"
 dependencies = [
+ "png 0.17.16",
  "sig-page-kit",
  "sighurt-sdk",
  "vt100",
