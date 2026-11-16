@@ -342,7 +342,8 @@ impl Terminal {
             }
             assert!(
                 start.elapsed() < Duration::from_secs(10),
-                "sig did not exit"
+                "sig did not exit\n{}",
+                self.context()
             );
         }
     }
@@ -2706,14 +2707,34 @@ fn a_megabyte_of_random_input_runs_no_command_the_keymap_did_not_bind() {
         "random input without Ctrl+C quit sig\n{}",
         term.context()
     );
-    // An Escape closes an address line a click may have opened; Ctrl+C then quits. Escape and
-    // Ctrl+C read together are one Alt+Ctrl+C (a legacy terminal's Escape prefix), so Ctrl+C
-    // waits until sig has read the Escape (a report after it) and taken it alone (a report
-    // after the parser's escape timeout), however loaded the machine.
+    // An Escape closes an address line a click may have opened; Ctrl+C then quits. A report
+    // answers at once, not after the input before it, and a loaded sig may still be working
+    // through the flood; Escape and Ctrl+C read together would be one Alt+Ctrl+C (a legacy
+    // terminal's Escape prefix). So: wait until the flood is handled (the count of input events
+    // stays put), send Escape, wait until it is taken alone (the count moves), then Ctrl+C.
+    let events = |r: &str| report_value(r, "input_events").parse::<u64>().unwrap_or(0);
+    let handling = Instant::now();
+    let mut before = events(&term.report_until(|_| true));
+    loop {
+        thread::sleep(Duration::from_millis(200));
+        let now = events(&term.report_until(|_| true));
+        if now == before {
+            break;
+        }
+        before = now;
+        assert!(
+            handling.elapsed() < Duration::from_secs(60),
+            "the flood was still being handled after 60 s\n{}",
+            term.context()
+        );
+    }
     term.type_bytes(b"\x1b");
-    let _ = term.tabs();
-    thread::sleep(Duration::from_millis(100));
-    let _ = term.tabs();
+    let report = term.report_until(|r| events(r) > before);
+    assert!(
+        events(&report) > before,
+        "Escape was not taken\n{}",
+        term.context()
+    );
     term.type_bytes(b"\x03");
     let status = term.exit();
     assert!(
