@@ -1453,7 +1453,7 @@ fn fuzz_kitty_placeholders_refusals_and_cells() {
             6 => 1 << rng.range(0, 31),
             _ => rng.range(1, 255) as u32 | (rng.range(1, 255) as u32) << 24,
         };
-        let mut side = |rng: &mut Rng| match rng.below(8) {
+        let side = |rng: &mut Rng| match rng.below(8) {
             0 => 0,
             1 => 1,
             2 => max - 1,
@@ -1462,9 +1462,10 @@ fn fuzz_kitty_placeholders_refusals_and_cells() {
             5 => u16::MAX,
             _ => rng.range(1, 12) as u16,
         };
+        let (any_column, any_row) = (rng.below(65536) as u16, rng.below(65536) as u16);
         let place = CellRect {
-            column: *rng.pick(&[0, 1, 77, u16::MAX, rng.below(65536) as u16]),
-            row: *rng.pick(&[0, 1, 40, u16::MAX, rng.below(65536) as u16]),
+            column: *rng.pick(&[0, 1, 77, u16::MAX, any_column]),
+            row: *rng.pick(&[0, 1, 40, u16::MAX, any_row]),
             columns: side(rng),
             rows: side(rng),
         };

@@ -335,8 +335,8 @@ fn fuzz_key_tables_with_a_defect_are_refused() {
             // An empty key.
             _ => format!("[{root}]\n\"\" = \"page.reload\"\n"),
         };
-        // The injected tables must not collide with the generated ones: the generated ones
-        // never use `ctrl-alt-q`'s first keystroke... they may, so drop such entries.
+        // The injected tables use `ctrl-alt-q`: drop generated entries that start with it, so
+        // the defect is the only one.
         let filtered: Vec<Entry> = list
             .into_iter()
             .filter(|e| !e.keys.starts_with("ctrl-alt-q"))
