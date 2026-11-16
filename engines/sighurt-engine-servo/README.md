@@ -52,9 +52,12 @@ tools/headless-sway --renderer gles2 -- target/debug/examples/servo-window --exi
   errors commit Servo's own error page; an address that isn't one fails the navigation.
 - **Input.** Keys by W3C code and key value (dead keys arrive composed, AltGr is `AltGraph`),
   held keys released on blur, input-method text as composition events, positions converted
-  once to device pixels. A wheel notch scrolls smoothly: 120 ms of smaller pixel wheel events,
-  one per frame the view presents (or after 25 ms without one), none while nothing scrolls
-  (`src/input.rs`, `SmoothScroll`). Touchpad deltas go as they come. Servo's script thread
+  once to device pixels. A wheel notch is one wheel event, as Servo 0.7 takes it, unless
+  `[engines.servo] smooth-scroll = true` (default `false`, needs a restart): then a notch
+  scrolls smoothly, 120 ms of smaller pixel wheel events, one per frame the view presents (or
+  after 25 ms without one), none while nothing scrolls (`src/input.rs`, `SmoothScroll`). Pages
+  then see several small wheel events per notch, as from a touchpad, and it costs CPU while
+  scrolling. Touchpad deltas go as they come. Servo's script thread
   renders 4 ms after a pending key, wheel or button event instead of upstream's 20 ms
   (`third_party/servo-script/SIGHURT-PATCH.md`), so input-driven frames follow the display.
 - **Services.** Clipboard reads and writes, permissions (camera, microphone, geolocation) and
