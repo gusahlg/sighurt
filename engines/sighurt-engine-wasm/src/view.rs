@@ -95,6 +95,16 @@ use crate::permissions::{self, PendingPermission};
 use crate::raster::{self, Frame, Scene};
 use crate::runtime::Loaded;
 
+/// A button of `InputState::mouse_buttons_down` (left, right, middle) as the `sig` input queue
+/// numbers it (left 0, middle 1, right 2).
+fn record_button(index: usize) -> u32 {
+    match index {
+        0 => 0,
+        1 => 2,
+        _ => 1,
+    }
+}
+
 /// Logical pixels scrolled per wheel notch, as in Chrome and the pre-rewrite browser.
 const WHEEL_NOTCH: f64 = 100.0;
 /// Most key presses and bytes of typed text a guest gets per frame; more is dropped.
@@ -935,10 +945,9 @@ impl View {
                     if let (Some(internal), Some(at)) = (&self.page.internal, self.canvas_pointer())
                     {
                         let held = lock(&self.page.input_state).mouse_buttons_down;
-                        let held = held
-                            .iter()
-                            .enumerate()
-                            .fold(0, |bits, (i, &down)| bits | (u32::from(down) << i));
+                        let held = held.iter().enumerate().fold(0, |bits, (i, &down)| {
+                            bits | (u32::from(down) << record_button(i))
+                        });
                         internal.pointer(pages::record::MOTION, modifiers, held, at, None);
                     }
                 }
@@ -1088,7 +1097,7 @@ impl View {
                 true => pages::record::POINTER_PRESS,
                 false => pages::record::POINTER_RELEASE,
             };
-            internal.pointer(kind, modifiers, index as u32, at, None);
+            internal.pointer(kind, modifiers, record_button(index), at, None);
         }
         if down {
             self.page.activation.activate();
@@ -1424,6 +1433,12 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn records_number_buttons_as_the_sig_module_does() {
+        // mouse_buttons_down is left, right, middle; records say left 0, middle 1, right 2.
+        assert_eq!([0, 1, 2].map(record_button), [0, 2, 1]);
+    }
     use crate::capabilities::{set_module_origin, TimerEntry};
 
     fn push_state(host_state: &HostState, url: &str) {

@@ -624,6 +624,10 @@ impl<P: Terminal> App<P> {
     fn start(&mut self, host: &mut impl Host<Pty = P>) {
         let (cols, rows) = self.size;
         self.term = Term::new(rows, cols);
+        // The new emulator measures images and answers size queries in the face's cells.
+        if let Some(m) = self.metrics {
+            self.term.set_cell(m.cell_w, m.cell_h);
+        }
         self.pending.clear();
         // Close the ended terminal first: a document has one at a time.
         self.phase = Phase::Start { refused: false };
@@ -1535,6 +1539,13 @@ mod tests {
             app.frame((40, 10));
         }
         assert_eq!(image(&app), Some([0.0, 12.0, 2.0, 2.0]));
+        // The emulator started with the program knows the cell: one cell, and the cursor
+        // right after it; the size queries say it.
+        assert_eq!(app.term.graphics().placements()[0].cols, 1);
+        assert_eq!(app.term.screen().cursor_position(), (1, 1));
+        typed(&browser);
+        output(&browser, &mut app, b"\x1b[16t");
+        assert_eq!(typed(&browser), "\x1b[6;12;6t");
         // Below the text: before the first text drawn.
         let lines: Vec<u8> = (0..12)
             .flat_map(|i| format!("{i}\r\n").into_bytes())
