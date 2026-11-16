@@ -54,7 +54,13 @@
 #   terminal-page  sig://terminal with [pages.terminal] on, /bin/sh as the shell and a
 #               private home: nothing starts on opening it or on a click, a shell on Enter in
 #               INSERT; typed text reaches the shell (a file it writes) and `echo hi` shows hi
-#               (the pixels of the first rows); stty size is the grid that fits the page, and
+#               (the pixels of the first rows); a program's images (a kitty RGB image in
+#               chunks and a sixel) are drawn at the cursor (their pixels counted); the wheel
+#               looks back through the history (the page's tag says so) and typing returns;
+#               a program that asks for the mouse gets a click as SGR reports; a drag selects
+#               text into the primary selection, Ctrl+Shift+C copies it to the clipboard,
+#               Ctrl+Shift+V and a middle click paste (wl-copy and wl-paste in the private
+#               compositor); stty size is the grid that fits the page, and
 #               follows a resize of the output; exit ends it, Enter starts it again; 20 s of
 #               `yes` keep sig's memory bounded, another tab responsive and the view alive, and
 #               Ctrl+C gets the shell back; Escape in INSERT goes to the program, and the
@@ -1455,6 +1461,130 @@ print(0 if hi > 15 and rest == 0 and prompt > 5 else 1, f'light pixels: "hi" {hi
 PY
 )
   check "echo hi shows hi" "${seen%% *}" "${seen#* }"
+
+  # count_px NAME X0 Y0 X1 Y1 R G B: a screenshot NAME.ppm, then how many pixels of the box are
+  # within 40 of the colour, and the box they are in.
+  count_px() {
+    grim -t ppm "$out/$1.ppm"
+    python3 - "$out/$1.ppm" "${@:2}" <<'PY'
+import re, sys
+data = open(sys.argv[1], 'rb').read()
+m = re.match(rb'P6\s+(\d+)\s+(\d+)\s+\d+\s', data)
+w, px = int(m[1]), data[m.end():]
+x0, y0, x1, y1, r, g, b = map(int, sys.argv[2:])
+n, xs, ys = 0, [], []
+for y in range(y0, y1):
+    for x in range(x0, x1):
+        p = px[3 * (y * w + x):3 * (y * w + x) + 3]
+        if abs(p[0] - r) < 40 and abs(p[1] - g) < 40 and abs(p[2] - b) < 40:
+            n += 1
+            xs.append(x)
+            ys.append(y)
+print(n, (min(xs), min(ys), max(xs), max(ys)) if n else None)
+PY
+  }
+  # A program's images: a 40x40 RGB image sent in kitty's chunks, then a 30x12 sixel below it.
+  cat > "$home/img.py" <<'PY'
+import base64, sys
+w = h = 40
+data = base64.b64encode(bytes([230, 20, 20]) * (w * h)).decode()
+chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+for i, chunk in enumerate(chunks):
+    keys = f"a=T,f=24,s={w},v={h},i=7,q=2," if i == 0 else ""
+    sys.stdout.write(f"\033_G{keys}m={int(i < len(chunks) - 1)};{chunk}\033\\")
+sys.stdout.write("\r\n\033Pq#1;2;10;90;10#1!30~-!30~\033\\")
+sys.stdout.flush()
+PY
+  type_line 'clear; python3 ~/img.py'
+  sleep 1
+  red=$(count_px 02b-images 0 "$top" 400 $((top + 200)) 230 20 20)
+  green=$(count_px 02b-images 0 "$top" 400 $((top + 200)) 25 230 25)
+  check "a kitty image is drawn at the cursor, its pixels as sent" \
+    "$(python3 -c "n, box = '''$red'''.split(' ', 1); box = eval(box); print(0 if int(n) >= 1500 and box[0] < 3 and box[1] < $top + 3 else 1)")" "red: $red"
+  check "a sixel image is drawn on the line below it" \
+    "$(python3 -c "n, box = '''$green'''.split(' ', 1); box = eval(box); print(0 if int(n) >= 330 and box[0] < 3 and $top + 54 <= box[1] <= $top + 56 else 1)")" "green: $green"
+  shot 02b-images 0.2
+
+  # The history: the wheel looks back (the page's tag, in its accent colour #7ab8ff, says how
+  # far), typing returns to the live screen.
+  type_line 'clear; seq 1 300'
+  sleep 1
+  page_w=$(diag "[x['width'] for x in t if x['role']=='view' and x['shown']][0]")
+  tag_box=(0 "$top" "$page_w" $((top + 18)) 122 184 255)
+  live=$(count_px 02c-live "${tag_box[@]}")
+  point 400 $((top + 200))
+  echo "scroll -5" >&3
+  sleep 0.5
+  back=$(count_px 02c-back "${tag_box[@]}")
+  shot 02c-back 0.2
+  wtype 'x'
+  sleep 0.5
+  again=$(count_px 02c-again "${tag_box[@]}")
+  check "the wheel looks back through the history, typing returns" \
+    "$([[ ${live%% *} == 0 && ${back%% *} -gt 30 && ${again%% *} == 0 ]]; echo $?)" \
+    "tag pixels: live ${live%% *}, scrolled back ${back%% *}, after typing ${again%% *}"
+  key -k BackSpace
+
+  # The mouse for a program that asks: a click is two SGR reports.
+  cat > "$home/mouse.py" <<'PY'
+import os, select, sys, termios, tty
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+os.write(1, b"\033[?1000h\033[?1006h")
+got = b""
+try:
+    while not got.endswith(b"m") and len(got) < 64:
+        if not select.select([fd], [], [], 8)[0]:
+            break
+        got += os.read(fd, 64)
+finally:
+    os.write(1, b"\033[?1000l\033[?1006l")
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+open(os.path.expanduser("~/mouse.txt"), "wb").write(got)
+PY
+  type_line 'clear; python3 ~/mouse.py'
+  sleep 1
+  click 95 $((top + 40))
+  sleep 1
+  reports=$(python3 -c "print(repr(open('$home/mouse.txt', 'rb').read()))" 2>/dev/null)
+  check "a program that asks for the mouse gets a click as SGR reports" \
+    "$(python3 -c "import re; print(0 if re.fullmatch(rb'\x1b\[<0;11;3M\x1b\[<0;11;3m', $reports) else 1)" 2>/dev/null || echo 1)" \
+    "reports $reports"
+
+  # Selection and the clipboards.
+  type_line 'clear; echo selectme'
+  sleep 0.5
+  point 2 $((top + 9))
+  echo press >&3
+  sleep 0.2
+  point 70 $((top + 9))
+  sleep 0.2
+  echo release >&3
+  sleep 0.5
+  primary=$(timeout 2 wl-paste --primary --no-newline 2>&1)
+  check "a drag selects text into the primary selection" "$([[ $primary == selectme ]]; echo $?)" "primary: $primary"
+  wtype -M ctrl -M shift c -m shift -m ctrl
+  sleep 0.5
+  clipboard=$(timeout 2 wl-paste --no-newline 2>&1)
+  check "Ctrl+Shift+C copies the selection to the clipboard" "$([[ $clipboard == selectme ]]; echo $?)" "clipboard: $clipboard"
+  wl-copy 'echo pasted > ~/pasted.txt'
+  sleep 0.3
+  wtype -M ctrl -M shift v -m shift -m ctrl
+  sleep 0.5
+  enter
+  sleep 0.5
+  wl-copy --primary 'echo middle > ~/middle.txt'
+  sleep 0.3
+  point 400 $((top + 200))
+  echo "click middle" >&3
+  sleep 0.5
+  enter
+  sleep 0.5
+  check "Ctrl+Shift+V pastes the clipboard, a middle click the primary selection" \
+    "$([[ $(cat "$home/pasted.txt" 2>/dev/null) == pasted && $(cat "$home/middle.txt" 2>/dev/null) == middle ]]; echo $?)" \
+    "pasted.txt: $(cat "$home/pasted.txt" 2>/dev/null), middle.txt: $(cat "$home/middle.txt" 2>/dev/null)"
+  type_line 'clear'
   read -r rows cols < "$home/size1.txt" || rows=0 cols=0
   size=$(view 2>/dev/null || echo '[0, 0]')
   # A cell is 18 pixels high (15 pixels times 1.2, the canvas's line box) and about 9 wide.
