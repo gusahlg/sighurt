@@ -136,8 +136,18 @@ cargo build -p sighurt-browser --no-default-features --features frontend-gui,eng
 cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-cef,engine-demo
 cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-ladybird,engine-demo
 cargo build -p sighurt-browser --no-default-features --features frontend-gui,engine-netsurf,engine-demo,frontend-tui
-cargo build -p sighurt-browser --no-default-features --features frontend-tui,engine-wasm,engine-demo   # the terminal only: no Wayland crate
+cargo build -p sighurt-browser --no-default-features --features frontend-tui,engine-wasm,engine-demo   # the terminal only: no Sighurt Wayland crate
 ```
+
+Since 1.1.0 the window is a feature of its own, `frontend-gui`, and a build with
+`--no-default-features` names it, as the lines above do. The 1.0 recipe for a window with the
+demo engine, `--no-default-features --features engine-demo`, now builds a `sig` with no
+frontend, which says so and exits: add `frontend-gui` (or `frontend-tui`). `chrome-line`,
+`render-wgpu` and `render-vulkan` turn `frontend-gui` on. The default build is unchanged. A
+terminal-only `sig` links none of Sighurt's Wayland crates (sighurt-wayland, sighurt-gui,
+sighurt-ui, the renderers) with the demo engine; the Wasm engine's file picker still links
+`wayland-client` on Linux, and Servo's adapter depends on sighurt-wayland, so a terminal-only
+`sig` with `engine-servo` links it.
 
 The terminal-only `sig` runs on macOS and on Windows too, tested on GitHub's runners: on macOS
 with the demo and Wasm engines (FFmpeg 7 from Homebrew), on Windows with the demo engine, in the
@@ -855,7 +865,8 @@ is the design of the experience.
 
 **A configuration in Rust.** `extensions/sighurt-config-example` is the configuration compiled
 into `sig`. Its `configure()` returns `Experience::default()`, the default experience of
-[`sighurt-config`](sdk/sighurt-config/) (Apache-2.0, depending on `sighurt-api` alone). Edit it, or
+[`sighurt-config`](sdk/sighurt-config/) (depending on `sighurt-api` alone; its licence is
+[below](#credits-and-license)). Edit it, or
 point the build at a copy of the crate, and change that value with the SDK. A binding replaces only
 what it binds, so changing one key keeps the rest. The crate's comments show each kind of change:
 
@@ -946,7 +957,7 @@ and `ui/sighurt-ui/tests/extension.rs` use the key engine's data and the chrome 
 | [`sighurt-wayland`](frontends/sighurt-wayland/) | the Wayland host: window, surfaces, targets, scaling, input, clipboard, shared-memory buffers, frame scheduling |
 | [`sighurt-ui`](ui/sighurt-ui/) | the standard chrome, the chrome API and its helpers |
 | [`sighurt-chrome-line`](extensions/sighurt-chrome-line/) | the line chrome |
-| [`sighurt-config`](sdk/sighurt-config/) | the SDK for the experience: `Experience`, `KeysBuilder`, table handles and the default experience (Apache-2.0) |
+| [`sighurt-config`](sdk/sighurt-config/) | the SDK for the experience: `Experience`, `KeysBuilder`, table handles and the default experience (its source Apache-2.0; it re-exports the AGPL `sighurt-api`) |
 | [`sighurt-config-example`](extensions/sighurt-config-example/) | the configuration compiled into `sig`: the default experience, which you edit |
 | [`sighurt-engine-servo`](engines/sighurt-engine-servo/) | the Servo engine |
 | [`sighurt-engine-wpe`](engines/sighurt-engine-wpe/) | the WPE WebKit engine |
@@ -1017,7 +1028,11 @@ Licensed under the GNU Affero General Public License, version 3 or later (`AGPL-
 see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). Oxide is Apache-2.0: its license notice and the
 Apache License are in [LICENSE-APACHE](./LICENSE-APACHE), and the code that came from it remains
 available under Apache-2.0 from Oxide. The guest SDK (`sighurt-sdk`) and the example apps stay
-Apache-2.0, so Wasm apps built with them may use any license. `sighurt-engine-servo` is
+Apache-2.0, so Wasm apps built with them may use any license. The configuration SDK
+(`sighurt-config`) is Apache-2.0 too, but it depends on and re-exports `sighurt-api`, which is
+AGPL-3.0-or-later: a configuration built with it today is combined with AGPL code and compiled
+into `sig`, so it is not freely licensable the way a Wasm app is. A permissively licensed data
+crate, with configurations loaded as separate modules, is planned. `sighurt-engine-servo` is
 `AGPL-3.0-or-later AND MPL-2.0`; `sig` built with Servo links Servo, which is MPL-2.0, and `sig`
 built with WPE WebKit loads WPE WebKit's libraries (LGPL and BSD licenses) dynamically.
 `sighurt-engine-cef` is `AGPL-3.0-or-later`; the CEF and Chromium BSD notices are in

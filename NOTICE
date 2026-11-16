@@ -34,6 +34,13 @@ Exceptions:
   applications in examples/ stay under the Apache License, Version 2.0, like
   Oxide, so applications built with them may use any license.
 
+- sighurt-config, the SDK configurations are written against, is under the
+  Apache License, Version 2.0, as to its own source. It depends on and
+  re-exports sighurt-api, which is AGPL-3.0-or-later, so a configuration built
+  with it is combined with AGPL-3.0-or-later code and compiled into sig; the
+  Apache License of sighurt-config does not change the terms of that
+  combination.
+
 - sighurt-engine-servo, the Servo engine compiled into sig, is licensed under
   AGPL-3.0-or-later AND MPL-2.0. It contains no files adapted from the Servo
   project (https://github.com/servo/servo) at present; any that it adapts keep

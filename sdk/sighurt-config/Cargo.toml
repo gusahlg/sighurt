@@ -4,7 +4,11 @@ description = "What a Sighurt configuration is written against: the experience (
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# Apache-2.0 like sighurt-sdk, so configurations written against it may be licensed freely.
+# This crate's own source is Apache-2.0. It depends on and re-exports sighurt-api, which is
+# AGPL-3.0-or-later, so a configuration built with it today is combined with AGPL code and
+# compiled into sig: the Apache licence here does not let such a configuration be distributed on
+# other terms. A permissively licensed data crate, with configurations loaded as separate
+# modules, is planned (docs/rewrite/experience-2026-11-15.md, §2).
 license = "Apache-2.0"
 authors.workspace = true
 

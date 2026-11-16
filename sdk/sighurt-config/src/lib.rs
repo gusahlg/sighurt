@@ -44,6 +44,12 @@
 //! conflict in a hand-built table) is `Keys::check`'s, which `sig` runs when it loads. An
 //! experience with any problem is not used at all.
 //!
+//! **Licence.** This crate's own source is Apache-2.0. It depends on and re-exports
+//! `sighurt-api`, which is AGPL-3.0-or-later, so a configuration built with it today is
+//! combined with AGPL-3.0-or-later code and compiled into `sig`: the Apache licence of this
+//! crate does not let such a configuration be distributed on other terms. A permissively
+//! licensed data crate, with configurations loaded as separate modules, is planned.
+//!
 //! Must not own: anything at run time (the engine, the mode, the presses taken are the core's),
 //! or a second vocabulary of actions: commands are [`Command`]s.
 
