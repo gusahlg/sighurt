@@ -3910,7 +3910,9 @@ fn home_links_open_by_click_and_by_tab_and_enter() {
 
 /// SIGTERM, SIGINT and SIGHUP while sig://terminal's shell runs (the signals arrive through
 /// `sighurt_runtime::signals`, SIGHUP through the terminal's own handler): sig quits with
-/// status 0, the terminal is restored, and the shell ends with it.
+/// status 0, the terminal is restored, and the shell ends with it. Linux's, with the Wasm
+/// engine, as the other tests of the terminal pages' programs: the pages and `/proc`.
+#[cfg(all(feature = "engine-wasm", target_os = "linux"))]
 #[test]
 fn signals_end_sig_and_the_shell_sig_terminal_runs() {
     for (name, signal) in [

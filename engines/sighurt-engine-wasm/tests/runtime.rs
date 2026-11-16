@@ -175,10 +175,14 @@ fn timers_and_events_reach_the_guest() {
     let events = host.until(5 * SECS, |event| {
         matches!(event, EngineEvent::HistoryChanged { entries, current: 2, .. } if entries.len() == 3)
     });
-    // The event emitted in start_app came first, at the first frame; the timer 30 ms later.
-    let order: Vec<_> = events
+    // The event emitted in start_app came first, at the first frame; the timer 30 ms later. The
+    // history says in which order: on a slow machine the first frame can come before `load`
+    // has seen the page's commit, and the ping's commit is then among the events `load` read.
+    let Some(EngineEvent::HistoryChanged { entries, .. }) = events.last() else {
+        panic!("no history: {events:?}");
+    };
+    let order: Vec<_> = entries
         .iter()
-        .filter_map(committed_url)
         .filter_map(|url| url.rsplit_once('#').map(|(_, fragment)| fragment))
         .collect();
     assert_eq!(order, ["ping", "timer"]);

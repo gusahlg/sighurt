@@ -205,12 +205,14 @@ impl Session {
             ));
         }
         let (winch_read, winch_write) = winch_pipe()?;
+        // Everything that is put back is read before anything changes: a descriptor that is no
+        // terminal fails here with its flags as they were.
         let original_flags = rustix::fs::fcntl_getfl(&fd)?;
-        let raw_flags = original_flags | OFlags::NONBLOCK;
-        rustix::fs::fcntl_setfl(&fd, raw_flags)?;
         let original = tcgetattr(&fd)?;
         let mut raw = original.clone();
         raw.make_raw();
+        let raw_flags = original_flags | OFlags::NONBLOCK;
+        rustix::fs::fcntl_setfl(&fd, raw_flags)?;
         if let Err(err) = tcsetattr(&fd, OptionalActions::Now, &raw) {
             let _ = rustix::fs::fcntl_setfl(&fd, original_flags);
             return Err(io::Error::from(err));

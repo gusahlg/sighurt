@@ -376,6 +376,11 @@ fn sig_in_a_console_shows_the_page_opens_an_address_and_quits_restoring_the_cons
     );
     // The evidence, with --nocapture: what the console showed at each step.
     eprintln!("modes before sig: {before}\nthe page:\n{}", console.text());
+    // Windows has no configuration watch, and the user is told (finding 4 of review C).
+    let told = console.wait(Duration::from_secs(10), |text| {
+        text.contains("configuration at startup only")
+    });
+    assert!(told, "no notice of the missing watch\n{}", console.text());
 
     // `o` opens the address line, Enter opens what was typed.
     console.type_bytes(b"o");

@@ -307,9 +307,13 @@ mode, keys, the commands as written (or `Custom::describe`, "pass to the page", 
 
 ## 2. The SDK: `sighurt-config`
 
-A new crate, `sdk/sighurt-config` (Apache-2.0 like `sighurt-sdk`, so configurations may be
-licensed freely), depending on `sighurt-api` only. It is what a configuration is written
-against, and what the default experience is written against:
+A new crate, `sdk/sighurt-config`, depending on `sighurt-api` only. It is what a configuration
+is written against, and what the default experience is written against. Its own source is
+Apache-2.0, like `sighurt-sdk`'s. That does not make configurations freely licensable, as this
+paragraph first said (review C, 16 November 2026): the crate re-exports `sighurt-api`, which is
+AGPL-3.0-or-later, so a configuration built with it today is combined with AGPL-3.0-or-later
+code and compiled into `sig`. A permissively licensed data crate, with configurations loaded as
+separate modules, is planned; until then a configuration is distributed as `sig` is.
 
 ```rust
 use sighurt_config::prelude::*;

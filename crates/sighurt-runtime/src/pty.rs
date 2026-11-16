@@ -58,6 +58,9 @@ use rustix::termios::{InputModes, OptionalActions, Winsize};
 use sighurt_api::ids::{PtySession, RequestId};
 use sighurt_api::services::{PtyProgram, ServiceError, ServiceReply, ServiceResult};
 
+/// Whether this build starts programs on this system: it does here (`pty_unsupported.rs` is the
+/// module that does not).
+pub const RUNS_PROGRAMS: bool = true;
 /// Most programs started and not yet reaped in one process. The core holds pages to the same
 /// number.
 pub const MAX_SESSIONS: usize = 8;
@@ -488,8 +491,10 @@ impl Ptys {
             .name("sighurt-pty-watch".into())
             .spawn(move || {
                 let status = watch(child, &pidfd, &woken);
-                watched.set(status);
+                // The place is given back before the exit is told: whoever waits for the exit
+                // (`Ptys::shutdown`) then finds it free.
                 drop(counted);
+                watched.set(status);
                 let mut ended = ended.lock().unwrap_or_else(PoisonError::into_inner);
                 ended.push((request, status.code()));
                 drop(ended);
@@ -1166,7 +1171,7 @@ mod tests {
         let ptys = ptys();
         let script = "ls /proc/self/fd | tr '\\n' ' '; echo; \
                       env | sort | tr '\\n' ' '; echo; \
-                      tty; pwd; \
+                      echo \"$(tty)\"; pwd; \
                       grep -E '^Sig(Ign|Blk)' /proc/self/status | tr '\\n' ' '; echo; \
                       [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && echo all-ttys";
         // As sig ignores and blocks signals, so does this test while it starts the child: an
@@ -1193,6 +1198,7 @@ mod tests {
         drop(stray);
         let out = read_all(&master);
         let lines: Vec<_> = out.lines().map(str::trim).collect();
+        // `tty` is in `$(…)` and echoed: uutils' `tty` (Ubuntu 26.04's) prints no newline.
         // `ls` itself opens its directory: 0, 1, 2 and that one.
         let fds: Vec<_> = lines[0].split_whitespace().collect();
         assert_eq!(fds.len(), 4, "{out}");
@@ -1215,7 +1221,11 @@ mod tests {
             assert!(!env.contains(gone), "{gone} in {env}");
         }
         assert!(lines[2].starts_with("/dev/pts/"), "{out}");
-        assert_eq!(Path::new(lines[3]), home.path().canonicalize().unwrap());
+        assert_eq!(
+            Path::new(lines[3]),
+            home.path().canonicalize().unwrap(),
+            "{out:?}"
+        );
         // What `grep`, the shell's child, inherited.
         assert!(lines[4].contains("SigIgn:\t0000000000000000"), "{out}");
         assert!(lines[4].contains("SigBlk:\t0000000000000000"), "{out}");

@@ -1027,7 +1027,7 @@ mod tests {
         let (read, write) = std::io::pipe().unwrap();
         let read = OwnedFd::from(read);
         rustix::io::ioctl_fionbio(&read, true).unwrap();
-        (Signals::from_pipe(read), write)
+        (Signals::from_pipe(read, Default::default()), write)
     }
 
     #[cfg(unix)]

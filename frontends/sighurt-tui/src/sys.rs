@@ -90,18 +90,23 @@ pub(crate) fn insert_signals<D: 'static>(
 }
 
 /// Watches the configuration at `path`: `on` gets whether the file changed each time the
-/// watch wakes the loop. A watch that can't be made (no directory yet, or a system without
-/// one) is logged, and the file is read at startup only.
+/// watch wakes the loop. A watch that can't be made (no directory yet) is logged, and the file
+/// is read at startup only; on a system with no watch at all (Windows) that is a notice for the
+/// user, which this returns.
 pub(crate) fn insert_config_watch<D: 'static>(
     handle: &LoopHandle<'static, D>,
     path: &Path,
     on: fn(&mut D, bool),
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let watch = match ConfigWatch::new(path) {
         Ok(watch) => watch,
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            log::info!("not watching {}: {error}", path.display());
+            return Ok(Some(NO_WATCH.into()));
+        }
         Err(error) => {
             log::info!("not watching {}: {error}", path.display());
-            return Ok(());
+            return Ok(None);
         }
     };
     #[cfg(unix)]
@@ -121,5 +126,9 @@ pub(crate) fn insert_config_watch<D: 'static>(
     {
         let _ = (handle, on, watch);
     }
-    Ok(())
+    Ok(None)
 }
+
+/// The notice where the configuration is not watched.
+pub(crate) const NO_WATCH: &str =
+    "sig reads its configuration at startup only here: restart it after a change";

@@ -111,6 +111,8 @@ pub struct EditorInfo {
     pub file: String,
     /// Whether the file does not exist yet.
     pub new: bool,
+    /// This build starts no program on this system (`programs no`), so no editor was looked for.
+    pub no_programs: bool,
     /// The file's problems, which keep sig on the configuration it has.
     pub problems: Vec<String>,
 }
@@ -127,6 +129,7 @@ impl EditorInfo {
                 "from" => info.from = value.into(),
                 "file" => info.file = value.into(),
                 "new" => info.new = value == "yes",
+                "programs" => info.no_programs = value == "no",
                 "problem" => info.problems.push(value.into()),
                 _ => {}
             }
@@ -891,7 +894,17 @@ impl<P: Terminal> App<P> {
                     lines.push(Line::new(format!("    {}", info.file), FOREGROUND));
                     lines.push(Line::new("", FOREGROUND));
                 }
-                if info.editor.is_empty() {
+                if info.no_programs {
+                    lines.push(
+                        Line::new("This sig starts no programs on this system.", WARNING).bold(),
+                    );
+                    lines.push(Line::new(
+                        "sig://config and sig://terminal run programs on Linux only, for now. \
+                         Edit sig's configuration file with any editor:",
+                        WARNING,
+                    ));
+                    lines.push(Line::new(format!("    {}", info.file), FOREGROUND));
+                } else if info.editor.is_empty() {
                     lines.push(Line::new("No editor found.", WARNING).bold());
                     lines.push(Line::new(
                         "Set [pages.config] editor in sig's configuration, or $VISUAL or $EDITOR, \
@@ -960,8 +973,9 @@ impl<P: Terminal> App<P> {
                 Line::new("    [pages.terminal]", FOREGROUND),
                 Line::new("    enabled = true", FOREGROUND),
                 Line::new(
-                    "It is also refused while eight terminals run, or when the key press did not \
-                     reach this page.",
+                    "It is also refused while eight terminals run, when the key press did not \
+                     reach this page, and where this sig starts no programs (anything but Linux, \
+                     for now).",
                     MUTED,
                 ),
             ],
@@ -970,8 +984,8 @@ impl<P: Terminal> App<P> {
                 Line::new("The editor did not start.", WARNING).bold(),
                 Line::new(
                     "sig refuses it while [pages.config] enabled is false, when it finds no \
-                     editor, while eight terminals run, or when the key press did not reach this \
-                     page.",
+                     editor, while eight terminals run, when the key press did not reach this \
+                     page, and where it starts no programs (anything but Linux, for now).",
                     MUTED,
                 ),
             ],
@@ -1654,8 +1668,25 @@ mod tests {
                 from: "PATH".into(),
                 file: "/home/u/.config/sighurt/config.toml".into(),
                 new: false,
+                no_programs: false,
                 problems: vec!["a".into(), "b".into()],
             }
         );
+    }
+
+    /// Finding 4 of review C: where this sig starts no programs (macOS, for now), the page says
+    /// so, and not that an editor is missing.
+    #[test]
+    fn sig_config_says_when_this_sig_starts_no_programs() {
+        let mut app = App::<Pty>::new(Program::EditConfig);
+        app.frame((200, 50));
+        app.editor_info(
+            "enabled\tyes\neditor\t\nfrom\tnone\nprograms\tno\nfile\t/c.toml\nnew\tno\n",
+        );
+        let text = shown(&app);
+        assert!(text.contains("starts no programs on this system"), "{text}");
+        assert!(text.contains("/c.toml"), "{text}");
+        assert!(!text.contains("No editor found"), "{text}");
+        assert!(!text.contains("install nvim"), "{text}");
     }
 }
