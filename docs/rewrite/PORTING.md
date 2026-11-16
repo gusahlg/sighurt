@@ -280,7 +280,7 @@ only)", every step green, 880 tests:
   terminal: kitty and sixel frames, keys, the address line, text mode, find, the clipboard,
   SIGTERM, resizes, floods and garbage) and again with the Wasm engine (48: sig's own pages and
   home's links to them too), all passing; first all green in run 43826803295. One of the 48 is
-  intermittent there and now ignored on macOS with the Wasm engine ([open](#macos-1)).
+  intermittent there and now ignored on macOS with the Wasm engine ([open](#macos)).
 - The crates' tests, `frontends/sighurt-tui/tests/pty.rs` (raw mode and its restoration after a
   panic, SIGABRT, a SIGSEGV fault, `kill -SEGV`, SIGTSTP and SIGCONT, a forced exit) and the
   kqueue configuration watch among them, all passing; first all green in run 43835363647.
