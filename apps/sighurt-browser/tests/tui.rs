@@ -269,17 +269,34 @@ impl Terminal {
         let mut rest = self.replies;
         let mut buf = vec![0u8; 1 << 16];
         let mut progress = Instant::now();
+        // When each 64 KiB of the answer was taken, for a stall's message.
+        let (start, mut taken) = (Instant::now(), Vec::new());
         while !rest.is_empty() {
             match rustix::io::write(&self.master, rest) {
                 Ok(n) => {
+                    let before = self.replies.len() - rest.len();
                     rest = &rest[n..];
                     progress = Instant::now();
+                    if (before + n) >> 16 != before >> 16 {
+                        taken.push(format!(
+                            "{} KiB at {:?}",
+                            (before + n) >> 10,
+                            start.elapsed()
+                        ));
+                    }
                 }
                 Err(Errno::AGAIN) | Err(Errno::INTR) => {
                     if let Ok(n) = rustix::io::read(&self.master, &mut buf) {
                         self.got.extend_from_slice(&buf[..n]);
                     }
-                    self.assert_taking(progress);
+                    if progress.elapsed() >= STALL {
+                        panic!(
+                            "sig took no more of the answer for {STALL:?}; taken: {}\n{}\n{}",
+                            taken.join(", "),
+                            self.stall_report(),
+                            self.context()
+                        );
+                    }
                     wait_on(
                         &self.master,
                         PollFlags::IN | PollFlags::OUT,
@@ -296,9 +313,30 @@ impl Terminal {
     fn assert_taking(&self, progress: Instant) {
         assert!(
             progress.elapsed() < STALL,
-            "sig took no more input for {STALL:?}\n{}",
+            "sig took no more input for {STALL:?}\n{}\n{}",
+            self.stall_report(),
             self.context()
         );
+    }
+
+    /// What `sig` is doing now, for a stall's message: its size and state, and on macOS every
+    /// thread's stack (`sample`).
+    fn stall_report(&self) -> String {
+        let pid = self.child.id().to_string();
+        let run = |program: &str, args: &[&str]| {
+            Command::new(program).args(args).output().map_or_else(
+                |error| format!("{program}: {error}\n"),
+                |out| {
+                    String::from_utf8_lossy(&out.stdout).into_owned()
+                        + &String::from_utf8_lossy(&out.stderr)
+                },
+            )
+        };
+        let mut report = run("ps", &["-o", "pid,rss,vsz,pcpu,stat", "-p", &pid]);
+        if cfg!(target_vendor = "apple") {
+            report += &run("sample", &[&pid, "2", "-mayDie"]);
+        }
+        report
     }
 
     fn type_bytes(&self, mut bytes: &[u8]) {
@@ -2483,6 +2521,24 @@ fn a_drag_that_leaves_the_page_still_reaches_the_page() {
 /// `$HOME` (`~/Library/Application Support`, as the `dirs` crate has it) and reads no `XDG_*`
 /// variable: `DIR/state`, `DIR/data` and that directory under `DIR/home` are made links to
 /// `DIR/config`, so the paths the tests name are the ones `sig` uses. Elsewhere nothing.
+/// A process by its pid, for whether it is still there: `kill(pid, 0)`, which needs no `/proc`
+/// (macOS has none). A zombie counts, as its `/proc` entry would.
+#[cfg(all(feature = "engine-wasm", any(target_os = "linux", target_os = "macos")))]
+struct Process(i32);
+
+#[cfg(all(feature = "engine-wasm", any(target_os = "linux", target_os = "macos")))]
+impl Process {
+    fn of(pid: &str) -> Self {
+        Self(pid.trim().parse().expect("a pid"))
+    }
+
+    fn exists(&self) -> bool {
+        // SAFETY: kill(2) with signal 0 sends nothing.
+        let sent = unsafe { libc::kill(self.0, 0) } == 0;
+        sent || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+}
+
 fn same_dirs_on_macos(dir: &Path) {
     #[cfg(target_vendor = "apple")]
     {
@@ -2858,14 +2914,6 @@ fn garbage_answers_to_the_probe_are_survived() {
 
 /// A megabyte of random terminal input as the answer to the probe: `sig` starts, answers its
 /// diagnostics signal, and SIGTERM still quits it and restores the terminal.
-// Open on macOS with the Wasm engine: on GitHub's macos-latest `sig` sometimes stops taking
-// the fake terminal's input for 30 s while it answers (runs 43818654935, 43821547281 and
-// 43842878416; it passed in 43826803295 and 43838694058, and with the demo engine alone it
-// always has). Not explained yet (docs/rewrite/PORTING.md); run it by hand with --ignored.
-#[cfg_attr(
-    all(target_vendor = "apple", feature = "engine-wasm"),
-    ignore = "stalls on macOS runners with the Wasm engine: open, see PORTING.md"
-)]
 #[test]
 fn a_megabyte_of_garbage_as_the_probes_answer_is_survived() {
     let replies: &'static [u8] = Box::leak(random_input(0x5eed, 1 << 20).into_boxed_slice());
@@ -3200,8 +3248,8 @@ fn sig_pages_need_graphics_and_say_so() {
 /// the shell, typed keys reach it, Escape in INSERT is the shell's, the example configuration's
 /// `ctrl-escape` (kitty's `CSI 27;5u`) and `f12` (`CSI 24~`) leave INSERT, and `q` quits sig
 /// with the shell ended. Needs the Wasm engine: run with `--features frontend-tui,engine-demo,engine-wasm`.
-// The terminal pages' programs are Linux's (docs/rewrite/PORTING.md).
-#[cfg(all(feature = "engine-wasm", target_os = "linux"))]
+// The terminal pages' programs are Linux's and macOS's (docs/rewrite/PORTING.md).
+#[cfg(all(feature = "engine-wasm", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
     let pages = "[pages.terminal]\nenabled = true\ncommand = \"/bin/sh\"";
@@ -3228,7 +3276,7 @@ fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
         term.wait(term.got.len(), Duration::from_millis(100), |_| false);
     }
     let pid = fs::read_to_string(home.join("pid")).unwrap();
-    let shell = Path::new("/proc").join(pid.trim());
+    let shell = Process::of(&pid);
     assert!(shell.exists(), "the shell is not running");
     // Escape is the shell's: INSERT stays, and the shell still reads the next line once
     // Ctrl+C has dropped what the Escape began.
@@ -3286,8 +3334,8 @@ fn sig_terminal_runs_a_shell_in_the_terminal_frontend() {
 /// configuration (here `[pages.config] editor`, a script that appends a line to the file it is
 /// given), and the file changes. Needs the Wasm engine: run with
 /// `--features frontend-tui,engine-demo,engine-wasm`.
-// The terminal pages' programs are Linux's (docs/rewrite/PORTING.md).
-#[cfg(all(feature = "engine-wasm", target_os = "linux"))]
+// The terminal pages' programs are Linux's and macOS's (docs/rewrite/PORTING.md).
+#[cfg(all(feature = "engine-wasm", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn sig_config_runs_the_editor_in_the_terminal() {
     use std::os::unix::fs::PermissionsExt;
@@ -3390,8 +3438,8 @@ const PASTE: &[u8] = b"\x1b[200~pasted\x1b[201~";
 /// Enter starts the editor and typing reaches it; back in text mode typing does not, while it
 /// keeps running, and with graphics again it does. Needs the Wasm engine: run with
 /// `--features frontend-tui,engine-demo,engine-wasm`.
-// The terminal pages' programs are Linux's (docs/rewrite/PORTING.md).
-#[cfg(all(feature = "engine-wasm", target_os = "linux"))]
+// The terminal pages' programs are Linux's and macOS's (docs/rewrite/PORTING.md).
+#[cfg(all(feature = "engine-wasm", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn sig_config_gets_no_input_where_it_is_not_drawn() {
     let dir = scripts("config-undrawn");
@@ -3487,7 +3535,7 @@ fn sig_config_gets_no_input_where_it_is_not_drawn() {
         term.context()
     );
     let pid = fs::read_to_string(&started).unwrap();
-    let program = Path::new("/proc").join(pid.trim());
+    let program = Process::of(&pid);
     // Typed until it reads them: stty may not have made it raw yet.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !fs::read_to_string(&input)
@@ -3582,8 +3630,8 @@ fn sig_config_gets_no_input_where_it_is_not_drawn() {
 /// from another), ignores it, and is killed 2 s later, when nothing else is due; a single report
 /// some seconds after that has the reload. Needs the Wasm engine: run with
 /// `--features frontend-tui,engine-demo,engine-wasm`.
-// The terminal pages' programs are Linux's (docs/rewrite/PORTING.md).
-#[cfg(all(feature = "engine-wasm", target_os = "linux"))]
+// The terminal pages' programs are Linux's and macOS's (docs/rewrite/PORTING.md).
+#[cfg(all(feature = "engine-wasm", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn an_editors_end_reads_a_linked_configuration_with_no_more_input() {
     let dir = scripts("config-linked");
@@ -3631,7 +3679,7 @@ fn an_editors_end_reads_a_linked_configuration_with_no_more_input() {
         term.context()
     );
     let pid = fs::read_to_string(&started).unwrap();
-    let program = Path::new("/proc").join(pid.trim());
+    let program = Process::of(&pid);
     term.type_bytes(b"\x1b[27;5u\x1b[27;5:3u");
     let left = term.wait(term.got.len(), Duration::from_secs(10), insert_mode_left);
     assert!(left, "ctrl-escape did not leave INSERT\n{}", term.context());
@@ -3910,9 +3958,9 @@ fn home_links_open_by_click_and_by_tab_and_enter() {
 
 /// SIGTERM, SIGINT and SIGHUP while sig://terminal's shell runs (the signals arrive through
 /// `sighurt_runtime::signals`, SIGHUP through the terminal's own handler): sig quits with
-/// status 0, the terminal is restored, and the shell ends with it. Linux's, with the Wasm
-/// engine, as the other tests of the terminal pages' programs: the pages and `/proc`.
-#[cfg(all(feature = "engine-wasm", target_os = "linux"))]
+/// status 0, the terminal is restored, and the shell ends with it. With the Wasm engine, on
+/// Linux and macOS, as the other tests of the terminal pages' programs.
+#[cfg(all(feature = "engine-wasm", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn signals_end_sig_and_the_shell_sig_terminal_runs() {
     for (name, signal) in [
@@ -3955,7 +4003,7 @@ fn signals_end_sig_and_the_shell_sig_terminal_runs() {
             );
             term.wait(term.got.len(), Duration::from_millis(100), |_| false);
         };
-        let shell = Path::new("/proc").join(pid.trim());
+        let shell = Process::of(&pid);
         assert!(shell.exists(), "{name}: the shell is not running");
         // SAFETY: kill(2) on the child.
         unsafe { libc::kill(term.child.id() as i32, signal) };
