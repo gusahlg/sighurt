@@ -9,11 +9,14 @@ log with what was decided instead.
 
 ## Where things stand
 
-**Latest release: 1.0.0** (6 November 2026, decision 144): find in page, visited pages and
-completion, fullscreen, the tab commands, strict modes, a terminal picture that is never
-blanked, sig's own pages (`sig://help`, `sig://config` running your editor, `sig://terminal`),
-configured commands, bindings for some addresses, and a home page with links in both
-frontends. Before it: 0.10.0 (31 October 2026, decision 120). The snapshot below predates some
+**Latest release: 1.1.0** (17 November 2026, decision 159): one key engine driven by data
+(modes, sequences, bindings that replace, `input.mode`), the configuration in Rust
+(`sighurt-config`, the experience), the interface as a layout tree (`[ui.layout]`,
+`[tui.layout]`), a terminal that follows input at 30 frames a second and kitty graphics
+through tmux, Servo's input rendered at once, a history, the mouse, the clipboard and images
+in `sig://terminal`, and a preview of the terminal frontend on macOS and Windows (no web
+engine and no window there yet). Before it: 1.0.0 (6 November 2026, decision 144) and 0.10.0
+(31 October 2026, decision 120). The snapshot below predates some
 of the decisions that amend it (Servo is 0.7, the modal keymap is now the example
 configuration); the decisions log is current.
 
@@ -4979,3 +4982,35 @@ Newest last. Each entry says what was decided and why.
     input-to-visible latency on real pages before more speed work; for configuration
     modules, a small versioned wire contract, no Cargo run by the browser, and the licence
     settled first.
+159. **Sighurt 1.1.0** (17 November 2026; the user on 16 November: "when the new
+    configuration model as well as macos + windows support is done and tested this should
+    become a new release. Call it 1.1.0", and on 17 November: "I give you permission to
+    release. push and fastforward", with the macOS and Windows part worded as a preview).
+    Since 1.0.0: the terminal follows input (`input-fps`) and kitty graphics go through tmux
+    (145, 155); Servo renders input 4 ms after its last update, optional smooth scrolling,
+    WPE WebKit at the output's rate (146, 156); one key engine driven by a `Keys` value, modes
+    as data, `input.mode`, sequences, bindings that replace, and the experience written in
+    Rust with `sighurt-config` (148, 150); the interface as a layout tree for the window and
+    the terminal, `[ui.layout]` and `[tui.layout]`, tabs right or bottom, a sidebar, a bottom
+    toolbar (152); `sig://terminal` and `sig://config` with a history, mouse reporting,
+    selection and the clipboard, kitty graphics and sixel (154); the reliability pass, the
+    lost-quit and the prewarm-thread fixes (153, 157, 158); and, as a preview, the terminal
+    frontend on macOS (demo and Wasm engines) and Windows (demo engine): no web engine and
+    no window on either (147, 151, 158). Three outside reviews by GPT-6 Astra (the experience
+    design, the interface design, the round: `reviews-experience-astra.md`,
+    `reviews-interface-astra.md`, `reviews-round-2026-11-15-astra.md`), their defects fixed
+    (150, 155 to 158). *Evidence*, on e1214fb, this desktop: the CI lines (1 966 tests), the
+    Servo and `--all-features` lines, headless.sh, the chromes' headless.sh and engines.sh
+    (945 checks passing, none failing), faults.sh, a 10-minute soak, both cross-checks;
+    GitHub's CI and Ports workflows green on the same code (runs 43923681379 and
+    43923681446: macOS 927 tests, Windows 757). *Known and open*: a configuration in Rust is
+    still compiled into `sig` (separately loaded modules are Part 5, not started; the
+    review's three questions come first); the line chrome is not folded into the tree and
+    `Label` is not drawn; no real terminal emulator tried on macOS or Windows; no real 120
+    or 144 Hz monitor tried; 145 and 146 show the rate caps removed, not the time from an
+    input to its visible result; one macOS test ignored (151); Ladybird's first frame late
+    once in nine all-engine runs (153); Rio 0.5.28's Vulkan renderer loses its device and
+    draws empty frames (Rio's; 133, 153); the Servo workflow fails on GitHub's runner
+    building mozangle. Work: Claude Fable 5.2 (design of the experience, orchestration,
+    integration, the reviews' triage), Claude Opus 5.5 lanes (implementation), Claude Sonnet
+    (delegated modules), GPT-6 Astra (reviews and 56 probe tests).
