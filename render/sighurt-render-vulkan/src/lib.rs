@@ -566,7 +566,7 @@ impl VulkanBackend {
         let swapchains = [chain.swapchain];
         let indices = [index];
         let chain = target.chain.as_mut().expect("configured");
-        let fence = chain.present_fence(gpu, index)?;
+        let fence = chain.present_fence(gpu)?;
         let fences = fence.map(|fence| [fence]);
         let mut signal = fences
             .as_ref()
@@ -603,7 +603,7 @@ impl VulkanBackend {
                     vk::Result::ERROR_SURFACE_LOST_KHR | vk::Result::ERROR_DEVICE_LOST
                 ) {
                     // Refused before anything was queued: its fence will never signal.
-                    chain.unpend(index);
+                    chain.unpend();
                 }
                 return Err(surface_error("vkQueuePresentKHR", e));
             }
