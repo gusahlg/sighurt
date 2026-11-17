@@ -11,8 +11,8 @@
 //!   Unix terminal. Output: VT processing, processed output and no automatic carriage return
 //!   after a line feed (a raw Unix terminal's `OPOST` off). Both code pages are UTF-8. The
 //!   modes and code pages found at [`Session::enter`] are put back by [`Session::restore`], by
-//!   `Drop`, by the panic hook (on the thread that entered) and by
-//!   [`restore_before_forced_exit`].
+//!   `Drop`, by the panic hook (on the thread that entered), by [`restore_before_forced_exit`]
+//!   and, after a native crash, by an unhandled-exception filter ([`on_crash`]).
 //! - Input is read by a thread of its own (`sighurt-console-in`): it waits on the console's
 //!   input handle and a stop event, reads the input records, turns the characters of key-down
 //!   records into UTF-8 (the VT sequences arrive one character per record) and keeps at most
@@ -29,8 +29,11 @@
 //! - There are no signals. Ctrl+C is a key; Ctrl+Break and the console closing are `sig`'s
 //!   console control handler's (a quit, `sighurt_runtime::signals`). There is no job control,
 //!   so nothing suspends or resumes, and no hangup: a closed console fails the reads and the
-//!   writes. A native crash (an access violation, an abort) leaves the console's modes as they
-//!   were: no handler restores them, and the shell that gets the console back sets its own.
+//!   writes. A native crash (an access violation, a stack overflow: an exception nothing handles)
+//!   reaches [`on_crash`] on the thread that crashed, which writes [`LEAVE`] and puts the modes
+//!   back, taking no lock and waiting for nothing, then lets the crash go on as before. What
+//!   ends the process without an exception (`abort`, Rust's `__fastfail`, `TerminateProcess`)
+//!   still leaves the modes as they were.
 //!
 //! Restoring waits up to [`RESTORE_BUDGET`] for the writer to finish its chunk, then writes
 //! what closes a sequence left open on the wire ([`terminator`]) and [`LEAVE`], and puts the
@@ -43,7 +46,7 @@ use std::ffi::OsStr;
 use std::io::{self, ErrorKind};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -62,6 +65,9 @@ use windows_sys::Win32::System::Console::{
     ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_OUTPUT,
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
     INPUT_RECORD, KEY_EVENT, WINDOW_BUFFER_SIZE_EVENT,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    SetUnhandledExceptionFilter, EXCEPTION_POINTERS, LPTOP_LEVEL_EXCEPTION_FILTER,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentThreadId, SetEvent, WaitForMultipleObjects, INFINITE,
@@ -94,6 +100,10 @@ static CURRENT: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
 static HOOK_ON: AtomicBool = AtomicBool::new(false);
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
 static PREV_HOOK: Mutex<Option<PanicHook>> = Mutex::new(None);
+/// The unhandled-exception filter is installed (once per process, never removed).
+static FILTER_ON: AtomicBool = AtomicBool::new(false);
+/// The filter there was before [`on_crash`], as a function address (0: none).
+static PREV_FILTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Window size, the shape of Unix's `struct winsize`. The console reports no pixel size.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -318,6 +328,7 @@ impl Session {
         };
         session.write_frame(ENTER)?;
         install_panic_hook();
+        install_crash_filter();
         Ok(session)
     }
 
@@ -973,6 +984,71 @@ fn install_panic_hook() {
             }
         }
     }));
+}
+
+/// Installs [`on_crash`] as the process's unhandled-exception filter, once.
+fn install_crash_filter() {
+    if FILTER_ON.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: `on_crash` is a filter for the life of the process.
+    let previous = unsafe { SetUnhandledExceptionFilter(Some(on_crash)) };
+    PREV_FILTER.store(
+        previous.map_or(0, |filter| filter as usize),
+        Ordering::Release,
+    );
+}
+
+/// The unhandled-exception filter: on the thread that crashed, with the process in an unknown
+/// state, so it takes no lock (`try_lock` only), allocates nothing and waits for nothing. It
+/// writes what closes a sequence left open and [`LEAVE`] straight to the console (a chunk the
+/// writer thread is writing may still be cut), puts the modes and code pages back, and hands
+/// the exception on: to the filter before it, else to Windows (which ends the process).
+unsafe extern "system" fn on_crash(info: *const EXCEPTION_POINTERS) -> i32 {
+    /// `EXCEPTION_CONTINUE_SEARCH`: the system goes on as if there were no filter.
+    const CONTINUE_SEARCH: i32 = 0;
+    if let Ok(current) = CURRENT.try_lock() {
+        if let Some(shared) = current.as_ref() {
+            if !shared.protocol_restored.swap(true, Ordering::AcqRel) {
+                let wire = Wire::from_u8(shared.wire.load(Ordering::Acquire));
+                let output = shared.writer.output.raw();
+                for bytes in [terminator(wire).as_bytes(), LEAVE] {
+                    let mut written = 0u32;
+                    // SAFETY: a console handle and bytes that outlive the call. One write each:
+                    // nothing here may wait or allocate.
+                    unsafe {
+                        WriteFile(
+                            output,
+                            bytes.as_ptr(),
+                            bytes.len() as u32,
+                            &mut written,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                }
+            }
+            if shared.active.swap(false, Ordering::AcqRel) {
+                // SAFETY: console handles shared with every thread; plain calls.
+                unsafe {
+                    SetConsoleMode(shared.input.raw(), shared.original_in);
+                    SetConsoleMode(shared.writer.output.raw(), shared.original_out);
+                    SetConsoleCP(shared.original_cp_in);
+                    SetConsoleOutputCP(shared.original_cp_out);
+                }
+            }
+        }
+    }
+    let previous = PREV_FILTER.load(Ordering::Acquire);
+    if previous == 0 {
+        return CONTINUE_SEARCH;
+    }
+    // SAFETY: the address SetUnhandledExceptionFilter returned, a filter's.
+    let previous: LPTOP_LEVEL_EXCEPTION_FILTER = unsafe { std::mem::transmute(previous) };
+    match previous {
+        // SAFETY: the system's own call, passed on.
+        Some(previous) => unsafe { previous(info) },
+        None => CONTINUE_SEARCH,
+    }
 }
 
 fn uninstall_panic_hook() {

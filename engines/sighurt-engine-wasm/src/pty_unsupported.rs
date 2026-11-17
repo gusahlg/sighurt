@@ -1,8 +1,8 @@
 //! The bytes of `sig://terminal` on a system where the runtime starts no terminal programs
-//! (anything but Linux, for now: `sighurt_runtime::pty`). Nothing is ever handed over, so
-//! [`take`] finds nothing and a [`Pty`] is never made. The module has the shape of the Linux one
-//! (`pty.rs`), whose master is a Unix descriptor polled with a wake-up pipe; Windows would move
-//! ConPTY's two pipe handles instead (docs/rewrite/PORTING.md).
+//! (anything but Linux and macOS, for now: `sighurt_runtime::pty`). Nothing is ever handed
+//! over, so [`take`] finds nothing and a [`Pty`] is never made. The module has the shape of the
+//! Unix one (`pty.rs`), whose master is a descriptor polled with a wake-up pipe; Windows would
+//! move ConPTY's two pipe handles instead (docs/rewrite/PORTING.md).
 //!
 //! Owns: nothing that runs. Must not own: starting or ending a program (the runtime's).
 

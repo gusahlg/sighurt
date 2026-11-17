@@ -33,7 +33,6 @@ use std::thread::JoinHandle;
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::OFlags;
 use rustix::io::Errno;
-use rustix::pipe::PipeFlags;
 use rustix::termios::Winsize;
 use sighurt_api::ids::PtySession;
 
@@ -126,7 +125,7 @@ impl Pty {
         let flags = rustix::fs::fcntl_getfl(&master)?;
         rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK)?;
         let master = Arc::new(master);
-        let (woken, wake) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+        let (woken, wake) = wake_pipe()?;
         let (fd, queues) = (master.clone(), shared.clone());
         let thread = std::thread::Builder::new()
             .name("sighurt-wasm-pty".into())
@@ -211,6 +210,30 @@ impl Drop for Pty {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// The I/O thread's wake-up pipe, non-blocking and close-on-exec.
+#[cfg(target_os = "linux")]
+fn wake_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    use rustix::pipe::PipeFlags;
+    Ok(rustix::pipe::pipe_with(
+        PipeFlags::CLOEXEC | PipeFlags::NONBLOCK,
+    )?)
+}
+
+/// The I/O thread's wake-up pipe, non-blocking and close-on-exec. macOS has no `pipe2`: the
+/// flags are set after it is made, so a program another thread starts meanwhile may inherit
+/// it. That costs nothing but the descriptor: the thread stops on its flag and a byte written,
+/// never on the pipe closing, and the master is never in it.
+#[cfg(target_os = "macos")]
+fn wake_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (woken, wake) = rustix::pipe::pipe()?;
+    for end in [&woken, &wake] {
+        rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)?;
+        let flags = rustix::fs::fcntl_getfl(end)?;
+        rustix::fs::fcntl_setfl(end, flags | OFlags::NONBLOCK)?;
+    }
+    Ok((woken, wake))
 }
 
 /// The I/O thread: waits for the master or a wake-up, reads while the output queue has room,

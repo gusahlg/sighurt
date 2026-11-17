@@ -268,7 +268,7 @@ mod tests {
     }
 
     // Only where the terminal pages run programs: elsewhere no editor is chosen.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_editor_is_named_with_its_file_and_the_files_problems() {
         let env = core().environment().clone();
@@ -307,7 +307,7 @@ mod tests {
             session: None,
         };
         let answer = info(PageInfo::Editor, &core, &paths);
-        if cfg!(target_os = "linux") {
+        if crate::pty::RUNS_PROGRAMS {
             assert!(!answer.contains("programs\t"), "{answer}");
         } else {
             assert_eq!(answer, "enabled\tyes\neditor\t\nfrom\tnone\nprograms\tno\n");

@@ -16,8 +16,8 @@
 //! Elsewhere (Windows) `sig`'s console control handler (its `main`) sends a quit for Ctrl+C,
 //! Ctrl+Break and the console closing through a [`Sender`] ([`Signals::channel`]), which raises
 //! the flag and runs the wake the frontend set with [`Signals::set_wake`]; the owner loop then
-//! takes the flags with [`Signals::take`]. Nothing asks for a report there. [`Signals::none`] is
-//! one nothing sends to.
+//! takes the flags with [`Signals::take`]. A report is asked for by setting a named event, whose
+//! thread (`main`'s too) sends it the same way. [`Signals::none`] is one nothing sends to.
 //!
 //! Owns: turning what arrives into [`Request`]s. Must not own: installing the handlers
 //! (process-wide setup, the executable's) or what a request does (the frontend's).

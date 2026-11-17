@@ -240,8 +240,9 @@ fn extension(url: &Url) -> Option<String> {
 /// input whose first word is one of `keywords` uses its template, the rest of the input
 /// percent-encoded where its `{}` is (a template without `{}` is used only for the keyword
 /// alone); a host name gets a scheme; an absolute path or `~/path` (with `home`, the user's
-/// home directory) becomes a `file:` URL; and anything else becomes a search with the `search`
-/// template. Empty input stays empty.
+/// home directory) becomes a `file:` URL (on Windows also a path with a drive, `C:\…` or
+/// `C:/…`, and a share's, `\\server\share\…`); and anything else becomes a search with the
+/// `search` template. Empty input stays empty.
 pub fn fixup(
     input: &str,
     search: &str,
@@ -274,7 +275,7 @@ pub fn fixup(
     if let (Some(path), Some(home)) = (input.strip_prefix("~/"), home) {
         return file_url(&home.join(path));
     }
-    if input.starts_with('/') {
+    if input.starts_with('/') || (cfg!(windows) && Path::new(input).is_absolute()) {
         return file_url(Path::new(input));
     }
     let host = input.split(['/', '?', '#']).next().unwrap_or_default();
@@ -505,6 +506,21 @@ mod tests {
             fixup("~/x", search, &none, None),
             "https://s.test/?q=%7E%2Fx"
         );
+        // Windows' absolute paths are paths there, and not elsewhere.
+        let windows = [
+            (r"C:\Users\me\a b.html", "file:///C:/Users/me/a%20b.html"),
+            ("C:/apps/x.wasm", "file:///C:/apps/x.wasm"),
+            (r"\\server\share\x.wasm", "file://server/share/x.wasm"),
+        ];
+        for (input, url) in windows {
+            if cfg!(windows) {
+                assert_eq!(fixup(input, search, &none, home), url, "{input:?}");
+            } else {
+                assert!(!fixup(input, search, &none, home).starts_with("file:"));
+            }
+        }
+        // A path without a drive is not absolute there.
+        assert!(!fixup(r"\x.html", search, &none, home).starts_with("file:"));
     }
 
     #[test]

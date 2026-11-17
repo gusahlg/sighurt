@@ -11,7 +11,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::Read;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Child, Command, ExitStatus, Stdio};
