@@ -1147,7 +1147,10 @@ mod tests {
             took < Duration::from_millis(500),
             "off-screen text took {took:?}"
         );
-        // On screen: the budget runs out after a few ops, and the rest isn't shaped.
+        // On screen: the budget runs out after a few ops, and the rest isn't shaped. One line
+        // first, so the system's fonts are loaded before the clock starts: loading them is not
+        // what this bounds (on GitHub's Windows runner the first paint took 2.3 s with it).
+        paint_list(vec![text(10.0)]);
         let (took, _) = paint_list(vec![text(10.0); 4000]);
         eprintln!("4000 on-screen lines of 16 KiB: {took:?}");
         assert!(
