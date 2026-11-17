@@ -1035,10 +1035,14 @@ renderers)
       check "SIG_LAVAPIPE=1: lavapipe's driver manifest" 1 "SIGHURT_LAVAPIPE_ICD is '${SIGHURT_LAVAPIPE_ICD:-}' (shell.nix sets it)"
     fi
   fi
-  # Every screenshot of every run against cpu's: the same pixels but near rounded corners.
+  # Every screenshot of every run against cpu's: the same pixels but near rounded corners. On
+  # lavapipe the status line says the chrome is drawn on a CPU device (the notice an explicit
+  # software renderer gets): its bottom 32 rows are left out.
   for run in "${runs[@]}"; do
+    skip=0
+    [[ $run == lvp-* ]] && skip=32
     for shot in 01-start 02-home 03-after-churn 03b-home-again 04-restored 05-home-150 06-after-scales; do
-      found=$(python3 - "$out/cpu-$shot.png" "$out/$run-$shot.png" <<'PY'
+      found=$(python3 - "$out/cpu-$shot.png" "$out/$run-$shot.png" "$skip" <<'PY'
 import struct, sys, zlib
 def png(path):
     data = open(path, 'rb').read()
@@ -1067,6 +1071,7 @@ w2, h2, b2, b = png(sys.argv[2])
 if (w1, h1) != (w2, h2):
     print(1, f'size {w1}x{h1} vs {w2}x{h2}'); sys.exit()
 differing = worst = 0
+h1 -= int(sys.argv[3]) if len(sys.argv) > 3 else 0
 for y in range(h1):
     for x in range(w1):
         d = max(abs(a[y][x * b1 + k] - b[y][x * b2 + k]) for k in range(3))
