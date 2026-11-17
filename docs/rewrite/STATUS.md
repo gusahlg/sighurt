@@ -5014,3 +5014,38 @@ Newest last. Each entry says what was decided and why.
     building mozangle. Work: Claude Fable 5.2 (design of the experience, orchestration,
     integration, the reviews' triage), Claude Opus 5.5 lanes (implementation), Claude Sonnet
     (delegated modules), GPT-6 Astra (reviews and 56 probe tests).
+160. **The chrome's renderers, hardened and measured beside Servo** (17 November 2026, branch
+    `r3-render`; RENDER.md §16). GPU icons are rasterized as the CPU backend paints them:
+    across the buffer on an axis the path crosses, cut to what is shown
+    (`PixelBounds::rasterized_within`, `Coverage::crop`); before, a path crossing a surface
+    edge was up to 38 levels off the CPU backend and a far-reaching one asked for a pixmap of
+    its own size, an allocation that could abort `sig`. The CPU backend's glyph cache starts
+    over at the next frame when full (it stayed full for the session, every new glyph
+    rasterized on every repaint). The Vulkan backend retires and destroys swapchains on
+    `VK_EXT_swapchain_maintenance1` present fences where the driver has them (NVIDIA 595,
+    lavapipe), which closes 125's open gap; its idle wait is then bounded and never
+    `vkDeviceWaitIdle`; without the extension it is as before. Seven lifetime and retry
+    findings of an outside review of that change fixed (a refused present's fence, leaks that
+    keep their device, the acquire semaphore's drain, two out-of-date presents in a row are a
+    `Surface` error). The comparison of the CPU backend with wgpu, Vulkan and the reference
+    rasterizer covers both chromes, every item kind under five clips, scales 1, 1.25, 1.5
+    and 2, and seeded random scenes through one backend instance, with a tolerance per class
+    of pixel and its measured reason (`tests/support/compare.rs`); known and ignored:
+    self-overlapping hairline strokes, corner radii over 12 px. `SIG_LAVAPIPE=1` adds a pass
+    on Mesa's lavapipe (the ICD of the mesa already in `shell.nix`); `SIG_RENDER_FAIL` takes
+    a list. `sighurt-render-wgpu` builds with Metal on macOS and DX12 on Windows for its
+    tests (never GL; Linux's dependency set unchanged, `Cargo.lock` gained lines only); not
+    yet run there. *Evidence*, louise-pc (RTX 4060, NVIDIA 595.80): `render/gpu-tests.sh` on
+    NVIDIA and lavapipe with the validation layer, no message; headless.sh `renderers`
+    111 of 111, with a fallback taken twice, a surface then a device failure and a storm of
+    scales; beside Servo (`bench/render/servo.sh`: an animating page, tab churn, resizes,
+    scale 1.5) 12 of 12 runs clean under every renderer and no chrome paint caused by the
+    page; the golden images unchanged. *Measured* (bench/results/RENDER.md): the chrome's
+    render 0.18 ms on the CPU, 0.27 ms Vulkan, 0.44 ms wgpu; a GPU renderer costs about
+    160 MiB of RSS in a `sig` with the demo engine and 67 to 71 MiB beside Servo, nearly all
+    of it the Vulkan loader and drivers at `vkCreateInstance` (the backends' own resources
+    are about 1.4 MB), and 0.1 to 0.3 % idle CPU in NVIDIA's thread. So neither meets
+    §14.5 and `auto` stays `cpu`. *Open*: a real output, Mesa's hardware drivers, eight
+    chrome surfaces, the comparison on macOS's and Windows' runners. Work: Claude Opus 5.5
+    (lane), Claude Sonnet (the comparison harness), GPT-6 Astra (review of the Vulkan
+    lifetime code).
