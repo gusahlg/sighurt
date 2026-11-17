@@ -149,13 +149,14 @@ sighurt-ui, the renderers) with the demo engine; the Wasm engine's file picker s
 `wayland-client` on Linux, and Servo's adapter depends on sighurt-wayland, so a terminal-only
 `sig` with `engine-servo` links it.
 
-The terminal-only `sig` runs on macOS and on Windows too, tested on GitHub's runners: on macOS
-with the demo and Wasm engines (FFmpeg 7 from Homebrew), on Windows with the demo engine, in the
-console in VT mode (Windows 10 1809 or later, or Windows Terminal). Build it there with
-`cargo build -p sighurt-browser --no-default-features --features frontend-tui,engine-demo`
-(add `engine-wasm` on macOS). Neither has the window, Servo, WPE WebKit, CEF, Ladybird or
-NetSurf, or the programs of `sig://terminal` and `sig://config`; Windows has no configuration
-watch. What runs where, what was tested and what a port still needs is in
+The terminal-only `sig` runs on macOS and on Windows too, tested on GitHub's runners, with the
+demo and Wasm engines: on macOS with FFmpeg 7 from Homebrew, and with the programs of
+`sig://terminal` and `sig://config`; on Windows in the console in VT mode (Windows 10 1809 or
+later, or Windows Terminal), without video in the Wasm engine and without the terminal pages'
+programs. Build it there with `cargo build -p sighurt-browser --no-default-features --features
+frontend-tui,engine-demo,engine-wasm` (sig's own pages are built for the
+`wasm32-unknown-unknown` target, which rustup adds). Neither has the window, Servo, WPE WebKit, CEF, Ladybird
+or NetSurf. What runs where, what was tested and what a port still needs is in
 [docs/rewrite/PORTING.md](docs/rewrite/PORTING.md).
 
 `engine-cef`, `engine-ladybird` and `engine-netsurf` are in no default feature set. A table for
