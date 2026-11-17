@@ -20,7 +20,8 @@
 //! asked for the other. On Windows a console has no `TERM`, so a console on stdout is the
 //! terminal there unless `TERM` says `dumb`. Windows has no signals: a console control handler
 //! quits cleanly for Ctrl+C, Ctrl+Break and the console closing (a second Ctrl+C or Ctrl+Break
-//! while that quit is under way ends the process at once), and nothing asks for the report there
+//! while that quit is under way ends the process at once), and setting the named event
+//! `Local\sighurt-report-<pid>` asks for the report, as SIGUSR1 does on Unix
 //! (docs/rewrite/PORTING.md).
 //! `--dump URL` needs neither: it prints the page as text from a session with no terminal
 //! (`sighurt_tui::dump`).
@@ -351,7 +352,9 @@ fn signal_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)
 /// the process when the handler returns, so it does not return: the owner loop quits and
 /// `main` returns, which ends the process with the session saved (Windows allows 5 s after a
 /// close). A second Ctrl+C or Ctrl+Break is left to the default handler, which ends the process
-/// at once.
+/// at once. And Windows' SIGUSR1: a thread that sends a report each time the auto-reset event
+/// [`report_event_name`] is set. The event has the default security of the user's token, so
+/// only the user (and the system) can set it, as only they can signal `sig` on Unix.
 #[cfg(windows)]
 fn install_signal_handlers() -> std::io::Result<Signals> {
     use sighurt_runtime::signals::{Request, Sender};
@@ -390,13 +393,51 @@ fn install_signal_handlers() -> std::io::Result<Signals> {
     }
 
     let (sender, signals) = Signals::channel();
-    let _ = SENDER.set(sender);
+    let _ = SENDER.set(sender.clone());
     // SAFETY: the handler only reads statics and sends on a queue; it runs on a thread of its
     // own that Windows starts.
     if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
+    report_requests(sender)?;
     Ok(signals)
+}
+
+/// The name of the event that asks this process for a report: `Local\sighurt-report-<pid>`.
+#[cfg(windows)]
+fn report_event_name(pid: u32) -> String {
+    format!("Local\\sighurt-report-{pid}")
+}
+
+/// Starts the thread that sends a report each time this process's report event is set.
+#[cfg(windows)]
+fn report_requests(sender: sighurt_runtime::signals::Sender) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+
+    let name: Vec<u16> = report_event_name(std::process::id())
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    // SAFETY: an auto-reset event, not set, with the token's default security and a
+    // NUL-terminated name.
+    let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+    if event.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a handle just created, owned by nothing else.
+    let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    std::thread::Builder::new()
+        .name("sighurt-report".into())
+        .spawn(move || loop {
+            // SAFETY: the event this thread owns.
+            if unsafe { WaitForSingleObject(event.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
+                return;
+            }
+            sender.send(sighurt_runtime::signals::Request::Report);
+        })?;
+    Ok(())
 }
 
 /// No signal reaches the loop here (see the module documentation).
