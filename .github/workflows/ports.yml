@@ -78,11 +78,9 @@ jobs:
         run: cargo test --locked -p sighurt-engine-wasm --lib pty --no-fail-fast
 
       # The wgpu renderer against the CPU one (render/sighurt-render-wgpu/tests/compare.rs and
-      # cost.rs): Metal on macOS, DX12 on Windows; "skipped" without an adapter. Not blocking
-      # until it has passed on the runners.
+      # cost.rs) on Metal: the runner's Apple Paravirtual device (run 44066514925).
       - name: Test the wgpu renderer against the CPU one
         if: ${{ !cancelled() }}
-        continue-on-error: true
         run: cargo test --locked -p sighurt-render-wgpu --no-fail-fast -- --nocapture
 
   windows:
@@ -132,10 +130,16 @@ jobs:
           --features frontend-tui,engine-demo,engine-wasm --bins --tests --no-fail-fast
           -- --nocapture
 
-      # The wgpu renderer against the CPU one (render/sighurt-render-wgpu/tests/compare.rs and
-      # cost.rs): Metal on macOS, DX12 on Windows; "skipped" without an adapter. Not blocking
-      # until it has passed on the runners.
+      # The wgpu renderer against the CPU one on DX12: the runner has only WARP (Microsoft Basic
+      # Render Driver), and the comparison's process crashed there with an access violation
+      # (run 44066514925, docs/rewrite/PORTING.md); not blocking. On a failure the comparison
+      # runs again one test at a time.
       - name: Test the wgpu renderer against the CPU one
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: cargo test --locked -p sighurt-render-wgpu --no-fail-fast -- --nocapture
+        run: |
+          cargo test --locked -p sighurt-render-wgpu --no-fail-fast -- --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            echo "== again, one test at a time"
+            cargo test --locked -p sighurt-render-wgpu --test compare -- --nocapture --test-threads=1
+          }
