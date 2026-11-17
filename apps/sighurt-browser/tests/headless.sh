@@ -84,10 +84,15 @@
 #               and nothing starts; nvim, if on PATH, writes the file with o, Escape and :wq
 #   renderers   the chrome's renderers in a GPU compositor (--renderer gles2): the same steps
 #               (tab churn that hides the page surface right after a frame, a resize storm, a
-#               zero-height window and back, scale 1.5, idle, quit) with [ui] renderer = "cpu",
+#               zero-height window and back, scale 1.5, a storm of scales (1.25, 2, 1.75, 1.33)
+#               with tab switches, idle, quit) with [ui] renderer = "cpu",
 #               "wgpu", "wgpu" with SIG_RENDER_FAIL=surface (bound again, stays on wgpu) and
-#               SIG_RENDER_FAIL=device (ends on cpu), then "vulkan" the same three ways; every
-#               screenshot compared with cpu's
+#               SIG_RENDER_FAIL=device (ends on cpu), and =surface,surface (lost again after it
+#               was bound again: ends on cpu), then "vulkan" the same three ways and with
+#               =surface,device (bound again, then ends on cpu); every
+#               screenshot compared with cpu's. With SIG_LAVAPIPE=1, also "wgpu" and "vulkan"
+#               on Mesa's software driver alone (the Vulkan loader pointed at
+#               $SIGHURT_LAVAPIPE_ICD, from shell.nix): Mesa's Wayland WSI
 #
 # Exits with the number of failed checks.
 set -u
@@ -943,8 +948,14 @@ renderers)
     key -M alt 2 -m alt
     swaymsg -q output HEADLESS-1 scale 1.5
     shot "$name-05-home-150" 1.5
-    swaymsg -q output HEADLESS-1 scale 1
+    step "scale storm: 1.25, 2, 1.75, 1.33 and 1 with the tab switched between them"
+    for s in 1.25 2 1.75 1.33 1; do
+      swaymsg -q output HEADLESS-1 scale $s; sleep 0.1
+      wtype -M alt 1 -m alt; sleep 0.05
+      wtype -M alt 2 -m alt; sleep 0.05
+    done
     key -M alt 1 -m alt
+    shot "$name-06-after-scales" 1
     sleep 1
     before=$(diag "c['wakeups'], c['chrome_paints']")
     sleep 3
@@ -975,6 +986,9 @@ renderers)
   run_renderer fallback wgpu device
   check "fallback: a failed device ends on the CPU renderer" \
     "$(python3 -c "r=$report; print(0 if r[0]=='cpu' and r[3]==1 else 1)")" "$report; $(grep -o 'chrome-renderer-fallback.*' "$out/fallback.log" | head -1)"
+  run_renderer surface-twice wgpu surface,surface
+  check "surface-twice: a surface lost again after it was bound again ends on the CPU renderer" \
+    "$(python3 -c "r=$report; print(0 if r[0]=='cpu' and r[3]==1 else 1)")" "$report; $(grep -o 'chrome-renderer-fallback.*' "$out/surface-twice.log" | head -1)"
   # The Khronos validation layer on for the Vulkan runs (it logs to sig's output).
   export SIG_VULKAN_VALIDATION=1
   run_renderer vulkan vulkan
@@ -993,9 +1007,37 @@ renderers)
   run_renderer vulkan-fallback vulkan device
   check "vulkan-fallback: a failed device ends on the CPU renderer" \
     "$(python3 -c "r=$report; print(0 if r[0]=='cpu' and r[3]==1 else 1)")" "$report; $(grep -o 'chrome-renderer-fallback.*' "$out/vulkan-fallback.log" | head -1)"
+  run_renderer vulkan-surface-device vulkan surface,device
+  check "vulkan-surface-device: bound again, then a failed device ends on the CPU renderer" \
+    "$(python3 -c "r=$report; print(0 if r[0]=='cpu' and r[3]==1 else 1)")" "$report; $(grep -c 'binding it again' "$out/vulkan-surface-device.log") rebinds"
+  runs=(wgpu surface fallback surface-twice vulkan vulkan-surface vulkan-fallback vulkan-surface-device)
+  # Mesa's Vulkan (lavapipe, its software driver) instead of the machine's: the loader sees
+  # only that driver, which presents through Mesa's Wayland WSI (wl_shm for a CPU device).
+  if [[ ${SIG_LAVAPIPE:-} == 1 ]]; then
+    if [[ -f ${SIGHURT_LAVAPIPE_ICD:-} ]]; then
+      export VK_DRIVER_FILES=$SIGHURT_LAVAPIPE_ICD VK_ICD_FILENAMES=$SIGHURT_LAVAPIPE_ICD
+      run_renderer lvp-wgpu wgpu
+      check "lvp-wgpu: wgpu draws on lavapipe, no fallback" \
+        "$(python3 -c "r=$report; print(0 if r[0]=='wgpu' and r[1]>0 and r[3]==0 and 'llvmpipe' in r[6] else 1)")" "$report"
+      check "lvp-wgpu: no chrome render failed" "$(grep -q "rendering the chrome's" "$out/lvp-wgpu.log"; [[ $? == 1 ]]; echo $?)" \
+        "$(grep -c "rendering the chrome's" "$out/lvp-wgpu.log") failures in lvp-wgpu.log"
+      run_renderer lvp-vulkan vulkan
+      check "lvp-vulkan: Vulkan draws on lavapipe, no fallback" \
+        "$(python3 -c "r=$report; print(0 if r[0]=='vulkan' and r[1]>0 and r[3]==0 and 'llvmpipe' in r[6] else 1)")" "$report"
+      check "lvp-vulkan: the validation layer reports nothing" \
+        "$(grep -q 'validation layer on' "$out/lvp-vulkan.log" && ! grep -qi 'validation error' "$out/lvp-vulkan.log"; echo $?)" \
+        "$(grep -ci 'validation error' "$out/lvp-vulkan.log") validation errors in lvp-vulkan.log"
+      check "lvp-vulkan: no chrome render failed" "$(grep -q "rendering the chrome's" "$out/lvp-vulkan.log"; [[ $? == 1 ]]; echo $?)" \
+        "$(grep -c "rendering the chrome's" "$out/lvp-vulkan.log") failures in lvp-vulkan.log"
+      unset VK_DRIVER_FILES VK_ICD_FILENAMES
+      runs+=(lvp-wgpu lvp-vulkan)
+    else
+      check "SIG_LAVAPIPE=1: lavapipe's driver manifest" 1 "SIGHURT_LAVAPIPE_ICD is '${SIGHURT_LAVAPIPE_ICD:-}' (shell.nix sets it)"
+    fi
+  fi
   # Every screenshot of every run against cpu's: the same pixels but near rounded corners.
-  for run in wgpu surface fallback vulkan vulkan-surface vulkan-fallback; do
-    for shot in 01-start 02-home 03-after-churn 03b-home-again 04-restored 05-home-150; do
+  for run in "${runs[@]}"; do
+    for shot in 01-start 02-home 03-after-churn 03b-home-again 04-restored 05-home-150 06-after-scales; do
       found=$(python3 - "$out/cpu-$shot.png" "$out/$run-$shot.png" <<'PY'
 import struct, sys, zlib
 def png(path):

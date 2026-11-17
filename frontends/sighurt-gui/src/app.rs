@@ -58,7 +58,9 @@
 //! surface is unbound, the renderer dropped, and every chrome target retired and made again in
 //! shared memory, with the cursor, keyboard focus and text field following (docs/rewrite/RENDER.md
 //! §14.4, §15). `SIG_RENDER_FAIL=device` or `=surface` injects such a failure after the native
-//! renderer's second frame, for tests.
+//! renderer's second frame, for tests; a list (`surface,surface`, `surface,device`) injects the
+//! next one two frames after the last, on the same surface (the second `surface` is then the
+//! one that falls back).
 //!
 //! A view's target outlives the view while its engine still holds the lease (Servo keeps a
 //! closing view until its GL context is free, and every lease after a crash). The host refuses
@@ -160,8 +162,11 @@ struct Gui {
     described: bool,
     /// Chrome targets bound again once after their surface was lost.
     rebound: BTreeSet<TargetId>,
-    /// `SIG_RENDER_FAIL`: a failure to inject once, for tests.
-    render_fail: Option<RenderFail>,
+    /// `SIG_RENDER_FAIL`: failures to inject, in order, for tests; the frame count the next
+    /// waits for, and the surface the first one hit.
+    render_fail: Vec<RenderFail>,
+    render_fail_after: u64,
+    render_fail_target: Option<TargetId>,
     /// Chrome targets whose frame the renderer put off, and when to ask the host for a new
     /// permit: a bounded one-shot retry, so a renderer that keeps putting frames off can't
     /// spin the loop (RENDER.md §14.4).
@@ -226,9 +231,9 @@ struct RenderHistory {
     replaced: Option<(&'static str, u64)>,
 }
 
-/// A renderer failure `SIG_RENDER_FAIL` injects once, after the native renderer's second
-/// frame: `device` (the renderer is replaced by the CPU one) or `surface` (the surface is
-/// bound again).
+/// A renderer failure `SIG_RENDER_FAIL` injects, after the native renderer's second frame:
+/// `device` (the renderer is replaced by the CPU one) or `surface` (the surface is bound again,
+/// or, the second time on one surface, the renderer is replaced).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderFail {
     Device,
@@ -649,13 +654,21 @@ impl Gui {
         self.layout_changed();
     }
 
-    /// The failure `SIG_RENDER_FAIL` asks for, once, after the native renderer's second frame.
-    fn injected_failure(&mut self) -> Option<RenderError> {
-        let fail = self.render_fail?;
-        if self.backend.presents() != Presents::Native || self.backend.stats().frames < 2 {
+    /// The next failure `SIG_RENDER_FAIL` asks for, for a render of `target`: the first after
+    /// the native renderer's second frame, each other two frames after the last, on the target
+    /// the first hit.
+    fn injected_failure(&mut self, target: TargetId) -> Option<RenderError> {
+        let &fail = self.render_fail.first()?;
+        let frames = self.backend.stats().frames;
+        if self.backend.presents() != Presents::Native
+            || frames < self.render_fail_after
+            || self.render_fail_target.is_some_and(|first| first != target)
+        {
             return None;
         }
-        self.render_fail = None;
+        self.render_fail.remove(0);
+        self.render_fail_after = frames + 2;
+        self.render_fail_target = Some(target);
         Some(match fail {
             RenderFail::Device => RenderError::Device("SIG_RENDER_FAIL=device".into()),
             RenderFail::Surface => RenderError::Surface("SIG_RENDER_FAIL=surface".into()),
@@ -901,11 +914,17 @@ impl App {
             rebound: BTreeSet::new(),
             deferred: Vec::new(),
             presentations: Vec::new(),
-            render_fail: match std::env::var("SIG_RENDER_FAIL").as_deref() {
-                Ok("device") => Some(RenderFail::Device),
-                Ok("surface") => Some(RenderFail::Surface),
-                _ => None,
-            },
+            render_fail: std::env::var("SIG_RENDER_FAIL")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|fail| match fail {
+                    "device" => Some(RenderFail::Device),
+                    "surface" => Some(RenderFail::Surface),
+                    _ => None,
+                })
+                .collect(),
+            render_fail_after: 2,
+            render_fail_target: None,
             leases: BTreeMap::new(),
             chrome_text: None,
             chrome_text_target: None,
@@ -1410,7 +1429,7 @@ impl App {
         let scene = pen.finish();
         let drawn = started.elapsed();
         let rendering = Instant::now();
-        let rendered = match self.gui.injected_failure() {
+        let rendered = match self.gui.injected_failure(target) {
             Some(error) => Err(error),
             // The backend presents inside `render`, after drawing; the mark is taken before it
             // starts, so the latency includes the render. A frame it puts off clears the mark.
