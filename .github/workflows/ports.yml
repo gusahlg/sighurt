@@ -77,6 +77,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p sighurt-engine-wasm --lib pty --no-fail-fast
 
+      # The wgpu renderer against the CPU one (render/sighurt-render-wgpu/tests/compare.rs and
+      # cost.rs): Metal on macOS, DX12 on Windows; "skipped" without an adapter. Not blocking
+      # until it has passed on the runners.
+      - name: Test the wgpu renderer against the CPU one
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: cargo test --locked -p sighurt-render-wgpu --no-fail-fast -- --nocapture
+
   windows:
     name: Windows (terminal only)
     runs-on: windows-latest
@@ -123,3 +131,11 @@ jobs:
           cargo test --locked -p sighurt-browser --no-default-features
           --features frontend-tui,engine-demo,engine-wasm --bins --tests --no-fail-fast
           -- --nocapture
+
+      # The wgpu renderer against the CPU one (render/sighurt-render-wgpu/tests/compare.rs and
+      # cost.rs): Metal on macOS, DX12 on Windows; "skipped" without an adapter. Not blocking
+      # until it has passed on the runners.
+      - name: Test the wgpu renderer against the CPU one
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: cargo test --locked -p sighurt-render-wgpu --no-fail-fast -- --nocapture
