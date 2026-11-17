@@ -895,11 +895,10 @@ fn spawn(exec: &Exec, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> {
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave));
-    // macOS has no close_range: the child marks each descriptor below the table's size, read
-    // here before the fork, close-on-exec.
+    // macOS has no close_range: the child marks each descriptor below `top`, found here before
+    // the fork, close-on-exec.
     #[cfg(target_os = "macos")]
-    // SAFETY: getdtablesize(3) reads the process's limit.
-    let table = unsafe { libc::getdtablesize() };
+    let top = descriptors_end();
     // SAFETY: the closure runs in the child between fork and exec, where only async-signal-safe
     // functions may be called. Everything it needs was prepared before the fork (std builds argv,
     // the environment and the directory as C strings first); it calls only setsid, ioctl,
@@ -944,10 +943,9 @@ fn spawn(exec: &Exec, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> {
                     return Err(io::Error::last_os_error());
                 }
             }
-            // One by one below the table's size, the soft limit of open files (above it is only
-            // what was opened before the limit was lowered): EBADF for those not open.
+            // One by one below `top`: EBADF for those not open.
             #[cfg(target_os = "macos")]
-            for fd in 3..table {
+            for fd in 3..top {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
             Ok(())
@@ -957,6 +955,27 @@ fn spawn(exec: &Exec, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> {
     // `command` holds the slave descriptors; drop them now, not at the end of the scope.
     drop(command);
     Ok((master, child))
+}
+
+/// One past the highest descriptor that can be open in this process from now until a fork that
+/// follows: the soft limit of open files (`getdtablesize`), or above it the highest one open now
+/// (`/dev/fd`). A descriptor opened later takes the lowest free number, which is below the
+/// limit, so only those opened before the limit was lowered can be above it, and they are open
+/// now. Read before the fork: listing a directory allocates.
+#[cfg(target_os = "macos")]
+fn descriptors_end() -> i32 {
+    // SAFETY: getdtablesize(3) reads the process's limit.
+    let limit = unsafe { libc::getdtablesize() };
+    let highest = std::fs::read_dir("/dev/fd")
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+                .max()
+                .unwrap_or(0)
+        })
+        // No list (it never fails while /dev is mounted): OPEN_MAX of <sys/syslimits.h>.
+        .unwrap_or(10240);
+    limit.max(highest.saturating_add(1))
 }
 
 #[cfg(test)]
@@ -1511,6 +1530,46 @@ mod tests {
         }
         assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 0);
         assert_eq!(ptys.live(), 0);
+    }
+
+    /// A descriptor without close-on-exec above the soft limit of open files (one opened before
+    /// the limit was lowered) does not reach the program: `close_range` on Linux, the sweep up
+    /// to the highest open descriptor on macOS.
+    #[test]
+    fn a_descriptor_above_a_lowered_limit_does_not_reach_the_program() {
+        let _serial = serial();
+        let (_home, vars) = home();
+        let ptys = ptys();
+        const HIGH: i32 = 3000;
+        let mut saved = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: getrlimit, setrlimit, fcntl and close on this process, restored below.
+        let saved = unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, saved.as_mut_ptr()), 0);
+            saved.assume_init()
+        };
+        let set = |soft: libc::rlim_t| {
+            let limit = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: saved.rlim_max,
+            };
+            // SAFETY: as above.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        };
+        set(4096.min(saved.rlim_max));
+        let null = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: F_DUPFD (no close-on-exec) at or above HIGH.
+        let high =
+            unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&null), libc::F_DUPFD, HIGH) };
+        assert!(high >= HIGH, "{}", io::Error::last_os_error());
+        set(256);
+        let script = format!("[ -e /dev/fd/{high} ] && echo leaked || echo sealed");
+        let (master, _session, exit) = start(&ptys, &sh(&script, &vars), 80, 24);
+        set(saved.rlim_cur);
+        // SAFETY: the descriptor dup'd above.
+        unsafe { libc::close(high) };
+        let out = read_all(&master);
+        assert!(out.contains("sealed"), "{out}");
+        assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 0);
     }
 
     #[test]
