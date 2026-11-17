@@ -3,7 +3,11 @@
 //! ratio, strokes' widths included), antialiased. The CPU backend paints with
 //! [`paint_path`] straight into the target; a GPU backend rasterizes the same path into a
 //! small coverage mask ([`coverage`]) at the same transform, offset by whole pixels to the
-//! [`ink_bounds`] it covers, so the two put the same coverage on the same pixels.
+//! [`ink_bounds`] it covers, so the two put the same coverage on the same pixels. A GPU backend
+//! rasterizes only the part within the buffer ([`PixelBounds::within`]), as the CPU backend
+//! paints only its buffer (tiny-skia's clipping to the pixmap changes the antialiasing, so the
+//! cut must be the buffer's): a path that reaches far beyond the surface costs no more than
+//! the surface.
 //!
 //! Must not own: what a path is (the scene's), where a mask goes (a backend's atlas), or
 //! blending (each backend's).
@@ -26,6 +30,23 @@ pub struct PixelBounds {
     pub width: u32,
     /// Height, at least 1.
     pub height: u32,
+}
+
+impl PixelBounds {
+    /// The part of these bounds inside `rect` (whole pixels, as [`Mapping::snap`] makes them),
+    /// if any.
+    pub fn within(self, rect: crate::scene::PixelRect) -> Option<PixelBounds> {
+        let left = i64::from(self.x).max(rect.left as i64);
+        let top = i64::from(self.y).max(rect.top as i64);
+        let right = (i64::from(self.x) + i64::from(self.width)).min(rect.right as i64);
+        let bottom = (i64::from(self.y) + i64::from(self.height)).min(rect.bottom as i64);
+        (right > left && bottom > top).then(|| PixelBounds {
+            x: left as i32,
+            y: top as i32,
+            width: (right - left) as u32,
+            height: (bottom - top) as u32,
+        })
+    }
 }
 
 /// A coverage mask: one byte per pixel, rows packed, `bounds.width` wide.
@@ -230,5 +251,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A path that crosses the surface's edges, rasterized only within the surface, has the
+    /// coverage the CPU backend paints into the surface: tiny-skia clips a path to its
+    /// pixmap, and that clipping changes the antialiasing along the path, so the bounds must
+    /// be cut to the buffer (not to a clip inside it, which the CPU backend applies as a
+    /// mask after painting). One that reaches millions of pixels beyond the surface costs
+    /// only the surface.
+    #[test]
+    fn coverage_within_the_surface_is_what_the_surface_paints() {
+        for scale in [120, 150, 180, 240] {
+            for (x, y, width, height) in [(3, 5, 61, 33), (15, 17, 9, 8), (2, 2, 14, 20)] {
+                let rect = WindowRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                let scale = Scale::from_fractional(scale).unwrap();
+                let metrics = Metrics::new(LayoutEpoch::next(), rect, scale);
+                let map = Mapping::new(&metrics);
+                let buffer = metrics.buffer();
+                let surface = crate::scene::PixelRect::from_ltrb(
+                    0.0,
+                    0.0,
+                    buffer.width as f32,
+                    buffer.height as f32,
+                )
+                .unwrap();
+                for (path, stroke) in [(icon(), None), (icon(), Some(1.5)), (acute(), Some(5.0))] {
+                    let mut painted = Pixmap::new(buffer.width, buffer.height).unwrap();
+                    let skia = skia_path(&path).unwrap();
+                    let white = Rgba::rgb(0xffffff);
+                    let to = transform(&map);
+                    paint_path(&mut painted.as_mut(), &skia, white, stroke, to, None);
+                    let visible =
+                        ink_bounds(&path, stroke, &map).and_then(|bounds| bounds.within(surface));
+                    let mask = visible.and_then(|b| coverage(&path, stroke, &map, b));
+                    for py in 0..buffer.height {
+                        for px in 0..buffer.width {
+                            let expected = painted.pixel(px, py).unwrap().alpha();
+                            let got = mask.as_ref().map_or(0, |mask| {
+                                let b = mask.bounds;
+                                let (mx, my) = (px as i32 - b.x, py as i32 - b.y);
+                                let inside = (0..b.width as i32).contains(&mx)
+                                    && (0..b.height as i32).contains(&my);
+                                if inside {
+                                    mask.data[(my * b.width as i32 + mx) as usize]
+                                } else {
+                                    0
+                                }
+                            });
+                            assert_eq!(
+                                got, expected,
+                                "({px}, {py}) of {rect:?} at {scale:?}, {stroke:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let map = mapping(240);
+        let mut huge = ScenePath::new();
+        huge.move_to(-4.0e6, -4.0e6);
+        huge.line_to(4.0e6, -4.0e6);
+        huge.line_to(0.0, 4.0e6);
+        huge.close();
+        let huge = huge.finish();
+        let bounds = ink_bounds(&huge, None, &map).unwrap();
+        assert!(bounds.width > 10_000_000, "{bounds:?}");
+        let buffer = crate::scene::PixelRect::from_ltrb(0.0, 0.0, 122.0, 66.0).unwrap();
+        let visible = bounds.within(buffer).unwrap();
+        assert_eq!((visible.width, visible.height), (122, 66));
+        let covered = coverage(&huge, None, &map, visible).unwrap();
+        assert!(
+            covered.data.iter().all(|&a| a == 255),
+            "the surface is inside the triangle"
+        );
+        let outside = crate::scene::PixelRect::from_ltrb(-9.0e9, 0.0, -8.0e9, 1.0).unwrap();
+        assert_eq!(bounds.within(outside), None);
     }
 }
