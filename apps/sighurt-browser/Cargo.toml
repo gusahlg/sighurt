@@ -75,7 +75,7 @@ libc = "0.2"
 # The console control handler (Ctrl+C, Ctrl+Break, the console closing), and the report's
 # event.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
 
 # `sig --tui` in a pty, with a fake terminal on the other side (tests/tui.rs).
 [[test]]

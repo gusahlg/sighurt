@@ -353,8 +353,11 @@ fn signal_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)
 /// `main` returns, which ends the process with the session saved (Windows allows 5 s after a
 /// close). A second Ctrl+C or Ctrl+Break is left to the default handler, which ends the process
 /// at once. And Windows' SIGUSR1: a thread that sends a report each time the auto-reset event
-/// [`report_event_name`] is set. The event has the default security of the user's token, so
-/// only the user (and the system) can set it, as only they can signal `sig` on Unix.
+/// [`report_event_name`] is set, at most one a second. The event has the default security of
+/// the user's token, so only the user (and the system) can set it, as only they can signal `sig`
+/// on Unix. An event of that name that already exists is not `sig`'s (another process made it,
+/// perhaps set and manual-reset, which would ask for a report on every wait): it is let go, and
+/// this `sig` takes no report requests.
 #[cfg(windows)]
 fn install_signal_handlers() -> std::io::Result<Signals> {
     use sighurt_runtime::signals::{Request, Sender};
@@ -399,7 +402,10 @@ fn install_signal_handlers() -> std::io::Result<Signals> {
     if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    report_requests(sender)?;
+    // Before any logger: on stderr, which is still the console's (or the dump's) here.
+    if let Err(error) = report_requests(sender) {
+        eprintln!("sig: no report requests: {error}");
+    }
     Ok(signals)
 }
 
@@ -413,7 +419,7 @@ fn report_event_name(pid: u32) -> String {
 #[cfg(windows)]
 fn report_requests(sender: sighurt_runtime::signals::Sender) -> std::io::Result<()> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 
     let name: Vec<u16> = report_event_name(std::process::id())
@@ -426,8 +432,16 @@ fn report_requests(sender: sighurt_runtime::signals::Sender) -> std::io::Result<
     if event.is_null() {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: a handle just created, owned by nothing else.
+    // SAFETY: read at once after the call that set it.
+    let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    // SAFETY: a handle just returned, owned by nothing else; dropped (closed) if not ours.
     let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    if existed {
+        return Err(std::io::Error::other(format!(
+            "{} already exists, made by another process",
+            report_event_name(std::process::id())
+        )));
+    }
     std::thread::Builder::new()
         .name("sighurt-report".into())
         .spawn(move || loop {
@@ -436,6 +450,8 @@ fn report_requests(sender: sighurt_runtime::signals::Sender) -> std::io::Result<
                 return;
             }
             sender.send(sighurt_runtime::signals::Request::Report);
+            // Requests set meanwhile wait (an auto-reset event holds one): one a second at most.
+            std::thread::sleep(std::time::Duration::from_secs(1));
         })?;
     Ok(())
 }
