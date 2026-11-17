@@ -36,7 +36,8 @@ use crate::scenes::{kind_scenes, random_hard_scene, random_scene};
 pub const TOLERANCE: u8 = 2;
 /// The most a corner pixel of the chromes' fixtures may differ.
 pub const CORNER_TOLERANCE: u8 = 16;
-/// The most a corner pixel of a random scene may differ: the GPU's corner is a signed
+/// The most a corner pixel of a random or synthetic scene (radii the chromes don't use, clips
+/// across corners) may differ: the GPU's corner is a signed
 /// distance antialiased linearly over a pixel, tiny-skia's a path it samples 4 × 4 a pixel, and
 /// where the arc crosses a pixel steeply the two coverages differ by up to about an eighth
 /// (seen: 33 at a radius of 5.4 buffer pixels), more where the corner also crosses the
@@ -268,13 +269,17 @@ pub fn line_chrome<G: Gpu>(open: impl Fn(FontSystemHandle) -> Option<G>) {
         }));
         line.handle(ChromeEvent::Snapshot(snapshot));
         for surface in [LINE, LINE_PAGE] {
-            let rect: WindowRect = line
+            // The line chrome lays out its page surface only while it draws a page.
+            let Some(rect) = line
                 .layout()
                 .surfaces
                 .iter()
                 .find(|s| s.name == surface)
-                .expect("the line chrome's surface")
-                .rect;
+                .map(|s| s.rect)
+                .filter(|rect| !rect.size().is_empty())
+            else {
+                continue;
+            };
             for scale in SCALES {
                 let metrics = metrics(rect, scale);
                 let mut pen = Pen::new(metrics.rect());
@@ -311,7 +316,7 @@ pub fn every_kind_and_clip<G: Gpu>(open: impl Fn(FontSystemHandle) -> Option<G>)
             &scene,
             &metrics,
             &mut tally,
-            (TOLERANCE, CORNER_TOLERANCE),
+            (TOLERANCE, RANDOM_CORNER_TOLERANCE),
         );
     }
     tally.report("kinds and clips");

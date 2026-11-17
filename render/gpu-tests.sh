@@ -19,7 +19,8 @@ pass() { # pass NAME ENV... -- CARGO ARGS...
   while [[ $1 != -- ]]; do envs+=("$1"); shift; done
   shift
   echo "── $name"
-  if env "${envs[@]}" cargo test "$@" 2>&1 | tee "/tmp/gpu-tests-$$.log" | grep -E '^on |skipped|notice|corner pixels|^cost |test result|panicked|FAILED|VUID|Validation Error'; then :; fi
+  if env "${envs[@]}" cargo test --no-fail-fast "$@" 2>&1 | tee "/tmp/gpu-tests-$$.log" \
+    | grep -A2 -E '^on |skipped|notice|corner pixels|^cost |test result|panicked|FAILED|VUID|Validation Error'; then :; fi
   if grep -q 'test result: FAILED\|panicked\|error: test failed\|could not compile' "/tmp/gpu-tests-$$.log" \
     || grep -q 'Validation Error\|VUID-' "/tmp/gpu-tests-$$.log"; then
     echo "FAIL $name"
