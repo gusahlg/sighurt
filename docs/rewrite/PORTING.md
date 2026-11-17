@@ -36,6 +36,7 @@ driving the real `sig` with a fake terminal on a pty (macOS) or in a ConPTY pseu
 | Restoring the terminal on a crash | panic, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV | the same code; `frontends/sighurt-tui/tests/pty.rs` tests a panic, SIGABRT (sent, and chained), a SIGSEGV fault and `kill -SEGV`; SIGBUS, SIGFPE, SIGILL, a stack overflow and a recovered Wasmtime trap are not tested there | a panic, and an exception nothing handles (an unhandled-exception filter): `tests/console.rs` crashes a process in raw mode with an access violation and finds the console's modes as before; `abort` and `TerminateProcess` still leave them |
 | Private files | 0700 directories, 0600 files | the same | a protected access list (the user and SYSTEM) on Sighurt's directories, given to an existing one whose list is wider and read back; files made in them inherit it (unit test on the runner); another local user, logged on and impersonated, is refused a file in one and reads one beside it (unit test, runners only) |
 | External addresses | `xdg-open` | `/usr/bin/open` (built, not tested) | `ShellExecuteW`, http, https and mailto only (built, not tested) |
+| The chrome's wgpu renderer against the CPU one (`render/sighurt-render-wgpu/tests/compare.rs`, offscreen; there is no window here to put it in) | Vulkan | Metal on the runner's Apple Paravirtual device: every comparison within its tolerances (run 44066514925: standard chrome worst difference 4, line chrome 1, item kinds and clips 26 at corners, random scenes 31 at corners, text 1) | DX12 on WARP (Microsoft Basic Render Driver, the runner's only adapter): within the same tolerances when it runs (run 44068580453: text 2, standard chrome 4, line chrome 0, kinds 26, random 29), but the test process once died with an access violation while four tests opened devices at once (run 44066514925), and passed the next time; not blocking there |
 | The address line | paths from `/` and `~/` | the same | also `C:\…`, `C:/…` and `\\server\share\…` (the router's unit test) |
 | The window, Servo, WPE WebKit, CEF, Ladybird, NetSurf | yes | no | no |
 
@@ -76,20 +77,29 @@ the chrome, text mode and the owner loop are Unix's, and only the session is new
   Ctrl+Break; a second one is left to Windows, which ends the process at once. The diagnostics
   report is asked for by setting the auto-reset event `Local\sighurt-report-<pid>`, which
   `main` makes with the token's default security (only the user and the system can set it) and
-  a thread of its waits on.
+  a thread of its waits on, taking at most one request a second. An event of that name that
+  already exists was made by another process (perhaps set and manual-reset, which would ask
+  for a report on every wait): `main` lets it go and takes no report requests, saying so on
+  stderr.
   Closing the console, logging off and shutting down quit too, and the handler does not return
   until `main` has (Windows ends the process when it returns, and allows 5 s after a close).
 - **A native crash** (an exception nothing handles: an access violation, a stack overflow)
-  reaches an unhandled-exception filter the session installs, on the crashing thread: it writes
-  what closes an open sequence and the leave sequence straight to the console, puts the modes
-  and code pages back, takes no lock and waits for nothing, then hands the exception on. What
+  reaches an unhandled-exception filter the session installs, on the crashing thread. A console
+  write blocks while output is stalled, so a helper thread started with the filter writes what
+  closes an open sequence and the leave sequence (which need the console's VT mode); the filter
+  waits for it at most 200 ms, then puts the modes and code pages back, takes no lock, and hands
+  the exception on either way. What
   ends the process without an exception (`abort`, Rust's `__fastfail`, `TerminateProcess`)
   still leaves the modes as they were.
 - **The configuration watch** is a thread that waits on `ReadDirectoryChangesW` for the
   configuration's directory (overlapped, with a stop event) and raises a flag when a change
-  names the file (written, created, deleted, renamed to or from; a full buffer counts as a
-  change); once 100 ms pass without another it rings a calloop ping, so an editor's burst of
-  writes is read once.
+  names the file (written, created, deleted, renamed to or from; a full buffer or
+  `ERROR_NOTIFY_ENUM_DIR`, changes lost to an overflow, counts as a change, and the watch goes
+  on); the wake rings at a deadline 100 ms after the last change to the file, which changes to
+  other files do not move (the session and the history are written in that directory), so an
+  editor's burst of writes is read once. The stop event comes first in every wait (the lowest
+  signalled handle wins), so a storm of changes cannot keep the thread from ending; only a
+  real read failure ends the watch, with a warning.
 - **`--dump`** writes the page from a thread of its own and waits for it with the dump's
   deadline: Windows has no non-blocking write to a pipe or a console.
 - **Starting it**: a console has no `TERM`, so on Windows a console on stdout is the terminal
@@ -154,8 +164,9 @@ The Unix session ran on macOS as written, apart from what the first runs found:
   kqueue, so nothing another child of `sig` holds can keep the session from ending, as a pipe
   made without `pipe2` could. An exit before the watch is found with `waitid(WNOWAIT)`. The
   master is `/dev/ptmx` opened with `O_CLOEXEC` (`posix_openpt` takes no such flag there);
-  the child marks every descriptor below the table's size close-on-exec in place of
-  `close_range`. `poll` on a pty master works (the Wasm engine's pty tests). The tests' probes
+  the child marks close-on-exec every descriptor below the soft limit of open files or, above
+  it, below the highest one open when the parent looked (`/dev/fd`, read before the fork: one
+  opened before the limit was lowered can only be among those), in place of `close_range`. `poll` on a pty master works (the Wasm engine's pty tests). The tests' probes
   need no `/proc`: the shell's own descriptors by builtin redirection, Python for the inherited
   dispositions and mask (`ps` there has no ignored-signals column), `ps -o pgid,tpgid,stat,tt`
   for the session, `F_GETPATH` and `fstat` for this process's descriptors, `kill(pid, 0)` for a
@@ -366,6 +377,15 @@ then.
 
 The Ports workflow (`.github/workflows/ports.yml`) on GitHub's hosted runners, `port2` branch,
 16 and 17 November 2026. Runs are at `https://github.com/gusahlg/sighurt/actions/runs/<id>`.
+
+**After the outside review of the port** (GPT-6 Astra, six findings, all fixed): Ports run
+44068580453, both jobs green, macOS 969 tests passed and Windows 962, none failed, with the new
+tests: on macOS (and Linux) a descriptor opened above a lowered soft limit does not reach the
+program; on Windows a sibling file written every 20 ms holds back neither the configuration's
+wake nor dropping the watch in a storm of writes, and the crash, report-event and live-reload
+tests pass with the bounded crash write and the refused foreign event. The overflow error
+(`ERROR_NOTIFY_ENUM_DIR`) and a stalled console at a crash were not provoked on the runner. The
+same run has the wgpu comparison (table above): blocking on macOS, not on Windows.
 
 **The `r3-port` branch** (17 November 2026): Ports run 44044117586, both jobs green, macOS 964
 tests passed and Windows 956, none failed (counted over every step; that run also had a
