@@ -1,8 +1,8 @@
 //! What the owner loop and `--dump` do differently on Unix and on Windows: pointing stderr at
 //! the log file, and waking the loop for `sig`'s signals and for the configuration watch. On
-//! Unix those are descriptors calloop polls; on Windows `sig`'s signals are a queue that rings a
-//! calloop ping ([`Signals::set_wake`]), and the configuration is not watched
-//! ([`ConfigWatch::new`] says so). The terminal's own sources are [`crate::term`]'s.
+//! Unix those are descriptors calloop polls; on Windows `sig`'s signals and the configuration
+//! watch each ring a calloop ping from a thread ([`Signals::set_wake`],
+//! [`ConfigWatch::set_wake`]). The terminal's own sources are [`crate::term`]'s.
 //!
 //! Owns: those calls. Must not own: the loop, the terminal's I/O, or what a request does.
 
@@ -91,8 +91,8 @@ pub(crate) fn insert_signals<D: 'static>(
 
 /// Watches the configuration at `path`: `on` gets whether the file changed each time the
 /// watch wakes the loop. A watch that can't be made (no directory yet) is logged, and the file
-/// is read at startup only; on a system with no watch at all (Windows) that is a notice for the
-/// user, which this returns.
+/// is read at startup only; on a system with no watch at all that is a notice for the user,
+/// which this returns.
 pub(crate) fn insert_config_watch<D: 'static>(
     handle: &LoopHandle<'static, D>,
     path: &Path,
@@ -121,10 +121,13 @@ pub(crate) fn insert_config_watch<D: 'static>(
             })
             .map_err(|e| e.error.to_string())?;
     }
-    // `ConfigWatch::new` refuses on Windows; a watch made there would have nothing to wake on.
     #[cfg(windows)]
     {
-        let _ = (handle, on, watch);
+        let (ping, source) = calloop::ping::make_ping().map_err(|e| e.to_string())?;
+        watch.set_wake(move || ping.ping());
+        handle
+            .insert_source(source, move |(), &mut (), data| on(data, watch.changed()))
+            .map_err(|e| e.to_string())?;
     }
     Ok(None)
 }

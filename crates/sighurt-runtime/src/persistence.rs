@@ -32,8 +32,11 @@
 //! it exists (written, extended, deleted, renamed, attributes changed), the file's watch made
 //! again on its current inode after each directory event; besides a file event, a change is the
 //! file's identity (existence, device and inode, size, modification time) differing from the
-//! last one seen. Other systems have no watch yet ([`ConfigWatch::new`] says
-//! so) and read the file at startup only.
+//! last one seen. On Windows a thread of the watch waits on `ReadDirectoryChangesW` for the
+//! directory and rings the frontend's wake ([`ConfigWatch::set_wake`]) once a change naming the
+//! file (written, created, deleted, renamed to or from) has been followed by 100 ms without
+//! another, so an editor's burst of writes is read once. Other systems have no watch
+//! ([`ConfigWatch::new`] says so) and read the file at startup only.
 //!
 //! Sessions are written atomically (a temporary file in the same directory, synced, then renamed
 //! over the old one) by a thread of their own, which writes only the latest snapshot it has been
@@ -255,7 +258,8 @@ fn shown(path: Option<&Path>) -> String {
 
 /// Watches the configuration file for being written, replaced or deleted. On Linux: inotify on
 /// its directory. On macOS: kqueue on its directory and, while it exists, on the file itself
-/// (see [`kqueue_watch`]). Nowhere else.
+/// (see [`kqueue_watch`]). On Windows: `ReadDirectoryChangesW` on its directory, on a thread
+/// (see [`windows_watch`]). Nowhere else.
 pub struct ConfigWatch {
     #[cfg(target_os = "linux")]
     fd: OwnedFd,
@@ -263,8 +267,10 @@ pub struct ConfigWatch {
     name: OsString,
     #[cfg(target_vendor = "apple")]
     kqueue: kqueue_watch::Watch,
+    #[cfg(windows)]
+    thread: windows_watch::Watch,
     /// Nothing can be watched here: a watch is never made.
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
     never: std::convert::Infallible,
 }
 
@@ -297,14 +303,31 @@ impl ConfigWatch {
         })
     }
 
-    /// Fails: watching needs inotify or kqueue, which this system does not have. The
-    /// configuration is read at startup only.
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    /// Watches `path`, whose directory must exist; the file may not exist yet. Nothing wakes
+    /// the loop until [`ConfigWatch::set_wake`].
+    #[cfg(windows)]
+    pub fn new(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            thread: windows_watch::Watch::new(path)?,
+        })
+    }
+
+    /// Fails: watching needs inotify, kqueue or `ReadDirectoryChangesW`, which this system does
+    /// not have. The configuration is read at startup only.
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
     pub fn new(_path: &Path) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "watching the configuration needs inotify or kqueue, which only Linux and macOS have",
+            "watching the configuration needs inotify, kqueue or ReadDirectoryChangesW, which \
+             only Linux, macOS and Windows have",
         ))
+    }
+
+    /// What the watch's thread calls when the file changed (a calloop ping's `ping`). A change
+    /// seen before this is set rings it at once.
+    #[cfg(windows)]
+    pub fn set_wake(&self, wake: impl Fn() + Send + 'static) {
+        self.thread.set_wake(Box::new(wake));
     }
 
     /// Reads every pending event; whether one was about the configuration file.
@@ -326,8 +349,14 @@ impl ConfigWatch {
         self.kqueue.changed()
     }
 
+    /// Whether the file changed since the last call.
+    #[cfg(windows)]
+    pub fn changed(&self) -> bool {
+        self.thread.changed()
+    }
+
     /// Never called: there is no watch here.
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
     pub fn changed(&self) -> bool {
         match self.never {}
     }
@@ -507,6 +536,258 @@ mod kqueue_watch {
         fn as_fd(&self) -> BorrowedFd<'_> {
             self.kqueue.as_fd()
         }
+    }
+}
+
+/// Windows' configuration watch: a thread that waits on `ReadDirectoryChangesW` for the
+/// directory (overlapped, with a stop event, so dropping the watch ends it at once), and a flag
+/// it raises when a change names the file. Owns the directory handle, the thread and the flag;
+/// decides nothing about the file's contents.
+#[cfg(windows)]
+mod windows_watch {
+    use std::io;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread::JoinHandle;
+
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+        FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+        FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, INFINITE,
+    };
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+    /// How long a change waits for the next one before the loop is woken.
+    const QUIET_MS: u32 = 100;
+    /// The notifications one read takes (a full buffer is reported as an overflow: a change).
+    const BUFFER_BYTES: usize = 16 * 1024;
+
+    type Wake = Box<dyn Fn() + Send>;
+
+    pub(super) struct Watch {
+        shared: Arc<Shared>,
+        stop: Arc<Event>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    struct Shared {
+        changed: AtomicBool,
+        wake: Mutex<Option<Wake>>,
+    }
+
+    impl Shared {
+        fn ring(&self) {
+            let wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(wake) = wake.as_ref() {
+                wake();
+            }
+        }
+    }
+
+    /// A manual-reset event.
+    struct Event(OwnedHandle);
+
+    impl Event {
+        fn new() -> io::Result<Self> {
+            // SAFETY: no attributes, no name.
+            let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a handle just created and owned by nothing else.
+            Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle) }))
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0.as_raw_handle() as HANDLE
+        }
+    }
+
+    /// The directory, open for its notifications only. Handles may be used from any thread.
+    struct Directory(OwnedHandle);
+
+    impl Directory {
+        fn raw(&self) -> HANDLE {
+            self.0.as_raw_handle() as HANDLE
+        }
+    }
+
+    impl Watch {
+        pub(super) fn new(path: &Path) -> io::Result<Self> {
+            let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+                return Err(io::Error::other("the configuration has no directory"));
+            };
+            let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+            // SAFETY: a NUL-terminated name; the handle is checked below.
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a handle just opened and owned by nothing else.
+            let directory = Directory(unsafe { OwnedHandle::from_raw_handle(handle) });
+            let shared = Arc::new(Shared {
+                changed: AtomicBool::new(false),
+                wake: Mutex::new(None),
+            });
+            let stop = Arc::new(Event::new()?);
+            let io = Event::new()?;
+            let name = name.to_string_lossy().to_lowercase();
+            let (theirs, stopped) = (shared.clone(), stop.clone());
+            let thread = std::thread::Builder::new()
+                .name("sighurt-config-watch".into())
+                .spawn(move || watch(&directory, &io, &stopped, &name, &theirs))?;
+            Ok(Self {
+                shared,
+                stop,
+                thread: Some(thread),
+            })
+        }
+
+        pub(super) fn set_wake(&self, wake: Wake) {
+            *self.shared.wake.lock().unwrap_or_else(PoisonError::into_inner) = Some(wake);
+            if self.shared.changed.load(Ordering::Acquire) {
+                self.shared.ring();
+            }
+        }
+
+        pub(super) fn changed(&self) -> bool {
+            self.shared.changed.swap(false, Ordering::AcqRel)
+        }
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            // SAFETY: an event this watch owns.
+            unsafe { SetEvent(self.stop.raw()) };
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// The thread: reads the directory's changes until `stop` is set or a read fails; a change
+    /// naming `name` (lowercase: the file system ignores case) raises the flag, and the wake
+    /// rings once [`QUIET_MS`] pass with no further change.
+    fn watch(directory: &Directory, io: &Event, stop: &Event, name: &str, shared: &Shared) {
+        // u32s, for the alignment the notifications need.
+        let mut buffer = vec![0u32; BUFFER_BYTES / 4];
+        let filter =
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+        let mut pending = false;
+        loop {
+            // SAFETY: zeroed is a valid OVERLAPPED; the event is this thread's.
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            overlapped.hEvent = io.raw();
+            // SAFETY: the buffer and `overlapped` outlive the read: it is waited for, or cancelled
+            // and waited for, before either is touched again.
+            let started = unsafe {
+                ResetEvent(io.raw());
+                ReadDirectoryChangesW(
+                    directory.raw(),
+                    buffer.as_mut_ptr().cast(),
+                    BUFFER_BYTES as u32,
+                    0,
+                    filter,
+                    std::ptr::null_mut(),
+                    &mut overlapped,
+                    None,
+                )
+            };
+            if started == 0 {
+                log::warn!(
+                    "the configuration watch stopped: {}",
+                    io::Error::last_os_error()
+                );
+                return;
+            }
+            let handles = [io.raw(), stop.raw()];
+            // The read stays pending while a change waits for its quiet moment.
+            let woke = loop {
+                let timeout = if pending { QUIET_MS } else { INFINITE };
+                // SAFETY: two live event handles.
+                let woke = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout) };
+                if woke != WAIT_TIMEOUT {
+                    break woke;
+                }
+                pending = false;
+                shared.ring();
+            };
+            if woke != WAIT_OBJECT_0 {
+                // Stopped (or the wait failed): the read is cancelled and waited for, so the
+                // buffer is free when the thread ends.
+                let mut bytes = 0;
+                // SAFETY: the read started above on this handle with this `overlapped`.
+                unsafe {
+                    CancelIoEx(directory.raw(), &overlapped);
+                    GetOverlappedResult(directory.raw(), &overlapped, &mut bytes, 1);
+                }
+                return;
+            }
+            let mut bytes = 0;
+            // SAFETY: the read completed (its event is set).
+            if unsafe { GetOverlappedResult(directory.raw(), &overlapped, &mut bytes, 0) } == 0 {
+                log::warn!(
+                    "the configuration watch stopped: {}",
+                    io::Error::last_os_error()
+                );
+                return;
+            }
+            // No bytes: more changed than the buffer held, the file perhaps among them.
+            let hit = bytes == 0 || names(&buffer, bytes as usize).any(|changed| changed == name);
+            if hit {
+                shared.changed.store(true, Ordering::Release);
+                pending = true;
+            }
+        }
+    }
+
+    /// The file names, lowercase, of the notifications in the first `len` bytes of `buffer`.
+    fn names(buffer: &[u32], len: usize) -> impl Iterator<Item = String> + '_ {
+        let bytes = &bytemuck_bytes(buffer)[..len.min(buffer.len() * 4)];
+        let header = std::mem::offset_of!(FILE_NOTIFY_INFORMATION, FileName);
+        let mut at = Some(0usize);
+        std::iter::from_fn(move || {
+            let start = at?;
+            let field = |offset: usize| {
+                let b = bytes.get(start + offset..start + offset + 4)?;
+                Some(u32::from_ne_bytes(b.try_into().ok()?) as usize)
+            };
+            let (next, length) = (field(0)?, field(8)?);
+            let units = bytes.get(start + header..start + header + length)?;
+            let wide: Vec<u16> = units
+                .chunks_exact(2)
+                .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                .collect();
+            at = (next != 0).then_some(start + next);
+            Some(
+                std::ffi::OsString::from_wide(&wide)
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
+        })
+    }
+
+    fn bytemuck_bytes(words: &[u32]) -> &[u8] {
+        // SAFETY: u32s are plain bytes, and the slice covers exactly their memory.
+        unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), std::mem::size_of_val(words)) }
     }
 }
 
@@ -1182,6 +1463,44 @@ mod tests {
         ));
         fs::write(&path, "version = 1\n").unwrap();
         assert_eq!(startup_config(Some(&path), &env), Ok(Config::default()));
+    }
+
+    /// Windows' watch reports from a thread, after a quiet moment: each change is waited for.
+    #[cfg(windows)]
+    #[test]
+    fn the_watch_sees_the_file_written_or_replaced_and_nothing_else() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let watch = ConfigWatch::new(&path).unwrap();
+        let rung = Arc::new(AtomicUsize::new(0));
+        let count = rung.clone();
+        watch.set_wake(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        });
+        let seen = |watch: &ConfigWatch| {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                if watch.changed() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        fs::write(dir.path().join("other.toml"), "x").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!watch.changed(), "another file is not the configuration");
+        assert_eq!(rung.load(Ordering::Acquire), 0);
+        fs::write(&path, "version = 1\n").unwrap();
+        assert!(seen(&watch), "written");
+        assert!(rung.load(Ordering::Acquire) >= 1, "the wake rang");
+        write_atomically(&path, "version = 1\n").unwrap();
+        assert!(seen(&watch), "replaced");
+        fs::remove_file(&path).unwrap();
+        assert!(seen(&watch), "deleted");
+        drop(watch);
     }
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
