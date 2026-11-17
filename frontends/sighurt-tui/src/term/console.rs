@@ -30,8 +30,9 @@
 //!   console control handler's (a quit, `sighurt_runtime::signals`). There is no job control,
 //!   so nothing suspends or resumes, and no hangup: a closed console fails the reads and the
 //!   writes. A native crash (an access violation, a stack overflow: an exception nothing handles)
-//!   reaches [`on_crash`] on the thread that crashed, which writes [`LEAVE`] and puts the modes
-//!   back, taking no lock and waiting for nothing, then lets the crash go on as before. What
+//!   reaches [`on_crash`] on the thread that crashed, which has a helper thread write [`LEAVE`]
+//!   (waiting for it at most 200 ms: a stalled console must not hold the crash up) and puts the
+//!   modes back, taking no lock, then lets the crash go on as before. What
 //!   ends the process without an exception (`abort`, Rust's `__fastfail`, `TerminateProcess`)
 //!   still leaves the modes as they were.
 //!
@@ -70,7 +71,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     SetUnhandledExceptionFilter, EXCEPTION_POINTERS, LPTOP_LEVEL_EXCEPTION_FILTER,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentThreadId, SetEvent, WaitForMultipleObjects, INFINITE,
+    CreateEventW, GetCurrentThreadId, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    INFINITE,
 };
 
 use super::modes::{startup_queries, ENTER, LEAVE};
@@ -104,6 +106,15 @@ static PREV_HOOK: Mutex<Option<PanicHook>> = Mutex::new(None);
 static FILTER_ON: AtomicBool = AtomicBool::new(false);
 /// The filter there was before [`on_crash`], as a function address (0: none).
 static PREV_FILTER: AtomicUsize = AtomicUsize::new(0);
+/// The crash helper's events (0: no helper): [`on_crash`] sets the first, the helper the
+/// second when the leave sequence is out.
+static CRASH_GO: AtomicUsize = AtomicUsize::new(0);
+static CRASH_DONE: AtomicUsize = AtomicUsize::new(0);
+/// The console and the wire the crash helper writes for.
+static CRASH_OUTPUT: AtomicUsize = AtomicUsize::new(0);
+static CRASH_WIRE: AtomicU8 = AtomicU8::new(0);
+/// How long [`on_crash`] waits for the helper's write.
+const CRASH_WRITE_MS: u32 = 200;
 
 /// Window size, the shape of Unix's `struct winsize`. The console reports no pixel size.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -986,10 +997,29 @@ fn install_panic_hook() {
     }));
 }
 
-/// Installs [`on_crash`] as the process's unhandled-exception filter, once.
+/// Installs [`on_crash`] as the process's unhandled-exception filter, once, and starts the
+/// helper thread that writes the leave sequence for it. Without the helper (no events or no
+/// thread) the filter still puts the modes back.
 fn install_crash_filter() {
     if FILTER_ON.swap(true, Ordering::AcqRel) {
         return;
+    }
+    // SAFETY: two auto-reset events, unnamed, not set.
+    let (go, done) = unsafe {
+        (
+            CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+            CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+        )
+    };
+    if !go.is_null() && !done.is_null() {
+        let (go_raw, done_raw) = (go as usize, done as usize);
+        let started = std::thread::Builder::new()
+            .name("sighurt-console-crash".into())
+            .spawn(move || write_on_crash(go_raw as HANDLE, done_raw as HANDLE));
+        if started.is_ok() {
+            CRASH_DONE.store(done_raw, Ordering::Release);
+            CRASH_GO.store(go_raw, Ordering::Release);
+        }
     }
     // SAFETY: `on_crash` is a filter for the life of the process.
     let previous = unsafe { SetUnhandledExceptionFilter(Some(on_crash)) };
@@ -999,32 +1029,49 @@ fn install_crash_filter() {
     );
 }
 
+/// The helper of [`on_crash`]: waits until a crash asks, then writes what closes the sequence
+/// left open and [`LEAVE`] to the console it names, and says it is done. If the console does
+/// not take the bytes the write blocks here, not on the crashing thread.
+fn write_on_crash(go: HANDLE, done: HANDLE) {
+    loop {
+        // SAFETY: an event this thread was given, never closed.
+        if unsafe { WaitForSingleObject(go, INFINITE) } != WAIT_OBJECT_0 {
+            return;
+        }
+        let output = CRASH_OUTPUT.load(Ordering::Acquire) as HANDLE;
+        let wire = Wire::from_u8(CRASH_WIRE.load(Ordering::Acquire));
+        let _ = write_all(output, terminator(wire).as_bytes());
+        let _ = write_all(output, LEAVE);
+        // SAFETY: as above.
+        unsafe { SetEvent(done) };
+    }
+}
+
 /// The unhandled-exception filter: on the thread that crashed, with the process in an unknown
-/// state, so it takes no lock (`try_lock` only), allocates nothing and waits for nothing. It
-/// writes what closes a sequence left open and [`LEAVE`] straight to the console (a chunk the
-/// writer thread is writing may still be cut), puts the modes and code pages back, and hands
-/// the exception on: to the filter before it, else to Windows (which ends the process).
+/// state, so it takes no lock (`try_lock` only), allocates nothing and waits at most
+/// [`CRASH_WRITE_MS`]. Its helper thread writes what closes a sequence left open and [`LEAVE`]
+/// to the console (a chunk the writer thread is writing may still be cut; a console that takes
+/// nothing gets nothing); then it puts the modes and code pages back, and hands the exception
+/// on: to the filter before it, else to Windows (which ends the process).
 unsafe extern "system" fn on_crash(info: *const EXCEPTION_POINTERS) -> i32 {
     /// `EXCEPTION_CONTINUE_SEARCH`: the system goes on as if there were no filter.
     const CONTINUE_SEARCH: i32 = 0;
     if let Ok(current) = CURRENT.try_lock() {
         if let Some(shared) = current.as_ref() {
-            if !shared.protocol_restored.swap(true, Ordering::AcqRel) {
-                let wire = Wire::from_u8(shared.wire.load(Ordering::Acquire));
-                let output = shared.writer.output.raw();
-                for bytes in [terminator(wire).as_bytes(), LEAVE] {
-                    let mut written = 0u32;
-                    // SAFETY: a console handle and bytes that outlive the call. One write each:
-                    // nothing here may wait or allocate.
-                    unsafe {
-                        WriteFile(
-                            output,
-                            bytes.as_ptr(),
-                            bytes.len() as u32,
-                            &mut written,
-                            std::ptr::null_mut(),
-                        )
-                    };
+            // The leave sequence needs the console's VT mode, so it goes before the modes are
+            // put back; a console write blocks while output is stalled, so the helper thread
+            // writes it and this waits at most CRASH_WRITE_MS, then goes on either way.
+            let go = CRASH_GO.load(Ordering::Acquire);
+            if go != 0 && !shared.protocol_restored.swap(true, Ordering::AcqRel) {
+                CRASH_OUTPUT.store(shared.writer.output.raw() as usize, Ordering::Release);
+                CRASH_WIRE.store(shared.wire.load(Ordering::Acquire), Ordering::Release);
+                // SAFETY: the helper's two events, which live as long as the process.
+                unsafe {
+                    SetEvent(go as HANDLE);
+                    WaitForSingleObject(
+                        CRASH_DONE.load(Ordering::Acquire) as HANDLE,
+                        CRASH_WRITE_MS,
+                    );
                 }
             }
             if shared.active.swap(false, Ordering::AcqRel) {
