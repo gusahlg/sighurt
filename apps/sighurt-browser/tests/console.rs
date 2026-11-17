@@ -95,6 +95,30 @@ fn print_console_modes_when_asked() {
     .unwrap();
 }
 
+/// Not a test of its own: with `SIG_CONSOLE_CRASH` set (by
+/// [`a_native_crash_in_raw_mode_puts_the_console_back`]) it enters raw mode on the console it
+/// was started in as `sig` does, says `RAW`, and writes through a null pointer: an access
+/// violation nothing handles, which ends the process.
+#[test]
+fn crash_in_raw_mode_when_asked() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_NOGPFAULTERRORBOX};
+    if std::env::var_os("SIG_CONSOLE_CRASH").is_none() {
+        return;
+    }
+    let _terminal = sighurt_tui::term::Terminal::enter_stdout(1 << 16).unwrap();
+    // Straight to the console: the session's own queue is drained by an owner loop, which this
+    // has not.
+    thread::sleep(Duration::from_millis(500));
+    let mut out = fs::OpenOptions::new().write(true).open("CONOUT$").unwrap();
+    std::io::Write::write_all(&mut out, b"RAW").unwrap();
+    thread::sleep(Duration::from_secs(2));
+    // SAFETY: none: the point is the crash. No error box, so nothing waits for a click.
+    unsafe {
+        SetErrorMode(SEM_NOGPFAULTERRORBOX);
+        std::ptr::null_mut::<u8>().write_volatile(1);
+    }
+}
+
 /// A pseudoconsole of 80×24 cells, what it renders, and the process started in it.
 struct Console {
     console: HPCON,
@@ -301,18 +325,28 @@ impl Console {
         }
     }
 
-    /// The console's input and output modes now, from a process started in it for that.
-    fn modes(&mut self) -> String {
+    /// The process started last, while it runs.
+    #[cfg(feature = "engine-wasm")]
+    fn pid(&self) -> u32 {
+        use windows_sys::Win32::System::Threading::GetProcessId;
+        // SAFETY: a process handle this console holds.
+        unsafe { GetProcessId(self.process.expect("a process")) }
+    }
+
+    /// Starts this test binary in the pseudoconsole for the not-a-test `name`, with `env` set.
+    fn start_myself(&mut self, name: &str, env: &[(&str, &str)]) {
         let me = std::env::current_exe().unwrap();
         self.start(
             me.as_os_str(),
-            &[
-                "--exact",
-                "print_console_modes_when_asked",
-                "--nocapture",
-                "--test-threads",
-                "1",
-            ],
+            &["--exact", name, "--nocapture", "--test-threads", "1"],
+            env,
+        );
+    }
+
+    /// The console's input and output modes now, from a process started in it for that.
+    fn modes(&mut self) -> String {
+        self.start_myself(
+            "print_console_modes_when_asked",
             &[("SIG_CONSOLE_MODES", "1")],
         );
         assert_eq!(
@@ -376,18 +410,42 @@ fn sig_in_a_console_shows_the_page_opens_an_address_and_quits_restoring_the_cons
     );
     // The evidence, with --nocapture: what the console showed at each step.
     eprintln!("modes before sig: {before}\nthe page:\n{}", console.text());
-    // Windows has no configuration watch, and the user is told (finding 4 of review C).
-    let told = console.wait(Duration::from_secs(10), |text| {
-        text.contains("configuration at startup only")
-    });
-    assert!(told, "no notice of the missing watch\n{}", console.text());
+    // The configuration is watched: a binding written into the file while sig runs is used
+    // once sig has read it again (`z` does nothing before that).
+    fs::write(
+        dir.join("config.toml"),
+        format!("{CONFIG}[keys]\n\"z\" = \"page.open demo://animation\"\n"),
+    )
+    .unwrap();
+    let reloaded = Instant::now();
+    let animation = |text: &str| {
+        text.lines()
+            .next()
+            .is_some_and(|line| line.contains("Demo: animation"))
+    };
+    let mut bound = false;
+    while !bound && reloaded.elapsed() < Duration::from_secs(15) {
+        console.type_bytes(b"z");
+        bound = console.wait(Duration::from_millis(500), animation);
+    }
+    assert!(
+        bound,
+        "the changed configuration was not read\n{}\ntui.log:\n{}",
+        console.text(),
+        log()
+    );
+    eprintln!(
+        "z bound by the file after {:?}:\n{}",
+        reloaded.elapsed(),
+        console.text()
+    );
 
     // `o` opens the address line, Enter opens what was typed.
     console.type_bytes(b"o");
     let editing = console.wait(Duration::from_secs(10), |text| {
         text.lines()
             .last()
-            .is_some_and(|line| line.contains("demo://pattern"))
+            .is_some_and(|line| line.contains("demo://animation"))
     });
     assert!(
         editing,
@@ -421,6 +479,124 @@ fn sig_in_a_console_shows_the_page_opens_an_address_and_quits_restoring_the_cons
     let after = console.modes();
     eprintln!("sig exited with 0; modes after: {after}");
     assert_eq!(after, before, "the console's modes were not restored");
+}
+
+/// sig://help with the Wasm engine on Windows: forced into graphics (sixel, which the console
+/// takes or drops), the page's guest runs and the tab loads without an error, which a report
+/// asked for by setting `sig`'s report event (`Local\sighurt-report-<pid>`) says; then `q`
+/// quits.
+#[cfg(feature = "engine-wasm")]
+#[test]
+fn sig_help_runs_its_guest_and_the_report_event_asks_for_a_report() {
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    if !allowed() {
+        return;
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = configure();
+    let tui = "[tui]\nmode = \"graphics\"\ngraphics = \"sixel\"\n";
+    fs::write(dir.join("config.toml"), format!("{CONFIG}{tui}")).unwrap();
+    let report = std::env::temp_dir().join(format!("sig-console-{}.json", std::process::id()));
+    let _ = fs::remove_file(&report);
+    let mut console = Console::new();
+    let path = report.to_str().unwrap();
+    console.start(
+        OsStr::new(env!("CARGO_BIN_EXE_sig")),
+        &["--diagnostics", path, "sig://help"],
+        &[],
+    );
+    let log = || fs::read_to_string(dir.join("tui.log")).unwrap_or_default();
+    let name: Vec<u16> = format!("Local\\sighurt-report-{}", console.pid())
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    // `main` makes the event before the frontend starts.
+    let start = Instant::now();
+    let event = loop {
+        // SAFETY: a NUL-terminated name; the handle is checked.
+        let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if !event.is_null() || start.elapsed() > Duration::from_secs(30) {
+            break event;
+        }
+        console.wait(Duration::from_millis(100), |_| false);
+    };
+    assert!(
+        !event.is_null(),
+        "no report event: {}\n{}\ntui.log:\n{}",
+        std::io::Error::last_os_error(),
+        console.text(),
+        log()
+    );
+    // The report, without white space, until the help tab has loaded.
+    let start = Instant::now();
+    let mut last = String::new();
+    let loaded = |json: &str| {
+        let wasm = json.find("\"name\":\"wasm\"").map(|at| &json[at..]);
+        let running = wasm.is_some_and(|rest| {
+            let entry = rest[1..]
+                .find("\"name\":")
+                .map_or(rest, |end| &rest[..=end]);
+            entry.contains("\"state\":\"running\"")
+        });
+        running
+            && json.contains("\"exit\":false")
+            && json.contains("\"loading\":false")
+            && json.contains("\"error\":false")
+            && !json.contains("\"error\":true")
+    };
+    while start.elapsed() < Duration::from_secs(30) {
+        // SAFETY: the event just opened.
+        unsafe { SetEvent(event) };
+        console.wait(Duration::from_millis(500), |_| false);
+        last = fs::read_to_string(&report)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        if loaded(&last) {
+            break;
+        }
+    }
+    // SAFETY: opened above, closed once.
+    unsafe { CloseHandle(event) };
+    assert!(
+        loaded(&last),
+        "no report of a loaded sig://help\nreport: {last}\n{}\ntui.log:\n{}",
+        console.text(),
+        log()
+    );
+    eprintln!("the report: {last}\nthe screen:\n{}", console.text());
+    console.type_bytes(b"q");
+    let code = console.exit(Duration::from_secs(20));
+    assert_eq!(code, Some(0), "{}\ntui.log:\n{}", console.text(), log());
+    let _ = fs::remove_file(&report);
+}
+
+/// An access violation in raw mode (not a panic, which the panic hook restores): the
+/// unhandled-exception filter puts the console's modes back before the process ends.
+#[test]
+fn a_native_crash_in_raw_mode_puts_the_console_back() {
+    if !allowed() {
+        return;
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut console = Console::new();
+    let before = console.modes();
+    console.start_myself(
+        "crash_in_raw_mode_when_asked",
+        &[("SIG_CONSOLE_CRASH", "1")],
+    );
+    let raw = console.wait(Duration::from_secs(20), |text| text.contains("RAW"));
+    assert!(
+        raw,
+        "the crashing process did not start\n{}",
+        console.text()
+    );
+    let code = console.exit(Duration::from_secs(20));
+    // STATUS_ACCESS_VIOLATION.
+    assert_eq!(code, Some(0xC000_0005), "{}", console.text());
+    let after = console.modes();
+    eprintln!("modes before: {before}; after the crash: {after}");
+    assert_eq!(after, before, "the console's modes were not put back");
 }
 
 #[test]
