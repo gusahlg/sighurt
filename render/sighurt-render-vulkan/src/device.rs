@@ -21,7 +21,7 @@ use sighurt_render::RenderError;
 /// The format of every chrome target: opaque, not sRGB (RENDER.md §14.12).
 pub const FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 /// The longest a frame may take before the device is given up on.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+pub const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A Vulkan error as the frontend acts on it: device loss and anything unexpected are the
 /// device's; `what` says which call.
@@ -57,6 +57,12 @@ pub struct Gpu {
     pub queue: vk::Queue,
     pub swapchain: ash::khr::swapchain::Device,
     pub describe: String,
+    /// `VK_EXT_swapchain_maintenance1` is on: each present signals a fence when the
+    /// presentation engine is done with its image and semaphore (`crate::target`).
+    pub present_fences: bool,
+    /// A call returned `VK_ERROR_DEVICE_LOST`: nothing runs on the device any more, and what
+    /// was submitted may still count as pending.
+    pub device_lost: bool,
     pub max_extent: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
     /// Render passes ending in `PRESENT_SRC_KHR` (swapchains) and `TRANSFER_SRC_OPTIMAL`
@@ -93,16 +99,24 @@ impl Gpu {
         instance: &ash::Instance,
         physical: vk::PhysicalDevice,
         family: u32,
-        describe: String,
+        mut describe: String,
+        maintenance: bool,
     ) -> Result<Self, RenderError> {
         let priorities = [1.0];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities)];
-        let extensions = [ash::khr::swapchain::NAME.as_ptr()];
-        let info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queues)
-            .enabled_extension_names(&extensions);
+        let present_fences = maintenance && unsafe { present_fences(instance, physical) };
+        let mut extensions = vec![ash::khr::swapchain::NAME.as_ptr()];
+        let mut feature = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
+            .swapchain_maintenance1(true);
+        let mut info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        if present_fences {
+            extensions.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
+            info = info.push_next(&mut feature);
+            describe.push_str(", present fences");
+        }
+        let info = info.enabled_extension_names(&extensions);
         let device = unsafe { instance.create_device(physical, &info, None) }
             .map_err(|e| device_error("vkCreateDevice", e))?;
         let queue = unsafe { device.get_device_queue(family, 0) };
@@ -116,6 +130,8 @@ impl Gpu {
             queue,
             swapchain,
             describe,
+            present_fences,
+            device_lost: false,
             max_extent: limits.max_image_dimension2_d,
             memory,
             present_pass: vk::RenderPass::null(),
@@ -235,44 +251,52 @@ impl Gpu {
 
     /// Waits for the frame in flight, if any (bounded: a frame that takes longer is the
     /// device's failure).
-    pub fn wait(&self) -> Result<(), RenderError> {
+    pub fn wait(&mut self) -> Result<(), RenderError> {
         let timeout = FRAME_TIMEOUT.as_nanos() as u64;
         match unsafe { self.device.wait_for_fences(&[self.fence], true, timeout) } {
             Ok(()) => Ok(()),
             Err(vk::Result::TIMEOUT) => Err(RenderError::Device(
                 "the last chrome frame did not finish in 2 s".into(),
             )),
-            Err(e) => Err(device_error("vkWaitForFences", e)),
-        }
-    }
-
-    /// Waits for the device to be idle. False if it failed for another reason than device
-    /// loss (after which nothing runs any more): then work may still be in flight, and what
-    /// it uses must not be destroyed.
-    ///
-    /// The presentation engine's own use of swapchain images and semaphores is not covered by
-    /// this (it is by `VK_EXT_swapchain_maintenance1`'s present fences, not used yet): like
-    /// wgpu-hal, the backend destroys a swapchain after the device is idle.
-    pub fn idle(&self) -> bool {
-        match unsafe { self.device.device_wait_idle() } {
-            Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => true,
-            Err(_) => false,
-        }
-    }
-
-    /// After a failure between an acquire and its submission: an empty submission that waits
-    /// on the acquire semaphore, so its signal is consumed. Best effort; the device is being
-    /// given up on anyway.
-    pub fn drain(&self) {
-        let d = &self.device;
-        unsafe {
-            let _ = d.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty());
-            let begin = vk::CommandBufferBeginInfo::default();
-            if d.begin_command_buffer(self.command, &begin).is_ok() {
-                let _ = self.submit(Some(self.acquired), None);
-                let _ = self.wait();
+            Err(e) => {
+                self.device_lost |= e == vk::Result::ERROR_DEVICE_LOST;
+                Err(device_error("vkWaitForFences", e))
             }
         }
+    }
+
+    /// Whether nothing of ours runs on the device any more. Every submission signals the frame
+    /// slot's fence, so a bounded wait on it covers the queue. Where presents have fences
+    /// (`VK_EXT_swapchain_maintenance1`), a swapchain waits for its own before it is destroyed
+    /// (`crate::target`), so that is all. Without them the presentation engine's use of a
+    /// swapchain's images and semaphores is covered by nothing better than the device going
+    /// idle (`vkDeviceWaitIdle`, which has no timeout), as in wgpu-hal. False if a wait failed
+    /// for another reason than device loss (after which nothing runs): then work may still be
+    /// in flight, and what it uses must not be destroyed.
+    pub fn idle(&self) -> bool {
+        let timeout = FRAME_TIMEOUT.as_nanos() as u64;
+        let done = |result: Result<(), vk::Result>| {
+            matches!(result, Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST))
+        };
+        if !done(unsafe { self.device.wait_for_fences(&[self.fence], true, timeout) }) {
+            return false;
+        }
+        self.present_fences || done(unsafe { self.device.device_wait_idle() })
+    }
+
+    /// After a failure between an acquire and its submission: a submission of no commands that
+    /// waits on the acquire semaphore, so its signal is consumed, and a wait for it. False if
+    /// that failed: then nothing proves the semaphore is no longer in use.
+    pub fn drain(&mut self) -> bool {
+        if self.device_lost {
+            return true;
+        }
+        let waits = [self.acquired];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let info = vk::SubmitInfo::default()
+            .wait_semaphores(&waits)
+            .wait_dst_stage_mask(&stages);
+        self.queue(info).is_ok() && self.wait().is_ok()
     }
 
     /// Records `prepared` drawn into `framebuffer` (`prepared.size`, [`FORMAT`], begun with
@@ -482,20 +506,15 @@ impl Gpu {
         Ok(())
     }
 
-    /// Ends the command buffer, resets the fence (a submission follows) and submits, waiting
-    /// on `wait` (at color output) and signalling `signal`, if given.
+    /// Ends the command buffer and submits it, waiting on `wait` (at color output) and
+    /// signalling `signal`, if given, and the frame slot's fence.
     pub fn submit(
-        &self,
+        &mut self,
         wait: Option<vk::Semaphore>,
         signal: Option<vk::Semaphore>,
     ) -> Result<(), RenderError> {
-        let d = &self.device;
-        unsafe {
-            d.end_command_buffer(self.command)
-                .map_err(|e| device_error("vkEndCommandBuffer", e))?;
-            d.reset_fences(&[self.fence])
-                .map_err(|e| device_error("vkResetFences", e))?;
-        }
+        unsafe { self.device.end_command_buffer(self.command) }
+            .map_err(|e| device_error("vkEndCommandBuffer", e))?;
         let waits: Vec<_> = wait.into_iter().collect();
         let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let signals: Vec<_> = signal.into_iter().collect();
@@ -505,8 +524,31 @@ impl Gpu {
             .wait_dst_stage_mask(&stages[..waits.len()])
             .command_buffers(&commands)
             .signal_semaphores(&signals);
-        unsafe { d.queue_submit(self.queue, &[info], self.fence) }
-            .map_err(|e| device_error("vkQueueSubmit", e))
+        self.queue(info)
+    }
+
+    /// Resets the frame slot's fence (a submission follows) and submits `info` with it. A
+    /// submission the device refused leaves the fence unsignalled for good, so it is made
+    /// again signalled: the next wait then finds nothing in flight, which is so.
+    fn queue(&mut self, info: vk::SubmitInfo<'_>) -> Result<(), RenderError> {
+        let d = &self.device;
+        unsafe { d.reset_fences(&[self.fence]) }.map_err(|e| device_error("vkResetFences", e))?;
+        match unsafe { d.queue_submit(self.queue, &[info], self.fence) } {
+            Ok(()) => Ok(()),
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                self.device_lost = true;
+                Err(device_error("vkQueueSubmit", vk::Result::ERROR_DEVICE_LOST))
+            }
+            Err(e) => {
+                let signalled =
+                    vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+                if let Ok(fence) = unsafe { d.create_fence(&signalled, None) } {
+                    unsafe { d.destroy_fence(self.fence, None) };
+                    self.fence = fence;
+                }
+                Err(device_error("vkQueueSubmit", e))
+            }
+        }
     }
 
     /// Atlas images at the plan's page sizes; a page that changed size is a new, cleared
@@ -884,7 +926,10 @@ unsafe fn render_pass(
         dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         dependency_flags: vk::DependencyFlags::empty(),
     };
-    // Offscreen, a copy reads the image next: the writes before it.
+    // Offscreen, a copy reads the image next: the writes before it. Presenting needs none
+    // (the render-finished semaphore orders it), but both passes have it: render passes that
+    // differ in their dependencies are not compatible, and the one pipeline, made with the
+    // present pass, draws in both (VUID-vkCmdDrawIndexed-renderPass-02684 otherwise).
     let outgoing = vk::SubpassDependency {
         src_subpass: 0,
         dst_subpass: vk::SUBPASS_EXTERNAL,
@@ -894,15 +939,11 @@ unsafe fn render_pass(
         dst_access_mask: vk::AccessFlags::TRANSFER_READ,
         dependency_flags: vk::DependencyFlags::empty(),
     };
-    let both = [incoming, outgoing];
-    let dependencies = match final_layout {
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => &both[..],
-        _ => &both[..1],
-    };
+    let dependencies = [incoming, outgoing];
     let info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
         .subpasses(&subpasses)
-        .dependencies(dependencies);
+        .dependencies(&dependencies);
     unsafe { device.create_render_pass(&info, None) }
         .map_err(|e| device_error("vkCreateRenderPass", e))
 }
@@ -990,6 +1031,27 @@ unsafe fn pipeline(
     unsafe { device.destroy_shader_module(module, None) };
     made.map(|pipelines| pipelines[0])
         .map_err(|(_, e)| device_error("vkCreateGraphicsPipelines", e))
+}
+
+/// Whether `physical` offers `VK_EXT_swapchain_maintenance1` with its feature on.
+///
+/// # Safety
+///
+/// `instance` is alive, at Vulkan 1.1 or later.
+unsafe fn present_fences(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+    let extensions =
+        unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+    let offered = extensions.iter().any(|e| {
+        e.extension_name_as_c_str()
+            .is_ok_and(|n| n == ash::ext::swapchain_maintenance1::NAME)
+    });
+    if !offered {
+        return false;
+    }
+    let mut feature = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut feature);
+    unsafe { instance.get_physical_device_features2(physical, &mut features) };
+    feature.swapchain_maintenance1 == vk::TRUE
 }
 
 /// A device's name as Vulkan reports it.

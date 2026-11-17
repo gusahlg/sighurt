@@ -1,6 +1,14 @@
 //! One bound chrome surface: its `VkSurfaceKHR` and the swapchain on it, with an image view, a
 //! framebuffer and a render-finished semaphore per image (the presentation engine waits on an
-//! image's semaphore, which no fence tracks, so each image has its own).
+//! image's semaphore, which no queue fence tracks, so each image has its own).
+//!
+//! Where the device has `VK_EXT_swapchain_maintenance1`, each image also has a present fence,
+//! signalled when the presentation engine is done with that image's present (its semaphore
+//! wait included). A swapchain, retired by a new one or destroyed, is destroyed only after
+//! its pending present fences have signalled, so the presentation engine never uses a freed
+//! semaphore or image; without the extension, after the device is idle only (RENDER.md §13's
+//! known gap, as in wgpu-hal). A wait that does not end within [`FRAME_TIMEOUT`] leaks the
+//! swapchain instead of destroying what may still be in use.
 //!
 //! Must not own: the device or the frame slot (`crate::device`), or when to render (`crate`).
 
@@ -8,7 +16,7 @@ use ash::vk;
 use sighurt_api::geometry::Metrics;
 use sighurt_render::{RenderError, Scene};
 
-use crate::device::{device_error, Gpu, FORMAT};
+use crate::device::{device_error, Gpu, FORMAT, FRAME_TIMEOUT};
 
 /// A swapchain and what each of its images needs.
 pub struct Chain {
@@ -17,6 +25,9 @@ pub struct Chain {
     pub framebuffers: Vec<vk::Framebuffer>,
     pub finished: Vec<vk::Semaphore>,
     views: Vec<vk::ImageView>,
+    /// Per image, with present fences: the fence and whether a present that signals it was
+    /// queued and not yet waited for. Empty without them.
+    presented: Vec<(vk::Fence, bool)>,
 }
 
 /// A bound surface.
@@ -25,8 +36,11 @@ pub struct Target {
     pub chain: Option<Chain>,
     /// Make the swapchain again before the next frame (`SUBOPTIMAL`, an outdated present).
     pub recreate: bool,
-    /// The recreate after a `SUBOPTIMAL` happened; not again until an acquire is optimal.
+    /// The recreate after a `SUBOPTIMAL` happened; not again until a frame is optimal.
     pub recreated: bool,
+    /// The last present was out of date (the frame was put off and the swapchain is made
+    /// again): a second one in a row is the surface's failure.
+    pub present_outdated: bool,
     /// The metrics and scene of the last frame presented.
     pub last: Option<(Metrics, Scene)>,
 }
@@ -96,6 +110,13 @@ impl Target {
             // Nothing of ours may still use the old images or their semaphores.
             return Err(RenderError::Device("the device didn't go idle".into()));
         }
+        if self.chain.as_ref().is_some_and(|chain| !chain.settled(gpu)) {
+            // The presentation engine may still use them: keep the old swapchain alive (it
+            // stays this target's) rather than retire it.
+            return Err(RenderError::Device(
+                "the presentation engine didn't release the swapchain".into(),
+            ));
+        }
         let old = self.chain.take();
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
@@ -128,6 +149,7 @@ impl Target {
             framebuffers: Vec::new(),
             finished: Vec::new(),
             views: Vec::new(),
+            presented: Vec::new(),
         };
         if let Err(error) = unsafe { chain.fill(gpu) } {
             unsafe { chain.destroy(gpu) };
@@ -138,16 +160,32 @@ impl Target {
         Ok(())
     }
 
-    /// Destroys the swapchain and the surface.
+    /// Destroys the swapchain and the surface. False if the presentation engine did not
+    /// release the swapchain in time: then both are left alive, and so must be the device and
+    /// the instance.
     ///
     /// # Safety
     ///
     /// The device is idle (nothing of this surface's is in flight).
-    pub unsafe fn destroy(mut self, gpu: Option<&Gpu>, surfaces: &ash::khr::surface::Instance) {
+    #[must_use]
+    pub unsafe fn destroy(
+        mut self,
+        gpu: Option<&Gpu>,
+        surfaces: &ash::khr::surface::Instance,
+    ) -> bool {
         if let (Some(chain), Some(gpu)) = (self.chain.take(), gpu) {
+            if !chain.settled(gpu) {
+                log::error!(
+                    "the presentation engine didn't release a chrome swapchain; it and its \
+                     surface are left alive"
+                );
+                std::mem::forget(chain);
+                return false;
+            }
             unsafe { chain.destroy(gpu) };
         }
         unsafe { surfaces.destroy_surface(self.surface, None) };
+        true
     }
 }
 
@@ -186,8 +224,63 @@ impl Chain {
                 unsafe { d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
                     .map_err(|e| device_error("vkCreateSemaphore", e))?;
             self.finished.push(semaphore);
+            if gpu.present_fences {
+                let fence = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }
+                    .map_err(|e| device_error("vkCreateFence", e))?;
+                self.presented.push((fence, false));
+            }
         }
         Ok(())
+    }
+
+    /// The fence for a present of image `index`, unsignalled, and from now on pending; `None`
+    /// without present fences. The image was acquired again, so its last present is done: the
+    /// wait for that present's fence is bounded and normally finds it signalled.
+    pub fn present_fence(
+        &mut self,
+        gpu: &Gpu,
+        index: u32,
+    ) -> Result<Option<vk::Fence>, RenderError> {
+        let Some((fence, pending)) = self.presented.get_mut(index as usize) else {
+            return Ok(None);
+        };
+        let d = &gpu.device;
+        if *pending {
+            let timeout = FRAME_TIMEOUT.as_nanos() as u64;
+            unsafe { d.wait_for_fences(&[*fence], true, timeout) }
+                .map_err(|e| device_error("vkWaitForFences (a present)", e))?;
+        }
+        unsafe { d.reset_fences(&[*fence]) }.map_err(|e| device_error("vkResetFences", e))?;
+        *pending = true;
+        Ok(Some(*fence))
+    }
+
+    /// After a present of image `index` that was refused before anything was queued: its fence
+    /// is not pending.
+    pub fn unpend(&mut self, index: u32) {
+        if let Some((_, pending)) = self.presented.get_mut(index as usize) {
+            *pending = false;
+        }
+    }
+
+    /// Whether the presentation engine is done with every present of this swapchain that has
+    /// a fence (bounded by [`FRAME_TIMEOUT`]; device loss counts as done, since nothing runs
+    /// after it). Always true without present fences.
+    fn settled(&self, gpu: &Gpu) -> bool {
+        let pending: Vec<vk::Fence> = self
+            .presented
+            .iter()
+            .filter(|(_, pending)| *pending)
+            .map(|(fence, _)| *fence)
+            .collect();
+        if pending.is_empty() {
+            return true;
+        }
+        let timeout = FRAME_TIMEOUT.as_nanos() as u64;
+        matches!(
+            unsafe { gpu.device.wait_for_fences(&pending, true, timeout) },
+            Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST)
+        )
     }
 
     /// The number of images the swapchain has: what the driver made, not what was asked.
@@ -209,6 +302,9 @@ impl Chain {
             }
             for view in self.views {
                 d.destroy_image_view(view, None);
+            }
+            for (fence, _) in self.presented {
+                d.destroy_fence(fence, None);
             }
             gpu.swapchain.destroy_swapchain(self.swapchain, None);
         }
