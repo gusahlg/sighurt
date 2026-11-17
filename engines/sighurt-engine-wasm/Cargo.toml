@@ -36,7 +36,6 @@ dirs = "5"
 percent-encoding = "2"
 getrandom = "0.2"
 rodio = "0.22.2"
-ffmpeg-next = "8.1.0"
 tempfile = "3"
 nokhwa = { version = "0.10.10", features = ["input-native", "camera-sync-impl"] }
 cpal = "0.17.3"
@@ -58,12 +57,20 @@ rustix = { workspace = true, features = ["event", "fs", "termios"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 coremidi = "0.7"
 
+# Video (`video_ffmpeg.rs`). Not on Windows, where FFmpeg would come from vcpkg: there the
+# decoder refuses (`video_none.rs`).
+[target.'cfg(not(windows))'.dependencies]
+ffmpeg-next = "8.1.0"
+
 [dev-dependencies]
 wat = "1"
-# The example and the compositor test mount views on the host's SHM lease. The lease
-# implements `CpuTarget` in sighurt-wayland.
-sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
 # A pty standing in for the runtime's in the `pty` tests.
 rustix = { workspace = true, features = ["pty"] }
+
+# Linux's, as the Wayland host is: the example and the compositor test mount views on the
+# host's SHM lease (which implements `CpuTarget` in sighurt-wayland), and the integration
+# tests' damage helpers are its. Elsewhere only the unit tests (`--lib`) build.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+sighurt-wayland = { path = "../../frontends/sighurt-wayland" }
 # The `wasm-view` example's event loop.
 calloop.workspace = true
