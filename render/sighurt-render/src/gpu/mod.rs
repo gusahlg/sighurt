@@ -391,15 +391,21 @@ fn place(
             }
             Kind::Path { path, stroke, .. } => {
                 let path = scene.path(path);
-                // Rasterized within the buffer, as the CPU backend paints it (its clip, a mask
-                // there, is the batch's scissor here); nothing if the clip shows none of it.
+                // Rasterized within the buffer as the CPU backend paints it, across the buffer
+                // on an axis the path crosses its edge on (`PixelBounds::rasterized_within`),
+                // and kept only where it is inside the buffer: the tile is never larger than
+                // the part shown. Nothing if the item's clip (a mask there, the batch's scissor
+                // here) shows none of it.
                 let coverage = shape::ink_bounds(path, stroke, mapping)
-                    .and_then(|bounds| bounds.within(surface))
-                    .filter(|bounds| {
+                    .and_then(|bounds| Some((bounds.within(surface)?, bounds)))
+                    .filter(|(inside, _)| {
                         let shown = visible(item, mapping, surface);
-                        shown.is_some_and(|shown| bounds.within(shown).is_some())
+                        shown.is_some_and(|shown| inside.within(shown).is_some())
                     })
-                    .and_then(|bounds| shape::coverage(path, stroke, mapping, bounds));
+                    .and_then(|(inside, bounds)| {
+                        let raster = bounds.rasterized_within(surface)?;
+                        shape::coverage(path, stroke, mapping, raster)?.crop(inside)
+                    });
                 icons.push(match coverage {
                     Some(coverage) => {
                         let bounds = coverage.bounds;
