@@ -553,7 +553,9 @@ mod windows_watch {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread::JoinHandle;
 
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{
+        HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
         FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
@@ -662,7 +664,11 @@ mod windows_watch {
         }
 
         pub(super) fn set_wake(&self, wake: Wake) {
-            *self.shared.wake.lock().unwrap_or_else(PoisonError::into_inner) = Some(wake);
+            *self
+                .shared
+                .wake
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(wake);
             if self.shared.changed.load(Ordering::Acquire) {
                 self.shared.ring();
             }
@@ -1495,7 +1501,15 @@ mod tests {
         assert_eq!(rung.load(Ordering::Acquire), 0);
         fs::write(&path, "version = 1\n").unwrap();
         assert!(seen(&watch), "written");
-        assert!(rung.load(Ordering::Acquire) >= 1, "the wake rang");
+        // The flag goes up at the change, the wake rings once the directory has been quiet.
+        let start = Instant::now();
+        while rung.load(Ordering::Acquire) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the wake did not ring"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         write_atomically(&path, "version = 1\n").unwrap();
         assert!(seen(&watch), "replaced");
         fs::remove_file(&path).unwrap();
@@ -1518,6 +1532,91 @@ mod tests {
         assert!(watch.changed());
         fs::remove_file(&path).unwrap();
         assert!(watch.changed());
+    }
+
+    /// The access list keeps another user out, tried as one: on GitHub's runners only (the test
+    /// adds a local user, logs on as it and removes it), in a directory under `C:\` that any user
+    /// may read, beside a file there that the other user can read.
+    #[cfg(windows)]
+    #[test]
+    fn another_user_cannot_read_a_private_directory() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{
+            ImpersonateLoggedOnUser, LogonUserW, RevertToSelf, LOGON32_LOGON_NETWORK,
+            LOGON32_PROVIDER_DEFAULT,
+        };
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            eprintln!(
+                "skipped: this test adds a Windows user, so it runs only on GitHub's runners"
+            );
+            return;
+        }
+        let wide = |text: &str| -> Vec<u16> {
+            std::ffi::OsStr::new(text)
+                .encode_wide()
+                .chain([0])
+                .collect()
+        };
+        let user = format!("sigacl{}", std::process::id() % 100_000);
+        // At most 14 characters, or `net user` asks whether to go on.
+        let password = "Sig-acl-T-1937";
+        let net = |args: &[&str]| {
+            std::process::Command::new("net")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let added = net(&["user", &user, password, "/add", "/y"]);
+        assert!(added.status.success(), "net user /add: {added:?}");
+        let root = std::path::PathBuf::from(format!("C:\\sig-acl-{}", std::process::id()));
+        let private = root.join("private");
+        fs::create_dir_all(&root).unwrap();
+        secure_private_dir(&private).unwrap();
+        fs::write(private.join("history.toml"), "secret").unwrap();
+        fs::write(root.join("open.txt"), "open").unwrap();
+        let mut token = std::ptr::null_mut();
+        // SAFETY: NUL-terminated strings and a valid out pointer.
+        let logged_on = unsafe {
+            LogonUserW(
+                wide(&user).as_ptr(),
+                wide(".").as_ptr(),
+                wide(password).as_ptr(),
+                LOGON32_LOGON_NETWORK,
+                LOGON32_PROVIDER_DEFAULT,
+                &mut token,
+            )
+        };
+        let logon_error = std::io::Error::last_os_error();
+        let (open, secret) = if logged_on != 0 {
+            // SAFETY: the token just returned; this thread only, reverted at once.
+            unsafe { ImpersonateLoggedOnUser(token) };
+            let open = fs::read_to_string(root.join("open.txt"));
+            let secret = fs::read_to_string(private.join("history.toml"));
+            // SAFETY: as above.
+            unsafe {
+                RevertToSelf();
+                CloseHandle(token);
+            }
+            (Some(open), Some(secret))
+        } else {
+            (None, None)
+        };
+        let _ = net(&["user", &user, "/delete"]);
+        let _ = fs::remove_dir_all(&root);
+        assert_ne!(logged_on, 0, "LogonUserW: {logon_error}");
+        let open = open.unwrap();
+        assert_eq!(
+            open.as_deref().ok(),
+            Some("open"),
+            "the other user reads a shared file"
+        );
+        let secret = secret.unwrap();
+        assert_eq!(
+            secret.as_ref().map_err(io::Error::kind).err(),
+            Some(io::ErrorKind::PermissionDenied),
+            "the other user read the private file: {secret:?}"
+        );
     }
 
     #[cfg(windows)]
