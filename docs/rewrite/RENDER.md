@@ -711,7 +711,9 @@ desktop (machine rules); numbers below name the machine.
   scales (1.25, 2, 1.75, 1.33, 1) with tab switches between them.
 - **Present fences close the Vulkan backend's known gap** (§13 lane 3): with
   `VK_EXT_swapchain_maintenance1` (and the instance's `VK_EXT_surface_maintenance1`,
-  `VK_KHR_get_surface_capabilities2`), each present signals a fence per image; a swapchain,
+  `VK_KHR_get_surface_capabilities2`), each present signals a fence (from a small pool per
+  swapchain, taken back once seen signalled, never waited for before a present unless 8 are
+  pending; an A/B showed no render-time cost); a swapchain,
   retired by `oldSwapchain` or destroyed, goes only after its pending present fences signal
   (bounded, 2 s; otherwise it is leaked, and then so are the device and instance it came
   from, since a parent may not die before a child). With present fences `Gpu::idle` is a
