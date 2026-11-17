@@ -2914,10 +2914,21 @@ fn garbage_answers_to_the_probe_are_survived() {
 
 /// A megabyte of random terminal input as the answer to the probe: `sig` starts, answers its
 /// diagnostics signal, and SIGTERM still quits it and restores the terminal.
+///
+/// What of the answer comes after the probe's deadline is typing. On Linux the pty takes the
+/// whole megabyte before the deadline; a macOS pty holds about a kilobyte, so there most of it
+/// arrives later, as some 500 000 keystrokes. With the default keys (`?` and F1 open sig://help
+/// in a new tab, `t` a tab, `x` closes one) that is hundreds of sig pages, each a Wasm guest,
+/// and `sig` takes the rest at about 20 KiB a second (as fast on Linux when it is typed: the
+/// temporary experiment of Ports run 44040226305, and on louise-pc), longer than the watchdog's
+/// 40 s: the watchdog killed `sig`, and the fake terminal then waited 30 s on a dead process
+/// (runs 43818654935, 43821547281, 43842878416). Not a stall. Here the keys do nothing but
+/// reach the page, as in the random-input test below, so the test is about the answer.
 #[test]
 fn a_megabyte_of_garbage_as_the_probes_answer_is_survived() {
     let replies: &'static [u8] = Box::leak(random_input(0x5eed, 1 << 20).into_boxed_slice());
-    let mut term = Terminal::start_with("garbage-1mb", &["demo://pattern"], replies);
+    let bindings = "[input]\nkeymap = \"bindings\"";
+    let mut term = Terminal::start_in("garbage-1mb", &["demo://pattern"], replies, bindings);
     let shown = term.wait(0, Duration::from_secs(20), |got| has(got, b"[1/"));
     assert!(shown, "no tab line\n{}", term.context());
     let (_, tabs) = term.tabs();
