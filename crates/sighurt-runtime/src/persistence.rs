@@ -35,7 +35,8 @@
 //! last one seen. On Windows a thread of the watch waits on `ReadDirectoryChangesW` for the
 //! directory and rings the frontend's wake ([`ConfigWatch::set_wake`]) once a change naming the
 //! file (written, created, deleted, renamed to or from) has been followed by 100 ms without
-//! another, so an editor's burst of writes is read once. Other systems have no watch
+//! another change to it (other files' changes do not count, and a lost batch of changes counts
+//! as one to it), so an editor's burst of writes is read once. Other systems have no watch
 //! ([`ConfigWatch::new`] says so) and read the file at startup only.
 //!
 //! Sessions are written atomically (a temporary file in the same directory, synced, then renamed
@@ -556,9 +557,10 @@ mod windows_watch {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
-        HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_NOTIFY_ENUM_DIR, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
@@ -567,7 +569,7 @@ mod windows_watch {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, INFINITE,
+        CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
     };
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -693,16 +695,35 @@ mod windows_watch {
         }
     }
 
-    /// The thread: reads the directory's changes until `stop` is set or a read fails; a change
-    /// naming `name` (lowercase: the file system ignores case) raises the flag, and the wake
-    /// rings once [`QUIET_MS`] pass with no further change.
+    /// The thread: reads the directory's changes until `stop` is set or a read fails for good. A
+    /// change naming `name` (lowercase: the file system ignores case) raises the flag and moves
+    /// the wake's deadline to [`QUIET_MS`] later; changes to other files move nothing, so a
+    /// busy directory (the session and the history are written there) never holds a reload
+    /// back. The wake rings when the deadline passes. `stop` comes first in every wait (the
+    /// lowest signalled handle wins), so a storm of changes cannot keep the thread from seeing
+    /// it, and is looked at again before each read. Changes lost to an overflow
+    /// (`ERROR_NOTIFY_ENUM_DIR`, or a read with no bytes) count as a change to the file.
     fn watch(directory: &Directory, io: &Event, stop: &Event, name: &str, shared: &Shared) {
         // u32s, for the alignment the notifications need.
         let mut buffer = vec![0u32; BUFFER_BYTES / 4];
         let filter =
             FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
-        let mut pending = false;
+        let mut due: Option<Instant> = None;
+        let changed = |due: &mut Option<Instant>| {
+            shared.changed.store(true, Ordering::Release);
+            *due = Some(Instant::now() + Duration::from_millis(u64::from(QUIET_MS)));
+        };
+        let stopped = || {
+            // SAFETY: a live event handle; no wait.
+            unsafe { WaitForSingleObject(stop.raw(), 0) == WAIT_OBJECT_0 }
+        };
+        let gave_up = |error: io::Error| {
+            log::warn!("the configuration is no longer watched: {error}");
+        };
         loop {
+            if stopped() {
+                return;
+            }
             // SAFETY: zeroed is a valid OVERLAPPED; the event is this thread's.
             let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
             overlapped.hEvent = io.raw();
@@ -722,25 +743,31 @@ mod windows_watch {
                 )
             };
             if started == 0 {
-                log::warn!(
-                    "the configuration watch stopped: {}",
-                    io::Error::last_os_error()
-                );
-                return;
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR as i32) {
+                    changed(&mut due);
+                    continue;
+                }
+                return gave_up(error);
             }
-            let handles = [io.raw(), stop.raw()];
-            // The read stays pending while a change waits for its quiet moment.
+            let handles = [stop.raw(), io.raw()];
+            // The read stays pending while the wake waits for its deadline.
             let woke = loop {
-                let timeout = if pending { QUIET_MS } else { INFINITE };
+                let timeout = due.map_or(INFINITE, |due| {
+                    let left = due.saturating_duration_since(Instant::now());
+                    u32::try_from(left.as_millis()).unwrap_or(u32::MAX)
+                });
                 // SAFETY: two live event handles.
                 let woke = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout) };
+                if due.is_some_and(|due| Instant::now() >= due) {
+                    due = None;
+                    shared.ring();
+                }
                 if woke != WAIT_TIMEOUT {
                     break woke;
                 }
-                pending = false;
-                shared.ring();
             };
-            if woke != WAIT_OBJECT_0 {
+            if woke != WAIT_OBJECT_0 + 1 {
                 // Stopped (or the wait failed): the read is cancelled and waited for, so the
                 // buffer is free when the thread ends.
                 let mut bytes = 0;
@@ -754,17 +781,16 @@ mod windows_watch {
             let mut bytes = 0;
             // SAFETY: the read completed (its event is set).
             if unsafe { GetOverlappedResult(directory.raw(), &overlapped, &mut bytes, 0) } == 0 {
-                log::warn!(
-                    "the configuration watch stopped: {}",
-                    io::Error::last_os_error()
-                );
-                return;
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR as i32) {
+                    changed(&mut due);
+                    continue;
+                }
+                return gave_up(error);
             }
             // No bytes: more changed than the buffer held, the file perhaps among them.
-            let hit = bytes == 0 || names(&buffer, bytes as usize).any(|changed| changed == name);
-            if hit {
-                shared.changed.store(true, Ordering::Release);
-                pending = true;
+            if bytes == 0 || names(&buffer, bytes as usize).any(|changed| changed == name) {
+                changed(&mut due);
             }
         }
     }
@@ -1519,6 +1545,71 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert!(seen(&watch), "deleted");
         drop(watch);
+    }
+
+    /// Windows' watch in a busy directory: another file written every 20 ms holds back neither
+    /// the configuration's wake nor dropping the watch.
+    #[cfg(windows)]
+    #[test]
+    fn a_busy_directory_holds_back_neither_the_wake_nor_the_end() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let watch = ConfigWatch::new(&path).unwrap();
+        let rung = Arc::new(AtomicUsize::new(0));
+        let count = rung.clone();
+        watch.set_wake(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+        });
+        let busy = Arc::new(AtomicBool::new(true));
+        let noise = {
+            let (busy, other) = (busy.clone(), dir.path().join("session.toml"));
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while busy.load(Ordering::Acquire) {
+                    let _ = fs::write(&other, n.to_string());
+                    n += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        fs::write(&path, "version = 1\n").unwrap();
+        let start = Instant::now();
+        while rung.load(Ordering::Acquire) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "the wake did not ring while another file kept changing"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(watch.changed());
+        // A storm: as many writes as the disk takes, while the watch is dropped.
+        let storm = {
+            let (busy, dir) = (busy.clone(), dir.path().to_owned());
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while busy.load(Ordering::Acquire) {
+                    let _ = fs::write(dir.join(format!("storm{}", n % 64)), "x");
+                    n += 1;
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let (dropped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(watch);
+            let _ = dropped.send(());
+        });
+        let ended = done.recv_timeout(Duration::from_secs(5));
+        busy.store(false, Ordering::Release);
+        noise.join().unwrap();
+        storm.join().unwrap();
+        assert!(
+            ended.is_ok(),
+            "dropping the watch hung in a storm of changes"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
