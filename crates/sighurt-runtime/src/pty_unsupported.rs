@@ -1,9 +1,8 @@
 //! The programs of `sig://terminal` and `sig://config` on a system this build cannot start them
-//! on: anything but Linux, for now. [`Ptys::open`] refuses with the reason ([`UNSUPPORTED`]),
-//! no program is ever started, and [`editor`] finds none. The module has the shape of the Linux
-//! one (`pty.rs`), which needs pidfds and `close_range`; macOS needs a kqueue `EVFILT_PROC`
-//! watch and a loop that closes descriptors in the child instead, Windows ConPTY and a job
-//! object (docs/rewrite/PORTING.md).
+//! on: anything but Linux and macOS, for now. [`Ptys::open`] refuses with the reason
+//! ([`UNSUPPORTED`]), no program is ever started, and [`editor`] finds none. The module has the
+//! shape of the Unix one (`pty.rs`); Windows needs ConPTY and a job object
+//! (docs/rewrite/PORTING.md).
 //!
 //! Owns: the refusal. Must not own: the policy (the core's) or what the page shows.
 
@@ -18,8 +17,8 @@ use sighurt_api::services::{PtyProgram, ServiceError, ServiceResult};
 pub const RUNS_PROGRAMS: bool = false;
 
 /// Why no program starts here.
-pub const UNSUPPORTED: &str = "sig://terminal and sig://config run programs on Linux only, \
-                               for now: this system has no terminal programs in sig";
+pub const UNSUPPORTED: &str = "sig://terminal and sig://config run programs on Linux and macOS \
+                               only, for now: this system has no terminal programs in sig";
 
 /// What a program would be started with, from the configuration and the session's paths.
 #[derive(Clone, Copy, Debug)]

@@ -17,11 +17,11 @@ pub mod history;
 pub mod home;
 pub mod page_info;
 pub mod persistence;
-/// The programs of `sig://terminal` and `sig://config`. Linux only for now: elsewhere a module of
-/// the same shape refuses to start them (`pty_unsupported.rs`, docs/rewrite/PORTING.md).
-#[cfg(target_os = "linux")]
+/// The programs of `sig://terminal` and `sig://config`. Linux and macOS: elsewhere a module of the
+/// same shape refuses to start them (`pty_unsupported.rs`, docs/rewrite/PORTING.md).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod pty;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[path = "pty_unsupported.rs"]
 pub mod pty;
 pub mod registry;

@@ -899,8 +899,8 @@ impl<P: Terminal> App<P> {
                         Line::new("This sig starts no programs on this system.", WARNING).bold(),
                     );
                     lines.push(Line::new(
-                        "sig://config and sig://terminal run programs on Linux only, for now. \
-                         Edit sig's configuration file with any editor:",
+                        "sig://config and sig://terminal run programs on Linux and macOS only, \
+                         for now. Edit sig's configuration file with any editor:",
                         WARNING,
                     ));
                     lines.push(Line::new(format!("    {}", info.file), FOREGROUND));

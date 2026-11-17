@@ -42,11 +42,11 @@ pub mod net;
 pub mod pages;
 pub mod permissions;
 mod pool;
-/// The master side of `sig://terminal`. Linux only, as the runtime's programs are: elsewhere a
-/// module of the same shape that never gets a master (`pty_unsupported.rs`).
-#[cfg(target_os = "linux")]
+/// The master side of `sig://terminal`. Linux and macOS, as the runtime's programs are: elsewhere
+/// a module of the same shape that never gets a master (`pty_unsupported.rs`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod pty;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[path = "pty_unsupported.rs"]
 pub mod pty;
 mod raster;

@@ -11,9 +11,12 @@
 //! set, starts the program as the leader of a new session with the slave as its controlling
 //! terminal, and hands the master to the Wasm engine under a new [`PtySession`], which the
 //! answer carries; nothing here keeps a copy of it. Every descriptor is close-on-exec from its creation, so no other child of
-//! `sig` inherits a master or a slave.
+//! `sig` inherits a master or a slave (on macOS the master is opened as `/dev/ptmx` with
+//! `O_CLOEXEC`, which `posix_openpt` does not take, and the watch is a kqueue, which no child
+//! inherits).
 //!
-//! Each program has a watcher thread that holds the unreaped child and its pidfd. Cancelling
+//! Each program has a watcher thread that holds the unreaped child and a watch of its exit (a
+//! pidfd on Linux, a kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS: [`exit_watch`]). Cancelling
 //! ([`Ptys::cancel`]; closing the tab, navigating away, reloading, quitting) wakes it: SIGHUP and
 //! SIGCONT to the program's process group, SIGKILL to the group after [`GRACE`], and the program
 //! reaped. Signals go out only while the program is unreaped, so its pid, which is also its
@@ -48,12 +51,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
-use rustix::pipe::PipeFlags;
-use rustix::process::{Pid, PidfdFlags, Signal};
-use rustix::pty::OpenptFlags;
+use rustix::process::{Pid, Signal};
 use rustix::termios::{InputModes, OptionalActions, Winsize};
 use sighurt_api::ids::{PtySession, RequestId};
 use sighurt_api::services::{PtyProgram, ServiceError, ServiceReply, ServiceResult};
@@ -470,27 +470,23 @@ impl Ptys {
             let program = exec.argv[0].to_string_lossy();
             format!("could not start {program}: {err}")
         };
-        let (woken, wake) =
-            rustix::pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|e| failed(e.into()))?;
         let (master, mut child) = spawn(exec, cols, rows).map_err(failed)?;
         // The child cannot be reaped before the watcher waits for it, so its pid is its own.
-        let pidfd = match rustix::process::pidfd_open(Pid::from_child(&child), PidfdFlags::empty())
-        {
-            Ok(pidfd) => pidfd,
+        let pid = Pid::from_child(&child);
+        let (exits, wake) = match exit_watch::new(&child) {
+            Ok(watch) => watch,
             Err(err) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(failed(err.into()));
+                return Err(failed(err));
             }
         };
-        // To kill the program if there is no thread to watch it.
-        let spare = pidfd.try_clone();
         let exit = Arc::new(Exit::default());
         let (watched, ended, owner) = (exit.clone(), self.ended.clone(), self.wake.clone());
         let watcher = std::thread::Builder::new()
             .name("sighurt-pty-watch".into())
             .spawn(move || {
-                let status = watch(child, &pidfd, &woken);
+                let status = watch(child, &exits);
                 // The place is given back before the exit is told: whoever waits for the exit
                 // (`Ptys::shutdown`) then finds it free.
                 drop(counted);
@@ -501,11 +497,9 @@ impl Ptys {
                 owner();
             });
         if let Err(err) = watcher {
-            // The closure owned the child and dropped it unreaped: kill it, though it stays a
-            // zombie until sig exits.
-            if let Ok(pidfd) = spare {
-                let _ = rustix::process::pidfd_send_signal(&pidfd, Signal::KILL);
-            }
+            // The closure owned the child and dropped it unreaped, so its pid is still its own:
+            // kill it, though it stays a zombie until sig exits.
+            let _ = rustix::process::kill_process(pid, Signal::KILL);
             return Err(format!("could not watch the program: {err}"));
         }
         let session = Session {
@@ -527,11 +521,11 @@ impl Drop for Counted {
     }
 }
 
-/// A program the watcher thread holds. Dropping it closes `_wake`, which tells the watcher to
+/// A program the watcher thread holds. Dropping it drops `_wake`, which tells the watcher to
 /// end the program, and closes the master if the engine never took it.
 #[derive(Debug)]
 struct Session {
-    _wake: OwnedFd,
+    _wake: exit_watch::Dropped,
     exit: Arc<Exit>,
     pty: PtySession,
 }
@@ -545,32 +539,27 @@ impl Drop for Session {
 
 /// The watcher: waits for the program to exit or for the session to be dropped; on the latter,
 /// SIGHUP and SIGCONT to its process group, SIGKILL after [`GRACE`]. Then reaps it.
-fn watch(mut child: Child, pidfd: &OwnedFd, woken: &OwnedFd) -> ExitStatus {
+fn watch(mut child: Child, exits: &exit_watch::Watch) -> ExitStatus {
     let group = Pid::from_child(&child);
     let mut kill_at: Option<Instant> = None;
     let mut killed = false;
     loop {
-        let mut fds = vec![PollFd::new(pidfd, PollFlags::IN)];
-        if kill_at.is_none() {
-            fds.push(PollFd::new(woken, PollFlags::IN));
-        }
         let timeout = kill_at
             .filter(|_| !killed)
-            .map(|at| at.saturating_duration_since(Instant::now()))
-            .and_then(|left| Timespec::try_from(left).ok());
-        match rustix::event::poll(&mut fds, timeout.as_ref()) {
-            Ok(_) | Err(Errno::INTR) => {}
+            .map(|at| at.saturating_duration_since(Instant::now()));
+        let woke = match exits.wait(kill_at.is_none(), timeout) {
+            Ok(woke) => woke,
+            Err(Errno::INTR) => Woke::default(),
             // Nothing to wait with: end it now.
-            Err(_) => kill_at = Some(Instant::now()),
-        }
-        if fds[0]
-            .revents()
-            .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-        {
+            Err(_) => {
+                kill_at = Some(Instant::now());
+                Woke::default()
+            }
+        };
+        if woke.exited {
             break;
         }
-        // The session was dropped (its end of the pipe closed).
-        if fds.get(1).is_some_and(|fd| !fd.revents().is_empty()) {
+        if woke.dropped {
             let _ = rustix::process::kill_process_group(group, Signal::HUP);
             let _ = rustix::process::kill_process_group(group, Signal::CONT);
             kill_at = Some(Instant::now() + GRACE);
@@ -578,7 +567,7 @@ fn watch(mut child: Child, pidfd: &OwnedFd, woken: &OwnedFd) -> ExitStatus {
         if !killed && kill_at.is_some_and(|at| Instant::now() >= at) {
             let _ = rustix::process::kill_process_group(group, Signal::KILL);
             // In case it left its group.
-            let _ = rustix::process::pidfd_send_signal(pidfd, Signal::KILL);
+            exits.kill();
             killed = true;
         }
     }
@@ -588,6 +577,232 @@ fn watch(mut child: Child, pidfd: &OwnedFd, woken: &OwnedFd) -> ExitStatus {
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             // Only ECHILD: someone else reaped it. Report it as killed.
             Err(_) => return ExitStatus::from_raw(libc::SIGKILL),
+        }
+    }
+}
+
+/// What a watcher's wait saw.
+#[derive(Clone, Copy, Debug, Default)]
+struct Woke {
+    /// The program exited (it is not reaped yet).
+    exited: bool,
+    /// The session was dropped.
+    dropped: bool,
+}
+
+/// What a watcher waits on: the program's exit, and its session dropped. On Linux a pidfd, and a
+/// pipe whose write end the session holds ([`Dropped`]).
+#[cfg(target_os = "linux")]
+mod exit_watch {
+    use std::io;
+    use std::os::fd::OwnedFd;
+    use std::process::Child;
+    use std::time::Duration;
+
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    use rustix::io::Errno;
+    use rustix::pipe::PipeFlags;
+    use rustix::process::{Pid, PidfdFlags, Signal};
+
+    use super::Woke;
+
+    pub(super) struct Watch {
+        pidfd: OwnedFd,
+        woken: OwnedFd,
+    }
+
+    /// The session's end of the pipe: dropping it wakes the watcher.
+    #[derive(Debug)]
+    pub(super) struct Dropped(#[allow(dead_code)] OwnedFd);
+
+    /// Watches `child`, which must not have been reaped.
+    pub(super) fn new(child: &Child) -> io::Result<(Watch, Dropped)> {
+        let (woken, wake) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC)?;
+        let pidfd = rustix::process::pidfd_open(Pid::from_child(child), PidfdFlags::empty())?;
+        Ok((Watch { pidfd, woken }, Dropped(wake)))
+    }
+
+    impl Watch {
+        /// Waits for the program's exit and, if `dropped`, for the session's end, at most
+        /// `timeout` (`None`: as long as it takes).
+        pub(super) fn wait(&self, dropped: bool, timeout: Option<Duration>) -> Result<Woke, Errno> {
+            let mut fds = vec![PollFd::new(&self.pidfd, PollFlags::IN)];
+            if dropped {
+                fds.push(PollFd::new(&self.woken, PollFlags::IN));
+            }
+            let timeout = timeout.and_then(|left| Timespec::try_from(left).ok());
+            rustix::event::poll(&mut fds, timeout.as_ref())?;
+            Ok(Woke {
+                exited: fds[0]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
+                // The session's end of the pipe closed.
+                dropped: fds.get(1).is_some_and(|fd| !fd.revents().is_empty()),
+            })
+        }
+
+        /// SIGKILL to the program itself.
+        pub(super) fn kill(&self) {
+            let _ = rustix::process::pidfd_send_signal(&self.pidfd, Signal::KILL);
+        }
+    }
+}
+
+/// What a watcher waits on: the program's exit, and its session dropped. On macOS one kqueue,
+/// with the program's `EVFILT_PROC`/`NOTE_EXIT` and an `EVFILT_USER` event that the session
+/// triggers when it is dropped ([`Dropped`]). No child inherits a kqueue, so no program `sig`
+/// starts can hold the session's end open, as one could a pipe made without `pipe2`.
+#[cfg(target_os = "macos")]
+mod exit_watch {
+    use std::io;
+    use std::os::fd::OwnedFd;
+    use std::process::Child;
+    use std::ptr::null_mut;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rustix::buffer::spare_capacity;
+    use rustix::event::kqueue::{
+        kevent, kqueue, Event, EventFilter, EventFlags, ProcessEvents, UserDefinedFlags, UserFlags,
+    };
+    use rustix::io::Errno;
+    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
+
+    use super::Woke;
+
+    /// The `EVFILT_USER` event's identifier.
+    const DROPPED: isize = 1;
+
+    pub(super) struct Watch {
+        kqueue: Arc<OwnedFd>,
+        pid: Pid,
+        /// The program had exited when the watch was made.
+        gone: bool,
+    }
+
+    /// Triggers the watcher's `EVFILT_USER` event when dropped.
+    #[derive(Debug)]
+    pub(super) struct Dropped(Arc<OwnedFd>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            let trigger = user(UserFlags::TRIGGER, EventFlags::empty());
+            let _ = change(&self.0, trigger);
+        }
+    }
+
+    fn user(flags: UserFlags, action: EventFlags) -> Event {
+        let filter = EventFilter::User {
+            ident: DROPPED,
+            flags,
+            user_flags: UserDefinedFlags::new(0),
+        };
+        Event::new(filter, action, null_mut())
+    }
+
+    fn change(kqueue: &OwnedFd, event: Event) -> Result<(), Errno> {
+        let mut none: Vec<Event> = Vec::new();
+        // SAFETY: neither event names a descriptor.
+        unsafe { kevent(kqueue, &[event], &mut none, Some(Duration::ZERO)) }.map(drop)
+    }
+
+    /// Watches `child`, which must not have been reaped.
+    pub(super) fn new(child: &Child) -> io::Result<(Watch, Dropped)> {
+        let kqueue = Arc::new(kqueue()?);
+        let pid = Pid::from_child(child);
+        change(
+            &kqueue,
+            user(UserFlags::empty(), EventFlags::ADD | EventFlags::CLEAR),
+        )?;
+        let exit = Event::new(
+            EventFilter::Proc {
+                pid,
+                flags: ProcessEvents::EXIT,
+            },
+            EventFlags::ADD | EventFlags::ONESHOT,
+            null_mut(),
+        );
+        let gone = match change(&kqueue, exit) {
+            // An exit before the watch would never be told: a zombie is looked for.
+            Ok(()) => rustix::process::waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )?
+            .is_some(),
+            // Exiting, or a zombie (unreaped, so the pid is still the child's).
+            Err(Errno::SRCH) => true,
+            Err(err) => return Err(err.into()),
+        };
+        let dropped = Dropped(kqueue.clone());
+        Ok((Watch { kqueue, pid, gone }, dropped))
+    }
+
+    impl Watch {
+        /// Waits for the program's exit and, if `dropped`, for the session's end, at most
+        /// `timeout` (`None`: as long as it takes).
+        pub(super) fn wait(&self, dropped: bool, timeout: Option<Duration>) -> Result<Woke, Errno> {
+            if self.gone {
+                return Ok(Woke {
+                    exited: true,
+                    dropped: false,
+                });
+            }
+            let mut events: Vec<Event> = Vec::with_capacity(2);
+            // SAFETY: neither event names a descriptor. Into the spare capacity: a `&mut Vec`
+            // is a buffer of its length, which would ask for no events and wait for none.
+            unsafe { kevent(&*self.kqueue, &[], spare_capacity(&mut events), timeout)? };
+            let mut woke = Woke::default();
+            for event in &events {
+                match event.filter() {
+                    EventFilter::Proc { .. } => woke.exited = true,
+                    // Triggered while not asked for (after the SIGHUP): nothing new.
+                    EventFilter::User { .. } => woke.dropped = dropped,
+                    _ => {}
+                }
+            }
+            Ok(woke)
+        }
+
+        /// SIGKILL to the program itself (unreaped, so the pid is still its own).
+        pub(super) fn kill(&self) {
+            let _ = rustix::process::kill_process(self.pid, Signal::KILL);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::process::Command;
+
+        use super::*;
+
+        #[test]
+        fn the_watch_sees_an_exit_and_the_session_dropped() {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "sleep 0.3; exit 3"])
+                .spawn()
+                .unwrap();
+            let (watch, _dropped) = new(&child).unwrap();
+            eprintln!("gone when watched: {}", watch.gone);
+            let woke = watch.wait(true, Some(Duration::from_secs(5)));
+            eprintln!("the exit: {woke:?}");
+            assert!(woke.is_ok_and(|woke| woke.exited), "{woke:?}");
+            assert_eq!(child.wait().unwrap().code(), Some(3));
+
+            let mut child = Command::new("/bin/sleep").arg("10").spawn().unwrap();
+            let (watch, dropped) = new(&child).unwrap();
+            eprintln!("gone when watched: {}", watch.gone);
+            drop(dropped);
+            let woke = watch.wait(true, Some(Duration::from_secs(5)));
+            eprintln!("the drop: {woke:?}");
+            assert!(
+                woke.is_ok_and(|woke| woke.dropped && !woke.exited),
+                "{woke:?}"
+            );
+            watch.kill();
+            let woke = watch.wait(false, Some(Duration::from_secs(5)));
+            eprintln!("the kill: {woke:?}");
+            assert!(woke.is_ok_and(|woke| woke.exited), "{woke:?}");
+            let _ = child.wait();
         }
     }
 }
@@ -632,8 +847,20 @@ impl Exit {
 /// are closed before this returns, so the master reads end-of-file once the session has closed
 /// its side.
 fn spawn(exec: &Exec, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> {
-    let master =
-        rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+    #[cfg(target_os = "linux")]
+    let master = rustix::pty::openpt(
+        rustix::pty::OpenptFlags::RDWR
+            | rustix::pty::OpenptFlags::NOCTTY
+            | rustix::pty::OpenptFlags::CLOEXEC,
+    )?;
+    // `posix_openpt` is `open` of `/dev/ptmx` there, and takes no `O_CLOEXEC`: open it so,
+    // close-on-exec from the start.
+    #[cfg(target_os = "macos")]
+    let master = rustix::fs::open(
+        "/dev/ptmx",
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
     rustix::pty::grantpt(&master)?;
     rustix::pty::unlockpt(&master)?;
     let name = rustix::pty::ptsname(&master, Vec::new())?;
@@ -668,14 +895,19 @@ fn spawn(exec: &Exec, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> {
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave));
+    // macOS has no close_range: the child marks each descriptor below the table's size, read
+    // here before the fork, close-on-exec.
+    #[cfg(target_os = "macos")]
+    // SAFETY: getdtablesize(3) reads the process's limit.
+    let table = unsafe { libc::getdtablesize() };
     // SAFETY: the closure runs in the child between fork and exec, where only async-signal-safe
     // functions may be called. Everything it needs was prepared before the fork (std builds argv,
     // the environment and the directory as C strings first); it calls only setsid, ioctl,
     // tcsetpgrp, getpid, sigaction (through `signal`), sigprocmask and close_range (a raw
-    // syscall), all async-signal-safe; it allocates nothing, logs nothing and takes no lock.
-    // `io::Error::last_os_error` only reads errno.
+    // syscall; fcntl on macOS), all async-signal-safe; it allocates nothing, logs nothing and
+    // takes no lock. `io::Error::last_os_error` only reads errno.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             // A session of its own: no controlling terminal yet, and signals to its group
             // reach nothing of sig's.
             if libc::setsid() == -1 {
@@ -700,14 +932,23 @@ fn spawn(exec: &Exec, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> {
             // Seal every other descriptor: mark, don't close, so std's pipe that reports a
             // failed exec survives until the exec. A kernel that can't (before 5.11) fails the
             // launch.
-            let sealed = libc::syscall(
-                libc::SYS_close_range,
-                3u32,
-                u32::MAX,
-                libc::CLOSE_RANGE_CLOEXEC,
-            );
-            if sealed == -1 {
-                return Err(io::Error::last_os_error());
+            #[cfg(target_os = "linux")]
+            {
+                let sealed = libc::syscall(
+                    libc::SYS_close_range,
+                    3u32,
+                    u32::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                );
+                if sealed == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            // One by one below the table's size, the soft limit of open files (above it is only
+            // what was opened before the limit was lowered): EBADF for those not open.
+            #[cfg(target_os = "macos")]
+            for fd in 3..table {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
             Ok(())
         });
@@ -722,6 +963,7 @@ fn spawn(exec: &Exec, cols: u16, rows: u16) -> io::Result<(OwnedFd, Child)> {
 mod tests {
     use std::os::fd::AsFd;
 
+    use rustix::event::{PollFd, PollFlags, Timespec};
     use rustix::process::WaitOptions;
 
     use super::*;
@@ -882,10 +1124,15 @@ mod tests {
     /// Whether `pid` is neither alive nor a zombie of this process.
     fn gone(pid: i32) -> bool {
         let pid = Pid::from_raw(pid).unwrap();
-        matches!(
+        let reaped = matches!(
             rustix::process::waitpid(Some(pid), WaitOptions::NOHANG),
             Err(Errno::CHILD)
-        ) && !Path::new(&format!("/proc/{}", pid.as_raw_nonzero())).exists()
+        );
+        #[cfg(target_os = "linux")]
+        let gone = !Path::new(&format!("/proc/{}", pid.as_raw_nonzero())).exists();
+        #[cfg(target_os = "macos")]
+        let gone = rustix::process::test_kill_process(pid) == Err(Errno::SRCH);
+        reaped && gone
     }
 
     #[test]
@@ -1169,11 +1416,26 @@ mod tests {
         let _serial = serial();
         let (home, vars) = home();
         let ptys = ptys();
+        #[cfg(target_os = "linux")]
         let script = "ls /proc/self/fd | tr '\\n' ' '; echo; \
                       env | sort | tr '\\n' ' '; echo; \
                       echo \"$(tty)\"; pwd; \
                       grep -E '^Sig(Ign|Blk)' /proc/self/status | tr '\\n' ' '; echo; \
                       [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && echo all-ttys";
+        // No /proc: the descriptors the shell has open are those a builtin can duplicate (`:
+        // <&N` fails for a closed one; ls(1) would add its own), and Python, exec'd so that it
+        // is the shell's own heir, says whether SIGUSR2 is ignored and which signals are
+        // blocked (ps(1) there shows no ignored signals).
+        #[cfg(target_os = "macos")]
+        let script =
+            "for fd in 0 1 2 3 4 5 6 7 8 9; do (: <&$fd) 2>/dev/null && printf '%s ' $fd; done; \
+                      echo; \
+                      env | sort | tr '\\n' ' '; echo; \
+                      echo \"$(tty)\"; pwd; \
+                      [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && echo all-ttys; \
+                      exec python3 -c 'import signal; print(\"ignored\", \
+                      signal.getsignal(signal.SIGUSR2) == signal.SIG_IGN, \"blocked\", \
+                      len(signal.pthread_sigmask(signal.SIG_BLOCK, [])))'";
         // As sig ignores and blocks signals, so does this test while it starts the child: an
         // ignored disposition and the forking thread's mask would otherwise be inherited. A
         // stray descriptor without close-on-exec, too.
@@ -1199,9 +1461,13 @@ mod tests {
         let out = read_all(&master);
         let lines: Vec<_> = out.lines().map(str::trim).collect();
         // `tty` is in `$(…)` and echoed: uutils' `tty` (Ubuntu 26.04's) prints no newline.
-        // `ls` itself opens its directory: 0, 1, 2 and that one.
+        // `ls` itself opens its directory: 0, 1, 2 and that one. On macOS the shell's own
+        // descriptors: 0, 1 and 2 only.
         let fds: Vec<_> = lines[0].split_whitespace().collect();
+        #[cfg(target_os = "linux")]
         assert_eq!(fds.len(), 4, "{out}");
+        #[cfg(target_os = "macos")]
+        assert_eq!(fds.len(), 3, "{out}");
         assert_eq!(&fds[..3], ["0", "1", "2"], "{out}");
         let env = lines[1];
         assert!(env.contains("TERM=xterm-256color"), "{env}");
@@ -1220,16 +1486,29 @@ mod tests {
         ] {
             assert!(!env.contains(gone), "{gone} in {env}");
         }
+        #[cfg(target_os = "linux")]
         assert!(lines[2].starts_with("/dev/pts/"), "{out}");
+        #[cfg(target_os = "macos")]
+        assert!(lines[2].starts_with("/dev/ttys"), "{out}");
         assert_eq!(
             Path::new(lines[3]),
             home.path().canonicalize().unwrap(),
             "{out:?}"
         );
-        // What `grep`, the shell's child, inherited.
-        assert!(lines[4].contains("SigIgn:\t0000000000000000"), "{out}");
-        assert!(lines[4].contains("SigBlk:\t0000000000000000"), "{out}");
-        assert_eq!(lines[5], "all-ttys", "{out}");
+        #[cfg(target_os = "linux")]
+        {
+            // What `grep`, the shell's child, inherited.
+            assert!(lines[4].contains("SigIgn:\t0000000000000000"), "{out}");
+            assert!(lines[4].contains("SigBlk:\t0000000000000000"), "{out}");
+            assert_eq!(lines[5], "all-ttys", "{out}");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(lines[4], "all-ttys", "{out}");
+            // What Python, which took the shell's place, inherited: SIGUSR2 not ignored,
+            // nothing blocked.
+            assert_eq!(lines[5], "ignored False blocked 0", "{out}");
+        }
         assert_eq!(exit_code(exited(&exit, Duration::from_secs(5))), 0);
         assert_eq!(ptys.live(), 0);
     }
@@ -1239,32 +1518,46 @@ mod tests {
         let _serial = serial();
         let (_home, vars) = home();
         let ptys = ptys();
-        let (master, _session, _exit) = start(
-            &ptys,
-            &sh(
-                "echo pid=$$; cat /proc/self/stat; exec </dev/tty && echo ctty",
-                &vars,
-            ),
-            80,
-            24,
-        );
+        #[cfg(target_os = "linux")]
+        let script = "echo pid=$$; cat /proc/self/stat; exec </dev/tty && echo ctty";
+        // ps(1) on the shell: its group, the terminal's foreground group, its state (`s` leads
+        // its session, `+` is in the foreground) and its terminal.
+        #[cfg(target_os = "macos")]
+        let script = "echo pid=$$; ps -o pgid=,tpgid=,stat=,tt= -p $$; exec </dev/tty && echo ctty";
+        let (master, _session, _exit) = start(&ptys, &sh(script, &vars), 80, 24);
         let out = read_all(&master);
-        let stat = out.lines().nth(1).unwrap();
-        let fields: Vec<_> = stat
-            .rsplit_once(')')
-            .unwrap()
-            .1
-            .split_whitespace()
-            .collect();
-        // `cat` is the shell's child: its group and session are the shell's pid, and its group
-        // is the terminal's foreground group (tpgid).
-        let pid = pid_in(&out).to_string();
-        assert_eq!(
-            (fields[2], fields[3], fields[5]),
-            (pid.as_str(), pid.as_str(), pid.as_str()),
-            "{stat}"
-        );
-        assert_ne!(fields[4], "0", "a controlling tty: {stat}");
+        #[cfg(target_os = "macos")]
+        {
+            let pid = pid_in(&out).to_string();
+            let fields: Vec<_> = out.lines().nth(1).unwrap().split_whitespace().collect();
+            assert_eq!(fields.len(), 4, "{out}");
+            assert_eq!(
+                (fields[0], fields[1]),
+                (pid.as_str(), pid.as_str()),
+                "{out}"
+            );
+            assert!(fields[2].contains('s') && fields[2].contains('+'), "{out}");
+            assert_ne!(fields[3], "??", "a controlling tty: {out}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let stat = out.lines().nth(1).unwrap();
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect();
+            // `cat` is the shell's child: its group and session are the shell's pid, and its
+            // group is the terminal's foreground group (tpgid).
+            let pid = pid_in(&out).to_string();
+            assert_eq!(
+                (fields[2], fields[3], fields[5]),
+                (pid.as_str(), pid.as_str(), pid.as_str()),
+                "{stat}"
+            );
+            assert_ne!(fields[4], "0", "a controlling tty: {stat}");
+        }
         assert!(out.contains("ctty"), "{out}");
     }
 
@@ -1473,11 +1766,34 @@ mod tests {
         let ptys = ptys();
         // Other tests of the crate open descriptors meanwhile, so look for this test's own: no
         // pty is left open, and failing many times leaves no pipes behind.
+        #[cfg(target_os = "linux")]
         let fds = |what: &str| {
             std::fs::read_dir("/proc/self/fd")
                 .unwrap()
                 .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
                 .filter(|target| target.to_string_lossy().starts_with(what))
+                .count()
+        };
+        // No /proc: each descriptor below the table's size, a pipe by its type and the rest by
+        // its path (F_GETPATH).
+        #[cfg(target_os = "macos")]
+        let fds = |what: &str| {
+            // SAFETY: getdtablesize(3), fstat(2) and fcntl(2) with buffers that outlive them.
+            (0..unsafe { libc::getdtablesize() })
+                .filter(|&fd| unsafe {
+                    let mut stat = std::mem::zeroed::<libc::stat>();
+                    if libc::fstat(fd, &mut stat) != 0 {
+                        return false;
+                    }
+                    if what == "pipe:" {
+                        return stat.st_mode & libc::S_IFMT == libc::S_IFIFO;
+                    }
+                    let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
+                    libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) == 0
+                        && std::ffi::CStr::from_ptr(path.as_ptr())
+                            .to_string_lossy()
+                            .starts_with(what)
+                })
                 .count()
         };
         let pipes = fds("pipe:");
@@ -1487,7 +1803,10 @@ mod tests {
             let err = ptys.start(RequestId::next(), &exec, 80, 24).unwrap_err();
             assert!(err.contains("/nonexistent/program"), "{err}");
         }
+        #[cfg(target_os = "linux")]
         assert_eq!(fds("/dev/ptmx") + fds("/dev/pts/"), 0);
+        #[cfg(target_os = "macos")]
+        assert_eq!(fds("/dev/ptmx") + fds("/dev/pty") + fds("/dev/ttys"), 0);
         assert!(
             fds("pipe:") < pipes + 50,
             "{} pipes, {pipes} before",
