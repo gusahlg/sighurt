@@ -64,12 +64,18 @@ jobs:
           -p sighurt-tui --features sighurt-tui/engine-demo --no-fail-fast
 
       # tests/tui.rs again with the Wasm engine: sig's own pages (sig://help, home's links to
-      # it). The terminal pages' programs are Linux's, and so are their tests.
+      # it) and the terminal pages' programs (sig://terminal's shell, sig://config's editor).
       - name: Test sig (terminal, demo and Wasm engines)
         if: ${{ !cancelled() }}
         run: >
           cargo test --locked -p sighurt-browser --no-default-features
           --features frontend-tui,engine-demo,engine-wasm --test tui --no-fail-fast
+
+      # The master side of the terminal pages' pty (the runtime's side, starting and ending the
+      # programs, is in the crates' tests above).
+      - name: Test the Wasm engine's terminal
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p sighurt-engine-wasm --lib pty --no-fail-fast
 
   windows:
     name: Windows (terminal only)
@@ -83,9 +89,11 @@ jobs:
       # aws-lc-sys (rustls' provider in sig) assembles with NASM on x86_64 Windows.
       - uses: ilammy/setup-nasm@v1
 
+      # sig's own pages (sighurt-pages) are built for wasm32 by a nested cargo.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.1
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
@@ -102,3 +110,16 @@ jobs:
           cargo test --locked -p sighurt-api -p sighurt-core -p sighurt-runtime
           -p sighurt-config -p sighurt-config-example -p sighurt-semantic
           -p sighurt-tui --features sighurt-tui/engine-demo --no-fail-fast
+
+      # The Wasm engine (no FFmpeg here: video refuses, video_none.rs), and with it sig's own
+      # pages: its unit tests (guests run under Wasmtime), and sig built with it.
+      - name: Test the Wasm engine
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p sighurt-engine-wasm --lib --no-fail-fast
+
+      - name: Test sig (terminal, demo and Wasm engines)
+        if: ${{ !cancelled() }}
+        run: >
+          cargo test --locked -p sighurt-browser --no-default-features
+          --features frontend-tui,engine-demo,engine-wasm --bins --tests --no-fail-fast
+          -- --nocapture
