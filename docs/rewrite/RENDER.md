@@ -665,3 +665,87 @@ Rules that follow (they amend §14):
   guards whose `pop()` is a future; always install `on_uncaptured_error`; image counts are
   only visible through `wgpu::hal` (`maximum_frame_latency` = image count − 1). Debug builds
   turn validation on and load the user's implicit layers (MangoHud here).
+
+## 16. The round of 17 November 2026: robustness, tests, cost, ports
+
+Branch `r3-render` (Claude Opus 5.5; the comparison tests with a Claude Sonnet subagent; review by GPT-6 Astra). The
+GPU work ran on louise-pc (RTX 4060, NVIDIA 595.80, Linux; `tools/remote`), never on the
+desktop (machine rules); numbers below name the machine.
+
+- **Icons are rasterized as the CPU backend paints them** (`shape::PixelBounds::within`,
+  `rasterized_within`, `Coverage::crop`, used by `gpu::prepare`). tiny-skia clips a path to
+  its pixmap, and the antialiasing it gives along the path depends on that pixmap's extent on
+  each axis the path crosses its edge on. An icon crossing a surface's edge, rasterized over
+  its own ink bounds, was up to 38 levels off the CPU backend's; and a path reaching far off the
+  surface made a pixmap of that size (millions of pixels: an allocation failure, so an abort).
+  Now the coverage is rasterized within the buffer, across all of it on a crossed axis, and the
+  tile keeps only the part inside the buffer (never larger than what is shown); the item's clip
+  stays the batch's scissor (the CPU backend's mask), and a path its clip shows nothing of is
+  not rasterized. Tests: `shape::tests::coverage_within_the_surface_is_what_the_surface_paints`
+  (fails without it), and the random scenes below, where two of the first mismatches the
+  generator found were this.
+- **Comparison tests** (`render/sighurt-render/tests/support/{scenes,compare}.rs`, shared by
+  both GPU crates' `tests/compare.rs` and by `gpu/tests.rs`'s reference rasterizer): the
+  standard chrome's and the line chrome's surfaces, every item kind under five clip cases, at
+  1, 1.25, 1.5 and 2, and seeded random scenes (tools/fuzz's generator and replay: surfaces
+  1–900 × 1–240 at eight scales, 0–40 items of every kind, nested clips, translucent colors,
+  text in several scripts), one backend instance across the sequence so the atlas grows,
+  resets and alternates its icon ring as in `sig`. Tolerances by class, each with its reason
+  in `compare.rs`: 2 levels (fixtures) or 3 (random: dozens of translucent layers, tiny-skia's
+  8-bit rounding); a rounded corner's pixels 16 (fixtures) or 64 (random: a linearly
+  antialiased signed distance against tiny-skia's 4 × 4 sampling, up to an eighth of a pixel's
+  coverage where the arc is steep, more where tiny-skia also clips the corner at the buffer's
+  edge); a path's ink 16 (one of tiny-skia's 16 samples: the tile's transform is translated, so
+  its rounding differs by about 10⁻⁴ pixel). Left to the `#[ignore]`d hard scenes: strokes
+  thinner than a pixel that overlap themselves (tiny-skia's hairlines, blended per segment:
+  up to 17) and radii over 12 logical pixels. The reference rasterizer now stores each draw
+  rounded to 8 bits, as the GPU's target does. 6000 random scenes passed it (548 M pixels).
+- **The CPU backend's glyph cache starts over when it filled** (`GlyphCache::full`, checked at
+  a frame's start): it admitted 2048 images or 8 MiB and then rasterized every further glyph
+  uncached on every frame until the scale changed, so after a session's titles in a few
+  scripts the chrome re-rasterized each new title on each repaint. The bound is unchanged.
+- **Failing twice.** `SIG_RENDER_FAIL` takes a list (`surface,surface`, `surface,device`): the
+  next failure two frames after the last, on the same surface. `headless.sh`'s `renderers`
+  scenario adds a surface lost again after it was bound again (wgpu: ends on the CPU renderer)
+  and a rebind followed by a device failure (Vulkan: ends on the CPU renderer), and a storm of
+  scales (1.25, 2, 1.75, 1.33, 1) with tab switches between them.
+- **Present fences close the Vulkan backend's known gap** (§13 lane 3): with
+  `VK_EXT_swapchain_maintenance1` (and the instance's `VK_EXT_surface_maintenance1`,
+  `VK_KHR_get_surface_capabilities2`), each present signals a fence (from a small pool per
+  swapchain, taken back once seen signalled, never waited for before a present unless 8 are
+  pending; an A/B showed no render-time cost); a swapchain,
+  retired by `oldSwapchain` or destroyed, goes only after its pending present fences signal
+  (bounded, 2 s; otherwise it is leaked, and then so are the device and instance it came
+  from, since a parent may not die before a child). With present fences `Gpu::idle` is a
+  bounded wait on the frame slot's fence (every submission signals it) and never
+  `vkDeviceWaitIdle`, which has no timeout; without the extension it is as before (the
+  device-idle wait, as wgpu-hal 30 still does). `describe()` says "present fences" when on.
+  From Astra's review of that change: a present refused before anything was queued un-pends
+  its fence; a failure between acquire and submission drains the acquire semaphore with a
+  submission of no commands, never resets a command buffer the device lost, and a drain
+  that fails leaks rather than destroys; a refused `vkQueueSubmit` leaves the slot's fence a
+  new signalled one (the old one would never signal); two out-of-date presents in a row are a
+  `Surface` error, not `Deferred` forever; the recreation after `SUBOPTIMAL` is rearmed only
+  after a frame optimal at both ends (an optimal acquire followed by a suboptimal present no
+  longer recreated the swapchain every frame); every configure is counted alike.
+- **Mesa, through lavapipe.** shell.nix exports `SIGHURT_LAVAPIPE_ICD`, the software driver's
+  manifest from the mesa already in the shell (nothing added to the closure; the system's
+  manifests are of another nixpkgs and need a newer glibc, §15). `render/gpu-tests.sh` runs
+  both GPU crates' comparisons on the machine's driver with validation, and with
+  `SIG_LAVAPIPE=1` once more with the loader pointed at lavapipe alone; `headless.sh`'s
+  `renderers` scenario with `SIG_LAVAPIPE=1` runs `wgpu` and `vulkan` on it in the GPU sway
+  (Mesa's Wayland WSI; a CPU device is allowed because the renderer is named).
+- **Ports.** `sighurt-render-wgpu` takes Metal on macOS and Direct3D 12 on Windows besides
+  Vulkan (`BACKENDS`; target-gated wgpu features), for the headless comparison test on the
+  Ports runners; never GL. Linux's dependency graph is unchanged (`cargo tree` with features,
+  identical), and `Cargo.lock` gained 30 lines, no version changed. Both `tools/cross-check`
+  targets check the crate with its tests.
+- **Beside Servo** (`bench/render/servo.sh`, a debug `sig` with Servo, the demo engine and both
+  GPU renderers, louise-pc, gles2 sway, 3 interleaved runs each): Servo's GL animating a page
+  at 60 Hz, tab churn, a resize storm, a window with no room for the page, scale 1.5 and back,
+  and a clean quit, with `[ui] renderer` = cpu, wgpu and vulkan in one process with Servo's
+  NVIDIA EGL: 12 of 12 runs clean (no renderer failure, fallback or panic), 0 chrome paints
+  during the page's animation under every renderer, and with `SIG_VULKAN_VALIDATION=1` no
+  validation message from either GPU renderer. Closes "the backends beside Servo" of §13.
+- **Mesa.** Both GPU crates' comparisons pass on lavapipe (Mesa 26.2.3, llvmpipe) with the
+  validation layer on, and `VK_EXT_swapchain_maintenance1` is on there too.

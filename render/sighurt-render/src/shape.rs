@@ -3,7 +3,12 @@
 //! ratio, strokes' widths included), antialiased. The CPU backend paints with
 //! [`paint_path`] straight into the target; a GPU backend rasterizes the same path into a
 //! small coverage mask ([`coverage`]) at the same transform, offset by whole pixels to the
-//! [`ink_bounds`] it covers, so the two put the same coverage on the same pixels.
+//! [`ink_bounds`] it covers, so the two put the same coverage on the same pixels. A GPU backend
+//! rasterizes only within the buffer ([`PixelBounds::rasterized_within`]), as the CPU backend
+//! paints only its buffer: tiny-skia's clipping to the pixmap changes the antialiasing, so a
+//! path crossing the buffer's edge is rasterized across the buffer's whole extent on that
+//! axis, as the CPU backend does. A path that reaches far beyond the surface costs no more than
+//! the surface.
 //!
 //! Must not own: what a path is (the scene's), where a mask goes (a backend's atlas), or
 //! blending (each backend's).
@@ -26,6 +31,53 @@ pub struct PixelBounds {
     pub width: u32,
     /// Height, at least 1.
     pub height: u32,
+}
+
+impl PixelBounds {
+    /// Where to rasterize a path with these ink bounds for a buffer `rect` so that its
+    /// coverage is what painting it into the buffer gives: the part inside `rect`, but across
+    /// all of `rect` along an axis the bounds cross its edges on. tiny-skia clips a path to its
+    /// pixmap, and the antialiasing it gives along the clipped path depends on the pixmap's
+    /// whole extent on that axis, not only on the edge crossed (a cubic crossing the right edge
+    /// of a 201-pixel-wide surface: 32 against 64 one pixel from it, rasterized from its own
+    /// left). `None` if no part is inside.
+    pub fn rasterized_within(self, rect: crate::scene::PixelRect) -> Option<PixelBounds> {
+        let inside = self.within(rect)?;
+        let (left, top) = (rect.left as i64, rect.top as i64);
+        let (right, bottom) = (rect.right as i64, rect.bottom as i64);
+        let (x, y) = (i64::from(self.x), i64::from(self.y));
+        let crosses_x = x < left || x + i64::from(self.width) > right;
+        let crosses_y = y < top || y + i64::from(self.height) > bottom;
+        let (x, width) = match crosses_x {
+            true => (left as i32, (right - left) as u32),
+            false => (inside.x, inside.width),
+        };
+        let (y, height) = match crosses_y {
+            true => (top as i32, (bottom - top) as u32),
+            false => (inside.y, inside.height),
+        };
+        Some(PixelBounds {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    /// The part of these bounds inside `rect` (whole pixels, as [`Mapping::snap`] makes them),
+    /// if any.
+    pub fn within(self, rect: crate::scene::PixelRect) -> Option<PixelBounds> {
+        let left = i64::from(self.x).max(rect.left as i64);
+        let top = i64::from(self.y).max(rect.top as i64);
+        let right = (i64::from(self.x) + i64::from(self.width)).min(rect.right as i64);
+        let bottom = (i64::from(self.y) + i64::from(self.height)).min(rect.bottom as i64);
+        (right > left && bottom > top).then(|| PixelBounds {
+            x: left as i32,
+            y: top as i32,
+            width: (right - left) as u32,
+            height: (bottom - top) as u32,
+        })
+    }
 }
 
 /// A coverage mask: one byte per pixel, rows packed, `bounds.width` wide.
@@ -131,6 +183,39 @@ pub fn ink_bounds(path: &Path, stroke: Option<f32>, mapping: &Mapping) -> Option
     })
 }
 
+impl Coverage {
+    /// The part of it within `bounds`, if it covers anything there.
+    pub fn crop(self, bounds: PixelBounds) -> Option<Coverage> {
+        let rect = crate::scene::PixelRect::from_ltrb(
+            bounds.x as f32,
+            bounds.y as f32,
+            (i64::from(bounds.x) + i64::from(bounds.width)) as f32,
+            (i64::from(bounds.y) + i64::from(bounds.height)) as f32,
+        )?;
+        let part = self.bounds.within(rect)?;
+        if part == self.bounds {
+            return Some(self);
+        }
+        let (dx, dy) = (
+            (part.x - self.bounds.x) as usize,
+            (part.y - self.bounds.y) as usize,
+        );
+        let stride = self.bounds.width as usize;
+        let mut data = Vec::with_capacity(part.width as usize * part.height as usize);
+        for row in self
+            .data
+            .chunks_exact(stride)
+            .skip(dy)
+            .take(part.height as usize)
+        {
+            data.extend_from_slice(&row[dx..dx + part.width as usize]);
+        }
+        data.iter()
+            .any(|&a| a != 0)
+            .then_some(Coverage { bounds: part, data })
+    }
+}
+
 /// `path`'s coverage under `mapping` within `bounds` (from [`ink_bounds`]): the pixels
 /// [`paint_path`] would paint, as the alpha an opaque white paint leaves. `None` if it covers
 /// nothing or the bounds can't be allocated.
@@ -186,6 +271,18 @@ mod tests {
         path.finish()
     }
 
+    /// A dome, from a random scene: its cubic crosses the right edge of a surface at
+    /// (671, 184) 201 × 149.
+    fn dome() -> Path {
+        let mut path = ScenePath::new();
+        path.move_to(860.5608, 265.31244);
+        path.cubic_to(
+            860.5608, 244.56256, 902.06055, 244.56256, 902.06055, 265.31244,
+        );
+        path.close();
+        path.finish()
+    }
+
     fn icon() -> Path {
         let mut path = ScenePath::new();
         path.move_to(10.0, 10.0);
@@ -230,5 +327,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A path that crosses the surface's edges, rasterized only within the surface, has the
+    /// coverage the CPU backend paints into the surface: tiny-skia clips a path to its
+    /// pixmap, and that clipping changes the antialiasing along the path, so the bounds must
+    /// be the buffer's on a crossed axis (not a clip inside it, which the CPU backend applies
+    /// as a mask after painting). One that reaches millions of pixels beyond the surface
+    /// costs only the surface.
+    #[test]
+    fn coverage_within_the_surface_is_what_the_surface_paints() {
+        for scale in [120, 150, 180, 240] {
+            let surfaces = [
+                (3, 5, 61, 33),
+                (15, 17, 9, 8),
+                (2, 2, 14, 20),
+                (671, 184, 201, 149),
+            ];
+            for (x, y, width, height) in surfaces {
+                let rect = WindowRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                let scale = Scale::from_fractional(scale).unwrap();
+                let metrics = Metrics::new(LayoutEpoch::next(), rect, scale);
+                let map = Mapping::new(&metrics);
+                let buffer = metrics.buffer();
+                let surface = crate::scene::PixelRect::from_ltrb(
+                    0.0,
+                    0.0,
+                    buffer.width as f32,
+                    buffer.height as f32,
+                )
+                .unwrap();
+                for (path, stroke) in [
+                    (icon(), None),
+                    (icon(), Some(1.5)),
+                    (acute(), Some(5.0)),
+                    (dome(), None),
+                    (dome(), Some(2.0)),
+                ] {
+                    let mut painted = Pixmap::new(buffer.width, buffer.height).unwrap();
+                    let skia = skia_path(&path).unwrap();
+                    let white = Rgba::rgb(0xffffff);
+                    let to = transform(&map);
+                    paint_path(&mut painted.as_mut(), &skia, white, stroke, to, None);
+                    let visible = ink_bounds(&path, stroke, &map)
+                        .and_then(|bounds| bounds.rasterized_within(surface));
+                    let inside = ink_bounds(&path, stroke, &map).and_then(|b| b.within(surface));
+                    let mask = visible
+                        .and_then(|b| coverage(&path, stroke, &map, b))
+                        .and_then(|mask| mask.crop(inside.unwrap()));
+                    if let (Some(mask), Some(inside)) = (&mask, inside) {
+                        assert!(
+                            mask.bounds.within(
+                                crate::scene::PixelRect::from_ltrb(
+                                    inside.x as f32,
+                                    inside.y as f32,
+                                    (inside.x + inside.width as i32) as f32,
+                                    (inside.y + inside.height as i32) as f32,
+                                )
+                                .unwrap()
+                            ) == Some(mask.bounds),
+                            "cropped to the part inside"
+                        );
+                    }
+                    for py in 0..buffer.height {
+                        for px in 0..buffer.width {
+                            let expected = painted.pixel(px, py).unwrap().alpha();
+                            let got = mask.as_ref().map_or(0, |mask| {
+                                let b = mask.bounds;
+                                let (mx, my) = (px as i32 - b.x, py as i32 - b.y);
+                                let inside = (0..b.width as i32).contains(&mx)
+                                    && (0..b.height as i32).contains(&my);
+                                if inside {
+                                    mask.data[(my * b.width as i32 + mx) as usize]
+                                } else {
+                                    0
+                                }
+                            });
+                            assert_eq!(
+                                got, expected,
+                                "({px}, {py}) of {rect:?} at {scale:?}, {stroke:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let map = mapping(240);
+        let mut huge = ScenePath::new();
+        huge.move_to(-4.0e6, -4.0e6);
+        huge.line_to(4.0e6, -4.0e6);
+        huge.line_to(0.0, 4.0e6);
+        huge.close();
+        let huge = huge.finish();
+        let bounds = ink_bounds(&huge, None, &map).unwrap();
+        assert!(bounds.width > 10_000_000, "{bounds:?}");
+        let buffer = crate::scene::PixelRect::from_ltrb(0.0, 0.0, 122.0, 66.0).unwrap();
+        let visible = bounds.within(buffer).unwrap();
+        assert_eq!((visible.width, visible.height), (122, 66));
+        let covered = coverage(&huge, None, &map, visible).unwrap();
+        assert!(
+            covered.data.iter().all(|&a| a == 255),
+            "the surface is inside the triangle"
+        );
+        let outside = crate::scene::PixelRect::from_ltrb(-9.0e9, 0.0, -8.0e9, 1.0).unwrap();
+        assert_eq!(bounds.within(outside), None);
     }
 }

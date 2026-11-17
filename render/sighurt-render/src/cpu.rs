@@ -7,7 +7,7 @@
 //! [`RenderOutcome::Unchanged`]: the surface still shows that frame, so the frontend commits
 //! nothing. [`Backend::unbind`] forgets the last frame, for a surface the host hid (its buffer
 //! is detached then) or retired. Glyph images are cached across frames and surfaces up to a
-//! budget, and the cache starts over when the scale changes.
+//! budget, and the cache starts over when the scale changes or a frame starts with it full.
 //!
 //! # Pixel format
 //!
@@ -64,10 +64,12 @@ impl CpuBackend {
         }
     }
 
-    /// The glyph cache for `scale`: kept from earlier frames at the same scale, and bounded
-    /// by its own admission rule ([`GlyphCache`]).
+    /// The glyph cache for a frame at `scale`: kept from earlier frames at the same scale, and
+    /// bounded by its own admission rule ([`GlyphCache`]). A cache that filled starts over, so
+    /// the glyphs of later text (other pages' titles, say) are cached too instead of being
+    /// rasterized on every frame for the rest of the session.
     fn glyph_cache(&mut self, scale: Scale) -> &mut GlyphCache {
-        if self.scale != Some(scale) {
+        if self.scale != Some(scale) || self.glyphs.full() {
             self.scale = Some(scale);
             self.glyphs.clear();
         }
@@ -466,5 +468,71 @@ mod tests {
         let second = u32::from_le_bytes(pixmap.data()[4..].try_into().unwrap());
         assert_eq!(first, 0xff11_2233);
         assert_eq!(second, 0x8080_0000, "half-transparent red, premultiplied");
+    }
+
+    /// A glyph cache that filled starts over at the next frame, so later text is cached too;
+    /// what is painted doesn't change.
+    #[test]
+    fn a_full_glyph_cache_starts_over_at_the_next_frame() {
+        use sighurt_api::geometry::WindowRect;
+        use sighurt_api::ids::LayoutEpoch;
+
+        let mut fonts = crate::text::tests::fonts();
+        let rect = WindowRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 24,
+        };
+        let metrics = Metrics::new(
+            LayoutEpoch::next(),
+            rect,
+            Scale::from_fractional(120).unwrap(),
+        );
+        let mut backend = CpuBackend::new(fonts.handle());
+        let render = |scene: &Scene, backend: &mut CpuBackend| {
+            let mut data = vec![0u8; 64 * 24 * 4];
+            let buffer = PixelBuffer {
+                data: &mut data,
+                width: 64,
+                height: 24,
+                stride: 64 * 4,
+            };
+            let outcome = backend.render(SurfaceKey(7), &metrics, scene, Output::Pixels(buffer));
+            assert_eq!(outcome, Ok(RenderOutcome::Submitted));
+            data
+        };
+        let mut small = crate::Pen::new(rect);
+        let line = fonts.line("Grüße", crate::TextStyle::SM);
+        small.text(
+            &line,
+            (2.0, 2.0),
+            Rgba::rgb(0xffffff),
+            [0.0, 0.0, 64.0, 24.0],
+        );
+        let small = small.finish();
+        let first = render(&small, &mut backend);
+        // One frame of many glyphs: far more than the cache admits.
+        let mut many = crate::Pen::new(rect);
+        for size in 6..200 {
+            let line = fonts.line(
+                "abcdefghijklmnopqrstuvwxyz0123456789",
+                crate::TextStyle::SM.at(size),
+            );
+            many.text(
+                &line,
+                (0.0, 0.0),
+                Rgba::rgb(0xffffff),
+                [0.0, 0.0, 64.0, 24.0],
+            );
+        }
+        render(&many.finish(), &mut backend);
+        assert!(backend.glyphs.full(), "{}", backend.glyphs.len());
+        let resets = backend.stats().glyph_resets;
+        // The next frame starts it over, and paints what the first did.
+        backend.forget_frame(SurfaceKey(7));
+        assert_eq!(render(&small, &mut backend), first);
+        assert_eq!(backend.stats().glyph_resets, resets + 1);
+        assert!(!backend.glyphs.full() && !backend.glyphs.is_empty());
     }
 }

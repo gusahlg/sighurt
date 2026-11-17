@@ -20,8 +20,18 @@ raw-window-handle.workspace = true
 wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
 log = "0.4"
 
+# Elsewhere the platform's own API as well, for the headless comparison test (RENDER.md §16):
+# Metal on macOS, Direct3D 12 on Windows. Never GL. Linux's dependency set is unchanged.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["dx12", "wgsl"] }
+
 [dev-dependencies]
 sighurt-render-wgpu = { path = ".", features = ["testing"] }
 # The standard chrome's fixtures (sighurt-ui's tests/common), for the comparison test.
 sighurt-ui = { path = "../../ui/sighurt-ui" }
 tiny-skia.workspace = true
+# The line chrome's surfaces, for the comparison test.
+sighurt-chrome-line = { path = "../../extensions/sighurt-chrome-line" }

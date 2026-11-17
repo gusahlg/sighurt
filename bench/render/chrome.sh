@@ -13,7 +13,9 @@
 #          pointer for the whole phase (bench/benchlib/seat.py): CPU time, wakeups, chrome paints;
 # and the chrome's render time per surface over the whole run, from SIG_DIAG's `chrome` lines
 # (render_ms: the renderer's render call, presenting included for wgpu and vulkan; scene_ms: the chrome
-# drawing the scene). Prints a table; logs and diagnostics in OUT.
+# drawing the scene). Prints a table; logs and diagnostics in OUT, with per run the resident
+# memory per mapping after the idle phase (smaps.txt) and each thread's CPU ticks at the idle
+# phase's start and end (threads-idle-*.txt).
 #
 #   tools/heavy tools/headless-sway --renderer gles2 -- bench/render/chrome.sh SIG OUT [REPS]
 #
@@ -78,9 +80,21 @@ CONF
     pid=$!
     sleep 3
     t0=$(cpu_ticks $pid); w0=$(diag $pid "$run/diag.json" "c['wakeups'], c['chrome_paints']")
+    for task in /proc/$pid/task/*; do
+      echo "$(sed 's/.*) //' "$task/stat" | awk '{print $12 + $13}') $(cat "$task/comm")"
+    done > "$run/threads-idle-start.txt"
     sleep 10
     t1=$(cpu_ticks $pid); w1=$(diag $pid "$run/diag.json" "c['wakeups'], c['chrome_paints']")
     rss=$(awk '/VmRSS|VmHWM/ {printf "%s ", $2}' "/proc/$pid/status")
+    # Where the memory is: resident kB per mapping (file, or [anon], [heap]...), largest first;
+    # and the threads, with their CPU ticks over the idle phase (the per-thread stat at its
+    # end, less the one at its start).
+    awk '/^[0-9a-f]+-[0-9a-f]+ / {name = (NF >= 6 ? $6 : "[anon]")} /^Rss:/ {rss[name] += $2}
+      END {for (n in rss) if (rss[n] > 0) printf "%8d %s\n", rss[n], n}' "/proc/$pid/smaps" \
+      | sort -rn > "$run/smaps.txt"
+    for task in /proc/$pid/task/*; do
+      echo "$(sed 's/.*) //' "$task/stat" | awk '{print $12 + $13}') $(cat "$task/comm")"
+    done > "$run/threads-idle-end.txt"
     for i in $(seq 20); do
       wtype -M alt 2 -m alt; sleep 0.25
       wtype -M alt 1 -m alt; sleep 0.25

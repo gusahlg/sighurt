@@ -31,8 +31,9 @@ pub fn rasterize(
 
 /// Glyph images kept across frames, bounded in entries ([`MAX_GLYPHS`]) and bytes
 /// ([`MAX_GLYPH_BYTES`]): a miss is admitted only while both have room; past them glyphs are
-/// rasterized uncached until the owner [`clear`](Self::clear)s it (a new scale), so one frame
-/// can't grow it without bound and an idle surface keeps nothing it didn't admit.
+/// rasterized uncached until the owner [`clear`](Self::clear)s it (a new scale, or a frame
+/// that starts with it [`full`](Self::full)), so one frame can't grow it without bound and an
+/// idle surface keeps nothing it didn't admit.
 #[derive(Default)]
 pub struct GlyphCache {
     swash: Option<SwashCache>,
@@ -64,6 +65,11 @@ impl GlyphCache {
         self.bytes += image.as_ref().map_or(0, |image| image.data.len());
         let slot = swash.image_cache.entry(key).or_insert(image);
         slot.as_ref().map(Cow::Borrowed)
+    }
+
+    /// Whether it admits nothing more: its glyphs or its bytes are at their budget.
+    pub fn full(&self) -> bool {
+        self.len() >= MAX_GLYPHS || self.bytes >= MAX_GLYPH_BYTES
     }
 
     /// Forgets every image; counted as a reset when it held any.
@@ -126,12 +132,13 @@ mod tests {
             }
         }
         assert!(cache.len() <= MAX_GLYPHS, "{}", cache.len());
+        assert!(cache.full());
         // Admission stops once the bytes pass the budget: at most one image beyond it.
         assert!(cache.bytes() <= MAX_GLYPH_BYTES + 400 * 400);
         // A glyph past the budget is still rasterized.
         assert!(cache.image(&handle, key(5, 401.0)).is_some());
         cache.clear();
-        assert!(cache.is_empty());
+        assert!(cache.is_empty() && !cache.full());
         assert_eq!(cache.bytes(), 0);
         assert_eq!(cache.resets(), 1);
     }

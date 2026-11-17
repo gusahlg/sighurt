@@ -116,3 +116,80 @@ The GPU renderers' code did not change; their rows show this session's run-to-ru
 medians fell 15–25 %, and it is now the fastest of the three on every surface but the
 page surface under wgpu (whose native surface keeps its frame across a hide, so most of its
 page renders find nothing new to draw). Idle: 0 wakeups and 0 chrome paints for every build.
+
+## Round of 17 November 2026: where the memory goes, beside Servo (branch `r3-render`)
+
+**Machine:** louise-pc: NVIDIA GeForce RTX 4060, driver NVIDIA 595.80, NixOS (13 Vulkan driver
+manifests installed: NVIDIA's and 12 of Mesa's), Vulkan loader 1.4.357. Not the desktop of the
+measurements above (the machine rules of 17 November keep GPU work off it), so compare rows
+only within a table.
+
+**The backends' cost probes** (`render/sighurt-render-{vulkan,wgpu}/tests/cost.rs`, `cargo test
+--test cost -- --ignored`, debug test binaries, headless device, the standard chrome's 1280×84
+surface rendered 101 times; resident memory, `VmRSS`):
+
+| stage | vulkan, all drivers | wgpu, all drivers | vulkan, NVIDIA's only | wgpu, NVIDIA's only | vulkan, lavapipe only |
+|---|---|---|---|---|---|
+| loader and instance | 125.6 MiB (181 ms) | 127.2 MiB (194 ms) | 103.0 MiB (116 ms) | 104.4 MiB (116 ms) | 41.7 MiB (14 ms) |
+| device | 167.1 MiB (324 ms) | 170.3 MiB (333 ms) | 129.4 MiB (198 ms) | 132.9 MiB (202 ms) | 62.2 MiB (18 ms) |
+| first frame | 168.4 MiB | 237.9 MiB¹ | 130.9 MiB | 200.9 MiB¹ | 83.4 MiB |
+| threads after the device | 7 | 7 | 7 | 7 | 28 |
+
+¹ wgpu's default memory hints, which the headless test device used then (fixed in e13cdd9: it
+now has the backend's `MemoryHints::MemoryUsage`): 80 MB of `/dev/nvidiactl` mappings, against
+14 MB for ash. With the backend's hints (final run, all drivers): wgpu 174.7 MiB after its first
+frame against vulkan's 165.8 MiB; on lavapipe 88.8 against 82.4 MiB.
+
+- **The instance is most of it.** `vkCreateInstance` loads every installed driver: NVIDIA's
+  (libnvidia-gpucomp 24–40 MB resident, eglcore 12, glcore 9, rtcore 9, glvkspirv 3–7) and
+  Mesa's (libLLVM 28 MB, gallium 4, the lvp and dzn drivers 4), about 23 MiB more than
+  NVIDIA's alone. The device adds 27–43 MiB (driver heaps and `/dev/nvidiactl` mappings). The
+  backends' own resources are about 1.4 MB of device memory (the atlas pages at 512², the
+  buffers). Nothing of this can be chosen by the application without writing the environment
+  (`VK_DRIVER_FILES`; decision 102) or reimplementing the loader's driver discovery
+  (`VK_LUNARG_direct_driver_loading`), so neither was done.
+- **Beside Servo the cost halves**, because Servo's NVIDIA EGL has loaded most of the same
+  libraries already. `bench/render/servo.sh` (debug sig with Servo, the demo engine, wgpu and
+  vulkan; gles2 sway; a page animating with CSS and requestAnimationFrame; 3 interleaved runs):
+
+| renderer | animate CPU | animate wakeups | animate chrome paints | churn CPU | churn wakeups | churn chrome paints | RSS |
+|---|---|---|---|---|---|---|---|
+| cpu | 9.0 % | 2471 | 0 | 8.8 % | 1022 | 52 | 295.9 MiB |
+| wgpu | 10.5 % | 2470 | 0 | 7.2 % | 1049 | 52 | 367.3 MiB (+71.4) |
+| vulkan | 9.0 % | 2442 | 0 | 8.8 % | 1218 | 52 | 362.6 MiB (+66.7) |
+
+  Of vulkan's +66 MiB (smaps, run 1): NVIDIA's libraries +49 MiB (glcore, rtcore and
+  glvkspirv are Vulkan's and not loaded for EGL; gpucomp and eglcore gain pages), the heap +7,
+  the debug binary's code +6, Mesa's drivers +4. CPU and wakeups are within run-to-run spread
+  (Servo's 60 Hz dominates them). Every run: no renderer failure, fallback or panic, a clean
+  quit; with `SIG_VULKAN_VALIDATION=1` no validation message from either GPU renderer.
+
+**The chrome in `sig`, before and after the round** (`bench/render/chrome.sh` with
+`CHROME_BUILDS`, release builds of b1da7e3 (`base`) and of this branch (`new`, 4141ee9: present
+fences from a pool), the demo engine, 1280×800 at scale 1, gles2 sway, louise-pc, 3
+interleaved runs; idle is 10 s on a static page, churn 10 s of tab switches, hover 10 s of
+pointer motion):
+
+| renderer | build | idle CPU | idle wakeups | churn CPU | hover CPU | RSS | chrome render median | status render median |
+|---|---|---|---|---|---|---|---|---|
+| cpu | base | 0.00 % | 0 | 2.3 % | 4.5 % | 15.6 MiB | 0.176 ms | 0.048 ms |
+| cpu | new | 0.00 % | 0 | 2.2 % | 6.2 % | 16.2 MiB | 0.197 ms | 0.057 ms |
+| wgpu | base | 0.20 % | 0 | 1.9 % | 5.9 % | 176.9 MiB | 0.460 ms | 0.311 ms |
+| wgpu | new | 0.20 % | 0 | 1.9 % | 7.5 % | 177.6 MiB | 0.433 ms | 0.338 ms |
+| vulkan | base | 0.10 % | 0 | 1.9 % | 5.2 % | 172.9 MiB | 0.279 ms | 0.180 ms |
+| vulkan | new | 0.30 % | 0 | 2.8 % | 8.8 % | 173.6 MiB | 0.885 ms | 0.283 ms |
+
+- The idle CPU of the GPU renderers is NVIDIA's `[vkps] Update` thread (0–2 ticks in 10 s,
+  per-thread `/proc` probe); the owner loop wakes 0 times for every renderer.
+- The Vulkan renderer's chrome render time is bimodal *per run*: a run's median is either
+  about 0.27 ms or 0.8–1.4 ms (base: 0.282, 0.267, 0.850 here and 0.267, 0.285, 0.825 in an
+  earlier session; new: 1.208, 1.371, 0.263, and 0.806, 0.821, 1.418 before the fence pool).
+  The new build was in the slow mode in 5 of 6 runs, base in 2 of 6, which suggested the
+  present fences; an A/B says they are not the cause: the final build against the same build
+  with present fences off (`fence`/`nofence`, `CHROME_RENDERERS=vulkan`, 6 interleaved runs
+  each, same machine an hour later): chrome render median 0.744 against 0.835 ms (per run
+  0.29–1.43 against 0.79–1.15), status 0.213 against 0.185 ms, idle 0.20 against 0.25 %,
+  RSS 173.7 against 173.8 MiB. The mode follows the machine (other lanes' jobs share it), not
+  the build; the fast mode, 0.26–0.29 ms, is what the backend costs. The CPU renderer's hover row (4.5 against 6.2 %) is
+  within this session's spread on a machine three other lanes share; its code changed only in
+  the glyph cache's restart, which a session this short never reaches.

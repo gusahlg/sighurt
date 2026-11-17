@@ -14,13 +14,13 @@ impl WgpuBackend {
     pub fn headless(fonts: FontSystemHandle) -> Result<Self, String> {
         let mut backend = Self::new(fonts, true)?;
         let instance = backend.instance.get_or_insert_with(instance);
-        let adapters = block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+        let adapters = block_on(instance.enumerate_adapters(crate::BACKENDS));
         let adapter = adapters
             .into_iter()
             .min_by_key(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
             .ok_or("no Vulkan adapter")?;
         let info = adapter.get_info();
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        let (device, queue) = block_on(adapter.request_device(&crate::device_descriptor()))
             .map_err(|e| e.to_string())?;
         let fault = std::sync::Arc::clone(&backend.fault);
         device.on_uncaptured_error(std::sync::Arc::new(move |error: wgpu::Error| {

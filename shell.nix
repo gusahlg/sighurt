@@ -48,6 +48,10 @@ pkgs.mkShell ({
   # (docs/rewrite/PORTING.md). Read by that script only.
   SIGHURT_RUST_LIB_SRC = "${pkgs.rustPlatform.rustLibSrc}";
   LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+  # Mesa's software Vulkan driver (lavapipe), from the mesa already in runtimeLibs: the chrome's
+  # GPU renderers' optional Mesa pass points the Vulkan loader at it alone
+  # (VK_DRIVER_FILES=$SIGHURT_LAVAPIPE_ICD; docs/rewrite/RENDER.md §16). Read by those tests only.
+  SIGHURT_LAVAPIPE_ICD = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs
     + pkgs.lib.optionalString hasWpe ":${wpe.prefix}/lib";
   # NetSurf (docs/rewrite/NETSURF.md). Not on PKG_CONFIG_PATH: see netsurfLibs above.

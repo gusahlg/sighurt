@@ -59,7 +59,7 @@ pub use atlas::{Atlas, AtlasFull, PageKind, Tile, Upload, INITIAL_SIZE, MAX_SIZE
 use sighurt_api::geometry::Metrics;
 
 use crate::color::Rgba;
-use crate::scene::{glyph_physical, Kind, Mapping, PixelRect, Scene};
+use crate::scene::{glyph_physical, Item, Kind, Mapping, PixelRect, Scene};
 use crate::shape;
 use crate::text::FontSystemHandle;
 
@@ -269,23 +269,20 @@ pub fn prepare(
     }
     let mapping = Mapping::new(metrics);
     atlas.begin_frame(metrics.scale());
+    let surface = PixelRect::from_ltrb(0.0, 0.0, buffer.width as f32, buffer.height as f32)
+        .expect("a non-empty buffer");
     let icons = loop {
-        match place(scene, &mapping, atlas, fonts) {
+        match place(scene, &mapping, surface, atlas, fonts) {
             Ok(icons) => break icons,
             Err(page) => atlas.make_room(page)?,
         }
     };
-    let surface = PixelRect::from_ltrb(0.0, 0.0, buffer.width as f32, buffer.height as f32)
-        .expect("a non-empty buffer");
     let mut mesh = Mesh {
         prepared: &mut prepared,
     };
     let mut icons = icons.into_iter();
     for item in &scene.items {
-        let clip = match item.clip {
-            None => Some(surface),
-            Some(clip) => mapping.snap(clip).and_then(|clip| intersect(clip, surface)),
-        };
+        let clip = visible(item, &mapping, surface);
         // A path's icon was placed in order, clip or not.
         let icon = matches!(item.kind, Kind::Path { .. }).then(|| icons.next().flatten());
         let Some(clip) = clip else {
@@ -363,12 +360,22 @@ pub fn prepare(
     Ok(prepared)
 }
 
+/// Where `item` may draw: its clip, snapped, within the buffer `surface`; `None` for nowhere.
+fn visible(item: &Item, mapping: &Mapping, surface: PixelRect) -> Option<PixelRect> {
+    match item.clip {
+        None => Some(surface),
+        Some(clip) => mapping.snap(clip).and_then(|clip| intersect(clip, surface)),
+    }
+}
+
 /// The tiles of a scene, placed: each glyph's in the atlas, and each path item's icon (in
-/// item order: `None` for a path that covers nothing). `Err` names the page that filled.
+/// item order: `None` for a path that covers nothing it may draw on), rasterized only within
+/// the buffer `surface`. `Err` names the page that filled.
 #[allow(clippy::type_complexity)]
 fn place(
     scene: &Scene,
     mapping: &Mapping,
+    surface: PixelRect,
     atlas: &mut Atlas,
     fonts: &FontSystemHandle,
 ) -> Result<Vec<Option<(shape::PixelBounds, Tile)>>, PageKind> {
@@ -384,8 +391,21 @@ fn place(
             }
             Kind::Path { path, stroke, .. } => {
                 let path = scene.path(path);
+                // Rasterized within the buffer as the CPU backend paints it, across the buffer
+                // on an axis the path crosses its edge on (`PixelBounds::rasterized_within`),
+                // and kept only where it is inside the buffer: the tile is never larger than
+                // the part shown. Nothing if the item's clip (a mask there, the batch's scissor
+                // here) shows none of it.
                 let coverage = shape::ink_bounds(path, stroke, mapping)
-                    .and_then(|bounds| shape::coverage(path, stroke, mapping, bounds));
+                    .and_then(|bounds| Some((bounds.within(surface)?, bounds)))
+                    .filter(|(inside, _)| {
+                        let shown = visible(item, mapping, surface);
+                        shown.is_some_and(|shown| inside.within(shown).is_some())
+                    })
+                    .and_then(|(inside, bounds)| {
+                        let raster = bounds.rasterized_within(surface)?;
+                        shape::coverage(path, stroke, mapping, raster)?.crop(inside)
+                    });
                 icons.push(match coverage {
                     Some(coverage) => {
                         let bounds = coverage.bounds;

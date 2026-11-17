@@ -4,6 +4,8 @@
 //!
 //! - **Vulkan only**, never wgpu's GL backend: that would open the EGL display of the
 //!   `wl_display`, which is Servo's (§14.1). The GPU-selection environment is never written.
+//!   On macOS and Windows, which have no window yet, Metal and Direct3D 12 serve the headless
+//!   comparison test ([`BACKENDS`]).
 //!   Validation only with `SIG_VULKAN_VALIDATION=1`, whatever the build profile.
 //! - **Construction is provisional**: [`WgpuBackend::new`] makes the instance and nothing else.
 //!   The first [`Backend::bind`] picks an adapter that can present to that surface (low power
@@ -53,6 +55,17 @@ use crate::device::{Device, FORMAT};
 
 /// Frames a swapchain may queue ahead: wgpu then asks for one image more.
 const FRAME_LATENCY: u32 = 2;
+
+/// wgpu's backends this renderer uses: Vulkan, never GL (RENDER.md §14.1); on macOS and
+/// Windows, where no Servo shares an EGL display, also the platform's own API, for the headless
+/// comparison test (`testing`; the window is Linux's).
+const BACKENDS: wgpu::Backends = if cfg!(target_os = "macos") {
+    wgpu::Backends::METAL
+} else if cfg!(windows) {
+    wgpu::Backends::VULKAN.union(wgpu::Backends::DX12)
+} else {
+    wgpu::Backends::VULKAN
+};
 
 /// Why the device can't go on, as its callbacks report it (they may run on wgpu's threads).
 type Fault = Arc<Mutex<Option<String>>>;
@@ -111,7 +124,7 @@ impl WgpuBackend {
     /// The adapter and device, made for `surface` on the first bind.
     fn start(&mut self, surface: &wgpu::Surface<'_>) -> Result<(), RenderError> {
         let instance = self.instance.as_ref().expect("made before");
-        let adapters = block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+        let adapters = block_on(instance.enumerate_adapters(BACKENDS));
         let presenting: Vec<_> = adapters
             .into_iter()
             .filter(|adapter| adapter.is_surface_supported(surface))
@@ -143,13 +156,8 @@ impl WgpuBackend {
                 info.name
             ));
         }
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("sighurt chrome"),
-            // The chrome's resources are small: prefer memory to speed.
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            ..Default::default()
-        }))
-        .map_err(|e| RenderError::Device(format!("no device: {e}")))?;
+        let (device, queue) = block_on(adapter.request_device(&device_descriptor()))
+            .map_err(|e| RenderError::Device(format!("no device: {e}")))?;
         let fault = Arc::clone(&self.fault);
         device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
             let mut fault = fault.lock().unwrap_or_else(|e| e.into_inner());
@@ -476,7 +484,7 @@ impl Drop for WgpuBackend {
 /// variables still apply on top.
 fn instance() -> wgpu::Instance {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-    desc.backends = wgpu::Backends::VULKAN;
+    desc.backends = BACKENDS;
     let validation = std::env::var_os("SIG_VULKAN_VALIDATION").is_some_and(|v| v == "1");
     desc.flags = match validation {
         true => wgpu::InstanceFlags::debugging(),
@@ -484,6 +492,17 @@ fn instance() -> wgpu::Instance {
     }
     .with_env();
     wgpu::Instance::new(desc)
+}
+
+/// The device: the chrome's resources are small, so memory is preferred to speed (wgpu's
+/// default hints map 80 MB of host-visible blocks on NVIDIA for the first frame's buffers).
+/// The headless test device is the same.
+fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("sighurt chrome"),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    }
 }
 
 /// A `NativeWindow` as the sized handle types wgpu takes.

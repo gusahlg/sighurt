@@ -66,6 +66,9 @@ struct Vulkan {
     api: u32,
     /// The Khronos validation layer is on.
     validation: bool,
+    /// `VK_EXT_surface_maintenance1` (and `VK_KHR_get_surface_capabilities2`, which it needs)
+    /// are on, so a device may offer `VK_EXT_swapchain_maintenance1`'s present fences.
+    maintenance: bool,
 }
 
 /// The Vulkan backend. One serves every chrome surface of a window.
@@ -81,7 +84,9 @@ pub struct VulkanBackend {
     /// The device was lost: nothing renders again.
     lost: Option<String>,
     notices: Vec<String>,
-    swapchain_images: Option<u32>,
+    /// Something could not be proved idle and was left alive: the device and the instance must
+    /// outlive it, so they are left alive too when the backend stops.
+    leaked: bool,
     stats: BackendStats,
 }
 
@@ -102,7 +107,7 @@ impl VulkanBackend {
             atlas: Atlas::new(),
             lost: None,
             notices: Vec::new(),
-            swapchain_images: None,
+            leaked: false,
             stats: BackendStats::default(),
         };
         backend.vulkan = Some(backend.instance()?);
@@ -130,6 +135,13 @@ impl VulkanBackend {
                 missing.to_string_lossy()
             ));
         }
+        // Present fences (`VK_EXT_swapchain_maintenance1`, `crate::target`) need these two at
+        // the instance; without them a retired swapchain waits for the device only.
+        let maintenance = [
+            ash::khr::get_surface_capabilities2::NAME,
+            ash::ext::surface_maintenance1::NAME,
+        ];
+        let maintained = api >= vk::API_VERSION_1_1 && maintenance.iter().all(|name| has(name));
         let mut layers: Vec<*const c_char> = Vec::new();
         if std::env::var_os("SIG_VULKAN_VALIDATION").is_some_and(|v| v == "1") {
             let installed = unsafe { entry.enumerate_instance_layer_properties() }
@@ -149,7 +161,10 @@ impl VulkanBackend {
             .application_name(c"sighurt")
             .engine_name(c"sighurt-render-vulkan")
             .api_version(api);
-        let extensions = wanted.map(CStr::as_ptr);
+        let mut extensions: Vec<*const c_char> = wanted.map(CStr::as_ptr).to_vec();
+        if maintained {
+            extensions.extend(maintenance.map(CStr::as_ptr));
+        }
         let info = vk::InstanceCreateInfo::default()
             .application_info(&app)
             .enabled_extension_names(&extensions)
@@ -162,6 +177,7 @@ impl VulkanBackend {
             instance,
             api,
             validation: !layers.is_empty(),
+            maintenance: maintained,
         })
     }
 
@@ -230,28 +246,33 @@ impl VulkanBackend {
             ));
         }
         // SAFETY: the instance outlives the device (`stop` destroys the device first).
-        let gpu = unsafe { Gpu::new(instance, physical, family, describe) }?;
+        let gpu = unsafe { Gpu::new(instance, physical, family, describe, vulkan.maintenance) }?;
         self.gpu = Some(gpu);
         Ok(())
     }
 
     /// Destroys every target, the device and the instance, and the atlas planned for them.
+    /// What can't be proved idle is left alive instead, and then so are the device and the
+    /// instance it was made from (a child is never outlived by its parent's destruction).
     fn stop(&mut self) {
         let surfaces = self.vulkan.as_ref().map(|v| v.surfaces.clone());
-        if self.gpu.as_ref().is_some_and(|gpu| !gpu.idle()) {
+        let mut leaked = std::mem::take(&mut self.leaked);
+        if leaked || self.gpu.as_ref().is_some_and(|gpu| !gpu.idle()) {
             // Something may still be in flight: leak rather than free what it uses.
             log::error!("the Vulkan device didn't go idle; its objects are left alive");
             std::mem::forget(std::mem::take(&mut self.targets));
-            std::mem::forget(self.gpu.take());
-            // The instance is left alive too (dropping it destroys nothing).
-            self.vulkan = None;
-            return;
+            leaked = true;
         }
         for (_, target) in std::mem::take(&mut self.targets) {
             if let Some(surfaces) = &surfaces {
                 // SAFETY: the device is idle.
-                unsafe { target.destroy(self.gpu.as_ref(), surfaces) };
+                leaked |= !unsafe { target.destroy(self.gpu.as_ref(), surfaces) };
             }
+        }
+        if leaked {
+            std::mem::forget(self.gpu.take());
+            // The instance is left alive too (dropping it destroys nothing).
+            self.vulkan = None;
         }
         if let Some(mut gpu) = self.gpu.take() {
             // SAFETY: every swapchain is gone.
@@ -262,6 +283,7 @@ impl VulkanBackend {
         }
         self.atlas = Atlas::new();
         self.lost = None;
+        self.stats.swapchain_images = None;
     }
 
     /// `result` with device loss remembered: nothing renders after it.
@@ -362,6 +384,7 @@ impl Backend for VulkanBackend {
                 chain: None,
                 recreate: false,
                 recreated: false,
+                present_outdated: false,
                 last: None,
             },
         );
@@ -386,11 +409,10 @@ impl Backend for VulkanBackend {
         if self.gpu.as_ref().is_some_and(|gpu| !gpu.idle()) {
             log::error!("the Vulkan device didn't go idle; the surface's objects are left alive");
             std::mem::forget(target);
-            return;
-        }
-        if let Some(vulkan) = &self.vulkan {
+            self.leaked = true;
+        } else if let Some(vulkan) = &self.vulkan {
             // SAFETY: the device is idle.
-            unsafe { target.destroy(self.gpu.as_ref(), &vulkan.surfaces) };
+            self.leaked |= !unsafe { target.destroy(self.gpu.as_ref(), &vulkan.surfaces) };
         }
         if self.targets.is_empty() {
             self.stop();
@@ -458,7 +480,6 @@ impl Backend for VulkanBackend {
             glyph_resets: atlas.resets,
             atlas: Some(atlas),
             surfaces: self.targets.len() as u64,
-            swapchain_images: self.swapchain_images,
             device_bytes: self.gpu.as_ref().map(|gpu| gpu.bytes),
             ..self.stats
         }
@@ -485,15 +506,10 @@ impl VulkanBackend {
         gpu.wait()?;
         let stale = target.chain.as_ref().is_none_or(|c| c.size != size);
         if stale || target.recreate {
-            let configured = Instant::now();
-            target.configure(gpu, &surfaces, size)?;
-            self.stats.configures += 1;
-            let took = micros(configured.elapsed());
-            self.stats.max_configure_us = Some(self.stats.max_configure_us.unwrap_or(0).max(took));
-            self.swapchain_images = target.chain.as_ref().map(|c| c.images() as u32);
+            configure(target, gpu, &surfaces, size, &mut self.stats)?;
         }
         let mut retried = false;
-        let (index, suboptimal) = loop {
+        let (index, acquired_suboptimal) = loop {
             let chain = target.chain.as_ref().expect("configured");
             let acquired = unsafe {
                 gpu.swapchain.acquire_next_image(
@@ -511,8 +527,7 @@ impl VulkanBackend {
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) if !retried => {
                     retried = true;
-                    target.configure(gpu, &surfaces, size)?;
-                    self.stats.configures += 1;
+                    configure(target, gpu, &surfaces, size, &mut self.stats)?;
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     target.last = None;
@@ -523,8 +538,80 @@ impl VulkanBackend {
                 Err(e) => return Err(surface_error("vkAcquireNextImageKHR", e)),
             }
         };
-        if suboptimal {
-            // Draw this one; make the swapchain again once before the next (§15).
+        // The image is acquired and the acquire semaphore will be signalled: it must be waited
+        // on before it is used again or destroyed, by the frame's submission or, if the frame
+        // fails before that, by an empty one.
+        let chain = target.chain.as_ref().expect("configured");
+        let framebuffer = chain.framebuffers[index as usize];
+        let finished = chain.finished[index as usize];
+        let recorded = gpu::prepare(scene, metrics, &mut self.atlas, &self.fonts)
+            .map_err(|full| RenderError::Device(full.to_string()))
+            .and_then(|prepared| gpu.record(gpu.present_pass, framebuffer, &prepared));
+        if let Err(error) = recorded {
+            if !gpu.drain() {
+                // Nothing proves the acquire's signal is done: keep everything alive.
+                self.leaked = true;
+            }
+            return Err(error);
+        }
+        if let Err(error) = gpu.submit(Some(gpu.acquired), Some(finished)) {
+            // A submission the device lost may still run; one that was refused waited on
+            // nothing, so the acquire's signal is drained as above.
+            if !gpu.device_lost && !gpu.drain() {
+                self.leaked = true;
+            }
+            return Err(error);
+        }
+        let waits = [finished];
+        let swapchains = [chain.swapchain];
+        let indices = [index];
+        let chain = target.chain.as_mut().expect("configured");
+        let fence = chain.present_fence(gpu)?;
+        let fences = fence.map(|fence| [fence]);
+        let mut signal = fences
+            .as_ref()
+            .map(|fences| vk::SwapchainPresentFenceInfoEXT::default().fences(fences));
+        let mut info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&waits)
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+        if let Some(signal) = signal.as_mut() {
+            info = info.push_next(signal);
+        }
+        let presented_suboptimal = match unsafe { gpu.swapchain.queue_present(gpu.queue, &info) } {
+            Ok(suboptimal) => suboptimal,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) if !target.present_outdated => {
+                // Not shown, so no commit carried the host's frame request: put off, with the
+                // swapchain made again before the retry. (Its semaphore wait and fence signal
+                // are still queued.)
+                target.present_outdated = true;
+                target.recreate = true;
+                target.last = None;
+                self.stats.deferred += 1;
+                return Ok(RenderOutcome::Deferred);
+            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                // Out of date again with a swapchain made for it: the surface's failure.
+                target.last = None;
+                return Err(RenderError::Surface(
+                    "presenting: the swapchain is out of date after it was made again".into(),
+                ));
+            }
+            Err(e) => {
+                if !matches!(
+                    e,
+                    vk::Result::ERROR_SURFACE_LOST_KHR | vk::Result::ERROR_DEVICE_LOST
+                ) {
+                    // Refused before anything was queued: its fence will never signal.
+                    chain.unpend();
+                }
+                return Err(surface_error("vkQueuePresentKHR", e));
+            }
+        };
+        target.present_outdated = false;
+        if acquired_suboptimal || presented_suboptimal {
+            // Shown; make the swapchain again once before the next frame (§15), and not again
+            // until a frame is optimal at both ends.
             if !target.recreated {
                 target.recreate = true;
                 target.recreated = true;
@@ -532,50 +619,26 @@ impl VulkanBackend {
         } else {
             target.recreated = false;
         }
-        // The image is acquired: from here on a submission follows, so the acquire semaphore
-        // is always waited on.
-        let chain = target.chain.as_ref().expect("configured");
-        let framebuffer = chain.framebuffers[index as usize];
-        let finished = chain.finished[index as usize];
-        let drawn = gpu::prepare(scene, metrics, &mut self.atlas, &self.fonts)
-            .map_err(|full| RenderError::Device(full.to_string()))
-            .and_then(|prepared| gpu.record(gpu.present_pass, framebuffer, &prepared))
-            .and_then(|()| gpu.submit(Some(gpu.acquired), Some(finished)));
-        if let Err(error) = drawn {
-            // The acquire's signal must still be waited on before the semaphore is destroyed
-            // or used again: an empty submission waits on it.
-            gpu.drain();
-            return Err(error);
-        }
-        let waits = [finished];
-        let swapchains = [chain.swapchain];
-        let indices = [index];
-        let info = vk::PresentInfoKHR::default()
-            .wait_semaphores(&waits)
-            .swapchains(&swapchains)
-            .image_indices(&indices);
-        match unsafe { gpu.swapchain.queue_present(gpu.queue, &info) } {
-            Ok(false) => {}
-            Ok(true) => {
-                // Shown, but suboptimal: once, as on acquire.
-                if !target.recreated {
-                    target.recreate = true;
-                    target.recreated = true;
-                }
-            }
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                // Not shown, so no commit carried the host's frame request: put off, with the
-                // swapchain made again before the retry.
-                target.recreate = true;
-                target.last = None;
-                self.stats.deferred += 1;
-                return Ok(RenderOutcome::Deferred);
-            }
-            Err(e) => return Err(surface_error("vkQueuePresentKHR", e)),
-        }
         target.last = Some((*metrics, scene.clone()));
         Ok(RenderOutcome::Submitted)
     }
+}
+
+/// Makes `target`'s swapchain at `size`, counted.
+fn configure(
+    target: &mut Target,
+    gpu: &Gpu,
+    surfaces: &ash::khr::surface::Instance,
+    size: (u32, u32),
+    stats: &mut BackendStats,
+) -> Result<(), RenderError> {
+    let started = Instant::now();
+    target.configure(gpu, surfaces, size)?;
+    stats.configures += 1;
+    let took = micros(started.elapsed());
+    stats.max_configure_us = Some(stats.max_configure_us.unwrap_or(0).max(took));
+    stats.swapchain_images = target.chain.as_ref().map(|c| c.images() as u32);
+    Ok(())
 }
 
 impl Drop for VulkanBackend {
