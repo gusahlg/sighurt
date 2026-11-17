@@ -388,6 +388,7 @@ mod kqueue_watch {
     use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
+    use rustix::buffer::spare_capacity;
     use rustix::event::kqueue::{kevent, kqueue, Event, EventFilter, EventFlags, VnodeEvents};
 
     /// `udata` of the directory's events and of the file's.
@@ -494,12 +495,15 @@ mod kqueue_watch {
             let mut events: Vec<Event> = Vec::with_capacity(16);
             loop {
                 events.clear();
-                // SAFETY: no change list, so no descriptor is named.
-                let count =
-                    match unsafe { kevent(&self.kqueue, &[], &mut events, Some(Duration::ZERO)) } {
-                        Ok(count) => count,
-                        Err(_) => break,
-                    };
+                // SAFETY: no change list, so no descriptor is named. Into the spare capacity:
+                // a `&mut Vec` is a buffer of its length, here none, so the events would stay
+                // queued, the kqueue readable and the owner loop awake for ever.
+                let buffer = spare_capacity(&mut events);
+                let count = match unsafe { kevent(&self.kqueue, &[], buffer, Some(Duration::ZERO)) }
+                {
+                    Ok(count) => count,
+                    Err(_) => break,
+                };
                 if count == 0 {
                     break;
                 }
@@ -1523,15 +1527,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let watch = ConfigWatch::new(&path).unwrap();
+        // What the owner loop waits on: once `changed` has read the events, nothing is left,
+        // or the loop would wake for ever (macOS's watch did, reading into an empty buffer).
+        // A note may come a moment late: what comes within a second is read too.
+        let quiet = |watch: &ConfigWatch| {
+            use rustix::event::{poll, PollFd, PollFlags, Timespec};
+            (0..20).any(|_| {
+                let mut fds = [PollFd::new(watch, PollFlags::IN)];
+                if poll(&mut fds, Some(&Timespec::default())).unwrap() == 0 {
+                    return true;
+                }
+                watch.changed();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                false
+            })
+        };
         assert!(!watch.changed());
         fs::write(dir.path().join("other.toml"), "x").unwrap();
         assert!(!watch.changed());
+        assert!(quiet(&watch), "events left after another file");
         fs::write(&path, "version = 1\n").unwrap();
         assert!(watch.changed());
+        assert!(quiet(&watch), "events left after a write");
         write_atomically(&path, "version = 1\n").unwrap();
         assert!(watch.changed());
         fs::remove_file(&path).unwrap();
         assert!(watch.changed());
+        assert!(quiet(&watch), "events left after a removal");
     }
 
     /// The access list keeps another user out, tried as one: on GitHub's runners only (the test
