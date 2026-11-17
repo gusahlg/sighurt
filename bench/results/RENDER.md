@@ -137,7 +137,8 @@ surface rendered 101 times; resident memory, `VmRSS`):
 
 ¹ wgpu's default memory hints, which the headless test device used then (fixed in e13cdd9: it
 now has the backend's `MemoryHints::MemoryUsage`): 80 MB of `/dev/nvidiactl` mappings, against
-14 MB for ash.
+14 MB for ash. With the backend's hints (final run, all drivers): wgpu 174.7 MiB after its first
+frame against vulkan's 165.8 MiB; on lavapipe 88.8 against 82.4 MiB.
 
 - **The instance is most of it.** `vkCreateInstance` loads every installed driver: NVIDIA's
   (libnvidia-gpucomp 24–40 MB resident, eglcore 12, glcore 9, rtcore 9, glvkspirv 3–7) and
@@ -162,3 +163,33 @@ now has the backend's `MemoryHints::MemoryUsage`): 80 MB of `/dev/nvidiactl` map
   the debug binary's code +6, Mesa's drivers +4. CPU and wakeups are within run-to-run spread
   (Servo's 60 Hz dominates them). Every run: no renderer failure, fallback or panic, a clean
   quit; with `SIG_VULKAN_VALIDATION=1` no validation message from either GPU renderer.
+
+**The chrome in `sig`, before and after the round** (`bench/render/chrome.sh` with
+`CHROME_BUILDS`, release builds of b1da7e3 (`base`) and of this branch (`new`, 4141ee9: present
+fences from a pool), the demo engine, 1280×800 at scale 1, gles2 sway, louise-pc, 3
+interleaved runs; idle is 10 s on a static page, churn 10 s of tab switches, hover 10 s of
+pointer motion):
+
+| renderer | build | idle CPU | idle wakeups | churn CPU | hover CPU | RSS | chrome render median | status render median |
+|---|---|---|---|---|---|---|---|---|
+| cpu | base | 0.00 % | 0 | 2.3 % | 4.5 % | 15.6 MiB | 0.176 ms | 0.048 ms |
+| cpu | new | 0.00 % | 0 | 2.2 % | 6.2 % | 16.2 MiB | 0.197 ms | 0.057 ms |
+| wgpu | base | 0.20 % | 0 | 1.9 % | 5.9 % | 176.9 MiB | 0.460 ms | 0.311 ms |
+| wgpu | new | 0.20 % | 0 | 1.9 % | 7.5 % | 177.6 MiB | 0.433 ms | 0.338 ms |
+| vulkan | base | 0.10 % | 0 | 1.9 % | 5.2 % | 172.9 MiB | 0.279 ms | 0.180 ms |
+| vulkan | new | 0.30 % | 0 | 2.8 % | 8.8 % | 173.6 MiB | 0.885 ms | 0.283 ms |
+
+- The idle CPU of the GPU renderers is NVIDIA's `[vkps] Update` thread (0–2 ticks in 10 s,
+  per-thread `/proc` probe); the owner loop wakes 0 times for every renderer.
+- The Vulkan renderer's chrome render time is bimodal *per run*: a run's median is either
+  about 0.27 ms or 0.8–1.4 ms (base: 0.282, 0.267, 0.850 here and 0.267, 0.285, 0.825 in an
+  earlier session; new: 1.208, 1.371, 0.263, and 0.806, 0.821, 1.418 before the fence pool).
+  The new build was in the slow mode in 5 of 6 runs, base in 2 of 6, which suggested the
+  present fences; an A/B says they are not the cause: the final build against the same build
+  with present fences off (`fence`/`nofence`, `CHROME_RENDERERS=vulkan`, 6 interleaved runs
+  each, same machine an hour later): chrome render median 0.744 against 0.835 ms (per run
+  0.29–1.43 against 0.79–1.15), status 0.213 against 0.185 ms, idle 0.20 against 0.25 %,
+  RSS 173.7 against 173.8 MiB. The mode follows the machine (other lanes' jobs share it), not
+  the build; the fast mode, 0.26–0.29 ms, is what the backend costs. The CPU renderer's hover row (4.5 against 6.2 %) is
+  within this session's spread on a machine three other lanes share; its code changed only in
+  the glyph cache's restart, which a session this short never reaches.

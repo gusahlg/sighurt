@@ -4,10 +4,10 @@
 //!
 //! Where the device has `VK_EXT_swapchain_maintenance1`, each present signals a fence when the
 //! presentation engine is done with it (its semaphore wait included). The fences come from a
-//! small pool per swapchain and are taken back once they are seen signalled, without waiting:
-//! the hot path never blocks on one (NVIDIA signals them well after the image can be acquired
-//! again; a wait before each present cost about half a millisecond a frame), and at most
-//! [`PENDING_PRESENTS`] are pending before the oldest is waited for. A swapchain, retired by a
+//! small pool per swapchain and are taken back once they are seen signalled, without waiting,
+//! so the hot path never blocks on one; at most [`PENDING_PRESENTS`] are pending before the
+//! oldest is waited for. (An A/B on louise-pc, 6 runs each, found no render-time cost of the
+//! fences against the same build without them: bench/results/RENDER.md.) A swapchain, retired by a
 //! new one or destroyed, is destroyed only after its pending present fences have signalled, so the presentation engine never uses a freed
 //! semaphore or image; without the extension, after the device is idle only (RENDER.md §13's
 //! known gap, as in wgpu-hal). A wait that does not end within [`FRAME_TIMEOUT`] leaks the
