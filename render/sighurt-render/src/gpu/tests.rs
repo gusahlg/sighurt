@@ -143,7 +143,7 @@ impl Pages {
     }
 }
 
-/// The shader, on the CPU: premultiplied RGBA, `f32`, source-over.
+/// The shader, on the CPU: premultiplied RGBA, `f32`, source-over, into an 8-bit target.
 fn draw(prepared: &Prepared, pages: &Pages) -> Vec<[f32; 4]> {
     let (w, h) = prepared.size;
     let mut pixels = vec![prepared.clear; (w * h) as usize];
@@ -187,7 +187,9 @@ fn draw(prepared: &Prepared, pages: &Pages) -> Vec<[f32; 4]> {
                     };
                     let target = &mut pixels[(y * w + x) as usize];
                     let keep = 1.0 - source[3];
-                    *target = [0, 1, 2, 3].map(|k| source[k] + target[k] * keep);
+                    // The target is 8 bits a channel (Bgra8Unorm): each draw is stored rounded.
+                    *target = [0, 1, 2, 3]
+                        .map(|k| ((source[k] + target[k] * keep) * 255.0).round() / 255.0);
                 }
             }
         }
@@ -502,4 +504,267 @@ fn a_new_scale_starts_over() {
         prepare(&scene, &metrics, &mut atlas, &handle).unwrap();
     }
     assert_eq!(atlas.stats().resets, 1);
+}
+
+#[path = "../../../../tools/fuzz/mod.rs"]
+mod fuzz;
+use crate as render;
+#[path = "../../tests/support/scenes.rs"]
+mod scenes;
+
+/// Compares what the reference rasterizer draws of `prepared` with the CPU backend's frame:
+/// `tolerance` levels off the corners, 64 at them (the GPU comparison's
+/// RANDOM_CORNER_TOLERANCE, which says why), 16 on a path's ink (its PATH_TOLERANCE). Returns the corner
+/// pixels beyond 2 and the pixels compared.
+fn compare_prepared(
+    name: &str,
+    scene: &Scene,
+    metrics: &Metrics,
+    prepared: &Prepared,
+    pages: &Pages,
+    fonts: &FontSystemHandle,
+    tolerance: u8,
+) -> (usize, usize) {
+    let ours = draw(prepared, pages);
+    let theirs = cpu(scene, metrics, fonts);
+    assert_eq!(ours.len(), theirs.len(), "{name}");
+    let mapping = Mapping::new(metrics);
+    let w = prepared.size.0;
+    let mut corners = 0;
+    for (i, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
+        let ours = ours.map(|v| (v * 255.0).round() as u8);
+        let diff = (0..4).map(|k| ours[k].abs_diff(theirs[k])).max().unwrap();
+        let (x, y) = (i as u32 % w, i as u32 / w);
+        if diff <= tolerance {
+            continue;
+        }
+        // One of tiny-skia's 16 samples a pixel on a path's ink: the GPU comparison's
+        // PATH_TOLERANCE (tests/support/compare.rs) says why.
+        if diff <= 16 && in_path_ink(scene, &mapping, x, y) {
+            continue;
+        }
+        assert!(
+            near_corner(scene, &mapping, x, y) && diff <= 64,
+            "{name}: ({x}, {y}) of {w}: {ours:?} vs {theirs:?}"
+        );
+        corners += 1;
+    }
+    (corners, ours.len())
+}
+
+/// Whether `(x, y)` is in the ink bounds of one of `scene`'s paths.
+fn in_path_ink(scene: &Scene, mapping: &Mapping, x: u32, y: u32) -> bool {
+    scene.items.iter().any(|item| {
+        let Kind::Path { path, stroke, .. } = item.kind else {
+            return false;
+        };
+        crate::shape::ink_bounds(scene.path(path), stroke, mapping).is_some_and(|b| {
+            let (x, y) = (i64::from(x), i64::from(y));
+            (i64::from(b.x)..i64::from(b.x) + i64::from(b.width)).contains(&x)
+                && (i64::from(b.y)..i64::from(b.y) + i64::from(b.height)).contains(&y)
+        })
+    })
+}
+
+/// Seeded random scenes (`SIG_FUZZ_ITERATIONS`, 15 % of 2000 by default: 300) prepared with
+/// one atlas in sequence, as a backend does (it grows, starts over at scale changes, and the
+/// icon ring alternates), drawn by the reference rasterizer and compared with the CPU
+/// backend. `SIG_FUZZ_SEED` and `SIG_FUZZ_CASE` replay.
+#[test]
+fn random_scenes_prepare_to_what_the_cpu_backend_draws() {
+    let mut shaping = fonts();
+    let handle = shaping.handle();
+    let mut atlas = Atlas::new();
+    let mut pages = Pages::new();
+    let (mut scenes, mut pixels, mut corners) = (0, 0, 0);
+    fuzz::run(
+        "gpu preparation random scenes",
+        fuzz::iterations(15),
+        std::time::Duration::from_secs(120),
+        |case| {
+            let (metrics, scene) = scenes::random_scene(&mut case.rng, &mut shaping);
+            case.note(|| {
+                format!(
+                    "{:?} at {} with {} items",
+                    metrics.rect(),
+                    metrics.scale().numerator(),
+                    scene.items.len()
+                )
+            });
+            let prepared = prepare(&scene, &metrics, &mut atlas, &handle)
+                .unwrap_or_else(|full| panic!("{full}"));
+            pages.apply(&prepared);
+            let name = format!("random case {}", case.index);
+            // Dozens of translucent layers: the random comparisons' RANDOM_TOLERANCE.
+            let (c, p) = compare_prepared(&name, &scene, &metrics, &prepared, &pages, &handle, 3);
+            scenes += 1;
+            pixels += p;
+            corners += c;
+        },
+    );
+    println!(
+        "preparation: {scenes} scenes, {pixels} pixels compared, {corners} corner pixels beyond 2"
+    );
+}
+
+/// Every item kind alone under each clip case at four scales, prepared with one atlas.
+#[test]
+fn every_item_kind_under_every_clip_prepares_to_what_the_cpu_backend_draws() {
+    let mut shaping = fonts();
+    let handle = shaping.handle();
+    let mut atlas = Atlas::new();
+    let mut pages = Pages::new();
+    let mut corners = 0;
+    let all = scenes::kind_scenes(&mut shaping);
+    for (name, metrics, scene) in &all {
+        let prepared = prepare(scene, metrics, &mut atlas, &handle).unwrap();
+        pages.apply(&prepared);
+        corners += compare_prepared(name, scene, metrics, &prepared, &pages, &handle, 2).0;
+    }
+    println!(
+        "preparation: {} fixed scenes, {corners} corner pixels beyond 2",
+        all.len()
+    );
+}
+
+/// Seeded random scenes with the paths and the long corner arcs `random_scene` leaves out:
+/// they differ from the CPU backend's by more than the tolerances (the reproductions below).
+/// Run with `--ignored`; `SIG_FUZZ_SEED` and `SIG_FUZZ_CASE` replay a failing case.
+#[test]
+#[ignore = "known CPU/GPU-preparation mismatches, reported"]
+fn random_hard_scenes_prepare_to_what_the_cpu_backend_draws() {
+    let mut shaping = fonts();
+    let handle = shaping.handle();
+    let mut atlas = Atlas::new();
+    let mut pages = Pages::new();
+    fuzz::run(
+        "gpu preparation random hard scenes",
+        fuzz::iterations(15),
+        std::time::Duration::from_secs(120),
+        |case| {
+            let (metrics, scene) = scenes::random_hard_scene(&mut case.rng, &mut shaping);
+            case.note(|| format!("{:?} at {}", metrics.rect(), metrics.scale().numerator()));
+            let prepared = prepare(&scene, &metrics, &mut atlas, &handle).unwrap();
+            pages.apply(&prepared);
+            let name = format!("random case {}", case.index);
+            compare_prepared(&name, &scene, &metrics, &prepared, &pages, &handle, 3);
+        },
+    );
+}
+
+/// The largest channel difference between the CPU backend's frame of `scene` and the prepared
+/// frame as the reference rasterizer draws it, over every pixel.
+fn worst_difference(scene: &Scene, metrics: &Metrics, fonts: &FontSystemHandle) -> u8 {
+    let mut atlas = Atlas::new();
+    let mut pages = Pages::new();
+    let prepared = prepare(scene, metrics, &mut atlas, fonts).unwrap();
+    pages.apply(&prepared);
+    let ours = draw(&prepared, &pages);
+    let theirs = cpu(scene, metrics, fonts);
+    ours.iter()
+        .zip(&theirs)
+        .map(|(o, t)| {
+            let o = o.map(|v| (v * 255.0).round() as u8);
+            (0..4).map(|k| o[k].abs_diff(t[k])).max().unwrap()
+        })
+        .max()
+        .unwrap()
+}
+
+fn reproduction(rect: WindowRect, scale: u32, clear: Rgba, draw: impl FnOnce(&mut Pen)) -> u8 {
+    let fonts = fonts();
+    let metrics = Metrics::new(
+        LayoutEpoch::next(),
+        rect,
+        Scale::from_fractional(scale).unwrap(),
+    );
+    let mut pen = Pen::new(rect);
+    pen.clear(clear);
+    draw(&mut pen);
+    worst_difference(&pen.finish(), &metrics, &fonts.handle())
+}
+
+const SURFACE: WindowRect = WindowRect {
+    x: 0,
+    y: 0,
+    width: 125,
+    height: 83,
+};
+
+/// A filled polygon that crosses itself and the surface's right edge: the prepared frame
+/// rasterized it over its whole ink bounds and differed from the CPU backend (tiny-skia
+/// painting it into the target, clipped there) by up to 9 levels; within the buffer it agrees
+/// (20643a3).
+#[test]
+fn a_self_crossing_polygon_differs_at_its_edges() {
+    let worst = reproduction(SURFACE, 126, Rgba::rgb(0xd51571), |pen| {
+        pen.shape(Rgba::rgb(0x3f0986), |p| {
+            p.move_to(131.758, 12.7764);
+            p.line_to(103.2556, 2.5775);
+            p.line_to(105.0964, 6.8918);
+            p.line_to(109.5137, 18.8708);
+            p.line_to(125.9628, 2.9291);
+            p.line_to(125.879, 24.0104);
+            p.line_to(104.7483, 32.0074);
+        });
+    });
+    assert!(worst <= 2, "worst difference {worst}");
+}
+
+/// A filled lens of two quads crossing the surface's right edge: 38 levels off before the
+/// prepared frame rasterized paths within the buffer (20643a3); now within 2.
+#[test]
+fn a_curve_differs_where_it_is_nearly_horizontal() {
+    let worst = reproduction(SURFACE, 126, Rgba::rgb(0xd51571), |pen| {
+        pen.shape(Rgba::rgb(0x3f0986), |p| {
+            p.move_to(101.9762, 17.7684);
+            p.quad_to(119.1262, 11.3684, 136.2762, 17.7684);
+            p.quad_to(119.1262, 23.7684, 101.9762, 17.7684);
+            p.close();
+        });
+    });
+    assert!(worst <= 2, "worst difference {worst}");
+}
+
+/// A stroke's round cap, at alpha 128 over a light green: one pixel at the cap's top differs
+/// by 4 levels, within the path tolerance.
+#[test]
+fn a_round_caps_top_pixel_differs() {
+    let rect = WindowRect {
+        x: 1526,
+        y: 1944,
+        width: 791,
+        height: 41,
+    };
+    let worst = reproduction(rect, 140, Rgba::rgb(0x96e74c), |pen| {
+        pen.stroke(3.57601, Rgba::rgb_alpha(0x4a5aa980), |p| {
+            p.move_to(2295.9668, 1971.5178);
+            p.line_to(2292.9783, 1984.4263);
+            p.line_to(2291.4016, 1991.8363);
+            p.line_to(2298.2078, 2005.2723);
+        });
+    });
+    assert!(worst <= 16, "worst difference {worst}");
+}
+
+/// A rounded rectangle with a long arc: radius 20.43 at scale 1.75 (36 buffer pixels, clamped
+/// to half its width), which also crosses the surface's edge: the analytic corner and
+/// tiny-skia's sampled one differ by 33 levels (12 with the same corner inside the surface,
+/// 18 unclamped), within the random comparisons' corner tolerance, not the fixtures' 16.
+#[test]
+fn a_long_corner_arc_differs_by_more_than_the_fixtures_corner_tolerance() {
+    let rect = WindowRect {
+        x: 651,
+        y: 592,
+        width: 17,
+        height: 107,
+    };
+    let worst = reproduction(rect, 210, Rgba::rgb(0xb40f50), |pen| {
+        pen.fill_rounded(
+            [649.5287, 589.5909, 37.0, 127.0],
+            20.43,
+            Rgba::rgb(0x571ed2),
+        );
+    });
+    assert!(worst > 16 && worst <= 64, "worst difference {worst}");
 }
